@@ -25096,7 +25096,17 @@ fn window_frame_bounds(
                     }
                     peers.group_start[g.max(0) as usize]
                 }
-                M::Range => match range_bound(order_values, pos, signed, ascending, true, peers)? {
+                M::Range => match range_bound(
+                    order_values,
+                    pos,
+                    signed,
+                    w.frame
+                        .start_value
+                        .map(|v| (v, matches!(w.frame.start, B::Preceding(_)))),
+                    ascending,
+                    true,
+                    peers,
+                )? {
                     Some(v) => v,
                     None => return Ok(None),
                 },
@@ -25138,7 +25148,17 @@ fn window_frame_bounds(
                     peers.group_start.get(g + 1).map(|s| s - 1).unwrap_or(n - 1)
                 }
                 M::Range => {
-                    match range_bound(order_values, pos, signed, ascending, false, peers)? {
+                    match range_bound(
+                        order_values,
+                        pos,
+                        signed,
+                        w.frame
+                            .end_value
+                            .map(|v| (v, matches!(w.frame.end, B::Preceding(_)))),
+                        ascending,
+                        false,
+                        peers,
+                    )? {
                         Some(v) => v,
                         None => return Ok(None),
                     }
@@ -25175,11 +25195,23 @@ fn range_bound(
     order_values: &[Option<Bson>],
     pos: usize,
     shift: i64,
+    value: Option<(secantus_pgplan::RangeOffset, bool)>,
     ascending: bool,
     start: bool,
     peers: &Peers,
 ) -> Result<Option<usize>, PlanError> {
-    let key = |v: &Bson| -> Option<f64> { numeric_f64(v).map(|x| if ascending { x } else { -x }) };
+    use secantus_pgplan::RangeOffset;
+    // An interval offset measures a date / time column in microseconds; a
+    // number measures a number.
+    let by_time = matches!(value, Some((RangeOffset::Interval(_), _)));
+    let key = |v: &Bson| -> Option<f64> {
+        let x = if by_time {
+            secantus_pgplan::instant_micros_pub(v).map(|m| m as f64)
+        } else {
+            numeric_f64(v)
+        };
+        x.map(|x| if ascending { x } else { -x })
+    };
     let current = order_values.get(pos).and_then(|v| v.clone());
     let Some(current) = current.filter(|v| *v != Bson::Null) else {
         return Ok(Some(if start {
@@ -25193,7 +25225,35 @@ fn range_bound(
             "RANGE with an offset over a non-numeric ORDER BY column".into(),
         ));
     };
-    let bound = base + shift as f64;
+    // A value offset's direction: PRECEDING moves the key down.
+    let bound = match value {
+        None => base + shift as f64,
+        Some((RangeOffset::Number(bits), preceding)) => {
+            let off = f64::from_bits(bits);
+            if preceding {
+                base - off
+            } else {
+                base + off
+            }
+        }
+        Some((RangeOffset::Interval(iv), preceding)) => {
+            // In VALUE space: PRECEDING on an ascending window subtracts.
+            let dir = if preceding { -1 } else { 1 } * if ascending { 1 } else { -1 };
+            let micros = secantus_pgplan::instant_micros_pub(&current).ok_or_else(|| {
+                PlanError::FeatureNotSupported(
+                    "RANGE with an interval offset over a non-date ORDER BY column".into(),
+                )
+            })?;
+            let moved = secantus_pgplan::add_interval_to_micros(micros, &iv, dir)
+                .ok_or_else(|| PlanError::Sqlstate("22008", "timestamp out of range".into()))?
+                as f64;
+            if ascending {
+                moved
+            } else {
+                -moved
+            }
+        }
+    };
     let keyed = |i: usize| -> Option<f64> {
         order_values
             .get(i)

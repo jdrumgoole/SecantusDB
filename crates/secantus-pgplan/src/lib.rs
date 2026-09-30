@@ -1261,6 +1261,18 @@ pub struct WindowFrame {
     pub start: FrameBound,
     pub end: FrameBound,
     pub exclude: FrameExclude,
+    /// A RANGE frame's VALUE offsets (`0.5 PRECEDING`, `'1 day'
+    /// FOLLOWING`), which the integer in `start` / `end` cannot carry.
+    pub start_value: Option<RangeOffset>,
+    pub end_value: Option<RangeOffset>,
+}
+
+/// The offset of a RANGE bound: a number (its `f64` bits, so the frame stays
+/// `Eq`), or an interval over a date / time ordering column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeOffset {
+    Number(u64),
+    Interval(Interval),
 }
 
 /// `EXCLUDE` removes rows from the frame AFTER its bounds are found.
@@ -1291,6 +1303,8 @@ impl WindowFrame {
         start: FrameBound::UnboundedPreceding,
         end: FrameBound::CurrentRow,
         exclude: FrameExclude::NoOthers,
+        start_value: None,
+        end_value: None,
     };
 }
 
@@ -7642,23 +7656,79 @@ fn plan_window_frame(
     } else {
         return Err(Error::Unsupported("this window frame".into()));
     };
-    let offset = |node: Option<&pg_query::protobuf::Node>| -> Result<i64> {
+    // ROWS and GROUPS take a bigint (a fraction rounds, as the cast does);
+    // RANGE takes a value of the ordering column's kind -- a number, or an
+    // interval over a date or time.
+    let offset = |node: Option<&pg_query::protobuf::Node>,
+                  which: &str|
+     -> Result<(i64, Option<RangeOffset>)> {
         let node = node.ok_or_else(|| Error::Parse("frame bound with no offset".into()))?;
-        match const_value(node, params)? {
-            Bson::Int32(v) => Ok(i64::from(v)),
-            Bson::Int64(v) => Ok(v),
-            // PostgreSQL's own message for a negative or non-integer bound.
-            _ => Err(Error::Unsupported("this window frame offset".into())),
+        let v = const_value(node, params)?;
+        if mode == FrameMode::Range {
+            let invalid = || {
+                Error::Sqlstate(
+                    "22013",
+                    "invalid preceding or following size in window function".into(),
+                )
+            };
+            let number = |v: &Bson| match v {
+                Bson::Int32(x) => Some(f64::from(*x)),
+                Bson::Int64(x) => Some(*x as f64),
+                Bson::Double(x) => Some(*x),
+                other => numeric::numeric_text(other).and_then(|t| t.parse::<f64>().ok()),
+            };
+            let r = if let Some(iv) = Interval::from_bson(&v) {
+                RangeOffset::Interval(iv)
+            } else if let Some(f) = number(&v) {
+                if f.is_nan() || f < 0.0 {
+                    return Err(invalid());
+                }
+                RangeOffset::Number(f.to_bits())
+            } else if let Bson::String(t) = &v {
+                match t.trim().parse::<f64>() {
+                    Ok(f) if !f.is_nan() && f >= 0.0 => RangeOffset::Number(f.to_bits()),
+                    Ok(_) => return Err(invalid()),
+                    Err(_) => match Interval::from_bson(&cast_value(v.clone(), "interval")?) {
+                        Some(iv) => RangeOffset::Interval(iv),
+                        None => return Err(Error::Unsupported("this window frame offset".into())),
+                    },
+                }
+            } else {
+                return Err(Error::Unsupported("this window frame offset".into()));
+            };
+            if let RangeOffset::Interval(iv) = r {
+                if iv.comparable_micros() < 0 {
+                    return Err(invalid());
+                }
+            }
+            return Ok((0, Some(r)));
         }
+        let k = match cast_value(v, "int8")? {
+            Bson::Int64(k) => k,
+            Bson::Int32(k) => i64::from(k),
+            _ => return Err(Error::Unsupported("this window frame offset".into())),
+        };
+        if k < 0 {
+            return Err(Error::Sqlstate(
+                "22013",
+                format!("frame {which} offset must not be negative"),
+            ));
+        }
+        Ok((k, None))
     };
+    let (mut start_value, mut end_value) = (None, None);
     let start = if opts & frameopt::START_UNBOUNDED_PRECEDING != 0 {
         FrameBound::UnboundedPreceding
     } else if opts & frameopt::START_CURRENT_ROW != 0 {
         FrameBound::CurrentRow
     } else if opts & frameopt::START_OFFSET_PRECEDING != 0 {
-        FrameBound::Preceding(offset(offsets.start_offset.as_deref())?)
+        let (k, v) = offset(offsets.start_offset.as_deref(), "starting")?;
+        start_value = v;
+        FrameBound::Preceding(k)
     } else if opts & frameopt::START_OFFSET_FOLLOWING != 0 {
-        FrameBound::Following(offset(offsets.start_offset.as_deref())?)
+        let (k, v) = offset(offsets.start_offset.as_deref(), "starting")?;
+        start_value = v;
+        FrameBound::Following(k)
     } else {
         return Err(Error::Unsupported("this window frame start".into()));
     };
@@ -7667,9 +7737,13 @@ fn plan_window_frame(
     } else if opts & frameopt::END_CURRENT_ROW != 0 {
         FrameBound::CurrentRow
     } else if opts & frameopt::END_OFFSET_PRECEDING != 0 {
-        FrameBound::Preceding(offset(offsets.end_offset.as_deref())?)
+        let (k, v) = offset(offsets.end_offset.as_deref(), "ending")?;
+        end_value = v;
+        FrameBound::Preceding(k)
     } else if opts & frameopt::END_OFFSET_FOLLOWING != 0 {
-        FrameBound::Following(offset(offsets.end_offset.as_deref())?)
+        let (k, v) = offset(offsets.end_offset.as_deref(), "ending")?;
+        end_value = v;
+        FrameBound::Following(k)
     } else {
         return Err(Error::Unsupported("this window frame end".into()));
     };
@@ -7678,6 +7752,8 @@ fn plan_window_frame(
         start,
         end,
         exclude,
+        start_value,
+        end_value,
     })
 }
 
