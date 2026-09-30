@@ -66,6 +66,35 @@ pub trait Host {
     fn notice(&self, severity: &str, sqlstate: &str, message: String);
     /// Run an INSERT / UPDATE / DELETE and answer its RETURNING rows
     /// (`... RETURNING ... INTO`).
+    /// `CALL p(...)` from a body: each OUTPUT parameter as `(argument
+    /// position, parameter name)`, and their values in that order.
+    #[allow(clippy::type_complexity)]
+    fn call(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<(Vec<(usize, String)>, Vec<Bson>), PlError> {
+        let _ = (sql, params, types);
+        Err(PlError::unsupported("CALL"))
+    }
+    /// Enter a block with EXCEPTION handlers: a subtransaction, so a caught
+    /// error undoes the block's writes. Answers a token for `subtxn_end`.
+    fn subtxn_begin(&self) -> Result<u64, PlError> {
+        Ok(0)
+    }
+    /// Leave that subtransaction: keep its writes, or (`rollback`) undo them.
+    fn subtxn_end(&self, token: u64, rollback: bool) -> Result<(), PlError> {
+        let _ = (token, rollback);
+        Ok(())
+    }
+    /// `COMMIT` / `ROLLBACK` [`AND CHAIN`] in a procedure or DO block: end the
+    /// session's transaction and start the next. Only a `CALL` / `DO` run
+    /// outside a transaction block may; anywhere else it is 2D000.
+    fn end_transaction(&self, commit: bool, chain: bool) -> Result<(), PlError> {
+        let _ = (commit, chain);
+        Err(PlError::new("2D000", "invalid transaction termination"))
+    }
     fn returning(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError> {
         let _ = (sql, params, types);
         Err(PlError::unsupported(
@@ -122,6 +151,9 @@ pub struct Invocation<'a> {
     pub out_params: &'a [String],
     /// A procedure: reaching the end without RETURN is how it finishes.
     pub procedure: bool,
+    /// A procedure or DO block, whose body may COMMIT / ROLLBACK; a
+    /// function's (or trigger's) may not.
+    pub nonatomic: bool,
 }
 
 /// What a call produced.
@@ -169,6 +201,10 @@ struct Interp<'a> {
     returns_set: bool,
     out_params: Vec<String>,
     procedure: bool,
+    nonatomic: bool,
+    /// Blocks with EXCEPTION handlers entered and not left: a COMMIT inside
+    /// one is refused (a subtransaction is active).
+    subtxn_depth: usize,
     set_rows: Vec<Vec<Bson>>,
     row_count: u64,
     found_no: Option<usize>,
@@ -504,6 +540,8 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         returns_set: inv.returns_set,
         out_params: inv.out_params.to_vec(),
         procedure: inv.procedure,
+        nonatomic: inv.nonatomic,
+        subtxn_depth: 0,
         set_rows: Vec::new(),
         row_count: 0,
         found_no,
@@ -902,14 +940,33 @@ impl Interp<'_> {
             .map(str::to_string);
         match kind.as_str() {
             "PLpgSQL_stmt_block" => {
-                let result = self.stmts(body.get("body").unwrap_or(&Value::Null));
-                let Some(handlers) = body
+                let handlers = body
                     .get("exceptions")
                     .and_then(|e| e.get("PLpgSQL_exception_block"))
                     .and_then(|b| b.get("exc_list"))
                     .and_then(Value::as_array)
-                    .cloned()
-                else {
+                    .cloned();
+                // A block with handlers runs as a subtransaction: an error it
+                // catches undoes the block's writes, as PostgreSQL has it.
+                let token = match handlers {
+                    Some(_) => {
+                        self.subtxn_depth += 1;
+                        match self.host.subtxn_begin() {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                self.subtxn_depth -= 1;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let result = self.stmts(body.get("body").unwrap_or(&Value::Null));
+                if let Some(t) = token {
+                    self.subtxn_depth -= 1;
+                    self.host.subtxn_end(t, result.is_err())?;
+                }
+                let Some(handlers) = handlers else {
                     return match result? {
                         Flow::Exit(Some(l)) if label.as_deref() == Some(l.as_str()) => {
                             Ok(Flow::Next)
@@ -1387,8 +1444,60 @@ impl Interp<'_> {
                 }
                 Ok(Flow::Next)
             }
+            "PLpgSQL_stmt_call" => {
+                let (text, _) = expr_query(body.get("expr").unwrap_or(&Value::Null))
+                    .ok_or_else(|| PlError::new("XX000", "a CALL without text"))?;
+                let (sql, params, types) = self.bind(text)?;
+                // A nested `DO` parses to the same statement.
+                if !body.get("is_call").and_then(Value::as_bool).unwrap_or(true) {
+                    self.host.execute(&sql, &params, &types)?;
+                    return Ok(Flow::Next);
+                }
+                let (outputs, values) = self.host.call(&sql, &params, &types)?;
+                // An OUTPUT parameter's value goes back into the variable
+                // passed for it, which must be one.
+                let targets = call_arguments(text);
+                for (k, (pos, param)) in outputs.iter().enumerate() {
+                    let Some(Some(var)) = targets.get(*pos) else {
+                        return Err(PlError::new(
+                            "42601",
+                            format!(
+                                "procedure parameter \"{param}\" is an output parameter \
+                                 but corresponding argument is not writable"
+                            ),
+                        ));
+                    };
+                    let value = values.get(k).cloned().unwrap_or(Bson::Null);
+                    let ty = self.datums.iter().rev().find_map(|d| match d {
+                        Datum::Var { name, ty, .. } if name == var => Some(ty.clone()),
+                        _ => None,
+                    });
+                    let value = match (ty, &value) {
+                        (_, Bson::Null) | (None, _) => value,
+                        (Some(t), _) => self.cast(value, &t)?,
+                    };
+                    self.set_named(var, value);
+                }
+                Ok(Flow::Next)
+            }
             "PLpgSQL_stmt_commit" | "PLpgSQL_stmt_rollback" => {
-                Err(PlError::new("2D000", "invalid transaction termination"))
+                let commit = kind == "PLpgSQL_stmt_commit";
+                if !self.nonatomic {
+                    return Err(PlError::new("2D000", "invalid transaction termination"));
+                }
+                if self.subtxn_depth > 0 {
+                    return Err(PlError::new(
+                        "2D000",
+                        if commit {
+                            "cannot commit while a subtransaction is active"
+                        } else {
+                            "cannot roll back while a subtransaction is active"
+                        },
+                    ));
+                }
+                let chain = body.get("chain").and_then(Value::as_bool).unwrap_or(false);
+                self.host.end_transaction(commit, chain)?;
+                Ok(Flow::Next)
             }
             other => Err(PlError::unsupported(&format!(
                 "the statement {}",
@@ -1529,4 +1638,35 @@ impl Interp<'_> {
 /// a name PostgreSQL would need quoted is not produced by `canonical_type`.
 fn sql_type(ty: &str) -> String {
     ty.to_string()
+}
+
+/// A `CALL`'s arguments as written: the variable each names, when it is a
+/// bare name (the only kind an OUTPUT parameter can write back to).
+fn call_arguments(text: &str) -> Vec<Option<String>> {
+    use pg_query::protobuf::node::Node as N;
+    let Ok(parsed) = pg_query::parse(text) else {
+        return Vec::new();
+    };
+    let Some(N::CallStmt(c)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return Vec::new();
+    };
+    let Some(f) = c.funccall.as_ref() else {
+        return Vec::new();
+    };
+    f.args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::ColumnRef(r)) if r.fields.len() == 1 => match r.fields[0].node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
