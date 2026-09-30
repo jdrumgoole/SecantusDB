@@ -362,6 +362,7 @@ impl PgHandler {
                         arg_types: &[],
                         trigger: Some(data),
                         returns_set: false,
+                        out_params: &[],
                     },
                     &PlHost { h: self },
                 )

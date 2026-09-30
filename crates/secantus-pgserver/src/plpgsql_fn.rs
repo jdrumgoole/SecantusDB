@@ -116,6 +116,10 @@ pub struct Invocation<'a> {
     pub arg_types: &'a [String],
     pub trigger: Option<TriggerData>,
     pub returns_set: bool,
+    /// The OUT / INOUT parameters' names, in order: a non-set function
+    /// returns their values when control reaches its end (or a bare RETURN)
+    /// -- the one value, or a record of several.
+    pub out_params: &'a [String],
 }
 
 /// What a call produced.
@@ -161,11 +165,51 @@ struct Interp<'a> {
     host: &'a dyn Host,
     trigger: Option<TriggerData>,
     returns_set: bool,
+    out_params: Vec<String>,
     set_rows: Vec<Vec<Bson>>,
     row_count: u64,
     found_no: Option<usize>,
     /// The error a handler is running for: `RAISE;` re-raises it.
     handling: Option<PlError>,
+}
+
+impl Interp<'_> {
+    /// The OUT parameters' values as the function's result: the one value,
+    /// or a record of several (named, so `(f()).b` and `select * from f()`
+    /// read them). `None` for a function without OUT parameters.
+    fn out_value(&self) -> Option<Bson> {
+        if self.out_params.is_empty() || self.returns_set {
+            return None;
+        }
+        let value_of = |name: &str| -> Bson {
+            self.datums
+                .iter()
+                .find_map(|d| match d {
+                    Datum::Var { name: n, value, .. } if n == name => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or(Bson::Null)
+        };
+        if let [one] = self.out_params.as_slice() {
+            return Some(value_of(one));
+        }
+        let mut record = bson::Document::new();
+        record.insert(
+            secantus_pgplan::RECORD_KEY,
+            self.out_params
+                .iter()
+                .map(|n| value_of(n))
+                .collect::<Vec<_>>(),
+        );
+        record.insert(
+            secantus_pgplan::RECORD_NAMES_KEY,
+            self.out_params
+                .iter()
+                .map(|n| Bson::String(n.clone()))
+                .collect::<Vec<_>>(),
+        );
+        Some(Bson::Document(record))
+    }
 }
 
 /// The parsed body of a function, by its full CREATE text.
@@ -455,6 +499,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         host,
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
+        out_params: inv.out_params.to_vec(),
         set_rows: Vec::new(),
         row_count: 0,
         found_no,
@@ -498,6 +543,10 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
     match interp.stmt(&action)? {
         Flow::Return(o) => Ok(o),
         _ if interp.returns_set => Ok(Outcome::Rows(std::mem::take(&mut interp.set_rows))),
+        // A function with OUT parameters returns them at its end.
+        _ if interp.trigger.is_none() && !interp.out_params.is_empty() => {
+            Ok(Outcome::Value(interp.out_value().unwrap_or(Bson::Null)))
+        }
         // An event trigger function returns nothing.
         _ if interp
             .trigger
@@ -1122,6 +1171,9 @@ impl Interp<'_> {
                         if let Some(Datum::Rec { rec, .. }) = self.datums.get(no as usize) {
                             return Ok(Flow::Return(Outcome::Record(rec.clone())));
                         }
+                    }
+                    if let Some(v) = self.out_value() {
+                        return Ok(Flow::Return(Outcome::Value(v)));
                     }
                     return Ok(Flow::Return(Outcome::Value(Bson::Null)));
                 };

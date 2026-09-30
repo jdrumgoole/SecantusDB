@@ -98,6 +98,8 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("proconfig", "text[]"),
             ("provariadic", "oid"),
             ("prosqlbody", "text"),
+            ("proargmodes", "\"char\"[]"),
+            ("proallargtypes", "oid[]"),
         ],
         "pg_extension" => &[
             ("extowner", "oid"),

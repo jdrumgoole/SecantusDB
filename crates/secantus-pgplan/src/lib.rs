@@ -2284,6 +2284,13 @@ pub struct UserFunctionDef {
     pub strict: bool,
     /// Each input parameter's `DEFAULT` as SQL, `None` where it has none.
     pub defaults: Vec<Option<String>>,
+    /// EVERY parameter in declared order, `(name, type, mode)` with
+    /// `proargmodes`' codes (`i`, `o`, `b` for INOUT, `v`, `t`).
+    pub all_params: Vec<(String, String, String)>,
+    /// The schema a qualified name gave (`CREATE FUNCTION s.f`).
+    pub schema: Option<String>,
+    /// `CREATE PROCEDURE`.
+    pub is_procedure: bool,
 }
 
 /// One `ALTER VIEW` action.
@@ -4162,9 +4169,17 @@ fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Stateme
 }
 
 fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
-    if f.is_procedure {
-        return Err(Error::Unsupported("CREATE PROCEDURE".into()));
-    }
+    let name_parts: Vec<String> = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let schema = (name_parts.len() > 1)
+        .then(|| name_parts[name_parts.len() - 2].clone())
+        .filter(|s| s != "public");
     let name = f
         .funcname
         .iter()
@@ -4186,11 +4201,63 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             .ok_or_else(|| Error::Parse("CREATE FUNCTION parameter without a type".into()))?;
         arg_types.push(ty);
     }
-    let return_type = f
-        .return_type
-        .as_ref()
-        .map(type_name_of)
-        .ok_or_else(|| Error::Unsupported("CREATE FUNCTION without RETURNS".into()))?;
+    // With no RETURNS, the OUT parameters are the result: one is its type,
+    // several a record (and a procedure without any returns nothing).
+    let out_types: Vec<String> = f
+        .parameters
+        .iter()
+        .filter_map(|p| match p.node.as_ref() {
+            Some(N::FunctionParameter(fp)) => {
+                use pg_query::protobuf::FunctionParameterMode as M;
+                matches!(
+                    M::try_from(fp.mode),
+                    Ok(M::FuncParamOut | M::FuncParamInout)
+                )
+                .then(|| fp.arg_type.as_ref().map(type_name_of).unwrap_or_default())
+            }
+            _ => None,
+        })
+        .collect();
+    let return_type = match f.return_type.as_ref().map(type_name_of) {
+        Some(declared) => {
+            // PostgreSQL's consistency rule between RETURNS and OUT.
+            match out_types.as_slice() {
+                [one] if !declared.eq_ignore_ascii_case(one) && declared != "record" => {
+                    return Err(Error::Sqlstate(
+                        "42P13",
+                        format!(
+                            "function result type must be {} because of OUT parameters",
+                            display_type(one)
+                        ),
+                    ));
+                }
+                [_, _, ..] if declared != "record" => {
+                    return Err(Error::Sqlstate(
+                        "42P13",
+                        "function result type must be record because of OUT parameters".into(),
+                    ));
+                }
+                _ => declared,
+            }
+        }
+        None if f.is_procedure => {
+            if out_types.is_empty() {
+                "void".to_string()
+            } else {
+                "record".to_string()
+            }
+        }
+        None => match out_types.as_slice() {
+            [] => {
+                return Err(Error::Sqlstate(
+                    "42P13",
+                    "function result type must be specified".into(),
+                ))
+            }
+            [one] => one.clone(),
+            _ => "record".to_string(),
+        },
+    };
     let mut language = None;
     let mut body = None;
     let mut volatility = "volatile".to_string();
@@ -4242,12 +4309,25 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         let mut columns = Vec::new();
         let mut variadic = false;
         let mut defaults: Vec<Option<String>> = Vec::new();
+        let mut all_params = Vec::new();
         for p in &f.parameters {
             let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
                 continue;
             };
             let ty = fp.arg_type.as_ref().map(type_name_of).unwrap_or_default();
             use pg_query::protobuf::FunctionParameterMode as M;
+            all_params.push((
+                fp.name.clone(),
+                ty.clone(),
+                match M::try_from(fp.mode) {
+                    Ok(M::FuncParamOut) => "o",
+                    Ok(M::FuncParamInout) => "b",
+                    Ok(M::FuncParamVariadic) => "v",
+                    Ok(M::FuncParamTable) => "t",
+                    _ => "i",
+                }
+                .to_string(),
+            ));
             let input = !matches!(
                 M::try_from(fp.mode),
                 Ok(M::FuncParamOut | M::FuncParamTable)
@@ -4299,6 +4379,9 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             variadic,
             strict,
             defaults,
+            all_params,
+            schema,
+            is_procedure: f.is_procedure,
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
@@ -9520,8 +9603,10 @@ fn srf_rows(
             .then(|| user_composite(&u.return_type).map(|(_, fields)| fields))
             .flatten()
     };
+    // A plain function with OUT parameters returns ONE row of them.
+    let out_row = |u: &correlated::UserFn| !u.returns_set && !u.columns.is_empty();
     if let Some(u) = correlated::user_function_for(name, &call.args)
-        .filter(|u| u.returns_set || composite(u).is_some())
+        .filter(|u| u.returns_set || composite(u).is_some() || (expand && out_row(u)))
     {
         let a: Vec<Bson> = call
             .args
@@ -9546,6 +9631,17 @@ fn srf_rows(
             correlated::FnResult::Rows(_, _, rows) => rows,
             correlated::FnResult::Value(v) => vec![vec![v]],
         };
+        if out_row(&u) && u.columns.len() > 1 {
+            // The one result is a record of the OUT values.
+            for row in &mut rows {
+                if let [single] = row.as_slice() {
+                    *row = match single {
+                        Bson::Null => vec![Bson::Null; u.columns.len()],
+                        v => record_fields(v).cloned().unwrap_or_else(|| vec![v.clone()]),
+                    };
+                }
+            }
+        }
         if let Some(fields) = &fields {
             // Each result is one composite value: its fields are the row.
             for row in &mut rows {
@@ -21172,6 +21268,11 @@ pub fn regtype_text(oid: i64) -> String {
         0 => return "-".to_string(),
         18 => return QUOTED_CHAR.to_string(),
         1002 => return format!("{QUOTED_CHAR}[]"),
+        // The pseudo-types a function signature names.
+        2249 => return "record".to_string(),
+        2278 => return "void".to_string(),
+        2279 => return "trigger".to_string(),
+        3838 => return "event_trigger".to_string(),
         _ => {}
     }
     if let Some(name) = pgtypes::name_of_oid(oid) {
@@ -28782,10 +28883,25 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         let fields = record_fields(&value)
             .ok_or_else(|| Error::Unsupported("field selection on a non-record value".into()))?;
         let ty = static_type(arg, &value);
+        // A record that carries its field names (a function's OUT
+        // parameters, a whole row) resolves the name among them.
+        let named: Option<Vec<String>> = match &value {
+            Bson::Document(d) => d.get_array(RECORD_NAMES_KEY).ok().map(|a| {
+                a.iter()
+                    .map(|n| n.as_str().unwrap_or_default().to_string())
+                    .collect()
+            }),
+            _ => None,
+        };
         let (idx, err) = if let Some((_, comp_fields)) = user_composite(&ty) {
             (
                 comp_fields.iter().position(|(n, _)| *n == field),
                 format!("column \"{field}\" not found in data type {ty}"),
+            )
+        } else if let Some(names) = named.filter(|n| n.iter().any(|x| *x == field)) {
+            (
+                names.iter().position(|n| *n == field),
+                format!("could not identify column \"{field}\" in record data type"),
             )
         } else {
             // An anonymous record names its fields f1, f2, ... by position.

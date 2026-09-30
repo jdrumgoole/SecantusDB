@@ -440,6 +440,46 @@ fn plpgsql_create_sql(doc: &Document) -> String {
         })
         .unwrap_or_default();
     let ret = doc.get_str("return_tag").unwrap_or("void");
+    // A document with every parameter's MODE renders them as declared, in
+    // order -- which is also the order the interpreter binds arguments in.
+    let all_names = strings("all_params");
+    let all_types = strings("all_param_types");
+    let modes = strings("param_modes");
+    if !modes.is_empty()
+        && modes.len() == all_types.len()
+        && !doc.get_bool("is_table").unwrap_or(false)
+    {
+        let declared: Vec<String> = modes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mode = match m.as_str() {
+                    "o" => "OUT ",
+                    "b" => "INOUT ",
+                    "v" => "VARIADIC ",
+                    _ => "",
+                };
+                let n = all_names.get(i).cloned().unwrap_or_default();
+                format!("{mode}{n} {}", all_types[i]).replace("  ", " ")
+            })
+            .collect();
+        let body = doc.get_str("body").unwrap_or_default();
+        if doc.get_bool("is_procedure").unwrap_or(false) {
+            return format!(
+                "CREATE PROCEDURE f({}) AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
+                declared.join(", ")
+            );
+        }
+        let returns = if doc.get_bool("returns_set").unwrap_or(false) {
+            format!("SETOF {ret}")
+        } else {
+            ret.to_string()
+        };
+        return format!(
+            "CREATE FUNCTION f({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
+            declared.join(", ")
+        );
+    }
     let returns = if doc.get_bool("is_table").unwrap_or(false) && !columns.is_empty() {
         let cols: Vec<String> = columns.iter().map(|(n, t)| format!("{n} {t}")).collect();
         format!("TABLE ({})", cols.join(", "))
@@ -456,6 +496,117 @@ fn plpgsql_create_sql(doc: &Document) -> String {
         "CREATE FUNCTION f({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
         params.join(", ")
     )
+}
+
+/// A call's input arguments spread over every declared parameter position
+/// (a NULL for each OUT one), with the declared types to match, when the
+/// document records modes; otherwise as given.
+pub(crate) fn positional_args(
+    doc: &Document,
+    args: &[Bson],
+    types: &[String],
+) -> (Vec<Bson>, Vec<String>) {
+    let strings = |key: &str| -> Vec<String> {
+        doc.get_array(key)
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let modes = strings("param_modes");
+    let all_types = strings("all_param_types");
+    if modes.is_empty() || modes.len() != all_types.len() || !modes.iter().any(|m| m == "o") {
+        return (args.to_vec(), types.to_vec());
+    }
+    let mut given = args.iter();
+    let spread = modes
+        .iter()
+        .map(|m| {
+            if m == "o" {
+                Bson::Null
+            } else {
+                given.next().cloned().unwrap_or(Bson::Null)
+            }
+        })
+        .collect();
+    (spread, all_types)
+}
+
+/// A function document in the shared (Python server's) shape -- `params`,
+/// `param_types` and `param_modes` over EVERY parameter -- as this server
+/// reads it: `params` / `param_types` the INPUT ones (IN, INOUT, VARIADIC),
+/// the OUT ones (OUT, INOUT, TABLE) as `table_columns` when it has none, and
+/// the full lists kept as `all_params` / `all_param_types` for `pg_proc`.
+/// A document without modes (every parameter an input) is unchanged.
+pub(crate) fn normalize_function_doc(d: &Document) -> Document {
+    let strings = |key: &str| -> Vec<String> {
+        d.get_array(key)
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let modes = strings("param_modes");
+    let names = strings("params");
+    let types = strings("param_types");
+    if modes.is_empty() || modes.len() != types.len() || d.contains_key("all_param_types") {
+        return d.clone();
+    }
+    let name_at = |i: usize| names.get(i).cloned().unwrap_or_default();
+    let is_input = |m: &str| matches!(m, "i" | "b" | "v" | "");
+    let is_output = |m: &str| matches!(m, "o" | "b" | "t");
+    let mut out = d.clone();
+    out.insert(
+        "params",
+        modes
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| is_input(m))
+            .map(|(i, _)| Bson::String(name_at(i)))
+            .collect::<Vec<_>>(),
+    );
+    out.insert(
+        "param_types",
+        modes
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| is_input(m))
+            .map(|(i, _)| Bson::String(types[i].clone()))
+            .collect::<Vec<_>>(),
+    );
+    let has_columns = d.get_array("table_columns").is_ok_and(|c| !c.is_empty());
+    if !has_columns {
+        out.insert(
+            "table_columns",
+            modes
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| is_output(m))
+                .map(|(i, _)| {
+                    Bson::Document(bson::doc! { "name": name_at(i), "type_tag": &types[i] })
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    out.insert(
+        "all_params",
+        names
+            .iter()
+            .map(|n| Bson::String(n.clone()))
+            .collect::<Vec<_>>(),
+    );
+    out.insert(
+        "all_param_types",
+        types
+            .iter()
+            .map(|t| Bson::String(t.clone()))
+            .collect::<Vec<_>>(),
+    );
+    out
 }
 
 /// A SQL function body's references to its parameters BY NAME, rewritten to
@@ -4226,6 +4377,19 @@ impl PgHandler {
     /// the session had ever created -- each one leaves a row type here --
     /// until a plain `select 1` ran twice as slowly on a used store.
     fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
+        let docs = self.type_catalog_docs_raw(collection)?;
+        // Functions are stored in the Python server's shape -- every
+        // parameter positionally, with `param_modes` -- and read here as
+        // inputs (`params` / `param_types`) plus OUT columns.
+        if collection == Self::FUNCTION_COLLECTION
+            && docs.iter().any(|d| d.contains_key("param_modes"))
+        {
+            return Ok(Arc::new(docs.iter().map(normalize_function_doc).collect()));
+        }
+        Ok(docs)
+    }
+
+    fn type_catalog_docs_raw(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
         let committed = self.committed_type_catalog_docs(collection)?;
         let overlay = self
             .uncommitted_types
@@ -5107,12 +5271,23 @@ impl PgHandler {
         &self,
         def: secantus_pgplan::UserFunctionDef,
     ) -> PgWireResult<Vec<Response>> {
-        let nargs = def.params.len();
+        // A procedure is keyed by EVERY parameter (a CALL passes a
+        // placeholder for each OUT one), a function by its inputs -- the
+        // Python server's convention.
+        let nargs = if def.is_procedure {
+            def.all_params.len()
+        } else {
+            def.params.len()
+        };
         // `name/nargs` is the shared catalog's key; an OVERLOAD at the same
         // arity (different argument types) takes `name/nargs/types`, which the
         // Python server does not know to look for.
         let base_key = format!("{}/{nargs}", def.name);
-        let new_types: Vec<String> = def.params.iter().map(|(_, t)| t.clone()).collect();
+        let new_types: Vec<String> = if def.is_procedure {
+            def.all_params.iter().map(|(_, t, _)| t.clone()).collect()
+        } else {
+            def.params.iter().map(|(_, t)| t.clone()).collect()
+        };
         let same_arity: Vec<UserFunction> = self
             .functions()?
             .into_iter()
@@ -5124,12 +5299,15 @@ impl PgHandler {
             None if same_arity.is_empty() => base_key,
             None => format!("{base_key}/{}", new_types.join(",")),
         };
-        let doc = bson::doc! {
+        // Every parameter positionally with its mode, as the Python server
+        // stores it (`normalize_function_doc` reads the inputs back out).
+        let mut doc = bson::doc! {
             "_id": &key,
             "name": &def.name,
             "nargs": nargs as i32,
-            "params": def.params.iter().map(|(n, _)| Bson::String(n.clone())).collect::<Vec<_>>(),
-            "param_types": def.params.iter().map(|(_, t)| Bson::String(t.clone())).collect::<Vec<_>>(),
+            "params": def.all_params.iter().map(|(n, _, _)| Bson::String(n.clone())).collect::<Vec<_>>(),
+            "param_types": def.all_params.iter().map(|(_, t, _)| Bson::String(t.clone())).collect::<Vec<_>>(),
+            "param_modes": def.all_params.iter().map(|(_, _, m)| Bson::String(m.clone())).collect::<Vec<_>>(),
             "return_tag": &def.return_type,
             "returns_set": def.returns_set,
             "is_table": !def.columns.is_empty() && def.returns_set,
@@ -5150,9 +5328,16 @@ impl PgHandler {
                 .map(|d| d.clone().map_or(Bson::Null, Bson::String))
                 .collect::<Vec<_>>(),
         };
+        if def.is_procedure {
+            doc.insert("is_procedure", true);
+        }
+        if let Some(schema) = &def.schema {
+            doc.insert("schema", schema);
+        }
+        let read_back = normalize_function_doc(&doc);
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
-            "plpgsql" => plpgsql_fn::validate(&plpgsql_create_sql(&doc)).map_err(|e| {
+            "plpgsql" => plpgsql_fn::validate(&plpgsql_create_sql(&read_back)).map_err(|e| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     e.sqlstate,
@@ -5180,7 +5365,12 @@ impl PgHandler {
                     "ERROR".into(),
                     "42723".into(),
                     format!(
-                        "function \"{}\" already exists with same argument types",
+                        "{} \"{}\" already exists with same argument types",
+                        if def.is_procedure {
+                            "procedure"
+                        } else {
+                            "function"
+                        },
                         def.name
                     ),
                 ))));
@@ -5188,7 +5378,11 @@ impl PgHandler {
             self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
         }
         self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, doc)?;
-        Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+        Ok(vec![Response::Execution(Tag::new(if def.is_procedure {
+            "CREATE PROCEDURE"
+        } else {
+            "CREATE FUNCTION"
+        }))])
     }
 
     /// The view an `ALTER VIEW` names, checked the way PostgreSQL does: it
@@ -5718,13 +5912,17 @@ impl PgHandler {
         match doc.get_str("language").unwrap_or_default() {
             "plpgsql" => {
                 let host = PlHost { h: self };
+                // The inputs spread over the declared positions, a NULL for
+                // each OUT parameter: the interpreter binds in that order.
+                let (args, arg_types) = positional_args(doc, args, &u.arg_types);
                 let outcome = plpgsql_fn::run(
                     &plpgsql_create_sql(doc),
                     plpgsql_fn::Invocation {
-                        args,
-                        arg_types: &u.arg_types,
+                        args: &args,
+                        arg_types: &arg_types,
                         trigger: None,
                         returns_set: u.returns_set,
+                        out_params: &u.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                     },
                     &host,
                 )
@@ -11098,8 +11296,19 @@ impl PgHandler {
             }
             "pg_proc" => {
                 let f = |name: &str| def.field_of(name).expect("column");
+                let namespaces = self.namespaces();
+                let roles = self.roles().unwrap_or_default();
                 let type_oid = |t: &str| -> i64 {
-                    secantus_pgplan::pgtypes::oid_of_name(t)
+                    // The pseudo-types a function can return.
+                    let pseudo = match t {
+                        "record" => Some(2249),
+                        "void" => Some(2278),
+                        "trigger" => Some(2279),
+                        "event_trigger" => Some(3838),
+                        _ => None,
+                    };
+                    pseudo
+                        .or_else(|| secantus_pgplan::pgtypes::oid_of_name(t))
                         .or_else(|| self.relation_oid(t))
                         .unwrap_or(0)
                 };
@@ -11118,6 +11327,9 @@ impl PgHandler {
                         };
                         let types = strings("param_types");
                         let names = strings("params");
+                        let modes = strings("param_modes");
+                        let all_types = strings("all_param_types");
+                        let all_names = strings("all_params");
                         let lang = match d.get_str("language").unwrap_or_default() {
                             "sql" => 14i64,
                             "plpgsql" => 14078,
@@ -11133,11 +11345,62 @@ impl PgHandler {
                             ))),
                         );
                         row.insert(f("proname"), d.get_str("name").unwrap_or_default());
-                        row.insert(f("pronamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
-                        row.insert(f("proowner"), Bson::Int64(10));
+                        let namespace = d
+                            .get_str("schema")
+                            .ok()
+                            .and_then(|s| namespaces.iter().find(|(n, _)| n == s))
+                            .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o);
+                        row.insert(f("pronamespace"), Bson::Int64(namespace));
+                        let owner = d
+                            .get_str("owner")
+                            .ok()
+                            .and_then(|o| roles.iter().find(|r| r.name == o))
+                            .map_or(10, |r| r.oid);
+                        row.insert(f("proowner"), Bson::Int64(owner));
                         row.insert(f("prolang"), Bson::Int64(lang));
-                        row.insert(f("prokind"), "f");
-                        row.insert(f("prosecdef"), false);
+                        row.insert(
+                            f("prokind"),
+                            if d.get_bool("is_procedure").unwrap_or(false) {
+                                "p"
+                            } else {
+                                "f"
+                            },
+                        );
+                        row.insert(
+                            f("prosecdef"),
+                            d.get_bool("security_definer").unwrap_or(false),
+                        );
+                        if let Ok(cost) = d.get_f64("cost") {
+                            row.insert(f("procost"), Bson::Double(cost));
+                        }
+                        if let Ok(rows) = d.get_f64("rows") {
+                            row.insert(f("prorows"), Bson::Double(rows));
+                        }
+                        if let Ok(leak) = d.get_bool("leakproof") {
+                            row.insert(f("proleakproof"), leak);
+                        }
+                        if let Ok(parallel) = d.get_str("parallel") {
+                            row.insert(f("proparallel"), parallel);
+                        }
+                        if let Ok(config) = d.get_array("config") {
+                            if !config.is_empty() {
+                                row.insert(f("proconfig"), Bson::Array(config.clone()));
+                            }
+                        }
+                        if modes.iter().any(|m| m != "i") && modes.len() == all_types.len() {
+                            row.insert(
+                                f("proargmodes"),
+                                Bson::Array(
+                                    modes.iter().map(|m| Bson::String(m.clone())).collect(),
+                                ),
+                            );
+                            row.insert(
+                                f("proallargtypes"),
+                                Bson::Array(
+                                    all_types.iter().map(|t| Bson::Int64(type_oid(t))).collect(),
+                                ),
+                            );
+                        }
                         row.insert(f("proisstrict"), d.get_bool("strict").unwrap_or(false));
                         row.insert(f("proretset"), d.get_bool("returns_set").unwrap_or(false));
                         row.insert(
@@ -11157,6 +11420,12 @@ impl PgHandler {
                             f("proargtypes"),
                             Bson::Array(types.iter().map(|t| Bson::Int64(type_oid(t))).collect()),
                         );
+                        // With modes, the names cover EVERY parameter.
+                        let names = if all_names.len() == modes.len() && !modes.is_empty() {
+                            all_names
+                        } else {
+                            names
+                        };
                         row.insert(
                             f("proargnames"),
                             if names.iter().all(|n| n.is_empty()) {
@@ -13396,6 +13665,7 @@ fn wire_type(pg_type: &str) -> Type {
         "circle[]" => Type::CIRCLE_ARRAY,
         "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
+        "\"char\"[]" => Type::CHAR_ARRAY,
         "name[]" => Type::NAME_ARRAY,
         // `array_agg(atttypid)` is an `oid[]` -- without this arm it fell to
         // varchar, so psycopg's `CompositeInfo.fetch` read `field_types` back as
