@@ -11210,22 +11210,21 @@ def test_correlated_subqueries_in_update_and_delete(home: Path) -> None:
         assert cur.fetchall() == [(3,)]
 
 
-def test_a_data_modifying_with_is_refused(home: Path) -> None:
-    """A write inside WITH must run exactly once however many times it is
-    referenced, so it cannot be inlined like a read. (`WITH RECURSIVE`, once
-    refused beside it, is iterated to a fixed point now.)"""
+def test_a_data_modifying_with_runs_once(home: Path) -> None:
+    """A write inside WITH runs exactly once, however many times it is
+    referenced, and the query reads its RETURNING rows."""
     with _Server(home) as server, server.connect() as conn:
         _dept_emp(conn)
         cur = conn.cursor()
         cur.execute("WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c")
         assert cur.fetchall() == [(1,)]
-        for sql in (
-            "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) SELECT * FROM c",
-        ):
-            with pytest.raises(psycopg.Error) as info:
-                cur.execute(sql)
-            assert info.value.sqlstate == "0A000"
-            conn.rollback()
+        cur.execute(
+            "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) "
+            "SELECT a.id, b.id FROM c a, c b"
+        )
+        assert cur.fetchall() == [(9, 9)]
+        cur.execute("SELECT count(*) FROM sq_dept WHERE id = 9")
+        assert cur.fetchall() == [(1,)]
 
 
 def test_a_qualified_aggregate_argument_resolves_to_the_column(home: Path) -> None:
@@ -12468,24 +12467,19 @@ def test_concatenation_joins_by_dimensionality(home: Path) -> None:
             cur.execute("SELECT array_cat(ARRAY[1,2], ARRAY[[3,4,5]])")
 
 
-def test_array_fill_refuses_a_lower_bound_it_cannot_represent(home: Path) -> None:
-    """This server does not model array lower bounds, so `array_fill` with one
-    is REFUSED rather than answered with a 1-based array.
-
-    The value would be right and every subscript into it wrong — PostgreSQL
-    renders it as `[3:4]={7,7}` and answers `(...)[3]` as 7. A named 0A000 is
-    the honest answer; silently re-basing is the kind of divergence this
-    project treats as data loss.
-    """
+def test_array_fill_keeps_its_lower_bound(home: Path) -> None:
+    """`array_fill(7, ARRAY[2], ARRAY[3])` is `[3:4]={7,7}`: its text shows the
+    bound and its subscripts start there, as PostgreSQL's do."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("SELECT array_fill(0, ARRAY[2,2]), array_fill(1, ARRAY[0])")
         assert cur.fetchall() == [([[0, 0], [0, 0]], [])]
         cur.execute("SELECT array_fill(7, ARRAY[2], ARRAY[1])")
         assert cur.fetchall() == [([7, 7],)]
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("SELECT array_fill(7, ARRAY[2], ARRAY[3])")
-        assert info.value.sqlstate == "0A000"
+        cur.execute(
+            "SELECT array_fill(7, ARRAY[2], ARRAY[3])::text, (array_fill(7, ARRAY[2], ARRAY[3]))[3]"
+        )
+        assert cur.fetchall() == [("[3:4]={7,7}", 7)]
 
 
 def test_subscripting_reads_elements_and_slices(home: Path) -> None:
@@ -12586,20 +12580,17 @@ def test_assigning_into_an_array_extends_it_with_nulls(home: Path) -> None:
         assert cur.fetchall() == [([7, 4, 5, None, None, 6], [[1, 42], [3, 4]])]
 
 
-def test_assigning_below_subscript_1_is_refused(home: Path) -> None:
-    """PostgreSQL answers it by MOVING the array's lower bound — `SET ia[0]=0`
-    leaves an `[0:5]={...}`. Without a lower-bound model, writing it at index 1
-    would silently shift every other subscript, so it is refused by name."""
+def test_assigning_below_subscript_1_moves_the_bound(home: Path) -> None:
+    """PostgreSQL answers it by MOVING the array's lower bound -- `SET ia[0]=0`
+    over `{1,2,3}` leaves `[0:3]={0,1,2,3}` -- and every other subscript
+    keeps pointing where it did."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("CREATE TABLE arr_lb (id int PRIMARY KEY, ia int[])")
         cur.execute("INSERT INTO arr_lb VALUES (1, ARRAY[1,2,3])")
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("UPDATE arr_lb SET ia[0] = 0 WHERE id=1")
-        assert info.value.sqlstate == "0A000"
-        conn.rollback()
-        cur.execute("SELECT ia FROM arr_lb WHERE id=1")
-        assert cur.fetchall() == [([1, 2, 3],)]
+        cur.execute("UPDATE arr_lb SET ia[0] = 0 WHERE id=1")
+        cur.execute("SELECT ia::text, ia[1] FROM arr_lb WHERE id=1")
+        assert cur.fetchall() == [("[0:3]={0,1,2,3}", 1)]
 
 
 def test_a_slice_assignment_source_must_fill_the_range(home: Path) -> None:
