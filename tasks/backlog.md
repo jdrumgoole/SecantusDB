@@ -732,10 +732,6 @@ remain open:
     secondary index; the `_id` index (numeric PRIMARY KEY) does resolve by
     value. (Typmod rounding, `avg(numeric)`, and literal coercion were
     re-measured fixed in batch 10.)
-  - `UPDATE t SET pk = <wide value>` on a numeric PRIMARY KEY bypasses the
-    value-equality duplicate precheck that INSERT runs (`UPDATE` of a
-    primary-key column is refused with 0A000 today, so unreachable until
-    that lands — keep the two together).
 - [ ] **OPEN — RUST pgserver: constraints -- what is left after multi-column
       FOREIGN KEYs landed (2026-09-29).** NOT NULL / CHECK / UNIQUE / FOREIGN
       KEY are all enforced; a FOREIGN KEY may now span several columns, target
@@ -3688,77 +3684,6 @@ These are explicit non-goals. Don't add them without a reason.
     not server bugs. `test_sessions_unified` snapshot tests fail 5 (event-count
     mismatches, not yet diagnosed).
 
-- [ ] **OPEN — RUST pgserver range family, what is left (measured 2026-09-09).**
-  psycopg's `tests/types/test_range.py` + `test_multirange.py` are at 479
-  passed / 1 failed / 24 xfailed against the Rust PG server (was 72 failed);
-  the one failure is `test_literal_invalid_name[order]`, the reserved-keyword
-  `regtype` quoting item below. Shipped 2026-09-09: literal-beside-range-array
-  param typing (the 36-test `test_dump_builtin_array_wrapper` campaign, built
-  the canonicalising way — `'{"[1,5]"}' = [Int4Range(1,6,'[)')]` is True and
-  `= [Int4Range(1,5,'[)')]` is False, both formats), untyped binary range /
-  multirange params typed from context (comparison operand or `$1::int4range`
-  cast), custom range value round-trip in every format (constructor, casts,
-  binary codec, schema-qualified names, `testmultirange`), `range_out` quoting
-  fidelity, range accessors, three-valued `AND`/`OR`/`NOT` in a constant
-  select, and COPY canonical form. Still open, all pre-existing and measured
-  against PG 16:
-  - `isempty(%s)` with an UNTYPED parameter is PG `42725 function
-    isempty(unknown) is not unique`; ours is `0A000`.
-  - A malformed range literal error carries only the first line; PG adds the
-    `LINE 1:` context and, for a bad bound, a `DETAIL:` line.
-  - `RangeSubselect` (`from (select ...)`) is unsupported in the range
-    corpus's few subquery shapes — a general planner gap, not a range one.
-
-- [ ] **OPEN — RUST pgserver prepared-statement / uuid / string campaign, what
-  is left (measured 2026-09-09).** psycopg's `tests/test_prepared.py` +
-  `tests/types/test_uuid.py` + `tests/types/test_string.py` are at 190
-  passed / 0 failed against the Rust PG server (was 45 failed). Shipped:
-  `pg_prepared_statements` (session registry of NAMED Parse statements —
-  `parameter_types` / `result_types` as regtype display names, `prepare_time`
-  timestamptz, `from_sql` false, generic / custom plan counts; protocol
-  `Close`, `DEALLOCATE <name>` (26000 when missing) and `DEALLOCATE ALL`
-  remove rows), `NOTIFY` (a no-op tag then; since 2026-09-09 LISTEN / UNLISTEN /
-  NOTIFY / `pg_notify` deliver asynchronously across connections — before the
-  statement's ReadyForQuery outside a block, at COMMIT inside one, unprompted
-  to an idle listener), a zero-oid Parse of `$1::uuid`
-  described from the cast, `uuid_in`'s hyphen-after-any-hex-group and brace
-  forms, uuid / bytea / `uuid[]` / `bytea[]` BINARY results, a NUL byte in a
-  binary text parameter as 22021, `inet` / `cidr` and their arrays as BINARY
-  results too (psycopg decodes a whole row with column 0's format, so one text
-  column in a binary row was "unexpected number of dimensions"), `inet[]` text
-  dropping a host address's full mask (`{::1}`, not `{::1/128}` — PG's
-  `inet_out` per element), `format` / `concat` / `concat_ws` /
-  `num_nulls` / `num_nonnulls` / `json(b)_build_*` with an untyped parameter
-  as 42P18 naming PG's parameter, COPY OUT mid-stream errors no longer
-  followed by a CopyFail (the client then said "you cannot mix COPY with
-  other operations"), `UPDATE … SET col = <row expression>` (`num * 2`,
-  `upper(s)`, `s || 'x'`, `coalesce(num, 0)`, `num::text`), and savepoint
-  restore of a CREATE TYPE on a store with no committed tables (the restore
-  read the catalog through a fresh WT session blind to the transaction's own
-  collection creation). Still open, all pre-existing and measured against PG
-  16:
-  - `select $1 is null` with an untyped parameter: PG `42P18 could not
-    determine data type of parameter $1`; ours `NullTest is not supported
-    yet` / 0A000 (the same `NullTest` gap as the `pg_sleep` item).
-  - `select $1 = 1` bound with `'a'`: PG resolves `$1` as integer and fails
-    22P02 `invalid input syntax for type integer: "a"`; ours 0A000
-    `comparing string with int32`.
-  - `to_json($1)` / `to_jsonb($1)` untyped: PG 42804 `could not determine
-    polymorphic type because input has type unknown`; ours 0A000 (`to_json`
-    is not implemented at all — `select to_json('a'::text)` is 0A000 too).
-  - `format($1, 'b')`: PG evaluates (`'x'`); ours 0A000 — `format()` is
-    unimplemented, only its untyped-parameter refusal is in place.
-  - `text * integer` (`update ut set num = s * 2`, `select s * 2 from ut`):
-    PG 42883 `operator does not exist: text * integer`; ours 0A000.
-  - A row expression over a `timestamp` column loses the sub-millisecond
-    remainder: `select ts + interval '1 hour' from ut` and `ts::text` over a
-    stored `00:00:00.123456` answer `.123`; `apply_row_expr` reads the bare
-    BSON date, not the companion field. Same for UPDATE SET.
-  - `DEALLOCATE` clears the handler's registry but not pgwire's statement
-    store, so a later `EXECUTE`-by-name over the protocol still finds the
-    statement (psycopg never does this — it re-prepares).
-  - `information_schema.columns` for a catalog VIEW (`where table_name =
-    'pg_prepared_statements'`) is `relation "columns" does not exist`.
 
 ### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open
 
