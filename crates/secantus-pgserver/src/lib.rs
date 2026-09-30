@@ -1172,6 +1172,107 @@ impl PgHandler {
     /// A table's owner: the role that created it (or took it with `ALTER
     /// TABLE ... OWNER TO`); a table from before owners were recorded
     /// belongs to the session's login role.
+    /// `pg_class.relacl`: NULL until a GRANT names the relation, then the
+    /// owner's full rights and each grantee's, as aclitems
+    /// (`grantee=privs/grantor`, `*` after a privilege held WITH GRANT
+    /// OPTION, an empty grantee for PUBLIC).
+    fn relation_acl(&self, relname: &str, kind: &str) -> Bson {
+        if !matches!(kind, "r" | "v" | "m" | "p" | "f") {
+            return Bson::Null;
+        }
+        let grants: Vec<Document> = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::GRANT_COLLECTION,
+                &bson::doc! {"table": relname},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .collect();
+        if grants.is_empty() {
+            return Bson::Null;
+        }
+        let owner = if kind == "v" {
+            self.view_owner(relname)
+                .unwrap_or_else(|| self.session_user_name())
+        } else {
+            match self.lookup(relname) {
+                Some(def) => self.table_owner(&def),
+                None => self.session_user_name(),
+            }
+        };
+        let name = |n: &str| -> String {
+            if n.eq_ignore_ascii_case("public") {
+                String::new()
+            } else {
+                secantus_pgplan::scalar::quote_identifier(n)
+            }
+        };
+        let letter = |p: &str| match p {
+            "SELECT" => 'r',
+            "INSERT" => 'a',
+            "UPDATE" => 'w',
+            "DELETE" => 'd',
+            "TRUNCATE" => 'D',
+            "REFERENCES" => 'x',
+            _ => 't',
+        };
+        let mut items = vec![Bson::String(format!(
+            "{}=arwdDxt/{}",
+            name(&owner),
+            name(&owner)
+        ))];
+        for g in grants {
+            let grantee = g.get_str("grantee").unwrap_or_default();
+            if grantee == owner {
+                continue;
+            }
+            let strs = |k: &str| -> Option<Vec<String>> {
+                g.get_array(k).ok().map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+            };
+            let held = strs("privileges").unwrap_or_default();
+            let with_option = strs("option_privileges").unwrap_or_else(|| {
+                if g.get_bool("grant_option").unwrap_or(false) {
+                    held.clone()
+                } else {
+                    Vec::new()
+                }
+            });
+            // In ACL_ALL_RIGHTS_STR's order, `arwdDxt`.
+            let privs: String = [
+                "INSERT",
+                "SELECT",
+                "UPDATE",
+                "DELETE",
+                "TRUNCATE",
+                "REFERENCES",
+                "TRIGGER",
+            ]
+            .iter()
+            .filter(|p| held.iter().any(|h| h == *p))
+            .map(|p| {
+                let mut s = letter(p).to_string();
+                if with_option.iter().any(|h| h == p) {
+                    s.push('*');
+                }
+                s
+            })
+            .collect();
+            items.push(Bson::String(format!(
+                "{}={privs}/{}",
+                name(grantee),
+                name(&owner)
+            )));
+        }
+        Bson::Array(items)
+    }
+
     fn table_owner(&self, def: &TableDef) -> String {
         def.extra
             .get_str("owner")
@@ -7381,13 +7482,36 @@ impl PgHandler {
                     .filter(|p| held.iter().any(|h| h == *p))
                     .map(|p| Bson::String(p.to_string()))
                     .collect();
+                // Which privileges are held WITH GRANT OPTION: per privilege,
+                // as PostgreSQL keeps it. A grant recorded before this list
+                // existed had one flag for all of them.
+                let mut with_option: Vec<String> = match existing
+                    .as_ref()
+                    .and_then(|d| d.get_array("option_privileges").ok())
+                {
+                    Some(a) => a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                    None if option => held.clone(),
+                    None => Vec::new(),
+                };
+                if is_grant && grant_option {
+                    for p in &wanted {
+                        if !with_option.iter().any(|h| h == p) {
+                            with_option.push(p.to_string());
+                        }
+                    }
+                }
+                with_option.retain(|p| held.iter().any(|h| h == p));
                 let doc = (!ordered.is_empty()).then(|| {
                     bson::doc! {
                         "_id": &id,
                         "table": table,
                         "grantee": grantee,
                         "privileges": ordered,
-                        "grant_option": if is_grant { option || grant_option } else { option },
+                        "grant_option": !with_option.is_empty(),
+                        "option_privileges": with_option,
                     }
                 });
                 self.put_comment_doc(Self::GRANT_COLLECTION, &id, doc)?;
@@ -8380,11 +8504,94 @@ impl PgHandler {
             .filter(|ix| ix.table.name == rel)
             .count() as i64;
         let indexes = index_count * pages(heap.max(PAGE) / 2);
+        // A table with a TOASTable column has a TOAST table, whose index is
+        // one page even when empty; `pg_table_size` counts it.
+        let toast = match self.lookup(&rel) {
+            Some(def) if Self::virtual_table(&rel).is_none() && Self::needs_toast(&def) => PAGE,
+            _ => 0,
+        };
         Ok(Bson::Int64(match name {
-            "pg_relation_size" | "pg_table_size" => heap,
+            "pg_relation_size" => heap,
+            "pg_table_size" => heap + toast,
             "pg_indexes_size" => indexes,
-            _ => heap + indexes,
+            _ => heap + toast + indexes,
         }))
+    }
+
+    /// PostgreSQL's `needs_toast_table`: a variable-length column with
+    /// non-plain storage and no bounded maximum length (or bounded ones
+    /// summing past the TOAST threshold).
+    fn needs_toast(def: &TableDef) -> bool {
+        const FIXED: &[&str] = &[
+            "int2",
+            "int4",
+            "int8",
+            "float4",
+            "float8",
+            "bool",
+            "\"char\"",
+            "char",
+            "date",
+            "time",
+            "timetz",
+            "timestamp",
+            "timestamptz",
+            "interval",
+            "uuid",
+            "oid",
+            "money",
+            "name",
+            "point",
+            "pg_lsn",
+            "macaddr",
+            "macaddr8",
+            "box",
+            "lseg",
+            "line",
+            "circle",
+            "tid",
+            "xid",
+            "xid8",
+            "cid",
+            "regclass",
+            "regtype",
+            "regproc",
+            "regprocedure",
+            "regoper",
+            "regoperator",
+            "regconfig",
+            "regdictionary",
+            "regnamespace",
+            "regrole",
+            "regcollation",
+            "smallint",
+            "integer",
+            "bigint",
+            "real",
+            "double precision",
+            "boolean",
+            "serial",
+            "bigserial",
+            "smallserial",
+        ];
+        let mut bounded = 0i64;
+        for c in &def.columns {
+            let base = c.pg_type.trim().to_ascii_lowercase();
+            if base.ends_with("[]") {
+                return true;
+            }
+            if FIXED.contains(&base.as_str()) || c.extra.get_str("enum_type").is_ok() {
+                continue;
+            }
+            let m = i64::from(c.typmod);
+            match base.as_str() {
+                "varchar" | "bpchar" if m >= 4 => bounded += (m - 4) * 4 + 4,
+                "numeric" if m >= 4 => bounded += (((m - 4) >> 16) + 3) / 4 * 2 + 8,
+                "bit" | "varbit" if m > 0 => bounded += (m + 7) / 8 + 8,
+                _ => return true,
+            }
+        }
+        bounded > 2032
     }
 
     /// Every stored comment as pg_description keys it: `(object oid,
@@ -10693,15 +10900,26 @@ impl PgHandler {
                             .filter_map(|(n, _, _)| Some((self.relation_oid(&n)?, n))),
                     );
                 for (relid, name) in views {
-                    let Ok((cols, _)) = self.internal_query(&format!(
-                        "SELECT * FROM {} LIMIT 0",
-                        secantus_pgplan::scalar::quote_identifier(&name)
-                    )) else {
+                    // The output columns' types AND modifiers: a view over
+                    // `x::numeric(5,2)` reports `numeric(5,2)`.
+                    let Ok(fields) = self
+                        .plan_internal(&format!(
+                            "SELECT * FROM {} LIMIT 0",
+                            secantus_pgplan::scalar::quote_identifier(&name)
+                        ))
+                        .and_then(|stmt| self.rows_with_schema(&stmt))
+                        .map(|(fields, _)| fields)
+                    else {
                         continue;
                     };
-                    for (i, (cname, ctype)) in cols.iter().enumerate() {
-                        if let Some(atttypid) = self.type_oid_by_name(ctype) {
-                            rows.push(plain(relid, cname, atttypid, i + 1));
+                    for (i, f) in fields.iter().enumerate() {
+                        if let Some(atttypid) = self.type_oid_by_name(f.datatype().name()) {
+                            let mut d = plain(relid, f.name(), atttypid, i + 1);
+                            d.insert(
+                                def.field_of("atttypmod").expect("column"),
+                                Bson::Int32(f.type_modifier()),
+                            );
+                            rows.push(d);
                         }
                     }
                 }
@@ -17469,7 +17687,7 @@ impl PgHandler {
                 // described as 4, which is also what the output padding below
                 // reads. A computed column (a cast or a call) keeps -1.
                 let typmod = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(_) => -1,
+                    Some(expr) => secantus_pgplan::column_expr_typmod(expr),
                     None => def
                         .columns
                         .iter()

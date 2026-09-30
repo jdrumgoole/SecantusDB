@@ -726,7 +726,7 @@ impl PgHandler {
                                 Bson::Int32(table.map_or(0, |t| t.check_constraints.len() as i32))
                             }
                             // A view is its `_RETURN` rule.
-                            "relhasrules" => Bson::Boolean(kind == "v"),
+                            "relhasrules" => Bson::Boolean(kind == "v" || self.has_rules(&relname)),
                             // A FOREIGN KEY is enforced by RI triggers on
                             // BOTH tables, so either side has triggers --
                             // which is what makes psql print its FK footers.
@@ -753,7 +753,8 @@ impl PgHandler {
                             ),
                             "relisshared" => Bson::Boolean(false),
                             "relpages" | "relallvisible" => Bson::Int32(0),
-                            "reloptions" | "relacl" => Bson::Null,
+                            "relacl" => self.relation_acl(&relname, &kind),
+                            "reloptions" => Bson::Null,
                             _ => Bson::Int64(0),
                         }
                     }

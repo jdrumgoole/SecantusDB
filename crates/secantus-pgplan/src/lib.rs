@@ -16787,10 +16787,13 @@ pub fn select_output_def(
         let mut col = Column::new(out, &ty, false);
         // A column read straight through keeps its modifier: a `char(n)`
         // is still `char(n)` seen from outside the subquery.
-        if expr.is_none() {
-            if let Some(c) = src {
-                col.typmod = c.typmod;
+        match expr {
+            None => {
+                if let Some(c) = src {
+                    col.typmod = c.typmod;
+                }
             }
+            Some(e) => col.typmod = column_expr_typmod(e),
         }
         columns.push(col);
     }
@@ -22343,6 +22346,15 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
             }
             apply_row_expr(expr, &row)
         }
+    }
+}
+
+/// The type modifier a ColumnExpr's column carries: a top-level cast's
+/// (`x::numeric(5,2)`), else -1.
+pub fn column_expr_typmod(expr: &ColumnExpr) -> i32 {
+    match expr {
+        ColumnExpr::Row { expr, .. } => cast_typmod(expr),
+        _ => -1,
     }
 }
 
