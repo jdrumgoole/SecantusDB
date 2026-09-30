@@ -60,8 +60,22 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("atthasmissing", "bool"),
             ("attstorage", secantus_pgplan::QUOTED_CHAR),
             ("attcompression", secantus_pgplan::QUOTED_CHAR),
+            ("attacl", "text[]"),
+            ("attoptions", "text[]"),
+            ("attfdwoptions", "text[]"),
         ],
         "pg_type" => &[("typcollation", "oid"), ("typelem", "oid")],
+        "pg_proc" => &[
+            ("proparallel", secantus_pgplan::QUOTED_CHAR),
+            ("proacl", "text[]"),
+            ("procost", "float4"),
+            ("prorows", "float4"),
+            ("proleakproof", "bool"),
+            ("prosupport", "oid"),
+            ("proconfig", "text[]"),
+            ("provariadic", "oid"),
+            ("prosqlbody", "text"),
+        ],
         "pg_extension" => &[
             ("extowner", "oid"),
             ("extnamespace", "oid"),
@@ -342,7 +356,7 @@ impl PgHandler {
 
     /// Every function's `(oid, pg_get_function_arguments,
     /// pg_get_function_result)` text.
-    pub(crate) fn function_sigs(&self) -> Vec<(i64, String, String)> {
+    pub(crate) fn function_sigs(&self) -> Vec<(i64, String, String, String)> {
         self.type_catalog_docs(Self::FUNCTION_COLLECTION)
             .unwrap_or_default()
             .iter()
@@ -358,9 +372,16 @@ impl PgHandler {
                 };
                 let names = strings("params");
                 let types = strings("param_types");
+                let defaults: Vec<Option<String>> = d
+                    .get_array("param_defaults")
+                    .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
                 let variadic = d.get_bool("variadic").unwrap_or(false);
                 let n = types.len();
-                let args: Vec<String> = types
+                // `(with DEFAULTs, without)`: `pg_get_function_arguments`
+                // prints a parameter's default as ruleutils does -- a string
+                // literal typed, `'x'::text` -- and the identity form omits it.
+                let pairs: Vec<(String, String)> = types
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
@@ -371,13 +392,26 @@ impl PgHandler {
                         } else {
                             ""
                         };
-                        if name.is_empty() {
+                        let bare = if name.is_empty() {
                             format!("{prefix}{ty}")
                         } else {
                             format!("{prefix}{name} {ty}")
-                        }
+                        };
+                        let default = match defaults.get(i).cloned().flatten() {
+                            None => String::new(),
+                            Some(sql) if sql.starts_with('\'') && sql.ends_with('\'') => {
+                                format!(" DEFAULT {sql}::{ty}")
+                            }
+                            Some(sql) => format!(
+                                " DEFAULT {}",
+                                secantus_pgplan::generation_expression(&sql).unwrap_or(sql)
+                            ),
+                        };
+                        (format!("{bare}{default}"), bare)
                     })
                     .collect();
+                let args: Vec<String> = pairs.iter().map(|(a, _)| a.clone()).collect();
+                let identity: Vec<String> = pairs.iter().map(|(_, b)| b.clone()).collect();
                 let ret = d.get_str("return_tag").unwrap_or("void");
                 let result = if d.get_bool("returns_trigger").unwrap_or(false) {
                     "trigger".to_string()
@@ -404,7 +438,7 @@ impl PgHandler {
                     self.display_type_name(ret)
                 };
                 let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
-                (oid, args.join(", "), result)
+                (oid, args.join(", "), identity.join(", "), result)
             })
             .collect()
     }
@@ -418,7 +452,7 @@ impl PgHandler {
         let functions: Vec<i64> = self
             .function_sigs()
             .into_iter()
-            .map(|(o, _, _)| o)
+            .map(|(o, _, _, _)| o)
             .collect();
         self.object_comments()
             .into_iter()
@@ -439,6 +473,38 @@ impl PgHandler {
                 d.insert(f("objsubid"), Bson::Int32(subid));
                 d.insert(f("description"), text);
                 d
+            })
+            .collect()
+    }
+
+    /// Every function's `(oid, pg_get_functiondef text)`, laid out as
+    /// ruleutils lays it out.
+    pub(crate) fn function_defs(&self) -> Vec<(i64, String)> {
+        let sigs = self.function_sigs();
+        self.type_catalog_docs(Self::FUNCTION_COLLECTION)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| {
+                let oid = Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                let (_, args, _, result) = sigs.iter().find(|(o, ..)| *o == oid)?;
+                let mut text = format!(
+                    "CREATE OR REPLACE FUNCTION public.{}({args})\n RETURNS {result}\n LANGUAGE {}\n",
+                    d.get_str("name").unwrap_or_default(),
+                    d.get_str("language").unwrap_or("sql"),
+                );
+                match d.get_str("volatility").unwrap_or("volatile") {
+                    "immutable" => text.push_str(" IMMUTABLE\n"),
+                    "stable" => text.push_str(" STABLE\n"),
+                    _ => {}
+                }
+                if d.get_bool("strict").unwrap_or(false) {
+                    text.push_str(" STRICT\n");
+                }
+                text.push_str(&format!(
+                    "AS $function${}$function$\n",
+                    d.get_str("body").unwrap_or_default()
+                ));
+                Some((oid, text))
             })
             .collect()
     }
@@ -611,30 +677,15 @@ impl PgHandler {
                             }),
                             // A fixed-width type is stored `p`lain, a
                             // varlena one `x` (extended), as `typstorage`.
-                            "attstorage" => Bson::String(
-                                if matches!(
-                                    type_oid,
-                                    16 | 18
-                                        | 20
-                                        | 21
-                                        | 23
-                                        | 26
-                                        | 700
-                                        | 701
-                                        | 1082
-                                        | 1083
-                                        | 1114
-                                        | 1184
-                                        | 1186
-                                        | 2950
-                                        | 19
-                                ) {
-                                    "p".into()
-                                } else {
-                                    "x".into()
-                                },
-                            ),
+                            "attstorage" => Bson::String(match type_oid {
+                                16 | 18 | 20 | 21 | 23 | 26 | 700 | 701 | 1082 | 1083 | 1114
+                                | 1184 | 1186 | 2950 | 19 => "p".into(),
+                                // numeric, inet and cidr are kept inline.
+                                1700 | 869 | 650 => "m".into(),
+                                _ => "x".into(),
+                            }),
                             "attcompression" => Bson::String(String::new()),
+                            "attacl" | "attoptions" | "attfdwoptions" => Bson::Null,
                             "attndims" | "attinhcount" => Bson::Int32(0),
                             "attstattarget" => Bson::Int32(-1),
                             "attislocal" => Bson::Boolean(true),
@@ -653,6 +704,20 @@ impl PgHandler {
                             })
                             .unwrap_or(0),
                     ),
+                    ("pg_proc", c) => match c {
+                        "proparallel" => Bson::String("u".into()),
+                        "procost" => Bson::Double(100.0),
+                        "prorows" => Bson::Double(
+                            if matches!(get(row, "proretset"), Some(Bson::Boolean(true))) {
+                                1000.0
+                            } else {
+                                0.0
+                            },
+                        ),
+                        "proleakproof" => Bson::Boolean(false),
+                        "prosupport" | "provariadic" => Bson::Int64(0),
+                        _ => Bson::Null,
+                    },
                     ("pg_extension", c) => match c {
                         "extowner" => Bson::Int64(10),
                         // plpgsql lives in pg_catalog, an installed extension

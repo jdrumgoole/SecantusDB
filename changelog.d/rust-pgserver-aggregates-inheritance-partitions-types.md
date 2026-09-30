@@ -27,9 +27,11 @@ Errors now carry PostgreSQL's position, so a client prints the caret under the
 token at fault.
 
 **psql's describe commands work.** With psql 15, the output of `\d`, `\d+`,
-`\dt`, `\di`, `\dv`, `\ds`, `\df`, `\dT`, `\dn` and `\dx` is byte-for-byte
-what PostgreSQL 15 prints, including the index, check, foreign-key,
-referenced-by, trigger and policy footers.
+`\dt`, `\di`, `\dv`, `\dm`, `\ds`, `\df`, `\df+`, `\sf`, `\dT`, `\dD`, `\dp`,
+`\dn` and `\dx` is byte-for-byte what PostgreSQL 15 prints, including the
+index, check, foreign-key, referenced-by, trigger and policy footers.
+`\dt+`'s Size column is the one exception: PostgreSQL counts its TOAST index
+pages, which this server does not have.
 
 #### Added
 
@@ -76,7 +78,8 @@ referenced-by, trigger and policy footers.
   - the missing columns of `pg_class`, `pg_index`, `pg_attribute`, `pg_type`
     and `pg_extension`, with `pg_attribute` rows for view and index columns;
   - the functions `pg_get_indexdef`, `pg_get_triggerdef`, `pg_get_partkeydef`,
-    `pg_get_function_arguments` / `_result`, `pg_get_userbyid`,
+    `pg_get_functiondef`, `pg_get_function_arguments` / `_identity_arguments`
+    / `_result`, `pg_get_function_sqlbody`, `pg_get_userbyid`,
     `pg_partition_ancestors`, `pg_relation_is_publishable` and the
     `pg_*_is_visible` family;
   - `OPERATOR(pg_catalog.op)` syntax;
@@ -101,6 +104,10 @@ referenced-by, trigger and policy footers.
 - `||` renders each side as its `::text`: a float4 in its own digits, a
   timestamptz in the session zone. An unknown literal beside a timestamp or
   interval is text there, not that type.
+- A function parameter's `DEFAULT` was accepted and ignored: a call that left
+  the argument out was `42883`. It now fills the call, and a later parameter
+  without a default is refused (`42P13`).
+- A domain's CHECK constraints are listed in `pg_constraint`.
 - An aggregate whose WHERE compares two columns over a join, such as `SELECT
   count(*) FROM a, b WHERE a.id = b.id`, was refused. So was a subquery
   correlated through a FROM function's argument, such as `ARRAY(SELECT ...

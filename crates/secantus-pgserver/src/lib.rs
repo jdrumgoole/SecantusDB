@@ -524,6 +524,10 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
         variadic: d.get_bool("variadic").unwrap_or(false),
         key: d.get_str("_id").unwrap_or_default().to_string(),
         strict: d.get_bool("strict").unwrap_or(false),
+        defaults: d
+            .get_array("param_defaults")
+            .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -2263,6 +2267,7 @@ impl PgHandler {
         secantus_pgplan::set_index_defs(self.index_defs());
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
         secantus_pgplan::set_function_sigs(self.function_sigs());
+        secantus_pgplan::set_function_defs(self.function_defs());
         secantus_pgplan::set_partkey_defs(
             self.all_table_defs()
                 .unwrap_or_default()
@@ -4919,6 +4924,11 @@ impl PgHandler {
             "volatility": &def.volatility,
             "variadic": def.variadic,
             "strict": def.strict,
+            "param_defaults": def
+                .defaults
+                .iter()
+                .map(|d| d.clone().map_or(Bson::Null, Bson::String))
+                .collect::<Vec<_>>(),
         };
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
@@ -5618,6 +5628,11 @@ impl PgHandler {
     /// (primary key, unique, check, foreign key), since the oid is positional.
     fn constraint_defs(&self) -> PgWireResult<Vec<(i64, String)>> {
         let mut out = Vec::new();
+        out.extend(
+            self.domain_constraints()
+                .into_iter()
+                .map(|(oid, _, _, _, text)| (oid, text)),
+        );
         for t in self.all_table_defs()? {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
@@ -7927,6 +7942,47 @@ impl PgHandler {
             name,
             bson::doc! {"_id": name, "matview": name, "definition": definition, "populated": populated},
         )
+    }
+
+    /// Every domain CHECK as a `pg_constraint` row's pieces: `(constraint
+    /// oid, name, domain type oid, domain name, pg_get_constraintdef text)`.
+    fn domain_constraints(&self) -> Vec<(i64, String, i64, String, String)> {
+        // `value` as a whole word, in any case, is PostgreSQL's `VALUE`.
+        let upper_value = |expr: &str| -> String {
+            let mut out = String::with_capacity(expr.len());
+            let chars: Vec<char> = expr.chars().collect();
+            let word = |c: char| c.is_alphanumeric() || c == '_';
+            let mut i = 0;
+            while i < chars.len() {
+                let rest: String = chars[i..chars.len().min(i + 5)].iter().collect();
+                if rest.eq_ignore_ascii_case("value")
+                    && (i == 0 || !word(chars[i - 1]))
+                    && chars.get(i + 5).is_none_or(|c| !word(*c))
+                {
+                    out.push_str("VALUE");
+                    i += 5;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            out
+        };
+        self.domains()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|d| {
+                let type_oid = d.oid;
+                d.checks
+                    .into_iter()
+                    .map(|(name, expr)| {
+                        let oid = Self::index_oid(&format!("domcon:{}:{name}", d.name));
+                        let text = format!("CHECK (({}))", upper_value(&expr));
+                        (oid, name, type_oid, d.name.clone(), text)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// PostgreSQL's 42809 for a write to a materialized view, which only
@@ -10909,6 +10965,31 @@ impl PgHandler {
                     .map(|ix| (ix.table.name.clone(), ix.name.clone(), ix.oid))
                     .collect();
                 let mut rows: Vec<Document> = Vec::new();
+                // A domain's CHECKs: `contypid` names the domain, `conrelid`
+                // is 0.
+                for (oid, conname, type_oid, _, text) in self.domain_constraints() {
+                    let mut d = Document::new();
+                    d.insert(field("oid"), Bson::Int64(oid));
+                    d.insert(field("conname"), conname);
+                    d.insert(
+                        field("connamespace"),
+                        Bson::Int64(Self::PUBLIC_NAMESPACE_OID),
+                    );
+                    d.insert(field("contype"), "c");
+                    d.insert(field("condeferrable"), Bson::Boolean(false));
+                    d.insert(field("condeferred"), Bson::Boolean(false));
+                    d.insert(field("convalidated"), Bson::Boolean(true));
+                    d.insert(field("conrelid"), Bson::Int64(0));
+                    d.insert(field("contypid"), Bson::Int64(type_oid));
+                    d.insert(field("conindid"), Bson::Int64(0));
+                    d.insert(field("conparentid"), Bson::Int64(0));
+                    d.insert(field("confrelid"), Bson::Int64(0));
+                    d.insert(field("confupdtype"), " ");
+                    d.insert(field("confdeltype"), " ");
+                    d.insert(field("confmatchtype"), " ");
+                    d.insert(field("conbin"), text);
+                    rows.push(d);
+                }
                 for t in &defs {
                     // A table created before row types were recorded has no
                     // relation oid, so nothing could join to its rows.

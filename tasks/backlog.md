@@ -694,10 +694,13 @@ remain open:
         message names. A name mentioned twice may point at the wrong
         occurrence. An error inside a function body carries no internal
         position.
-      - `information_schema.tables` / `.columns` list no `pg_catalog` or
-        `information_schema` relation (PostgreSQL 15 lists 139 relations and
-        2,005 columns); matching the set needs the catalogs this server does
-        not model.
+      - `information_schema.tables` / `.columns` and `pg_class` list no
+        `pg_catalog` or `information_schema` relation (PostgreSQL 15 lists
+        139 relations and 2,005 columns); matching the set needs the catalogs
+        this server does not model. psql's describe commands do not depend on
+        it (`psql_describe*` corpora, byte-identical output).
+      - `pg_table_size` / `\dt+` report 0 bytes for an empty table where
+        PostgreSQL counts its TOAST index's 8192.
       - `CREATE AGGREGATE`'s built-in state / final function signatures are
         checked for the operator functions (`int4pl`, `numeric_add`,
         `textcat`, ...); any other built-in is taken as declared.

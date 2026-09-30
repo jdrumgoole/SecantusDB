@@ -642,6 +642,8 @@ pub struct UserFn {
     /// `STRICT`: any NULL argument answers NULL (no rows, for a set-returning
     /// function) without the body running.
     pub strict: bool,
+    /// Each input parameter's `DEFAULT` as SQL, `None` where it has none.
+    pub defaults: Vec<Option<String>>,
 }
 
 /// What a user function call produced.
@@ -681,7 +683,11 @@ pub(crate) fn user_function_for(name: &str, args: &[pg_query::protobuf::Node]) -
             .filter(|u| {
                 u.name == name
                     && (u.arg_types.len() == args.len()
-                        || (u.variadic && args.len() >= u.arg_types.len()))
+                        || (u.variadic && args.len() >= u.arg_types.len())
+                        // Trailing parameters with a DEFAULT may be left out.
+                        || (args.len() < u.arg_types.len()
+                            && (args.len()..u.arg_types.len())
+                                .all(|i| u.defaults.get(i).is_some_and(Option::is_some))))
             })
             .cloned()
             .collect()
@@ -752,6 +758,24 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(FnResult::Value(Bson::Null));
     }
+    // Parameters the call left out take their DEFAULT, evaluated now and
+    // cast to the parameter's type.
+    let defaulted;
+    let args = if args.len() < u.arg_types.len() && !u.variadic {
+        let mut out = args.to_vec();
+        for i in args.len()..u.arg_types.len() {
+            let sql = u.defaults.get(i).cloned().flatten().ok_or_else(|| {
+                Error::UndefinedFunction(format!("function {}() does not exist", u.name))
+            })?;
+            let node = crate::domains::parse_default_sql(&sql)?;
+            let v = crate::const_value(&node, &[])?;
+            out.push(crate::cast_value(v, &u.arg_types[i])?);
+        }
+        defaulted = out;
+        &defaulted[..]
+    } else {
+        args
+    };
     if u.strict && args.contains(&Bson::Null) {
         return Ok(if u.returns_set {
             FnResult::Rows(Vec::new(), Vec::new(), Vec::new())

@@ -2165,6 +2165,8 @@ pub struct UserFunctionDef {
     pub variadic: bool,
     /// `STRICT`: a NULL argument answers NULL without running the body.
     pub strict: bool,
+    /// Each input parameter's `DEFAULT` as SQL, `None` where it has none.
+    pub defaults: Vec<Option<String>>,
 }
 
 /// One `ALTER VIEW` action.
@@ -3801,12 +3803,30 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         let mut params = Vec::new();
         let mut columns = Vec::new();
         let mut variadic = false;
+        let mut defaults: Vec<Option<String>> = Vec::new();
         for p in &f.parameters {
             let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
                 continue;
             };
             let ty = fp.arg_type.as_ref().map(type_name_of).unwrap_or_default();
             use pg_query::protobuf::FunctionParameterMode as M;
+            let input = !matches!(
+                M::try_from(fp.mode),
+                Ok(M::FuncParamOut | M::FuncParamTable)
+            );
+            if input {
+                let default = fp.defexpr.as_deref().map(deparse_expr).transpose()?;
+                // PostgreSQL's rule: once one input has a default, every
+                // later one needs one too.
+                if default.is_none() && defaults.iter().any(Option::is_some) {
+                    return Err(Error::Sqlstate(
+                        "42P13",
+                        "input parameters after one with a default value must also have defaults"
+                            .into(),
+                    ));
+                }
+                defaults.push(default);
+            }
             match M::try_from(fp.mode) {
                 Ok(M::FuncParamOut | M::FuncParamTable) => columns.push((fp.name.clone(), ty)),
                 Ok(M::FuncParamInout) => {
@@ -3840,6 +3860,7 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             volatility,
             variadic,
             strict,
+            defaults,
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
@@ -5535,13 +5556,24 @@ thread_local! {
 }
 
 thread_local! {
-    /// `(function oid, arguments text, result text)`.
-    static FUNCTION_SIGS: std::cell::RefCell<Vec<(i64, String, String)>> =
+    /// `(function oid, arguments, identity arguments, result)` text.
+    static FUNCTION_SIGS: std::cell::RefCell<Vec<(i64, String, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// `(function oid, pg_get_functiondef text)`.
+    static FUNCTION_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install what `pg_get_functiondef` answers from.
+pub fn set_function_defs(defs: Vec<(i64, String)>) {
+    FUNCTION_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
 /// Install what `pg_get_function_arguments` / `_result` answer from.
-pub fn set_function_sigs(sigs: Vec<(i64, String, String)>) {
+pub fn set_function_sigs(sigs: Vec<(i64, String, String, String)>) {
     FUNCTION_SIGS.with(|d| *d.borrow_mut() = sigs);
 }
 
@@ -16646,6 +16678,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         | "pg_get_function_arguments"
                         | "pg_get_function_identity_arguments"
                         | "pg_get_function_result"
+                        | "pg_get_functiondef"
                 )
             ) =>
         {
@@ -17993,6 +18026,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     || name == "pg_get_function_arguments"
                     || name == "pg_get_function_identity_arguments"
                     || name == "pg_get_function_result"
+                    || name == "pg_get_functiondef"
                     || (name.starts_with("has_") && name.ends_with("_privilege"))
                 {
                     let node = rt.val.as_deref().expect("checked");
@@ -27113,8 +27147,10 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // `pg_get_function_arguments(fn)` / `_identity_arguments` / `_result`:
         // a function's signature as `\df` prints it.
         if let Some(which) = func_name(f).as_deref().and_then(|n| match n {
-            "pg_get_function_arguments" | "pg_get_function_identity_arguments" => Some(1),
-            "pg_get_function_result" => Some(2),
+            "pg_get_function_arguments" => Some(1),
+            "pg_get_function_identity_arguments" => Some(2),
+            "pg_get_function_result" => Some(3),
+            "pg_get_functiondef" => Some(4),
             _ => None,
         }) {
             if !f.args.is_empty() {
@@ -27125,13 +27161,25 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     Bson::String(t) => t.trim().parse().unwrap_or(-1),
                     other => regobj::from_bson(&other).map_or(-1, |(_, o)| o),
                 };
+                if which == 4 {
+                    return Ok(FUNCTION_DEFS.with(|d| {
+                        d.borrow()
+                            .iter()
+                            .find(|(o, _)| *o == oid)
+                            .map_or(Bson::Null, |(_, t)| Bson::String(t.clone()))
+                    }));
+                }
                 return Ok(FUNCTION_SIGS.with(|d| {
-                    d.borrow()
-                        .iter()
-                        .find(|(o, _, _)| *o == oid)
-                        .map_or(Bson::Null, |(_, a, r)| {
-                            Bson::String(if which == 1 { a.clone() } else { r.clone() })
-                        })
+                    d.borrow().iter().find(|(o, _, _, _)| *o == oid).map_or(
+                        Bson::Null,
+                        |(_, a, i, r)| {
+                            Bson::String(match which {
+                                1 => a.clone(),
+                                2 => i.clone(),
+                                _ => r.clone(),
+                            })
+                        },
+                    )
                 }));
             }
         }

@@ -75,6 +75,7 @@ const CATALOG_NAMES: &[&str] = &[
     "pg_table_is_visible",
     "pg_relation_is_publishable",
     "pg_get_userbyid",
+    "pg_get_function_sqlbody",
     "pg_type_is_visible",
     "pg_function_is_visible",
     "pg_operator_is_visible",
@@ -1501,6 +1502,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // Every table is a regular, permanent one or a view; a view (or a
         // missing oid) is not publishable, which only the catalog can tell,
         // and psql's publication footer asks it about tables.
+        // A function body is kept as its source text (`prosrc`), never as
+        // a SQL-standard `BEGIN ATOMIC` parse tree, so there is none.
+        "pg_get_function_sqlbody" => Ok(Bson::Null),
         "pg_get_userbyid" => Ok(match args.first() {
             None | Some(Bson::Null) => Bson::Null,
             Some(Bson::Int32(i)) => Bson::String(crate::regobj::role_name(i64::from(*i))),
@@ -2106,6 +2110,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
         "pg_relation_is_publishable" => "bool",
         "pg_get_userbyid" => "name",
+        "pg_get_function_sqlbody" => "text",
         "to_number" => "numeric",
         "jsonb_path_exists"
         | "jsonb_path_match"
