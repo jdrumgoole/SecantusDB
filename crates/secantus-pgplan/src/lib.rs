@@ -37,6 +37,7 @@ pub mod geom;
 pub mod regobj;
 pub mod privileges;
 pub mod rls;
+mod rowsfrom;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -7341,6 +7342,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
             .map(|(n, t)| Column::new(n, t, false))
             .collect(),
     );
+    distinct_fields(&mut def);
     def.name = alias.clone();
     Ok(Some(SubSource {
         alias,
@@ -10973,6 +10975,14 @@ fn resolve_sublinks_in_from(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
+    // `WITH ORDINALITY` / a several-function `ROWS FROM` become the
+    // subqueries they mean first, so the subqueries THAT introduces
+    // (`ARRAY(SELECT f(...))`) are resolved with the rest.
+    if let Some(N::RangeFunction(rf)) = item.node.as_ref() {
+        if rf.ordinality || rf.functions.len() > 1 {
+            item.node = Some(rowsfrom::as_subselect(rf)?);
+        }
+    }
     match item.node.as_mut() {
         Some(N::RangeSubselect(rs)) => {
             match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
@@ -10981,6 +10991,18 @@ fn resolve_sublinks_in_from(
                 }
                 _ => Ok(()),
             }
+        }
+        // A subquery in a FROM function's arguments: `unnest(ARRAY(SELECT
+        // ...))`.
+        Some(N::RangeFunction(rf)) => {
+            for f in &mut rf.functions {
+                if let Some(N::List(l)) = f.node.as_mut() {
+                    if let Some(call) = l.items.first_mut() {
+                        resolve_sublinks_in_expr(call, lookup, params, run, &[])?;
+                    }
+                }
+            }
+            Ok(())
         }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
@@ -12242,6 +12264,10 @@ fn plan_select(
     }
     let expanded = expand_views(s)?;
     let s = &expanded;
+    // `WITH ORDINALITY` and a several-function `ROWS FROM` as subqueries.
+    if let Some(rewritten) = rowsfrom::rewrite(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
@@ -12258,6 +12284,16 @@ fn plan_select(
     // An enum orders by its labels' declared positions, not their text.
     if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
+    }
+    // A bare `VALUES` with ORDER BY / LIMIT / OFFSET: the clauses belong to
+    // the rows, so it is `SELECT * FROM (VALUES ...) AS "*VALUES*"(column1,
+    // ...)` with them outside -- PostgreSQL's own column names, which is what
+    // `ORDER BY column1` refers to.
+    if !s.values_lists.is_empty()
+        && s.target_list.is_empty()
+        && (!s.sort_clause.is_empty() || s.limit_count.is_some() || s.limit_offset.is_some())
+    {
+        return plan_select(&values_as_subquery(s), lookup, params);
     }
     if s.from_clause.is_empty() {
         return plan_select_constant(s, params);
@@ -12878,12 +12914,30 @@ fn plan_from_subquery(
     for (c, name) in def.columns.iter_mut().zip(&colnames) {
         c.name = name.clone();
     }
+    distinct_fields(&mut def);
     def.name = alias.clone();
     Ok(SubSource {
         alias,
         plan: Box::new(plan),
         def,
     })
+}
+
+/// Give a column whose name repeats an earlier one's a field of its own.
+///
+/// A subquery's output may carry one name twice -- `(SELECT 1 AS a, 2 AS a)
+/// s`, a two-array `unnest` whose columns are both `unnest` -- and each is
+/// still its own column: PostgreSQL shows `(1, 2)`. Keyed by name, the second
+/// overwrote the first and `SELECT *` answered `(2, 2)`.
+fn distinct_fields(def: &mut TableDef) {
+    let mut seen: Vec<String> = Vec::new();
+    for (i, c) in def.columns.iter_mut().enumerate() {
+        let field = c.field();
+        if seen.contains(&field) {
+            c.field_override = Some(format!("{field}\u{1}{i}"));
+        }
+        seen.push(c.field());
+    }
 }
 
 /// One name from an alias's column list (`s(a, b)`).
@@ -15769,6 +15823,62 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         types,
         rows,
     }))
+}
+
+/// `VALUES ... ORDER BY ... LIMIT ...` as the select over the bare rows.
+fn values_as_subquery(s: &pg_query::protobuf::SelectStmt) -> pg_query::protobuf::SelectStmt {
+    let width = s
+        .values_lists
+        .first()
+        .and_then(|r| match r.node.as_ref() {
+            Some(N::List(l)) => Some(l.items.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let mut rows = s.clone();
+    rows.sort_clause.clear();
+    rows.limit_count = None;
+    rows.limit_offset = None;
+    rows.limit_option = pg_query::protobuf::LimitOption::Default as i32;
+    let string = |v: String| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String { sval: v })),
+    };
+    let star = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let from = pg_query::protobuf::Node {
+        node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
+            lateral: false,
+            subquery: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(Box::new(rows))),
+            })),
+            alias: Some(pg_query::protobuf::Alias {
+                aliasname: "*VALUES*".into(),
+                colnames: (1..=width).map(|i| string(format!("column{i}"))).collect(),
+            }),
+        }))),
+    };
+    pg_query::protobuf::SelectStmt {
+        target_list: vec![star],
+        from_clause: vec![from],
+        sort_clause: s.sort_clause.clone(),
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    }
 }
 
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
