@@ -596,25 +596,71 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
 /// actually run: it answers `UnsatisfiableWriteConcern`, and so does a
 /// `failCommand` injecting 100 at the top level. Neither context uses the old
 /// name.
+///
+/// Measured again on 2026-09-30 across insert / update / delete / findAndModify
+/// / create / createIndexes / drop, three things this missed:
+///
+/// - an UNKNOWN tag (`w: "tag"`) is not a pre-flight refusal: the write runs,
+///   and the reply carries `79 UnknownReplWriteConcern` here, like `w > 1`;
+/// - every `writeConcernError` carries `errInfo.writeConcern` -- the client's
+///   `w`, its `j` if given, `wtimeout` (0 when absent) and
+///   `provenance: "clientSupplied"`, in that order;
+/// - it sits immediately BEFORE `ok`, not after it.
 fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     if reply.get_f64("ok").unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
         return;
     }
-    let w = doc
-        .get("writeConcern")
-        .and_then(bson::Bson::as_document)
-        .and_then(|wc| wc.get("w"));
-    let unsatisfiable = match w {
-        Some(bson::Bson::Int32(n)) => *n > 1,
-        Some(bson::Bson::Int64(n)) => *n > 1,
-        _ => false,
+    let Some(wc) = doc.get("writeConcern").and_then(bson::Bson::as_document) else {
+        return;
     };
-    if unsatisfiable {
-        let mut wce = Document::new();
-        wce.insert("code", 100i32);
-        wce.insert("codeName", "UnsatisfiableWriteConcern");
-        wce.insert("errmsg", "Not enough data-bearing nodes");
-        reply.insert("writeConcernError", wce);
+    let (code, code_name, errmsg) = match wc.get("w") {
+        Some(bson::Bson::Int32(n)) if *n > 1 => (
+            100,
+            "UnsatisfiableWriteConcern",
+            "Not enough data-bearing nodes".to_string(),
+        ),
+        Some(bson::Bson::Int64(n)) if *n > 1 => (
+            100,
+            "UnsatisfiableWriteConcern",
+            "Not enough data-bearing nodes".to_string(),
+        ),
+        Some(bson::Bson::String(tag)) if tag != "majority" => (
+            79,
+            "UnknownReplWriteConcern",
+            format!("No write concern mode named '{tag}' found in replica set configuration"),
+        ),
+        _ => return,
+    };
+    let mut echoed = Document::new();
+    if let Some(w) = wc.get("w") {
+        echoed.insert("w", w.clone());
+    }
+    if let Some(j) = wc.get("j") {
+        let j = match j {
+            bson::Bson::Boolean(b) => *b,
+            other => util::as_i64(other).is_some_and(|n| n != 0),
+        };
+        echoed.insert("j", j);
+    }
+    echoed.insert(
+        "wtimeout",
+        wc.get("wtimeout")
+            .and_then(util::as_i64)
+            .map_or(bson::Bson::Int32(0), |n| {
+                i32::try_from(n).map_or(bson::Bson::Int64(n), bson::Bson::Int32)
+            }),
+    );
+    echoed.insert("provenance", "clientSupplied");
+    let mut wce = Document::new();
+    wce.insert("code", code);
+    wce.insert("codeName", code_name);
+    wce.insert("errmsg", errmsg);
+    wce.insert("errInfo", doc! {"writeConcern": echoed});
+    // Before `ok`: take `ok` out, add the error, put `ok` back last.
+    let ok = reply.remove("ok");
+    reply.insert("writeConcernError", wce);
+    if let Some(ok) = ok {
+        reply.insert("ok", ok);
     }
 }
 
@@ -644,10 +690,10 @@ fn is_write_concern_command(name: &str) -> bool {
 /// Reject a malformed `writeConcern` before a write command runs, mirroring
 /// `commands.py::_validate_write_concern`: a non-document `writeConcern` or a
 /// non-bool/int `j` / non-number `wtimeout` → `TypeMismatch` (14); a `w` that's a
-/// bool or non-number/string → `TypeMismatch` (14); a string `w` other than
-/// `"majority"` → `UnknownReplWriteConcern` (79); an integer `w` outside `[0, 50]`
-/// → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1` still
-/// succeeds with a `writeConcernError` attached — see `attach_write_concern_error`.)
+/// bool or non-number/string → `TypeMismatch` (14); an integer `w` outside
+/// `[0, 50]` → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1`
+/// and an unknown tag still succeed with a `writeConcernError` attached — see
+/// `attach_write_concern_error`.)
 fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError> {
     let wc = match doc.get("writeConcern") {
         // An explicit `writeConcern: null` is ACCEPTED — the BSON-field family's
@@ -686,14 +732,9 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
                     ));
                 }
             }
-            Bson::String(s) if s == "majority" => {}
-            Bson::String(s) => {
-                return Some(CommandError::new(
-                    79,
-                    "UnknownReplWriteConcern",
-                    format!("No write concern mode named '{s}' found in replica set configuration"),
-                ))
-            }
+            // Any tag parses; an unknown one is reported AFTER the write, as a
+            // `writeConcernError` (see `attach_write_concern_error`).
+            Bson::String(_) => {}
             _ => {
                 return Some(CommandError::new(
                     14,
