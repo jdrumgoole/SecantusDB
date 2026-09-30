@@ -569,7 +569,7 @@ impl PgHandler {
         })
     }
 
-    fn role_oid_of(&self, name: &str) -> i64 {
+    pub(crate) fn role_oid_of(&self, name: &str) -> i64 {
         self.role(name).ok().flatten().map_or(10, |r| r.oid)
     }
 

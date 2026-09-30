@@ -27,6 +27,7 @@ mod enum_order;
 mod errpos;
 pub mod escape_strings;
 pub mod event_triggers;
+pub mod fdw;
 pub mod formatting;
 pub mod fts;
 mod func_cast;
@@ -531,6 +532,8 @@ pub enum Statement {
         actions: Vec<String>,
         replace: bool,
     },
+    /// Foreign data wrappers, servers, user mappings and foreign tables.
+    Fdw(fdw::FdwOp),
     /// `CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE
     /// FUNCTION f()`: `tags` upper-cased, `None` for every tag.
     CreateEventTrigger {
@@ -1169,6 +1172,8 @@ pub enum AlterTableAction {
         name: Option<String>,
         enabled: bool,
     },
+    /// A foreign table's `OPTIONS (...)`, as they stand after the edit.
+    ForeignOptions(Vec<String>),
     /// `ENABLE` / `DISABLE RULE name`.
     RuleEnabled {
         name: String,
@@ -2930,6 +2935,9 @@ pub fn plan_with_params(
         node: Some(parse_one(sql)?),
     };
     event_triggers::rewrite_sources(sql, &mut node);
+    if let Some(inner) = node.node.as_ref() {
+        fdw::refuse_foreign_access(inner, lookup)?;
+    }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2967,6 +2975,9 @@ pub fn plan_with_subqueries(
     // the list the statement is finally planned with is longer than the one
     // the client bound.
     event_triggers::rewrite_sources(sql, &mut node);
+    if let Some(inner) = node.node.as_ref() {
+        fdw::refuse_foreign_access(inner, lookup)?;
+    }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2997,11 +3008,23 @@ pub fn plan_with_subqueries(
     )
 }
 
+pub(crate) fn plan_node_public(
+    node: N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    plan_node(node, lookup, params)
+}
+
 fn plan_node(
     node: N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    if let Some(st) = fdw::plan(&node, lookup, params)? {
+        return Ok(st);
+    }
+    fdw::refuse_foreign_access(&node, lookup)?;
     // A write or ALTER over an inheritance parent reaches every descendant.
     if let Some((tag, nodes)) = inherit::per_table(&node)? {
         let statements = nodes
@@ -4566,6 +4589,30 @@ fn plan_alter_action(
             name: cmd.name.clone(),
             enabled: false,
         }),
+        Ok(AT::AtGenericOptions) => {
+            let Some(N::List(l)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("OPTIONS without a list".into()));
+            };
+            if !fdw::is_foreign(def) {
+                return Err(Error::Sqlstate(
+                    "42809",
+                    format!("\"{}\" is not a foreign table", def.name),
+                ));
+            }
+            let stored: Vec<String> = def
+                .extra
+                .get_array("foreign_options")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let edits = fdw::option_edits_public(&l.items);
+            Ok(AlterTableAction::ForeignOptions(fdw::apply_option_edits(
+                &stored, &edits,
+            )?))
+        }
         Ok(AT::AtEnableRowSecurity) => Ok(AlterTableAction::RowSecurity {
             enable: Some(true),
             force: None,
@@ -5056,6 +5103,16 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
                 def.extra.remove("clustered_index");
             }
         },
+        AlterTableAction::ForeignOptions(options) => {
+            def.extra.insert(
+                "foreign_options",
+                options
+                    .iter()
+                    .cloned()
+                    .map(Bson::String)
+                    .collect::<Vec<_>>(),
+            );
+        }
         AlterTableAction::RowSecurity { .. }
         | AlterTableAction::TriggerEnabled { .. }
         | AlterTableAction::RuleEnabled { .. }

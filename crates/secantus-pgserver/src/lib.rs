@@ -19,6 +19,7 @@ mod do_block;
 mod encoding;
 mod event_triggers;
 mod explain;
+mod fdw;
 mod merge;
 mod partition;
 mod plpgsql_do;
@@ -9233,6 +9234,7 @@ impl PgHandler {
             "pg_rules" => Some(rules::pg_rules_def()),
             "pg_depend" => Some(catalog_fill::pg_depend_def()),
             "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
+            other if fdw::fdw_catalog_def(other).is_some() => fdw::fdw_catalog_def(other),
             _ => Self::catalog_object_table(name),
         }
     }
@@ -9253,6 +9255,7 @@ impl PgHandler {
             "pg_opclass" => self.pg_opclass_rows(&def),
             "pg_cast" => self.pg_cast_rows(&def),
             "pg_rewrite" => self.pg_rewrite_rows(&def),
+            other if fdw::fdw_catalog_def(other).is_some() => self.fdw_catalog_rows(other, &def)?,
             "pg_event_trigger" => self.pg_event_trigger_rows(&def),
             "pg_event_trigger_dropped_objects" => self.dropped_objects_rows(&def),
             "pg_event_trigger_ddl_commands" => self.ddl_commands_rows(&def),
@@ -9480,7 +9483,14 @@ impl PgHandler {
                         // A temporary table is still a BASE TABLE; `LOCAL
                         // TEMPORARY` is the table_type of a declared local
                         // temporary, which this server has none of.
-                        d.insert(f("table_type"), "BASE TABLE");
+                        d.insert(
+                            f("table_type"),
+                            if secantus_pgplan::fdw::is_foreign(&t) {
+                                "FOREIGN"
+                            } else {
+                                "BASE TABLE"
+                            },
+                        );
                         d
                     })
                     .chain(
@@ -9640,6 +9650,8 @@ impl PgHandler {
                         f("relkind"),
                         if matviews.contains(&t.name) {
                             "m"
+                        } else if secantus_pgplan::fdw::is_foreign(&t) {
+                            "f"
                         } else if partition::is_partitioned(&t) {
                             "p"
                         } else {
@@ -13522,6 +13534,12 @@ impl PgHandler {
             | Statement::DropEventTrigger { .. } => {
                 vec![event_triggers::EVENT_TRIGGER_COLLECTION.to_string()]
             }
+            Statement::Fdw(_) => vec![
+                fdw::FDW_COLLECTION.to_string(),
+                CATALOG_COLLECTION.to_string(),
+                SEQUENCE_COLLECTION.to_string(),
+                Self::COMPOSITE_COLLECTION.to_string(),
+            ],
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
@@ -13698,6 +13716,7 @@ impl PgHandler {
             A::RowSecurity { .. }
             | A::TriggerEnabled { .. }
             | A::RuleEnabled { .. }
+            | A::ForeignOptions(_)
             | A::AttachPartition { .. }
             | A::DetachPartition(_) => return Ok(Some(action.clone())),
             A::OwnerTo(role) => {
@@ -13924,6 +13943,7 @@ impl PgHandler {
                 self.set_trigger_enabled(table, name.as_deref(), *enabled)
             }
             A::RuleEnabled { name, enabled } => self.set_rule_enabled(table, name, *enabled),
+            A::ForeignOptions(_) => Ok(()),
             A::ValidateConstraint(name) => {
                 let Some(check) = before.check_constraints.iter().find(|c| c.name == *name) else {
                     return Ok(());
@@ -18351,6 +18371,7 @@ impl PgHandler {
             Statement::DropCast { .. } => "DROP CAST",
             Statement::CreateRule { .. } => "CREATE RULE",
             Statement::DropRule { .. } => "DROP RULE",
+            Statement::Fdw(op) => op.tag(),
             Statement::CreateEventTrigger { .. } => "CREATE EVENT TRIGGER",
             Statement::AlterEventTrigger { .. } => "ALTER EVENT TRIGGER",
             Statement::DropEventTrigger { .. } => "DROP EVENT TRIGGER",
@@ -19684,6 +19705,7 @@ impl PgHandler {
                 tags,
                 function,
             } => self.create_event_trigger(&name, &event, tags, &function),
+            Statement::Fdw(op) => self.execute_fdw(op),
             Statement::AlterEventTrigger { name, enabled } => {
                 self.alter_event_trigger(&name, &enabled)
             }
@@ -20655,6 +20677,9 @@ impl PgHandler {
 
             Statement::DropTable(drop) => {
                 for table in &drop.tables {
+                    if let Some(def) = self.lookup(table) {
+                        fdw::check_drop_table(&def)?;
+                    }
                     if self.views()?.iter().any(|(n, _)| n == table) {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
