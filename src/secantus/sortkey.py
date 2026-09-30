@@ -188,6 +188,9 @@ def _encode_number(value: int | float | Decimal128) -> bytes:
     return bytes([prefix, bias_e]) + pairs + terminator
 
 
+COMPOUND_SEP = b"\x00\x00"
+
+
 def _escape(data: bytes) -> bytes:
     """Replace 0x00 bytes so 0x00 0x00 can be a compound separator."""
     return data.replace(b"\x00", b"\x00\xff")
@@ -256,15 +259,55 @@ def _encode_timestamp(ts: Timestamp) -> bytes:
     return struct.pack(">II", ts.time, ts.inc)
 
 
-def _encode_doc(doc: Mapping[str, Any]) -> bytes:
-    return _escape(bson.encode(dict(doc)))
+# The end of a document's or array's elements. Every element starts with its
+# value's type rank, and every rank is >= 1, so a value that is a strict prefix
+# of another -- fewer elements, the rest equal -- sorts first, as mongod has it.
+_ELEMENTS_END = b"\x00"
 
 
-def _encode_array(arr: list[Any]) -> bytes:
-    # Encode as a BSON document with positional keys — this matches how
-    # BSON itself stores arrays, so equality through the index lines up
-    # with equality at the matches() layer.
-    return _escape(bson.encode({str(i): v for i, v in enumerate(arr)}))
+def _element_value(value: Any, collation: Any) -> tuple[bytes, bytes]:
+    """One element's value inside a document or array: its type rank, then the
+    rest of its key, escaped and terminated so the bytes that follow cannot
+    change the comparison (an escaped string never contains ``00 00``)."""
+    key = encode_value(value, collation=collation)
+    return key[:1], _escape(key[1:]) + COMPOUND_SEP
+
+
+def _encode_doc(doc: Mapping[str, Any], collation: Any = None) -> bytes:
+    """A document, byte-ordered the way mongod compares documents.
+
+    mongod compares two documents element by element, and each pair of elements
+    by the value's canonical TYPE first, then the field NAME, then the value;
+    a document that runs out of elements first is the smaller. Entry format 4
+    encodes exactly that. Formats up to 3 used the raw BSON, whose leading
+    length made byte order SIZE order: ``{a: 2, b: [3]}`` sorted above
+    ``{a: 5}``, and an index range bounded by a document scanned the wrong
+    stretch. A nested string takes the index's collation, as it does in
+    mongod's comparison.
+    """
+    out = bytearray()
+    for name, value in doc.items():
+        rank, rest = _element_value(value, collation)
+        out += rank + _escape(str(name).encode("utf-8")) + COMPOUND_SEP + rest
+    return bytes(out) + _ELEMENTS_END
+
+
+def _encode_array(arr: list[Any], collation: Any = None) -> bytes:
+    """An array: its elements in order, as ``_encode_doc`` without the field
+    names -- two arrays' names are the same positions, so they never decide."""
+    out = bytearray()
+    for value in arr:
+        rank, rest = _element_value(value, collation)
+        out += rank + rest
+    return bytes(out) + _ELEMENTS_END
+
+
+def _legacy_encode_container(value: Any) -> bytes:
+    """Formats 1-3's document / array encoding: the escaped raw BSON. Kept ONLY
+    for ``encode_id_key`` -- see there."""
+    if isinstance(value, list):
+        return _escape(bson.encode({str(i): v for i, v in enumerate(value)}))
+    return _escape(bson.encode(dict(value)))
 
 
 # re flag bit -> option char, in pymongo's on-the-wire order ("ilmsux"). After
@@ -306,9 +349,9 @@ def encode_value(value: Any, *, collation: Any = None) -> bytes:
         # ignores for ordering.
         return head + _escape(str(value).encode("utf-8"))
     if rank == RANK_DOCUMENT:
-        return head + _encode_doc(value)
+        return head + _encode_doc(value, collation)
     if rank == RANK_ARRAY:
-        return head + _encode_array(value)
+        return head + _encode_array(value, collation)
     if rank == RANK_BINDATA:
         return head + _encode_binary(value)
     if rank == RANK_OBJECTID:
@@ -324,7 +367,23 @@ def encode_value(value: Any, *, collation: Any = None) -> bytes:
     return head  # unreachable
 
 
-COMPOUND_SEP = b"\x00\x00"
+def encode_id_key(value: Any) -> bytes:
+    """The ``_id`` key: ``encode_value`` with formats 1-3's document / array
+    encoding, frozen.
+
+    An ``_id`` key is not an index entry. It is stored inside every document
+    row and keys the ``_id`` index, so changing it would strand every stored
+    document whose ``_id`` is a document -- its lookups would compute a key no
+    row carries, silently. Entry format 4 changed how documents and arrays
+    ORDER in secondary indexes; an ``_id`` key only has to be the same bytes
+    for the same value, which the old encoding already is. (An array cannot be
+    an ``_id``; it is here for completeness.) Mirrors the Rust
+    ``sortkey::encode_id_key``.
+    """
+    rank = _rank(value)
+    if rank in (RANK_DOCUMENT, RANK_ARRAY):
+        return bytes([rank]) + _legacy_encode_container(value)
+    return encode_value(value)
 
 
 def encode_compound(values: list[Any], *, collation: Any = None) -> bytes:

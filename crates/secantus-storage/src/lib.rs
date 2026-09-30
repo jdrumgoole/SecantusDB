@@ -1083,27 +1083,15 @@ const CONFLICTING_OPTS: &[&str] = &[
 const RANGE_OPS: &[&str] = &["$eq", "$gt", "$gte", "$lt", "$lte", "$in"];
 
 /// Whether an operator document can be answered from index BOUNDS: every
-/// operator is in `RANGE_OPS`, and no range operator is bounded by a document
-/// or an array.
+/// operator is in `RANGE_OPS`.
 ///
-/// The entries order a document or array key by its raw BSON, which leads with
-/// a little-endian LENGTH -- so byte bounds are not value bounds there. With an
-/// index on `x`, `find({x: {$gt: [1, 2, 3]}})` dropped `{x: [9]}`, whose short
-/// encoding sorts below the bound although `[9]` is greater element by
-/// element; a collection scan and mongod 8.2.11 both return it (2026-09-30).
-/// Equality and `$in` stay indexable: exact byte equality IS value equality.
+/// Until entry format 4 a range bounded by a document or an array was refused
+/// here too: the entries ordered those keys by raw BSON, which leads with a
+/// little-endian LENGTH, so with an index on `x`, `find({x: {$gt: [1, 2, 3]}})`
+/// dropped `{x: [9]}` (measured against mongod 8.2.11, 2026-09-30). Format 4
+/// keys them by value, so byte bounds are value bounds for every type.
 fn index_can_bound(opd: &Document) -> bool {
-    opd.iter().all(|(k, v)| {
-        RANGE_OPS.contains(&k.as_str())
-            && !(matches!(k.as_str(), "$gt" | "$gte" | "$lt" | "$lte")
-                && byte_order_is_not_value_order(v))
-    })
-}
-
-/// A value whose `sortkey` bytes do not order it by value (see
-/// `index_can_bound`).
-fn byte_order_is_not_value_order(v: &Bson) -> bool {
-    matches!(v, Bson::Document(_) | Bson::Array(_))
+    opd.iter().all(|(k, _)| RANGE_OPS.contains(&k.as_str()))
 }
 
 /// `(index_name, direction, is_compound)` — the index a leading-field lookup
@@ -1772,9 +1760,12 @@ fn encode_id_doc(id: &Bson) -> Result<Vec<u8>> {
     encode_doc(&d)
 }
 
-/// `id_key = sortkey.encode_value(_id)` — the byte-sortable key for the `_id`.
+/// `id_key = sortkey.encode_id_key(_id)` — the byte-sortable key for the `_id`.
+/// Not `encode_value`: an `_id` key is stored in every document row, so it keeps
+/// formats 1-3's document encoding when index entries moved to format 4 (see
+/// `sortkey::encode_id_key`).
 fn id_key(id: &Bson) -> Result<Vec<u8>> {
-    sortkey::encode_value(id, None).map_err(|_| StorageError::UnsupportedId)
+    sortkey::encode_id_key(id).map_err(|_| StorageError::UnsupportedId)
 }
 
 /// Whether applying `update` to a doc with `_id == old_id` would modify the
@@ -2006,11 +1997,17 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
 ///   back in the OLD order, and since `order::type_rank` moved with it, the
 ///   index and a collection scan would disagree — an index that changes the
 ///   sort answer.
+/// * 4 — documents and arrays are keyed by VALUE (`sortkey::encode_doc`):
+///   type, then name, then value per element, the way mongod compares them.
+///   Formats 1-3 keyed them by raw BSON, whose leading length made byte order
+///   SIZE order, so ranges, partial-filter implication and sort walks over
+///   document keys had to be refused. `_id` keys are NOT index entries and
+///   keep the old encoding (`sortkey::encode_id_key`).
 ///
 /// The catalog is the only place this is visible — the WT `key_format` is
 /// `SSSu` for all three — so the marker is how an older store is detected
 /// (`reject_legacy_index_entry_format`). Mirrors the Python `_ENTRY_FORMAT`.
-const ENTRY_FORMAT: i32 = 3;
+const ENTRY_FORMAT: i32 = 4;
 
 /// Pack an index-entry payload into a single trailing `u` column:
 /// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
@@ -2507,12 +2504,9 @@ fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
     if pop != "$eq" && type_bracket(&a) != type_bracket(&b) {
         return false;
     }
-    // Inside the document and array brackets the bytes are raw BSON, which
-    // order by LENGTH first, not by value -- so a byte compare there answers an
-    // implication question about the wrong order. See `index_can_bound`.
-    if pop != "$eq" && (byte_order_is_not_value_order(qv) || byte_order_is_not_value_order(pv)) {
-        return false;
-    }
+    // Documents and arrays used to need their own refusal here (raw-BSON bytes
+    // ordered them by length); since entry format 4 they order by value like
+    // every other type, so the bracket check above is the whole story.
     let (le, lt, ge, gt, eq) = (a <= b, a < b, a >= b, a > b, a == b);
     match pop {
         // query upper-bounds the field; need its max <= / < pv.
@@ -2669,9 +2663,10 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// documents was wrong on 5 of 7 measured shapes (8.2.11, 2026-09-30) while the
 /// aggregation `$sort`, which compares values, was right on all 7. So a
 /// document or array also carries its value, compared with the same
-/// `order::cmp` the `$sort` stage uses. The entries table keeps the byte form
-/// -- it is on disk -- which is why an index walk that meets one of these
-/// values gives up its claim to be in sort order (`sort_values_are_nested`).
+/// `order::cmp` the `$sort` stage uses. (Since entry format 4 the bytes order a
+/// document by value too, so for documents this is belt and braces; for arrays
+/// it is not, because a sort orders an array by its smallest or largest
+/// element, not by the whole array -- see `sort_values_are_nested`.)
 struct SortPart {
     bytes: Vec<u8>,
     nested: Option<Bson>,
@@ -2842,10 +2837,12 @@ fn is_nested_rank(bytes: &[u8]) -> bool {
     )
 }
 
-/// Whether any of these documents sorts by a document or array value under
-/// `spec` -- the values the entries table's byte order gets wrong (see
-/// `SortPart`), so an index walk over them is not a sort. Reads raw BSON, only
-/// the sort paths.
+/// Whether any of these documents sorts by an ARRAY value under `spec` -- the
+/// one kind of value whose index order is not its sort order (a sort takes an
+/// array's smallest or largest element; the index keys the whole array), so an
+/// index walk over them is not a sort. A document at the sort path used to
+/// count too, when the entries keyed documents by raw BSON; entry format 4
+/// keys them by value. Reads raw BSON, only the sort paths.
 fn sort_values_are_nested(blobs: &[Vec<u8>], spec: &[(String, i32)]) -> bool {
     blobs.iter().any(|blob| {
         let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
@@ -2862,7 +2859,7 @@ fn raw_path_is_nested(raw: &bson::RawDocument, path: &str) -> bool {
         match cur.get(part) {
             Ok(Some(bson::RawBsonRef::Document(d))) => {
                 if parts.peek().is_none() {
-                    return true;
+                    return false;
                 }
                 cur = d;
             }

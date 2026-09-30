@@ -158,6 +158,27 @@ def test_collation_encoding_parity(s, strength, case_level, numeric_ordering):
     assert same(rust, _pure.encode_value(s, collation=obj)), f"s={s!r} wire={wire}"
 
 
+@pytest.mark.parametrize("value", _curated_values())
+def test_curated_id_key_parity(value):
+    """The frozen `_id` key encoding (entry formats 1-3's documents) must match
+    too: it is stored in every document row, so a drift strands documents."""
+    v = _roundtrip(value)
+    rust = _rust.sortkey_encode_id_key(bson.encode({"v": v}))
+    assert same(rust, _pure.encode_id_key(v))
+
+
+@pytest.mark.parametrize("strength", [1, 2, 3])
+def test_nested_strings_take_the_collation(strength):
+    """Entry format 4 applies an index's collation to strings INSIDE documents
+    and arrays, as mongod's comparison does -- on both engines identically."""
+    wire = {"strength": strength, "caseLevel": False, "numericOrdering": False}
+    obj = _Collation(strength=strength, case_level=False, numeric_ordering=False)
+    for v in ({"a": "PING", "b": ["X", {"c": "y"}]}, ["B", "b", {"k": "Hello"}]):
+        rust = _rust_encode(v, wire)
+        assert rust is not None, f"rust deferred an ASCII value: {v!r}"
+        assert same(rust, _pure.encode_value(v, collation=obj)), f"v={v!r} wire={wire}"
+
+
 def test_cross_type_numeric_collision_matches_python():
     # The headline property, asserted on both implementations at once.
     for triple in ([3, 3.0, Decimal128("3")], [1, Decimal128("1.00"), 1.0]):
