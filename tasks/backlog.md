@@ -671,7 +671,9 @@ remain open:
         `srf_fields`). An operand of any other shape is not checked.
       - **Error positions** (`P`) come from the parse location where the
         raising site recorded one, and otherwise from the first token the
-        message names. A name mentioned twice may point at the wrong
+        message names -- since batch 15 also for an error raised while the
+        rows stream, and for a record without the named field (corpus
+        `error_positions`). A name mentioned twice may point at the wrong
         occurrence. An error inside a function body carries no internal
         position.
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::

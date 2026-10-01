@@ -15112,3 +15112,28 @@ def test_procedure_transaction_control_and_do_block_atomicity(home: Path) -> Non
         with pytest.raises(psycopg.errors.InvalidTransactionTermination):
             c.execute("insert into pt_t values (20); call pt_p()")
         assert c.execute("select count(*) from pt_t").fetchone() == (3,)
+
+
+@pytest.mark.parametrize(
+    ("sql", "sqlstate", "position"),
+    [
+        # Raised while the rows stream, after planning: still positioned.
+        ("select g + 'a' from generate_series(1, 2) g", "22P02", 12),
+        # A record without that field: PostgreSQL points at the record.
+        ("select (c).b + 1 from (select row(1,'x')::record as c) s", "42703", 9),
+        # Judged statically, so even over no rows.
+        ("select x::int + true from ep_t", "42883", 15),
+        ("select (c).b + 1 from ep_t", "42883", 14),
+    ],
+)
+def test_runtime_and_static_errors_carry_postgres_positions(
+    home: Path, sql: str, sqlstate: str, position: int
+) -> None:
+    """Positions measured on PostgreSQL 15 for the same statements."""
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create type ep_c as (a int, b text)")
+        c.execute("create table ep_t (id int, c ep_c, x text)")
+        with pytest.raises(psycopg.Error) as caught:
+            c.execute(sql)
+        assert caught.value.sqlstate == sqlstate
+        assert caught.value.diag.statement_position == str(position)

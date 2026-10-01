@@ -16933,7 +16933,28 @@ impl PgHandler {
             },
             None,
         );
-        result.map_err(|e| Self::positioned(e, query))
+        // An error can also surface while the rows STREAM (a value that
+        // fails to evaluate on some row): it gets the same position.
+        result
+            .map(|responses| {
+                responses
+                    .into_iter()
+                    .map(|r| match r {
+                        Response::Query(mut q) => {
+                            let sql = query.to_string();
+                            let rows = std::mem::replace(
+                                &mut q.data_rows,
+                                Box::pin(futures::stream::empty()),
+                            );
+                            q.data_rows =
+                                Box::pin(rows.map_err(move |e| Self::positioned(e, &sql)));
+                            Response::Query(q)
+                        }
+                        other => other,
+                    })
+                    .collect()
+            })
+            .map_err(|e| Self::positioned(e, query))
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and

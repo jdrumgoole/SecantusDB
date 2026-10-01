@@ -83,6 +83,22 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         return pos(usize::try_from(loc).ok()?);
     }
     match sqlstate {
+        // `could not identify column "b" in record data type`: PostgreSQL
+        // points at the record, the `c` of `(c).b`.
+        "42703" if m.starts_with("could not identify column ") => {
+            let field = m
+                .strip_prefix("could not identify column \"")?
+                .split('"')
+                .next()?;
+            let i = toks.iter().enumerate().position(|(i, t)| {
+                unquote_ident(t.text) == field
+                    && i >= 4
+                    && toks[i - 1].text == "."
+                    && toks[i - 2].text == ")"
+                    && toks[i - 4].text == "("
+            })?;
+            pos(toks[i - 3].start)
+        }
         "42703" => {
             // `column "x" does not exist`, or `column t.x does not exist`:
             // a qualified reference points at its qualifier.

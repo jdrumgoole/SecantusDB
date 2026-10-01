@@ -418,6 +418,26 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
                 }
             }
         }
+        // A composite column's field, `(c).b`: the field's declared type.
+        N::AIndirection(ind)
+            if matches!(
+                ind.indirection.as_slice(),
+                [one] if matches!(one.node.as_ref(), Some(N::String(_)))
+            ) =>
+        {
+            let Some(N::String(field)) = ind.indirection[0].node.as_ref() else {
+                return None;
+            };
+            let base = match ind.arg.as_deref()?.node.as_ref()? {
+                N::ColumnRef(c) => scope.column_type(c)?,
+                _ => return None,
+            };
+            let (_, fields) = user_composite(&base)?;
+            fields
+                .into_iter()
+                .find(|(n, _)| *n == field.sval)
+                .map(|(_, t)| t)
+        }
         // An array subscript: the ELEMENT type; a slice keeps the array's.
         N::AIndirection(ind)
             if !ind.indirection.is_empty()
@@ -539,6 +559,17 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 }
                 (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
                 _ => {}
+            }
+        }
+    }
+    // `boolean` has no arithmetic at all: `integer + boolean` is 42883.
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            // Nor do the string types (`text + integer`, `text + text`).
+            let string = |t: &str| category(t) == Some("string");
+            if l == "bool" || r == "bool" || string(&l) || string(&r) {
+                return Err(mismatch(&op, &l, &r, e.location));
             }
         }
     }
