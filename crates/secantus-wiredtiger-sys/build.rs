@@ -70,6 +70,12 @@ fn main() {
     let out = cfg.build();
     let build = out.join("build");
     emit(&build.join("include"), &build);
+    // A multi-config generator (MSBuild, the Windows default) puts the
+    // library under a per-configuration directory instead.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build.join("Release").display()
+    );
 
     let sys_libs: &[&str] = match target_os.as_str() {
         "linux" => &["pthread", "rt", "dl"],
