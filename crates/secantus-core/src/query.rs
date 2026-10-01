@@ -753,13 +753,6 @@ fn is_exotic(b: &Bson) -> bool {
     )
 }
 
-/// A single `$in` / `$nin` candidate. A regex candidate matches string values by
-/// pattern (mongod semantics — bare equality would silently match nothing);
-/// everything else is array-aware, collation-aware equality. Mirrors
-/// `query._in_candidate_matches`.
-/// mongod rejects a `$in` / `$nin` element that is a document with a
-/// `$`-prefixed key ("cannot nest $ under $in", BadValue) — defer so Python
-/// raises it. A BSON regex literal is fine (handled in `in_candidate_matches`).
 // ---------------------------------------------------------------------------
 // Hashed `$in` / `$nin` lists for a scan.
 //
@@ -897,6 +890,13 @@ fn in_set_lookup(arr: &[Bson], values: &[Cand], coll: Option<&Collation>) -> Opt
     Some(hit)
 }
 
+/// A single `$in` / `$nin` candidate. A regex candidate matches string values by
+/// pattern (mongod semantics — bare equality would silently match nothing);
+/// everything else is array-aware, collation-aware equality. Mirrors
+/// `query._in_candidate_matches`.
+/// mongod rejects a `$in` / `$nin` element that is a document with a
+/// `$`-prefixed key ("cannot nest $ under $in", BadValue) — defer so Python
+/// raises it. A BSON regex literal is fine (handled in `in_candidate_matches`).
 fn in_elements_ok(arr: &[Bson]) -> Result<(), Fallback> {
     for el in arr {
         if let Bson::Document(d) = el {
