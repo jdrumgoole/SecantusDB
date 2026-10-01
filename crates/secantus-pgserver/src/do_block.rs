@@ -73,7 +73,13 @@ impl PgHandler {
                     "CREATE FUNCTION inline_code_block() RETURNS void AS \
                      $secantus_do$\n{body}\n$secantus_do$ LANGUAGE plpgsql"
                 );
-                crate::plpgsql_fn::run(
+                // Alone in its query string outside a block, the body may
+                // COMMIT; anywhere else it is atomic.
+                let prev = self.txn_control.swap(
+                    self.may_end_transaction(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let out = crate::plpgsql_fn::run(
                     &sql,
                     crate::plpgsql_fn::Invocation {
                         args: &[],
@@ -82,10 +88,13 @@ impl PgHandler {
                         returns_set: false,
                         out_params: &[],
                         procedure: false,
+                        nonatomic: true,
                     },
                     &crate::PlHost { h: self },
-                )
-                .map_err(crate::wire_pl_error)?;
+                );
+                self.txn_control
+                    .store(prev, std::sync::atomic::Ordering::Relaxed);
+                out.map_err(crate::wire_pl_error)?;
                 return Ok(vec![Response::Execution(Tag::new("DO"))]);
             }
             Err(e) => return Err(Self::do_parse_error(e, body, query)),

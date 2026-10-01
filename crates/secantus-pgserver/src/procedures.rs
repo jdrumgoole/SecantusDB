@@ -17,6 +17,9 @@ use crate::{
     PgHandler, PlHost,
 };
 
+/// `(output positions, parameter names, parameter types, output values)`.
+pub(crate) type ProcedureOutput = (Vec<usize>, Vec<String>, Vec<String>, Vec<Option<Bson>>);
+
 fn strings(d: &Document, key: &str) -> Vec<String> {
     d.get_array(key)
         .map(|a| {
@@ -35,6 +38,51 @@ impl PgHandler {
         args: Vec<Bson>,
         arg_types: Vec<String>,
     ) -> PgWireResult<Vec<Response>> {
+        let (outputs, names, types, row) = self.run_procedure(name, args, arg_types)?;
+        if outputs.is_empty() {
+            return Ok(vec![Response::Execution(Tag::new("CALL"))]);
+        }
+        let tz = self.session_timezone();
+        let fields = outputs
+            .iter()
+            .map(|i| {
+                self.field(
+                    names.get(*i).cloned().unwrap_or_default(),
+                    wire_type(&types[*i]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(fields);
+        let schema_ref = schema.clone();
+        let ds = self.session_datestyle();
+        let cenc = self.client_encoding();
+        let rows = stream::iter(vec![row]).map(move |vals| {
+            let mut enc = DataRowEncoder::new(schema_ref.clone());
+            for (i, v) in vals.iter().enumerate() {
+                encode_field_value(
+                    &mut enc,
+                    column_at(&schema_ref, i)?,
+                    v.as_ref(),
+                    &tz,
+                    &ds,
+                    cenc,
+                )?;
+            }
+            Ok(enc.take_row())
+        });
+        let mut response = QueryResponse::new(schema, rows);
+        response.set_bare_command_tag("CALL");
+        Ok(vec![Response::Query(response)])
+    }
+
+    /// Run a procedure: its OUTPUT parameters' positions, every parameter's
+    /// name and type, and the output values (in position order).
+    pub(crate) fn run_procedure(
+        &self,
+        name: &str,
+        args: Vec<Bson>,
+        arg_types: Vec<String>,
+    ) -> PgWireResult<ProcedureOutput> {
         let docs = self.user_function_docs()?;
         let shown = || {
             format!(
@@ -132,6 +180,7 @@ impl PgHandler {
                             returns_set: false,
                             out_params: &out_names,
                             procedure: true,
+                            nonatomic: true,
                         },
                         &host,
                     )
@@ -166,7 +215,7 @@ impl PgHandler {
             }
         };
         if outputs.is_empty() {
-            return Ok(vec![Response::Execution(Tag::new("CALL"))]);
+            return Ok((outputs, names, types, Vec::new()));
         }
         let row: Vec<Option<Bson>> = if outputs.len() == 1 {
             vec![Some(value)]
@@ -178,36 +227,7 @@ impl PgHandler {
             .unwrap_or_else(|| vec![Bson::Null; outputs.len()]);
             fields.into_iter().map(Some).collect()
         };
-        let fields = outputs
-            .iter()
-            .map(|i| {
-                self.field(
-                    names.get(*i).cloned().unwrap_or_default(),
-                    wire_type(&types[*i]),
-                )
-            })
-            .collect::<Vec<_>>();
-        let schema = Arc::new(fields);
-        let schema_ref = schema.clone();
-        let ds = self.session_datestyle();
-        let cenc = self.client_encoding();
-        let rows = stream::iter(vec![row]).map(move |vals| {
-            let mut enc = DataRowEncoder::new(schema_ref.clone());
-            for (i, v) in vals.iter().enumerate() {
-                encode_field_value(
-                    &mut enc,
-                    column_at(&schema_ref, i)?,
-                    v.as_ref(),
-                    &tz,
-                    &ds,
-                    cenc,
-                )?;
-            }
-            Ok(enc.take_row())
-        });
-        let mut response = QueryResponse::new(schema, rows);
-        response.set_bare_command_tag("CALL");
-        Ok(vec![Response::Query(response)])
+        Ok((outputs, names, types, row))
     }
 }
 

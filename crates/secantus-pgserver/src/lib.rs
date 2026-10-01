@@ -719,6 +719,39 @@ struct PlHost<'a> {
 }
 
 impl PlHost<'_> {
+    /// Run `f` inside the session's open transaction. A statement's own
+    /// scope already is; a DO block, or a CALL that may COMMIT, runs its
+    /// statements here one at a time, so each joins it -- otherwise each
+    /// wrote on its own and a later error left the earlier writes committed.
+    fn joined<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, plpgsql_fn::PlError>,
+    ) -> Result<T, plpgsql_fn::PlError> {
+        if self.h.storage.in_user_txn() {
+            return f();
+        }
+        self.h
+            .in_open_transaction(|| Ok(f()))
+            .map_err(|e| pl_error(&e))?
+    }
+
+    /// Run `f` as an ATOMIC context: a function it calls cannot COMMIT.
+    fn atomic<T>(&self, f: impl FnOnce() -> T) -> T {
+        let prev = self
+            .h
+            .txn_control
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let out = f();
+        self.h
+            .txn_control
+            .store(prev, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    fn subtxn_name(token: u64) -> String {
+        format!("\u{1}plpgsql subtransaction {token}")
+    }
+
     fn plan(
         &self,
         sql: &str,
@@ -743,6 +776,36 @@ impl PlHost<'_> {
         })
         .map_err(|e| pl_error(&PgHandler::err(&e)))
     }
+}
+
+/// The command tag of a transaction-control statement (`COMMIT`,
+/// `SAVEPOINT`, ...), `None` for any other statement.
+fn transaction_statement_tag(sql: &str) -> Option<&'static str> {
+    use pg_query::protobuf::node::Node as N;
+    use pg_query::protobuf::TransactionStmtKind as K;
+    let parsed = pg_query::parse(sql).ok()?;
+    let Some(N::TransactionStmt(t)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return None;
+    };
+    Some(match K::try_from(t.kind).ok()? {
+        K::TransStmtBegin => "BEGIN",
+        K::TransStmtStart => "START TRANSACTION",
+        K::TransStmtCommit => "COMMIT",
+        K::TransStmtRollback => "ROLLBACK",
+        K::TransStmtSavepoint => "SAVEPOINT",
+        K::TransStmtRelease => "RELEASE",
+        K::TransStmtRollbackTo => "ROLLBACK",
+        K::TransStmtPrepare => "PREPARE TRANSACTION",
+        K::TransStmtCommitPrepared => "COMMIT PREPARED",
+        K::TransStmtRollbackPrepared => "ROLLBACK PREPARED",
+        _ => return None,
+    })
 }
 
 /// The interpreter's error as a wire error.
@@ -773,8 +836,12 @@ impl plpgsql_fn::Host for PlHost<'_> {
         params: &[Bson],
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
-        let stmt = self.plan(sql, params, types)?;
-        let (schema, rows) = self.h.rows_with_schema(&stmt).map_err(|e| pl_error(&e))?;
+        let (schema, rows) = self.joined(|| {
+            self.atomic(|| {
+                let stmt = self.plan(sql, params, types)?;
+                self.h.rows_with_schema(&stmt).map_err(|e| pl_error(&e))
+            })
+        })?;
         let columns = schema
             .iter()
             .map(|f| {
@@ -797,10 +864,24 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<u64, plpgsql_fn::PlError> {
         let stmt = self.plan(sql, params, types)?;
-        let responses = self
-            .h
-            .execute_statement(stmt, 0)
-            .map_err(|e| pl_error(&e))?;
+        // A nested CALL keeps the non-atomic context, and its statements
+        // join the transaction themselves (holding the guard across it would
+        // deadlock its COMMIT). Everything else is atomic and joins here,
+        // captured first for any subtransaction open around it.
+        let responses = if matches!(stmt, Statement::Call { .. }) {
+            self.h
+                .execute_statement(stmt, 0)
+                .map_err(|e| pl_error(&e))?
+        } else {
+            self.joined(|| {
+                self.atomic(|| {
+                    self.h
+                        .capture_for_savepoints(&stmt)
+                        .and_then(|()| self.h.execute_statement(stmt, 0))
+                        .map_err(|e| pl_error(&e))
+                })
+            })?
+        };
         Ok(responses
             .iter()
             .filter_map(|r| match r {
@@ -817,11 +898,93 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         let stmt = self.plan(sql, params, types)?;
-        let (columns, rows) = self
-            .h
-            .dml_returning_values(stmt)
-            .map_err(|e| pl_error(&e))?;
+        let (columns, rows) = self.joined(|| {
+            self.atomic(|| {
+                self.h
+                    .capture_for_savepoints(&stmt)
+                    .and_then(|()| self.h.dml_returning_values(stmt))
+                    .map_err(|e| pl_error(&e))
+            })
+        })?;
         Ok(plpgsql_fn::QueryOut { columns, rows })
+    }
+
+    fn call(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<(Vec<(usize, String)>, Vec<Bson>), plpgsql_fn::PlError> {
+        let Statement::Call {
+            name,
+            args,
+            arg_types,
+            ..
+        } = self.plan(sql, params, types)?
+        else {
+            return Err(plpgsql_fn::PlError::new("XX000", "not a CALL"));
+        };
+        // A PL/pgSQL procedure keeps the non-atomic context and joins the
+        // transaction statement by statement; a SQL one runs as one atomic
+        // statement.
+        let run = || {
+            self.h
+                .run_procedure(&name, args, arg_types)
+                .map_err(|e| pl_error(&e))
+        };
+        let (outputs, names, _, row) = if self.h.plpgsql_procedure(&name) {
+            run()?
+        } else {
+            self.joined(|| self.atomic(run))?
+        };
+        let outputs = outputs
+            .into_iter()
+            .map(|i| (i, names.get(i).cloned().unwrap_or_default()))
+            .collect();
+        Ok((
+            outputs,
+            row.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect(),
+        ))
+    }
+
+    fn subtxn_begin(&self) -> Result<u64, plpgsql_fn::PlError> {
+        let token = self
+            .h
+            .subtxn_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.h
+            .savepoint_op(&TransactionControl::Savepoint(Self::subtxn_name(token)))
+            .map_err(|e| pl_error(&e))?;
+        Ok(token)
+    }
+
+    fn subtxn_end(&self, token: u64, rollback: bool) -> Result<(), plpgsql_fn::PlError> {
+        let name = Self::subtxn_name(token);
+        if rollback {
+            self.h
+                .savepoint_op(&TransactionControl::RollbackTo(name.clone()))
+                .map_err(|e| pl_error(&e))?;
+        }
+        self.h
+            .savepoint_op(&TransactionControl::Release(name))
+            .map_err(|e| pl_error(&e))?;
+        Ok(())
+    }
+
+    fn end_transaction(&self, commit: bool, chain: bool) -> Result<(), plpgsql_fn::PlError> {
+        if !self
+            .h
+            .txn_control
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(plpgsql_fn::PlError::new(
+                "2D000",
+                "invalid transaction termination",
+            ));
+        }
+        self.h
+            .restart_transaction(commit, chain)
+            .map_err(|e| pl_error(&e))
     }
 
     fn notice(&self, severity: &str, sqlstate: &str, message: String) {
@@ -855,6 +1018,16 @@ fn bson_i64(v: &Bson) -> Option<i64> {
 /// `bool` must not meet a number.
 fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
     let Some(b) = v else { return None };
+    // PostgreSQL's equality puts every NaN in one group and `-0` with `0`;
+    // Rust's `==` would make each NaN its own (`NaN != NaN`).
+    if let Bson::Double(d) = b {
+        if d.is_nan() {
+            return Some(Bson::Document(bson::doc! { "__nan": true }));
+        }
+        if *d == 0.0 {
+            return Some(Bson::Double(0.0));
+        }
+    }
     if secantus_pgplan::numeric::is_numeric(b) {
         if let Some(text) = secantus_pgplan::numeric::numeric_text(b) {
             return Some(Bson::String(secantus_pgplan::numeric::numeric_sort_key(
@@ -1915,6 +2088,16 @@ pub struct PgHandler {
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
+    /// A `CALL` / `DO` is running that may end the session's transaction
+    /// (`COMMIT` / `ROLLBACK` in its body): it was run outside a block, and
+    /// no function or other statement stands between it and the body.
+    txn_control: AtomicBool,
+    /// The statement `run_batch` is running is the ONLY one of a simple
+    /// query outside a block -- PostgreSQL's non-atomic context. A
+    /// multi-statement query string is an implicit block.
+    sole_implicit: AtomicBool,
+    /// Names the savepoints a PL/pgSQL block with EXCEPTION handlers opens.
+    subtxn_seq: std::sync::atomic::AtomicU64,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -2150,6 +2333,9 @@ impl PgHandler {
             pending_listens: Mutex::new(Vec::new()),
             touched_temp: AtomicBool::new(false),
             holdable_declared: AtomicBool::new(false),
+            txn_control: AtomicBool::new(false),
+            sole_implicit: AtomicBool::new(false),
+            subtxn_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -5956,6 +6142,7 @@ impl PgHandler {
                         returns_set: u.returns_set,
                         out_params: &u.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                         procedure: false,
+                        nonatomic: false,
                     },
                     &host,
                 )
@@ -6006,6 +6193,17 @@ impl PgHandler {
                 e.to_string(),
             )))
         })?;
+        // Transaction control is refused before any statement runs
+        // (PostgreSQL checks the body at the function's startup).
+        for stmt in &statements {
+            if let Some(tag) = transaction_statement_tag(stmt) {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0A000".into(),
+                    format!("{tag} is not allowed in an SQL function"),
+                ))));
+            }
+        }
         let host = PlHost { h: self };
         let mut last: Option<plpgsql_fn::QueryOut> = None;
         for (i, stmt) in statements.iter().enumerate() {
@@ -14368,7 +14566,14 @@ impl PgHandler {
                     cursor += at + sql.len();
                     whole[..cursor - sql.len()].chars().count()
                 });
-            match self.run(sql, &[], 0).await {
+            self.sole_implicit.store(
+                implicit && stmts.len() == 1,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let ran = self.run(sql, &[], 0).await;
+            self.sole_implicit
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            match ran {
                 Ok(responses) => {
                     // A BEGIN inside the batch makes the implicit transaction
                     // the BLOCK: it stays open past the batch's end, and so
@@ -17066,6 +17271,25 @@ impl PgHandler {
         // (`pg_sleep`, a big scan) would otherwise take the runtime's I/O
         // driver down with it — no other connection is served, and the
         // `CancelRequest` meant to interrupt the statement never arrives.
+        // A CALL of a PL/pgSQL procedure outside a block may COMMIT: it runs
+        // WITHOUT the transaction guard, each of its statements joining the
+        // session's transaction on its own, so a COMMIT between them can end
+        // that transaction and start the next.
+        if let Statement::Call { name, .. } = &stmt {
+            if self.may_end_transaction() && self.plpgsql_procedure(name) {
+                let prev = self
+                    .txn_control
+                    .swap(true, std::sync::atomic::Ordering::Relaxed);
+                let out = tokio::task::block_in_place(|| self.execute(stmt, max_rows));
+                self.txn_control
+                    .store(prev, std::sync::atomic::Ordering::Relaxed);
+                self.collect_planner_warnings();
+                if out.is_err() {
+                    self.note_failure();
+                }
+                return out;
+            }
+        }
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         let out = tokio::task::block_in_place(|| match guard.as_mut() {
             Some(handle) => {
@@ -17623,7 +17847,21 @@ impl PgHandler {
     }
 
     fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
-        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        // Already inside it (a statement's own scope, which holds the
+        // non-reentrant `txn` guard): run there.
+        if self.storage.in_user_txn() {
+            return f();
+        }
+        // The guard is this connection's alone, so a held one means this
+        // thread holds it: a statement `run` is executing with no handle (an
+        // autocommit statement), from inside which this was reached. Waiting
+        // for it would deadlock the connection -- a DO block's REFRESH
+        // MATERIALIZED VIEW did -- and there is no transaction to join.
+        let mut guard = match self.txn.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return f(),
+        };
         match guard.as_mut() {
             Some(handle) => self
                 .storage
@@ -17631,6 +17869,71 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("transaction failed", e))?,
             None => f(),
         }
+    }
+
+    /// Is this CALL / DO in PostgreSQL's non-atomic context -- outside a
+    /// transaction block and alone in its query string (or an extended-
+    /// protocol statement, which is not a block)?
+    fn may_end_transaction(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sole_implicit.load(Relaxed)
+            || (self.implicit_extended.load(Relaxed) && !self.in_transaction.load(Relaxed))
+    }
+
+    /// Every procedure named `name` is PL/pgSQL (the language whose body
+    /// can end a transaction; a SQL-language body runs as one statement).
+    fn plpgsql_procedure(&self, name: &str) -> bool {
+        let Ok(docs) = self.user_function_docs() else {
+            return false;
+        };
+        let mut found = docs
+            .iter()
+            .filter(|d| {
+                d.get_str("name") == Ok(name) && d.get_bool("is_procedure").unwrap_or(false)
+            })
+            .peekable();
+        found.peek().is_some() && found.all(|d| d.get_str("language") == Ok("plpgsql"))
+    }
+
+    /// `COMMIT` / `ROLLBACK` [`AND CHAIN`] from a procedure or DO block: end
+    /// the session's transaction and open the next of the same kind (the
+    /// batch's implicit one, or an extended-protocol group), which whoever
+    /// opened the first then commits or rolls back.
+    fn restart_transaction(&self, commit: bool, chain: bool) -> PgWireResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let block = self.in_transaction.load(Relaxed);
+        let extended = self.implicit_extended.load(Relaxed);
+        // AND CHAIN keeps the transaction's characteristics.
+        let kept: Vec<(String, String)> = if chain {
+            let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            settings
+                .iter()
+                .filter(|(k, _)| k.starts_with("transaction_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if commit {
+            self.commit_implicit()?;
+        } else {
+            self.rollback_implicit()?;
+        }
+        let pid = self.backend_pid.load(Relaxed);
+        advisory::release_xact(pid);
+        table_locks::release(pid);
+        bump_catalog_version();
+        let handle = self.open_transaction_handle()?;
+        *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.in_transaction.store(block, Relaxed);
+        self.implicit_extended.store(extended, Relaxed);
+        if chain {
+            let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, v) in kept {
+                settings.insert(k, v);
+            }
+        }
+        Ok(())
     }
 
     /// `25001` for the statements PostgreSQL refuses inside a block
@@ -17865,6 +18168,12 @@ impl PgHandler {
                 format!("{word} can only be used in transaction blocks"),
             ))));
         }
+        self.savepoint_op(control)
+    }
+
+    /// A savepoint statement, the block check already made; PL/pgSQL's
+    /// EXCEPTION blocks use it for their subtransactions.
+    fn savepoint_op(&self, control: &TransactionControl) -> PgWireResult<Vec<Response>> {
         let name = match control {
             TransactionControl::Savepoint(n)
             | TransactionControl::Release(n)
@@ -19914,10 +20223,21 @@ impl PgHandler {
         // session state at encode time. `ClientEncoding` is `Copy`.
         let row_cenc = self.client_encoding();
         match stmt {
-            Statement::Transaction(_) => unreachable!("handled before execute"),
+            // Reached only from a statement another runs (a function body's):
+            // the session-level path handles them before `execute`.
+            Statement::Transaction(_) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "transaction commands are not supported here".into(),
+            )))),
             // Handled in `run`, which can await the row stream.
-            Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
-            Statement::Do { .. } => unreachable!("handled before execute"),
+            Statement::DeclareCursor { .. } | Statement::Do { .. } => {
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0A000".into(),
+                    "this statement is not supported inside another".into(),
+                ))))
+            }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
                 if self.lookup(&def.name).is_some()
@@ -27222,27 +27542,39 @@ fn materialise_windows(
 
 /// The row indices of each partition, in the rows' original order.
 ///
-/// Grouped by VALUE rather than by a hash of it (`group_key_ident`), because
-/// BSON equality and Rust's `==` disagree about NaN, signed zero and
-/// bool-versus-int, and a partition keyed on the wrong one would split or
-/// merge groups that PostgreSQL keeps together.
+/// Partitions group what PostgreSQL's equality groups: every NaN together
+/// and `-0` with `0` (Rust's `==` splits the first and a byte compare the
+/// second), a numeric by its value (`group_key_ident`). Each row's key is
+/// that canonical form ENCODED, so partitioning is one hash lookup per row
+/// rather than a scan of the partitions seen so far.
 fn window_partitions(docs: &[Document], keys: &[OrderKey]) -> Vec<Vec<usize>> {
     if keys.is_empty() {
         return vec![(0..docs.len()).collect()];
     }
-    let ident = |d: &Document| -> Vec<Option<Bson>> {
-        keys.iter()
-            .map(|k| group_key_ident(&d.get(&k.field).cloned()))
-            .collect()
+    fn canonical(v: Option<Bson>) -> Bson {
+        match v {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(Bson::Double(d)) if d.is_nan() => Bson::Double(f64::NAN),
+            // A float pattern compares by `==`, so `-0.0` matches too.
+            Some(Bson::Double(0.0)) => Bson::Double(0.0),
+            Some(Bson::Int32(i)) => Bson::Int64(i64::from(i)),
+            Some(other) => other,
+        }
+    }
+    let key = |d: &Document| -> Vec<u8> {
+        let values: Vec<Bson> = keys
+            .iter()
+            .map(|k| canonical(group_key_ident(&d.get(&k.field).cloned())))
+            .collect();
+        bson::to_vec(&bson::doc! { "k": values }).unwrap_or_default()
     };
-    let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut out: Vec<Vec<usize>> = Vec::new();
     for (i, d) in docs.iter().enumerate() {
-        let id = ident(d);
-        match seen.iter().position(|s| *s == id) {
-            Some(p) => out[p].push(i),
-            None => {
-                seen.push(id);
+        match index.entry(key(d)) {
+            std::collections::hash_map::Entry::Occupied(e) => out[*e.get()].push(i),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(out.len());
                 out.push(vec![i]);
             }
         }

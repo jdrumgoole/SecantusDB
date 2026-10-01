@@ -460,6 +460,7 @@ impl PgHandler {
                         returns_set: false,
                         out_params: &[],
                         procedure: false,
+                        nonatomic: false,
                     },
                     &PlHost { h: self },
                 )

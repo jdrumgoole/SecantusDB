@@ -15070,3 +15070,45 @@ def test_column_grants_are_shared_with_the_python_server(home: Path) -> None:
         " where table_name = 'cg_t' and grantee = 'cg_r'",
     )
     assert python_grants == [("cg_r", "SELECT")]
+
+
+def test_procedure_transaction_control_and_do_block_atomicity(home: Path) -> None:
+    """COMMIT / ROLLBACK in a procedure, and a DO block's writes, as on PG 15.
+
+    Three bugs pinned together, each measured against PostgreSQL 15:
+
+    * a DO block the function interpreter runs WROTE EACH STATEMENT ON ITS
+      OWN, so one that raised after inserting left the insert committed;
+    * a BEGIN ... EXCEPTION block did not undo its writes when its handler
+      caught an error (PostgreSQL runs such a block as a subtransaction);
+    * a procedure's COMMIT / ROLLBACK was refused everywhere. It is allowed in
+      a CALL run alone outside a transaction block, and 2D000 inside a block
+      or a multi-statement query string (an implicit block).
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table pt_t (n int)")
+        with pytest.raises(psycopg.errors.RaiseException):
+            c.execute(
+                "do $$ declare x int := 1; begin insert into pt_t values (x);"
+                " raise exception 'boom'; end $$"
+            )
+        assert c.execute("select count(*) from pt_t").fetchone() == (0,)
+        c.execute(
+            "do $$ begin begin insert into pt_t values (1); raise exception 'x';"
+            " exception when others then null; end; insert into pt_t values (2); end $$"
+        )
+        assert c.execute("select n from pt_t").fetchall() == [(2,)]
+        c.execute(
+            "create procedure pt_p() language plpgsql as $$ begin"
+            " insert into pt_t values (10); commit; insert into pt_t values (11);"
+            " rollback; insert into pt_t values (12); end $$"
+        )
+        c.execute("call pt_p()")
+        assert c.execute("select n from pt_t order by 1").fetchall() == [(2,), (10,), (12,)]
+        c.execute("begin")
+        with pytest.raises(psycopg.errors.InvalidTransactionTermination):
+            c.execute("call pt_p()")
+        c.execute("rollback")
+        with pytest.raises(psycopg.errors.InvalidTransactionTermination):
+            c.execute("insert into pt_t values (20); call pt_p()")
+        assert c.execute("select count(*) from pt_t").fetchone() == (3,)

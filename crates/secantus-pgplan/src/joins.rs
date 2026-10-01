@@ -157,6 +157,10 @@ impl Scope {
 }
 
 thread_local! {
+    /// WHERE conjuncts pushed into a table leaf, by the leaf's alias, while
+    /// its join is built (see `pushdown_filters`).
+    static PUSHDOWN: std::cell::RefCell<Vec<(String, pg_query::protobuf::Node)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -191,6 +195,19 @@ pub(crate) fn plan_join_source(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
+    // A nested join (one inside a FROM subquery) plans with its own.
+    let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown_filters(s)));
+    let built = build_tree(s, lookup, params);
+    PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
+    let (tree, scope) = built?;
+    finish_join_source(s, tree, scope)
+}
+
+fn build_tree(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<(JoinNode, Scope)> {
     let mut scope = Scope::default();
     let mut tree: Option<JoinNode> = None;
     for item in &s.from_clause {
@@ -213,6 +230,14 @@ pub(crate) fn plan_join_source(
         scope.cols.extend(item_scope.cols);
     }
     let tree = tree.ok_or_else(|| Error::Parse("empty FROM".into()))?;
+    Ok((tree, scope))
+}
+
+fn finish_join_source(
+    s: &pg_query::protobuf::SelectStmt,
+    tree: JoinNode,
+    scope: Scope,
+) -> Result<pg_query::protobuf::SelectStmt> {
     let def = TableDef::new(
         "",
         scope
@@ -339,7 +364,14 @@ fn build(
                 .as_ref()
                 .map(|a| a.colnames.clone())
                 .unwrap_or_default();
-            leaf(
+            // Only a leaf whose columns keep their names takes a filter:
+            // the pushed conjunct names the table's own columns.
+            let filter = if colnames.is_empty() {
+                pushed_filter(&alias)
+            } else {
+                None
+            };
+            leaf_filtered(
                 pg_query::protobuf::Node {
                     node: Some(N::RangeVar(rv)),
                 },
@@ -348,6 +380,7 @@ fn build(
                 lookup,
                 params,
                 aliases,
+                filter,
             )
         }
         Some(N::RangeSubselect(rs)) => {
@@ -403,18 +436,25 @@ fn keep_column_names(
         })
 }
 
-/// A function's output column names from its alias: `AS t(a, b)` names them;
-/// a bare `AS x` over a function returning ONE column names that column too,
-/// which is PostgreSQL's rule for a scalar function in FROM.
+/// A function's output column names from its alias: `AS t(a, b)` names them.
+/// A bare `AS x` names the column only of a function returning ONE -- the
+/// rule for a scalar function in FROM -- which is applied once the width is
+/// known (`scalar_alias`); naming a WIDER function's first column `x` hid
+/// `jsonb_each`'s `key` in a join.
 fn function_colnames(rf: &pg_query::protobuf::RangeFunction) -> Vec<pg_query::protobuf::Node> {
     match rf.alias.as_ref() {
         Some(a) if !a.colnames.is_empty() => a.colnames.clone(),
-        Some(a) if !a.aliasname.is_empty() => vec![pg_query::protobuf::Node {
-            node: Some(N::String(pg_query::protobuf::String {
-                sval: a.aliasname.clone(),
-            })),
-        }],
         _ => Vec::new(),
+    }
+}
+
+/// The names a function's columns take: the alias list, else -- for a
+/// one-column function -- the bare alias.
+fn scalar_alias(names: Vec<String>, function: bool, alias: &str, width: usize) -> Vec<String> {
+    if names.is_empty() && function && width == 1 {
+        vec![alias.to_string()]
+    } else {
+        names
     }
 }
 
@@ -550,6 +590,7 @@ fn lateral_leaf(
     let plan = plan_select(&inner, lookup, &sample_params)?;
     let def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
+    let names = scalar_alias(names, function, &alias, def.columns.len());
     if names.len() > def.columns.len() {
         return Err(Error::Parse(format!(
             "table \"{alias}\" has {} columns available but {} columns specified",
@@ -635,7 +676,21 @@ fn leaf(
     params: &[Bson],
     aliases: &mut Vec<String>,
 ) -> Result<(JoinNode, Scope)> {
+    leaf_filtered(item, alias, colnames, lookup, params, aliases, None)
+}
+
+/// `leaf`, with a WHERE the query's own WHERE implies for this leaf's rows.
+fn leaf_filtered(
+    item: pg_query::protobuf::Node,
+    alias: &str,
+    colnames: &[pg_query::protobuf::Node],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    aliases: &mut Vec<String>,
+    filter: Option<pg_query::protobuf::Node>,
+) -> Result<(JoinNode, Scope)> {
     let select = pg_query::protobuf::SelectStmt {
+        where_clause: filter.map(Box::new),
         target_list: vec![pg_query::protobuf::Node {
             node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
                 val: Some(Box::new(pg_query::protobuf::Node {
@@ -654,9 +709,11 @@ fn leaf(
         op: pg_query::protobuf::SetOperation::SetopNone as i32,
         ..Default::default()
     };
+    let function = matches!(select.from_clause[0].node, Some(N::RangeFunction(_)));
     let plan = plan_select(&select, lookup, params)?;
     let mut def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
+    let names = scalar_alias(names, function, alias, def.columns.len());
     if names.len() > def.columns.len() {
         return Err(Error::Parse(format!(
             "table \"{alias}\" has {} columns available but {} columns specified",
@@ -1276,4 +1333,155 @@ pub(crate) fn select_list_srf(
         node: Some(N::RangeFunction(rf)),
     });
     Ok(Some(out))
+}
+
+/// The WHERE conjuncts a table leaf can apply to its own rows, by alias.
+///
+/// A conjunct qualifies when every column it reads is qualified by ONE
+/// alias, and it is built only of operators, casts, constants and parameters
+/// (no function call, which may be volatile, and no subquery). Its leaf must
+/// be on the PRESERVED side of every outer join above it: filtering the
+/// nullable side before the join would keep the NULL-extended rows
+/// PostgreSQL's WHERE drops. The conjunct also stays in the outer WHERE, so
+/// the answer is the same whether or not the leaf applied it -- the leaf
+/// just reads fewer rows, and can reach an index.
+fn pushdown_filters(s: &pg_query::protobuf::SelectStmt) -> Vec<(String, pg_query::protobuf::Node)> {
+    let Some(w) = s.where_clause.as_deref() else {
+        return Vec::new();
+    };
+    let mut preserved = Vec::new();
+    for item in &s.from_clause {
+        preserved_aliases(item, false, &mut preserved);
+    }
+    let mut conjuncts = Vec::new();
+    split_and(w, &mut conjuncts);
+    conjuncts
+        .into_iter()
+        .filter_map(|c| {
+            let alias = single_alias(c)?;
+            preserved.contains(&alias).then(|| {
+                let mut c = c.clone();
+                strip_qualifier(&mut c);
+                (alias, c)
+            })
+        })
+        .collect()
+}
+
+/// The table aliases below `item` that no outer join makes nullable.
+fn preserved_aliases(item: &pg_query::protobuf::Node, nullable: bool, out: &mut Vec<String>) {
+    use pg_query::protobuf::JoinType;
+    match item.node.as_ref() {
+        Some(N::RangeVar(r)) if !nullable => out.push(
+            r.alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| r.relname.clone()),
+        ),
+        Some(N::JoinExpr(j)) => {
+            let (l, r) = match JoinType::try_from(j.jointype) {
+                Ok(JoinType::JoinInner) => (false, false),
+                Ok(JoinType::JoinLeft) => (false, true),
+                Ok(JoinType::JoinRight) => (true, false),
+                _ => (true, true),
+            };
+            if let Some(larg) = j.larg.as_deref() {
+                preserved_aliases(larg, nullable || l, out);
+            }
+            if let Some(rarg) = j.rarg.as_deref() {
+                preserved_aliases(rarg, nullable || r, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn split_and<'a>(n: &'a pg_query::protobuf::Node, out: &mut Vec<&'a pg_query::protobuf::Node>) {
+    match n.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            for a in &b.args {
+                split_and(a, out);
+            }
+        }
+        _ => out.push(n),
+    }
+}
+
+/// The one alias every column of `n` is qualified by, when `n` is a shape
+/// that may be pushed.
+fn single_alias(n: &pg_query::protobuf::Node) -> Option<String> {
+    fn walk(n: &pg_query::protobuf::Node, alias: &mut Option<String>) -> bool {
+        match n.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let parts: Option<Vec<&str>> = c
+                    .fields
+                    .iter()
+                    .map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                match parts.as_deref() {
+                    Some([q, _]) => match alias {
+                        Some(a) => a == q,
+                        None => {
+                            *alias = Some(q.to_string());
+                            true
+                        }
+                    },
+                    _ => false,
+                }
+            }
+            Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias)),
+            Some(N::AExpr(e)) => {
+                e.lexpr.as_deref().is_none_or(|x| walk(x, alias))
+                    && e.rexpr.as_deref().is_none_or(|x| walk(x, alias))
+            }
+            Some(N::BoolExpr(b)) => b.args.iter().all(|a| walk(a, alias)),
+            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias)),
+            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias)),
+            Some(N::List(l)) => l.items.iter().all(|a| walk(a, alias)),
+            Some(N::AArrayExpr(a)) => a.elements.iter().all(|x| walk(x, alias)),
+            _ => false,
+        }
+    }
+    let mut alias = None;
+    (walk(n, &mut alias)).then_some(alias).flatten()
+}
+
+/// `a.x` -> `x`, for a conjunct moved into `a`'s own `SELECT * FROM t`.
+fn strip_qualifier(n: &mut pg_query::protobuf::Node) {
+    let _ = walk_expr(n, &mut |x| {
+        if let Some(N::ColumnRef(c)) = x.node.as_mut() {
+            if c.fields.len() == 2 {
+                c.fields.remove(0);
+            }
+        }
+        Ok(())
+    });
+}
+
+/// The conjuncts pushed to `alias`, AND-ed.
+fn pushed_filter(alias: &str) -> Option<pg_query::protobuf::Node> {
+    let mine: Vec<pg_query::protobuf::Node> = PUSHDOWN.with(|p| {
+        p.borrow()
+            .iter()
+            .filter(|(a, _)| a == alias)
+            .map(|(_, c)| c.clone())
+            .collect()
+    });
+    match mine.len() {
+        0 => None,
+        1 => mine.into_iter().next(),
+        _ => Some(pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+                args: mine,
+                location: -1,
+                ..Default::default()
+            }))),
+        }),
+    }
 }

@@ -29,7 +29,12 @@ const PRETTYINDENT_VAR: i32 = 4;
 /// One relation in a query's FROM, as ruleutils names it.
 #[derive(Clone, Debug)]
 struct Rte {
+    /// The name ruleutils PRINTS: the alias or relation name, made unique
+    /// against the enclosing queries' and this level's earlier names
+    /// (`t_1`), as `set_rtable_names` does.
     refname: String,
+    /// The name the query WROTE, which its column references use.
+    name: String,
     columns: Vec<(String, String)>,
     /// A rule's NEW / OLD: named only when qualified.
     qualified_only: bool,
@@ -257,7 +262,7 @@ impl<'a> Printer<'a> {
                     }
                 }
                 [.., rel, col] => {
-                    if let Some(r) = scope.iter().find(|r| r.refname == *rel) {
+                    if let Some(r) = scope.iter().find(|r| r.name == *rel) {
                         return Some((r.refname.clone(), col.clone(), find_col(r, col)?));
                     }
                 }
@@ -1178,11 +1183,7 @@ impl<'a> Printer<'a> {
             self.buf.push_str(&q(&w.name));
             return Some(());
         }
-        if !w.refname.is_empty() || w.start_offset.is_some() || w.end_offset.is_some() {
-            return None;
-        }
-        // The default frame only (no FRAMEOPTION_NONDEFAULT).
-        if w.frame_options & 0x00001 != 0 {
+        if !w.refname.is_empty() {
             return None;
         }
         self.buf.push('(');
@@ -1203,8 +1204,85 @@ impl<'a> Printer<'a> {
             }
             self.buf.push_str("ORDER BY ");
             self.sort_list(&w.order_clause)?;
+            need_space = true;
         }
+        self.frame(w, need_space)?;
         self.buf.push(')');
+        Some(())
+    }
+
+    /// A non-default frame, as `get_rule_windowspec` prints it.
+    fn frame(&mut self, w: &pg_query::protobuf::WindowDef, need_space: bool) -> Option<()> {
+        let o = w.frame_options;
+        if o & 0x00001 == 0 {
+            return Some(());
+        }
+        // A RANGE offset carries the ordering column's type, which this
+        // printer does not reproduce.
+        if o & 0x00002 != 0 && (w.start_offset.is_some() || w.end_offset.is_some()) {
+            return None;
+        }
+        if need_space {
+            self.buf.push(' ');
+        }
+        self.buf.push_str(if o & 0x00002 != 0 {
+            "RANGE "
+        } else if o & 0x00004 != 0 {
+            "ROWS "
+        } else if o & 0x00008 != 0 {
+            "GROUPS "
+        } else {
+            return None;
+        });
+        let between = o & 0x00010 != 0;
+        if between {
+            self.buf.push_str("BETWEEN ");
+        }
+        let offset = |p: &mut Self, n: Option<&Node>| -> Option<()> {
+            match n?.node.as_ref()? {
+                N::AConst(c) if matches!(c.val, Some(Val::Ival(_))) => p.expr(n?),
+                _ => None,
+            }
+        };
+        if o & 0x00020 != 0 {
+            self.buf.push_str("UNBOUNDED PRECEDING ");
+        } else if o & 0x00200 != 0 {
+            self.buf.push_str("CURRENT ROW ");
+        } else if o & 0x00800 != 0 {
+            offset(self, w.start_offset.as_deref())?;
+            self.buf.push_str(" PRECEDING ");
+        } else if o & 0x02000 != 0 {
+            offset(self, w.start_offset.as_deref())?;
+            self.buf.push_str(" FOLLOWING ");
+        } else {
+            return None;
+        }
+        if between {
+            self.buf.push_str("AND ");
+            if o & 0x00100 != 0 {
+                self.buf.push_str("UNBOUNDED FOLLOWING ");
+            } else if o & 0x00040 != 0 {
+                self.buf.push_str("UNBOUNDED PRECEDING ");
+            } else if o & 0x00400 != 0 {
+                self.buf.push_str("CURRENT ROW ");
+            } else if o & 0x01000 != 0 {
+                offset(self, w.end_offset.as_deref())?;
+                self.buf.push_str(" PRECEDING ");
+            } else if o & 0x04000 != 0 {
+                offset(self, w.end_offset.as_deref())?;
+                self.buf.push_str(" FOLLOWING ");
+            } else {
+                return None;
+            }
+        }
+        if o & 0x08000 != 0 {
+            self.buf.push_str("EXCLUDE CURRENT ROW ");
+        } else if o & 0x10000 != 0 {
+            self.buf.push_str("EXCLUDE GROUP ");
+        } else if o & 0x20000 != 0 {
+            self.buf.push_str("EXCLUDE TIES ");
+        }
+        self.buf.pop();
         Some(())
     }
 
@@ -1501,14 +1579,21 @@ impl Printer<'_> {
                         return None;
                     }
                     let alias = rv.alias.as_ref();
-                    if alias.is_some_and(|a| !a.colnames.is_empty()) {
+                    let mut columns = self.relation_columns(&rv.relname)?;
+                    let renames = alias.map(|a| names(&a.colnames)).unwrap_or_default();
+                    if renames.len() > columns.len() {
                         return None;
                     }
-                    let columns = self.relation_columns(&rv.relname)?;
+                    for (c, n) in columns.iter_mut().zip(&renames) {
+                        c.0 = n.clone();
+                    }
+                    let name = alias
+                        .map(|a| a.aliasname.clone())
+                        .unwrap_or_else(|| rv.relname.clone());
+                    let refname = self.unique_refname(&name, out);
                     out.push(Rte {
-                        refname: alias
-                            .map(|a| a.aliasname.clone())
-                            .unwrap_or_else(|| rv.relname.clone()),
+                        refname,
+                        name,
                         columns,
                         qualified_only: false,
                     });
@@ -1523,16 +1608,28 @@ impl Printer<'_> {
                     )?;
                 }
                 N::RangeSubselect(rs) => {
-                    if rs.lateral {
-                        return None;
-                    }
                     let alias = rs.alias.as_ref()?;
-                    if !alias.colnames.is_empty() {
+                    // A LATERAL subquery sees the items before it.
+                    if rs.lateral {
+                        self.scopes.push(out.clone());
+                    }
+                    let columns = self.subquery_columns(rs.subquery.as_deref()?);
+                    if rs.lateral {
+                        self.scopes.pop();
+                    }
+                    let mut columns = columns?;
+                    let renames = names(&alias.colnames);
+                    if renames.len() > columns.len() {
                         return None;
                     }
-                    let columns = self.subquery_columns(rs.subquery.as_deref()?)?;
+                    for (c, n) in columns.iter_mut().zip(&renames) {
+                        c.0 = n.clone();
+                    }
+                    let name = alias.aliasname.clone();
+                    let refname = self.unique_refname(&name, out);
                     out.push(Rte {
-                        refname: alias.aliasname.clone(),
+                        refname,
+                        name,
                         columns,
                         qualified_only: false,
                     });
@@ -1541,6 +1638,22 @@ impl Printer<'_> {
             }
         }
         Some(())
+    }
+
+    /// `set_rtable_names`: `name`, or `name_N` for the least N free, when an
+    /// enclosing query or an earlier item of this one already uses it.
+    fn unique_refname(&self, name: &str, level: &[Rte]) -> String {
+        let taken = |n: &str| {
+            level.iter().any(|r| r.refname == n)
+                || self.scopes.iter().flatten().any(|r| r.refname == n)
+        };
+        if !taken(name) {
+            return name.to_string();
+        }
+        (1..)
+            .map(|i| format!("{name}_{i}"))
+            .find(|n| !taken(n))
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// A select list with `*` expanded.
@@ -1559,7 +1672,7 @@ impl Printer<'_> {
                 if is_star {
                     let qual = names(&c.fields);
                     for r in rtes {
-                        if !qual.is_empty() && qual.last() != Some(&r.refname) {
+                        if !qual.is_empty() && qual.last() != Some(&r.name) {
                             continue;
                         }
                         for (col, _) in &r.columns {
@@ -1592,14 +1705,11 @@ impl Printer<'_> {
         };
         let pushed_ctes = self.ctes.len();
         if let Some(w) = &s.with_clause {
-            if w.recursive {
-                return None;
-            }
             for c in &w.ctes {
                 let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
                     return None;
                 };
-                let cols = self.query_columns(cte.ctequery.as_deref()?)?;
+                let cols = self.cte_columns(cte, w.recursive)?;
                 self.ctes.push((cte.ctename.clone(), cols));
             }
         }
@@ -1633,7 +1743,12 @@ impl Printer<'_> {
             }
             Some(out)
         } else if !s.values_lists.is_empty() {
-            None
+            self.values_types(s).map(|ts| {
+                ts.into_iter()
+                    .enumerate()
+                    .map(|(i, t)| (format!("column{}", i + 1), t))
+                    .collect()
+            })
         } else {
             let mut rtes = Vec::new();
             self.collect_rtes(&s.from_clause, &mut rtes)?;
@@ -1670,17 +1785,67 @@ impl Printer<'_> {
         }
         let pushed_ctes = self.ctes.len();
         if let Some(w) = &s.with_clause {
-            self.with_clause(w)?;
+            // This level's relations take their names BEFORE the WITH bodies
+            // print (`set_deparse_for_query`), so a CTE body's reference to
+            // a name the query also uses becomes `name_1`.
+            for c in &w.ctes {
+                let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
+                    return None;
+                };
+                let cols = self.cte_columns(cte, w.recursive)?;
+                self.ctes.push((cte.ctename.clone(), cols));
+            }
+            let mut level = Vec::new();
+            if s.op == SetOperation::SetopNone as i32 {
+                self.collect_rtes(&s.from_clause, &mut level)?;
+            }
+            self.ctes.truncate(pushed_ctes);
+            self.scopes.push(level);
+            let printed = self.with_clause(w);
+            self.scopes.pop();
+            printed?;
         }
         if s.op != SetOperation::SetopNone as i32 {
-            if !s.sort_clause.is_empty() || s.limit_count.is_some() || s.limit_offset.is_some() {
-                return None;
-            }
-            let names = match colnames {
+            let outputs = match colnames {
                 Some(c) => c.to_vec(),
                 None => self.query_columns(n)?.into_iter().map(|(n, _)| n).collect(),
             };
-            self.setop(s, &names)?;
+            self.setop(s, &outputs)?;
+            // A set operation's ORDER BY names its output columns, and
+            // ruleutils prints them by NUMBER (`force_colno`).
+            if !s.sort_clause.is_empty() {
+                self.keyword(" ORDER BY ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+                let mut resolved = Vec::new();
+                for sb in &s.sort_clause {
+                    let Some(N::SortBy(b)) = sb.node.as_ref() else {
+                        return None;
+                    };
+                    let pos = match b.node.as_deref()?.node.as_ref()? {
+                        N::AConst(c) => match c.val.as_ref()? {
+                            Val::Ival(i) => i.ival,
+                            _ => return None,
+                        },
+                        N::ColumnRef(c) if c.fields.len() == 1 => {
+                            let name = names(&c.fields).pop()?;
+                            let at = outputs.iter().position(|n| *n == name)?;
+                            i32::try_from(at + 1).ok()?
+                        }
+                        _ => return None,
+                    };
+                    let mut b = (**b).clone();
+                    b.node = Some(Box::new(Node {
+                        node: Some(N::AConst(pg_query::protobuf::AConst {
+                            val: Some(Val::Ival(pg_query::protobuf::Integer { ival: pos })),
+                            ..Default::default()
+                        })),
+                    }));
+                    resolved.push(Node {
+                        node: Some(N::SortBy(Box::new(b))),
+                    });
+                }
+                self.sort_list(&resolved)?;
+            }
+            self.offset_limit(s)?;
         } else {
             self.basic_select(s, colnames)?;
         }
@@ -1689,24 +1854,33 @@ impl Printer<'_> {
     }
 
     fn with_clause(&mut self, w: &pg_query::protobuf::WithClause) -> Option<()> {
-        if w.recursive {
-            return None;
-        }
         self.indent += PRETTYINDENT_STD;
         self.buf.push(' ');
-        let mut sep = "WITH ";
+        let mut sep = if w.recursive {
+            "WITH RECURSIVE "
+        } else {
+            "WITH "
+        };
         for c in &w.ctes {
             let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
                 return None;
             };
-            if !cte.aliascolnames.is_empty()
-                || cte.ctematerialized != pg_query::protobuf::CteMaterialize::Default as i32
-            {
+            if cte.ctematerialized != pg_query::protobuf::CteMaterialize::Default as i32 {
                 return None;
             }
             let body = cte.ctequery.as_deref()?;
+            let cols = self.cte_columns(cte, w.recursive)?;
+            // A recursive body reads itself.
+            if w.recursive {
+                self.ctes.push((cte.ctename.clone(), cols.clone()));
+            }
             self.buf.push_str(sep);
             self.buf.push_str(&q(&cte.ctename));
+            let aliases = names(&cte.aliascolnames);
+            if !aliases.is_empty() {
+                let quoted: Vec<String> = aliases.iter().map(|a| q(a)).collect();
+                self.buf.push_str(&format!("({})", quoted.join(", ")));
+            }
             self.buf.push_str(" AS (");
             self.keyword("", 0, 0, 0);
             let mut inner = Printer::new(self.cat, self.indent);
@@ -1718,13 +1892,42 @@ impl Printer<'_> {
             self.buf.push_str(&inner.buf);
             self.keyword("", 0, 0, 0);
             self.buf.push(')');
-            let cols = self.query_columns(body)?;
-            self.ctes.push((cte.ctename.clone(), cols));
+            if !w.recursive {
+                self.ctes.push((cte.ctename.clone(), cols));
+            }
             sep = ", ";
         }
         self.indent -= PRETTYINDENT_STD;
         self.keyword("", 0, 0, 0);
         Some(())
+    }
+
+    /// A CTE's output columns: its body's (a recursive one's non-recursive
+    /// term's), renamed by its column list.
+    fn cte_columns(
+        &mut self,
+        cte: &pg_query::protobuf::CommonTableExpr,
+        recursive: bool,
+    ) -> Option<Vec<(String, String)>> {
+        let body = cte.ctequery.as_deref()?;
+        let Some(N::SelectStmt(b)) = body.node.as_ref() else {
+            return None;
+        };
+        let mut cols = if recursive && b.op != SetOperation::SetopNone as i32 {
+            self.query_columns(&Node {
+                node: Some(N::SelectStmt(b.larg.clone()?)),
+            })?
+        } else {
+            self.query_columns(body)?
+        };
+        let aliases = names(&cte.aliascolnames);
+        if aliases.len() > cols.len() {
+            return None;
+        }
+        for (c, a) in cols.iter_mut().zip(aliases) {
+            c.0 = a;
+        }
+        Some(cols)
     }
 
     /// `get_setop_query`.
@@ -1747,6 +1950,7 @@ impl Printer<'_> {
             inner.ctes = self.ctes.clone();
             inner.depth = self.depth + 1;
             inner.pretty = self.pretty;
+            inner.col_names_visible = self.col_names_visible;
             inner.query(
                 &Node {
                     node: Some(N::SelectStmt(Box::new(s.clone()))),
@@ -1793,7 +1997,11 @@ impl Printer<'_> {
             0
         };
         self.keyword("", sub, 0, 0);
-        self.setop(rarg, colnames)?;
+        // Only the leftmost query's column names are visible outside.
+        let visible = std::mem::replace(&mut self.col_names_visible, false);
+        let printed = self.setop(rarg, colnames);
+        self.col_names_visible = visible;
+        printed?;
         self.indent -= sub;
         if need_paren {
             self.keyword(")", 0, 0, 0);
@@ -1808,8 +2016,12 @@ impl Printer<'_> {
         s: &pg_query::protobuf::SelectStmt,
         colnames: Option<&[String]>,
     ) -> Option<()> {
-        if !s.values_lists.is_empty() || s.group_distinct {
+        if s.group_distinct {
             return None;
+        }
+        if !s.values_lists.is_empty() {
+            self.buf.push(' ');
+            return self.values_def(s);
         }
         let mut rtes = Vec::new();
         self.collect_rtes(&s.from_clause, &mut rtes)?;
@@ -1929,6 +2141,13 @@ impl Printer<'_> {
             }
             self.sort_list(&resolved)?;
         }
+        self.offset_limit(s)?;
+        self.scopes.pop();
+        Some(())
+    }
+
+    /// `OFFSET` / `LIMIT`, as `get_select_query_def` prints them.
+    fn offset_limit(&mut self, s: &pg_query::protobuf::SelectStmt) -> Option<()> {
         if let Some(o) = s.limit_offset.as_deref() {
             self.keyword(" OFFSET ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
             self.expr(o)?;
@@ -1943,7 +2162,6 @@ impl Printer<'_> {
                 _ => self.expr(l)?,
             }
         }
-        self.scopes.pop();
         Some(())
     }
 
@@ -1985,22 +2203,116 @@ impl Printer<'_> {
         }
     }
 
+    /// This level's relation the query wrote as `name`.
+    fn level_rte(&self, name: &str) -> Option<Rte> {
+        self.scopes.last()?.iter().find(|r| r.name == name).cloned()
+    }
+
+    /// `(a, b, c)` after an item's alias.
+    fn column_alias_list(&mut self, rte: &Rte) {
+        let cols: Vec<String> = rte.columns.iter().map(|(n, _)| q(n)).collect();
+        self.buf.push_str(&format!("({})", cols.join(", ")));
+    }
+
+    /// `get_values_def`: `VALUES (1,'a'::text), (2,'b'::text)`, each column
+    /// coerced to the rows' common type.
+    fn values_def(&mut self, v: &pg_query::protobuf::SelectStmt) -> Option<()> {
+        let types = self.values_types(v)?;
+        self.buf.push_str("VALUES ");
+        for (i, row) in v.values_lists.iter().enumerate() {
+            let Some(N::List(l)) = row.node.as_ref() else {
+                return None;
+            };
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            self.buf.push('(');
+            for (j, item) in l.items.iter().enumerate() {
+                if j > 0 {
+                    self.buf.push(',');
+                }
+                // An implicit numeric widening prints as its argument.
+                let want = types.get(j)?;
+                let own = self.typ(item)?;
+                if own != *want && is_numberish(&own) && is_numberish(want) {
+                    self.expr(item)?;
+                } else {
+                    self.expr_as(item, want)?;
+                }
+            }
+            self.buf.push(')');
+        }
+        Some(())
+    }
+
+    /// Each VALUES column's type: the rows' common type, `text` for an
+    /// all-unknown column.
+    fn values_types(&mut self, v: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+        let rows: Vec<&Vec<Node>> = v
+            .values_lists
+            .iter()
+            .map(|r| match r.node.as_ref() {
+                Some(N::List(l)) => Some(&l.items),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let width = rows.first()?.len();
+        (0..width)
+            .map(|j| {
+                let col: Vec<Node> = rows
+                    .iter()
+                    .map(|r| r.get(j).cloned())
+                    .collect::<Option<_>>()?;
+                let t = self.common_type(&col)?;
+                Some(if t == "unknown" { "text".into() } else { t })
+            })
+            .collect()
+    }
+
     /// `get_from_clause_item`.
     fn print_from_item(&mut self, it: &Node) -> Option<()> {
         match it.node.as_ref()? {
             N::RangeVar(rv) => {
                 self.buf.push_str(&q(&rv.relname));
-                if let Some(a) = &rv.alias {
+                let written = rv
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| rv.relname.clone());
+                let rte = self.level_rte(&written)?;
+                if rv.alias.is_some() || rte.refname != rv.relname {
                     self.buf.push(' ');
-                    self.buf.push_str(&q(&a.aliasname));
+                    self.buf.push_str(&q(&rte.refname));
+                }
+                // An alias list names EVERY column once it names any.
+                if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
+                    self.column_alias_list(&rte);
                 }
             }
             N::RangeSubselect(rs) => {
+                if rs.lateral {
+                    self.buf.push_str("LATERAL ");
+                }
                 self.buf.push('(');
-                self.subquery_visible(rs.subquery.as_deref()?)?;
+                let sub = rs.subquery.as_deref()?;
+                if matches!(sub.node.as_ref(), Some(N::SelectStmt(s)) if !s.values_lists.is_empty())
+                {
+                    let Some(N::SelectStmt(v)) = sub.node.as_ref() else {
+                        return None;
+                    };
+                    self.buf.push(' ');
+                    self.values_def(v)?;
+                } else {
+                    self.subquery_visible(sub)?;
+                }
                 self.buf.push(')');
                 self.buf.push(' ');
-                self.buf.push_str(&q(&rs.alias.as_ref()?.aliasname));
+                let alias = rs.alias.as_ref()?;
+                let rte = self.level_rte(&alias.aliasname)?;
+                self.buf.push_str(&q(&rte.refname));
+                if !alias.colnames.is_empty() {
+                    self.column_alias_list(&rte);
+                }
             }
             N::JoinExpr(j) => {
                 let open = !self.pretty;
@@ -2175,6 +2487,7 @@ impl Printer<'_> {
                 let columns = self.relation_columns(&rel.relname)?;
                 self.scopes.last_mut()?.push(Rte {
                     refname: rel.relname.clone(),
+                    name: rel.relname.clone(),
                     columns: columns.clone(),
                     qualified_only: false,
                 });
@@ -2220,6 +2533,7 @@ impl Printer<'_> {
                 let columns = self.relation_columns(&rel.relname)?;
                 self.scopes.last_mut()?.push(Rte {
                     refname: rel.relname.clone(),
+                    name: rel.relname.clone(),
                     columns,
                     qualified_only: false,
                 });
@@ -2257,6 +2571,7 @@ pub fn rule_def(
     if event != "DELETE" {
         pseudo.push(Rte {
             refname: "new".into(),
+            name: "new".into(),
             columns: columns.clone(),
             qualified_only: true,
         });
@@ -2264,6 +2579,7 @@ pub fn rule_def(
     if event != "INSERT" {
         pseudo.push(Rte {
             refname: "old".into(),
+            name: "old".into(),
             columns,
             qualified_only: true,
         });
@@ -2521,6 +2837,7 @@ pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
     p.unqualified = true;
     p.scopes.push(vec![Rte {
         refname: def.name.clone(),
+        name: def.name.clone(),
         columns: def
             .columns
             .iter()
@@ -2556,6 +2873,7 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
     p.unqualified = true;
     p.scopes.push(vec![Rte {
         refname: def.name.clone(),
+        name: def.name.clone(),
         columns: def
             .columns
             .iter()
