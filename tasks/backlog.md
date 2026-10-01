@@ -3081,21 +3081,14 @@ These are explicit non-goals. Don't add them without a reason.
       All eleven gauges and their rates are tabulated in
       `tasks/driver-conformance-followups-plan.md` §5.
 
-- [ ] **OPEN -- the C gauge's `--standalone` daemon trades 4 passes for 20
-  skips.** `c_validation/runner.py` has started the daemon `--standalone`
-  since #1622, which fixed the four `/Client/select_server` tests (they assert
-  standalone semantics because `MONGOC_TEST_URI` carries no `replicaSet=`).
-  But libmongoc then self-skips every replica-set-only test: measured
-  2026-09-30 on the Rust server, `/change_stream` went from 23 pass / 2 skip to
-  **7 pass / 18 skip** (`live/watch`, `live/track_resume_token`,
-  `resume_at_optime`, `start_at_operation_time`, `database`, `client`,
-  `live/prose_test_11`-`14`, ...), and `/WriteConcern`, `/Collection` and
-  `/long_namespace` lost 4 more to skips. The headline went UP (98.9% -> 99.7%)
-  while passing tests went DOWN (782 -> 768), and the gauge no longer
-  exercises change streams through libmongoc at all. Options: run the C gauge
-  twice (a standalone pass for `select_server`, a replica-set pass for the
-  rest) and merge, or go back to the replica-set daemon and list the four
-  `select_server` tests as inherent. A scope decision, not a bug -- Joe's call.
+- [x] **The C gauge runs both topologies (2026-09-30).** `--standalone` alone
+  (#1622) fixed four `/Client/select_server` tests but self-skipped 20 others,
+  most of `/change_stream` (768 / 2 / 68 on the Rust server). `c_validation`
+  now runs the suite against the single-node replica set, re-runs the six
+  tests that assert standalone semantics (`STANDALONE_ONLY`: the four
+  `select_server`, and `last_write_date_absent` single / pooled) against a
+  `--standalone` daemon, and merges them: 790 / 2 / 46 of 838, the 2 being the
+  `ipv6` inherents. `tests/test_c_gauge_topologies.py` keeps the list exact.
 - [ ] **OPEN — the .NET gauge spends ~90% of its wall clock after its last log
       line (2026-09-28).** Observed: TRX and report both written at 14:53, the
       process exited at 15:12 with `rc=0` and nothing logged in between — 19 of
