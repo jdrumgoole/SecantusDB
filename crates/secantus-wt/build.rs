@@ -201,9 +201,30 @@ fn main() {
     generate_bindings(&inc);
 }
 
+/// The committed bindings, which a build without the `bindgen` feature uses.
+const COMMITTED: &str = "src/bindings.rs";
+
+#[cfg(not(feature = "bindgen"))]
+fn generate_bindings(_inc: &str) {
+    println!("cargo:rerun-if-changed={COMMITTED}");
+}
+
+/// Regenerate the bindings and require they match the committed copy, so the
+/// two cannot drift: a WiredTiger header change has to be followed by
+/// `./inv wt-bindings-refresh` (which sets SECANTUS_WT_BINDINGS_WRITE=1).
+///
+/// The output is made platform-independent so one file serves every target:
+/// the `off_t` typedef chain (`__darwin_off_t` on macOS, `__off_t` on Linux)
+/// is replaced by `wt_off_t = i64`, which is what WiredTiger means by it on
+/// every 64-bit platform, and doc comments are dropped. Enum typedefs still
+/// come out `c_uint` on Unix and `c_int` under MSVC -- the same size, so the
+/// layout agrees -- which is why the comparison is skipped on Windows.
+#[cfg(feature = "bindgen")]
 fn generate_bindings(inc: &str) {
     let header = format!("{inc}/wiredtiger.h");
     println!("cargo:rerun-if-changed={header}");
+    println!("cargo:rerun-if-changed={COMMITTED}");
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_BINDINGS_WRITE");
     let bindings = bindgen::Builder::default()
         .header(&header)
         .allowlist_function("wiredtiger_open")
@@ -213,11 +234,34 @@ fn generate_bindings(inc: &str) {
         .allowlist_type("WT_CURSOR")
         .allowlist_type("WT_ITEM")
         .allowlist_var("WT_.*")
+        .blocklist_type("wt_off_t")
+        .blocklist_type("off_t")
+        .blocklist_type("__darwin_off_t")
+        .blocklist_type("__off_t")
+        .blocklist_type("__int64_t")
+        .raw_line("pub type wt_off_t = i64;")
+        .generate_comments(false)
         .generate()
         .expect("bindgen failed to generate WiredTiger bindings");
+    let text = bindings.to_string();
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out.join("wt_sys.rs"))
-        .expect("failed to write WiredTiger bindings");
+    std::fs::write(out.join("wt_sys.rs"), &text).expect("failed to write WiredTiger bindings");
+
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let committed = manifest.join(COMMITTED);
+    if env::var_os("SECANTUS_WT_BINDINGS_WRITE").is_some() {
+        std::fs::write(&committed, &text).expect("failed to write src/bindings.rs");
+        return;
+    }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        return;
+    }
+    let have = std::fs::read_to_string(&committed).unwrap_or_default();
+    if have.replace("\r\n", "\n") != text {
+        panic!(
+            "src/bindings.rs is stale against {header}: run `./inv wt-bindings-refresh` \
+             and commit the result"
+        );
+    }
 }

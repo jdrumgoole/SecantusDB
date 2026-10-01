@@ -515,6 +515,18 @@ def wt_sys_refresh(c: Context, check: bool = False) -> None:
     c.run(f"{sys.executable} scripts/wt_sys_refresh.py{flag}", pty=PTY)
 
 
+@task(name="wt-bindings-refresh")
+def wt_bindings_refresh(c: Context) -> None:
+    """Regenerate crates/secantus-wt/src/bindings.rs with bindgen.
+
+    The committed file is what a build without the ``bindgen`` feature uses (a
+    crates.io build, which needs no libclang); a build WITH it regenerates and
+    fails if the two differ. Needs WiredTiger and libclang, as rust-wt-test.
+    """
+    env = {**_rust_env(), "SECANTUS_WT_BINDINGS_WRITE": "1"}
+    c.run(f"cd {_RUST_WT_DIR} && cargo build", pty=PTY, env=env)
+
+
 @task(name="rust-storage-test")
 def rust_storage_test(c: Context) -> None:
     """fmt/clippy/test the secantus-storage crate (the Rust Storage layer).
