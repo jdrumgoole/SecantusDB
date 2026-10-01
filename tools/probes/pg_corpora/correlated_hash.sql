@@ -25,3 +25,13 @@ select id, (select t.v from ch30_t t where t.x = o.a) from ch30_o o where o.id <
 select id, (select t.v from ch30_t t where t.x = o.a) from ch30_o o order by id;
 update ch30_o o set b = 'z' where exists (select 1 from ch30_t t where t.x = o.a and t.v = 50) returning id;
 select id, b from ch30_o order by id;
+# Range filters (batch 31): an equality picks the group, `col op $N` filters it.
+select id from ch30_o o where exists (select 1 from ch30_t t where t.x = o.a and t.v > o.a * 10) order by id;
+select id from ch30_o o where exists (select 1 from ch30_t t where t.v >= o.a * 20) order by id;
+select id from ch30_o o where exists (select 1 from ch30_t t where o.f < t.g) order by id;
+select id from ch30_o o where exists (select 1 from ch30_t t where t.g <> o.f and t.x = o.a) order by id;
+select id from ch30_o o where exists (select 1 from ch30_t t where t.d > o.d) order by id;
+select id from ch30_o o where exists (select 1 from ch30_t t where t.y < o.b) order by id;
+select id, (select t.id from ch30_t t where t.v < o.a * 30 limit 1) from ch30_o o order by id;
+select id, (select count(*) from ch30_t t where t.x = o.a and t.v > 15) from ch30_o o order by id;
+select id from ch30_o o where not exists (select 1 from ch30_t t where t.v <= o.a) order by id;
