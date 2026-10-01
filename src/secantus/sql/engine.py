@@ -135,7 +135,8 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
 
 def _fires_user_code(stmts: list[exp.Expression], storage: Any, db: str) -> bool:
     """Whether a statement batch writes while the database has a trigger."""
-    if not any(isinstance(st, (exp.Insert, exp.Update, exp.Delete, exp.Merge)) for st in stmts):
+    writes = (exp.Insert, exp.Update, exp.Delete, exp.Merge, exp.TruncateTable)
+    if not any(isinstance(st, writes) for st in stmts):
         return False
     from secantus.sql.catalog import TRIGGER_COLLECTION
 
@@ -2927,7 +2928,7 @@ def _run_statement(
         return executor.execute_alter_table(planner.plan_alter_table(stmt), catalog, storage, db)
 
     if isinstance(stmt, exp.TruncateTable):
-        return _run_truncate(stmt, storage, db, catalog)
+        return _run_truncate(stmt, storage, db, catalog, session)
 
     if isinstance(stmt, exp.Comment):
         return executor.execute_comment(stmt, catalog, storage, db)
@@ -4417,7 +4418,9 @@ def _drop_policy_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLRes
     return SQLResult(command_tag="DROP POLICY")
 
 
-def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catalog) -> SQLResult:
+def _run_truncate(
+    stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catalog, session: Any = None
+) -> SQLResult:
     """``TRUNCATE [TABLE] t [, …] [RESTART | CONTINUE IDENTITY] [CASCADE | RESTRICT]``
     (#133) — empty each table fast. ``RESTART IDENTITY`` resets owned sequences;
     ``CASCADE`` also truncates referencing tables (transitive), while the default
@@ -4430,7 +4433,7 @@ def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catal
             if exists:
                 continue
             raise errors.undefined_table(name)
-        executor.refuse_unfirable_triggers(catalog, db, name, "TRUNCATE")
+        executor.refuse_unfirable_triggers(catalog, db, name, "TRUNCATE", fires=True)
         named.append(name)
 
     restart = str(stmt.args.get("identity") or "").upper() == "RESTART"
@@ -4454,13 +4457,20 @@ def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catal
                         f'DETAIL: Table "{child.name}" references "{parent}".',
                     )
 
-    for name in to_truncate:
-        tdef = catalog.get(db, name) or reflect.reflect(storage, db, name)
+    tdefs = {
+        name: catalog.get(db, name) or reflect.reflect(storage, db, name)
+        for name in sorted(to_truncate)
+    }
+    for tdef in tdefs.values():
+        executor.fire_statement_triggers(storage, db, catalog, session, tdef, "TRUNCATE", "BEFORE")
+    for tdef in tdefs.values():
         storage.delete_matching(db, tdef.collection, {})
         if restart:
             for col in tdef.columns:
                 if col.sequence and catalog.sequence_exists(db, col.sequence):
                     catalog.alter_sequence(db, col.sequence, {"restart": None})
+    for tdef in tdefs.values():
+        executor.fire_statement_triggers(storage, db, catalog, session, tdef, "TRUNCATE", "AFTER")
     return SQLResult(command_tag="TRUNCATE TABLE")
 
 
@@ -5536,10 +5546,10 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
         unsupported = f"{timing or 'this'} triggers"
     elif for_each not in ("ROW", "STATEMENT"):
         unsupported = "this trigger level"
-    elif not events or any(e not in ("INSERT", "UPDATE", "DELETE") for e in events):
-        unsupported = "TRUNCATE triggers"
-    elif any(e.args.get("columns") for e in event_nodes):
-        unsupported = "UPDATE OF column-list triggers"
+    elif not events or any(e not in ("INSERT", "UPDATE", "DELETE", "TRUNCATE") for e in events):
+        unsupported = "this trigger event"
+    elif "TRUNCATE" in events and for_each == "ROW":
+        raise errors.feature_not_supported("TRUNCATE FOR EACH ROW triggers are not supported")
     elif tp.args.get("referencing"):
         unsupported = "trigger transition tables (REFERENCING)"
     elif tp.args.get("constraint"):
@@ -5571,8 +5581,18 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
     if not fn_name:
         raise errors.feature_not_supported("CREATE TRIGGER EXECUTE shape is not supported")
     call = execute.this if execute is not None else None
-    if getattr(call, "expressions", None):
-        raise errors.feature_not_supported("trigger arguments are not supported")
+    # Trigger arguments are literals PostgreSQL stores as their text.
+    args: list[str] = []
+    for a in getattr(call, "expressions", None) or []:
+        if isinstance(a, exp.Literal):
+            args.append(str(a.this))
+        elif isinstance(a, (exp.Column, exp.Identifier)):
+            args.append(a.name)
+        else:
+            raise errors.syntax_error("trigger arguments must be literals")
+    update_columns = [
+        c.name for e in event_nodes for c in (e.args.get("columns") or []) if hasattr(c, "name")
+    ]
     func = catalog.get_function(db, fn_name, 0)
     if func is None:
         raise errors.SQLError("42883", f"function {fn_name}() does not exist")
@@ -5592,8 +5612,8 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
             "events": events,
             "level": for_each,
             "function": fn_name,
-            "args": [],
-            "update_columns": [],
+            "args": args,
+            "update_columns": update_columns,
             **({"when": when.sql(dialect="postgres")} if (when := tp.args.get("when")) else {}),
         },
     )
