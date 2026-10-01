@@ -861,8 +861,10 @@ class SecantusPGServer:
             # them (and errors on a NOTIFY payload), so run_sql handles them.
             # Two-phase commit (#139) also bypasses the probe: sqlglot can't parse
             # COMMIT/ROLLBACK PREPARED, so run_sql intercepts them pre-parse.
-            if not sql_engine.is_pubsub_statement(sql) and not sql_engine.is_two_phase_statement(
-                sql
+            if (
+                not sql_engine.is_pubsub_statement(sql)
+                and not sql_engine.is_two_phase_statement(sql)
+                and not sql_engine.is_multi_drop_index(sql)
             ):
                 stmts = planner.parse(sql)
                 if len(stmts) == 1 and isinstance(stmts[0], exp.Copy):

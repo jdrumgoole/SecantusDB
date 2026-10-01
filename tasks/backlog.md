@@ -7119,18 +7119,16 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       Corpus `join_pushdown`. Not pushed: an unqualified column, a function
       call (it may be volatile), a subquery, a conjunct over two aliases.
 
-- [ ] **OPEN — PYTHON pgserver: CREATE INDEX diverges from PostgreSQL 14.13
-      on 13 of 48 lines of `indexes.sql` (found 2026-09-29).** Three are
-      INTERNAL ERRORS reaching the client as `XX000`: a `CREATE UNIQUE INDEX`
-      over rows that already collide, and an UPDATE into a unique index's
-      duplicate (the storage `IndexConflict` is not translated to 23505). The
-      rest: a default index name is the Mongo form (`b_1`, `a_1_b_1`) rather
-      than `<table>_<cols>_idx`; an index name is not checked against the
-      relation namespace (`CREATE INDEX t ON other (...)` and `CREATE TABLE
-      <index name>` both succeed); dropping a UNIQUE constraint's index is
-      allowed (PostgreSQL: 2BP01); `DROP INDEX a, b` is `42601`; `USING hash`
-      and `INCLUDE (...)` are not rendered in `pg_indexes.indexdef`. The
-      corpus is `tools/probes/pg_corpora/indexes.sql` (run WITHOUT `--rust`).
+- [x] **DONE (batch 16) — PYTHON pgserver: CREATE INDEX matched
+      PostgreSQL 14.13 on only 35 of 48 lines of `indexes.sql`; now 48 of
+      48.** Fixed: a UNIQUE index over colliding rows and an UPDATE into a
+      unique index's duplicate were `XX000` (storage `IndexConflict` now maps
+      to 23505, with `could not create unique index` / `Key (...)=(...)`);
+      the default name is PostgreSQL's `<table>_<cols>_idx` (numbered while
+      taken) instead of the Mongo form; an index name is checked against
+      tables and views, both ways; dropping a UNIQUE constraint's index is
+      2BP01; `DROP INDEX a, b` works; `USING hash` and `INCLUDE (...)` render
+      in `pg_indexes.indexdef`. The corpus runs WITHOUT `--rust`.
 
 - [ ] **OPEN — RUST pgserver: window functions -- the two known limits
       (landed 2026-09-29: over an aggregate, over `generate_series`, over a

@@ -278,11 +278,12 @@ def _create_unique_index(storage: Any, db: str, table: planner.TableDef, uq: Any
 def execute_create_table(
     plan: planner.CreateTablePlan, catalog: Catalog, storage: Any, db: str
 ) -> SQLResult:
-    if catalog.exists(db, plan.table.name):
+    if catalog.exists(db, plan.table.name) or plan.table.name in index_names(catalog, storage, db):
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE TABLE")
         # `duplicate_table` strips the schema/temp-namespace prefix a catalog
-        # key carries — PG names the bare relation.
+        # key carries — PG names the bare relation. An index name is taken
+        # too: PostgreSQL keeps both in pg_class.
         raise errors.duplicate_table(plan.table.name)
     if "." in plan.table.name and not plan.table.temp:
         schema = plan.table.name.split(".", 1)[0]
@@ -858,11 +859,61 @@ def _apply_alter_action(
     raise errors.feature_not_supported(f"unsupported ALTER TABLE action: {action.sql()}")
 
 
+def _key_text(key_value: dict[str, Any] | None) -> tuple[str, str]:
+    """``(columns, values)`` of a storage key, as PostgreSQL's ``Key (a, b)=(1,
+    2)`` detail shows them."""
+    kv = key_value or {}
+    cols = ", ".join(kv)
+    vals = ", ".join("null" if v is None else str(v) for v in kv.values())
+    return cols, vals
+
+
+def index_conflict_error(exc: Any) -> errors.SQLError:
+    """A storage unique-index collision as PostgreSQL's 23505."""
+    cols, vals = _key_text(getattr(exc, "key_value", None))
+    err = errors.SQLError(
+        "23505", f'duplicate key value violates unique constraint "{exc.index_name}"'
+    )
+    if cols:
+        err.diag["D"] = f"Key ({cols})=({vals}) already exists."
+    return err
+
+
+def index_names(catalog: Catalog, storage: Any, db: str) -> set[str]:
+    """Every index name in the database (a relation name, as in ``pg_class``)."""
+    names: set[str] = set()
+    for tname in catalog.list_tables(db):
+        table = catalog.get(db, tname)
+        if table is None:
+            continue
+        for ix in storage.list_indexes(db, table.collection):
+            name = ix.get("name")
+            if name and name != "_id_":
+                names.add(name)
+    return names
+
+
+def relation_taken(catalog: Catalog, storage: Any, db: str, name: str) -> bool:
+    """Is ``name`` a table, view or index already? PostgreSQL keeps them in
+    one namespace, so each collides with the others."""
+    return (
+        catalog.exists(db, name)
+        or catalog.get_view(db, name) is not None
+        or name in index_names(catalog, storage, db)
+    )
+
+
 def execute_create_index(
     plan: planner.CreateIndexPlan, catalog: Catalog, storage: Any, db: str, session: Any = None
 ) -> SQLResult:
-    existing = [ix.get("name") for ix in storage.list_indexes(db, plan.collection)]
-    if plan.name in existing:
+    if getattr(plan, "auto_name", False):
+        # PostgreSQL's ChooseRelationName: `<table>_<cols>_idx`, then a number
+        # appended until the name is free.
+        base, n = plan.name, 0
+        while relation_taken(catalog, storage, db, plan.name):
+            n += 1
+            plan.name = f"{base}{n}"
+    elif relation_taken(catalog, storage, db, plan.name):
         if plan.if_not_exists:
             return SQLResult(command_tag="CREATE INDEX")
         raise errors.duplicate_table(plan.name)
@@ -878,7 +929,20 @@ def execute_create_index(
         options["partialFilterExpression"] = plan.partial_filter
     if plan.include:
         options["include"] = list(plan.include)
-    storage.create_index(db, plan.collection, plan.name, plan.key_spec, options or None)
+    if getattr(plan, "method", None) and plan.method != "btree":
+        options["sqlMethod"] = plan.method
+    from secantus.storage import IndexConflict
+
+    try:
+        storage.create_index(db, plan.collection, plan.name, plan.key_spec, options or None)
+    except IndexConflict as exc:
+        # Rows already collide: PostgreSQL's message names the index being
+        # built and the key that repeats.
+        cols, vals = _key_text(exc.key_value)
+        err = errors.SQLError("23505", f'could not create unique index "{plan.name}"')
+        if cols:
+            err.diag["D"] = f"Key ({cols})=({vals}) is duplicated."
+        raise err from exc
     return SQLResult(command_tag="CREATE INDEX")
 
 
@@ -925,6 +989,14 @@ def execute_drop_index(
         if table is None:
             continue
         if any(ix.get("name") == plan.name for ix in storage.list_indexes(db, table.collection)):
+            # The index behind a UNIQUE / PRIMARY KEY constraint goes with the
+            # constraint, not on its own (PostgreSQL's 2BP01).
+            if any(uq.name == plan.name for uq in getattr(table, "unique_constraints", []) or []):
+                raise errors.SQLError(
+                    "2BP01",
+                    f"cannot drop index {plan.name} because constraint {plan.name} "
+                    f"on table {table.name} requires it",
+                )
             storage.drop_index(db, table.collection, plan.name)
             _drop_expr_index(table, plan.name, catalog, storage, db)
             return SQLResult(command_tag="DROP INDEX")

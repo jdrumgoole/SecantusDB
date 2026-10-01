@@ -142,6 +142,12 @@ class CreateIndexPlan:
     # only (a surrogate needs no physical INCLUDE payload) and reflected via
     # pg_index's indnkeyatts/indkey split.
     include: list[str] = field(default_factory=list)
+    # The name was chosen, not written: the executor may number it
+    # (`t_a_idx1`) while it is taken, as PostgreSQL's ChooseRelationName does.
+    auto_name: bool = False
+    # ``USING hash`` / ``gin`` ...: recorded for ``pg_indexes``; every index
+    # is a B-tree in storage.
+    method: str | None = None
 
 
 @dataclass
@@ -2548,7 +2554,12 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
         name = _column_name(col_node)
         direction = -1 if (ordered is not None and ordered.args.get("desc")) else 1
         key_spec[table.field_for(name)] = direction
-    index_name = name_ident.name if name_ident is not None else _default_index_name(key_spec)
+    columns = [_column_name(c.this if isinstance(c, exp.Ordered) else c) for c in cols]
+    index_name = (
+        name_ident.name
+        if name_ident is not None
+        else f"{table.name.rsplit('.', 1)[-1]}_{'_'.join(columns)}_idx"
+    )
     # A partial-index predicate (``WHERE …``) lowers to a Mongo filter.
     where = params.args.get("where")
     partial_filter = (
@@ -2563,12 +2574,18 @@ def plan_create_index(stmt: exp.Create, table: TableDef) -> CreateIndexPlan:
         if_not_exists=bool(stmt.args.get("exists")),
         partial_filter=partial_filter,
         include=include,
+        auto_name=name_ident is None,
+        method=_index_method(index),
     )
 
 
-def _default_index_name(key_spec: dict[str, int]) -> str:
-    # Mirror mongod's auto-generated index name: field_dir joined by underscores.
-    return "_".join(f"{field}_{direction}" for field, direction in key_spec.items())
+def _index_method(index: exp.Index) -> str | None:
+    """The index's ``USING`` access method, lower-case, or None for none."""
+    params = index.args.get("params")
+    using = params.args.get("using") if params is not None else None
+    if using is None:
+        return None
+    return (using.name if hasattr(using, "name") else str(using)).lower() or None
 
 
 def plan_drop_index(stmt: exp.Drop) -> DropIndexPlan:

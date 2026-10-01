@@ -85,6 +85,9 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
         if two_phase is not None:
             return [two_phase]
+        dropped = _maybe_drop_indexes(sql, storage, db, catalog)
+        if dropped is not None:
+            return [dropped]
         results: list[SQLResult] = []
         if session.get_setting("standard_conforming_strings").lower() in ("off", "false", "0"):
             sql = planner.decode_nonstandard_strings(sql)
@@ -125,6 +128,45 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         return results
 
 
+_DROP_INDEXES_RE = re.compile(
+    r"^\s*DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(IF\s+EXISTS\s+)?"
+    r"((?:\"[^\"]+\"|[\w.]+)(?:\s*,\s*(?:\"[^\"]+\"|[\w.]+))+)"
+    r"(?:\s+(?:CASCADE|RESTRICT))?\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_multi_drop_index(sql: str) -> bool:
+    """A ``DROP INDEX a, b`` -- which sqlglot cannot parse, so the wire layer
+    leaves it to ``run_sql``."""
+    return _DROP_INDEXES_RE.match(sql) is not None
+
+
+def _maybe_drop_indexes(sql: str, storage: Any, db: str, catalog: Catalog) -> SQLResult | None:
+    """``DROP INDEX a, b`` -- several names, which sqlglot cannot parse. Every
+    name is checked before any is dropped, so a missing one (without ``IF
+    EXISTS``) drops nothing, as on PostgreSQL."""
+    m = _DROP_INDEXES_RE.match(sql)
+    if m is None:
+        return None
+    if_exists = m.group(1) is not None
+    names = []
+    for raw in m.group(2).split(","):
+        raw = raw.strip()
+        name = raw[1:-1] if raw.startswith('"') else raw.lower()
+        names.append(name.rsplit(".", 1)[-1])
+    taken = executor.index_names(catalog, storage, db)
+    missing = [n for n in names if n not in taken]
+    if missing and not if_exists:
+        raise errors.undefined_relation_of_kind("INDEX", missing[0])
+    for name in names:
+        if name in taken:
+            executor.execute_drop_index(
+                planner.DropIndexPlan(name=name, if_exists=if_exists), catalog, storage, db
+            )
+    return SQLResult(command_tag="DROP INDEX")
+
+
 def _drain_plpgsql_notices(session: Session, result: SQLResult) -> None:
     """Move plpgsql ``RAISE`` notices raised by any function this statement
     evaluated (side-channel from ``secantus.sql.plpgsql``) onto the result, so
@@ -157,6 +199,13 @@ def _storage_conflicts_as_sqlstate() -> Iterator[None]:
 
         if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
             raise errors.serialization_failure() from exc
+        from secantus.storage import IndexConflict
+
+        if isinstance(exc, IndexConflict):
+            # A write colliding with a unique INDEX (one `CREATE UNIQUE INDEX`
+            # made, not a declared constraint the executor checks first): the
+            # same 23505, rather than an XX000.
+            raise executor.index_conflict_error(exc) from exc
         if isinstance(exc, AggregateError):
             # The pipeline hit a hard limit (an unbounded cross-product cap) —
             # surface it as a clean SQLSTATE 54000 (program_limit_exceeded)
