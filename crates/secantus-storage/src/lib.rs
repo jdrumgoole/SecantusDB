@@ -2546,6 +2546,24 @@ fn clause_implies_bounds(qval: &Bson, pbound: &Document) -> bool {
         _ => vec![("$eq", qval)],
     };
     for (pop, pv) in pbound.iter() {
+        // `$exists: true` is implied by any constraint a MISSING field
+        // cannot satisfy: an equality or range against a non-null value, an
+        // `$in` without null, or `$exists: true` itself. (A comparison WITH
+        // null matches a missing field, so it does not.)
+        if pop == "$exists" && matches!(pv, Bson::Boolean(true)) {
+            let excludes_missing = q_constraints.iter().any(|(qop, qv)| match *qop {
+                "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => !matches!(qv, Bson::Null),
+                "$in" => qv
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty() && !a.iter().any(|v| matches!(v, Bson::Null))),
+                "$exists" => matches!(qv, Bson::Boolean(true)),
+                _ => false,
+            });
+            if !excludes_missing {
+                return false;
+            }
+            continue;
+        }
         if !matches!(pop.as_str(), "$eq" | "$lt" | "$lte" | "$gt" | "$gte") {
             return false; // partial filter uses an operator we can't reason about
         }
@@ -14476,6 +14494,28 @@ mod tests {
             out2.get_document("$set").unwrap().get("x"),
             Some(Bson::DateTime(_))
         ));
+    }
+
+    #[test]
+    fn query_implies_partial_exists_true() {
+        let p = doc! {"f": {"$exists": true}};
+        assert!(query_implies_partial(&doc! {"f": "x"}, &p));
+        assert!(query_implies_partial(&doc! {"f": {"$gt": 1i32}}, &p));
+        assert!(query_implies_partial(
+            &doc! {"f": {"$in": [1i32, 2i32]}},
+            &p
+        ));
+        assert!(!query_implies_partial(&doc! {"f": Bson::Null}, &p));
+        assert!(!query_implies_partial(
+            &doc! {"f": {"$lte": Bson::Null}},
+            &p
+        ));
+        assert!(!query_implies_partial(
+            &doc! {"f": {"$in": [1i32, Bson::Null]}},
+            &p
+        ));
+        assert!(!query_implies_partial(&doc! {"f": {"$ne": 1i32}}, &p));
+        assert!(!query_implies_partial(&doc! {"g": 1i32}, &p));
     }
 
     #[test]

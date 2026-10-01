@@ -15,6 +15,8 @@ use bson::{doc, Bson, Document};
 
 pub mod acl;
 mod agg_hoist;
+mod expr_where;
+pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
 pub mod bytea;
@@ -28820,6 +28822,19 @@ fn plan_truncate(
 
 /// A WHERE predicate as a Mongo filter over STORED FIELDS.
 pub fn lower_where(
+    w: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<Document> {
+    // A comparison of an indexed expression reads its index's field.
+    if let Some((w, def)) = expr_where::rewrite(w, def) {
+        return lower_where_plain(&w, &def, params);
+    }
+    lower_where_plain(w, def, params)
+}
+
+/// `lower_where` without the expression-index rewrite.
+fn lower_where_plain(
     node: &pg_query::protobuf::Node,
     def: &TableDef,
     params: &[Bson],

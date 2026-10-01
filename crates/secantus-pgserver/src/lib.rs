@@ -16560,8 +16560,41 @@ impl PgHandler {
             self.call_user_function(u, args)
                 .map_err(Self::to_plan_error)
         };
+        // A table's expression indexes the planner may read a WHERE through:
+        // one expression, no predicate. Listed once per table per statement.
+        let memo: std::cell::RefCell<HashMap<String, Vec<(String, String)>>> =
+            std::cell::RefCell::new(HashMap::new());
+        let expr_indexes = |table: &str| -> Vec<(String, String)> {
+            if let Some(found) = memo.borrow().get(table) {
+                return found.clone();
+            }
+            let found: Vec<(String, String)> = self
+                .storage
+                .list_indexes(self.db(), table)
+                .unwrap_or_default()
+                .iter()
+                .filter(|ix| {
+                    ix.get_str("sqlPredicate").is_err()
+                        && ix
+                            .get_document("options")
+                            .map_or(true, |o| o.get_str("sqlPredicate").is_err())
+                })
+                .filter_map(|ix| {
+                    let (exprs, _) = Self::index_expressions(ix)?;
+                    let [only] = exprs.as_slice() else {
+                        return None;
+                    };
+                    let name = ix.get_str("name").ok()?;
+                    Some((only.clone(), Self::expression_index_field(name)))
+                })
+                .collect();
+            memo.borrow_mut().insert(table.to_string(), found.clone());
+            found
+        };
         secantus_pgplan::with_function_hook(&functions, || {
-            secantus_pgplan::with_sequence_hook(&hook, || self.correlated_scope(f))
+            secantus_pgplan::with_sequence_hook(&hook, || {
+                secantus_pgplan::with_expr_index_hook(&expr_indexes, || self.correlated_scope(f))
+            })
         })
     }
 

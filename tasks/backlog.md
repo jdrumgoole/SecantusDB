@@ -638,9 +638,11 @@ remain open:
         field was never written and UNIQUE re-evaluated the expression over
         every row per write -- 1.6 s per INSERT at 20,000 rows, now 0.9 ms).
         Rows another writer left are recomputed when the server opens the
-        store. `ON CONFLICT (expr)` arbitrates on it (corpus `expr_unique`).
-        Left: a WHERE over the expression (`lower(t) = 'x'`) does not use the
-        index yet -- it is evaluated per row.
+        store. `ON CONFLICT (expr)` arbitrates on it (corpus `expr_unique`),
+        and a WHERE comparing the expression with a constant reads the field
+        through the index (`lower(t) = 'x'`, 2.4 s -> 3.7 ms at 20,000 rows;
+        corpus `expr_where`) -- a non-partial, single-expression index only,
+        since a partial index's field is absent outside its predicate.
 - [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
       security, domains, materialized views, WITH RECURSIVE, xml, READ
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
