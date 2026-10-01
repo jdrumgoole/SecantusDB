@@ -567,8 +567,11 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
         if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
             // Nor do the string types (`text + integer`, `text + text`).
+            // Judged only between BUILT-IN categories: an extension or user
+            // type can define one (`hstore - text` exists).
             let string = |t: &str| category(t) == Some("string");
-            if l == "bool" || r == "bool" || string(&l) || string(&r) {
+            let known = category(&l).is_some() && category(&r).is_some();
+            if known && (l == "bool" || r == "bool" || string(&l) || string(&r)) {
                 return Err(mismatch(&op, &l, &r, e.location));
             }
         }
@@ -583,7 +586,9 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             let delete = op == "-"
                 && l == "jsonb"
                 && matches!(r.as_str(), "text" | "int4" | "int2" | "int8" | "text[]");
-            if (json(&l) || json(&r)) && !delete {
+            // The other side a built-in type: an extension may define one.
+            let known = |t: &str| json(t) || category(t).is_some() || t == "text[]";
+            if (json(&l) || json(&r)) && known(&l) && known(&r) && !delete {
                 return Err(mismatch(&op, &l, &r, e.location));
             }
         }
