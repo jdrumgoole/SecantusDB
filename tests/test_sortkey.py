@@ -4,10 +4,11 @@ import datetime as _dt
 import math
 import random
 
+import bson
 import pytest
 from bson import Binary, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
-from secantus.sortkey import encode_compound, encode_value
+from secantus.sortkey import encode_compound, encode_id_key, encode_value
 
 
 def _sorted(values: list) -> list[bytes]:
@@ -194,3 +195,50 @@ def test_compound_prefix_equality_bytes() -> None:
 )
 def test_encode_value_is_deterministic(v: object) -> None:
     assert encode_value(v) == encode_value(v)
+
+
+# --- entry format 4: documents and arrays keyed by VALUE ------------------
+# Each pair below is `a < b` by mongod 8.2.11's `$cmp` (measured 2026-09-30);
+# `tools/probes/value_order_encoding.py` checks 16,110 random pairs the same way.
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        # a longer document is not a larger one: raw BSON said it was
+        ({"a": 2, "b": [3]}, {"a": 5}),
+        # a strict prefix sorts first
+        ({"a": 1}, {"a": 1, "b": 0}),
+        ({}, {"a": MinKey()}),
+        # the element's TYPE decides before its field NAME
+        ({"b": 1}, {"a": "x"}),
+        # then the name, then the value
+        ({"a": 1}, {"b": 1}),
+        ({"a": 1}, {"a": 2}),
+        # arrays: element by element, prefix first
+        ([9], [10]),
+        ([1, 2, 3], [9]),
+        ([1, 2], [1, 2, 0]),
+        ([], [MinKey()]),
+        # nested
+        ({"a": {"b": 1}}, {"a": {"b": 1, "c": 0}}),
+        ({"a": [1, {"x": 2}]}, {"a": [1, {"x": 3}]}),
+    ],
+)
+def test_documents_and_arrays_are_keyed_by_value(a: object, b: object) -> None:
+    assert encode_value(a) < encode_value(b)
+
+
+def test_numerically_equal_documents_share_a_key() -> None:
+    # mongod compares {a: 1} and {a: 1.0} EQUAL; raw BSON did not.
+    assert (
+        encode_value({"a": 1}) == encode_value({"a": 1.0}) == encode_value({"a": Decimal128("1")})
+    )
+
+
+def test_the_id_key_keeps_the_formats_1_to_3_encoding() -> None:
+    """An `_id` key is stored in every document row: a document `_id` must keep
+    the bytes it was written with, or its row becomes unreachable."""
+    doc = {"b": 2, "a": [1, "x"]}
+    assert encode_id_key(doc) == bytes([5]) + bson.encode(doc).replace(b"\x00", b"\x00\xff")
+    # everything that is not a document or array is just `encode_value`
+    for v in (5, "s", None, ObjectId(b"a" * 12), 2.5):
+        assert encode_id_key(v) == encode_value(v)

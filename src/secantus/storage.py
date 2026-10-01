@@ -52,6 +52,7 @@ from secantus.query import matches
 from secantus.sortkey import (
     COMPOUND_SEP,
     RANK_ARRAY,
+    encode_id_key,
     encode_value,
     encode_value_directed,
 )
@@ -390,11 +391,17 @@ _ENTRY_SEP = b"\x00\x00"
 #   back in the OLD order, and since ``ordering._bson_type_rank`` moved with it,
 #   the index and a collection scan would disagree — an index that changes the
 #   sort answer, which is the one failure this project refuses to ship.
+# * 4 — documents and arrays are keyed by VALUE (``sortkey._encode_doc``):
+#   type, then name, then value per element, the way mongod compares them.
+#   Formats 1-3 keyed them by raw BSON, whose leading length made byte order
+#   SIZE order, so a range or sort over document keys walked the wrong
+#   stretch and the planners had to refuse it. ``_id`` keys are NOT index
+#   entries and keep the old encoding (``sortkey.encode_id_key``).
 #
 # The catalog is the only place this is visible — the WT ``key_format`` is
 # ``SSSu`` for all three — so the marker is how an older store is detected (see
 # ``_reject_legacy_index_entry_format``). Mirrors the Rust ``ENTRY_FORMAT``.
-_ENTRY_FORMAT = 3
+_ENTRY_FORMAT = 4
 
 
 def _escape_kb(kb: bytes) -> bytes:
@@ -731,17 +738,14 @@ def _order_upserted_doc(new: dict[str, Any], seeded: list[str]) -> dict[str, Any
 def _id_key(doc_id: Any) -> bytes:
     """Byte-sortable canonical bytes for an ``_id`` value.
 
-    Uses the same byte-sortable encoding the secondary-index entries
-    table relies on. Two consequences worth knowing:
-
-    * Cross-numeric collision: ``1 == 1.0 == Decimal128("1")`` produce
-      identical bytes (so they hit the same doc / clash on uniqueness),
-      because ``encode_value`` normalises numerics through ``Decimal``.
-    * Natural iteration: walking the doc table in WT-key order yields
-      docs in BSON cross-type sort order, which matches what real
-      MongoDB calls "natural order" for non-capped collections.
+    ``sortkey.encode_id_key``: the index encoding with entry formats 1-3's
+    document encoding frozen, because this key is stored in every document row
+    and keys the ``_id`` index -- changing it would strand every stored
+    document whose ``_id`` is a document. Cross-numeric collision still holds:
+    ``1 == 1.0 == Decimal128("1")`` produce identical bytes, so they hit the
+    same doc and clash on uniqueness.
     """
-    return encode_value(doc_id)
+    return encode_id_key(doc_id)
 
 
 def _is_regex_value(v: Any) -> bool:
@@ -5182,7 +5186,7 @@ class Storage:
         if "recordId" in wanted:
             with self._lock:
                 for i, doc in enumerate(docs):
-                    record_ids[i] = self._doc_recordid(db, coll, encode_value(doc.get("_id")))
+                    record_ids[i] = self._doc_recordid(db, coll, _id_key(doc.get("_id")))
         for i, doc in enumerate(docs):
             meta: dict[str, Any] = {}
             recordid = record_ids.get(i)
