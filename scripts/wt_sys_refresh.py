@@ -128,6 +128,10 @@ def digest(root: Path) -> str:
         rel = path.relative_to(root).as_posix()
         h.update(rel.encode() + b"\0")
         data = str(path.readlink()).encode() if path.is_symlink() else path.read_bytes()
+        # Line endings are not content: a Windows checkout (core.autocrlf) and
+        # the patch scripts' text-mode writes both produce CRLF there, which
+        # changes no byte the compiler acts on but would change the digest.
+        data = data.replace(b"\r\n", b"\n")
         h.update(hashlib.sha256(data).digest())
     return h.hexdigest()
 
