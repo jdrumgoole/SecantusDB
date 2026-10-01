@@ -289,6 +289,26 @@ either; see the backlog entry.
 
 ### 5.5 Phase E — the release pipeline
 
+**Status (2026-10-01): step 1 is in place for the MongoDB crates; steps 2-3
+are open.** Done:
+
+- All 15 `secantus-*` names are claimed on crates.io as empty `0.0.0`
+  placeholders (Joe's account). Each has a trusted-publishing config for
+  `jdrumgoole/SecantusDB`, workflow `publish-crates.yml`, environment
+  `crates-io`. Re-run the config script from the session that set it up, or
+  add one by hand on crates.io, for any crate that does not have one yet.
+- The GitHub `crates-io` environment accepts only the `secantusdb-v*` and
+  `secantusd-pg-v*` tags.
+- `.github/workflows/publish-crates.yml` runs on `secantusdb-v*` tags. It
+  refuses a tag that disagrees with `secantus-mdb`'s version, stages and
+  verifies the ten crates with `scripts/crates_package_check.py`, exchanges
+  the OIDC token through `rust-lang/crates-io-auth-action`, and runs
+  `cargo publish --workspace`, which publishes in dependency order. A
+  `workflow_dispatch` defaults to a dry run.
+
+Open: the PG crates (their Phase B), and teaching the `secantusdb-release`
+skill that a Rust release tag now also publishes to crates.io.
+
 1. A `publish-crates.yml` workflow on the existing `secantusdb-v*` /
    `secantusd-pg-v*` tags: verify the tag against the crate version (as the
    binary workflows do), then `cargo publish` each crate in dependency order,
