@@ -612,29 +612,6 @@ remain open:
       subtransactions -- corpus `procedure_transactions`.) An EXCEPTION
       block's subtransaction is a savepoint, which captures whole tables
       (see the SAVEPOINT cost entry in section 7).
-- [ ] **OPEN — RUST pgserver triggers: the cross-server gap (2026-09-30).**
-      `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
-      and transition tables landed in batch 9 (corpora `instead_of`,
-      `constraint_triggers`, `transition_tables`, `triggers`, `triggers2` at
-      0 against PostgreSQL 14). **Cross-server:** since batch 17 the Python
-      PG server runs BEFORE / AFTER, ROW / STATEMENT triggers on INSERT,
-      UPDATE and DELETE (with `TG_OP` / `TG_WHEN` / `TG_LEVEL` /
-      `TG_TABLE_NAME`, NULL `OLD` / `NEW` where the event has none, and a
-      `WHEN` condition over them), and a
-      write that fires one is ONE transaction, so a trigger's writes roll
-      back with a failing statement (`tests/test_sql_triggers.py::
-      TestTriggerKinds`, checked against PostgreSQL 15's output). Batch 18
-      added trigger arguments (`TG_ARGV` from 0, `TG_NARGS`), `UPDATE OF`
-      column lists and TRUNCATE statement triggers (`TestArgsUpdateOfTruncate`).
-      Batch 19 made ON CONFLICT, UPDATE FROM, DELETE USING and MERGE fire
-      them in PostgreSQL's order (`TestTriggersOnEveryWritePath`), and batch
-      20 added transition tables (`REFERENCING OLD / NEW TABLE`,
-      `TestTransitionTables`), and batch 21 constraint triggers with
-      DEFERRABLE / INITIALLY DEFERRED and SET CONSTRAINTS
-      (`TestConstraintTriggers`), and INSTEAD OF row triggers on views
-      (`TestInsteadOfTriggers`). Left on the Python server: a statement-level
-      BEFORE / AFTER trigger on a VIEW is refused at CREATE (0A000), where
-      PostgreSQL stores it and fires it around a write through the view.
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,

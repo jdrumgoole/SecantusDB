@@ -1038,3 +1038,64 @@ class TestInsteadOfTriggers:
         run(storage, session, "insert into tb22_v values (4, 'd')")
         assert run(storage, session, "select count(*) from tb22_log").rows == [(6,)]
         assert run(storage, session, "select v from tb22_t where id = 4").rows == [("d",)]
+
+
+VIEW_STATEMENT_SQL = """\
+create table tb23_t(id int primary key, v text);
+create table tb23_log(msg text);
+create view tb23_v as select id, v from tb23_t;
+create view tb23_w as select id, v from tb23_t;
+create function tb23_s() returns trigger language plpgsql as $$ begin
+insert into tb23_log values (tg_name||':'||tg_when||':'||tg_op||':'||tg_level
+  ||':'||tg_table_name); return null; end $$;
+create function tb23_io() returns trigger language plpgsql as $$ begin
+insert into tb23_log values ('io:'||tg_op);
+  insert into tb23_t values (new.id, new.v); return new; end $$;
+create trigger v_bs before insert or update or delete on tb23_v
+  for each statement execute function tb23_s();
+create trigger v_as after insert or update or delete on tb23_v
+  for each statement execute function tb23_s();
+create trigger t_bs before insert or update or delete on tb23_t
+  for each statement execute function tb23_s();
+create trigger t_as after insert or update or delete on tb23_t
+  for each statement execute function tb23_s();
+create trigger w_bs before insert on tb23_w
+  for each statement execute function tb23_s();
+create trigger w_as after insert on tb23_w
+  for each statement execute function tb23_s();
+create trigger w_io instead of insert on tb23_w
+  for each row execute function tb23_io();
+insert into tb23_v values (1, 'a');
+insert into tb23_log values ('---');
+update tb23_v set v = 'b' where id = 99;
+insert into tb23_log values ('---');
+delete from tb23_v where id = 1;
+insert into tb23_log values ('---');
+insert into tb23_w values (2, 'c');
+select msg from tb23_log;
+"""
+
+
+class TestStatementTriggersOnViews:
+    """A view's BEFORE / AFTER STATEMENT triggers fire around its INSTEAD OF
+    rows, and NOT for a write through an automatically-updatable view, which
+    fires the base table's instead. PostgreSQL 15's log, verbatim."""
+
+    def test_matches_postgres(self, storage, session):
+        results = run_sql(storage, DB, VIEW_STATEMENT_SQL, session=session)
+        assert results[-1].rows == [
+            ("t_bs:BEFORE:INSERT:STATEMENT:tb23_t",),
+            ("t_as:AFTER:INSERT:STATEMENT:tb23_t",),
+            ("---",),
+            ("t_bs:BEFORE:UPDATE:STATEMENT:tb23_t",),
+            ("t_as:AFTER:UPDATE:STATEMENT:tb23_t",),
+            ("---",),
+            ("t_bs:BEFORE:DELETE:STATEMENT:tb23_t",),
+            ("t_as:AFTER:DELETE:STATEMENT:tb23_t",),
+            ("---",),
+            ("w_bs:BEFORE:INSERT:STATEMENT:tb23_w",),
+            ("io:INSERT",),
+            ("t_bs:BEFORE:INSERT:STATEMENT:tb23_t",),
+            ("t_as:AFTER:INSERT:STATEMENT:tb23_t",),
+            ("w_as:AFTER:INSERT:STATEMENT:tb23_w",),
+        ]

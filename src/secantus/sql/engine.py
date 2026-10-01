@@ -5776,17 +5776,13 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
             raise errors.feature_not_supported("INSTEAD OF triggers cannot have column lists")
         if tp.args.get("when"):
             raise errors.feature_not_supported("INSTEAD OF triggers cannot have WHEN conditions")
-    elif is_view:
-        if for_each == "ROW":
-            raise errors.SQLError(
-                "42809",
-                f'"{tname}" is a view',
-                diag={"D": "Views cannot have row-level BEFORE or AFTER triggers."},
-            )
-        # PostgreSQL accepts a statement-level trigger on a view; this server
-        # would store it and never fire it, so it says so instead.
-        raise errors.feature_not_supported("statement-level triggers on views are not supported")
-    elif catalog.get(db, tname) is None:
+    elif is_view and for_each == "ROW":
+        raise errors.SQLError(
+            "42809",
+            f'"{tname}" is a view',
+            diag={"D": "Views cannot have row-level BEFORE or AFTER triggers."},
+        )
+    elif not is_view and catalog.get(db, tname) is None:
         raise errors.undefined_table(tname)
     execute = tp.args.get("execute")
     fn_name = None
@@ -6408,6 +6404,15 @@ def _updatable_view_base(vdef_sql: str) -> tuple[str, exp.Expression | None] | N
     return from_.this.name, (where.this if isinstance(where, exp.Where) else None)
 
 
+@dataclass
+class _ViewRelation:
+    """A view standing where the trigger helpers expect a table."""
+
+    name: str
+    reflected: bool = False
+    columns: tuple = ()
+
+
 def _dml_target(stmt: exp.Expression) -> exp.Table | None:
     if isinstance(stmt, exp.Insert):
         tgt = stmt.this
@@ -6494,6 +6499,11 @@ def _run_instead_of(
             for i, eq in enumerate(stmt.expressions):
                 new[eq.this.name] = row[len(cols) + i]
             pairs.append((old, new))
+    # The view's own statement triggers fire around the INSTEAD OF rows --
+    # and only here: a write through an automatically-updatable view fires
+    # the BASE table's statement triggers, never the view's (PostgreSQL 15).
+    view_rel = _ViewRelation(vname)
+    executor.fire_statement_triggers(storage, db, catalog, session, view_rel, event, "BEFORE")
     ctx = executor._trigger_ctx(storage, db, catalog, session)
     done: list[dict[str, Any]] = []
     for old, new in pairs:
@@ -6508,6 +6518,7 @@ def _run_instead_of(
                 new = result
         if result is not None:
             done.append(result)
+    executor.fire_statement_triggers(storage, db, catalog, session, view_rel, event, "AFTER")
     n = len(done)
     tag = f"INSERT 0 {n}" if event == "INSERT" else f"{event} {n}"
     returning = stmt.args.get("returning")
