@@ -351,8 +351,8 @@ def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
 
 class TestTriggersThisServerCannotRun:
     """A trigger the Rust server stored that this server cannot run refuses
-    the write it would fire on (0A000) rather than being skipped: UPDATE OF,
-    transition tables, constraint triggers, and every path that fires nothing (ON CONFLICT ...)."""
+    the write it would fire on (0A000) rather than being skipped: constraint
+    (deferrable) triggers and INSTEAD OF."""
 
     @pytest.fixture()
     def rt(self, storage, session):
@@ -368,7 +368,7 @@ class TestTriggersThisServerCannotRun:
         assert "cannot run on this server" in str(ei.value)
 
     def test_unrunnable_shapes_refuse_their_writes(self, rt, session):
-        _rust_trigger(rt, "trans", "AFTER", ["INSERT"], level="STATEMENT", transition_new="nt")
+        _rust_trigger(rt, "cons", "AFTER", ["INSERT"], constraint=True)
         self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
         assert run(rt, session, "select t from rt").rows == [("a",)]
 
@@ -380,8 +380,8 @@ class TestTriggersThisServerCannotRun:
         run(rt, session, "update rt set t = 'dogs' where id = 2")
         assert run(rt, session, "select ts::text from rt where id = 2").rows == [("'dog':1",)]
 
-    def test_on_conflict_with_a_transition_table_refuses(self, rt, session):
-        _rust_trigger(rt, "ins", "AFTER", ["INSERT"], level="STATEMENT", transition_new="nt")
+    def test_on_conflict_with_a_constraint_trigger_refuses(self, rt, session):
+        _rust_trigger(rt, "ins", "AFTER", ["INSERT"], constraint=True)
         self._refused(
             rt, session, "insert into rt (id, t) values (1, 'b') on conflict (id) do nothing"
         )
@@ -650,3 +650,116 @@ class TestTriggersOnEveryWritePath:
             ("s_ai:AFTER:INSERT:STATEMENT",),
         ]
         assert rows == [(1, "x!"), (2, "b!"), (5, "n!"), (13, "D!"), (14, "D!")]
+
+
+TRANSITION_SQL = """\
+create table tb20_t(id int primary key, v text);
+create table tb20_log(msg text);
+create function tb20_ins() returns trigger language plpgsql as $$ begin
+insert into tb20_log
+select tg_name||':'||tg_level||':'||string_agg(id||'='||v, ',' order by id) from nt;
+return null; end $$;
+create function tb20_upd() returns trigger language plpgsql as $$ begin
+insert into tb20_log
+select tg_name||':'||tg_level
+  ||':'||coalesce(string_agg(o.id||':'||o.v||'>'||n.v, ',' order by o.id), 'none')
+  from ot o join nt n on n.id = o.id;
+return null; end $$;
+create function tb20_del() returns trigger language plpgsql as $$ begin
+insert into tb20_log
+select tg_name||':'||tg_level||':'||count(*)
+  ||':'||coalesce(string_agg(v, ',' order by id), '') from ot;
+return null; end $$;
+create trigger a_ins after insert on tb20_t
+  referencing new table as nt
+  for each statement execute function tb20_ins();
+create trigger b_insr after insert on tb20_t
+  referencing new table as nt
+  for each row execute function tb20_ins();
+create trigger c_upd after update on tb20_t
+  referencing old table as ot new table as nt
+  for each statement execute function tb20_upd();
+create trigger d_del after delete on tb20_t
+  referencing old table as ot
+  for each statement execute function tb20_del();
+insert into tb20_t values (1, 'a'), (2, 'b');
+update tb20_t set v = v || '!';
+update tb20_t set v = 'x' where id = 99;
+insert into tb20_t values (2, 'z') on conflict (id) do update set v = 'zz';
+delete from tb20_t;
+select msg from tb20_log;
+"""
+
+
+class TestTransitionTables:
+    """``REFERENCING OLD / NEW TABLE``: the AFTER trigger's function queries
+    the statement's affected rows as a relation. Expected values are
+    PostgreSQL 15's output for the same script, including the NULL an empty
+    NEW TABLE gives the INSERT half of an ON CONFLICT DO UPDATE."""
+
+    def test_matches_postgres(self, storage, session):
+        log, _rows = _scenario(storage, session, TRANSITION_SQL + "select 1;\n")
+        assert log == [
+            ("b_insr:ROW:1=a,2=b",),
+            ("b_insr:ROW:1=a,2=b",),
+            ("a_ins:STATEMENT:1=a,2=b",),
+            ("c_upd:STATEMENT:1:a>a!,2:b>b!",),
+            ("c_upd:STATEMENT:none",),
+            ("c_upd:STATEMENT:2:b!>zz",),
+            (None,),
+            ("d_del:STATEMENT:2:a!,zz",),
+        ]
+
+    def test_the_transition_table_is_gone_after_the_statement(self, storage, session):
+        run_sql(storage, DB, TRANSITION_SQL, session=session)
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, "select * from nt")
+        assert ei.value.sqlstate == "42P01"
+
+    @pytest.mark.parametrize(
+        ("ddl", "sqlstate", "message"),
+        [
+            (
+                "before insert on tb20_x referencing new table as nt for each statement",
+                "42P17",
+                "transition table name can only be specified for an AFTER trigger",
+            ),
+            (
+                "after insert or update on tb20_x referencing new table as nt for each statement",
+                "0A000",
+                "transition tables cannot be specified for triggers with more than one event",
+            ),
+            (
+                "after insert on tb20_x referencing old table as ot for each statement",
+                "42P17",
+                "OLD TABLE can only be specified for a DELETE or UPDATE trigger",
+            ),
+            (
+                "after update of id on tb20_x referencing new table as nt for each statement",
+                "0A000",
+                "transition tables cannot be specified for triggers with column lists",
+            ),
+            (
+                "after delete on tb20_x referencing new table as nt for each statement",
+                "42P17",
+                "NEW TABLE can only be specified for an INSERT or UPDATE trigger",
+            ),
+            (
+                "after truncate on tb20_x referencing old table as nt for each statement",
+                "0A000",
+                "TRUNCATE triggers with transition tables are not supported",
+            ),
+        ],
+    )
+    def test_invalid_shapes_match_postgres(self, storage, session, ddl, sqlstate, message):
+        run(storage, session, "create table tb20_x(id int)")
+        run(
+            storage,
+            session,
+            "create function tb20_n() returns trigger language plpgsql as "
+            "$$ begin return null; end $$",
+        )
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, f"create trigger e {ddl} execute function tb20_n()")
+        assert ei.value.sqlstate == sqlstate
+        assert message in str(ei.value)

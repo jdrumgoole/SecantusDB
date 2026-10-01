@@ -1300,6 +1300,71 @@ _TRIGGER_EVENTS = ("INSERT", "UPDATE", "DELETE", "TRUNCATE")
 # The column names the running UPDATE's SET list targets, for ``UPDATE OF``
 # triggers (PostgreSQL fires one when ANY listed column is a SET target,
 # whether or not its value changes). None outside an UPDATE.
+# The rows a running statement affected, per event, as ``(old, new)`` pairs --
+# what an AFTER trigger's transition tables (``REFERENCING OLD / NEW TABLE``)
+# hold. None outside the AFTER phase of a write.
+_TRANSITION: contextvars.ContextVar[dict[str, list[tuple[Any, Any]]] | None] = (
+    contextvars.ContextVar("_TRANSITION", default=None)
+)
+
+
+@contextlib.contextmanager
+def transition_rows(rows: dict[str, list[tuple[Any, Any]]]) -> Any:
+    """Bind the statement's affected rows for its AFTER triggers."""
+    token = _TRANSITION.set(rows)
+    try:
+        yield
+    finally:
+        _TRANSITION.reset(token)
+
+
+@contextlib.contextmanager
+def _transition_tables(
+    trg: dict[str, Any], op: str, table: Any, storage: Any, db: str, catalog: Any, session: Any
+) -> Any:
+    """Materialise ``trg``'s transition tables as session temp tables for the
+    length of the call, so the function's queries resolve ``nt`` / ``ot``
+    like any relation (a temp table shadows a permanent one, as the
+    ephemeral relation does in PostgreSQL)."""
+    import copy
+    import uuid
+
+    from secantus.sql.catalog import TableDef
+
+    wanted = [
+        (name, side)
+        for name, side in ((trg.get("transition_old"), 0), (trg.get("transition_new"), 1))
+        if name
+    ]
+    if not wanted or session is None or table is None:
+        yield
+        return
+    pairs = (_TRANSITION.get() or {}).get(op, [])
+    made: list[tuple[str, str]] = []
+    try:
+        for name, side in wanted:
+            qualified = f"{session.ensure_temp_schema()}.{name}"
+            coll = f"__transition_{uuid.uuid4().hex}"
+            catalog.put(
+                db,
+                TableDef(
+                    name=qualified,
+                    collection=coll,
+                    columns=copy.deepcopy(table.columns),
+                    temp=True,
+                ),
+            )
+            made.append((qualified, coll))
+            docs = [copy.deepcopy(p[side]) for p in pairs if p[side] is not None]
+            if docs:
+                storage.insert(db, coll, docs)
+        yield
+    finally:
+        for qualified, coll in made:
+            catalog.drop(db, qualified)
+            storage.drop_collection(db, coll)
+
+
 _UPDATE_TARGETS: contextvars.ContextVar[frozenset[str] | None] = contextvars.ContextVar(
     "_UPDATE_TARGETS", default=None
 )
@@ -1315,8 +1380,6 @@ def _firable_here(trg: dict[str, Any]) -> bool:
         trg.get("timing") in ("BEFORE", "AFTER")
         and trg.get("level", "ROW") in ("ROW", "STATEMENT")
         and all(e in _TRIGGER_EVENTS for e in _trigger_events(trg))
-        and not trg.get("transition_new")
-        and not trg.get("transition_old")
         and not trg.get("constraint")
     )
 
@@ -1405,6 +1468,23 @@ def _call_trigger(
     func = catalog.get_function(db, trg["function"], 0)
     if func is None:
         raise errors.SQLError("42883", f"function {trg['function']}() does not exist")
+    if trg.get("transition_old") or trg.get("transition_new"):
+        tdef = catalog.get(db, table)
+        with _transition_tables(trg, op, tdef, ctx.storage, db, catalog, ctx.session):
+            return plpgsql.invoke_trigger(
+                func,
+                new,
+                ctx,
+                old_record=old,
+                tg={
+                    "op": op,
+                    "when": trg.get("timing"),
+                    "level": trg.get("level", "ROW"),
+                    "name": trg.get("name"),
+                    "table": table,
+                    "args": list(trg.get("args") or []),
+                },
+            )
     return plpgsql.invoke_trigger(
         func,
         new,
@@ -1422,8 +1502,19 @@ def _call_trigger(
 
 
 def fire_statement_triggers(
-    storage: Any, db: str, catalog: Any, session: Any, table: Any, event: str, timing: str
+    storage: Any,
+    db: str,
+    catalog: Any,
+    session: Any,
+    table: Any,
+    event: str,
+    timing: str,
+    transition: list[tuple[Any, Any]] | None = None,
 ) -> None:
+    if transition is not None and _TRANSITION.get() is None:
+        with transition_rows({event: transition}):
+            fire_statement_triggers(storage, db, catalog, session, table, event, timing)
+        return
     """Run ``table``'s FOR EACH STATEMENT triggers for ``event``: once, even
     when no row is touched, with NEW and OLD NULL."""
     trgs = _triggers(catalog, db, table, event, timing, "STATEMENT")
@@ -1479,6 +1570,9 @@ def fire_row_triggers(
     trgs = _triggers(catalog, db, table, event, timing, "ROW")
     if not trgs:
         return pairs
+    if timing == "AFTER" and _TRANSITION.get() is None:
+        with transition_rows({event: pairs}):
+            return fire_row_triggers(storage, db, catalog, session, table, event, timing, pairs)
     ctx = _trigger_ctx(storage, db, catalog, session)
     out = []
     for old, new in pairs:
@@ -1576,7 +1670,16 @@ def execute_insert(
         "AFTER",
         [(None, d) for d in plan.docs[:inserted]],
     )
-    fire_statement_triggers(storage, db, catalog, session, plan.table, "INSERT", "AFTER")
+    fire_statement_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        plan.table,
+        "INSERT",
+        "AFTER",
+        transition=[(None, d) for d in plan.docs[:inserted]],
+    )
     if plan.returning is not None:
         return _returning_result(
             plan.docs[:inserted],
@@ -2173,11 +2276,15 @@ def _execute_insert_on_conflict(
                 _validate_check_option([updated], plan.check_option, plan.table, sctx)
             affected += 1
             result_docs.append(updated)
+    by_event: dict[str, list[tuple[Any, Any]]] = {"INSERT": [], "UPDATE": []}
     for event, old, new in after_rows:
-        fire_row_triggers(storage, db, catalog, session, table, event, "AFTER", [(old, new)])
-    if do_update:
-        fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "AFTER")
-    fire_statement_triggers(storage, db, catalog, session, table, "INSERT", "AFTER")
+        by_event[event].append((old, new))
+    with transition_rows(by_event):
+        for event, old, new in after_rows:
+            fire_row_triggers(storage, db, catalog, session, table, event, "AFTER", [(old, new)])
+        if do_update:
+            fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "AFTER")
+        fire_statement_triggers(storage, db, catalog, session, table, "INSERT", "AFTER")
     tag = f"INSERT 0 {affected}"
     if plan.returning is not None:
         return _returning_result(
@@ -3465,7 +3572,16 @@ def _execute_update_materialized_body(
         "AFTER",
         list(zip(matched, posts, strict=True)),
     )
-    fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "AFTER")
+    fire_statement_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        table,
+        "UPDATE",
+        "AFTER",
+        transition=list(zip(matched, posts, strict=True)),
+    )
     n = len(matched)
     if plan.returning is not None:
         return _returning_result(
@@ -3760,6 +3876,10 @@ def execute_delete(
     row_triggered = bool(
         _triggers(catalog, db, plan.table, "DELETE", "BEFORE", "ROW")
         or _triggers(catalog, db, plan.table, "DELETE", "AFTER", "ROW")
+        or any(
+            t.get("transition_old")
+            for t in _triggers(catalog, db, plan.table, "DELETE", "AFTER", "STATEMENT")
+        )
     )
     # RETURNING yields the deleted rows, so snapshot them before the delete. FK
     # enforcement also needs the victims, and so does a row trigger (OLD).
@@ -3805,7 +3925,16 @@ def execute_delete(
         )
     else:
         n = storage.delete_matching(db, coll, plan.filter)
-    fire_statement_triggers(storage, db, catalog, session, plan.table, "DELETE", "AFTER")
+    fire_statement_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        plan.table,
+        "DELETE",
+        "AFTER",
+        transition=[(v, None) for v in victims],
+    )
     if plan.returning is not None:
         return _returning_result(
             victims, plan.returning, f"DELETE {n}", n, plan.table, storage, db, catalog, session

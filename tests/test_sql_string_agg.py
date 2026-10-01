@@ -139,3 +139,41 @@ def test_percentile_cont_supported(t, session):
 def test_mode_supported(t, session):
     # ids are all distinct -> the smallest.
     assert run(t, session, "SELECT mode() WITHIN GROUP (ORDER BY id) FROM t").rows == [(1,)]
+
+
+class TestNestedStringAgg:
+    """A ``string_agg`` inside an expression keeps its in-call ORDER BY (it was
+    dropped -- a silent wrong order), works over a JOIN (it was a 0A000), and
+    ``||`` over a non-text operand casts it to text (it was an XX000). Each
+    expected value is PostgreSQL 15's."""
+
+    @pytest.fixture
+    def t(self, storage, session):
+        run(storage, session, "create table nsa(id int primary key, v text)")
+        run(storage, session, "insert into nsa values (1,'a'),(2,'b'),(3,null),(4,'c')")
+        return storage
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("select coalesce(string_agg(v, ',' order by id desc), 'x') from nsa", "c,b,a"),
+            ("select 'x' || string_agg(v, ',' order by v desc) from nsa", "xc,b,a"),
+            (
+                "select 'x' || string_agg(id || v, ',' order by v desc nulls last, id) from nsa",
+                "x4c,2b,1a",
+            ),
+            ("select string_agg(id || '=' || v, ',' order by id) from nsa", "1=a,2=b,4=c"),
+            (
+                "select 'x' || string_agg(o.v, ',' order by o.id desc) "
+                "from nsa o join nsa n on n.id = o.id",
+                "xc,b,a",
+            ),
+            (
+                "select coalesce(string_agg(o.v, ','), 'none') "
+                "from nsa o join nsa n on n.id = o.id and false",
+                "none",
+            ),
+        ],
+    )
+    def test_matches_postgres(self, t, session, sql, expected):
+        assert run(t, session, sql).rows == [(expected,)]

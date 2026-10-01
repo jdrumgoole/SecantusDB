@@ -1331,14 +1331,19 @@ def _run_merge(
     token = _MERGE_AFTER.set([])
     try:
         result = _run_merge_body(stmt, storage, db, catalog, session, target)
-        for event, old, new in _MERGE_AFTER.get():
+        queued = _MERGE_AFTER.get()
+    finally:
+        _MERGE_AFTER.reset(token)
+    by_event: dict[str, list[tuple[Any, Any]]] = {e: [] for e in ("INSERT", "UPDATE", "DELETE")}
+    for event, old, new in queued:
+        by_event[event].append((old, new))
+    with executor.transition_rows(by_event):
+        for event, old, new in queued:
             executor.fire_row_triggers(
                 storage, db, catalog, session, target, event, "AFTER", [(old, new)]
             )
-    finally:
-        _MERGE_AFTER.reset(token)
-    for event in reversed(events):
-        executor.fire_statement_triggers(storage, db, catalog, session, target, event, "AFTER")
+        for event in reversed(events):
+            executor.fire_statement_triggers(storage, db, catalog, session, target, event, "AFTER")
     return result
 
 
@@ -1620,7 +1625,16 @@ def _run_delete_using(
     executor.fire_row_triggers(
         storage, db, catalog, session, target, "DELETE", "AFTER", [(v, None) for v in victims]
     )
-    executor.fire_statement_triggers(storage, db, catalog, session, target, "DELETE", "AFTER")
+    executor.fire_statement_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        target,
+        "DELETE",
+        "AFTER",
+        transition=[(v, None) for v in victims],
+    )
     n = len(victims)
     returning = planner._returning_columns(stmt, target)
     if returning is not None:
@@ -1777,7 +1791,9 @@ def _run_update_from_body(
         updated.append(post)
         pairs.append((tdoc, post))
     executor.fire_row_triggers(storage, db, catalog, session, target, "UPDATE", "AFTER", pairs)
-    executor.fire_statement_triggers(storage, db, catalog, session, target, "UPDATE", "AFTER")
+    executor.fire_statement_triggers(
+        storage, db, catalog, session, target, "UPDATE", "AFTER", transition=pairs
+    )
     n = len(updated)
     if returning is not None:
         return executor._returning_result(updated, returning, f"UPDATE {n}", n, target, storage, db)
@@ -4536,6 +4552,47 @@ def _drop_policy_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLRes
     return SQLResult(command_tag="DROP POLICY")
 
 
+def _trigger_transition(
+    tp: exp.Expression, timing: str, events: list[str], event_nodes: list[exp.Expression]
+) -> dict[str, str]:
+    """``REFERENCING OLD TABLE AS o NEW TABLE AS n``: the catalog keys the
+    Rust server writes, after PostgreSQL's checks in PostgreSQL's order."""
+    ref = tp.args.get("referencing")
+    if not ref:
+        return {}
+    old, new = ref.args.get("old"), ref.args.get("new")
+    if "TRUNCATE" in events:
+        raise errors.feature_not_supported(
+            "TRUNCATE triggers with transition tables are not supported"
+        )
+    if len(events) > 1:
+        raise errors.feature_not_supported(
+            "transition tables cannot be specified for triggers with more than one event"
+        )
+    if any(e.args.get("columns") for e in event_nodes):
+        raise errors.feature_not_supported(
+            "transition tables cannot be specified for triggers with column lists"
+        )
+    if timing != "AFTER":
+        raise errors.SQLError(
+            "42P17", "transition table name can only be specified for an AFTER trigger"
+        )
+    if old is not None and events[0] == "INSERT":
+        raise errors.SQLError(
+            "42P17", "OLD TABLE can only be specified for a DELETE or UPDATE trigger"
+        )
+    if new is not None and events[0] == "DELETE":
+        raise errors.SQLError(
+            "42P17", "NEW TABLE can only be specified for an INSERT or UPDATE trigger"
+        )
+    out = {}
+    if old is not None:
+        out["transition_old"] = old.name
+    if new is not None:
+        out["transition_new"] = new.name
+    return out
+
+
 def _run_truncate(
     stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catalog, session: Any = None
 ) -> SQLResult:
@@ -5668,12 +5725,11 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
         unsupported = "this trigger event"
     elif "TRUNCATE" in events and for_each == "ROW":
         raise errors.feature_not_supported("TRUNCATE FOR EACH ROW triggers are not supported")
-    elif tp.args.get("referencing"):
-        unsupported = "trigger transition tables (REFERENCING)"
     elif tp.args.get("constraint"):
         unsupported = "constraint triggers"
     if unsupported is not None or table_node is None:
         raise errors.feature_not_supported(f"{unsupported or 'this trigger'} are not supported")
+    transition = _trigger_transition(tp, timing, events, event_nodes)
     tname = planner.qualified_table_name(table_node)
     if catalog.get(db, tname) is None:
         raise errors.undefined_table(tname)
@@ -5732,6 +5788,7 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
             "function": fn_name,
             "args": args,
             "update_columns": update_columns,
+            **transition,
             **({"when": when.sql(dialect="postgres")} if (when := tp.args.get("when")) else {}),
         },
     )
