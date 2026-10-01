@@ -6881,12 +6881,23 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   `$sort: {x: -1, _id: 1}` over `[[3], [1, 2, 3]]` returns `[1, 0]` on mongod,
   contradicting its own `_id` tiebreak (without the index it returns `[0, 1]`).
   `nested_value_sort.py` lists it as KNOWN.
-- [ ] **The entries table still orders document / array keys by raw BSON.** The
-  batch made every READER correct (sort walks, hint walks and range bounds no
-  longer trust that order), so no query answers differently. What is lost is
-  speed: those queries now post-sort or scan. A real fix is an `entryFormat`
-  bump with a value-ordered encoding for documents and arrays, on both servers
-  (the layout is shared).
+- [x] **The entries table orders document / array keys by VALUE -- entry format
+  4 (2026-09-30), both servers.** A document is encoded element by element --
+  the value's type rank, then the field name, then the value, the way mongod
+  compares documents (measured: type decides before name) -- and an array the
+  same without names; formats 1-3 used raw BSON, whose leading length made byte
+  order SIZE order. `tools/probes/value_order_encoding.py` checks the encoder
+  against mongod's `$cmp` over 16,110 random pairs: the old encoding disagreed
+  on 424, the new on 0, and the Rust bytes equal Python's on every value. The
+  Rust planner's refusals for document / array range bounds, partial-filter
+  implication and sort walks are lifted (arrays still refuse a sort walk: a
+  sort orders an array by its smallest or largest element); the Python planner
+  never refused, so it was scanning the wrong range until now.
+  `index_result_sets.py` 0 / 0 / 0. Nested strings now take the index's
+  collation. `_id` keys are NOT index entries and keep the old encoding
+  (`encode_id_key`), because they are stored in every document row. A store
+  whose indexes were written by an older build is refused at open with the
+  usual `IncompatibleStorageFormatError` -- drop and recreate its indexes.
 - [x] **The Go gauge was re-run 2026-09-30** with `--noop-heartbeat-seconds 10`
   reaching the Rust server (checked in the daemon's argv): 598 / 12 / 49 of
   659, 98.0%, all 659 reporting a result, no change-stream failure, and

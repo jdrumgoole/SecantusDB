@@ -77,6 +77,14 @@ fn sortkey_encode_value(
     Ok(out.map(|b| to_pybytes(py, b)))
 }
 
+/// `sortkey.encode_id_key(value)` — the frozen `_id` key encoding.
+#[pyfunction]
+fn sortkey_encode_id_key(py: Python<'_>, doc_bytes: &[u8]) -> PyResult<Option<Py<PyBytes>>> {
+    let value = unwrap_value(doc_bytes)?;
+    let out = py.detach(|| sortkey::encode_id_key(&value).ok());
+    Ok(out.map(|b| to_pybytes(py, b)))
+}
+
 /// `sortkey.encode_value_directed(value, direction, collation=)`.
 #[pyfunction]
 fn sortkey_encode_value_directed(
@@ -598,6 +606,7 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__source_tree__", env!("SECANTUS_SOURCE_TREE"))?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
+    m.add_function(wrap_pyfunction!(sortkey_encode_id_key, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches_raw, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches_batch, m)?)?;

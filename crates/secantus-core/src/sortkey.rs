@@ -219,28 +219,102 @@ fn signed_int64_sortable(n: i64) -> [u8; 8] {
     ((n as u64) ^ 0x8000_0000_0000_0000).to_be_bytes()
 }
 
-/// Encode an array as a BSON document with positional string keys, matching
-/// `secantus.sortkey._encode_array` (so array equality lines up at the index).
-fn encode_array_bytes(arr: &[Bson]) -> Result<Vec<u8>, UnsupportedValue> {
+/// Formats 1-3's array encoding (a BSON document with positional keys) -- kept
+/// only for [`encode_id_key`].
+fn legacy_array_bytes(arr: &[Bson]) -> Result<Vec<u8>, UnsupportedValue> {
     let mut doc = Document::new();
     for (i, v) in arr.iter().enumerate() {
         doc.insert(i.to_string(), v.clone());
     }
-    doc_to_escaped_bytes(&doc)
+    legacy_doc_bytes(&doc)
 }
 
-fn doc_to_escaped_bytes(doc: &Document) -> Result<Vec<u8>, UnsupportedValue> {
+/// Formats 1-3's document encoding (the escaped raw BSON) -- kept only for
+/// [`encode_id_key`].
+fn legacy_doc_bytes(doc: &Document) -> Result<Vec<u8>, UnsupportedValue> {
     let mut buf = Vec::new();
     doc.to_writer(&mut buf)
         .map_err(|e| UnsupportedValue(format!("doc encode failed: {e}")))?;
     Ok(escape(&buf))
 }
 
+/// The end of a document's or array's elements. Every element starts with its
+/// value's type rank, and every rank is >= 1, so a value that is a strict
+/// prefix of another -- fewer elements, the rest equal -- sorts first.
+const ELEMENTS_END: u8 = 0x00;
+
+/// One element's value inside a document or array: its type rank, then the rest
+/// of its key escaped and terminated, so the bytes after it cannot change the
+/// comparison (an escaped value never contains `00 00`). Byte-exact counterpart
+/// of Python's `sortkey._element_value`.
+fn element_value(v: &Bson, coll: Option<&Collation>) -> Result<(u8, Vec<u8>), UnsupportedValue> {
+    let key = encode_value(v, coll)?;
+    let mut rest = escape(&key[1..]);
+    rest.extend_from_slice(COMPOUND_SEP);
+    Ok((key[0], rest))
+}
+
+/// A document, byte-ordered the way mongod compares documents: element by
+/// element, each by the value's canonical TYPE, then the field NAME, then the
+/// value; the document that runs out first is the smaller. Entry format 4.
+/// Formats 1-3 used the raw BSON, whose leading length made byte order SIZE
+/// order -- `{a: 2, b: [3]}` sorted above `{a: 5}`, and an index range bounded
+/// by a document scanned the wrong stretch. A nested string takes the index's
+/// collation, as mongod's comparison does. Mirrors `sortkey._encode_doc`.
+fn encode_doc(d: &Document, coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
+    let mut out = Vec::new();
+    for (name, v) in d {
+        let (rank, rest) = element_value(v, coll)?;
+        out.push(rank);
+        out.extend(escape(name.as_bytes()));
+        out.extend_from_slice(COMPOUND_SEP);
+        out.extend(rest);
+    }
+    out.push(ELEMENTS_END);
+    Ok(out)
+}
+
+/// An array: its elements in order, as [`encode_doc`] without the names -- two
+/// arrays' names are the same positions, so they never decide.
+fn encode_array(a: &[Bson], coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
+    let mut out = Vec::new();
+    for v in a {
+        let (rank, rest) = element_value(v, coll)?;
+        out.push(rank);
+        out.extend(rest);
+    }
+    out.push(ELEMENTS_END);
+    Ok(out)
+}
+
+/// The `_id` key: [`encode_value`] with formats 1-3's document / array encoding,
+/// frozen.
+///
+/// An `_id` key is not an index entry. It is stored in every document row and
+/// keys the `_id` index, so changing it would strand every stored document whose
+/// `_id` is a document -- its lookups would compute a key no row carries,
+/// silently. Entry format 4 changed how documents and arrays ORDER in secondary
+/// indexes; an `_id` key only needs to be the same bytes for the same value,
+/// which the old encoding already is. Mirrors `sortkey.encode_id_key`.
+pub fn encode_id_key(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
+    match v {
+        Bson::Document(d) => {
+            let mut out = vec![RANK_DOCUMENT];
+            out.extend(legacy_doc_bytes(d)?);
+            Ok(out)
+        }
+        Bson::Array(a) => {
+            let mut out = vec![RANK_ARRAY];
+            out.extend(legacy_array_bytes(a)?);
+            Ok(out)
+        }
+        other => encode_value(other, None),
+    }
+}
+
 /// Byte-sortable encoding of a single BSON value. Byte-exact counterpart of
 /// `secantus.sortkey.encode_value`. `coll` is the index's collation (or `None`);
-/// it applies only to top-level string values — strings nested inside documents
-/// / arrays are encoded as raw BSON, matching Python's `_encode_doc` /
-/// `_encode_array` (which don't thread collation).
+/// it applies to every string, nested ones included (entry format 4).
 pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
     let mut out = Vec::new();
     match v {
@@ -282,11 +356,11 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
         }
         Bson::Document(d) => {
             out.push(RANK_DOCUMENT);
-            out.extend(doc_to_escaped_bytes(d)?);
+            out.extend(encode_doc(d, coll)?);
         }
         Bson::Array(a) => {
             out.push(RANK_ARRAY);
-            out.extend(encode_array_bytes(a)?);
+            out.extend(encode_array(a, coll)?);
         }
         Bson::Binary(b) => {
             out.push(RANK_BINDATA);
@@ -387,6 +461,49 @@ mod tests {
 
     fn ev(v: Bson) -> Vec<u8> {
         encode_value(&v, None).unwrap()
+    }
+
+    /// Entry format 4: documents and arrays keyed by VALUE. Each pair is
+    /// `a < b` by mongod 8.2.11's `$cmp` (measured 2026-09-30); the same pairs
+    /// are in Python's `test_sortkey.py`.
+    #[test]
+    fn documents_and_arrays_are_keyed_by_value() {
+        use bson::{bson, doc};
+        let pairs: Vec<(Bson, Bson)> = vec![
+            // a longer document is not a larger one: raw BSON said it was
+            (bson!({"a": 2, "b": [3]}), bson!({"a": 5})),
+            (bson!({"a": 1}), bson!({"a": 1, "b": 0})),
+            (Bson::Document(doc! {}), bson!({"a": Bson::MinKey})),
+            // the element's TYPE decides before its field NAME
+            (bson!({"b": 1}), bson!({"a": "x"})),
+            (bson!({"a": 1}), bson!({"b": 1})),
+            (bson!({"a": 1}), bson!({"a": 2})),
+            (bson!([9]), bson!([10])),
+            (bson!([1, 2, 3]), bson!([9])),
+            (bson!([1, 2]), bson!([1, 2, 0])),
+            (bson!([]), bson!([Bson::MinKey])),
+            (bson!({"a": {"b": 1}}), bson!({"a": {"b": 1, "c": 0}})),
+            (bson!({"a": [1, {"x": 2}]}), bson!({"a": [1, {"x": 3}]})),
+        ];
+        for (a, b) in pairs {
+            assert!(ev(a.clone()) < ev(b.clone()), "{a} should sort below {b}");
+        }
+        // mongod compares {a: 1} and {a: 1.0} equal; raw BSON did not.
+        assert_eq!(ev(bson!({"a": 1})), ev(bson!({"a": 1.0})));
+    }
+
+    /// An `_id` key keeps formats 1-3's document encoding: it is stored in
+    /// every document row.
+    #[test]
+    fn the_id_key_keeps_the_old_document_encoding() {
+        use bson::doc;
+        let d = doc! {"b": 2, "a": [1, "x"]};
+        let mut raw = Vec::new();
+        d.to_writer(&mut raw).unwrap();
+        let mut want = vec![RANK_DOCUMENT];
+        want.extend(escape(&raw));
+        assert_eq!(encode_id_key(&Bson::Document(d)).unwrap(), want);
+        assert_eq!(encode_id_key(&Bson::Int32(5)).unwrap(), ev(Bson::Int32(5)));
     }
 
     #[test]
