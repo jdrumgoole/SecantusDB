@@ -72,11 +72,10 @@ jobs:
 
       - name: Publish in dependency order
         if: github.event_name == 'push' || !inputs.dry_run
-        working-directory: ${{ runner.temp }}/stage
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           CARGO_TARGET_DIR: ${{ runner.temp }}/stage/target
-        # `--workspace` publishes every member in dependency order and waits
-        # for each to reach the index before publishing its dependents. The
-        # previous step already verified each tarball.
-        run: cargo publish --workspace --allow-dirty --no-verify
+        # One crate at a time, skipping any version already on crates.io, so a
+        # run that failed part way is fixed by re-running it on the same tag.
+        # The previous step already verified each tarball.
+        run: python scripts/crates_publish.py "$RUNNER_TEMP/stage"
