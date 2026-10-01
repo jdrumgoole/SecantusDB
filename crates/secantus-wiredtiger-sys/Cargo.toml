@@ -9,7 +9,7 @@ links = "wiredtiger"
 build = "build.rs"
 # The WiredTiger copy is gitignored (scripts/wt_sys_refresh.py writes it), so
 # it has to be named here or `cargo package` would leave it out.
-include = ["build.rs", "src/**", "wiredtiger/**", "wiredtiger.sha256", "README.md"]
+include = ["build.rs", "src/**", "wiredtiger/**", "wiredtiger.sha256", "wiredtiger.manifest", "README.md"]
 
 # Standalone, like secantus-wt: it builds C, which the clean workspace does not.
 [workspace]

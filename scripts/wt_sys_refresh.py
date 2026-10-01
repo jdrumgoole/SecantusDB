@@ -40,6 +40,8 @@ VENDOR = REPO / "vendor" / "wiredtiger"
 CRATE = REPO / "crates" / "secantus-wiredtiger-sys"
 DEFAULT_DEST = CRATE / "wiredtiger"
 STAMP = CRATE / "wiredtiger.sha256"
+# Per-file hashes, so a mismatch names the files rather than only failing.
+MANIFEST = CRATE / "wiredtiger.manifest"
 
 # Top-level entries of vendor/wiredtiger that the library build does not need.
 SKIP_TOP = {"bench", "examples", "lang", "test", "tools", ".git", ".github"}
@@ -121,19 +123,30 @@ def _patch(dest: Path) -> None:
         )
 
 
-def digest(root: Path) -> str:
-    """A content digest over every file's relative path and bytes."""
-    h = hashlib.sha256()
+def manifest(root: Path) -> dict[str, str]:
+    """Each file's relative path -> sha256 of its bytes."""
+    out = {}
     for path in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
-        rel = path.relative_to(root).as_posix()
-        h.update(rel.encode() + b"\0")
         data = str(path.readlink()).encode() if path.is_symlink() else path.read_bytes()
         # Line endings are not content: a Windows checkout (core.autocrlf) and
         # the patch scripts' text-mode writes both produce CRLF there, which
         # changes no byte the compiler acts on but would change the digest.
         data = data.replace(b"\r\n", b"\n")
-        h.update(hashlib.sha256(data).digest())
-    return h.hexdigest()
+        out[path.relative_to(root).as_posix()] = hashlib.sha256(data).hexdigest()
+    return out
+
+
+def render(files: dict[str, str]) -> str:
+    return "".join(f"{h}  {rel}\n" for rel, h in sorted(files.items()))
+
+
+def parse(text: str) -> dict[str, str]:
+    return {rel: h for h, rel in (line.split("  ", 1) for line in text.splitlines() if line)}
+
+
+def digest(root: Path) -> str:
+    """One digest over the whole manifest."""
+    return hashlib.sha256(render(manifest(root)).encode()).hexdigest()
 
 
 def refresh(dest: Path) -> str:
@@ -151,14 +164,20 @@ def main() -> int:
     )
     args = ap.parse_args()
     got = refresh(args.dest)
+    files = manifest(args.dest)
     if args.check:
         want = STAMP.read_text().strip()
         if got != want:
             print(f"stale: regenerated {got}, stamp says {want}", file=sys.stderr)
+            old = parse(MANIFEST.read_text())
+            for rel in sorted(set(old) | set(files)):
+                if old.get(rel) != files.get(rel):
+                    print(f"  differs: {rel} ({old.get(rel)} -> {files.get(rel)})", file=sys.stderr)
             return 1
         print(f"fresh: {got}")
         return 0
     STAMP.write_text(got + "\n")
+    MANIFEST.write_text(render(files))
     print(f"wrote {args.dest} ({got})")
     return 0
 
