@@ -1341,7 +1341,7 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
     let f = filter("SELECT id FROM w WHERE n = 1.2345678901234567890123456789012345");
     assert_eq!(
         f,
-        doc! { "n.__numkey": { "$eq": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } }
+        doc! { "n": { "$gte": Document::new() }, "n.__numkey": { "$eq": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } }
     );
     // `>` on a wide constant: every Decimal128 at or above the bracket's
     // upper neighbour, or a wide row above the key.
@@ -1358,7 +1358,7 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
         f,
         doc! { "$or": [
             { "n": { "$gte": hi } },
-            { "n.__numkey": { "$gt": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } },
+            { "n": { "$gte": Document::new() }, "n.__numkey": { "$gt": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } },
             { "n": &nan },
         ]}
     );
@@ -1383,7 +1383,7 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
         f,
         doc! { "$or": [
             { "n": { "$lt": Bson::Decimal128("5".parse().unwrap()) } },
-            { "n.__numkey": { "$lt": numeric::numeric_sort_key("5") } },
+            { "n": { "$gte": Document::new() }, "n.__numkey": { "$lt": numeric::numeric_sort_key("5") } },
         ]}
     );
     // A non-numeric column is lowered as before.

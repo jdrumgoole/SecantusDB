@@ -647,8 +647,11 @@ remain open:
         (`PARTITION BY HASH`, expression keys, `tableoid` everywhere, and a
         partition's own column options and constraints -- NOT NULL, DEFAULT,
         CHECK, UNIQUE, PRIMARY KEY, enforced -- landed in batch 10.) A
-        partition's UNIQUE / PRIMARY KEY is checked by scanning the
-        partition's rows per write, not by an index.
+        partition's UNIQUE / PRIMARY KEY check reads the partition's rows per
+        statement; re-measured in batch 15 it is NOT a cost in practice --
+        single-row inserts stay flat at 20,000 rows (~2.3 ms over a plain
+        table's, debug build, spread across catalog reads rather than the
+        check).
       - The ruleutils deparser (`secantus-pgplan/src/ruleutils.rs`, batch 11)
         prints views, rules and stored expressions from a small analyser; a
         shape outside it falls back to the text as written -- see the batch
@@ -725,10 +728,16 @@ remain open:
       (`secantus-pgplan/src/numeric.rs`); round-trip, `::text`, comparison,
       ORDER BY, `+ - * /`, `sum` / `min` / `max` and the numeric PRIMARY KEY
       path all match PG 16.15. Left open, each measured:
-  - a numeric-column predicate lowers to an `$or` of a Decimal128 arm and a
-    `__numkey` arm (plus a NaN arm for `>` / `>=`), so it never IXSCANs a
-    secondary index; the `_id` index (numeric PRIMARY KEY) does resolve by
-    value. (Typmod rounding, `avg(numeric)`, and literal coercion were
+  - (FIXED batch 15) a numeric-column predicate lowers to an `$or` of a
+    Decimal128 arm and a `__numkey` arm, which never used a secondary index:
+    `n = 5` over 20,000 rows took 820 ms (an `int` column 0.9 ms). Now the
+    wide arm also says `n >= {}` (every wide row is a document, so that
+    document-bracket range holds exactly them), storage answers an `$or`
+    whose every branch indexes as the union of the branches (intersected
+    across ANDed `$or`s, RecordId-ordered so documents arrive in scan
+    order), and an index range takes that one document bound. `n = 5`
+    1.2 ms, `BETWEEN` 1.9 s -> 17 ms. Corpus `numeric_index`. Mongo's
+    `explain` does not yet report the OR plan (it still says COLLSCAN). (Typmod rounding, `avg(numeric)`, and literal coercion were
     re-measured fixed in batch 10.)
 - [ ] **OPEN — RUST pgserver: constraints -- what is left after multi-column
       FOREIGN KEYs landed (2026-09-29).** NOT NULL / CHECK / UNIQUE / FOREIGN

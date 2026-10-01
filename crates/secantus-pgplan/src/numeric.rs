@@ -498,7 +498,11 @@ pub fn numeric_filter(field: &str, mql_op: &str, value: &Bson) -> Option<Documen
         "$lte" => Some(doc! { field: { "$lte": lo } }),
         _ => return None,
     };
-    let wide = doc! { wide_field: { mql_op: key } };
+    // Every wide row is a DOCUMENT, so `field >= {}` (the document type
+    // bracket) holds exactly the wide rows: it gives the arm a clause an
+    // index on `field` can range-scan, and with the narrow arm the whole
+    // `$or` routes through that index instead of a collection scan.
+    let wide = doc! { field: { "$gte": Document::new() }, wide_field: { mql_op: key } };
     let mut arms = Vec::new();
     arms.extend(narrow);
     arms.push(wide);

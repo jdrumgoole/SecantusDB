@@ -10801,6 +10801,8 @@ impl Storage {
             docs
         } else if let Some(id_keys) = self.try_residual_index_id_keys(&session, db, coll, filter)? {
             self.docs_by_recordids(&session, db, coll, &id_keys)?
+        } else if let Some(id_keys) = self.try_or_index_id_keys(&session, db, coll, filter)? {
+            self.docs_by_recordids(&session, db, coll, &id_keys)?
         } else if filter.is_empty() || sort.is_some() {
             // With a non-empty filter nothing indexes, so the choice is a scan
             // plus a blocking sort, or a walk of the SORT index that filters
@@ -12530,6 +12532,70 @@ impl Storage {
         Ok(None)
     }
 
+    /// An `$or` whose EVERY branch routes through an index: the union of the
+    /// branches' candidates -- mongod's OR plan -- intersected across every
+    /// such `$or` the filter ANDs. The `$or` may be the filter's
+    /// own clause or a conjunct of its `$and`; the caller's full-filter pass
+    /// checks everything else. A branch of several fields routes through any
+    /// one of them (`try_residual_index_id_keys`). The union is ordered by
+    /// RecordId, which is insertion order, so the documents arrive in the
+    /// order a collection scan gives.
+    fn try_or_index_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<i64>>> {
+        let mut ors: Vec<&Vec<Bson>> = Vec::new();
+        if let Ok(arms) = filter.get_array("$or") {
+            ors.push(arms);
+        }
+        if let Ok(conjuncts) = filter.get_array("$and") {
+            for c in conjuncts {
+                if let Bson::Document(d) = c {
+                    if d.len() == 1 {
+                        if let Ok(arms) = d.get_array("$or") {
+                            ors.push(arms);
+                        }
+                    }
+                }
+            }
+        }
+        // Each indexable `$or` gives a superset of the matches, so several
+        // (a BETWEEN over a numeric is two) INTERSECT.
+        let mut best: Option<Vec<i64>> = None;
+        'or: for arms in ors {
+            if arms.is_empty() {
+                continue;
+            }
+            let mut ids: Vec<i64> = Vec::new();
+            for arm in arms {
+                let Bson::Document(branch) = arm else {
+                    continue 'or;
+                };
+                let found = match self.try_index_id_keys(session, db, coll, branch)? {
+                    Some(found) => found,
+                    None => match self.try_residual_index_id_keys(session, db, coll, branch)? {
+                        Some(found) => found,
+                        None => continue 'or,
+                    },
+                };
+                ids.extend(found);
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            best = Some(match best {
+                None => ids,
+                Some(prev) => {
+                    let keep: HashSet<i64> = ids.into_iter().collect();
+                    prev.into_iter().filter(|id| keep.contains(id)).collect()
+                }
+            });
+        }
+        Ok(best)
+    }
+
     /// Route `filter` to a set of candidate `id_key`s via an index, or `None`
     /// (caller does a COLLSCAN). The `_id` point-lookup fast path, compound
     /// bare-equality prefix, compound prefix + trailing operator, and
@@ -12943,7 +13009,22 @@ impl Storage {
         let mut upper: Option<Vec<u8>> = None;
         let mut upper_incl = true;
         for (op, bound) in opdoc {
-            if matches!(bound, Bson::Document(_)) {
+            // `$gte: {}` -- every document (the type bracket's floor): the
+            // keys from the empty document's up to the next type's first.
+            // The one document bound walked; the PostgreSQL server marks a
+            // wide numeric's rows with it so they can share the index.
+            if let Bson::Document(d) = bound {
+                if op == "$gte" && d.is_empty() && direction == 1 && opdoc.len() == 1 {
+                    let floor = enc_dir(bound, direction)?;
+                    let Some(&rank) = floor.first() else {
+                        return Ok(None);
+                    };
+                    lower = Some(floor);
+                    lower_incl = true;
+                    upper = Some(vec![rank.saturating_add(1)]);
+                    upper_incl = false;
+                    continue;
+                }
                 return Ok(None);
             }
             if op == "$eq" {
@@ -14740,6 +14821,65 @@ mod tests {
     /// index than without it, no error. The Python server carried the same four
     /// and was fixed in the same batch; nothing caught these on the Rust side
     /// because the parity suites cover the pure operator engines, not storage.
+    /// An `$or` routed through the indexes (one per branch, unioned, and
+    /// intersected across ANDed `$or`s) answers exactly the documents a
+    /// collection scan does, in the same (insertion) order -- across a sparse
+    /// index, multikey arrays, nulls, missing fields and the document bracket.
+    #[test]
+    fn or_plan_matches_a_collection_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("src");
+        std::fs::create_dir_all(&home).unwrap();
+        let s = Storage::open(home.to_str().unwrap()).unwrap();
+        s.create_index("app", "o", "a_1", &doc! {"a": 1i32}, &doc! {})
+            .unwrap();
+        s.create_index("app", "o", "b_1", &doc! {"b": 1i32}, &doc! {"sparse": true})
+            .unwrap();
+        let docs = vec![
+            doc! {"_id": 1i32, "a": 5i32, "b": 1i32},
+            doc! {"_id": 2i32, "a": Bson::Null},
+            doc! {"_id": 3i32, "b": 7i32},
+            doc! {"_id": 4i32, "a": [5i32, 9i32], "b": 2i32},
+            doc! {"_id": 5i32, "a": {"__numkey": "x"}, "b": 7i32},
+            doc! {"_id": 6i32, "a": 5.0f64, "b": Bson::Null},
+            doc! {"_id": 7i32, "a": "5"},
+            doc! {"_id": 8i32, "a": {}, "b": 3i32},
+        ];
+        s.insert(
+            "app",
+            "o",
+            docs.iter().map(|d| encode_doc(d).unwrap()).collect(),
+            true,
+        )
+        .unwrap();
+        let empty = Document::new();
+        for f in [
+            doc! {"$or": [{"a": 5i32}, {"b": 7i32}]},
+            doc! {"$or": [{"a": {"$gt": 4i32}}, {"b": {"$gte": 3i32}}]},
+            doc! {"$or": [{"a": Bson::Null}, {"b": 2i32}]},
+            doc! {"$or": [{"a": {"$gte": {}}}, {"a": 9i32}]},
+            doc! {"$or": [{"a": {"$gte": {}}, "a.__numkey": "x"}, {"b": 1i32}]},
+            doc! {"$and": [
+                {"$or": [{"a": {"$gte": 5i32}}, {"b": 7i32}]},
+                {"$or": [{"a": {"$lte": 5i32}}, {"b": 3i32}]},
+            ]},
+            doc! {"$or": [{"a": 5i32}, {"c": 1i32}]},
+        ] {
+            let got: Vec<i32> = s
+                .find_matching("app", "o", &f)
+                .unwrap()
+                .iter()
+                .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+                .collect();
+            let want: Vec<i32> = docs
+                .iter()
+                .filter(|d| secantus_core::query::matches(d, &f, &empty, None).unwrap())
+                .map(|d| d.get_i32("_id").unwrap())
+                .collect();
+            assert_eq!(got, want, "{f:?}");
+        }
+    }
+
     #[test]
     fn sparse_index_never_drops_absent_field_documents() {
         let dir = tempfile::tempdir().unwrap();
