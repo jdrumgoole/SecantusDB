@@ -1299,14 +1299,14 @@ _TRIGGER_EVENTS = ("INSERT", "UPDATE", "DELETE")
 
 def _firable_here(trg: dict[str, Any]) -> bool:
     """Whether this server can run ``trg`` faithfully: BEFORE or AFTER, ROW
-    or STATEMENT, on INSERT / UPDATE / DELETE -- with no WHEN condition, no
-    ``UPDATE OF`` column list, no transition tables, no constraint
-    (deferred) firing and no arguments, which it does not implement."""
+    or STATEMENT, on INSERT / UPDATE / DELETE, with or without a WHEN
+    condition -- but no ``UPDATE OF`` column list, no transition tables, no
+    constraint (deferred) firing and no arguments, which it does not
+    implement."""
     return (
         trg.get("timing") in ("BEFORE", "AFTER")
         and trg.get("level", "ROW") in ("ROW", "STATEMENT")
         and all(e in _TRIGGER_EVENTS for e in _trigger_events(trg))
-        and not trg.get("when")
         and not trg.get("update_columns")
         and not trg.get("transition_new")
         and not trg.get("transition_old")
@@ -1405,6 +1405,11 @@ def fire_statement_triggers(
         return
     ctx = _trigger_ctx(storage, db, catalog, session)
     for trg in trgs:
+        if trg.get("when"):
+            from secantus.sql import plpgsql
+
+            if not plpgsql.trigger_when(trg["when"], None, None, ctx):
+                continue
         _call_trigger(trg, catalog, db, ctx, op=event, new=None, old=None, table=table.name)
 
 
@@ -1455,6 +1460,12 @@ def fire_row_triggers(
         new_rec = _row_record(new, table)
         keep = True
         for trg in trgs:
+            # WHEN: the trigger fires only for rows the condition holds for.
+            if trg.get("when"):
+                from secantus.sql import plpgsql
+
+                if not plpgsql.trigger_when(trg["when"], new_rec, old_rec, ctx):
+                    continue
             result = _call_trigger(
                 trg, catalog, db, ctx, op=event, new=new_rec, old=old_rec, table=table.name
             )

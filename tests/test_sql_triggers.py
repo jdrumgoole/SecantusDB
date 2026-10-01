@@ -70,8 +70,6 @@ class TestDDL:
             "create trigger trg instead of insert on t2 for each row execute procedure tfn()",
             "create trigger trg before truncate on t2 execute procedure tfn()",
             "create trigger trg before update of t on t2 for each row execute procedure tfn()",
-            "create trigger trg before insert on t2 for each row when (new.t <> '') "
-            "execute procedure tfn()",
             "create trigger trg before insert on t2 for each row execute procedure tfn('x')",
         ):
             with pytest.raises(SQLError) as ei:
@@ -297,6 +295,28 @@ class TestTriggerKinds:
             ("UPDATE", "STATEMENT", "AFTER", None, None, "tk"),
         ]
 
+    def test_when_conditions_match_postgres(self, storage, session):
+        for sql in (
+            "create table tw (id int primary key, t text)",
+            "create table tw_log (op text, id int, t text)",
+            "create function tw_fn() returns trigger as $$ begin insert into tw_log values "
+            "(tg_op, coalesce(new.id, old.id), new.t); return null; end $$ language plpgsql",
+            "create trigger w1 after insert on tw for each row when (new.id > 1) "
+            "execute function tw_fn()",
+            "create trigger w2 after update on tw for each row "
+            "when (old.t is distinct from new.t) execute function tw_fn()",
+            "insert into tw values (1, 'a'), (2, 'b'), (3, null)",
+            "update tw set t = 'b' where id <= 2",
+            "update tw set t = 'c' where id = 3",
+        ):
+            run(storage, session, sql)
+        assert run(storage, session, "select * from tw_log").rows == [
+            ("INSERT", 2, "b"),
+            ("INSERT", 3, None),
+            ("UPDATE", 1, "b"),
+            ("UPDATE", 3, "c"),
+        ]
+
     def test_a_failing_statement_takes_its_triggers_writes_with_it(self, storage, session):
         for sql in self.SETUP:
             run(storage, session, sql)
@@ -333,8 +353,8 @@ def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
 
 class TestTriggersThisServerCannotRun:
     """A trigger the Rust server stored that this server cannot run refuses
-    the write it would fire on (0A000) rather than being skipped: WHEN,
-    UPDATE OF, arguments, transition tables, constraint triggers, TRUNCATE,
+    the write it would fire on (0A000) rather than being skipped: UPDATE OF,
+    arguments, transition tables, constraint triggers, TRUNCATE,
     and every path that fires nothing (ON CONFLICT ...)."""
 
     @pytest.fixture()
@@ -351,9 +371,6 @@ class TestTriggersThisServerCannotRun:
         assert "cannot run on this server" in str(ei.value)
 
     def test_unrunnable_shapes_refuse_their_writes(self, rt, session):
-        _rust_trigger(rt, "cond", "BEFORE", ["INSERT"], when="new.id > 5")
-        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
-        run(rt, session, "drop trigger cond on rt")
         _rust_trigger(rt, "cols", "BEFORE", ["UPDATE"], update_columns=["t"])
         self._refused(rt, session, "update rt set t = 'z' where id = 1")
         run(rt, session, "drop trigger cols on rt")

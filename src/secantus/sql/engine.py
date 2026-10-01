@@ -5540,8 +5540,6 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
         unsupported = "TRUNCATE triggers"
     elif any(e.args.get("columns") for e in event_nodes):
         unsupported = "UPDATE OF column-list triggers"
-    elif tp.args.get("when"):
-        unsupported = "trigger WHEN conditions"
     elif tp.args.get("referencing"):
         unsupported = "trigger transition tables (REFERENCING)"
     elif tp.args.get("constraint"):
@@ -5596,6 +5594,7 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
             "function": fn_name,
             "args": [],
             "update_columns": [],
+            **({"when": when.sql(dialect="postgres")} if (when := tp.args.get("when")) else {}),
         },
     )
     return SQLResult(command_tag="CREATE TRIGGER")

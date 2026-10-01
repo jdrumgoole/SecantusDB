@@ -860,6 +860,19 @@ def invoke_trigger(
     return result
 
 
+def trigger_when(
+    cond: str, new_record: dict | None, old_record: dict | None, ctx: scalar.ScalarContext
+) -> bool:
+    """A trigger's ``WHEN (...)`` condition over its NEW / OLD rows: the
+    trigger fires only when it is TRUE (NULL counts as false, as in SQL)."""
+    runner = _Runner(ctx, [], {})
+    env: dict[str, Any] = {
+        "new": dict(new_record) if new_record is not None else None,
+        "old": dict(old_record) if old_record is not None else None,
+    }
+    return runner._eval(cond, env) is True
+
+
 def invoke(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> Any:
     """Run a ``LANGUAGE plpgsql`` function and return its scalar result."""
     block = parse(func["body"])

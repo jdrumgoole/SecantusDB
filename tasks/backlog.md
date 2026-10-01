@@ -619,11 +619,12 @@ remain open:
       0 against PostgreSQL 14). **Cross-server:** since batch 17 the Python
       PG server runs BEFORE / AFTER, ROW / STATEMENT triggers on INSERT,
       UPDATE and DELETE (with `TG_OP` / `TG_WHEN` / `TG_LEVEL` /
-      `TG_TABLE_NAME`, NULL `OLD` / `NEW` where the event has none), and a
+      `TG_TABLE_NAME`, NULL `OLD` / `NEW` where the event has none, and a
+      `WHEN` condition over them), and a
       write that fires one is ONE transaction, so a trigger's writes roll
       back with a failing statement (`tests/test_sql_triggers.py::
       TestTriggerKinds`, checked against PostgreSQL 15's output). Every
-      other trigger -- WHEN, `UPDATE OF`, arguments, transition tables,
+      other trigger -- `UPDATE OF`, arguments, transition tables,
       constraint triggers, TRUNCATE, INSTEAD OF -- and every path that
       fires nothing (ON CONFLICT, MERGE, UPDATE FROM, DELETE USING) REFUSES
       the write (`0A000 ... cannot run on this server`) rather than
