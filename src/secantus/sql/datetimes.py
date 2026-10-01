@@ -514,6 +514,12 @@ def parse_date(value: Any) -> str:
     sentinel = datetime_sentinel(s)
     if sentinel is not None:
         return sentinel
+    if isinstance(value, str):
+        # PostgreSQL's DecodeDateTime, ported: every text spelling, the
+        # DateStyle field order, and the exact 22007 / 22008 split.
+        from secantus.sql import dtparse
+
+        return dtparse.parse_date_text(value)
     if s.lower() == "epoch":
         return "1970-01-01"
     m = _BC_DATE_RE.match(s)

@@ -612,6 +612,14 @@ remain open:
       subtransactions -- corpus `procedure_transactions`.) An EXCEPTION
       block's subtransaction is a savepoint, which captures whole tables
       (see the SAVEPOINT cost entry in section 7).
+- [ ] **OPEN — PYTHON pgserver: what the DecodeDateTime port leaves
+      (batch 27, 2026-10-01).** `dt_input` is at 0 against PostgreSQL. Left:
+      about 50 zone abbreviations (MSK and others) carry one FIXED offset in
+      `dtparse.py`, where PostgreSQL derives a date-dependent one from the
+      zone's history (the Rust server does too); `time_input` 19/37,
+      `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
+      `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
+      port of one C function family, so the split is by table, not logic).
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,
