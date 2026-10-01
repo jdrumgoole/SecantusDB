@@ -146,7 +146,11 @@ fn match_clause_raw(
             6108304,
             "no globalScriptEngine in $where parsing",
         )),
-        // $text, ... -> Python.
+        // A top-level name mongod does not know is its own error (measured
+        // 8.2.11, 2026-10-01); `$text` and the other known ones still defer.
+        _ if key.starts_with('$') && !KNOWN_TOP_LEVEL_OPERATORS.contains(&key) => {
+            Err(unknown_top_level_operator(key))
+        }
         _ if key.starts_with('$') => Err(Fallback::Defer),
         _ => {
             let reached = resolve_path_raw(raw, key)?;
@@ -278,10 +282,53 @@ fn match_clause(
             6108304,
             "no globalScriptEngine in $where parsing",
         )),
-        // $text, ... -> Python.
+        // A top-level name mongod does not know is its own error (measured
+        // 8.2.11, 2026-10-01); `$text` and the other known ones still defer.
+        _ if key.starts_with('$') && !KNOWN_TOP_LEVEL_OPERATORS.contains(&key) => {
+            Err(unknown_top_level_operator(key))
+        }
         _ if key.starts_with('$') => Err(Fallback::Defer),
         _ => field_matches(&resolve_path(doc, key), cond, coll, key),
     }
+}
+
+/// mongod's 51091 for a pattern PCRE refuses (measured 8.2.11, 2026-10-01);
+/// a pattern the checker does not recognise as malformed still defers.
+fn invalid_regex(pattern: &Bson) -> Fallback {
+    let pat = match pattern {
+        Bson::String(s) => s.as_str(),
+        Bson::RegularExpression(r) => r.pattern.as_str(),
+        _ => return Fallback::Defer,
+    };
+    match regexutil::pcre_compile_error(pat) {
+        Some(msg) => Fallback::mongo(51091, format!("Regular expression is invalid: {msg}")),
+        None => Fallback::Defer,
+    }
+}
+
+/// Top-level query operators mongod 8.2 recognises.
+const KNOWN_TOP_LEVEL_OPERATORS: &[&str] = &[
+    "$and",
+    "$or",
+    "$nor",
+    "$expr",
+    "$jsonSchema",
+    "$where",
+    "$comment",
+    "$text",
+    "$alwaysTrue",
+    "$alwaysFalse",
+    "$sampleRate",
+];
+
+fn unknown_top_level_operator(key: &str) -> Fallback {
+    Fallback::mongo(
+        2,
+        format!(
+            "unknown top level operator: {key}. If you have a field name that starts with a \
+             '$' symbol, consider using $getField or $setField."
+        ),
+    )
 }
 
 /// Resolve a dotted path into the list of values it reaches, mirroring
@@ -563,7 +610,7 @@ fn op_regex(values: &[Cand], pattern: &Bson, options: Option<&Bson>, descend: bo
     if !matches!(pattern, Bson::String(_) | Bson::RegularExpression(_)) {
         return Err(Fallback::mongo(2, "$regex has to be a string"));
     }
-    let re = regexutil::compile(pattern, options).map_err(|_| Fallback::Defer)?;
+    let re = regexutil::compile(pattern, options).map_err(|_| invalid_regex(pattern))?;
     // The regex this query denotes, for the stored-regex case below. `$regex`
     // with a separate `$options` participates too: `{$regex: "ab", $options:
     // "i"}` equals a stored `/ab/i` on mongod, while a bare `{$regex: "ab"}`
@@ -733,9 +780,14 @@ fn op_matches(
         // `$elemMatch`/`$not`) only the self-contained list / GeoJSON form is seen.
         "$near" => crate::geo::op_geo_near(values, arg, None, None, false),
         "$nearSphere" => crate::geo::op_geo_near(values, arg, None, None, true),
-        // Anything unknown -> Python (Python raises QueryError for genuinely-
-        // unknown operators). $regex/$options are intercepted in `field_matches`
-        // (they share a condition dict).
+        // A name mongod does not know at all is its own error (measured 8.2.11,
+        // 2026-10-01); a Defer reached the client as "query uses a construct
+        // the Rust server does not support". A KNOWN operator this engine does
+        // not evaluate still defers. $regex/$options are intercepted in
+        // `field_matches` (they share a condition dict).
+        _ if !KNOWN_FIELD_OPERATORS.contains(&op) => {
+            Err(Fallback::mongo(2, format!("unknown operator: {op}")))
+        }
         _ => Err(Fallback::Defer),
     }
 }

@@ -52,6 +52,10 @@ pub struct UpdateOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct DuplicateKey {
     pub errmsg: String,
+    /// Raised while applying an update to a stored document, so mongod reports
+    /// it under `Plan executor error during <command> :: caused by ::` -- see
+    /// `StorageError::WriteError::exec`. An insert's duplicate key is bare.
+    pub exec: bool,
     pub key_pattern: Option<Document>,
     pub key_value: Option<Document>,
 }

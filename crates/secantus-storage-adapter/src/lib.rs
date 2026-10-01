@@ -841,11 +841,18 @@ fn to_hint(b: RawHint<'_>) -> Hint {
 /// Translate a storage error into the command layer's pre-classified error.
 fn map_err(e: WtError) -> StorageError {
     match e {
+        // mongod's message, with the key rendered as the shell does (the Rust
+        // `Debug` form, `Document({"a": Int32(1)})`, reached clients from the
+        // update / upsert / findAndModify / index-build paths -- measured
+        // against 8.2.11, 2026-10-01). Every path that reaches here is applying
+        // a write to a stored document, hence `exec`.
         WtError::DuplicateKey(conflict) => StorageError::DuplicateKey(Box::new(DuplicateKey {
-            errmsg: format!(
-                "E11000 duplicate key error index: {} dup key: {:?}",
-                conflict.index, conflict.key_value
+            errmsg: secantus_storage::format_dup_key_errmsg(
+                &conflict.namespace,
+                &conflict.index,
+                &conflict.key_value,
             ),
+            exec: true,
             key_pattern: Some(conflict.key_pattern),
             key_value: Some(conflict.key_value),
         })),

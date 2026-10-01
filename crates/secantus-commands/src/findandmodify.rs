@@ -519,7 +519,10 @@ fn storage_err_reply(e: StorageError) -> Document {
     match e {
         StorageError::DuplicateKey(info) => {
             let mut r = doc! {
-                "ok": 0.0, "errmsg": info.errmsg, "code": 11000, "codeName": "DuplicateKey",
+                "ok": 0.0,
+                "errmsg": crate::util::exec_wrapped(info.errmsg, info.exec, "findAndModify"),
+                "code": 11000,
+                "codeName": "DuplicateKey",
             };
             if let Some(kp) = info.key_pattern {
                 r.insert("keyPattern", kp);

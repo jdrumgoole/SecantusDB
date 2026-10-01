@@ -61,7 +61,7 @@ const GENERIC_ARGS: &[&str] = &[
 ];
 
 /// Whether `key` is envelope rather than a parameter the client wants to set.
-fn is_generic_arg(key: &str) -> bool {
+pub(crate) fn is_generic_arg(key: &str) -> bool {
     key.starts_with('$') || GENERIC_ARGS.contains(&key)
 }
 

@@ -168,6 +168,169 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
         .map_err(|_| ())
 }
 
+/// PCRE2's message for a pattern it would refuse, for the malformations measured
+/// against mongod 8.2.11 (2026-10-01), which reports them as `51091 Regular
+/// expression is invalid: <message>`. Scans left to right as PCRE does, so the
+/// first fault wins. `None` when none of these applies.
+pub(crate) fn pcre_compile_error(pat: &str) -> Option<String> {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut depth = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    // Whether the previous token can take a quantifier.
+    let mut repeatable = false;
+    let mut i = 0;
+    let quantifier_error = || Some("quantifier does not follow a repeatable item".to_string());
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                if i + 1 >= chars.len() {
+                    return Some("\\ at end of pattern".to_string());
+                }
+                if chars[i + 1] == 'k' && chars.get(i + 2) == Some(&'<') {
+                    let end = chars[i + 3..].iter().position(|&ch| ch == '>')?;
+                    let name: String = chars[i + 3..i + 3 + end].iter().collect();
+                    if !names.contains(&name) {
+                        return Some("reference to non-existent subpattern".to_string());
+                    }
+                    i += 4 + end;
+                } else {
+                    i += 2;
+                }
+                repeatable = true;
+                continue;
+            }
+            '[' => {
+                let mut j = i + 1;
+                if chars.get(j) == Some(&'^') {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&']') {
+                    j += 1;
+                }
+                let mut prev: Option<char> = None;
+                loop {
+                    let Some(&ch) = chars.get(j) else {
+                        return Some("missing terminating ] for character class".to_string());
+                    };
+                    if ch == ']' {
+                        break;
+                    }
+                    if ch == '\\' {
+                        prev = chars.get(j + 1).copied();
+                        j += 2;
+                        continue;
+                    }
+                    if ch == '-' {
+                        if let (Some(lo), Some(&hi)) = (prev, chars.get(j + 1)) {
+                            if hi != ']' && hi != '\\' && hi < lo {
+                                return Some("range out of order in character class".to_string());
+                            }
+                        }
+                    }
+                    prev = Some(ch);
+                    j += 1;
+                }
+                i = j + 1;
+                repeatable = true;
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                if chars.get(i + 1) == Some(&'?') {
+                    let rest: String = chars[i + 2..].iter().collect();
+                    let named = rest.strip_prefix("P<").or_else(|| {
+                        rest.strip_prefix('<')
+                            .filter(|r| !r.starts_with(['=', '!']))
+                    });
+                    if let Some(after) = named {
+                        let name: String = after
+                            .chars()
+                            .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                            .collect();
+                        if name.is_empty() {
+                            return Some("subpattern name expected".to_string());
+                        }
+                        if names.contains(&name) {
+                            return Some(
+                                "two named subpatterns have the same name (PCRE2_DUPNAMES not set)"
+                                    .to_string(),
+                            );
+                        }
+                        names.push(name);
+                    }
+                    // Skip the group header so its `?` is not read as a
+                    // quantifier: `?:` `?=` `?!` `?<=` `?<!`, a name, or flags.
+                    let mut j = i + 2;
+                    if let Some(after) = named {
+                        let consumed = rest.len() - after.len();
+                        let name_len = after.chars().take_while(|ch| *ch != '>').count();
+                        j += consumed + name_len + 1;
+                    } else {
+                        while let Some(&ch) = chars.get(j) {
+                            j += 1;
+                            if matches!(ch, ':' | '=' | '!' | ')') {
+                                if ch == ')' {
+                                    j -= 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    i = j;
+                    repeatable = false;
+                    continue;
+                }
+                repeatable = false;
+            }
+            ')' => {
+                if depth == 0 {
+                    return Some("unmatched closing parenthesis".to_string());
+                }
+                depth -= 1;
+                repeatable = true;
+            }
+            '|' => repeatable = false,
+            '*' | '+' | '?' => {
+                if !repeatable {
+                    return quantifier_error();
+                }
+                // A lazy `?` or possessive `+` straight after a quantifier is
+                // part of it, not a second quantifier.
+                if matches!(chars.get(i + 1), Some('?') | Some('+')) {
+                    i += 1;
+                }
+                repeatable = false;
+            }
+            '{' => {
+                let close = chars[i..].iter().position(|&ch| ch == '}');
+                let body: Option<String> = close.map(|e| chars[i + 1..i + e].iter().collect());
+                let bounds = body.as_deref().and_then(|b| {
+                    let (lo, hi) = b.split_once(',').unwrap_or((b, b));
+                    Some((lo.parse::<u64>().ok()?, hi))
+                });
+                if let Some((lo, hi)) = bounds {
+                    if !repeatable {
+                        return quantifier_error();
+                    }
+                    if let Ok(hi) = hi.parse::<u64>() {
+                        if hi < lo {
+                            return Some("numbers out of order in {} quantifier".to_string());
+                        }
+                    }
+                    i += close.unwrap_or(0) + 1;
+                    repeatable = false;
+                    continue;
+                }
+                repeatable = true;
+            }
+            _ => repeatable = true,
+        }
+        i += 1;
+    }
+    (depth > 0).then(|| "missing closing parenthesis".to_string())
+}
+
 /// PCRE's lookahead-free spelling of `$` and `\Z`, for a pattern that uses
 /// them -- `None` when it uses neither.
 ///
@@ -384,5 +547,45 @@ mod regex_key_agreement {
         by_bytes.sort_by_key(|&i| crate::sortkey::encode_value(&vals[i], None).unwrap());
 
         assert_eq!(by_cmp, by_bytes);
+    }
+}
+
+#[cfg(test)]
+mod pcre_error_tests {
+    use super::pcre_compile_error;
+
+    /// PCRE's messages for the malformations measured against mongod 8.2.11.
+    #[test]
+    fn pcre_compile_errors_match_mongod() {
+        for (pat, want) in [
+            ("(", "missing closing parenthesis"),
+            (")", "unmatched closing parenthesis"),
+            ("[", "missing terminating ] for character class"),
+            ("*", "quantifier does not follow a repeatable item"),
+            ("a\\", "\\ at end of pattern"),
+            ("a{2,1}", "numbers out of order in {} quantifier"),
+            ("(?<", "subpattern name expected"),
+            ("[z-a]", "range out of order in character class"),
+            ("a**", "quantifier does not follow a repeatable item"),
+            (
+                "(?P<n>a)(?P<n>b)",
+                "two named subpatterns have the same name (PCRE2_DUPNAMES not set)",
+            ),
+            ("\\k<x>", "reference to non-existent subpattern"),
+        ] {
+            assert_eq!(pcre_compile_error(pat).as_deref(), Some(want), "{pat}");
+        }
+        for ok in [
+            "a*?",
+            "a+?",
+            "(?:a)",
+            "(?=a)",
+            "(?<n>a)\\k<n>",
+            "[a-z]",
+            "a{2,3}",
+            "x{",
+        ] {
+            assert_eq!(pcre_compile_error(ok), None, "{ok}");
+        }
     }
 }

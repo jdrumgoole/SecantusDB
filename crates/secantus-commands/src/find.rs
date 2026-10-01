@@ -247,6 +247,22 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         argtypes::require_number(doc, field, &format!("FindCommandRequest.{field}"))?;
     }
     argtypes::require_object(doc, "let", "FindCommandRequest.let")?;
+    // Negative `skip` / `limit` are refused, not clamped (measured 8.2.11,
+    // 2026-10-01: `skip: -1` returned every document).
+    for field in ["skip", "limit"] {
+        if let Some(n) = doc.get(field).and_then(as_i64) {
+            if n < 0 {
+                return Err(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!("BSON field '{field}' value must be >= 0, actual value '{n}'"),
+                ));
+            }
+        }
+    }
+    if let Some(Bson::Document(sort)) = doc.get("sort") {
+        argtypes::require_sort_spec(sort)?;
+    }
     // `min` / `max` are the Expected-field family, which REJECTS an explicit
     // null -- not the BSON-field family, which accepts it. Probed.
     argtypes::require_object_expected(doc, "min")?;
