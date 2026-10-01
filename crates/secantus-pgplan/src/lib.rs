@@ -30938,6 +30938,17 @@ fn lower_negated(
                     flipped.name = vec![string_node(if in_is_negated(e) { "=" } else { "<>" })];
                     return lower_in(&flipped, def, params);
                 }
+                // `NOT (x = ANY (a))` -- how PostgreSQL parses `x NOT IN
+                // (subquery)` -- is `x <> ALL (a)`, and NOT over ALL is ANY:
+                // De Morgan holds under SQL's three-valued logic, so the
+                // flipped form keeps every NULL case. Left unflipped it ran
+                // as a per-row residual, O(rows x list).
+                Ok(AExprKind::AexprOpAny) => {
+                    flipped.kind = AExprKind::AexprOpAll as i32;
+                }
+                Ok(AExprKind::AexprOpAll) => {
+                    flipped.kind = AExprKind::AexprOpAny as i32;
+                }
                 Ok(AExprKind::AexprOp) => {}
                 _ => return Err(Error::Unsupported("this operator form".into())),
             }

@@ -3454,6 +3454,9 @@ impl PgHandler {
         max_rows: usize,
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
         let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(&agg.filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let docs: Vec<Document> = match &agg.series {
             Some(series) => series
                 .values()
@@ -4248,6 +4251,9 @@ impl PgHandler {
             return Ok(docs);
         }
         let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         Ok(docs
             .into_iter()
             .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
@@ -12808,6 +12814,9 @@ impl PgHandler {
         };
         self.fill_catalog_columns(name, &def, &mut rows);
         let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         Some(
             rows.into_iter()
                 .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
@@ -19216,6 +19225,9 @@ impl PgHandler {
             (Some(series), _) => {
                 let column = series.column.clone();
                 let empty = Document::new();
+                // Large scalar `$in` / `$nin` lists hashed once for these rows.
+                let in_sets = secantus_core::query::InSets::prepare(&sel.filter);
+                let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
                 let docs = series
                     .values()
                     .into_iter()
@@ -27129,6 +27141,9 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
         None => rows.to_vec(),
         Some(filter) => {
             let empty = Document::new();
+            // Large scalar `$in` / `$nin` lists hashed once for these rows.
+            let in_sets = secantus_core::query::InSets::prepare(filter);
+            let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
             rows.iter()
                 .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
                 .cloned()
@@ -27184,6 +27199,9 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         None => rows,
         Some(filter) => {
             let empty = Document::new();
+            // Large scalar `$in` / `$nin` lists hashed once for these rows.
+            let in_sets = secantus_core::query::InSets::prepare(filter);
+            let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
             filtered = rows
                 .iter()
                 .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))

@@ -7007,11 +7007,12 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         equality (plus inner-only conjuncts) is rewritten to the uncorrelated
         `IN` / null-safe `NOT IN` it equals (`semijoin.rs`, corpus
         `semi_join`): 2,000 x 2,000 rows, debug build, EXISTS 7.2 s -> 46 ms,
-        NOT EXISTS 7.3 s -> 0.73 s. Left: `NOT IN` itself is `$nin`, which
-        the core matcher checks element by element per row (O(rows x list));
-        a hash-set fast path belongs in `secantus-core`'s matcher and must
-        keep BSON equality (numeric cross-type, collation, array descent).
-        Other correlated shapes (two equalities, a correlated IN, a
+        NOT EXISTS 7.3 s -> 34 ms (batch 15: `NOT (x = ANY ...)`, how
+        `NOT IN` parses, now lowers to `$nin` instead of running per row,
+        and a scan hashes a `$in` / `$nin` list of 16+ plain scalars once
+        -- `InSets` in `secantus-core`, pinned against the element path by
+        `hashed_lists_agree_with_the_ordinary_path`; corpus
+        `not_in_large`). Other correlated shapes (two equalities, a correlated IN, a
         select-list EXISTS) still run per outer value.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a

@@ -10757,6 +10757,9 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         // Lock-free read (see the `lock` field's invariants).
         let session = self.op_session()?;
         let (sort_field, sort_dir) = single_sort_spec(sort);
@@ -10955,6 +10958,9 @@ impl Storage {
         filter: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         if self.is_oplog_rs(db, coll) {
             return Ok(self
                 .find_oplog_rs(filter, None, coll_opt, &Document::new())?
@@ -11304,6 +11310,9 @@ impl Storage {
         validator_moderate: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let (matched, modified) = {
             // The coll lock's guard lives only for this block: the zero-match
             // delegation below re-enters `update_matching_single_txn`, which
@@ -11412,6 +11421,9 @@ impl Storage {
         validator_moderate: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<(usize, usize, usize)> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let ns = format!("{db}.{coll}");
         let descs = self.index_descs(session, db, coll)?;
         let oplog_on = self.enable_oplog;
@@ -11553,6 +11565,9 @@ impl Storage {
         want_post_image: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
     ) -> Result<UpdateOutcome> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         self.retry_write_conflicts("update_matching_core", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -11828,6 +11843,9 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
         let rids: Vec<i64> = {
@@ -11882,6 +11900,9 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<(usize, usize)> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let descs = self.index_descs(session, db, coll)?;
         let oplog_on = self.enable_oplog;
         let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
@@ -11968,6 +11989,9 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        // Large scalar `$in` / `$nin` lists hashed once for the scan.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         self.retry_write_conflicts("delete_matching", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,0 +1,14 @@
+select count(*) from nl15_a where id not in (select k from nl15_b where k is not null);
+select count(*) from nl15_a where id not in (select k from nl15_b);
+select count(*) from nl15_a where id in (select k from nl15_b);
+select count(*) from nl15_a where f not in (select f from nl15_b where f is not null);
+select count(*) from nl15_a where f in (select f from nl15_b);
+select count(*) from nl15_a where t not in (select t from nl15_b where t is not null);
+select count(*) from nl15_a where t in (select t from nl15_b);
+select count(*) from nl15_a where n not in (select n from nl15_b where n is not null);
+select count(*) from nl15_a where n in (select n from nl15_b);
+select count(*) from nl15_a a where not exists (select 1 from nl15_b b where b.k = a.id);
+select count(*) from nl15_a a where not exists (select 1 from nl15_b b where b.f = a.f);
+select count(*) from nl15_a where not (id = any (array(select k from nl15_b where k is not null)));
+select count(*) from nl15_a where not (id <> all (array(select k from nl15_b where k is not null)));
+select count(*) from nl15_a where id <> all (array(select k from nl15_b));
