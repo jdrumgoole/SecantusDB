@@ -1368,6 +1368,61 @@ def _expr_to_filter(
     if isinstance(node, exp.Paren):
         return _expr_to_filter(node.this, resolve, subctx)
 
+    # ``a IS [NOT] DISTINCT FROM b`` -- null-safe comparison, which answered
+    # ``0A000 unsupported WHERE clause``. It lowers through the forms the
+    # filter already has: against NULL it is IS [NOT] NULL, against a
+    # non-NULL constant plain (in)equality (a NULL row is then simply not
+    # equal, which is exactly the null-safe answer), and otherwise
+    # ``a = b OR (a IS NULL AND b IS NULL)``.
+    if isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)):
+        a, b = node.this, node.expression
+        if _null_literal_operand(a):
+            a, b = b, a
+        if _null_literal_operand(b):
+            same: exp.Expression = exp.Is(this=a.copy(), expression=exp.Null())
+        elif isinstance(b, exp.Literal) or isinstance(a, exp.Literal):
+            same = exp.EQ(this=a.copy(), expression=b.copy())
+        else:
+            same = exp.Or(
+                this=exp.Paren(this=exp.EQ(this=a.copy(), expression=b.copy())),
+                expression=exp.Paren(
+                    this=exp.And(
+                        this=exp.Is(this=a.copy(), expression=exp.Null()),
+                        expression=exp.Is(this=b.copy(), expression=exp.Null()),
+                    )
+                ),
+            )
+        if isinstance(node, exp.NullSafeNEQ):
+            # Spelled out rather than NOT(...): SQL's NOT keeps a NULL row out,
+            # where IS DISTINCT FROM 10 is TRUE for it.
+            def is_null(e: exp.Expression, null: bool) -> exp.Expression:
+                test = exp.Is(this=e.copy(), expression=exp.Null())
+                return test if null else exp.Not(this=test)
+
+            if _null_literal_operand(b):
+                same = is_null(a, False)
+            elif isinstance(b, exp.Literal) or isinstance(a, exp.Literal):
+                col = b if isinstance(a, exp.Literal) else a
+                same = exp.Or(
+                    this=exp.Paren(this=exp.NEQ(this=a.copy(), expression=b.copy())),
+                    expression=is_null(col, True),
+                )
+            else:
+                same = exp.Or(
+                    this=exp.Paren(this=exp.NEQ(this=a.copy(), expression=b.copy())),
+                    expression=exp.Paren(
+                        this=exp.Or(
+                            this=exp.Paren(
+                                this=exp.And(this=is_null(a, True), expression=is_null(b, False))
+                            ),
+                            expression=exp.Paren(
+                                this=exp.And(this=is_null(a, False), expression=is_null(b, True))
+                            ),
+                        )
+                    ),
+                )
+        return _expr_to_filter(same, resolve, subctx)
+
     # Boolean literals — ``WHERE TRUE`` matches all, ``WHERE FALSE`` matches none
     # (the latter is how a default-deny RLS policy renders). ``$nor`` of match-all
     # is the empty-result filter.
@@ -6840,11 +6895,57 @@ def _attribute_view_source(plan: Any, view_name: str, positions: dict[str, int])
     ]
 
 
+def _rename_clashing_join_aliases(stmt: exp.Select, db: str, catalog: Any) -> None:
+    """Rename a joined relation whose alias equals a column of the FROM table.
+
+    A join embeds each joined relation under its alias, beside the base
+    table's own columns at the top level of the joined row -- so in
+    `FROM a o JOIN a n`, the base column `n` and the relation `n` were the
+    SAME key, and `o.n` read the whole embedded row: `1 {'_id': 1, 'n': 10}`
+    where PostgreSQL answers `1 10`. A silently wrong value. Renaming the
+    alias (and every reference qualified by it) keeps the two apart; output
+    column names come from the columns, so nothing visible changes.
+    """
+    from_node = next((v for v in stmt.args.values() if isinstance(v, exp.From)), None)
+    base = from_node.this if from_node is not None else None
+    if not isinstance(base, exp.Table) or catalog is None:
+        return
+    base_def = catalog.get(db, qualified_table_name(base))
+    if base_def is None:
+        return
+    base_cols = {c.name for c in base_def.columns}
+    taken = {base.alias_or_name}
+    for join in stmt.args.get("joins") or []:
+        node = join.this
+        if isinstance(node, (exp.Table, exp.Subquery)) and node.alias_or_name:
+            taken.add(node.alias_or_name)
+    for join in stmt.args.get("joins") or []:
+        node = join.this
+        if not isinstance(node, (exp.Table, exp.Subquery)):
+            continue
+        old = node.alias_or_name
+        if not old or old not in base_cols:
+            continue
+        new = f"{old}__j"
+        while new in taken or new in base_cols:
+            new += "_"
+        taken.add(new)
+        alias = node.args.get("alias")
+        if isinstance(alias, exp.TableAlias):
+            alias.set("this", exp.to_identifier(new))
+        else:
+            node.set("alias", exp.TableAlias(this=exp.to_identifier(new)))
+        for col in stmt.find_all(exp.Column):
+            if col.table == old:
+                col.set("table", exp.to_identifier(new))
+
+
 def _plan_pipeline_select(
     stmt: exp.Select, db: str, catalog: Any, storage: Any = None
 ) -> PipelineSelectPlan | EvaluatedSelectPlan:
     unwrap_paren_join_from(stmt)
     if stmt.args.get("joins"):
+        _rename_clashing_join_aliases(stmt, db, catalog)
         if _has_grouping_sets(stmt):
             if _select_has_window(stmt):
                 return _plan_join_grouping_sets_window_select(stmt, db, catalog, storage)
@@ -9747,6 +9848,11 @@ class _OnTranslator:
             return {"$not": [self.expr(node.this)]}
         if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
             return {"$eq": [self.expr(node.this), None]}
+        # ``a IS [NOT] DISTINCT FROM b``: an aggregation ``$eq`` already treats
+        # two NULLs as equal; ``$ifNull`` folds a MISSING field into NULL too.
+        if isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)):
+            sides = [{"$ifNull": [self.expr(x), None]} for x in (node.this, node.expression)]
+            return {"$eq" if isinstance(node, exp.NullSafeEQ) else "$ne": sides}
         # ``col = ANY(ARRAY[...])`` → ``$in`` (Postgres IN, as in SQLAlchemy's
         # ``contype = ANY(ARRAY['p','u','x'])`` index-reflection join condition).
         if isinstance(node, exp.EQ) and isinstance(node.expression, exp.Any):
@@ -11545,8 +11651,10 @@ def _plan_join_group_select(
                     (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
                 )
             else:
-                path, _ = resolve(sagg[0])
-                accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
+                # Any expression, not just a column: `string_agg(k.v::text, ',')`
+                # over a join answered `0A000 expected a column`.
+                value = _to_agg_expr(sagg[0], resolve)
+                accumulators[fname] = {"$push": _push_filtered(value, fcond)}
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif (
@@ -11831,8 +11939,10 @@ def _join_grouping_set_branch(
                     (fname, "sorted_string", ([(d, nf) for _k, d, nf in terms], sagg[1]))
                 )
             else:
-                path, _ = resolve(sagg[0])
-                accumulators[fname] = {"$push": _push_filtered(f"${path}", fcond)}
+                # Any expression, not just a column: `string_agg(k.v::text, ',')`
+                # over a join answered `0A000 expected a column`.
+                value = _to_agg_expr(sagg[0], resolve)
+                accumulators[fname] = {"$push": _push_filtered(value, fcond)}
                 project[fname] = _string_agg_project(fname, sagg[1])
             out_columns.append((fname, "text"))
         elif (

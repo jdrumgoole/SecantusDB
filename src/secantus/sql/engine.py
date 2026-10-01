@@ -4609,6 +4609,8 @@ def _trigger_transition(
         raise errors.SQLError(
             "42P17", "NEW TABLE can only be specified for an INSERT or UPDATE trigger"
         )
+    if old is not None and new is not None and old.name == new.name:
+        raise errors.SQLError("42P17", "OLD TABLE name and NEW TABLE name cannot be the same")
     out = {}
     if old is not None:
         out["transition_old"] = old.name
@@ -4780,14 +4782,37 @@ def _set_constraints_command(
         from secantus.sql.catalog import TRIGGER_COLLECTION
 
         for name in names:
-            for trg in storage.find_matching(db, TRIGGER_COLLECTION, {"name": name}):
-                if trg.get("constraint") and not trg.get("deferrable"):
+            trgs = [
+                t
+                for t in storage.find_matching(db, TRIGGER_COLLECTION, {"name": name})
+                if t.get("constraint")
+            ]
+            for trg in trgs:
+                if not trg.get("deferrable"):
                     raise errors.SQLError("42809", f'constraint "{name}" is not deferrable')
+            if not trgs and not _is_named_constraint(catalog, db, name):
+                raise errors.SQLError("42704", f'constraint "{name}" does not exist')
         for name in names:
             session.deferred_names[name] = deferred
         if not deferred and session.pending_deferred:
             executor.flush_deferred(session, storage, db, catalog, names=names)
     return SQLResult(command_tag="SET CONSTRAINTS")
+
+
+def _is_named_constraint(catalog: Catalog, db: str, name: str) -> bool:
+    """Whether some table declares a constraint (FK / UNIQUE / CHECK / PK)
+    called ``name`` -- what ``SET CONSTRAINTS name`` may name besides a
+    constraint trigger."""
+    for tname in catalog.list_tables(db):
+        t = catalog.get(db, tname)
+        if t is None:
+            continue
+        for c in [*t.foreign_keys, *t.unique_constraints, *t.check_constraints]:
+            if getattr(c, "name", None) == name:
+                return True
+        if t.pk_name == name or f"{t.name}_pkey" == name:
+            return True
+    return False
 
 
 def _create_matview_command(

@@ -103,9 +103,10 @@ def test_bare_whole_row_projection(seeded):
     """`SELECT t FROM t` had to route to the evaluated path: a plain projection
     of columns cannot build a composite."""
     row = seeded.execute("SELECT jr FROM jr WHERE id=1").fetchone()[0]
-    # Reported as generic RECORD rather than the table's rowtype, so psycopg
-    # hands back the parsed fields; the VALUES are what matter here.
-    assert tuple(str(v) for v in row) == ("1", "10", "x")
+    # Described with the table's ROW TYPE, as PostgreSQL does (it used to be
+    # the generic RECORD), so psycopg -- which has no loader for that type --
+    # hands back the composite's text exactly as it does from PostgreSQL 15.
+    assert row == "(1,10,x)"
 
 
 # --- a column named after its table still wins -------------------------------- #
