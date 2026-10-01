@@ -67,9 +67,10 @@ class TestDDL:
         run(storage, session, "create table t2 (t text)")
         run(storage, session, TRIGGER_FN)
         for ddl in (
-            "create trigger trg after insert on t2 for each row execute procedure tfn()",
-            "create trigger trg before update on t2 for each row execute procedure tfn()",
-            "create trigger trg before insert on t2 execute procedure tfn()",
+            "create trigger trg instead of insert on t2 for each row execute procedure tfn()",
+            "create trigger trg before truncate on t2 execute procedure tfn()",
+            "create trigger trg before update of t on t2 for each row execute procedure tfn()",
+            "create trigger trg before insert on t2 for each row execute procedure tfn('x')",
         ):
             with pytest.raises(SQLError) as ei:
                 run(storage, session, ddl)
@@ -243,14 +244,118 @@ def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
     )
 
 
-class TestTriggersThisServerCannotRun:
-    """A trigger the Rust server stored refuses the write it would fire on.
+class TestTriggerKinds:
+    """AFTER / BEFORE, ROW / STATEMENT, INSERT / UPDATE / DELETE triggers run
+    as PostgreSQL runs them. The expected log is PostgreSQL 15's own output
+    for the same statements."""
 
-    This server runs only BEFORE INSERT FOR EACH ROW triggers. It used to
-    SKIP every other kind the shared catalog holds, so a write here bypassed
-    an AFTER / UPDATE / DELETE / statement-level trigger the Rust server
-    enforces. Now that write is PostgreSQL's 0A000 and does not happen.
-    """
+    SETUP = (
+        "create table tk (id int primary key, t text)",
+        "create table tk_log (op text, lvl text, wh text, old_id int, new_id int, new_t text)",
+        "create function tk_audit() returns trigger as $$ begin insert into tk_log values "
+        "(tg_op, tg_level, tg_when, old.id, new.id, new.t); return null; end $$ language plpgsql",
+        "create function tk_upper() returns trigger as $$ begin new.t := upper(new.t); "
+        "return new; end $$ language plpgsql",
+        "create function tk_keep() returns trigger as $$ begin if old.id = 2 then "
+        "return null; end if; return old; end $$ language plpgsql",
+        "create function tk_stmt() returns trigger as $$ begin insert into tk_log values "
+        "(tg_op, tg_level, tg_when, null, null, tg_table_name); return null; end $$ "
+        "language plpgsql",
+        "create trigger a1 after insert or update or delete on tk for each row "
+        "execute function tk_audit()",
+        "create trigger b1 before update on tk for each row execute function tk_upper()",
+        "create trigger b2 before delete on tk for each row execute function tk_keep()",
+        "create trigger s1 before insert or delete on tk for each statement "
+        "execute function tk_stmt()",
+        "create trigger s2 after update on tk execute function tk_stmt()",
+    )
+
+    def test_matches_postgres(self, storage, session):
+        for sql in self.SETUP:
+            run(storage, session, sql)
+        assert (
+            run(storage, session, "insert into tk values (1, 'a'), (2, 'b'), (3, 'c')").rowcount
+            == 3
+        )
+        assert run(storage, session, "update tk set t = 'x' where id >= 2").rowcount == 2
+        assert run(storage, session, "delete from tk").rowcount == 2
+        run(storage, session, "update tk set t = 'y' where id = 99")
+        assert run(storage, session, "select * from tk order by id").rows == [(2, "X")]
+        assert run(storage, session, "select * from tk_log").rows == [
+            ("INSERT", "STATEMENT", "BEFORE", None, None, "tk"),
+            ("INSERT", "ROW", "AFTER", None, 1, "a"),
+            ("INSERT", "ROW", "AFTER", None, 2, "b"),
+            ("INSERT", "ROW", "AFTER", None, 3, "c"),
+            ("UPDATE", "ROW", "AFTER", 2, 2, "X"),
+            ("UPDATE", "ROW", "AFTER", 3, 3, "X"),
+            ("UPDATE", "STATEMENT", "AFTER", None, None, "tk"),
+            ("DELETE", "STATEMENT", "BEFORE", None, None, "tk"),
+            ("DELETE", "ROW", "AFTER", 1, None, None),
+            ("DELETE", "ROW", "AFTER", 3, None, None),
+            ("UPDATE", "STATEMENT", "AFTER", None, None, "tk"),
+        ]
+
+    def test_when_conditions_match_postgres(self, storage, session):
+        for sql in (
+            "create table tw (id int primary key, t text)",
+            "create table tw_log (op text, id int, t text)",
+            "create function tw_fn() returns trigger as $$ begin insert into tw_log values "
+            "(tg_op, coalesce(new.id, old.id), new.t); return null; end $$ language plpgsql",
+            "create trigger w1 after insert on tw for each row when (new.id > 1) "
+            "execute function tw_fn()",
+            "create trigger w2 after update on tw for each row "
+            "when (old.t is distinct from new.t) execute function tw_fn()",
+            "insert into tw values (1, 'a'), (2, 'b'), (3, null)",
+            "update tw set t = 'b' where id <= 2",
+            "update tw set t = 'c' where id = 3",
+        ):
+            run(storage, session, sql)
+        assert run(storage, session, "select * from tw_log").rows == [
+            ("INSERT", 2, "b"),
+            ("INSERT", 3, None),
+            ("UPDATE", 1, "b"),
+            ("UPDATE", 3, "c"),
+        ]
+
+    def test_a_failing_statement_takes_its_triggers_writes_with_it(self, storage, session):
+        for sql in self.SETUP:
+            run(storage, session, sql)
+        run(storage, session, "insert into tk values (1, 'a')")
+        before = run(storage, session, "select count(*) from tk_log").rows
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, "insert into tk values (1, 'dup')")
+        assert ei.value.sqlstate == "23505"
+        # The BEFORE STATEMENT trigger logged a row; it rolled back with the
+        # INSERT, as in PostgreSQL.
+        assert run(storage, session, "select count(*) from tk_log").rows == before
+
+
+def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
+    """A trigger as the Rust PG server records it in the shared catalog."""
+    from secantus.sql.catalog import Catalog
+
+    Catalog(storage).put_trigger(
+        DB,
+        {
+            "name": name,
+            "table": "rt",
+            "timing": timing,
+            "event": events[0],
+            "events": events,
+            "level": level,
+            "function": "tfn",
+            "args": extra.pop("args", []),
+            "update_columns": extra.pop("update_columns", []),
+            **extra,
+        },
+    )
+
+
+class TestTriggersThisServerCannotRun:
+    """A trigger the Rust server stored that this server cannot run refuses
+    the write it would fire on (0A000) rather than being skipped: UPDATE OF,
+    arguments, transition tables, constraint triggers, TRUNCATE,
+    and every path that fires nothing (ON CONFLICT ...)."""
 
     @pytest.fixture()
     def rt(self, storage, session):
@@ -265,39 +370,29 @@ class TestTriggersThisServerCannotRun:
         assert ei.value.sqlstate == "0A000"
         assert "cannot run on this server" in str(ei.value)
 
-    def test_after_insert_refuses_the_insert(self, rt, session):
-        _rust_trigger(rt, "audit", "AFTER", ["INSERT"])
-        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
-        assert run(rt, session, "select count(*) from rt").rows == [(1,)]
-
-    def test_update_and_delete_triggers_refuse_those_writes(self, rt, session):
-        _rust_trigger(rt, "upd", "BEFORE", ["UPDATE"])
-        _rust_trigger(rt, "del", "AFTER", ["DELETE"], level="STATEMENT")
+    def test_unrunnable_shapes_refuse_their_writes(self, rt, session):
+        _rust_trigger(rt, "cols", "BEFORE", ["UPDATE"], update_columns=["t"])
         self._refused(rt, session, "update rt set t = 'z' where id = 1")
+        run(rt, session, "drop trigger cols on rt")
+        _rust_trigger(rt, "argd", "AFTER", ["DELETE"], args=["x"])
         self._refused(rt, session, "delete from rt where id = 1")
+        run(rt, session, "drop trigger argd on rt")
+        _rust_trigger(rt, "trans", "AFTER", ["INSERT"], level="STATEMENT", transition_new="nt")
+        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
         assert run(rt, session, "select t from rt").rows == [("a",)]
-        # An INSERT fires neither, so it goes through.
-        run(rt, session, "insert into rt (id, t) values (2, 'b')")
 
     def test_truncate_trigger_refuses_truncate(self, rt, session):
         _rust_trigger(rt, "trunc", "BEFORE", ["TRUNCATE"], level="STATEMENT")
         self._refused(rt, session, "truncate rt")
         assert run(rt, session, "select count(*) from rt").rows == [(1,)]
 
-    def test_statement_level_and_when_triggers_are_not_run_per_row(self, rt, session):
-        _rust_trigger(rt, "stmt", "BEFORE", ["INSERT"], level="STATEMENT")
-        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
-        run(rt, session, "drop trigger stmt on rt")
-        _rust_trigger(rt, "cond", "BEFORE", ["INSERT"], when="new.id > 5")
-        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
-
-    def test_a_multi_event_before_row_trigger_fires_on_insert(self, rt, session):
+    def test_a_multi_event_rust_trigger_fires(self, rt, session):
         # Recorded with `event` = UPDATE (the first) and both in `events`:
         # reading only `event` skipped it on INSERT.
         _rust_trigger(rt, "both", "BEFORE", ["UPDATE", "INSERT"])
         run(rt, session, "insert into rt (id, t) values (2, 'cats')")
-        assert run(rt, session, "select ts::text from rt where id = 2").rows == [("'cat':1",)]
-        self._refused(rt, session, "update rt set t = 'x' where id = 2")
+        run(rt, session, "update rt set t = 'dogs' where id = 2")
+        assert run(rt, session, "select ts::text from rt where id = 2").rows == [("'dog':1",)]
 
     def test_on_conflict_runs_no_trigger_so_refuses(self, rt, session):
         _rust_trigger(rt, "ins", "BEFORE", ["INSERT"])

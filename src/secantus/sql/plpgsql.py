@@ -733,11 +733,14 @@ class _Runner:
             if isinstance(col, exp.Column):
                 if col.table:
                     # ``new.t`` — a record variable's field (trigger NEW row).
-                    record = env.get(col.table.lower())
+                    qual = col.table.lower()
+                    record = env.get(qual)
                     if isinstance(record, dict):
                         key = col.name.lower()
                         if key in record:
                             return record[key]
+                    elif qual in ("new", "old") and qual in env and record is None:
+                        return None
                 else:
                     nm = col.name.lower()
                     if nm in env:
@@ -762,6 +765,14 @@ class _Runner:
         node = self._sub_params(node)
         for c in list(node.find_all(exp.Column)):
             if c.table:
+                # A trigger's ``new.x`` / ``old.x``: a record variable's field.
+                # A NULL record (OLD on INSERT, NEW on DELETE) has NULL fields.
+                qual = c.table.lower()
+                record = env.get(qual)
+                if isinstance(record, dict) and c.name.lower() in record:
+                    c.replace(_planner._value_to_node(record[c.name.lower()]))
+                elif qual in ("new", "old") and qual in env and record is None:
+                    c.replace(_planner._value_to_node(None))
                 continue
             nm = c.name.lower()
             if nm in env:
@@ -805,22 +816,61 @@ def _truthy(value: Any) -> bool:
     return bool(value)
 
 
-def invoke_trigger(func: dict, new_record: dict, ctx: scalar.ScalarContext) -> dict | None:
-    """Run a ``RETURNS trigger`` plpgsql function for a BEFORE ROW event.
+def invoke_trigger(
+    func: dict,
+    new_record: dict | None,
+    ctx: scalar.ScalarContext,
+    *,
+    old_record: dict | None = None,
+    tg: dict[str, Any] | None = None,
+) -> dict | None:
+    """Run a ``RETURNS trigger`` plpgsql function.
 
-    ``new_record`` is the row as a column-name-keyed dict, bound to the
-    function's ``NEW`` variable — the body may read fields (``new.t``), assign
-    them (``new.ts := …``), and ``RETURN NEW``. Returns the (possibly mutated)
-    record, or None when the function returned NULL — PG's "skip this row"."""
+    ``new_record`` / ``old_record`` are the rows as column-name-keyed dicts,
+    bound to ``NEW`` / ``OLD`` (NULL where the event has none: ``OLD`` on
+    INSERT, ``NEW`` on DELETE, both at statement level) -- the body may read
+    fields (``new.t``), assign them (``new.ts := …``) and ``RETURN NEW``.
+    ``tg`` carries the ``TG_*`` variables (``op``, ``when``, ``level``,
+    ``name``, ``table``). Returns the record the function returned, or None
+    for NULL -- for a BEFORE ROW trigger, PG's "skip this row"."""
     block = parse(func["body"])
     runner = _Runner(ctx, [], func)
-    env: dict[str, Any] = {"new": dict(new_record)}
+    env: dict[str, Any] = {
+        "new": dict(new_record) if new_record is not None else None,
+        "old": dict(old_record) if old_record is not None else None,
+    }
+    tg = tg or {}
+    env.update(
+        {
+            "tg_op": tg.get("op", "INSERT"),
+            "tg_when": tg.get("when", "BEFORE"),
+            "tg_level": tg.get("level", "ROW"),
+            "tg_name": tg.get("name"),
+            "tg_table_name": tg.get("table"),
+            "tg_relname": tg.get("table"),
+            "tg_table_schema": "public",
+            "tg_nargs": 0,
+        }
+    )
     result = runner.run(block, env)
     if result is None:
         return None
     if not isinstance(result, dict):
         raise errors.SQLError("42804", "trigger function must return NEW or NULL")
     return result
+
+
+def trigger_when(
+    cond: str, new_record: dict | None, old_record: dict | None, ctx: scalar.ScalarContext
+) -> bool:
+    """A trigger's ``WHEN (...)`` condition over its NEW / OLD rows: the
+    trigger fires only when it is TRUE (NULL counts as false, as in SQL)."""
+    runner = _Runner(ctx, [], {})
+    env: dict[str, Any] = {
+        "new": dict(new_record) if new_record is not None else None,
+        "old": dict(old_record) if old_record is not None else None,
+    }
+    return runner._eval(cond, env) is True
 
 
 def invoke(func: dict, args: list[Any], ctx: scalar.ScalarContext) -> Any:

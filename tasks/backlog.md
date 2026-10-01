@@ -616,16 +616,19 @@ remain open:
       `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
       and transition tables landed in batch 9 (corpora `instead_of`,
       `constraint_triggers`, `transition_tables`, `triggers`, `triggers2` at
-      0 against PostgreSQL 14). **Cross-server:** the Python PG server runs
-      only `BEFORE INSERT FOR EACH ROW` triggers (no WHEN, transition
-      tables, constraint firing or arguments). Since batch 16 every other
-      trigger in the shared `__sql_triggers__` catalog REFUSES the write it
-      would fire on (`0A000 ... cannot run on this server` -- INSERT,
-      UPDATE, DELETE, TRUNCATE, MERGE, ON CONFLICT, UPDATE FROM, DELETE
-      USING) instead of being silently skipped, and a multi-event trigger
-      is read from `events`, not just the first `event`
-      (`tests/test_sql_triggers.py::TestTriggersThisServerCannotRun`).
-      Left: running those kinds on the Python server.
+      0 against PostgreSQL 14). **Cross-server:** since batch 17 the Python
+      PG server runs BEFORE / AFTER, ROW / STATEMENT triggers on INSERT,
+      UPDATE and DELETE (with `TG_OP` / `TG_WHEN` / `TG_LEVEL` /
+      `TG_TABLE_NAME`, NULL `OLD` / `NEW` where the event has none, and a
+      `WHEN` condition over them), and a
+      write that fires one is ONE transaction, so a trigger's writes roll
+      back with a failing statement (`tests/test_sql_triggers.py::
+      TestTriggerKinds`, checked against PostgreSQL 15's output). Every
+      other trigger -- `UPDATE OF`, arguments, transition tables,
+      constraint triggers, TRUNCATE, INSTEAD OF -- and every path that
+      fires nothing (ON CONFLICT, MERGE, UPDATE FROM, DELETE USING) REFUSES
+      the write (`0A000 ... cannot run on this server`) rather than
+      skipping the trigger. Left: those shapes on the Python server.
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,
