@@ -6744,6 +6744,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.03 Rust packages (crates.io) -- open items, 2026-10-01
+
+Phases A and B are merged for the MongoDB side and Phase C's MongoDB half is
+on `mdb-embedding-api` (`tasks/rust-packages-plan.md` has the status per step).
+What is left, recorded so the PG session and the release work find it:
+
+- [ ] **The PG half of Phases B and C** -- `pgwire` upstreaming or the
+      `secantus-pgwire` fork, crates.io metadata on the three PG crates, the
+      `secantus-pg` rename, `secantus_pg::PgServer`. Deliberately not done by
+      the session that did the Mongo half (asked to keep clear of the PG
+      server). Its `Cargo.lock` already carries the bundled-WiredTiger deps.
+- [ ] **`secantus_mdb::Server` runs no background sweepers.** The daemon runs
+      a noop heartbeat (keeps quiet change-stream resume tokens advancing and
+      prunes the oplog) and a TTL sweeper; the embedded server, like the Python
+      embedded handle, runs neither, so TTL indexes never expire documents in
+      it and the oplog only prunes opportunistically. Add builder knobs if a
+      user needs them.
+- [ ] **crates.io names are not registered yet** (`secantus-mdb`,
+      `secantus-pg`, the `secantus-*` internals). Needs Joe's account; a
+      squatter is the one risk with no engineering fix.
+
 ### 7.02 Rust MongoDB server: change-stream events and error replies -- 2026-10-01
 
 Two new differential probes against mongod 8.2.11, everything they found fixed

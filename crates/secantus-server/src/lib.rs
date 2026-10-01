@@ -112,7 +112,7 @@ impl Drop for AllocReservation<'_> {
 /// `cert_file` + `key_file` enable server-side TLS; adding `ca_file` (and
 /// optionally `require_client_cert`) layers on mTLS client-certificate
 /// verification.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsOptions {
     /// PEM server certificate chain.
     pub cert_file: String,

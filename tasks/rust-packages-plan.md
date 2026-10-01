@@ -239,6 +239,14 @@ the `secantus-pgserver` package. What landed, for the ten crates in
 
 ### 5.3 Phase C — the embedding API
 
+**Status (2026-10-01): the MongoDB half is done (steps 1, 4 and 5); the PG half
+(step 2, `secantus_pg::PgServer`) is not started**, for the same reason as
+Phase B. `secantus_mdb::Server` lives in `crates/secantusdb/src/lib.rs`; the
+tests are `crates/secantusdb/tests/embedded.rs` (official driver, tokio both
+flavours, 50 in parallel). Not carried over from the daemon: its noop
+heartbeat and TTL sweeper threads -- the Python embedded handle runs neither
+either; see the backlog entry.
+
 1. `secantus_mdb::Server`:
    - `Server::start()` — temporary store (removed on drop), `127.0.0.1:0`,
      `enable_test_commands: true`, replica-set advertising ON (so change
