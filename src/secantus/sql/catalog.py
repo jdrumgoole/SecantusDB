@@ -14,6 +14,7 @@ column maps to a field of its own name.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from weakref import WeakKeyDictionary
@@ -256,6 +257,10 @@ class Column:
     # the ``atttypmod`` (``varchar(52)`` → 56, ``numeric(18,5)`` → ((18<<16)|5)+4).
     decl_oid: int | None = None
     typmod: int = -1
+    # Keys of the stored column this server does not model, written back
+    # verbatim: the Rust server records more per column (collation, ACLs,
+    # ...), and dropping them on a rewrite erased what it stored.
+    extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
     # True for a column declared ``json`` (not ``jsonb``): the value behaviour
     # is identical (both store parsed JSON under type_tag "json") but the wire
     # identity differs — RowDescription/COPY report oid 114, whose binary form
@@ -351,6 +356,11 @@ class TableDef:
     # columns (so a query rewritten onto one plans through the normal index path)
     # but are NOT in ``columns`` (so ``SELECT *`` / reflection never surface them).
     expr_indexes: list[ExprIndex] = field(default_factory=list)
+    # Keys of the stored table this server does not model (the Rust server's
+    # `partition_by` / `partition_of` / `owner` ...), written back verbatim:
+    # an ALTER here used to rewrite the document without them, silently
+    # undoing what the other server recorded.
+    extra: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def ordered_pk_columns(self) -> list[Column]:
         """PK columns in the constraint's declared order (reflection order);
@@ -420,6 +430,16 @@ class TableDef:
 
 
 def _to_doc(table: TableDef) -> dict[str, Any]:
+    doc = _known_doc(table)
+    for key, value in table.extra.items():
+        doc.setdefault(key, value)
+    for stored, column in zip(doc["columns"], table.columns, strict=True):
+        for key, value in column.extra.items():
+            stored.setdefault(key, value)
+    return doc
+
+
+def _known_doc(table: TableDef) -> dict[str, Any]:
     return {
         "_id": table.name,
         "table": table.name,
@@ -495,6 +515,19 @@ def _to_doc(table: TableDef) -> dict[str, Any]:
     }
 
 
+@functools.cache
+def _known_table_keys() -> frozenset[str]:
+    """The table-document keys this server models (`_known_doc`'s)."""
+    sample = TableDef(name="x", collection="x", columns=[Column("c", "text", "c", False, True)])
+    return frozenset(_known_doc(sample)) | {"_id"}
+
+
+@functools.cache
+def _known_column_keys() -> frozenset[str]:
+    sample = TableDef(name="x", collection="x", columns=[Column("c", "text", "c", False, True)])
+    return frozenset(_known_doc(sample)["columns"][0])
+
+
 def _from_doc(doc: dict[str, Any]) -> TableDef:
     return TableDef(
         name=doc["table"],
@@ -520,9 +553,11 @@ def _from_doc(doc: dict[str, Any]) -> TableDef:
                 json_plain=bool(c.get("json_plain", False)),
                 decl_oid=c.get("decl_oid"),
                 typmod=int(c.get("typmod", -1)),
+                extra={k: v for k, v in c.items() if k not in _known_column_keys()},
             )
             for c in doc["columns"]
         ],
+        extra={k: v for k, v in doc.items() if k not in _known_table_keys()},
         comment=doc.get("comment"),
         pk_name=doc.get("pk_name"),
         pk_comment=doc.get("pk_comment"),

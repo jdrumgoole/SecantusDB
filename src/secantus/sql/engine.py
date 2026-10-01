@@ -85,6 +85,9 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         two_phase = _maybe_two_phase(sql, storage, db, catalog, session)
         if two_phase is not None:
             return [two_phase]
+        dropped = _maybe_drop_indexes(sql, storage, db, catalog)
+        if dropped is not None:
+            return [dropped]
         results: list[SQLResult] = []
         if session.get_setting("standard_conforming_strings").lower() in ("off", "false", "0"):
             sql = planner.decode_nonstandard_strings(sql)
@@ -125,6 +128,45 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         return results
 
 
+_DROP_INDEXES_RE = re.compile(
+    r"^\s*DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(IF\s+EXISTS\s+)?"
+    r"((?:\"[^\"]+\"|[\w.]+)(?:\s*,\s*(?:\"[^\"]+\"|[\w.]+))+)"
+    r"(?:\s+(?:CASCADE|RESTRICT))?\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_multi_drop_index(sql: str) -> bool:
+    """A ``DROP INDEX a, b`` -- which sqlglot cannot parse, so the wire layer
+    leaves it to ``run_sql``."""
+    return _DROP_INDEXES_RE.match(sql) is not None
+
+
+def _maybe_drop_indexes(sql: str, storage: Any, db: str, catalog: Catalog) -> SQLResult | None:
+    """``DROP INDEX a, b`` -- several names, which sqlglot cannot parse. Every
+    name is checked before any is dropped, so a missing one (without ``IF
+    EXISTS``) drops nothing, as on PostgreSQL."""
+    m = _DROP_INDEXES_RE.match(sql)
+    if m is None:
+        return None
+    if_exists = m.group(1) is not None
+    names = []
+    for raw in m.group(2).split(","):
+        raw = raw.strip()
+        name = raw[1:-1] if raw.startswith('"') else raw.lower()
+        names.append(name.rsplit(".", 1)[-1])
+    taken = executor.index_names(catalog, storage, db)
+    missing = [n for n in names if n not in taken]
+    if missing and not if_exists:
+        raise errors.undefined_relation_of_kind("INDEX", missing[0])
+    for name in names:
+        if name in taken:
+            executor.execute_drop_index(
+                planner.DropIndexPlan(name=name, if_exists=if_exists), catalog, storage, db
+            )
+    return SQLResult(command_tag="DROP INDEX")
+
+
 def _drain_plpgsql_notices(session: Session, result: SQLResult) -> None:
     """Move plpgsql ``RAISE`` notices raised by any function this statement
     evaluated (side-channel from ``secantus.sql.plpgsql``) onto the result, so
@@ -157,6 +199,13 @@ def _storage_conflicts_as_sqlstate() -> Iterator[None]:
 
         if isinstance(exc, WriteConflictError) or _is_wt_rollback(exc):
             raise errors.serialization_failure() from exc
+        from secantus.storage import IndexConflict
+
+        if isinstance(exc, IndexConflict):
+            # A write colliding with a unique INDEX (one `CREATE UNIQUE INDEX`
+            # made, not a declared constraint the executor checks first): the
+            # same 23505, rather than an XX000.
+            raise executor.index_conflict_error(exc) from exc
         if isinstance(exc, AggregateError):
             # The pipeline hit a hard limit (an unbounded cross-product cap) —
             # surface it as a clean SQLSTATE 54000 (program_limit_exceeded)
@@ -372,6 +421,49 @@ def _rollback_prepared(gid: str, storage: Any, session: Session) -> SQLResult:
     return SQLResult(command_tag="ROLLBACK PREPARED")
 
 
+def refuse_partitioned(
+    stmt: exp.Expression, storage: Any, db: str, *, read: bool | None = None
+) -> None:
+    """Refuse a statement over a table the Rust server partitioned.
+
+    This server knows no partitions. The Rust server keeps a partitioned
+    table's rows in the ROOT's collection, so here a partition read as EMPTY,
+    and a write to the root went in unrouted and unchecked (a row no
+    partition covers was accepted). Reading the root is right -- every row is
+    in its collection -- so only that is allowed; anything touching a
+    partition, or writing the root, is PostgreSQL's 0A000.
+    """
+    from secantus.sql.catalog import CATALOG_COLLECTION
+
+    names = {planner.qualified_table_name(t) for t in stmt.find_all(exp.Table) if t.name}
+    if not names:
+        return
+    docs = storage.find_matching(
+        db,
+        CATALOG_COLLECTION,
+        {
+            "_id": {"$in": sorted(names)},
+            "$or": [{"partition_of": {"$exists": True}}, {"partition_by": {"$exists": True}}],
+        },
+    )
+    if not docs:
+        return
+    if read is None:
+        read = isinstance(stmt, (exp.Select, exp.SetOperation)) and not any(
+            stmt.find_all(exp.Insert, exp.Update, exp.Delete, exp.Merge)
+        )
+    for doc in docs:
+        if doc.get("partition_of") is not None:
+            raise errors.feature_not_supported(
+                f'"{doc["_id"]}" is a partition of "{doc["partition_of"]}", and this '
+                "server does not support partitioned tables"
+            )
+        if not read:
+            raise errors.feature_not_supported(
+                f'"{doc["_id"]}" is a partitioned table, and this server can only read it'
+            )
+
+
 def _dispatch(
     stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
@@ -389,6 +481,7 @@ def _dispatch(
     # value it derives into ``session.txn_now``.
     if session.txn_handle is None:
         session.txn_now = None
+    refuse_partitioned(stmt, storage, db)
     if isinstance(stmt, exp.Transaction):
         session.txn_now = None  # BEGIN starts a fresh transaction clock
         return _begin_txn(storage, session, stmt.args.get("modes") or [])
@@ -1208,6 +1301,8 @@ def _run_merge(
         planner.written_table_name(stmt.this),
     )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
+    if not getattr(target, "reflected", False):
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "INSERT", "UPDATE", "DELETE")
     src_alias, source_rows, source_cols = _merge_source(
         stmt.args["using"], db, catalog, session, storage
     )
@@ -1449,6 +1544,8 @@ def _run_delete_using(
         planner.written_table_name(stmt.this),
     )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
+    if not getattr(target, "reflected", False):
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "DELETE")
     sources = _collect_dml_sources(stmt.args["using"], db, catalog, session, storage)
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     where = stmt.args.get("where")
@@ -1560,6 +1657,8 @@ def _run_update_from(
         planner.written_table_name(target_node),
     )
     target_alias = (target_node.alias or target_node.name).lower()
+    if not getattr(target, "reflected", False):
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "UPDATE")
     from_node = stmt.args["from_"]
     sources = _collect_dml_sources([from_node.this], db, catalog, session, storage)
     source_cols = {a: cols for a, _, cols in sources}
@@ -4317,6 +4416,7 @@ def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catal
             if exists:
                 continue
             raise errors.undefined_table(name)
+        executor.refuse_unfirable_triggers(catalog, db, name, "TRUNCATE")
         named.append(name)
 
     restart = str(stmt.args.get("identity") or "").upper() == "RESTART"
