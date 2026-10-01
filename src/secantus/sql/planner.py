@@ -5655,13 +5655,53 @@ def _sorted_agg_push_resolve(
     }
 
 
-def _string_agg_project(fname: str, sep: str) -> dict[str, Any]:
+def _nested_string_agg(
+    sa_expr: exp.Expression, lower: Any
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The ``(accumulator, sort spec)`` for a ``string_agg`` nested inside an
+    expression (``coalesce(string_agg(...), '-')``, ``'x' || string_agg(...)``).
+
+    The wrapping expression is evaluated INSIDE the pipeline, so the
+    Python-side ``sorted_string`` post-aggregate the top-level path uses comes
+    too late: the in-call ORDER BY has to be applied in the reduction. It was
+    dropped instead -- ``coalesce(string_agg(v, ',' ORDER BY id DESC), '')``
+    answered in insertion order, a silent wrong answer. Each sort key is pushed
+    beside a NULL flag so NULLs land where PostgreSQL puts them (last
+    ascending, first descending, or as NULLS FIRST / LAST says) rather than
+    where Mongo's order would. ``lower`` maps an sqlglot node to a Mongo
+    expression (per table, or through the join resolver)."""
+    value_node, terms = _agg_order_spec(sa_expr)
+    if not terms:
+        return {"$push": lower(sa_expr)}, None
+    item: dict[str, Any] = {"v": lower(value_node)}
+    sort_by: dict[str, int] = {}
+    for i, (key, direction, nulls_first) in enumerate(terms):
+        k = lower(key)
+        item[f"n{i}"] = {"$cond": [{"$eq": [{"$ifNull": [k, None]}, None]}, 1, 0]}
+        item[f"k{i}"] = k
+        sort_by[f"n{i}"] = -1 if nulls_first else 1
+        sort_by[f"k{i}"] = direction
+    return {"$push": item}, sort_by
+
+
+def _string_agg_project(
+    fname: str, sep: str, sort_by: dict[str, int] | None = None
+) -> dict[str, Any]:
     """The ``$project`` expression that turns a ``string_agg`` field's pushed
     array (``[v1, v2, …]``) into the delimited string, skipping NULL elements and
     yielding NULL when every element was NULL (Postgres ``string_agg`` semantics)."""
     return {
         "$reduce": {
-            "input": f"${fname}",
+            "input": (
+                {
+                    "$map": {
+                        "input": {"$sortArray": {"input": f"${fname}", "sortBy": sort_by}},
+                        "in": "$$this.v",
+                    }
+                }
+                if sort_by
+                else f"${fname}"
+            ),
             "initialValue": None,
             "in": {
                 "$cond": [
@@ -6126,8 +6166,10 @@ def _agg_func_to_expr(node: exp.Expression, table: Any) -> Any:
         return None
     if isinstance(node, exp.DPipe):
         # Postgres' `||` yields NULL when either side is NULL; Mongo's $concat
-        # does too, so the operands pass straight through.
-        return {op: args}
+        # does too. A non-text side (`id || '=' || v` over an int `id`) is
+        # cast to text as PostgreSQL does -- bare $concat rejected it with an
+        # XX000 "$concat only supports strings". `$toString` keeps NULL NULL.
+        return {op: [{"$toString": a} for a in args]}
     return {op: args}
 
 
@@ -8246,8 +8288,10 @@ def _plan_grouping_sets_window_select(
             # separator in the reduction, like the plain string_agg path does.
             sa_expr, sep = sa
             fname = names.fresh("string_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(sa_expr, table)}
-            reductions[fname] = _string_agg_project(fname, sep)
+            accumulators[fname], ordered = _nested_string_agg(
+                sa_expr, lambda n: _agg_arg_to_expr(n, table)
+            )
+            reductions[fname] = _string_agg_project(fname, sep, ordered)
             field_tags[fname] = "text"
             agg_field_names.append(fname)
             return fname
@@ -9029,8 +9073,10 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
             # separator in the reduction, like the plain string_agg path does.
             sa_expr, sep = sa
             fname = names.fresh("string_agg")
-            accumulators[fname] = {"$push": _agg_arg_to_expr(sa_expr, table)}
-            reductions[fname] = _string_agg_project(fname, sep)
+            accumulators[fname], ordered = _nested_string_agg(
+                sa_expr, lambda n: _agg_arg_to_expr(n, table)
+            )
+            reductions[fname] = _string_agg_project(fname, sep, ordered)
             field_tags[fname] = "text"
             agg_field_names.append(fname)
             return fname
@@ -12065,6 +12111,17 @@ def _plan_join_grouping_sets_window_select(
             )
             agg_field_names.append(fname)
             return fname
+        sa = _string_agg_arg(node)
+        if sa is not None:
+            sa_expr, sep = sa
+            fname = names.fresh("string_agg")
+            accumulators[fname], ordered = _nested_string_agg(
+                sa_expr, lambda n: _to_agg_expr(n, resolve)
+            )
+            reductions[fname] = _string_agg_project(fname, sep, ordered)
+            field_tags[fname] = "text"
+            agg_field_names.append(fname)
+            return fname
         agg = _join_aggregate_of(node)
         if agg is None:
             raise errors.feature_not_supported(f"unsupported aggregate: {node.sql()}")
@@ -12303,6 +12360,17 @@ def _plan_join_group_window_select(
             field_tags[fname] = (
                 _array_agg_out_tag(arr_arg, resolve) if _is_true_array_agg(node) else "json"
             )
+            agg_field_names.append(fname)
+            return fname
+        sa = _string_agg_arg(node)
+        if sa is not None:
+            sa_expr, sep = sa
+            fname = names.fresh("string_agg")
+            accumulators[fname], ordered = _nested_string_agg(
+                sa_expr, lambda n: _to_agg_expr(n, resolve)
+            )
+            reductions[fname] = _string_agg_project(fname, sep, ordered)
+            field_tags[fname] = "text"
             agg_field_names.append(fname)
             return fname
         agg = _join_aggregate_of(node)
