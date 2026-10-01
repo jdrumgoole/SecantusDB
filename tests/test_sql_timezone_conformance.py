@@ -126,13 +126,11 @@ def test_bc_timestamptz_literal_takes_session_offset(storage, session):
     q(storage, session, "CREATE TABLE bt (dt timestamptz)")
     q(storage, session, "SET TimeZone = 'GMT+12'")  # POSIX: UTC-12
     q(storage, session, "INSERT INTO bt VALUES ('0101-01-01 BC')")
-    assert q(storage, session, "SELECT dt::text FROM bt").rows == [
-        ("0101-01-01 00:00:00-12:00 BC",)
-    ]
+    assert q(storage, session, "SELECT dt::text FROM bt").rows == [("0101-01-01 00:00:00-12 BC",)]
     q(storage, session, "DELETE FROM bt")
     q(storage, session, "SET TimeZone = 'UTC'")
     q(storage, session, "INSERT INTO bt VALUES ('0101-01-01 BC')")
-    assert q(storage, session, "SELECT dt::text FROM bt").rows == [("0101-01-01 00:00:00 BC",)]
+    assert q(storage, session, "SELECT dt::text FROM bt").rows == [("0101-01-01 00:00:00+00 BC",)]
 
 
 # --------------------------------------------------------------------------- #

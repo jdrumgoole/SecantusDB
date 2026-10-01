@@ -1547,6 +1547,13 @@ def coerce(value: Any, tag: str) -> Any:
         sentinel = datetime_sentinel(value)
         if sentinel is not None:
             return sentinel
+        if isinstance(value, str):
+            from secantus.sql import dtparse
+
+            parsed = dtparse.parse_timestamp_text(value, with_tz=True)
+            if isinstance(parsed, _dt.datetime):
+                return _representable_instant(_as_session_instant(parsed))
+            return parsed
         session = _render_session.get()
         default_off = None
         if session is not None:
@@ -1581,6 +1588,10 @@ def coerce(value: Any, tag: str) -> Any:
             sentinel = datetime_sentinel(value)
             if sentinel is not None:
                 return sentinel
+            if isinstance(value, str):
+                from secantus.sql import dtparse
+
+                return dtparse.parse_timestamp_text(value, with_tz=False)
             # A "without time zone" column forgets any offset the input
             # carried, the same as the in-range path below does.
             wide = wide_timestamp_text(value, drop_offset=True)
