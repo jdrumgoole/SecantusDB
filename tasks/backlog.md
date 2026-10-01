@@ -629,9 +629,12 @@ remain open:
       Batch 19 made ON CONFLICT, UPDATE FROM, DELETE USING and MERGE fire
       them in PostgreSQL's order (`TestTriggersOnEveryWritePath`), and batch
       20 added transition tables (`REFERENCING OLD / NEW TABLE`,
-      `TestTransitionTables`). Constraint triggers and INSTEAD OF REFUSE the
-      write (`0A000 ... cannot run on this server`) rather than skipping the
-      trigger. Left: those two shapes on the Python server.
+      `TestTransitionTables`), and batch 21 constraint triggers with
+      DEFERRABLE / INITIALLY DEFERRED and SET CONSTRAINTS
+      (`TestConstraintTriggers`), and INSTEAD OF row triggers on views
+      (`TestInsteadOfTriggers`). Left on the Python server: a statement-level
+      BEFORE / AFTER trigger on a VIEW is refused at CREATE (0A000), where
+      PostgreSQL stores it and fires it around a write through the view.
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,

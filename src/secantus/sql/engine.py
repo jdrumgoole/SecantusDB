@@ -3115,6 +3115,9 @@ def _run_statement(
         # DML through an (automatically-updatable) view rewrites onto its base
         # table before planning (#146). ``check_pred`` is the view's WITH CHECK
         # OPTION predicate, enforced against each written row.
+        instead = _run_instead_of(stmt, storage, db, catalog, session)
+        if instead is not None:
+            return instead
         stmt, check_pred = _rewrite_write_through_view(stmt, catalog, db)
 
     if isinstance(stmt, exp.Insert):
@@ -4552,6 +4555,27 @@ def _drop_policy_command(stmt: exp.Command, db: str, catalog: Catalog) -> SQLRes
     return SQLResult(command_tag="DROP POLICY")
 
 
+def _constraint_trigger(tp: exp.Expression, timing: str, for_each: str) -> dict[str, Any]:
+    """``CREATE CONSTRAINT TRIGGER``: AFTER ... FOR EACH ROW only (PostgreSQL's
+    grammar has no other form, so anything else is its 42601), with the
+    deferral the Rust server records under the same catalog keys."""
+    if not tp.args.get("constraint"):
+        return {}
+    if timing != "AFTER":
+        raise errors.SQLError("42601", f'syntax error at or near "{timing.lower()}"')
+    if for_each != "ROW":
+        raise errors.SQLError("42601", 'syntax error at or near "statement"')
+    deferrable = str(tp.args.get("deferrable") or "").upper() == "DEFERRABLE"
+    initially_deferred = str(tp.args.get("initially") or "").upper() == "DEFERRED"
+    if initially_deferred and not deferrable:
+        raise errors.SQLError("42601", "constraint declared INITIALLY DEFERRED must be DEFERRABLE")
+    return {
+        "constraint": True,
+        "deferrable": deferrable,
+        "initially_deferred": initially_deferred,
+    }
+
+
 def _trigger_transition(
     tp: exp.Expression, timing: str, events: list[str], event_nodes: list[exp.Expression]
 ) -> dict[str, str]:
@@ -4753,6 +4777,12 @@ def _set_constraints_command(
             executor.flush_deferred(session, storage, db, catalog)
     else:
         names = {t.strip().strip('"') for t in targets.split(",") if t.strip()}
+        from secantus.sql.catalog import TRIGGER_COLLECTION
+
+        for name in names:
+            for trg in storage.find_matching(db, TRIGGER_COLLECTION, {"name": name}):
+                if trg.get("constraint") and not trg.get("deferrable"):
+                    raise errors.SQLError("42809", f'constraint "{name}" is not deferrable')
         for name in names:
             session.deferred_names[name] = deferred
         if not deferred and session.pending_deferred:
@@ -5717,7 +5747,7 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
     events = [str(e.this).upper() for e in event_nodes]
     table_node = tp.args.get("table")
     unsupported = None
-    if timing not in ("BEFORE", "AFTER"):
+    if timing not in ("BEFORE", "AFTER", "INSTEAD OF"):
         unsupported = f"{timing or 'this'} triggers"
     elif for_each not in ("ROW", "STATEMENT"):
         unsupported = "this trigger level"
@@ -5725,13 +5755,38 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
         unsupported = "this trigger event"
     elif "TRUNCATE" in events and for_each == "ROW":
         raise errors.feature_not_supported("TRUNCATE FOR EACH ROW triggers are not supported")
-    elif tp.args.get("constraint"):
-        unsupported = "constraint triggers"
     if unsupported is not None or table_node is None:
         raise errors.feature_not_supported(f"{unsupported or 'this trigger'} are not supported")
     transition = _trigger_transition(tp, timing, events, event_nodes)
+    transition.update(_constraint_trigger(tp, timing, for_each))
     tname = planner.qualified_table_name(table_node)
-    if catalog.get(db, tname) is None:
+    is_view = catalog.get_view(db, tname) is not None
+    if timing == "INSTEAD OF":
+        if not is_view:
+            if catalog.get(db, tname) is None:
+                raise errors.undefined_table(tname)
+            raise errors.SQLError(
+                "42809",
+                f'"{tname}" is a table',
+                diag={"D": "Tables cannot have INSTEAD OF triggers."},
+            )
+        if for_each != "ROW":
+            raise errors.feature_not_supported("INSTEAD OF triggers must be FOR EACH ROW")
+        if any(e.args.get("columns") for e in event_nodes):
+            raise errors.feature_not_supported("INSTEAD OF triggers cannot have column lists")
+        if tp.args.get("when"):
+            raise errors.feature_not_supported("INSTEAD OF triggers cannot have WHEN conditions")
+    elif is_view:
+        if for_each == "ROW":
+            raise errors.SQLError(
+                "42809",
+                f'"{tname}" is a view',
+                diag={"D": "Views cannot have row-level BEFORE or AFTER triggers."},
+            )
+        # PostgreSQL accepts a statement-level trigger on a view; this server
+        # would store it and never fire it, so it says so instead.
+        raise errors.feature_not_supported("statement-level triggers on views are not supported")
+    elif catalog.get(db, tname) is None:
         raise errors.undefined_table(tname)
     execute = tp.args.get("execute")
     fn_name = None
@@ -6351,6 +6406,131 @@ def _updatable_view_base(vdef_sql: str) -> tuple[str, exp.Expression | None] | N
                 return None
     where = sel.args.get("where")
     return from_.this.name, (where.this if isinstance(where, exp.Where) else None)
+
+
+def _dml_target(stmt: exp.Expression) -> exp.Table | None:
+    if isinstance(stmt, exp.Insert):
+        tgt = stmt.this
+        node = tgt.this if isinstance(tgt, exp.Schema) else tgt
+    else:
+        node = stmt.this if isinstance(stmt.this, exp.Table) else stmt.find(exp.Table)
+    return node if isinstance(node, exp.Table) else None
+
+
+def _run_instead_of(
+    stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
+) -> SQLResult | None:
+    """A write to a view with ``INSTEAD OF`` row triggers: each row the
+    statement names goes to the triggers (in name order) instead of to the
+    view's base table. A trigger returning NULL skips the row (and the
+    triggers after it), and the command tag counts the rows that were not
+    skipped -- PostgreSQL's rules, measured on 15. None when the target is
+    not such a view."""
+    node = _dml_target(stmt)
+    if node is None:
+        return None
+    vname = planner.qualified_table_name(node)
+    if catalog.get_view(db, vname) is None:
+        return None
+    event = {exp.Insert: "INSERT", exp.Update: "UPDATE", exp.Delete: "DELETE"}[type(stmt)]
+    trgs = [
+        t
+        for t in catalog.triggers_for_table(db, vname)
+        if t.get("timing") == "INSTEAD OF" and event in (t.get("events") or [t.get("event")])
+    ]
+    if not trgs:
+        return None
+    alias = node.alias or node.name
+    view_sql = (
+        f"{exp.to_identifier(node.name).sql('postgres')} AS "
+        f"{exp.to_identifier(alias).sql('postgres')}"
+    )
+    probe = run_statement(
+        storage,
+        db,
+        sqlglot.parse_one(f"SELECT * FROM {view_sql} WHERE false", read="postgres"),
+        session,
+        catalog,
+    )
+    cols = [c.name for c in probe.columns]
+    pairs: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
+    if event == "INSERT":
+        tgt = stmt.this
+        targets = [c.name for c in tgt.expressions] if isinstance(tgt, exp.Schema) else list(cols)
+        src = run_statement(storage, db, stmt.expression.copy(), session, catalog)
+        for row in src.rows:
+            new = {c: None for c in cols}
+            new.update(zip(targets, row, strict=False))
+            pairs.append((None, new))
+    else:
+        where = stmt.args.get("where")
+        sel = sqlglot.parse_one(f"SELECT * FROM {view_sql}", read="postgres")
+        if event == "UPDATE":
+            sel = sqlglot.parse_one(
+                "SELECT "
+                + ", ".join(
+                    [
+                        f"{exp.to_identifier(alias).sql('postgres')}."
+                        f"{exp.to_identifier(c).sql('postgres')}"
+                        for c in cols
+                    ]
+                    + [
+                        f"({eq.expression.sql('postgres')}) AS __io_{i}"
+                        for i, eq in enumerate(stmt.expressions)
+                    ]
+                )
+                + f" FROM {view_sql}",
+                read="postgres",
+            )
+        if isinstance(where, exp.Where):
+            sel.set("where", where.copy())
+        res = run_statement(storage, db, sel, session, catalog)
+        for row in res.rows:
+            old = dict(zip(cols, row[: len(cols)], strict=True))
+            if event == "DELETE":
+                pairs.append((old, None))
+                continue
+            new = dict(old)
+            for i, eq in enumerate(stmt.expressions):
+                new[eq.this.name] = row[len(cols) + i]
+            pairs.append((old, new))
+    ctx = executor._trigger_ctx(storage, db, catalog, session)
+    done: list[dict[str, Any]] = []
+    for old, new in pairs:
+        result: Any = None
+        for trg in trgs:
+            result = executor._call_trigger(
+                trg, catalog, db, ctx, op=event, new=new, old=old, table=vname
+            )
+            if result is None:
+                break
+            if event != "DELETE":
+                new = result
+        if result is not None:
+            done.append(result)
+    n = len(done)
+    tag = f"INSERT 0 {n}" if event == "INSERT" else f"{event} {n}"
+    returning = stmt.args.get("returning")
+    if returning is None:
+        return SQLResult(command_tag=tag, rowcount=n)
+    # RETURNING projects the row each trigger chain returned.
+    values = exp.Values(
+        expressions=[
+            exp.Tuple(expressions=[planner._value_to_node(r.get(c)) for c in cols]) for r in done
+        ],
+        alias=exp.TableAlias(
+            this=exp.to_identifier(alias), columns=[exp.to_identifier(c) for c in cols]
+        ),
+    )
+    if done:
+        source: exp.Expression = values
+    else:
+        source = sqlglot.parse_one(
+            f"SELECT * FROM {view_sql} WHERE false", read="postgres"
+        ).subquery(alias)
+    proj = exp.select(*[e.copy() for e in returning.expressions]).from_(source)
+    out = run_statement(storage, db, proj, session, catalog)
+    return SQLResult(command_tag=tag, columns=out.columns, rows=out.rows, rowcount=n)
 
 
 def _rewrite_write_through_view(

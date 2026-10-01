@@ -67,7 +67,6 @@ class TestDDL:
         run(storage, session, "create table t2 (t text)")
         run(storage, session, TRIGGER_FN)
         for ddl in (
-            "create trigger trg instead of insert on t2 for each row execute procedure tfn()",
             "create trigger trg before truncate on t2 for each row execute procedure tfn()",
         ):
             with pytest.raises(SQLError) as ei:
@@ -351,8 +350,7 @@ def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
 
 class TestTriggersThisServerCannotRun:
     """A trigger the Rust server stored that this server cannot run refuses
-    the write it would fire on (0A000) rather than being skipped: constraint
-    (deferrable) triggers and INSTEAD OF."""
+    the write it would fire on (0A000) rather than being skipped: INSTEAD OF."""
 
     @pytest.fixture()
     def rt(self, storage, session):
@@ -368,7 +366,7 @@ class TestTriggersThisServerCannotRun:
         assert "cannot run on this server" in str(ei.value)
 
     def test_unrunnable_shapes_refuse_their_writes(self, rt, session):
-        _rust_trigger(rt, "cons", "AFTER", ["INSERT"], constraint=True)
+        _rust_trigger(rt, "inst", "INSTEAD OF", ["INSERT"])
         self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
         assert run(rt, session, "select t from rt").rows == [("a",)]
 
@@ -380,8 +378,8 @@ class TestTriggersThisServerCannotRun:
         run(rt, session, "update rt set t = 'dogs' where id = 2")
         assert run(rt, session, "select ts::text from rt where id = 2").rows == [("'dog':1",)]
 
-    def test_on_conflict_with_a_constraint_trigger_refuses(self, rt, session):
-        _rust_trigger(rt, "ins", "AFTER", ["INSERT"], constraint=True)
+    def test_on_conflict_with_an_instead_of_trigger_refuses(self, rt, session):
+        _rust_trigger(rt, "ins", "INSTEAD OF", ["INSERT"])
         self._refused(
             rt, session, "insert into rt (id, t) values (1, 'b') on conflict (id) do nothing"
         )
@@ -763,3 +761,280 @@ class TestTransitionTables:
             run(storage, session, f"create trigger e {ddl} execute function tb20_n()")
         assert ei.value.sqlstate == sqlstate
         assert message in str(ei.value)
+
+
+def _statements(sql):
+    """Split a script on ``;`` line ends, keeping ``$$`` bodies whole."""
+    out, buf = [], ""
+    for part in sql.split(";\n"):
+        buf += part + ";\n"
+        if buf.count("$$") % 2 == 0:
+            if buf.strip(" ;\n"):
+                out.append(buf)
+            buf = ""
+    return out
+
+
+def _run_script(storage, session, sql):
+    """Run each statement, recording an error's SQLSTATE and message the way
+    psql would show it, and every result's rows."""
+    seen = []
+    for stmt in _statements(sql):
+        try:
+            for r in run_sql(storage, DB, stmt, session=session):
+                if r.rows:
+                    seen.append(r.rows)
+        except SQLError as e:
+            seen.append((e.sqlstate, str(e)))
+    return seen
+
+
+CONSTRAINT_TRIGGER_SQL = """\
+create table tb21_t(id int primary key, v int);
+create table tb21_log(msg text);
+create function tb21_f() returns trigger language plpgsql as $$ begin
+insert into tb21_log
+  values (tg_name||':'||tg_op||':'||new.id||':'||(select count(*) from tb21_t));
+if new.v < 0 then raise exception 'negative v in %', new.id; end if;
+return null; end $$;
+create constraint trigger c_def after insert on tb21_t deferrable initially deferred
+  for each row execute function tb21_f();
+create constraint trigger c_imm after insert on tb21_t
+  for each row execute function tb21_f();
+begin;
+insert into tb21_t values (1, 1);
+insert into tb21_t values (2, 2);
+insert into tb21_log values ('before commit');
+commit;
+begin;
+set constraints c_def immediate;
+insert into tb21_t values (3, 3);
+insert into tb21_log values ('after 3');
+commit;
+insert into tb21_t values (4, 4);
+begin;
+insert into tb21_t values (5, -1);
+insert into tb21_log values ('queued 5');
+set constraints all immediate;
+commit;
+select msg from tb21_log;
+select id from tb21_t order by id;
+"""
+
+ABORTED = (
+    "25P02",
+    "current transaction is aborted, commands ignored until end of transaction block",
+)
+
+
+class TestConstraintTriggers:
+    """``CREATE CONSTRAINT TRIGGER``: a DEFERRABLE INITIALLY DEFERRED one
+    queues its events for COMMIT (or ``SET CONSTRAINTS ... IMMEDIATE``), and
+    outside a block runs at the end of the statement, after the immediate
+    triggers. Every expected value is PostgreSQL 15's for the same script."""
+
+    def test_matches_postgres(self, storage, session):
+        seen = _run_script(storage, session, CONSTRAINT_TRIGGER_SQL)
+        assert seen == [
+            ("P0001", "negative v in 5"),
+            ABORTED,
+            ABORTED,
+            [
+                ("c_imm:INSERT:1:1",),
+                ("c_imm:INSERT:2:2",),
+                ("before commit",),
+                ("c_def:INSERT:1:2",),
+                ("c_def:INSERT:2:2",),
+                ("c_def:INSERT:3:3",),
+                ("c_imm:INSERT:3:3",),
+                ("after 3",),
+                ("c_imm:INSERT:4:4",),
+                ("c_def:INSERT:4:4",),
+            ],
+            [(1,), (2,), (3,), (4,)],
+        ]
+
+    def test_a_deferred_raise_at_commit_rolls_the_block_back(self, storage, session):
+        seen = _run_script(
+            storage,
+            session,
+            """\
+create table tb21_t(id int primary key, v int);
+create function tb21_f() returns trigger language plpgsql as $$ begin
+if new.v < 0 then raise exception 'negative v in %', new.id; end if;
+return null; end $$;
+create constraint trigger c_def after insert on tb21_t deferrable initially deferred
+  for each row execute function tb21_f();
+begin;
+insert into tb21_t values (1, -1);
+insert into tb21_t values (2, 2);
+commit;
+select count(*) from tb21_t;
+""",
+        )
+        assert seen == [("P0001", "negative v in 1"), [(0,)]]
+
+    @pytest.mark.parametrize(
+        ("sql", "sqlstate", "message"),
+        [
+            (
+                "create constraint trigger e before insert on tb21_x "
+                "for each row execute function tb21_n()",
+                "42601",
+                'syntax error at or near "before"',
+            ),
+            (
+                "create constraint trigger e after insert on tb21_x "
+                "for each statement execute function tb21_n()",
+                "42601",
+                'syntax error at or near "statement"',
+            ),
+            (
+                "create constraint trigger e after insert on tb21_x "
+                "not deferrable initially deferred for each row execute function tb21_n()",
+                "42601",
+                "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+            ),
+        ],
+    )
+    def test_invalid_shapes_match_postgres(self, storage, session, sql, sqlstate, message):
+        run(storage, session, "create table tb21_x(id int)")
+        run(
+            storage,
+            session,
+            "create function tb21_n() returns trigger language plpgsql as "
+            "$$ begin return null; end $$",
+        )
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, sql)
+        assert (ei.value.sqlstate, str(ei.value)) == (sqlstate, message)
+
+    def test_set_constraints_on_a_non_deferrable_trigger_is_42809(self, storage, session):
+        run(storage, session, "create table tb21_x(id int)")
+        run(
+            storage,
+            session,
+            "create function tb21_n() returns trigger language plpgsql as "
+            "$$ begin return null; end $$",
+        )
+        run(
+            storage,
+            session,
+            "create constraint trigger e4 after insert on tb21_x "
+            "for each row execute function tb21_n()",
+        )
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, "set constraints e4 deferred")
+        assert (ei.value.sqlstate, str(ei.value)) == ("42809", 'constraint "e4" is not deferrable')
+
+
+INSTEAD_OF_SQL = """\
+create table tb22_t(id int primary key, v text);
+create table tb22_log(msg text);
+create view tb22_v as select id, upper(v) as uv from tb22_t;
+create function tb22_f() returns trigger language plpgsql as $$ begin
+insert into tb22_log values (tg_name||':'||tg_op||':'||tg_level||':'
+  ||coalesce(old.id::text,'-')||'/'||coalesce(old.uv,'-')||'>'
+  ||coalesce(new.id::text,'-')||'/'||coalesce(new.uv,'-'));
+if tg_op = 'INSERT' then
+  if new.id = 99 then return null; end if;
+  insert into tb22_t values (new.id, lower(new.uv)); return new;
+elsif tg_op = 'UPDATE' then
+  update tb22_t set v = lower(new.uv) where id = old.id; return new;
+else
+  delete from tb22_t where id = old.id; return old;
+end if; end $$;
+create trigger io instead of insert or update or delete on tb22_v
+  for each row execute function tb22_f();
+insert into tb22_v values (1, 'A'), (2, 'B'), (99, 'Z');
+update tb22_v set uv = uv || 'X' where id = 1;
+update tb22_v set uv = 'Q' where id = 42;
+delete from tb22_v where id = 2;
+insert into tb22_v values (3, 'C') returning id, uv;
+select msg from tb22_log;
+select * from tb22_t order by id;
+"""
+
+
+class TestInsteadOfTriggers:
+    """``INSTEAD OF`` row triggers on a view: each row the INSERT / UPDATE /
+    DELETE names goes to the trigger instead of the base table; a NULL return
+    skips it, the command tag counts the rest, and RETURNING projects what the
+    trigger returned. Expected values are PostgreSQL 15's."""
+
+    def test_matches_postgres(self, storage, session):
+        results = run_sql(storage, DB, INSTEAD_OF_SQL, session=session)
+        tags = [r.command_tag for r in results[5:10]]
+        assert tags == ["INSERT 0 2", "UPDATE 1", "UPDATE 0", "DELETE 1", "INSERT 0 1"]
+        assert results[9].rows == [(3, "C")]
+        assert results[10].rows == [
+            ("io:INSERT:ROW:-/->1/A",),
+            ("io:INSERT:ROW:-/->2/B",),
+            ("io:INSERT:ROW:-/->99/Z",),
+            ("io:UPDATE:ROW:1/A>1/AX",),
+            ("io:DELETE:ROW:2/B>-/-",),
+            ("io:INSERT:ROW:-/->3/C",),
+        ]
+        assert results[11].rows == [(1, "ax"), (3, "c")]
+
+    @pytest.mark.parametrize(
+        ("sql", "sqlstate", "message", "detail"),
+        [
+            (
+                "create trigger a instead of insert on tb22_x for each row "
+                "execute function tb22_n()",
+                "42809",
+                '"tb22_x" is a table',
+                "Tables cannot have INSTEAD OF triggers.",
+            ),
+            (
+                "create trigger b instead of insert on tb22_xv for each statement "
+                "execute function tb22_n()",
+                "0A000",
+                "INSTEAD OF triggers must be FOR EACH ROW",
+                None,
+            ),
+            (
+                "create trigger c instead of update of id on tb22_xv for each row "
+                "execute function tb22_n()",
+                "0A000",
+                "INSTEAD OF triggers cannot have column lists",
+                None,
+            ),
+            (
+                "create trigger d instead of insert on tb22_xv for each row "
+                "when (new.id > 0) execute function tb22_n()",
+                "0A000",
+                "INSTEAD OF triggers cannot have WHEN conditions",
+                None,
+            ),
+            (
+                "create trigger e before insert on tb22_xv for each row execute function tb22_n()",
+                "42809",
+                '"tb22_xv" is a view',
+                "Views cannot have row-level BEFORE or AFTER triggers.",
+            ),
+        ],
+    )
+    def test_invalid_shapes_match_postgres(self, storage, session, sql, sqlstate, message, detail):
+        run(storage, session, "create table tb22_x(id int)")
+        run(storage, session, "create view tb22_xv as select id from tb22_x")
+        run(
+            storage,
+            session,
+            "create function tb22_n() returns trigger language plpgsql as "
+            "$$ begin return null; end $$",
+        )
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, sql)
+        assert (ei.value.sqlstate, str(ei.value)) == (sqlstate, message)
+        assert ei.value.diag.get("D") == detail
+
+    def test_dropping_the_view_drops_its_triggers(self, storage, session):
+        run_sql(storage, DB, INSTEAD_OF_SQL, session=session)
+        run(storage, session, "drop view tb22_v")
+        run(storage, session, "create view tb22_v as select id, v from tb22_t")
+        # No INSTEAD OF trigger now: the write goes through the plain view.
+        run(storage, session, "insert into tb22_v values (4, 'd')")
+        assert run(storage, session, "select count(*) from tb22_log").rows == [(6,)]
+        assert run(storage, session, "select v from tb22_t where id = 4").rows == [("d",)]
