@@ -13573,9 +13573,22 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     # ``-|-`` adjacency -> bool.
     if getattr(exp, "Adjacent", None) is not None and isinstance(node, exp.Adjacent):
         return "bool"
+    # ``&<`` / ``&>`` -> bool; ``<<`` / ``>>`` -> bool over ranges (they are
+    # bit shifts over integers, which keep their own typing below).
+    if type(node).__name__ in ("ExtendsLeft", "ExtendsRight"):
+        return "bool"
+    if isinstance(node, (exp.BitwiseLeftShift, exp.BitwiseRightShift)) and (
+        _range_tag_of((node.this, node.expression), resolve) is not None
+    ):
+        return "bool"
     # ``*`` / ``+`` / ``-`` over range operands -> the range type (intersection /
     # union / difference).
     if isinstance(node, (exp.Mul, exp.Add, exp.Sub)):
+        # A multirange operand makes it multirange arithmetic.
+        for operand in (node.this, node.expression):
+            mtag = _infer_scalar_tag(operand, resolve) if operand is not None else None
+            if ranges.is_multirange_tag(mtag):
+                return mtag
         rtag = _range_tag_of((node.this, node.expression), resolve)
         if rtag is not None:
             return rtag

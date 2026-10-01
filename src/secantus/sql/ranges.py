@@ -10,6 +10,7 @@ range types, and range GiST indexes are out of scope.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 from decimal import Decimal
 from typing import Any
@@ -196,6 +197,18 @@ def contains_value(rng: Any, value: Any) -> bool:
         return False
     value = _cv(value)
     lo, hi = _cv(_bound(rng, "lower")), _cv(_bound(rng, "upper"))
+    # A `date` value is carried as ISO text; a daterange bound as a datetime.
+    # Ordering the two raised TypeError (XX000) for `daterange @> date`.
+    edge = lo if lo is not None else hi
+    if isinstance(value, str) and isinstance(edge, _dt.datetime):
+        with contextlib.suppress(ValueError):
+            value = _dt.datetime.fromisoformat(value[:10]).replace(tzinfo=edge.tzinfo)
+    elif (
+        isinstance(value, _dt.date)
+        and not isinstance(value, _dt.datetime)
+        and isinstance(edge, _dt.datetime)
+    ):
+        value = _dt.datetime(value.year, value.month, value.day, tzinfo=edge.tzinfo)
     if lo is not None and (value < lo or (value == lo and not rng.get("lower_inc"))):
         return False
     return not (hi is not None and (value > hi or (value == hi and not rng.get("upper_inc"))))
@@ -627,6 +640,127 @@ def canonical(rng: Any) -> tuple:
         bool(r.get("lower_inc")),
         bool(r.get("upper_inc")),
     )
+
+
+def sort_key(rng: Any) -> tuple:
+    """PostgreSQL's range ORDER (``range_cmp``): the empty range first, then by
+    lower bound (unbounded lowest; at one value an inclusive bound sorts before
+    an exclusive one), then by upper bound (unbounded highest; at one value
+    an exclusive bound sorts before an inclusive one). ``canonical`` is an
+    identity, not an order: comparing it with ``<`` raised for an unbounded
+    or empty range, which the client saw as 42883."""
+    r = rng if isinstance(rng, dict) else {}
+    if r.get("empty"):
+        return (0,)
+    lo, hi = _canonical_bound(_bound(r, "lower")), _canonical_bound(_bound(r, "upper"))
+    lower = (0,) if lo is None else (1, lo, 0 if r.get("lower_inc") else 1)
+    upper = (2,) if hi is None else (1, hi, 1 if r.get("upper_inc") else 0)
+    return (1, lower, upper)
+
+
+def multirange_sort_key(mr: Any) -> tuple:
+    """Member by member, a shorter multirange first on a common prefix."""
+    return tuple(sort_key(r) for r in multirange_members(mr))
+
+
+def type_name(x: Any) -> str:
+    """The SQL type name of a range or multirange VALUE, read off its bounds
+    (for error messages; an int bound reads as int4)."""
+    multi = is_multirange(x)
+    members = multirange_members(x) if multi else [x]
+    base = "int4"
+    for r in members:
+        v = _bound(r, "lower") if isinstance(r, dict) else None
+        v = v if v is not None else (_bound(r, "upper") if isinstance(r, dict) else None)
+        if v is None:
+            continue
+        if isinstance(v, _dt.datetime):
+            base = "tstz" if v.tzinfo is not None else "ts"
+        elif isinstance(v, _dt.date):
+            base = "date"
+        elif not isinstance(v, int):
+            base = "num"
+        break
+    return f"{base}multirange" if multi else f"{base}range"
+
+
+def span(x: Any) -> Any:
+    """A multirange as the single range spanning its members (empty when it
+    has none); a range unchanged."""
+    if not is_multirange(x):
+        return x
+    members = multirange_members(x)
+    if not members:
+        return {"empty": True}
+    out = dict(members[0])
+    for r in members[1:]:
+        out = merge(out, r)
+    return out
+
+
+def strictly_left(a: Any, b: Any) -> bool:
+    """``a << b``: every point of ``a`` is below every point of ``b``."""
+    if is_empty(a) or is_empty(b) or not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    return not _after_lower(a, b)
+
+
+def not_extend_right(a: Any, b: Any) -> bool:
+    """``a &< b``: ``a`` reaches no further right than ``b``."""
+    if is_empty(a) or is_empty(b) or not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    return _upper_ge(b, a)
+
+
+def not_extend_left(a: Any, b: Any) -> bool:
+    """``a &> b``: ``a`` reaches no further left than ``b``."""
+    if is_empty(a) or is_empty(b) or not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    return _lower_le(b, a)
+
+
+def multirange_union(a: Any, b: Any) -> dict[str, Any]:
+    """``+`` on multiranges."""
+    return make_multirange([*multirange_members(a), *multirange_members(b)])
+
+
+def multirange_intersect(a: Any, b: Any) -> dict[str, Any]:
+    """``*`` on multiranges: every pairwise overlap."""
+    return make_multirange(
+        [intersect(x, y) for x in multirange_members(a) for y in multirange_members(b)]
+    )
+
+
+def multirange_difference(a: Any, b: Any) -> dict[str, Any]:
+    """``-`` on multiranges: each member of ``a`` with every member of ``b``
+    cut out of it, which may split it in two."""
+    pieces = [dict(r) for r in multirange_members(a)]
+    for cut in multirange_members(b):
+        out = []
+        for p in pieces:
+            if not overlaps(p, cut):
+                out.append(p)
+                continue
+            if not _lower_le(cut, p):  # a piece of p left of the cut
+                out.append(
+                    {
+                        "lower": _bound(p, "lower"),
+                        "lower_inc": bool(p.get("lower_inc")),
+                        "upper": _bound(cut, "lower"),
+                        "upper_inc": not cut.get("lower_inc"),
+                    }
+                )
+            if not _upper_ge(cut, p):  # a piece right of it
+                out.append(
+                    {
+                        "lower": _bound(cut, "upper"),
+                        "lower_inc": not cut.get("upper_inc"),
+                        "upper": _bound(p, "upper"),
+                        "upper_inc": bool(p.get("upper_inc")),
+                    }
+                )
+        pieces = out
+    return make_multirange(pieces)
 
 
 def canonical_multirange(mr: Any) -> tuple:
