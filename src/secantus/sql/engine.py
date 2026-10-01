@@ -421,6 +421,49 @@ def _rollback_prepared(gid: str, storage: Any, session: Session) -> SQLResult:
     return SQLResult(command_tag="ROLLBACK PREPARED")
 
 
+def refuse_partitioned(
+    stmt: exp.Expression, storage: Any, db: str, *, read: bool | None = None
+) -> None:
+    """Refuse a statement over a table the Rust server partitioned.
+
+    This server knows no partitions. The Rust server keeps a partitioned
+    table's rows in the ROOT's collection, so here a partition read as EMPTY,
+    and a write to the root went in unrouted and unchecked (a row no
+    partition covers was accepted). Reading the root is right -- every row is
+    in its collection -- so only that is allowed; anything touching a
+    partition, or writing the root, is PostgreSQL's 0A000.
+    """
+    from secantus.sql.catalog import CATALOG_COLLECTION
+
+    names = {planner.qualified_table_name(t) for t in stmt.find_all(exp.Table) if t.name}
+    if not names:
+        return
+    docs = storage.find_matching(
+        db,
+        CATALOG_COLLECTION,
+        {
+            "_id": {"$in": sorted(names)},
+            "$or": [{"partition_of": {"$exists": True}}, {"partition_by": {"$exists": True}}],
+        },
+    )
+    if not docs:
+        return
+    if read is None:
+        read = isinstance(stmt, (exp.Select, exp.SetOperation)) and not any(
+            stmt.find_all(exp.Insert, exp.Update, exp.Delete, exp.Merge)
+        )
+    for doc in docs:
+        if doc.get("partition_of") is not None:
+            raise errors.feature_not_supported(
+                f'"{doc["_id"]}" is a partition of "{doc["partition_of"]}", and this '
+                "server does not support partitioned tables"
+            )
+        if not read:
+            raise errors.feature_not_supported(
+                f'"{doc["_id"]}" is a partitioned table, and this server can only read it'
+            )
+
+
 def _dispatch(
     stmt: exp.Expression, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
@@ -438,6 +481,7 @@ def _dispatch(
     # value it derives into ``session.txn_now``.
     if session.txn_handle is None:
         session.txn_now = None
+    refuse_partitioned(stmt, storage, db)
     if isinstance(stmt, exp.Transaction):
         session.txn_now = None  # BEGIN starts a fresh transaction clock
         return _begin_txn(storage, session, stmt.args.get("modes") or [])

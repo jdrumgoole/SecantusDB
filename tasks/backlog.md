@@ -653,8 +653,14 @@ remain open:
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
       swept against PostgreSQL 14 at 0 divergences except `arrays` and
       `strings` (one line each, below). Left:
-      - Partitioning: the Python server does not know partitions: it sees a
-        partition as an empty table (the rows are in the root's collection).
+      - Partitioning: the Python server does not know partitions (the rows
+        are in the root's collection). Since batch 16 it reads the ROOT --
+        which is right -- and refuses everything else with 0A000: any
+        statement on a partition, any write / ALTER / DROP of the root, COPY
+        FROM into it. It used to read a partition as EMPTY and accept root
+        writes no partition covers. Its catalog rewrites also keep the keys
+        only the Rust server models (`partition_by`, `owner`, a column's
+        `collation` ...); an ALTER there used to erase them.
         (`PARTITION BY HASH`, expression keys, `tableoid` everywhere, and a
         partition's own column options and constraints -- NOT NULL, DEFAULT,
         CHECK, UNIQUE, PRIMARY KEY, enforced -- landed in batch 10.) A

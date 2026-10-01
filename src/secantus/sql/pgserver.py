@@ -930,6 +930,10 @@ class SecantusPGServer:
         ``FROM STDIN``, or CopyOutResponse → CopyData* → CopyDone for ``TO STDOUT``."""
         catalog = Catalog(self.storage)
         try:
+            # COPY bypasses `_dispatch`, so it is checked here: TO reads, FROM
+            # writes.
+            to_stdout = not stmt.args.get("kind")
+            sql_engine.refuse_partitioned(stmt, self.storage, session.database, read=to_stdout)
             with self._txn_scope(session):
                 plan = sql_engine.copy_plan(stmt, self.storage, session.database, catalog, session)
             if plan.to_stdout:
