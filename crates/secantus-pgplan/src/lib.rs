@@ -37,6 +37,7 @@ mod func_cast;
 mod funcsig;
 mod optype;
 mod semijoin;
+mod semijoin_hash;
 pub use errpos::error_position;
 pub mod alter_routine;
 pub mod collation;
