@@ -16,6 +16,7 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 mod agg_hoist;
 mod expr_where;
+mod filter_sublink;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -9999,7 +10000,7 @@ fn srf_rows(
                 other => value_text(other),
             };
             let (source, pattern) = (text(&a[0]), text(&a[1]));
-            let flags = a.get(2).map(&text).unwrap_or_default();
+            let flags = a.get(2).map(text).unwrap_or_default();
             let re = regex::Regex::new(&format!(
                 "{}{}",
                 if flags.contains('i') { "(?i)" } else { "" },
@@ -13899,6 +13900,8 @@ fn resolve_sublinks_in_select_scoped(
         resolve_sublinks_in_from(item, lookup, params, run)?;
     }
 
+    // A FILTER holding a subquery, as the CASE argument it is equivalent to.
+    filter_sublink::rewrite(s)?;
     // `EXISTS` over one equality, as the uncorrelated `IN` it is.
     semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
@@ -23424,7 +23427,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     let source = text(&args[0])?;
     let pattern = text(&args[1])?;
     let replacement = text(&args[2])?;
-    let flags = args.get(3).map(&text).transpose()?.unwrap_or_default();
+    let flags = args.get(3).map(text).transpose()?.unwrap_or_default();
     let mut builder = String::new();
     if flags.contains('i') {
         builder.push_str("(?i)");
@@ -28685,8 +28688,8 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
     };
     if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
         let lb = lower.first().copied().unwrap_or(1);
-        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(lb);
-        let hi = match hi.as_ref().map(&index).transpose()? {
+        let lo = lo.as_ref().map(index).transpose()?.unwrap_or(lb);
+        let hi = match hi.as_ref().map(index).transpose()? {
             Some(h) => h,
             None => lb + items.len() as i64 - 1,
         };
