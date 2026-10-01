@@ -10,6 +10,7 @@ and ``SHOW`` / ``SET`` resolve against real state.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import datetime as _dt
 import re
@@ -1304,8 +1305,6 @@ def _close_non_hold_cursors(session: Session) -> None:
 def _run_merge(
     stmt: exp.Merge, storage: Any, db: str, catalog: Catalog, session: Session
 ) -> SQLResult:
-    from secantus.paths import get_path
-
     if not isinstance(stmt.this, exp.Table):
         raise errors.feature_not_supported("MERGE target must be a table")
     target = _require_table(
@@ -1315,9 +1314,45 @@ def _run_merge(
         storage,
         planner.written_table_name(stmt.this),
     )
-    target_alias = (stmt.this.alias or stmt.this.name).lower()
     if not getattr(target, "reflected", False):
-        executor.refuse_unfirable_triggers(catalog, db, target.name, "INSERT", "UPDATE", "DELETE")
+        executor.refuse_unfirable_triggers(
+            catalog, db, target.name, "INSERT", "UPDATE", "DELETE", fires=True
+        )
+    # PostgreSQL fires BEFORE STATEMENT for each action a WHEN clause names
+    # (INSERT, UPDATE, DELETE in that order), and the AFTER ones in reverse.
+    actions = {
+        _merge_when_action(w)
+        for w in stmt.args["whens"].expressions
+        if w.args["then"].sql().strip().upper() != "DO NOTHING"
+    }
+    events = [e for e in ("INSERT", "UPDATE", "DELETE") if e in actions]
+    for event in events:
+        executor.fire_statement_triggers(storage, db, catalog, session, target, event, "BEFORE")
+    token = _MERGE_AFTER.set([])
+    try:
+        result = _run_merge_body(stmt, storage, db, catalog, session, target)
+        for event, old, new in _MERGE_AFTER.get():
+            executor.fire_row_triggers(
+                storage, db, catalog, session, target, event, "AFTER", [(old, new)]
+            )
+    finally:
+        _MERGE_AFTER.reset(token)
+    for event in reversed(events):
+        executor.fire_statement_triggers(storage, db, catalog, session, target, event, "AFTER")
+    return result
+
+
+def _run_merge_body(
+    stmt: exp.Merge,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session,
+    target: TableDef,
+) -> SQLResult:
+    from secantus.paths import get_path
+
+    target_alias = (stmt.this.alias or stmt.this.name).lower()
     src_alias, source_rows, source_cols = _merge_source(
         stmt.args["using"], db, catalog, session, storage
     )
@@ -1560,7 +1595,8 @@ def _run_delete_using(
     )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
     if not getattr(target, "reflected", False):
-        executor.refuse_unfirable_triggers(catalog, db, target.name, "DELETE")
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "DELETE", fires=True)
+    executor.fire_statement_triggers(storage, db, catalog, session, target, "DELETE", "BEFORE")
     sources = _collect_dml_sources(stmt.args["using"], db, catalog, session, storage)
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     where = stmt.args.get("where")
@@ -1571,10 +1607,20 @@ def _run_delete_using(
             target_docs, sources, where.this if where else None, target, target_alias, sctx
         )
     ]
+    victims = [
+        old
+        for old, _new in executor.fire_row_triggers(
+            storage, db, catalog, session, target, "DELETE", "BEFORE", [(v, None) for v in victims]
+        )
+    ]
     if catalog is not None and not getattr(target, "reflected", False):
         executor.enforce_parent_delete(victims, target, storage, db, catalog)
     for tdoc in victims:
         storage.delete_matching(db, target.collection, {"_id": tdoc["_id"]})
+    executor.fire_row_triggers(
+        storage, db, catalog, session, target, "DELETE", "AFTER", [(v, None) for v in victims]
+    )
+    executor.fire_statement_triggers(storage, db, catalog, session, target, "DELETE", "AFTER")
     n = len(victims)
     returning = planner._returning_columns(stmt, target)
     if returning is not None:
@@ -1671,9 +1717,27 @@ def _run_update_from(
         storage,
         planner.written_table_name(target_node),
     )
-    target_alias = (target_node.alias or target_node.name).lower()
     if not getattr(target, "reflected", False):
-        executor.refuse_unfirable_triggers(catalog, db, target.name, "UPDATE")
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "UPDATE", fires=True)
+    token = executor._UPDATE_TARGETS.set(frozenset(eq.this.name for eq in stmt.expressions))
+    try:
+        return _run_update_from_body(stmt, storage, db, catalog, session, target)
+    finally:
+        executor._UPDATE_TARGETS.reset(token)
+
+
+def _run_update_from_body(
+    stmt: exp.Update,
+    storage: Any,
+    db: str,
+    catalog: Catalog,
+    session: Session,
+    target: TableDef,
+) -> SQLResult:
+    from secantus.paths import get_path
+
+    target_alias = (stmt.this.alias or stmt.this.name).lower()
+    executor.fire_statement_triggers(storage, db, catalog, session, target, "UPDATE", "BEFORE")
     from_node = stmt.args["from_"]
     sources = _collect_dml_sources([from_node.this], db, catalog, session, storage)
     source_cols = {a: cols for a, _, cols in sources}
@@ -1685,6 +1749,8 @@ def _run_update_from(
     )
     returning = planner._returning_columns(stmt, target)
     updated: list[dict[str, Any]] = []
+    before_row = executor._triggers(catalog, db, target, "UPDATE", "BEFORE", "ROW")
+    pairs = []
     for tdoc, binding in matches:
         scope = _dml_join_scope(tdoc, binding, target, target_alias, source_cols)
         set_doc: dict[str, Any] = {}
@@ -1694,9 +1760,24 @@ def _run_update_from(
                 scalar.evaluate(eq.expression, scope, sctx), target.type_for(col)
             )
         post = {**tdoc, **set_doc}
+        if before_row:
+            kept = executor.fire_row_triggers(
+                storage, db, catalog, session, target, "UPDATE", "BEFORE", [(tdoc, post)]
+            )
+            if not kept:
+                continue
+            post = kept[0][1]
+            set_doc = {
+                c.field: get_path(post, c.field)
+                for c in target.columns
+                if c.field != "_id" and not c.field.startswith("_id.")
+            }
         executor.enforce_update_images([post], [tdoc["_id"]], target, storage, db, catalog, session)
         storage.update_matching(db, target.collection, {"_id": tdoc["_id"]}, {"$set": set_doc})
         updated.append(post)
+        pairs.append((tdoc, post))
+    executor.fire_row_triggers(storage, db, catalog, session, target, "UPDATE", "AFTER", pairs)
+    executor.fire_statement_triggers(storage, db, catalog, session, target, "UPDATE", "AFTER")
     n = len(updated)
     if returning is not None:
         return executor._returning_result(updated, returning, f"UPDATE {n}", n, target, storage, db)
@@ -1729,7 +1810,7 @@ def _merge_apply_matched(
     if isinstance(then, exp.Update):
         import copy
 
-        from secantus.paths import set_path
+        from secantus.paths import get_path, set_path
 
         set_doc: dict[str, Any] = {}
         for eq in then.expressions:
@@ -1748,6 +1829,15 @@ def _merge_apply_matched(
         post = copy.deepcopy(td)
         for k, v in {**other_sets, **id_sets}.items():
             set_path(post, k, v)
+        post = _merge_before_row(target, "UPDATE", td, post, storage, db, sctx)
+        if post is None:
+            return 0, None
+        if executor._triggers(sctx.catalog, db, target, "UPDATE", "BEFORE", "ROW"):
+            other_sets = {
+                c.field: get_path(post, c.field)
+                for c in target.columns
+                if c.field != "_id" and not c.field.startswith("_id.")
+            }
         executor.enforce_update_images(
             [post], [td["_id"]], target, storage, db, sctx.catalog, sctx.session
         )
@@ -1767,11 +1857,15 @@ def _merge_apply_matched(
             storage.insert(db, target.collection, [post])
         else:
             storage.update_matching(db, target.collection, {"_id": td["_id"]}, {"$set": other_sets})
+        _MERGE_AFTER.get().append(("UPDATE", td, post))
         return 1, post
     action = then.sql().strip().upper()
     if action == "DELETE":
+        if _merge_before_row(target, "DELETE", td, None, storage, db, sctx) is None:
+            return 0, None
         executor.enforce_parent_delete([td], target, storage, db, sctx.catalog)
         storage.delete_matching(db, target.collection, {"_id": td["_id"]})
+        _MERGE_AFTER.get().append(("DELETE", td, None))
         return 1, td
     if action == "DO NOTHING":
         return 0, None
@@ -1809,9 +1903,33 @@ def _merge_apply_not_matched(
             typemap.coerce(scalar.evaluate(vexpr, scope, sctx), target.type_for(col)),
         )
     doc.setdefault("_id", bson.ObjectId())
+    doc = _merge_before_row(target, "INSERT", None, doc, storage, db, sctx)
+    if doc is None:
+        return 0, None
     executor.enforce_insert_rows([doc], target, storage, db, sctx.catalog, sctx.session)
     storage.insert(db, target.collection, [doc])
+    _MERGE_AFTER.get().append(("INSERT", None, doc))
     return 1, doc
+
+
+# The AFTER ROW events a running MERGE queues, fired at the end of the
+# statement in the order the rows were acted on.
+_MERGE_AFTER: contextvars.ContextVar[list[tuple[str, Any, Any]]] = contextvars.ContextVar(
+    "_MERGE_AFTER"
+)
+
+
+def _merge_before_row(
+    target: TableDef, event: str, old: Any, new: Any, storage: Any, db: str, sctx: Any
+) -> Any:
+    """Run a MERGE action's BEFORE ROW triggers: the row to write (NEW, or OLD
+    for a DELETE), or None when a trigger skipped it."""
+    kept = executor.fire_row_triggers(
+        storage, db, sctx.catalog, sctx.session, target, event, "BEFORE", [(old, new)]
+    )
+    if not kept:
+        return None
+    return kept[0][1] if event != "DELETE" else kept[0][0]
 
 
 def run_statement(

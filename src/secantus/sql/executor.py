@@ -2114,11 +2114,20 @@ def _execute_insert_on_conflict(
     ``RETURNING`` projects the inserted and updated rows, not the skipped ones."""
     from secantus.sql import scalar
 
-    # No trigger runs on this path, so any INSERT / UPDATE trigger refuses it.
-    if not getattr(plan.table, "reflected", False):
-        refuse_unfirable_triggers(catalog, db, plan.table.name, "INSERT", "UPDATE")
-
     oc = plan.on_conflict
+    table = plan.table
+    if not getattr(table, "reflected", False):
+        refuse_unfirable_triggers(catalog, db, table.name, "INSERT", "UPDATE", fires=True)
+    # PostgreSQL's order (measured on 15): BEFORE INSERT STATEMENT, then
+    # BEFORE UPDATE STATEMENT for DO UPDATE; per row BEFORE INSERT ROW (its
+    # NEW is what EXCLUDED sees), and on a conflict BEFORE UPDATE ROW; AFTER
+    # ROW events queue to the end of the statement, then the AFTER STATEMENT
+    # triggers in reverse.
+    do_update = oc.action != "nothing"
+    fire_statement_triggers(storage, db, catalog, session, table, "INSERT", "BEFORE")
+    if do_update:
+        fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "BEFORE")
+    after_rows: list[tuple[str, dict[str, Any] | None, dict[str, Any]]] = []
     coll = plan.table.collection
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     affected = 0
@@ -2127,6 +2136,11 @@ def _execute_insert_on_conflict(
         _assign_sequences([doc], plan.table, db, catalog, session)
         if plan.returning is not None:
             doc.setdefault("_id", bson.ObjectId())
+        kept = fire_row_triggers(
+            storage, db, catalog, session, table, "INSERT", "BEFORE", [(None, doc)]
+        )
+        if not kept:
+            continue
         existing = _find_conflict(storage, db, coll, oc, doc)
         if existing is None:
             # Full enforcement — including any UNIQUE / CHECK / FK other than the
@@ -2145,16 +2159,25 @@ def _execute_insert_on_conflict(
             affected += inserted
             if inserted:
                 result_docs.append(doc)
+                after_rows.append(("INSERT", None, doc))
             continue
         if oc.action == "nothing":
             continue
-        updated = _apply_conflict_update(plan.table, storage, db, oc, existing, doc, sctx)
+        updated = _apply_conflict_update(
+            plan.table, storage, db, oc, existing, doc, sctx, session=session
+        )
         if updated is not None:
+            after_rows.append(("UPDATE", existing, updated))
             # DO UPDATE post-image must also satisfy a view's CHECK OPTION.
             if plan.check_option is not None:
                 _validate_check_option([updated], plan.check_option, plan.table, sctx)
             affected += 1
             result_docs.append(updated)
+    for event, old, new in after_rows:
+        fire_row_triggers(storage, db, catalog, session, table, event, "AFTER", [(old, new)])
+    if do_update:
+        fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "AFTER")
+    fire_statement_triggers(storage, db, catalog, session, table, "INSERT", "AFTER")
     tag = f"INSERT 0 {affected}"
     if plan.returning is not None:
         return _returning_result(
@@ -2193,6 +2216,7 @@ def _apply_conflict_update(
     existing: dict[str, Any],
     excluded: dict[str, Any],
     sctx: Any,
+    session: Any = None,
 ) -> dict[str, Any] | None:
     """Apply a ``DO UPDATE`` to the conflicting ``existing`` row. ``EXCLUDED``
     references resolve to the proposed ``excluded`` row; bare / target-qualified
@@ -2200,6 +2224,7 @@ def _apply_conflict_update(
     ``WHERE`` predicate gates the update out (the row is left untouched)."""
     import copy
 
+    from secantus.paths import set_path
     from secantus.sql import scalar
 
     def scope(node: Any) -> Any:
@@ -2214,7 +2239,24 @@ def _apply_conflict_update(
     for field, type_tag, expr in oc.set_exprs:
         set_doc[field] = typemap.coerce(scalar.evaluate(expr, scope, sctx), type_tag)
     updated = copy.deepcopy(existing)
-    updated.update(set_doc)
+    for field, value in set_doc.items():
+        set_path(updated, field, value)
+    # A BEFORE UPDATE ROW trigger may change the post-image or skip the row.
+    kept = fire_row_triggers(
+        storage, db, sctx.catalog, session, table, "UPDATE", "BEFORE", [(existing, updated)]
+    )
+    if not kept:
+        return None
+    updated = kept[0][1]
+    set_doc = (
+        {
+            c.field: get_path(updated, c.field)
+            for c in table.columns
+            if not c.field.startswith("_id") and c.field != "_id"
+        }
+        if _triggers(sctx.catalog, db, table, "UPDATE", "BEFORE", "ROW")
+        else set_doc
+    )
     # Enforce every constraint on the DO UPDATE post-image (UNIQUE excludes the
     # row itself; NOT NULL / CHECK / FK-child all apply).
     enforce_update_images(
