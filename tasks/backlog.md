@@ -6761,9 +6761,6 @@ What is left, recorded so the PG session and the release work find it:
       embedded handle, runs neither, so TTL indexes never expire documents in
       it and the oplog only prunes opportunistically. Add builder knobs if a
       user needs them.
-- [ ] **crates.io names are not registered yet** (`secantus-mdb`,
-      `secantus-pg`, the `secantus-*` internals). Needs Joe's account; a
-      squatter is the one risk with no engineering fix.
 
 ### 7.02 Rust MongoDB server: change-stream events and error replies -- 2026-10-01
 
