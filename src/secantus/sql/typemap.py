@@ -1430,7 +1430,9 @@ def coerce(value: Any, tag: str) -> Any:
             return value
         from secantus.sql import fts as _fts
 
-        return _fts.parse_tsvector(str(value)) if tag == "tsvector" else _fts.to_tsquery(str(value))
+        return (
+            _fts.parse_tsvector(str(value)) if tag == "tsvector" else _fts.parse_tsquery(str(value))
+        )
     if tag in _NET_TAGS:
         from secantus.sql import net as _net
 

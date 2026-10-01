@@ -52,6 +52,8 @@ dev = [
     "httpx2>=2.12",
     "trustme>=1.2",  # ephemeral CA + self-signed certs for tests/test_tls.py
     "sqlglot>=25",  # SQL parser for the secantus.sql tests (mirrors the [sql] extra)
+    # Mirrors the [fts] extra, so the suite stems every text search language.
+    "snowballstemmer==2.2.0",
     "pg8000>=1.31",  # pure-Python Postgres driver: real-driver gauge for the SQL server
     # Pinned exactly: the validate-psycopg gauge runs the vendored psycopg test
     # suite (vendor/psycopg, same tag) against the installed wheel — the two
@@ -75,6 +77,13 @@ dev = [
     "sphinx>=7.2",
     "myst-parser>=2.0",
     "furo>=2024.1",
+]
+# Full-text search in the 26 non-English Snowball configurations. Pinned
+# exactly: 2.2.0 is the Snowball release PostgreSQL 15 ships, and a different
+# release stems some words differently. Without it those configurations
+# refuse with 0A000 instead of answering differently from PostgreSQL.
+fts = [
+    "snowballstemmer==2.2.0",
 ]
 website = [
     # Pelican + markdown plugin pull in Jinja2, feedgenerator, etc.

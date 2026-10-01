@@ -195,6 +195,10 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         right = evaluate(node.expression, scope, ctx)
         if left is None or right is None:
             return None
+        from secantus.sql import fts as _fts
+
+        if _fts.is_tsquery(left) and _fts.is_tsquery(right):
+            return _fts.tsquery_phrase(left, right, 1)
         return _pggeo.distance(left, right)
     range_pos = _eval_range_position(node, scope, ctx)
     if range_pos is not _NOT_RANGE:
@@ -279,6 +283,17 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
                 return all(f is not None for f in fields)
         # Three-valued logic: NOT NULL is NULL (a WHERE treats it as
         # not-matched), never TRUE.
+        # `!! tsquery` is the tsquery negation; sqlglot reads `!!` as two
+        # `Not`s (and `NOT` is not defined over a tsquery at all), so a
+        # double negation over a tsquery negates it ONCE.
+        if isinstance(inner_node, exp.Not):
+            from secantus.sql import fts as _fts
+
+            inner2 = evaluate(inner_node.this, scope, ctx)
+            if _fts.is_tsquery(inner2):
+                return _fts.tsquery_not(inner2)
+            inner = None if inner2 is None else not _truthy(inner2)
+            return None if inner is None else not inner
         inner = evaluate(node.this, scope, ctx)
         return None if inner is None else not _truthy(inner)
     if isinstance(node, exp.And):
@@ -5414,81 +5429,8 @@ def _call_func(
         if a is None or b is None:
             return None
         return _ranges.merge(a, b)
-    if name in (
-        "to_tsvector",
-        "to_tsquery",
-        "plainto_tsquery",
-        "phraseto_tsquery",
-        "websearch_to_tsquery",
-    ):
-        from secantus.sql import fts as _fts
-
-        # A two-argument form passes the text-search config first. Only its
-        # stop-word half is modelled (`simple` keeps them, anything else drops
-        # them); the last argument is the document / query.
-        text = args[-1] if args else None
-        if text is None:
-            return None
-        config = _as_text(args[0]) if len(args) > 1 else None
-        if name == "to_tsvector":
-            return _fts.to_tsvector(_as_text(text), config)
-        if name == "plainto_tsquery":
-            return _fts.plainto_tsquery(_as_text(text), config)
-        if name == "phraseto_tsquery":
-            return _fts.phraseto_tsquery(_as_text(text), config)
-        if name == "websearch_to_tsquery":
-            return _fts.websearch_to_tsquery(_as_text(text), config)
-        return _fts.to_tsquery(_as_text(text), config)
-    if name in (
-        "strip",
-        "numnode",
-        "querytree",
-        "tsvector_to_array",
-        "array_to_tsvector",
-        "tsvector_concat",
-        "tsquery_and",
-        "tsquery_or",
-        "tsquery_not",
-    ):
-        from secantus.sql import fts as _fts
-
-        a = args[0] if args else None
-        b = args[1] if len(args) > 1 else None
-        if a is None:
-            return None
-        if name == "strip":
-            return _fts.strip_tsvector(a)
-        if name == "numnode":
-            return _fts.numnode(a)
-        if name == "querytree":
-            return _fts.querytree(a)
-        if name == "tsvector_to_array":
-            return _fts.tsvector_to_array(a)
-        if name == "array_to_tsvector":
-            return _fts.array_to_tsvector(a)
-        if name == "tsvector_concat":
-            return _fts.tsvector_concat(a, b)
-        if name == "tsquery_not":
-            return _fts.tsquery_not(a)
-        return (_fts.tsquery_and if name == "tsquery_and" else _fts.tsquery_or)(a, b)
-    if name == "ts_headline":
-        from secantus.sql import fts as _fts
-
-        # ts_headline([config,] document, query [, options]) — ignore config /
-        # options; the query is the tsquery arg and the document is the text arg
-        # immediately before it.
-        q_idx = next((i for i, a in enumerate(args) if _fts.is_tsquery(a)), None)
-        if q_idx is None or q_idx == 0:
-            return _as_text(args[0]) if args else None
-        return _fts.ts_headline(_as_text(args[q_idx - 1]), args[q_idx])
-    if name in ("ts_rank", "ts_rank_cd"):
-        from secantus.sql import fts as _fts
-
-        vec = args[0] if args else None
-        query = args[1] if len(args) > 1 else None
-        if vec is None or query is None:
-            return None
-        return _fts.ts_rank(vec, query)
+    if name in _FTS_FUNCTIONS:
+        return _eval_fts_function(name, args)
     if name in (
         "host",
         "masklen",
@@ -6300,6 +6242,14 @@ def _eval_net_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     return _net.overlaps(left, right)  # a && b
 
 
+def _looks_like_jsonpath(text: str) -> bool:
+    """Whether a string opposite ``@@`` reads as a jsonpath predicate (every
+    one starts with ``$`` / ``@``, a mode, ``exists``, ``!`` or a parenthesis)
+    rather than the plain text of ``text @@ text``."""
+    t = text.lstrip().lower()
+    return t.startswith(("$", "@", "(", "!", "lax", "strict", "exists", "like_regex"))
+
+
 def _eval_fts_match(left: Any, right: Any) -> Any:
     """``@@`` on full-text operands: ``tsvector @@ tsquery`` (either order). Returns
     ``_NOT_FTS`` when neither operand is a tsvector / tsquery so the caller can fall
@@ -6315,6 +6265,19 @@ def _eval_fts_match(left: Any, right: Any) -> Any:
         left, left_v = _fts.text_as_tsvector(left), True
     elif left_q and isinstance(right, str):
         right, right_v = _fts.text_as_tsvector(right), True
+    elif left_v and isinstance(right, str):
+        # `tsvector @@ 'cat'`: the untyped literal is a tsquery.
+        right, right_q = _fts.parse_tsquery(right), True
+    elif right_v and isinstance(left, str):
+        left, left_q = _fts.parse_tsquery(left), True
+    if (
+        not (left_v or left_q or right_v or right_q)
+        and isinstance(left, str)
+        and isinstance(right, str)
+        and not _looks_like_jsonpath(right)
+    ):
+        # `text @@ text` is `to_tsvector(left) @@ plainto_tsquery(right)`.
+        return _fts.matches(_fts.to_tsvector(left), _fts.plainto_tsquery(right))
     if not (left_v or left_q or right_v or right_q):
         return _NOT_FTS
     if left is None or right is None:
@@ -7171,3 +7134,81 @@ def _sub_scope(inner_alias: str, tdef: Any, row: dict[str, Any], outer: Scope) -
         return outer(node)  # correlated reference to the enclosing query
 
     return resolve
+
+
+_FTS_FUNCTIONS = frozenset(
+    {
+        "to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery",
+        "websearch_to_tsquery", "strip", "numnode", "querytree", "tsvector_to_array",
+        "array_to_tsvector", "tsvector_concat", "tsquery_and", "tsquery_or",
+        "tsquery_not", "tsquery_phrase", "setweight", "ts_delete", "ts_filter",
+        "get_current_ts_config", "ts_rank", "ts_rank_cd", "ts_headline",
+    }
+)  # fmt: skip
+
+
+def _fts_vec(v: Any) -> Any:
+    from secantus.sql import fts as _fts
+
+    return v if _fts.is_tsvector(v) else _fts.parse_tsvector(_as_text(v))
+
+
+def _fts_query(v: Any) -> Any:
+    from secantus.sql import fts as _fts
+
+    return v if _fts.is_tsquery(v) else _fts.parse_tsquery(_as_text(v))
+
+
+def _eval_fts_function(name: str, args: list[Any]) -> Any:
+    """The full-text functions (``fts`` / ``fts_rank``)."""
+    from secantus.sql import fts as _fts
+
+    if name == "get_current_ts_config":
+        return _fts.get_current_ts_config()
+    if name in ("ts_rank", "ts_rank_cd", "ts_headline"):
+        fn = {"ts_rank": _fts.ts_rank, "ts_rank_cd": _fts.ts_rank_cd}.get(name, _fts.ts_headline)
+        return fn(*args)
+    if name == "setweight":
+        if len(args) < 2 or args[0] is None or args[1] is None:
+            return None
+        only = args[2] if len(args) > 2 else None
+        return _fts.setweight(
+            _fts_vec(args[0]), _as_text(args[1]), [] if len(args) > 2 and only is None else only
+        )
+    if any(a is None for a in args):
+        return None
+    if name in (
+        "to_tsvector",
+        "to_tsquery",
+        "plainto_tsquery",
+        "phraseto_tsquery",
+        "websearch_to_tsquery",
+    ):
+        config = _as_text(args[0]) if len(args) > 1 else None
+        builder = getattr(_fts, name)
+        return builder(_as_text(args[-1]), config)
+    a = args[0] if args else None
+    b = args[1] if len(args) > 1 else None
+    if name == "strip":
+        return _fts.strip_tsvector(_fts_vec(a))
+    if name == "tsvector_to_array":
+        return _fts.tsvector_to_array(_fts_vec(a))
+    if name == "array_to_tsvector":
+        return _fts.array_to_tsvector(a)
+    if name == "tsvector_concat":
+        return _fts.tsvector_concat(_fts_vec(a), _fts_vec(b))
+    if name == "ts_delete":
+        return _fts.ts_delete(_fts_vec(a), b)
+    if name == "ts_filter":
+        return _fts.ts_filter(_fts_vec(a), b)
+    if name == "numnode":
+        return _fts.numnode(_fts_query(a))
+    if name == "querytree":
+        return _fts.querytree(_fts_query(a))
+    if name == "tsquery_not":
+        return _fts.tsquery_not(_fts_query(a))
+    if name == "tsquery_phrase":
+        dist = args[2] if len(args) > 2 else 1
+        return _fts.tsquery_phrase(_fts_query(a), _fts_query(b), dist)
+    combine = _fts.tsquery_and if name == "tsquery_and" else _fts.tsquery_or
+    return combine(_fts_query(a), _fts_query(b))
