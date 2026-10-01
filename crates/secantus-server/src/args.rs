@@ -198,9 +198,19 @@ fn build_tls(
 /// would read as a bug rather than an absence.
 pub fn version_text(binary: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    match option_env!("SECANTUS_SOURCE_TREE").unwrap_or("") {
-        "" => format!("{binary} {version}\n"),
-        tree => format!("{binary} {version}\ntree: {tree}\n"),
+    let tree = option_env!("SECANTUS_SOURCE_TREE").unwrap_or("");
+    let origin = option_env!("SECANTUS_SOURCE_ORIGIN").unwrap_or("");
+    version_lines(binary, version, tree, origin)
+}
+
+/// `version_text` over explicit stamps, so the three shapes are testable.
+/// A packaged build has no git tree; it says `source: crates.io` instead, so a
+/// bug report still says where the binary came from.
+fn version_lines(binary: &str, version: &str, tree: &str, origin: &str) -> String {
+    match (tree, origin) {
+        ("", "") => format!("{binary} {version}\n"),
+        ("", origin) => format!("{binary} {version}\nsource: {origin}\n"),
+        (tree, _) => format!("{binary} {version}\ntree: {tree}\n"),
     }
 }
 
@@ -457,6 +467,21 @@ OPTIONS:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_lines_say_where_the_build_came_from() {
+        assert_eq!(version_lines("b", "1", "", ""), "b 1\n");
+        assert_eq!(version_lines("b", "1", "abc", ""), "b 1\ntree: abc\n");
+        assert_eq!(
+            version_lines("b", "1", "", "crates.io"),
+            "b 1\nsource: crates.io\n"
+        );
+        // A checkout's tree hash wins: it is the more specific answer.
+        assert_eq!(
+            version_lines("b", "1", "abc", "crates.io"),
+            "b 1\ntree: abc\n"
+        );
+    }
 
     fn parse(words: &[&str]) -> Result<Parsed, String> {
         let owned: Vec<String> = words.iter().map(|s| s.to_string()).collect();

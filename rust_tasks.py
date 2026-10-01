@@ -499,8 +499,12 @@ def rust_wt_test(c: Context) -> None:
     """
     env = _rust_env()
     c.run(f"cd {_RUST_WT_DIR} && cargo fmt --check", pty=PTY, env=env)
-    c.run(f"cd {_RUST_WT_DIR} && cargo clippy --all-targets -- -D warnings", pty=PTY, env=env)
-    c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=PTY, env=env)
+    c.run(
+        f"cd {_RUST_WT_DIR} && cargo clippy --all-targets --features bindgen -- -D warnings",
+        pty=PTY,
+        env=env,
+    )
+    c.run(f"cd {_RUST_WT_DIR} && cargo test --features bindgen", pty=PTY, env=env)
 
 
 @task(name="wt-sys-refresh")
@@ -524,7 +528,7 @@ def wt_bindings_refresh(c: Context) -> None:
     fails if the two differ. Needs WiredTiger and libclang, as rust-wt-test.
     """
     env = {**_rust_env(), "SECANTUS_WT_BINDINGS_WRITE": "1"}
-    c.run(f"cd {_RUST_WT_DIR} && cargo build", pty=PTY, env=env)
+    c.run(f"cd {_RUST_WT_DIR} && cargo build --features bindgen", pty=PTY, env=env)
 
 
 @task(name="rust-storage-test")

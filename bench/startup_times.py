@@ -30,7 +30,7 @@ Run it::
 mongod is skipped with a note when it is not on PATH. The Rust server uses
 the compiled ``secantusdb`` binary (release preferred, else debug;
 auto-discovered under ``crates/`` and ``build/``, or set ``SECANTUSDB_BIN``);
-build it with ``./inv rust-server-build`` or ``cargo build -p secantusdb``.
+build it with ``./inv rust-server-build`` or ``cargo build -p secantus-mdb``.
 """
 
 from __future__ import annotations
