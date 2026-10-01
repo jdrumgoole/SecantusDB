@@ -78,6 +78,32 @@ def _stage(dest: Path) -> None:
     )
 
 
+def _forget_previous_runs() -> None:
+    """Remove earlier runs' extracted tarballs of OUR crates from cargo's cache.
+
+    `cargo package --workspace` unpacks each tarball into a local registry under
+    `$CARGO_HOME/registry/{src,cache}/-<hash>/`, keyed by name and version. Our
+    version does not change between commits, so a second run REUSES the first
+    run's extraction and verifies the old content -- a gate that silently
+    checks stale files (seen 2026-10-01: a fixed build.rs was verified as the
+    broken one). Only the local-registry directories (named `-<hash>`) and only
+    our crates' entries are removed.
+    """
+    home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    names = {
+        (CRATES / n / "Cargo.toml").read_text().split('name = "', 1)[1].split('"', 1)[0]
+        for n in PUBLISH_ORDER
+    }
+    for kind in ("src", "cache"):
+        for registry in (home / "registry" / kind).glob("-*"):
+            for entry in registry.iterdir():
+                if any(entry.name.startswith(f"{n}-") for n in names):
+                    if entry.is_dir():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink(missing_ok=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -94,6 +120,7 @@ def main() -> int:
         shutil.rmtree(stage)
     stage.mkdir(parents=True, exist_ok=True)
     try:
+        _forget_previous_runs()
         _stage(stage)
         cmd = ["cargo", "package", "--workspace", "--allow-dirty"]
         if args.no_verify:

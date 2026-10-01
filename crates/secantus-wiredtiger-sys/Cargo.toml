@@ -9,7 +9,7 @@ links = "wiredtiger"
 build = "build.rs"
 # The WiredTiger copy is gitignored (scripts/wt_sys_refresh.py writes it), so
 # it has to be named here or `cargo package` would leave it out.
-include = ["build.rs", "src/**", "wiredtiger/**", "wiredtiger.sha256", "wiredtiger.manifest", "README.md"]
+include = ["build.rs", "src/**", "wiredtiger/**", "wiredtiger.sha256", "wiredtiger.manifest", "lz4/**", "README.md"]
 
 # Standalone, like secantus-wt: it builds C, which the clean workspace does not.
 rust-version = "1.98"
@@ -27,11 +27,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Bundled, statically linked compressors. WiredTiger is built with zlib and lz4
-# as BUILTIN block-compressor extensions; linking them from these crates rather
-# than the host means the result needs nothing beyond libc (a macOS binary once
-# linked Homebrew's liblz4 by absolute path and would not start elsewhere).
+# as BUILTIN block-compressor extensions; linking them from bundled source
+# rather than the host means the result needs nothing beyond libc (a macOS
+# binary once linked Homebrew's liblz4 by absolute path and would not start
+# elsewhere). lz4 is compiled here from `lz4/lz4.c` alone -- see build.rs.
 libz-sys = { version = "1", default-features = false, features = ["static"] }
-lz4-sys = "1"
 
 [build-dependencies]
 cmake = "0.1"
+cc = "1"

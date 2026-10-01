@@ -10,7 +10,10 @@ CI gate keeps them that way.
 - `secantus-wt` now builds through the bundled WiredTiger by default. The
   `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB` override still links a prebuilt
   WiredTiger, which is how the wheel and the release binaries build. zlib and
-  lz4 are now linked statically from bundled sources everywhere.
+  lz4 are now linked statically from bundled sources everywhere: zlib from
+  `libz-sys`, and lz4 from `lz4.c` alone, vendored in `secantus-wiredtiger-sys`.
+  It is not `lz4-sys`, because that crate's bundled xxhash collides with
+  libpg_query's when both link into the PostgreSQL server.
 - Regenerating the bindings with bindgen is now opt-in (`--features bindgen`).
   `./inv rust-wt-test` turns it on, so the drift check still runs in CI.
 - `secantus-wiredtiger-sys` joins the MongoDB server's version line.
