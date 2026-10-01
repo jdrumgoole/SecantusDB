@@ -633,10 +633,16 @@ remain open:
         print as zeros, and which side of a hash join is built (and so
         `Hash Left` vs `Hash Right Join`) follows this server's join order,
         not PostgreSQL's estimates.
-      - An EXPRESSION index is an empty storage index (a synthetic key, a
-        partial filter nothing matches) plus its SQL; a MongoDB-side
-        `listIndexes` on that collection shows it. Its UNIQUE check scans the
-        table per write.
+      - An EXPRESSION index is a storage index on a computed field,
+        `__sqlexpr_<name>`, which every write fills (batch 15; before, the
+        field was never written and UNIQUE re-evaluated the expression over
+        every row per write -- 1.6 s per INSERT at 20,000 rows, now 0.9 ms).
+        Rows another writer left are recomputed when the server opens the
+        store. `ON CONFLICT (expr)` arbitrates on it (corpus `expr_unique`),
+        and a WHERE comparing the expression with a constant reads the field
+        through the index (`lower(t) = 'x'`, 2.4 s -> 3.7 ms at 20,000 rows;
+        corpus `expr_where`) -- a non-partial, single-expression index only,
+        since a partial index's field is absent outside its predicate.
 - [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
       security, domains, materialized views, WITH RECURSIVE, xml, READ
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
@@ -647,8 +653,11 @@ remain open:
         (`PARTITION BY HASH`, expression keys, `tableoid` everywhere, and a
         partition's own column options and constraints -- NOT NULL, DEFAULT,
         CHECK, UNIQUE, PRIMARY KEY, enforced -- landed in batch 10.) A
-        partition's UNIQUE / PRIMARY KEY is checked by scanning the
-        partition's rows per write, not by an index.
+        partition's UNIQUE / PRIMARY KEY check reads the partition's rows per
+        statement; re-measured in batch 15 it is NOT a cost in practice --
+        single-row inserts stay flat at 20,000 rows (~2.3 ms over a plain
+        table's, debug build, spread across catalog reads rather than the
+        check).
       - The ruleutils deparser (`secantus-pgplan/src/ruleutils.rs`, batch 11)
         prints views, rules and stored expressions from a small analyser; a
         shape outside it falls back to the text as written -- see the batch
@@ -671,7 +680,9 @@ remain open:
         `srf_fields`). An operand of any other shape is not checked.
       - **Error positions** (`P`) come from the parse location where the
         raising site recorded one, and otherwise from the first token the
-        message names. A name mentioned twice may point at the wrong
+        message names -- since batch 15 also for an error raised while the
+        rows stream, and for a record without the named field (corpus
+        `error_positions`). A name mentioned twice may point at the wrong
         occurrence. An error inside a function body carries no internal
         position.
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
@@ -723,10 +734,21 @@ remain open:
       (`secantus-pgplan/src/numeric.rs`); round-trip, `::text`, comparison,
       ORDER BY, `+ - * /`, `sum` / `min` / `max` and the numeric PRIMARY KEY
       path all match PG 16.15. Left open, each measured:
-  - a numeric-column predicate lowers to an `$or` of a Decimal128 arm and a
-    `__numkey` arm (plus a NaN arm for `>` / `>=`), so it never IXSCANs a
-    secondary index; the `_id` index (numeric PRIMARY KEY) does resolve by
-    value. (Typmod rounding, `avg(numeric)`, and literal coercion were
+  - (FIXED batch 15) a numeric-column predicate lowers to an `$or` of a
+    Decimal128 arm and a `__numkey` arm, which never used a secondary index:
+    `n = 5` over 20,000 rows took 820 ms (an `int` column 0.9 ms). Now the
+    wide arm also says `n >= {}` (every wide row is a document, so that
+    document-bracket range holds exactly them), storage answers an `$or`
+    whose every branch indexes as the union of the branches (intersected
+    across ANDed `$or`s, RecordId-ordered so documents arrive in scan
+    order), and an index range takes that one document bound. `n = 5`
+    1.2 ms, `BETWEEN` 1.9 s -> 17 ms. Corpus `numeric_index`. The Rust
+    MongoDB server's `explain` reports the OR plan as mongod 8.2.11 does --
+    SUBPLAN / FETCH / OR / IXSCAN per branch, SUBPLAN only for a filter that
+    is just an `$or` of two or more branches, a one-branch `$or` and an
+    `$or` of equalities on one field normalised first. Which index a branch
+    uses, and the order of the OR inputs, are mongod's cost model and are
+    not reproduced. (Typmod rounding, `avg(numeric)`, and literal coercion were
     re-measured fixed in batch 10.)
 - [ ] **OPEN — RUST pgserver: constraints -- what is left after multi-column
       FOREIGN KEYs landed (2026-09-29).** NOT NULL / CHECK / UNIQUE / FOREIGN
@@ -7007,11 +7029,12 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         equality (plus inner-only conjuncts) is rewritten to the uncorrelated
         `IN` / null-safe `NOT IN` it equals (`semijoin.rs`, corpus
         `semi_join`): 2,000 x 2,000 rows, debug build, EXISTS 7.2 s -> 46 ms,
-        NOT EXISTS 7.3 s -> 0.73 s. Left: `NOT IN` itself is `$nin`, which
-        the core matcher checks element by element per row (O(rows x list));
-        a hash-set fast path belongs in `secantus-core`'s matcher and must
-        keep BSON equality (numeric cross-type, collation, array descent).
-        Other correlated shapes (two equalities, a correlated IN, a
+        NOT EXISTS 7.3 s -> 34 ms (batch 15: `NOT (x = ANY ...)`, how
+        `NOT IN` parses, now lowers to `$nin` instead of running per row,
+        and a scan hashes a `$in` / `$nin` list of 16+ plain scalars once
+        -- `InSets` in `secantus-core`, pinned against the element path by
+        `hashed_lists_agree_with_the_ordinary_path`; corpus
+        `not_in_large`). Other correlated shapes (two equalities, a correlated IN, a
         select-list EXISTS) still run per outer value.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a

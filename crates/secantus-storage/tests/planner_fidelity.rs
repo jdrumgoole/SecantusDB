@@ -61,7 +61,7 @@ fn plan_index(st: &Storage, filter: Document, sort: Option<Document>) -> Option<
         .unwrap()
     {
         ExplainPlan::IxScan { index_name, .. } => Some(index_name),
-        ExplainPlan::CollScan => None,
+        ExplainPlan::CollScan | ExplainPlan::Or { .. } => None,
     }
 }
 

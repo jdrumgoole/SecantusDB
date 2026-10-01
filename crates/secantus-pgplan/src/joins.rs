@@ -157,6 +157,11 @@ impl Scope {
 }
 
 thread_local! {
+    /// Set while `build` plans a FROM function the query gave a bare alias
+    /// (`f(...) AS x`), which names a ONE-column function's column; without
+    /// an alias the column keeps its own name (`pg_partition_ancestors`'s
+    /// `relid`), and a wider function's columns always do.
+    static BARE_FUNCTION_ALIAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// WHERE conjuncts pushed into a table leaf, by the leaf's alias, while
     /// its join is built (see `pushdown_filters`).
     static PUSHDOWN: std::cell::RefCell<Vec<(String, pg_query::protobuf::Node)>> =
@@ -403,8 +408,11 @@ fn build(
             let mut rf = rf.clone();
             rf.lateral = false;
             let colnames = function_colnames(&rf);
+            let bare =
+                colnames.is_empty() && rf.alias.as_ref().is_some_and(|a| !a.aliasname.is_empty());
             rf.alias = keep_column_names(&rf, &alias);
-            leaf(
+            let prev = BARE_FUNCTION_ALIAS.with(|b| b.replace(bare));
+            let built = leaf(
                 pg_query::protobuf::Node {
                     node: Some(N::RangeFunction(rf)),
                 },
@@ -413,7 +421,9 @@ fn build(
                 lookup,
                 params,
                 aliases,
-            )
+            );
+            BARE_FUNCTION_ALIAS.with(|b| b.set(prev));
+            built
         }
         _ => Err(Error::Unsupported("this JOIN side".into())),
     }
@@ -590,7 +600,11 @@ fn lateral_leaf(
     let plan = plan_select(&inner, lookup, &sample_params)?;
     let def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
-    let names = scalar_alias(names, function, &alias, def.columns.len());
+    let bare_alias = matches!(
+        item.node.as_ref(),
+        Some(N::RangeFunction(rf)) if rf.alias.as_ref().is_some_and(|a| !a.aliasname.is_empty())
+    );
+    let names = scalar_alias(names, function && bare_alias, &alias, def.columns.len());
     if names.len() > def.columns.len() {
         return Err(Error::Parse(format!(
             "table \"{alias}\" has {} columns available but {} columns specified",
@@ -689,6 +703,8 @@ fn leaf_filtered(
     aliases: &mut Vec<String>,
     filter: Option<pg_query::protobuf::Node>,
 ) -> Result<(JoinNode, Scope)> {
+    // Taken before anything nested plans, which may build leaves of its own.
+    let bare_alias = BARE_FUNCTION_ALIAS.with(|b| b.replace(false));
     let select = pg_query::protobuf::SelectStmt {
         where_clause: filter.map(Box::new),
         target_list: vec![pg_query::protobuf::Node {
@@ -709,11 +725,10 @@ fn leaf_filtered(
         op: pg_query::protobuf::SetOperation::SetopNone as i32,
         ..Default::default()
     };
-    let function = matches!(select.from_clause[0].node, Some(N::RangeFunction(_)));
     let plan = plan_select(&select, lookup, params)?;
     let mut def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
-    let names = scalar_alias(names, function, alias, def.columns.len());
+    let names = scalar_alias(names, bare_alias, alias, def.columns.len());
     if names.len() > def.columns.len() {
         return Err(Error::Parse(format!(
             "table \"{alias}\" has {} columns available but {} columns specified",
