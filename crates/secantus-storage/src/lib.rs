@@ -14835,7 +14835,7 @@ mod tests {
             .unwrap();
         s.create_index("app", "o", "b_1", &doc! {"b": 1i32}, &doc! {"sparse": true})
             .unwrap();
-        let docs = vec![
+        let docs = [
             doc! {"_id": 1i32, "a": 5i32, "b": 1i32},
             doc! {"_id": 2i32, "a": Bson::Null},
             doc! {"_id": 3i32, "b": 7i32},
