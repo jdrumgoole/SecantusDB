@@ -1,0 +1,17 @@
+select id from ew15 where upper(t) = 'V5' order by 1;
+select id from ew15 where 'V7' = upper(t) order by 1;
+select id from ew15 where upper(t) in ('V1', 'V2', 'MIXED CASE') order by 1;
+select id from ew15 where upper(t) > 'V8' order by 1;
+select id from ew15 where upper(t) between 'V2' and 'V22' order by 1;
+select count(*) from ew15 where upper(t) <> 'V5';
+select id from ew15 where (a + b) = 10 order by 1;
+select id from ew15 where (a + b) >= 31 and id < 40 order by 1;
+select id from ew15 where a + b < 3 order by 1;
+select id from ew15 where lower(t) = 'v5' order by 1;
+select id from ew15 where lower(t) = 'v25' order by 1;
+select count(*) from ew15 where upper(t) is null;
+select id from ew15 where upper(t) = 'V5' or a = 9 order by 1;
+update ew15 set b = 100 where upper(t) = 'V3';
+select id, b from ew15 where (a + b) = 103;
+delete from ew15 where upper(t) = 'V4';
+select count(*) from ew15;

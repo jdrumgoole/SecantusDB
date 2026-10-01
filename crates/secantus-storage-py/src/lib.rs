@@ -88,7 +88,9 @@ fn doc_list(py: Python<'_>, docs: Vec<Vec<u8>>) -> Vec<Py<PyBytes>> {
 fn explain_to_doc(plan: ExplainPlan) -> Document {
     let mut d = Document::new();
     match plan {
-        ExplainPlan::CollScan => {
+        // The Python command layer has no OR plan to render; an OR plan is
+        // reported as the scan it replaces there.
+        ExplainPlan::CollScan | ExplainPlan::Or { .. } => {
             d.insert("kind", "COLLSCAN");
         }
         ExplainPlan::IxScan {

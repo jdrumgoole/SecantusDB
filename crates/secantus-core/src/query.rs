@@ -652,6 +652,9 @@ fn op_matches(
             let Some(arr) = arg.as_array() else {
                 return Err(Fallback::mongo(2, "$in needs an array"));
             };
+            if let Some(hit) = in_set_lookup(arr, values, coll) {
+                return Ok(hit);
+            }
             in_elements_ok(arr)?;
             for cand in arr {
                 if in_candidate_matches(values, cand, coll, descend)? {
@@ -664,6 +667,9 @@ fn op_matches(
             let Some(arr) = arg.as_array() else {
                 return Err(Fallback::mongo(2, "$nin needs an array"));
             };
+            if let Some(hit) = in_set_lookup(arr, values, coll) {
+                return Ok(!hit);
+            }
             in_elements_ok(arr)?;
             for cand in arr {
                 if in_candidate_matches(values, cand, coll, descend)? {
@@ -745,6 +751,143 @@ fn is_exotic(b: &Bson) -> bool {
             | Bson::DbPointer(_)
             | Bson::Undefined
     )
+}
+
+// ---------------------------------------------------------------------------
+// Hashed `$in` / `$nin` lists for a scan.
+//
+// The matcher interprets its filter afresh for every document, so a `$nin`
+// of N values cost N comparisons per row -- O(rows x N) for a SQL `NOT IN`
+// over a subquery's result. A scan prepares its filter ONCE (`InSets::
+// prepare`) and installs it for the loop (`InSetsGuard`): each large list of
+// plain scalars becomes a hash set of the values' sort keys, whose byte
+// equality is the matcher's equality for those types (int / long / double
+// collide on equal value, NaN equals NaN, -0 equals 0, bool never equals a
+// number). A list is found again by its ADDRESS inside the filter, which
+// cannot move or change while the borrowed filter drives the loop; the
+// address is only compared, never dereferenced.
+//
+// Anything outside the plain scalars -- a Decimal128, a regex, null, a
+// document or array, a value under a collation, a field holding an array --
+// takes the ordinary element-by-element path, so the fast path can only
+// agree with it.
+// ---------------------------------------------------------------------------
+
+/// The smallest list worth hashing.
+const IN_SET_MIN: usize = 16;
+
+/// A value whose matcher equality is its sort key's byte equality.
+fn plain_scalar(v: &Bson) -> bool {
+    matches!(
+        v,
+        Bson::Int32(_)
+            | Bson::Int64(_)
+            | Bson::Double(_)
+            | Bson::String(_)
+            | Bson::ObjectId(_)
+            | Bson::DateTime(_)
+            | Bson::Boolean(_)
+    )
+}
+
+/// A scan's hashed `$in` / `$nin` lists, by the list's address in its filter.
+#[derive(Default)]
+pub struct InSets {
+    sets: std::collections::HashMap<usize, std::collections::HashSet<Vec<u8>>>,
+}
+
+impl InSets {
+    /// Hash every `$in` / `$nin` list of `filter` that holds only plain
+    /// scalars and is long enough to pay for it. `filter` must be the very
+    /// document the scan then matches with, unmodified.
+    pub fn prepare(filter: &Document) -> Self {
+        fn walk(d: &Document, out: &mut InSets) {
+            for (k, v) in d.iter() {
+                match (k.as_str(), v) {
+                    ("$in" | "$nin", Bson::Array(arr))
+                        if arr.len() >= IN_SET_MIN && arr.iter().all(plain_scalar) =>
+                    {
+                        let keys = arr
+                            .iter()
+                            .map(|x| crate::sortkey::encode_value(x, None))
+                            .collect::<Result<_, _>>();
+                        if let Ok(keys) = keys {
+                            out.sets.insert(arr.as_ptr() as usize, keys);
+                        }
+                    }
+                    (_, Bson::Document(sub)) => walk(sub, out),
+                    (_, Bson::Array(items)) => {
+                        for it in items {
+                            if let Bson::Document(sub) = it {
+                                walk(sub, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = InSets::default();
+        walk(filter, &mut out);
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+}
+
+thread_local! {
+    static IN_SETS: std::cell::Cell<*const InSets> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Installs a scan's `InSets` for this thread until dropped (restoring
+/// whatever was installed before, so a nested scan's sets come and go
+/// inside the outer one's).
+pub struct InSetsGuard {
+    previous: *const InSets,
+}
+
+impl InSetsGuard {
+    pub fn install(sets: &InSets) -> Self {
+        let previous = IN_SETS.with(|c| c.replace(sets as *const InSets));
+        InSetsGuard { previous }
+    }
+}
+
+impl Drop for InSetsGuard {
+    fn drop(&mut self) {
+        IN_SETS.with(|c| c.set(self.previous));
+    }
+}
+
+/// `Some(any value is in the list)` when the list was hashed and every value
+/// can be answered from the hash; `None` for the ordinary path.
+fn in_set_lookup(arr: &[Bson], values: &[Cand], coll: Option<&Collation>) -> Option<bool> {
+    if coll.is_some() {
+        return None;
+    }
+    let sets = IN_SETS.with(|c| c.get());
+    if sets.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null pointer is installed only by an `InSetsGuard`, whose
+    // `InSets` outlives it (the guard borrows it for its whole life), and the
+    // guard restores the previous pointer when it drops.
+    let set = unsafe { &*sets }.sets.get(&(arr.as_ptr() as usize))?;
+    let mut hit = false;
+    for c in values {
+        match c.value {
+            None => {}
+            Some(v) if plain_scalar(v) => {
+                if set.contains(&crate::sortkey::encode_value(v, None).ok()?) {
+                    hit = true;
+                }
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(hit)
 }
 
 /// A single `$in` / `$nin` candidate. A regex candidate matches string values by
@@ -3205,5 +3348,58 @@ mod json_schema_type_name_tests {
         );
         assert_eq!(code(bson!({"bsonType": "int"})), None);
         assert_eq!(code(bson!({"type": "number"})), None);
+    }
+}
+
+#[cfg(test)]
+mod in_set_tests {
+    use super::*;
+    use bson::{doc, Bson, Decimal128};
+
+    /// The hashed `$in` / `$nin` path must answer exactly what the
+    /// element-by-element path answers, over the values where BSON equality
+    /// is subtle.
+    #[test]
+    fn hashed_lists_agree_with_the_ordinary_path() {
+        let mut list: Vec<Bson> = (0..20).map(Bson::Int32).collect();
+        list.push(Bson::Double(f64::NAN));
+        list.push(Bson::Double(2.5));
+        list.push(Bson::String("x".into()));
+        list.push(Bson::Int64(9_007_199_254_740_993));
+        let values = vec![
+            Bson::Int32(3),
+            Bson::Int64(3),
+            Bson::Double(3.0),
+            Bson::Double(-0.0),
+            Bson::Double(f64::NAN),
+            Bson::Double(2.5),
+            Bson::Double(9_007_199_254_740_992.0),
+            Bson::Int64(9_007_199_254_740_993),
+            Bson::Boolean(true),
+            Bson::Boolean(false),
+            Bson::Null,
+            Bson::String("x".into()),
+            Bson::String("X".into()),
+            Bson::Array(vec![Bson::Int32(99), Bson::Int32(4)]),
+            Bson::Array(vec![]),
+            Bson::Decimal128("3".parse::<Decimal128>().unwrap()),
+            Bson::Int32(100),
+        ];
+        let empty = Document::new();
+        for op in ["$in", "$nin"] {
+            let filter = doc! { "a": { op: list.clone() } };
+            let sets = InSets::prepare(&filter);
+            assert!(!sets.is_empty());
+            let mut docs: Vec<Document> = values.iter().map(|v| doc! { "a": v.clone() }).collect();
+            docs.push(doc! { "b": 1 });
+            for d in &docs {
+                let plain = matches(d, &filter, &empty, None).unwrap();
+                let hashed = {
+                    let _g = InSetsGuard::install(&sets);
+                    matches(d, &filter, &empty, None).unwrap()
+                };
+                assert_eq!(plain, hashed, "{op} over {d:?}");
+            }
+        }
     }
 }

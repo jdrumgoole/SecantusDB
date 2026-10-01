@@ -1,0 +1,12 @@
+select (c).b + 1 from ep15_t;
+select g + 'a' from generate_series(1, 2) g;
+select x + 1 from ep15_t;
+select id, x from ep15_t where x = 1;
+select id from ep15_t where id = 'a';
+select nope from ep15_t;
+select id from ep15_t t where t.nope = 1;
+select id, id from ep15_t order by zz;
+select length(id) from ep15_t;
+select x::int + true from ep15_t;
+select id from ep15_t where x > 1 and id = 'q';
+select (c).b + 1 from (select row(1,'x')::record as c) s;

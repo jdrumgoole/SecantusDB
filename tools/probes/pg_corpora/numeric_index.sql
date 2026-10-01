@@ -1,0 +1,14 @@
+select id from ni15 where n = 5 order by 1;
+select id from ni15 where n = 1.5 order by 1;
+select id from ni15 where n = 1.2345678901234567890123456789012345 order by 1;
+select id from ni15 where n > 39 order by 1;
+select id from ni15 where n >= 1e30 order by 1;
+select id from ni15 where n < -2 order by 1;
+select id from ni15 where n between 1 and 2 order by 1;
+select id from ni15 where n between 4 and 6 order by 1;
+select id from ni15 where n = 'NaN' order by 1;
+select id from ni15 where n > 'Infinity' order by 1;
+select id from ni15 where n <> 5 and id > 40 order by 1;
+select count(*) from ni15 where n in (1, 2, 5, 1.5);
+select count(*) from ni15 where n is null;
+select id from ni15 where n < 1.2345678901234567890123456789012346 and n > 1.2 order by 1;

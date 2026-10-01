@@ -418,6 +418,26 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
                 }
             }
         }
+        // A composite column's field, `(c).b`: the field's declared type.
+        N::AIndirection(ind)
+            if matches!(
+                ind.indirection.as_slice(),
+                [one] if matches!(one.node.as_ref(), Some(N::String(_)))
+            ) =>
+        {
+            let Some(N::String(field)) = ind.indirection[0].node.as_ref() else {
+                return None;
+            };
+            let base = match ind.arg.as_deref()?.node.as_ref()? {
+                N::ColumnRef(c) => scope.column_type(c)?,
+                _ => return None,
+            };
+            let (_, fields) = user_composite(&base)?;
+            fields
+                .into_iter()
+                .find(|(n, _)| *n == field.sval)
+                .map(|(_, t)| t)
+        }
         // An array subscript: the ELEMENT type; a slice keeps the array's.
         N::AIndirection(ind)
             if !ind.indirection.is_empty()
@@ -542,6 +562,20 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // `boolean` has no arithmetic at all: `integer + boolean` is 42883.
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            // Nor do the string types (`text + integer`, `text + text`).
+            // Judged only between BUILT-IN categories: an extension or user
+            // type can define one (`hstore - text` exists).
+            let string = |t: &str| category(t) == Some("string");
+            let known = category(&l).is_some() && category(&r).is_some();
+            if known && (l == "bool" || r == "bool" || string(&l) || string(&r)) {
+                return Err(mismatch(&op, &l, &r, e.location));
+            }
+        }
+    }
     // `json` / `jsonb` have no arithmetic: `jsonb + integer` is 42883 where
     // evaluating it over the value's text answered `text + integer`. The one
     // operator among them is `jsonb - text | integer | text[]` (delete).
@@ -552,7 +586,9 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             let delete = op == "-"
                 && l == "jsonb"
                 && matches!(r.as_str(), "text" | "int4" | "int2" | "int8" | "text[]");
-            if (json(&l) || json(&r)) && !delete {
+            // The other side a built-in type: an extension may define one.
+            let known = |t: &str| json(t) || category(t).is_some() || t == "text[]";
+            if (json(&l) || json(&r)) && known(&l) && known(&r) && !delete {
                 return Err(mismatch(&op, &l, &r, e.location));
             }
         }
