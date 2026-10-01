@@ -623,9 +623,11 @@ remain open:
       `WHEN` condition over them), and a
       write that fires one is ONE transaction, so a trigger's writes roll
       back with a failing statement (`tests/test_sql_triggers.py::
-      TestTriggerKinds`, checked against PostgreSQL 15's output). Every
-      other trigger -- `UPDATE OF`, arguments, transition tables,
-      constraint triggers, TRUNCATE, INSTEAD OF -- and every path that
+      TestTriggerKinds`, checked against PostgreSQL 15's output). Batch 18
+      added trigger arguments (`TG_ARGV` from 0, `TG_NARGS`), `UPDATE OF`
+      column lists and TRUNCATE statement triggers (`TestArgsUpdateOfTruncate`).
+      Every other trigger -- transition tables, constraint triggers,
+      INSTEAD OF -- and every path that
       fires nothing (ON CONFLICT, MERGE, UPDATE FROM, DELETE USING) REFUSES
       the write (`0A000 ... cannot run on this server`) rather than
       skipping the trigger. Left: those shapes on the Python server.

@@ -68,9 +68,7 @@ class TestDDL:
         run(storage, session, TRIGGER_FN)
         for ddl in (
             "create trigger trg instead of insert on t2 for each row execute procedure tfn()",
-            "create trigger trg before truncate on t2 execute procedure tfn()",
-            "create trigger trg before update of t on t2 for each row execute procedure tfn()",
-            "create trigger trg before insert on t2 for each row execute procedure tfn('x')",
+            "create trigger trg before truncate on t2 for each row execute procedure tfn()",
         ):
             with pytest.raises(SQLError) as ei:
                 run(storage, session, ddl)
@@ -354,8 +352,7 @@ def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
 class TestTriggersThisServerCannotRun:
     """A trigger the Rust server stored that this server cannot run refuses
     the write it would fire on (0A000) rather than being skipped: UPDATE OF,
-    arguments, transition tables, constraint triggers, TRUNCATE,
-    and every path that fires nothing (ON CONFLICT ...)."""
+    transition tables, constraint triggers, and every path that fires nothing (ON CONFLICT ...)."""
 
     @pytest.fixture()
     def rt(self, storage, session):
@@ -371,20 +368,9 @@ class TestTriggersThisServerCannotRun:
         assert "cannot run on this server" in str(ei.value)
 
     def test_unrunnable_shapes_refuse_their_writes(self, rt, session):
-        _rust_trigger(rt, "cols", "BEFORE", ["UPDATE"], update_columns=["t"])
-        self._refused(rt, session, "update rt set t = 'z' where id = 1")
-        run(rt, session, "drop trigger cols on rt")
-        _rust_trigger(rt, "argd", "AFTER", ["DELETE"], args=["x"])
-        self._refused(rt, session, "delete from rt where id = 1")
-        run(rt, session, "drop trigger argd on rt")
         _rust_trigger(rt, "trans", "AFTER", ["INSERT"], level="STATEMENT", transition_new="nt")
         self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
         assert run(rt, session, "select t from rt").rows == [("a",)]
-
-    def test_truncate_trigger_refuses_truncate(self, rt, session):
-        _rust_trigger(rt, "trunc", "BEFORE", ["TRUNCATE"], level="STATEMENT")
-        self._refused(rt, session, "truncate rt")
-        assert run(rt, session, "select count(*) from rt").rows == [(1,)]
 
     def test_a_multi_event_rust_trigger_fires(self, rt, session):
         # Recorded with `event` = UPDATE (the first) and both in `events`:
@@ -399,3 +385,56 @@ class TestTriggersThisServerCannotRun:
         self._refused(
             rt, session, "insert into rt (id, t) values (1, 'b') on conflict (id) do nothing"
         )
+
+
+class TestArgsUpdateOfTruncate:
+    """Trigger arguments (TG_ARGV from 0, TG_NARGS), UPDATE OF column lists
+    (fire when a listed column is a SET target, changed or not) and TRUNCATE
+    statement triggers. The expected log is PostgreSQL 15's verbatim."""
+
+    def test_matches_postgres(self, storage, session):
+        for sql in (
+            "create table tb18_t(id int primary key, a int, b int)",
+            "create table tb18_log(msg text)",
+            "create function tb18_f() returns trigger language plpgsql as $$ begin "
+            "insert into tb18_log values (tg_name||':'||tg_op||':'||tg_level||':'||tg_nargs"
+            "||':'||coalesce(tg_argv[0],'-')||':'||coalesce(tg_argv[1],'-')); "
+            "return null; end $$",
+            "create trigger tb18_tr before truncate on tb18_t for each statement "
+            "execute function tb18_f('x', 7)",
+            "create trigger tb18_ua after update of a on tb18_t for each row "
+            "execute function tb18_f()",
+            "create trigger tb18_us after update of b on tb18_t for each statement "
+            "execute function tb18_f('-3')",
+            "insert into tb18_t values (1,1,1),(2,2,2)",
+            "update tb18_t set a = a",
+            "update tb18_t set b = 5 where id = 1",
+            "update tb18_t set id = id",
+            "truncate tb18_t",
+        ):
+            run(storage, session, sql)
+        assert run(storage, session, "select msg from tb18_log").rows == [
+            ("tb18_ua:UPDATE:ROW:0:-:-",),
+            ("tb18_ua:UPDATE:ROW:0:-:-",),
+            ("tb18_us:UPDATE:STATEMENT:1:-3:-",),
+            ("tb18_tr:TRUNCATE:STATEMENT:2:x:7",),
+        ]
+        assert run(storage, session, "select count(*) from tb18_t").rows == [(0,)]
+
+    def test_a_raising_truncate_trigger_keeps_the_rows(self, storage, session):
+        run(storage, session, "create table tb18_k(id int)")
+        run(storage, session, "insert into tb18_k values (1)")
+        run(
+            storage,
+            session,
+            "create function tb18_no() returns trigger language plpgsql as "
+            "$$ begin raise exception 'no'; end $$",
+        )
+        run(
+            storage,
+            session,
+            "create trigger tb18_g after truncate on tb18_k execute function tb18_no()",
+        )
+        with pytest.raises(SQLError):
+            run(storage, session, "truncate tb18_k")
+        assert run(storage, session, "select count(*) from tb18_k").rows == [(1,)]
