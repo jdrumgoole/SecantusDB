@@ -393,9 +393,19 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let filter = doc_field(spec, "q");
         // `collation` is per-delete-statement (inside each `deletes[]` entry).
         let collation = collation_of(spec);
-        // `limit: 0` ⇒ delete all matches; any positive value ⇒ at most that
-        // many (mongod only defines 0 and 1, but we honour the integer).
-        let limit = spec.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize;
+        // `limit: 0` ⇒ delete all matches, `1` ⇒ at most one. mongod defines
+        // nothing else and refuses the whole command (measured 8.2.11,
+        // 2026-10-01); `limit: 5` used to delete up to five.
+        let limit = spec.get("limit").and_then(as_i64).unwrap_or(0);
+        if limit != 0 && limit != 1 {
+            return Ok(CommandError::new(
+                9,
+                "FailedToParse",
+                format!("The limit field in delete objects must be 0 or 1. Got {limit}"),
+            )
+            .into_reply());
+        }
+        let limit = limit as usize;
         match storage.delete_matching_with_let(
             &ctx.db_name,
             &coll,
@@ -745,6 +755,21 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
+        // A replacement document cannot apply to many documents. mongod refuses
+        // the statement (measured 8.2.11, 2026-10-01); this applied it.
+        let is_replacement_doc = matches!(spec.get("u"),
+            Some(Bson::Document(u)) if !u.keys().any(|k| k.starts_with('$')));
+        if multi && is_replacement_doc {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": 9,
+                "errmsg": "multi update is not supported for replacement-style update",
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
 
         // An undefined `$$variable` in the filter or in a PIPELINE-form `u` is a
         // per-statement writeError with mongod's 17276, not the storage layer's

@@ -17,9 +17,9 @@ use crate::{CommandContext, CommandError, HandlerResult};
 /// `distinct` — return the distinct values of `key` over docs matching `query`.
 pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "distinct")?;
-    // mongod reports these two under the IDL struct name
-    // (`distinctCommandRequest`), not under the command name `distinct` that
-    // `distinct.key` above uses. Two naming conventions on one command; probed.
+    // mongod 8.2 reports every field under the IDL struct name
+    // (`distinctCommandRequest`), `key` included -- an older probe had `key` as
+    // `distinct.key`; re-measured 8.2.11, 2026-10-01.
     argtypes::require_object(doc, "query", "distinctCommandRequest.query")?;
     argtypes::require_object(doc, "collation", "distinctCommandRequest.collation")?;
     // An undefined `$$variable` is a PARSE error (17276), not the storage
@@ -47,8 +47,8 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None | Some(Bson::Null) => {
             return Ok(CommandError::new(
                 40414,
-                "Location40414",
-                "BSON field 'distinct.key' is missing but a required field",
+                "IDLFailedToParse",
+                "BSON field 'distinctCommandRequest.key' is missing but a required field",
             )
             .into_reply())
         }
@@ -57,7 +57,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 14,
                 "TypeMismatch",
                 format!(
-                    "BSON field 'distinct.key' is the wrong type '{}', expected type 'string'",
+                    "BSON field 'distinctCommandRequest.key' is the wrong type '{}', expected type 'string'",
                     secantus_core::query::bson_type_name(v)
                 ),
             )

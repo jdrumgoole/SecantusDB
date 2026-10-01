@@ -1310,6 +1310,8 @@ fn s2_cells_for_bbox(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<u64>
 /// `keyPattern` / `keyValue` for the error response the command layer builds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniqueConflict {
+    /// `<db>.<coll>`, for mongod's `E11000 duplicate key error collection: <ns>`.
+    pub namespace: String,
     pub index: String,
     pub key_pattern: Document,
     pub key_value: Document,
@@ -1954,7 +1956,7 @@ fn shell_value(v: &Bson) -> String {
 /// Build mongod's E11000 duplicate-key `errmsg`:
 /// `E11000 duplicate key error collection: <ns> index: <name> dup key: { <k>: <v>, … }`
 /// — the exact shape drivers assert against. Mirrors `storage.format_dup_key_errmsg`.
-fn format_dup_key_errmsg(namespace: &str, index_name: &str, key_value: &Document) -> String {
+pub fn format_dup_key_errmsg(namespace: &str, index_name: &str, key_value: &Document) -> String {
     let dup = if key_value.is_empty() {
         "{ }".to_string()
     } else {
@@ -9064,6 +9066,7 @@ impl Storage {
                         // A pre-existing doc already holds this key — can't
                         // build a unique index over the data.
                         return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                            namespace: format!("{db}.{coll}"),
                             index: name.to_string(),
                             key_pattern: key_spec.clone(),
                             key_value: conflict_key_value(&d, key_spec, &kb),
@@ -9952,6 +9955,7 @@ impl Storage {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
                         return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                            namespace: format!("{db}.{coll}"),
                             index: desc.name.clone(),
                             key_pattern: desc.key_spec.clone(),
                             key_value: conflict_key_value(doc, &desc.key_spec, &kb),
@@ -10256,6 +10260,7 @@ impl Storage {
                     let is_self = row_id.is_some() && exclude_recordid == row_id;
                     if !is_self {
                         return Ok(Some(UniqueConflict {
+                            namespace: format!("{db}.{coll}"),
                             index: desc.name.clone(),
                             key_pattern: desc.key_spec.clone(),
                             key_value: conflict_key_value(candidate, &desc.key_spec, &kb),
@@ -11094,6 +11099,21 @@ impl Storage {
                 // a generic "unsupported".
                 if let Some(old_id) = doc.get("_id") {
                     if update_would_change_id(update, old_id) {
+                        // A REPLACEMENT is checked after it is applied, and mongod
+                        // says so, naming the new value (measured 8.2.11,
+                        // 2026-10-01); an operator update keeps the path wording.
+                        if is_replacement {
+                            let new_id = update.get("_id").cloned().unwrap_or(Bson::Null);
+                            return Err(StorageError::QueryError {
+                                code: 66,
+                                errmsg: format!(
+                                    "After applying the update, the (immutable) field '_id' was \
+                                     found to have been altered to _id: {}",
+                                    shell_value(&new_id)
+                                ),
+                                exec: true,
+                            });
+                        }
                         return Err(StorageError::ImmutableField);
                     }
                 }
@@ -11332,7 +11352,7 @@ impl Storage {
             let mut modified = 0usize;
             let mut idx = 0usize;
             while idx < rids.len() {
-                let (consumed, m, w) =
+                let (consumed, m, w, stopped) =
                     self.retry_write_conflicts("update_matching_chunk", || {
                         let session = self.op_session()?;
                         self.with_statement_txn(&session, || {
@@ -11352,6 +11372,11 @@ impl Storage {
                             )
                         })
                     })?;
+                // The chunk committed what it did before the failure (see
+                // `update_chunk_txn`); the failure is now the statement's.
+                if let Some(e) = stopped {
+                    return Err(e);
+                }
                 debug_assert!(consumed > 0);
                 idx += consumed;
                 matched += m;
@@ -11411,7 +11436,7 @@ impl Storage {
         // `validationLevel: "moderate"` — see `update_matching_core`.
         validator_moderate: bool,
         transform: &dyn Fn(&Document, bool) -> Result<Document>,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<(usize, usize, usize, Option<StorageError>)> {
         let ns = format!("{db}.{coll}");
         let descs = self.index_descs(session, db, coll)?;
         let oplog_on = self.enable_oplog;
@@ -11427,6 +11452,13 @@ impl Storage {
         let mut chunk_bytes = 0usize;
         let mut oplog_entries: Vec<OplogEntry> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        // A DOCUMENT-level failure part-way through ends the update there, but
+        // the documents already updated stay updated: mongod's multi-update is
+        // not atomic (measured 8.2.11, 2026-10-01 -- `$push` over
+        // `[{b: []}, {b: -1}, {b: []}]` updates the first, fails on the second,
+        // leaves the third). This chunk commits what it did and hands the
+        // error back; it used to roll the chunk back, so nothing was updated.
+        let mut stopped: Option<StorageError> = None;
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         for &recordid in rids {
             if modified >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
@@ -11453,8 +11485,14 @@ impl Storage {
                 continue;
             }
             let doc = decode_doc(&blob)?;
+            let new = match transform(&doc, false) {
+                Ok(new) => new,
+                Err(e) => {
+                    stopped = Some(e);
+                    break;
+                }
+            };
             matched += 1;
-            let new = transform(&doc, false)?;
             // The encoded bytes decide, plus mongod's one rule they cannot show:
             // an arithmetic write whose result is a NaN counts as a
             // modification, while an operator that DECLINED to write does not.
@@ -11470,17 +11508,20 @@ impl Storage {
                 let was_already_invalid = validator_moderate
                     && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
                 if !new_ok && !was_already_invalid {
-                    return Err(StorageError::DocumentValidationFailure);
+                    stopped = Some(StorageError::DocumentValidationFailure);
+                    break;
                 }
             }
             if let Some(c) =
                 self.unique_conflict(session, db, coll, &new, &descs, Some(recordid))?
             {
-                return Err(StorageError::DuplicateKey(Box::new(c)));
+                stopped = Some(StorageError::DuplicateKey(Box::new(c)));
+                break;
             }
             let new_blob = encode_doc(&new)?;
             if new_blob.len() > MAX_BSON_OBJECT_SIZE {
-                return Err(StorageError::DocumentTooLarge(new_blob.len()));
+                stopped = Some(StorageError::DocumentTooLarge(new_blob.len()));
+                break;
             }
             modified += 1;
             chunk_bytes += new_blob.len();
@@ -11494,20 +11535,28 @@ impl Storage {
             self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
             if oplog_on {
                 let o_owned: Vec<u8>;
-                let o_bytes: &[u8] = if is_replacement {
-                    &new_blob
+                // A PIPELINE update (no operator spec) is logged as a full
+                // replacement whenever mongod's delta would not be clearly smaller
+                // than the document -- see `diff::pipeline_update_description`.
+                let delta: Option<Document> = if is_replacement {
+                    None
+                } else if update_spec.is_none() {
+                    secantus_core::diff::pipeline_update_description(&doc, &new)
                 } else {
-                    let mut o = Document::new();
-                    o.insert("$v", 2i32);
-                    o.insert(
-                        "diff",
-                        Bson::Document(
-                            compute_update_description_for(&doc, &new, update_spec)
-                                .map_err(query_fault)?,
-                        ),
-                    );
-                    o_owned = encode_doc(&o)?;
-                    &o_owned
+                    Some(
+                        compute_update_description_for(&doc, &new, update_spec)
+                            .map_err(query_fault)?,
+                    )
+                };
+                let o_bytes: &[u8] = match delta {
+                    None => &new_blob,
+                    Some(diff) => {
+                        let mut o = Document::new();
+                        o.insert("$v", 2i32);
+                        o.insert("diff", Bson::Document(diff));
+                        o_owned = encode_doc(&o)?;
+                        &o_owned
+                    }
                 };
                 let o2 = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
                 oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(
@@ -11528,7 +11577,7 @@ impl Storage {
         if oplog_on && !oplog_entries.is_empty() {
             self.emit_oplog_entries(session, oplog_entries, pre_images)?;
         }
-        Ok((consumed, matched, modified))
+        Ok((consumed, matched, modified, stopped))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11647,20 +11696,28 @@ impl Storage {
                             // (no second serialize). Operator `o` is the small
                             // `{$v:2, diff}`, encoded fresh.
                             let o_owned: Vec<u8>;
-                            let o_bytes: &[u8] = if is_replacement {
-                                &new_blob
+                            // A PIPELINE update (no operator spec) is logged as a full
+                            // replacement whenever mongod's delta would not be clearly smaller
+                            // than the document -- see `diff::pipeline_update_description`.
+                            let delta: Option<Document> = if is_replacement {
+                                None
+                            } else if update_spec.is_none() {
+                                secantus_core::diff::pipeline_update_description(&doc, &new)
                             } else {
-                                let mut o = Document::new();
-                                o.insert("$v", 2i32);
-                                o.insert(
-                                    "diff",
-                                    Bson::Document(
-                                        compute_update_description_for(&doc, &new, update_spec)
-                                            .map_err(query_fault)?,
-                                    ),
-                                );
-                                o_owned = encode_doc(&o)?;
-                                &o_owned
+                                Some(
+                                    compute_update_description_for(&doc, &new, update_spec)
+                                        .map_err(query_fault)?,
+                                )
+                            };
+                            let o_bytes: &[u8] = match delta {
+                                None => &new_blob,
+                                Some(diff) => {
+                                    let mut o = Document::new();
+                                    o.insert("$v", 2i32);
+                                    o.insert("diff", Bson::Document(diff));
+                                    o_owned = encode_doc(&o)?;
+                                    &o_owned
+                                }
                             };
                             let o2 = encode_id_doc(&doc.get("_id").cloned().unwrap_or(Bson::Null))?;
                             oplog_entries.push(OplogEntry::Raw(Self::oplog_entry_crud(

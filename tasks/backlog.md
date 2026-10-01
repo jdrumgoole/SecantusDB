@@ -6694,6 +6694,66 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.02 Rust MongoDB server: change-stream events and error replies -- 2026-10-01
+
+Two new differential probes against mongod 8.2.11, everything they found fixed
+on the Rust server. `change_stream_fuzz.py` (random write sequences, the whole
+event stream compared) 60 of 60 -> 0 of 600; `update_description.py` (61
+hand cases, operator by operator) 11 -> 0; `write_error_replies.py` (58 real
+failures, the whole reply compared) 29 -> 0; `error_labels.py` stays 0 of 540.
+
+- [x] **Silent writes that stored nothing or the wrong thing:**
+  - `$set: {"b.0.c": x}` over `b: []` was acknowledged and wrote NOTHING;
+    mongod pads with null and creates the element (`[null, null, {c: x}]`
+    for `b.2.c`);
+  - `update_one({a: 2}, {$set: {"a.$": 9}})` -- a positional update whose
+    query names the array itself -- was refused as an unsupported construct;
+  - `updateMany` that fails on the second document rolled back the first; mongod
+    keeps documents updated before the failure (it is not atomic);
+  - `multi: true` with a replacement document APPLIED it; `delete` with
+    `limit: 5` deleted up to five; `createIndexes` with the same key under a
+    new name built a DUPLICATE index; an empty key and a missing name built
+    indexes; `a$b`, `""`, `.x`, `system.foo` became collections. mongod refuses
+    all of these.
+- [x] **Change events:** insert events carried `fullDocumentBeforeChange: null`
+  under `whenAvailable` (mongod omits it); a modifier update was described by a
+  deep value diff where mongod reports what each operator touched (a `$set` or
+  `$rename` target whole, a `$rename` target even when unchanged, a `$push` onto
+  an EMPTY array as the whole array, a positional `$set` as `a.1`); a PIPELINE
+  update is now described by a port of mongod's own `$v: 2` diff and logged as a
+  `replace` whenever `bsonsize(diff) + 15 >= bsonsize(post)` (the boundary
+  measured byte by byte on two diff shapes).
+- [x] **Error replies:** duplicate keys on update / upsert / findAndModify /
+  index builds render the key as mongod does (`dup key: { a: 1 }`, not
+  `Document({"a": Int32(1)})`) under the executor wrapper, and an index build
+  carries `keyPattern` / `keyValue`; `_id` altered by a replacement, an
+  unmatched positional `$`, an unused array filter, unknown field and top-level
+  operators, and invalid regexes (PCRE2's messages, 51091) now say what mongod
+  says instead of "query uses a construct the Rust server does not support";
+  `createIndexes` conflicts (85 / 86, numeric directions compared by value),
+  `dropIndexes: "_id_"` (72), `create` of an existing collection (ok with the
+  same options), `collMod` unknown fields (40415), `renameCollection` outside
+  `admin` (13), `find` sort values (15974 / 15975) and negative `skip` /
+  `limit`, `aggregate` without `cursor` (9), and `distinct`'s IDL names.
+- [x] **Code 330 crashes mongod** when injected (recorded in §7.01).
+
+**Still open on the Rust server:**
+
+- [ ] Collection-name validation runs on `create` only; an insert into `a$b`
+  (implicit creation) was not measured.
+- [ ] `find` sort-spec validation runs on `find`; the aggregation `$sort`
+  stage's own checks were not probed this batch.
+- [ ] Write replies on a replica set omit mongod's `opTime` / `electionId`
+  (drivers ignore them; field order differs too).
+- [ ] Invalid-arrayFilter shapes other than an unused identifier still defer.
+
+**Found and NOT fixed -- Python-server divergences** (out of scope):
+
+- [ ] the same positional gap: `update_one({a: 2}, {$set: {"a.$": 9}})`
+  fails with code 9 on the Python server;
+- [ ] its change events, update descriptions and these error replies were not
+  measured; run the three new probes with `PROBE_SERVER` at a Python server.
+
 ### 7.01 Rust MongoDB server driver-gauge sweep — 2026-09-30
 
 Every MongoDB driver gauge run against the Rust server (tree `96f95c18`), then

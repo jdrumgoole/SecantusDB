@@ -35,7 +35,9 @@ use crate::find::split_into_cursor;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, docs_to_bson, encode_docs,
 };
-use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, SERVER_VERSION};
+use crate::{
+    CommandContext, CommandError, HandlerResult, StorageError, DEFAULT_BATCH_SIZE, SERVER_VERSION,
+};
 
 /// Collection-option keys (from `create` / `collMod`) the Rust server persists.
 /// `validator` + `validationLevel`/`validationAction` drive document validation;
@@ -110,6 +112,9 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ));
     }
     let coll = coll_arg(doc, "create")?;
+    if let Some(e) = invalid_collection_name(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
     if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
         return Ok(CommandError::new(
             40415,
@@ -175,10 +180,35 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .create_collection_with_options(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
     if !created {
+        // mongod answers ok when the collection already exists with the SAME
+        // options -- a bare `create` of an existing collection included -- and
+        // 48 quoting the existing options otherwise (measured 8.2.11,
+        // 2026-10-01). This was always 48.
+        let mut existing = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .unwrap_or_default();
+        // The stored options carry the collection's UUID; it is quoted
+        // separately, and is never a requested option.
+        existing.remove("uuid");
+        if existing == opts {
+            return Ok(doc! { "ok": 1.0 });
+        }
+        let uuid = storage
+            .collection_uuid(&ctx.db_name, &coll)
+            .ok()
+            .and_then(|b| uuid_text(&b))
+            .unwrap_or_default();
+        let mut shown = format!("uuid: UUID(\"{uuid}\")");
+        for (k, v) in &existing {
+            shown.push_str(&format!(", {k}: {}", argtypes::render_stage_value(v)));
+        }
         return Ok(CommandError::new(
             48,
             "NamespaceExists",
-            format!("a collection '{}.{}' already exists", ctx.db_name, coll),
+            format!(
+                "namespace {}.{coll} already exists, but with different options: {{ {shown} }}",
+                ctx.db_name
+            ),
         )
         .into_reply());
     }
@@ -198,6 +228,18 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "collMod.changeStreamPreAndPostImages",
     )?;
     argtypes::require_string(doc, "viewOn", "collMod.viewOn")?;
+    // An unknown field is refused, not ignored (measured 8.2.11, 2026-10-01).
+    if let Some(unknown) = doc
+        .keys()
+        .skip(1)
+        .find(|k| !COLLMOD_FIELDS.contains(&k.as_str()) && !crate::params::is_generic_arg(k))
+    {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'collMod.{unknown}' is an unknown field."),
+        ));
+    }
     let coll = match doc.get("collMod").or_else(|| doc.get("collmod")) {
         Some(Bson::String(s)) => s.clone(),
         _ => {
@@ -1189,6 +1231,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .create_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
 
+    let existing = storage
+        .list_indexes(&ctx.db_name, &coll)
+        .map_err(command_error)?;
     let mut any_created = false;
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
@@ -1197,11 +1242,50 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             .and_then(Bson::as_document)
             .cloned()
             .unwrap_or_default();
-        let name = s
-            .get("name")
-            .and_then(Bson::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| default_index_name(&key));
+        // mongod refuses these two before anything else about the spec, and
+        // quotes the spec as given (measured 8.2.11, 2026-10-01). Both used to
+        // be ACCEPTED: an empty key built an index over nothing, and a missing
+        // name was invented from the key.
+        let spec_text = argtypes::render_stage_value(&Bson::Document(s.clone()));
+        if key.is_empty() {
+            return Ok(CommandError::new(
+                67,
+                "CannotCreateIndex",
+                format!(
+                    "Error in specification {spec_text} :: caused by :: Index keys cannot be empty."
+                ),
+            )
+            .into_reply());
+        }
+        // A string key value names an index PLUGIN. mongod knows a handful; any
+        // other name is refused as unknown, quoting the spec (measured 8.2.11,
+        // 2026-10-01). Known-but-unsupported types keep the storage layer's own
+        // refusal.
+        if let Some(plugin) = key.values().find_map(|v| match v {
+            Bson::String(p) if !KNOWN_INDEX_PLUGINS.contains(&p.as_str()) => Some(p.clone()),
+            _ => None,
+        }) {
+            return Ok(CommandError::new(
+                67,
+                "CannotCreateIndex",
+                format!(
+                    "Error in specification {spec_text} :: caused by :: Unknown index plugin \
+                     '{plugin}'"
+                ),
+            )
+            .into_reply());
+        }
+        let Some(name) = s.get("name").and_then(Bson::as_str).map(str::to_string) else {
+            return Ok(CommandError::new(
+                9,
+                "FailedToParse",
+                format!(
+                    "Error in specification {spec_text} :: caused by :: The 'name' field is a \
+                     required property of an index specification"
+                ),
+            )
+            .into_reply());
+        };
         // Unknown fields on the spec itself are rejected, not ignored.
         let spec_opts: Document = s
             .iter()
@@ -1285,9 +1369,41 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 spec.remove(opt);
             }
         }
-        let created = storage
-            .create_index(&ctx.db_name, &coll, &name, &key, &spec)
-            .map_err(command_error)?;
+        if let Some(e) = index_conflict(&existing, &name, &key, &spec) {
+            return Ok(e.into_reply());
+        }
+        let created = match storage.create_index(&ctx.db_name, &coll, &name, &key, &spec) {
+            Ok(c) => c,
+            // A unique index over data that already holds duplicates: mongod
+            // fails the BUILD, under its own wrapper, and still carries
+            // keyPattern / keyValue (measured 8.2.11, 2026-10-01).
+            Err(StorageError::DuplicateKey(info)) => {
+                let coll_uuid = storage
+                    .collection_uuid(&ctx.db_name, &coll)
+                    .ok()
+                    .and_then(|b| uuid_text(&b))
+                    .unwrap_or_default();
+                let build = uuid_text(&bson::uuid::Uuid::new().bytes()).unwrap_or_default();
+                let mut reply = doc! {
+                    "ok": 0.0,
+                    "errmsg": format!(
+                        "Index build failed: {build}: Collection {}.{coll} ( {coll_uuid} ) \
+                         :: caused by :: {}",
+                        ctx.db_name, info.errmsg
+                    ),
+                    "code": 11000,
+                    "codeName": "DuplicateKey",
+                };
+                if let Some(kp) = info.key_pattern {
+                    reply.insert("keyPattern", kp);
+                }
+                if let Some(kv) = info.key_value {
+                    reply.insert("keyValue", kv);
+                }
+                return Ok(reply);
+            }
+            Err(e) => return Err(command_error(e)),
+        };
         any_created |= created;
     }
 
@@ -1310,6 +1426,170 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     Ok(reply)
 }
 
+/// The index plugin names mongod 8.2 recognises in a key pattern.
+const KNOWN_INDEX_PLUGINS: &[&str] = &["2d", "2dsphere", "text", "hashed", "2dsphere_bucket"];
+
+/// The fields `collMod` accepts, besides the generic command arguments.
+const COLLMOD_FIELDS: &[&str] = &[
+    "validator",
+    "validationLevel",
+    "validationAction",
+    "index",
+    "viewOn",
+    "pipeline",
+    "expireAfterSeconds",
+    "changeStreamPreAndPostImages",
+    "timeseries",
+    "cappedSize",
+    "cappedMax",
+    "dryRun",
+    "recordIdsReplicated",
+    "timeseriesBucketsMayHaveMixedSchemaData",
+];
+
+/// mongod's refusal of a collection name it will not create (measured 8.2.11,
+/// 2026-10-01). These used to be created.
+fn invalid_collection_name(db: &str, coll: &str) -> Option<CommandError> {
+    let err = |m: String| Some(CommandError::new(73, "InvalidNamespace", m));
+    if coll.is_empty() {
+        return err(format!("Invalid namespace specified: {db}"));
+    }
+    if coll.contains('\0') {
+        return err("namespaces cannot have embedded null characters".to_string());
+    }
+    if coll.starts_with('.') {
+        return err(format!("Collection names cannot start with '.': {coll}"));
+    }
+    if coll.contains('$') {
+        return err(format!("Invalid collection name: {coll}"));
+    }
+    if let Some(rest) = coll.strip_prefix("system.") {
+        let allowed = matches!(
+            rest,
+            "views" | "profile" | "js" | "users" | "roles" | "version"
+        ) || rest.starts_with("buckets.");
+        if !allowed {
+            return err(format!("Invalid system namespace: {db}.{coll}"));
+        }
+    }
+    None
+}
+
+/// A UUID's canonical text from its 16 bytes.
+fn uuid_text(bytes: &[u8]) -> Option<String> {
+    let b: [u8; 16] = bytes.try_into().ok()?;
+    Some(bson::uuid::Uuid::from_bytes(b).to_string())
+}
+
+/// mongod's spec rendering for a conflict message: `v` first, then the
+/// options, then `key` and `name` (measured 8.2.11, 2026-10-01).
+fn conflict_spec_text(spec: &Document) -> String {
+    let mut out = Document::new();
+    out.insert("v", 2i32);
+    for (k, v) in spec {
+        if !matches!(k.as_str(), "v" | "key" | "name" | "ns")
+            && !INDEX_CATALOG_ONLY.contains(&k.as_str())
+        {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(k) = spec.get("key") {
+        out.insert("key", k.clone());
+    }
+    if let Some(n) = spec.get("name") {
+        out.insert("name", n.clone());
+    }
+    argtypes::render_stage_value(&Bson::Document(out))
+}
+
+/// The options that make two index specs different indexes.
+/// Catalog bookkeeping that is not part of an index's options (and that
+/// `listIndexes` already hides from clients).
+const INDEX_CATALOG_ONLY: &[&str] = &["entryFormat", "multikey"];
+
+fn index_options(spec: &Document) -> Document {
+    spec.iter()
+        .filter(|(k, _)| {
+            !matches!(k.as_str(), "v" | "key" | "name" | "ns")
+                && !INDEX_CATALOG_ONLY.contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Two specs' documents compared as mongod compares them: field order matters,
+/// but numbers are equal by VALUE -- a `{filename: 1.0}` index (mongocxx's
+/// GridFS creates them that way) is the same index as `{filename: 1}`.
+fn docs_equal_by_value(a: &Document, b: &Document) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|((ka, va), (kb, vb))| ka == kb && values_equal_by_value(va, vb))
+}
+
+fn values_equal_by_value(a: &Bson, b: &Bson) -> bool {
+    let num = |v: &Bson| match v {
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Double(d) => Some(*d),
+        _ => None,
+    };
+    match (a, b) {
+        (Bson::Document(x), Bson::Document(y)) => docs_equal_by_value(x, y),
+        _ => match (num(a), num(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
+    }
+}
+
+/// mongod's answer when a requested index collides with an existing one
+/// (measured 8.2.11, 2026-10-01):
+///
+/// * same NAME, different key or options -> 86 `IndexKeySpecsConflict`, quoting
+///   both specs;
+/// * same KEY and options under another name -> 85 `IndexOptionsConflict`.
+///   This one used to BUILD a second, duplicate index.
+fn index_conflict(
+    existing: &[Document],
+    name: &str,
+    key: &Document,
+    spec: &Document,
+) -> Option<CommandError> {
+    let wanted = index_options(spec);
+    for idx in existing {
+        let same_name = idx.get_str("name").is_ok_and(|n| n == name);
+        let same_key = idx
+            .get_document("key")
+            .is_ok_and(|k| docs_equal_by_value(k, key));
+        let same_opts = docs_equal_by_value(&index_options(idx), &wanted);
+        if same_name && !(same_key && same_opts) {
+            return Some(CommandError::new(
+                86,
+                "IndexKeySpecsConflict",
+                format!(
+                    "An existing index has the same name as the requested index. When index \
+                     names are not specified, they are auto generated and can cause conflicts. \
+                     Please refer to our documentation. Requested index: {}, existing index: {}",
+                    conflict_spec_text(spec),
+                    conflict_spec_text(idx),
+                ),
+            ));
+        }
+        if !same_name && same_key && same_opts {
+            return Some(CommandError::new(
+                85,
+                "IndexOptionsConflict",
+                format!(
+                    "Index already exists with a different name: {}",
+                    idx.get_str("name").unwrap_or("")
+                ),
+            ));
+        }
+    }
+    None
+}
+
 /// `dropIndexes` — drop a named index, or all of them with `"*"`.
 pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_index_name_or_key(doc, "index", "dropIndexes.index")?;
@@ -1329,6 +1609,13 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(Bson::String(name)) => {
             if let Some(e) = crate::nul_in_namespace("index name", name) {
                 return Ok(e.into_reply());
+            }
+            // mongod refuses outright (72), before looking the index up; this
+            // answered `27 index not found` (measured 8.2.11, 2026-10-01).
+            if name == "_id_" {
+                return Ok(
+                    CommandError::new(72, "InvalidOptions", "cannot drop _id index").into_reply(),
+                );
             }
             let existed = storage
                 .drop_index(&ctx.db_name, &coll, name)
@@ -1393,6 +1680,15 @@ pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
 pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    // mongod runs this only against `admin` (measured 8.2.11, 2026-10-01);
+    // drivers send it there, and any other database is refused.
+    if ctx.db_name != "admin" {
+        return Err(CommandError::new(
+            13,
+            "Unauthorized",
+            "renameCollection may only be run against the admin database.",
+        ));
+    }
     argtypes::require_required_string(doc, "to", "renameCollection.to")?;
     argtypes::require_bool_or_bindata(doc, "dropTarget", "renameCollection.dropTarget")?;
     let src = match doc.get("renameCollection") {
@@ -1849,24 +2145,6 @@ fn split_ns(ns: &str) -> (String, String) {
         Some((d, c)) => (d.to_string(), c.to_string()),
         None => (String::new(), ns.to_string()),
     }
-}
-
-/// The default index name mongod derives from a key spec, e.g. `{a:1, b:-1}` →
-/// `"a_1_b_-1"`, `{loc:"2dsphere"}` → `"loc_2dsphere"`.
-fn default_index_name(key: &Document) -> String {
-    key.iter()
-        .map(|(k, v)| {
-            let vs = match v {
-                Bson::Int32(i) => i.to_string(),
-                Bson::Int64(i) => i.to_string(),
-                Bson::Double(d) => (*d as i64).to_string(),
-                Bson::String(s) => s.clone(),
-                _ => "1".to_string(),
-            };
-            format!("{k}_{vs}")
-        })
-        .collect::<Vec<_>>()
-        .join("_")
 }
 
 /// `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` — Atlas Search

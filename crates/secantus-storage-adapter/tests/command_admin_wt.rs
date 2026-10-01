@@ -87,14 +87,14 @@ fn create_compound_geo_scalar_index() {
     // maintains the index cleanly (mongo-php-library CreateIndexesFunctionalTest).
     with_wt(|c| {
         let r = dispatch(
-            &doc! {"createIndexes": "c", "indexes": [{"key": {"g": "2dsphere", "z": 1}}]},
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"g": "2dsphere", "z": 1}, "name": "g_2dsphere_z_1"}]},
             c,
         );
         assert_eq!(r.get_f64("ok").unwrap(), 1.0, "{r:?}");
         assert!(index_names(c, "c").contains(&"g_2dsphere_z_1".to_string()));
         // A 2d compound index is likewise accepted.
         let r2d = dispatch(
-            &doc! {"createIndexes": "c", "indexes": [{"key": {"p": "2d", "z": 1}}]},
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"p": "2d", "z": 1}, "name": "p_2d_z_1"}]},
             c,
         );
         assert_eq!(r2d.get_f64("ok").unwrap(), 1.0, "{r2d:?}");
@@ -240,8 +240,11 @@ fn create_then_drop_collection() {
             dispatch(&doc! {"create": "c"}, c).get_f64("ok").unwrap(),
             1.0
         );
-        // re-create ⇒ NamespaceExists
+        // Re-creating with the same (no) options is a no-op success on mongod
+        // 8.2.11; different options are NamespaceExists.
         let reply = dispatch(&doc! {"create": "c"}, c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply:?}");
+        let reply = dispatch(&doc! {"create": "c", "capped": true, "size": 4096}, c);
         assert_eq!(reply.get_i32("code").unwrap(), 48);
         let reply = dispatch(&doc! {"drop": "c"}, c);
         assert_eq!(reply.get_str("ns").unwrap(), "t.c");
@@ -569,7 +572,8 @@ fn create_indexes_and_list() {
         let reply = dispatch(
             &doc! {"createIndexes": "c", "indexes": [
                 {"key": {"a": 1}, "name": "a_1"},
-                {"key": {"b": -1}},  // name auto-derived ⇒ b_-1
+                // mongod requires `name` (8.2.11); drivers derive it.
+                {"key": {"b": -1}, "name": "b_-1"},
             ]},
             c,
         );
@@ -608,8 +612,9 @@ fn create_index_conflicts_and_noop_note() {
             ]},
             c,
         );
-        assert_eq!(r.get_i32("code").unwrap(), 85);
-        assert_eq!(r.get_str("codeName").unwrap(), "IndexOptionsConflict");
+        // Same name, different options: mongod 8.2.11 answers 86.
+        assert_eq!(r.get_i32("code").unwrap(), 86);
+        assert_eq!(r.get_str("codeName").unwrap(), "IndexKeySpecsConflict");
     });
 }
 
@@ -712,7 +717,10 @@ fn rename_collection_ok() {
     with_wt(|c| {
         // Real rename needs a real source collection.
         dispatch(&doc! {"create": "a"}, c);
+        // renameCollection runs against `admin` (mongod 8.2.11).
+        c.db_name = "admin".to_string();
         let reply = dispatch(&doc! {"renameCollection": "t.a", "to": "t.b"}, c);
+        c.db_name = "t".to_string();
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
         assert_eq!(index_names(c, "b"), vec!["_id_"]);
     });
@@ -723,7 +731,9 @@ fn rename_nonexistent_source_is_namespace_not_found() {
     // Renaming a missing source is NamespaceNotFound (26), not NamespaceExists
     // (48) — php-lib RenameCollectionFunctionalTest::testRenameNonexistentCollection.
     with_wt(|c| {
+        c.db_name = "admin".to_string();
         let r = dispatch(&doc! {"renameCollection": "t.nope", "to": "t.dst"}, c);
+        c.db_name = "t".to_string();
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert_eq!(r.get_i32("code").unwrap(), 26);
         assert_eq!(r.get_str("codeName").unwrap(), "NamespaceNotFound");

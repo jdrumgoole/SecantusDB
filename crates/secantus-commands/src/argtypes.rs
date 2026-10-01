@@ -805,6 +805,43 @@ mod tests {
 /// mongod's rendering of a stage argument inside an error message: strings are
 /// quoted, bools lowercase, arrays spaced (`[ 1 ]`), an empty document `{}`.
 /// Probed on 6.0.16 via `$skip`'s message, which echoes the offending value.
+/// mongod's check of a sort specification (measured 8.2.11, 2026-10-01): each
+/// value is a number that truncates to 1 or -1 (`1.5` is ascending), or a
+/// `{$meta: ...}` document; any other number is 15975 and anything else 15974.
+/// `sort: {a: 2}` used to sort ascending.
+pub(crate) fn require_sort_spec(sort: &Document) -> Result<(), CommandError> {
+    for (field, v) in sort {
+        let n = match v {
+            Bson::Int32(n) => Some(*n as f64),
+            Bson::Int64(n) => Some(*n as f64),
+            Bson::Double(d) => Some(*d),
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
+            Bson::Document(d) if d.contains_key("$meta") => None,
+            other => {
+                return Err(CommandError::new(
+                    15974,
+                    "Location15974",
+                    format!(
+                        "Illegal key in $sort specification: {field}: {}",
+                        render_stage_value(other)
+                    ),
+                ))
+            }
+        };
+        if let Some(n) = n {
+            let t = n.trunc();
+            if t != 1.0 && t != -1.0 {
+                return Err(CommandError::new(
+                    15975,
+                    "Location15975",
+                    "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn render_stage_value(v: &Bson) -> String {
     match v {
         Bson::String(s) => format!("\"{s}\""),
