@@ -128,11 +128,15 @@ def _render(raw: dict) -> str:
     lines.append("")
     lines.append(
         "`invoke validate-c` builds the vendored driver's `test-libmongoc` "
-        "binary once (CMake, `ENABLE_TESTS=ON`), spawns a SecantusDB daemon "
-        "on a fresh ephemeral port, and runs the curated `-l` prefixes with "
-        "`MONGOC_TEST_URI` pointed at the daemon, writing JSON results via "
-        "`-F`. The list of in-scope test prefixes (and the skip-list of "
-        "out-of-scope tests) lives in `c_validation/include_paths.py`."
+        "binary once (CMake, `ENABLE_TESTS=ON`) and runs it TWICE, each "
+        "against a fresh SecantusDB daemon on an ephemeral port with "
+        "`MONGOC_TEST_URI` pointed at it, writing JSON results via `-F`: the "
+        "curated `-l` prefixes against the default single-node replica set, "
+        "then the few tests that assert standalone semantics "
+        "(`STANDALONE_ONLY`) against a `--standalone` daemon. The two are "
+        "merged into one result set. The in-scope prefixes, the skip-list of "
+        "out-of-scope tests and the standalone list live in "
+        "`c_validation/include_paths.py`."
     )
     lines.append("")
     return "\n".join(lines)
