@@ -33,6 +33,7 @@ pub mod fts;
 mod func_cast;
 mod funcsig;
 mod optype;
+mod semijoin;
 pub use errpos::error_position;
 pub mod alter_routine;
 pub mod collation;
@@ -3093,6 +3094,9 @@ pub fn plan_with_subqueries(
             **s = expand_views(s)?;
         }
     }
+    // A recursive CTE inside a FROM subquery -- a view's body among them,
+    // now expanded -- is materialised the same way as one at the top.
+    materialize_nested_recursive_ctes(&mut node, lookup, &mut params, run)?;
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
     plan_node(
         node.node
@@ -6661,9 +6665,6 @@ fn plan_create_view(v: &pg_query::protobuf::ViewStmt) -> Result<Statement> {
     let Some(N::SelectStmt(select)) = query.node.as_ref() else {
         return Err(Error::Unsupported("a view over this statement".into()));
     };
-    if select.with_clause.as_ref().is_some_and(|w| w.recursive) {
-        return Err(Error::Unsupported("CREATE RECURSIVE VIEW".into()));
-    }
     let body = query.deparse().map_err(|e| Error::Parse(e.to_string()))?;
     let columns: Vec<String> = v
         .aliases
@@ -8409,6 +8410,19 @@ fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
             }
             Some(N::CaseWhen(w)) => {
                 walk(w.expr.as_deref(), depth + 1) || walk(w.result.as_deref(), depth + 1)
+            }
+            Some(N::MinMaxExpr(m)) => m.args.iter().any(|a| walk(Some(a), depth + 1)),
+            Some(N::NullTest(t)) => walk(t.arg.as_deref(), depth + 1),
+            // `(array_agg(n))[2]`.
+            Some(N::AIndirection(a)) => {
+                walk(a.arg.as_deref(), depth + 1)
+                    || a.indirection.iter().any(|i| match i.node.as_ref() {
+                        Some(N::AIndices(ix)) => {
+                            walk(ix.lidx.as_deref(), depth + 1)
+                                || walk(ix.uidx.as_deref(), depth + 1)
+                        }
+                        _ => false,
+                    })
             }
             _ => false,
         }
@@ -13041,6 +13055,69 @@ fn returning_output_def(
     Ok(Some(TableDef::new("", columns)))
 }
 
+/// `materialize_recursive_ctes` for every SELECT nested in a FROM clause
+/// (subqueries, join sides, set-operation legs), innermost first.
+fn materialize_nested_recursive_ctes(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    fn from_item(
+        item: &mut pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &mut Vec<Bson>,
+        run: SubqueryRunner<'_>,
+    ) -> Result<()> {
+        match item.node.as_mut() {
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(q) = rs.subquery.as_deref_mut() {
+                    select(q, lookup, params, run)?;
+                    materialize_recursive_ctes(q, lookup, params, run)?;
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    from_item(side, lookup, params, run)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn select(
+        node: &mut pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &mut Vec<Bson>,
+        run: SubqueryRunner<'_>,
+    ) -> Result<()> {
+        let Some(N::SelectStmt(s)) = node.node.as_mut() else {
+            return Ok(());
+        };
+        for side in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            let mut n = pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(Box::new(side.clone()))),
+            };
+            select(&mut n, lookup, params, run)?;
+            materialize_recursive_ctes(&mut n, lookup, params, run)?;
+            if let Some(N::SelectStmt(done)) = n.node {
+                *side = *done;
+            }
+        }
+        for item in &mut s.from_clause {
+            from_item(item, lookup, params, run)?;
+        }
+        Ok(())
+    }
+    select(node, lookup, params, run)
+}
+
 fn materialize_recursive_ctes(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -13798,6 +13875,8 @@ fn resolve_sublinks_in_select_scoped(
         resolve_sublinks_in_from(item, lookup, params, run)?;
     }
 
+    // `EXISTS` over one equality, as the uncorrelated `IN` it is.
+    semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
             if let Some(v) = rt.val.as_deref_mut() {
@@ -15667,6 +15746,288 @@ fn order_by_output_exprs(
     changed.then_some(out)
 }
 
+/// `(alias).field`, where `alias` names a FROM item rather than a column, as
+/// the plain reference `alias.field` it means (PostgreSQL reads the alias as
+/// the item's whole-row value). A name that is also a column of a table in
+/// FROM is left alone: the column wins.
+fn alias_field_rewrite(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    fn aliases(
+        n: &pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        out: &mut Vec<(String, Option<String>)>,
+    ) {
+        match n.node.as_ref() {
+            // Only a function returning SEVERAL columns is a record: a
+            // one-column function's alias is its scalar value, and field
+            // notation on it is PostgreSQL's 42809.
+            Some(N::RangeFunction(f)) => {
+                let Some(a) = f.alias.as_ref() else {
+                    return;
+                };
+                let mut bare = f.clone();
+                bare.alias = None;
+                let probe = pg_query::protobuf::SelectStmt {
+                    target_list: vec![pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            val: Some(Box::new(star_target_node())),
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    }],
+                    from_clause: vec![pg_query::protobuf::Node {
+                        node: Some(N::RangeFunction(bare)),
+                    }],
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                let def = plan_select(&probe, lookup, &[]).and_then(|p| sub_plan_def(&p, lookup));
+                match def.as_ref().map(|d| d.columns.as_slice()) {
+                    Ok([one]) => {
+                        out.push((a.aliasname.clone(), Some(format!("\u{1}{}", one.pg_type))))
+                    }
+                    Ok(cols) if cols.len() > 1 => out.push((a.aliasname.clone(), None)),
+                    _ => {}
+                }
+            }
+            Some(N::RangeSubselect(r)) => {
+                if let Some(a) = r.alias.as_ref() {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeVar(r)) => out.push((
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone()),
+                Some(relation_name(r)),
+            )),
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    aliases(side, lookup, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = Vec::new();
+    for n in &s.from_clause {
+        aliases(n, lookup, &mut items);
+    }
+    // Function and subquery aliases only: a table's whole-row value is
+    // already handled (`whole_row_rewrite`).
+    let names: Vec<String> = items
+        .iter()
+        .filter(|(_, rel)| rel.is_none())
+        .map(|(a, _)| a.clone())
+        .collect();
+    // A one-column function's alias, with its column's type (marked by a
+    // leading \u{1}, which no relation name carries).
+    let scalars: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|(a, rel)| {
+            Some((
+                a.clone(),
+                rel.as_deref()?.strip_prefix('\u{1}')?.to_string(),
+            ))
+        })
+        .collect();
+    let items: Vec<(String, Option<String>)> = items
+        .into_iter()
+        .filter(|(_, rel)| !rel.as_deref().is_some_and(|r| r.starts_with('\u{1}')))
+        .collect();
+    if names.is_empty() && scalars.is_empty() {
+        return Ok(None);
+    }
+    let is_column = |name: &str| {
+        items.iter().any(|(_, rel)| {
+            rel.as_deref()
+                .and_then(lookup)
+                .is_some_and(|d| d.column(name).is_some())
+        })
+    };
+    let mut changed = false;
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        let Some(N::AIndirection(a)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(N::ColumnRef(c)) = a.arg.as_deref().and_then(|x| x.node.as_ref()) else {
+            return Ok(());
+        };
+        let [only] = c.fields.as_slice() else {
+            return Ok(());
+        };
+        let Some(N::String(alias)) = only.node.as_ref() else {
+            return Ok(());
+        };
+        let [field, rest @ ..] = a.indirection.as_slice() else {
+            return Ok(());
+        };
+        let Some(N::String(f)) = field.node.as_ref() else {
+            return Ok(());
+        };
+        if is_column(&alias.sval) {
+            return Ok(());
+        }
+        if let Some((_, ty)) = scalars.iter().find(|(n, _)| *n == alias.sval) {
+            return Err(Error::Sqlstate(
+                "42809",
+                format!(
+                    "column notation .{} applied to type {}, which is not a composite type",
+                    f.sval,
+                    display_type(ty)
+                ),
+            ));
+        }
+        if !names.contains(&alias.sval) {
+            return Ok(());
+        }
+        let column = pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![string_node(&alias.sval), string_node(&f.sval)],
+                location: c.location,
+            })),
+        };
+        *n = if rest.is_empty() {
+            column
+        } else {
+            pg_query::protobuf::Node {
+                node: Some(N::AIndirection(Box::new(
+                    pg_query::protobuf::AIndirection {
+                        arg: Some(Box::new(column)),
+                        indirection: rest.to_vec(),
+                    },
+                ))),
+            }
+        };
+        changed = true;
+        Ok(())
+    };
+    let mut out = s.clone();
+    for t in &mut out.target_list {
+        walk_expr(t, &mut visit)?;
+    }
+    for c in [
+        out.where_clause.as_deref_mut(),
+        out.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        walk_expr(c, &mut visit)?;
+    }
+    for n in out
+        .sort_clause
+        .iter_mut()
+        .chain(out.group_clause.iter_mut())
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    Ok(changed.then_some(out))
+}
+
+/// A table in FROM with a column-alias list (`t r(a, b)`) as the subquery
+/// it is shorthand for, `(SELECT id AS a, g AS b, v FROM t) r`, so every
+/// planner path sees ordinary column names. `None` when there is none.
+fn column_alias_rewrite(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    fn item(
+        n: &mut pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        changed: &mut bool,
+    ) -> Result<()> {
+        match n.node.as_mut() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    item(side, lookup, changed)?;
+                }
+            }
+            Some(N::RangeVar(rv)) => {
+                let Some(alias) = rv.alias.as_ref().filter(|a| !a.colnames.is_empty()) else {
+                    return Ok(());
+                };
+                let Some(def) = lookup(&relation_name(rv)) else {
+                    return Ok(());
+                };
+                let renames: Vec<String> =
+                    alias.colnames.iter().filter_map(alias_colname).collect();
+                if renames.len() > def.columns.len() {
+                    return Err(Error::Sqlstate(
+                        "42P10",
+                        format!(
+                            "table \"{}\" has {} columns available but {} columns specified",
+                            alias.aliasname,
+                            def.columns.len(),
+                            renames.len()
+                        ),
+                    ));
+                }
+                let targets = def
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            name: renames.get(i).cloned().unwrap_or_else(|| c.name.clone()),
+                            val: Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                                    fields: vec![string_node(&c.name)],
+                                    location: -1,
+                                })),
+                            })),
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    })
+                    .collect();
+                let mut table = rv.clone();
+                table.alias = None;
+                let sub = pg_query::protobuf::SelectStmt {
+                    target_list: targets,
+                    from_clause: vec![pg_query::protobuf::Node {
+                        node: Some(N::RangeVar(table)),
+                    }],
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                let aliasname = alias.aliasname.clone();
+                *n = pg_query::protobuf::Node {
+                    node: Some(N::RangeSubselect(Box::new(
+                        pg_query::protobuf::RangeSubselect {
+                            lateral: false,
+                            subquery: Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::SelectStmt(Box::new(sub))),
+                            })),
+                            alias: Some(pg_query::protobuf::Alias {
+                                aliasname,
+                                colnames: Vec::new(),
+                            }),
+                        },
+                    ))),
+                };
+                *changed = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut out = s.clone();
+    let mut changed = false;
+    for n in &mut out.from_clause {
+        item(n, lookup, &mut changed)?;
+    }
+    Ok(changed.then_some(out))
+}
+
 fn plan_select(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -15688,6 +16049,14 @@ fn plan_select(
     let s = &expanded;
     // `WITH ORDINALITY` and a several-function `ROWS FROM` as subqueries.
     if let Some(rewritten) = rowsfrom::rewrite(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // `FROM t r(a, b)` renames t's leading columns: the subquery it equals.
+    if let Some(rewritten) = column_alias_rewrite(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // `(j).value` where `j` names a FROM item: the item's column.
+    if let Some(rewritten) = alias_field_rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
@@ -19619,11 +19988,33 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         }
         rows.push(row);
     }
-    // A column that was NULL in every row defaults to `text`, as PostgreSQL
-    // resolves an all-unknown VALUES column.
-    for t in &mut types {
-        if t.is_empty() {
-            *t = "text".to_string();
+    // Each column's type is the rows' COMMON type (`select_common_type`):
+    // an untyped literal takes it (`VALUES (1.5::float8), ('2.5')` is two
+    // float8s), and mixed numerics widen (`(1), (2.5)` is numeric). A column
+    // NULL or untyped in every row is `text`. Every row's value is then that
+    // type -- a `'2.25'` left a string summed as 0.
+    for (i, t) in types.iter_mut().enumerate() {
+        let items: Vec<&pg_query::protobuf::Node> = s
+            .values_lists
+            .iter()
+            .filter_map(|vl| match vl.node.as_ref() {
+                Some(N::List(l)) => l.items.get(i),
+                _ => None,
+            })
+            .collect();
+        let common = common_type(&items);
+        *t = common.clone();
+        for (row, item) in rows.iter_mut().zip(&items) {
+            let untyped = matches!(item.node.as_ref(), Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
+            let v = std::mem::replace(&mut row[i], Bson::Null);
+            row[i] = if v == Bson::Null || common == "text" {
+                v
+            } else if untyped {
+                cast_value(v, &common)?
+            } else {
+                to_common_type(v, &common)?
+            };
         }
     }
     let names = (1..=width).map(|i| format!("column{i}")).collect();

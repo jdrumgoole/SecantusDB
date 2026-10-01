@@ -1,0 +1,15 @@
+select j.value + 1 from jsonb_each('{"a":1}') j;
+select pg_typeof(j.value) from jsonb_each('{"a":1}') j;
+select j.key, s.n from jsonb_each('{"a":1}') j, (select 7 as n) s;
+select key from jsonb_each('{"a":1}') j, (select 7 as n) s;
+select j.key from jsonb_each('{"a":1}') j, generate_series(1,1) g;
+select g.g from generate_series(1,1) g, (select 7 as n) s;
+select (j).value from jsonb_each('{"a":1,"b":2}') j order by 1;
+select (j).key, (s).n from jsonb_each('{"a":1}') j, (select 7 as n) s;
+select (g).x from generate_series(1, 2) g(x) order by 1;
+select c + 1 from sf14_j;
+select c - 'a' from sf14_j order by 1;
+select c - 0 from sf14_j order by 1;
+select c * 2 from sf14_j;
+select c::json + 1 from sf14_j;
+select '{"a":1}'::jsonb - 'a';
