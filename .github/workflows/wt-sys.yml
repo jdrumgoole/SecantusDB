@@ -1,0 +1,71 @@
+name: wt-sys crate
+
+# The gate for crates/secantus-wiredtiger-sys (tasks/rust-packages-plan.md,
+# Phase A step 6): package the crate, then build that .crate tarball OUTSIDE
+# the repository, on each OS. It is the only check that proves the crate needs
+# nothing but itself, CMake and a C compiler -- no Python, no prebuilt
+# WiredTiger, no Homebrew.
+#
+# The package step runs from a copy outside the checkout because `cargo
+# package` inside it walks the repo's git state and fails on the vendored
+# submodules this job does not initialise.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/secantus-wiredtiger-sys/**"
+      - "crates/secantus-wt/**"
+      - "scripts/wt_sys_refresh.py"
+      - "cmake/patch_wt_*.py"
+      - "vendor/wiredtiger"
+      - ".github/workflows/wt-sys.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/secantus-wiredtiger-sys/**"
+      - "crates/secantus-wt/**"
+      - "scripts/wt_sys_refresh.py"
+      - "cmake/patch_wt_*.py"
+      - "vendor/wiredtiger"
+      - ".github/workflows/wt-sys.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Init vendor/wiredtiger
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Regenerate the WiredTiger copy and check the stamp
+        shell: bash
+        run: python scripts/wt_sys_refresh.py --check
+      - name: Package and build from the tarball, outside the repo
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/wt-sys-src"
+          cp -R crates/secantus-wiredtiger-sys "$stage"
+          cd "$stage"
+          # `cargo package` verifies by building the extracted .crate.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/wt-sys-target" cargo package --allow-dirty
+          ls -la "$RUNNER_TEMP"/wt-sys-target/package/*.crate

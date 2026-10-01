@@ -64,6 +64,13 @@ fn resolve_wt() -> (String, String) {
 }
 
 fn main() {
+    // `bundled`: secantus-wiredtiger-sys built (or located) WiredTiger and has
+    // already emitted every link directive, compressors included; only the
+    // header is needed here, for the bindings.
+    if let Ok(inc) = env::var("DEP_WIREDTIGER_INCLUDE") {
+        generate_bindings(&inc);
+        return;
+    }
     let (inc, lib) = resolve_wt();
 
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_INCLUDE");
@@ -191,6 +198,10 @@ fn main() {
         }
     }
 
+    generate_bindings(&inc);
+}
+
+fn generate_bindings(inc: &str) {
     let header = format!("{inc}/wiredtiger.h");
     println!("cargo:rerun-if-changed={header}");
     let bindings = bindgen::Builder::default()

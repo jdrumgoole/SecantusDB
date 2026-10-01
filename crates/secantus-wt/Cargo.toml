@@ -15,7 +15,14 @@ publish = false
 [lib]
 name = "secantus_wt"
 
+[features]
+# Build WiredTiger from the bundled source in `secantus-wiredtiger-sys` instead
+# of linking a prebuilt one. Off by default for now: the wheel, the release
+# workflows and CI link the CMake build via SECANTUS_WT_INCLUDE / _LIB.
+bundled = ["dep:secantus-wiredtiger-sys"]
+
 [dependencies]
+secantus-wiredtiger-sys = { path = "../secantus-wiredtiger-sys", optional = true }
 
 [build-dependencies]
 bindgen = "0.70"
