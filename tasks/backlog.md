@@ -742,8 +742,13 @@ remain open:
     whose every branch indexes as the union of the branches (intersected
     across ANDed `$or`s, RecordId-ordered so documents arrive in scan
     order), and an index range takes that one document bound. `n = 5`
-    1.2 ms, `BETWEEN` 1.9 s -> 17 ms. Corpus `numeric_index`. Mongo's
-    `explain` does not yet report the OR plan (it still says COLLSCAN). (Typmod rounding, `avg(numeric)`, and literal coercion were
+    1.2 ms, `BETWEEN` 1.9 s -> 17 ms. Corpus `numeric_index`. The Rust
+    MongoDB server's `explain` reports the OR plan as mongod 8.2.11 does --
+    SUBPLAN / FETCH / OR / IXSCAN per branch, SUBPLAN only for a filter that
+    is just an `$or` of two or more branches, a one-branch `$or` and an
+    `$or` of equalities on one field normalised first. Which index a branch
+    uses, and the order of the OR inputs, are mongod's cost model and are
+    not reproduced. (Typmod rounding, `avg(numeric)`, and literal coercion were
     re-measured fixed in batch 10.)
 - [ ] **OPEN — RUST pgserver: constraints -- what is left after multi-column
       FOREIGN KEYs landed (2026-09-29).** NOT NULL / CHECK / UNIQUE / FOREIGN

@@ -1105,6 +1105,9 @@ type LeadingFieldMatch = (String, i32, bool);
 pub enum ExplainPlan {
     /// A full collection scan.
     CollScan,
+    /// A top-level `$or` answered by one index per branch, unioned (mongod's
+    /// `OR` stage): each branch's `(index name, key pattern)`, in branch order.
+    Or { branches: Vec<(String, Document)> },
     /// An index scan over `index_name` (`key_pattern`), walked in `direction`
     /// (`"forward"` / `"backward"`; always `"forward"` until sort acceleration
     /// lands in slice 2f).
@@ -12139,6 +12142,51 @@ impl Storage {
         if let Some((name, key_spec)) = self.pick_index_for_filter(&session, db, coll, filter)? {
             return Ok(make_ixscan_plan(name, &key_spec, sort_field, sort_dir));
         }
+        // The OR plan `find_matching` takes after the two above: a top-level
+        // `$or` whose every branch has an index.
+        let or_plan = |this: &Self| -> Result<Option<ExplainPlan>> {
+            let Ok(arms) = filter.get_array("$or") else {
+                return Ok(None);
+            };
+            if arms.is_empty() {
+                return Ok(None);
+            }
+            // A one-branch `$or` is planned as its branch (mongod collapses it).
+            if let [Bson::Document(only)] = arms.as_slice() {
+                return Ok(this.pick_index_for_filter(&session, db, coll, only)?.map(
+                    |(name, key_spec)| {
+                        let mut plan = make_ixscan_plan(name, &key_spec, sort_field, sort_dir);
+                        if let ExplainPlan::IxScan {
+                            sorted_by_index, ..
+                        } = &mut plan
+                        {
+                            *sorted_by_index = false;
+                        }
+                        plan
+                    },
+                ));
+            }
+            let mut branches = Vec::new();
+            for arm in arms {
+                let Bson::Document(branch) = arm else {
+                    return Ok(None);
+                };
+                let mut found = this.pick_index_for_filter(&session, db, coll, branch)?;
+                if found.is_none() {
+                    for sub in residual_subfilters(branch) {
+                        found = this.pick_index_for_filter(&session, db, coll, &sub)?;
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(b) => branches.push(b),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(ExplainPlan::Or { branches }))
+        };
         for sub in residual_subfilters(filter) {
             if let Some((name, key_spec)) = self.pick_index_for_filter(&session, db, coll, &sub)? {
                 // The residual walk is not in sort order (`find_matching_with`
@@ -12152,6 +12200,9 @@ impl Storage {
                 }
                 return Ok(plan);
             }
+        }
+        if let Some(plan) = or_plan(self)? {
+            return Ok(plan);
         }
         if filter.is_empty() || sort.is_some() {
             if let Some(sf) = sort_field {

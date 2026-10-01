@@ -22465,7 +22465,8 @@ impl PgHandler {
                                 index_name
                             })
                         }
-                        secantus_storage::ExplainPlan::CollScan => None,
+                        secantus_storage::ExplainPlan::CollScan
+                        | secantus_storage::ExplainPlan::Or { .. } => None,
                     }
                 };
                 let mut tree = explain::plan_tree(&inner, &chooser);
