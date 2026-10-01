@@ -10737,6 +10737,31 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
         // The constructor keywords name their column: `array[1]` is `array`,
         // `row(1)` is `row`, `coalesce(1)` / `greatest(1, 2)` / `least(1)` /
         // `nullif(1, 2)` take the keyword. Measured on PG 16.
+        // A subquery is named for what it returns: a scalar subquery takes its
+        // one column's name (`(select t.id ...)` is `id`, an alias wins),
+        // EXISTS is `exists` and ARRAY(...) `array`. All three were
+        // `?column?`, so `ORDER BY id` over `id` and `(select t.id ...)` was
+        // not seen as PostgreSQL's 42702 ambiguity.
+        Some(N::SubLink(sl)) => match SubLinkType::try_from(sl.sub_link_type) {
+            Ok(SubLinkType::ExistsSublink) => "exists".to_string(),
+            Ok(SubLinkType::ArraySublink) => "array".to_string(),
+            Ok(SubLinkType::ExprSublink) => {
+                match sl.subselect.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::SelectStmt(sel)) => {
+                        match sel.target_list.first().and_then(|t| t.node.as_ref()) {
+                            Some(N::ResTarget(rt)) if !rt.name.is_empty() => rt.name.clone(),
+                            Some(N::ResTarget(rt)) => rt
+                                .val
+                                .as_deref()
+                                .map_or_else(|| "?column?".to_string(), expression_column_name),
+                            _ => "?column?".to_string(),
+                        }
+                    }
+                    _ => "?column?".to_string(),
+                }
+            }
+            _ => "?column?".to_string(),
+        },
         Some(N::AArrayExpr(_)) => "array".to_string(),
         Some(N::RowExpr(_)) => "row".to_string(),
         // The SQL/XML keywords name their column too (FigureColname);
