@@ -531,6 +531,22 @@ def wt_bindings_refresh(c: Context) -> None:
     c.run(f"cd {_RUST_WT_DIR} && cargo build --features bindgen", pty=PTY, env=env)
 
 
+@task(name="rust-version-bump")
+def rust_version_bump(c: Context, to: str = "", check: bool = False) -> None:
+    """Bump the Rust MongoDB server's lockstep version (``--to 0.5.3-beta.166``).
+
+    Rewrites every MongoDB-side ``[package] version``, every ``=`` pin between
+    those crates, and every ``Cargo.lock`` that records one (the PG server's and
+    the Python bindings' included), then fails if the old version survives or
+    a lockfile no longer resolves ``--locked``. The PG crates' own version line
+    is not touched. ``--check`` only verifies the lockfiles.
+    """
+    args = "--check" if check else to
+    if not args:
+        raise SystemExit("give --to <version> or --check")
+    c.run(f"{sys.executable} scripts/rust_version_bump.py {args}", pty=PTY)
+
+
 @task(name="rust-storage-test")
 def rust_storage_test(c: Context) -> None:
     """fmt/clippy/test the secantus-storage crate (the Rust Storage layer).

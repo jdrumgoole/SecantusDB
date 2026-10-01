@@ -2,7 +2,7 @@
 name = "secantus-mdb"
 version = "0.5.3-beta.165"
 edition = "2021"
-description = "Standalone SecantusDB server binary (Rust): WiredTiger-backed, MongoDB wire protocol."
+description = "A surrogate MongoDB server for tests: the real wire protocol over WiredTiger, single-node. Embed it (secantus_mdb::Server) or run the secantusd-rs binary."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
 
@@ -18,6 +18,14 @@ rust-version = "1.98"
 readme = "README.md"
 keywords = ["mongodb", "database", "testing", "server", "wiredtiger"]
 categories = ["database-implementations", "development-tools::testing"]
+
+# `cargo binstall secantus-mdb` fetches the prebuilt, PGO-optimised binary that
+# release-binaries.yml attaches to the `secantusdb-v<version>` release, instead
+# of compiling WiredTiger. Targets without an archive fall back to a source build.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/secantusdb-v{ version }/secantusdb-{ version }-{ target }.tar.gz"
+bin-dir = "secantusdb-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [workspace]
 

@@ -306,8 +306,14 @@ are open.** Done:
   `cargo publish --workspace`, which publishes in dependency order. A
   `workflow_dispatch` defaults to a dry run.
 
-Open: the PG crates (their Phase B), and teaching the `secantusdb-release`
-skill that a Rust release tag now also publishes to crates.io.
+Steps 2-4 landed 2026-10-02: `./inv rust-version-bump --to <ver>`
+(`scripts/rust_version_bump.py`) rewrites versions, `=` pins and lockfiles and
+checks `--locked` still resolves; publishing is per crate and resumable
+(`scripts/crates_publish.py` skips versions already on crates.io); and the
+`secantusdb-release` skill documents the publish step, the yank procedure and
+that a fix is always a new version. Phase D.2 landed with them: binstall
+metadata on `secantus-mdb` points at the release archives. Open: the PG crates
+(their Phase B).
 
 1. A `publish-crates.yml` workflow on the existing `secantusdb-v*` /
    `secantusd-pg-v*` tags: verify the tag against the crate version (as the
