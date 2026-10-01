@@ -17852,7 +17852,16 @@ impl PgHandler {
         if self.storage.in_user_txn() {
             return f();
         }
-        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        // The guard is this connection's alone, so a held one means this
+        // thread holds it: a statement `run` is executing with no handle (an
+        // autocommit statement), from inside which this was reached. Waiting
+        // for it would deadlock the connection -- a DO block's REFRESH
+        // MATERIALIZED VIEW did -- and there is no transaction to join.
+        let mut guard = match self.txn.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return f(),
+        };
         match guard.as_mut() {
             Some(handle) => self
                 .storage

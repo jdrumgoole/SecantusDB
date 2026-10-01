@@ -693,13 +693,16 @@ remain open:
         and a `VALIDATOR` must be a user function, which cannot be written.
       - **ruleutils** (`pg_get_viewdef`, `pg_views`, `pg_rules`,
         `pg_get_expr` over generated columns, CHECKs and policies): the
-        analyser knows the common operator and function families. A view or
-        expression it cannot type -- a cross-type date/time comparison, a
-        function outside its signature table, VALUES, window frames, LATERAL,
-        column-alias lists, a set operation with ORDER BY / LIMIT, WITH
-        RECURSIVE -- falls back to the definition as written. The int
-        wrap-column form of `pg_get_viewdef` prints the pretty form without
-        its wrapping rule.
+        analyser knows the common operator and function families. Since
+        batch 14 it also prints VALUES (in FROM and as a whole view), ROWS /
+        GROUPS frames with EXCLUDE, LATERAL, column-alias lists, a set
+        operation's ORDER BY / LIMIT / OFFSET, WITH RECURSIVE and CTE column
+        lists, and renames a relation an enclosing query already names
+        (`t t_1`) -- corpus `viewdef_shapes`. A view or expression it cannot
+        type -- a cross-type date/time comparison, a function outside its
+        signature table, a RANGE frame with an offset, a MATERIALIZED CTE --
+        falls back to the definition as written. The int wrap-column form of
+        `pg_get_viewdef` prints the pretty form without its wrapping rule.
       - **Collations**: `pg_collation` lists only `und-x-icu` / `en-x-icu` of
         PostgreSQL's hundreds of ICU built-ins, deliberately: ordering by a
         locale needs ICU's CLDR data, which this server does not carry, so
