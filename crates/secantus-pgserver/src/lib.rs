@@ -1829,7 +1829,7 @@ impl PgHandler {
                 .filter(|p| p.get_str("table") == Ok(table.as_str()))
                 .filter(|p| {
                     p.get_array("roles")
-                        .is_ok_and(|rs| rs.iter().any(|r| r.as_str().is_some_and(&member_of)))
+                        .is_ok_and(|rs| rs.iter().any(|r| r.as_str().is_some_and(member_of)))
                 })
                 .collect();
             let combine = |command: &str, key: &str, fallback_using: bool| -> String {

@@ -7127,8 +7127,12 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         corpus `correlated_hash`). 2,000 x 2,000 rows, debug build: EXISTS
         over two equalities 7.3 s -> 36 ms, NOT EXISTS 7.4 s -> 47 ms, a
         correlated scalar `count(*)` 1.1 s -> 227 ms, a correlated `LIMIT 1`
-        7.6 s -> 36 ms. Still per outer value: a correlation that is not an
-        equality (`t.y > o.b`, 7.6 s), a numeric / non-hashable key, a
+        7.6 s -> 36 ms. Since batch 31 a comparison `col op $N` (`<`, `<=`,
+        `>`, `>=`, `<>`) filters a key's rows per outer row instead of
+        forcing the per-row path, for numbers and timestamps: `t.x = o.a
+        AND t.y > o.b` 7.6 s -> 40 ms. Still per outer value: a TEXT
+        comparison (its order is a collation's), an aggregate under a
+        comparison filter, a numeric / non-hashable key, a
         nondeterministic collation on a text key, and inner queries with
         ORDER BY, DISTINCT, grouping, joins written with JOIN, functions or
         nested subqueries -- each falls back to the per-row path, which
