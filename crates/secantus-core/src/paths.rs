@@ -281,7 +281,7 @@ pub fn path_block<'a>(doc: &'a Document, path: &str) -> Option<(Option<String>, 
 /// Hard cap on a numeric path index that would grow a list (mirrors
 /// `secantus.paths._MAX_LIST_GROW_INDEX`). Exceeding it is `Err(())` so callers
 /// can defer to Python (which raises `PathError`).
-const MAX_LIST_GROW_INDEX: usize = 100_000;
+pub(crate) const MAX_LIST_GROW_INDEX: usize = 100_000;
 
 /// Set `value` at a dotted path, creating intermediate documents, growing lists
 /// for a trailing numeric index. `Err(())` only when the list-growth cap is

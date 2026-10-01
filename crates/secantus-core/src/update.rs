@@ -188,6 +188,42 @@ fn array_filters_valid(filters: &[Document], update: &Document) -> bool {
     identifiers.iter().all(|id| referenced.contains(id))
 }
 
+/// The first well-formed array filter whose identifier no `$[<id>]` path uses.
+fn unused_array_filter(filters: &[Document], update: &Document) -> Option<String> {
+    let referenced = referenced_af_identifiers(update);
+    filters.iter().find_map(|f| {
+        let found = extract_af_identifiers(f);
+        match found.as_slice() {
+            [ident] if is_valid_af_ident(ident) && !referenced.contains(ident) => {
+                Some(ident.clone())
+            }
+            _ => None,
+        }
+    })
+}
+
+/// mongod's spaced shell rendering of a value, as its update-parse messages
+/// quote an update (`{ $set: { a.0: 2 } }`).
+fn render_shell(v: &Bson) -> String {
+    match v {
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::Document(d) if d.is_empty() => "{}".to_string(),
+        Bson::Document(d) => format!(
+            "{{ {} }}",
+            d.iter()
+                .map(|(k, v)| format!("{k}: {}", render_shell(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Bson::Array(a) if a.is_empty() => "[]".to_string(),
+        Bson::Array(a) => format!(
+            "[ {} ]",
+            a.iter().map(render_shell).collect::<Vec<_>>().join(", ")
+        ),
+        other => render_scalar(other),
+    }
+}
+
 /// Map each arrayFilter identifier to its filter document (the identifier may
 /// nest inside `$and`/`$or`/`$nor`). First entry wins per identifier, as in Python.
 fn index_array_filters(filters: &[Document]) -> HashMap<String, &Document> {
@@ -200,37 +236,48 @@ fn index_array_filters(filters: &[Document]) -> HashMap<String, &Document> {
     out
 }
 
-/// The first matching array index for each top-level array field referenced by a
-/// dotted equality clause in `filter` — the resolution for the `$` positional
-/// operator. Mirrors `update.find_positional_matches`.
+/// The first matching array index for each top-level array field the query
+/// constrains -- the resolution for the `$` positional operator. Mirrors
+/// `update.find_positional_matches`.
+///
+/// An element matches when every clause on that array holds for it alone,
+/// tested as `{field: [element]}` against the clause, which applies the query
+/// language's own array semantics one element at a time. That covers a
+/// predicate on the array itself -- `{a: 2}`, `{a: {$gt: 1}}`,
+/// `{a: {$elemMatch: {...}}}` -- as well as a dotted one (`{"a.x": 1}`). Only
+/// the dotted form was handled: `update_one({a: 2}, {$set: {"a.$": 9}})`, about
+/// the most common positional update there is, was refused with "query uses a
+/// construct the Rust server does not support" (measured against mongod 8.2.11,
+/// 2026-10-01, which sets `a.1`).
 pub fn find_positional_matches(doc: &Document, filter: &Document) -> Document {
-    let mut array_paths: HashMap<&str, Document> = HashMap::new();
+    let mut clauses: Vec<(&str, Document)> = Vec::new();
     for (key, value) in filter {
-        if key.starts_with('$') || !key.contains('.') {
+        if key.starts_with('$') {
             continue;
         }
-        let (top, rest) = key.split_once('.').unwrap();
-        if matches!(doc.get(top), Some(Bson::Array(_))) {
-            array_paths
-                .entry(top)
-                .or_default()
-                .insert(rest.to_string(), value.clone());
+        let top = key.split_once('.').map_or(key.as_str(), |(t, _)| t);
+        if !matches!(doc.get(top), Some(Bson::Array(_))) {
+            continue;
+        }
+        match clauses.iter_mut().find(|(t, _)| *t == top) {
+            Some((_, d)) => {
+                d.insert(key.clone(), value.clone());
+            }
+            None => {
+                let mut d = Document::new();
+                d.insert(key.clone(), value.clone());
+                clauses.push((top, d));
+            }
         }
     }
     let mut out = Document::new();
-    for (path, sub_filter) in array_paths {
-        if let Some(Bson::Array(arr)) = doc.get(path) {
+    for (top, sub_filter) in clauses {
+        if let Some(Bson::Array(arr)) = doc.get(top) {
             for (i, elem) in arr.iter().enumerate() {
-                let elem_doc = match elem {
-                    Bson::Document(d) => d.clone(),
-                    other => {
-                        let mut d = Document::new();
-                        d.insert("_", other.clone());
-                        d
-                    }
-                };
-                if query::matches(&elem_doc, &sub_filter, &Document::new(), None).unwrap_or(false) {
-                    out.insert(path.to_string(), i as i64);
+                let mut one = Document::new();
+                one.insert(top, Bson::Array(vec![elem.clone()]));
+                if query::matches(&one, &sub_filter, &Document::new(), None).unwrap_or(false) {
+                    out.insert(top.to_string(), i as i64);
                     break;
                 }
             }
@@ -283,8 +330,17 @@ fn walk_positional(
         let idx = pos.get(&path_so_far).and_then(as_int_like);
         let idx = match idx {
             Some(i) if i >= 0 && (i as usize) < arr.len() => i as usize,
-            // Unresolvable `$` — Python raises; we defer (server → BadValue).
-            _ => return Err(Fallback::Defer),
+            // The query matched no element of this array: mongod's own words,
+            // under the executor wrapper (measured 8.2.11, 2026-10-01). A
+            // Defer here reached the client as "query uses a construct the
+            // Rust server does not support".
+            _ => {
+                return Err(Fallback::mongo(
+                    2,
+                    "The positional operator did not find the match needed from the query.",
+                )
+                .exec())
+            }
         };
         prefix.push(idx.to_string());
         walk_positional(&arr[idx], rest, prefix, out, filters, pos)?;
@@ -340,7 +396,54 @@ fn set_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
     if paths::path_block(doc, path).is_some() {
         return Err(Fallback::Defer);
     }
+    open_array_slots(doc, path)?;
     paths::set_path(doc, path, value).map_err(|_| Fallback::Defer)
+}
+
+/// Make room for a path that runs through an array index past the end.
+///
+/// `$set: {"b.0.c": 1}` over `b: []` creates the element: mongod pads the array
+/// with nulls up to the index and puts an empty document there to carry the rest
+/// of the path -- `[null, null, {c: 1}]` for `b.2.c`, measured against mongod
+/// 8.2.11 (2026-10-01). The shared setter treats an intermediate index past the
+/// end as a no-op (right for projection), so the update was acknowledged and
+/// wrote NOTHING. Only intermediate indices are opened here; a final index is
+/// already padded by the setter.
+fn open_array_slots(doc: &mut Document, path: &str) -> R<()> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur: &mut Bson = match doc.get_mut(parts[0]) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        let last = i == parts.len() - 1;
+        cur = match cur {
+            Bson::Document(d) => match d.get_mut(*part) {
+                Some(v) => v,
+                None => return Ok(()),
+            },
+            Bson::Array(arr) => {
+                let Ok(idx) = part.parse::<usize>() else {
+                    return Ok(());
+                };
+                if last {
+                    return Ok(());
+                }
+                if idx > paths::MAX_LIST_GROW_INDEX {
+                    return Err(Fallback::Defer);
+                }
+                if idx >= arr.len() {
+                    while arr.len() < idx {
+                        arr.push(Bson::Null);
+                    }
+                    arr.push(Bson::Document(Document::new()));
+                }
+                &mut arr[idx]
+            }
+            _ => return Ok(()),
+        };
+    }
+    Ok(())
 }
 
 use crate::paths::unset_path;
@@ -1225,6 +1328,18 @@ pub fn apply_update_with(
     // 6.0.16, which reports `nModified: 1` for it). Returning `doc.clone()`
     // here silently kept every field the client asked to drop. An empty
     // *pipeline* is the genuine no-op, and is a different entry point.
+    if let Some(unused) = unused_array_filter(array_filters, update) {
+        // mongod names the identifier and quotes the update (measured 8.2.11,
+        // 2026-10-01); a Defer told the client "query uses a construct the
+        // Rust server does not support".
+        return Err(Fallback::mongo(
+            9,
+            format!(
+                "The array filter for identifier '{unused}' was not used in the update {}",
+                render_shell(&Bson::Document(update.clone()))
+            ),
+        ));
+    }
     if !array_filters_valid(array_filters, update) {
         return Err(Fallback::Defer); // invalid arrayFilters -> Python raises the exact code
     }
@@ -2559,12 +2674,31 @@ mod tests {
         assert_eq!(scores, vec![100, 80, 100]);
     }
 
+    /// `$set` through an index past the end pads with null and creates the
+    /// element (mongod 8.2.11); it used to write nothing.
+    #[test]
+    fn set_through_an_index_past_the_end_creates_the_element() {
+        let out = apply_update(&doc! {"b": []}, &doc! {"$set": {"b.2.c": 1}}, false).unwrap();
+        assert_eq!(out, doc! {"b": [Bson::Null, Bson::Null, {"c": 1}]});
+        let out = apply_update(&doc! {"b": [[]]}, &doc! {"$set": {"b.0.1.x": 1}}, false).unwrap();
+        assert_eq!(out, doc! {"b": [[Bson::Null, {"x": 1}]]});
+    }
+
     #[test]
     fn positional_dollar_uses_matches() {
         // $ resolves via positional_matches (computed from the query filter).
+        // A predicate on the array itself resolves `$` (mongod sets `g.1`).
         let pos = find_positional_matches(&doc! {"g": [5, 6, 7]}, &doc! {"g": 6});
-        // find_positional_matches only fires for dotted clauses; bare {g: 6}
-        // doesn't populate it, so $ stays unresolved -> here we feed it directly.
+        assert_eq!(pos, doc! {"g": 1i64});
+        let pos = find_positional_matches(&doc! {"g": [5, 6, 7]}, &doc! {"g": {"$gt": 5}});
+        assert_eq!(pos, doc! {"g": 1i64});
+        let pos = find_positional_matches(
+            &doc! {"g": [{"x": 1}, {"x": 2}]},
+            &doc! {"g": {"$elemMatch": {"x": 2}}},
+        );
+        assert_eq!(pos, doc! {"g": 1i64});
+        // A whole-array equality is not an element match.
+        let pos = find_positional_matches(&doc! {"g": [5, 6]}, &doc! {"g": [5, 6]});
         assert!(pos.is_empty());
         let out = upd_af(
             doc! {"g": [5, 6, 7]},

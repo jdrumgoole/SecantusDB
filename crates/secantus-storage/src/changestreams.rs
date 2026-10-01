@@ -473,12 +473,18 @@ fn project_unordered(
             event.insert("updateDescription", Bson::Document(ud));
         }
         attach_full_document(&mut event, op, oplog_entry, storage, full_document_mode)?;
-        attach_full_document_before_change(
-            &mut event,
-            seq,
-            storage,
-            full_document_before_change_mode,
-        )?;
+        // An insert has no "before" -- mongod omits `fullDocumentBeforeChange`
+        // from insert events in every mode, `required` included (measured
+        // 8.2.11, 2026-10-01). This put `fullDocumentBeforeChange: null` on
+        // each insert under `whenAvailable`.
+        if op != "i" {
+            attach_full_document_before_change(
+                &mut event,
+                seq,
+                storage,
+                full_document_before_change_mode,
+            )?;
+        }
         // Splitting (splitLargeChangeStreamEvents / $changeStreamSplitLargeEvent)
         // is applied by the caller via `stamp_split_event` so one over-16MB event
         // can expand into several fragments — mirrors `commands.py`'s producer

@@ -286,7 +286,8 @@ pub(crate) fn exec_wrapped(errmsg: String, exec: bool, command: &str) -> String 
 pub(crate) fn write_error(index: usize, err: StorageError, command: &str) -> Document {
     match err {
         StorageError::DuplicateKey(info) => {
-            let mut e = doc! { "index": index as i32, "code": 11000, "errmsg": info.errmsg };
+            let errmsg = exec_wrapped(info.errmsg, info.exec, command);
+            let mut e = doc! { "index": index as i32, "code": 11000, "errmsg": errmsg };
             if let Some(kp) = info.key_pattern {
                 e.insert("keyPattern", kp);
             }

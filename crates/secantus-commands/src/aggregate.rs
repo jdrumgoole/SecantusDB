@@ -67,6 +67,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `cursor` means "missing or an object" literally: an explicit `cursor: null`
     // is rejected where an absent one is fine. `let` is the BSON-field family.
     argtypes::require_cursor_object(doc)?;
+    // `cursor` is required unless the command is an inline explain (measured
+    // 8.2.11, 2026-10-01); an aggregate without one used to run and return a
+    // cursor anyway.
+    if !doc.contains_key("cursor") && doc.get("explain") != Some(&Bson::Boolean(true)) {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "The 'cursor' option is required, except for aggregate with the explain argument",
+        ));
+    }
     argtypes::require_object(doc, "let", "aggregate.let")?;
     argtypes::require_object(doc, "collation", "aggregate.collation")?;
     argtypes::require_object(doc, "readConcern", "aggregate.readConcern")?;
