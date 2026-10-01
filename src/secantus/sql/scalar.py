@@ -1911,21 +1911,65 @@ def _eval_at_time_zone(node: exp.Expression, scope: Scope, ctx: ScalarContext) -
     an AWARE one is converted into `zone` and loses the zone. So
     `'2020-06-15 12:00'::timestamp AT TIME ZONE 'America/New_York'` is
     16:00 UTC, and the same instant back through it is 08:00."""
-    import zoneinfo
-
     value = evaluate(node.this, scope, ctx)
     zone_node = node.args.get("zone")
     zone = evaluate(zone_node, scope, ctx) if isinstance(zone_node, exp.Expression) else zone_node
+    return _at_time_zone(value, zone, ctx)
+
+
+def _zone_for_at_time_zone(zone: Any) -> _dt.tzinfo:
+    """The zone an AT TIME ZONE / ``timezone()`` operand names, resolved in
+    PostgreSQL's order: an interval (an offset EAST, hours and smaller only),
+    an abbreviation (``EST``), a full zone name, then a POSIX offset spec
+    (``+05`` / ``utc+3`` are WEST of Greenwich)."""
+    from secantus.sql import dtparse
+    from secantus.sql import intervals as _intervals
+
+    if isinstance(zone, dict) and "interval" in zone:
+        months, days, micros = _intervals._fields(zone)
+        if months or days:
+            raise errors.SQLError(
+                "22023",
+                f'interval time zone "{_intervals.render(zone)}" must not include months or days',
+            )
+        return _dt.timezone(_dt.timedelta(microseconds=micros))
+    name = _as_text(zone)
+    off = dtparse.abbreviation_offset(name)
+    if off is not None:
+        return _dt.timezone(_dt.timedelta(seconds=off))
+    tz = dtparse.resolve_zone(name)
+    if tz is not None:
+        return tz
+    from secantus.sql import datetimes as _datetimes
+
+    stripped = name.strip()
+    if _datetimes._TZ_PREFIXED_RE.match(stripped) or _datetimes._TZ_NUM_RE.match(stripped):
+        return _datetimes.tzinfo_for_setting(stripped)
+    raise errors.SQLError("22023", f'time zone "{name}" not recognized')
+
+
+def _at_time_zone(value: Any, zone: Any, ctx: ScalarContext | None) -> Any:
+    from secantus.sql import datetimes as _datetimes
+    from secantus.sql import dtparse
+
     if value is None or zone is None:
         return None
+    if isinstance(value, str) and _datetimes.is_date_value(value):
+        # A date operand is promoted to timestamptz: midnight in the SESSION
+        # zone, then converted into `zone`.
+        d = _datetimes.to_date_obj(value)
+        midnight = _dt.datetime(d.year, d.month, d.day)
+        stz = _datetimes.session_tzinfo(getattr(ctx, "session", None))
+        off = dtparse.zone_offset(midnight, stz)
+        value = (midnight - _dt.timedelta(seconds=off)).replace(tzinfo=_dt.timezone.utc)
+    elif isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
+        value = _dt.datetime(value.year, value.month, value.day)
     if not isinstance(value, _dt.datetime):
         value = _as_datetime(value)
-    try:
-        tz = zoneinfo.ZoneInfo(_as_text(zone))
-    except Exception:
-        raise errors.SQLError("22023", f'time zone "{_as_text(zone)}" not recognized') from None
+    tz = _zone_for_at_time_zone(zone)
     if value.tzinfo is None:
-        return value.replace(tzinfo=tz).astimezone(_dt.timezone.utc)
+        off = dtparse.zone_offset(value, tz)
+        return (value - _dt.timedelta(seconds=off)).replace(tzinfo=_dt.timezone.utc)
     return value.astimezone(tz).replace(tzinfo=None)
 
 
@@ -4153,6 +4197,8 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
                 value,
                 _datetimes.session_offset_text(ctx.session) if ctx is not None else "+00:00",
             )
+        except errors.SQLError:
+            raise  # already PostgreSQL's exact error
         except _datetimes.DateTimeError as e:
             # A date-SHAPED value with a field out of range (`Feb 29 2021`,
             # `2020-02-30`) is PostgreSQL's 22008; only an unparseable one is
@@ -4193,6 +4239,8 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
                             .replace(tzinfo=None)
                         )
                 return result
+            except errors.SQLError:
+                raise  # already PostgreSQL's exact error
             except ValueError as e:
                 # PG errors on an unparseable timestamp literal; silently
                 # passing the raw string through detonates later in the binary
@@ -5766,6 +5814,9 @@ def _call_func(
         if not args or args[0] is None:
             return None
         return _split_qualified_ident(str(args[0]))
+    if name == "timezone" and len(args) == 2:
+        # `timezone(zone, ts)` is the function spelling of `ts AT TIME ZONE zone`.
+        return _at_time_zone(args[1], args[0], ctx)
     if name == "unistr":
         if not args or args[0] is None:
             return None

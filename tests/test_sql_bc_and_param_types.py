@@ -53,7 +53,8 @@ class TestBcAndWideTimestamps:
         "text,expected",
         [
             ("0101-01-01 00:00:00+00 BC", "0101-01-01 00:00:00+00 BC"),
-            ("10000-01-01 12:00:00+02", "10000-01-01 12:00:00+02"),
+            # Same instant, rendered in the session zone as PostgreSQL 15 does.
+            ("10000-01-01 12:00:00+02", "10000-01-01 10:00:00+00"),
         ],
     )
     def test_timestamptz_column_keeps_it(self, text, expected):
