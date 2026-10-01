@@ -13483,6 +13483,19 @@ def _scalar_subquery_tag(target: exp.Expression, resolve: Resolve) -> str | None
 
 def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     """The uncached body of ``_infer_scalar_tag``."""
+    # `!! tsquery` (two `Not`s to sqlglot) and `tsquery <-> tsquery` are tsquery.
+    if (
+        isinstance(node, exp.Not)
+        and isinstance(node.this, exp.Not)
+        and _infer_scalar_tag(node.this.this, resolve) == "tsquery"
+    ):
+        return "tsquery"
+    if (
+        getattr(exp, "Distance", None) is not None
+        and isinstance(node, exp.Distance)
+        and _infer_scalar_tag(node.this, resolve) == "tsquery"
+    ):
+        return "tsquery"
     # A literal minted by `rewrite_pg_typeof` is a regtype, not text.
     if node.args.get(_REGTYPE_MARKER):
         return "regtype"
@@ -14288,7 +14301,15 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             return "bool"
         if fname == "isempty":
             return "bool"
-        if fname in ("to_tsvector", "strip", "array_to_tsvector", "tsvector_concat"):
+        if fname in (
+            "to_tsvector",
+            "strip",
+            "array_to_tsvector",
+            "tsvector_concat",
+            "setweight",
+            "ts_delete",
+            "ts_filter",
+        ):
             return "tsvector"
         if fname in (
             "to_tsquery",
@@ -14298,6 +14319,7 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             "tsquery_and",
             "tsquery_or",
             "tsquery_not",
+            "tsquery_phrase",
         ):
             return "tsquery"
         # Getting these tags wrong is not just a wrong oid: a tsvector / tsquery
@@ -14313,7 +14335,9 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
         if fname == "tsvector_to_array":
             return "text[]"
         if fname in ("ts_rank", "ts_rank_cd"):
-            return "float8"
+            return "float4"
+        if fname == "get_current_ts_config":
+            return "text"
         if fname == "ts_headline":
             return "text"
         # Network functions: masklen/family -> int4; network -> cidr; netmask/

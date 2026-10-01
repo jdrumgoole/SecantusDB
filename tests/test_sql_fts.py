@@ -168,8 +168,9 @@ def test_ts_rank_orders_results(docs, session):
 
 
 def test_ts_rank_typed_float(docs, session):
+    # PostgreSQL 15: `pg_typeof(ts_rank(...))` is `real` (float4).
     c = col(docs, session, "SELECT ts_rank(body, to_tsquery('quick')) FROM docs WHERE id = 1")
-    assert c.type_tag == "float8"
+    assert c.type_tag == "float4"
 
 
 def test_tsvector_cast(storage, session):
