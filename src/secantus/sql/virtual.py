@@ -280,6 +280,8 @@ def _indexes(db: str, storage: Any, catalog: Catalog) -> list[dict[str, Any]]:
                     "conname": None,
                     "table": t.name,
                     "columns": [_index_coldef(f, d, field_to_name) for f, d in key.items()],
+                    "include": list(ix.get("include") or []),
+                    "method": ix.get("sqlMethod") or "btree",
                     "partial": bool(ix.get("partialFilterExpression")),
                     # The expression itself, so `indexdef` can render the
                     # WHERE clause rather than silently dropping it.
@@ -432,9 +434,13 @@ def indexdef_for_oid(db: str, storage: Any, catalog: Catalog, oid: int) -> str |
         if ix["indexrelid"] == oid:
             unique = "UNIQUE " if ix["unique"] else ""
             cols = ", ".join(ix["columns"])
+            method = ix.get("method") or "btree"
             base = (
-                f"CREATE {unique}INDEX {ix['relname']} ON public.{ix['table']} USING btree ({cols})"
+                f"CREATE {unique}INDEX {ix['relname']} ON public.{ix['table']} "
+                f"USING {method} ({cols})"
             )
+            if ix.get("include"):
+                base += f" INCLUDE ({', '.join(ix['include'])})"
             # A partial index's predicate, reversed back to SQL. Without this the
             # rendered statement claimed a FULL index -- a tool recreating from
             # `indexdef` built the wrong one.

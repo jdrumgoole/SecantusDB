@@ -15160,3 +15160,54 @@ def test_expression_index_rows_written_elsewhere_are_reindexed_at_open(home: Pat
             c.execute("insert into ex_u values (4, 'APPLE')")
         c.execute("insert into ex_u values (5, 'plum')")
         assert c.execute("select count(*) from ex_u").fetchone() == (3,)
+
+
+def test_python_server_refuses_what_it_cannot_do_with_rust_partitions(home: Path) -> None:
+    """The Python server knows no partitions; a Rust-partitioned table's rows
+    live in the root's collection. It used to read a partition as EMPTY and
+    to accept a root write no partition covers. Now it reads the root (which
+    is right) and refuses the rest with 0A000."""
+    from secantus.sql.errors import SQLError
+
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table pp (id int, k int) partition by range (k)")
+        c.execute("create table pp1 partition of pp for values from (0) to (10)")
+        c.execute("insert into pp values (1, 5)")
+    assert _python_sql(home, "select id, k from pp") == [(1, 5)]
+    for sql in (
+        "select * from pp1",
+        "insert into pp values (2, 50)",
+        "delete from pp",
+        "drop table pp1",
+    ):
+        with pytest.raises(SQLError) as caught:
+            _python_sql(home, sql)
+        assert caught.value.sqlstate == "0A000", sql
+    with _Server(home) as server, server.connect() as c:
+        assert c.execute("select id, k from pp1").fetchall() == [(1, 5)]
+
+
+def test_python_rewrite_of_a_table_keeps_the_keys_only_rust_records(home: Path) -> None:
+    """A table's catalog document carries keys only the Rust server models
+    (`owner`, a column's `collation`). The Python server rewrote the
+    document from what IT models on any ALTER, erasing them. They now
+    round-trip verbatim."""
+    from secantus.storage import Storage
+
+    def catalog_doc() -> dict:
+        storage = Storage(str(home))
+        try:
+            return storage.find_matching("postgres", "__sql_catalog__", {"_id": "kk"})[0]
+        finally:
+            storage.close()
+
+    with _Server(home) as server, server.connect() as c:
+        c.execute('create table kk (id int, t text collate "C")')
+    owner = catalog_doc().get("owner")
+    assert owner
+    _python_sql(home, "alter table kk add column z int")
+    doc = catalog_doc()
+    assert doc.get("owner") == owner
+    by_name = {col["name"]: col for col in doc["columns"]}
+    assert by_name["t"].get("collation") == "C"
+    assert "z" in by_name

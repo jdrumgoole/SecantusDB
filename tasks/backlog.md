@@ -616,11 +616,16 @@ remain open:
       `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
       and transition tables landed in batch 9 (corpora `instead_of`,
       `constraint_triggers`, `transition_tables`, `triggers`, `triggers2` at
-      0 against PostgreSQL 14). **Cross-server:** the Python PG server
-      fires only `BEFORE INSERT FOR EACH ROW` triggers, so it silently
-      ignores every other kind the Rust server stores in the shared
-      `__sql_triggers__` catalog; its `event` key carries only the first
-      event of a multi-event trigger.
+      0 against PostgreSQL 14). **Cross-server:** the Python PG server runs
+      only `BEFORE INSERT FOR EACH ROW` triggers (no WHEN, transition
+      tables, constraint firing or arguments). Since batch 16 every other
+      trigger in the shared `__sql_triggers__` catalog REFUSES the write it
+      would fire on (`0A000 ... cannot run on this server` -- INSERT,
+      UPDATE, DELETE, TRUNCATE, MERGE, ON CONFLICT, UPDATE FROM, DELETE
+      USING) instead of being silently skipped, and a multi-event trigger
+      is read from `events`, not just the first `event`
+      (`tests/test_sql_triggers.py::TestTriggersThisServerCannotRun`).
+      Left: running those kinds on the Python server.
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,
@@ -648,8 +653,14 @@ remain open:
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
       swept against PostgreSQL 14 at 0 divergences except `arrays` and
       `strings` (one line each, below). Left:
-      - Partitioning: the Python server does not know partitions: it sees a
-        partition as an empty table (the rows are in the root's collection).
+      - Partitioning: the Python server does not know partitions (the rows
+        are in the root's collection). Since batch 16 it reads the ROOT --
+        which is right -- and refuses everything else with 0A000: any
+        statement on a partition, any write / ALTER / DROP of the root, COPY
+        FROM into it. It used to read a partition as EMPTY and accept root
+        writes no partition covers. Its catalog rewrites also keep the keys
+        only the Rust server models (`partition_by`, `owner`, a column's
+        `collation` ...); an ALTER there used to erase them.
         (`PARTITION BY HASH`, expression keys, `tableoid` everywhere, and a
         partition's own column options and constraints -- NOT NULL, DEFAULT,
         CHECK, UNIQUE, PRIMARY KEY, enforced -- landed in batch 10.) A
@@ -7114,18 +7125,16 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       Corpus `join_pushdown`. Not pushed: an unqualified column, a function
       call (it may be volatile), a subquery, a conjunct over two aliases.
 
-- [ ] **OPEN — PYTHON pgserver: CREATE INDEX diverges from PostgreSQL 14.13
-      on 13 of 48 lines of `indexes.sql` (found 2026-09-29).** Three are
-      INTERNAL ERRORS reaching the client as `XX000`: a `CREATE UNIQUE INDEX`
-      over rows that already collide, and an UPDATE into a unique index's
-      duplicate (the storage `IndexConflict` is not translated to 23505). The
-      rest: a default index name is the Mongo form (`b_1`, `a_1_b_1`) rather
-      than `<table>_<cols>_idx`; an index name is not checked against the
-      relation namespace (`CREATE INDEX t ON other (...)` and `CREATE TABLE
-      <index name>` both succeed); dropping a UNIQUE constraint's index is
-      allowed (PostgreSQL: 2BP01); `DROP INDEX a, b` is `42601`; `USING hash`
-      and `INCLUDE (...)` are not rendered in `pg_indexes.indexdef`. The
-      corpus is `tools/probes/pg_corpora/indexes.sql` (run WITHOUT `--rust`).
+- [x] **DONE (batch 16) — PYTHON pgserver: CREATE INDEX matched
+      PostgreSQL 14.13 on only 35 of 48 lines of `indexes.sql`; now 48 of
+      48.** Fixed: a UNIQUE index over colliding rows and an UPDATE into a
+      unique index's duplicate were `XX000` (storage `IndexConflict` now maps
+      to 23505, with `could not create unique index` / `Key (...)=(...)`);
+      the default name is PostgreSQL's `<table>_<cols>_idx` (numbered while
+      taken) instead of the Mongo form; an index name is checked against
+      tables and views, both ways; dropping a UNIQUE constraint's index is
+      2BP01; `DROP INDEX a, b` works; `USING hash` and `INCLUDE (...)` render
+      in `pg_indexes.indexdef`. The corpus runs WITHOUT `--rust`.
 
 - [ ] **OPEN — RUST pgserver: window functions -- the two known limits
       (landed 2026-09-29: over an aggregate, over `generate_series`, over a
