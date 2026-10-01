@@ -1,101 +1,208 @@
-"""Postgres full-text search: ``tsvector`` / ``tsquery`` types and the
-``to_tsvector`` / ``to_tsquery`` / ``plainto_tsquery`` builders, the ``@@`` match
-operator, and ``ts_rank``.
+"""PostgreSQL full-text search: the ``tsvector`` / ``tsquery`` types, their
+input and output functions, the ``to_tsvector`` / ``to_tsquery`` family, the
+``@@`` match and the functions over the two types.
 
-Storage. A ``tsvector`` is ``{"tsvector": {lexeme: [pos, …], …}}`` — normalised
-lexemes (lower-cased, stop-words dropped) with 1-based token positions. A
-``tsquery`` is a small boolean tree of ``{"lexeme": w}`` / ``{"and": [..]}`` /
-``{"or": [..]}`` / ``{"not": q}`` nodes under ``{"tsquery": <node>}``.
+Ported from the Rust server's ``crates/secantus-pgplan/src/fts.rs`` (which is
+transcribed from PostgreSQL's C source) and checked against PostgreSQL 15.
+The configurations and the document parser live in ``fts_lang``; ranking and
+``ts_headline`` in ``fts_rank``.
 
-Prefix (``cat:*``) and phrase (``foo <-> bar`` / ``foo <N> bar``) queries are
-supported (positions are tracked in the tsvector), as are ``phraseto_tsquery``
-and ``ts_headline``.
-
-Stemming IS applied: ``english`` (and the default) run the Porter2 algorithm
-from ``secantus.sql.snowball``, so ``cats`` matches ``cat``, on the query side
-as well as the document side. ``simple`` neither stems nor drops stop-words.
-
-Simplifications vs real Postgres: the text-search configuration is otherwise
-fixed (one English stop-word list; no other language), and ``ts_rank`` is a
-simple normalised match count rather than the cover-density algorithm. Lexeme
-weights (``:A`` / ``setweight`` / weighted ``ts_rank``) are out of scope (the
-tsvector stores no per-lexeme weight).
+Storage. A ``tsvector`` is ``{"tsvector": {lexeme: [pos, ...]}}`` and, when a
+position carries a weight other than D, ``"weights": {lexeme: [w, ...]}``
+beside it (3 = A, 2 = B, 1 = C, 0 = D, one per position). The Rust server
+reads the ``tsvector`` map and ignores the sibling, so the shared on-disk
+shape is unchanged. A ``tsquery`` is ``{"tsquery": <node>}`` over
+``{"lexeme": w}`` / ``{"prefix": w}`` leaves (optionally with a ``"weight"``
+mask, A = 8 .. D = 1) and ``{"not": q}`` / ``{"and": [l, r]}`` /
+``{"or": [l, r]}`` / ``{"phrase": {"left", "right", "distance"}}`` nodes.
+A string in either position is the canonical TEXT the Rust server stores.
 """
 
 from __future__ import annotations
 
-import math
 import re
 from typing import Any
 
-from . import snowball as _snowball
+from . import errors
+from .fts_lang import DEFAULT_CONFIG, MAX_POS, config, is_word_char, parse_document
 
-# A small English stop-word set (a subset of Postgres' ``english`` list — enough
-# for the common cases without shipping the full 100+ word table).
-_STOPWORDS = frozenset(
-    {
-        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in",
-        "into", "is", "it", "no", "not", "of", "on", "or", "such", "that", "the",
-        "their", "then", "there", "these", "they", "this", "to", "was", "will", "with",
-    }
-)  # fmt: skip
+Vec = dict[str, list[tuple[int, int]]]
 
-_TOKEN_RE = re.compile(r"[0-9A-Za-z]+")
+# Kept for callers that still catch it; every error raised here is a SQLError.
+TSQueryError = errors.SQLError
 
 
-class TSQueryError(ValueError):
-    """A malformed ``tsquery`` text."""
+# --------------------------------------------------------------------------- #
+# tsvector
+# --------------------------------------------------------------------------- #
 
 
-#: Real PG silently refuses to index words longer than 2046 bytes (with a
-#: client NOTICE we don't emit) — to_tsvector of a 10 kB token yields an
-#: empty tsvector, which pgx's trigger-maintenance test relies on.
-_MAX_LEXEME_LEN = 2046
+def _normalise_vec(v: Vec) -> Vec:
+    """Positions sorted, a repeated position kept once with its highest
+    weight, at most 256 per lexeme -- what ``tsvector_in`` stores."""
+    out: Vec = {}
+    for lex in sorted(v):
+        merged: list[tuple[int, int]] = []
+        for p, w in sorted(v[lex]):
+            if merged and merged[-1][0] == p:
+                merged[-1] = (p, max(merged[-1][1], w))
+            else:
+                merged.append((p, w))
+        out[lex] = merged[:256]
+    return out
 
 
-def _is_simple(config: str | None) -> bool:
-    """Whether `config` is the ``simple`` text-search configuration, which
-    neither drops stop-words nor stems. Anything else (``english``, and the
-    default) does both."""
-    return (config or "").strip().lower() == "simple"
+def _vec_out(v: Vec) -> dict[str, Any]:
+    v = _normalise_vec(v)
+    doc: dict[str, Any] = {"tsvector": {lex: [p for p, _ in ps] for lex, ps in v.items()}}
+    if any(w for ps in v.values() for _, w in ps):
+        doc["weights"] = {lex: [w for _, w in ps] for lex, ps in v.items()}
+    return doc
 
 
-def _normalise(word: str, config: str | None) -> str:
-    """One token as the configuration's dictionary would store it: stemmed
-    under ``english``, left alone under ``simple``. PostgreSQL stems the QUERY
-    side too, prefixes included (``running:*`` becomes ``'run':*``), which is
-    what makes a query match a differently-inflected document."""
-    return word if _is_simple(config) else _snowball.stem(word)
-
-
-def _lexemes(text: str, config: str | None = None) -> list[str]:
-    """Tokenise text into normalised lexemes (lower-case, stemmed unless the
-    configuration is ``simple``; stop-words kept so the caller can decide —
-    positions count every token in Postgres)."""
-    return [_normalise(t.lower(), config) for t in _TOKEN_RE.findall(text or "")]
-
-
-def to_tsvector(text: str, config: str | None = None) -> dict[str, Any]:
-    """Build a ``tsvector`` subdocument from text: lower-cased tokens mapped to
-    their 1-based positions.
-
-    ``config`` is the text-search configuration. Only the stop-word half of it
-    is modelled: ``simple`` keeps every token, anything else (``english`` and
-    the default) drops stop-words. That distinction is not cosmetic —
-    ``to_tsvector('simple', 'The quick brown fox')`` must keep ``'the':1``, and
-    dropping it silently loses a token the caller explicitly asked to index.
-    Stemming is still absent under every config; see the module docstring."""
-    keep_stopwords = _is_simple(config)
-    positions: dict[str, list[int]] = {}
-    for pos, lex in enumerate(_lexemes(text, config), start=1):
-        if len(lex) > _MAX_LEXEME_LEN or (not keep_stopwords and lex in _STOPWORDS):
-            continue
-        positions.setdefault(lex, []).append(pos)
-    return {"tsvector": positions}
+def vec_of(v: Any) -> Vec:
+    """A stored tsvector (either server's shape) as ``{lexeme: [(pos, w)]}``."""
+    if isinstance(v, str):
+        return parse_vector(v)
+    if not isinstance(v, dict):
+        return {}
+    positions = v.get("tsvector") or {}
+    weights = v.get("weights") or {}
+    out: Vec = {}
+    for lex, ps in positions.items():
+        ws = weights.get(lex) or []
+        out[lex] = [
+            (min(int(p), MAX_POS), int(ws[k]) if k < len(ws) else 0) for k, p in enumerate(ps or [])
+        ]
+    return _normalise_vec(out)
 
 
 def is_tsvector(v: Any) -> bool:
     return isinstance(v, dict) and "tsvector" in v
+
+
+def is_tsquery(v: Any) -> bool:
+    return isinstance(v, dict) and "tsquery" in v
+
+
+def tsvector_lexemes(v: Any) -> dict[str, list[int]]:
+    return {lex: [p for p, _ in ps] for lex, ps in vec_of(v).items()}
+
+
+def _quote(lex: str) -> str:
+    return "'" + "".join(c * 2 if c in "'\\" else c for c in lex) + "'"
+
+
+_WEIGHT_LETTER = {3: "A", 2: "B", 1: "C", 0: ""}
+
+
+def render_vector(v: Vec) -> str:
+    parts = []
+    for lex, ps in v.items():
+        s = _quote(lex)
+        if ps:
+            s += ":" + ",".join(f"{p}{_WEIGHT_LETTER[w]}" for p, w in ps)
+        parts.append(s)
+    return " ".join(parts)
+
+
+def render_tsvector(v: Any) -> str:
+    return render_vector(vec_of(v))
+
+
+def _syntax(kind: str, text: str) -> errors.SQLError:
+    return errors.SQLError("42601", f'syntax error in {kind}: "{text}"')
+
+
+def _read_word(text: str, i: int, stop: str) -> tuple[str, int] | None:
+    """One lexeme -- quoted (``'it''s'``) or bare -- honouring backslash
+    escapes; ``(word, next_index)``, or None for an unterminated quote."""
+    n = len(text)
+    out: list[str] = []
+    if i < n and text[i] == "'":
+        i += 1
+        while True:
+            if i >= n:
+                return None
+            c = text[i]
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+            elif c == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                else:
+                    return "".join(out), i + 1
+            else:
+                out.append(c)
+                i += 1
+    while i < n:
+        c = text[i]
+        if c.isspace() or c in stop:
+            break
+        if c == "\\" and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), i
+
+
+def parse_vector(text: str) -> Vec:
+    """``tsvector_in``."""
+    n = len(text)
+    i = 0
+    out: Vec = {}
+    while True:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        got = _read_word(text, i, ":")
+        if got is None or not got[0]:
+            raise _syntax("tsvector", text)
+        lex, i = got
+        entry = out.setdefault(lex, [])
+        if i < n and text[i] == ":":
+            i += 1
+            while True:
+                start = i
+                while i < n and "0" <= text[i] <= "9":
+                    i += 1
+                if i == start:
+                    raise _syntax("tsvector", text)
+                p = int(text[start:i])
+                if p == 0:
+                    raise errors.SQLError("42601", f'wrong position info in tsvector: "{text}"')
+                w = 0
+                if i < n:
+                    c = text[i].upper()
+                    if c in "ABC":
+                        w = {"A": 3, "B": 2, "C": 1}[c]
+                        i += 1
+                    elif c in "D*":
+                        i += 1
+                entry.append((min(p, MAX_POS), w))
+                if i < n and text[i] == ",":
+                    i += 1
+                    continue
+                break
+    return _normalise_vec(out)
+
+
+def parse_tsvector(text: str) -> dict[str, Any]:
+    return _vec_out(parse_vector(text))
+
+
+def to_tsvector(text: str, config_name: Any = None) -> dict[str, Any]:
+    cfg = config(config_name)
+    v: Vec = {}
+    for pos, lex in parse_document(text, cfg):
+        if lex is not None:
+            v.setdefault(lex, []).append((pos, 0))
+    return _vec_out(v)
 
 
 _TSVECTOR_ENTRY = r"'(?:[^']|'')*'(?::\d+[A-D]?(?:,\d+[A-D]?)*)?"
@@ -111,540 +218,670 @@ def text_as_tsvector(text: str) -> dict[str, Any]:
     return to_tsvector(text)
 
 
-def is_tsquery(v: Any) -> bool:
-    return isinstance(v, dict) and "tsquery" in v
+def setweight(v: Any, weight: Any, only: Any = None) -> dict[str, Any]:
+    letter = str(weight)[:1].upper()
+    if letter not in ("A", "B", "C", "D"):
+        code = ord(str(weight)[:1]) if str(weight) else 0
+        raise errors.SQLError("XX000", f"unrecognized weight: {code}")
+    w = {"A": 3, "B": 2, "C": 1, "D": 0}[letter]
+    keep = None if only is None else set(_strings(only))
+    out = {
+        lex: [(p, w) for p, _ in ps] if keep is None or lex in keep else ps
+        for lex, ps in vec_of(v).items()
+    }
+    return _vec_out(out)
 
 
-def tsvector_lexemes(v: Any) -> dict[str, list[int]]:
-    # The Rust server stores a tsvector as its canonical TEXT (weights and
-    # all); both servers share one store, so the text form is read too.
-    if isinstance(v, str):
-        return parse_tsvector(v)["tsvector"]
-    return v.get("tsvector", {}) if isinstance(v, dict) else {}
+def _strings(items: Any) -> list[str]:
+    if isinstance(items, (list, tuple)):
+        out = []
+        for x in items:
+            if x is None:
+                raise errors.SQLError("22004", "lexeme array may not contain nulls")
+            out.append(str(x))
+        return out
+    s = str(items)
+    if s.startswith("{") and s.endswith("}"):
+        return [x.strip().strip('"') for x in s[1:-1].split(",") if x.strip().strip('"')]
+    return [s]
 
 
-def render_tsvector(v: Any) -> str:
-    """Render a ``tsvector`` as Postgres' text form ``'cat':2 'sat':3`` (lexemes in
-    sort order, positions ascending)."""
-    lexemes = tsvector_lexemes(v)
-    parts = []
-    for lex in sorted(lexemes):
-        pos = lexemes[lex]
-        if pos:
-            parts.append(f"'{lex}':" + ",".join(str(p) for p in pos))
-        else:
-            parts.append(f"'{lex}'")
-    return " ".join(parts)
+def ts_delete(v: Any, lexemes: Any) -> dict[str, Any]:
+    drop = set(_strings(lexemes))
+    return _vec_out({k: ps for k, ps in vec_of(v).items() if k not in drop})
 
 
-def parse_tsvector(text: str) -> dict[str, Any]:
-    """Parse a ``tsvector`` text literal (``'cat':2 'sat' foo``) into the
-    subdocument form. Accepts bare or quoted lexemes with optional ``:pos`` lists."""
-    positions: dict[str, list[int]] = {}
-    for token in text.split():
-        if ":" in token:
-            lex, _, poss = token.partition(":")
-            pos_list = [int(p) for p in re.findall(r"\d+", poss)]
-        else:
-            lex, pos_list = token, []
-        lex = lex.strip().strip("'").replace("''", "'").lower()
-        if not lex:
-            continue
-        positions.setdefault(lex, []).extend(pos_list)
-    return {"tsvector": positions}
+def ts_filter(v: Any, weights: Any) -> dict[str, Any]:
+    keep = set()
+    for w in _strings(weights):
+        letter = w.upper()
+        if letter not in ("A", "B", "C", "D"):
+            raise errors.SQLError("XX000", f'unrecognized weight: "{w}"')
+        keep.add({"A": 3, "B": 2, "C": 1, "D": 0}[letter])
+    out: Vec = {}
+    for lex, ps in vec_of(v).items():
+        kept = [(p, w) for p, w in ps if w in keep]
+        if kept:
+            out[lex] = kept
+    return _vec_out(out)
+
+
+def strip_tsvector(v: Any) -> dict[str, Any]:
+    return _vec_out({lex: [] for lex in vec_of(v)})
+
+
+def tsvector_length(v: Any) -> int:
+    return len(vec_of(v))
+
+
+def tsvector_to_array(v: Any) -> list[str]:
+    return list(vec_of(v))
+
+
+def array_to_tsvector(items: Any) -> dict[str, Any]:
+    out: Vec = {}
+    for s in _strings(items or []):
+        if s == "":
+            raise errors.SQLError("2200F", "lexeme array may not contain empty strings")
+        out[s] = []
+    return _vec_out(out)
+
+
+def tsvector_concat(a: Any, b: Any) -> dict[str, Any]:
+    """``tsvector || tsvector``: the right side's positions shift past the
+    left's largest."""
+    left, right = vec_of(a), vec_of(b)
+    shift = max((p for ps in left.values() for p, _ in ps), default=0)
+    out: Vec = {lex: list(ps) for lex, ps in left.items()}
+    for lex, ps in right.items():
+        entry = out.setdefault(lex, [])
+        entry.extend((min(p + shift, MAX_POS), w) for p, w in ps)
+    return _vec_out(out)
 
 
 # --------------------------------------------------------------------------- #
 # tsquery
 # --------------------------------------------------------------------------- #
 
-
-def plainto_tsquery(text: str, config: str | None = None) -> dict[str, Any]:
-    """``plainto_tsquery`` — AND together every non-stop-word lexeme in the text."""
-    terms = [{"lexeme": lex} for lex in _lexemes(text, config) if lex not in _STOPWORDS]
-    if not terms:
-        return {"tsquery": None}
-    node = terms[0] if len(terms) == 1 else {"and": terms}
-    return {"tsquery": node}
-
-
-def phraseto_tsquery(text: str, config: str | None = None) -> dict[str, Any]:
-    """``phraseto_tsquery`` — chain the text's non-stop-word lexemes with the phrase
-    operator ``<->`` (adjacency), so word order matters. A dropped stop-word widens
-    the distance between its neighbours (``<2>``), matching Postgres."""
-    tokens = _lexemes(text, config)
-    terms: list[tuple[str, int]] = []  # (lexeme, gap-since-previous-kept-term)
-    gap = 1
-    for lex in tokens:
-        if lex in _STOPWORDS:
-            gap += 1
-            continue
-        terms.append((lex, gap))
-        gap = 1
-    if not terms:
-        return {"tsquery": None}
-    node: Any = {"lexeme": terms[0][0]}
-    for lex, distance in terms[1:]:
-        node = {"phrase": {"left": node, "right": {"lexeme": lex}, "distance": distance}}
-    return {"tsquery": node}
-
-
-def to_tsquery(text: str, config: str | None = None) -> dict[str, Any]:
-    """``to_tsquery`` — parse a boolean query over ``& | !`` and parentheses.
-
-    Stop-words are dropped, as they are on the document side:
-    ``to_tsquery('english','the')`` is the EMPTY query, not ``'the'``. Leaving
-    them in makes a query that can never match, since no document indexes
-    them."""
-    parser = _TSQueryParser(text, config)
-    node = _prune_stopwords(parser.parse(), config)
-    return {"tsquery": node}
-
-
-def _prune_stopwords(node: Any, config: str | None) -> Any:
-    """`node` with stop-word lexemes removed. None when nothing survives."""
-    if _is_simple(config):
-        return node
-    pruned, _owed = _prune(node, config)
-    return pruned
-
-
-def _prune(node: Any, config: str | None) -> tuple[Any, int]:
-    """``(node_without_stop_words, distance_owed)``.
-
-    The second element is what makes a phrase come out right. Dropping a term
-    from the MIDDLE of a phrase must WIDEN the gap between its neighbours, not
-    close it: PostgreSQL renders ``quick <-> the <-> brown`` as
-    ``'quick' <2> 'brown'``, because `brown` is still two tokens after `quick`
-    in any document that matches. Simply deleting the node would give ``<->``
-    and silently match a different set of documents. A term dropped from the
-    START of a phrase owes nothing — there is no earlier term for the gap to
-    apply to — which is why `the <-> quick` is just ``'quick'``."""
-    if not isinstance(node, dict):
-        return node, 0
-    if "lexeme" in node:
-        return (None, 0) if node["lexeme"] in _STOPWORDS else (node, 0)
-    if "prefix" in node:
-        return node, 0
-    if "not" in node:
-        inner, _ = _prune(node["not"], config)
-        return (None if inner is None else {"not": inner}), 0
-    for key in ("and", "or"):
-        if key in node:
-            kids = [k for k, _ in (_prune(c, config) for c in node[key]) if k is not None]
-            if not kids:
-                return None, 0
-            return (kids[0] if len(kids) == 1 else {key: kids}), 0
-    if "phrase" in node:
-        ph = node["phrase"]
-        distance = int(ph.get("distance", 1))
-        left, owed_left = _prune(ph.get("left"), config)
-        right, owed_right = _prune(ph.get("right"), config)
-        if left is None and right is None:
-            return None, 0
-        if left is None:
-            return right, owed_right
-        if right is None:
-            # The gap this term occupied is owed to whatever follows.
-            return left, owed_left + distance + owed_right
-        return {
-            "phrase": {**ph, "left": left, "right": right, "distance": distance + owed_left}
-        }, owed_right
-    return node, 0
-
-
-# The web-search grammar: bare words AND together, ``"quoted phrases"`` become
-# phrase (``<->``) queries, the bare word ``or`` is an OR, and a leading ``-``
-# negates the following word/phrase. Any other punctuation is ignored.
-_WEBSEARCH_TOKEN_RE = re.compile(r'\s*(-?"[^"]*"|-?[^\s"]+)')
-
-
-def websearch_to_tsquery(text: str, config: str | None = None) -> dict[str, Any]:
-    """``websearch_to_tsquery`` — parse a web-search-style query."""
-    items: list[Any] = []  # a mix of query-nodes and the sentinel "or"
-    for m in _WEBSEARCH_TOKEN_RE.finditer(text):
-        tok = m.group(1)
-        negate = tok.startswith("-")
-        if negate:
-            tok = tok[1:]
-        if not tok:
-            continue
-        if tok.startswith('"') and tok.endswith('"'):
-            node = phraseto_tsquery(tok[1:-1])["tsquery"]
-        elif tok.lower() == "or" and not negate:
-            items.append("or")
-            continue
-        else:
-            lexemes = [lex for lex in _lexemes(tok, config) if lex not in _STOPWORDS]
-            node = (
-                {"and": [{"lexeme": x} for x in lexemes]}
-                if len(lexemes) > 1
-                else ({"lexeme": lexemes[0]} if lexemes else None)
-            )
-        if node is None:
-            continue
-        items.append({"not": node} if negate else node)
-
-    # Split on the ``or`` sentinels into AND-groups, then OR the groups together.
-    groups: list[list[Any]] = [[]]
-    for it in items:
-        if it == "or":
-            groups.append([])
-        else:
-            groups[-1].append(it)
-    or_terms: list[Any] = []
-    for grp in groups:
-        if not grp:
-            continue
-        or_terms.append(grp[0] if len(grp) == 1 else {"and": grp})
-    if not or_terms:
-        return {"tsquery": None}
-    node = or_terms[0] if len(or_terms) == 1 else {"or": or_terms}
-    return {"tsquery": node}
-
-
-_QUERY_TOKEN_RE = re.compile(r"\s*(<->|<\d+>|&|\||!|\(|\)|[0-9A-Za-z]+(?::\*)?)")
-_PHRASE_OP_RE = re.compile(r"^<(-|\d+)>$")
-
-
-class _TSQueryParser:
-    """A tiny recursive-descent parser: ``or := and ('|' and)*``; ``and := phrase
-    ('&' phrase)*``; ``phrase := factor (('<->' | '<N>') factor)*``; a factor is
-    ``!factor`` / ``(or)`` / a lexeme (optionally ``lex:*`` for a prefix match)."""
-
-    def __init__(self, text: str, config: str | None = None) -> None:
-        self._tokens = self._tokenize(text)
-        self._i = 0
-        self.config = config
-
-    def _tokenize(self, text: str) -> list[str]:
-        out: list[str] = []
-        pos = 0
-        while pos < len(text):
-            m = _QUERY_TOKEN_RE.match(text, pos)
-            if not m:
-                if text[pos].isspace():
-                    pos += 1
-                    continue
-                raise TSQueryError(f"invalid tsquery token near {text[pos:]!r}")
-            out.append(m.group(1))
-            pos = m.end()
-        return out
-
-    def _peek(self) -> str | None:
-        return self._tokens[self._i] if self._i < len(self._tokens) else None
-
-    def _next(self) -> str | None:
-        tok = self._peek()
-        if tok is not None:
-            self._i += 1
-        return tok
-
-    def parse(self) -> Any:
-        node = self._parse_or()
-        if self._peek() is not None:
-            raise TSQueryError(f"trailing tsquery input near {self._peek()!r}")
-        return node
-
-    def _parse_or(self) -> Any:
-        node = self._parse_and()
-        while self._peek() == "|":
-            self._next()
-            node = {"or": [node, self._parse_and()]}
-        return node
-
-    def _parse_and(self) -> Any:
-        node = self._parse_phrase()
-        while self._peek() == "&":
-            self._next()
-            node = {"and": [node, self._parse_phrase()]}
-        return node
-
-    def _parse_phrase(self) -> Any:
-        node = self._parse_factor()
-        while (tok := self._peek()) is not None and _PHRASE_OP_RE.match(tok):
-            self._next()
-            distance = 1 if tok == "<->" else int(tok[1:-1])
-            right = self._parse_factor()
-            node = {"phrase": {"left": node, "right": right, "distance": distance}}
-        return node
-
-    def _parse_factor(self) -> Any:
-        tok = self._next()
-        if tok is None:
-            raise TSQueryError("unexpected end of tsquery")
-        if tok == "!":
-            return {"not": self._parse_factor()}
-        if tok == "(":
-            node = self._parse_or()
-            if self._next() != ")":
-                raise TSQueryError("unbalanced parentheses in tsquery")
-            return node
-        if tok in ("&", "|", ")") or _PHRASE_OP_RE.match(tok):
-            raise TSQueryError(f"unexpected token {tok!r} in tsquery")
-        if tok.endswith(":*"):
-            # A prefix is stemmed too — PostgreSQL renders `running:*` as
-            # `'run':*` — so a prefix query keeps matching a stemmed document.
-            return {"prefix": _normalise(tok[:-2].lower(), self.config)}
-        return {"lexeme": _normalise(tok.lower(), self.config)}
-
-
-def render_tsquery(v: Any) -> str:
-    """Render a ``tsquery`` as its Postgres text form (``'cat' & 'dog'``)."""
-    return _render_query_node(v.get("tsquery") if isinstance(v, dict) else None)
-
-
-def _render_query_node(node: Any) -> str:
-    if node is None:
-        return ""
-    if "lexeme" in node:
-        return f"'{node['lexeme']}'"
-    if "prefix" in node:
-        return f"'{node['prefix']}':*"
-    if "phrase" in node:
-        ph = node["phrase"]
-        op = "<->" if ph["distance"] == 1 else f"<{ph['distance']}>"
-        return f"{_wrap(ph['left'])} {op} {_wrap(ph['right'])}"
-    if "not" in node:
-        return "!" + _render_query_node(node["not"])
-    if "and" in node:
-        return " & ".join(_wrap(a) for a in node["and"])
-    if "or" in node:
-        return " | ".join(_wrap(a) for a in node["or"])
-    return ""
-
-
-def _wrap(node: Any) -> str:
-    inner = _render_query_node(node)
-    return f"( {inner} )" if ("and" in node or "or" in node or "phrase" in node) else inner
-
-
-# --------------------------------------------------------------------------- #
-# Match + rank
-# --------------------------------------------------------------------------- #
-
-
-def matches(tsvector: Any, tsquery: Any) -> bool:
-    """Does the ``tsvector`` satisfy the ``tsquery``? The ``@@`` operator."""
-    posmap = tsvector_lexemes(tsvector)
-    node = tsquery.get("tsquery") if isinstance(tsquery, dict) else None
-    return _eval_query(node, posmap)
-
-
-def _eval_query(node: Any, posmap: dict[str, list[int]]) -> bool:
-    if node is None:
-        return False
-    if "lexeme" in node:
-        return node["lexeme"] in posmap
-    if "prefix" in node:
-        return any(k.startswith(node["prefix"]) for k in posmap)
-    if "phrase" in node:
-        return bool(_phrase_positions(node["phrase"], posmap))
-    if "not" in node:
-        return not _eval_query(node["not"], posmap)
-    if "and" in node:
-        return all(_eval_query(a, posmap) for a in node["and"])
-    if "or" in node:
-        return any(_eval_query(a, posmap) for a in node["or"])
-    return False
-
-
-def _end_positions(node: Any, posmap: dict[str, list[int]]) -> set[int]:
-    """The set of token positions at which ``node`` (a lexeme / prefix / phrase)
-    matches — the phrase operator uses these to check adjacency."""
-    if node is None:
-        return set()
-    if "lexeme" in node:
-        return set(posmap.get(node["lexeme"], []))
-    if "prefix" in node:
-        out: set[int] = set()
-        for k, ps in posmap.items():
-            if k.startswith(node["prefix"]):
-                out.update(ps)
-        return out
-    if "phrase" in node:
-        return _phrase_positions(node["phrase"], posmap)
-    return set()
-
-
-def _phrase_positions(ph: dict[str, Any], posmap: dict[str, list[int]]) -> set[int]:
-    """End positions where ``left <distance> right`` is satisfied — ``right`` sits
-    exactly ``distance`` tokens after ``left``."""
-    left = _end_positions(ph["left"], posmap)
-    right = _end_positions(ph["right"], posmap)
-    d = ph["distance"]
-    return {pb for pa in left for pb in right if pb == pa + d}
-
-
-def _count_hits(node: Any, posmap: dict[str, list[int]]) -> int:
-    """Total positive-term occurrences a query contributes, for ranking."""
-    if node is None:
-        return 0
-    if "lexeme" in node:
-        return len(posmap.get(node["lexeme"], []))
-    if "prefix" in node:
-        return sum(len(ps) for k, ps in posmap.items() if k.startswith(node["prefix"]))
-    if "phrase" in node:
-        return len(_phrase_positions(node["phrase"], posmap))
-    if "not" in node:
-        return 0
-    if "and" in node or "or" in node:
-        return sum(_count_hits(a, posmap) for a in node.get("and", node.get("or", [])))
-    return 0
-
-
-def ts_rank(tsvector: Any, tsquery: Any) -> float:
-    """A simplified relevance score: the log-dampened count of query-term
-    occurrences in the document, 0.0 when the query doesn't match. (Real Postgres
-    uses a cover-density algorithm; this keeps the monotonic 'more hits ranks
-    higher' behaviour that ``ORDER BY ts_rank(...) DESC`` relies on.)"""
-    if not matches(tsvector, tsquery):
-        return 0.0
-    posmap = tsvector_lexemes(tsvector)
-    node = tsquery.get("tsquery") if isinstance(tsquery, dict) else None
-    hits = _count_hits(node, posmap)
-    if hits == 0:
-        return 0.0
-    return round(1.0 - 1.0 / (1.0 + math.log1p(hits)), 6)
-
-
-def _query_lexemes_and_prefixes(node: Any) -> tuple[set[str], set[str]]:
-    """The positive lexemes and prefixes in a query, for ``ts_headline``."""
-    lexemes: set[str] = set()
-    prefixes: set[str] = set()
-    if node is None:
-        return lexemes, prefixes
-    if "lexeme" in node:
-        lexemes.add(node["lexeme"])
-    elif "prefix" in node:
-        prefixes.add(node["prefix"])
-    elif "phrase" in node:
-        for side in (node["phrase"]["left"], node["phrase"]["right"]):
-            l2, p2 = _query_lexemes_and_prefixes(side)
-            lexemes |= l2
-            prefixes |= p2
-    elif "and" in node or "or" in node:
-        for a in node.get("and", node.get("or", [])):
-            l2, p2 = _query_lexemes_and_prefixes(a)
-            lexemes |= l2
-            prefixes |= p2
-    return lexemes, prefixes
-
-
-def ts_headline(
-    document: str, tsquery: Any, *, start_sel: str = "<b>", stop_sel: str = "</b>"
-) -> str:
-    """``ts_headline(document, query)`` — return the document with every token that
-    matches a query lexeme / prefix wrapped in ``StartSel`` / ``StopSel`` (default
-    ``<b>`` / ``</b>``). Simplified: the whole document is returned (no fragment
-    selection / MaxWords windowing)."""
-    node = tsquery.get("tsquery") if isinstance(tsquery, dict) else None
-    lexemes, prefixes = _query_lexemes_and_prefixes(node)
-    out: list[str] = []
-    for part in re.split(r"([0-9A-Za-z]+)", document or ""):
-        low = part.lower()
-        is_word = bool(part) and _TOKEN_RE.fullmatch(part)
-        if is_word and (low in lexemes or any(low.startswith(p) for p in prefixes)):
-            out.append(f"{start_sel}{part}{stop_sel}")
-        else:
-            out.append(part)
-    return "".join(out)
-
-
-def strip_tsvector(v: Any) -> dict[str, Any]:
-    """``strip(tsvector)`` — drop every position, keeping the lexemes."""
-    return {"tsvector": {lex: [] for lex in tsvector_lexemes(v)}}
-
-
-def tsvector_length(v: Any) -> int:
-    """``length(tsvector)`` — the number of DISTINCT lexemes, not of positions
-    and emphatically not of the rendered string (which is what a generic
-    ``length`` on the internal dict was returning)."""
-    return len(tsvector_lexemes(v))
-
-
-def tsvector_to_array(v: Any) -> list[str]:
-    """``tsvector_to_array`` — the lexemes, sorted, as a text array."""
-    return sorted(tsvector_lexemes(v))
-
-
-def array_to_tsvector(items: Any) -> dict[str, Any]:
-    """``array_to_tsvector`` — a text array as a position-less tsvector."""
-    return {"tsvector": {str(x): [] for x in sorted(str(i) for i in (items or []))}}
-
-
-def tsvector_concat(a: Any, b: Any) -> dict[str, Any]:
-    """``tsvector || tsvector`` — union, with the right operand's positions
-    SHIFTED past the left's highest position, as PostgreSQL does:
-    ``'a':1 'b':2 || 'c':1 'd':2`` is ``'a':1 'b':2 'c':3 'd':4``. Concatenating
-    without the shift would collide the two documents' position spaces and
-    silently corrupt any phrase query over the result."""
-    left, right = tsvector_lexemes(a), tsvector_lexemes(b)
-    offset = max((p for ps in left.values() for p in ps), default=0)
-    out: dict[str, list[int]] = {lex: list(ps) for lex, ps in left.items()}
-    for lex, ps in right.items():
-        out.setdefault(lex, []).extend(p + offset for p in ps)
-    for lex in out:
-        out[lex] = sorted(set(out[lex]))
-    return {"tsvector": out}
-
-
-def tsquery_and(a: Any, b: Any) -> dict[str, Any]:
-    return {"tsquery": {"and": [_node(a), _node(b)]}}
-
-
-def tsquery_or(a: Any, b: Any) -> dict[str, Any]:
-    return {"tsquery": {"or": [_node(a), _node(b)]}}
-
-
-def tsquery_not(a: Any) -> dict[str, Any]:
-    return {"tsquery": {"not": _node(a)}}
+_STOP: dict[str, Any] = {"stop": True}
 
 
 def _node(q: Any) -> Any:
-    """The bare tree inside a ``{"tsquery": …}`` wrapper."""
-    return q.get("tsquery") if isinstance(q, dict) and "tsquery" in q else q
+    """The bare tree of a stored tsquery (either server's shape)."""
+    if isinstance(q, str):
+        return parse_query(q)
+    if isinstance(q, dict) and "tsquery" in q:
+        return q["tsquery"]
+    return q
+
+
+def _binary(node: dict[str, Any]) -> tuple[str, Any, Any, int]:
+    """``(kind, left, right, distance)`` of an and / or / phrase node; an
+    n-ary and / or (an older stored shape) folds to the left."""
+    if "phrase" in node:
+        ph = node["phrase"]
+        return "phrase", ph["left"], ph["right"], int(ph.get("distance", 1))
+    kind = "and" if "and" in node else "or"
+    items = list(node[kind])
+    left = items[0]
+    for nxt in items[1:-1]:
+        left = {kind: [left, nxt]}
+    return kind, left, items[-1] if len(items) > 1 else None, 0
+
+
+def _mk(kind: str, left: Any, right: Any, distance: int = 1) -> dict[str, Any]:
+    if kind == "phrase":
+        return {"phrase": {"left": left, "right": right, "distance": distance}}
+    return {kind: [left, right]}
+
+
+def _priority(node: dict[str, Any]) -> int:
+    if "or" in node:
+        return 1
+    if "and" in node:
+        return 2
+    if "phrase" in node:
+        return 3
+    if "not" in node:
+        return 4
+    return 5
+
+
+def _leaf(node: dict[str, Any]) -> tuple[str, bool, int] | None:
+    if "lexeme" in node:
+        return node["lexeme"], False, int(node.get("weight", 0))
+    if "prefix" in node:
+        return node["prefix"], True, int(node.get("weight", 0))
+    return None
+
+
+def _render(node: Any, parent: int, right_phrase: bool, out: list[str]) -> None:
+    if not isinstance(node, dict) or "stop" in node:
+        return
+    leaf = _leaf(node)
+    if leaf is not None:
+        lex, prefix, weight = leaf
+        out.append(_quote(lex))
+        if prefix or weight:
+            out.append(":" + ("*" if prefix else ""))
+            out.append(
+                "".join(ch for bit, ch in ((8, "A"), (4, "B"), (2, "C"), (1, "D")) if weight & bit)
+            )
+        return
+    p = _priority(node)
+    if "not" in node:
+        paren = p < parent
+        out.append("( !" if paren else "!")
+        _render(node["not"], p, False, out)
+        if paren:
+            out.append(" )")
+        return
+    kind, left, right, d = _binary(node)
+    if right is None:
+        _render(left, parent, right_phrase, out)
+        return
+    is_phrase = kind == "phrase"
+    paren = p < parent or (is_phrase and right_phrase)
+    if paren:
+        out.append("( ")
+    _render(left, p, False, out)
+    if kind == "and":
+        out.append(" & ")
+    elif kind == "or":
+        out.append(" | ")
+    else:
+        out.append(" <-> " if d == 1 else f" <{d}> ")
+    _render(right, p, is_phrase, out)
+    if paren:
+        out.append(" )")
+
+
+def render_query(node: Any) -> str:
+    out: list[str] = []
+    if node is not None:
+        _render(node, 0, False, out)
+    return "".join(out)
+
+
+def render_tsquery(v: Any) -> str:
+    return render_query(_node(v))
+
+
+def _wrap_query(node: Any) -> dict[str, Any]:
+    return {"tsquery": node}
+
+
+class _QueryParser:
+    """``tsquery_in`` / ``to_tsquery``: ``or := and ('|' and)*``,
+    ``and := phrase ('&' phrase)*``, ``phrase := unary (('<->'|'<N>') unary)*``,
+    ``unary := '!' unary | '(' or ')' | operand``."""
+
+    def __init__(self, text: str, cfg: str | None) -> None:
+        self.text = text
+        self.i = 0
+        self.cfg = cfg
+
+    def ws(self) -> None:
+        while self.i < len(self.text) and self.text[self.i].isspace():
+            self.i += 1
+
+    def peek(self) -> str | None:
+        return self.text[self.i] if self.i < len(self.text) else None
+
+    def parse_or(self) -> Any:
+        left = self.parse_and()
+        while True:
+            self.ws()
+            if self.peek() != "|":
+                return left
+            self.i += 1
+            left = {"or": [left, self.parse_and()]}
+
+    def parse_and(self) -> Any:
+        left = self.parse_phrase()
+        while True:
+            self.ws()
+            if self.peek() != "&":
+                return left
+            self.i += 1
+            left = {"and": [left, self.parse_phrase()]}
+
+    def phrase_op(self) -> int | None:
+        self.ws()
+        if self.peek() != "<":
+            return None
+        start = self.i
+        self.i += 1
+        if self.text[self.i : self.i + 2] == "->":
+            self.i += 2
+            return 1
+        ds = self.i
+        while self.peek() is not None and "0" <= self.peek() <= "9":  # type: ignore[operator]
+            self.i += 1
+        if self.i > ds and self.peek() == ">":
+            d = int(self.text[ds : self.i])
+            self.i += 1
+            if d > 16384:
+                raise errors.SQLError(
+                    "22023",
+                    "distance in phrase operator must be an integer value between zero "
+                    "and 16384 inclusive",
+                )
+            return d
+        self.i = start
+        raise _syntax("tsquery", self.text)
+
+    def parse_phrase(self) -> Any:
+        left = self.parse_unary()
+        while (d := self.phrase_op()) is not None:
+            left = _mk("phrase", left, self.parse_unary(), d)
+        return left
+
+    def parse_unary(self) -> Any:
+        self.ws()
+        c = self.peek()
+        if c is None:
+            raise errors.SQLError("42601", f'no operand in tsquery: "{self.text}"')
+        if c == "!":
+            self.i += 1
+            return {"not": self.parse_unary()}
+        if c == "(":
+            self.i += 1
+            q = self.parse_or()
+            self.ws()
+            if self.peek() != ")":
+                raise _syntax("tsquery", self.text)
+            self.i += 1
+            return q
+        if c in "&|)<":
+            raise _syntax("tsquery", self.text)
+        return self.operand()
+
+    def operand(self) -> Any:
+        got = _read_word(self.text, self.i, "&|!()<:")
+        if got is None:
+            raise _syntax("tsquery", self.text)
+        word, self.i = got
+        prefix, weight = False, 0
+        if self.peek() == ":":
+            self.i += 1
+            while (c := self.peek()) is not None:
+                u = c.upper()
+                if u == "*":
+                    prefix = True
+                elif u in "ABCD" and len(u) == 1:
+                    weight |= {"A": 8, "B": 4, "C": 2, "D": 1}[u]
+                else:
+                    break
+                self.i += 1
+        if not word:
+            raise _syntax("tsquery", self.text)
+        if self.cfg is None:
+            return _val(word, prefix, weight)
+        return _morph(word, self.cfg, prefix, weight, True)
+
+
+def _val(lex: str, prefix: bool, weight: int) -> dict[str, Any]:
+    node: dict[str, Any] = {"prefix": lex} if prefix else {"lexeme": lex}
+    if weight:
+        node["weight"] = weight
+    return node
+
+
+def _morph(text: str, cfg: str, prefix: bool, weight: int, phrase: bool) -> Any:
+    """An operand's text through the configuration: its lexemes joined by
+    ``<->`` (or ``&``) at their position distances, or a stop-word placeholder
+    when it has none -- PostgreSQL's ``pushval_morph``."""
+    out: Any = None
+    prev = 0
+    for pos, lex in parse_document(text, cfg):
+        if lex is None:
+            continue
+        v = _val(lex, prefix, weight)
+        if out is None:
+            out = v
+        elif phrase:
+            out = _mk("phrase", out, v, pos - prev)
+        else:
+            out = _mk("and", out, v)
+        prev = pos
+    return _STOP if out is None else out
+
+
+def _clean_stop(node: Any) -> tuple[Any, int, int]:
+    """Remove stop-word placeholders, widening the phrases around them --
+    ``clean_stopword_intree``. ``(node, ladd, radd)``."""
+    if not isinstance(node, dict) or "stop" in node:
+        return None, 0, 0
+    if _leaf(node) is not None:
+        return node, 0, 0
+    if "not" in node:
+        inner, la, ra = _clean_stop(node["not"])
+        return (None, 0, 0) if inner is None else ({"not": inner}, la, ra)
+    kind, l_node, r_node, dist = _binary(node)
+    if r_node is None:
+        return _clean_stop(l_node)
+    is_phrase = kind == "phrase"
+    left, lladd, lradd = _clean_stop(l_node)
+    right, rladd, rradd = _clean_stop(r_node)
+    if left is None and right is None:
+        add = lladd + dist + rradd if is_phrase else 0
+        return None, add, add
+    if left is None:
+        return right, (lladd + dist + rladd if is_phrase else 0), rradd
+    if right is None:
+        return left, lladd, (lradd + dist + rradd if is_phrase else 0)
+    if is_phrase:
+        return _mk("phrase", left, right, dist + lradd + rladd), lladd, rradd
+    return _mk(kind, left, right), 0, 0
+
+
+def _finish(node: Any) -> Any:
+    return _clean_stop(node)[0]
+
+
+def _parse_with(text: str, cfg: str | None) -> Any:
+    p = _QueryParser(text, cfg)
+    p.ws()
+    if p.i >= len(text):
+        return None
+    q = p.parse_or()
+    p.ws()
+    if p.i < len(text):
+        raise _syntax("tsquery", text)
+    return q if cfg is None else _finish(q)
+
+
+def parse_query(text: str) -> Any:
+    """``tsquery_in``: operands taken as written."""
+    return _parse_with(text, None)
+
+
+def parse_tsquery(text: str) -> dict[str, Any]:
+    return _wrap_query(parse_query(text))
+
+
+def to_tsquery(text: str, config_name: Any = None) -> dict[str, Any]:
+    return _wrap_query(_parse_with(text, config(config_name)))
+
+
+def plainto_tsquery(text: str, config_name: Any = None) -> dict[str, Any]:
+    return _wrap_query(_finish(_morph(text, config(config_name), False, 0, False)))
+
+
+def phraseto_tsquery(text: str, config_name: Any = None) -> dict[str, Any]:
+    return _wrap_query(_finish(_morph(text, config(config_name), False, 0, True)))
+
+
+def websearch_to_tsquery(text: str, config_name: Any = None) -> dict[str, Any]:
+    """Words AND together, ``"..."`` is a phrase, a leading ``-`` negates, and
+    the word ``or`` separates alternatives."""
+    cfg = config(config_name)
+    n = len(text)
+    items: list[Any] = []
+    i = 0
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+            continue
+        negate = c == "-"
+        j = i + 1 if negate else i
+        if j < n and text[j] == '"':
+            k = text.find('"', j + 1)
+            k = n if k < 0 else k
+            q = _morph(text[j + 1 : k], cfg, False, 0, True)
+            i = min(k + 1, n)
+            items.append({"not": q} if negate else q)
+            continue
+        k = j
+        while k < n and not text[k].isspace() and text[k] != '"':
+            k += 1
+        word = text[j:k]
+        i = max(k, i + 1)
+        if not negate and word.lower() == "or":
+            items.append("or")
+            continue
+        if not word:
+            continue
+        q = _morph(word, cfg, False, 0, True)
+        if q is _STOP and not any(is_word_char(ch) for ch in word):
+            continue
+        items.append({"not": q} if negate else q)
+    groups: list[list[Any]] = [[]]
+    for it in items:
+        if it == "or":
+            if groups[-1]:
+                groups.append([])
+        else:
+            groups[-1].append(it)
+    out: Any = None
+    for g in groups:
+        if not g:
+            continue
+        acc = g[0]
+        for nxt in g[1:]:
+            acc = _mk("and", acc, nxt)
+        out = acc if out is None else _mk("or", out, acc)
+    return _wrap_query(None if out is None else _finish(out))
+
+
+# --------------------------------------------------------------------------- #
+# Matching
+# --------------------------------------------------------------------------- #
+
+
+def _weight_ok(mask: int, w: int) -> bool:
+    return mask == 0 or bool(mask & (1 << w))
+
+
+def _entries(v: Vec, lex: str, prefix: bool) -> list[str]:
+    if prefix:
+        return [k for k in v if k.startswith(lex)]
+    return [lex] if lex in v else []
+
+
+def _leaf_positions(v: Vec, lex: str, prefix: bool, weight: int) -> tuple[list[int], bool]:
+    out: set[int] = set()
+    present = False
+    for k in _entries(v, lex, prefix):
+        ps = v[k]
+        if not ps:
+            if weight == 0 or weight & 1:
+                present = True
+            continue
+        for p, w in ps:
+            if _weight_ok(weight, w):
+                out.add(p)
+                present = True
+    return sorted(out), present
+
+
+class _Hits:
+    __slots__ = ("lossy", "negate", "positions", "width")
+
+    def __init__(self, positions: list[int], width: int, negate: bool, lossy: bool) -> None:
+        self.positions = positions
+        self.width = width
+        self.negate = negate
+        self.lossy = lossy
+
+
+def _phrase_hits(v: Vec, q: Any) -> _Hits:
+    if not isinstance(q, dict) or "stop" in q:
+        return _Hits([], 0, False, False)
+    leaf = _leaf(q)
+    if leaf is not None:
+        positions, present = _leaf_positions(v, *leaf)
+        return _Hits(positions, 0, False, present and not positions)
+    if "not" in q:
+        h = _phrase_hits(v, q["not"])
+        return _Hits(h.positions, h.width, not h.negate, h.lossy)
+    kind, l_node, r_node, d = _binary(q)
+    if r_node is None:
+        return _phrase_hits(v, l_node)
+    a, b = _phrase_hits(v, l_node), _phrase_hits(v, r_node)
+    lossy = a.lossy or b.lossy
+    width = max(a.width, b.width)
+    if kind == "or":
+        if a.negate or b.negate:
+            return _Hits([], width, True, lossy)
+        return _Hits(sorted(set(a.positions) | set(b.positions)), width, False, lossy)
+    if kind == "and":
+        sa, sb = set(a.positions), set(b.positions)
+        if a.negate and b.negate:
+            return _Hits(sorted(sa | sb), width, True, lossy)
+        if not a.negate and not b.negate:
+            pos = sa & sb
+        elif not a.negate:
+            pos = sa - sb
+        else:
+            pos = sb - sa
+        return _Hits(sorted(pos), width, False, lossy)
+    width = a.width + d + b.width
+    if lossy:
+        return _Hits([], width, False, True)
+    sa, sb = set(a.positions), set(b.positions)
+    out: set[int] = set()
+    if b.negate:
+        if a.negate:
+            return _Hits([], width, True, False)
+        for lp in a.positions:
+            r = lp + d + b.width
+            if 0 < r <= MAX_POS and r not in sb:
+                out.add(r)
+    else:
+        for rp in b.positions:
+            end = rp - b.width - d
+            left_ok = a.negate if end < 1 else ((end in sa) != a.negate)
+            if left_ok:
+                out.add(rp)
+    return _Hits(sorted(out), width, False, False)
+
+
+def eval_query(v: Vec, q: Any) -> bool:
+    if not isinstance(q, dict) or "stop" in q:
+        return False
+    leaf = _leaf(q)
+    if leaf is not None:
+        return _leaf_positions(v, *leaf)[1]
+    if "not" in q:
+        return not eval_query(v, q["not"])
+    kind, l_node, r_node, _d = _binary(q)
+    if r_node is None:
+        return eval_query(v, l_node)
+    if kind == "and":
+        return eval_query(v, l_node) and eval_query(v, r_node)
+    if kind == "or":
+        return eval_query(v, l_node) or eval_query(v, r_node)
+    h = _phrase_hits(v, q)
+    if h.lossy:
+        return False
+    return True if h.negate else bool(h.positions)
+
+
+def matches(tsvector: Any, tsquery: Any) -> bool:
+    """``tsvector @@ tsquery``."""
+    node = _node(tsquery)
+    return node is not None and eval_query(vec_of(tsvector), node)
+
+
+# --------------------------------------------------------------------------- #
+# Functions over tsquery
+# --------------------------------------------------------------------------- #
 
 
 def numnode(q: Any) -> int:
-    """``numnode(tsquery)`` — the node count PostgreSQL reports: every lexeme
-    AND every operator. Measured against 14.13: ``'quick'`` is 1,
-    ``'quick' & 'brown'`` is 3, ``!'quick'`` is 2, and
-    ``'quick' & 'brown' | 'fox'`` is 5."""
-
     def count(node: Any) -> int:
         if not isinstance(node, dict):
             return 0
-        if "lexeme" in node or "phrase" in node:
+        if _leaf(node) is not None or "stop" in node:
             return 1
         if "not" in node:
             return 1 + count(node["not"])
-        for key in ("and", "or"):
-            if key in node:
-                return 1 + sum(count(c) for c in node[key])
-        return 0
+        _k, left, right, _d = _binary(node)
+        if right is None:
+            return count(left)
+        return 1 + count(left) + count(right)
 
     return count(_node(q))
 
 
 def querytree(q: Any) -> str:
-    """``querytree(tsquery)`` — the query as text, or ``'T'`` when it contains
-    no positive lexeme to search for. PostgreSQL renders ``!'quick'`` as ``T``
-    because a purely negative query selects nothing on its own."""
+    """The query with its negated parts removed, ``T`` when nothing indexable
+    is left."""
+
+    def clean(node: Any) -> Any:
+        if not isinstance(node, dict) or "stop" in node or "not" in node:
+            return None
+        if _leaf(node) is not None:
+            return node
+        kind, left, right, d = _binary(node)
+        if right is None:
+            return clean(left)
+        a, b = clean(left), clean(right)
+        if kind == "or":
+            return None if a is None or b is None else _mk("or", a, b)
+        if a is None or b is None:
+            return a if b is None else b
+        return _mk(kind, a, b, d)
+
     node = _node(q)
-    if not _has_positive_term(node):
-        return "T"
-    return _render_query_node(node)
+    if node is None:
+        return ""
+    c = clean(node)
+    return "T" if c is None else render_query(c)
 
 
-def _has_positive_term(node: Any) -> bool:
-    if not isinstance(node, dict):
-        return False
-    if "lexeme" in node or "phrase" in node:
-        return True
-    if "not" in node:
-        return False
-    for key in ("and", "or"):
-        if key in node:
-            return any(_has_positive_term(c) for c in node[key])
-    return False
+def _combine(kind: str, a: Any, b: Any, distance: int = 1) -> dict[str, Any]:
+    na, nb = _node(a), _node(b)
+    if na is None:
+        return _wrap_query(nb)
+    if nb is None:
+        return _wrap_query(na)
+    return _wrap_query(_mk(kind, na, nb, distance))
+
+
+def tsquery_and(a: Any, b: Any) -> dict[str, Any]:
+    return _combine("and", a, b)
+
+
+def tsquery_or(a: Any, b: Any) -> dict[str, Any]:
+    return _combine("or", a, b)
+
+
+def tsquery_phrase(a: Any, b: Any, distance: Any = 1) -> dict[str, Any]:
+    d = 1 if distance is None else int(distance)
+    if d < 0 or d > 16384:
+        raise errors.SQLError(
+            "22023",
+            "distance in phrase operator must be an integer value between zero and 16384 inclusive",
+        )
+    return _combine("phrase", a, b, d)
+
+
+def tsquery_not(a: Any) -> dict[str, Any]:
+    node = _node(a)
+    return _wrap_query(None if node is None else {"not": node})
+
+
+def get_current_ts_config() -> str:
+    return DEFAULT_CONFIG
+
+
+def ts_rank(*args: Any) -> float:
+    from .fts_rank import rank_call
+
+    return rank_call(list(args), cover_density=False)
+
+
+def ts_rank_cd(*args: Any) -> float:
+    from .fts_rank import rank_call
+
+    return rank_call(list(args), cover_density=True)
+
+
+def ts_headline(*args: Any) -> str:
+    from .fts_rank import headline_call
+
+    return headline_call(list(args))
