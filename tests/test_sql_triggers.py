@@ -380,8 +380,8 @@ class TestTriggersThisServerCannotRun:
         run(rt, session, "update rt set t = 'dogs' where id = 2")
         assert run(rt, session, "select ts::text from rt where id = 2").rows == [("'dog':1",)]
 
-    def test_on_conflict_runs_no_trigger_so_refuses(self, rt, session):
-        _rust_trigger(rt, "ins", "BEFORE", ["INSERT"])
+    def test_on_conflict_with_a_transition_table_refuses(self, rt, session):
+        _rust_trigger(rt, "ins", "AFTER", ["INSERT"], level="STATEMENT", transition_new="nt")
         self._refused(
             rt, session, "insert into rt (id, t) values (1, 'b') on conflict (id) do nothing"
         )
@@ -438,3 +438,215 @@ class TestArgsUpdateOfTruncate:
         with pytest.raises(SQLError):
             run(storage, session, "truncate tb18_k")
         assert run(storage, session, "select count(*) from tb18_k").rows == [(1,)]
+
+
+ON_CONFLICT_SQL = """\
+create table tb19_t(id int primary key, v text);
+create table tb19_log(msg text);
+create function tb19_f() returns trigger language plpgsql as $$ begin
+insert into tb19_log values (
+  tg_name||':'||tg_when||':'||tg_op||':'||tg_level
+  ||':'||coalesce(old.v,'-')||'>'||coalesce(new.v,'-'));
+if tg_level = 'ROW' and tg_when = 'BEFORE' then
+  if new.v = 'skip' then return null; end if;
+  new.v := new.v || '!'; return new;
+end if;
+return null; end $$;
+create function tb19_s() returns trigger language plpgsql as $$ begin
+insert into tb19_log values (
+  tg_name||':'||tg_when||':'||tg_op||':'||tg_level); return null; end $$;
+create trigger a_bi before insert on tb19_t for each row execute function tb19_f();
+create trigger b_bu before update on tb19_t for each row execute function tb19_f();
+create trigger c_ai after insert on tb19_t for each row execute function tb19_f();
+create trigger d_au after update on tb19_t for each row execute function tb19_f();
+create trigger e_bis before insert on tb19_t for each statement execute function tb19_s();
+create trigger f_bus before update on tb19_t for each statement execute function tb19_s();
+create trigger g_ais after insert on tb19_t for each statement execute function tb19_s();
+create trigger h_aus after update on tb19_t for each statement execute function tb19_s();
+insert into tb19_t values (1, 'a');
+delete from tb19_log;
+insert into tb19_t values (1, 'b'), (2, 'c'), (3, 'skip')
+  on conflict (id) do update set v = excluded.v || '+';
+insert into tb19_log values ('---');
+insert into tb19_t values (1, 'x'), (4, 'd') on conflict do nothing;
+select msg from tb19_log;
+select * from tb19_t order by id;
+"""
+
+UPDATE_FROM_SQL = """\
+create table tb19_t(id int primary key, v text);
+create table tb19_s(id int, w text);
+create table tb19_log(msg text);
+create function tb19_f() returns trigger language plpgsql as $$ begin
+insert into tb19_log values (
+  tg_name||':'||tg_when||':'||tg_op||':'||tg_level
+  ||':'||coalesce(old.v,'-')||'>'||coalesce(new.v,'-'));
+if tg_when = 'BEFORE' and tg_op = 'UPDATE' then
+  if new.v = 'skip' then return null; end if;
+  new.v := new.v || '!'; return new;
+end if;
+if tg_when = 'BEFORE' and tg_op = 'DELETE' then
+  if old.v = 'keep!' then return null; end if;
+  return old;
+end if;
+return null; end $$;
+create function tb19_st() returns trigger language plpgsql as $$ begin
+insert into tb19_log values (
+  tg_name||':'||tg_when||':'||tg_op||':'||tg_level); return null; end $$;
+create trigger a_bu before update of v on tb19_t for each row execute function tb19_f();
+create trigger b_au after update on tb19_t for each row execute function tb19_f();
+create trigger c_bd before delete on tb19_t for each row execute function tb19_f();
+create trigger d_ad after delete on tb19_t for each row execute function tb19_f();
+create trigger e_us before update on tb19_t for each statement execute function tb19_st();
+create trigger f_ds after delete on tb19_t for each statement execute function tb19_st();
+insert into tb19_t values (1, 'a'), (2, 'b'), (3, 'c');
+insert into tb19_s values (1, 'x'), (2, 'skip'), (3, 'keep');
+update tb19_t set v = s.w from tb19_s s where s.id = tb19_t.id;
+insert into tb19_log values ('---');
+delete from tb19_t using tb19_s s where s.id = tb19_t.id;
+select msg from tb19_log;
+select * from tb19_t order by id;
+"""
+
+MERGE_SQL = """\
+create table tb19_t(id int primary key, v text);
+create table tb19_s(id int, w text);
+create table tb19_log(msg text);
+create function tb19_f() returns trigger language plpgsql as $$ begin
+insert into tb19_log values (
+  tg_name||':'||tg_when||':'||tg_op||':'||tg_level
+  ||':'||coalesce(old.v,'-')||'>'||coalesce(new.v,'-'));
+if tg_when = 'BEFORE' and tg_op in ('UPDATE','INSERT') then
+  if new.v = 'skip' then return null; end if;
+  new.v := new.v || '!'; return new;
+end if;
+if tg_when = 'BEFORE' and tg_op = 'DELETE' then
+  if old.v = 'keep' then return null; end if;
+  return old;
+end if;
+return null; end $$;
+create function tb19_st() returns trigger language plpgsql as $$ begin
+insert into tb19_log values (
+  tg_name||':'||tg_when||':'||tg_op||':'||tg_level); return null; end $$;
+create trigger r_bi before insert on tb19_t for each row execute function tb19_f();
+create trigger r_bu before update on tb19_t for each row execute function tb19_f();
+create trigger r_bd before delete on tb19_t for each row execute function tb19_f();
+create trigger r_ai after insert on tb19_t for each row execute function tb19_f();
+create trigger r_au after update on tb19_t for each row execute function tb19_f();
+create trigger r_ad after delete on tb19_t for each row execute function tb19_f();
+create trigger s_bi before insert on tb19_t for each statement execute function tb19_st();
+create trigger s_bu before update on tb19_t for each statement execute function tb19_st();
+create trigger s_bd before delete on tb19_t for each statement execute function tb19_st();
+create trigger s_ai after insert on tb19_t for each statement execute function tb19_st();
+create trigger s_au after update on tb19_t for each statement execute function tb19_st();
+create trigger s_ad after delete on tb19_t for each statement execute function tb19_st();
+insert into tb19_t values (1, 'a'), (2, 'b'), (3, 'del'), (4, 'keep');
+delete from tb19_log;
+insert into tb19_s values (1, 'x'), (2, 'skip'), (3, 'D'), (4, 'D'), (5, 'n'), (6, 'skip');
+merge into tb19_t t using tb19_s s on t.id = s.id
+  when matched and s.w = 'D' then delete
+  when matched then update set v = s.w
+  when not matched then insert values (s.id, s.w);
+insert into tb19_log values ('---');
+merge into tb19_t t using tb19_s s on t.id = s.id
+  when not matched then insert values (s.id + 10, s.w);
+select msg from tb19_log;
+select * from tb19_t order by id;
+"""
+
+
+def _scenario(storage, session, sql):
+    """Run a multi-statement scenario; the last two SELECTs' rows."""
+    results = run_sql(storage, DB, sql, session=session)
+    return results[-2].rows, results[-1].rows
+
+
+class TestTriggersOnEveryWritePath:
+    """ON CONFLICT, UPDATE FROM / DELETE USING and MERGE fire triggers in
+    PostgreSQL's order: BEFORE STATEMENT per event, BEFORE ROW as each row is
+    acted on (its NEW is what ON CONFLICT's EXCLUDED sees), AFTER ROW queued
+    to the end of the statement, AFTER STATEMENT in reverse. Each expected
+    log and table is PostgreSQL 15's output for the same script."""
+
+    def test_on_conflict(self, storage, session):
+        log, rows = _scenario(
+            storage,
+            session,
+            ON_CONFLICT_SQL,
+        )
+        assert log == [
+            ("e_bis:BEFORE:INSERT:STATEMENT",),
+            ("f_bus:BEFORE:UPDATE:STATEMENT",),
+            ("a_bi:BEFORE:INSERT:ROW:->b",),
+            ("b_bu:BEFORE:UPDATE:ROW:a!>b!+",),
+            ("a_bi:BEFORE:INSERT:ROW:->c",),
+            ("a_bi:BEFORE:INSERT:ROW:->skip",),
+            ("d_au:AFTER:UPDATE:ROW:a!>b!+!",),
+            ("c_ai:AFTER:INSERT:ROW:->c!",),
+            ("h_aus:AFTER:UPDATE:STATEMENT",),
+            ("g_ais:AFTER:INSERT:STATEMENT",),
+            ("---",),
+            ("e_bis:BEFORE:INSERT:STATEMENT",),
+            ("a_bi:BEFORE:INSERT:ROW:->x",),
+            ("a_bi:BEFORE:INSERT:ROW:->d",),
+            ("c_ai:AFTER:INSERT:ROW:->d!",),
+            ("g_ais:AFTER:INSERT:STATEMENT",),
+        ]
+        assert rows == [(1, "b!+!"), (2, "c!"), (4, "d!")]
+
+    def test_update_from_delete_using(self, storage, session):
+        log, rows = _scenario(
+            storage,
+            session,
+            UPDATE_FROM_SQL,
+        )
+        assert log == [
+            ("e_us:BEFORE:UPDATE:STATEMENT",),
+            ("a_bu:BEFORE:UPDATE:ROW:a>x",),
+            ("a_bu:BEFORE:UPDATE:ROW:b>skip",),
+            ("a_bu:BEFORE:UPDATE:ROW:c>keep",),
+            ("b_au:AFTER:UPDATE:ROW:a>x!",),
+            ("b_au:AFTER:UPDATE:ROW:c>keep!",),
+            ("---",),
+            ("c_bd:BEFORE:DELETE:ROW:x!>-",),
+            ("c_bd:BEFORE:DELETE:ROW:b>-",),
+            ("c_bd:BEFORE:DELETE:ROW:keep!>-",),
+            ("d_ad:AFTER:DELETE:ROW:x!>-",),
+            ("d_ad:AFTER:DELETE:ROW:b>-",),
+            ("f_ds:AFTER:DELETE:STATEMENT",),
+        ]
+        assert rows == [(3, "keep!")]
+
+    def test_merge(self, storage, session):
+        log, rows = _scenario(
+            storage,
+            session,
+            MERGE_SQL,
+        )
+        assert log == [
+            ("s_bi:BEFORE:INSERT:STATEMENT",),
+            ("s_bu:BEFORE:UPDATE:STATEMENT",),
+            ("s_bd:BEFORE:DELETE:STATEMENT",),
+            ("r_bu:BEFORE:UPDATE:ROW:a!>x",),
+            ("r_bu:BEFORE:UPDATE:ROW:b!>skip",),
+            ("r_bd:BEFORE:DELETE:ROW:del!>-",),
+            ("r_bd:BEFORE:DELETE:ROW:keep!>-",),
+            ("r_bi:BEFORE:INSERT:ROW:->n",),
+            ("r_bi:BEFORE:INSERT:ROW:->skip",),
+            ("r_au:AFTER:UPDATE:ROW:a!>x!",),
+            ("r_ad:AFTER:DELETE:ROW:del!>-",),
+            ("r_ad:AFTER:DELETE:ROW:keep!>-",),
+            ("r_ai:AFTER:INSERT:ROW:->n!",),
+            ("s_ad:AFTER:DELETE:STATEMENT",),
+            ("s_au:AFTER:UPDATE:STATEMENT",),
+            ("s_ai:AFTER:INSERT:STATEMENT",),
+            ("---",),
+            ("s_bi:BEFORE:INSERT:STATEMENT",),
+            ("r_bi:BEFORE:INSERT:ROW:->D",),
+            ("r_bi:BEFORE:INSERT:ROW:->D",),
+            ("r_bi:BEFORE:INSERT:ROW:->skip",),
+            ("r_ai:AFTER:INSERT:ROW:->D!",),
+            ("r_ai:AFTER:INSERT:ROW:->D!",),
+            ("s_ai:AFTER:INSERT:STATEMENT",),
+        ]
+        assert rows == [(1, "x!"), (2, "b!"), (5, "n!"), (13, "D!"), (14, "D!")]
