@@ -598,7 +598,10 @@ def execute_create_view(
 
 def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
     name = planner.qualified_table_name(stmt.this)
-    if not catalog.drop_view(db, name) and not stmt.args.get("exists"):
+    dropped = catalog.drop_view(db, name)
+    if dropped:
+        catalog.drop_triggers_for_table(db, name)
+    if not dropped and not stmt.args.get("exists"):
         raise errors.undefined_relation_of_kind("VIEW", name)
     return SQLResult(command_tag="DROP VIEW")
 
@@ -1380,7 +1383,6 @@ def _firable_here(trg: dict[str, Any]) -> bool:
         trg.get("timing") in ("BEFORE", "AFTER")
         and trg.get("level", "ROW") in ("ROW", "STATEMENT")
         and all(e in _TRIGGER_EVENTS for e in _trigger_events(trg))
-        and not trg.get("constraint")
     )
 
 
@@ -1575,6 +1577,9 @@ def fire_row_triggers(
             return fire_row_triggers(storage, db, catalog, session, table, event, timing, pairs)
     ctx = _trigger_ctx(storage, db, catalog, session)
     out = []
+    # A deferred constraint trigger's events: outside a transaction block
+    # they run at the end of the statement, after the immediate triggers.
+    end_of_statement: list[tuple[dict[str, Any], Any, Any]] = []
     for old, new in pairs:
         old_rec = _row_record(old, table)
         new_rec = _row_record(new, table)
@@ -1586,6 +1591,15 @@ def fire_row_triggers(
 
                 if not plpgsql.trigger_when(trg["when"], new_rec, old_rec, ctx):
                     continue
+            if _deferred_now(trg, session):
+                if getattr(session, "txn_handle", None) is not None:
+                    session.pending_deferred.append(("trigger", table.name, trg["name"]))
+                    session.pending_trigger_events.append(
+                        (trg["name"], trg, event, old_rec, new_rec, table.name)
+                    )
+                else:
+                    end_of_statement.append((trg, old_rec, new_rec))
+                continue
             result = _call_trigger(
                 trg, catalog, db, ctx, op=event, new=new_rec, old=old_rec, table=table.name
             )
@@ -1601,7 +1615,28 @@ def fire_row_triggers(
         if timing == "BEFORE" and new is not None and new_rec is not None:
             _record_into(new, new_rec, table)
         out.append((old, new))
+    for trg, old_rec, new_rec in end_of_statement:
+        _call_trigger(trg, catalog, db, ctx, op=event, new=new_rec, old=old_rec, table=table.name)
     return out
+
+
+def _deferred_now(trg: dict[str, Any], session: Any) -> bool:
+    """Whether a constraint trigger's event waits (for COMMIT, or for the
+    end of the statement outside a transaction block)."""
+    if not trg.get("constraint") or not trg.get("deferrable") or session is None:
+        return False
+    return session.constraint_is_deferred(trg["name"], bool(trg.get("initially_deferred")))
+
+
+def _run_deferred_trigger(session: Any, name: str, storage: Any, db: str, catalog: Any) -> None:
+    """Run the oldest queued event of constraint trigger ``name``."""
+    queue = session.pending_trigger_events
+    i = next((i for i, ev in enumerate(queue) if ev[0] == name), None)
+    if i is None:
+        return
+    _name, trg, op, old_rec, new_rec, table_name = queue.pop(i)
+    ctx = _trigger_ctx(storage, db, catalog, session)
+    _call_trigger(trg, catalog, db, ctx, op=op, new=new_rec, old=old_rec, table=table_name)
 
 
 def _fire_before_insert_triggers(
@@ -3709,6 +3744,9 @@ def flush_deferred(
         pending = [r for r in session.pending_deferred if r[2] in names]
         session.pending_deferred = [r for r in session.pending_deferred if r[2] not in names]
     for kind, table_name, cname in pending:
+        if kind == "trigger":
+            _run_deferred_trigger(session, cname, storage, db, catalog)
+            continue
         table = catalog.get(db, table_name) if catalog is not None else None
         if table is None:
             continue  # table dropped inside the txn — nothing to re-check

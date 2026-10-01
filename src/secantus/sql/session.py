@@ -461,6 +461,10 @@ class Session:
     # ``deferred_all`` is the SET CONSTRAINTS ALL override (None = per-constraint
     # default); ``deferred_names`` overrides individual constraints by name.
     pending_deferred: list[Any] = field(default_factory=list)
+    # A deferred constraint trigger's queued events, in firing order, as
+    # ``(name, trigger, op, old, new, table)``; each has a ``("trigger", table,
+    # name)`` record in ``pending_deferred`` that runs it.
+    pending_trigger_events: list[Any] = field(default_factory=list)
     deferred_all: bool | None = None
     deferred_names: dict[str, bool] = field(default_factory=dict)
     # Per-session sequence values for currval / lastval. ``seq_values`` maps a
@@ -596,6 +600,7 @@ class Session:
     def reset_deferred(self) -> None:
         """Clear all deferred-constraint state (at end of transaction)."""
         self.pending_deferred = []
+        self.pending_trigger_events = []
         self.deferred_all = None
         self.deferred_names = {}
 
