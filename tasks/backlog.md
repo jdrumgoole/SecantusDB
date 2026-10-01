@@ -10215,12 +10215,12 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   ships (`secantusd-rs`, the `secantusdb-v*` release-binaries track). (a)
   flipping `publish = false` and publishing `secantus-core` to crates.io needs
   Joe's crates.io account + a public-API freeze decision — flagged.
-  **Planned 2026-09-30 in `tasks/rust-packages-plan.md`** — one crates.io
-  package per server (`secantusdb`, `secantus-pg`) with a one-line embedding
-  API and `cargo install` / `cargo binstall` binaries. That plan found what
-  blocks it (WiredTiger is prebuilt-only, a patched `pgwire`, a PG handle that
-  panics when dropped inside a tokio runtime) and lists the six decisions it
-  needs from Joe in §2. Original: With the lib/bindings
+  **Planned 2026-09-30 in `tasks/rust-packages-plan.md`; decisions made
+  2026-10-01** -- packages `secantus-mdb` and `secantus-pg`, `secantus-pgserver`
+  relabelled GPL-2.0-only (planner / catalog stay Apache-2.0), internal crates
+  published with no semver promise, trusted publishing from Actions, two
+  exact-pinned version lines, MSRV = CI's toolchain. Next step: register the two
+  names, then Phase A (build WiredTiger from a crate). Original: With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to
   crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the

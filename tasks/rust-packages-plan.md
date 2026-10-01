@@ -1,8 +1,8 @@
 # Rust packages for the two Rust servers
 
-**Status:** plan, 2026-09-30. Nothing here is built yet. Every fact below was
-read from `origin/main` at `aa0161de` or measured on this box that day; re-check
-before relying on one, and see the decisions in §2, which are Joe's.
+**Status:** plan, 2026-09-30; decisions made 2026-10-01 (§2). Nothing here is
+built yet. Every fact below was read from `origin/main` at `aa0161de` or
+measured on this box that day; re-check before relying on one.
 
 ## 1. Goal
 
@@ -15,16 +15,16 @@ Two user-facing packages, one per server:
 
 | package (crates.io) | library entry point | binary |
 | --- | --- | --- |
-| `secantusdb` | `secantusdb::Server::start()` | `secantusd-rs` |
+| `secantus-mdb` | `secantus_mdb::Server::start()` | `secantusd-rs` |
 | `secantus-pg` | `secantus_pg::PgServer::start()` | `secantusd-pg` |
 
 The target experience, for each:
 
 ```rust
-// Cargo.toml: [dev-dependencies] secantusdb = "0.6"
+// Cargo.toml: [dev-dependencies] secantus-mdb = "0.6"
 #[test]
 fn inserts_a_document() {
-    let server = secantusdb::Server::start().unwrap();   // temp store, free port
+    let server = secantus_mdb::Server::start().unwrap();   // temp store, free port
     let client = mongodb::sync::Client::with_uri_str(server.uri()).unwrap();
     // ... the server stops and its store is removed on drop
 }
@@ -38,39 +38,31 @@ async fn selects_one() {
 }
 ```
 
-And `cargo install secantusdb` / `cargo binstall secantusdb` for the binary.
+And `cargo install secantus-mdb` / `cargo binstall secantus-mdb` for the binary.
 
-## 2. Decisions needed before any work (Joe's)
+## 2. Decisions -- made by Joe, 2026-10-01
 
-1. **Names.** Proposed `secantusdb` (Mongo) and `secantus-pg` (PG); every
-   `secantus*` name was unclaimed on crates.io on 2026-09-30. Register them
-   early — a squatter is the one risk here with no engineering fix.
-2. **The PG crates' licence.** `secantus-pgcatalog` / `-pgplan` / `-pgserver`
-   say `Apache-2.0`, but `secantus-pgserver` links `secantus-core`,
-   `-storage`, `-wt` and `-auth`, which are `GPL-2.0-only`, and WiredTiger is
-   GPL v2-or-v3. The combined `secantus-pg` package is therefore GPL in effect,
-   and publishing it labelled Apache-2.0 would misstate that. Pick one:
-   relabel the PG crates GPL-2.0-only, or keep the planner / catalog crates
-   Apache-2.0 (they link nothing GPL) and label only the server crate GPL.
-3. **Which internal crates go public.** crates.io cannot resolve path
-   dependencies, so everything the two packages depend on must be published
-   too: about ten `secantus-*` crates. The alternative is folding them into the
-   two packages as modules, which is a large refactor of a working workspace.
-   Recommendation: publish them, with a crate-level note that they are
-   implementation details with no semver promise, and keep their names under
-   the `secantus-` prefix.
-4. **Who owns the crates.io account** and the publish token (a GitHub Actions
-   secret, used only by the tag-triggered workflow, mirroring PyPI's OIDC
-   rule that no human publishes by hand). crates.io now supports trusted
-   publishing from GitHub Actions; prefer it to a long-lived token.
-5. **Version lines.** Today the Mongo crates are lockstep `0.5.3-beta.165` and
-   the PG crates `0.1.0-beta.2`, and the PG server depends on four Mongo-line
-   crates. Publishing makes those cross-line dependencies VERSIONED
-   (`secantus-storage = "=0.5.3-beta.165"`), so a PG release pins a specific
-   storage release. Proposal: keep the two lines, pin exact versions between
-   internal crates (`=x.y.z`), and let the release tooling rewrite both.
-6. **MSRV.** Pick one (the current toolchain in CI is the candidate) and put
-   `rust-version` in every published `Cargo.toml`.
+1. **Names: `secantus-mdb` (MongoDB server) and `secantus-pg` (PostgreSQL
+   server).** Both were unclaimed on crates.io on 2026-09-30; register them
+   first, before any other work, because a squatter is the one risk here with
+   no engineering fix. The binaries keep their names (`secantusd-rs`,
+   `secantusd-pg`), and so do the existing `secantusdb-v*` release tags.
+2. **Licence: the PG SERVER crate is GPL-2.0-only; `secantus-pgcatalog` and
+   `secantus-pgplan` stay Apache-2.0.** `secantus-pgserver` links
+   `secantus-core`, `-storage`, `-wt` and `-auth` (GPL-2.0-only) and WiredTiger
+   (GPL v2-or-v3), so it is GPL in effect and is now labelled so; the planner
+   and catalog link nothing GPL. Relabelling `secantus-pgserver/Cargo.toml` is
+   the first change of Phase B.
+3. **Internal crates are published**, under the `secantus-` prefix, each with a
+   front-page note that it is an implementation detail with no semver promise.
+   No folding into the two packages.
+4. **Publishing is crates.io trusted publishing from GitHub Actions**, on the
+   release tags only; nobody runs `cargo publish` by hand (the PyPI rule).
+5. **Two version lines with exact pins.** The MongoDB line (`0.5.x`) and the PG
+   line (`0.1.x`) stay separate; every internal dependency is pinned
+   `=x.y.z`, and the release tooling rewrites the pins with the versions.
+6. **MSRV is the toolchain CI builds with today**, declared as `rust-version`
+   in every published crate and raised deliberately later.
 
 ## 3. What stands in the way today
 
@@ -118,7 +110,7 @@ compress to **3.2 MB** (measured), well under crates.io's 10 MB limit. `test/`
 ## 4. Package layout
 
 ```
-secantusdb            (user-facing: Server + bin secantusd-rs)
+secantus-mdb          (user-facing: Server + bin secantusd-rs)
  ├─ secantus-server   ├─ secantus-commands ─┬─ secantus-core
  │                    │                     ├─ secantus-auth
  │                    │                     └─ secantus-wire
@@ -197,7 +189,7 @@ step 1 is what protects that, and it is non-negotiable.
 
 ### 5.3 Phase C — the embedding API
 
-1. `secantusdb::Server`:
+1. `secantus_mdb::Server`:
    - `Server::start()` — temporary store (removed on drop), `127.0.0.1:0`,
      `enable_test_commands: true`, replica-set advertising ON (so change
      streams work, as in the Python default).
@@ -226,7 +218,7 @@ step 1 is what protects that, and it is non-negotiable.
 
 ### 5.4 Phase D — binaries
 
-1. `cargo install secantusdb` / `cargo install secantus-pg` work once A and B
+1. `cargo install secantus-mdb` / `cargo install secantus-pg` work once A and B
    land (source build; needs CMake, a C compiler, and libclang for PG).
 2. `[package.metadata.binstall]` pointing at the tarballs the release workflows
    ALREADY publish (`secantusdb-<ver>-<target>.tar.gz`,
@@ -263,7 +255,7 @@ not a footnote.
 
 | phase | depends on | rough size |
 | --- | --- | --- |
-| §2 decisions | — | a conversation |
+| §2 decisions | — | **made** 2026-10-01 |
 | C.3 async-drop fix | — | **done** (#1665) |
 | D.2 binstall metadata | names registered | small |
 | A — WT from a crate | — | **largest and riskiest**: 3-5 days, mostly CI across three OSes |
