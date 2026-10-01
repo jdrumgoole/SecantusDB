@@ -640,7 +640,7 @@ fn op_regex(values: &[Cand], pattern: &Bson, options: Option<&Bson>, descend: bo
         _ => false,
     };
     for c in values {
-        if c.value.is_some_and(&hit) {
+        if c.value.is_some_and(hit) {
             return Ok(true);
         }
         if let Some(arr) = c.elements(descend) {

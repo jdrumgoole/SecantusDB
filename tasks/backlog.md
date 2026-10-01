@@ -618,6 +618,14 @@ remain open:
       `agg_where`, `dt_input` (212 lines) and the numeric / catalog / misc /
       transactions / views / indexes / defaults / explain / casts corpora at 0
       against PostgreSQL 14. Left:
+      - An aggregate FILTER holding a subquery works since batch 24 for
+        the aggregates that skip NULL inputs (`count`, `sum`, `avg`, `min`,
+        `max`, `string_agg`, `bool_*`, `bit_*`, the variance family) by
+        rewriting it to the CASE argument it equals (`filter_sublink.rs`,
+        corpus `filter_sublink`). `array_agg` / `json_agg` / `jsonb_agg` and
+        the other NULL-keeping aggregates still answer `0A000 SubLink is not
+        supported yet` there, since the CASE form would add the filtered
+        rows back as NULLs.
       - EXPLAIN (batch 12) prints `Index Cond` / `Filter` / `Hash Cond` /
         `Join Filter` and scan aliases as PostgreSQL does (`explain_quals`
         corpus). What it cannot reproduce is PostgreSQL's COST MODEL: costs
@@ -7094,7 +7102,16 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         -- `InSets` in `secantus-core`, pinned against the element path by
         `hashed_lists_agree_with_the_ordinary_path`; corpus
         `not_in_large`). Other correlated shapes (two equalities, a correlated IN, a
-        select-list EXISTS) still run per outer value.
+        select-list EXISTS) still run per outer value. Re-measured
+        2026-10-01, 2,000 x 2,000 rows, DEBUG build (PostgreSQL 15 answers
+        each in under 1 ms): EXISTS over two equalities 7.3 s, NOT EXISTS
+        over two 7.4 s, EXISTS over `=` plus `>` 7.4 s. Rewriting the
+        two-equality EXISTS to `(a, b) IN (SELECT x, y ...)` would NOT help
+        on its own: that uncorrelated row IN is itself 2.4 s, because
+        `row_subquery_comparison` expands it to an OR over the subquery's
+        rows of AND-ed equalities, evaluated per outer row (O(outer x
+        inner)). The lever is a hashed row-IN (a composite-key `InSets`)
+        that the multi-equality semi-join rewrite can then target.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes
