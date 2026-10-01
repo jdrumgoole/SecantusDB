@@ -36,6 +36,46 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "sqllogictest" / "test"
 CORPUS = REPO_ROOT / ".validation" / "slt-corpus"
 RAW_OUT = REPO_ROOT / ".validation" / "slt-raw.json"
+#: The Rust PostgreSQL server, driven when SECANTUS_GAUGE_SERVER=rust (as the
+#: psycopg gauge does). `.exe` on Windows, where the bare name never exists.
+RUST_BINARY = (
+    REPO_ROOT
+    / "crates"
+    / "secantus-pgserver"
+    / "target"
+    / "debug"
+    / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")
+)
+
+
+def _which_server() -> str:
+    which = os.environ.get("SECANTUS_GAUGE_SERVER", "python").lower()
+    if which not in ("python", "rust"):
+        raise SystemExit(f"SECANTUS_GAUGE_SERVER must be 'python' or 'rust', got {which!r}")
+    return which
+
+
+def _raw_out(which: str) -> Path:
+    """A separate report per server, so a Rust run never overwrites the
+    Python server's published numbers."""
+    return RAW_OUT if which == "python" else RAW_OUT.with_name("slt-raw-rust-server.json")
+
+
+def _daemon_argv(which: str, host: str, port: int, storage_dir: str) -> list[str]:
+    if which == "rust":
+        return [str(RUST_BINARY), storage_dir, f"{host}:{port}"]
+    return [
+        sys.executable,
+        "-m",
+        "secantus.sql.pgserver",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--storage-path",
+        storage_dir,
+    ]
+
 
 #: Per-file wall-clock cap. The slowest included file (select3.test) is ~40s
 #: locally; a hang (a regressed awaitless wait, a runaway join) gets cut well
@@ -96,17 +136,7 @@ def _run_file(slt: str, test_file: Path, engine: str = "postgres") -> dict:
     port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-slt-gauge-")
     daemon = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "secantus.sql.pgserver",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--storage-path",
-            storage_dir,
-        ],
+        _daemon_argv(_which_server(), host, port, storage_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -162,6 +192,22 @@ def main() -> int:
         )
         return 2
     slt = _sqllogictest_bin()
+    which = _which_server()
+    raw_out = _raw_out(which)
+    if which == "rust":
+        if not RUST_BINARY.exists():
+            print(
+                f"{RUST_BINARY.relative_to(REPO_ROOT)} not built — run "
+                "`uv run python -m invoke rust-pgserver-build`",
+                file=sys.stderr,
+            )
+            return 2
+        # Refuse a binary built from a different crates/ tree (the psycopg
+        # gauge once published a number from a stale build).
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.provenance import require_fresh_pgserver
+
+        require_fresh_pgserver(RUST_BINARY, repo_root=REPO_ROOT)
 
     if CORPUS.exists():
         shutil.rmtree(CORPUS)
@@ -182,9 +228,9 @@ def main() -> int:
             results[f"{engine}:{rel}"] = res
             status = "PASS" if res["ok"] else "FAIL"
             print(f"[{n}/{total}] {status} [{engine}] {rel} ({res['seconds']}s)", flush=True)
-    RAW_OUT.write_text(json.dumps(results, indent=1))
+    raw_out.write_text(json.dumps(results, indent=1))
     npass = sum(1 for r in results.values() if r["ok"])
-    print(f"\n{npass}/{len(results)} lane-files pass — raw results in {RAW_OUT}")
+    print(f"\n{npass}/{len(results)} lane-files pass — raw results in {raw_out}")
     return 0
 
 
