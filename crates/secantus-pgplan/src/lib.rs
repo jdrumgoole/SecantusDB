@@ -16,6 +16,7 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 mod agg_hoist;
 mod expr_where;
+mod filter_sublink;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -13899,6 +13900,8 @@ fn resolve_sublinks_in_select_scoped(
         resolve_sublinks_in_from(item, lookup, params, run)?;
     }
 
+    // A FILTER holding a subquery, as the CASE argument it is equivalent to.
+    filter_sublink::rewrite(s)?;
     // `EXISTS` over one equality, as the uncorrelated `IN` it is.
     semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
