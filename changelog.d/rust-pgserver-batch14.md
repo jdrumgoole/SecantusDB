@@ -2,7 +2,7 @@
 
 Batch 14 adds transaction control to procedures and `DO` blocks, and plans
 `EXISTS` and selective joins far faster. It also fixes three silent-data bugs.
-Every change is measured against PostgreSQL 15.
+Each change was probed against PostgreSQL 15, and the corpora run against PostgreSQL 14.
 
 #### Fixed
 
@@ -51,5 +51,5 @@ Every change is measured against PostgreSQL 15.
 - Window partitions are hashed rather than scanned.
 
 New corpora: `values_common_type`, `derived_collation`,
-`procedure_transactions`, `join_pushdown`, `semi_join` and `viewdef_shapes`.
-All six are at 0 divergences against PostgreSQL 15.
+`procedure_transactions`, `join_pushdown`, `semi_join`, `viewdef_shapes` and `srf_fields`.
+All are at 0 divergences, and so is every other corpus.
