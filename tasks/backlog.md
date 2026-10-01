@@ -9436,12 +9436,24 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   decision** (2026-07-17 audit). (b) the `secantusdb` binary crate exists and
   ships (`secantusd-rs`, the `secantusdb-v*` release-binaries track). (a)
   flipping `publish = false` and publishing `secantus-core` to crates.io needs
-  Joe's crates.io account + a public-API freeze decision — flagged. Original: With the lib/bindings
+  Joe's crates.io account + a public-API freeze decision — flagged.
+  **Planned 2026-09-30 in `tasks/rust-packages-plan.md`; decisions made
+  2026-10-01** -- packages `secantus-mdb` and `secantus-pg`, `secantus-pgserver`
+  relabelled GPL-2.0-only (planner / catalog stay Apache-2.0), internal crates
+  published with no semver promise, trusted publishing from Actions, two
+  exact-pinned version lines, MSRV = CI's toolchain. Next step: register the two
+  names, then Phase A (build WiredTiger from a crate). Original: With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to
   crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the
   engines + storage) — gated on the storage keystone (Phase 4 above), since a
   standalone server also needs storage in Rust, not just the operator engines.
+- [x] **`RunningPgServer` inside a tokio runtime -- FIXED in #1665.** Found
+  while planning the packages: `bind` panicked inside a runtime ("Cannot start
+  a runtime from within a runtime" -- it `block_on`'d its own), and so did
+  `stop()` / `Drop` ("Cannot drop a runtime in a context where blocking is not
+  allowed"). So a `#[tokio::test]` could neither start nor drop the server.
+  Invisible to the Python embedding, which calls from a plain thread.
 - [ ] **Make Rust the *recommended* default — a product/docs decision for
   Joe** (2026-07-17 audit). The byte-seam overhead rationale below is moot
   under the two-server model (the Rust server has no per-call seam); what
