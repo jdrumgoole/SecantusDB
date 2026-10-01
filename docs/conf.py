@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -116,6 +117,30 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "pymongo": ("https://pymongo.readthedocs.io/en/stable/", None),
 }
+
+
+class _InventoryOutageFilter(logging.Filter):
+    """Keep an unreachable intersphinx inventory from failing the -W build.
+
+    The inventories live on other sites (docs.python.org, readthedocs). When
+    one is down, Sphinx warns "failed to reach any of the inventories" with
+    no warning type, so ``suppress_warnings`` cannot target it, and -W turns
+    an outage elsewhere into a red docs job. This downgrades just that one
+    message to a printed notice; every other warning still fails the build.
+    The cost: during an outage, cross-references into those sites render as
+    plain text instead of links.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno == logging.WARNING and "failed to reach any of the inventories" in str(
+            record.msg
+        ):
+            print("NOTE: intersphinx inventory unreachable; building without it", file=sys.stderr)
+            return False
+        return True
+
+
+logging.getLogger("sphinx.sphinx.ext.intersphinx").addFilter(_InventoryOutageFilter())
 
 autodoc_member_order = "bysource"
 # Mock the compiled WiredTiger extension so autodoc can `import secantus`
