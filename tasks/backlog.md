@@ -636,9 +636,11 @@ remain open:
         since a partial index's field is absent outside its predicate.
 - [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
       security, domains, materialized views, WITH RECURSIVE, xml, READ
-      COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
-      swept against PostgreSQL 14 at 0 divergences except `arrays` and
-      `strings` (one line each, below). Left:
+      COMMITTED, enums, generated columns) leaves (2026-09-30).** Re-swept
+      2026-10-01 against a build of `main` (tree `44c0d4dc`): all 187
+      corpora in `tools/probes/pg_corpora/`, 6,730 checks, 0 divergences
+      against PostgreSQL 14 (`arrays` and `strings`, once a line each, are
+      at 0). Left:
       - Partitioning: the Python server does not know partitions (the rows
         are in the root's collection). Since batch 16 it reads the ROOT --
         which is right -- and refuses everything else with 0A000: any
