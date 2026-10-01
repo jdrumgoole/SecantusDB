@@ -136,7 +136,9 @@ and are not the version or patches we run, so we do not depend on them.
 
 **Status (2026-10-01): steps 1, 2, 3, 5 landed; the gate (6) passes on macOS
 arm64 and runs on Linux / Windows in `.github/workflows/wt-sys.yml`; step 4
-(pre-generated bindings) is still open.** Measured, not estimated: the
+(pre-generated bindings) landed too: `secantus-wt/src/bindings.rs`, used
+when the default `bindgen` feature is off and checked against bindgen when it
+is on.** Measured, not estimated: the
 `.crate` is 3.2 MB and builds from the tarball in ~26s on an M-series Mac;
 `secantus-storage`'s 290 tests pass over it (`--features secantus-wt/bundled`),
 and the test binary links only system libraries (`otool -L`). What the spike

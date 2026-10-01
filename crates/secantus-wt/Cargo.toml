@@ -16,6 +16,11 @@ publish = false
 name = "secantus_wt"
 
 [features]
+# Regenerate the WiredTiger bindings with bindgen (needs libclang) and check
+# them against the committed src/bindings.rs. Without it the committed file is
+# used as-is, so a crates.io build needs no libclang.
+default = ["bindgen"]
+bindgen = ["dep:bindgen"]
 # Build WiredTiger from the bundled source in `secantus-wiredtiger-sys` instead
 # of linking a prebuilt one. Off by default for now: the wheel, the release
 # workflows and CI link the CMake build via SECANTUS_WT_INCLUDE / _LIB.
@@ -25,4 +30,4 @@ bundled = ["dep:secantus-wiredtiger-sys"]
 secantus-wiredtiger-sys = { path = "../secantus-wiredtiger-sys", optional = true }
 
 [build-dependencies]
-bindgen = "0.70"
+bindgen = { version = "0.70", optional = true }
