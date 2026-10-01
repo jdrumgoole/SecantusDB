@@ -307,7 +307,7 @@ jobs:
             #     shutdown). Verified to yield a valid, mergeable profile.
             echo "=== macOS PGO stage 1: instrumented build (system allocator + self-written profile) ==="
             RUSTFLAGS="-Cprofile-generate=$profraw" \
-              cargo build --release --locked --no-default-features --features pgo-instrument --target "$target" --manifest-path "$manifest"
+              cargo build --release --locked --no-default-features --features bin,pgo-instrument --target "$target" --manifest-path "$manifest"
 
             echo "=== macOS PGO stage 2: run + drive workload; binary writes the profile on shutdown ==="
             datadir=$(mktemp -d)
@@ -354,7 +354,7 @@ jobs:
             # flush writes the profile normally here.
             echo "=== PGO stage 1: instrumented build (system allocator) ==="
             RUSTFLAGS="-Cprofile-generate=$profraw" \
-              cargo build --release --locked --no-default-features --target "$target" --manifest-path "$manifest"
+              cargo build --release --locked --no-default-features --features bin --target "$target" --manifest-path "$manifest"
 
             echo "=== PGO stage 2: run the instrumented binary + drive the workloads ==="
             datadir=$(mktemp -d)
