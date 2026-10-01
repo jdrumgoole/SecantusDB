@@ -601,6 +601,34 @@ class _ReturnSignal(Exception):
         self.value = value
 
 
+def _shift_tg_argv(node: exp.Expression, env: dict[str, Any] | None = None) -> exp.Expression:
+    """Resolve ``TG_ARGV[n]``, which is subscripted from 0 where every other
+    array is from 1. sqlglot stores a Postgres subscript already shifted
+    down by one, so ``tg_argv[0]`` holds ``-1``: the subscript becomes a CASE
+    over that stored value, which no later offset handling can disturb."""
+    if not env or "tg_argv" not in env:
+        return node
+    argv = env.get("tg_argv") or []
+    for b in list(node.find_all(exp.Bracket)):
+        base = b.this
+        if (
+            isinstance(base, exp.Column)
+            and not base.table
+            and base.name.lower() == "tg_argv"
+            and len(b.expressions) == 1
+        ):
+            case = exp.Case(
+                this=b.expressions[0].copy(),
+                ifs=[
+                    exp.If(this=exp.Literal.number(i - 1), true=exp.Literal.string(str(a)))
+                    for i, a in enumerate(argv)
+                ],
+                default=exp.Null(),
+            )
+            b.replace(exp.Paren(this=case) if argv else exp.Null())
+    return node
+
+
 class _Runner:
     def __init__(self, ctx: scalar.ScalarContext, args: list[Any], func: dict):
         self.ctx = ctx
@@ -725,7 +753,7 @@ class _Runner:
         sel = sqlglot.parse_one(f"SELECT {src}", read="postgres")
         if not isinstance(sel, exp.Select) or not sel.selects:
             raise errors.syntax_error(f"plpgsql: bad expression {src!r}")
-        node = self._sub_params(sel.selects[0])
+        node = _shift_tg_argv(self._sub_params(sel.selects[0]), env)
         return scalar.evaluate(node, self._scope(env), self.ctx)
 
     def _scope(self, env: dict[str, Any]):
@@ -762,7 +790,7 @@ class _Runner:
     def _inline(self, node: exp.Expression, env: dict[str, Any]) -> exp.Expression:
         """Replace ``$N`` and unqualified variable columns with literal nodes so an
         embedded SQL statement can run through the ordinary engine path."""
-        node = self._sub_params(node)
+        node = _shift_tg_argv(self._sub_params(node), env)
         for c in list(node.find_all(exp.Column)):
             if c.table:
                 # A trigger's ``new.x`` / ``old.x``: a record variable's field.
@@ -849,7 +877,8 @@ def invoke_trigger(
             "tg_table_name": tg.get("table"),
             "tg_relname": tg.get("table"),
             "tg_table_schema": "public",
-            "tg_nargs": 0,
+            "tg_nargs": len(tg.get("args") or []),
+            "tg_argv": list(tg.get("args") or []),
         }
     )
     result = runner.run(block, env)

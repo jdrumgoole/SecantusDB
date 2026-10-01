@@ -9,6 +9,7 @@ the planner stays pure translation.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import operator
 import re
@@ -1294,7 +1295,14 @@ def _trigger_events(trg: dict[str, Any]) -> list[str]:
     return [str(trg.get("event", ""))]
 
 
-_TRIGGER_EVENTS = ("INSERT", "UPDATE", "DELETE")
+_TRIGGER_EVENTS = ("INSERT", "UPDATE", "DELETE", "TRUNCATE")
+
+# The column names the running UPDATE's SET list targets, for ``UPDATE OF``
+# triggers (PostgreSQL fires one when ANY listed column is a SET target,
+# whether or not its value changes). None outside an UPDATE.
+_UPDATE_TARGETS: contextvars.ContextVar[frozenset[str] | None] = contextvars.ContextVar(
+    "_UPDATE_TARGETS", default=None
+)
 
 
 def _firable_here(trg: dict[str, Any]) -> bool:
@@ -1307,11 +1315,9 @@ def _firable_here(trg: dict[str, Any]) -> bool:
         trg.get("timing") in ("BEFORE", "AFTER")
         and trg.get("level", "ROW") in ("ROW", "STATEMENT")
         and all(e in _TRIGGER_EVENTS for e in _trigger_events(trg))
-        and not trg.get("update_columns")
         and not trg.get("transition_new")
         and not trg.get("transition_old")
         and not trg.get("constraint")
-        and not trg.get("args")
     )
 
 
@@ -1355,7 +1361,26 @@ def _triggers(
         and event in _trigger_events(t)
         and t.get("timing") == timing
         and t.get("level", "ROW") == level
+        and _update_of_applies(t, event)
     ]
+
+
+def _update_of_applies(trg: dict[str, Any], event: str) -> bool:
+    cols = trg.get("update_columns")
+    if event != "UPDATE" or not cols:
+        return True
+    targets = _UPDATE_TARGETS.get()
+    return targets is not None and any(c in targets for c in cols)
+
+
+def _update_target_names(plan: Any) -> frozenset[str]:
+    fields: set[str] = set()
+    for spec in (plan.update or {}).values():
+        if isinstance(spec, dict):
+            fields.update(spec)
+    fields.update(f for f, _t, _e in plan.computed)
+    fields.update(f for f, _t, _e in plan.array_sets)
+    return frozenset(c.name for c in plan.table.columns if c.field in fields)
 
 
 def _trigger_ctx(storage: Any, db: str, catalog: Any, session: Any) -> Any:
@@ -1391,6 +1416,7 @@ def _call_trigger(
             "level": trg.get("level", "ROW"),
             "name": trg.get("name"),
             "table": table,
+            "args": list(trg.get("args") or []),
         },
     )
 
@@ -3126,6 +3152,16 @@ def execute_evaluated_select(
 
 @_serialized_write
 def execute_update(
+    plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
+) -> SQLResult:
+    token = _UPDATE_TARGETS.set(_update_target_names(plan))
+    try:
+        return _execute_update(plan, storage, db, catalog, session)
+    finally:
+        _UPDATE_TARGETS.reset(token)
+
+
+def _execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
     triggered = False
