@@ -52,6 +52,9 @@ pub fn with_correlated_runner<R>(runner: &CorrelatedRunner<'_>, f: impl FnOnce()
         >(runner)
     };
     let _restore = Restore(RUNNER.with(|r| r.replace(Some(ptr))));
+    // A semi-join index is a snapshot of one statement's view of the data:
+    // it must not outlive the runner it was built through.
+    let _decor = semijoin_hash::Scope::enter();
     f()
 }
 
@@ -61,6 +64,13 @@ fn run(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
             "a subquery evaluated for its type".into(),
         ));
     }
+    if let Some(rows) = semijoin_hash::lookup(sql, params, run_direct)? {
+        return Ok(rows);
+    }
+    run_direct(sql, params)
+}
+
+fn run_direct(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
     match RUNNER.with(|r| r.get()) {
         // SAFETY: set only inside `with_correlated_runner`, whose borrow is
         // still live while the pointer is installed.

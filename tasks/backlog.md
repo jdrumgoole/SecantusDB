@@ -7119,16 +7119,20 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         -- `InSets` in `secantus-core`, pinned against the element path by
         `hashed_lists_agree_with_the_ordinary_path`; corpus
         `not_in_large`). Other correlated shapes (two equalities, a correlated IN, a
-        select-list EXISTS) still run per outer value. Re-measured
-        2026-10-01, 2,000 x 2,000 rows, DEBUG build (PostgreSQL 15 answers
-        each in under 1 ms): EXISTS over two equalities 7.3 s, NOT EXISTS
-        over two 7.4 s, EXISTS over `=` plus `>` 7.4 s. Rewriting the
-        two-equality EXISTS to `(a, b) IN (SELECT x, y ...)` would NOT help
-        on its own: that uncorrelated row IN is itself 2.4 s, because
-        `row_subquery_comparison` expands it to an OR over the subquery's
-        rows of AND-ed equalities, evaluated per outer row (O(outer x
-        inner)). The lever is a hashed row-IN (a composite-key `InSets`)
-        that the multi-equality semi-join rewrite can then target.
+        select-list EXISTS) no longer run per outer value when every outer
+        reference is an equality: since batch 30 the inner query runs ONCE
+        per statement with those equalities removed and the columns
+        appended (grouped by, for an aggregate; LIMIT / OFFSET applied per
+        key), and each outer row is a hash lookup (`semijoin_hash.rs`,
+        corpus `correlated_hash`). 2,000 x 2,000 rows, debug build: EXISTS
+        over two equalities 7.3 s -> 36 ms, NOT EXISTS 7.4 s -> 47 ms, a
+        correlated scalar `count(*)` 1.1 s -> 227 ms, a correlated `LIMIT 1`
+        7.6 s -> 36 ms. Still per outer value: a correlation that is not an
+        equality (`t.y > o.b`, 7.6 s), a numeric / non-hashable key, a
+        nondeterministic collation on a text key, and inner queries with
+        ORDER BY, DISTINCT, grouping, joins written with JOIN, functions or
+        nested subqueries -- each falls back to the per-row path, which
+        gives the same answers.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes
