@@ -20,6 +20,7 @@ mod do_block;
 mod encoding;
 mod event_triggers;
 mod explain;
+mod expr_index;
 mod fdw;
 mod merge;
 mod partition;
@@ -6529,6 +6530,7 @@ impl PgHandler {
     /// result rather than failing, so a caller that drops the result drops the
     /// row with it -- which is how a table rewrite once lost rows silently.
     fn insert_checked(&self, coll: &str, docs: Vec<Vec<u8>>, context: &str) -> PgWireResult<usize> {
+        let docs = self.with_expr_fields(coll, docs)?;
         let (n, errors) = self
             .storage
             .insert(self.db(), coll, docs, true)
@@ -7114,6 +7116,8 @@ impl PgHandler {
         self.storage
             .create_index(self.db(), &def.name, name, &key_spec, &options)
             .map_err(|e| Self::storage_err("could not create the index", e))?;
+        // The existing rows take their computed key.
+        self.refresh_expr_fields(&def.name, &Document::new())?;
         Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))])
     }
 
@@ -7386,62 +7390,17 @@ impl PgHandler {
             .collect())
     }
 
-    /// Enforce every UNIQUE expression index on the rows about to be written:
-    /// against each other, and against the stored rows other than `replacing`
-    /// (an UPDATE's own old versions).
+    /// Enforce the UNIQUE constraints the storage indexes cannot: those over
+    /// a nondeterministic collation. A UNIQUE EXPRESSION index is enforced by
+    /// its storage index on the computed field (`expr_index`) -- this used to
+    /// re-evaluate the expression over every stored row on every write.
     fn check_expression_unique(
         &self,
         def: &TableDef,
         rows: &[Document],
         replacing: &[Bson],
     ) -> PgWireResult<()> {
-        self.check_collated_unique(def, rows, replacing)?;
-        let indexes = self.unique_expression_indexes(&def.name)?;
-        if indexes.is_empty() {
-            return Ok(());
-        }
-        let stored: Vec<Document> = self
-            .storage
-            .find_matching(self.db(), &def.name, &Document::new())
-            .map_err(|e| Self::storage_err("could not read", e))?
-            .into_iter()
-            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
-            .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
-            .collect();
-        for ix in &indexes {
-            let name = ix.get_str("name").unwrap_or_default();
-            let keys: Vec<String> = ix
-                .get_array("sqlKeys")
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Bson::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut taken: Vec<Vec<Bson>> = Vec::new();
-            for row in &stored {
-                if let Some((k, _)) = self.expression_key(def, ix, row)? {
-                    taken.push(k);
-                }
-            }
-            for row in rows {
-                if let Some((k, text)) = self.expression_key(def, ix, row)? {
-                    if taken.contains(&k) {
-                        return Err(Self::constraint_error(
-                            "23505",
-                            format!("duplicate key value violates unique constraint \"{name}\""),
-                            format!("Key ({})=({text}) already exists.", keys.join(", ")),
-                            def,
-                            Some(name),
-                            None,
-                        ));
-                    }
-                    taken.push(k);
-                }
-            }
-        }
-        Ok(())
+        self.check_collated_unique(def, rows, replacing)
     }
 
     /// `CREATE [UNIQUE] INDEX`.
@@ -13017,12 +12976,19 @@ impl PgHandler {
         } else {
             None
         };
+        // An expression target's index: its computed field, and the planned
+        // indexes to compute it with.
+        let expr_arbiter = match self.expression_arbiter(table, oc)? {
+            Some(name) => Some((Self::expression_index_field(&name), self.expr_indexes(def)?)),
+            None => None,
+        };
         for row in rows {
             let bytes =
                 encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
+            let bytes = self.with_expr_fields(table, vec![bytes])?;
             let (n, errors) = self
                 .storage
-                .insert(self.db(), table, vec![bytes], true)
+                .insert(self.db(), table, bytes, true)
                 .map_err(|e| Self::storage_err("could not insert", e))?;
             let Some(err) = errors.first() else {
                 written += n;
@@ -13048,8 +13014,21 @@ impl PgHandler {
             // against the target would raise 23505 for the first case whenever
             // storage reported the other index -- which is what the first
             // version of this did, and what the tests caught.
-            let Some(probe) = Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) else {
-                return Err(Self::write_error(table, def, err));
+            let probe = match &expr_arbiter {
+                // An expression arbiter: the existing row holding the proposed
+                // row's computed key.
+                Some((field, indexes)) => {
+                    let mut filled = row.clone();
+                    Self::fill_expr_fields(indexes, &mut filled)?;
+                    match filled.get(field) {
+                        Some(v) => bson::doc! { field.clone(): v.clone() },
+                        None => return Err(Self::write_error(table, def, err)),
+                    }
+                }
+                None => match Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) {
+                    Some(p) => p,
+                    None => return Err(Self::write_error(table, def, err)),
+                },
             };
             let probe = match &index_filter {
                 Some(Some(partial)) => bson::doc! { "$and": [probe, partial.clone()] },
@@ -13124,6 +13103,13 @@ impl PgHandler {
         let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
             return Err(no_arbiter());
         };
+        // An expression target matches a unique expression index on the same
+        // expressions (compared normalised); its arbiter is the index's
+        // computed field.
+        if let Some(name) = self.expression_arbiter(table, oc)? {
+            let field = Self::expression_index_field(&name);
+            return Ok(Some(bson::doc! { field: { "$exists": true } }));
+        }
         let mut want: Vec<String> = cols.iter().filter_map(|c| def.field_of(c)).collect();
         want.sort();
         for ix in self
@@ -13161,6 +13147,68 @@ impl PgHandler {
             }
         }
         Err(no_arbiter())
+    }
+
+    /// The unique EXPRESSION index an `ON CONFLICT (expr, ...)` target names,
+    /// by name; `None` for a target of plain columns. An expression target no
+    /// index matches is PostgreSQL's 42P10.
+    fn expression_arbiter(
+        &self,
+        table: &str,
+        oc: &secantus_pgplan::OnConflict,
+    ) -> PgWireResult<Option<String>> {
+        let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
+            return Ok(None);
+        };
+        let mark = secantus_pgplan::CONFLICT_EXPR_MARK;
+        if !cols.iter().any(|c| c.starts_with(mark)) {
+            return Ok(None);
+        }
+        let normalize = |e: &str| secantus_pgplan::normalized_expression(e).unwrap_or_default();
+        let mut want: Vec<String> = cols
+            .iter()
+            .map(|c| match c.strip_prefix(mark) {
+                Some(e) => normalize(e),
+                None => normalize(c),
+            })
+            .collect();
+        want.sort();
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let options = ix.get_document("options").ok();
+            let unique = ix.get_bool("unique").unwrap_or(false)
+                || options.is_some_and(|o| o.get_bool("unique").unwrap_or(false));
+            let Some((exprs, _)) = Self::index_expressions(&ix) else {
+                continue;
+            };
+            if !unique {
+                continue;
+            }
+            let mut have: Vec<String> = exprs.iter().map(|e| normalize(e)).collect();
+            have.sort();
+            if have != want {
+                continue;
+            }
+            let predicate = ix
+                .get_str("sqlPredicate")
+                .ok()
+                .or_else(|| options.and_then(|o| o.get_str("sqlPredicate").ok()));
+            let usable = match (predicate, &oc.where_sql) {
+                (None, _) => true,
+                (Some(p), Some(w)) => secantus_pgplan::predicate_implied(w, p),
+                (Some(_), None) => false,
+            };
+            if usable {
+                return Ok(ix.get_str("name").ok().map(str::to_string));
+            }
+        }
+        Err(Self::err(&PlanError::NoArbiter(
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+                .to_string(),
+        )))
     }
 
     /// The filter identifying the row the clause arbitrates on.
@@ -13338,6 +13386,46 @@ impl PgHandler {
         key_value: &Document,
         index: Option<&str>,
     ) -> PgWireError {
+        // An expression index's hidden field: its index name and key SQL,
+        // with the computed value (`Key (lower(t))=(x) already exists.`).
+        if let [field] = key_pattern.keys().collect::<Vec<_>>().as_slice() {
+            if let Some((name, keys)) = expr_index::field_index(field) {
+                let shown = match key_value.get(field.as_str()) {
+                    Some(Bson::Document(d)) => d
+                        .values()
+                        .map(secantus_pgplan::value_text)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Some(v) => secantus_pgplan::value_text(v),
+                    None => String::new(),
+                };
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "23505".into(),
+                    format!("duplicate key value violates unique constraint \"{name}\""),
+                );
+                // The key SQL is `pg_get_indexdef`'s, which wraps a bare
+                // expression in a second pair of parentheses; the error's
+                // key list shows it with one (`Key ((a + b))=...`).
+                let keys: Vec<&str> = keys
+                    .iter()
+                    .map(|k| {
+                        k.strip_prefix('(')
+                            .and_then(|k| k.strip_suffix(')'))
+                            .filter(|inner| inner.starts_with('(') && inner.ends_with(')'))
+                            .unwrap_or(k)
+                    })
+                    .collect();
+                info.detail = Some(format!(
+                    "Key ({})=({shown}) already exists.",
+                    keys.join(", ")
+                ));
+                info.schema = Some(Self::schema_of(def));
+                info.table = Some(table.to_string());
+                info.constraint = Some(name);
+                return PgWireError::UserError(Box::new(info));
+            }
+        }
         // A COMPOSITE key collides on the whole `_id` subdocument: report its
         // columns and their values, not `_id`.
         let composite: Vec<&Column> = def
@@ -20691,6 +20779,7 @@ impl PgHandler {
                         .map(encode_doc)
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| Self::storage_err("could not encode a row", e))?;
+                    let docs = self.with_expr_fields(&ins.table, docs)?;
                     let (written, errors) = self
                         .storage
                         .insert(self.db(), &ins.table, docs, true)
@@ -22466,9 +22555,22 @@ impl PgHandler {
                         ));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
+                    // An expression index's computed field goes with it.
+                    let expression = self
+                        .storage
+                        .list_indexes(self.db(), &def.name)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|ix| {
+                            ix.get_str("name") == Ok(name.as_str())
+                                && Self::index_expressions(ix).is_some()
+                        });
                     self.storage
                         .drop_index(self.db(), &def.name, name)
                         .map_err(|e| Self::storage_err("could not drop the index", e))?;
+                    if expression {
+                        self.clear_expr_field(&def.name, &Self::expression_index_field(name))?;
+                    }
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP INDEX"))])
             }
@@ -24551,6 +24653,39 @@ impl PgHandler {
         set: &Document,
         unset: &[String],
     ) -> PgWireResult<usize> {
+        // A table with expression indexes recomputes the updated rows'
+        // index fields: found BEFORE the update, which may move them out of
+        // `filter`.
+        let has_expr = self
+            .lookup(table)
+            .map(|def| self.expr_indexes(&def))
+            .transpose()?
+            .is_some_and(|ix| !ix.is_empty());
+        if !has_expr {
+            return self.update_rows_raw(table, filter, set, unset);
+        }
+        let ids: Vec<Bson> = self
+            .storage
+            .find_matching(self.db(), table, filter)
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .iter()
+            .filter_map(|raw| decode_doc(raw).ok()?.get("_id").cloned())
+            .collect();
+        let matched = self.update_rows_raw(table, filter, set, unset)?;
+        if !ids.is_empty() {
+            self.refresh_expr_fields(table, &bson::doc! { "_id": { "$in": ids } })?;
+        }
+        Ok(matched)
+    }
+
+    /// `update_rows` without the expression index upkeep.
+    pub(crate) fn update_rows_raw(
+        &self,
+        table: &str,
+        filter: &Document,
+        set: &Document,
+        unset: &[String],
+    ) -> PgWireResult<usize> {
         let mut ops = bson::doc! { "$set": set.clone() };
         if !unset.is_empty() {
             let mut u = Document::new();
@@ -24792,9 +24927,10 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("could not update", e))?;
             let bytes =
                 encode_doc(new).map_err(|e| Self::storage_err("could not encode a row", e))?;
+            let bytes = self.with_expr_fields(table, vec![bytes])?;
             let (_, errors) = self
                 .storage
-                .insert(self.db(), table, vec![bytes], true)
+                .insert(self.db(), table, bytes, true)
                 .map_err(|e| Self::storage_err("could not update", e))?;
             if let Some(first) = errors.first() {
                 // A secondary UNIQUE refused the new row: put the old one
@@ -30722,6 +30858,7 @@ impl CopyHandler for PgHandler {
                     .map(encode_doc)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
+                let docs = self.with_expr_fields(&table, docs)?;
                 self.storage
                     .insert(self.db(), &table, docs, true)
                     .map_err(|e| Self::storage_err("could not insert COPY rows", e))

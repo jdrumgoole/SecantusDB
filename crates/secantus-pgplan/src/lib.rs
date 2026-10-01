@@ -982,6 +982,21 @@ pub enum ConflictAction {
     },
 }
 
+/// Marks an `ON CONFLICT` target element that is an EXPRESSION, by its SQL.
+pub const CONFLICT_EXPR_MARK: char = '\u{1}';
+
+/// `expr` normalised for comparison: parsed and printed back, so
+/// `lower( t )` and `LOWER(t)` agree.
+pub fn normalized_expression(expr: &str) -> Option<String> {
+    let N::SelectStmt(s) = parse_one(&format!("SELECT {expr}")).ok()? else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = s.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    deparse_expr(rt.val.as_deref()?).ok()
+}
+
 /// `INSERT ... ON CONFLICT ...`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflict {
@@ -7812,9 +7827,16 @@ fn plan_on_conflict(
                         Some(N::IndexElem(ie)) if !ie.name.is_empty() => {
                             cols.push(ie.name.clone());
                         }
-                        // An expression index (`ON CONFLICT (lower(a))`) is
-                        // inference this server cannot do.
-                        _ => return Err(Error::Unsupported("ON CONFLICT on an expression".into())),
+                        // An expression (`ON CONFLICT (lower(a))`): its SQL,
+                        // marked, for the executor to match against an
+                        // expression index's.
+                        Some(N::IndexElem(ie)) => {
+                            let expr = ie.expr.as_deref().ok_or_else(|| {
+                                Error::Unsupported("this ON CONFLICT target".into())
+                            })?;
+                            cols.push(format!("{CONFLICT_EXPR_MARK}{}", deparse_expr(expr)?));
+                        }
+                        _ => return Err(Error::Unsupported("this ON CONFLICT target".into())),
                     }
                 }
                 Some(ConflictTarget::Columns(cols))
@@ -7845,7 +7867,7 @@ fn plan_on_conflict(
                 ConflictTarget::Columns(cols) => cols.clone(),
                 ConflictTarget::Constraint(_) => Vec::new(),
             } {
-                if def.column(&col).is_none() {
+                if !col.starts_with(CONFLICT_EXPR_MARK) && def.column(&col).is_none() {
                     return Err(Error::UndefinedColumn(col));
                 }
             }

@@ -280,6 +280,19 @@ pub fn bind(
     let address = listener.local_addr()?;
 
     let storage = Arc::new(storage);
+    // Expression indexes keep a computed field on every row; rows another
+    // writer left are brought up to date before any client connects.
+    for info in databases.all(&storage).unwrap_or_default() {
+        if !info.allow_conn {
+            continue;
+        }
+        let handler = PgHandler::new(storage.clone(), databases.clone());
+        if handler.select_database(&info.name).is_ok() {
+            if let Err(e) = handler.refresh_all_expression_indexes() {
+                eprintln!("secantusd-pg: could not rebuild the expression indexes: {e}");
+            }
+        }
+    }
     let stop_flag = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
     let (shutdown, shutdown_rx) = watch::channel(false);

@@ -633,10 +633,14 @@ remain open:
         print as zeros, and which side of a hash join is built (and so
         `Hash Left` vs `Hash Right Join`) follows this server's join order,
         not PostgreSQL's estimates.
-      - An EXPRESSION index is an empty storage index (a synthetic key, a
-        partial filter nothing matches) plus its SQL; a MongoDB-side
-        `listIndexes` on that collection shows it. Its UNIQUE check scans the
-        table per write.
+      - An EXPRESSION index is a storage index on a computed field,
+        `__sqlexpr_<name>`, which every write fills (batch 15; before, the
+        field was never written and UNIQUE re-evaluated the expression over
+        every row per write -- 1.6 s per INSERT at 20,000 rows, now 0.9 ms).
+        Rows another writer left are recomputed when the server opens the
+        store. `ON CONFLICT (expr)` arbitrates on it (corpus `expr_unique`).
+        Left: a WHERE over the expression (`lower(t) = 'x'`) does not use the
+        index yet -- it is evaluated per row.
 - [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
       security, domains, materialized views, WITH RECURSIVE, xml, READ
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora

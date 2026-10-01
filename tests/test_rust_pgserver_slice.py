@@ -15137,3 +15137,26 @@ def test_runtime_and_static_errors_carry_postgres_positions(
             c.execute(sql)
         assert caught.value.sqlstate == sqlstate
         assert caught.value.diag.statement_position == str(position)
+
+
+def test_expression_index_rows_written_elsewhere_are_reindexed_at_open(home: Path) -> None:
+    """A UNIQUE expression index is a storage index on a computed field.
+
+    The Python server knows no expression indexes, so a row it writes carries
+    no computed field. The Rust server recomputes the fields when it opens the
+    store, so the index still sees that row: a case-insensitive duplicate of
+    it is refused (PostgreSQL's 23505), not silently admitted.
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table ex_u (id int primary key, t text)")
+        c.execute("create unique index ex_u_lt on ex_u (lower(t))")
+        c.execute("insert into ex_u values (1, 'Apple')")
+    _python_sql(home, "insert into ex_u (id, t) values (2, 'Pear')")
+    with _Server(home) as server, server.connect() as c:
+        with pytest.raises(psycopg.errors.UniqueViolation) as caught:
+            c.execute("insert into ex_u values (3, 'PEAR')")
+        assert caught.value.diag.message_detail == "Key (lower(t))=(pear) already exists."
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute("insert into ex_u values (4, 'APPLE')")
+        c.execute("insert into ex_u values (5, 'plum')")
+        assert c.execute("select count(*) from ex_u").fetchone() == (3,)
