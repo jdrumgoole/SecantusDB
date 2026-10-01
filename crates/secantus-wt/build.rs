@@ -64,6 +64,12 @@ fn resolve_wt() -> (String, String) {
 }
 
 fn main() {
+    // docs.rs only runs rustdoc, which links nothing, and its sandbox has
+    // neither the time nor the toolchain to compile WiredTiger; the
+    // committed bindings serve the docs.
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
     // `bundled`: secantus-wiredtiger-sys built (or located) WiredTiger and has
     // already emitted every link directive, compressors included; only the
     // header is needed here, for the bindings.

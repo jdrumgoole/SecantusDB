@@ -196,6 +196,28 @@ step 1 is what protects that, and it is non-negotiable.
 
 ### 5.2 Phase B — make every crate publishable
 
+**Status (2026-10-01): the MongoDB side is done; the PG side is not started.**
+That session was asked to keep clear of the PG server, so steps 2 (pgwire) and
+the PG crates' metadata in step 4 are still open, and `secantus-pg` is still
+the `secantus-pgserver` package. What landed, for the ten crates in
+`scripts/crates_package_check.py`'s `PUBLISH_ORDER`:
+
+- `publish = false` gone, `=0.5.3-beta.165` pins on every internal dependency
+  (`secantus-wiredtiger-sys` moved onto the Mongo line), crates.io metadata,
+  `rust-version = "1.98"`, and a README per crate (the internal ones carry the
+  no-semver note). `secantusdb` is renamed `secantus-mdb`; directory, binary
+  and tags unchanged.
+- `secantus-wt` defaults to `bundled`, so a crates.io build needs neither
+  Python nor libclang; `bindgen` is opt-in and `./inv rust-wt-test` enables it.
+  The repo's `build/*/wt-build` probe moved into the sys crate, behind the
+  override and the bundled source, where a packaged crate never reaches it.
+- `--version` says `source: crates.io` for a packaged build.
+- DOCS_RS skips both native builds.
+- The gate is `scripts/crates_package_check.py` in `crates-package.yml`: it
+  stages the crates into one workspace and runs `cargo package --workspace`,
+  because `cargo publish --dry-run` resolves siblings from crates.io and
+  cannot check anything before the first release.
+
 1. Flip `publish = false` on the crates §2.3 keeps; give every internal path
    dependency a `version = "=x.y.z"` alongside its `path`.
 2. `pgwire`: open a PR upstream adding `parameter_oids` (the one local change

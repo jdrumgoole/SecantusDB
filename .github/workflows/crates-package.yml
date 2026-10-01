@@ -1,0 +1,56 @@
+name: crates package
+
+# The Phase B gate of tasks/rust-packages-plan.md: package every crates.io-bound
+# MongoDB-side crate together and build each FROM ITS TARBALL, as `cargo
+# publish` would (scripts/crates_package_check.py). Runs on every PR that
+# touches crates/, so a new path dependency without a version, or a file a
+# crate reaches for outside its own directory, fails the day it is introduced
+# rather than on release day.
+#
+# Linux only: the per-OS native build of WiredTiger is wt-sys.yml's job.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "scripts/crates_package_check.py"
+      - "scripts/wt_sys_refresh.py"
+      - "cmake/patch_wt_*.py"
+      - "vendor/wiredtiger"
+      - ".github/workflows/crates-package.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "scripts/crates_package_check.py"
+      - "scripts/wt_sys_refresh.py"
+      - "cmake/patch_wt_*.py"
+      - "vendor/wiredtiger"
+      - ".github/workflows/crates-package.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Init vendor/wiredtiger
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Package and verify every crate
+        run: python scripts/crates_package_check.py

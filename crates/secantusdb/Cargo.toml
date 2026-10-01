@@ -1,11 +1,10 @@
 [package]
-name = "secantusdb"
+name = "secantus-mdb"
 version = "0.5.3-beta.165"
 edition = "2021"
 description = "Standalone SecantusDB server binary (Rust): WiredTiger-backed, MongoDB wire protocol."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
-publish = false
 
 # Links WiredTiger (via secantus-storage / secantus-storage-adapter), so — like
 # those crates — it is EXCLUDED from the `crates` workspace and is NOT built by
@@ -15,6 +14,11 @@ publish = false
 
 # Standalone (own [workspace]) so `cargo` invoked inside this dir isn't pulled
 # into the parent `crates` workspace, matching secantus-storage-adapter.
+rust-version = "1.98"
+readme = "README.md"
+keywords = ["mongodb", "database", "testing", "server", "wiredtiger"]
+categories = ["database-implementations", "development-tools::testing"]
+
 [workspace]
 
 # Binary name follows the `secantusd-<engine>` daemon scheme so the compiled
@@ -27,10 +31,10 @@ path = "src/main.rs"
 [dependencies]
 bson = "2"
 ctrlc = { version = "3", features = ["termination"] }
-secantus-storage = { path = "../secantus-storage" }
-secantus-storage-adapter = { path = "../secantus-storage-adapter" }
-secantus-commands = { path = "../secantus-commands" }
-secantus-server = { path = "../secantus-server" }
+secantus-storage = { version = "=0.5.3-beta.165", path = "../secantus-storage" }
+secantus-storage-adapter = { version = "=0.5.3-beta.165", path = "../secantus-storage-adapter" }
+secantus-commands = { version = "=0.5.3-beta.165", path = "../secantus-commands" }
+secantus-server = { version = "=0.5.3-beta.165", path = "../secantus-server" }
 # --log-level: init a logger to the resolved level before storage opens.
 log = "0.4"
 env_logger = "0.11"

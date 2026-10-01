@@ -10,7 +10,6 @@
 //!
 //! Internal to SecantusDB: there is no semver promise.
 
-// Referenced so the linker keeps the bundled compressors WiredTiger's builtin
-// zlib and lz4 extensions call into.
+// Referenced so the linker keeps the zlib WiredTiger's builtin zlib extension
+// calls into. lz4 is compiled by build.rs.
 extern crate libz_sys;
-extern crate lz4_sys;

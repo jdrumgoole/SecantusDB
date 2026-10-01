@@ -1,5 +1,10 @@
 # secantus-wt
 
+**Internal to [SecantusDB](https://github.com/jdrumgoole/SecantusDB).** This crate is an
+implementation detail of the SecantusDB Rust servers, published so they can be
+built from crates.io. It carries **no semver promise**: any release may change
+its API. Depend on `secantus-mdb` instead.
+
 Safe Rust bindings over the vendored **WiredTiger** C library — the storage
 foundation for SecantusDB's Rust engine (Phase 4 of the Python→Rust rewrite).
 

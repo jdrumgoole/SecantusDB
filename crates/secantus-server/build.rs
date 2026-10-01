@@ -61,6 +61,20 @@ fn stamp_source_tree() {
     println!("cargo:rustc-env=SECANTUS_SOURCE_TREE={stamp}");
 }
 
+/// Whether this build came from a packaged crate (crates.io, or a vendored
+/// `.crate`) rather than a checkout. `cargo package` keeps the original
+/// manifest beside the normalised one as `Cargo.toml.orig`, so its presence is
+/// the marker. Such a build has no git tree to stamp, and `--version` says
+/// where it came from instead of saying nothing.
+fn stamp_source_origin() {
+    let packaged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("Cargo.toml.orig")
+        .exists();
+    let origin = if packaged { "crates.io" } else { "" };
+    println!("cargo:rustc-env=SECANTUS_SOURCE_ORIGIN={origin}");
+}
+
 fn main() {
     stamp_source_tree();
+    stamp_source_origin();
 }
