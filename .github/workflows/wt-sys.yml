@@ -69,3 +69,12 @@ jobs:
           # `cargo package` verifies by building the extracted .crate.
           CARGO_TARGET_DIR="$RUNNER_TEMP/wt-sys-target" cargo package --allow-dirty
           ls -la "$RUNNER_TEMP"/wt-sys-target/package/*.crate
+      - name: secantus-wt over bundled WiredTiger and the committed bindings
+        # No libclang: without the `bindgen` feature the committed
+        # src/bindings.rs is used, and its compile-time layout assertions
+        # check the struct sizes on this OS.
+        shell: bash
+        run: |
+          python scripts/wt_sys_refresh.py
+          cd crates/secantus-wt
+          CARGO_TARGET_DIR="$RUNNER_TEMP/wt-target" cargo test --no-default-features --features bundled
