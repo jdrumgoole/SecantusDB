@@ -627,10 +627,11 @@ remain open:
       added trigger arguments (`TG_ARGV` from 0, `TG_NARGS`), `UPDATE OF`
       column lists and TRUNCATE statement triggers (`TestArgsUpdateOfTruncate`).
       Batch 19 made ON CONFLICT, UPDATE FROM, DELETE USING and MERGE fire
-      them in PostgreSQL's order (`TestTriggersOnEveryWritePath`). Every
-      other trigger -- transition tables, constraint triggers, INSTEAD OF --
-      REFUSES the write (`0A000 ... cannot run on this server`) rather than
-      skipping the trigger. Left: those three shapes on the Python server.
+      them in PostgreSQL's order (`TestTriggersOnEveryWritePath`), and batch
+      20 added transition tables (`REFERENCING OLD / NEW TABLE`,
+      `TestTransitionTables`). Constraint triggers and INSTEAD OF REFUSE the
+      write (`0A000 ... cannot run on this server`) rather than skipping the
+      trigger. Left: those two shapes on the Python server.
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,
