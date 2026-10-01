@@ -5,7 +5,6 @@ edition = "2021"
 description = "Adapts the WiredTiger-backed secantus-storage Storage to the secantus-commands Storage trait for the Rust server."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
-publish = false
 
 # Links WiredTiger (via secantus-storage), so — like secantus-storage itself —
 # this crate is EXCLUDED from the `crates` workspace and is NOT built by the
@@ -18,6 +17,11 @@ publish = false
 # Standalone (own [workspace]) so `cargo` invoked inside this dir — as the
 # rust-storage CI job does — isn't pulled into the parent `crates` workspace
 # (where it's excluded), matching secantus-storage / secantus-server-py.
+rust-version = "1.98"
+readme = "README.md"
+keywords = ["mongodb", "wiredtiger", "database"]
+categories = ["database-implementations"]
+
 [workspace]
 
 [lib]
@@ -26,8 +30,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 bson = "2"
-secantus-storage = { path = "../secantus-storage" }
-secantus-commands = { path = "../secantus-commands" }
+secantus-storage = { version = "=0.5.3-beta.165", path = "../secantus-storage" }
+secantus-commands = { version = "=0.5.3-beta.165", path = "../secantus-commands" }
 
 # Test-only: the server-roundtrip integration tests (moved here from the
 # WiredTiger-free secantus-server crate) bind the real Rust server over real
@@ -35,4 +39,4 @@ secantus-commands = { path = "../secantus-commands" }
 # secantus-server is itself WT-free, so this adds no WiredTiger to the dep graph
 # beyond what secantus-storage already pulls in.
 [dev-dependencies]
-secantus-server = { path = "../secantus-server" }
+secantus-server = { version = "=0.5.3-beta.165", path = "../secantus-server" }

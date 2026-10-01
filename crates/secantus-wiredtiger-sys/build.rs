@@ -12,6 +12,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // docs.rs only runs rustdoc, which links nothing, and its sandbox has
+    // neither the time nor the toolchain to compile WiredTiger.
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_INCLUDE");
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_LIB");
     if let (Ok(inc), Ok(lib)) = (env::var("SECANTUS_WT_INCLUDE"), env::var("SECANTUS_WT_LIB")) {
@@ -22,6 +27,13 @@ fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let src = manifest.join("wiredtiger");
     if !src.join("CMakeLists.txt").exists() {
+        // In a SecantusDB checkout that has not run the refresh script, use a
+        // WiredTiger the repo's own CMake build produced. A packaged crate
+        // always carries `wiredtiger/`, so this never runs from crates.io.
+        if let Some(dir) = repo_wt_build(&manifest) {
+            emit(&dir.join("include"), &dir);
+            return;
+        }
         panic!(
             "{} is missing. In a SecantusDB checkout run \
              `python scripts/wt_sys_refresh.py`, or set SECANTUS_WT_INCLUDE and \
@@ -93,4 +105,22 @@ fn emit(include: &Path, lib: &Path) {
     println!("cargo:rustc-link-lib=static=wiredtiger");
     println!("cargo:include={}", include.display());
     println!("cargo:lib={}", lib.display());
+}
+
+/// `<repo>/build/*/wt-build` holding a built WiredTiger, if there is one.
+fn repo_wt_build(manifest: &Path) -> Option<PathBuf> {
+    let root = manifest.parent()?.parent()?;
+    let mut found: Vec<PathBuf> = std::fs::read_dir(root.join("build"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("wt-build"))
+        .filter(|d| {
+            d.join("include/wiredtiger.h").exists()
+                && ["libwiredtiger.a", "wiredtiger.lib"]
+                    .iter()
+                    .any(|n| d.join(n).exists())
+        })
+        .collect();
+    found.sort();
+    found.pop()
 }

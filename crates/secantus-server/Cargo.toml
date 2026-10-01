@@ -5,23 +5,25 @@ edition = "2021"
 description = "The standalone SecantusDB Rust server: TCP accept loop + connection handling over secantus-wire + secantus-commands."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
-# Part of the Rust-server build-out (tasks/rust-server-plan.md, R4). Not released
-# to crates.io yet.
-publish = false
 
 # The connection loop is **generic over the command `Storage` trait**, so this
 # crate is WT-free: it builds and runs over real TCP in the WT-less `rust` CI
 # job (and this dev sandbox) with any `Storage` impl. The WiredTiger-backed
 # adapter (`secantus_storage::Storage` → the command `Storage` trait) lives
 # elsewhere (R4b) so this crate doesn't link the C library.
+rust-version = "1.98"
+readme = "README.md"
+keywords = ["mongodb", "database", "server", "testing"]
+categories = ["database-implementations", "network-programming"]
+
 [lib]
 name = "secantus_server"
 crate-type = ["rlib"]
 
 [dependencies]
 bson = { workspace = true }
-secantus-wire = { path = "../secantus-wire" }
-secantus-commands = { path = "../secantus-commands" }
+secantus-wire = { version = "=0.5.3-beta.165", path = "../secantus-wire" }
+secantus-commands = { version = "=0.5.3-beta.165", path = "../secantus-commands" }
 # TLS / mTLS in the accept loop (R5c). `ring` crypto backend (no cmake/nasm
 # build, unlike aws-lc-rs). `rustls-pemfile` loads the PEM cert/key/CA;
 # `x509-parser` extracts the verified client cert's subject DN for MONGODB-X509.

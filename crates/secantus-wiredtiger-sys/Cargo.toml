@@ -1,6 +1,6 @@
 [package]
 name = "secantus-wiredtiger-sys"
-version = "0.1.0-beta.0"
+version = "0.5.3-beta.165"
 edition = "2021"
 description = "Builds the WiredTiger storage engine (mongodb-7.0.33, SecantusDB's patches) from bundled source as a static library. Internal to SecantusDB: no semver promise."
 license = "GPL-2.0-only"
@@ -12,6 +12,17 @@ build = "build.rs"
 include = ["build.rs", "src/**", "wiredtiger/**", "wiredtiger.sha256", "wiredtiger.manifest", "README.md"]
 
 # Standalone, like secantus-wt: it builds C, which the clean workspace does not.
+rust-version = "1.98"
+readme = "README.md"
+keywords = ["wiredtiger", "storage-engine", "ffi", "database"]
+categories = ["external-ffi-bindings", "database-implementations"]
+
+
+[package.metadata.docs.rs]
+# The build scripts skip the native WiredTiger build under DOCS_RS; the
+# committed bindings are all rustdoc needs.
+rustdoc-args = ["--cfg", "docsrs"]
+
 [workspace]
 
 [dependencies]
