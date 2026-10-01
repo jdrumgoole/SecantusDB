@@ -3308,6 +3308,15 @@ These are explicit non-goals. Don't add them without a reason.
       than a wall-clock one. Same family as the `test_concurrent_server_
       lifecycle_no_panic` entry in §5.
 
+      **Seen again 2026-10-01** on PR #1690 (`test-windows (3.10, 3)`, a change
+      that touched no Python), and the message adds a clue: `stop` reported
+      `taskkill exited 255: ... The process with PID 5196 (child process of PID
+      3960) could not be terminated. Reason: There is no running instance of the
+      task.` -- i.e. a CHILD in the tree had already exited when `taskkill /T`
+      walked it, so the retry path took the race as a failure. That points at
+      the tree-kill's handling of a child that exits mid-walk, not only at the
+      wait being too short.
+
 - [ ] **OPEN — a push/PR CI run tests only Python 3.10 on Linux, so a 3.11+
       Linux bug can ONLY surface in the weekly cron (found 2026-09-28).** This
       is the structural half of the `cbrt` finding below, and it is the more
