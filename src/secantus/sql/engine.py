@@ -1208,6 +1208,8 @@ def _run_merge(
         planner.written_table_name(stmt.this),
     )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
+    if not getattr(target, "reflected", False):
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "INSERT", "UPDATE", "DELETE")
     src_alias, source_rows, source_cols = _merge_source(
         stmt.args["using"], db, catalog, session, storage
     )
@@ -1449,6 +1451,8 @@ def _run_delete_using(
         planner.written_table_name(stmt.this),
     )
     target_alias = (stmt.this.alias or stmt.this.name).lower()
+    if not getattr(target, "reflected", False):
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "DELETE")
     sources = _collect_dml_sources(stmt.args["using"], db, catalog, session, storage)
     sctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
     where = stmt.args.get("where")
@@ -1560,6 +1564,8 @@ def _run_update_from(
         planner.written_table_name(target_node),
     )
     target_alias = (target_node.alias or target_node.name).lower()
+    if not getattr(target, "reflected", False):
+        executor.refuse_unfirable_triggers(catalog, db, target.name, "UPDATE")
     from_node = stmt.args["from_"]
     sources = _collect_dml_sources([from_node.this], db, catalog, session, storage)
     source_cols = {a: cols for a, _, cols in sources}
@@ -4317,6 +4323,7 @@ def _run_truncate(stmt: exp.TruncateTable, storage: Any, db: str, catalog: Catal
             if exists:
                 continue
             raise errors.undefined_table(name)
+        executor.refuse_unfirable_triggers(catalog, db, name, "TRUNCATE")
         named.append(name)
 
     restart = str(stmt.args.get("identity") or "").upper() == "RESTART"

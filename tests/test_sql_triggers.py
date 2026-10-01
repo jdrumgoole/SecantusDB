@@ -220,3 +220,87 @@ $$ language plpgsql"""
                 copy.write("the cat sat\nbig red dog\n")
             got = c.execute("select t from sentences where ts @@ to_tsquery('cat')").fetchall()
             assert got == [("the cat sat",)]
+
+
+def _rust_trigger(storage, name, timing, events, level="ROW", **extra):
+    """A trigger as the Rust PG server records it in the shared catalog."""
+    from secantus.sql.catalog import Catalog
+
+    Catalog(storage).put_trigger(
+        DB,
+        {
+            "name": name,
+            "table": "rt",
+            "timing": timing,
+            "event": events[0],
+            "events": events,
+            "level": level,
+            "function": "tfn",
+            "args": [],
+            "update_columns": [],
+            **extra,
+        },
+    )
+
+
+class TestTriggersThisServerCannotRun:
+    """A trigger the Rust server stored refuses the write it would fire on.
+
+    This server runs only BEFORE INSERT FOR EACH ROW triggers. It used to
+    SKIP every other kind the shared catalog holds, so a write here bypassed
+    an AFTER / UPDATE / DELETE / statement-level trigger the Rust server
+    enforces. Now that write is PostgreSQL's 0A000 and does not happen.
+    """
+
+    @pytest.fixture()
+    def rt(self, storage, session):
+        run(storage, session, TRIGGER_FN)
+        run(storage, session, "create table rt (id int primary key, t text, ts tsvector)")
+        run(storage, session, "insert into rt (id, t) values (1, 'a')")
+        return storage
+
+    def _refused(self, storage, session, sql):
+        with pytest.raises(SQLError) as ei:
+            run(storage, session, sql)
+        assert ei.value.sqlstate == "0A000"
+        assert "cannot run on this server" in str(ei.value)
+
+    def test_after_insert_refuses_the_insert(self, rt, session):
+        _rust_trigger(rt, "audit", "AFTER", ["INSERT"])
+        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
+        assert run(rt, session, "select count(*) from rt").rows == [(1,)]
+
+    def test_update_and_delete_triggers_refuse_those_writes(self, rt, session):
+        _rust_trigger(rt, "upd", "BEFORE", ["UPDATE"])
+        _rust_trigger(rt, "del", "AFTER", ["DELETE"], level="STATEMENT")
+        self._refused(rt, session, "update rt set t = 'z' where id = 1")
+        self._refused(rt, session, "delete from rt where id = 1")
+        assert run(rt, session, "select t from rt").rows == [("a",)]
+        # An INSERT fires neither, so it goes through.
+        run(rt, session, "insert into rt (id, t) values (2, 'b')")
+
+    def test_truncate_trigger_refuses_truncate(self, rt, session):
+        _rust_trigger(rt, "trunc", "BEFORE", ["TRUNCATE"], level="STATEMENT")
+        self._refused(rt, session, "truncate rt")
+        assert run(rt, session, "select count(*) from rt").rows == [(1,)]
+
+    def test_statement_level_and_when_triggers_are_not_run_per_row(self, rt, session):
+        _rust_trigger(rt, "stmt", "BEFORE", ["INSERT"], level="STATEMENT")
+        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
+        run(rt, session, "drop trigger stmt on rt")
+        _rust_trigger(rt, "cond", "BEFORE", ["INSERT"], when="new.id > 5")
+        self._refused(rt, session, "insert into rt (id, t) values (2, 'b')")
+
+    def test_a_multi_event_before_row_trigger_fires_on_insert(self, rt, session):
+        # Recorded with `event` = UPDATE (the first) and both in `events`:
+        # reading only `event` skipped it on INSERT.
+        _rust_trigger(rt, "both", "BEFORE", ["UPDATE", "INSERT"])
+        run(rt, session, "insert into rt (id, t) values (2, 'cats')")
+        assert run(rt, session, "select ts::text from rt where id = 2").rows == [("'cat':1",)]
+        self._refused(rt, session, "update rt set t = 'x' where id = 2")
+
+    def test_on_conflict_runs_no_trigger_so_refuses(self, rt, session):
+        _rust_trigger(rt, "ins", "BEFORE", ["INSERT"])
+        self._refused(
+            rt, session, "insert into rt (id, t) values (1, 'b') on conflict (id) do nothing"
+        )

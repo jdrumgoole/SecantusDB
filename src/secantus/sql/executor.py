@@ -1212,6 +1212,63 @@ def _returning_result(
     return SQLResult(command_tag=command_tag, columns=columns, rows=rows, rowcount=rowcount)
 
 
+def _trigger_events(trg: dict[str, Any]) -> list[str]:
+    """A trigger's events. The Rust server records every one under
+    ``events`` (and the first under ``event``); this server's own triggers
+    carry only ``event``."""
+    events = trg.get("events")
+    if isinstance(events, list) and events:
+        return [str(e) for e in events]
+    return [str(trg.get("event", ""))]
+
+
+def _firable_here(trg: dict[str, Any]) -> bool:
+    """Whether this server can run ``trg`` faithfully: a BEFORE ... FOR EACH
+    ROW trigger on INSERT, with no WHEN condition, no transition tables, no
+    constraint (deferred) firing and no arguments -- the one shape it
+    implements."""
+    return (
+        trg.get("timing") == "BEFORE"
+        and trg.get("level", "ROW") == "ROW"
+        and "INSERT" in _trigger_events(trg)
+        and not trg.get("when")
+        and not trg.get("transition_new")
+        and not trg.get("transition_old")
+        and not trg.get("constraint")
+        and not trg.get("args")
+    )
+
+
+def refuse_unfirable_triggers(
+    catalog: Any, db: str, table: str, *events: str, fires_insert: bool = False
+) -> None:
+    """Refuse a write that would have to fire a trigger this server cannot.
+
+    The Rust server stores every kind of trigger in the shared catalog --
+    AFTER, statement-level, UPDATE / DELETE / TRUNCATE, WHEN, transition
+    tables, constraint triggers. This server used to fire only BEFORE INSERT
+    row triggers and SILENTLY skip the rest, so a write here bypassed an
+    audit trigger or an invariant the Rust server enforces. A faithful
+    ``0A000`` is the honest answer: the write does not happen."""
+    if catalog is None:
+        return
+    for trg in catalog.triggers_for_table(db, table):
+        fired = [e for e in _trigger_events(trg) if e in events]
+        if not fired:
+            continue
+        # Only a path that FIRES the supported shape (a plain INSERT) may
+        # pass it; every other path runs no trigger at all.
+        if fires_insert and events == ("INSERT",) and _firable_here(trg):
+            continue
+        timing = trg.get("timing", "BEFORE")
+        level = trg.get("level", "ROW")
+        raise errors.feature_not_supported(
+            f'trigger "{trg.get("name")}" on table "{table}" '
+            f"({timing} {' OR '.join(_trigger_events(trg))} FOR EACH {level}) "
+            "cannot run on this server"
+        )
+
+
 def _fire_before_insert_triggers(
     plan: Any, storage: Any, db: str, catalog: Any, session: Any
 ) -> list[dict[str, Any]]:
@@ -1223,11 +1280,8 @@ def _fire_before_insert_triggers(
     record is written back through each column's storage field."""
     if catalog is None or getattr(plan.table, "reflected", False):
         return plan.docs
-    triggers = [
-        t
-        for t in catalog.triggers_for_table(db, plan.table.name)
-        if t.get("timing") == "BEFORE" and t.get("event") == "INSERT"
-    ]
+    refuse_unfirable_triggers(catalog, db, plan.table.name, "INSERT", fires_insert=True)
+    triggers = [t for t in catalog.triggers_for_table(db, plan.table.name) if _firable_here(t)]
     if not triggers:
         return plan.docs
     from secantus.paths import set_path
@@ -1826,6 +1880,10 @@ def _execute_insert_on_conflict(
     rows inserted *or* updated (matching Postgres); skipped rows don't count.
     ``RETURNING`` projects the inserted and updated rows, not the skipped ones."""
     from secantus.sql import scalar
+
+    # No trigger runs on this path, so any INSERT / UPDATE trigger refuses it.
+    if not getattr(plan.table, "reflected", False):
+        refuse_unfirable_triggers(catalog, db, plan.table.name, "INSERT", "UPDATE")
 
     oc = plan.on_conflict
     coll = plan.table.collection
@@ -2863,6 +2921,8 @@ def execute_evaluated_select(
 def execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
+    if not getattr(plan.table, "reflected", False):
+        refuse_unfirable_triggers(catalog, db, plan.table.name, "UPDATE")
     # A SUBSCRIPTED assignment reads the row's old array, so it needs the
     # materialized path exactly as a computed RHS does.
     if (
@@ -3366,6 +3426,8 @@ def _enforce_fk_on_parent_update(
 def execute_delete(
     plan: planner.DeletePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
+    if not getattr(plan.table, "reflected", False):
+        refuse_unfirable_triggers(catalog, db, plan.table.name, "DELETE")
     coll = plan.table.collection
     # RETURNING yields the deleted rows, so snapshot them before the delete. FK
     # enforcement also needs the victims, so read them whenever either applies.
