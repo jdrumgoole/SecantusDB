@@ -140,6 +140,61 @@ impl<'p> Scope<'p> {
                     None => self.complete = false,
                 }
             }
+            // A function in FROM: typed by planning `SELECT * FROM f(...)`,
+            // its columns named by the alias list, or -- a one-column
+            // function -- by the bare alias.
+            Some(N::RangeFunction(rf)) if !rf.lateral => {
+                let alias = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .or_else(|| crate::joins::range_function_name(rf));
+                let mut bare = rf.clone();
+                bare.alias = None;
+                let probe = pg_query::protobuf::SelectStmt {
+                    target_list: vec![pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            val: Some(Box::new(crate::star_target_node())),
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    }],
+                    from_clause: vec![pg_query::protobuf::Node {
+                        node: Some(N::RangeFunction(bare)),
+                    }],
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                let def = crate::plan_select(&probe, lookup, &[])
+                    .and_then(|p| crate::sub_plan_def(&p, lookup));
+                match (alias, def) {
+                    (Some(alias), Ok(mut def)) => {
+                        let names: Vec<String> = rf
+                            .alias
+                            .as_ref()
+                            .map(|a| {
+                                a.colnames
+                                    .iter()
+                                    .filter_map(|n| match n.node.as_ref() {
+                                        Some(N::String(s)) => Some(s.sval.clone()),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if names.is_empty() && def.columns.len() == 1 {
+                            def.columns[0].name = alias.clone();
+                        }
+                        for (c, n) in def.columns.iter_mut().zip(names) {
+                            c.name = n;
+                        }
+                        self.tables.push((alias, def));
+                    }
+                    _ => self.complete = false,
+                }
+            }
             Some(N::JoinExpr(j)) => {
                 // A USING / NATURAL join merges columns; their types are the
                 // sides' own, which is what an unqualified lookup finds.
@@ -340,6 +395,68 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
                 _ => None,
             }
         }
+        // A window function's result: the ranking functions are bigint (ntile
+        // integer, the distributions float8), the value functions their
+        // argument's type, an aggregate over a window its overload's result.
+        N::FuncCall(f) if f.over.is_some() => {
+            let name = func_name(f)?;
+            match name.as_str() {
+                "row_number" | "rank" | "dense_rank" => Some("int8".into()),
+                "count" => Some("int8".into()),
+                "ntile" => Some("int4".into()),
+                "percent_rank" | "cume_dist" => Some("float8".into()),
+                "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
+                    operand_type(f.args.first()?, scope)
+                }
+                _ => {
+                    let args = f
+                        .args
+                        .iter()
+                        .map(|a| operand_type(a, scope))
+                        .collect::<Option<Vec<_>>>()?;
+                    crate::funcsig::result_type(&name, &args)
+                }
+            }
+        }
+        // A composite column's field, `(c).b`: the field's declared type.
+        N::AIndirection(ind)
+            if matches!(
+                ind.indirection.as_slice(),
+                [one] if matches!(one.node.as_ref(), Some(N::String(_)))
+            ) =>
+        {
+            let Some(N::String(field)) = ind.indirection[0].node.as_ref() else {
+                return None;
+            };
+            let base = match ind.arg.as_deref()?.node.as_ref()? {
+                N::ColumnRef(c) => scope.column_type(c)?,
+                _ => return None,
+            };
+            let (_, fields) = user_composite(&base)?;
+            fields
+                .into_iter()
+                .find(|(n, _)| *n == field.sval)
+                .map(|(_, t)| t)
+        }
+        // An array subscript: the ELEMENT type; a slice keeps the array's.
+        N::AIndirection(ind)
+            if !ind.indirection.is_empty()
+                && ind
+                    .indirection
+                    .iter()
+                    .all(|i| matches!(i.node.as_ref(), Some(N::AIndices(_)))) =>
+        {
+            let base = match ind.arg.as_deref()?.node.as_ref()? {
+                N::ColumnRef(c) => scope.column_type(c)?,
+                _ => return None,
+            };
+            let slice = ind
+                .indirection
+                .iter()
+                .any(|i| matches!(i.node.as_ref(), Some(N::AIndices(x)) if x.is_slice));
+            let element = base.strip_suffix("[]")?.to_string();
+            (!slice).then_some(element)
+        }
         // A built-in's result, as the overload its arguments select returns.
         N::FuncCall(f) if f.over.is_none() && !f.agg_star && f.agg_order.is_empty() => {
             let name = func_name(f)?;
@@ -443,6 +560,62 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
                 _ => {}
             }
+        }
+    }
+    // `boolean` has no arithmetic at all: `integer + boolean` is 42883.
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            // Nor do the string types (`text + integer`, `text + text`).
+            // Judged only between BUILT-IN categories: an extension or user
+            // type can define one (`hstore - text` exists).
+            let string = |t: &str| category(t) == Some("string");
+            let known = category(&l).is_some() && category(&r).is_some();
+            if known && (l == "bool" || r == "bool" || string(&l) || string(&r)) {
+                return Err(mismatch(&op, &l, &r, e.location));
+            }
+        }
+    }
+    // `json` / `jsonb` have no arithmetic: `jsonb + integer` is 42883 where
+    // evaluating it over the value's text answered `text + integer`. The one
+    // operator among them is `jsonb - text | integer | text[]` (delete).
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let json = |t: &str| matches!(t, "json" | "jsonb");
+            let delete = op == "-"
+                && l == "jsonb"
+                && matches!(r.as_str(), "text" | "int4" | "int2" | "int8" | "text[]");
+            // The other side a built-in type: an extension may define one.
+            let known = |t: &str| json(t) || category(t).is_some() || t == "text[]";
+            if (json(&l) || json(&r)) && known(&l) && known(&r) && !delete {
+                return Err(mismatch(&op, &l, &r, e.location));
+            }
+        }
+    }
+    // Two row constructors compare field by field: each pair needs an
+    // operator of its own (`row(id, t) = row(true, 'a')` is integer =
+    // boolean).
+    if kind == Some(K::AexprOp)
+        && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+    {
+        if let (Some(N::RowExpr(l)), Some(N::RowExpr(r))) = (
+            e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            if l.args.len() == r.args.len() {
+                for (a, b) in l.args.iter().zip(&r.args) {
+                    let (Some(at), Some(bt)) = (operand_type(a, scope), operand_type(b, scope))
+                    else {
+                        continue;
+                    };
+                    if matches!((category(&at), category(&bt)), (Some(x), Some(y)) if x != y) {
+                        let op = if op == "!=" { "<>" } else { op.as_str() };
+                        return Err(mismatch(op, &at, &bt, e.location));
+                    }
+                }
+            }
+            return Ok(());
         }
     }
     let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {

@@ -498,6 +498,22 @@ impl CmdStorage for StorageAdapter {
             ExplainPlan::CollScan => {
                 d.insert("kind", "COLLSCAN");
             }
+            ExplainPlan::Or { branches } => {
+                d.insert("kind", "OR");
+                let branches: Vec<Bson> = branches
+                    .into_iter()
+                    .map(|(name, key_pattern)| {
+                        let multikey = self.inner.index_is_multikey(db, coll, &name);
+                        Bson::Document(bson::doc! {
+                            "indexName": name,
+                            "keyPattern": key_pattern,
+                            "multikey": multikey,
+                            "direction": "forward",
+                        })
+                    })
+                    .collect();
+                d.insert("branches", branches);
+            }
             ExplainPlan::IxScan {
                 index_name,
                 key_pattern,

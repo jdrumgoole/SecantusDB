@@ -418,6 +418,7 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
     }
+    let filter = normalize_or(filter);
     // explain + a journaled / majority writeConcern is ill-formed (InvalidOptions).
     for wc in [doc.get("writeConcern"), inner.get("writeConcern")] {
         if let Some(Bson::Document(wc)) = wc {
@@ -462,7 +463,9 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .explain_plan(&ctx.db_name, &coll, &filter, sort, hint)
             .map_err(command_error)?
     };
-    let is_ixscan = plan.get_str("kind").ok() == Some("IXSCAN");
+    let is_or = plan.get_str("kind").ok() == Some("OR");
+    // An OR plan reads its documents through indexes too.
+    let is_ixscan = plan.get_str("kind").ok() == Some("IXSCAN") || is_or;
 
     let (mut n_returned, mut docs_examined, mut keys_examined) = (0i64, 0i64, 0i64);
     if verbosity != "queryPlanner" && !coll.is_empty() {
@@ -489,55 +492,85 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let canonical = secantus_core::canonical_match(&Bson::Document(filter.clone()));
-    let winning_plan = if is_ixscan {
+    // One IXSCAN node, with the index's own flags, in mongod's key order.
+    let ixscan_node =
+        |index_name: &str, key_pattern: &Document, multikey: bool, direction: &str| {
+            let index_spec = if coll.is_empty() {
+                Document::new()
+            } else {
+                storage
+                    .list_indexes(&ctx.db_name, &coll)
+                    .ok()
+                    .and_then(|ixs| {
+                        ixs.into_iter()
+                            .find(|ix| ix.get_str("name").ok() == Some(index_name))
+                    })
+                    .unwrap_or_default()
+            };
+            let mut multikey_paths = Document::new();
+            for field in key_pattern.keys() {
+                multikey_paths.insert(
+                    field.clone(),
+                    Bson::Array(if multikey {
+                        vec![Bson::String(field.clone())]
+                    } else {
+                        vec![]
+                    }),
+                );
+            }
+            doc! {
+                "stage": "IXSCAN",
+                "keyPattern": key_pattern.clone(),
+                "indexName": index_name,
+                "isMultiKey": multikey,
+                "multiKeyPaths": multikey_paths,
+                "isUnique": index_spec.get_bool("unique").unwrap_or(false),
+                "isSparse": index_spec.get_bool("sparse").unwrap_or(false),
+                "isPartial": index_spec.contains_key("partialFilterExpression"),
+                "indexVersion": index_spec.get_i32("v").unwrap_or(2),
+                "direction": direction,
+            }
+        };
+    let winning_plan = if is_or {
+        // mongod's OR plan: an IXSCAN per branch under OR, under a FETCH
+        // carrying whatever the filter says beside the `$or`.
+        let inputs: Vec<Bson> = plan
+            .get_array("branches")
+            .map(|bs| {
+                bs.iter()
+                    .filter_map(Bson::as_document)
+                    .map(|b| {
+                        Bson::Document(ixscan_node(
+                            b.get_str("indexName").unwrap_or(""),
+                            &b.get_document("keyPattern").cloned().unwrap_or_default(),
+                            b.get_bool("multikey").unwrap_or(false),
+                            b.get_str("direction").unwrap_or("forward"),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut rest = filter.clone();
+        rest.remove("$or");
+        let mut fetch = doc! { "stage": "FETCH" };
+        if !rest.is_empty() {
+            fetch.insert(
+                "filter",
+                Bson::Document(secantus_core::canonical_match(&Bson::Document(rest))),
+            );
+        }
+        fetch.insert("inputStage", doc! { "stage": "OR", "inputStages": inputs });
+        fetch
+    } else if is_ixscan {
         let index_name = plan.get_str("indexName").unwrap_or("").to_string();
         let key_pattern = plan.get_document("keyPattern").cloned().unwrap_or_default();
         let multikey = plan.get_bool("multikey").unwrap_or(false);
-        // The index's own options, for the flags mongod reports on every
-        // IXSCAN. An index we cannot find reports the defaults rather than
-        // omitting the keys -- a client testing for `isUnique` finds it either
-        // way, which is what mongod does.
-        let index_spec = if coll.is_empty() {
-            Document::new()
-        } else {
-            storage
-                .list_indexes(&ctx.db_name, &coll)
-                .ok()
-                .and_then(|ixs| {
-                    ixs.into_iter()
-                        .find(|ix| ix.get_str("name").ok() == Some(index_name.as_str()))
-                })
-                .unwrap_or_default()
-        };
-        // mongod's IXSCAN key ORDER, verbatim -- drivers and Compass read the
-        // node positionally in places, so a reordered document is a needless
-        // difference. `multiKeyPaths` names, per indexed field, the array paths
-        // that made the index multikey; we do not track WHICH path did, so a
-        // non-multikey index reports the empty list mongod reports and a
-        // multikey one reports the field itself.
-        let mut multikey_paths = Document::new();
-        for field in key_pattern.keys() {
-            multikey_paths.insert(
-                field.clone(),
-                Bson::Array(if multikey {
-                    vec![Bson::String(field.clone())]
-                } else {
-                    vec![]
-                }),
-            );
-        }
-        let input_stage = doc! {
-            "stage": "IXSCAN",
-            "keyPattern": key_pattern.clone(),
-            "indexName": index_name.as_str(),
-            "isMultiKey": multikey,
-            "multiKeyPaths": multikey_paths,
-            "isUnique": index_spec.get_bool("unique").unwrap_or(false),
-            "isSparse": index_spec.get_bool("sparse").unwrap_or(false),
-            "isPartial": index_spec.contains_key("partialFilterExpression"),
-            "indexVersion": index_spec.get_i32("v").unwrap_or(2),
-            "direction": plan.get_str("direction").unwrap_or("forward"),
-        };
+        let input_stage = ixscan_node(
+            &index_name,
+            &key_pattern,
+            multikey,
+            plan.get_str("direction").unwrap_or("forward"),
+        );
         // The FETCH stage carries only the RESIDUAL filter -- the predicate the
         // index bounds did not already satisfy -- and mongod OMITS the key
         // entirely when the bounds cover the whole filter. That is how a reader
@@ -597,6 +630,17 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             as_i64(inner.get("skip")),
             as_i64(inner.get("limit")),
         )
+    } else {
+        winning_plan
+    };
+    // A filter that is ONLY an `$or` of two or more branches is planned per
+    // branch: mongod wraps the whole tree in SUBPLAN, whatever is under it --
+    // an index union or a collection scan (measured on 8.2.11, sort and
+    // projection inside). A one-branch `$or` is its branch, and a filter with
+    // anything beside the `$or` gets no SUBPLAN.
+    let only_or = filter.len() == 1 && filter.get_array("$or").is_ok_and(|a| a.len() >= 2);
+    let winning_plan = if only_or {
+        doc! { "stage": "SUBPLAN", "inputStage": winning_plan }
     } else {
         winning_plan
     };
@@ -2164,6 +2208,48 @@ pub fn search_index_not_supported(_doc: &Document, _ctx: &mut CommandContext) ->
         crate::aggregate::SEARCH_INDEX_ATLAS_MSG,
     )
     .into_reply())
+}
+
+/// mongod's normalisation of a filter that is ONLY an `$or`, before planning
+/// (measured on 8.2.11): a one-branch `$or` is its branch, and an `$or` of
+/// plain equalities on ONE field is that field's `$in` -- so neither gets the
+/// OR plan's SUBPLAN.
+fn normalize_or(filter: Document) -> Document {
+    let Some(Bson::Array(arms)) = filter.get("$or").filter(|_| filter.len() == 1) else {
+        return filter;
+    };
+    if let [Bson::Document(only)] = arms.as_slice() {
+        return only.clone();
+    }
+    let mut field: Option<&str> = None;
+    let mut values = Vec::new();
+    for arm in arms {
+        let Bson::Document(d) = arm else {
+            return filter.clone();
+        };
+        let [(k, v)] = d.iter().collect::<Vec<_>>()[..] else {
+            return filter.clone();
+        };
+        if k.starts_with('$') || field.is_some_and(|f| f != k) {
+            return filter.clone();
+        }
+        let value = match v {
+            Bson::Document(op) if op.keys().any(|key| key.starts_with('$')) => {
+                match (op.len(), op.get("$eq")) {
+                    (1, Some(eq)) => eq.clone(),
+                    _ => return filter.clone(),
+                }
+            }
+            Bson::RegularExpression(_) | Bson::Array(_) => return filter.clone(),
+            other => other.clone(),
+        };
+        field = Some(k);
+        values.push(value);
+    }
+    match field {
+        Some(f) => doc! { f: { "$in": values } },
+        None => filter.clone(),
+    }
 }
 
 #[cfg(test)]

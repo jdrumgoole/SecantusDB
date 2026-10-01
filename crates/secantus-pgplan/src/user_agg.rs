@@ -120,7 +120,11 @@ pub fn result_type(agg: &UserAggregate, source: Option<&str>) -> String {
     match &agg.finalfunc {
         Some(f) => match user_fn(f, std::slice::from_ref(&state)) {
             Some(u) => resolve_polymorphic(&u.return_type, Some(&state)),
-            None => builtin_result_type(f).unwrap_or(state),
+            // PostgreSQL's own signature first: the static table answers
+            // text for a name it does not know (`int4abs`).
+            None => crate::funcsig::result_type(f, std::slice::from_ref(&state))
+                .or_else(|| builtin_result_type(f))
+                .unwrap_or(state),
         },
         None => state,
     }
@@ -184,8 +188,20 @@ fn builtin(name: &str) -> Option<Builtin> {
         "booland_statefunc" => Some(Builtin::And),
         "boolor_statefunc" => Some(Builtin::Or),
         n if crate::scalar::is_scalar(n) => Some(Builtin::Scalar),
+        // A C function's own name (`int4abs`): the SQL built-in over it.
+        n if internal_alias(n).is_some() => Some(Builtin::Scalar),
         _ => None,
     }
+}
+
+/// The SQL-callable built-in behind a C function's name (`int4abs` is
+/// `abs`), when there is one.
+fn internal_alias(name: &str) -> Option<String> {
+    let sql = crate::user_ops::internal_call_sql(name, 1)
+        .or_else(|| crate::user_ops::internal_call_sql(name, 2))?;
+    let body = sql.strip_prefix("SELECT ")?;
+    let (callee, _) = body.split_once('(')?;
+    crate::scalar::is_scalar(callee).then(|| callee.to_string())
 }
 
 fn builtin_result_type(name: &str) -> Option<String> {
@@ -249,6 +265,7 @@ fn call_builtin(name: &str, b: Builtin, args: &[Bson]) -> Result<Bson> {
             })
         }
         Builtin::Scalar => crate::scalar::call(name, args)
+            .or_else(|| internal_alias(name).and_then(|alias| crate::scalar::call(&alias, args)))
             .unwrap_or_else(|| Err(Error::Unsupported(format!("the function {name}")))),
     }
 }
@@ -288,14 +305,18 @@ fn callee(name: &str, arg_types: &[String]) -> Result<Callee> {
     if let Some(b) = builtin(name) {
         return Ok(Callee::Builtin(name.to_string(), b));
     }
-    Err(Error::UndefinedFunction(format!(
-        "function {name}({}) does not exist",
-        arg_types
-            .iter()
-            .map(|t| crate::display_type(t))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
+    // `DefineAggregate`'s lookup error carries no HINT.
+    Err(Error::Sqlstate(
+        "42883",
+        format!(
+            "function {name}({}) does not exist",
+            arg_types
+                .iter()
+                .map(|t| crate::display_type(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
 }
 
 /// The argument types of a built-in operator function, read off its name as
@@ -348,6 +369,27 @@ fn builtin_signature(name: &str) -> Option<Vec<&'static str>> {
 /// 42883 when a built-in state or final function does not take these
 /// argument types (`int4pl(integer, text)`), as `DefineAggregate` finds.
 fn check_builtin_signature(name: &str, arg_types: &[String]) -> Result<()> {
+    let missing = || {
+        Error::Sqlstate(
+            "42883",
+            format!(
+                "function {name}({}) does not exist",
+                arg_types
+                    .iter()
+                    .map(|t| crate::display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    };
+    // PostgreSQL 15's own signatures first: every built-in is checked.
+    if !crate::correlated::user_function_named(name) {
+        match crate::funcsig::resolves(name, arg_types) {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(missing()),
+            None => {}
+        }
+    }
     let Some(want) = builtin_signature(name) else {
         return Ok(());
     };
@@ -361,14 +403,7 @@ fn check_builtin_signature(name: &str, arg_types: &[String]) -> Result<()> {
     if want.len() == arg_types.len() && want.iter().zip(arg_types).all(|(w, a)| same(w, a)) {
         return Ok(());
     }
-    Err(Error::UndefinedFunction(format!(
-        "function {name}({}) does not exist",
-        arg_types
-            .iter()
-            .map(|t| crate::display_type(t))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
+    Err(missing())
 }
 
 /// Check a definition the way `DefineAggregate` does, before it is stored:
@@ -394,7 +429,11 @@ pub fn validate(agg: &UserAggregate) -> Result<()> {
     if let Some(f) = &agg.finalfunc {
         check_builtin_signature(f, std::slice::from_ref(&agg.stype))?;
         match callee(f, std::slice::from_ref(&agg.stype))? {
-            Callee::Builtin(_, Builtin::Scalar) if builtin_result_type(f).is_none() => {
+            Callee::Builtin(_, Builtin::Scalar)
+                if builtin_result_type(f).is_none()
+                    && crate::funcsig::result_type(f, std::slice::from_ref(&agg.stype))
+                        .is_none() =>
+            {
                 return Err(Error::Unsupported(format!(
                     "the built-in final function {f}"
                 )))

@@ -511,6 +511,16 @@ fn expand_in_select(
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_default();
                 let cols = match rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                    // A VALUES list's columns are `column1..N`; it has no
+                    // select list to read them from.
+                    Some(N::SelectStmt(sub)) if !sub.values_lists.is_empty() => {
+                        match sub.values_lists.first().and_then(|r| r.node.as_ref()) {
+                            Some(N::List(l)) => Some(
+                                (1..=l.items.len()).map(|i| format!("column{i}")).collect(),
+                            ),
+                            _ => None,
+                        }
+                    }
                     Some(N::SelectStmt(sub)) if !sub.target_list.iter().any(|t| {
                         matches!(t.node.as_ref(), Some(N::ResTarget(rt))
                             if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(N::ColumnRef(c)) if is_star(c)))

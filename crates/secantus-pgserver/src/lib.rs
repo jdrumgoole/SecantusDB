@@ -20,6 +20,7 @@ mod do_block;
 mod encoding;
 mod event_triggers;
 mod explain;
+mod expr_index;
 mod fdw;
 mod merge;
 mod partition;
@@ -719,6 +720,39 @@ struct PlHost<'a> {
 }
 
 impl PlHost<'_> {
+    /// Run `f` inside the session's open transaction. A statement's own
+    /// scope already is; a DO block, or a CALL that may COMMIT, runs its
+    /// statements here one at a time, so each joins it -- otherwise each
+    /// wrote on its own and a later error left the earlier writes committed.
+    fn joined<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, plpgsql_fn::PlError>,
+    ) -> Result<T, plpgsql_fn::PlError> {
+        if self.h.storage.in_user_txn() {
+            return f();
+        }
+        self.h
+            .in_open_transaction(|| Ok(f()))
+            .map_err(|e| pl_error(&e))?
+    }
+
+    /// Run `f` as an ATOMIC context: a function it calls cannot COMMIT.
+    fn atomic<T>(&self, f: impl FnOnce() -> T) -> T {
+        let prev = self
+            .h
+            .txn_control
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let out = f();
+        self.h
+            .txn_control
+            .store(prev, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    fn subtxn_name(token: u64) -> String {
+        format!("\u{1}plpgsql subtransaction {token}")
+    }
+
     fn plan(
         &self,
         sql: &str,
@@ -743,6 +777,36 @@ impl PlHost<'_> {
         })
         .map_err(|e| pl_error(&PgHandler::err(&e)))
     }
+}
+
+/// The command tag of a transaction-control statement (`COMMIT`,
+/// `SAVEPOINT`, ...), `None` for any other statement.
+fn transaction_statement_tag(sql: &str) -> Option<&'static str> {
+    use pg_query::protobuf::node::Node as N;
+    use pg_query::protobuf::TransactionStmtKind as K;
+    let parsed = pg_query::parse(sql).ok()?;
+    let Some(N::TransactionStmt(t)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return None;
+    };
+    Some(match K::try_from(t.kind).ok()? {
+        K::TransStmtBegin => "BEGIN",
+        K::TransStmtStart => "START TRANSACTION",
+        K::TransStmtCommit => "COMMIT",
+        K::TransStmtRollback => "ROLLBACK",
+        K::TransStmtSavepoint => "SAVEPOINT",
+        K::TransStmtRelease => "RELEASE",
+        K::TransStmtRollbackTo => "ROLLBACK",
+        K::TransStmtPrepare => "PREPARE TRANSACTION",
+        K::TransStmtCommitPrepared => "COMMIT PREPARED",
+        K::TransStmtRollbackPrepared => "ROLLBACK PREPARED",
+        _ => return None,
+    })
 }
 
 /// The interpreter's error as a wire error.
@@ -773,8 +837,12 @@ impl plpgsql_fn::Host for PlHost<'_> {
         params: &[Bson],
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
-        let stmt = self.plan(sql, params, types)?;
-        let (schema, rows) = self.h.rows_with_schema(&stmt).map_err(|e| pl_error(&e))?;
+        let (schema, rows) = self.joined(|| {
+            self.atomic(|| {
+                let stmt = self.plan(sql, params, types)?;
+                self.h.rows_with_schema(&stmt).map_err(|e| pl_error(&e))
+            })
+        })?;
         let columns = schema
             .iter()
             .map(|f| {
@@ -797,10 +865,24 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<u64, plpgsql_fn::PlError> {
         let stmt = self.plan(sql, params, types)?;
-        let responses = self
-            .h
-            .execute_statement(stmt, 0)
-            .map_err(|e| pl_error(&e))?;
+        // A nested CALL keeps the non-atomic context, and its statements
+        // join the transaction themselves (holding the guard across it would
+        // deadlock its COMMIT). Everything else is atomic and joins here,
+        // captured first for any subtransaction open around it.
+        let responses = if matches!(stmt, Statement::Call { .. }) {
+            self.h
+                .execute_statement(stmt, 0)
+                .map_err(|e| pl_error(&e))?
+        } else {
+            self.joined(|| {
+                self.atomic(|| {
+                    self.h
+                        .capture_for_savepoints(&stmt)
+                        .and_then(|()| self.h.execute_statement(stmt, 0))
+                        .map_err(|e| pl_error(&e))
+                })
+            })?
+        };
         Ok(responses
             .iter()
             .filter_map(|r| match r {
@@ -817,11 +899,93 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         let stmt = self.plan(sql, params, types)?;
-        let (columns, rows) = self
-            .h
-            .dml_returning_values(stmt)
-            .map_err(|e| pl_error(&e))?;
+        let (columns, rows) = self.joined(|| {
+            self.atomic(|| {
+                self.h
+                    .capture_for_savepoints(&stmt)
+                    .and_then(|()| self.h.dml_returning_values(stmt))
+                    .map_err(|e| pl_error(&e))
+            })
+        })?;
         Ok(plpgsql_fn::QueryOut { columns, rows })
+    }
+
+    fn call(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<(Vec<(usize, String)>, Vec<Bson>), plpgsql_fn::PlError> {
+        let Statement::Call {
+            name,
+            args,
+            arg_types,
+            ..
+        } = self.plan(sql, params, types)?
+        else {
+            return Err(plpgsql_fn::PlError::new("XX000", "not a CALL"));
+        };
+        // A PL/pgSQL procedure keeps the non-atomic context and joins the
+        // transaction statement by statement; a SQL one runs as one atomic
+        // statement.
+        let run = || {
+            self.h
+                .run_procedure(&name, args, arg_types)
+                .map_err(|e| pl_error(&e))
+        };
+        let (outputs, names, _, row) = if self.h.plpgsql_procedure(&name) {
+            run()?
+        } else {
+            self.joined(|| self.atomic(run))?
+        };
+        let outputs = outputs
+            .into_iter()
+            .map(|i| (i, names.get(i).cloned().unwrap_or_default()))
+            .collect();
+        Ok((
+            outputs,
+            row.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect(),
+        ))
+    }
+
+    fn subtxn_begin(&self) -> Result<u64, plpgsql_fn::PlError> {
+        let token = self
+            .h
+            .subtxn_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.h
+            .savepoint_op(&TransactionControl::Savepoint(Self::subtxn_name(token)))
+            .map_err(|e| pl_error(&e))?;
+        Ok(token)
+    }
+
+    fn subtxn_end(&self, token: u64, rollback: bool) -> Result<(), plpgsql_fn::PlError> {
+        let name = Self::subtxn_name(token);
+        if rollback {
+            self.h
+                .savepoint_op(&TransactionControl::RollbackTo(name.clone()))
+                .map_err(|e| pl_error(&e))?;
+        }
+        self.h
+            .savepoint_op(&TransactionControl::Release(name))
+            .map_err(|e| pl_error(&e))?;
+        Ok(())
+    }
+
+    fn end_transaction(&self, commit: bool, chain: bool) -> Result<(), plpgsql_fn::PlError> {
+        if !self
+            .h
+            .txn_control
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(plpgsql_fn::PlError::new(
+                "2D000",
+                "invalid transaction termination",
+            ));
+        }
+        self.h
+            .restart_transaction(commit, chain)
+            .map_err(|e| pl_error(&e))
     }
 
     fn notice(&self, severity: &str, sqlstate: &str, message: String) {
@@ -855,6 +1019,16 @@ fn bson_i64(v: &Bson) -> Option<i64> {
 /// `bool` must not meet a number.
 fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
     let Some(b) = v else { return None };
+    // PostgreSQL's equality puts every NaN in one group and `-0` with `0`;
+    // Rust's `==` would make each NaN its own (`NaN != NaN`).
+    if let Bson::Double(d) = b {
+        if d.is_nan() {
+            return Some(Bson::Document(bson::doc! { "__nan": true }));
+        }
+        if *d == 0.0 {
+            return Some(Bson::Double(0.0));
+        }
+    }
     if secantus_pgplan::numeric::is_numeric(b) {
         if let Some(text) = secantus_pgplan::numeric::numeric_text(b) {
             return Some(Bson::String(secantus_pgplan::numeric::numeric_sort_key(
@@ -1915,6 +2089,16 @@ pub struct PgHandler {
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
+    /// A `CALL` / `DO` is running that may end the session's transaction
+    /// (`COMMIT` / `ROLLBACK` in its body): it was run outside a block, and
+    /// no function or other statement stands between it and the body.
+    txn_control: AtomicBool,
+    /// The statement `run_batch` is running is the ONLY one of a simple
+    /// query outside a block -- PostgreSQL's non-atomic context. A
+    /// multi-statement query string is an implicit block.
+    sole_implicit: AtomicBool,
+    /// Names the savepoints a PL/pgSQL block with EXCEPTION handlers opens.
+    subtxn_seq: std::sync::atomic::AtomicU64,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -2150,6 +2334,9 @@ impl PgHandler {
             pending_listens: Mutex::new(Vec::new()),
             touched_temp: AtomicBool::new(false),
             holdable_declared: AtomicBool::new(false),
+            txn_control: AtomicBool::new(false),
+            sole_implicit: AtomicBool::new(false),
+            subtxn_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -3268,6 +3455,9 @@ impl PgHandler {
         max_rows: usize,
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
         let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(&agg.filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let docs: Vec<Document> = match &agg.series {
             Some(series) => series
                 .values()
@@ -4062,6 +4252,9 @@ impl PgHandler {
             return Ok(docs);
         }
         let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         Ok(docs
             .into_iter()
             .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
@@ -5956,6 +6149,7 @@ impl PgHandler {
                         returns_set: u.returns_set,
                         out_params: &u.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                         procedure: false,
+                        nonatomic: false,
                     },
                     &host,
                 )
@@ -6006,6 +6200,17 @@ impl PgHandler {
                 e.to_string(),
             )))
         })?;
+        // Transaction control is refused before any statement runs
+        // (PostgreSQL checks the body at the function's startup).
+        for stmt in &statements {
+            if let Some(tag) = transaction_statement_tag(stmt) {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0A000".into(),
+                    format!("{tag} is not allowed in an SQL function"),
+                ))));
+            }
+        }
         let host = PlHost { h: self };
         let mut last: Option<plpgsql_fn::QueryOut> = None;
         for (i, stmt) in statements.iter().enumerate() {
@@ -6325,6 +6530,7 @@ impl PgHandler {
     /// result rather than failing, so a caller that drops the result drops the
     /// row with it -- which is how a table rewrite once lost rows silently.
     fn insert_checked(&self, coll: &str, docs: Vec<Vec<u8>>, context: &str) -> PgWireResult<usize> {
+        let docs = self.with_expr_fields(coll, docs)?;
         let (n, errors) = self
             .storage
             .insert(self.db(), coll, docs, true)
@@ -6910,6 +7116,8 @@ impl PgHandler {
         self.storage
             .create_index(self.db(), &def.name, name, &key_spec, &options)
             .map_err(|e| Self::storage_err("could not create the index", e))?;
+        // The existing rows take their computed key.
+        self.refresh_expr_fields(&def.name, &Document::new())?;
         Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))])
     }
 
@@ -7182,62 +7390,17 @@ impl PgHandler {
             .collect())
     }
 
-    /// Enforce every UNIQUE expression index on the rows about to be written:
-    /// against each other, and against the stored rows other than `replacing`
-    /// (an UPDATE's own old versions).
+    /// Enforce the UNIQUE constraints the storage indexes cannot: those over
+    /// a nondeterministic collation. A UNIQUE EXPRESSION index is enforced by
+    /// its storage index on the computed field (`expr_index`) -- this used to
+    /// re-evaluate the expression over every stored row on every write.
     fn check_expression_unique(
         &self,
         def: &TableDef,
         rows: &[Document],
         replacing: &[Bson],
     ) -> PgWireResult<()> {
-        self.check_collated_unique(def, rows, replacing)?;
-        let indexes = self.unique_expression_indexes(&def.name)?;
-        if indexes.is_empty() {
-            return Ok(());
-        }
-        let stored: Vec<Document> = self
-            .storage
-            .find_matching(self.db(), &def.name, &Document::new())
-            .map_err(|e| Self::storage_err("could not read", e))?
-            .into_iter()
-            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
-            .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
-            .collect();
-        for ix in &indexes {
-            let name = ix.get_str("name").unwrap_or_default();
-            let keys: Vec<String> = ix
-                .get_array("sqlKeys")
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Bson::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut taken: Vec<Vec<Bson>> = Vec::new();
-            for row in &stored {
-                if let Some((k, _)) = self.expression_key(def, ix, row)? {
-                    taken.push(k);
-                }
-            }
-            for row in rows {
-                if let Some((k, text)) = self.expression_key(def, ix, row)? {
-                    if taken.contains(&k) {
-                        return Err(Self::constraint_error(
-                            "23505",
-                            format!("duplicate key value violates unique constraint \"{name}\""),
-                            format!("Key ({})=({text}) already exists.", keys.join(", ")),
-                            def,
-                            Some(name),
-                            None,
-                        ));
-                    }
-                    taken.push(k);
-                }
-            }
-        }
-        Ok(())
+        self.check_collated_unique(def, rows, replacing)
     }
 
     /// `CREATE [UNIQUE] INDEX`.
@@ -12610,6 +12773,9 @@ impl PgHandler {
         };
         self.fill_catalog_columns(name, &def, &mut rows);
         let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         Some(
             rows.into_iter()
                 .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
@@ -12810,12 +12976,19 @@ impl PgHandler {
         } else {
             None
         };
+        // An expression target's index: its computed field, and the planned
+        // indexes to compute it with.
+        let expr_arbiter = match self.expression_arbiter(table, oc)? {
+            Some(name) => Some((Self::expression_index_field(&name), self.expr_indexes(def)?)),
+            None => None,
+        };
         for row in rows {
             let bytes =
                 encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
+            let bytes = self.with_expr_fields(table, vec![bytes])?;
             let (n, errors) = self
                 .storage
-                .insert(self.db(), table, vec![bytes], true)
+                .insert(self.db(), table, bytes, true)
                 .map_err(|e| Self::storage_err("could not insert", e))?;
             let Some(err) = errors.first() else {
                 written += n;
@@ -12841,8 +13014,21 @@ impl PgHandler {
             // against the target would raise 23505 for the first case whenever
             // storage reported the other index -- which is what the first
             // version of this did, and what the tests caught.
-            let Some(probe) = Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) else {
-                return Err(Self::write_error(table, def, err));
+            let probe = match &expr_arbiter {
+                // An expression arbiter: the existing row holding the proposed
+                // row's computed key.
+                Some((field, indexes)) => {
+                    let mut filled = row.clone();
+                    Self::fill_expr_fields(indexes, &mut filled)?;
+                    match filled.get(field) {
+                        Some(v) => bson::doc! { field.clone(): v.clone() },
+                        None => return Err(Self::write_error(table, def, err)),
+                    }
+                }
+                None => match Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) {
+                    Some(p) => p,
+                    None => return Err(Self::write_error(table, def, err)),
+                },
             };
             let probe = match &index_filter {
                 Some(Some(partial)) => bson::doc! { "$and": [probe, partial.clone()] },
@@ -12917,6 +13103,13 @@ impl PgHandler {
         let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
             return Err(no_arbiter());
         };
+        // An expression target matches a unique expression index on the same
+        // expressions (compared normalised); its arbiter is the index's
+        // computed field.
+        if let Some(name) = self.expression_arbiter(table, oc)? {
+            let field = Self::expression_index_field(&name);
+            return Ok(Some(bson::doc! { field: { "$exists": true } }));
+        }
         let mut want: Vec<String> = cols.iter().filter_map(|c| def.field_of(c)).collect();
         want.sort();
         for ix in self
@@ -12954,6 +13147,68 @@ impl PgHandler {
             }
         }
         Err(no_arbiter())
+    }
+
+    /// The unique EXPRESSION index an `ON CONFLICT (expr, ...)` target names,
+    /// by name; `None` for a target of plain columns. An expression target no
+    /// index matches is PostgreSQL's 42P10.
+    fn expression_arbiter(
+        &self,
+        table: &str,
+        oc: &secantus_pgplan::OnConflict,
+    ) -> PgWireResult<Option<String>> {
+        let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
+            return Ok(None);
+        };
+        let mark = secantus_pgplan::CONFLICT_EXPR_MARK;
+        if !cols.iter().any(|c| c.starts_with(mark)) {
+            return Ok(None);
+        }
+        let normalize = |e: &str| secantus_pgplan::normalized_expression(e).unwrap_or_default();
+        let mut want: Vec<String> = cols
+            .iter()
+            .map(|c| match c.strip_prefix(mark) {
+                Some(e) => normalize(e),
+                None => normalize(c),
+            })
+            .collect();
+        want.sort();
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let options = ix.get_document("options").ok();
+            let unique = ix.get_bool("unique").unwrap_or(false)
+                || options.is_some_and(|o| o.get_bool("unique").unwrap_or(false));
+            let Some((exprs, _)) = Self::index_expressions(&ix) else {
+                continue;
+            };
+            if !unique {
+                continue;
+            }
+            let mut have: Vec<String> = exprs.iter().map(|e| normalize(e)).collect();
+            have.sort();
+            if have != want {
+                continue;
+            }
+            let predicate = ix
+                .get_str("sqlPredicate")
+                .ok()
+                .or_else(|| options.and_then(|o| o.get_str("sqlPredicate").ok()));
+            let usable = match (predicate, &oc.where_sql) {
+                (None, _) => true,
+                (Some(p), Some(w)) => secantus_pgplan::predicate_implied(w, p),
+                (Some(_), None) => false,
+            };
+            if usable {
+                return Ok(ix.get_str("name").ok().map(str::to_string));
+            }
+        }
+        Err(Self::err(&PlanError::NoArbiter(
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+                .to_string(),
+        )))
     }
 
     /// The filter identifying the row the clause arbitrates on.
@@ -13131,6 +13386,46 @@ impl PgHandler {
         key_value: &Document,
         index: Option<&str>,
     ) -> PgWireError {
+        // An expression index's hidden field: its index name and key SQL,
+        // with the computed value (`Key (lower(t))=(x) already exists.`).
+        if let [field] = key_pattern.keys().collect::<Vec<_>>().as_slice() {
+            if let Some((name, keys)) = expr_index::field_index(field) {
+                let shown = match key_value.get(field.as_str()) {
+                    Some(Bson::Document(d)) => d
+                        .values()
+                        .map(secantus_pgplan::value_text)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Some(v) => secantus_pgplan::value_text(v),
+                    None => String::new(),
+                };
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "23505".into(),
+                    format!("duplicate key value violates unique constraint \"{name}\""),
+                );
+                // The key SQL is `pg_get_indexdef`'s, which wraps a bare
+                // expression in a second pair of parentheses; the error's
+                // key list shows it with one (`Key ((a + b))=...`).
+                let keys: Vec<&str> = keys
+                    .iter()
+                    .map(|k| {
+                        k.strip_prefix('(')
+                            .and_then(|k| k.strip_suffix(')'))
+                            .filter(|inner| inner.starts_with('(') && inner.ends_with(')'))
+                            .unwrap_or(k)
+                    })
+                    .collect();
+                info.detail = Some(format!(
+                    "Key ({})=({shown}) already exists.",
+                    keys.join(", ")
+                ));
+                info.schema = Some(Self::schema_of(def));
+                info.table = Some(table.to_string());
+                info.constraint = Some(name);
+                return PgWireError::UserError(Box::new(info));
+            }
+        }
         // A COMPOSITE key collides on the whole `_id` subdocument: report its
         // columns and their values, not `_id`.
         let composite: Vec<&Column> = def
@@ -14368,7 +14663,14 @@ impl PgHandler {
                     cursor += at + sql.len();
                     whole[..cursor - sql.len()].chars().count()
                 });
-            match self.run(sql, &[], 0).await {
+            self.sole_implicit.store(
+                implicit && stmts.len() == 1,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let ran = self.run(sql, &[], 0).await;
+            self.sole_implicit
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            match ran {
                 Ok(responses) => {
                     // A BEGIN inside the batch makes the implicit transaction
                     // the BLOCK: it stays open past the batch's end, and so
@@ -16258,8 +16560,41 @@ impl PgHandler {
             self.call_user_function(u, args)
                 .map_err(Self::to_plan_error)
         };
+        // A table's expression indexes the planner may read a WHERE through:
+        // one expression, no predicate. Listed once per table per statement.
+        let memo: std::cell::RefCell<HashMap<String, Vec<(String, String)>>> =
+            std::cell::RefCell::new(HashMap::new());
+        let expr_indexes = |table: &str| -> Vec<(String, String)> {
+            if let Some(found) = memo.borrow().get(table) {
+                return found.clone();
+            }
+            let found: Vec<(String, String)> = self
+                .storage
+                .list_indexes(self.db(), table)
+                .unwrap_or_default()
+                .iter()
+                .filter(|ix| {
+                    ix.get_str("sqlPredicate").is_err()
+                        && ix
+                            .get_document("options")
+                            .map_or(true, |o| o.get_str("sqlPredicate").is_err())
+                })
+                .filter_map(|ix| {
+                    let (exprs, _) = Self::index_expressions(ix)?;
+                    let [only] = exprs.as_slice() else {
+                        return None;
+                    };
+                    let name = ix.get_str("name").ok()?;
+                    Some((only.clone(), Self::expression_index_field(name)))
+                })
+                .collect();
+            memo.borrow_mut().insert(table.to_string(), found.clone());
+            found
+        };
         secantus_pgplan::with_function_hook(&functions, || {
-            secantus_pgplan::with_sequence_hook(&hook, || self.correlated_scope(f))
+            secantus_pgplan::with_sequence_hook(&hook, || {
+                secantus_pgplan::with_expr_index_hook(&expr_indexes, || self.correlated_scope(f))
+            })
         })
     }
 
@@ -16719,7 +17054,28 @@ impl PgHandler {
             },
             None,
         );
-        result.map_err(|e| Self::positioned(e, query))
+        // An error can also surface while the rows STREAM (a value that
+        // fails to evaluate on some row): it gets the same position.
+        result
+            .map(|responses| {
+                responses
+                    .into_iter()
+                    .map(|r| match r {
+                        Response::Query(mut q) => {
+                            let sql = query.to_string();
+                            let rows = std::mem::replace(
+                                &mut q.data_rows,
+                                Box::pin(futures::stream::empty()),
+                            );
+                            q.data_rows =
+                                Box::pin(rows.map_err(move |e| Self::positioned(e, &sql)));
+                            Response::Query(q)
+                        }
+                        other => other,
+                    })
+                    .collect()
+            })
+            .map_err(|e| Self::positioned(e, query))
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -17066,6 +17422,25 @@ impl PgHandler {
         // (`pg_sleep`, a big scan) would otherwise take the runtime's I/O
         // driver down with it — no other connection is served, and the
         // `CancelRequest` meant to interrupt the statement never arrives.
+        // A CALL of a PL/pgSQL procedure outside a block may COMMIT: it runs
+        // WITHOUT the transaction guard, each of its statements joining the
+        // session's transaction on its own, so a COMMIT between them can end
+        // that transaction and start the next.
+        if let Statement::Call { name, .. } = &stmt {
+            if self.may_end_transaction() && self.plpgsql_procedure(name) {
+                let prev = self
+                    .txn_control
+                    .swap(true, std::sync::atomic::Ordering::Relaxed);
+                let out = tokio::task::block_in_place(|| self.execute(stmt, max_rows));
+                self.txn_control
+                    .store(prev, std::sync::atomic::Ordering::Relaxed);
+                self.collect_planner_warnings();
+                if out.is_err() {
+                    self.note_failure();
+                }
+                return out;
+            }
+        }
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         let out = tokio::task::block_in_place(|| match guard.as_mut() {
             Some(handle) => {
@@ -17623,7 +17998,21 @@ impl PgHandler {
     }
 
     fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
-        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        // Already inside it (a statement's own scope, which holds the
+        // non-reentrant `txn` guard): run there.
+        if self.storage.in_user_txn() {
+            return f();
+        }
+        // The guard is this connection's alone, so a held one means this
+        // thread holds it: a statement `run` is executing with no handle (an
+        // autocommit statement), from inside which this was reached. Waiting
+        // for it would deadlock the connection -- a DO block's REFRESH
+        // MATERIALIZED VIEW did -- and there is no transaction to join.
+        let mut guard = match self.txn.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return f(),
+        };
         match guard.as_mut() {
             Some(handle) => self
                 .storage
@@ -17631,6 +18020,71 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("transaction failed", e))?,
             None => f(),
         }
+    }
+
+    /// Is this CALL / DO in PostgreSQL's non-atomic context -- outside a
+    /// transaction block and alone in its query string (or an extended-
+    /// protocol statement, which is not a block)?
+    fn may_end_transaction(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sole_implicit.load(Relaxed)
+            || (self.implicit_extended.load(Relaxed) && !self.in_transaction.load(Relaxed))
+    }
+
+    /// Every procedure named `name` is PL/pgSQL (the language whose body
+    /// can end a transaction; a SQL-language body runs as one statement).
+    fn plpgsql_procedure(&self, name: &str) -> bool {
+        let Ok(docs) = self.user_function_docs() else {
+            return false;
+        };
+        let mut found = docs
+            .iter()
+            .filter(|d| {
+                d.get_str("name") == Ok(name) && d.get_bool("is_procedure").unwrap_or(false)
+            })
+            .peekable();
+        found.peek().is_some() && found.all(|d| d.get_str("language") == Ok("plpgsql"))
+    }
+
+    /// `COMMIT` / `ROLLBACK` [`AND CHAIN`] from a procedure or DO block: end
+    /// the session's transaction and open the next of the same kind (the
+    /// batch's implicit one, or an extended-protocol group), which whoever
+    /// opened the first then commits or rolls back.
+    fn restart_transaction(&self, commit: bool, chain: bool) -> PgWireResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let block = self.in_transaction.load(Relaxed);
+        let extended = self.implicit_extended.load(Relaxed);
+        // AND CHAIN keeps the transaction's characteristics.
+        let kept: Vec<(String, String)> = if chain {
+            let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            settings
+                .iter()
+                .filter(|(k, _)| k.starts_with("transaction_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if commit {
+            self.commit_implicit()?;
+        } else {
+            self.rollback_implicit()?;
+        }
+        let pid = self.backend_pid.load(Relaxed);
+        advisory::release_xact(pid);
+        table_locks::release(pid);
+        bump_catalog_version();
+        let handle = self.open_transaction_handle()?;
+        *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.in_transaction.store(block, Relaxed);
+        self.implicit_extended.store(extended, Relaxed);
+        if chain {
+            let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, v) in kept {
+                settings.insert(k, v);
+            }
+        }
+        Ok(())
     }
 
     /// `25001` for the statements PostgreSQL refuses inside a block
@@ -17865,6 +18319,12 @@ impl PgHandler {
                 format!("{word} can only be used in transaction blocks"),
             ))));
         }
+        self.savepoint_op(control)
+    }
+
+    /// A savepoint statement, the block check already made; PL/pgSQL's
+    /// EXCEPTION blocks use it for their subtransactions.
+    fn savepoint_op(&self, control: &TransactionControl) -> PgWireResult<Vec<Response>> {
         let name = match control {
             TransactionControl::Savepoint(n)
             | TransactionControl::Release(n)
@@ -18907,6 +19367,9 @@ impl PgHandler {
             (Some(series), _) => {
                 let column = series.column.clone();
                 let empty = Document::new();
+                // Large scalar `$in` / `$nin` lists hashed once for these rows.
+                let in_sets = secantus_core::query::InSets::prepare(&sel.filter);
+                let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
                 let docs = series
                     .values()
                     .into_iter()
@@ -19914,10 +20377,21 @@ impl PgHandler {
         // session state at encode time. `ClientEncoding` is `Copy`.
         let row_cenc = self.client_encoding();
         match stmt {
-            Statement::Transaction(_) => unreachable!("handled before execute"),
+            // Reached only from a statement another runs (a function body's):
+            // the session-level path handles them before `execute`.
+            Statement::Transaction(_) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "transaction commands are not supported here".into(),
+            )))),
             // Handled in `run`, which can await the row stream.
-            Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
-            Statement::Do { .. } => unreachable!("handled before execute"),
+            Statement::DeclareCursor { .. } | Statement::Do { .. } => {
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0A000".into(),
+                    "this statement is not supported inside another".into(),
+                ))))
+            }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
                 if self.lookup(&def.name).is_some()
@@ -20338,6 +20812,7 @@ impl PgHandler {
                         .map(encode_doc)
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| Self::storage_err("could not encode a row", e))?;
+                    let docs = self.with_expr_fields(&ins.table, docs)?;
                     let (written, errors) = self
                         .storage
                         .insert(self.db(), &ins.table, docs, true)
@@ -21990,7 +22465,8 @@ impl PgHandler {
                                 index_name
                             })
                         }
-                        secantus_storage::ExplainPlan::CollScan => None,
+                        secantus_storage::ExplainPlan::CollScan
+                        | secantus_storage::ExplainPlan::Or { .. } => None,
                     }
                 };
                 let mut tree = explain::plan_tree(&inner, &chooser);
@@ -22113,9 +22589,22 @@ impl PgHandler {
                         ));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
+                    // An expression index's computed field goes with it.
+                    let expression = self
+                        .storage
+                        .list_indexes(self.db(), &def.name)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|ix| {
+                            ix.get_str("name") == Ok(name.as_str())
+                                && Self::index_expressions(ix).is_some()
+                        });
                     self.storage
                         .drop_index(self.db(), &def.name, name)
                         .map_err(|e| Self::storage_err("could not drop the index", e))?;
+                    if expression {
+                        self.clear_expr_field(&def.name, &Self::expression_index_field(name))?;
+                    }
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP INDEX"))])
             }
@@ -24198,6 +24687,39 @@ impl PgHandler {
         set: &Document,
         unset: &[String],
     ) -> PgWireResult<usize> {
+        // A table with expression indexes recomputes the updated rows'
+        // index fields: found BEFORE the update, which may move them out of
+        // `filter`.
+        let has_expr = self
+            .lookup(table)
+            .map(|def| self.expr_indexes(&def))
+            .transpose()?
+            .is_some_and(|ix| !ix.is_empty());
+        if !has_expr {
+            return self.update_rows_raw(table, filter, set, unset);
+        }
+        let ids: Vec<Bson> = self
+            .storage
+            .find_matching(self.db(), table, filter)
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .iter()
+            .filter_map(|raw| decode_doc(raw).ok()?.get("_id").cloned())
+            .collect();
+        let matched = self.update_rows_raw(table, filter, set, unset)?;
+        if !ids.is_empty() {
+            self.refresh_expr_fields(table, &bson::doc! { "_id": { "$in": ids } })?;
+        }
+        Ok(matched)
+    }
+
+    /// `update_rows` without the expression index upkeep.
+    pub(crate) fn update_rows_raw(
+        &self,
+        table: &str,
+        filter: &Document,
+        set: &Document,
+        unset: &[String],
+    ) -> PgWireResult<usize> {
         let mut ops = bson::doc! { "$set": set.clone() };
         if !unset.is_empty() {
             let mut u = Document::new();
@@ -24439,9 +24961,10 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("could not update", e))?;
             let bytes =
                 encode_doc(new).map_err(|e| Self::storage_err("could not encode a row", e))?;
+            let bytes = self.with_expr_fields(table, vec![bytes])?;
             let (_, errors) = self
                 .storage
-                .insert(self.db(), table, vec![bytes], true)
+                .insert(self.db(), table, bytes, true)
                 .map_err(|e| Self::storage_err("could not update", e))?;
             if let Some(first) = errors.first() {
                 // A secondary UNIQUE refused the new row: put the old one
@@ -26809,6 +27332,9 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
         None => rows.to_vec(),
         Some(filter) => {
             let empty = Document::new();
+            // Large scalar `$in` / `$nin` lists hashed once for these rows.
+            let in_sets = secantus_core::query::InSets::prepare(filter);
+            let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
             rows.iter()
                 .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
                 .cloned()
@@ -26864,6 +27390,9 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         None => rows,
         Some(filter) => {
             let empty = Document::new();
+            // Large scalar `$in` / `$nin` lists hashed once for these rows.
+            let in_sets = secantus_core::query::InSets::prepare(filter);
+            let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
             filtered = rows
                 .iter()
                 .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
@@ -27222,27 +27751,39 @@ fn materialise_windows(
 
 /// The row indices of each partition, in the rows' original order.
 ///
-/// Grouped by VALUE rather than by a hash of it (`group_key_ident`), because
-/// BSON equality and Rust's `==` disagree about NaN, signed zero and
-/// bool-versus-int, and a partition keyed on the wrong one would split or
-/// merge groups that PostgreSQL keeps together.
+/// Partitions group what PostgreSQL's equality groups: every NaN together
+/// and `-0` with `0` (Rust's `==` splits the first and a byte compare the
+/// second), a numeric by its value (`group_key_ident`). Each row's key is
+/// that canonical form ENCODED, so partitioning is one hash lookup per row
+/// rather than a scan of the partitions seen so far.
 fn window_partitions(docs: &[Document], keys: &[OrderKey]) -> Vec<Vec<usize>> {
     if keys.is_empty() {
         return vec![(0..docs.len()).collect()];
     }
-    let ident = |d: &Document| -> Vec<Option<Bson>> {
-        keys.iter()
-            .map(|k| group_key_ident(&d.get(&k.field).cloned()))
-            .collect()
+    fn canonical(v: Option<Bson>) -> Bson {
+        match v {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(Bson::Double(d)) if d.is_nan() => Bson::Double(f64::NAN),
+            // A float pattern compares by `==`, so `-0.0` matches too.
+            Some(Bson::Double(0.0)) => Bson::Double(0.0),
+            Some(Bson::Int32(i)) => Bson::Int64(i64::from(i)),
+            Some(other) => other,
+        }
+    }
+    let key = |d: &Document| -> Vec<u8> {
+        let values: Vec<Bson> = keys
+            .iter()
+            .map(|k| canonical(group_key_ident(&d.get(&k.field).cloned())))
+            .collect();
+        bson::to_vec(&bson::doc! { "k": values }).unwrap_or_default()
     };
-    let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut out: Vec<Vec<usize>> = Vec::new();
     for (i, d) in docs.iter().enumerate() {
-        let id = ident(d);
-        match seen.iter().position(|s| *s == id) {
-            Some(p) => out[p].push(i),
-            None => {
-                seen.push(id);
+        match index.entry(key(d)) {
+            std::collections::hash_map::Entry::Occupied(e) => out[*e.get()].push(i),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(out.len());
                 out.push(vec![i]);
             }
         }
@@ -30351,6 +30892,7 @@ impl CopyHandler for PgHandler {
                     .map(encode_doc)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
+                let docs = self.with_expr_fields(&table, docs)?;
                 self.storage
                     .insert(self.db(), &table, docs, true)
                     .map_err(|e| Self::storage_err("could not insert COPY rows", e))

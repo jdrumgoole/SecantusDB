@@ -79,7 +79,7 @@ fn plan_dir(p: &ExplainPlan) -> Option<(String, String)> {
             direction,
             ..
         } => Some((index_name.clone(), direction.clone())),
-        ExplainPlan::CollScan => None,
+        ExplainPlan::CollScan | ExplainPlan::Or { .. } => None,
     }
 }
 

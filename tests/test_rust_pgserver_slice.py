@@ -15070,3 +15070,93 @@ def test_column_grants_are_shared_with_the_python_server(home: Path) -> None:
         " where table_name = 'cg_t' and grantee = 'cg_r'",
     )
     assert python_grants == [("cg_r", "SELECT")]
+
+
+def test_procedure_transaction_control_and_do_block_atomicity(home: Path) -> None:
+    """COMMIT / ROLLBACK in a procedure, and a DO block's writes, as on PG 15.
+
+    Three bugs pinned together, each measured against PostgreSQL 15:
+
+    * a DO block the function interpreter runs WROTE EACH STATEMENT ON ITS
+      OWN, so one that raised after inserting left the insert committed;
+    * a BEGIN ... EXCEPTION block did not undo its writes when its handler
+      caught an error (PostgreSQL runs such a block as a subtransaction);
+    * a procedure's COMMIT / ROLLBACK was refused everywhere. It is allowed in
+      a CALL run alone outside a transaction block, and 2D000 inside a block
+      or a multi-statement query string (an implicit block).
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table pt_t (n int)")
+        with pytest.raises(psycopg.errors.RaiseException):
+            c.execute(
+                "do $$ declare x int := 1; begin insert into pt_t values (x);"
+                " raise exception 'boom'; end $$"
+            )
+        assert c.execute("select count(*) from pt_t").fetchone() == (0,)
+        c.execute(
+            "do $$ begin begin insert into pt_t values (1); raise exception 'x';"
+            " exception when others then null; end; insert into pt_t values (2); end $$"
+        )
+        assert c.execute("select n from pt_t").fetchall() == [(2,)]
+        c.execute(
+            "create procedure pt_p() language plpgsql as $$ begin"
+            " insert into pt_t values (10); commit; insert into pt_t values (11);"
+            " rollback; insert into pt_t values (12); end $$"
+        )
+        c.execute("call pt_p()")
+        assert c.execute("select n from pt_t order by 1").fetchall() == [(2,), (10,), (12,)]
+        c.execute("begin")
+        with pytest.raises(psycopg.errors.InvalidTransactionTermination):
+            c.execute("call pt_p()")
+        c.execute("rollback")
+        with pytest.raises(psycopg.errors.InvalidTransactionTermination):
+            c.execute("insert into pt_t values (20); call pt_p()")
+        assert c.execute("select count(*) from pt_t").fetchone() == (3,)
+
+
+@pytest.mark.parametrize(
+    ("sql", "sqlstate", "position"),
+    [
+        # Raised while the rows stream, after planning: still positioned.
+        ("select g + 'a' from generate_series(1, 2) g", "22P02", 12),
+        # A record without that field: PostgreSQL points at the record.
+        ("select (c).b + 1 from (select row(1,'x')::record as c) s", "42703", 9),
+        # Judged statically, so even over no rows.
+        ("select x::int + true from ep_t", "42883", 15),
+        ("select (c).b + 1 from ep_t", "42883", 14),
+    ],
+)
+def test_runtime_and_static_errors_carry_postgres_positions(
+    home: Path, sql: str, sqlstate: str, position: int
+) -> None:
+    """Positions measured on PostgreSQL 15 for the same statements."""
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create type ep_c as (a int, b text)")
+        c.execute("create table ep_t (id int, c ep_c, x text)")
+        with pytest.raises(psycopg.Error) as caught:
+            c.execute(sql)
+        assert caught.value.sqlstate == sqlstate
+        assert caught.value.diag.statement_position == str(position)
+
+
+def test_expression_index_rows_written_elsewhere_are_reindexed_at_open(home: Path) -> None:
+    """A UNIQUE expression index is a storage index on a computed field.
+
+    The Python server knows no expression indexes, so a row it writes carries
+    no computed field. The Rust server recomputes the fields when it opens the
+    store, so the index still sees that row: a case-insensitive duplicate of
+    it is refused (PostgreSQL's 23505), not silently admitted.
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table ex_u (id int primary key, t text)")
+        c.execute("create unique index ex_u_lt on ex_u (lower(t))")
+        c.execute("insert into ex_u values (1, 'Apple')")
+    _python_sql(home, "insert into ex_u (id, t) values (2, 'Pear')")
+    with _Server(home) as server, server.connect() as c:
+        with pytest.raises(psycopg.errors.UniqueViolation) as caught:
+            c.execute("insert into ex_u values (3, 'PEAR')")
+        assert caught.value.diag.message_detail == "Key (lower(t))=(pear) already exists."
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute("insert into ex_u values (4, 'APPLE')")
+        c.execute("insert into ex_u values (5, 'plum')")
+        assert c.execute("select count(*) from ex_u").fetchone() == (3,)
