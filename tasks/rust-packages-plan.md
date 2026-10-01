@@ -134,6 +134,32 @@ and are not the version or patches we run, so we do not depend on them.
 
 ### 5.1 Phase A — build WiredTiger from a crate (the critical path)
 
+**Status (2026-10-01): steps 1, 2, 3, 5 landed; the gate (6) passes on macOS
+arm64 and runs on Linux / Windows in `.github/workflows/wt-sys.yml`; step 4
+(pre-generated bindings) is still open.** Measured, not estimated: the
+`.crate` is 3.2 MB and builds from the tarball in ~26s on an M-series Mac;
+`secantus-storage`'s 290 tests pass over it (`--features secantus-wt/bundled`),
+and the test binary links only system libraries (`otool -L`). What the spike
+found that the plan above did not say:
+
+- The non-Python build needs only two of the five patch scripts (`strict`,
+  `musl`), plus two crate-only trims done by `scripts/wt_sys_refresh.py`: the
+  bench / example / test / utility `add_subdirectory` lines, and
+  `cmake/configs/base.cmake`'s **unconditional, REQUIRED** Python-3
+  development probe — without that, the crate build fails on any machine
+  lacking Python headers even with `ENABLE_PYTHON=OFF`.
+- The copy is gitignored; its digest (`wiredtiger.sha256`) is committed and
+  `tests/test_wt_sys_fresh.py` regenerates and compares.
+- Compressors come from `libz-sys` (static) and `lz4-sys`; WT's library probe
+  is satisfied by pre-setting `HAVE_LIBZ*` / `HAVE_LIBLZ4*` to their headers.
+  snappy / zstd / sodium / tcmalloc / memkind are forced OFF so the host's
+  installs cannot leak in.
+- `cargo package` fails INSIDE the checkout (`No such file or directory`, from
+  cargo's git walk over uninitialised submodules); packaging from a staged copy
+  works. The publish job must stage the same way.
+- `secantus-wt` gains a `bundled` feature (off by default) — the prebuilt path
+  is unchanged for the wheel, release workflows and CI.
+
 1. New crate `crates/secantus-wiredtiger-sys` containing a copy of the WT
    source **with the `cmake/patch_wt_*.py` patches already applied** — the
    crate build must not need Python. A repo task

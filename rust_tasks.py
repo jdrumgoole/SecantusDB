@@ -503,6 +503,18 @@ def rust_wt_test(c: Context) -> None:
     c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=PTY, env=env)
 
 
+@task(name="wt-sys-refresh")
+def wt_sys_refresh(c: Context, check: bool = False) -> None:
+    """Regenerate crates/secantus-wiredtiger-sys/wiredtiger from vendor/wiredtiger.
+
+    Applies the same cmake/patch_wt_*.py scripts as the wheel build and writes
+    the digest to wiredtiger.sha256, which is committed. ``--check`` compares
+    with the stamp instead (tests/test_wt_sys_fresh.py does the same).
+    """
+    flag = " --check" if check else ""
+    c.run(f"{sys.executable} scripts/wt_sys_refresh.py{flag}", pty=PTY)
+
+
 @task(name="rust-storage-test")
 def rust_storage_test(c: Context) -> None:
     """fmt/clippy/test the secantus-storage crate (the Rust Storage layer).

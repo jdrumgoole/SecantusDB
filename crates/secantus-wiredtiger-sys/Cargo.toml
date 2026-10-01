@@ -1,0 +1,26 @@
+[package]
+name = "secantus-wiredtiger-sys"
+version = "0.1.0-beta.0"
+edition = "2021"
+description = "Builds the WiredTiger storage engine (mongodb-7.0.33, SecantusDB's patches) from bundled source as a static library. Internal to SecantusDB: no semver promise."
+license = "GPL-2.0-only"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+links = "wiredtiger"
+build = "build.rs"
+# The WiredTiger copy is gitignored (scripts/wt_sys_refresh.py writes it), so
+# it has to be named here or `cargo package` would leave it out.
+include = ["build.rs", "src/**", "wiredtiger/**", "wiredtiger.sha256", "wiredtiger.manifest", "README.md"]
+
+# Standalone, like secantus-wt: it builds C, which the clean workspace does not.
+[workspace]
+
+[dependencies]
+# Bundled, statically linked compressors. WiredTiger is built with zlib and lz4
+# as BUILTIN block-compressor extensions; linking them from these crates rather
+# than the host means the result needs nothing beyond libc (a macOS binary once
+# linked Homebrew's liblz4 by absolute path and would not start elsewhere).
+libz-sys = { version = "1", default-features = false, features = ["static"] }
+lz4-sys = "1"
+
+[build-dependencies]
+cmake = "0.1"
