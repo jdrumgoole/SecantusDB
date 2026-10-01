@@ -8439,6 +8439,11 @@ fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
             }
             Some(N::MinMaxExpr(m)) => m.args.iter().any(|a| walk(Some(a), depth + 1)),
             Some(N::NullTest(t)) => walk(t.arg.as_deref(), depth + 1),
+            Some(N::BooleanTest(t)) => walk(t.arg.as_deref(), depth + 1),
+            // `x IN (count(*), 5)`, an array or a row of aggregates.
+            Some(N::List(l)) => l.items.iter().any(|a| walk(Some(a), depth + 1)),
+            Some(N::AArrayExpr(a)) => a.elements.iter().any(|e| walk(Some(e), depth + 1)),
+            Some(N::RowExpr(r)) => r.args.iter().any(|a| walk(Some(a), depth + 1)),
             // `(array_agg(n))[2]`.
             Some(N::AIndirection(a)) => {
                 walk(a.arg.as_deref(), depth + 1)
@@ -12200,6 +12205,61 @@ fn extract_aggregates(
                 found |= extract_aggregates(a, def, items, slots, params)?;
             }
         }
+        // An aggregate under a CASE (or GREATEST / LEAST, a NULL test, an
+        // array or row) inside another expression is still the query's
+        // aggregate. Not descending into them left `count(*)` in
+        // `coalesce(CASE WHEN count(*) = 5 THEN 6 END, min(x))` unextracted,
+        // and the whole expression answered NULL (sqllogictest random/expr).
+        N::CaseExpr(c) => {
+            if let Some(a) = c.arg.as_deref_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+            for w in c.args.iter_mut() {
+                if let Some(N::CaseWhen(cw)) = w.node.as_mut() {
+                    for part in [cw.expr.as_deref_mut(), cw.result.as_deref_mut()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        found |= extract_aggregates(part, def, items, slots, params)?;
+                    }
+                }
+            }
+            if let Some(d) = c.defresult.as_deref_mut() {
+                found |= extract_aggregates(d, def, items, slots, params)?;
+            }
+        }
+        N::MinMaxExpr(m) => {
+            for a in m.args.iter_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        N::NullTest(t) => {
+            if let Some(a) = t.arg.as_deref_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        N::BooleanTest(t) => {
+            if let Some(a) = t.arg.as_deref_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        N::AArrayExpr(a) => {
+            for e in a.elements.iter_mut() {
+                found |= extract_aggregates(e, def, items, slots, params)?;
+            }
+        }
+        N::RowExpr(r) => {
+            for a in r.args.iter_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        // `x IN (count(*), 5)`: the list is a `List` node on the AExpr's
+        // right-hand side.
+        N::List(l) => {
+            for a in l.items.iter_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
         _ => {}
     }
     Ok(found)
@@ -12303,7 +12363,11 @@ fn sample_for_type(pg_type: &str) -> Bson {
         "int2" | "int4" => Bson::Int32(1),
         "int8" => Bson::Int64(1),
         "float4" | "float8" => Bson::Double(1.0),
-        "numeric" | "decimal" => Bson::String("1".into()),
+        // A real numeric, as `sample_value_for_type` uses. The TEXT "1"
+        // here made `- avg(x)`, `avg(x) / count(*)` and every other
+        // arithmetic over a numeric aggregate fail at PLAN time with 42883
+        // "operator does not exist: integer - text" (sqllogictest).
+        "numeric" | "decimal" => Bson::Decimal128("1".parse().expect("literal")),
         "bool" => Bson::Boolean(true),
         t if t.ends_with("[]") => Bson::Array(vec![]),
         _ => Bson::String("x".into()),
@@ -12526,16 +12590,127 @@ fn plan_aggregate_order(
     Ok(keys)
 }
 
-/// `SELECT DISTINCT ON (k) ... GROUP BY ...` (or over aggregates): the
-/// grouping runs in a FROM subquery and DISTINCT ON / ORDER BY / LIMIT over
+/// `SELECT DISTINCT [ON (k)] ... GROUP BY ...` (or over aggregates): the
+/// grouping runs in a FROM subquery and DISTINCT [ON] / ORDER BY / LIMIT over
 /// its output -- which is what they apply to in PostgreSQL, since they run
 /// after grouping. Each key and sort item must name an output column (by
 /// position, by name, or as the same expression); otherwise `None`, and the
-/// shape stays refused.
+/// shape stays refused. (Plain DISTINCT over a computed grouped target --
+/// `SELECT DISTINCT - b + - 51 FROM t GROUP BY b`, `SELECT DISTINCT 77,
+/// count(*) - 11` -- answered `0A000 this target is not supported yet`;
+/// sqllogictest's random/ files are full of it.)
+/// `SELECT * ... GROUP BY ...` (or `t.*`) over one table, with the star
+/// spelled out as the table's columns. The aggregate planner reads each
+/// target as an expression, and a bare `*` came out as an unnamed column:
+/// `42803 column "" must appear in the GROUP BY clause` (sqllogictest
+/// `random/groupby`). PostgreSQL's own grouping rule then applies to each
+/// column, as it does when they are written out.
+fn expand_star_in_grouped(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    if s.group_clause.is_empty() && !has_aggregate(s) {
+        return None;
+    }
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+        return None;
+    };
+    let alias = rv
+        .alias
+        .as_ref()
+        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+    let is_star = |c: &pg_query::protobuf::ColumnRef| -> bool {
+        match c.fields.as_slice() {
+            [one] => matches!(one.node.as_ref(), Some(N::AStar(_))),
+            [q, one] => {
+                matches!(one.node.as_ref(), Some(N::AStar(_)))
+                    && matches!(q.node.as_ref(), Some(N::String(x)) if x.sval == alias)
+            }
+            _ => false,
+        }
+    };
+    let has_star = s.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if is_star(c)))
+    });
+    if !has_star {
+        return None;
+    }
+    let def = lookup(&relation_name(rv))?;
+    let mut out = s.clone();
+    out.target_list = Vec::new();
+    for t in &s.target_list {
+        let star = matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if is_star(c)));
+        if !star {
+            out.target_list.push(t.clone());
+            continue;
+        }
+        for col in &def.columns {
+            out.target_list.push(pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    val: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            fields: [alias.as_str(), col.name.as_str()]
+                                .iter()
+                                .map(|p| pg_query::protobuf::Node {
+                                    node: Some(N::String(pg_query::protobuf::String {
+                                        sval: (*p).to_string(),
+                                    })),
+                                })
+                                .collect(),
+                            location: -1,
+                        })),
+                    })),
+                    location: -1,
+                    ..Default::default()
+                }))),
+            });
+        }
+    }
+    Some(out)
+}
+
 fn distinct_on_over_groups(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
-    if s.distinct_clause.is_empty() || s.distinct_clause[0].node.is_none() {
+    if s.distinct_clause.is_empty() {
+        return None;
+    }
+    let plain = s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none();
+    // `SELECT DISTINCT * ... GROUP BY` names no column to carry through the
+    // subquery; it keeps the ordinary path.
+    let star = s.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))))))
+    });
+    if plain && star {
+        return None;
+    }
+    // A plain DISTINCT whose targets are all bare aggregate calls or bare
+    // columns is the aggregate planner's own `distinct` -- only a COMPUTED
+    // target needs the subquery.
+    let simple = s.target_list.iter().all(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(_)) => true,
+            Some(N::FuncCall(f)) => {
+                f.over.is_none()
+                    && func_name(f)
+                        .as_deref()
+                        .is_some_and(|n| aggregate_func(n, f.agg_within_group).is_some())
+                    && !f.args.iter().any(contains_nested_aggregate)
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    if plain && simple {
         return None;
     }
     if s.group_clause.is_empty() && !has_aggregate(s) {
@@ -12595,8 +12770,11 @@ fn distinct_on_over_groups(
         }
         None
     };
-    let keys: Vec<pg_query::protobuf::Node> =
-        s.distinct_clause.iter().map(map).collect::<Option<_>>()?;
+    let keys: Vec<pg_query::protobuf::Node> = if plain {
+        s.distinct_clause.clone()
+    } else {
+        s.distinct_clause.iter().map(map).collect::<Option<_>>()?
+    };
     let mut sorts = Vec::with_capacity(s.sort_clause.len());
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
@@ -13871,9 +14049,29 @@ fn resolve_sublinks_in_select(
     // The scoped body pushes this statement's CTEs once their own bodies are
     // resolved; whatever it pushed is popped here, on every exit.
     let depth = VISIBLE_CTES.with(|v| v.borrow().len());
+    // The relations this query's FROM makes visible to its subqueries, for
+    // deciding whether a qualifier inside one names an OUTER relation.
+    let mut visible = Vec::new();
+    for item in &s.from_clause {
+        collect_visible_names(item, &mut visible);
+    }
+    let outer_depth = OUTER_RELATIONS.with(|o| {
+        let mut o = o.borrow_mut();
+        let d = o.len();
+        o.extend(visible);
+        d
+    });
     let out = resolve_sublinks_in_select_scoped(s, lookup, params, run);
+    OUTER_RELATIONS.with(|o| o.borrow_mut().truncate(outer_depth));
     VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
     out
+}
+
+thread_local! {
+    /// Relation names the enclosing queries' FROM clauses make visible,
+    /// outermost first, while their subqueries are resolved.
+    static OUTER_RELATIONS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn resolve_sublinks_in_select_scoped(
@@ -14885,9 +15083,27 @@ fn row_subquery_comparison(
 /// in `s`'s own FROM -- that is, a correlation. `None` when every reference
 /// resolves inside the subquery.
 fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    // An ALIASED relation goes by its alias only, as in PostgreSQL: in
+    // `(SELECT count(*) FROM t1 AS x WHERE x.b < t1.b)`, `t1.b` is the OUTER
+    // row's. Counting the hidden table name as an inner one planned the
+    // subquery uncorrelated, which then failed with 42P01 "invalid reference
+    // to FROM-clause entry for table t1" (sqllogictest select1-3).
     let mut names: Vec<String> = Vec::new();
     for item in &s.from_clause {
-        collect_from_names(item, &mut names);
+        collect_visible_names(item, &mut names);
+    }
+    // ...unless no enclosing query has that name either: then it is the
+    // subquery's own hidden table, and planning reports PostgreSQL's
+    // "invalid reference to FROM-clause entry" for it.
+    let mut hidden = Vec::new();
+    for item in &s.from_clause {
+        collect_from_names(item, &mut hidden);
+    }
+    let outer_has = |q: &str| OUTER_RELATIONS.with(|o| o.borrow().iter().any(|n| n == q));
+    for h in hidden {
+        if !names.contains(&h) && !outer_has(&h) {
+            names.push(h);
+        }
     }
     let mut found: Option<String> = None;
     let mut s = s.clone();
@@ -15021,6 +15237,25 @@ fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> 
 
 /// Every name a FROM item can be addressed by: its alias when it has one, and
 /// a table's own name as well (`from t` accepts both `t.c` and a bare `c`).
+/// `collect_from_names` with PostgreSQL's visibility rule: an aliased
+/// relation is addressable by its alias alone.
+fn collect_visible_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    match item.node.as_ref() {
+        Some(N::RangeVar(r)) => out.push(
+            r.alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| r.relname.clone()),
+        ),
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                collect_visible_names(side, out);
+            }
+        }
+        _ => collect_from_names(item, out),
+    }
+}
+
 fn collect_from_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
     match item.node.as_ref() {
         Some(N::RangeVar(r)) => {
@@ -16126,6 +16361,9 @@ fn plan_select(
         return plan_select(&rewritten, lookup, params);
     }
     if let Some(rewritten) = expand_composite_star(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = expand_star_in_grouped(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
     if let Some(rewritten) = distinct_on_over_groups(s) {
@@ -18065,6 +18303,40 @@ pub fn join_output_keys(join: &JoinSelect) -> Vec<String> {
 
 /// The shared tail of `plan_aggregate`, over whichever SOURCE the FROM named:
 /// a table, or a joined subquery whose output columns stand in for one.
+/// How PostgreSQL names an ungrouped column in its 42803: qualified --
+/// by what the query wrote, or by the one FROM relation (`tab2.col1` for a
+/// bare `col1`). The bare name was printed instead.
+fn grouping_error_name(
+    c: &pg_query::protobuf::ColumnRef,
+    s: &pg_query::protobuf::SelectStmt,
+) -> String {
+    let parts: Vec<String> = c
+        .fields
+        .iter()
+        .filter_map(|f| match f.node.as_ref() {
+            Some(N::String(x)) => Some(x.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    if parts.len() >= 2 {
+        return parts[parts.len() - 2..].join(".");
+    }
+    let col = parts.last().cloned().unwrap_or_default();
+    match s.from_clause.as_slice() {
+        [only] => match only.node.as_ref() {
+            Some(N::RangeVar(rv)) => {
+                let q = rv
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                format!("{q}.{col}")
+            }
+            _ => col,
+        },
+        _ => col,
+    }
+}
+
 fn finish_aggregate(
     s: &pg_query::protobuf::SelectStmt,
     table: String,
@@ -18276,8 +18548,9 @@ fn finish_aggregate(
                     .position(|k| k.expr.is_none() && k.name == col)
                     .ok_or_else(|| {
                         Error::Grouping(format!(
-                            "column \"{col}\" must appear in the GROUP BY clause \
-                             or be used in an aggregate function"
+                            "column \"{}\" must appear in the GROUP BY clause \
+                             or be used in an aggregate function",
+                            grouping_error_name(c, s)
                         ))
                     })?;
                 let out = if rt.name.is_empty() {
@@ -29226,6 +29499,73 @@ fn net_elements_out(v: &Bson, is_cidr: bool) -> Bson {
     }
 }
 
+/// `x [NOT] BETWEEN [SYMMETRIC] a AND b` as the boolean tree it means, or
+/// `None` for any other expression. `x` is repeated, which is only sound
+/// because the evaluator's inputs here are values, not volatile calls.
+fn expand_between(e: &pg_query::protobuf::AExpr) -> Option<pg_query::protobuf::Node> {
+    let kind = AExprKind::try_from(e.kind).ok()?;
+    let (not, symmetric) = match kind {
+        AExprKind::AexprBetween => (false, false),
+        AExprKind::AexprNotBetween => (true, false),
+        AExprKind::AexprBetweenSym => (false, true),
+        AExprKind::AexprNotBetweenSym => (true, true),
+        _ => return None,
+    };
+    let x = e.lexpr.as_deref()?.clone();
+    let Some(N::List(list)) = e.rexpr.as_deref().and_then(|n| n.node.as_ref()) else {
+        return None;
+    };
+    let [lo, hi] = list.items.as_slice() else {
+        return None;
+    };
+    let cmp = |op: &str, a: &pg_query::protobuf::Node, b: &pg_query::protobuf::Node| {
+        pg_query::protobuf::Node {
+            node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+                kind: AExprKind::AexprOp as i32,
+                name: vec![string_node(op)],
+                lexpr: Some(Box::new(a.clone())),
+                rexpr: Some(Box::new(b.clone())),
+                location: -1,
+            }))),
+        }
+    };
+    let boolean =
+        |op: BoolExprType, args: Vec<pg_query::protobuf::Node>| pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                boolop: op as i32,
+                args,
+                location: -1,
+                ..Default::default()
+            }))),
+        };
+    let between = |lo: &pg_query::protobuf::Node, hi: &pg_query::protobuf::Node| {
+        if not {
+            boolean(
+                BoolExprType::OrExpr,
+                vec![cmp("<", &x, lo), cmp(">", &x, hi)],
+            )
+        } else {
+            boolean(
+                BoolExprType::AndExpr,
+                vec![cmp(">=", &x, lo), cmp("<=", &x, hi)],
+            )
+        }
+    };
+    if !symmetric {
+        return Some(between(lo, hi));
+    }
+    // SYMMETRIC: either order of the bounds. NOT is then "outside both".
+    let (a, b) = (between(lo, hi), between(hi, lo));
+    Some(boolean(
+        if not {
+            BoolExprType::AndExpr
+        } else {
+            BoolExprType::OrExpr
+        },
+        vec![a, b],
+    ))
+}
+
 fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
@@ -30474,6 +30814,15 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             } else {
                 hit
             }));
+        }
+        // `x [NOT] BETWEEN [SYMMETRIC] a AND b`, evaluated as the
+        // comparisons it means so their three-valued rules apply: a NULL
+        // bound or operand gives NULL, not an error. Only a column-against-
+        // constants BETWEEN lowered to a filter; every other shape -- `NULL
+        // BETWEEN ...`, `NOT x BETWEEN ...`, an expression bound -- answered
+        // `0A000 this operator form is not supported yet` (sqllogictest).
+        if let Some(expanded) = expand_between(e) {
+            return const_value_inner(&expanded, params);
         }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
@@ -31983,7 +32332,18 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
         });
     }
     if lo == Bson::Null || hi == Bson::Null {
-        return Ok(match_nothing());
+        // `x BETWEEN NULL AND hi` is `x >= NULL AND x <= hi`: never true.
+        // `x NOT BETWEEN NULL AND hi` is `x < NULL OR x > hi`, which IS true
+        // wherever `x > hi` -- answering "nothing" there dropped those rows
+        // (sqllogictest random/aggregates).
+        if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprNotBetween) {
+            return Ok(match_nothing());
+        }
+        return Ok(match (&lo, &hi) {
+            (Bson::Null, Bson::Null) => match_nothing(),
+            (Bson::Null, _) => scalar_filter(def, &field, "$gt", hi),
+            _ => scalar_filter(def, &field, "$lt", lo),
+        });
     }
     // Inclusive both ends. A NULL column value matches neither bound in MQL,
     // which is what PostgreSQL's three-valued logic gives too.

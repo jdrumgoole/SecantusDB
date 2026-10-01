@@ -620,6 +620,24 @@ remain open:
       `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
       `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
       port of one C function family, so the split is by table, not logic).
+- [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
+      2026-10-01).** `slt_validation` can now drive the Rust server
+      (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
+      run 28/60 lane-files; after this batch's fixes (BETWEEN in every shape,
+      DISTINCT over aggregates and grouped expressions, `*` with GROUP BY, a
+      correlated subquery aliasing the outer table's name, aggregates under
+      CASE / COALESCE / NULLIF / IN lists, arithmetic over a numeric
+      aggregate, NOT BETWEEN with a NULL bound, the 42803 column naming --
+      corpus `slt_regressions`) see the batch's PR for the count. What is
+      left is NOT a Rust divergence from PostgreSQL -- each line was checked
+      on PostgreSQL 15 and it answers as the Rust server does:
+      `IN ()` is a syntax error; `DELETE` through a simple view succeeds (it
+      is automatically updatable); `col / CAST(32 AS REAL)` is a real, not an
+      integer; `415.0000000000000000` (numeric) where SQLite prints `415`; an
+      ungrouped column under COALESCE is 42803. These are SQLite
+      expectations the corpus carries; the Python lane marks the same ones as
+      expected divergences. Remaining Rust-only gaps: an error's `LINE` /
+      `HINT` decoration for the ungrouped-column and invalid-reference cases.
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,

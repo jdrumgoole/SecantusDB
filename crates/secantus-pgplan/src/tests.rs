@@ -3365,3 +3365,17 @@ fn extension_statements_plan() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn arithmetic_over_a_numeric_aggregate_plans() {
+    // The plan-time sample for a numeric aggregate slot was the TEXT "1", so
+    // these answered 42883 "operator does not exist: integer - text".
+    for q in [
+        "SELECT - avg(23)",
+        "SELECT avg(23) + 1",
+        "SELECT 40 + avg(2) / count(*)",
+        "SELECT - avg(CAST(NULL AS integer))",
+    ] {
+        assert!(plan(q, &|_| None).is_ok(), "{q}");
+    }
+}

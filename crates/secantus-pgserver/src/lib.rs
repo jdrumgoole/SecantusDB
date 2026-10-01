@@ -19440,6 +19440,22 @@ impl PgHandler {
         // order, and the reason `select distinct g, sum(v) over (partition by
         // g)` dedups on the computed value rather than computing it over the
         // deduped rows.
+        // A WHERE that could not lower to an MQL filter is applied here, per
+        // row -- BEFORE windows and DISTINCT, which run over the rows WHERE
+        // keeps. Applied after DISTINCT it dropped a group's first row and
+        // with it every equal row behind it, so `SELECT DISTINCT -28 FROM t
+        // WHERE <per-row test>` answered nothing (sqllogictest). Only TRUE keeps a row, so SQL's three-valued logic falls out:
+        // a NULL result excludes the row exactly as PostgreSQL does.
+        if let Some(residual) = sel.residual.as_ref() {
+            let mut kept = Vec::with_capacity(docs.len());
+            for d in docs {
+                let v = secantus_pgplan::apply_row_expr(residual, &d).map_err(|e| Self::err(&e))?;
+                if v == Bson::Boolean(true) {
+                    kept.push(d);
+                }
+            }
+            docs = kept;
+        }
         if !sel.windows.is_empty() {
             materialise_windows(&mut docs, &sel.windows).map_err(|e| Self::err(&e))?;
             // The synthetic `__winN` columns go into the def HERE rather than
@@ -19486,19 +19502,6 @@ impl PgHandler {
             docs = kept;
         }
 
-        // A WHERE that could not lower to an MQL filter is applied here, per
-        // row. Only TRUE keeps a row, so SQL's three-valued logic falls out:
-        // a NULL result excludes the row exactly as PostgreSQL does.
-        if let Some(residual) = sel.residual.as_ref() {
-            let mut kept = Vec::with_capacity(docs.len());
-            for d in docs {
-                let v = secantus_pgplan::apply_row_expr(residual, &d).map_err(|e| Self::err(&e))?;
-                if v == Bson::Boolean(true) {
-                    kept.push(d);
-                }
-            }
-            docs = kept;
-        }
         if !sel.order.is_empty() {
             materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
             sort_rows(&mut docs, &sel.order);
@@ -19688,7 +19691,19 @@ impl PgHandler {
     ) -> PgWireResult<Bson> {
         let mut row = Document::new();
         for (i, v) in vals.iter().enumerate() {
-            row.insert(format!("__aggval{i}"), v.clone());
+            // A numeric aggregate (`avg`, `sum` over numeric) can arrive as
+            // its TEXT form; the expression was typed against `numeric`, so
+            // `- avg(x)` / `avg(x) / count(*)` saw text and answered 42883
+            // "operator does not exist: integer - text" (sqllogictest).
+            let value = match (v, agg.items.get(i)) {
+                (Bson::String(text), Some(item))
+                    if secantus_pgplan::aggregate_item_type(item) == "numeric" =>
+                {
+                    secantus_pgplan::numeric::parse_numeric(text).unwrap_or_else(|_| v.clone())
+                }
+                _ => v.clone(),
+            };
+            row.insert(format!("__aggval{i}"), value);
         }
         for (i, k) in agg.group_by.iter().enumerate() {
             if k.expr.is_none() {
