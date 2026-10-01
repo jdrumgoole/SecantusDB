@@ -32,6 +32,10 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/wt_sys.rs"));
 }
 
+// Named so the bundled WiredTiger and its compressors are actually linked.
+#[cfg(feature = "bundled")]
+extern crate secantus_wiredtiger_sys;
+
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
