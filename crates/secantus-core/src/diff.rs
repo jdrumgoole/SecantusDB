@@ -417,7 +417,7 @@ fn report_whole_values(update: &Document, post: &Document, acc: &mut Acc) {
         touched |= acc.removed.len() != before_removed;
         let before_truncated = acc.truncated.len();
         acc.truncated
-            .retain(|t| !matches!(t, Bson::Document(d) if d.get_str("field").is_ok_and(&below)));
+            .retain(|t| !matches!(t, Bson::Document(d) if d.get_str("field").is_ok_and(below)));
         touched |= acc.truncated.len() != before_truncated;
         if touched || always {
             let mut updated = Document::new();
