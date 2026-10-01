@@ -98,7 +98,12 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
         # and an explicit BEGIN inside the batch takes the transaction over
         # while COMMIT/ROLLBACK end it (the remainder starts a fresh implicit
         # one). Pinned by the pgtest batch_stmt corpus.
-        implicit = len(stmts) > 1 and session.txn_handle is None
+        # A write that can fire a trigger is ONE transaction too: a trigger
+        # that wrote and then the statement failing must take those writes
+        # with it, as in PostgreSQL (the Rust server does the same).
+        implicit = (len(stmts) > 1 or _fires_user_code(stmts, storage, db)) and (
+            session.txn_handle is None
+        )
         if implicit:
             session.txn_handle = storage.begin_user_transaction()
             session.txn_failed = False
@@ -126,6 +131,15 @@ def run_sql(storage: Any, db: str, sql: str, *, session: Session | None = None) 
             exc.partial_results = results
             raise
         return results
+
+
+def _fires_user_code(stmts: list[exp.Expression], storage: Any, db: str) -> bool:
+    """Whether a statement batch writes while the database has a trigger."""
+    if not any(isinstance(st, (exp.Insert, exp.Update, exp.Delete, exp.Merge)) for st in stmts):
+        return False
+    from secantus.sql.catalog import TRIGGER_COLLECTION
+
+    return bool(storage.find_matching(db, TRIGGER_COLLECTION, {}, limit=1))
 
 
 _DROP_INDEXES_RE = re.compile(
@@ -5496,10 +5510,13 @@ def _call_out_columns(tail: str, db: str, catalog: Catalog) -> list[ColumnDesc] 
 
 
 def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Session) -> SQLResult:
-    """``CREATE TRIGGER name BEFORE INSERT ON table FOR EACH ROW EXECUTE
-    PROCEDURE fn()`` — the supported shape (pgx's tsvector-maintenance
-    trigger). Every other timing / event / level is rejected faithfully
-    rather than stored-and-never-fired, which would lie about user triggers."""
+    """``CREATE TRIGGER name {BEFORE | AFTER} {INSERT | UPDATE | DELETE} [OR
+    ...] ON table [FOR EACH {ROW | STATEMENT}] EXECUTE {FUNCTION | PROCEDURE}
+    fn()`` -- the shapes the executor fires. INSTEAD OF, TRUNCATE, ``UPDATE
+    OF`` columns, WHEN, REFERENCING (transition tables), constraint triggers
+    and trigger arguments are rejected faithfully rather than
+    stored-and-never-fired, which would lie about user triggers. Stored in
+    the Rust server's shape, which both servers read."""
     trigger_name = stmt.this.name
     props = stmt.args.get("properties")
     tp = next(
@@ -5509,13 +5526,26 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
     if tp is None:
         raise errors.feature_not_supported("CREATE TRIGGER shape is not supported")
     timing = str(tp.args.get("timing") or "").upper()
-    for_each = str(tp.args.get("for_each") or "").upper()
-    events = [
-        str(e.this).upper() for e in tp.args.get("events") or [] if isinstance(e, exp.TriggerEvent)
-    ]
+    # PostgreSQL's default is FOR EACH STATEMENT.
+    for_each = str(tp.args.get("for_each") or "STATEMENT").upper()
+    event_nodes = [e for e in tp.args.get("events") or [] if isinstance(e, exp.TriggerEvent)]
+    events = [str(e.this).upper() for e in event_nodes]
     table_node = tp.args.get("table")
-    if timing != "BEFORE" or for_each != "ROW" or events != ["INSERT"] or table_node is None:
-        raise errors.feature_not_supported("only BEFORE INSERT FOR EACH ROW triggers are supported")
+    unsupported = None
+    if timing not in ("BEFORE", "AFTER"):
+        unsupported = f"{timing or 'this'} triggers"
+    elif for_each not in ("ROW", "STATEMENT"):
+        unsupported = "this trigger level"
+    elif not events or any(e not in ("INSERT", "UPDATE", "DELETE") for e in events):
+        unsupported = "TRUNCATE triggers"
+    elif any(e.args.get("columns") for e in event_nodes):
+        unsupported = "UPDATE OF column-list triggers"
+    elif tp.args.get("referencing"):
+        unsupported = "trigger transition tables (REFERENCING)"
+    elif tp.args.get("constraint"):
+        unsupported = "constraint triggers"
+    if unsupported is not None or table_node is None:
+        raise errors.feature_not_supported(f"{unsupported or 'this trigger'} are not supported")
     tname = planner.qualified_table_name(table_node)
     if catalog.get(db, tname) is None:
         raise errors.undefined_table(tname)
@@ -5540,6 +5570,9 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
         fn_name = target.name
     if not fn_name:
         raise errors.feature_not_supported("CREATE TRIGGER EXECUTE shape is not supported")
+    call = execute.this if execute is not None else None
+    if getattr(call, "expressions", None):
+        raise errors.feature_not_supported("trigger arguments are not supported")
     func = catalog.get_function(db, fn_name, 0)
     if func is None:
         raise errors.SQLError("42883", f"function {fn_name}() does not exist")
@@ -5555,9 +5588,13 @@ def _create_trigger(stmt: exp.Create, db: str, catalog: Catalog, session: Sessio
             "name": trigger_name,
             "table": tname,
             "timing": timing,
-            "event": "INSERT",
-            "level": "ROW",
+            "event": events[0],
+            "events": events,
+            "level": for_each,
             "function": fn_name,
+            "args": [],
+            "update_columns": [],
+            **({"when": when.sql(dialect="postgres")} if (when := tp.args.get("when")) else {}),
         },
     )
     return SQLResult(command_tag="CREATE TRIGGER")
