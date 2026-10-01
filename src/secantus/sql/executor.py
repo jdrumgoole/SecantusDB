@@ -1294,16 +1294,20 @@ def _trigger_events(trg: dict[str, Any]) -> list[str]:
     return [str(trg.get("event", ""))]
 
 
+_TRIGGER_EVENTS = ("INSERT", "UPDATE", "DELETE")
+
+
 def _firable_here(trg: dict[str, Any]) -> bool:
-    """Whether this server can run ``trg`` faithfully: a BEFORE ... FOR EACH
-    ROW trigger on INSERT, with no WHEN condition, no transition tables, no
-    constraint (deferred) firing and no arguments -- the one shape it
-    implements."""
+    """Whether this server can run ``trg`` faithfully: BEFORE or AFTER, ROW
+    or STATEMENT, on INSERT / UPDATE / DELETE -- with no WHEN condition, no
+    ``UPDATE OF`` column list, no transition tables, no constraint
+    (deferred) firing and no arguments, which it does not implement."""
     return (
-        trg.get("timing") == "BEFORE"
-        and trg.get("level", "ROW") == "ROW"
-        and "INSERT" in _trigger_events(trg)
+        trg.get("timing") in ("BEFORE", "AFTER")
+        and trg.get("level", "ROW") in ("ROW", "STATEMENT")
+        and all(e in _TRIGGER_EVENTS for e in _trigger_events(trg))
         and not trg.get("when")
+        and not trg.get("update_columns")
         and not trg.get("transition_new")
         and not trg.get("transition_old")
         and not trg.get("constraint")
@@ -1312,25 +1316,21 @@ def _firable_here(trg: dict[str, Any]) -> bool:
 
 
 def refuse_unfirable_triggers(
-    catalog: Any, db: str, table: str, *events: str, fires_insert: bool = False
+    catalog: Any, db: str, table: str, *events: str, fires: bool = False
 ) -> None:
     """Refuse a write that would have to fire a trigger this server cannot.
 
-    The Rust server stores every kind of trigger in the shared catalog --
-    AFTER, statement-level, UPDATE / DELETE / TRUNCATE, WHEN, transition
-    tables, constraint triggers. This server used to fire only BEFORE INSERT
-    row triggers and SILENTLY skip the rest, so a write here bypassed an
-    audit trigger or an invariant the Rust server enforces. A faithful
-    ``0A000`` is the honest answer: the write does not happen."""
+    The Rust server stores every kind of trigger in the shared catalog. A
+    plain INSERT / UPDATE / DELETE here (``fires``) runs the kinds
+    `_firable_here` accepts; every other path, and every other kind, would
+    skip the trigger -- which bypassed an audit trigger or an invariant the
+    Rust server enforces -- so the write is PostgreSQL's ``0A000`` instead."""
     if catalog is None:
         return
     for trg in catalog.triggers_for_table(db, table):
-        fired = [e for e in _trigger_events(trg) if e in events]
-        if not fired:
+        if not any(e in events for e in _trigger_events(trg)):
             continue
-        # Only a path that FIRES the supported shape (a plain INSERT) may
-        # pass it; every other path runs no trigger at all.
-        if fires_insert and events == ("INSERT",) and _firable_here(trg):
+        if fires and _firable_here(trg):
             continue
         timing = trg.get("timing", "BEFORE")
         level = trg.get("level", "ROW")
@@ -1341,47 +1341,157 @@ def refuse_unfirable_triggers(
         )
 
 
+def _triggers(
+    catalog: Any, db: str, table: Any, event: str, timing: str, level: str
+) -> list[dict[str, Any]]:
+    """The triggers of ``table`` that fire for ``event`` at ``timing`` /
+    ``level``, in name order (PostgreSQL's firing order)."""
+    if catalog is None or getattr(table, "reflected", False):
+        return []
+    return [
+        t
+        for t in catalog.triggers_for_table(db, table.name)
+        if _firable_here(t)
+        and event in _trigger_events(t)
+        and t.get("timing") == timing
+        and t.get("level", "ROW") == level
+    ]
+
+
+def _trigger_ctx(storage: Any, db: str, catalog: Any, session: Any) -> Any:
+    from secantus.sql import scalar
+
+    return scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
+
+
+def _call_trigger(
+    trg: dict[str, Any],
+    catalog: Any,
+    db: str,
+    ctx: Any,
+    *,
+    op: str,
+    new: dict[str, Any] | None,
+    old: dict[str, Any] | None,
+    table: str,
+) -> dict[str, Any] | None:
+    from secantus.sql import plpgsql
+
+    func = catalog.get_function(db, trg["function"], 0)
+    if func is None:
+        raise errors.SQLError("42883", f"function {trg['function']}() does not exist")
+    return plpgsql.invoke_trigger(
+        func,
+        new,
+        ctx,
+        old_record=old,
+        tg={
+            "op": op,
+            "when": trg.get("timing"),
+            "level": trg.get("level", "ROW"),
+            "name": trg.get("name"),
+            "table": table,
+        },
+    )
+
+
+def fire_statement_triggers(
+    storage: Any, db: str, catalog: Any, session: Any, table: Any, event: str, timing: str
+) -> None:
+    """Run ``table``'s FOR EACH STATEMENT triggers for ``event``: once, even
+    when no row is touched, with NEW and OLD NULL."""
+    trgs = _triggers(catalog, db, table, event, timing, "STATEMENT")
+    if not trgs:
+        return
+    ctx = _trigger_ctx(storage, db, catalog, session)
+    for trg in trgs:
+        _call_trigger(trg, catalog, db, ctx, op=event, new=None, old=None, table=table.name)
+
+
+def _row_record(doc: dict[str, Any] | None, table: Any) -> dict[str, Any] | None:
+    """A stored row as a trigger's column-name-keyed record."""
+    if doc is None:
+        return None
+    return {c.name: get_path(doc, c.field) for c in table.columns}
+
+
+def _record_into(doc: dict[str, Any], record: dict[str, Any], table: Any) -> None:
+    """Write a BEFORE trigger's returned record back into ``doc``."""
+    from secantus.paths import set_path
+
+    for c in table.columns:
+        value = record.get(c.name)
+        # Structured values (tsvector / jsonb dicts) pass through as-is;
+        # scalars get best-effort coercion to the column type.
+        if value is not None and not isinstance(value, dict):
+            with contextlib.suppress(errors.SQLError, ValueError, TypeError):
+                value = typemap.coerce(value, c.type_tag)
+        set_path(doc, c.field, value)
+
+
+def fire_row_triggers(
+    storage: Any,
+    db: str,
+    catalog: Any,
+    session: Any,
+    table: Any,
+    event: str,
+    timing: str,
+    pairs: list[tuple[dict[str, Any] | None, dict[str, Any] | None]],
+) -> list[tuple[dict[str, Any] | None, dict[str, Any] | None]]:
+    """Run ``table``'s FOR EACH ROW triggers over ``(old, new)`` row pairs.
+
+    BEFORE: each trigger sees the record the previous one returned; NULL
+    skips the row (dropped from the result), and a returned NEW replaces the
+    new row's values. AFTER: the result is ignored. Returns the pairs that
+    proceed."""
+    trgs = _triggers(catalog, db, table, event, timing, "ROW")
+    if not trgs:
+        return pairs
+    ctx = _trigger_ctx(storage, db, catalog, session)
+    out = []
+    for old, new in pairs:
+        old_rec = _row_record(old, table)
+        new_rec = _row_record(new, table)
+        keep = True
+        for trg in trgs:
+            result = _call_trigger(
+                trg, catalog, db, ctx, op=event, new=new_rec, old=old_rec, table=table.name
+            )
+            if timing != "BEFORE":
+                continue
+            if result is None:
+                keep = False
+                break
+            if event != "DELETE":
+                new_rec = result
+        if not keep:
+            continue
+        if timing == "BEFORE" and new is not None and new_rec is not None:
+            _record_into(new, new_rec, table)
+        out.append((old, new))
+    return out
+
+
 def _fire_before_insert_triggers(
     plan: Any, storage: Any, db: str, catalog: Any, session: Any
 ) -> list[dict[str, Any]]:
-    """Run BEFORE INSERT FOR EACH ROW triggers over the planned rows.
-
-    Each row becomes a column-name-keyed NEW record for the plpgsql trigger
-    function, which may mutate fields (``new.ts := to_tsvector(new.t)``) or
-    return NULL to skip the row — PG's BEFORE-trigger semantics. The returned
-    record is written back through each column's storage field."""
+    """Run BEFORE INSERT FOR EACH ROW triggers over the planned rows; a NULL
+    return skips the row, a returned NEW replaces its values."""
     if catalog is None or getattr(plan.table, "reflected", False):
         return plan.docs
-    refuse_unfirable_triggers(catalog, db, plan.table.name, "INSERT", fires_insert=True)
-    triggers = [t for t in catalog.triggers_for_table(db, plan.table.name) if _firable_here(t)]
-    if not triggers:
-        return plan.docs
-    from secantus.paths import set_path
-    from secantus.sql import plpgsql, scalar
-
-    ctx = scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
-    out: list[dict[str, Any]] = []
-    for doc in plan.docs:
-        record: dict[str, Any] | None = {c.name: get_path(doc, c.field) for c in plan.table.columns}
-        for trg in triggers:
-            func = catalog.get_function(db, trg["function"], 0)
-            if func is None:
-                raise errors.SQLError("42883", f"function {trg['function']}() does not exist")
-            record = plpgsql.invoke_trigger(func, record, ctx)
-            if record is None:
-                break  # RETURN NULL: skip this row
-        if record is None:
-            continue
-        for c in plan.table.columns:
-            value = record.get(c.name)
-            # Structured values (tsvector / jsonb dicts) pass through as-is;
-            # scalars get best-effort coercion to the column type.
-            if value is not None and not isinstance(value, dict):
-                with contextlib.suppress(errors.SQLError, ValueError, TypeError):
-                    value = typemap.coerce(value, c.type_tag)
-            set_path(doc, c.field, value)
-        out.append(doc)
-    return out
+    refuse_unfirable_triggers(catalog, db, plan.table.name, "INSERT", fires=True)
+    pairs = fire_row_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        plan.table,
+        "INSERT",
+        "BEFORE",
+        [(None, d) for d in plan.docs],
+    )
+    return [new for _, new in pairs if new is not None]
 
 
 @_serialized_write
@@ -1394,6 +1504,9 @@ def execute_insert(
 ) -> SQLResult:
     if plan.on_conflict is not None:
         return _execute_insert_on_conflict(plan, storage, db, catalog, session)
+    if catalog is not None and not getattr(plan.table, "reflected", False):
+        refuse_unfirable_triggers(catalog, db, plan.table.name, "INSERT", fires=True)
+        fire_statement_triggers(storage, db, catalog, session, plan.table, "INSERT", "BEFORE")
     plan.docs = _fire_before_insert_triggers(plan, storage, db, catalog, session)
     _assign_sequences(plan.docs, plan.table, db, catalog, session)
     if plan.check_option is not None:
@@ -1416,6 +1529,17 @@ def execute_insert(
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         _raise_write_error(write_errors[0], plan.table)
+    fire_row_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        plan.table,
+        "INSERT",
+        "AFTER",
+        [(None, d) for d in plan.docs[:inserted]],
+    )
+    fire_statement_triggers(storage, db, catalog, session, plan.table, "INSERT", "AFTER")
     if plan.returning is not None:
         return _returning_result(
             plan.docs[:inserted],
@@ -2993,12 +3117,20 @@ def execute_evaluated_select(
 def execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
+    triggered = False
     if not getattr(plan.table, "reflected", False):
-        refuse_unfirable_triggers(catalog, db, plan.table.name, "UPDATE")
+        refuse_unfirable_triggers(catalog, db, plan.table.name, "UPDATE", fires=True)
+        triggered = any(
+            _triggers(catalog, db, plan.table, "UPDATE", timing, level)
+            for timing in ("BEFORE", "AFTER")
+            for level in ("ROW", "STATEMENT")
+        )
     # A SUBSCRIPTED assignment reads the row's old array, so it needs the
-    # materialized path exactly as a computed RHS does.
+    # materialized path exactly as a computed RHS does -- and so does a
+    # trigger, which sees each row's OLD and NEW.
     if (
-        getattr(plan, "rekey", False)
+        triggered
+        or getattr(plan, "rekey", False)
         or getattr(plan, "computed", None)
         or getattr(plan, "array_sets", None)
     ):
@@ -3154,8 +3286,28 @@ def _execute_update_materialized_body(
                 set_path(new, field, val)
         return new
 
+    fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "BEFORE")
     matched = storage.find_matching(db, coll, plan.filter)
     posts = [post_image(doc) for doc in matched]
+    # BEFORE ROW triggers see each (OLD, NEW): one may change NEW, or skip
+    # the row with NULL -- before the row's constraints are checked.
+    row_triggered = bool(
+        _triggers(catalog, db, table, "UPDATE", "BEFORE", "ROW")
+        or _triggers(catalog, db, table, "UPDATE", "AFTER", "ROW")
+    )
+    if row_triggered:
+        kept = fire_row_triggers(
+            storage,
+            db,
+            catalog,
+            session,
+            table,
+            "UPDATE",
+            "BEFORE",
+            list(zip(matched, posts, strict=True)),
+        )
+        matched = [old for old, _ in kept]
+        posts = [new for _, new in kept]
     # Shared post-image validation (also applies generated columns to ``posts``).
     _validate_update_post_images(
         plan, storage, db, session, catalog, matched=matched, post_images=posts
@@ -3204,6 +3356,9 @@ def _execute_update_materialized_body(
             + [f for f, _, _ in plan.array_sets]
             + gen_fields
         )
+        if row_triggered:
+            # A BEFORE trigger may have changed any column.
+            changed = [c.field for c in table.columns if c.field != "_id"]
         for old, new in zip(matched, posts, strict=True):
             write_set = {f: get_path(new, f) for f in changed}
             if write_set:
@@ -3211,6 +3366,17 @@ def _execute_update_materialized_body(
                     db, coll, {"_id": old["_id"]}, {"$set": write_set}, multi=False
                 )
 
+    fire_row_triggers(
+        storage,
+        db,
+        catalog,
+        session,
+        table,
+        "UPDATE",
+        "AFTER",
+        list(zip(matched, posts, strict=True)),
+    )
+    fire_statement_triggers(storage, db, catalog, session, table, "UPDATE", "AFTER")
     n = len(matched)
     if plan.returning is not None:
         return _returning_result(
@@ -3499,10 +3665,15 @@ def execute_delete(
     plan: planner.DeletePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
     if not getattr(plan.table, "reflected", False):
-        refuse_unfirable_triggers(catalog, db, plan.table.name, "DELETE")
+        refuse_unfirable_triggers(catalog, db, plan.table.name, "DELETE", fires=True)
     coll = plan.table.collection
+    fire_statement_triggers(storage, db, catalog, session, plan.table, "DELETE", "BEFORE")
+    row_triggered = bool(
+        _triggers(catalog, db, plan.table, "DELETE", "BEFORE", "ROW")
+        or _triggers(catalog, db, plan.table, "DELETE", "AFTER", "ROW")
+    )
     # RETURNING yields the deleted rows, so snapshot them before the delete. FK
-    # enforcement also needs the victims, so read them whenever either applies.
+    # enforcement also needs the victims, and so does a row trigger (OLD).
     enforce_fk = (
         catalog is not None
         and not getattr(plan.table, "reflected", False)
@@ -3510,12 +3681,42 @@ def execute_delete(
     )
     victims = (
         storage.find_matching(db, coll, plan.filter)
-        if (plan.returning is not None or enforce_fk)
+        if (plan.returning is not None or enforce_fk or row_triggered)
         else []
     )
+    if row_triggered:
+        # A BEFORE ROW trigger returning NULL keeps its row: delete exactly
+        # the rows that proceed, by `_id`.
+        kept = fire_row_triggers(
+            storage,
+            db,
+            catalog,
+            session,
+            plan.table,
+            "DELETE",
+            "BEFORE",
+            [(v, None) for v in victims],
+        )
+        victims = [old for old, _ in kept if old is not None]
     if enforce_fk:
         _enforce_fk_on_parent_delete(victims, plan.table, storage, db, catalog)
-    n = storage.delete_matching(db, coll, plan.filter)
+    if row_triggered:
+        n = 0
+        for v in victims:
+            n += storage.delete_matching(db, coll, {"_id": v["_id"]})
+        fire_row_triggers(
+            storage,
+            db,
+            catalog,
+            session,
+            plan.table,
+            "DELETE",
+            "AFTER",
+            [(v, None) for v in victims],
+        )
+    else:
+        n = storage.delete_matching(db, coll, plan.filter)
+    fire_statement_triggers(storage, db, catalog, session, plan.table, "DELETE", "AFTER")
     if plan.returning is not None:
         return _returning_result(
             victims, plan.returning, f"DELETE {n}", n, plan.table, storage, db, catalog, session
