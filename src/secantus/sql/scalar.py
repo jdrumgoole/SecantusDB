@@ -4114,6 +4114,13 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
                 _datetimes.session_offset_text(ctx.session) if ctx is not None else "+00:00",
             )
         except _datetimes.DateTimeError as e:
+            # A date-SHAPED value with a field out of range (`Feb 29 2021`,
+            # `2020-02-30`) is PostgreSQL's 22008; only an unparseable one is
+            # 22007.
+            if _datetimes.field_out_of_range(value):
+                raise errors.SQLError(
+                    "22008", f'date/time field value out of range: "{value}"'
+                ) from e
             raise errors.SQLError(
                 "22007", f'invalid input syntax for type {to_tag_early}: "{value}"'
             ) from e

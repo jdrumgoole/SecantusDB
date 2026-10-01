@@ -413,6 +413,14 @@ def field_out_of_range(text: Any) -> bool:
     """
     if not isinstance(text, str):
         return False
+    named = _month_name_fields(text)
+    if named is not None:
+        y, mo, d = named
+        try:
+            _dt.date(y, mo, d)
+        except ValueError:
+            return True
+        return False
     m = _FIELD_SHAPE_RE.search(text)
     if m is None or not any(m.group(g) for g in ("y", "h")):
         return False
@@ -426,6 +434,14 @@ def field_out_of_range(text: Any) -> bool:
         return True
     if day is not None and not 1 <= day <= 31:
         return True
+    # A day past its MONTH's end (`2020-02-30`, `2021-02-29`) is out of
+    # range too, not a syntax error.
+    year = _n("y")
+    if year is not None and mon is not None and day is not None and 1 <= year <= 9999:
+        try:
+            _dt.date(year, mon, day)
+        except ValueError:
+            return True
     if hour is not None and hour > 24:
         return True
     if minute is not None and minute > 59:
@@ -441,6 +457,46 @@ _BC_DATE_RE = re.compile(
     re.IGNORECASE,
 )
 _WIDE_DATE_RE = re.compile(r"^(\d{4,7})-(\d{1,2})-(\d{1,2})$")
+
+
+_MONTH_NAMES = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}  # fmt: skip
+_WEEKDAY_NAMES = {
+    "mon", "monday", "tue", "tues", "tuesday", "wed", "wednesday", "thu", "thur",
+    "thurs", "thursday", "fri", "friday", "sat", "saturday", "sun", "sunday",
+}  # fmt: skip
+
+
+def _month_name_fields(text: str) -> tuple[int, int, int] | None:
+    """``(year, month, day)`` of a date written with a month NAME, in any of
+    the three orders PostgreSQL reads (with DateStyle MDY): ``Jan 5, 2020``,
+    ``5 Jan 2020``, ``2020-Jan-05``, optionally after a weekday name. A
+    two-digit year is 1970-2069 as in PostgreSQL. None for any other shape.
+    Unvalidated: the caller decides whether the fields form a real date."""
+    tokens = [t for t in re.split(r"[\s,/-]+", text.strip()) if t]
+    tokens = [t for t in tokens if t.lower().rstrip(".") not in _WEEKDAY_NAMES]
+    if len(tokens) != 3:
+        return None
+    months = [i for i, t in enumerate(tokens) if t.lower().rstrip(".") in _MONTH_NAMES]
+    if len(months) != 1 or not all(t.isdigit() for i, t in enumerate(tokens) if i != months[0]):
+        return None
+    mon = _MONTH_NAMES[tokens[months[0]].lower().rstrip(".")]
+    if months[0] == 0:
+        day_s, year_s = tokens[1], tokens[2]
+    elif months[0] == 1 and len(tokens[0]) >= 3:
+        year_s, day_s = tokens[0], tokens[2]
+    elif months[0] == 1:
+        day_s, year_s = tokens[0], tokens[2]
+    else:
+        return None
+    year = int(year_s)
+    if len(year_s) <= 2:
+        year += 2000 if year < 70 else 1900
+    return year, mon, int(day_s)
 
 
 def parse_date(value: Any) -> str:
@@ -477,6 +533,12 @@ def parse_date(value: Any) -> str:
         y, mo, d = int(m.group("y")), int(m.group("mo")), int(m.group("d"))
         era = " BC" if (m.group("bc1") or m.group("bc2")) else ""
         return f"{y:04d}-{mo:02d}-{d:02d}{era}"
+    named = _month_name_fields(s)
+    if named is not None:
+        try:
+            return _dt.date(*named).isoformat()
+        except ValueError as e:
+            raise DateTimeError(f"invalid date value: {value!r}") from e
     try:
         # Strict on the date part, but accept a trailing datetime tail.
         head = s[:10] if len(s) > 10 and (s[10:11] in (" ", "T")) else s

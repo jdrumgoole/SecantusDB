@@ -592,8 +592,51 @@ def execute_create_view(
                 "CREATE VIEW with a column list is supported for SELECT bodies only"
             )
         body = _apply_view_column_names(body, column_names, catalog, storage, db)
+    previous = catalog.get_view(db, name) if replace else None
+    if previous is not None:
+        _check_view_replacement(previous, body.sql(dialect="postgres"), catalog, storage, db)
     catalog.put_view(db, name, body.sql(dialect="postgres"), check_option=check_option)
     return SQLResult(command_tag="CREATE VIEW")
+
+
+def _view_columns(sql: str, catalog: Catalog, storage: Any, db: str) -> list[Any]:
+    import sqlglot
+
+    from secantus.sql import engine
+    from secantus.sql.session import Session
+
+    probe = sqlglot.parse_one(f"SELECT * FROM ({sql}) AS __view WHERE false", read="postgres")
+    return engine.run_statement(storage, db, probe, Session(), catalog).columns
+
+
+def _check_view_replacement(
+    old_sql: str, new_sql: str, catalog: Catalog, storage: Any, db: str
+) -> None:
+    """``CREATE OR REPLACE VIEW`` may only ADD columns at the end: dropping one,
+    renaming one or changing its type is PostgreSQL's 42P16. The replacement
+    used to be stored whatever it was, so a client's view silently lost or
+    renamed the columns its queries read."""
+    old_cols = _view_columns(old_sql, catalog, storage, db)
+    new_cols = _view_columns(new_sql, catalog, storage, db)
+    if len(new_cols) < len(old_cols):
+        raise errors.SQLError("42P16", "cannot drop columns from view")
+    for o, n in zip(old_cols, new_cols, strict=False):
+        if o.name != n.name:
+            raise errors.SQLError(
+                "42P16",
+                f'cannot change name of view column "{o.name}" to "{n.name}"',
+                diag={
+                    "H": "Use ALTER VIEW ... RENAME COLUMN ... to change name of view "
+                    "column instead."
+                },
+            )
+        if o.pg_oid != n.pg_oid:
+            old_t = typemap.SQL_TYPE_NAME.get(o.type_tag, o.type_tag)
+            new_t = typemap.SQL_TYPE_NAME.get(n.type_tag, n.type_tag)
+            raise errors.SQLError(
+                "42P16",
+                f'cannot change data type of view column "{o.name}" from {old_t} to {new_t}',
+            )
 
 
 def execute_drop_view(stmt: Any, catalog: Catalog, storage: Any, db: str) -> SQLResult:
@@ -1201,6 +1244,8 @@ def _tagged_out_column_descs(
     out: list[ColumnDesc] = []
     for i, (name, tag) in enumerate(cols):
         oid = typemap.PG_OID.get(tag, 25)
+        if tag == "composite" and out_exprs is not None and i < len(out_exprs):
+            oid = _whole_row_rowtype_oid(out_exprs[i], base_table, storage, db) or oid
         enum_name = enum_types.get(i)
         if enum_name is not None and storage is not None and db is not None:
             if enum_oids is None:
@@ -1244,6 +1289,31 @@ def _tagged_out_column_descs(
             )
         )
     return out
+
+
+def _whole_row_rowtype_oid(expr: Any, base_table: Any, storage: Any, db: str | None) -> int:
+    """A bare reference to the base table (`SELECT t FROM t`) describes as
+    that table's ROW TYPE, as PostgreSQL does -- not the generic `record`
+    (2249), which a client parses differently (psycopg turned `(1,10,x)` into
+    a tuple of strings). 0 when `expr` is not such a reference."""
+    from sqlglot import exp as _exp
+
+    if isinstance(expr, _exp.Alias):
+        expr = expr.this
+    name = getattr(base_table, "name", None)
+    if (
+        not isinstance(expr, _exp.Column)
+        or expr.table
+        or name is None
+        or expr.name != name
+        or storage is None
+        or db is None
+        or any(c.name == name for c in getattr(base_table, "columns", []))
+    ):
+        return 0
+    from secantus.sql import virtual
+
+    return virtual._table_rowtype_oids(db, Catalog(storage)).get(name, 0)
 
 
 def _returning_result(

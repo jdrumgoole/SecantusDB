@@ -3578,6 +3578,49 @@ def _empty_rows(db: str, session: Session, storage: Any, catalog: Catalog) -> li
     return []
 
 
+_TRIGGER_OID_BASE = 92000
+_CONSTRAINT_TRIGGER_OID_BASE = 93000
+
+
+def _pg_trigger(db: str, storage: Any, catalog: Catalog) -> list[dict]:
+    """One row per user trigger, with PostgreSQL's ``tgtype`` bit layout
+    (ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64).
+    It answered no rows at all, so a client could not see a trigger it had
+    just created. OIDs are fictional but stable within a catalog read."""
+    from secantus.sql.catalog import TRIGGER_COLLECTION
+
+    rels = {**_table_oids(db, catalog), **_view_oids(db, catalog)}
+    funcs = _function_oids(db, catalog)
+    events = {"INSERT": 4, "DELETE": 8, "UPDATE": 16, "TRUNCATE": 32}
+    trgs = sorted(
+        storage.find_matching(db, TRIGGER_COLLECTION, {}),
+        key=lambda t: (t.get("table", ""), t.get("name", "")),
+    )
+    rows = []
+    for i, t in enumerate(trgs):
+        tgtype = 1 if t.get("level", "ROW") == "ROW" else 0
+        timing = t.get("timing")
+        tgtype |= 2 if timing == "BEFORE" else 64 if timing == "INSTEAD OF" else 0
+        for e in t.get("events") or [t.get("event")]:
+            tgtype |= events.get(e, 0)
+        constraint = bool(t.get("constraint"))
+        rows.append(
+            {
+                "oid": _TRIGGER_OID_BASE + i,
+                "tgrelid": rels.get(t.get("table"), 0),
+                "tgname": t.get("name"),
+                "tgfoid": funcs.get(f"{t.get('function')}/0", 0),
+                "tgtype": tgtype,
+                "tgenabled": "O",
+                "tgisinternal": False,
+                "tgconstraint": _CONSTRAINT_TRIGGER_OID_BASE + i if constraint else 0,
+                "tgdeferrable": bool(t.get("deferrable")),
+                "tginitdeferred": bool(t.get("initially_deferred")),
+            }
+        )
+    return rows
+
+
 # Present-but-empty catalogs psql's ``\d`` family joins: no extended
 # statistics, triggers, rules, inheritance, or publications in our model —
 # but the relations must exist so the queries run.
@@ -3610,7 +3653,7 @@ _register(
         ("tgdeferrable", "bool"),
         ("tginitdeferred", "bool"),
     ],
-    _empty_rows,
+    lambda db, session, storage, catalog: _pg_trigger(db, storage, catalog),
 )
 _register(
     "pg_catalog",
