@@ -196,6 +196,9 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         if left is None or right is None:
             return None
         return _pggeo.distance(left, right)
+    range_pos = _eval_range_position(node, scope, ctx)
+    if range_pos is not _NOT_RANGE:
+        return range_pos
     if isinstance(node, (exp.BitwiseLeftShift, exp.BitwiseRightShift)):
         net_result = _eval_net_op(node, scope, ctx)
         if net_result is not _NOT_NET:
@@ -802,15 +805,28 @@ def _eval_arith(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     left, right = _unwrap_decimal(left), _unwrap_decimal(right)
     # ``*`` / ``+`` / ``-`` are overloaded for ranges (intersection / union /
     # difference) when both operands are range subdocuments.
-    if _is_range_value(left) and _is_range_value(right):
-        from secantus.sql import ranges as _ranges
+    from secantus.sql import ranges as _ranges
 
+    _mixed_range_operands(node, left, right)
+    if _ranges.is_multirange(left) and _ranges.is_multirange(right):
         if isinstance(node, exp.Mul):
-            return _ranges.intersect(left, right)
+            return _ranges.multirange_intersect(left, right)
         if isinstance(node, exp.Add):
-            return _ranges.union(left, right)
+            return _ranges.multirange_union(left, right)
         if isinstance(node, exp.Sub):
-            return _ranges.difference(left, right)
+            return _ranges.multirange_difference(left, right)
+    if _is_range_value(left) and _is_range_value(right):
+        try:
+            if isinstance(node, exp.Mul):
+                return _ranges.intersect(left, right)
+            if isinstance(node, exp.Add):
+                return _ranges.union(left, right)
+            if isinstance(node, exp.Sub):
+                return _ranges.difference(left, right)
+        except _ranges.RangeError as e:
+            # A non-contiguous union / difference is PostgreSQL's 22000, not
+            # an internal error.
+            raise errors.SQLError("22000", str(e)) from e
     # A bare string literal is Postgres' ``unknown``, and unknown resolves to the
     # OTHER operand's type before an operator is chosen — so it must not be read
     # as a date here. ``'2020-01-01' + 1`` is *integer* input in PG (22P02); we
@@ -3108,6 +3124,28 @@ def _is_nan(v: Any) -> bool:
         return False
 
 
+_OP_SYMBOL = {
+    exp.Add: "+", exp.Sub: "-", exp.Mul: "*", exp.EQ: "=", exp.NEQ: "<>",
+    exp.LT: "<", exp.LTE: "<=", exp.GT: ">", exp.GTE: ">=",
+}  # fmt: skip
+
+
+def _mixed_range_operands(node: exp.Expression, left: Any, right: Any) -> None:
+    """A multirange against a plain range has no ``+ - *`` or comparison
+    operator in PostgreSQL (42883); one side read as jsonb answered a confusing
+    `jsonb + range`, a `cannot delete from scalar`, or a quiet `false`."""
+    from secantus.sql import ranges as _ranges
+
+    lm, rm = _ranges.is_multirange(left), _ranges.is_multirange(right)
+    lr, rr = _is_range_value(left), _is_range_value(right)
+    if (lm and rr) or (lr and rm):
+        op = _OP_SYMBOL.get(type(node), "?")
+        raise errors.SQLError(
+            "42883",
+            f"operator does not exist: {_ranges.type_name(left)} {op} {_ranges.type_name(right)}",
+        )
+
+
 def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     left = evaluate(node.this, scope, ctx)
     right = evaluate(node.expression, scope, ctx)
@@ -3123,18 +3161,20 @@ def _eval_compare(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any
         left = _intervals.total_micros(left)
         right = _intervals.total_micros(right)
     left, right = _coerce_untyped_range_operand(left, right)
+    _mixed_range_operands(node, left, right)
     ls, rs = _range_value_shape(left), _range_value_shape(right)
     if ls is not None and ls == rs:
         # Ranges compare by canonical identity — bound representations vary by
         # construction path (int vs Decimal vs Decimal128, date obj vs text).
         from secantus.sql import ranges as _ranges
 
+        # Equality by identity; ORDER by PostgreSQL's range order.
+        ordering = not isinstance(node, (exp.EQ, exp.NEQ))
         if ls == "multirange":
-            left = _ranges.canonical_multirange(left)
-            right = _ranges.canonical_multirange(right)
+            key = _ranges.multirange_sort_key if ordering else _ranges.canonical_multirange
         else:
-            left = _ranges.canonical(left)
-            right = _ranges.canonical(right)
+            key = _ranges.sort_key if ordering else _ranges.canonical
+        left, right = key(left), key(right)
     left, right = _parse_date_text_against_date(left, right)
     left, right = _promote_date_against_datetime(left, right)
     if (
@@ -6233,6 +6273,46 @@ def _eval_fts_match(left: Any, right: Any) -> Any:
     if left_q and right_v:
         return _fts.matches(right, left)
     return None
+
+
+_RANGE_POSITION_NODES = tuple(
+    c
+    for c in (
+        exp.BitwiseLeftShift,
+        exp.BitwiseRightShift,
+        getattr(exp, "ExtendsLeft", None),
+        getattr(exp, "ExtendsRight", None),
+    )
+    if c is not None
+)
+
+
+def _eval_range_position(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``<<`` / ``>>`` / ``&<`` / ``&>`` over ranges and multiranges (a
+    multirange by the span of its members). ``&<`` / ``&>`` answered
+    ``0A000 unsupported scalar expression`` and ``<<`` / ``>>`` fell to the
+    bit-shift path. ``_NOT_RANGE`` when neither operand is a range."""
+    if not isinstance(node, _RANGE_POSITION_NODES):
+        return _NOT_RANGE
+    from secantus.sql import ranges as _ranges
+
+    left = evaluate(node.this, scope, ctx)
+    right = evaluate(node.expression, scope, ctx)
+    is_r = lambda v: _ranges._is_range(v) or _ranges.is_multirange(v)  # noqa: E731
+    if not (is_r(left) or is_r(right)):
+        if isinstance(node, (exp.BitwiseLeftShift, exp.BitwiseRightShift)):
+            return _NOT_RANGE
+        raise errors.feature_not_supported(f"unsupported scalar expression: {node.sql()}")
+    if left is None or right is None:
+        return None
+    a, b = _ranges.span(left), _ranges.span(right)
+    if isinstance(node, exp.BitwiseLeftShift):
+        return _ranges.strictly_left(a, b)
+    if isinstance(node, exp.BitwiseRightShift):
+        return _ranges.strictly_left(b, a)
+    if type(node).__name__ == "ExtendsLeft":  # &<
+        return _ranges.not_extend_right(a, b)
+    return _ranges.not_extend_left(a, b)  # &>
 
 
 def _eval_range_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
