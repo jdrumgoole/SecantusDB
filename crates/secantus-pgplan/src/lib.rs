@@ -10000,7 +10000,7 @@ fn srf_rows(
                 other => value_text(other),
             };
             let (source, pattern) = (text(&a[0]), text(&a[1]));
-            let flags = a.get(2).map(&text).unwrap_or_default();
+            let flags = a.get(2).map(text).unwrap_or_default();
             let re = regex::Regex::new(&format!(
                 "{}{}",
                 if flags.contains('i') { "(?i)" } else { "" },
@@ -23427,7 +23427,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     let source = text(&args[0])?;
     let pattern = text(&args[1])?;
     let replacement = text(&args[2])?;
-    let flags = args.get(3).map(&text).transpose()?.unwrap_or_default();
+    let flags = args.get(3).map(text).transpose()?.unwrap_or_default();
     let mut builder = String::new();
     if flags.contains('i') {
         builder.push_str("(?i)");
@@ -28688,8 +28688,8 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
     };
     if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
         let lb = lower.first().copied().unwrap_or(1);
-        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(lb);
-        let hi = match hi.as_ref().map(&index).transpose()? {
+        let lo = lo.as_ref().map(index).transpose()?.unwrap_or(lb);
+        let hi = match hi.as_ref().map(index).transpose()? {
             Some(h) => h,
             None => lb + items.len() as i64 - 1,
         };
