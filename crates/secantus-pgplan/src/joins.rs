@@ -436,18 +436,25 @@ fn keep_column_names(
         })
 }
 
-/// A function's output column names from its alias: `AS t(a, b)` names them;
-/// a bare `AS x` over a function returning ONE column names that column too,
-/// which is PostgreSQL's rule for a scalar function in FROM.
+/// A function's output column names from its alias: `AS t(a, b)` names them.
+/// A bare `AS x` names the column only of a function returning ONE -- the
+/// rule for a scalar function in FROM -- which is applied once the width is
+/// known (`scalar_alias`); naming a WIDER function's first column `x` hid
+/// `jsonb_each`'s `key` in a join.
 fn function_colnames(rf: &pg_query::protobuf::RangeFunction) -> Vec<pg_query::protobuf::Node> {
     match rf.alias.as_ref() {
         Some(a) if !a.colnames.is_empty() => a.colnames.clone(),
-        Some(a) if !a.aliasname.is_empty() => vec![pg_query::protobuf::Node {
-            node: Some(N::String(pg_query::protobuf::String {
-                sval: a.aliasname.clone(),
-            })),
-        }],
         _ => Vec::new(),
+    }
+}
+
+/// The names a function's columns take: the alias list, else -- for a
+/// one-column function -- the bare alias.
+fn scalar_alias(names: Vec<String>, function: bool, alias: &str, width: usize) -> Vec<String> {
+    if names.is_empty() && function && width == 1 {
+        vec![alias.to_string()]
+    } else {
+        names
     }
 }
 
@@ -583,6 +590,7 @@ fn lateral_leaf(
     let plan = plan_select(&inner, lookup, &sample_params)?;
     let def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
+    let names = scalar_alias(names, function, &alias, def.columns.len());
     if names.len() > def.columns.len() {
         return Err(Error::Parse(format!(
             "table \"{alias}\" has {} columns available but {} columns specified",
@@ -701,9 +709,11 @@ fn leaf_filtered(
         op: pg_query::protobuf::SetOperation::SetopNone as i32,
         ..Default::default()
     };
+    let function = matches!(select.from_clause[0].node, Some(N::RangeFunction(_)));
     let plan = plan_select(&select, lookup, params)?;
     let mut def = sub_plan_def(&plan, lookup)?;
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
+    let names = scalar_alias(names, function, alias, def.columns.len());
     if names.len() > def.columns.len() {
         return Err(Error::Parse(format!(
             "table \"{alias}\" has {} columns available but {} columns specified",

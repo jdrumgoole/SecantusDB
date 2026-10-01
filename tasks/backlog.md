@@ -666,8 +666,9 @@ remain open:
         numeric arithmetic and a scalar subquery; an untyped literal compared
         with one is coerced when analysed; since batch 14 also an array
         subscript, a pair of row constructors and a window function's result
-        (`operand_shapes` corpus). An operand of any other shape (a record
-        field, a set-returning function's column) is not checked.
+        (`operand_shapes` corpus), a set-returning function's column, a
+        record field, and `json` / `jsonb` arithmetic (batch 14, corpus
+        `srf_fields`). An operand of any other shape is not checked.
       - **Error positions** (`P`) come from the parse location where the
         raising site recorded one, and otherwise from the first token the
         message names. A name mentioned twice may point at the wrong

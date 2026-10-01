@@ -15746,6 +15746,189 @@ fn order_by_output_exprs(
     changed.then_some(out)
 }
 
+/// `(alias).field`, where `alias` names a FROM item rather than a column, as
+/// the plain reference `alias.field` it means (PostgreSQL reads the alias as
+/// the item's whole-row value). A name that is also a column of a table in
+/// FROM is left alone: the column wins.
+fn alias_field_rewrite(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    fn aliases(
+        n: &pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        out: &mut Vec<(String, Option<String>)>,
+    ) {
+        match n.node.as_ref() {
+            // Only a function returning SEVERAL columns is a record: a
+            // one-column function's alias is its scalar value, and field
+            // notation on it is PostgreSQL's 42809.
+            Some(N::RangeFunction(f)) => {
+                let Some(a) = f.alias.as_ref() else {
+                    return;
+                };
+                let mut bare = f.clone();
+                bare.alias = None;
+                let probe = pg_query::protobuf::SelectStmt {
+                    target_list: vec![pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            val: Some(Box::new(star_target_node())),
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    }],
+                    from_clause: vec![pg_query::protobuf::Node {
+                        node: Some(N::RangeFunction(bare)),
+                    }],
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                let def = plan_select(&probe, lookup, &[]).and_then(|p| sub_plan_def(&p, lookup));
+                match def.as_ref().map(|d| d.columns.as_slice()) {
+                    Ok([one]) => {
+                        out.push((a.aliasname.clone(), Some(format!("\u{1}{}", one.pg_type))))
+                    }
+                    Ok(cols) if cols.len() > 1 => out.push((a.aliasname.clone(), None)),
+                    _ => {}
+                }
+            }
+            Some(N::RangeSubselect(r)) => {
+                if let Some(a) = r.alias.as_ref() {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeVar(r)) => out.push((
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone()),
+                Some(relation_name(r)),
+            )),
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    aliases(side, lookup, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = Vec::new();
+    for n in &s.from_clause {
+        aliases(n, lookup, &mut items);
+    }
+    // Function and subquery aliases only: a table's whole-row value is
+    // already handled (`whole_row_rewrite`).
+    let names: Vec<String> = items
+        .iter()
+        .filter(|(_, rel)| rel.is_none())
+        .map(|(a, _)| a.clone())
+        .collect();
+    // A one-column function's alias, with its column's type (marked by a
+    // leading \u{1}, which no relation name carries).
+    let scalars: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|(a, rel)| {
+            Some((
+                a.clone(),
+                rel.as_deref()?.strip_prefix('\u{1}')?.to_string(),
+            ))
+        })
+        .collect();
+    let items: Vec<(String, Option<String>)> = items
+        .into_iter()
+        .filter(|(_, rel)| !rel.as_deref().is_some_and(|r| r.starts_with('\u{1}')))
+        .collect();
+    if names.is_empty() && scalars.is_empty() {
+        return Ok(None);
+    }
+    let is_column = |name: &str| {
+        items.iter().any(|(_, rel)| {
+            rel.as_deref()
+                .and_then(lookup)
+                .is_some_and(|d| d.column(name).is_some())
+        })
+    };
+    let mut changed = false;
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        let Some(N::AIndirection(a)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(N::ColumnRef(c)) = a.arg.as_deref().and_then(|x| x.node.as_ref()) else {
+            return Ok(());
+        };
+        let [only] = c.fields.as_slice() else {
+            return Ok(());
+        };
+        let Some(N::String(alias)) = only.node.as_ref() else {
+            return Ok(());
+        };
+        let [field, rest @ ..] = a.indirection.as_slice() else {
+            return Ok(());
+        };
+        let Some(N::String(f)) = field.node.as_ref() else {
+            return Ok(());
+        };
+        if is_column(&alias.sval) {
+            return Ok(());
+        }
+        if let Some((_, ty)) = scalars.iter().find(|(n, _)| *n == alias.sval) {
+            return Err(Error::Sqlstate(
+                "42809",
+                format!(
+                    "column notation .{} applied to type {}, which is not a composite type",
+                    f.sval,
+                    display_type(ty)
+                ),
+            ));
+        }
+        if !names.contains(&alias.sval) {
+            return Ok(());
+        }
+        let column = pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![string_node(&alias.sval), string_node(&f.sval)],
+                location: c.location,
+            })),
+        };
+        *n = if rest.is_empty() {
+            column
+        } else {
+            pg_query::protobuf::Node {
+                node: Some(N::AIndirection(Box::new(
+                    pg_query::protobuf::AIndirection {
+                        arg: Some(Box::new(column)),
+                        indirection: rest.to_vec(),
+                    },
+                ))),
+            }
+        };
+        changed = true;
+        Ok(())
+    };
+    let mut out = s.clone();
+    for t in &mut out.target_list {
+        walk_expr(t, &mut visit)?;
+    }
+    for c in [
+        out.where_clause.as_deref_mut(),
+        out.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        walk_expr(c, &mut visit)?;
+    }
+    for n in out
+        .sort_clause
+        .iter_mut()
+        .chain(out.group_clause.iter_mut())
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    Ok(changed.then_some(out))
+}
+
 /// A table in FROM with a column-alias list (`t r(a, b)`) as the subquery
 /// it is shorthand for, `(SELECT id AS a, g AS b, v FROM t) r`, so every
 /// planner path sees ordinary column names. `None` when there is none.
@@ -15870,6 +16053,10 @@ fn plan_select(
     }
     // `FROM t r(a, b)` renames t's leading columns: the subquery it equals.
     if let Some(rewritten) = column_alias_rewrite(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // `(j).value` where `j` names a FROM item: the item's column.
+    if let Some(rewritten) = alias_field_rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {

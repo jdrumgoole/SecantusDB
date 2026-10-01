@@ -140,6 +140,61 @@ impl<'p> Scope<'p> {
                     None => self.complete = false,
                 }
             }
+            // A function in FROM: typed by planning `SELECT * FROM f(...)`,
+            // its columns named by the alias list, or -- a one-column
+            // function -- by the bare alias.
+            Some(N::RangeFunction(rf)) if !rf.lateral => {
+                let alias = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .or_else(|| crate::joins::range_function_name(rf));
+                let mut bare = rf.clone();
+                bare.alias = None;
+                let probe = pg_query::protobuf::SelectStmt {
+                    target_list: vec![pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            val: Some(Box::new(crate::star_target_node())),
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    }],
+                    from_clause: vec![pg_query::protobuf::Node {
+                        node: Some(N::RangeFunction(bare)),
+                    }],
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                let def = crate::plan_select(&probe, lookup, &[])
+                    .and_then(|p| crate::sub_plan_def(&p, lookup));
+                match (alias, def) {
+                    (Some(alias), Ok(mut def)) => {
+                        let names: Vec<String> = rf
+                            .alias
+                            .as_ref()
+                            .map(|a| {
+                                a.colnames
+                                    .iter()
+                                    .filter_map(|n| match n.node.as_ref() {
+                                        Some(N::String(s)) => Some(s.sval.clone()),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if names.is_empty() && def.columns.len() == 1 {
+                            def.columns[0].name = alias.clone();
+                        }
+                        for (c, n) in def.columns.iter_mut().zip(names) {
+                            c.name = n;
+                        }
+                        self.tables.push((alias, def));
+                    }
+                    _ => self.complete = false,
+                }
+            }
             Some(N::JoinExpr(j)) => {
                 // A USING / NATURAL join merges columns; their types are the
                 // sides' own, which is what an unqualified lookup finds.
@@ -484,6 +539,21 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 }
                 (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
                 _ => {}
+            }
+        }
+    }
+    // `json` / `jsonb` have no arithmetic: `jsonb + integer` is 42883 where
+    // evaluating it over the value's text answered `text + integer`. The one
+    // operator among them is `jsonb - text | integer | text[]` (delete).
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let json = |t: &str| matches!(t, "json" | "jsonb");
+            let delete = op == "-"
+                && l == "jsonb"
+                && matches!(r.as_str(), "text" | "int4" | "int2" | "int8" | "text[]");
+            if (json(&l) || json(&r)) && !delete {
+                return Err(mismatch(&op, &l, &r, e.location));
             }
         }
     }
