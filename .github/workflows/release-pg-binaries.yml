@@ -182,6 +182,9 @@ jobs:
           ls -l "$libdir/libz.a" "$libdir/liblz4.a"
           {
             echo "SECANTUS_WT_STATIC_COMPRESSORS=1"
+            # zlib comes from libz-sys; this makes it build and link zlib
+            # statically (with gcc) instead of linking the system's libz.so.
+            echo "LIBZ_SYS_STATIC=1"
             echo "SECANTUS_WT_EXTRA_LIBDIR=$libdir"
           } >> "$GITHUB_ENV"
 

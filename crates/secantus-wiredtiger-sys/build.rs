@@ -72,16 +72,18 @@ fn main() {
         // Windows builds WiredTiger with no compressors, as the wheel does.
         // Elsewhere the builtin extensions only need the HEADERS at configure
         // time; the symbols come from libz-sys and compile_lz4 at the link.
-        let z_inc = env::var("DEP_Z_INCLUDE").expect("libz-sys exports its include dir");
         let lz4_inc = manifest.join("lz4");
-        // WiredTiger's find step wants a library path too; it is recorded,
-        // never linked, because the static archive links nothing itself.
-        let marker = Path::new(&z_inc).join("zlib.h");
         cfg.define("ENABLE_ZLIB", "OFF")
-            .define("HAVE_BUILTIN_EXTENSION_ZLIB", "ON")
-            .define("HAVE_LIBZ", &marker)
-            .define("HAVE_LIBZ_INCLUDES", &z_inc)
-            .define("ENABLE_LZ4", "OFF")
+            .define("HAVE_BUILTIN_EXTENSION_ZLIB", "ON");
+        // A zlib libz-sys built from source exports its headers; a system zlib
+        // does not, and WiredTiger's own probe finds the system one. The
+        // library path is recorded, never linked: the static archive links
+        // nothing itself.
+        if let Ok(z_inc) = env::var("DEP_Z_INCLUDE") {
+            cfg.define("HAVE_LIBZ", Path::new(&z_inc).join("zlib.h"))
+                .define("HAVE_LIBZ_INCLUDES", &z_inc);
+        }
+        cfg.define("ENABLE_LZ4", "OFF")
             .define("HAVE_BUILTIN_EXTENSION_LZ4", "ON")
             .define("HAVE_LIBLZ4", lz4_inc.join("lz4.h"))
             .define("HAVE_LIBLZ4_INCLUDES", &lz4_inc);
@@ -143,6 +145,13 @@ fn compile_lz4(manifest: &Path) {
     let dir = manifest.join("lz4");
     println!("cargo:rerun-if-changed={}", dir.join("lz4.c").display());
     cc::Build::new()
+        // Do NOT copy rustc's flags onto the C compile. `cc` turns
+        // `-Cprofile-generate` into clang's `-fprofile-generate`, which is only
+        // sound when clang and rustc share an LLVM profile format. Apple clang
+        // and rustc 1.99 do not ("Runtime and instrumentation version
+        // mismatch: expected 11, but get 10"), and the macOS PGO release build
+        // failed on exactly that. lz4 is not on the hot path PGO is for.
+        .inherit_rustflags(false)
         .file(dir.join("lz4.c"))
         .include(&dir)
         .opt_level(3)
