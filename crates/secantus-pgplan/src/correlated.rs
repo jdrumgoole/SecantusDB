@@ -637,6 +637,23 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "pg_try_advisory_xact_lock_shared",
     // The role graph lives in the executor's catalog.
     "pg_has_role",
+    // Large objects live in the store.
+    "lo_creat",
+    "lo_create",
+    "lo_unlink",
+    "lo_open",
+    "lo_close",
+    "loread",
+    "lowrite",
+    "lo_lseek",
+    "lo_lseek64",
+    "lo_tell",
+    "lo_tell64",
+    "lo_truncate",
+    "lo_truncate64",
+    "lo_get",
+    "lo_put",
+    "lo_from_bytea",
 ];
 
 /// The result type of an executor-answered function other than the
@@ -652,6 +669,12 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         n if n.contains("advisory") => "void",
         "pg_has_role" => "bool",
         "set_limit" => "float4",
+        "lo_creat" | "lo_create" | "lo_from_bytea" => "oid",
+        "lo_unlink" | "lo_open" | "lo_close" | "lowrite" | "lo_lseek" | "lo_tell"
+        | "lo_truncate" | "lo_truncate64" => "int4",
+        "lo_lseek64" | "lo_tell64" => "int8",
+        "loread" | "lo_get" => "bytea",
+        "lo_put" => "void",
         _ => return None,
     })
 }

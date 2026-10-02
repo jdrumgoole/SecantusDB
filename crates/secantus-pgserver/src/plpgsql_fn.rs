@@ -57,7 +57,23 @@ pub struct QueryOut {
 }
 
 /// What the interpreter asks of the server.
+mod open_cursor;
+
 pub trait Host {
+    /// `OPEN cur FOR query`: make a portal over the query's rows, named
+    /// `name` or (`None`) `<unnamed portal N>`; answers the name.
+    fn open_cursor(
+        &self,
+        name: Option<&str>,
+        statement: &str,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+        scroll: bool,
+    ) -> Result<String, PlError> {
+        let _ = (name, statement, sql, params, types, scroll);
+        Err(PlError::unsupported("OPEN"))
+    }
     /// Run a statement that yields rows, with `params` typed by `types`.
     fn query(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError>;
     /// Run a statement for its effect; answers the rows it affected.
@@ -210,6 +226,8 @@ struct Interp<'a> {
     found_no: Option<usize>,
     /// The error a handler is running for: `RAISE;` re-raises it.
     handling: Option<PlError>,
+    /// Bound cursors' queries, by datum number (`open_cursor`).
+    cursor_exprs: HashMap<usize, String>,
 }
 
 impl Interp<'_> {
@@ -266,7 +284,31 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
     // number (`retvarno`) that the JSON rendering omits, so the statement
     // would arrive with nothing to return. Parenthesised, it is an ordinary
     // expression; a record variable is recognised again by name below.
-    let rewritten = parenthesise_return_next(create_sql);
+    let mut rewritten = parenthesise_return_next(create_sql);
+    // A refcursor PARAMETER opened as a cursor: see `open_cursor`.
+    for _ in 0..8 {
+        let Err(e) = pg_query::parse_plpgsql(&rewritten) else {
+            break;
+        };
+        let text = e.to_string();
+        let Some(var) = text
+            .split("variable \"")
+            .nth(1)
+            .and_then(|r| r.strip_suffix("\" must be of type cursor or refcursor"))
+            .or_else(|| {
+                text.split("variable \"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .filter(|_| text.contains("must be of type cursor or refcursor"))
+            })
+        else {
+            break;
+        };
+        match open_cursor::cursor_param_rewrite(&rewritten, var) {
+            Some(next) => rewritten = next,
+            None => break,
+        }
+    }
     let v = pg_query::parse_plpgsql(&rewritten).map_err(|e| {
         let text = e.to_string();
         PlError::new(
@@ -546,6 +588,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         row_count: 0,
         found_no,
         handling: None,
+        cursor_exprs: open_cursor::cursor_exprs(&f),
     };
     if let Some(t) = &inv.trigger {
         let new_no = f
@@ -1295,6 +1338,7 @@ impl Interp<'_> {
                 Ok(Flow::Next)
             }
             "PLpgSQL_stmt_raise" => self.raise(body),
+            "PLpgSQL_stmt_open" => self.open_cursor(body),
             "PLpgSQL_stmt_perform" => {
                 let (text, _) = expr_query(body.get("expr").unwrap_or(&Value::Null))
                     .ok_or_else(|| PlError::new("XX000", "PERFORM without a query"))?;
