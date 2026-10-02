@@ -633,13 +633,20 @@ remain open:
       (`nextval` already did); privileges checked on the schema-qualified
       table -- `SELECT` / `INSERT` on `s.t` were checked against a bare `t`
       and so ALLOWED for any role; `has_table_privilege` answering true for
-      every role; and the gauge runner's temp dir.) Still open, found in
-      batch 41: schema `USAGE` is not enforced (`GRANT` / `REVOKE ... ON
-      SCHEMA` are accepted and ignored, so a role reads `s.t` where
-      PostgreSQL answers `42501 permission denied for schema s`);
-      `has_column_privilege` / `has_schema_privilege` / `has_sequence_privilege`
-      / `has_function_privilege` still answer true for every role;
-      `information_schema.role_table_grants` does not exist (42P01).
+      every role; and the gauge runner's temp dir.) Batch 42 (corpus
+      `b42_privileges`) enforces schema `USAGE` on a schema-qualified
+      relation, records GRANT / REVOKE on schemas, sequences and functions
+      (`__sql_object_acl__`, this server's own store -- the Python server
+      keeps none), answers `has_schema_privilege` / `has_sequence_privilege` /
+      `has_function_privilege` / `has_column_privilege` from them, and adds
+      `information_schema.role_table_grants` / `table_privileges`. Still
+      open: an UNQUALIFIED name is not checked for schema USAGE (PostgreSQL
+      skips a `search_path` schema the role cannot use); schema `CREATE`,
+      sequence `USAGE` / `SELECT` / `UPDATE` (at `nextval` / `currval`) and
+      function `EXECUTE` (at a call) are recorded and answered but not
+      enforced; a function's grants are keyed by its bare name, so they
+      cover every overload; `GRANT ... ON ALL SEQUENCES / FUNCTIONS IN
+      SCHEMA` is accepted and changes nothing.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
@@ -719,15 +726,17 @@ remain open:
       `cid` / `xid8` / snapshot parameters and their arrays (stored as their
       raw bytes before; `macaddr[]` / `pg_lsn[]` already decoded), and SET /
       `set_config` / ALTER DATABASE SET of a postmaster / sighup / backend
-      parameter (55P02). Still open:
-      `pg_class` does not list another session's temp tables; extended
-      Execute materialises the whole result; `set_config(x, v, true)` outside
-      a block is not visible later in the same statement; SQL `lo_open` in
-      autocommit leaves its descriptor open after the statement; a notice is
-      sent early only while a statement waits on a table lock; the
-      `pg_snapshot_xmin` / `_xmax` / `_xip`, `pg_visible_in_snapshot` (and
-      `txid_` twins) and `pg_current_snapshot` functions do not exist
-      (0A000) though the types do.
+      parameter (55P02). Batch 42 fixed (corpus `b42_misc`): another
+      session's temp tables in `pg_class`, `set_config(x, v, true)` outside a
+      block (visible to the rest of its statement, then put back -- it had
+      leaked into the session, or not applied at all over the extended
+      protocol), SQL `lo_open` in autocommit (closed with its statement;
+      descriptors number from the lowest free slot again), a notice raised
+      before a `pg_sleep` sent while it sleeps, and the snapshot functions.
+      Still open: extended Execute materialises the whole result; a notice
+      is sent early only while a statement waits on a table lock or sleeps,
+      not during other long work; `pg_current_snapshot()` is the fixed
+      `3:3:` (this server exposes no transaction ids).
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
@@ -900,17 +909,6 @@ remain open:
       `pg_get_constraintdef()` and `conbin` were re-measured working in
       batch 10.)
 
-- [ ] **OPEN — RUST pgserver: a COMMIT is not durable against a process
-      kill (found batch 41, 2026-10-02).** `secantusd-pg` opens WiredTiger
-      with `transaction_sync=(enabled=false)` (the storage default the
-      MongoDB server shares), so a SIGKILL loses the commits of roughly the
-      last second: measured with `SECANTUS_FORCE_DURABLE=1`, a `CREATE TABLE`
-      + `INSERT` acknowledged just before the kill were gone after restart,
-      while the same statements 2 s earlier survived. PostgreSQL's default
-      (`synchronous_commit = on`) makes an acknowledged COMMIT survive a
-      crash. Whether a test surrogate should pay a sync per commit is Joe's
-      call (the storage has a `sync_on_commit` knob; `secantusd-pg` does not
-      expose it).
 - [x] **RESOLVED (found and fixed 2026-09-28): a regclass/regtype operand
       inside a LIST matched NOTHING, silently.** A `regclass` value is a
       one-field document carrying its oid (`{__regclass_oid: N}`); the stored

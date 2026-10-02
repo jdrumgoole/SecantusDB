@@ -49,7 +49,6 @@ pub(crate) struct LoDesc {
 
 #[derive(Default)]
 pub(crate) struct LoDescriptors {
-    next: i32,
     open: HashMap<i32, LoDesc>,
 }
 
@@ -329,8 +328,11 @@ impl PgHandler {
                     return Err(err("42704", format!("large object {oid} does not exist")));
                 }
                 let mut descs = self.lo_descriptors.lock().unwrap_or_else(|e| e.into_inner());
-                let fd = descs.next;
-                descs.next += 1;
+                // The lowest free slot, as PostgreSQL's `newLOfd` picks: a
+                // transaction's first descriptor is 0 again.
+                let fd = (0..)
+                    .find(|i| !descs.open.contains_key(i))
+                    .expect("a free descriptor");
                 descs.open.insert(fd, LoDesc { oid, pos: 0, mode });
                 Ok(i32_out(i64::from(fd)))
             }

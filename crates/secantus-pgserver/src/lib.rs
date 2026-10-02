@@ -26,6 +26,7 @@ mod fdw;
 mod largeobjects;
 mod live_notices;
 mod merge;
+mod object_acl;
 mod partition;
 mod pg15_settings;
 mod pg_type_facts;
@@ -42,7 +43,7 @@ mod triggers;
 mod txn_gucs;
 mod wire_portals;
 
-pub use server::{bind, RunningPgServer};
+pub use server::{bind, open_storage, sync_on_commit, RunningPgServer};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2251,6 +2252,9 @@ pub struct PgHandler {
     holdable_declared: AtomicBool,
     /// Settings the open block changed (see `txn_gucs`).
     txn_gucs: Mutex<txn_gucs::TxnGucs>,
+    /// `set_config(x, v, true)` run outside any transaction: per key, the
+    /// value before it, put back when the statement ends (`txn_gucs`).
+    statement_gucs: Mutex<HashMap<String, Option<String>>>,
     /// Open large-object descriptors (see `largeobjects`).
     lo_descriptors: Mutex<largeobjects::LoDescriptors>,
     /// The last `<unnamed portal N>` a PL/pgSQL OPEN named.
@@ -2521,6 +2525,7 @@ impl PgHandler {
             txn_sequences: Mutex::new(std::collections::HashSet::new()),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
+            statement_gucs: Mutex::new(HashMap::new()),
             lo_descriptors: Mutex::new(largeobjects::LoDescriptors::default()),
             portal_seq: std::sync::atomic::AtomicU32::new(0),
             wire_portals: Mutex::new(HashMap::new()),
@@ -5754,6 +5759,18 @@ impl PgHandler {
             let oid = Self::index_oid(&format!("ns:{name}"));
             out.push((name, oid));
         }
+        // Another session's temp namespace, while it holds a table: its
+        // tables are in `pg_class` for everyone, as PostgreSQL lists them
+        // (only resolving them by name is the owning session's).
+        if let Ok(defs) = self.all_table_defs() {
+            for d in defs.iter().filter(|d| d.temp) {
+                if let Some((schema, _)) = d.name.split_once('.') {
+                    if schema.starts_with("pg_temp_") && !out.iter().any(|(n, _)| n == schema) {
+                        out.push((schema.to_string(), Self::index_oid(&format!("ns:{schema}"))));
+                    }
+                }
+            }
+        }
         if let Ok(docs) = self.type_catalog_docs(Self::SCHEMA_COLLECTION) {
             for d in docs.iter() {
                 if let Ok(name) = d.get_str("_id") {
@@ -7364,6 +7381,7 @@ impl PgHandler {
         while let Some((as_role, relation, privilege, depth, source)) = pending.pop() {
             match views.iter().find(|(n, _)| *n == relation) {
                 Some((name, definition)) => {
+                    self.check_schema_usage(&as_role, name)?;
                     self.check_privilege_as(&as_role, name, privilege, "view", &source)?;
                     if depth < 16 {
                         // `security_invoker` views read as the caller.
@@ -7385,6 +7403,7 @@ impl PgHandler {
                     }
                 }
                 None => {
+                    self.check_schema_usage(&as_role, &relation)?;
                     self.check_privilege_as(&as_role, &relation, privilege, "table", &source)?
                 }
             }
@@ -8709,6 +8728,17 @@ impl PgHandler {
             .map(|g| self.grantee_name(g))
             .collect::<PgWireResult<Vec<_>>>()?;
         if kind != "table" {
+            if let (Some(acl), false) = (object_acl::acl_kind(kind), all_in_schema) {
+                self.grant_object(
+                    is_grant,
+                    privileges,
+                    acl,
+                    kind,
+                    objects,
+                    &grantees,
+                    grant_option,
+                )?;
+            }
             return Ok(());
         }
         // `GRANT ALL ON t` parses to no privilege list at all; a statement
@@ -10660,6 +10690,32 @@ impl PgHandler {
                     Column::new("cycle_option", "varchar", false),
                 ],
             )),
+            "information_schema.role_table_grants" => Some(TableDef::new(
+                "role_table_grants",
+                vec![
+                    Column::new("grantor", "name", false),
+                    Column::new("grantee", "name", false),
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("privilege_type", "varchar", false),
+                    Column::new("is_grantable", "varchar", false),
+                    Column::new("with_hierarchy", "varchar", false),
+                ],
+            )),
+            "information_schema.table_privileges" => Some(TableDef::new(
+                "table_privileges",
+                vec![
+                    Column::new("grantor", "name", false),
+                    Column::new("grantee", "name", false),
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("privilege_type", "varchar", false),
+                    Column::new("is_grantable", "varchar", false),
+                    Column::new("with_hierarchy", "varchar", false),
+                ],
+            )),
             "pg_class" => Some(TableDef::new(
                 "pg_class",
                 vec![
@@ -11489,6 +11545,27 @@ impl PgHandler {
                     }
                 }
                 rows
+            }
+            "information_schema.role_table_grants" | "information_schema.table_privileges" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                self.table_grant_rows(name == "information_schema.table_privileges")
+                    .into_iter()
+                    .map(
+                        |[grantor, grantee, schema, table, privilege, grantable, hierarchy]| {
+                            let mut d = Document::new();
+                            d.insert(f("grantor"), grantor);
+                            d.insert(f("grantee"), grantee);
+                            d.insert(f("table_catalog"), db.as_str());
+                            d.insert(f("table_schema"), schema);
+                            d.insert(f("table_name"), table);
+                            d.insert(f("privilege_type"), privilege);
+                            d.insert(f("is_grantable"), grantable);
+                            d.insert(f("with_hierarchy"), hierarchy);
+                            d
+                        },
+                    )
+                    .collect()
             }
             "information_schema.key_column_usage" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -16464,7 +16541,11 @@ impl PgHandler {
             Statement::CreateShellType { .. } | Statement::CreateBaseType { .. } => {
                 vec![Self::BASE_TYPE_COLLECTION.to_string()]
             }
-            Statement::Grant { .. } => Self::grant_collections().map(String::from).to_vec(),
+            Statement::Grant { .. } => {
+                let mut v: Vec<String> = Self::grant_collections().map(String::from).to_vec();
+                v.push(object_acl::OBJECT_ACL_COLLECTION.to_string());
+                v
+            }
             // A rename rewrites the catalog rows naming the object, and an
             // expression index's hidden field in the rows.
             Statement::RenameObject { target, .. } => vec![
@@ -17920,6 +18001,23 @@ impl PgHandler {
         if name == "has_table_privilege" {
             return self.has_table_privilege_call(args);
         }
+        if name == "pg_sleep" {
+            let secs = match args.first() {
+                Some(Bson::Double(d)) => *d,
+                _ => 0.0,
+            };
+            self.sleep_for(secs)?;
+            return Ok(Bson::String(String::new()));
+        }
+        if matches!(
+            name,
+            "has_column_privilege"
+                | "has_schema_privilege"
+                | "has_sequence_privilege"
+                | "has_function_privilege"
+        ) {
+            return self.has_object_privilege_call(name, args);
+        }
         if name.starts_with("lo") && largeobjects::is_sql_function(name) {
             return self.lo_sql_call(name, args);
         }
@@ -18328,6 +18426,14 @@ impl PgHandler {
     /// No-op when the handle belongs to a block -- a `BEGIN` in the group
     /// made it one, and only `COMMIT` / `ROLLBACK` end that.
     fn close_extended_group(&self, failed: bool) -> PgWireResult<()> {
+        // What a statement outside any transaction opened ends with it.
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.end_statement_gucs();
+            self.lo_close_all();
+        }
         if !self
             .implicit_extended
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -18352,6 +18458,8 @@ impl PgHandler {
         }
         advisory::release_xact(pid);
         table_locks::release(pid);
+        self.end_txn_gucs(false);
+        self.lo_close_all();
         self.settle_notifies(false);
         // Not `rollback_implicit`: that closes every cursor, holdable ones
         // included, and a `WITH HOLD` cursor from an earlier, committed
@@ -18379,6 +18487,13 @@ impl PgHandler {
     }
 
     fn commit_implicit(&self) -> PgWireResult<()> {
+        // `set_config(x, v, true)` / `SET LOCAL` end with the implicit
+        // transaction too, not only with a block.
+        self.end_txn_gucs(true);
+        self.end_statement_gucs();
+        // So do large-object descriptors: `lo_open` in autocommit leaves
+        // nothing open after its statement.
+        self.lo_close_all();
         self.close_cursors_on_txn_end(true);
         self.savepoints
             .lock()
@@ -18438,6 +18553,8 @@ impl PgHandler {
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        self.end_txn_gucs(false);
+        self.lo_close_all();
         self.settle_notifies(false);
         self.close_cursors_on_txn_end(false);
         self.savepoints
@@ -18674,6 +18791,27 @@ impl PgHandler {
             .get(name)
             .and_then(|v| parse_ms_guc(v))
             .unwrap_or(0)
+    }
+
+    /// `pg_sleep`: in slices, so a `CancelRequest` interrupts the sleep
+    /// (`pg_sleep` is the statement every cancel test cancels), and a notice
+    /// raised before it reaches the client while it sleeps, as PostgreSQL
+    /// sends one the moment it is raised.
+    fn sleep_for(&self, secs: f64) -> PgWireResult<()> {
+        if !(secs > 0.0 && secs.is_finite()) {
+            return Ok(());
+        }
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs_f64(secs.min(3600.0));
+        loop {
+            self.send_live_notices();
+            self.check_cancel()?;
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+        }
     }
 
     /// The poll a lock wait runs: a cancel or `statement_timeout` ends it, and
@@ -19339,11 +19477,21 @@ impl PgHandler {
                     };
                     // `is_local` outside a block lasts only for the
                     // statement's own implicit transaction: nothing stays.
+                    // `is_local` outside any transaction lasts for the
+                    // statement: visible to the rest of it, then put back.
                     if *is_local
                         && !self
                             .in_transaction
                             .load(std::sync::atomic::Ordering::Relaxed)
+                        && !self
+                            .implicit_extended
+                            .load(std::sync::atomic::Ordering::Relaxed)
                     {
+                        self.note_statement_guc(&key);
+                        self.settings
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key.clone(), text.clone());
                         return Ok(Bson::String(text));
                     }
                     let kept = self.txn_guc_kept(&key);
@@ -19444,20 +19592,7 @@ impl PgHandler {
                     Bson::Int64(i) => *i as f64,
                     _ => 0.0,
                 };
-                if secs > 0.0 && secs.is_finite() {
-                    // In slices, so a `CancelRequest` interrupts the sleep:
-                    // `pg_sleep` is the statement every cancel test cancels.
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
-                    loop {
-                        self.check_cancel()?;
-                        let left = deadline.saturating_duration_since(std::time::Instant::now());
-                        if left.is_zero() {
-                            break;
-                        }
-                        std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
-                    }
-                }
+                self.sleep_for(secs)?;
                 Ok(Bson::String(String::new()))
             }
             ConstCol::PgNotify { channel, payload } => {
@@ -22730,7 +22865,8 @@ impl PgHandler {
                         format!("schema \"{name}\" already exists"),
                     ))));
                 }
-                let doc = bson::doc! {"_id": &name, "schema": &name};
+                let doc =
+                    bson::doc! {"_id": &name, "schema": &name, "owner": self.current_role_name()};
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the schema", e))?;
                 self.insert_checked(
@@ -22816,6 +22952,9 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the schema", e))?;
+                    if removed > 0 {
+                        self.drop_object_acl("schema", name)?;
+                    }
                     if removed == 0 && !if_exists {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
@@ -24135,7 +24274,8 @@ impl PgHandler {
                     ))));
                 }
                 let _ = temp;
-                let doc = Self::new_sequence_doc(&name, &options)?;
+                let mut doc = Self::new_sequence_doc(&name, &options)?;
+                doc.insert("owner", self.current_role_name());
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
                 self.insert_checked(

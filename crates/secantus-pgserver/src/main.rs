@@ -10,7 +10,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use secantus_pgserver::{bind, DatabaseRegistry};
-use secantus_storage::Storage;
 
 /// `--version` output: the version, and the source tree it was built from.
 fn version_text() -> String {
@@ -95,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is the first thing to drive this binary the way a new user would.
     std::fs::create_dir_all(&home)
         .map_err(|e| format!("could not create storage path {home}: {e}"))?;
-    let storage = Storage::open(&home)?;
+    let storage = secantus_pgserver::open_storage(&home)?;
     let mut server = bind(&addr, storage, databases)?;
 
     // One line, flushed, so a harness can wait for readiness. It reports the
