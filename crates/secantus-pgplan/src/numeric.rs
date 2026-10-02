@@ -988,6 +988,37 @@ pub fn apply_numeric_typmod(canonical: &str, typmod: i32) -> Result<String> {
     let Some(d) = Dec::parse(canonical) else {
         return Ok(canonical.to_string());
     };
+    // PostgreSQL 15: the scale is a SIGNED 11-bit field, and a negative one
+    // rounds to the left of the point (`numeric(3,-2)` holds 12300).
+    let signed_scale = (((typmod - 4) & 0x7FF) ^ 0x400) - 0x400;
+    if signed_scale < 0 {
+        let shift = d.scale + signed_scale.unsigned_abs();
+        let q = round_half_away(&d.unscaled.abs(), &BigInt::from(10u32).pow(shift));
+        let digits = if q.is_zero() {
+            0
+        } else {
+            q.to_string().len() as i32
+        };
+        if digits > precision {
+            let limit = precision - signed_scale;
+            return Err(overflow(format!(
+                "A field with precision {precision}, scale {signed_scale} must round to an absolute value less than 10^{limit}."
+            )));
+        }
+        let value = q * BigInt::from(10u32).pow(signed_scale.unsigned_abs());
+        let value = if d.unscaled.is_negative() {
+            -value
+        } else {
+            value
+        };
+        return canonical_numeric_text(
+            &Dec {
+                unscaled: value,
+                scale: 0,
+            }
+            .render(),
+        );
+    }
     let unscaled = if d.scale > scale {
         let q = round_half_away(&d.unscaled.abs(), &BigInt::from(10u32).pow(d.scale - scale));
         if d.unscaled.is_negative() {

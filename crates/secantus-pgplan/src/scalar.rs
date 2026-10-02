@@ -171,6 +171,10 @@ const SCALAR_NAMES: &[&str] = &[
     "lpad",
     "rpad",
     "to_hex",
+    "cash_words",
+    "getdatabaseencoding",
+    "pg_encoding_to_char",
+    "pg_char_to_encoding",
     "translate",
     "overlay",
     "quote_literal",
@@ -1254,6 +1258,42 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 format!("{body}{pad}")
             }))
         }
+        // The server encoding is UTF8.
+        "getdatabaseencoding" => Ok(Bson::String("UTF8".into())),
+        "pg_encoding_to_char" => {
+            need(1)?;
+            let id = as_i64(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            Ok(Bson::String(
+                usize::try_from(id)
+                    .ok()
+                    .and_then(|i| PG_ENCODINGS.get(i))
+                    .map_or("", |n| *n)
+                    .to_string(),
+            ))
+        }
+        "pg_char_to_encoding" => {
+            need(1)?;
+            let norm = |s: &str| -> String {
+                s.chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect()
+            };
+            let wanted = norm(&crate::value_text(&arg(0)));
+            Ok(Bson::Int32(
+                PG_ENCODINGS
+                    .iter()
+                    .position(|n| norm(n) == wanted)
+                    .map_or(-1, |i| i as i32),
+            ))
+        }
+        "cash_words" => {
+            need(1)?;
+            match crate::money::cents_of(&arg(0)) {
+                Some(c) => Ok(Bson::String(crate::money::words(c))),
+                None => Err(wrong_args(name)),
+            }
+        }
         // `to_hex`'s WIDTH follows the argument's TYPE, not its value: an
         // `int4` -1 is `ffffffff` and an `int8` -1 is `ffffffffffffffff`.
         // Formatting from the value alone would collapse the two.
@@ -2306,7 +2346,8 @@ pub fn static_result_type(name: &str) -> &'static str {
         "starts_with" => "bool",
         n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
         "pg_relation_is_publishable" => "bool",
-        "pg_get_userbyid" => "name",
+        "pg_get_userbyid" | "getdatabaseencoding" | "pg_encoding_to_char" => "name",
+        "pg_char_to_encoding" => "int4",
         "pg_get_function_sqlbody" => "text",
         "to_number" => "numeric",
         "jsonb_path_exists"
@@ -2321,7 +2362,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         | "jsonb_path_query_array"
         | "jsonb_path_query_first_tz"
         | "jsonb_path_query_array_tz" => "jsonb",
-        "lpad" | "rpad" | "to_hex" | "translate" | "overlay" | "quote_literal"
+        "lpad" | "rpad" | "to_hex" | "cash_words" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",
         "set_byte" | "decode" => "bytea",
@@ -2498,3 +2539,49 @@ fn column_size(v: &Bson) -> Bson {
         }
     }
 }
+
+/// PostgreSQL's encoding ids (`pg_enc`), in id order.
+const PG_ENCODINGS: &[&str] = &[
+    "SQL_ASCII",
+    "EUC_JP",
+    "EUC_CN",
+    "EUC_KR",
+    "EUC_TW",
+    "EUC_JIS_2004",
+    "UTF8",
+    "MULE_INTERNAL",
+    "LATIN1",
+    "LATIN2",
+    "LATIN3",
+    "LATIN4",
+    "LATIN5",
+    "LATIN6",
+    "LATIN7",
+    "LATIN8",
+    "LATIN9",
+    "LATIN10",
+    "WIN1256",
+    "WIN1258",
+    "WIN866",
+    "WIN874",
+    "KOI8R",
+    "WIN1251",
+    "WIN1252",
+    "ISO_8859_5",
+    "ISO_8859_6",
+    "ISO_8859_7",
+    "ISO_8859_8",
+    "WIN1250",
+    "WIN1253",
+    "WIN1254",
+    "WIN1255",
+    "WIN1257",
+    "KOI8U",
+    "SJIS",
+    "BIG5",
+    "GBK",
+    "UHC",
+    "GB18030",
+    "JOHAB",
+    "SHIFT_JIS_2004",
+];

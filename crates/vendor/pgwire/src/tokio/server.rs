@@ -345,6 +345,9 @@ where
                 PgWireFrontendMessage::Close(close) => {
                     extended_query_handler.on_close(socket, close).await?;
                 }
+                PgWireFrontendMessage::FunctionCall(call) => {
+                    query_handler.on_function_call(socket, call).await?;
+                }
                 _ => {}
             }
         }

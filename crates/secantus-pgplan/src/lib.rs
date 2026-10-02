@@ -52,6 +52,7 @@ pub mod instead_of;
 pub mod joins;
 pub mod merge;
 pub mod partitions;
+mod pg_expandarray;
 pub mod pgcrypto;
 pub mod pgcrypto_raw;
 pub mod pgp;
@@ -73,6 +74,7 @@ pub mod jsonfn;
 pub mod jsonops;
 pub mod jsonpath;
 pub mod mathfn;
+pub mod money;
 pub mod net;
 pub mod numeric;
 pub mod numeric_math;
@@ -789,8 +791,20 @@ pub enum Statement {
         name: String,
         value: String,
     },
+    /// `SET LOCAL name = value`: undone when the block ends.
+    SetLocal {
+        name: String,
+        value: String,
+    },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `ALTER DATABASE d SET name = value` (`value` None for `RESET name` /
+    /// `SET name TO DEFAULT`; `name` None for `RESET ALL`).
+    AlterDatabaseSet {
+        database: String,
+        name: Option<String>,
+        value: Option<String>,
+    },
     /// `SET TRANSACTION <modes>` -- the characteristics of the CURRENT
     /// transaction (isolation level / read-write mode / deferrable). Reflected
     /// in `transaction_isolation` / `transaction_read_only` /
@@ -3658,6 +3672,30 @@ fn plan_node(
             })
         }
         N::VariableSetStmt(v) => plan_set(&v),
+        // `ALTER DATABASE d SET name = value` / `RESET name` / `RESET ALL`:
+        // a GUC default for every NEW session of d.
+        N::AlterDatabaseSetStmt(a) => {
+            let set = a
+                .setstmt
+                .as_ref()
+                .ok_or_else(|| Error::Parse("ALTER DATABASE SET without a setting".into()))?;
+            let (name, value) = match VariableSetKind::try_from(set.kind) {
+                Ok(VariableSetKind::VarResetAll) => (None, None),
+                Ok(VariableSetKind::VarReset | VariableSetKind::VarSetDefault) => {
+                    (Some(set.name.clone()), None)
+                }
+                Ok(VariableSetKind::VarSetValue) => match plan_set(set)? {
+                    Statement::Set { name, value } => (Some(name), Some(value)),
+                    _ => return Err(Error::Unsupported("this ALTER DATABASE SET form".into())),
+                },
+                _ => return Err(Error::Unsupported("this ALTER DATABASE SET form".into())),
+            };
+            Ok(Statement::AlterDatabaseSet {
+                database: a.dbname.clone(),
+                name,
+                value,
+            })
+        }
         N::ConstraintsSetStmt(c) => Ok(Statement::SetConstraints {
             names: c
                 .constraints
@@ -8260,7 +8298,14 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
             _ => return None,
         })
     };
-    let cross_family = matches!((family(&from), family(to)), (Some(a), Some(b)) if a != b);
+    // pg_cast's assignment casts between the date/time families: an
+    // instant to its time of day (`timestamptz -> timetz` too).
+    let datetime_assignment = matches!(
+        (from.as_str(), to),
+        ("timestamp" | "timestamptz", "time") | ("timestamptz", "timetz")
+    );
+    let cross_family =
+        !datetime_assignment && matches!((family(&from), family(to)), (Some(a), Some(b)) if a != b);
     // A user cast AS ASSIGNMENT / AS IMPLICIT makes the pair assignable; with
     // none, a composite and anything but itself (or a string type) are not.
     if user_casts::find_assignment(&from, to).is_some() {
@@ -10119,8 +10164,13 @@ fn srf_rows(
             // The argument's declared type names the element; a value with
             // no static type (a correlated reference's parameter) names it
             // by what it holds -- and a NULL holds no rows at all.
-            let element = match static_type(&call.args[0], &value).strip_suffix("[]") {
+            let arg_type = static_type(&call.args[0], &value);
+            let element = match arg_type.strip_suffix("[]") {
                 Some(e) => e.to_owned(),
+                // `int2vector` / `oidvector` (`pg_index.indkey`) are arrays
+                // of int2 / oid.
+                None if arg_type == "int2vector" => "int2".to_string(),
+                None if arg_type == "oidvector" => "oid".to_string(),
                 None => match &value {
                     Bson::Null => "text".to_string(),
                     Bson::Array(items) => items
@@ -10139,6 +10189,35 @@ fn srf_rows(
                 _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
             };
             one(values, &element)
+        }
+        // `information_schema._pg_expandarray(arr)`: (x, n) per element.
+        "_pg_expandarray" if call.args.len() == 1 => {
+            let value = arrays::strip(&const_value(&call.args[0], params)?);
+            let ty = static_type(&call.args[0], &value);
+            let element = match ty.as_str() {
+                "int2vector" => "int2".to_string(),
+                "oidvector" => "oid".to_string(),
+                t => t.strip_suffix("[]").unwrap_or("text").to_string(),
+            };
+            let values = match value {
+                Bson::Null => Vec::new(),
+                v @ Bson::Array(_) => arrays::flatten(&v),
+                _ => {
+                    return Err(Error::Unsupported(
+                        "_pg_expandarray() over a non-array".into(),
+                    ))
+                }
+            };
+            let rows = values
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| vec![v, Bson::Int32(i32::try_from(i + 1).unwrap_or(i32::MAX))])
+                .collect();
+            return Ok(Some((
+                vec!["x".into(), "n".into()],
+                vec![element, "int4".into()],
+                rows,
+            )));
         }
         "generate_subscripts" => {
             let a = args(2)?;
@@ -12111,6 +12190,12 @@ fn plan_aggregate_item(
             display_type(item.source_type.as_deref().unwrap_or("unknown"))
         )));
     }
+    // There is no `avg(money)` (only sum / min / max).
+    if func == AggFunc::Avg && item.source_type.as_deref() == Some("money") {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}(money) does not exist"
+        )));
+    }
     if matches!(func, AggFunc::BitAnd | AggFunc::BitOr)
         && !matches!(
             item.source_type.as_deref(),
@@ -13580,6 +13665,16 @@ fn resolve_sublinks(
         // before the insert runs, gives the same answer.
         Some(N::InsertStmt(i)) => {
             let outer = outer_columns(&i.relation, lookup);
+            // `INSERT ... SELECT (SELECT ...) FROM ...`: the source query's
+            // uncorrelated subqueries, resolved as a SELECT's are. (A VALUES
+            // source keeps its own path.)
+            if let Some(N::SelectStmt(sel)) =
+                i.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut())
+            {
+                if sel.values_lists.is_empty() {
+                    resolve_sublinks_in_select(sel, lookup, params, run)?;
+                }
+            }
             for n in &mut i.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
                     if let Some(v) = rt.val.as_deref_mut() {
@@ -16384,6 +16479,10 @@ fn plan_select(
     }
     let expanded = expand_views(s)?;
     let s = &expanded;
+    // `information_schema._pg_expandarray(arr)` in the select list.
+    if let Some(rewritten) = pg_expandarray::rewrite(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     // `WITH ORDINALITY` and a several-function `ROWS FROM` as subqueries.
     if let Some(rewritten) = rowsfrom::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
@@ -19118,7 +19217,10 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             if func_name(f)
                 .is_some_and(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) =>
         {
-            "int8".to_string()
+            func_name(f)
+                .and_then(|n| correlated::executor_function_type(&n))
+                .unwrap_or("int8")
+                .to_string()
         }
         Some(N::FuncCall(f))
             if func_name(f)
@@ -19585,6 +19687,9 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     if let (Some(lt), Some(rt)) = (lt(), rt()) {
                         let (lt, rt) = (lt.clone(), rt.clone());
                         if let Some(t) = datetime_arith_type(op, &lt, &rt) {
+                            return t.to_string();
+                        }
+                        if let Some(t) = money::arith_type(op, &lt, &rt) {
                             return t.to_string();
                         }
                         // Numeric arithmetic types from the operands too:
@@ -22948,13 +23053,47 @@ impl DateStyle {
     /// ignored rather than erroring -- the setting is applied when SET, and the
     /// server has no business refusing a query over a spelling it does not know.
     pub fn parse(value: &str) -> Self {
-        let mut format = DateStyleFormat::Iso;
-        let mut order = DateStyleOrder::Mdy;
+        Self::parse_over(
+            &DateStyle {
+                format: DateStyleFormat::Iso,
+                order: DateStyleOrder::Mdy,
+            },
+            value,
+        )
+    }
+
+    /// `check_datestyle`: the words in `value` change only what they name,
+    /// starting from `current` -- `SET datestyle = 'euro'` keeps the format.
+    /// `German` alone also sets DMY.
+    pub fn parse_over(current: &DateStyle, value: &str) -> Self {
+        let mut format = current.format;
+        let mut order = current.order;
+        let mut have_order = false;
         for tok in value.trim().trim_matches('\'').split(',') {
             let t = tok.trim();
+            if [
+                "ymd",
+                "mdy",
+                "dmy",
+                "euro",
+                "european",
+                "us",
+                "noneuro",
+                "noneuropean",
+            ]
+            .iter()
+            .any(|w| t.eq_ignore_ascii_case(w))
+            {
+                have_order = true;
+            }
+            if t.eq_ignore_ascii_case("german") && !have_order {
+                order = DateStyleOrder::Dmy;
+            }
             if t.eq_ignore_ascii_case("iso") {
                 format = DateStyleFormat::Iso;
-            } else if t.eq_ignore_ascii_case("postgres") {
+            } else if t.len() >= 8 && t[..8].eq_ignore_ascii_case("postgres") {
+                // `check_datestyle` compares only the first 8 letters, so
+                // `PostgreSQL` is `Postgres`.
                 format = DateStyleFormat::Postgres;
             } else if t.eq_ignore_ascii_case("sql") {
                 format = DateStyleFormat::Sql;
@@ -22964,8 +23103,16 @@ impl DateStyle {
                 order = DateStyleOrder::Ymd;
             } else if t.eq_ignore_ascii_case("mdy") {
                 order = DateStyleOrder::Mdy;
-            } else if t.eq_ignore_ascii_case("dmy") {
+            } else if t.eq_ignore_ascii_case("dmy")
+                || t.eq_ignore_ascii_case("euro")
+                || t.eq_ignore_ascii_case("european")
+            {
                 order = DateStyleOrder::Dmy;
+            } else if t.eq_ignore_ascii_case("us")
+                || t.eq_ignore_ascii_case("noneuro")
+                || t.eq_ignore_ascii_case("noneuropean")
+            {
+                order = DateStyleOrder::Mdy;
             }
         }
         DateStyle { format, order }
@@ -23951,6 +24098,14 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                 let from = current.replace(target.clone());
                 if let Some(cast) = from.as_deref().and_then(|f| user_casts::find(f, target)) {
                     v = user_casts::apply(&cast, v)?;
+                    prev = Some(target);
+                    continue;
+                }
+                // `cash_out`: a money value to a string type is `$1.50`.
+                if from.as_deref() == Some("money") && is_string_type(target) {
+                    if v != Bson::Null {
+                        v = cast_value(Bson::String(money::render_value(&v)), target)?;
+                    }
                     prev = Some(target);
                     continue;
                 }
@@ -26109,6 +26264,9 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         }
         // `xml_in`: the text, checked as XMLOPTION CONTENT (the session
         // default).
+        "money" => money::cast(&value),
+        // A `refcursor` is the portal's name.
+        "refcursor" => Ok(Bson::String(as_text(&value))),
         "xml" => Ok(Bson::String(xml::parse(
             &as_text(&value),
             xml::XmlOption::Content,
@@ -28333,6 +28491,12 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
         };
         parts.push(text);
     }
+    if v.is_local {
+        return Ok(Statement::SetLocal {
+            name: v.name.clone(),
+            value: parts.join(", "),
+        });
+    }
     Ok(Statement::Set {
         name: v.name.clone(),
         value: parts.join(", "),
@@ -29846,6 +30010,24 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     let out = net_elements_out(&value, source == "cidr[]");
                     return cast_value(out, &target);
                 }
+            }
+            // A money value to a string type is `cash_out` (`$1.50`).
+            if source == "money" && is_string_type(&target) && value != Bson::Null {
+                return cast_value(Bson::String(money::render_value(&value)), &target);
+            }
+            if source == "money" && target == "money" {
+                return Ok(value);
+            }
+            // There is no cast from a float to money (only numeric / int).
+            if target == "money"
+                && matches!(source.as_str(), "float8" | "float4")
+                && !unknown_operand(Some(arg))
+            {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to money",
+                    display_type(&source)
+                )));
             }
             // An aclitem casts to the string types (I/O conversion) and to
             // itself; nothing else (`'x=r/x'::aclitem::oid` is 42846).
@@ -31387,6 +31569,41 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         } else {
             (lhs, rhs)
         };
+        // money arithmetic types from the operands (`cash.c`); there is no
+        // prefix minus for money.
+        if e.lexpr.is_none()
+            && op == "-"
+            && e.rexpr
+                .as_deref()
+                .is_some_and(|r| static_type(r, &rhs) == "money")
+        {
+            return Err(Error::UndefinedFunction(
+                "operator does not exist: - money".into(),
+            ));
+        }
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            let (mut lt, mut rt) = (static_type(l, &lhs), static_type(r, &rhs));
+            // An untyped literal beside money IS money (`m + '1'`).
+            if lt == "money" && unknown_operand(Some(r)) {
+                rt = "money".into();
+            }
+            if rt == "money" && unknown_operand(Some(l)) {
+                lt = "money".into();
+            }
+            if let Some(out) = money::arith(&op, &lhs, &lt, &rhs, &rt) {
+                return out;
+            }
+            // `interval + <datetime>` is `<datetime> + interval`.
+            if op == "+"
+                && lt == "interval"
+                && matches!(
+                    rt.as_str(),
+                    "date" | "time" | "timetz" | "timestamp" | "timestamptz"
+                )
+            {
+                return eval_binary(&op, rhs, lhs);
+            }
+        }
         return eval_binary(&op, lhs, rhs);
     }
     if let Some(N::ParamRef(p)) = node.node.as_ref() {
@@ -31667,7 +31884,7 @@ fn needs_numeric_filter(def: &TableDef, field: &str, value: &Bson) -> bool {
         .iter()
         .find(|c| c.field() == field || c.name == field)
         .map(|c| c.pg_type.as_str());
-    matches!(declared, Some("numeric" | "decimal"))
+    matches!(declared, Some("numeric" | "decimal" | "money"))
         && matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_))
 }
 
@@ -31738,7 +31955,7 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
     match field_type(def, field) {
         Some(
             ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
-            | "timestamptz" | "interval" | "oid"),
+            | "timestamptz" | "interval" | "oid" | "money"),
         ) => cast_value(value, ty),
         // A date is stored as its text, but the literal is read AS a date
         // first: `d < '2020-01-01 10:00'` compares with `2020-01-01`.
