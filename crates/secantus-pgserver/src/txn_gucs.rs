@@ -153,7 +153,7 @@ impl PgHandler {
                 .filter(|(k, v)| settings.get(*k) != Some(*v))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            *settings = saved;
+            *settings = saved.into();
             changed
         };
         for (k, v) in changed {

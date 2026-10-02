@@ -32,6 +32,20 @@ thread_local! {
     /// are in PostgreSQL, where every backend has its own temp namespace.
     static TEMP_SCHEMA: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// The schemas the current role holds no `USAGE` on, installed per
+    /// statement: PostgreSQL drops them from the active search path, so an
+    /// unqualified name never resolves into one and nothing is created there.
+    static UNUSABLE_SCHEMAS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the schemas the current role cannot use (no `USAGE`).
+pub fn set_unusable_schemas(schemas: Vec<String>) {
+    UNUSABLE_SCHEMAS.with(|s| *s.borrow_mut() = schemas);
+}
+
+fn schema_usable(schema: &str) -> bool {
+    UNUSABLE_SCHEMAS.with(|s| !s.borrow().iter().any(|n| n == schema))
 }
 
 /// Install the session's temporary schema for the statements that follow.
@@ -136,9 +150,11 @@ pub fn search_path() -> Vec<String> {
                 p.to_ascii_lowercase()
             };
             if p == "$user" {
-                return user.clone().filter(|u| is_user_schema(u));
+                return user
+                    .clone()
+                    .filter(|u| is_user_schema(u) && schema_usable(u));
             }
-            (!p.is_empty()).then_some(p)
+            (!p.is_empty() && schema_usable(&p)).then_some(p)
         })
         .collect()
 }

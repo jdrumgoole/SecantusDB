@@ -11,8 +11,10 @@
 //! (measured on PostgreSQL 15). The owner holds every privilege regardless.
 //! The Python server keeps no such state, so this shape is this server's own.
 //!
-//! Functions are keyed by their bare name, so a GRANT on one overload applies
-//! to all of them.
+//! A function is keyed by its catalog key (`name/nargs`, or
+//! `name/nargs/types` for a second overload at one arity), so a GRANT on one
+//! overload leaves the others alone, as PostgreSQL's per-signature ACL does.
+//! A built-in, which has no catalog document, is keyed `name/nargs`.
 
 use bson::{Bson, Document};
 use pgwire::error::PgWireResult;
@@ -41,14 +43,31 @@ pub(crate) fn acl_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// A function named in text (`'s.f(int)'`, `'f()'`, `'f'`): its bare name.
-fn function_key(text: &str) -> String {
-    let head = text.split('(').next().unwrap_or(text).trim();
-    head.rsplit('.')
-        .next()
-        .unwrap_or(head)
-        .trim_matches('"')
-        .to_string()
+/// Split `f(t1,t2)` into `("f", Some(["t1", "t2"]))`, `f` into
+/// `("f", None)`, splitting arguments at top-level commas only.
+fn split_signature(text: &str) -> (String, Option<Vec<String>>) {
+    let Some((name, rest)) = text.split_once('(') else {
+        return (text.trim().to_string(), None);
+    };
+    let inner = rest.strip_suffix(')').unwrap_or(rest);
+    let mut args = Vec::new();
+    let (mut depth, mut current) = (0usize, String::new());
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(std::mem::take(&mut current).trim().to_string());
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+    }
+    if !current.trim().is_empty() {
+        args.push(current.trim().to_string());
+    }
+    (name.trim().to_string(), Some(args))
 }
 
 fn strings(d: &Document, key: &str) -> Vec<String> {
@@ -124,7 +143,7 @@ impl PgHandler {
                 .ok()
                 .and_then(|docs| {
                     docs.iter()
-                        .find(|d| d.get_str("name") == Ok(name))
+                        .find(|d| d.get_str("_id") == Ok(name))
                         .and_then(|d| d.get_str("owner").ok().map(str::to_string))
                 }),
         };
@@ -228,7 +247,7 @@ impl PgHandler {
                 }
                 // Already the catalog key: the planner resolved the RangeVar.
                 "sequence" => object.clone(),
-                _ => function_key(object),
+                _ => self.function_acl_key(object)?,
             };
             let mut grants = self.object_grants(kind, &name);
             for grantee in grantees {
@@ -280,6 +299,149 @@ impl PgHandler {
                 &id,
                 Some(bson::doc! {"_id": &id, "kind": kind, "name": &name, "grants": grants}),
             )?;
+        }
+        Ok(())
+    }
+
+    /// A signature as text (`'s.f(integer, text)'`) in the planner's
+    /// normal form (`f(int4,text)`), read through GRANT's own parse.
+    fn normalized_signature(text: &str) -> PgWireResult<String> {
+        let sql = format!("GRANT EXECUTE ON FUNCTION {text} TO PUBLIC");
+        match secantus_pgplan::plan(&sql, &|_| None) {
+            Ok(secantus_pgplan::Statement::Grant { objects, .. }) if objects.len() == 1 => {
+                Ok(objects[0].clone())
+            }
+            _ => Err(Self::user_error(
+                "42601",
+                format!("invalid function signature \"{text}\""),
+            )),
+        }
+    }
+
+    /// The ACL key of the routine a GRANT names (`f(int4)`, or bare `f`
+    /// when it is the only one of that name): its catalog key. 42883 when no
+    /// such signature exists, 42725 for an ambiguous bare name. A built-in
+    /// has no catalog document and is keyed `name/nargs`.
+    pub(crate) fn function_acl_key(&self, signature: &str) -> PgWireResult<String> {
+        // Already a catalog key (`ON ALL FUNCTIONS IN SCHEMA` expanded it).
+        if let Some(key) = signature.strip_prefix('\0') {
+            return Ok(key.to_string());
+        }
+        let (name, args) = split_signature(signature);
+        let functions = self.functions()?;
+        let candidates: Vec<_> = functions.iter().filter(|f| f.name == name).collect();
+        match args {
+            Some(types) => {
+                if let Some(f) = candidates.iter().find(|f| f.param_types == types) {
+                    return Ok(f.key.clone());
+                }
+                if candidates.is_empty() && secantus_pgplan::is_known_function(&name) {
+                    return Ok(format!("{name}/{}", types.len()));
+                }
+                let shown: Vec<String> = types
+                    .iter()
+                    .map(|t| secantus_pgplan::display_type(t))
+                    .collect();
+                Err(Self::user_error(
+                    "42883",
+                    format!("function {name}({}) does not exist", shown.join(", ")),
+                ))
+            }
+            None => match candidates.as_slice() {
+                [one] => Ok(one.key.clone()),
+                [] if secantus_pgplan::is_known_function(&name) => Ok(name),
+                [] => Err(Self::user_error(
+                    "42883",
+                    format!("could not find a function named \"{name}\""),
+                )),
+                _ => {
+                    let mut info = pgwire::error::ErrorInfo::new(
+                        "ERROR".into(),
+                        "42725".into(),
+                        format!("function name \"{name}\" is not unique"),
+                    );
+                    info.hint = Some(
+                        "Specify the argument list to select the function unambiguously.".into(),
+                    );
+                    Err(pgwire::error::PgWireError::UserError(Box::new(info)))
+                }
+            },
+        }
+    }
+
+    /// `EXECUTE` on a user function at its call: 42501 `permission denied
+    /// for function f` otherwise.
+    pub(crate) fn check_function_execute(&self, key: &str, name: &str) -> PgWireResult<()> {
+        let role = self.current_role_name();
+        if self.object_privilege_held(&role, "function", key, "EXECUTE", false) {
+            return Ok(());
+        }
+        Err(Self::user_error(
+            "42501",
+            format!("permission denied for function {name}"),
+        ))
+    }
+
+    /// A sequence function's privilege: any of `privileges` on `name`
+    /// (`nextval` takes USAGE or UPDATE, `currval` USAGE or SELECT, `setval`
+    /// UPDATE), else 42501 `permission denied for sequence q`.
+    pub(crate) fn check_sequence_privilege(
+        &self,
+        name: &str,
+        privileges: &[&str],
+    ) -> PgWireResult<()> {
+        let role = self.current_role_name();
+        if self.is_superuser(&role) || self.sequence_doc(name)?.is_none() {
+            return Ok(());
+        }
+        if privileges
+            .iter()
+            .any(|p| self.object_privilege_held(&role, "sequence", name, p, false))
+        {
+            return Ok(());
+        }
+        Err(Self::user_error(
+            "42501",
+            format!(
+                "permission denied for sequence {}",
+                secantus_pgplan::schemas::split_key(name).1
+            ),
+        ))
+    }
+
+    /// The schemas `role` holds no `USAGE` on, which PostgreSQL leaves off
+    /// its active search path. None for a superuser.
+    pub(crate) fn unusable_schemas(&self, role: &str) -> Vec<String> {
+        if self.is_superuser(role) {
+            return Vec::new();
+        }
+        self.namespaces()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !matches!(n.as_str(), "pg_catalog" | "information_schema" | "pg_toast"))
+            .filter(|n| !n.starts_with("pg_temp"))
+            .filter(|n| !self.object_privilege_held(role, "schema", n, "USAGE", false))
+            .collect()
+    }
+
+    /// Schema `CREATE` for every schema a CREATE statement makes something
+    /// in: 42501 `permission denied for schema s` otherwise.
+    pub(crate) fn check_schema_create(&self, role: &str, sql: &str) -> PgWireResult<()> {
+        if self.is_superuser(role) {
+            return Ok(());
+        }
+        for schema in secantus_pgplan::privileges::sql_creation_schemas(sql) {
+            if !secantus_pgplan::schemas::schema_exists(&schema) {
+                continue;
+            }
+            if !self.object_privilege_held(role, "schema", &schema, "USAGE", false)
+                || !self.object_privilege_held(role, "schema", &schema, "CREATE", false)
+            {
+                return Err(Self::user_error(
+                    "42501",
+                    format!("permission denied for schema {schema}"),
+                ));
+            }
         }
         Ok(())
     }
@@ -393,7 +555,21 @@ impl PgHandler {
                 }
                 held("sequence", &key)?
             }
-            "has_function_privilege" => held("function", &function_key(&text(&rest[0])))?,
+            "has_function_privilege" => {
+                let written = text(&rest[0]);
+                if !written.contains('(') {
+                    return Err(Self::user_error(
+                        "22P02",
+                        "expected a left parenthesis".into(),
+                    ));
+                }
+                let key = self
+                    .function_acl_key(&Self::normalized_signature(&written)?)
+                    .map_err(|_| {
+                        Self::user_error("42883", format!("function \"{written}\" does not exist"))
+                    })?;
+                held("function", &key)?
+            }
             _ => {
                 // has_column_privilege: the table privilege, or the
                 // column's own grant.
