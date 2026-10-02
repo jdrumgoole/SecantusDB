@@ -212,6 +212,8 @@ enum Flow {
 
 struct Interp<'a> {
     datums: Vec<Datum>,
+    /// The datum of each argument, in declared order, for `$n`.
+    arg_slots: Vec<usize>,
     host: &'a dyn Host,
     trigger: Option<TriggerData>,
     returns_set: bool,
@@ -560,7 +562,8 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
     }
     // The arguments are the first datums, in declared order.
     let mut arg = 0;
-    for d in datums.iter_mut() {
+    let mut arg_slots = Vec::new();
+    for (slot, d) in datums.iter_mut().enumerate() {
         if arg >= inv.args.len() {
             break;
         }
@@ -568,6 +571,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             if name == "found" {
                 continue;
             }
+            arg_slots.push(slot);
             *value = inv.args[arg].clone();
             if let Some(declared) = inv.arg_types.get(arg) {
                 *ty = canonical_type(declared);
@@ -577,6 +581,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
     }
     let mut interp = Interp {
         datums,
+        arg_slots,
         host,
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
@@ -719,6 +724,20 @@ impl Interp<'_> {
                     if let Some((v, ty)) = self.scalar(&name) {
                         bound = Some((v, ty, i));
                     }
+                }
+            }
+            // `$n` in the body is the function's n-th argument (PL/pgSQL
+            // names an argument's datum `$n`, whether or not it has a name).
+            if bound.is_none() {
+                let n = tok(i)
+                    .and_then(|p| p.strip_prefix('$'))
+                    .and_then(|d| d.parse::<usize>().ok());
+                if let Some(Datum::Var { value, ty, .. }) = n
+                    .filter(|n| *n >= 1)
+                    .and_then(|n| self.arg_slots.get(n - 1))
+                    .and_then(|slot| self.datums.get(*slot))
+                {
+                    bound = Some((value.clone(), ty.clone(), i));
                 }
             }
             // `TG_ARGV[i]` counts from ZERO; the array bound here counts

@@ -49,6 +49,7 @@ pub mod hashpart;
 pub mod hstore;
 pub mod inherit;
 pub mod instead_of;
+mod join_order;
 pub mod joins;
 pub mod merge;
 pub mod partitions;
@@ -1345,6 +1346,10 @@ pub enum AlterTableAction {
     AddPrimaryKey {
         name: String,
         columns: Vec<String>,
+        /// `ADD PRIMARY KEY USING INDEX ix`: the unique index whose columns
+        /// become the key (the server resolves them), and which the key's
+        /// own index then replaces.
+        using_index: Option<String>,
     },
     /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
     /// there, then enforced on every write. `named` when the statement gave
@@ -2291,6 +2296,9 @@ pub struct CopyFrom {
     pub format: CopyFormat,
     /// `COPY (SELECT ...) TO STDOUT`. Mutually exclusive with `table`.
     pub query: Option<Box<Statement>>,
+    /// `HEADER`: a first line of column names, written on the way out and
+    /// skipped on the way in.
+    pub header: bool,
 }
 
 /// `DROP TABLE a, b` / `DROP TABLE IF EXISTS a`.
@@ -5168,13 +5176,19 @@ fn plan_alter_action(
                     return Ok(AlterTableAction::AddUnique(uq));
                 }
                 Ok(CT::ConstrPrimary) => {
+                    let using_index = (!k.indexname.is_empty()).then(|| k.indexname.clone());
                     return Ok(AlterTableAction::AddPrimaryKey {
-                        name: if k.conname.is_empty() {
-                            format!("{table}_pkey")
-                        } else {
+                        // USING INDEX with no CONSTRAINT name names the key
+                        // after the index, as PostgreSQL does.
+                        name: if !k.conname.is_empty() {
                             k.conname.clone()
+                        } else if let Some(ix) = &using_index {
+                            ix.clone()
+                        } else {
+                            format!("{table}_pkey")
                         },
                         columns: string_list(&k.keys),
+                        using_index,
                     });
                 }
                 Ok(CT::ConstrForeign) => {
@@ -5625,7 +5639,12 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
         }
         AlterTableAction::AddUnique(uq) => def.unique_constraints.push(uq.clone()),
-        AlterTableAction::AddPrimaryKey { columns, .. } => {
+        AlterTableAction::AddPrimaryKey { columns, name, .. } => {
+            // A name the statement gave is the constraint's (and its
+            // index's), as `CONSTRAINT x PRIMARY KEY` in CREATE TABLE is.
+            if *name != format!("{}_pkey", def.name) {
+                def.extra.insert("pk_name", name.clone());
+            }
             // The key is the document `_id`, as a CREATE TABLE key is: the
             // value itself for one column, a subdocument of the key columns
             // in TABLE-column order for several. The executor moves every
@@ -8393,7 +8412,8 @@ pub fn insert_row_typed(
             // An assignment through a user cast (`AS ASSIGNMENT`).
             fit_to_column(user_casts::apply(&cast, value)?, column)?
         } else {
-            fit_to_column(cast_value(value, &column.pg_type)?, column)?
+            let source = types.get(i).map_or("", String::as_str);
+            fit_to_column(assign_value(value, source, &column.pg_type)?, column)?
         };
         // Resolves the hidden companion (setting or CLEARING it), so a
         // whole-millisecond write cannot inherit stale microseconds.
@@ -14476,7 +14496,8 @@ fn sql_json_absent(node: &pg_query::protobuf::Node, sql: &str, params: &[Bson]) 
                     "unknown".to_string()
                 }
                 _ => {
-                    let v = const_value(a, params).unwrap_or(Bson::Null);
+                    let v = correlated::without_side_effects(|| const_value(a, params))
+                        .unwrap_or(Bson::Null);
                     display_type(&static_type(a, &v))
                 }
             })
@@ -14799,7 +14820,8 @@ fn call_arg_types(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Vec<Stri
                 "unknown".to_string()
             }
             _ => {
-                let v = const_value(a, params).unwrap_or(Bson::Null);
+                let v = correlated::without_side_effects(|| const_value(a, params))
+                    .unwrap_or(Bson::Null);
                 static_type(a, &v)
             }
         })
@@ -14825,7 +14847,8 @@ fn function_absent_in_reference(
             .args
             .iter()
             .map(|a| {
-                let v = const_value(a, params).unwrap_or(Bson::Null);
+                let v = correlated::without_side_effects(|| const_value(a, params))
+                    .unwrap_or(Bson::Null);
                 display_type(&static_type(a, &v))
             })
             .collect();
@@ -14854,7 +14877,8 @@ fn function_absent_in_reference(
                 "unknown".to_string()
             }
             _ => {
-                let v = const_value(a, params).unwrap_or(Bson::Null);
+                let v = correlated::without_side_effects(|| const_value(a, params))
+                    .unwrap_or(Bson::Null);
                 display_type(&static_type(a, &v))
             }
         })
@@ -19667,6 +19691,9 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     }
                 }
                 "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => "bool".to_string(),
+                // LIKE / ILIKE / the regex match operators: a boolean, NULL
+                // operand or not (`'a' LIKE $1` at Describe time).
+                op if pattern_operator(op).is_some() && e.lexpr.is_some() => "bool".to_string(),
                 // Arithmetic keeps the value's type when it computed one, and
                 // falls back to int4 for the NULL-placeholder case, which is
                 // what PostgreSQL reports for `1 + NULL`.
@@ -19681,6 +19708,15 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     if e.lexpr.is_none()
                         && matches!(op, "-" | "+")
                         && rt().is_some_and(|t| t == "interval")
+                    {
+                        return "interval".to_string();
+                    }
+                    // An untyped operand beside an interval is an interval.
+                    if matches!(op, "+" | "-")
+                        && ((rt().is_some_and(|t| t == "interval")
+                            && unknown_operand(e.lexpr.as_deref()))
+                            || (lt().is_some_and(|t| t == "interval")
+                                && unknown_operand(e.rexpr.as_deref())))
                     {
                         return "interval".to_string();
                     }
@@ -20149,6 +20185,58 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
 /// value could report. Lives in one place so the FROM-less target list and the
 /// general expression evaluator cannot disagree — `pg_typeof(1)` and
 /// `pg_typeof(1)::text` reach it by different routes.
+/// The key (and INCLUDE) items of an index definition as
+/// `pg_get_indexdef` prints it: the top-level, comma-separated items of the
+/// parenthesised list after `USING <method>` -- an expression key keeps its
+/// own parentheses, and a WHERE clause after the list is not a key.
+pub fn index_def_keys(def: &str) -> Vec<String> {
+    // One parenthesised list starting at `open`: its items and where it ends.
+    fn list(text: &str, open: usize) -> (Vec<String>, usize) {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut item = String::new();
+        for (i, ch) in text[open + 1..].char_indices() {
+            match ch {
+                '"' | '\'' => {
+                    quoted = !quoted;
+                    item.push(ch);
+                }
+                '(' if !quoted => {
+                    depth += 1;
+                    item.push(ch);
+                }
+                ')' if !quoted && depth == 0 => {
+                    out.push(item.trim().to_string());
+                    return (out, open + 1 + i + 1);
+                }
+                ')' if !quoted => {
+                    depth -= 1;
+                    item.push(ch);
+                }
+                ',' if !quoted && depth == 0 => {
+                    out.push(item.trim().to_string());
+                    item.clear();
+                }
+                _ => item.push(ch),
+            }
+        }
+        (out, text.len())
+    }
+    let Some(start) = def
+        .find(" USING ")
+        .and_then(|u| def[u..].find('(').map(|p| u + p))
+    else {
+        return Vec::new();
+    };
+    let (mut keys, end) = list(def, start);
+    if let Some(rest) = def[end..].strip_prefix(" INCLUDE (") {
+        let open = def.len() - rest.len() - 1;
+        keys.extend(list(def, open).0);
+    }
+    keys
+}
+
 fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     if f.args.len() != 1 {
         return Err(Error::Parse(
@@ -22814,7 +22902,7 @@ pub(crate) fn parse_timestamp(text: &str) -> Result<i64> {
         },
     };
     match parsed {
-        Ok(dt) => Ok(dt.and_utc().timestamp_micros()),
+        Ok(dt) => Ok(rounded_micros(dt)),
         Err(_) => {
             let numeric_shape = normalised
                 .split([' ', '-', ':', '.'])
@@ -22828,6 +22916,21 @@ pub(crate) fn parse_timestamp(text: &str) -> Result<i64> {
             })
         }
     }
+}
+
+/// A parsed wall clock as microseconds since the epoch, its fraction
+/// ROUNDED to the microsecond as PostgreSQL's `rint(frac * 1000000)` does
+/// (half to even): `15:00:00.000000789` is `.000001`, and
+/// `23:59:59.9999995` carries into the next day. Truncating dropped both.
+fn rounded_micros(dt: NaiveDateTime) -> i64 {
+    use chrono::Timelike;
+    let whole = dt
+        .with_nanosecond(0)
+        .unwrap_or(dt)
+        .and_utc()
+        .timestamp_micros();
+    let frac = f64::from(dt.nanosecond()) / 1e9;
+    whole + (frac * 1e6).round_ties_even() as i64
 }
 
 /// The session's `TimeZone`, resolved to something that can date arithmetic.
@@ -24134,6 +24237,26 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                         continue;
                     }
                 }
+                // ... and so does each element of a timestamptz[] (`array_out`
+                // over `timestamptz_out`).
+                if is_string_type(target) && prev == Some("timestamptz[]") {
+                    if let Bson::Array(items) = &v {
+                        let rendered: Vec<Bson> = items
+                            .iter()
+                            .map(|e| match e {
+                                Bson::String(s) => Bson::String(wide_timestamptz_text(s, tz)),
+                                other => timestamptz_value_text(other, tz)
+                                    .map_or_else(|| other.clone(), Bson::String),
+                            })
+                            .collect();
+                        v = cast_value(
+                            Bson::String(render_value_text(&Bson::Array(rendered))),
+                            target,
+                        )?;
+                        prev = Some(target);
+                        continue;
+                    }
+                }
                 // timestamptz -> text renders the instant in the session zone
                 // (a wide or BC one is kept as UTC text).
                 if target == "text" && prev == Some("timestamptz") {
@@ -24392,11 +24515,18 @@ fn split_trailing_offset(text: &str) -> (String, Option<i32>) {
         // convention settled. An earlier comment here asserted no zone in use
         // carried seconds; the psycopg corpus contains them.
         let mut parts = tail.split(':');
-        let h = parts.next().and_then(|v| v.parse::<i32>().ok());
-        let m = parts.next().map_or(Some(0), |v| v.parse::<i32>().ok());
+        let mut h = parts.next().and_then(|v| v.parse::<i32>().ok());
+        let mut m = parts.next().map_or(Some(0), |v| v.parse::<i32>().ok());
         let sec = parts.next().map_or(Some(0), |v| v.parse::<i32>().ok());
         if parts.next().is_some() {
             continue;
+        }
+        // Without colons three or four digits are `hhmm` (`+0300`), as
+        // `DecodeTimezone` reads them.
+        if !tail.contains(':') && matches!(tail.len(), 3 | 4) {
+            if let Some(v) = h {
+                (h, m) = (Some(v / 100), Some(v % 100));
+            }
         }
         if let (Some(h), Some(m), Some(sec)) = (h, m, sec) {
             if (0..=15).contains(&h) && (0..60).contains(&m) && (0..60).contains(&sec) {
@@ -24424,7 +24554,7 @@ fn parse_timestamptz(text: &str, tz: &TimeZoneSetting) -> Result<i64> {
         decode_general(text.trim(), "timestamp with time zone")
     {
         if (1..=9999).contains(&chrono::Datelike::year(&at)) {
-            let local = at.and_utc().timestamp_micros();
+            let local = rounded_micros(at);
             let seconds = match (offset, zone) {
                 (Some(s), _) => s,
                 (None, Some(z)) => TimeZoneSetting::Named(z)
@@ -24951,13 +25081,26 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
 /// epoch. Rendering it back to canonical text lets a binary parameter take the
 /// exact same path through the planner as a text one.
 pub fn render_date_from_pg_days(days: i32) -> String {
-    // 2000-01-01 is 10957 days after 1970-01-01.
+    // `date_send`'s infinities are the extreme day counts.
+    match days {
+        i32::MAX => return "infinity".to_string(),
+        i32::MIN => return "-infinity".to_string(),
+        _ => {}
+    }
+    // 2000-01-01 is 10957 days after 1970-01-01. A BC date (a proleptic
+    // year <= 0) renders with its era, as `date_out` does: `-0100-01-01`
+    // was stored for pgjdbc's `0101-01-01 BC`.
     let unix_days = i64::from(days) + 10_957;
-    render_timestamp(unix_days * 86_400 * 1_000_000)
-        .split(' ')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    match NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|e| e.checked_add_signed(chrono::Duration::days(unix_days)))
+    {
+        Some(d) => render_date_pg(d),
+        None => render_timestamp(unix_days * 86_400 * 1_000_000)
+            .split(' ')
+            .next()
+            .unwrap_or("")
+            .to_string(),
+    }
 }
 
 /// Microseconds since midnight as PostgreSQL's `time` text.
@@ -24977,8 +25120,25 @@ pub fn render_time_from_micros(micros: i64) -> String {
 
 /// Microseconds since 2000-01-01 as PostgreSQL's `timestamp` text.
 pub fn render_timestamp_from_pg_micros(micros: i64) -> String {
+    match micros {
+        i64::MAX => return "infinity".to_string(),
+        i64::MIN => return "-infinity".to_string(),
+        _ => {}
+    }
     // 2000-01-01T00:00:00Z is 946684800 seconds after the Unix epoch.
-    render_timestamp(micros + 946_684_800 * 1_000_000)
+    let text = render_timestamp(micros + 946_684_800 * 1_000_000);
+    // A proleptic year <= 0 is BC, written with its era (`timestamp_out`).
+    if let Some(rest) = text.strip_prefix('-') {
+        if let Some((year, tail)) = rest.split_once('-') {
+            if let Ok(y) = year.parse::<i64>() {
+                return format!("{:04}-{tail} BC", y + 1);
+            }
+        }
+    }
+    if let Some(tail) = text.strip_prefix("0000-") {
+        return format!("0001-{tail} BC");
+    }
+    text
 }
 
 /// PostgreSQL's `date` binary form: signed days since 2000-01-01.
@@ -27860,12 +28020,32 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             (Some(iv), None) if op == "+" && is_time_text(&rhs) => {
                 return datetime::time_plus(&rhs, &iv, 1);
             }
+            (None, Some(iv)) if datetime::timetz_plus(&lhs, &iv, sign).is_some() => {
+                return datetime::timetz_plus(&lhs, &iv, sign).expect("checked");
+            }
+            (Some(iv), None) if op == "+" && datetime::timetz_plus(&rhs, &iv, 1).is_some() => {
+                return datetime::timetz_plus(&rhs, &iv, 1).expect("checked");
+            }
             (None, Some(iv)) => {
                 // <instant or date or timestamp text> +/- interval.
                 if let Some(micros) = instant_micros(&lhs) {
                     let out = add_interval_to_micros(micros, &iv, sign).ok_or_else(|| {
                         Error::DatetimeFieldOverflow("timestamp out of range".to_string())
                     })?;
+                    // A stored instant stays one -- as text it was no longer
+                    // a timestamp to the next operator: `(now() + i) - now()`
+                    // was "text - text" (pgjdbc's {fn timestampdiff}).
+                    let stored = matches!(lhs, Bson::DateTime(_))
+                        || matches!(&lhs, Bson::Document(d) if d.contains_key(COMPOSITE_DATE));
+                    if stored {
+                        let (ms, rem) = split_subms(out);
+                        let date = Bson::DateTime(bson::DateTime::from_millis(ms));
+                        return Ok(if rem == 0 {
+                            date
+                        } else {
+                            Bson::Document(doc! { COMPOSITE_DATE: date, COMPOSITE_US: rem })
+                        });
+                    }
                     return Ok(Bson::String(render_timestamp(out)));
                 }
             }
@@ -28372,6 +28552,7 @@ fn plan_copy(
         ));
     }
     let mut format = CopyFormat::Text;
+    let mut header = false;
     for opt in &c.options {
         if let Some(N::DefElem(d)) = opt.node.as_ref() {
             let name = d.defname.to_ascii_lowercase();
@@ -28393,9 +28574,29 @@ fn plan_copy(
                         other.unwrap_or("?")
                     )))
                 }
+                // `HEADER` alone is true; `HEADER MATCH` (COPY FROM) checks the
+                // names, which is refused rather than skipped unchecked.
+                ("header", None | Some("true" | "on" | "1")) => header = true,
+                ("header", Some("false" | "off" | "0")) => header = false,
+                ("header", Some("match")) => {
+                    return Err(Error::Unsupported("COPY ... HEADER MATCH".into()))
+                }
+                ("header", Some(v)) => {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        format!("header requires a Boolean value or \"match\": {v}"),
+                    ))
+                }
                 (other, _) => return Err(Error::Unsupported(format!("COPY option {other}"))),
             }
         }
+    }
+    // PostgreSQL 15: `cannot specify HEADER in BINARY mode`.
+    if header && format == CopyFormat::Binary {
+        return Err(Error::Sqlstate(
+            "0A000",
+            "cannot specify HEADER in BINARY mode".into(),
+        ));
     }
     // `COPY (SELECT ...) TO STDOUT`. PostgreSQL allows a query only when
     // copying OUT -- there is nowhere to put rows copied INTO one.
@@ -28414,6 +28615,7 @@ fn plan_copy(
             columns: Vec::new(),
             format,
             query: Some(Box::new(inner)),
+            header,
         }));
     }
     let table = c
@@ -28439,6 +28641,7 @@ fn plan_copy(
         columns,
         format,
         query: None,
+        header,
     };
     Ok(if c.is_from {
         Statement::CopyFrom(spec)
@@ -29081,10 +29284,9 @@ fn plan_update(
             set_exprs.push((field, column.pg_type.clone(), column.typmod, row));
             continue;
         }
-        let value = fit_to_column(
-            cast_value(const_value(val, params)?, &column.pg_type)?,
-            column,
-        )?;
+        let value = const_value(val, params)?;
+        let source = static_type(val, &value);
+        let value = fit_to_column(assign_value(value, &source, &column.pg_type)?, column)?;
         set_stored_value(&mut set, &mut unset, field, value);
     }
     if set.is_empty() && set_exprs.is_empty() && set_subscripts.is_empty() {
@@ -29157,7 +29359,7 @@ pub fn on_conflict_row_sets(
     let mut unset = Vec::new();
     for (field, pg_type, typmod, expr) in set_exprs {
         let value = fit_length(
-            cast_value(apply_row_expr(expr, row)?, pg_type)?,
+            assign_value(apply_row_expr(expr, row)?, column_expr_type(expr), pg_type)?,
             pg_type,
             *typmod,
         )?;
@@ -29174,12 +29376,39 @@ pub fn on_conflict_filter_passes(filter: &ColumnExpr, row: &Document) -> Result<
     Ok(matches!(apply_row_expr(filter, row)?, Bson::Boolean(true)))
 }
 
+/// A value of type `source` assigned to a `target` column. A
+/// `timestamptz` is an instant whose carrier (a UTC `DateTime`) is the same
+/// as a `timestamp`'s wall clock, so `cast_value` -- which sees only the
+/// value -- re-read it as a wall clock in the session zone: `update t set b
+/// = a` between two timestamptz columns moved the instant by the zone's
+/// offset (an hour in Dublin's summer), and a bound timestamptz parameter
+/// was stored an hour off (pgjdbc's insertRow). The source type says which
+/// it is.
+fn assign_value(value: Bson, source: &str, target: &str) -> Result<Bson> {
+    let instant = matches!(value, Bson::DateTime(_))
+        || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE));
+    if source == "timestamptz" && instant {
+        if target == "timestamptz" {
+            return Ok(value);
+        }
+        if matches!(target, "date" | "timestamp" | "time" | "timetz") {
+            if let Some(v) = timestamptz_as_local(&value, target)? {
+                return Ok(v);
+            }
+        }
+    }
+    if source == "timestamptz[]" && target == "timestamptz[]" && matches!(value, Bson::Array(_)) {
+        return Ok(value);
+    }
+    cast_value(value, target)
+}
+
 pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<String>)> {
     let mut set = upd.set.clone();
     let mut unset = upd.unset.clone();
     for (field, pg_type, typmod, expr) in &upd.set_exprs {
         let value = fit_length(
-            cast_value(apply_row_expr(expr, row)?, pg_type)?,
+            assign_value(apply_row_expr(expr, row)?, column_expr_type(expr), pg_type)?,
             pg_type,
             *typmod,
         )?;
@@ -30625,12 +30854,8 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 return Ok(Bson::Null);
             };
             if column > 0 {
-                let keys = def
-                    .rfind('(')
-                    .and_then(|open| def[open + 1..].split_once(')').map(|(k, _)| k.to_string()))
-                    .unwrap_or_default();
-                let key = keys
-                    .split(", ")
+                let key = index_def_keys(&def)
+                    .into_iter()
                     .nth(usize::try_from(column - 1).unwrap_or(usize::MAX))
                     .map(|k| {
                         k.trim_end_matches(" NULLS FIRST")
@@ -31245,6 +31470,18 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 .ok_or_else(|| Error::Parse("operator with no right operand".into()))?,
             params,
         )?;
+        // There is no prefix minus (or plus) for money (`cash.c`); checked
+        // before the unary folds below, which would negate its numeric value.
+        if e.lexpr.is_none()
+            && matches!(op.as_str(), "-" | "+")
+            && e.rexpr
+                .as_deref()
+                .is_some_and(|r| static_type(r, &rhs) == "money")
+        {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {op} money"
+            )));
+        }
         // A missing left operand is unary: `-3`, `+3`. A double is negated
         // outright rather than subtracted from zero, which is the difference
         // between `-(0.0::float8)` printing `-0` (PostgreSQL) and `0`.
@@ -31592,6 +31829,20 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             }
             if let Some(out) = money::arith(&op, &lhs, &lt, &rhs, &rt) {
                 return out;
+            }
+            // An untyped operand beside an interval IS an interval
+            // (`$1 + $2::interval`, `'1 day' - i`): PostgreSQL resolves the
+            // unknown to the other operand's type, and `interval op
+            // interval` exists.
+            if matches!(op.as_str(), "+" | "-") {
+                if rt == "interval" && unknown_operand(Some(l)) && lhs != Bson::Null {
+                    let lhs = cast_value(lhs, "interval")?;
+                    return eval_binary(&op, lhs, rhs);
+                }
+                if lt == "interval" && unknown_operand(Some(r)) && rhs != Bson::Null {
+                    let rhs = cast_value(rhs, "interval")?;
+                    return eval_binary(&op, lhs, rhs);
+                }
             }
             // `interval + <datetime>` is `<datetime> + interval`.
             if op == "+"

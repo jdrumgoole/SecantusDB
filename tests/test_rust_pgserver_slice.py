@@ -15277,3 +15277,35 @@ def test_python_rewrite_of_a_table_keeps_the_keys_only_rust_records(home: Path) 
     by_name = {col["name"]: col for col in doc["columns"]}
     assert by_name["t"].get("collation") == "C"
     assert "z" in by_name
+
+
+def test_parallel_sessions_resolve_their_own_new_temp_table(home: Path) -> None:
+    """A table created in an implicit multi-statement transaction resolves
+    on the connection's next statement however many other connections run
+    beside it. The catalog version moved when the DDL ran, before its
+    commit, so another connection could record the pre-commit catalog as
+    current on a shared worker thread, and the creator's own `update t`
+    answered 42P01 (pgx's parallel deferred-error tests)."""
+    failures: list[str] = []
+
+    def work() -> None:
+        for _ in range(15):
+            with server.connect() as c:
+                c.execute(
+                    "create temporary table t (id text primary key, n int); "
+                    "insert into t values ('a', 1), ('b', 2)",
+                    prepare=False,
+                )
+                try:
+                    c.execute("update t set n = n + %s where id = %s", (1, "b"), prepare=True)
+                except psycopg.Error as e:
+                    failures.append(f"{e.sqlstate}: {e}")
+
+    with _Server(home) as server:
+        workers = [threading.Thread(target=work) for _ in range(8)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(120)
+        assert not any(w.is_alive() for w in workers)
+    assert failures == []

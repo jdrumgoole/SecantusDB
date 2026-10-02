@@ -342,17 +342,20 @@ fn source_of(n: &pg_query::protobuf::Node) -> Option<Result<pg_query::protobuf::
         return None;
     };
     let name = crate::string_list(&f.funcname).pop()?;
-    if !SOURCES.contains(&name.as_str()) || !f.args.is_empty() {
+    if !(SOURCES.contains(&name.as_str()) || name == "pg_get_keywords") || !f.args.is_empty() {
         return None;
     }
     // Only inside the event that fills it (`sql_drop`, `ddl_command_end`).
-    let event = if name == "pg_event_trigger_dropped_objects" {
-        "sql_drop"
-    } else {
-        "ddl_command_end"
-    };
-    if CONTEXT.with(std::cell::Cell::get) != Some(event) {
-        return Some(Err(outside(&name, event)));
+    // `pg_get_keywords()` is the grammar's keyword list: always there.
+    if name != "pg_get_keywords" {
+        let event = if name == "pg_event_trigger_dropped_objects" {
+            "sql_drop"
+        } else {
+            "ddl_command_end"
+        };
+        if CONTEXT.with(std::cell::Cell::get) != Some(event) {
+            return Some(Err(outside(&name, event)));
+        }
     }
     Some(Ok(pg_query::protobuf::Node {
         node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
@@ -368,7 +371,8 @@ fn source_of(n: &pg_query::protobuf::Node) -> Option<Result<pg_query::protobuf::
 /// Turn `FROM pg_event_trigger_dropped_objects()` (and its sibling) into a
 /// read of the relation the server fills while an event trigger runs.
 pub(crate) fn rewrite_sources(sql: &str, node: &mut pg_query::protobuf::Node) -> Result<()> {
-    if !sql.to_ascii_lowercase().contains("pg_event_trigger_") {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("pg_event_trigger_") && !lower.contains("pg_get_keywords") {
         return Ok(());
     }
     let Some(root) = node.node.as_mut() else {

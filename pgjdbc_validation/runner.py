@@ -141,9 +141,9 @@ def _verify_secantus_identity(host: str, port: int) -> None:
 
 
 def _ensure_test_database(host: str, port: int) -> None:
-    """Create the ``test`` database pgjdbc's suite connects to, as pgjdbc's
-    own CI setup does on a real PostgreSQL. A server that already has it (or
-    accepts any database name) is left alone."""
+    """Create the ``test`` database and role pgjdbc's suite connects with, as
+    pgjdbc's own CI setup does on a real PostgreSQL. A server that already
+    has them (or accepts any database name) is left alone."""
     import psycopg
 
     with psycopg.connect(
@@ -152,6 +152,12 @@ def _ensure_test_database(host: str, port: int) -> None:
         exists = conn.execute("select 1 from pg_database where datname = 'test'").fetchone()
         if exists is None:
             conn.execute("create database test")
+        # ... and the `test` role it connects as, which owns what the suite
+        # creates (getTablePrivileges reports the owner's privileges by its
+        # role). A superuser, as an unknown user is treated already.
+        role = conn.execute("select 1 from pg_roles where rolname = 'test'").fetchone()
+        if role is None:
+            conn.execute("create role test login superuser")
 
 
 def _is_jdk21(home: str) -> bool:

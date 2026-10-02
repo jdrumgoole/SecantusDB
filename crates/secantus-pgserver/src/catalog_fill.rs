@@ -708,6 +708,32 @@ impl PgHandler {
         } else {
             Vec::new()
         };
+        // Per index: its expressions (the keys with no column, as
+        // `pg_get_indexdef` prints them) and its WHERE, for `indexprs` /
+        // `indpred` -- NULL when it has none, which is what a client tests.
+        let index_text: Vec<(i64, Option<String>, Option<String>)> = if name == "pg_index" {
+            let defs = self.index_defs();
+            self.index_relations()
+                .into_iter()
+                .map(|ix| {
+                    let text = defs.iter().find(|(o, _)| *o == ix.oid).map(|(_, t)| t);
+                    let exprs: Vec<String> = text
+                        .map(|t| secantus_pgplan::index_def_keys(t))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .zip(ix.keys.iter())
+                        .filter(|(_, k)| **k == 0)
+                        .map(|(e, _)| e)
+                        .collect();
+                    let pred = text
+                        .and_then(|t| t.split_once(" WHERE "))
+                        .map(|(_, p)| p.to_string());
+                    (ix.oid, (!exprs.is_empty()).then(|| exprs.join(", ")), pred)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let parents: Vec<String> = if name == "pg_class" {
             tables
                 .iter()
@@ -820,7 +846,20 @@ impl PgHandler {
                         "indcheckxmin" | "indisreplident" | "indnullsnotdistinct" => {
                             Bson::Boolean(false)
                         }
-                        "indexprs" | "indpred" => Bson::Null,
+                        "indexprs" | "indpred" => {
+                            let oid = int(get(row, "indexrelid"));
+                            index_text
+                                .iter()
+                                .find(|(o, _, _)| *o == oid)
+                                .and_then(|(_, e, p)| {
+                                    if c == "indexprs" {
+                                        e.clone()
+                                    } else {
+                                        p.clone()
+                                    }
+                                })
+                                .map_or(Bson::Null, Bson::String)
+                        }
                         _ => Bson::Boolean(true),
                     },
                     ("pg_attribute", c) => {

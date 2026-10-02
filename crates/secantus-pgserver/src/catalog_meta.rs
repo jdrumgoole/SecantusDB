@@ -211,3 +211,46 @@ pub(crate) fn attribute_rows(def: &TableDef) -> Vec<Document> {
     }
     out
 }
+
+/// PostgreSQL 15's `pg_get_keywords()`, dumped from the reference server:
+/// `word`, `catcode`, `barelabel`, `catdesc`, `baredesc`.
+const KEYWORDS: &str = include_str!("pg_keywords.tsv");
+
+/// `pg_get_keywords()`, served as a relation of that name (the planner
+/// rewrites the FROM call to it).
+pub(crate) fn pg_get_keywords_def() -> TableDef {
+    TableDef::new(
+        "pg_get_keywords",
+        vec![
+            secantus_pgcatalog::Column::new("word", "text", false),
+            secantus_pgcatalog::Column::new("catcode", secantus_pgplan::QUOTED_CHAR, false),
+            secantus_pgcatalog::Column::new("barelabel", "bool", false),
+            secantus_pgcatalog::Column::new("catdesc", "text", false),
+            secantus_pgcatalog::Column::new("baredesc", "text", false),
+        ],
+    )
+}
+
+pub(crate) fn pg_get_keywords_rows(def: &TableDef) -> Vec<Document> {
+    let f = |c: &str| def.field_of(c).expect("column");
+    KEYWORDS
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let (word, code, bare, catdesc, baredesc) = (
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+                parts.next()?,
+            );
+            let mut d = Document::new();
+            d.insert(f("word"), word);
+            d.insert(f("catcode"), code);
+            d.insert(f("barelabel"), bare == "t");
+            d.insert(f("catdesc"), catdesc);
+            d.insert(f("baredesc"), baredesc);
+            Some(d)
+        })
+        .collect()
+}

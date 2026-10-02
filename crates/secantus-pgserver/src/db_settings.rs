@@ -137,11 +137,14 @@ impl PgHandler {
                 d.insert(field("name"), name.as_str());
                 d.insert(field("setting"), setting.as_str());
                 d.insert(field("source"), source);
-                d.insert(field("context"), "user");
+                let internal = is_internal_setting(name);
+                d.insert(field("context"), if internal { "internal" } else { "user" });
                 d.insert(
                     field("vartype"),
                     if setting == "on" || setting == "off" {
                         "bool"
+                    } else if internal && setting.parse::<i64>().is_ok() {
+                        "integer"
                     } else {
                         "string"
                     },

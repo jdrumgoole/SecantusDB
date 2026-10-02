@@ -946,6 +946,16 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
             })))
         }
         ("?#", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(b(segs_intersect(*a1, *a2, *b1, *b2)))),
+        // `inter_sb`: an endpoint inside the box, or the segment crossing
+        // one of its edges.
+        ("?#", Lseg(a1, a2), Box(h, l)) => {
+            let corners = box_pts(*h, *l);
+            Some(Ok(b(in_box(*a1, *h, *l)
+                || in_box(*a2, *h, *l)
+                || (0..4).any(|i| {
+                    segs_intersect(*a1, *a2, corners[i], corners[(i + 1) % 4])
+                }))))
+        }
         ("#", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(match seg_intersection(*a1, *a2, *b1, *b2) {
             Some(p) => to_bson(&Point(p)),
             None => Bson::Null,
