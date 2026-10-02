@@ -214,13 +214,54 @@ fn build_tree(
     params: &[Bson],
 ) -> Result<(JoinNode, Scope)> {
     let mut scope = Scope::default();
-    let mut tree: Option<JoinNode> = None;
+    let mut items: Vec<(JoinNode, Vec<ScopeCol>)> = Vec::new();
     for item in &s.from_clause {
-        let left = (tree.is_some()).then(|| scope.clone());
+        let left = (!items.is_empty()).then(|| scope.clone());
         let (node, item_scope) = build(item, lookup, params, &mut scope.aliases, left.as_ref())?;
+        scope.cols.extend(item_scope.cols.iter().cloned());
+        items.push((node, item_scope.cols));
+    }
+    if items.is_empty() {
+        return Err(Error::Parse("empty FROM".into()));
+    }
+    // `FROM a, b, c`: cross joins, combined in the order that lets each
+    // join hash on a WHERE equality to what is already joined (see
+    // `join_order`); left to right when nothing connects them.
+    let lateral = items
+        .iter()
+        .any(|(n, _)| matches!(n, JoinNode::Lateral { .. }));
+    let equalities = if lateral {
+        Vec::new()
+    } else {
+        let cols: Vec<Vec<(String, String, String, String)>> = items
+            .iter()
+            .map(|(_, cols)| {
+                cols.iter()
+                    .map(|c| {
+                        (
+                            c.alias.clone(),
+                            c.name.clone(),
+                            c.key.clone(),
+                            if c.bare {
+                                c.pg_type.clone()
+                            } else {
+                                String::new()
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        crate::join_order::where_equalities(s.where_clause.as_deref(), &cols)
+    };
+    let order = crate::join_order::order(items.len(), &equalities);
+    let mut slots: Vec<Option<JoinNode>> = items.into_iter().map(|(n, _)| Some(n)).collect();
+    let mut joined: Vec<usize> = Vec::new();
+    let mut tree: Option<JoinNode> = None;
+    for i in order {
+        let node = slots[i].take().expect("each item joined once");
         tree = Some(match tree {
             None => node,
-            // `FROM a, b`: a cross join, left to right.
             Some(left) => JoinNode::Join {
                 kind: JoinKind::Inner,
                 left_keys: keys_of(&left),
@@ -228,13 +269,15 @@ fn build_tree(
                 left: Box::new(left),
                 right: Box::new(node),
                 on: None,
-                equi: Vec::new(),
+                // The WHERE still decides every row; these only narrow the
+                // candidates a left row is paired with.
+                equi: crate::join_order::pairs_between(&equalities, &joined, i),
                 merged: Vec::new(),
             },
         });
-        scope.cols.extend(item_scope.cols);
+        joined.push(i);
     }
-    let tree = tree.ok_or_else(|| Error::Parse("empty FROM".into()))?;
+    let tree = tree.expect("a non-empty FROM");
     Ok((tree, scope))
 }
 

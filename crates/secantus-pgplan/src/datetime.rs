@@ -906,6 +906,25 @@ pub fn time_plus(v: &Bson, iv: &Interval, sign: i64) -> Result<Bson> {
     Ok(Bson::String(render_time(out)))
 }
 
+/// `timetz +/- interval`: the time part wraps round the clock, the offset
+/// stays (`timetz_pl_interval`). `None` when `v` is not a timetz's text.
+pub fn timetz_plus(v: &Bson, iv: &Interval, sign: i64) -> Option<Result<Bson>> {
+    let Bson::String(s) = v else {
+        return None;
+    };
+    let at = s.rfind(['+', '-']).filter(|&i| i >= 5)?;
+    let (time, offset) = s.split_at(at);
+    if time_of(&Bson::String(time.to_string())).is_err() {
+        return None;
+    }
+    Some(
+        time_plus(&Bson::String(time.to_string()), iv, sign).map(|r| match r {
+            Bson::String(t) => Bson::String(format!("{t}{offset}")),
+            other => other,
+        }),
+    )
+}
+
 /// `time - time`.
 pub fn time_diff(a: &Bson, b: &Bson) -> Result<Bson> {
     let m = |t: NaiveTime| {

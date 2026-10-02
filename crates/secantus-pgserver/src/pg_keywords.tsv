@@ -1,0 +1,460 @@
+abort	U	t	unreserved	can be bare label
+absolute	U	t	unreserved	can be bare label
+access	U	t	unreserved	can be bare label
+action	U	t	unreserved	can be bare label
+add	U	t	unreserved	can be bare label
+admin	U	t	unreserved	can be bare label
+after	U	t	unreserved	can be bare label
+aggregate	U	t	unreserved	can be bare label
+all	R	t	reserved	can be bare label
+also	U	t	unreserved	can be bare label
+alter	U	t	unreserved	can be bare label
+always	U	t	unreserved	can be bare label
+analyse	R	t	reserved	can be bare label
+analyze	R	t	reserved	can be bare label
+and	R	t	reserved	can be bare label
+any	R	t	reserved	can be bare label
+array	R	f	reserved	requires AS
+as	R	f	reserved	requires AS
+asc	R	t	reserved	can be bare label
+asensitive	U	t	unreserved	can be bare label
+assertion	U	t	unreserved	can be bare label
+assignment	U	t	unreserved	can be bare label
+asymmetric	R	t	reserved	can be bare label
+at	U	t	unreserved	can be bare label
+atomic	U	t	unreserved	can be bare label
+attach	U	t	unreserved	can be bare label
+attribute	U	t	unreserved	can be bare label
+authorization	T	t	reserved (can be function or type name)	can be bare label
+backward	U	t	unreserved	can be bare label
+before	U	t	unreserved	can be bare label
+begin	U	t	unreserved	can be bare label
+between	C	t	unreserved (cannot be function or type name)	can be bare label
+bigint	C	t	unreserved (cannot be function or type name)	can be bare label
+binary	T	t	reserved (can be function or type name)	can be bare label
+bit	C	t	unreserved (cannot be function or type name)	can be bare label
+boolean	C	t	unreserved (cannot be function or type name)	can be bare label
+both	R	t	reserved	can be bare label
+breadth	U	t	unreserved	can be bare label
+by	U	t	unreserved	can be bare label
+cache	U	t	unreserved	can be bare label
+call	U	t	unreserved	can be bare label
+called	U	t	unreserved	can be bare label
+cascade	U	t	unreserved	can be bare label
+cascaded	U	t	unreserved	can be bare label
+case	R	t	reserved	can be bare label
+cast	R	t	reserved	can be bare label
+catalog	U	t	unreserved	can be bare label
+chain	U	t	unreserved	can be bare label
+char	C	f	unreserved (cannot be function or type name)	requires AS
+character	C	f	unreserved (cannot be function or type name)	requires AS
+characteristics	U	t	unreserved	can be bare label
+check	R	t	reserved	can be bare label
+checkpoint	U	t	unreserved	can be bare label
+class	U	t	unreserved	can be bare label
+close	U	t	unreserved	can be bare label
+cluster	U	t	unreserved	can be bare label
+coalesce	C	t	unreserved (cannot be function or type name)	can be bare label
+collate	R	t	reserved	can be bare label
+collation	T	t	reserved (can be function or type name)	can be bare label
+column	R	t	reserved	can be bare label
+columns	U	t	unreserved	can be bare label
+comment	U	t	unreserved	can be bare label
+comments	U	t	unreserved	can be bare label
+commit	U	t	unreserved	can be bare label
+committed	U	t	unreserved	can be bare label
+compression	U	t	unreserved	can be bare label
+concurrently	T	t	reserved (can be function or type name)	can be bare label
+configuration	U	t	unreserved	can be bare label
+conflict	U	t	unreserved	can be bare label
+connection	U	t	unreserved	can be bare label
+constraint	R	t	reserved	can be bare label
+constraints	U	t	unreserved	can be bare label
+content	U	t	unreserved	can be bare label
+continue	U	t	unreserved	can be bare label
+conversion	U	t	unreserved	can be bare label
+copy	U	t	unreserved	can be bare label
+cost	U	t	unreserved	can be bare label
+create	R	f	reserved	requires AS
+cross	T	t	reserved (can be function or type name)	can be bare label
+csv	U	t	unreserved	can be bare label
+cube	U	t	unreserved	can be bare label
+current	U	t	unreserved	can be bare label
+current_catalog	R	t	reserved	can be bare label
+current_date	R	t	reserved	can be bare label
+current_role	R	t	reserved	can be bare label
+current_schema	T	t	reserved (can be function or type name)	can be bare label
+current_time	R	t	reserved	can be bare label
+current_timestamp	R	t	reserved	can be bare label
+current_user	R	t	reserved	can be bare label
+cursor	U	t	unreserved	can be bare label
+cycle	U	t	unreserved	can be bare label
+data	U	t	unreserved	can be bare label
+database	U	t	unreserved	can be bare label
+day	U	f	unreserved	requires AS
+deallocate	U	t	unreserved	can be bare label
+dec	C	t	unreserved (cannot be function or type name)	can be bare label
+decimal	C	t	unreserved (cannot be function or type name)	can be bare label
+declare	U	t	unreserved	can be bare label
+default	R	t	reserved	can be bare label
+defaults	U	t	unreserved	can be bare label
+deferrable	R	t	reserved	can be bare label
+deferred	U	t	unreserved	can be bare label
+definer	U	t	unreserved	can be bare label
+delete	U	t	unreserved	can be bare label
+delimiter	U	t	unreserved	can be bare label
+delimiters	U	t	unreserved	can be bare label
+depends	U	t	unreserved	can be bare label
+depth	U	t	unreserved	can be bare label
+desc	R	t	reserved	can be bare label
+detach	U	t	unreserved	can be bare label
+dictionary	U	t	unreserved	can be bare label
+disable	U	t	unreserved	can be bare label
+discard	U	t	unreserved	can be bare label
+distinct	R	t	reserved	can be bare label
+do	R	t	reserved	can be bare label
+document	U	t	unreserved	can be bare label
+domain	U	t	unreserved	can be bare label
+double	U	t	unreserved	can be bare label
+drop	U	t	unreserved	can be bare label
+each	U	t	unreserved	can be bare label
+else	R	t	reserved	can be bare label
+enable	U	t	unreserved	can be bare label
+encoding	U	t	unreserved	can be bare label
+encrypted	U	t	unreserved	can be bare label
+end	R	t	reserved	can be bare label
+enum	U	t	unreserved	can be bare label
+escape	U	t	unreserved	can be bare label
+event	U	t	unreserved	can be bare label
+except	R	f	reserved	requires AS
+exclude	U	t	unreserved	can be bare label
+excluding	U	t	unreserved	can be bare label
+exclusive	U	t	unreserved	can be bare label
+execute	U	t	unreserved	can be bare label
+exists	C	t	unreserved (cannot be function or type name)	can be bare label
+explain	U	t	unreserved	can be bare label
+expression	U	t	unreserved	can be bare label
+extension	U	t	unreserved	can be bare label
+external	U	t	unreserved	can be bare label
+extract	C	t	unreserved (cannot be function or type name)	can be bare label
+false	R	t	reserved	can be bare label
+family	U	t	unreserved	can be bare label
+fetch	R	f	reserved	requires AS
+filter	U	f	unreserved	requires AS
+finalize	U	t	unreserved	can be bare label
+first	U	t	unreserved	can be bare label
+float	C	t	unreserved (cannot be function or type name)	can be bare label
+following	U	t	unreserved	can be bare label
+for	R	f	reserved	requires AS
+force	U	t	unreserved	can be bare label
+foreign	R	t	reserved	can be bare label
+forward	U	t	unreserved	can be bare label
+freeze	T	t	reserved (can be function or type name)	can be bare label
+from	R	f	reserved	requires AS
+full	T	t	reserved (can be function or type name)	can be bare label
+function	U	t	unreserved	can be bare label
+functions	U	t	unreserved	can be bare label
+generated	U	t	unreserved	can be bare label
+global	U	t	unreserved	can be bare label
+grant	R	f	reserved	requires AS
+granted	U	t	unreserved	can be bare label
+greatest	C	t	unreserved (cannot be function or type name)	can be bare label
+group	R	f	reserved	requires AS
+grouping	C	t	unreserved (cannot be function or type name)	can be bare label
+groups	U	t	unreserved	can be bare label
+handler	U	t	unreserved	can be bare label
+having	R	f	reserved	requires AS
+header	U	t	unreserved	can be bare label
+hold	U	t	unreserved	can be bare label
+hour	U	f	unreserved	requires AS
+identity	U	t	unreserved	can be bare label
+if	U	t	unreserved	can be bare label
+ilike	T	t	reserved (can be function or type name)	can be bare label
+immediate	U	t	unreserved	can be bare label
+immutable	U	t	unreserved	can be bare label
+implicit	U	t	unreserved	can be bare label
+import	U	t	unreserved	can be bare label
+in	R	t	reserved	can be bare label
+include	U	t	unreserved	can be bare label
+including	U	t	unreserved	can be bare label
+increment	U	t	unreserved	can be bare label
+index	U	t	unreserved	can be bare label
+indexes	U	t	unreserved	can be bare label
+inherit	U	t	unreserved	can be bare label
+inherits	U	t	unreserved	can be bare label
+initially	R	t	reserved	can be bare label
+inline	U	t	unreserved	can be bare label
+inner	T	t	reserved (can be function or type name)	can be bare label
+inout	C	t	unreserved (cannot be function or type name)	can be bare label
+input	U	t	unreserved	can be bare label
+insensitive	U	t	unreserved	can be bare label
+insert	U	t	unreserved	can be bare label
+instead	U	t	unreserved	can be bare label
+int	C	t	unreserved (cannot be function or type name)	can be bare label
+integer	C	t	unreserved (cannot be function or type name)	can be bare label
+intersect	R	f	reserved	requires AS
+interval	C	t	unreserved (cannot be function or type name)	can be bare label
+into	R	f	reserved	requires AS
+invoker	U	t	unreserved	can be bare label
+is	T	t	reserved (can be function or type name)	can be bare label
+isnull	T	f	reserved (can be function or type name)	requires AS
+isolation	U	t	unreserved	can be bare label
+join	T	t	reserved (can be function or type name)	can be bare label
+key	U	t	unreserved	can be bare label
+label	U	t	unreserved	can be bare label
+language	U	t	unreserved	can be bare label
+large	U	t	unreserved	can be bare label
+last	U	t	unreserved	can be bare label
+lateral	R	t	reserved	can be bare label
+leading	R	t	reserved	can be bare label
+leakproof	U	t	unreserved	can be bare label
+least	C	t	unreserved (cannot be function or type name)	can be bare label
+left	T	t	reserved (can be function or type name)	can be bare label
+level	U	t	unreserved	can be bare label
+like	T	t	reserved (can be function or type name)	can be bare label
+limit	R	f	reserved	requires AS
+listen	U	t	unreserved	can be bare label
+load	U	t	unreserved	can be bare label
+local	U	t	unreserved	can be bare label
+localtime	R	t	reserved	can be bare label
+localtimestamp	R	t	reserved	can be bare label
+location	U	t	unreserved	can be bare label
+lock	U	t	unreserved	can be bare label
+locked	U	t	unreserved	can be bare label
+logged	U	t	unreserved	can be bare label
+mapping	U	t	unreserved	can be bare label
+match	U	t	unreserved	can be bare label
+matched	U	t	unreserved	can be bare label
+materialized	U	t	unreserved	can be bare label
+maxvalue	U	t	unreserved	can be bare label
+merge	U	t	unreserved	can be bare label
+method	U	t	unreserved	can be bare label
+minute	U	f	unreserved	requires AS
+minvalue	U	t	unreserved	can be bare label
+mode	U	t	unreserved	can be bare label
+month	U	f	unreserved	requires AS
+move	U	t	unreserved	can be bare label
+name	U	t	unreserved	can be bare label
+names	U	t	unreserved	can be bare label
+national	C	t	unreserved (cannot be function or type name)	can be bare label
+natural	T	t	reserved (can be function or type name)	can be bare label
+nchar	C	t	unreserved (cannot be function or type name)	can be bare label
+new	U	t	unreserved	can be bare label
+next	U	t	unreserved	can be bare label
+nfc	U	t	unreserved	can be bare label
+nfd	U	t	unreserved	can be bare label
+nfkc	U	t	unreserved	can be bare label
+nfkd	U	t	unreserved	can be bare label
+no	U	t	unreserved	can be bare label
+none	C	t	unreserved (cannot be function or type name)	can be bare label
+normalize	C	t	unreserved (cannot be function or type name)	can be bare label
+normalized	U	t	unreserved	can be bare label
+not	R	t	reserved	can be bare label
+nothing	U	t	unreserved	can be bare label
+notify	U	t	unreserved	can be bare label
+notnull	T	f	reserved (can be function or type name)	requires AS
+nowait	U	t	unreserved	can be bare label
+null	R	t	reserved	can be bare label
+nullif	C	t	unreserved (cannot be function or type name)	can be bare label
+nulls	U	t	unreserved	can be bare label
+numeric	C	t	unreserved (cannot be function or type name)	can be bare label
+object	U	t	unreserved	can be bare label
+of	U	t	unreserved	can be bare label
+off	U	t	unreserved	can be bare label
+offset	R	f	reserved	requires AS
+oids	U	t	unreserved	can be bare label
+old	U	t	unreserved	can be bare label
+on	R	f	reserved	requires AS
+only	R	t	reserved	can be bare label
+operator	U	t	unreserved	can be bare label
+option	U	t	unreserved	can be bare label
+options	U	t	unreserved	can be bare label
+or	R	t	reserved	can be bare label
+order	R	f	reserved	requires AS
+ordinality	U	t	unreserved	can be bare label
+others	U	t	unreserved	can be bare label
+out	C	t	unreserved (cannot be function or type name)	can be bare label
+outer	T	t	reserved (can be function or type name)	can be bare label
+over	U	f	unreserved	requires AS
+overlaps	T	f	reserved (can be function or type name)	requires AS
+overlay	C	t	unreserved (cannot be function or type name)	can be bare label
+overriding	U	t	unreserved	can be bare label
+owned	U	t	unreserved	can be bare label
+owner	U	t	unreserved	can be bare label
+parallel	U	t	unreserved	can be bare label
+parameter	U	t	unreserved	can be bare label
+parser	U	t	unreserved	can be bare label
+partial	U	t	unreserved	can be bare label
+partition	U	t	unreserved	can be bare label
+passing	U	t	unreserved	can be bare label
+password	U	t	unreserved	can be bare label
+placing	R	t	reserved	can be bare label
+plans	U	t	unreserved	can be bare label
+policy	U	t	unreserved	can be bare label
+position	C	t	unreserved (cannot be function or type name)	can be bare label
+preceding	U	t	unreserved	can be bare label
+precision	C	f	unreserved (cannot be function or type name)	requires AS
+prepare	U	t	unreserved	can be bare label
+prepared	U	t	unreserved	can be bare label
+preserve	U	t	unreserved	can be bare label
+primary	R	t	reserved	can be bare label
+prior	U	t	unreserved	can be bare label
+privileges	U	t	unreserved	can be bare label
+procedural	U	t	unreserved	can be bare label
+procedure	U	t	unreserved	can be bare label
+procedures	U	t	unreserved	can be bare label
+program	U	t	unreserved	can be bare label
+publication	U	t	unreserved	can be bare label
+quote	U	t	unreserved	can be bare label
+range	U	t	unreserved	can be bare label
+read	U	t	unreserved	can be bare label
+real	C	t	unreserved (cannot be function or type name)	can be bare label
+reassign	U	t	unreserved	can be bare label
+recheck	U	t	unreserved	can be bare label
+recursive	U	t	unreserved	can be bare label
+ref	U	t	unreserved	can be bare label
+references	R	t	reserved	can be bare label
+referencing	U	t	unreserved	can be bare label
+refresh	U	t	unreserved	can be bare label
+reindex	U	t	unreserved	can be bare label
+relative	U	t	unreserved	can be bare label
+release	U	t	unreserved	can be bare label
+rename	U	t	unreserved	can be bare label
+repeatable	U	t	unreserved	can be bare label
+replace	U	t	unreserved	can be bare label
+replica	U	t	unreserved	can be bare label
+reset	U	t	unreserved	can be bare label
+restart	U	t	unreserved	can be bare label
+restrict	U	t	unreserved	can be bare label
+return	U	t	unreserved	can be bare label
+returning	R	f	reserved	requires AS
+returns	U	t	unreserved	can be bare label
+revoke	U	t	unreserved	can be bare label
+right	T	t	reserved (can be function or type name)	can be bare label
+role	U	t	unreserved	can be bare label
+rollback	U	t	unreserved	can be bare label
+rollup	U	t	unreserved	can be bare label
+routine	U	t	unreserved	can be bare label
+routines	U	t	unreserved	can be bare label
+row	C	t	unreserved (cannot be function or type name)	can be bare label
+rows	U	t	unreserved	can be bare label
+rule	U	t	unreserved	can be bare label
+savepoint	U	t	unreserved	can be bare label
+schema	U	t	unreserved	can be bare label
+schemas	U	t	unreserved	can be bare label
+scroll	U	t	unreserved	can be bare label
+search	U	t	unreserved	can be bare label
+second	U	f	unreserved	requires AS
+security	U	t	unreserved	can be bare label
+select	R	t	reserved	can be bare label
+sequence	U	t	unreserved	can be bare label
+sequences	U	t	unreserved	can be bare label
+serializable	U	t	unreserved	can be bare label
+server	U	t	unreserved	can be bare label
+session	U	t	unreserved	can be bare label
+session_user	R	t	reserved	can be bare label
+set	U	t	unreserved	can be bare label
+setof	C	t	unreserved (cannot be function or type name)	can be bare label
+sets	U	t	unreserved	can be bare label
+share	U	t	unreserved	can be bare label
+show	U	t	unreserved	can be bare label
+similar	T	t	reserved (can be function or type name)	can be bare label
+simple	U	t	unreserved	can be bare label
+skip	U	t	unreserved	can be bare label
+smallint	C	t	unreserved (cannot be function or type name)	can be bare label
+snapshot	U	t	unreserved	can be bare label
+some	R	t	reserved	can be bare label
+sql	U	t	unreserved	can be bare label
+stable	U	t	unreserved	can be bare label
+standalone	U	t	unreserved	can be bare label
+start	U	t	unreserved	can be bare label
+statement	U	t	unreserved	can be bare label
+statistics	U	t	unreserved	can be bare label
+stdin	U	t	unreserved	can be bare label
+stdout	U	t	unreserved	can be bare label
+storage	U	t	unreserved	can be bare label
+stored	U	t	unreserved	can be bare label
+strict	U	t	unreserved	can be bare label
+strip	U	t	unreserved	can be bare label
+subscription	U	t	unreserved	can be bare label
+substring	C	t	unreserved (cannot be function or type name)	can be bare label
+support	U	t	unreserved	can be bare label
+symmetric	R	t	reserved	can be bare label
+sysid	U	t	unreserved	can be bare label
+system	U	t	unreserved	can be bare label
+table	R	t	reserved	can be bare label
+tables	U	t	unreserved	can be bare label
+tablesample	T	t	reserved (can be function or type name)	can be bare label
+tablespace	U	t	unreserved	can be bare label
+temp	U	t	unreserved	can be bare label
+template	U	t	unreserved	can be bare label
+temporary	U	t	unreserved	can be bare label
+text	U	t	unreserved	can be bare label
+then	R	t	reserved	can be bare label
+ties	U	t	unreserved	can be bare label
+time	C	t	unreserved (cannot be function or type name)	can be bare label
+timestamp	C	t	unreserved (cannot be function or type name)	can be bare label
+to	R	f	reserved	requires AS
+trailing	R	t	reserved	can be bare label
+transaction	U	t	unreserved	can be bare label
+transform	U	t	unreserved	can be bare label
+treat	C	t	unreserved (cannot be function or type name)	can be bare label
+trigger	U	t	unreserved	can be bare label
+trim	C	t	unreserved (cannot be function or type name)	can be bare label
+true	R	t	reserved	can be bare label
+truncate	U	t	unreserved	can be bare label
+trusted	U	t	unreserved	can be bare label
+type	U	t	unreserved	can be bare label
+types	U	t	unreserved	can be bare label
+uescape	U	t	unreserved	can be bare label
+unbounded	U	t	unreserved	can be bare label
+uncommitted	U	t	unreserved	can be bare label
+unencrypted	U	t	unreserved	can be bare label
+union	R	f	reserved	requires AS
+unique	R	t	reserved	can be bare label
+unknown	U	t	unreserved	can be bare label
+unlisten	U	t	unreserved	can be bare label
+unlogged	U	t	unreserved	can be bare label
+until	U	t	unreserved	can be bare label
+update	U	t	unreserved	can be bare label
+user	R	t	reserved	can be bare label
+using	R	t	reserved	can be bare label
+vacuum	U	t	unreserved	can be bare label
+valid	U	t	unreserved	can be bare label
+validate	U	t	unreserved	can be bare label
+validator	U	t	unreserved	can be bare label
+value	U	t	unreserved	can be bare label
+values	C	t	unreserved (cannot be function or type name)	can be bare label
+varchar	C	t	unreserved (cannot be function or type name)	can be bare label
+variadic	R	t	reserved	can be bare label
+varying	U	f	unreserved	requires AS
+verbose	T	t	reserved (can be function or type name)	can be bare label
+version	U	t	unreserved	can be bare label
+view	U	t	unreserved	can be bare label
+views	U	t	unreserved	can be bare label
+volatile	U	t	unreserved	can be bare label
+when	R	t	reserved	can be bare label
+where	R	f	reserved	requires AS
+whitespace	U	t	unreserved	can be bare label
+window	R	f	reserved	requires AS
+with	R	f	reserved	requires AS
+within	U	f	unreserved	requires AS
+without	U	f	unreserved	requires AS
+work	U	t	unreserved	can be bare label
+wrapper	U	t	unreserved	can be bare label
+write	U	t	unreserved	can be bare label
+xml	U	t	unreserved	can be bare label
+xmlattributes	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlconcat	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlelement	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlexists	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlforest	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlnamespaces	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlparse	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlpi	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlroot	C	t	unreserved (cannot be function or type name)	can be bare label
+xmlserialize	C	t	unreserved (cannot be function or type name)	can be bare label
+xmltable	C	t	unreserved (cannot be function or type name)	can be bare label
+year	U	f	unreserved	requires AS
+yes	U	t	unreserved	can be bare label
+zone	U	t	unreserved	can be bare label
