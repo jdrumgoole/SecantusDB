@@ -10,6 +10,25 @@
 
 use super::*;
 
+/// The built-in function calls `sql` makes, each as its name and the
+/// argument types of the overload chosen (`None` when undetermined), for
+/// the EXECUTE check PostgreSQL makes at every call.
+pub fn builtin_calls(
+    sql: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<(String, Option<Vec<String>>)> {
+    let Ok(parsed) = parse_tree(sql) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw in &parsed.stmts {
+        if let Some(node) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            out.extend(crate::optype::builtin_calls(node, lookup));
+        }
+    }
+    out
+}
+
 /// `(relation, privilege)` for every relation `sql` names, before view
 /// expansion. The target of an INSERT / UPDATE / DELETE takes that
 /// privilege (and SELECT too when the statement reads its rows to choose
