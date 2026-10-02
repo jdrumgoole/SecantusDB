@@ -15309,3 +15309,36 @@ def test_parallel_sessions_resolve_their_own_new_temp_table(home: Path) -> None:
             w.join(120)
         assert not any(w.is_alive() for w in workers)
     assert failures == []
+
+
+def test_pg_temp_function_is_session_private_and_dropped_at_disconnect(home: Path) -> None:
+    """`create function pg_temp.f()` lives in the session's temp schema: no
+    other session sees it, and it is gone when the session ends. It used to
+    land in `public`, shared and permanent, so a second run of pgx's
+    TestConnCopyFromNoticeResponseReceivedMidStream over one store failed
+    42723."""
+    with _Server(home) as server:
+        with server.connect() as a:
+            a.execute("create function pg_temp.f() returns int language sql as 'select 1'")
+            assert a.execute("select pg_temp.f()").fetchone() == (1,)
+            with server.connect() as b:
+                assert b.execute("select count(*) from pg_proc where proname = 'f'").fetchone() == (
+                    0,
+                )
+                # Its own pg_temp.f does not collide with a's.
+                b.execute("create function pg_temp.f() returns int language sql as 'select 2'")
+                assert b.execute("select pg_temp.f()").fetchone() == (2,)
+            assert a.execute("select pg_temp.f()").fetchone() == (1,)
+        with server.connect() as c:
+            assert c.execute("select count(*) from pg_proc where proname = 'f'").fetchone() == (0,)
+            c.execute("create function pg_temp.f() returns int language sql as 'select 3'")
+            assert c.execute("select pg_temp.f()").fetchone() == (3,)
+
+
+def test_startup_parameter_status_matches_postgresql_15(home: Path) -> None:
+    """PostgreSQL 15 reports no `search_path` (reported from 18) and no
+    `scram_iterations` (from 16) at startup."""
+    with _Server(home) as server, server.connect() as c:
+        assert c.pgconn.parameter_status(b"search_path") is None
+        assert c.pgconn.parameter_status(b"scram_iterations") is None
+        assert c.pgconn.parameter_status(b"TimeZone") is not None

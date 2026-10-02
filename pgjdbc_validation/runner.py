@@ -154,10 +154,15 @@ def _ensure_test_database(host: str, port: int) -> None:
             conn.execute("create database test")
         # ... and the `test` role it connects as, which owns what the suite
         # creates (getTablePrivileges reports the owner's privileges by its
-        # role). A superuser, as an unknown user is treated already.
+        # role). A superuser, as an unknown user is treated already. With
+        # pgjdbc CI's password (`CREATE USER test with password 'test'`), so
+        # the suite authenticates as it does there -- LoginTimeoutInterruptTest
+        # times out an authentication plugin, which a trusted login never
+        # calls.
         role = conn.execute("select 1 from pg_roles where rolname = 'test'").fetchone()
         if role is None:
             conn.execute("create role test login superuser")
+        conn.execute("alter role test password 'test'")
 
 
 def _is_jdk21(home: str) -> bool:
