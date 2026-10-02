@@ -1,0 +1,33 @@
+DROP VIEW IF EXISTS sa35_v
+DROP TABLE IF EXISTS sa35_c
+DROP TABLE IF EXISTS sa35_p
+DROP TABLE IF EXISTS sa35_s.sa35_d
+DROP TABLE IF EXISTS sa35_s.sa35_e
+DROP TABLE IF EXISTS sa35_s.sa35_u
+DROP TABLE IF EXISTS sa35_u
+DROP TABLE IF EXISTS sa35_pk
+DROP TABLE IF EXISTS sa35_ci
+DROP TABLE IF EXISTS sa35_ts
+DROP SEQUENCE IF EXISTS sa35_seq
+CREATE SCHEMA IF NOT EXISTS sa35_s
+CREATE TABLE sa35_p (id int PRIMARY KEY, b int, UNIQUE (id, b))
+CREATE TABLE sa35_c (id int PRIMARY KEY, pid int REFERENCES sa35_p (id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED, x int, y int, FOREIGN KEY (x, y) REFERENCES sa35_p (id, b) MATCH FULL, "Q" int REFERENCES sa35_p)
+CREATE VIEW sa35_v AS SELECT * FROM sa35_p
+CREATE TABLE sa35_s.sa35_e (id int PRIMARY KEY, b int, CONSTRAINT sa35_e_uq UNIQUE (b))
+CREATE TABLE sa35_s.sa35_d (id int PRIMARY KEY, e_id int, CONSTRAINT sa35_d_fk FOREIGN KEY (e_id) REFERENCES sa35_s.sa35_e (id), CONSTRAINT sa35_d_ck CHECK (id > 0))
+CREATE INDEX sa35_d_ix ON sa35_s.sa35_d (e_id)
+COMMENT ON CONSTRAINT sa35_d_fk ON sa35_s.sa35_d IS 'fk comment'
+COMMENT ON CONSTRAINT sa35_d_ck ON sa35_s.sa35_d IS 'ck comment'
+COMMENT ON CONSTRAINT sa35_e_uq ON sa35_s.sa35_e IS 'uq comment'
+COMMENT ON CONSTRAINT sa35_d_pkey ON sa35_s.sa35_d IS 'pk comment'
+COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'
+CREATE TABLE sa35_u (a int, b int)
+CREATE TABLE sa35_s.sa35_u (a int, b int)
+CREATE UNIQUE INDEX sa35_u_ix ON sa35_u (a, b)
+CREATE UNIQUE INDEX sa35_u_ix ON sa35_s.sa35_u (a, b)
+CREATE INDEX ON sa35_s.sa35_u (a)
+CREATE TABLE sa35_pk (id int, attr int, name text, PRIMARY KEY (name, id, attr))
+CREATE TABLE sa35_ci (x int, y int, z int)
+CREATE INDEX sa35_ci_ix ON sa35_ci (x) INCLUDE (y)
+CREATE TABLE sa35_ts (id int PRIMARY KEY, d timestamp)
+INSERT INTO sa35_ts VALUES (1, '2006-05-12 12:00:00'), (2, '2007-01-01 00:00:00')

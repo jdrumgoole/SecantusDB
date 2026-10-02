@@ -124,6 +124,8 @@ struct IndexRelation {
     table: TableDef,
     /// 1-based column numbers; 0 for an expression key.
     keys: Vec<i32>,
+    /// The `INCLUDE` columns' numbers, which `indkey` lists after the keys.
+    include: Vec<i32>,
     unique: bool,
     primary: bool,
     exclusion: bool,
@@ -4911,7 +4913,15 @@ impl PgHandler {
             })
             .chain(self.index_relations().into_iter().map(|ix| {
                 let temp = temps.contains(&ix.table.name);
-                (ix.name, ix.oid, temp)
+                // An index lives in its table's schema, so it carries that
+                // schema's key (`test_schema.ix`) like any relation there.
+                let (schema, _) = secantus_pgplan::schemas::split_key(&ix.table.name);
+                let name = if ix.name.contains('.') {
+                    ix.name
+                } else {
+                    secantus_pgplan::schemas::relation_key(&schema, &ix.name)
+                };
+                (name, ix.oid, temp)
             }))
             .chain(
                 self.views()
@@ -4922,18 +4932,40 @@ impl PgHandler {
                         (name, oid, false)
                     }),
             )
-            // A sequence is a relation too: `'s'::regclass` names it.
-            .chain(
-                self.all_sequence_docs()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|d| {
-                        let name = d.get_str("_id").ok()?.to_string();
-                        let oid = Self::sequence_oid(&name);
-                        Some((name, oid, false))
-                    }),
-            )
+            // A sequence is a relation too: `'s'::regclass` names it --
+            // including one this open transaction created or dropped.
+            .chain(self.sequence_names().into_iter().map(|name| {
+                let oid = Self::sequence_oid(&name);
+                (name, oid, false)
+            }))
             .collect()
+    }
+
+    /// Every sequence's name, with this transaction's uncommitted creates and
+    /// drops applied.
+    fn sequence_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = self
+            .all_sequence_docs()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+            .collect();
+        for ((coll, id), doc) in self
+            .uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if *coll != SEQUENCE_COLLECTION {
+                continue;
+            }
+            if doc.is_some() {
+                names.insert(id.clone());
+            } else {
+                names.remove(id);
+            }
+        }
+        names.into_iter().collect()
     }
 
     /// A sequence's relation oid: stable for its name, in its own band.
@@ -5010,12 +5042,10 @@ impl PgHandler {
                     .position(|c| t.field_of(&c.name).as_deref() == Some(field))
                     .map_or(0, |i| (i + 1) as i32)
             };
-            let pk: Vec<i32> = t
-                .columns
+            let pk: Vec<i32> = secantus_pgplan::ordered_pk_columns(&t)
                 .iter()
-                .enumerate()
-                .filter(|(_, c)| c.pk)
-                .map(|(i, _)| (i + 1) as i32)
+                .filter_map(|p| t.columns.iter().position(|c| c.name == p.name))
+                .map(|i| (i + 1) as i32)
                 .collect();
             if !pk.is_empty() {
                 let name = pk_constraint_name(&t);
@@ -5024,6 +5054,7 @@ impl PgHandler {
                     name,
                     table: t.clone(),
                     keys: pk,
+                    include: Vec::new(),
                     unique: true,
                     primary: true,
                     exclusion: false,
@@ -5058,11 +5089,16 @@ impl PgHandler {
                     (_, Some(i)) => derived(2 + i as i64, name),
                     _ => Self::index_oid(name),
                 };
+                let include: Vec<i32> = ix
+                    .get_array("include")
+                    .map(|a| a.iter().filter_map(Bson::as_str).map(&position).collect())
+                    .unwrap_or_default();
                 out.push(IndexRelation {
                     oid,
                     name: name.to_string(),
                     table: t.clone(),
                     keys,
+                    include,
                     unique,
                     primary: false,
                     exclusion: false,
@@ -5087,6 +5123,7 @@ impl PgHandler {
                     name: u.name.clone(),
                     table: t.clone(),
                     keys,
+                    include: Vec::new(),
                     unique: !u.exclusion,
                     primary: false,
                     exclusion: u.exclusion,
@@ -5106,6 +5143,7 @@ impl PgHandler {
                 oid: ix.oid,
                 table: ix.table.clone(),
                 keys: ix.keys.clone(),
+                include: ix.include.clone(),
                 unique: ix.unique,
                 primary: ix.primary,
                 exclusion: ix.exclusion,
@@ -5130,6 +5168,7 @@ impl PgHandler {
                     name,
                     table: child.clone(),
                     keys: ix.keys.clone(),
+                    include: ix.include.clone(),
                     unique: ix.unique,
                     primary: ix.primary,
                     exclusion: ix.exclusion,
@@ -5140,6 +5179,7 @@ impl PgHandler {
                         oid: rel.oid,
                         table: rel.table.clone(),
                         keys: rel.keys.clone(),
+                        include: rel.include.clone(),
                         unique: rel.unique,
                         primary: rel.primary,
                         exclusion: rel.exclusion,
@@ -6317,6 +6357,8 @@ impl PgHandler {
                 .into_iter()
                 .map(|(oid, _, _, _, text)| (oid, text)),
         );
+        let q = secantus_pgplan::scalar::quote_identifier;
+        let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         for t in self.all_table_defs()? {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
@@ -6333,11 +6375,9 @@ impl PgHandler {
                     _ => String::new(),
                 }
             };
-            let pk: Vec<&str> = t
-                .columns
+            let pk: Vec<String> = secantus_pgplan::ordered_pk_columns(&t)
                 .iter()
-                .filter(|c| c.pk)
-                .map(|c| c.name.as_str())
+                .map(|c| q(&c.name))
                 .collect();
             if !pk.is_empty() {
                 push(format!("PRIMARY KEY ({})", pk.join(", ")));
@@ -6350,7 +6390,8 @@ impl PgHandler {
                         .enumerate()
                         .map(|(i, c)| {
                             format!(
-                                "{c} WITH {}",
+                                "{} WITH {}",
+                                q(c),
                                 u.exclusion_ops.get(i).map_or("=", String::as_str)
                             )
                         })
@@ -6368,7 +6409,7 @@ impl PgHandler {
                         } else {
                             ""
                         },
-                        u.columns.join(", "),
+                        qlist(&u.columns),
                         deferral(u.deferrable, u.initially_deferred)
                     ));
                 }
@@ -6393,9 +6434,9 @@ impl PgHandler {
                 };
                 let mut text = format!(
                     "FOREIGN KEY ({}) REFERENCES {}({})",
-                    fk.columns.join(", "),
-                    fk.ref_table,
-                    ref_columns.join(", ")
+                    qlist(&fk.columns),
+                    fk.ref_table.split('.').map(q).collect::<Vec<_>>().join("."),
+                    qlist(&ref_columns)
                 );
                 if fk.match_full {
                     text.push_str(" MATCH FULL");
@@ -7055,6 +7096,52 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// Is the bare `name` taken in `schema`'s relation namespace? An index
+    /// lives in its table's schema (storage keys it by its bare name per
+    /// table), so `public.users` and `test_schema.users` may each have an
+    /// index `users_t_idx`, as PostgreSQL allows.
+    fn relation_exists_in(&self, schema: &str, name: &str) -> PgWireResult<bool> {
+        let key = secantus_pgplan::schemas::relation_key(schema, name);
+        if self.lookup(&key).is_some() || self.views()?.iter().any(|(n, _)| *n == key) {
+            return Ok(true);
+        }
+        if self.composites()?.iter().any(|(n, _, _)| *n == key) {
+            return Ok(true);
+        }
+        Ok(self.all_indexes()?.iter().any(|(t, ix)| {
+            ix.get_str("name") == Ok(name)
+                && secantus_pgplan::schemas::split_key(&t.name).0 == schema
+        }))
+    }
+
+    /// The index a DROP INDEX names: `schema.name` (the planner keys a
+    /// qualified name that way) in that schema; a bare name in the first
+    /// schema on the search path holding one, else anywhere.
+    fn find_index_by_name(&self, name: &str) -> PgWireResult<Option<(TableDef, Document)>> {
+        let (schema, bare) = match secantus_pgplan::schemas::split_key(name) {
+            (s, b) if s != "public" => (Some(s), b),
+            _ => (None, name.to_string()),
+        };
+        let schema_of = |t: &TableDef| secantus_pgplan::schemas::split_key(&t.name).0;
+        let candidates: Vec<(TableDef, Document)> = self
+            .all_indexes()?
+            .into_iter()
+            .filter(|(_, ix)| ix.get_str("name") == Ok(bare.as_str()))
+            .collect();
+        if let Some(s) = schema {
+            return Ok(candidates.into_iter().find(|(t, _)| schema_of(t) == s));
+        }
+        let path = secantus_pgplan::schemas::search_path();
+        let ranked = candidates.iter().enumerate().min_by_key(|(i, (t, _))| {
+            let sch = schema_of(t);
+            (
+                path.iter().position(|p| *p == sch).unwrap_or(usize::MAX),
+                *i,
+            )
+        });
+        Ok(ranked.map(|(_, c)| c.clone()))
+    }
+
     /// Is `name` taken in the relation namespace -- a table, a view, a
     /// sequence, an index, a composite type or a catalog relation? PostgreSQL
     /// keeps them all in one `pg_class`, so each collides with the others.
@@ -7426,23 +7513,26 @@ impl PgHandler {
         let def = self
             .lookup(&ci.table)
             .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ci.table.clone())))?;
+        // The index goes in its table's schema.
+        let index_schema = secantus_pgplan::schemas::split_key(&def.name).0;
         let name = match &ci.name {
             Some(n) => n.clone(),
             None => {
                 // PostgreSQL's ChooseRelationName: `<table>_<cols>_idx`, then
                 // a number appended until it is free.
                 let cols: Vec<&str> = ci.columns.iter().map(|(c, _)| c.as_str()).collect();
-                let base = format!("{}_{}_idx", ci.table, cols.join("_"));
+                let table = secantus_pgplan::schemas::split_key(&def.name).1;
+                let base = format!("{table}_{}_idx", cols.join("_"));
                 let mut candidate = base.clone();
                 let mut n = 0;
-                while self.relation_exists(&candidate)? {
+                while self.relation_exists_in(&index_schema, &candidate)? {
                     n += 1;
                     candidate = format!("{base}{n}");
                 }
                 candidate
             }
         };
-        if self.relation_exists(&name)? {
+        if self.relation_exists_in(&index_schema, &name)? {
             if ci.if_not_exists {
                 self.notice(
                     "42P07",
@@ -7915,7 +8005,14 @@ impl PgHandler {
                         found = true;
                     }
                 }
-                if !found && *con == pk_constraint_name(&def) && def.columns.iter().any(|c| c.pk) {
+                // A schema table's primary key is keyed `schema.<t>_pkey`; its
+                // constraint name is the bare part.
+                let pk_name = pk_constraint_name(&def);
+                let pk_bare = secantus_pgplan::schemas::split_key(&pk_name).1;
+                if !found
+                    && (*con == pk_name || *con == pk_bare)
+                    && def.columns.iter().any(|c| c.pk)
+                {
                     match &comment {
                         Some(text) => {
                             def.extra.insert("pk_comment", text.clone());
@@ -7936,9 +8033,24 @@ impl PgHandler {
                 self.rewrite_catalog(&name, &def)
             }
             "index" => {
-                let name = Self::comment_relation(names);
-                if !self.index_relations().iter().any(|ix| ix.name == name) {
-                    return Err(missing_relation(&name));
+                // An index lives in its table's schema but is keyed by its
+                // bare name, so `test_schema.ix` names the index `ix` on a
+                // table of `test_schema`.
+                let (schema, name) = match names {
+                    [.., s, n] => (Some(s.clone()), n.clone()),
+                    [n] => match secantus_pgplan::schemas::split_key(n) {
+                        (s, bare) if s != "public" => (Some(s), bare),
+                        _ => (None, n.clone()),
+                    },
+                    [] => (None, String::new()),
+                };
+                if !self.index_relations().iter().any(|ix| {
+                    ix.name == name
+                        && schema.as_ref().is_none_or(|s| {
+                            secantus_pgplan::schemas::split_key(&ix.table.name).0 == *s
+                        })
+                }) {
+                    return Err(missing_relation(&Self::comment_relation(names)));
                 }
                 self.put_comment_doc(
                     Self::INDEX_COMMENT_COLLECTION,
@@ -9539,6 +9651,38 @@ impl PgHandler {
         bounded > 2032
     }
 
+    /// Every table constraint's comment, under the oid its `pg_constraint`
+    /// row carries -- numbered in the order `constraint_defs` walks them
+    /// (primary key, unique / exclusion, check, foreign key).
+    pub(crate) fn constraint_comments(&self) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for t in self.all_table_defs().unwrap_or_default() {
+            let Some(rel) = self.relation_oid(&t.name) else {
+                continue;
+            };
+            let mut ordinal = 0i64;
+            let mut push = |comment: Option<&str>| {
+                if let Some(c) = comment {
+                    out.push((Self::constraint_oid(rel, ordinal), c.to_string()));
+                }
+                ordinal += 1;
+            };
+            if t.columns.iter().any(|c| c.pk) {
+                push(t.extra.get_str("pk_comment").ok());
+            }
+            for u in &t.unique_constraints {
+                push(u.comment.as_deref());
+            }
+            for ck in &t.check_constraints {
+                push(ck.comment.as_deref());
+            }
+            for fk in &t.foreign_keys {
+                push(fk.comment.as_deref());
+            }
+        }
+        out
+    }
+
     /// Every stored comment as pg_description keys it: `(object oid,
     /// sub-id, text)`, the sub-id a column's number or 0. Objects with no
     /// oid here (a sequence, a schema) are not listed.
@@ -9568,6 +9712,11 @@ impl PgHandler {
                 }
             }
         }
+        out.extend(
+            self.constraint_comments()
+                .into_iter()
+                .map(|(oid, c)| (oid, 0, c)),
+        );
         let index_comments: Vec<Document> = self
             .storage
             .find_matching(self.db(), Self::INDEX_COMMENT_COLLECTION, &Document::new())
@@ -10737,7 +10886,7 @@ impl PgHandler {
                     // for a single-column primary key rather than one per
                     // constraint of any kind.
                     let pkey = pk_constraint_name(&t);
-                    for (i, c) in t.columns.iter().filter(|c| c.pk).enumerate() {
+                    for (i, c) in secantus_pgplan::ordered_pk_columns(&t).iter().enumerate() {
                         push(&pkey, &c.name, (i + 1) as i32, &mut rows);
                     }
                     for u in &t.unique_constraints {
@@ -10967,7 +11116,10 @@ impl PgHandler {
                             f("indrelid"),
                             Bson::Int64(self.relation_oid(&ix.table.name).unwrap_or(0)),
                         );
-                        d.insert(f("indnatts"), Bson::Int32(ix.keys.len() as i32));
+                        d.insert(
+                            f("indnatts"),
+                            Bson::Int32((ix.keys.len() + ix.include.len()) as i32),
+                        );
                         d.insert(f("indisunique"), ix.unique);
                         d.insert(f("indisprimary"), ix.primary);
                         d.insert(f("indisexclusion"), ix.exclusion);
@@ -10977,7 +11129,13 @@ impl PgHandler {
                         );
                         d.insert(
                             f("indkey"),
-                            Bson::Array(ix.keys.into_iter().map(Bson::Int32).collect()),
+                            Bson::Array(
+                                ix.keys
+                                    .into_iter()
+                                    .chain(ix.include)
+                                    .map(Bson::Int32)
+                                    .collect(),
+                            ),
                         );
                         d
                     })
@@ -11061,10 +11219,8 @@ impl PgHandler {
                 let mut rows = Vec::new();
                 for t in self.all_table_defs().ok()? {
                     let schema = Self::schema_of(&t);
-                    let pk: Vec<&str> = t
-                        .columns
+                    let pk: Vec<&str> = secantus_pgplan::ordered_pk_columns(&t)
                         .iter()
-                        .filter(|c| c.pk)
                         .map(|c| c.name.as_str())
                         .collect();
                     if !pk.is_empty() {
@@ -12685,12 +12841,10 @@ impl PgHandler {
                     };
 
                     // PRIMARY KEY, named as PostgreSQL names an implicit one.
-                    let pk_cols: Vec<i32> = t
-                        .columns
+                    let pk_cols: Vec<i32> = secantus_pgplan::ordered_pk_columns(t)
                         .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.pk)
-                        .map(|(i, _)| i as i32 + 1)
+                        .filter_map(|p| t.columns.iter().position(|c| c.name == p.name))
+                        .map(|i| i as i32 + 1)
                         .collect();
                     if !pk_cols.is_empty() {
                         push(
@@ -15406,7 +15560,8 @@ impl PgHandler {
                         return Err(missing_column(c));
                     }
                 }
-                if self.relation_exists(&uq.name)? {
+                let schema = secantus_pgplan::schemas::split_key(&def.name).0;
+                if self.relation_exists_in(&schema, &uq.name)? {
                     return Err(Self::user_error(
                         "42P07",
                         format!("relation \"{}\" already exists", uq.name),
@@ -17400,7 +17555,22 @@ impl PgHandler {
             let binary = self
                 .binary_results
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
-            let responses = self.execute(*query, 0);
+            // INSIDE the block's transaction, as every other statement runs:
+            // a cursor over rows this block wrote must see them.
+            let responses = {
+                let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_mut() {
+                    Some(handle) => match self.with_isolation(handle) {
+                        Ok(handle) => self
+                            .storage
+                            .with_user_transaction(handle, || self.execute((*query).clone(), 0))
+                            .map_err(|e| Self::storage_err("transaction failed", e))
+                            .and_then(|r| r),
+                        Err(e) => Err(e),
+                    },
+                    None => self.execute(*query, 0),
+                }
+            };
             self.binary_results
                 .store(binary, std::sync::atomic::Ordering::Relaxed);
             let responses = match responses {
@@ -22463,6 +22633,10 @@ impl PgHandler {
                     vec![bytes],
                     "could not create the sequence",
                 )?;
+                // Planning reads the catalog outside the transaction, so a
+                // sequence this block created is named to it by the overlay
+                // (`'s'::regclass`, `pg_table_is_visible`).
+                self.note_uncommitted_type(SEQUENCE_COLLECTION, &name, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))])
             }
 
@@ -22526,6 +22700,7 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the sequence", e))?;
+                    self.note_uncommitted_type(SEQUENCE_COLLECTION, name, None);
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP SEQUENCE"))])
             }
@@ -22626,11 +22801,13 @@ impl PgHandler {
             Statement::CreateIndex(ci) => self.create_index(ci),
 
             Statement::DropIndex { names, if_exists } => {
-                for name in &names {
-                    let found = self
-                        .all_indexes()?
-                        .into_iter()
-                        .find(|(_, ix)| ix.get_str("name") == Ok(name.as_str()));
+                for qualified in &names {
+                    let found = self.find_index_by_name(qualified)?;
+                    let bare = match secantus_pgplan::schemas::split_key(qualified) {
+                        (s, b) if s != "public" => b,
+                        _ => qualified.clone(),
+                    };
+                    let name = &bare;
                     let Some((def, _)) = found else {
                         if self.relation_exists(name)? {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
