@@ -8102,7 +8102,7 @@ fn plan_insert(
     };
     for t in &targets {
         if def.column(t).is_none() {
-            return Err(Error::UndefinedColumn(t.clone()));
+            return Err(no_column_of(t, &table));
         }
     }
 
@@ -8437,7 +8437,7 @@ pub fn insert_row_typed(
     for (i, (col, value)) in targets.iter().zip(values).enumerate() {
         let column = def
             .column(col)
-            .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+            .ok_or_else(|| no_column_of(col, &def.name))?;
         let already_stored = types.get(i).is_some_and(|t| {
             *t == column.pg_type && (range::is_range_type(t) || range::is_multirange_type(t))
         });
@@ -16965,7 +16965,9 @@ fn invalid_from_reference(e: Error, s: &pg_query::protobuf::SelectStmt) -> Error
     if here.iter().any(|n| n == name) {
         Error::Sqlstate(
             "42P01",
-            format!("invalid reference to FROM-clause entry for table \"{name}\""),
+            format!(
+                "invalid reference to FROM-clause entry for table \"{name}\"\nHint: There is an entry for table \"{name}\", but it cannot be referenced from this part of the query."
+            ),
         )
     } else {
         e
@@ -17055,7 +17057,10 @@ fn check_single_source_qualifiers(s: &pg_query::protobuf::SelectStmt) -> Result<
     match bad {
         Some((q, true)) => Err(Error::Sqlstate(
             "42P01",
-            format!("invalid reference to FROM-clause entry for table \"{q}\""),
+            format!(
+                "invalid reference to FROM-clause entry for table \"{q}\"\nHint: Perhaps you meant to reference the table alias \"{}\".",
+                names.first().map(String::as_str).unwrap_or_default()
+            ),
         )),
         Some((q, false)) => Err(Error::Sqlstate(
             "42P01",
@@ -29410,6 +29415,18 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     }))
 }
 
+/// 42703 for an INSERT / UPDATE target column the table lacks, worded as
+/// PostgreSQL's `checkInsertTargets` / `transformUpdateTargetList` word it.
+fn no_column_of(column: &str, table: &str) -> Error {
+    Error::Sqlstate(
+        "42703",
+        format!(
+            "column \"{column}\" of relation \"{}\" does not exist",
+            schemas::split_key(table).1
+        ),
+    )
+}
+
 fn plan_update(
     u: &pg_query::protobuf::UpdateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -29447,7 +29464,7 @@ fn plan_update(
         };
         let column = def
             .column(&rt.name)
-            .ok_or_else(|| Error::UndefinedColumn(rt.name.clone()))?;
+            .ok_or_else(|| no_column_of(&rt.name, &table))?;
         // A PRIMARY KEY column is the document's `_id`: the executor
         // re-keys a row whose key changes (a delete plus an insert, checked
         // for uniqueness first), so it is planned like any other column.

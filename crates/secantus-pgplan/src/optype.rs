@@ -318,6 +318,41 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
             (!t.ends_with("[]")).then_some(t)
         }
         N::ColumnRef(c) => scope.column_type(c),
+        // `current_date` and friends: their fixed types.
+        N::SqlvalueFunction(f) => {
+            use pg_query::protobuf::SqlValueFunctionOp as O;
+            Some(
+                match O::try_from(f.op).ok()? {
+                    O::SvfopCurrentDate => "date",
+                    O::SvfopCurrentTime | O::SvfopCurrentTimeN => "timetz",
+                    O::SvfopCurrentTimestamp | O::SvfopCurrentTimestampN => "timestamptz",
+                    O::SvfopLocaltime | O::SvfopLocaltimeN => "time",
+                    O::SvfopLocaltimestamp | O::SvfopLocaltimestampN => "timestamp",
+                    _ => return None,
+                }
+                .into(),
+            )
+        }
+        // `count(*)` is bigint.
+        N::FuncCall(f) if f.agg_star && f.over.is_none() => {
+            (func_name(f)?.as_str() == "count").then(|| "int8".into())
+        }
+        // `->>` / `#>>` extract text; `->` / `#>` keep the json kind.
+        N::AExpr(e)
+            if pg_query::protobuf::AExprKind::try_from(e.kind)
+                == Ok(pg_query::protobuf::AExprKind::AexprOp)
+                && matches!(op_of(e).as_deref(), Some("->" | "->>" | "#>" | "#>>")) =>
+        {
+            let l = operand_type(e.lexpr.as_deref()?, scope)?;
+            if !matches!(l.as_str(), "json" | "jsonb") {
+                return None;
+            }
+            Some(if op_of(e)?.ends_with(">>") {
+                "text".into()
+            } else {
+                l
+            })
+        }
         N::ParamRef(p) => declared_param_type(usize::try_from(p.number).ok()?),
         // A scalar subquery: its one column's type, in a scope of its own.
         N::SubLink(sl)
@@ -386,11 +421,7 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
                 (Some(l), Some(r), _)
                     if category(l) == Some("numeric") && category(r) == Some("numeric") =>
                 {
-                    Some(if l == r {
-                        l.to_string()
-                    } else {
-                        "numeric".to_string()
-                    })
+                    Some(numeric_meet(l, r))
                 }
                 _ => None,
             }
@@ -486,13 +517,8 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
         {
             let l = operand_type(e.lexpr.as_deref()?, scope)?;
             let r = operand_type(e.rexpr.as_deref()?, scope)?;
-            (category(&l) == Some("numeric") && category(&r) == Some("numeric")).then(|| {
-                if l == r {
-                    l
-                } else {
-                    "numeric".to_string()
-                }
-            })
+            (category(&l) == Some("numeric") && category(&r) == Some("numeric"))
+                .then(|| numeric_meet(&l, &r))
         }
         _ => None,
     }
@@ -502,6 +528,24 @@ fn op_of(e: &pg_query::protobuf::AExpr) -> Option<String> {
     match e.name.last()?.node.as_ref()? {
         N::String(s) => Some(s.sval.clone()),
         _ => None,
+    }
+}
+
+/// The type two numbers meet as in arithmetic: a float wins (`int + float8`
+/// is float8), then numeric, then the wider integer.
+fn numeric_meet(l: &str, r: &str) -> String {
+    if l == r {
+        return l.to_string();
+    }
+    let has = |t: &str| l == t || r == t;
+    if has("float8") || has("float4") {
+        "float8".into()
+    } else if has("numeric") {
+        "numeric".into()
+    } else if has("int8") {
+        "int8".into()
+    } else {
+        "int4".into()
     }
 }
 
@@ -621,9 +665,86 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
     let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
         return Ok(());
     };
+    // An array beside a scalar of a built-in category: no comparison
+    // operator takes them (`integer[] = integer`), where the lowering
+    // matched an array containing the value.
+    if kind == Some(K::AexprOp)
+        && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+    {
+        if let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) {
+            let array_beside_scalar = |a: &str, b: &str| {
+                a.strip_suffix("[]")
+                    .is_some_and(|el| category(el).is_some())
+                    && category(b).is_some()
+            };
+            if array_beside_scalar(&l, &r) || array_beside_scalar(&r, &l) {
+                let op = if op == "!=" { "<>" } else { op.as_str() };
+                return Err(mismatch(op, &l, &r, e.location));
+            }
+        }
+    }
     let Some(lc) = category(&l) else {
         return Ok(());
     };
+    // `x op ANY / ALL (ARRAY[...])`: each element against `x`, and a typed
+    // array's element type.
+    if matches!(kind, Some(K::AexprOpAny | K::AexprOpAll)) {
+        let elements: Vec<String> = match e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
+            Some(N::AArrayExpr(a)) => {
+                let typed: Vec<String> = a
+                    .elements
+                    .iter()
+                    .filter_map(|el| operand_type(el, scope))
+                    .collect();
+                // Untyped literals alone make a text[] (`ARRAY['x']`).
+                let literal = a.elements.iter().any(|el| {
+                    matches!(el.node.as_ref(), Some(N::AConst(c))
+                        if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+                });
+                if typed.is_empty() && literal {
+                    vec!["text".to_string()]
+                } else {
+                    typed
+                }
+            }
+            _ => e
+                .rexpr
+                .as_deref()
+                .and_then(|n| operand_type(n, scope))
+                .and_then(|t| t.strip_suffix("[]").map(str::to_string))
+                .into_iter()
+                .collect(),
+        };
+        if let Some(r) = elements
+            .iter()
+            .find(|r| category(r).is_some_and(|rc| rc != lc))
+        {
+            if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+                let op = if op == "!=" { "<>" } else { op.as_str() };
+                return Err(mismatch(op, &l, r, e.location));
+            }
+        }
+        return Ok(());
+    }
+    // `x BETWEEN lo AND hi` is `x >= lo AND x <= hi` (NOT: `x < lo OR x >
+    // hi`): each bound needs that operator.
+    if matches!(kind, Some(K::AexprBetween | K::AexprNotBetween)) {
+        if let Some(N::List(bounds)) = e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
+            let ops = if kind == Some(K::AexprBetween) {
+                [">=", "<="]
+            } else {
+                ["<", ">"]
+            };
+            for (b, op) in bounds.items.iter().zip(ops) {
+                if let Some(r) = operand_type(b, scope) {
+                    if category(&r).is_some_and(|rc| rc != lc) {
+                        return Err(mismatch(op, &l, &r, e.location));
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     match kind {
         Some(K::AexprOp) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => {
             // An untyped literal takes the other side's type when the
@@ -751,6 +872,28 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             }
         }
         N::FuncCall(f) => {
+            record_builtin_call(f, scope);
+            if let Some(w) = f.over.as_deref() {
+                check_range_offset(w, scope)?;
+            }
+            if let (Some(name), [arg]) = (func_name(f), f.args.as_slice()) {
+                if checked_aggregate(&name)
+                    && !f.agg_star
+                    && !correlated::user_function_named(&name)
+                    && !crate::user_agg::is_user_aggregate(&name)
+                {
+                    if let Some(t) = operand_type(arg, scope) {
+                        if crate::funcsig::resolves(&name, std::slice::from_ref(&t)) == Some(false)
+                        {
+                            set_error_location(f.location);
+                            return Err(Error::UndefinedFunction(format!(
+                                "function {name}({}) does not exist",
+                                crate::display_type(&t)
+                            )));
+                        }
+                    }
+                }
+            }
             // `min` / `max` have no boolean form (`bool_and` / `bool_or` do
             // that job): a missing function, whatever the query's shape.
             if let (Some(name), [arg]) = (func_name(f), f.args.as_slice()) {
@@ -814,7 +957,295 @@ fn check_select(
         walk(t, &scope, &cx)?;
     }
     if let Some(w) = s.where_clause.as_deref() {
+        // Only at the top level: in a subquery an aggregate over the OUTER
+        // query's columns (`WHERE x.k = min(d.id)`) is the outer query's.
+        if parent.is_none() {
+            no_aggregate_in_where(w)?;
+        }
         walk(w, &scope, &cx)?;
+    }
+    if let Some(h) = s.having_clause.as_deref() {
+        walk(h, &scope, &cx)?;
+    }
+    for w in &s.window_clause {
+        if let Some(N::WindowDef(w)) = w.node.as_ref() {
+            check_range_offset(w, &scope)?;
+        }
+    }
+    for n in s.sort_clause.iter().filter_map(|n| match n.node.as_ref() {
+        Some(N::SortBy(b)) => b.node.as_deref(),
+        _ => None,
+    }) {
+        walk(n, &scope, &cx)?;
+    }
+    Ok(())
+}
+
+/// A `RANGE` frame with an offset, as `transformFrameOffset` checks it:
+/// exactly one ORDER BY column (42P20); a number column takes a number
+/// offset, a date/time column an interval, and any other is 0A000.
+fn check_range_offset(w: &pg_query::protobuf::WindowDef, scope: &Scope) -> Result<()> {
+    const RANGE: i32 = 0x00002;
+    if w.frame_options & RANGE == 0 {
+        return Ok(());
+    }
+    let offsets: Vec<&pg_query::protobuf::Node> = w
+        .start_offset
+        .iter()
+        .chain(w.end_offset.iter())
+        .map(|b| &**b)
+        .collect();
+    if offsets.is_empty() {
+        return Ok(());
+    }
+    if !w.refname.is_empty() {
+        return Ok(());
+    }
+    if w.order_clause.len() != 1 {
+        set_error_location(w.location);
+        return Err(Error::Sqlstate(
+            "42P20",
+            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column".into(),
+        ));
+    }
+    let Some(N::SortBy(b)) = w.order_clause[0].node.as_ref() else {
+        return Ok(());
+    };
+    let Some(ordering) = b.node.as_deref().and_then(|n| operand_type(n, scope)) else {
+        return Ok(());
+    };
+    let datetime = matches!(
+        ordering.as_str(),
+        "date" | "timestamp" | "timestamptz" | "time" | "timetz"
+    );
+    for off in offsets {
+        let location = crate::expr_location(off).unwrap_or(-1);
+        match category(&ordering) {
+            Some("numeric") => literal_fits(off, &ordering)?,
+            _ if datetime => {
+                if let Some(t) = operand_type(off, scope) {
+                    if t != "interval" {
+                        set_error_location(location);
+                        return Err(Error::Sqlstate(
+                            "0A000",
+                            format!(
+                                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {} and offset type {}\nHint: Cast the offset value to an appropriate type.",
+                                display_type(&ordering),
+                                display_type(&t)
+                            ),
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                set_error_location(location);
+                return Err(Error::Sqlstate(
+                    "0A000",
+                    format!(
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                        display_type(&ordering)
+                    ),
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// 42803 `aggregate functions are not allowed in WHERE`, at the call: the
+/// WHERE runs before any aggregate. A subquery's own aggregates are its own.
+fn no_aggregate_in_where(n: &pg_query::protobuf::Node) -> Result<()> {
+    let mut found: Option<i32> = None;
+    fn visit(n: &pg_query::protobuf::Node, found: &mut Option<i32>) {
+        if found.is_some() {
+            return;
+        }
+        match n.node.as_ref() {
+            Some(N::FuncCall(f)) if f.over.is_some() => {
+                *found = Some(-1 - f.location);
+            }
+            Some(N::FuncCall(f)) => {
+                if crate::is_aggregate_call(f)
+                    && !func_name(f).is_some_and(|n| correlated::user_function_named(&n))
+                {
+                    *found = Some(f.location);
+                    return;
+                }
+                for a in &f.args {
+                    visit(a, found);
+                }
+            }
+            Some(N::AExpr(e)) => {
+                for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                    visit(s, found);
+                }
+            }
+            Some(N::BoolExpr(b)) => b.args.iter().for_each(|a| visit(a, found)),
+            Some(N::List(l)) => l.items.iter().for_each(|a| visit(a, found)),
+            Some(N::NullTest(t)) => t.arg.iter().for_each(|a| visit(a, found)),
+            Some(N::TypeCast(c)) => c.arg.iter().for_each(|a| visit(a, found)),
+            Some(N::CoalesceExpr(c)) => c.args.iter().for_each(|a| visit(a, found)),
+            _ => {}
+        }
+    }
+    visit(n, &mut found);
+    match found {
+        // A window function (its location stored as `-1 - location`).
+        Some(window) if window < 0 => {
+            set_error_location(-1 - window);
+            Err(Error::Windowing(
+                "window functions are not allowed in WHERE".into(),
+            ))
+        }
+        Some(location) => {
+            set_error_location(location);
+            Err(Error::Grouping(
+                "aggregate functions are not allowed in WHERE".into(),
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The aggregates whose overloads are all numeric / interval / boolean /
+/// bit: an argument of a known type none of them takes is 42883 at plan
+/// time, where the lowering would aggregate it anyway (`sum(text)` was 0).
+fn checked_aggregate(name: &str) -> bool {
+    matches!(
+        name,
+        "sum"
+            | "avg"
+            | "stddev"
+            | "stddev_pop"
+            | "stddev_samp"
+            | "variance"
+            | "var_pop"
+            | "var_samp"
+            | "bool_and"
+            | "bool_or"
+            | "every"
+            | "bit_and"
+            | "bit_or"
+            | "bit_xor"
+    )
+}
+
+/// A built-in call: its name and the argument types of the overload chosen.
+pub(crate) type BuiltinCall = (String, Option<Vec<String>>);
+
+thread_local! {
+    /// While `builtin_calls` walks a statement: the built-in calls it met.
+    static BUILTIN_CALLS: std::cell::RefCell<Option<Vec<BuiltinCall>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn record_builtin_call(f: &pg_query::protobuf::FuncCall, scope: &Scope) {
+    if BUILTIN_CALLS.with(|c| c.borrow().is_none()) {
+        return;
+    }
+    let Some(name) = func_name(f) else {
+        return;
+    };
+    if correlated::user_function_named(&name)
+        || f.funcname.len() > 2
+        || !crate::funcsig::is_builtin_function_name(&name)
+    {
+        return;
+    }
+    let args: Option<Vec<String>> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                Some(String::new())
+            }
+            _ => operand_type(a, scope),
+        })
+        .collect();
+    let chosen = args.and_then(|a| crate::funcsig::selected_args(&name, &a));
+    BUILTIN_CALLS.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.push((name, chosen));
+        }
+    });
+}
+
+/// The built-in function calls of a SELECT (its select list, FROM and
+/// WHERE, subqueries included) and of an UPDATE / DELETE's WHERE: each
+/// name with the argument types of the overload PostgreSQL's
+/// `func_select_candidate` picks, `None` where that is not determined.
+pub(crate) fn builtin_calls(
+    node: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<BuiltinCall> {
+    BUILTIN_CALLS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let _ = check(node, lookup);
+    let _ = walk_other_clauses(node, lookup);
+    BUILTIN_CALLS.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// The clauses `check` leaves alone but a call can sit in: a SELECT's
+/// ORDER BY / GROUP BY / HAVING / VALUES, an UPDATE's SET, an INSERT's
+/// VALUES or query, and a RETURNING list. Walked only to collect calls.
+fn walk_other_clauses(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
+    let cx = Cx {
+        lookup,
+        ctes: Vec::new(),
+    };
+    let relation = |r: &Option<pg_query::protobuf::RangeVar>| -> Vec<pg_query::protobuf::Node> {
+        r.iter()
+            .map(|r| pg_query::protobuf::Node {
+                node: Some(N::RangeVar(r.clone())),
+            })
+            .collect()
+    };
+    match node {
+        N::SelectStmt(s) => {
+            let scope = Scope::new(&s.from_clause, &[], lookup, None);
+            for n in s.sort_clause.iter().filter_map(|n| match n.node.as_ref() {
+                Some(N::SortBy(b)) => b.node.as_deref(),
+                _ => None,
+            }) {
+                walk(n, &scope, &cx)?;
+            }
+            for n in s
+                .group_clause
+                .iter()
+                .chain(s.having_clause.iter().map(|b| &**b))
+                .chain(s.values_lists.iter())
+            {
+                walk(n, &scope, &cx)?;
+            }
+        }
+        N::UpdateStmt(u) => {
+            let mut items = relation(&u.relation);
+            items.extend(u.from_clause.iter().cloned());
+            let scope = Scope::new(&items, &[], lookup, None);
+            for n in u.target_list.iter().chain(u.returning_list.iter()) {
+                walk(n, &scope, &cx)?;
+            }
+        }
+        N::DeleteStmt(d) => {
+            let scope = Scope::new(&relation(&d.relation), &[], lookup, None);
+            for n in &d.returning_list {
+                walk(n, &scope, &cx)?;
+            }
+        }
+        N::InsertStmt(i) => {
+            if let Some(N::SelectStmt(sel)) = i.select_stmt.as_deref().and_then(|n| n.node.as_ref())
+            {
+                let _ = check_select(sel, &[], lookup, None);
+                walk_other_clauses(&N::SelectStmt(sel.clone()), lookup)?;
+            }
+            let scope = Scope::new(&relation(&i.relation), &[], lookup, None);
+            for n in &i.returning_list {
+                walk(n, &scope, &cx)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -839,7 +1270,10 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
                 ctes: Vec::new(),
             };
             match u.where_clause.as_deref() {
-                Some(w) => walk(w, &scope, &cx),
+                Some(w) => {
+                    no_aggregate_in_where(w)?;
+                    walk(w, &scope, &cx)
+                }
                 None => Ok(()),
             }
         }
@@ -854,7 +1288,10 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
                 ctes: Vec::new(),
             };
             match d.where_clause.as_deref() {
-                Some(w) => walk(w, &scope, &cx),
+                Some(w) => {
+                    no_aggregate_in_where(w)?;
+                    walk(w, &scope, &cx)
+                }
                 None => Ok(()),
             }
         }

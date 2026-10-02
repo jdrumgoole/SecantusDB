@@ -5274,31 +5274,17 @@ impl PgHandler {
         // WiredTiger session: such a read can see the block's uncommitted
         // writes, and the cache it would fill is process-wide.
         //
-        // **Reached, but its necessity is NOT demonstrated, and both halves of
-        // that were measured on 2026-09-19 rather than assumed.**
-        //
-        // Reached: a block that has written rows (`CREATE TABLE` then `CREATE
-        // TYPE`) does take catalog reads inside `with_user_transaction`. An
-        // earlier reading of this concluded the opposite -- a narrower probe
-        // saw `in_user_txn()` false at all 16 publishes and called the gate
-        // unreachable. A temporary `debug_assert` on that "invariant" panicked
-        // the server on the first test that opens a block with a table in it.
-        //
-        // Not demonstrated: forcing this function to `true` leaked nothing
-        // observable -- not through casts, `pg_type`, `pg_enum`, a pre-warmed
-        // cache, a ROLLBACK, nor `tests/...::test_uncommitted_types_stay_
-        // private_and_stay_current`. A block's own view of its uncommitted
-        // types comes from the per-connection `uncommitted_types` overlay,
-        // which never reaches this cache, so the overlay appears to carry the
-        // isolation on its own today.
-        //
-        // It stays because "I could not build the exploit" is not "the exploit
-        // cannot exist", and publishing one connection's uncommitted DDL to
-        // every other one is the kind of wrong answer a database must not
-        // risk for a few microseconds. What IS pinned is the behaviour:
-        // `test_an_open_blocks_uncommitted_type_is_invisible_to_other_
-        // connections` and `test_a_rolled_back_type_never_becomes_visible`
-        // fail if that isolation ever breaks, whatever holds it up.
+        // **Load-bearing, demonstrated 2026-10-02 (batch 45).** A plain read
+        // inside a block that has written rows takes its catalog reads on
+        // the transaction's session at the LIVE version (no bump follows a
+        // read), and `__sql_event_triggers__` is written inside the block.
+        // With this gate forced open, a block's uncommitted `CREATE EVENT
+        // TRIGGER` followed by any read published the trigger to the
+        // process-wide cache, and ANOTHER connection's `CREATE TABLE` then
+        // FIRED it. Types escaped only because their DDL keeps the rows in
+        // the per-connection `uncommitted_types` overlay rather than in the
+        // transaction. Pinned by
+        // `test_an_open_blocks_uncommitted_event_trigger_fires_for_no_one_else`.
         !self.storage.in_user_txn()
     }
 
@@ -7570,6 +7556,7 @@ impl PgHandler {
     fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
         let role = self.current_role_name();
         self.check_schema_create(&role, sql)?;
+        self.check_builtin_execute(&role, sql)?;
         let views = self.views()?;
         // A superuser needs no check of its own -- but what a view reads is
         // checked as the view's OWNER even then, so views still expand.

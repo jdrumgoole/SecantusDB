@@ -385,6 +385,60 @@ impl PgHandler {
         ))
     }
 
+    /// `EXECUTE` on every built-in `sql` calls, by the overload chosen at
+    /// each call (PostgreSQL refuses `abs(-1)` once `REVOKE EXECUTE ON
+    /// FUNCTION abs(int) FROM PUBLIC` leaves the role no grant). Only a
+    /// built-in a GRANT / REVOKE has touched can be refused, so nothing is
+    /// walked while none has; a call whose overload is not determined here
+    /// is not checked.
+    pub(crate) fn check_builtin_execute(&self, role: &str, sql: &str) -> PgWireResult<()> {
+        if self.is_superuser(role) {
+            return Ok(());
+        }
+        let touched: Vec<String> = self
+            .storage
+            .find_matching(
+                self.db(),
+                OBJECT_ACL_COLLECTION,
+                &bson::doc! {"kind": "function"},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .filter_map(|d| d.get_str("name").ok().map(str::to_string))
+            .filter(|n| n.contains('('))
+            .collect();
+        if touched.is_empty() {
+            return Ok(());
+        }
+        let lookup = |n: &str| self.lookup(n);
+        for (name, chosen) in secantus_pgplan::privileges::builtin_calls(sql, &lookup) {
+            let Some(args) = chosen else {
+                continue;
+            };
+            let key = format!("{name}({})", args.join(","));
+            if !touched.contains(&key) {
+                continue;
+            }
+            // A built-in belongs to the bootstrap superuser, so only a grant
+            // (to the role, a role it is in, or PUBLIC) lets a role call it.
+            let held = self
+                .object_grants("function", &key)
+                .iter()
+                .any(|(g, privs, _)| {
+                    (g.eq_ignore_ascii_case("PUBLIC") || self.role_is_member(role, g))
+                        && privs.iter().any(|p| p == "EXECUTE")
+                });
+            if !held {
+                return Err(Self::user_error(
+                    "42501",
+                    format!("permission denied for function {name}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// A sequence function's privilege: any of `privileges` on `name`
     /// (`nextval` takes USAGE or UPDATE, `currval` USAGE or SELECT, `setval`
     /// UPDATE), else 42501 `permission denied for sequence q`.

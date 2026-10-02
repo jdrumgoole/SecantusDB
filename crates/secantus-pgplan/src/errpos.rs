@@ -99,9 +99,35 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             })?;
             pos(toks[i - 3].start)
         }
-        "42703" => {
+        // `ORDER BY position 5 is not in select list`: at the number.
+        "42P10" if m.ends_with(" is not in select list") => {
+            let (clause, rest) = m.split_once(" position ")?;
+            let n = rest.split(' ').next()?;
+            let i = toks.windows(3).position(|w| {
+                w[0].text
+                    .eq_ignore_ascii_case(clause.rsplit(' ').next().unwrap_or(""))
+                    && w[1].text.eq_ignore_ascii_case("by")
+            });
+            // The number among the clause's items: the first token equal to it
+            // after the clause keyword.
+            let from = i.map_or(0, |i| i + 2);
+            pos(toks.iter().skip(from).find(|t| t.text == n)?.start)
+        }
+        // `invalid reference to FROM-clause entry for table "t"`: at `t.`.
+        "42P01" if m.starts_with("invalid reference to FROM-clause entry") => {
+            let name = quoted_between(m, "invalid reference to FROM-clause entry for table ")?;
+            let i = toks.iter().enumerate().position(|(i, t)| {
+                unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == ".")
+            })?;
+            pos(toks[i].start)
+        }
+        "42703" | "42803" => {
             // `column "x" does not exist`, or `column t.x does not exist`:
-            // a qualified reference points at its qualifier.
+            // a qualified reference points at its qualifier. And `column "x"
+            // must appear in the GROUP BY clause ...`: its first mention.
+            if sqlstate == "42803" && !m.contains(" must appear in the GROUP BY clause") {
+                return None;
+            }
             let name = quoted_between(m, "column ")
                 .map(str::to_string)
                 .or_else(|| {
@@ -111,15 +137,22 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 })?;
             let parts: Vec<&str> = name.split('.').collect();
             let last = parts.last()?;
-            let i = toks.iter().enumerate().position(|(i, t)| {
+            let qualified = toks.iter().enumerate().position(|(i, t)| {
                 unquote_ident(t.text) == *last
                     && (parts.len() == 1
                         || (i >= 2
                             && toks[i - 1].text == "."
                             && unquote_ident(toks[i - 2].text) == parts[parts.len() - 2]))
-            })?;
-            let first = if parts.len() > 1 { i - 2 } else { i };
-            pos(toks[first].start)
+            });
+            match qualified {
+                Some(i) => pos(toks[if parts.len() > 1 { i - 2 } else { i }].start),
+                // An ungrouped column is NAMED qualified (`t.a`) however it
+                // was written: a bare mention is the one PostgreSQL means.
+                None if sqlstate == "42803" => {
+                    pos(toks.iter().find(|t| unquote_ident(t.text) == *last)?.start)
+                }
+                None => None,
+            }
         }
         "42P01" => {
             let name = quoted_between(m, "relation ")

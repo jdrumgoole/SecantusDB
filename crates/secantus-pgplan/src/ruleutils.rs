@@ -559,7 +559,12 @@ impl<'a> Printer<'a> {
             };
             return Some((lt.into(), rt.into()));
         }
-        // date vs timestamp and the like: this analyser does not know.
+        // date / timestamp / timestamptz compare across one another with
+        // operators of their own (`date_lt_timestamp` ...): no cast.
+        let datetime = |t: &str| matches!(t, "date" | "timestamp" | "timestamptz");
+        if datetime(l) && datetime(r) {
+            return Some((String::new(), String::new()));
+        }
         None
     }
 
@@ -1217,10 +1222,35 @@ impl<'a> Printer<'a> {
         if o & 0x00001 == 0 {
             return Some(());
         }
-        // A RANGE offset carries the ordering column's type, which this
-        // printer does not reproduce.
+        // A RANGE offset over a NUMBER ordering prints as the constant it
+        // is (measured on PostgreSQL 15 over int2 / int4 / int8 / float8 /
+        // numeric); an interval offset over a date/time one is not
+        // reproduced.
         if o & 0x00002 != 0 && (w.start_offset.is_some() || w.end_offset.is_some()) {
-            return None;
+            let ordering = match w.order_clause.as_slice() {
+                [one] => match one.node.as_ref() {
+                    Some(N::SortBy(b)) => self.typ(b.node.as_deref()?),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let datetime = ordering
+                .as_deref()
+                .is_some_and(|t| matches!(t, "date" | "timestamp" | "timestamptz"));
+            let interval = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+                None => true,
+                Some(N::TypeCast(tc)) => tc
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|t| crate::type_name_of(t) == "interval"),
+                _ => false,
+            };
+            if datetime && interval(w.start_offset.as_deref()) && interval(w.end_offset.as_deref())
+            {
+                // `'1 day'::interval`, printed as the cast it is.
+            } else if !ordering.as_deref().is_some_and(is_numberish) {
+                return None;
+            }
         }
         if need_space {
             self.buf.push(' ');
@@ -1240,7 +1270,15 @@ impl<'a> Printer<'a> {
         }
         let offset = |p: &mut Self, n: Option<&Node>| -> Option<()> {
             match n?.node.as_ref()? {
-                N::AConst(c) if matches!(c.val, Some(Val::Ival(_))) => p.expr(n?),
+                N::AConst(c) if matches!(c.val, Some(Val::Ival(_) | Val::Fval(_))) => p.expr(n?),
+                N::TypeCast(tc)
+                    if tc
+                        .type_name
+                        .as_ref()
+                        .is_some_and(|t| crate::type_name_of(t) == "interval") =>
+                {
+                    p.expr(n?)
+                }
                 _ => None,
             }
         };
@@ -1865,9 +1903,12 @@ impl Printer<'_> {
             let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
                 return None;
             };
-            if cte.ctematerialized != pg_query::protobuf::CteMaterialize::Default as i32 {
-                return None;
-            }
+            let materialized =
+                match pg_query::protobuf::CteMaterialize::try_from(cte.ctematerialized) {
+                    Ok(pg_query::protobuf::CteMaterialize::Always) => "MATERIALIZED ",
+                    Ok(pg_query::protobuf::CteMaterialize::Never) => "NOT MATERIALIZED ",
+                    _ => "",
+                };
             let body = cte.ctequery.as_deref()?;
             let cols = self.cte_columns(cte, w.recursive)?;
             // A recursive body reads itself.
@@ -1881,7 +1922,9 @@ impl Printer<'_> {
                 let quoted: Vec<String> = aliases.iter().map(|a| q(a)).collect();
                 self.buf.push_str(&format!("({})", quoted.join(", ")));
             }
-            self.buf.push_str(" AS (");
+            self.buf.push_str(" AS ");
+            self.buf.push_str(materialized);
+            self.buf.push('(');
             self.keyword("", 0, 0, 0);
             let mut inner = Printer::new(self.cat, self.indent);
             inner.scopes = self.scopes.clone();

@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS b45e
+CREATE TABLE b45e (a int, b text, c int)
+INSERT INTO b45e VALUES (1, 'x', 2)
