@@ -133,27 +133,61 @@ impl PgHandler {
                 } else {
                     "session"
                 };
+                // PostgreSQL 15's row, where it has one: a value still at
+                // its default reads in the row's own unit (`work_mem` is
+                // `4096` kB, where SHOW says `4MB`).
+                let pg = pg15_settings::pg15_setting(name);
+                let raw = |v: &str| -> String {
+                    match pg {
+                        Some(p) if p.show == v => p.setting.to_string(),
+                        _ => v.to_string(),
+                    }
+                };
                 let mut d = Document::new();
                 d.insert(field("name"), name.as_str());
-                d.insert(field("setting"), setting.as_str());
+                d.insert(field("setting"), raw(&setting));
                 d.insert(field("source"), source);
                 let internal = is_internal_setting(name);
-                d.insert(field("context"), if internal { "internal" } else { "user" });
-                d.insert(
-                    field("vartype"),
-                    if setting == "on" || setting == "off" {
-                        "bool"
-                    } else if internal && setting.parse::<i64>().is_ok() {
-                        "integer"
-                    } else {
-                        "string"
-                    },
-                );
+                match pg {
+                    Some(p) => {
+                        let opt = |v: &str| {
+                            if v.is_empty() {
+                                Bson::Null
+                            } else {
+                                Bson::String(v.to_string())
+                            }
+                        };
+                        d.insert(field("unit"), opt(p.unit));
+                        d.insert(field("category"), p.category);
+                        d.insert(field("short_desc"), p.short_desc);
+                        d.insert(field("context"), p.context);
+                        d.insert(field("vartype"), p.vartype);
+                        d.insert(field("min_val"), opt(p.min_val));
+                        d.insert(field("max_val"), opt(p.max_val));
+                    }
+                    None => {
+                        d.insert(field("context"), if internal { "internal" } else { "user" });
+                        d.insert(
+                            field("vartype"),
+                            if setting == "on" || setting == "off" {
+                                "bool"
+                            } else if internal && setting.parse::<i64>().is_ok() {
+                                "integer"
+                            } else {
+                                "string"
+                            },
+                        );
+                    }
+                }
                 if let Some(b) = boot {
+                    let b = match pg {
+                        Some(p) if p.show == b => p.boot_val.to_string(),
+                        _ => b,
+                    };
                     d.insert(field("boot_val"), b);
                 }
                 if let Some(r) = self.reset_value(name) {
-                    d.insert(field("reset_val"), r);
+                    d.insert(field("reset_val"), raw(&r));
                 }
                 d.insert(field("pending_restart"), Bson::Boolean(false));
                 d
