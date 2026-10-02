@@ -448,12 +448,14 @@ pub fn qualify(node: &mut N) -> Result<()> {
                     if relation_kind {
                         qualify_name_list(l, 0, trivial);
                     } else if index {
-                        // Index names are per table in storage: keep the
-                        // bare name, as the Python server does.
+                        // Index names are per table in storage, so the
+                        // schema is carried as the `schema.name` key and
+                        // the server finds the index on a table of it.
                         if let Some(parts) = strings(l) {
                             if parts.len() >= 2 && !is_builtin(&parts[parts.len() - 2]) {
-                                let last = parts[parts.len() - 1].clone();
-                                l.items = vec![string_node(last)];
+                                let schema = &parts[parts.len() - 2];
+                                let last = &parts[parts.len() - 1];
+                                l.items = vec![string_node(relation_key(schema, last))];
                             }
                         }
                     }

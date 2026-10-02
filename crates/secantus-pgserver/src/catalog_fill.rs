@@ -536,11 +536,18 @@ impl PgHandler {
             .into_iter()
             .map(|(o, _, _, _)| o)
             .collect();
+        let constraints: Vec<i64> = self
+            .constraint_comments()
+            .into_iter()
+            .map(|(o, _)| o)
+            .collect();
         self.object_comments()
             .into_iter()
             .map(|(oid, subid, text)| {
                 // The catalog the object lives in, as `pg_description` keys it.
-                let classoid = if extensions.contains(&oid) {
+                let classoid = if constraints.contains(&oid) {
+                    2606
+                } else if extensions.contains(&oid) {
                     3079
                 } else if relations.contains(&oid) {
                     1259
@@ -802,7 +809,14 @@ impl PgHandler {
                                     .collect(),
                             )
                         }
-                        "indnkeyatts" => get(row, "indnatts").unwrap_or(Bson::Int32(0)),
+                        // The KEY columns, which leave out the INCLUDE ones.
+                        "indnkeyatts" => {
+                            let oid = int(get(row, "indexrelid"));
+                            match index_keys.iter().find(|(o, _)| *o == oid) {
+                                Some((_, k)) => Bson::Int32(k.len() as i32),
+                                None => get(row, "indnatts").unwrap_or(Bson::Int32(0)),
+                            }
+                        }
                         "indcheckxmin" | "indisreplident" | "indnullsnotdistinct" => {
                             Bson::Boolean(false)
                         }

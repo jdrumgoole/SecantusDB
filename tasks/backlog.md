@@ -620,24 +620,22 @@ remain open:
       `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
       `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
       port of one C function family, so the split is by table, not logic).
-- [ ] **OPEN — RUST pgserver: what the SQLAlchemy dialect suite still
-      fails (batch 34, 2026-10-02).** Schema-qualified relations landed in
-      batch 34 (`schemas.rs` / `schema_rows.rs`, corpus `schemas` 0/75): the
-      Rust run went 421 passed / 40 failed / 782 errors -> 811 / 167 / 0
-      (435 skipped; the Python server's published run is 978 / 0). Left,
-      grouped: ~76 reflection checks where `get_table_names` /
-      `get_view_names` return SQLAlchemy's own information_schema relations
-      or schema `None` (a catalog filter on system relations); 30
-      `'NoneType' has no attribute 'groups'` (a `pg_get_constraintdef` /
-      `pg_get_indexdef` text shape the dialect's regex rejects); 16
-      `(None, 'users')` assertions; 24 `test_schema` constraint / index
-      comment and FK-name reflection mismatches; 2 server-side cursor
-      roundtrips. Schema limits carried from the Python server's convention:
-      index names are global (two same-named indexes in different schemas
-      collide); a view's stored text names `"s.t"`, so `pg_get_viewdef`
-      differs for views over schema tables; an unqualified `'t'::regclass` /
-      `nextval('t')` does not walk a non-default `search_path` (the qualified
-      forms do); privilege checks see the bare relname.
+- [ ] **OPEN — RUST pgserver: a column name containing a DOT is read as
+      a nested path -- SILENT WRITE LOSS (batch 35, 2026-10-02).** The last
+      SQLAlchemy dialect failure on the Rust server (977 passed / 1 failed,
+      `DifficultParametersTest::test_round_trip_same_named_column[dot.s]`).
+      `WHERE "dot.s" = 'x'` matches 0 rows and `UPDATE t SET "dot.s" = 'x'`
+      reports success and changes nothing; SELECT / INSERT work. PostgreSQL
+      15 handles it. The fix must keep the Python server's on-disk layout (a
+      literal dotted key), so it touches filter lowering and update. Also
+      left from batch 35: composite types are absent from the Rust
+      `pg_class`; index comments are keyed by bare name (two same-named
+      indexes in different schemas would share one); a view's stored text
+      names `"s.t"`, so `pg_get_viewdef` differs for views over schema
+      tables; an unqualified `'t'::regclass` / `nextval('t')` does not walk
+      a non-default `search_path`; privilege checks see the bare relname;
+      the gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp
+      directory.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First

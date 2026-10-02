@@ -7367,6 +7367,12 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     if let Some(name) = pk_name {
         def.extra.insert("pk_name", name);
     }
+    // A table-level PRIMARY KEY keeps its declared column order for the
+    // catalog (`conkey`, `indkey`, `pg_get_constraintdef`), as the Python
+    // server records it.
+    if !table_pk.is_empty() {
+        def.extra.insert("pk_column_order", table_pk.clone());
+    }
     def.temp = temp;
     // A self-referencing FOREIGN KEY reads this table's own PK, which is only
     // settled now; a FK to another table is checked against the catalog by
@@ -14137,6 +14143,15 @@ fn resolve_sublinks_in_select_scoped(
     for t in &mut s.target_list {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
             if let Some(v) = rt.val.as_deref_mut() {
+                // A subquery target is named after the subquery (its
+                // column, or `exists` / `array`), which the value it is
+                // replaced by would not carry.
+                if rt.name.is_empty() && matches!(v.node.as_ref(), Some(N::SubLink(_))) {
+                    let name = expression_column_name(v);
+                    if name != "?column?" {
+                        rt.name = name;
+                    }
+                }
                 resolve_sublinks_in_expr(v, lookup, params, run, &outer)?;
             }
         }
@@ -14872,7 +14887,10 @@ fn resolve_one_sublink(
     match SubLinkType::try_from(sl.sub_link_type) {
         Ok(SubLinkType::ExistsSublink) => Ok(bool_const_node(!rows.is_empty())),
         Ok(SubLinkType::ExprSublink) => {
-            if rows.len() > 1 {
+            // Only the plan that executes can tell: a Describe plans with
+            // its parameters unbound, so `limit $1` there limits nothing,
+            // and that plan needs only the subquery's TYPE.
+            if rows.len() > 1 && PLANNING_TO_EXECUTE.with(|p| p.get()) {
                 return Err(Error::CardinalityViolation(
                     "more than one row returned by a subquery used as an expression".into(),
                 ));
@@ -14895,7 +14913,9 @@ fn resolve_one_sublink(
                     Ok(match ty.as_deref() {
                         Some(
                             ty @ ("int2vector" | "oidvector" | "oid" | "int2" | "float4" | "name"
-                            | "varchar" | "bpchar" | "\"char\"" | "xid" | "cid"),
+                            | "varchar" | "bpchar" | "\"char\"" | "xid" | "cid" | "timestamp"
+                            | "timestamptz" | "date" | "time" | "timetz" | "interval"
+                            | "uuid"),
                         ) => pg_query::protobuf::Node {
                             node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                                 arg: Some(Box::new(node)),
@@ -17867,12 +17887,10 @@ fn plan_join_select(
                         .is_ok_and(|(_, (_, chain))| !user_casts::in_chain(None, &chain)) =>
             {
                 let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
+                // An unnamed cast over a column keeps the COLUMN's name
+                // (`t.oid::regtype::text` is `oid`), as FigureColname does.
                 let out = if rt.name.is_empty() {
-                    chain
-                        .1
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| col_name.1.clone())
+                    col_name.1.clone()
                 } else {
                     rt.name.clone()
                 };
@@ -22294,6 +22312,55 @@ const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_foreign_table", 3118),
     ("pg_shdescription", 2396),
 ];
+
+/// The PRIMARY KEY columns in the constraint's declared order
+/// (`pk_column_order`), else table-column order.
+pub fn ordered_pk_columns(def: &TableDef) -> Vec<&Column> {
+    let cols: Vec<&Column> = def.columns.iter().filter(|c| c.pk).collect();
+    let Ok(order) = def.extra.get_array("pk_column_order") else {
+        return cols;
+    };
+    let ordered: Vec<&Column> = order
+        .iter()
+        .filter_map(|n| n.as_str())
+        .filter_map(|n| cols.iter().find(|c| c.name == n).copied())
+        .collect();
+    if ordered.len() == cols.len() {
+        ordered
+    } else {
+        cols
+    }
+}
+
+/// `pg_table_is_visible(oid)`: is the relation findable by its bare name --
+/// its schema on the search path (`pg_catalog` always, implicitly first, and
+/// a temp table always) and no relation of that name in an earlier schema.
+/// `None` (SQL NULL) for an oid naming no relation, as PostgreSQL answers.
+pub fn table_is_visible(oid: i64) -> Option<bool> {
+    let path = schemas::search_path();
+    if let Some((key, temp)) = PLAN_USER_RELATIONS.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, tmp)| (n.clone(), *tmp))
+    }) {
+        if temp {
+            return Some(true);
+        }
+        let (schema, name) = schemas::split_key(&key);
+        if system_relation("pg_catalog", &name).is_some() || !path.contains(&schema) {
+            return Some(false);
+        }
+        return Some(schemas::resolve_unqualified(&name) == key);
+    }
+    if CATALOG_RELATIONS.iter().any(|(_, o)| *o == oid) {
+        return Some(true);
+    }
+    let (schema, _, _) = SYSTEM_RELATIONS
+        .get()
+        .and_then(|v| v.iter().find(|(_, _, o)| *o == oid))?;
+    Some(schema == "pg_catalog" || path.contains(schema))
+}
 
 /// The display rendering of a regclass value: the relation's name, quoted
 /// where an identifier needs it (`"Order"`, `"order"`), bare for a catalog
