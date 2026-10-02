@@ -6855,6 +6855,18 @@ What is left, recorded so the PG session and the release work find it:
       it and the oplog only prunes opportunistically. Add builder knobs if a
       user needs them.
 
+- [ ] **`test_replset_step_down_refusals_match_mongod[unforced, catch-up
+      overridden]` depends on mongod's timing (seen 2026-10-02, Windows CI).**
+      With `{replSetStepDown: 5, secondaryCatchUpPeriodSecs: 1}`, mongod
+      normally answers 262 "No electable secondaries caught up". On a slow
+      runner it answered 262 "By the time we were ready to step down, we were
+      already past the time we were supposed to step down until". That is
+      mongod's own branch for a catch-up wait that outran the step-down
+      window, so the REFERENCE answer varied, not ours. Every recent `main`
+      run passed and a re-run passed. Fix the test, not the server: accept
+      either of mongod's 262 messages for this case, or widen the step-down
+      period so the catch-up wait cannot reach it.
+
 ### 7.02 Rust MongoDB server: change-stream events and error replies -- 2026-10-01
 
 Two new differential probes against mongod 8.2.11, everything they found fixed
