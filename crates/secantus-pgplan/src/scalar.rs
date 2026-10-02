@@ -217,6 +217,8 @@ const SCALAR_NAMES: &[&str] = &[
     "__net_diff",
     "__coll_key",
     "__coll_keyv",
+    "__coll_keys",
+    "__regex_quote",
     "__coll_value",
     "transaction_timestamp",
     "statement_timestamp",
@@ -728,6 +730,37 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "__coll_keyv" => {
             need(2)?;
             crate::collation::sort_key_with_value(&s(0), &s(1)).map(Bson::String)
+        }
+        "__coll_keys" => {
+            // (collation, array): each element's key, a NULL kept NULL.
+            need(2)?;
+            match arg(1) {
+                Bson::Array(items) => items
+                    .iter()
+                    .map(|v| match v {
+                        Bson::String(t) => crate::collation::sort_key(&s(0), t).map(Bson::String),
+                        other => Ok(other.clone()),
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(Bson::Array),
+                other => Ok(other),
+            }
+        }
+        "__regex_quote" => {
+            // citext's pattern quoting: every character but [a-zA-Z_0-9]
+            // backslashed, so the text matches itself as a regex.
+            need(1)?;
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let mut out = String::new();
+            for c in s(0).chars() {
+                if !(c.is_ascii_alphanumeric() || c == '_') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            Ok(Bson::String(out))
         }
         "__coll_value" => {
             need(1)?;

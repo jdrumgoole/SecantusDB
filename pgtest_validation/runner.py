@@ -39,7 +39,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GO_DIR = Path(__file__).resolve().parent / "go"
 CHECKOUT = REPO_ROOT / ".validation" / "pgtest-checkout"
 CORPUS = REPO_ROOT / ".validation" / "pgtest-corpus"
-RAW_OUT = REPO_ROOT / ".validation" / "pgtest-raw.json"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import pg_gauge_server  # noqa: E402
+
+RAW_OUT = pg_gauge_server.raw_out(REPO_ROOT / ".validation" / "pgtest-raw.json")
 
 CRDB_REMOTE = "https://github.com/cockroachdb/cockroach"
 CORPUS_PATH = "pkg/sql/pgwire/testdata/pgtest"
@@ -143,17 +147,7 @@ def _run_one(name: str, out) -> int:
     port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-pgtest-gauge-")
     daemon = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "secantus.sql.pgserver",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--storage-path",
-            storage_dir,
-        ],
+        pg_gauge_server.daemon_argv(host, port, storage_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

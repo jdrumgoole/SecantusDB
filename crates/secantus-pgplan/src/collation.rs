@@ -62,12 +62,38 @@ pub enum Resolved {
         locale: String,
         deterministic: bool,
     },
+    /// citext's comparison: `lower(a)` against `lower(b)` in byte order,
+    /// nondeterministic (`Apple` and `apple` are equal). Reached only by
+    /// [`CITEXT`], the collation a citext value carries implicitly.
+    Lower,
+}
+
+/// The internal collation name a `citext` value carries implicitly: its
+/// comparisons, ordering, grouping and uniqueness all go through it.
+pub const CITEXT: &str = "__citext";
+
+/// The collation a column compares under: its declared one, else citext's
+/// implicit one for a `citext` (or `citext[]`) column.
+pub fn column_collation(column: &Column) -> Option<String> {
+    column
+        .extra
+        .get_str("collation")
+        .ok()
+        .map(str::to_string)
+        .or_else(|| is_citext(&column.pg_type).then(|| CITEXT.to_string()))
+}
+
+/// Is `ty` citext (with the extension installed)?
+pub fn is_citext(ty: &str) -> bool {
+    let t = ty.trim();
+    let t = t.strip_prefix("public.").unwrap_or(t);
+    t.eq_ignore_ascii_case("citext") && crate::extension_installed("citext")
 }
 
 impl Resolved {
     /// Does ordering under it differ from byte order?
     pub fn is_locale(&self) -> bool {
-        matches!(self, Resolved::Icu { .. })
+        matches!(self, Resolved::Icu { .. } | Resolved::Lower)
     }
 
     pub fn deterministic(&self) -> bool {
@@ -76,7 +102,7 @@ impl Resolved {
             Resolved::Icu {
                 deterministic: false,
                 ..
-            }
+            } | Resolved::Lower
         )
     }
 }
@@ -100,6 +126,9 @@ pub fn resolve(name: &str) -> Result<Resolved> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     if matches!(name, "C" | "POSIX" | "ucs_basic" | "default") {
         return Ok(Resolved::Bytes);
+    }
+    if name == CITEXT {
+        return Ok(Resolved::Lower);
     }
     if let Some(u) = USER_COLLATIONS.with(|c| c.borrow().iter().find(|u| u.name == name).cloned()) {
         return Ok(match u.provider {
@@ -192,6 +221,7 @@ pub fn sort_key(collation: &str, text: &str) -> Result<String> {
     Ok(match resolve(collation)? {
         // Byte order: the text's own bytes, hex, keep that order.
         Resolved::Bytes => hex(text.as_bytes()),
+        Resolved::Lower => hex(lower(text).as_bytes()),
         Resolved::Icu {
             locale,
             deterministic,
@@ -204,6 +234,11 @@ pub fn sort_key(collation: &str, text: &str) -> Result<String> {
             }
         }
     })
+}
+
+/// citext's `lower`: the database's (simple, per-character) case mapping.
+pub fn lower(text: &str) -> String {
+    text.chars().map(crate::scalar::simple_lower).collect()
 }
 
 /// `__coll_keyv(collation, text)`: the sort key carrying its text after a

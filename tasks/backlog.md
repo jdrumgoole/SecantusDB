@@ -620,6 +620,26 @@ remain open:
       `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
       `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
       port of one C function family, so the split is by table, not logic).
+- [ ] **OPEN — RUST pgserver: tables are NOT schema-qualified (found
+      2026-10-02 by the SQLAlchemy gauge, batch 33).** `relation_name` drops
+      the schema, so every table lives in one namespace:
+      `CREATE TABLE test_schema.users2 (...)` is created in `public`, and
+      `CREATE TABLE test_schema.users` after `CREATE TABLE users` answers
+      42P07 "relation users already exists" where PostgreSQL makes a second,
+      distinct table. That is silent misplacement as well as an error. The
+      Python server keys a non-public relation `schema.name` in the shared
+      catalog; the Rust server must do the same, resolve unqualified names
+      through `search_path`, and report `pg_class.relnamespace` /
+      `information_schema.tables.table_schema` from the key. It is 749 of the
+      SQLAlchemy dialect suite's 782 errors against the Rust server (421
+      passed, 40 failed, 782 errors; the Python server's published run is
+      978 / 0 / 435 skipped). The other groups, smaller: 30 `BizarroCharacterTest`
+      FK reflection ('NoneType' has no attribute 'groups' -- a constraint
+      definition the dialect's regex cannot parse), covering-index
+      `include_columns` reflection, composite-PK column order, a scalar
+      subquery CardinalityViolation in a LIMIT test, server-side cursors
+      returning no rows, a datetime returned as text. Re-measure after the
+      schema work; most will shift.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
