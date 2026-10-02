@@ -252,6 +252,70 @@ def test_the_rust_server_reads_a_python_created_table(home: Path) -> None:
         assert cur.fetchall() == [(9, "made-by-python")]
 
 
+def test_schema_qualified_tables_cross_from_rust_to_python(home: Path) -> None:
+    """A table outside `public` is stored under `schema.name` by BOTH servers.
+
+    Two same-named tables in different schemas must stay two tables when the
+    other server opens the store -- a key that drifted would have one server
+    read the other schema's rows, with no error to say so.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SCHEMA sx")
+        cur.execute("CREATE TABLE users (id serial PRIMARY KEY, name text)")
+        cur.execute("CREATE TABLE sx.users (id serial PRIMARY KEY, name text)")
+        cur.execute("INSERT INTO users (name) VALUES ('public-row')")
+        cur.execute("INSERT INTO sx.users (name) VALUES ('sx-1'), ('sx-2')")
+
+    assert _python_sql(home, "SELECT id, name FROM sx.users ORDER BY id") == [
+        (1, "sx-1"),
+        (2, "sx-2"),
+    ]
+    assert _python_sql(home, "SELECT name FROM users") == [("public-row",)]
+    # Python writes into the Rust-created schema table, drawing on the same
+    # serial sequence the Rust server created for it.
+    _python_sql(home, "INSERT INTO sx.users (name) VALUES ('from-python')")
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM sx.users ORDER BY id")
+        assert cur.fetchall() == [(1, "sx-1"), (2, "sx-2"), (3, "from-python")]
+        cur.execute("SELECT count(*) FROM users")
+        assert cur.fetchall() == [(1,)]
+
+
+def test_schema_qualified_tables_cross_from_python_to_rust(home: Path) -> None:
+    """The other direction, resolved through `search_path` as well."""
+    _python_sql(
+        home,
+        "CREATE SCHEMA py",
+        "CREATE TABLE py.items (k int PRIMARY KEY, label text)",
+        "INSERT INTO py.items VALUES (1, 'made-by-python')",
+        "CREATE TABLE items (k int PRIMARY KEY, label text)",
+        "INSERT INTO items VALUES (1, 'public')",
+    )
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT label FROM py.items")
+        assert cur.fetchall() == [("made-by-python",)]
+        cur.execute("SELECT label FROM items")
+        assert cur.fetchall() == [("public",)]
+        cur.execute("SET search_path TO py, public")
+        cur.execute("SELECT label FROM items")
+        assert cur.fetchall() == [("made-by-python",)]
+        cur.execute(
+            "SELECT table_schema FROM information_schema.tables "
+            "WHERE table_name = 'items' ORDER BY 1"
+        )
+        assert cur.fetchall() == [("public",), ("py",)]
+        cur.execute("INSERT INTO py.items VALUES (2, 'made-by-rust')")
+
+    assert _python_sql(home, "SELECT k, label FROM py.items ORDER BY k") == [
+        (1, "made-by-python"),
+        (2, "made-by-rust"),
+    ]
+
+
 def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
     """The storage layer speaks MongoDB (`E11000 duplicate key error ...`).
     None of that may reach a PostgreSQL client. Probed against PG 14."""

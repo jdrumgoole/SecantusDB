@@ -620,26 +620,24 @@ remain open:
       `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
       `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
       port of one C function family, so the split is by table, not logic).
-- [ ] **OPEN — RUST pgserver: tables are NOT schema-qualified (found
-      2026-10-02 by the SQLAlchemy gauge, batch 33).** `relation_name` drops
-      the schema, so every table lives in one namespace:
-      `CREATE TABLE test_schema.users2 (...)` is created in `public`, and
-      `CREATE TABLE test_schema.users` after `CREATE TABLE users` answers
-      42P07 "relation users already exists" where PostgreSQL makes a second,
-      distinct table. That is silent misplacement as well as an error. The
-      Python server keys a non-public relation `schema.name` in the shared
-      catalog; the Rust server must do the same, resolve unqualified names
-      through `search_path`, and report `pg_class.relnamespace` /
-      `information_schema.tables.table_schema` from the key. It is 749 of the
-      SQLAlchemy dialect suite's 782 errors against the Rust server (421
-      passed, 40 failed, 782 errors; the Python server's published run is
-      978 / 0 / 435 skipped). The other groups, smaller: 30 `BizarroCharacterTest`
-      FK reflection ('NoneType' has no attribute 'groups' -- a constraint
-      definition the dialect's regex cannot parse), covering-index
-      `include_columns` reflection, composite-PK column order, a scalar
-      subquery CardinalityViolation in a LIMIT test, server-side cursors
-      returning no rows, a datetime returned as text. Re-measure after the
-      schema work; most will shift.
+- [ ] **OPEN — RUST pgserver: what the SQLAlchemy dialect suite still
+      fails (batch 34, 2026-10-02).** Schema-qualified relations landed in
+      batch 34 (`schemas.rs` / `schema_rows.rs`, corpus `schemas` 0/75): the
+      Rust run went 421 passed / 40 failed / 782 errors -> 811 / 167 / 0
+      (435 skipped; the Python server's published run is 978 / 0). Left,
+      grouped: ~76 reflection checks where `get_table_names` /
+      `get_view_names` return SQLAlchemy's own information_schema relations
+      or schema `None` (a catalog filter on system relations); 30
+      `'NoneType' has no attribute 'groups'` (a `pg_get_constraintdef` /
+      `pg_get_indexdef` text shape the dialect's regex rejects); 16
+      `(None, 'users')` assertions; 24 `test_schema` constraint / index
+      comment and FK-name reflection mismatches; 2 server-side cursor
+      roundtrips. Schema limits carried from the Python server's convention:
+      index names are global (two same-named indexes in different schemas
+      collide); a view's stored text names `"s.t"`, so `pg_get_viewdef`
+      differs for views over schema tables; an unqualified `'t'::regclass` /
+      `nextval('t')` does not walk a non-default `search_path` (the qualified
+      forms do); privilege checks see the bare relname.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
