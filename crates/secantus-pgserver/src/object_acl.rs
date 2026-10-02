@@ -14,7 +14,8 @@
 //! A function is keyed by its catalog key (`name/nargs`, or
 //! `name/nargs/types` for a second overload at one arity), so a GRANT on one
 //! overload leaves the others alone, as PostgreSQL's per-signature ACL does.
-//! A built-in, which has no catalog document, is keyed `name/nargs`.
+//! A built-in, which has no catalog document, is keyed by its signature
+//! (`name(types)`).
 
 use bson::{Bson, Document};
 use pgwire::error::PgWireResult;
@@ -321,7 +322,7 @@ impl PgHandler {
     /// The ACL key of the routine a GRANT names (`f(int4)`, or bare `f`
     /// when it is the only one of that name): its catalog key. 42883 when no
     /// such signature exists, 42725 for an ambiguous bare name. A built-in
-    /// has no catalog document and is keyed `name/nargs`.
+    /// has no catalog document and is keyed `name(types)`.
     pub(crate) fn function_acl_key(&self, signature: &str) -> PgWireResult<String> {
         // Already a catalog key (`ON ALL FUNCTIONS IN SCHEMA` expanded it).
         if let Some(key) = signature.strip_prefix('\0') {
@@ -336,7 +337,9 @@ impl PgHandler {
                     return Ok(f.key.clone());
                 }
                 if candidates.is_empty() && secantus_pgplan::is_known_function(&name) {
-                    return Ok(format!("{name}/{}", types.len()));
+                    // Keyed by the full signature, so `abs(int4)` and
+                    // `abs(numeric)` hold separate grants as in PostgreSQL.
+                    return Ok(format!("{name}({})", types.join(",")));
                 }
                 let shown: Vec<String> = types
                     .iter()
