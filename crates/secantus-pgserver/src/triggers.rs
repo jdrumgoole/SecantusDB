@@ -952,11 +952,13 @@ impl PgHandler {
                     q(&table)
                 ))?;
                 made.push(name.clone());
-                let tdef = self.lookup(name).ok_or_else(|| {
+                // A TEMP table lives in the session's own temp schema.
+                let key = secantus_pgplan::schemas::relation_key(&self.temp_schema_name(), name);
+                let tdef = self.lookup(&key).ok_or_else(|| {
                     user_error("42P01", format!("relation \"{name}\" does not exist"))
                 })?;
                 let docs = if *is_new { &new } else { &old };
-                self.insert_shaped(name, Self::reshape_rows(&def, &tdef, docs)?)?;
+                self.insert_shaped(&key, Self::reshape_rows(&def, &tdef, docs)?)?;
             }
             Ok(())
         };

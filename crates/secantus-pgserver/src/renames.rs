@@ -208,6 +208,8 @@ impl PgHandler {
             ));
         };
         self.relation_name_free(to)?;
+        self.note_txn_sequence(name);
+        self.note_txn_sequence(to);
         self.storage
             .delete_matching(
                 self.db(),

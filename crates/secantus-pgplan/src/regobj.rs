@@ -59,6 +59,60 @@ pub fn set_procs(v: Vec<(String, i64, String)>) {
     PROCS.with(|t| *t.borrow_mut() = v);
 }
 
+/// PostgreSQL 15's own functions, `oid -> name` (`pg_proc_oids.tsv`, dumped
+/// from `pg_proc where oid < 16384`): what a `regproc` of a built-in name
+/// resolves to, and how one renders. pgjdbc's type cache compares
+/// `typinput = 'pg_catalog.array_in'::regproc`.
+const BUILTIN_PROCS: &str = include_str!("pg_proc_oids.tsv");
+
+/// `(oid -> name, name -> oids)` over the built-in functions.
+type BuiltinProcs = (
+    std::collections::HashMap<i64, &'static str>,
+    std::collections::HashMap<&'static str, Vec<i64>>,
+);
+
+fn builtin_procs() -> &'static BuiltinProcs {
+    static T: std::sync::OnceLock<BuiltinProcs> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut by_oid = std::collections::HashMap::new();
+        let mut by_name: std::collections::HashMap<&'static str, Vec<i64>> =
+            std::collections::HashMap::new();
+        for line in BUILTIN_PROCS.lines() {
+            let Some((oid, name)) = line.split_once('\t') else {
+                continue;
+            };
+            let Ok(oid) = oid.parse::<i64>() else {
+                continue;
+            };
+            by_oid.insert(oid, name);
+            by_name.entry(name).or_default().push(oid);
+        }
+        (by_oid, by_name)
+    })
+}
+
+/// A built-in function's name by oid.
+pub fn builtin_proc_name(oid: i64) -> Option<&'static str> {
+    builtin_procs().0.get(&oid).copied()
+}
+
+/// The oids of the built-in functions named `name`.
+pub fn builtin_proc_oids(name: &str) -> &'static [i64] {
+    builtin_procs().1.get(name).map_or(&[], Vec::as_slice)
+}
+
+/// A `regproc` value for the built-in function named `name` (`-` is 0),
+/// when exactly one has that name.
+pub fn builtin_regproc(name: &str) -> Option<Bson> {
+    if name == "-" {
+        return Some(value("regproc", 0));
+    }
+    match builtin_proc_oids(name) {
+        [one] => Some(value("regproc", *one)),
+        _ => None,
+    }
+}
+
 pub fn is_kind(t: &str) -> bool {
     KINDS.iter().any(|(k, _)| *k == t)
 }
@@ -107,12 +161,14 @@ pub fn text(kind: &str, oid: i64) -> String {
             .into_iter()
             .find(|(_, o)| *o == oid)
             .map(|(n, _)| crate::scalar::quote_identifier(&n)),
-        "regproc" => PROCS.with(|t| {
-            t.borrow()
-                .iter()
-                .find(|(_, o, _)| *o == oid)
-                .map(|(n, _, _)| n.clone())
-        }),
+        "regproc" => PROCS
+            .with(|t| {
+                t.borrow()
+                    .iter()
+                    .find(|(_, o, _)| *o == oid)
+                    .map(|(n, _, _)| n.clone())
+            })
+            .or_else(|| builtin_proc_name(oid).map(str::to_string)),
         _ => PROCS.with(|t| {
             t.borrow()
                 .iter()
@@ -164,14 +220,29 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
                 .ok_or_else(|| Error::UndefinedObject(format!("role \"{name}\" does not exist")))
         }
         "regproc" => {
-            let name = unquote(input);
-            let hits: Vec<i64> = PROCS.with(|t| {
-                t.borrow()
-                    .iter()
-                    .filter(|(n, _, _)| *n == name)
-                    .map(|(_, o, _)| *o)
-                    .collect()
-            });
+            let mut name = unquote(input);
+            // `pg_catalog.array_in`: the built-ins live in pg_catalog.
+            let qualified_builtin = match name.strip_prefix("pg_catalog.") {
+                Some(bare) => {
+                    name = bare.to_string();
+                    true
+                }
+                None => false,
+            };
+            let mut hits: Vec<i64> = if qualified_builtin {
+                Vec::new()
+            } else {
+                PROCS.with(|t| {
+                    t.borrow()
+                        .iter()
+                        .filter(|(n, _, _)| *n == name)
+                        .map(|(_, o, _)| *o)
+                        .collect()
+                })
+            };
+            if hits.is_empty() {
+                hits = builtin_proc_oids(&name).to_vec();
+            }
             match hits.as_slice() {
                 [one] => Ok(*one),
                 [] => Err(Error::UndefinedFunction(format!(
