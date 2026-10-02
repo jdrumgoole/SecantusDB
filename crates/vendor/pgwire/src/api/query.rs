@@ -63,6 +63,26 @@ pub trait SimpleQueryHandler: Send + Sync {
         Ok(query.query.clone())
     }
 
+    /// Executed on a Fastpath `FunctionCall`. The default refuses it; the
+    /// connection stays usable. (SecantusDB local patch.)
+    async fn on_function_call<C>(
+        &self,
+        _client: &mut C,
+        _call: crate::messages::fastpath::FunctionCall,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "0A000".to_owned(),
+            "the fastpath function call protocol is not supported".to_owned(),
+        ))))
+    }
+
     /// Executed on `Query` request arrived. This is how postgres respond to
     /// simple query. The default implementation calls `do_query` with the
     /// incoming query string.

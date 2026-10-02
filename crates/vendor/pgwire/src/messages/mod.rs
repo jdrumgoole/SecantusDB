@@ -156,6 +156,8 @@ mod codec;
 pub mod copy;
 /// Data related messages
 pub mod data;
+/// Fastpath function call messages (SecantusDB local patch)
+pub mod fastpath;
 /// Extended query messages, including request/response for parse, bind and etc.
 pub mod extendedquery;
 /// General response messages
@@ -203,6 +205,8 @@ pub enum PgWireFrontendMessage {
     CopyData(copy::CopyData),
     CopyFail(copy::CopyFail),
     CopyDone(copy::CopyDone),
+
+    FunctionCall(fastpath::FunctionCall),
 }
 
 impl PgWireFrontendMessage {
@@ -250,6 +254,7 @@ impl PgWireFrontendMessage {
             Self::CopyData(msg) => msg.encode(buf),
             Self::CopyFail(msg) => msg.encode(buf),
             Self::CopyDone(msg) => msg.encode(buf),
+            Self::FunctionCall(msg) => msg.encode(buf),
         }
     }
 
@@ -347,6 +352,9 @@ impl PgWireFrontendMessage {
                 copy::MESSAGE_TYPE_BYTE_COPY_DONE => {
                     copy::CopyDone::decode(buf, ctx).map(|v| v.map(Self::CopyDone))
                 }
+                fastpath::MESSAGE_TYPE_BYTE_FUNCTION_CALL => {
+                    fastpath::FunctionCall::decode(buf, ctx).map(|v| v.map(Self::FunctionCall))
+                }
                 _ => Err(PgWireError::InvalidMessageType(first_byte)),
             }
         } else {
@@ -393,6 +401,9 @@ pub enum PgWireBackendMessage {
     CopyInResponse(copy::CopyInResponse),
     CopyOutResponse(copy::CopyOutResponse),
     CopyBothResponse(copy::CopyBothResponse),
+
+    // fastpath
+    FunctionCallResponse(fastpath::FunctionCallResponse),
 }
 
 impl PgWireBackendMessage {
@@ -429,6 +440,7 @@ impl PgWireBackendMessage {
             Self::CopyInResponse(msg) => msg.encode(buf),
             Self::CopyOutResponse(msg) => msg.encode(buf),
             Self::CopyBothResponse(msg) => msg.encode(buf),
+            Self::FunctionCallResponse(msg) => msg.encode(buf),
         }
     }
 

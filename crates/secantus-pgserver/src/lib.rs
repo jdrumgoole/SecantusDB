@@ -16,17 +16,20 @@ mod catalog_fill;
 mod catalog_meta;
 mod catalog_objects;
 mod collations;
+mod db_settings;
 mod do_block;
 mod encoding;
 mod event_triggers;
 mod explain;
 mod expr_index;
 mod fdw;
+mod largeobjects;
 mod merge;
 mod partition;
 mod pg_type_facts;
 mod plpgsql_do;
 mod plpgsql_fn;
+mod plpgsql_portals;
 mod procedures;
 mod renames;
 mod rules;
@@ -34,6 +37,8 @@ mod schema_rows;
 mod server;
 mod table_locks;
 mod triggers;
+mod txn_gucs;
+mod wire_portals;
 
 pub use server::{bind, RunningPgServer};
 
@@ -834,6 +839,18 @@ fn pl_error(e: &PgWireError) -> plpgsql_fn::PlError {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn open_cursor(
+        &self,
+        name: Option<&str>,
+        statement: &str,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+        scroll: bool,
+    ) -> Result<String, plpgsql_fn::PlError> {
+        self.open_portal(name, statement, sql, params, types, scroll)
+    }
+
     fn query(
         &self,
         sql: &str,
@@ -2104,6 +2121,14 @@ pub struct PgHandler {
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
+    /// Settings the open block changed (see `txn_gucs`).
+    txn_gucs: Mutex<txn_gucs::TxnGucs>,
+    /// Open large-object descriptors (see `largeobjects`).
+    lo_descriptors: Mutex<largeobjects::LoDescriptors>,
+    /// The last `<unnamed portal N>` a PL/pgSQL OPEN named.
+    portal_seq: std::sync::atomic::AtomicU32,
+    /// Open named protocol portals, for `pg_cursors` (see `wire_portals`).
+    wire_portals: Mutex<HashMap<String, wire_portals::WirePortal>>,
     /// A `CALL` / `DO` is running that may end the session's transaction
     /// (`COMMIT` / `ROLLBACK` in its body): it was run outside a block, and
     /// no function or other statement stands between it and the body.
@@ -2357,6 +2382,10 @@ impl PgHandler {
             temp_tables: Mutex::new(Vec::new()),
             txn_sequences: Mutex::new(std::collections::HashSet::new()),
             holdable_declared: AtomicBool::new(false),
+            txn_gucs: Mutex::new(HashMap::new()),
+            lo_descriptors: Mutex::new(largeobjects::LoDescriptors::default()),
+            portal_seq: std::sync::atomic::AtomicU32::new(0),
+            wire_portals: Mutex::new(HashMap::new()),
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
@@ -10697,6 +10726,37 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("database", "name", false),
                 ],
             )),
+            "pg_largeobject_metadata" => Some(TableDef::new(
+                "pg_largeobject_metadata",
+                vec![
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("lomowner", "oid", false),
+                    secantus_pgcatalog::Column::new("lomacl", "aclitem[]", false),
+                ],
+            )),
+            // `pg_settings`: what a client reads a setting back through.
+            "pg_settings" => Some(TableDef::new(
+                "pg_settings",
+                vec![
+                    secantus_pgcatalog::Column::new("name", "text", false),
+                    secantus_pgcatalog::Column::new("setting", "text", false),
+                    secantus_pgcatalog::Column::new("unit", "text", false),
+                    secantus_pgcatalog::Column::new("category", "text", false),
+                    secantus_pgcatalog::Column::new("short_desc", "text", false),
+                    secantus_pgcatalog::Column::new("extra_desc", "text", false),
+                    secantus_pgcatalog::Column::new("context", "text", false),
+                    secantus_pgcatalog::Column::new("vartype", "text", false),
+                    secantus_pgcatalog::Column::new("source", "text", false),
+                    secantus_pgcatalog::Column::new("min_val", "text", false),
+                    secantus_pgcatalog::Column::new("max_val", "text", false),
+                    secantus_pgcatalog::Column::new("enumvals", "text[]", false),
+                    secantus_pgcatalog::Column::new("boot_val", "text", false),
+                    secantus_pgcatalog::Column::new("reset_val", "text", false),
+                    secantus_pgcatalog::Column::new("sourcefile", "text", false),
+                    secantus_pgcatalog::Column::new("sourceline", "int4", false),
+                    secantus_pgcatalog::Column::new("pending_restart", "bool", false),
+                ],
+            )),
             "pg_cursors" => Some(TableDef::new(
                 "pg_cursors",
                 vec![
@@ -12174,6 +12234,7 @@ impl PgHandler {
                         row.insert(f("prosrc"), "aggregate_dummy");
                         row
                     }))
+                    .chain(Self::lo_pg_proc_rows(&def))
                     .collect()
             }
             "pg_inherits" => {
@@ -12897,7 +12958,10 @@ impl PgHandler {
                     })
                     .collect()
             }
+            "pg_settings" => self.pg_settings_rows(&def),
+            "pg_largeobject_metadata" => self.lo_metadata_rows(&def),
             "pg_cursors" => {
+                let portals = self.wire_portal_rows(&def);
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
                 cursors
                     .iter()
@@ -12926,6 +12990,7 @@ impl PgHandler {
                         );
                         d
                     })
+                    .chain(portals)
                     .collect()
             }
             "pg_constraint" => {
@@ -14410,6 +14475,8 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea" => Type::BYTEA,
         "inet" => Type::INET,
         "cidr" => Type::CIDR,
+        "refcursor" => Type::REFCURSOR,
+        "money" => Type::MONEY,
         "aclitem" => Type::ACLITEM,
         "box" => Type::BOX,
         "point" => Type::POINT,
@@ -14989,6 +15056,23 @@ impl PgHandler {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         startup.sort();
+        // The database's own defaults (ALTER DATABASE SET) come first, so
+        // anything the client sends overrides them, as in PostgreSQL. One
+        // the SET refuses is skipped (PostgreSQL warns and connects).
+        let db_defaults = self.db_setting_defaults();
+        for (name, value) in &db_defaults {
+            let sql = format!(
+                "SET \"{}\" TO '{}'",
+                name.replace('"', "\"\""),
+                value.replace('\'', "''")
+            );
+            if let Err(e) = self.run_typed_inner(&sql, &[], &[], 0).await {
+                eprintln!("secantusd-pg: database default {name} = {value} not applied: {e:?}");
+            }
+        }
+        if !db_defaults.is_empty() && startup.is_empty() {
+            self.report_pending_params(_c).await?;
+        }
         // `options` carries command-line switches; the `-c name=value` /
         // `--name=value` ones are settings (libpq's PGOPTIONS, pgjdbc's
         // `options`), applied after the packet's own parameters as
@@ -15046,6 +15130,20 @@ impl Drop for PgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for PgHandler {
+    async fn on_function_call<C>(
+        &self,
+        client: &mut C,
+        call: pgwire::messages::fastpath::FunctionCall,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.fastpath_call(client, call).await
+    }
+
     async fn before_ready_for_query<C>(&self, client: &mut C) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -17027,6 +17125,9 @@ impl PgHandler {
         if name == "pg_has_role" {
             return self.has_role_call(args);
         }
+        if name.starts_with("lo") && largeobjects::is_sql_function(name) {
+            return self.lo_sql_call(name, args);
+        }
         // `pg_trgm`'s `set_limit(real)`: the session's similarity threshold.
         if name == "set_limit" {
             let v = match args.first() {
@@ -18380,7 +18481,11 @@ impl PgHandler {
                     )))),
                 }
             }
-            ConstCol::SetConfig { name, value, .. } => {
+            ConstCol::SetConfig {
+                name,
+                value,
+                is_local,
+            } => {
                 // `is_local` is accepted and ignored: this server has no
                 // statement-scoped settings, and the difference is only
                 // observable across a rollback.
@@ -18417,6 +18522,20 @@ impl PgHandler {
                     } else {
                         text
                     };
+                    // `is_local` outside a block lasts only for the
+                    // statement's own implicit transaction: nothing stays.
+                    if *is_local
+                        && !self
+                            .in_transaction
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return Ok(Bson::String(text));
+                    }
+                    let kept = self.txn_guc_kept(&key);
+                    self.note_txn_guc(&key, *is_local, &text);
+                    if *is_local {
+                        self.restore_txn_guc_kept(&key, kept);
+                    }
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), text.clone());
                     drop(settings);
@@ -19251,6 +19370,9 @@ impl PgHandler {
             }
             TransactionControl::Commit { chain } => {
                 self.reset_transaction_gucs();
+                self.end_txn_gucs(true);
+                self.lo_close_all();
+                self.forget_wire_portals();
                 // A COMMIT with no BEGIN commits the statement group so far;
                 // what follows before the Sync starts a new one.
                 self.implicit_extended
@@ -19286,6 +19408,9 @@ impl PgHandler {
             }
             TransactionControl::Rollback { chain } => {
                 self.reset_transaction_gucs();
+                self.end_txn_gucs(false);
+                self.lo_close_all();
+                self.forget_wire_portals();
                 self.implicit_extended
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A ROLLBACK closes ALL cursors, holdable included.
@@ -19303,6 +19428,7 @@ impl PgHandler {
             }
             TransactionControl::Prepare(gid) => {
                 self.reset_transaction_gucs();
+                self.end_txn_gucs(true);
                 self.implicit_extended
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A PREPARE ends the block the way a COMMIT does: non-holdable
@@ -20955,6 +21081,7 @@ impl PgHandler {
                 | Statement::CopyTo(_)
                 | Statement::Show(_)
                 | Statement::Set { .. }
+                | Statement::SetLocal { .. }
                 | Statement::Reset(_)
                 | Statement::SetTransaction(_)
                 | Statement::SetSessionCharacteristics(_)
@@ -24753,6 +24880,18 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
             }
 
+            // `SET LOCAL`: a SET the end of the block takes back.
+            Statement::SetLocal { name, value } => {
+                if !self.set_local_allowed() {
+                    return Ok(vec![Response::Execution(Tag::new("SET"))]);
+                }
+                let key = canonical_setting(&name);
+                let kept = self.txn_guc_kept(&key);
+                self.note_txn_guc(&key, true, &value);
+                let out = self.execute_statement(Statement::Set { name, value }, max_rows);
+                self.restore_txn_guc_kept(&key, kept);
+                out
+            }
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
                 if key == "role" {
@@ -24788,6 +24927,7 @@ impl PgHandler {
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
                 }
                 if key == "client_encoding" {
+                    self.note_txn_guc(&key, false, &value);
                     // Validated, canonicalised, and reported separately: an
                     // invalid name must be refused (not stored), and the stored
                     // value must be the canonical spelling the client reads back.
@@ -24797,7 +24937,8 @@ impl PgHandler {
                     // datestyle` answers what PostgreSQL does (`ISO, MDY`), and so
                     // the stored value and the reported ParameterStatus agree.
                     let value = if key == "DateStyle" {
-                        secantus_pgplan::DateStyle::parse(&value).canonical()
+                        secantus_pgplan::DateStyle::parse_over(&self.session_datestyle(), &value)
+                            .canonical()
                     } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key)
                         || MS_GUCS.contains(&key.as_str())
                     {
@@ -24811,6 +24952,7 @@ impl PgHandler {
                     } else {
                         value
                     };
+                    self.note_txn_guc(&key, false, &value);
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), value.clone());
                     // A session default set outside a block is what the next
@@ -24899,16 +25041,29 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
 
+            Statement::AlterDatabaseSet {
+                database,
+                name,
+                value,
+            } => self.alter_database_set(&database, name, value),
+
             Statement::Reset(name) => {
+                let db_defaults = self.db_setting_defaults();
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 if name.is_empty() {
                     *settings = default_settings();
+                    settings.extend(db_defaults);
                 } else {
                     let key = canonical_setting(&name);
                     // RESET restores the DEFAULT, which is not the same as
                     // removing the setting: a client reading it back afterwards
-                    // must see the default, not an error.
-                    match default_settings().get(&key) {
+                    // must see the default, not an error. A database's own
+                    // default (ALTER DATABASE SET) comes first.
+                    let db_default = db_defaults
+                        .into_iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v);
+                    match db_default.as_ref().or(default_settings().get(&key)) {
                         Some(d) => {
                             settings.insert(key.clone(), d.clone());
                             let d = d.clone();
@@ -26642,7 +26797,8 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 60] = [
+    const OK: [Type; 61] = [
+        Type::MONEY,
         Type::REGNAMESPACE,
         Type::REGROLE,
         Type::REGPROC,
@@ -27009,6 +27165,17 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             format!("cannot send {what} as a binary {}", ty.name()),
         )))
     };
+    // `money`: its int8 count of cents.
+    if *ty == Type::MONEY {
+        if let Some(cents) = secantus_pgplan::money::cents_of(v) {
+            return enc.encode_field_with_type_and_format(
+                &RawEncoded(cents.to_be_bytes().to_vec()),
+                ty,
+                FieldFormat::Binary,
+                &FormatOptions::default(),
+            );
+        }
+    }
     if matches!(*ty, Type::BIT | Type::VARBIT) {
         if let Bson::String(bits) = v {
             return enc.encode_field(&Some(secantus_pgplan::bits::to_wire(bits)));
@@ -27780,6 +27947,21 @@ fn encode_field_value_inner(
 ) -> PgWireResult<()> {
     let padded = blank_padded(field, v);
     let v = padded.as_deref();
+    // `money`: `cash_out` in text, the int8 cent count in binary.
+    if *field.datatype() == Type::MONEY {
+        if let Some(value) = v.filter(|x| **x != Bson::Null) {
+            return match secantus_pgplan::money::cents_of(value) {
+                Some(cents) if field.format() == FieldFormat::Binary => enc
+                    .encode_field_with_type_and_format(
+                        &RawEncoded(cents.to_be_bytes().to_vec()),
+                        field.datatype(),
+                        field.format(),
+                        &FormatOptions::default(),
+                    ),
+                _ => enc.encode_field(&Some(secantus_pgplan::money::render_value(value))),
+            };
+        }
+    }
     if field.format() == FieldFormat::Binary {
         // Binary datetime output is DateStyle-INDEPENDENT (it is a fixed-width
         // integer, not text), so `ds` is deliberately unused on this path.
@@ -31435,6 +31617,7 @@ impl ExtendedQueryHandler for PgHandler {
             }
             pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
                 pgwire::api::store::PortalStore::rm_portal(client.portal_store(), name);
+                self.forget_wire_portal(name);
                 // A DECLAREd cursor IS a portal of that name on PostgreSQL, so
                 // a wire `Close` of it closes the cursor (libpq 17's
                 // `PQclosePortal`); the next Describe of it is `34000`.
@@ -31544,6 +31727,14 @@ impl ExtendedQueryHandler for PgHandler {
             client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
         }
         pgwire::api::store::PortalStore::rm_portal(client.portal_store(), DEFAULT_NAME);
+        // Outside a block the Sync ended the implicit transaction, and every
+        // portal with it.
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.forget_wire_portals();
+        }
         self.flush_notifications(client).await?;
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
@@ -31603,6 +31794,11 @@ impl ExtendedQueryHandler for PgHandler {
             return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
         };
         let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
+        self.note_wire_portal(
+            &portal.name,
+            &portal.statement.statement.sql,
+            &portal.result_column_format,
+        );
         pgwire::api::store::PortalStore::put_portal(client.portal_store(), Arc::new(portal));
         client
             .send(PgWireBackendMessage::BindComplete(
