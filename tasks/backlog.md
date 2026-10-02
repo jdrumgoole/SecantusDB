@@ -639,14 +639,23 @@ remain open:
       (`__sql_object_acl__`, this server's own store -- the Python server
       keeps none), answers `has_schema_privilege` / `has_sequence_privilege` /
       `has_function_privilege` / `has_column_privilege` from them, and adds
-      `information_schema.role_table_grants` / `table_privileges`. Still
-      open: an UNQUALIFIED name is not checked for schema USAGE (PostgreSQL
-      skips a `search_path` schema the role cannot use); schema `CREATE`,
-      sequence `USAGE` / `SELECT` / `UPDATE` (at `nextval` / `currval`) and
-      function `EXECUTE` (at a call) are recorded and answered but not
-      enforced; a function's grants are keyed by its bare name, so they
-      cover every overload; `GRANT ... ON ALL SEQUENCES / FUNCTIONS IN
-      SCHEMA` is accepted and changes nothing.
+      `information_schema.role_table_grants` / `table_privileges`. Batch 43
+      (corpus `b43_privileges`, 89/89 against PostgreSQL 15) enforces the
+      rest: the active search path drops a schema the role has no `USAGE`
+      on (an unqualified name there is 42P01, nothing is created there,
+      `current_schemas` omits it); schema `CREATE` for CREATE TABLE / VIEW /
+      SEQUENCE / FUNCTION / TYPE / DOMAIN / TABLE AS (public included -- PG
+      15 grants PUBLIC no CREATE there); `nextval` (USAGE or UPDATE),
+      `currval` (USAGE or SELECT), `setval` (UPDATE) and a sequence read as
+      a relation (SELECT); `EXECUTE` at a user-function call; function
+      grants keyed per signature (the catalog key, `f(int)` and `f(text)`
+      apart; a bare name that is ambiguous is 42725); `ON ALL SEQUENCES /
+      FUNCTIONS / PROCEDURES / ROUTINES IN SCHEMA`; and a dropped sequence's
+      or function's grants go with it. Still open: a SERIAL column's
+      default `nextval` is not checked for the inserting role (PostgreSQL
+      checks it; an identity column it does not); `lastval()` is not
+      checked; `EXECUTE` is not checked on a trigger function at CREATE
+      TRIGGER; a built-in function's grants are keyed `name/nargs`.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
@@ -733,10 +742,22 @@ remain open:
       protocol), SQL `lo_open` in autocommit (closed with its statement;
       descriptors number from the lowest free slot again), a notice raised
       before a `pg_sleep` sent while it sleeps, and the snapshot functions.
-      Still open: extended Execute materialises the whole result; a notice
-      is sent early only while a statement waits on a table lock or sleeps,
-      not during other long work; `pg_current_snapshot()` is the fixed
-      `3:3:` (this server exposes no transaction ids).
+      Batch 43: a PL/pgSQL / DO-block `RAISE` below EXCEPTION is now sent
+      the moment it is raised (not only during a lock wait or `pg_sleep`).
+      Still open: other notices (a CASCADE list, `... does not exist,
+      skipping`) still go at the statement's end, which only matters for a
+      statement that then runs long; `pg_current_snapshot()` is the fixed
+      `3:3:` (this server exposes no transaction ids); and extended Execute
+      still materialises the whole result. That last one is NOT a protocol
+      fix (re-read 2026-10-02): the executor itself returns a `Vec` of
+      documents (`select_docs`), so streaming the encoded rows would save
+      only the encoded copy; bounding memory needs a storage cursor that
+      outlives one handler call and resumes on whichever tokio thread runs
+      the next Execute, while WiredTiger sessions are thread-affine. And the
+      batch-37 `materialise_rows` rule must stay for anything that WRITES
+      (PostgreSQL also runs a writing portal to completion first), so only a
+      read-only SELECT could stream. Size: a storage-cursor API plus a
+      portal state machine -- days, not a patch.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
@@ -970,6 +991,13 @@ remain open:
         deletion is detected at the next `COMMIT PREPARED` by the first minted
         seq being readable (`prepared_already_committed`), not by a commit
         record.
+      - Re-measured 2026-10-02 (batch 43): still as described -- block A
+        updates row 1, B holds row 2, A's update of row 2 answers `40001`
+        at once (PostgreSQL waits for B, then gives `(1,1),(2,11)`); B's
+        commit stands and nothing of A's lands, so it is a refused
+        transaction, not a lost write. Fixing it needs WiredTiger to refresh
+        a snapshot that has written (or a statement-level savepoint WT does
+        not have), so it stays.
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
@@ -1262,6 +1290,38 @@ These work end-to-end but cut corners.
       general per-statement target; the protocol work above has taken the
       extended path as far as it goes cheaply.
 
+      **RE-MEASURED 2026-10-02 (batch 43): the per-statement cost had
+      tripled since this entry, and most of it is back.** Release builds of
+      the batch-43 base and of the batch, the same psycopg loop
+      (`scratchpad/bench43.py`: 5 x 1000 statements, median), PostgreSQL 15
+      on the same box:
+
+      | us / statement | base | batch 43 | PG 15 |
+      | --- | --- | --- | --- |
+      | simple `select 1` | 78.2 | 37.1 | 22.9 |
+      | extended `select 1` | 151.5 | 59.5 | 26.8 |
+      | extended PK read | 204.9 | 102.5 | 33.7 |
+      | extended autocommit UPDATE by PK | 206.2 | 99.9 | 55.5 |
+
+      Measured with `sample`, not guessed: `install_user_types` -- run at
+      Describe AND Execute -- was ~60% of the server's time on `select 1`.
+      Its pre-gate part (session state, installed per statement) had grown:
+      the GUC map (every PostgreSQL 15 setting since batch 40) was CLONED
+      into the planner per statement; `is_superuser` read the role
+      collection from storage (twice a statement, more with RLS); the RLS
+      "any table enabled" query and `inheritance()`'s full catalog scan ran
+      per statement. Fixes: the settings map carries a generation
+      (`GucMap`, bumped on every mutable access) and is re-installed only
+      when it changed; roles, the RLS-enabled set, the inheritance tree and
+      each table's expression-index list are cached against the catalog
+      version (`committed_cached` / the role cache), used only where the
+      read would have seen exactly the committed catalog anyway (a fresh
+      session, no uncommitted table or type of this connection's, no role
+      written by its open transaction); the privilege / lock readers use the
+      memoised parse tree. What is left on a PK read is planning, done
+      twice (Describe and Execute), much of it cloning `pg_query` protobuf
+      trees; the storage read itself is ~5% of the samples.
+
       | us / statement | ours | PG 16 | excess |
       | --- | --- | --- | --- |
       | `select 1` (extended) | 51.6 | 30.1 | +21.5 |
@@ -1372,7 +1432,10 @@ These work end-to-end but cut corners.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
       layer, not the query engine (attributed 2026-09-20).** `select 1` costs
-      ~55.8us against PostgreSQL 16's ~30us. Instrumented with steady-state
+      ~55.8us against PostgreSQL 16's ~30us. (Batch 43, 2026-10-02: the
+      base had drifted to 151us and is 59.5us again -- see the PK-read entry
+      above for what grew and what fixed it. The breakdown below predates
+      that drift.) Instrumented with steady-state
       windows (NOT cumulative means -- an earlier reading drifted 144 -> 89us
       on warmup alone while the truth sat still), release build, quiet box:
 

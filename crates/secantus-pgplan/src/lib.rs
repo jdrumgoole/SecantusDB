@@ -38,6 +38,7 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
 mod semijoin_hash;
@@ -15932,10 +15933,29 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
             }
             Some(N::RangeVar(rv)) => Some(relation_name(rv)),
             Some(N::String(st)) => Some(st.sval.clone()),
-            Some(N::ObjectWithArgs(ow)) => ow.objname.last().and_then(|n| match n.node.as_ref() {
-                Some(N::String(st)) => Some(st.sval.clone()),
-                _ => None,
-            }),
+            // A routine keeps its signature, `f(int4,text)` (bare `f` when
+            // the GRANT left it off): its privileges are per overload.
+            Some(N::ObjectWithArgs(ow)) => ow
+                .objname
+                .last()
+                .and_then(|n| match n.node.as_ref() {
+                    Some(N::String(st)) => Some(st.sval.clone()),
+                    _ => None,
+                })
+                .map(|name| {
+                    if ow.args_unspecified {
+                        return name;
+                    }
+                    let args: Vec<String> = ow
+                        .objargs
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref()? {
+                            N::TypeName(tn) => Some(type_name_of(tn)),
+                            _ => None,
+                        })
+                        .collect();
+                    format!("{name}({})", args.join(","))
+                }),
             Some(N::TypeName(t)) => t.names.last().and_then(|n| match n.node.as_ref() {
                 Some(N::String(st)) => Some(st.sval.clone()),
                 _ => None,
@@ -23745,6 +23765,16 @@ thread_local! {
 }
 
 /// Install the database and settings for the statements that follow.
+/// Install only the database name, keeping the settings already installed.
+pub fn set_session_database(database: &str) {
+    PLAN_SESSION_DB.with(|d| {
+        let mut d = d.borrow_mut();
+        if *d != database {
+            *d = database.to_string();
+        }
+    });
+}
+
 pub fn set_session_context(database: &str, settings: std::collections::HashMap<String, String>) {
     PLAN_SESSION_DB.with(|d| *d.borrow_mut() = database.to_string());
     PLAN_SETTINGS.with(|s| *s.borrow_mut() = settings);

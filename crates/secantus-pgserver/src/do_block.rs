@@ -329,6 +329,8 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(info);
+        // Sent as it is raised, not when the block ends.
+        self.send_live_notices();
         Ok(())
     }
 
