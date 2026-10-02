@@ -165,6 +165,11 @@ impl PgHandler {
                 format!("function {}() does not exist", def.function),
             ));
         };
+        // PostgreSQL checks EXECUTE on the trigger function at CREATE
+        // TRIGGER (before its return type).
+        if let Ok(fkey) = function.get_str("_id") {
+            self.check_function_execute(fkey, &def.function)?;
+        }
         if !function.get_bool("returns_trigger").unwrap_or(false) {
             return Err(user_error(
                 "42P17",
