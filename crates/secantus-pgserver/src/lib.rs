@@ -30,6 +30,7 @@ mod plpgsql_fn;
 mod procedures;
 mod renames;
 mod rules;
+mod schema_rows;
 mod server;
 mod table_locks;
 mod triggers;
@@ -2957,7 +2958,27 @@ impl PgHandler {
                 .map(|(n, _, _)| n)
                 .collect(),
         );
+        secantus_pgplan::schemas::set_user_schemas(
+            self.namespaces()
+                .into_iter()
+                .map(|(n, _)| n)
+                .filter(|n| {
+                    !matches!(
+                        n.as_str(),
+                        "public" | "pg_catalog" | "information_schema" | "pg_toast"
+                    )
+                })
+                .collect(),
+        );
         secantus_pgplan::set_user_relations(self.relations());
+        secantus_pgplan::schemas::set_relation_keys(
+            self.all_table_defs()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.name)
+                .chain(self.views().unwrap_or_default().into_iter().map(|(n, _)| n))
+                .collect(),
+        );
     }
 
     /// The name a user type resolves under: its bare name in `public` (on the
@@ -10735,9 +10756,20 @@ impl PgHandler {
             "information_schema.sequences" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
+                // An identity column's sequence is internal: PostgreSQL's
+                // view leaves it out (measured on 15).
+                let identity: std::collections::HashSet<String> = self
+                    .all_table_defs()
+                    .unwrap_or_default()
+                    .iter()
+                    .flat_map(|t| t.columns.iter())
+                    .filter(|c| c.identity.is_some())
+                    .filter_map(|c| c.sequence.clone())
+                    .collect();
                 self.all_sequence_docs()
                     .ok()?
                     .into_iter()
+                    .filter(|s| !identity.contains(s.get_str("_id").unwrap_or_default()))
                     .map(|s| {
                         let text = |k: &str, fallback: i64| {
                             Bson::String(
@@ -12769,6 +12801,7 @@ impl PgHandler {
             _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
         self.fill_catalog_columns(name, &def, &mut rows);
+        self.schema_qualify_rows(&def, &mut rows);
         let empty = Document::new();
         // Large scalar `$in` / `$nin` lists hashed once for these rows.
         let in_sets = secantus_core::query::InSets::prepare(filter);
@@ -16054,15 +16087,33 @@ impl PgHandler {
         }
         Ok(match value {
             Bson::Null => None,
-            Bson::String(s) => Some(
-                s.rsplit('.')
-                    .next()
-                    .unwrap_or(&s)
-                    .trim_matches('"')
-                    .to_string(),
-            ),
+            Bson::String(s) => Some(Self::relation_text_key(&s)),
             other => Some(format!("{other}")),
         })
+    }
+
+    /// The catalog key a relation named in TEXT resolves to (`'s.t'`,
+    /// `'t'`, `'public.t'`): a user schema keeps its `schema.` prefix, a
+    /// builtin one drops it, and a bare name walks the search_path.
+    fn relation_text_key(text: &str) -> String {
+        let parts: Vec<&str> = text.split('.').map(|p| p.trim_matches('"')).collect();
+        match parts.as_slice() {
+            [.., schema, name] if secantus_pgplan::schemas::schema_exists(schema) => {
+                secantus_pgplan::schemas::relation_key(
+                    if matches!(*schema, "pg_catalog" | "information_schema")
+                        || schema.starts_with("pg_temp")
+                    {
+                        "public"
+                    } else {
+                        schema
+                    },
+                    name,
+                )
+            }
+            [.., name] if parts.len() > 1 => (*name).to_string(),
+            [name] => secantus_pgplan::schemas::resolve_unqualified(name),
+            _ => text.to_string(),
+        }
     }
 
     /// The relation a sequence presents itself as: PostgreSQL's three
@@ -17818,12 +17869,21 @@ impl PgHandler {
                 // NULL rather than an error when the column is not serial,
                 // and when the table is not there -- PostgreSQL answers NULL
                 // for a column with no owned sequence.
+                let table = if table.contains('.') {
+                    table
+                } else {
+                    secantus_pgplan::schemas::resolve_unqualified(&table)
+                };
                 let owned = self
                     .lookup(&table)
                     .and_then(|def| def.column(&column).and_then(|c| c.sequence.clone()));
                 Ok(match owned {
-                    // PostgreSQL schema-qualifies the answer.
-                    Some(seq) => Bson::String(format!("public.{seq}")),
+                    // PostgreSQL schema-qualifies the answer; a sequence
+                    // outside `public` is already stored as `schema.name`.
+                    Some(seq) => {
+                        let (schema, name) = secantus_pgplan::schemas::split_key(&seq);
+                        Bson::String(format!("{schema}.{name}"))
+                    }
                     None => Bson::Null,
                 })
             }
@@ -20375,6 +20435,11 @@ impl PgHandler {
     }
 
     fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        self.execute_inner_keys(stmt, max_rows)
+            .map_err(|e| self.unqualify_error(e))
+    }
+
+    fn execute_inner_keys(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
         // thread it into the row encoder explicitly. A thread-local does not
         // work: pgwire may encode the DataRows lazily on another async worker
@@ -21023,7 +21088,7 @@ impl PgHandler {
                         }
                     }
                     // What PostgreSQL names each dependant: `type s.t`.
-                    let descs: Vec<String> = members
+                    let mut descs: Vec<String> = members
                         .iter()
                         .map(|(_, id)| {
                             if id.contains('.') {
@@ -21033,7 +21098,10 @@ impl PgHandler {
                             }
                         })
                         .collect();
-                    if !members.is_empty() && !cascade {
+                    // The relations it holds, stored as `schema.name`.
+                    let relations = self.schema_relations(name)?;
+                    descs.extend(relations.iter().map(|(kind, key)| format!("{kind} {key}")));
+                    if (!members.is_empty() || !relations.is_empty()) && !cascade {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "2BP01".into(),
@@ -21051,6 +21119,7 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
                     self.cascade_notice(&descs);
+                    self.drop_schema_relations(&relations)?;
                     for (coll, id) in &members {
                         self.delete_type_doc(coll, id)?;
                     }

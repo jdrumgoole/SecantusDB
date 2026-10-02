@@ -17,6 +17,7 @@ pub mod acl;
 mod agg_hoist;
 mod expr_where;
 mod filter_sublink;
+pub mod schemas;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -3018,6 +3019,7 @@ fn parse_one(sql: &str) -> Result<N> {
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
     func_cast::rewrite(&mut node);
+    schemas::qualify(&mut node)?;
     Ok(node)
 }
 
