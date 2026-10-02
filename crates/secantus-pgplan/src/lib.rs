@@ -1698,6 +1698,10 @@ pub struct AggItem {
     pub field2: Option<String>,
     pub expr2: Option<ColumnExpr>,
     pub source_type2: Option<String>,
+    /// A FILTER holding a subquery, which no MQL filter can run: evaluated
+    /// per row into this hidden slot, and `filter` matches the slot `true`.
+    pub filter_field: Option<String>,
+    pub filter_expr: Option<ColumnExpr>,
     /// An ordered-set or hypothetical-set aggregate's DIRECT arguments, already
     /// evaluated: the fraction, or the hypothetical row.
     pub direct: Vec<Bson>,
@@ -2579,13 +2583,28 @@ pub fn is_catalog_function(name: &str) -> bool {
 
 /// The bare (schema-less) name of a called function, as PostgreSQL prints it.
 fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
-    f.funcname
+    let parts: Vec<&str> = f
+        .funcname
         .iter()
         .filter_map(|n| match n.node.as_ref()? {
-            N::String(st) => Some(st.sval.clone()),
+            N::String(st) => Some(st.sval.as_str()),
             _ => None,
         })
-        .next_back()
+        .collect();
+    let name = parts.last()?;
+    // A call qualified with `pg_temp` names a session's temp function, and
+    // only such a call does: PostgreSQL never searches `pg_temp` for a
+    // function (an unqualified call of one is 42883), and no built-in lives
+    // there. The executor installs a temp function under this name.
+    if parts.len() >= 2 && is_pg_temp_schema(parts[parts.len() - 2]) {
+        return Some(format!("pg_temp.{name}"));
+    }
+    Some(name.to_string())
+}
+
+/// `pg_temp`, or a session's own `pg_temp_N`.
+pub fn is_pg_temp_schema(schema: &str) -> bool {
+    schema == "pg_temp" || schema.starts_with("pg_temp_")
 }
 
 /// `a[i]`, `a[lo:hi]` and their multidimensional forms.
@@ -12082,11 +12101,25 @@ fn plan_aggregate_item(
             }
         }
     }
+    // A FILTER no MQL filter can express -- one holding a subquery, or the
+    // per-row call a correlated one became -- is evaluated per row (below).
+    let mut sublink_filter = None;
     let filter = match f.agg_filter.as_deref() {
         None => None,
-        Some(node) => Some(lower_where(node, def, params)?),
+        Some(node) if filter_sublink::has_sublink(node) => {
+            sublink_filter = Some(node);
+            None
+        }
+        Some(node) => match lower_where(node, def, params) {
+            Ok(d) => Some(d),
+            Err(_) if correlated::has_correlated_call(node) => {
+                sublink_filter = Some(node);
+                None
+            }
+            Err(e) => return Err(e),
+        },
     };
-    if name == "count" && f.agg_star {
+    if name == "count" && f.agg_star && sublink_filter.is_none() {
         return Ok(AggItem {
             func: AggFunc::CountStar,
             out,
@@ -12143,6 +12176,12 @@ fn plan_aggregate_item(
         source_typmod: -1,
         ..Default::default()
     };
+    if let Some(node) = sublink_filter {
+        let (field, _, _, expr) = resolve(node, format!("__aggf{index}"))?;
+        item.filter = Some(bson::doc! { field.clone(): true });
+        item.filter_field = Some(field);
+        item.filter_expr = expr;
+    }
     if f.agg_within_group {
         // `percentile_cont(0.5) WITHIN GROUP (ORDER BY v)`: the ordered
         // argument is `v`, sorted as written; the fraction / hypothetical
@@ -12266,13 +12305,43 @@ fn plan_aggregate_item(
             item.source_type.as_deref().unwrap_or("unknown")
         )));
     }
-    // There is no `min` / `max` over boolean in PostgreSQL (`bool_and` /
-    // `bool_or` are the boolean aggregates): a missing function, 42883.
+    // PostgreSQL 15 has no `min` / `max` over these types (none of them is
+    // an aggregate's input in `pg_aggregate`, nor implicitly castable to
+    // one; `bool_and` / `bool_or` are the boolean aggregates): a missing
+    // function, 42883.
     if matches!(item.func, AggFunc::Min | AggFunc::Max)
-        && matches!(item.source_type.as_deref(), Some("bool" | "boolean"))
+        && matches!(
+            item.source_type.as_deref(),
+            Some(
+                "bool"
+                    | "boolean"
+                    | "macaddr"
+                    | "macaddr8"
+                    | "uuid"
+                    | "bytea"
+                    | "json"
+                    | "jsonb"
+                    | "point"
+                    | "line"
+                    | "lseg"
+                    | "box"
+                    | "path"
+                    | "polygon"
+                    | "circle"
+                    | "bit"
+                    | "varbit"
+                    | "xid"
+                    | "cid"
+                    | "txid_snapshot"
+                    | "pg_snapshot"
+                    | "tsvector"
+                    | "tsquery"
+            )
+        )
     {
         return Err(Error::UndefinedFunction(format!(
-            "function {name}(boolean) does not exist"
+            "function {name}({}) does not exist",
+            display_type(item.source_type.as_deref().unwrap_or("unknown"))
         )));
     }
     Ok(item)
@@ -14450,7 +14519,11 @@ fn resolve_sublinks_in_expr(
             children.extend(e.lexpr.as_deref_mut());
             children.extend(e.rexpr.as_deref_mut());
         }
-        N::FuncCall(f) => children.extend(f.args.iter_mut()),
+        N::FuncCall(f) => {
+            children.extend(f.args.iter_mut());
+            // An aggregate's FILTER reads the row as its arguments do.
+            children.extend(f.agg_filter.as_deref_mut());
+        }
         N::BoolExpr(b) => children.extend(b.args.iter_mut()),
         N::AArrayExpr(a) => children.extend(a.elements.iter_mut()),
         N::RowExpr(r) => children.extend(r.args.iter_mut()),
@@ -22640,7 +22713,14 @@ pub fn regclass_text(oid: i64) -> String {
             return scalar::quote_identifier(&bare);
         }
         // A schema-qualified table is stored as `schema.name`; each part
-        // quotes on its own (`"Order"`, `testschema."Order"`).
+        // quotes on its own (`"Order"`, `testschema."Order"`). One the
+        // search path finds by its bare name prints bare, as PostgreSQL's
+        // `regclassout` does.
+        if let Some((_, bare)) = name.split_once('.') {
+            if table_is_visible(oid) == Some(true) {
+                return scalar::quote_identifier(bare);
+            }
+        }
         return name
             .split('.')
             .map(scalar::quote_identifier)
@@ -22764,6 +22844,9 @@ fn resolve_regclass(text: &str) -> Result<i64> {
             .as_deref()
             .and_then(|k| user(k, Some(true)))
             .or_else(|| user(name, Some(true)))
+            // The search path's first schema that holds the name (a table of
+            // a schema other than `public` is stored `schema.name`).
+            .or_else(|| user(&schemas::resolve_unqualified(name), Some(false)))
             .or_else(|| user(name, Some(false)))
             .or_else(catalog)
             .or_else(|| system_relation("pg_catalog", name)),
@@ -31034,8 +31117,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 return Ok(Bson::Null);
             }
             let privileges = value_text(args.last().expect("has_*_privilege takes arguments"));
-            for p in privileges.split(',') {
-                let p = p.trim().to_ascii_uppercase();
+            for written in privileges.split(',') {
+                let written = written.trim();
+                let p = written.to_ascii_uppercase();
                 let p = p.strip_suffix(" WITH GRANT OPTION").unwrap_or(&p).trim();
                 if !matches!(
                     p,
@@ -31055,9 +31139,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                         | "SET"
                         | "ALTER SYSTEM"
                 ) {
+                    // Named as written (`"Frob with grant option"`).
                     return Err(Error::InvalidParameter(format!(
-                        "unrecognized privilege type: \"{}\"",
-                        p.to_ascii_lowercase()
+                        "unrecognized privilege type: \"{written}\""
                     )));
                 }
             }
@@ -31068,8 +31152,30 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 let table = &args[args
                     .len()
                     .saturating_sub(if name == "has_column_privilege" { 3 } else { 2 })];
-                if let Bson::String(t) = table {
-                    resolve_regclass(t)?;
+                let oid = match table {
+                    Bson::String(t) => Some(resolve_regclass(t)?),
+                    Bson::Int32(i) => Some(i64::from(*i)),
+                    Bson::Int64(i) => Some(*i),
+                    other => regclass_oid(other),
+                };
+                // A user table's privileges are the executor's to answer
+                // (its GRANTs and owners); a catalog relation is readable by
+                // everyone, as PostgreSQL's are.
+                let key = oid.and_then(|oid| {
+                    PLAN_USER_RELATIONS.with(|t| {
+                        t.borrow()
+                            .iter()
+                            .find(|(_, o, temp)| *o == oid && !*temp)
+                            .map(|(k, _, _)| k.clone())
+                    })
+                });
+                if let (Some(key), "has_table_privilege", true) =
+                    (key, name.as_str(), correlated::executor_hook_installed())
+                {
+                    let mut call = args.clone();
+                    let at = call.len() - 2;
+                    call[at] = Bson::String(key);
+                    return correlated::call_sequence("has_table_privilege", &call);
                 }
             }
             return Ok(Bson::Boolean(true));

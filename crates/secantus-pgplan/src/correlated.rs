@@ -465,6 +465,19 @@ fn is_correlated(f: &pg_query::protobuf::FuncCall) -> bool {
     )
 }
 
+/// Does `node` hold a correlated subquery's per-row call anywhere?
+pub(crate) fn has_correlated_call(node: &pg_query::protobuf::Node) -> bool {
+    let mut copy = node.clone();
+    let mut found = false;
+    let _ = walk_expr(&mut copy, &mut |n| {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            found |= is_correlated(f);
+        }
+        Ok(())
+    });
+    found
+}
+
 /// The static type of a correlated call, when `f` is one.
 pub(crate) fn correlated_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     if !is_correlated(f) {
@@ -682,6 +695,12 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
 /// Call a sequence function. With no hook installed -- a Describe, or any
 /// plan that will not execute -- the call must NOT advance anything, and its
 /// value is not needed, so it is NULL.
+/// Is the executor's hook installed -- will an executor-answered call be
+/// answered, rather than read as NULL?
+pub(crate) fn executor_hook_installed() -> bool {
+    !SUPPRESSED.with(|s| s.get()) && SEQUENCE_HOOK.with(|r| r.get()).is_some()
+}
+
 pub(crate) fn call_sequence(name: &str, args: &[Bson]) -> Result<Bson> {
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(Bson::Null);

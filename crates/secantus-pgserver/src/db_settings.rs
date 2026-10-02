@@ -80,6 +80,9 @@ impl PgHandler {
             ));
         }
         let key = name.as_deref().map(canonical_setting);
+        if let Some(msg) = key.as_deref().and_then(super::setting_change_refusal) {
+            return Err(Self::user_error("55P02", msg));
+        }
         self.remove_db_setting(key.as_deref())?;
         if let (Some(key), Some(value)) = (key, value) {
             let bytes = encode_doc(&bson::doc! {"_id": &key, "value": &value})

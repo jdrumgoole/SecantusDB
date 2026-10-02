@@ -2273,14 +2273,33 @@ impl Printer<'_> {
     fn print_from_item(&mut self, it: &Node) -> Option<()> {
         match it.node.as_ref()? {
             N::RangeVar(rv) => {
-                self.buf.push_str(&q(&rv.relname));
+                // A table of another schema is stored `schema.name`: printed
+                // qualified while its schema is off the search path (as
+                // `generate_relation_name` does), its alias compared with
+                // the bare name.
+                let bare = match rv.relname.split_once('.') {
+                    Some((schema, bare)) => {
+                        if !crate::schemas::search_path().iter().any(|s| s == schema) {
+                            self.buf.push_str(&q(schema));
+                            self.buf.push('.');
+                        }
+                        bare.to_string()
+                    }
+                    None => rv.relname.clone(),
+                };
+                self.buf.push_str(&q(&bare));
                 let written = rv
                     .alias
                     .as_ref()
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| rv.relname.clone());
                 let rte = self.level_rte(&written)?;
-                if rv.alias.is_some() || rte.refname != rv.relname {
+                let shown = if rv.relname.contains('.') {
+                    rte.refname != bare
+                } else {
+                    rv.alias.is_some() || rte.refname != rv.relname
+                };
+                if shown {
                     self.buf.push(' ');
                     self.buf.push_str(&q(&rte.refname));
                 }

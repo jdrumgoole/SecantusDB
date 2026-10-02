@@ -20,6 +20,7 @@ project venv — sqlalchemy + psycopg[binary] ride the ``dev`` extra.
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -145,6 +146,10 @@ def main() -> int:
             daemon.wait(timeout=10)
         except subprocess.TimeoutExpired:
             daemon.kill()
+            daemon.wait(timeout=10)
+        # The daemon is gone, so its WiredTiger home is ours to delete; it
+        # used to be left behind on every run.
+        shutil.rmtree(storage_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
