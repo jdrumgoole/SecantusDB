@@ -17,7 +17,9 @@ pub mod acl;
 mod agg_hoist;
 mod expr_where;
 mod filter_sublink;
+mod like_match;
 pub mod schemas;
+pub mod systypes;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -298,6 +300,11 @@ impl Error {
             }
             Error::UndefinedFunction(m) if m.starts_with("operator does not exist: ") => {
                 Some("No operator matches the given name and argument types. You might need to add explicit type casts.")
+            }
+            Error::NumericOutOfRange(m)
+                if m == "macaddr8 data out of range to convert to macaddr" =>
+            {
+                Some("Only addresses that have FF and FE as values in the 4th and 5th bytes from the left, for example xx:xx:xx:ff:fe:xx:xx:xx, are eligible to be converted from macaddr8 to macaddr.")
             }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
@@ -1350,6 +1357,9 @@ pub enum AlterTableAction {
         /// become the key (the server resolves them), and which the key's
         /// own index then replaces.
         using_index: Option<String>,
+        /// The INCLUDE columns of that index, which the key's index keeps
+        /// (`indkey` lists them after the key columns).
+        include: Vec<String>,
     },
     /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
     /// there, then enforced on every write. `named` when the statement gave
@@ -5189,6 +5199,7 @@ fn plan_alter_action(
                         },
                         columns: string_list(&k.keys),
                         using_index,
+                        include: string_list(&k.including),
                     });
                 }
                 Ok(CT::ConstrForeign) => {
@@ -5639,11 +5650,21 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
         }
         AlterTableAction::AddUnique(uq) => def.unique_constraints.push(uq.clone()),
-        AlterTableAction::AddPrimaryKey { columns, name, .. } => {
+        AlterTableAction::AddPrimaryKey {
+            columns,
+            name,
+            include,
+            ..
+        } => {
             // A name the statement gave is the constraint's (and its
             // index's), as `CONSTRAINT x PRIMARY KEY` in CREATE TABLE is.
             if *name != format!("{}_pkey", def.name) {
                 def.extra.insert("pk_name", name.clone());
+            }
+            if include.is_empty() {
+                def.extra.remove("pk_include");
+            } else {
+                def.extra.insert("pk_include", include.clone());
             }
             // The key is the document `_id`, as a CREATE TABLE key is: the
             // value itself for one column, a subdocument of the key columns
@@ -19290,6 +19311,16 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("current_schemas") => {
             "name[]".to_string()
         }
+        // A built-in declared to return `name` (`getdatabaseencoding`,
+        // `current_database`, `pg_get_userbyid`): its value is a string, which
+        // read as `text`.
+        Some(N::FuncCall(f))
+            if func_name(f).is_some_and(|n| {
+                scalar::is_scalar(&n) && scalar::static_result_type(&n) == "name"
+            }) =>
+        {
+            "name".to_string()
+        }
         Some(N::FuncCall(f))
             if func_name(f).as_deref() == Some("pg_event_trigger_table_rewrite_oid") =>
         {
@@ -22986,6 +23017,27 @@ impl TimeZoneSetting {
 
     /// `numeric_zone_hours`'s form as PostgreSQL shows the setting:
     /// `3` -> `<+03>-03`. `None` when `value` is not a bare number.
+    /// The spelling `SHOW timezone` (and the ParameterStatus) gives a zone
+    /// NAME, as `pg_tzset` settles it: a zone file's own case when one
+    /// matches case-insensitively (`america/new_york` is
+    /// `America/New_York`), and otherwise -- a POSIX spec -- upper-cased
+    /// (`gmt-3` is `GMT-3`). pgjdbc builds a Java zone from the
+    /// ParameterStatus, and Java reads `gmt-3` as GMT: a binary timestamptz
+    /// then rendered three hours off. Measured on 15.19.
+    pub fn canonical_name(value: &str) -> String {
+        let v = value.trim().trim_matches('\'');
+        if let Some(tz) = chrono_tz::TZ_VARIANTS
+            .iter()
+            .find(|tz| tz.name().eq_ignore_ascii_case(v))
+        {
+            return tz.name().to_string();
+        }
+        if v.bytes().any(|b| b.is_ascii_digit()) && v.is_ascii() {
+            return v.to_ascii_uppercase();
+        }
+        v.to_string()
+    }
+
     pub fn canonical_setting(value: &str) -> Option<String> {
         let v = value.trim().trim_matches('\'');
         let hours = numeric_zone_hours(v)?;
@@ -24201,6 +24253,13 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                 let from = current.replace(target.clone());
                 if let Some(cast) = from.as_deref().and_then(|f| user_casts::find(f, target)) {
                     v = user_casts::apply(&cast, v)?;
+                    prev = Some(target);
+                    continue;
+                }
+                // `pg_lsn_out` / `macaddr8tomacaddr`: what the stored form
+                // does not say by itself.
+                if let Some(out) = systypes_cast(from.as_deref(), target, &v) {
+                    v = out?;
                     prev = Some(target);
                     continue;
                 }
@@ -26338,6 +26397,33 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // `timestamp`) and rendered in the session zone on the way out --
             // storing session-rendered text would be a wrong answer for any
             // other session. infinity / wide-year / BC stay text.
+            // A wide or BC reading that names its own offset or zone
+            // (`0101-01-01 BC -05`, which pgjdbc sends for a BC date) is that
+            // instant: the generic path below read it as a `timestamp` and
+            // dropped the offset.
+            if let Ok(GeneralDateTime::At(at, offset, zone, _)) =
+                decode_general(as_text(&value).trim(), "timestamp with time zone")
+            {
+                if !(1..=9999).contains(&chrono::Datelike::year(&at))
+                    && (offset.is_some() || zone.is_some())
+                {
+                    let local = at.and_utc().timestamp_micros();
+                    let seconds = match (offset, zone) {
+                        (Some(s), _) => s,
+                        (None, Some(z)) => TimeZoneSetting::Named(z)
+                            .offset_for_local(local)
+                            .local_minus_utc(),
+                        (None, None) => 0,
+                    };
+                    let utc = at - chrono::Duration::seconds(i64::from(seconds));
+                    if let Some(text) = wide_timestamp_text(&utc) {
+                        return Ok(Bson::String(text));
+                    }
+                    return Ok(timestamptz_value_from_micros(
+                        utc.and_utc().timestamp_micros(),
+                    ));
+                }
+            }
             if let Some(text) = special_timestamp_text(&as_text(&value)) {
                 // A wide or BC instant is kept as UTC text: one given with no
                 // offset is read in the session zone now, not at output.
@@ -26411,6 +26497,15 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         },
         "inet" => Ok(Bson::String(net::normalize_inet(&as_text(&value))?)),
         "cidr" => Ok(Bson::String(net::normalize_cidr(&as_text(&value))?)),
+        "macaddr" => Ok(Bson::String(systypes::parse_macaddr(&as_text(&value))?)),
+        "macaddr8" => Ok(Bson::String(systypes::parse_macaddr8(&as_text(&value))?)),
+        "pg_lsn" => systypes::cast_lsn(&value),
+        "xid" | "cid" => Ok(systypes::cast_xid(&value)),
+        "xid8" => Ok(systypes::cast_xid8(&value)),
+        "txid_snapshot" | "pg_snapshot" => Ok(Bson::String(systypes::parse_snapshot(
+            &as_text(&value),
+            target,
+        )?)),
         "aclitem" => Ok(Bson::String(acl::parse(&as_text(&value))?)),
         "bytea" => {
             let bytes = bytea::parse(&value)?;
@@ -30104,6 +30199,36 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
     out
 }
 
+/// A cast whose answer depends on the SOURCE type, for the types in
+/// `systypes`: a `pg_lsn` (stored as its position) to a string type is
+/// `pg_lsn_out`; a `macaddr8` to `macaddr` drops the `ff:fe` middle (and
+/// refuses an address without it). `None` for every other cast.
+fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<Bson>> {
+    if *v == Bson::Null {
+        return None;
+    }
+    match (source?, target) {
+        ("pg_lsn", t) if is_string_type(t) => {
+            Some(cast_value(Bson::String(systypes::render_lsn_value(v)), t))
+        }
+        ("pg_lsn", "pg_lsn") => Some(Ok(v.clone())),
+        ("pg_lsn[]", t) if is_string_type(t) => {
+            fn out(v: &Bson) -> Bson {
+                match v {
+                    Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
+                    Bson::Null => Bson::Null,
+                    other => Bson::String(systypes::render_lsn_value(other)),
+                }
+            }
+            Some(cast_value(Bson::String(value_text(&out(v))), t))
+        }
+        ("macaddr8", "macaddr") => {
+            Some(systypes::macaddr8_to_macaddr(&value_text(v)).map(Bson::String))
+        }
+        _ => None,
+    }
+}
+
 /// Each element of an `inet[]` / `cidr[]` as `inet_out` / `cidr_out` prints
 /// it, at any depth.
 fn net_elements_out(v: &Bson, is_cidr: bool) -> Bson {
@@ -30239,6 +30364,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     let out = net_elements_out(&value, source == "cidr[]");
                     return cast_value(out, &target);
                 }
+            }
+            if let Some(out) = systypes_cast(Some(source.as_str()), &target, &value) {
+                return out;
             }
             // A money value to a string type is `cash_out` (`$1.50`).
             if source == "money" && is_string_type(&target) && value != Bson::Null {
@@ -32362,7 +32490,8 @@ fn like_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
                 // PostgreSQL 14.13: a pattern ending in the escape character
                 // is an error, not a literal backslash.
                 None => {
-                    return Err(Error::InvalidText(
+                    return Err(Error::Sqlstate(
+                        "22025",
                         "LIKE pattern must not end with escape character".into(),
                     ))
                 }
@@ -32458,6 +32587,11 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
     let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
         return Ok(Bson::Null);
     };
+    // A pattern ending in its escape errors only if matching reaches it.
+    if is_like && like_match::ends_in_escape(pattern, escape) {
+        let m = like_match::like_match(subject, pattern, escape, insensitive)?;
+        return Ok(Bson::Boolean(m != negated));
+    }
     let source = if is_like {
         like_to_regex(pattern, escape)?
     } else {
@@ -32523,6 +32657,26 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
         // A NULL pattern is NULL for every row, which is no rows.
         return Ok(match_nothing());
     };
+    // A pattern ending in its escape character errors only for a row whose
+    // matching reaches it (PostgreSQL's lazy 22025): matched per row.
+    if is_like && like_match::ends_in_escape(&pattern, escape) {
+        // Except over an indexed catalog `name` column: PostgreSQL's planner
+        // reads a wildcard-free pattern as an EXACT prefix (`like_fixed_prefix`
+        // stops at the dangling escape) and scans the index for that one
+        // value, which the LIKE then rejects without reaching the escape --
+        // `relname LIKE 'a\'` is no rows, where `relname::text LIKE 'a\'`
+        // raises 22025 (measured on 15.19).
+        let is_name = def
+            .columns
+            .iter()
+            .any(|c| c.field() == field && c.pg_type == "name");
+        if is_name && !like_match::has_wildcard(&pattern, escape) {
+            return Ok(match_nothing());
+        }
+        return Err(Error::Unsupported(
+            "a LIKE pattern ending in its escape character".into(),
+        ));
+    }
     let regex = if is_like {
         like_to_regex(&pattern, escape)?
     } else {

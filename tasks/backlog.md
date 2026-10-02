@@ -628,16 +628,17 @@ remain open:
       column with existing rows fills the hidden `__sqlexpr_` field only at
       the next open (weaker duplicate check until then, unprobed); `UNIQUE
       NULLS NOT DISTINCT` there falls back to NULLs-distinct; the Python PG
-      server was not checked for these names. Also: composite types are
-      absent from the Rust `pg_class`; index comments are keyed by bare name;
+      server was not checked for these names. Also: index comments are keyed
+      by bare name;
       `pg_get_viewdef` differs for views over schema tables; an unqualified
       `'t'::regclass` / `nextval('t')` does not walk a non-default
       `search_path`; privilege checks see the bare relname; the SQLAlchemy
       gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp dir.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
-      2026-10-02; re-measured after batch 39).** pgx is clean (377 / 0 / 22,
-      the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips). pgjdbc:
-      7354 tests, 22 failed, 28 skipped (batch 38 left 84 failed). The gauge
+      2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
+      the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
+      over one store both pass). pgjdbc: 7354 tests, 3 failed, 28 skipped
+      (batch 39 left 22 failed, batch 38 84). The gauge
       harness now also creates the `test` ROLE pgjdbc's own CI creates (a
       superuser, as an unknown user was already treated), so what the suite
       creates is owned by a real role. Batch 39 fixed (corpora `b39_*`, and
@@ -669,45 +670,53 @@ remain open:
       (on the domain doc, the Python server's layout), a schema's composite
       type's `typnamespace`, the pseudo-types in `pg_type`, `relowner`, PL/
       pgSQL `$n` argument references, `lseg ?# box`, `COPY ... HEADER`.
+      Batch 40 fixed (corpora `b40_fixes` / `b40_types`, and
+      `test_pg_temp_function_is_session_private_and_dropped_at_disconnect`):
+      the `macaddr` / `macaddr8` / `pg_lsn` / `txid_snapshot` / `pg_snapshot`
+      / `xid` / `xid8` / `cid` types (I/O, binary, arrays; `pg_lsn` stored as
+      its position so it sorts), `_custom`-style array type names
+      (`makeArrayTypeName`'s extra underscores) and composite / enum array
+      columns missing from `pg_attribute`, a LIKE pattern ending in its escape
+      (22025 only when matching reaches it; never over a catalog `name`
+      column, whose planner reads an exact prefix), a BC timestamptz with its
+      own offset (`0101-01-01 BC -05`, what pgjdbc sends) losing the offset,
+      a 2-D enum array sent as one quoted string, a Describe of a STATEMENT
+      reporting the previous Bind's binary formats (pgjdbc then decoded text
+      rows as binary -- TimezoneTest / ResultSetTest binary mode), `SHOW
+      timezone` not canonicalising a zone name's case (`gmt-3` is `GMT-3`;
+      Java read `gmt-3` as GMT), system relations' `relacl`, `xid` in
+      `pg_type` (DatabaseMetaDataCacheTest), every PostgreSQL 15 GUC
+      SHOW-able with its default (`pg15_settings.tsv`; `work_mem` answered
+      42704 after a ROLLBACK reset it), `pg_temp` functions now
+      session-private and dropped at disconnect, and `ADD PRIMARY KEY USING
+      INDEX` keeping INCLUDE columns and the index's name; also a standalone
+      composite type's `pg_class` row (relkind `c`), `pg_typeof` of a
+      built-in returning `name`, the 42P16 position, and no `search_path` /
+      `scram_iterations` in the startup ParameterStatus (PostgreSQL 15 sends
+      neither). The gauge harness
+      now gives the `test` role pgjdbc CI's password, so the suite
+      authenticates (LoginTimeoutInterruptTest).
       What still fails:
-      - DatabaseMetaDataTest `types()`: `macaddr`, `txid_snapshot`, `pg_lsn`
-        are not types here at all (no I/O); `customArrayTypeInfo()` needs
-        `_custom` as a type name (`_custom[]` fails on PostgreSQL 15 too, so
-        part of that test is 16-only); `escaping()`: `relname LIKE 'a\'`
-        errors where pgjdbc expects no error -- PostgreSQL raises the same
-        error lazily, only when matching reaches the trailing escape;
-        uninvestigated why PostgreSQL never reaches it there.
-      - DateTest testSetDate x4: `makeDate(-100, 1, 1)` set by pgjdbc reads
-        back `0102-12-31`; text and binary BC parameters both decode right
-        now (measured), so what pgjdbc sends is still to be captured.
-      - TimezoneTest getTimestamp (binary getString of a timestamptz) and
-        ResultSetTest testMaxFieldSize / testGetBooleanJDBCCompliance (binary
-        mode only): pgjdbc gets a binary column it asked for as text; a raw
-        Bind with per-column result formats is honoured (measured), so the
-        path pgjdbc takes is still to be found.
-      - EnumTest enumArrayArray, ArrayTest testUnknownArrayType (no system
-        relation has a non-NULL `relacl`; `pg_class_system.tsv` carries none),
-        UpdateableResultTest testOidUpdatable (`pg_index` has no rows for the
-        system catalogs), DatabaseMetaDataCacheTest, LoginTimeoutInterruptTest.
+      - UpdateableResultTest testOidUpdatable: `pg_index` has no rows for the
+        system catalogs, and an UPDATE of `pg_class` is not supported.
       - `BlobTransactionTest` needs `CREATE FUNCTION lo_manage() ... AS
         '$libdir/lo' LANGUAGE C` (the `lo` extension's trigger).
         ConnectionTest pGStreamSettings asserts the CLIENT socket's receive
         buffer and flickers independently of the server.
-      Also found: `create function pg_temp.f()` is neither session-private
-      nor dropped at disconnect (a second run of pgx's
-      TestConnCopyFromNoticeResponseReceivedMidStream over one store fails
-      42723); `ADD PRIMARY KEY USING INDEX` drops the index's INCLUDE columns
-      from `indkey`; a `work_mem` the server has no default for answers 42704
-      on SHOW after a ROLLBACK resets it; `pg_class` does not list another
-      session's temp tables; 42P16 for `create temp table public.x` has no
-      position; `search_path` is sent in startup ParameterStatus (PG15 does
-      not); extended Execute materialises the whole result; `set_config(x,
-      v, true)` outside a block is not visible later in the same statement;
-      SQL `lo_open` in autocommit leaves its descriptor open after the
-      statement; `pg_typeof(getdatabaseencoding())` says text, not name;
-      `pg_settings` fills only name / setting / source / context / vartype /
-      boot_val / reset_val; a notice is sent early only while a statement
-      waits on a table lock.
+      Also found and still open: a `pg_temp` function is callable
+      UNQUALIFIED (PostgreSQL never searches `pg_temp` for functions, 42883);
+      `min` / `max(macaddr)` answer where PostgreSQL has no such aggregate
+      (42883); a `pg_temp` function left by a crashed server process
+      reappears for the next session that gets the same serial (they are
+      dropped at a clean disconnect only); binary INPUT of `macaddr[]` /
+      `pg_lsn[]` parameters and of the snapshot / xid types is not decoded;
+      SET of a postmaster / sighup parameter from `pg15_settings.tsv`
+      (`shared_buffers`) is accepted where PostgreSQL refuses (55P02);
+      `pg_class` does not list another session's temp tables; extended
+      Execute materialises the whole result; `set_config(x, v, true)` outside
+      a block is not visible later in the same statement; SQL `lo_open` in
+      autocommit leaves its descriptor open after the statement; a notice is
+      sent early only while a statement waits on a table lock.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First

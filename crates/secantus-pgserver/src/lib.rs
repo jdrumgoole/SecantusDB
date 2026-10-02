@@ -27,6 +27,7 @@ mod largeobjects;
 mod live_notices;
 mod merge;
 mod partition;
+mod pg15_settings;
 mod pg_type_facts;
 mod plpgsql_do;
 mod plpgsql_fn;
@@ -279,6 +280,24 @@ fn bump_catalog_version() {
     catalog_cache()
         .version
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The startup ParameterStatus set PostgreSQL 15 sends: pgwire's, without
+/// `search_path` (reported only from PostgreSQL 18) and `scram_iterations`
+/// (from 16).
+struct Pg15StartupParameters(DefaultServerParameterProvider);
+
+impl pgwire::api::auth::ServerParameterProvider for Pg15StartupParameters {
+    fn server_parameters<C>(&self, client: &C) -> Option<HashMap<String, String>>
+    where
+        C: ClientInfo,
+    {
+        let mut params =
+            pgwire::api::auth::ServerParameterProvider::server_parameters(&self.0, client)?;
+        params.remove("search_path");
+        params.remove("scram_iterations");
+        Some(params)
+    }
 }
 
 /// The `CancelRequest` handler: a cancel connection names a `(pid, secret)`,
@@ -2835,7 +2854,7 @@ impl PgHandler {
             Arc::as_ptr(&self.storage) as usize,
             self.db().to_string(),
             version,
-            if overlay_empty {
+            if overlay_empty && !self.any_temp_function() {
                 0
             } else {
                 self.session_serial
@@ -4795,7 +4814,18 @@ impl PgHandler {
     /// the session had ever created -- each one leaves a row type here --
     /// until a plain `select 1` ran twice as slowly on a used store.
     fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
-        let docs = self.type_catalog_docs_raw(collection)?;
+        let mut docs = self.type_catalog_docs_raw(collection)?;
+        // Another session's `pg_temp` function is invisible here.
+        if collection == Self::FUNCTION_COLLECTION
+            && docs.iter().any(|d| Self::foreign_temp_function(d, self))
+        {
+            docs = Arc::new(
+                docs.iter()
+                    .filter(|d| !Self::foreign_temp_function(d, self))
+                    .cloned()
+                    .collect(),
+            );
+        }
         // Functions are stored in the Python server's shape -- every
         // parameter positionally, with `param_modes` -- and read here as
         // inputs (`params` / `param_types`) plus OUT columns.
@@ -4805,6 +4835,42 @@ impl PgHandler {
             return Ok(Arc::new(docs.iter().map(normalize_function_doc).collect()));
         }
         Ok(docs)
+    }
+
+    /// Is `d` a function in ANOTHER session's temp schema?
+    fn foreign_temp_function(d: &Document, me: &Self) -> bool {
+        d.get_str("schema")
+            .is_ok_and(|s| s.starts_with("pg_temp_") && s != me.temp_schema_name())
+    }
+
+    /// Does the function catalog hold any session's `pg_temp` function?
+    /// While one does, what a session sees of the catalog is its own.
+    fn any_temp_function(&self) -> bool {
+        self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION)
+            .is_ok_and(|docs| {
+                docs.iter()
+                    .any(|d| d.get_str("schema").is_ok_and(|s| s.starts_with("pg_temp_")))
+            })
+    }
+
+    /// Drop this session's `pg_temp` functions, as PostgreSQL does when the
+    /// session ends.
+    fn drop_own_temp_functions(&self) -> PgWireResult<()> {
+        let own = self.temp_schema_name();
+        let keys: Vec<String> = self
+            .type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
+            .iter()
+            .filter(|d| d.get_str("schema") == Ok(own.as_str()))
+            .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for key in keys {
+            self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
+        }
+        bump_catalog_version();
+        Ok(())
     }
 
     fn type_catalog_docs_raw(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
@@ -5235,12 +5301,25 @@ impl PgHandler {
                 .collect();
             if !pk.is_empty() {
                 let name = pk_constraint_name(&t);
+                // `ADD PRIMARY KEY USING INDEX` over an index with INCLUDE
+                // columns keeps them (by column name).
+                let include: Vec<i32> = t
+                    .extra
+                    .get_array("pk_include")
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Bson::as_str)
+                            .filter_map(|c| t.columns.iter().position(|x| x.name == c))
+                            .map(|i| (i + 1) as i32)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 out.push(IndexRelation {
                     oid: derived(1, &name),
                     name,
                     table: t.clone(),
                     keys: pk,
-                    include: Vec::new(),
+                    include,
                     unique: true,
                     primary: true,
                     exclusion: false,
@@ -5564,13 +5643,20 @@ impl PgHandler {
             ("information_schema".into(), 13),
             ("pg_toast".into(), 99),
         ];
-        // The session's temp namespace exists once it holds a relation, as
-        // PostgreSQL's `pg_temp_N` does.
+        // The session's temp namespace exists once it holds a relation (or
+        // a function), as PostgreSQL's `pg_temp_N` does.
+        let own_temp = self.temp_schema_name();
         if !self
             .temp_tables
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+            || self
+                .type_catalog_docs_raw(Self::FUNCTION_COLLECTION)
+                .is_ok_and(|docs| {
+                    docs.iter()
+                        .any(|d| d.get_str("schema") == Ok(own_temp.as_str()))
+                })
         {
             let name = self.temp_schema_name();
             let oid = Self::index_oid(&format!("ns:{name}"));
@@ -5641,6 +5727,23 @@ impl PgHandler {
         if let Ok(bs) = self.base_types() {
             if let Some(b) = bs.iter().find(|b| b.name == name) {
                 return Some(b.oid);
+            }
+        }
+        // A user composite's / enum's ARRAY (`custom[]`): its typarray, the
+        // element's oid + 100_000 (a column of one was missing from
+        // `pg_attribute` altogether).
+        if let Some(element) = name.strip_suffix("[]") {
+            let user = self
+                .composites()
+                .ok()
+                .and_then(|cs| cs.iter().find(|(n, _, _)| n == element).map(|c| c.1))
+                .or_else(|| {
+                    self.enums()
+                        .ok()
+                        .and_then(|es| es.iter().find(|(n, _, _)| n == element).map(|e| e.1))
+                });
+            if let Some(oid) = user {
+                return Some(oid + Self::USER_TYPE_ARRAY_OID_OFFSET);
             }
         }
         None
@@ -5775,8 +5878,19 @@ impl PgHandler {
     /// either server can call the other's.
     fn create_user_function(
         &self,
-        def: secantus_pgplan::UserFunctionDef,
+        mut def: secantus_pgplan::UserFunctionDef,
     ) -> PgWireResult<Vec<Response>> {
+        // `CREATE FUNCTION pg_temp.f`: the function lives in THIS session's
+        // temp schema -- invisible to every other session, dropped with the
+        // session (it used to land in `public`, shared and permanent, so a
+        // second run of a client's test over one store failed 42723).
+        let temp = def
+            .schema
+            .as_deref()
+            .is_some_and(|s| s == "pg_temp" || s == self.temp_schema_name());
+        if temp {
+            def.schema = Some(self.temp_schema_name());
+        }
         // A procedure is keyed by EVERY parameter (a CALL passes a
         // placeholder for each OUT one), a function by its inputs -- the
         // Python server's convention.
@@ -5788,7 +5902,11 @@ impl PgHandler {
         // `name/nargs` is the shared catalog's key; an OVERLOAD at the same
         // arity (different argument types) takes `name/nargs/types`, which the
         // Python server does not know to look for.
-        let base_key = format!("{}/{nargs}", def.name);
+        let base_key = if temp {
+            format!("{}.{}/{nargs}", self.temp_schema_name(), def.name)
+        } else {
+            format!("{}/{nargs}", def.name)
+        };
         // A routine's identity is its INPUT types (OUT ones excluded).
         let new_types: Vec<String> = def.params.iter().map(|(_, t)| t.clone()).collect();
         let same_arity: Vec<UserFunction> = self
@@ -11496,8 +11614,60 @@ impl PgHandler {
                     d.insert(f("relpartbound"), Bson::Null);
                     rows.push(d);
                 }
-                // PostgreSQL's own relations, as its pg_class lists them.
+                // A composite type is a relation too, `relkind 'c'`, under the
+                // oid its `pg_type.typrelid` (and `pg_attribute.attrelid`)
+                // gives it here.
                 let namespaces = self.namespaces();
+                let composite_schema: HashMap<i64, String> = self
+                    .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+                    .map(|docs| {
+                        docs.iter()
+                            .filter_map(|d| {
+                                Some((
+                                    d.get("oid").and_then(bson_i64)?,
+                                    d.get_str("schema").ok()?.to_string(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Only a STANDALONE one (CREATE TYPE ... AS): a table's or a
+                // view's row type is listed under the relation's own oid, so
+                // it already has its row.
+                let listed: HashSet<i64> = rows
+                    .iter()
+                    .filter_map(|d| d.get(f("oid")).and_then(bson_i64))
+                    .collect();
+                for (name, oid, fields) in self.composites().unwrap_or_default() {
+                    if listed.contains(&oid) || self.lookup(&name).is_some() {
+                        continue;
+                    }
+                    let (schema, bare) = secantus_pgplan::schemas::split_key(&name);
+                    let schema = composite_schema.get(&oid).cloned().unwrap_or(schema);
+                    let nsp = namespaces
+                        .iter()
+                        .find(|(n, _)| *n == schema)
+                        .map_or(Self::PUBLIC_NAMESPACE_OID, |(_, o)| *o);
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(oid));
+                    d.insert(f("relname"), bare.as_str());
+                    d.insert(f("relnamespace"), Bson::Int64(nsp));
+                    d.insert(f("relkind"), "c");
+                    if let Some(field) = def.field_of("reltype") {
+                        d.insert(field, Bson::Int64(oid));
+                    }
+                    d.insert(f("relnatts"), Bson::Int32(fields.len() as i32));
+                    d.insert(f("relhasindex"), false);
+                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    d.insert(f("relowner"), Bson::Int64(10));
+                    d.insert(f("relpersistence"), "p");
+                    d.insert(f("relrowsecurity"), false);
+                    d.insert(f("relforcerowsecurity"), false);
+                    d.insert(f("relispartition"), false);
+                    d.insert(f("relpartbound"), Bson::Null);
+                    rows.push(d);
+                }
+                // PostgreSQL's own relations, as its pg_class lists them.
                 rows.extend(catalog_meta::class_rows(&def, |nsp| {
                     namespaces
                         .iter()
@@ -11647,15 +11817,23 @@ impl PgHandler {
                         d.insert(f("tablename"), t.name.as_str());
                         d.insert(f("indexname"), pk_constraint_name(&t));
                         d.insert(f("tablespace"), Bson::Null);
-                        d.insert(
-                            f("indexdef"),
-                            format!(
-                                "CREATE UNIQUE INDEX {}_pkey ON {schema}.{} USING btree ({})",
-                                t.name,
+                        d.insert(f("indexdef"), {
+                            let include: Vec<&str> = t
+                                .extra
+                                .get_array("pk_include")
+                                .map(|a| a.iter().filter_map(Bson::as_str).collect())
+                                .unwrap_or_default();
+                            let mut def = format!(
+                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({})",
+                                pk_constraint_name(&t),
                                 t.name,
                                 pk.join(", ")
-                            ),
-                        );
+                            );
+                            if !include.is_empty() {
+                                def.push_str(&format!(" INCLUDE ({})", include.join(", ")));
+                            }
+                            def
+                        });
                         rows.push(d);
                     }
                     for ix in self.storage.list_indexes(self.db(), &t.name).ok()? {
@@ -12075,6 +12253,39 @@ impl PgHandler {
                     .iter()
                     .filter_map(|d| d.get(f("oid")).and_then(Bson::as_i64))
                     .collect();
+                // Each array's NAME is PostgreSQL's `makeArrayTypeName`: `_`
+                // and the element's name, with another `_` in front for as
+                // long as that is taken -- by any type's own name, or an
+                // array named before it (in creation, i.e. oid, order). So
+                // `custom`'s array is `__custom` once a type is itself
+                // named `_custom` (whose array is `___custom`), as
+                // PostgreSQL 15 renames them (`moveArrayTypeName`).
+                let array_names: HashMap<i64, String> = {
+                    let mut taken: HashSet<String> = rows
+                        .iter()
+                        .filter_map(|d| d.get_str(f("typname")).ok().map(str::to_string))
+                        .collect();
+                    let mut wanted: Vec<(i64, i64, String)> = rows
+                        .iter()
+                        .filter_map(|d| {
+                            let oid = d.get(f("oid")).and_then(Bson::as_i64)?;
+                            let array = d.get(f("typarray")).and_then(Bson::as_i64)?;
+                            let name = d.get_str(f("typname")).ok()?.to_string();
+                            (array != 0 && !have.contains(&array)).then_some((oid, array, name))
+                        })
+                        .collect();
+                    wanted.sort();
+                    let mut out = HashMap::new();
+                    for (_, array, name) in wanted {
+                        let mut candidate = format!("_{name}");
+                        while taken.contains(&candidate) {
+                            candidate.insert(0, '_');
+                        }
+                        taken.insert(candidate.clone());
+                        out.insert(array, candidate);
+                    }
+                    out
+                };
                 let mut arrays = Vec::new();
                 for d in &rows {
                     let (Some(Bson::Int64(oid)), Some(Bson::Int64(array))) =
@@ -12098,7 +12309,13 @@ impl PgHandler {
                         _ => "i".to_string(),
                     };
                     let mut a = Document::new();
-                    a.insert(f("typname"), format!("_{name}"));
+                    a.insert(
+                        f("typname"),
+                        array_names
+                            .get(array)
+                            .cloned()
+                            .unwrap_or_else(|| format!("_{name}")),
+                    );
                     a.insert(f("oid"), Bson::Int64(*array));
                     a.insert(f("typarray"), Bson::Int64(0));
                     common(&mut a, "b");
@@ -14496,7 +14713,7 @@ fn canonical_bool_guc(name: &str, value: &str) -> PgWireResult<String> {
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
 fn default_settings() -> HashMap<String, String> {
-    [
+    let own = [
         ("client_encoding", "UTF8"),
         ("DateStyle", "ISO, MDY"),
         ("TimeZone", "UTC"),
@@ -14541,8 +14758,16 @@ fn default_settings() -> HashMap<String, String> {
     ]
     .into_iter()
     .chain(INTERNAL_SETTINGS.iter().copied())
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
+    .map(|(k, v)| (k.to_string(), v.to_string()));
+    // PostgreSQL 15's own defaults first, so every parameter it has is
+    // SHOW-able (and RESET / ROLLBACK restore it rather than removing it --
+    // `work_mem` answered 42704 after a ROLLBACK reset it); the server's own
+    // values above win where both name one.
+    pg15_settings::pg15_settings()
+        .iter()
+        .map(|s| (canonical_setting(s.name), s.show.to_string()))
+        .chain(own)
+        .collect()
 }
 
 /// PostgreSQL 15's pseudo-types, `(typname, oid, typarray)`, as `pg_type`
@@ -14593,6 +14818,7 @@ const INTERNAL_SETTINGS: &[(&str, &str)] = &[
 /// Is `key` a setting of PostgreSQL's `internal` context?
 pub(crate) fn is_internal_setting(key: &str) -> bool {
     INTERNAL_SETTINGS.iter().any(|(k, _)| *k == key)
+        || pg15_settings::pg15_setting(key).is_some_and(|s| s.context == "internal")
         || matches!(
             key,
             "integer_datetimes"
@@ -14625,6 +14851,14 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             17 => "bytea",
             869 => "inet",
             650 => "cidr",
+            829 => "macaddr",
+            774 => "macaddr8",
+            3220 => "pg_lsn",
+            28 => "xid",
+            5069 => "xid8",
+            29 => "cid",
+            2970 => "txid_snapshot",
+            5038 => "pg_snapshot",
             1033 => "aclitem",
             603 => "box",
             24 => "regproc",
@@ -14667,6 +14901,9 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1001 => "bytea[]",
             1034 => "aclitem[]",
             1041 => "inet[]",
+            1040 => "macaddr[]",
+            775 => "macaddr8[]",
+            3221 => "pg_lsn[]",
             651 => "cidr[]",
             1020 => "box[]",
             1017 => "point[]",
@@ -14725,7 +14962,14 @@ fn type_size(ty: &Type) -> i16 {
         Type::BOOL | Type::CHAR => 1,
         Type::INT2 => 2,
         Type::INT4 | Type::FLOAT4 | Type::DATE | Type::OID | Type::REGTYPE | Type::REGCLASS => 4,
-        Type::INT8 | Type::FLOAT8 | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
+        Type::INT8
+        | Type::FLOAT8
+        | Type::TIME
+        | Type::TIMESTAMP
+        | Type::TIMESTAMPTZ
+        | Type::MACADDR8
+        | Type::PG_LSN => 8,
+        Type::MACADDR => 6,
         Type::TIMETZ => 12,
         Type::INTERVAL | Type::UUID => 16,
         Type::BOX | Type::LSEG => 32,
@@ -14757,6 +15001,14 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea" => Type::BYTEA,
         "inet" => Type::INET,
         "cidr" => Type::CIDR,
+        "macaddr" => Type::MACADDR,
+        "macaddr8" => Type::MACADDR8,
+        "pg_lsn" => Type::PG_LSN,
+        "xid" => Type::XID,
+        "xid8" => Type::XID8,
+        "cid" => Type::CID,
+        "txid_snapshot" => Type::TXID_SNAPSHOT,
+        "pg_snapshot" => Type::PG_SNAPSHOT,
         "refcursor" => Type::REFCURSOR,
         "money" => Type::MONEY,
         "aclitem" => Type::ACLITEM,
@@ -14889,6 +15141,11 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea[]" => Type::BYTEA_ARRAY,
         "inet[]" => Type::INET_ARRAY,
         "cidr[]" => Type::CIDR_ARRAY,
+        "macaddr[]" => Type::MACADDR_ARRAY,
+        "macaddr8[]" => Type::MACADDR8_ARRAY,
+        "pg_lsn[]" => Type::PG_LSN_ARRAY,
+        "txid_snapshot[]" => Type::TXID_SNAPSHOT_ARRAY,
+        "pg_snapshot[]" => Type::PG_SNAPSHOT_ARRAY,
         "aclitem[]" => Type::ACLITEM_ARRAY,
         "box[]" => Type::BOX_ARRAY,
         "point[]" => Type::POINT_ARRAY,
@@ -15187,7 +15444,7 @@ impl PgHandler {
         if let Some(v) = defaults.get("server_version") {
             provider.server_version = v.clone();
         }
-        pgwire::api::auth::finish_authentication0(client, &provider).await?;
+        pgwire::api::auth::finish_authentication0(client, &Pg15StartupParameters(provider)).await?;
         self.post_startup(client).await?;
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
@@ -15397,6 +15654,9 @@ impl Drop for PgHandler {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = self.drop_own_temp_tables() {
             eprintln!("secantusd-pg: dropping session temp tables failed: {e:?}");
+        }
+        if let Err(e) = self.drop_own_temp_functions() {
+            eprintln!("secantusd-pg: dropping session temp functions failed: {e:?}");
         }
         // A session's advisory locks die with it, and its table locks.
         advisory::release_session(pid);
@@ -16339,6 +16599,7 @@ impl PgHandler {
                 columns,
                 name,
                 using_index,
+                ..
             } => {
                 if def.columns.iter().any(|c| c.pk) {
                     return Err(Self::user_error(
@@ -16347,11 +16608,12 @@ impl PgHandler {
                     ));
                 }
                 if let Some(ix) = using_index {
-                    let columns = self.unique_index_columns(table, def, ix)?;
+                    let (columns, include) = self.unique_index_columns(table, def, ix)?;
                     return Ok(Some(A::AddPrimaryKey {
                         name: name.clone(),
                         columns,
                         using_index: Some(ix.clone()),
+                        include,
                     }));
                 }
                 for c in columns {
@@ -16573,6 +16835,7 @@ impl PgHandler {
                 name,
                 columns,
                 using_index,
+                ..
             } => {
                 self.add_primary_key(table, def, before, name, columns)?;
                 // The key's own index replaces the one it was made from.
@@ -16863,7 +17126,7 @@ impl PgHandler {
         table: &str,
         def: &TableDef,
         ix: &str,
-    ) -> PgWireResult<Vec<String>> {
+    ) -> PgWireResult<(Vec<String>, Vec<String>)> {
         let stored = self
             .storage
             .list_indexes(self.db(), table)
@@ -16889,19 +17152,31 @@ impl PgHandler {
                 format!("index \"{ix}\" contains expressions"),
             ));
         }
-        stored
+        let column_of = |f: &str| {
+            def.columns
+                .iter()
+                .find(|c| def.field_of(&c.name).as_deref() == Some(f))
+                .or_else(|| def.column(f))
+                .map(|c| c.name.clone())
+        };
+        let keys = stored
             .get_document("key")
-            .map(|k| {
-                k.keys()
-                    .filter_map(|f| {
-                        def.columns
-                            .iter()
-                            .find(|c| def.field_of(&c.name).as_deref() == Some(f.as_str()))
-                            .map(|c| c.name.clone())
-                    })
+            .map(|k| k.keys().filter_map(|f| column_of(f)).collect())
+            .map_err(|_| Self::user_error("42704", format!("index \"{ix}\" does not exist")))?;
+        // INCLUDE columns are recorded by FIELD in the index options.
+        let include = stored
+            .get_document("options")
+            .ok()
+            .and_then(|o| o.get_array("include").ok())
+            .or_else(|| stored.get_array("include").ok())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Bson::as_str)
+                    .filter_map(column_of)
                     .collect()
             })
-            .map_err(|_| Self::user_error("42704", format!("index \"{ix}\" does not exist")))
+            .unwrap_or_default();
+        Ok((keys, include))
     }
 
     fn add_primary_key(
@@ -25411,7 +25686,9 @@ impl PgHandler {
                     } else if key == "TimeZone" {
                         // A bare number of hours is recorded as its POSIX
                         // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
-                        secantus_pgplan::TimeZoneSetting::canonical_setting(&value).unwrap_or(value)
+                        secantus_pgplan::TimeZoneSetting::canonical_setting(&value).unwrap_or_else(
+                            || secantus_pgplan::TimeZoneSetting::canonical_name(&value),
+                        )
                     } else {
                         value
                     };
@@ -27260,7 +27537,13 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 64] = [
+    const OK: [Type; 70] = [
+        Type::MACADDR,
+        Type::MACADDR8,
+        Type::PG_LSN,
+        Type::MACADDR_ARRAY,
+        Type::MACADDR8_ARRAY,
+        Type::PG_LSN_ARRAY,
         Type::VARCHAR_ARRAY,
         Type::BPCHAR_ARRAY,
         Type::NAME_ARRAY,
@@ -27798,6 +28081,26 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         return enc.encode_field(&b.bytes);
     }
     // A uuid's binary form is its 16 raw bytes (`uuid_send`).
+    if *ty == Type::MACADDR || *ty == Type::MACADDR8 {
+        let wire = as_text(v)
+            .and_then(|t| secantus_pgplan::systypes::mac_to_wire(&t))
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field_with_type_and_format(
+            &RawEncoded(wire),
+            ty,
+            FieldFormat::Binary,
+            &FormatOptions::default(),
+        );
+    }
+    if *ty == Type::PG_LSN {
+        let lsn = secantus_pgplan::systypes::lsn_of(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field_with_type_and_format(
+            &RawEncoded(lsn.to_be_bytes().to_vec()),
+            ty,
+            FieldFormat::Binary,
+            &FormatOptions::default(),
+        );
+    }
     if *ty == Type::UUID {
         let wire = as_text(v)
             .and_then(|t| secantus_pgplan::uuid_to_wire(&t))
@@ -28017,6 +28320,9 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     if let Some(elem) = match *ty {
         Type::BYTEA_ARRAY => Some(Type::BYTEA),
         Type::UUID_ARRAY => Some(Type::UUID),
+        Type::MACADDR_ARRAY => Some(Type::MACADDR),
+        Type::MACADDR8_ARRAY => Some(Type::MACADDR8),
+        Type::PG_LSN_ARRAY => Some(Type::PG_LSN),
         Type::INET_ARRAY => Some(Type::INET),
         Type::CIDR_ARRAY => Some(Type::CIDR),
         Type::JSON_ARRAY => Some(Type::JSON),
@@ -28484,6 +28790,13 @@ fn encode_field_value_inner(
             return enc.encode_field(&Some(out));
         }
     }
+    // A pg_lsn is stored as its position and prints as `%X/%X`.
+    if *field.datatype() == Type::PG_LSN {
+        if let Some(v) = v.filter(|v| **v != Bson::Null) {
+            let out = secantus_pgplan::systypes::render_lsn_value(v);
+            return enc.encode_field(&Some(out));
+        }
+    }
     // A COMPOSITE / anonymous-RECORD ARRAY in TEXT format: render each element
     // as its composite `(...)` text and let the text-array encoder escape it
     // once. The element oid is a user oid `element_of_array_oid` does not know,
@@ -28492,7 +28805,26 @@ fn encode_field_value_inner(
     if let (Some(Bson::Array(items)), postgres_types::Kind::Array(inner)) =
         (v, field.datatype().kind())
     {
-        if *inner == Type::RECORD || matches!(inner.kind(), postgres_types::Kind::Composite(_)) {
+        if *inner == Type::RECORD
+            || matches!(
+                inner.kind(),
+                postgres_types::Kind::Composite(_) | postgres_types::Kind::Enum(_)
+            )
+        {
+            // A MULTIDIMENSIONAL one is its whole text, sent as plain TEXT:
+            // the element-wise encoder would quote each sub-array as one
+            // string (pgjdbc's EnumTest `'{{a,b},{c,d}}'::flag[][]` read back
+            // a single quoted element).
+            if items.iter().any(|x| matches!(x, Bson::Array(_))) {
+                let text = secantus_pgplan::value_text(&Bson::Array(items.clone()));
+                let options = field.format_options().clone();
+                return enc.encode_field_with_type_and_format(
+                    &Some(text),
+                    &Type::TEXT,
+                    field.format(),
+                    options.as_ref(),
+                );
+            }
             let rendered: Vec<Option<String>> = items
                 .iter()
                 .map(|x| match x {
@@ -28519,6 +28851,17 @@ fn encode_field_value_inner(
                 .map(|x| match x {
                     Bson::Null => None,
                     other => Some(secantus_pgplan::value_text(other)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
+        }
+        // A `pg_lsn[]` in text is `pg_lsn_out` per element.
+        if element == "pg_lsn" {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    other => Some(secantus_pgplan::systypes::render_lsn_value(other)),
                 })
                 .collect();
             return enc.encode_field(&rendered);
@@ -30367,6 +30710,13 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
     if let (postgres_types::Kind::Array(inner), Bson::Array(items)) = (elem.kind(), v) {
         return array_binary(items, inner);
     }
+    // `macaddr_send` / `macaddr8_send` (the raw bytes), `pg_lsn_send` (int8).
+    if *elem == Type::MACADDR || *elem == Type::MACADDR8 {
+        return secantus_pgplan::systypes::mac_to_wire(&secantus_pgplan::value_text(v));
+    }
+    if *elem == Type::PG_LSN {
+        return secantus_pgplan::systypes::lsn_of(v).map(|l| l.to_be_bytes().to_vec());
+    }
     // A geometric element: its type's `*_send` layout.
     if matches!(
         *elem,
@@ -30706,6 +31056,9 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1001 => "bytea",
         1041 => "inet",
         651 => "cidr",
+        1040 => "macaddr",
+        775 => "macaddr8",
+        3221 => "pg_lsn",
         1034 => "aclitem",
         1020 => "box",
         1017 => "point",
@@ -31054,6 +31407,7 @@ fn copy_text_row(
             Some(Bson::String(v)) if matches!(oid, 869 | 650) => {
                 secantus_pgplan::net::text_out(v, oid == 650)
             }
+            Some(v) if oid == 3220 => secantus_pgplan::systypes::render_lsn_value(v),
             Some(Bson::String(v)) => v.clone(),
             Some(Bson::Array(items)) if matches!(oid, 1041 | 651) => {
                 let rendered: Vec<Bson> = items
@@ -31168,6 +31522,15 @@ fn decode_parameter(
                     .map(|g| secantus_pgplan::geom::to_bson(&g))
                     .map_err(|e| PgHandler::err(&e))
             }
+            Some(829) if bytes.len() == 6 => Ok(Bson::String(
+                secantus_pgplan::systypes::mac_from_wire(bytes),
+            )),
+            Some(774) if bytes.len() == 8 => Ok(Bson::String(
+                secantus_pgplan::systypes::mac_from_wire(bytes),
+            )),
+            Some(3220) if bytes.len() == 8 => Ok(secantus_pgplan::systypes::lsn_bson(
+                u64::from_be_bytes(bytes[..8].try_into().expect("checked")),
+            )),
             // An oid is a 4-byte UNSIGNED integer; through i64 so the value
             // survives the top bit.
             Some(26) if bytes.len() == 4 => Ok(Bson::Int64(i64::from(u32::from_be_bytes(
@@ -32173,7 +32536,19 @@ impl ExtendedQueryHandler for PgHandler {
             })
             .collect();
         Ok(match fields {
-            Some(fields) => DescribeStatementResponse::new(types, fields),
+            // A STATEMENT's description has no Bind behind it, so every
+            // column's format is text (0), as PostgreSQL reports it ("not yet
+            // known"). The binary flag a previous Bind left set used to leak
+            // in: pgjdbc then decoded the text rows it asked for as binary
+            // (`select 1::bpchar` in binary mode: "Cannot convert the column
+            // of type BPCHAR to requested type boolean").
+            Some(fields) => DescribeStatementResponse::new(
+                types,
+                fields
+                    .iter()
+                    .map(|f| rebind_field_format(f, false))
+                    .collect(),
+            ),
             None => DescribeStatementResponse::no_data_with_parameters(types),
         })
     }

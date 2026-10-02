@@ -197,6 +197,8 @@ fn qualify_target(r: &mut RangeVar) -> Result<()> {
                 r.relname = relation_key(&t, &r.relname);
                 r.schemaname.clear();
             } else {
+                // At the relation's name, as PostgreSQL points it.
+                crate::set_error_location(r.location);
                 return Err(Error::Sqlstate(
                     "42P16",
                     "cannot create temporary relation in non-temporary schema".into(),

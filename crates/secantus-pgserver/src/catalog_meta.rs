@@ -150,9 +150,47 @@ pub(crate) fn class_rows(def: &TableDef, namespace_oid: impl Fn(&str) -> i64) ->
         put("relpartbound", Bson::Null);
         put("relhastriggers", Bson::Boolean(false));
         put("relhassubclass", Bson::Boolean(false));
+        put("relacl", system_relacl(relname, nsp, kind));
         out.push(d);
     }
     out
+}
+
+/// `relacl` of one of PostgreSQL's own relations, as initdb leaves it
+/// (15.19, bootstrap superuser `postgres`): every catalog table and view
+/// readable by PUBLIC, except the few holding secrets or server state,
+/// which only the superuser (or `pg_read_all_stats`) reads, and
+/// `pg_settings`, which PUBLIC may also UPDATE (`SET`). Indexes, TOAST
+/// relations and sequences carry none.
+fn system_relacl(relname: &str, nsp: &str, kind: &str) -> Bson {
+    if !matches!(kind, "r" | "v") || nsp == "pg_toast" {
+        return Bson::Null;
+    }
+    let owner = "postgres=arwdDxt/postgres";
+    let items: Vec<String> = match relname {
+        "pg_authid"
+        | "pg_config"
+        | "pg_file_settings"
+        | "pg_hba_file_rules"
+        | "pg_ident_file_mappings"
+        | "pg_largeobject"
+        | "pg_replication_origin_status"
+        | "pg_shadow"
+        | "pg_statistic"
+        | "pg_statistic_ext_data"
+        | "pg_subscription"
+        | "pg_user_mapping"
+            if nsp == "pg_catalog" =>
+        {
+            vec![owner.into()]
+        }
+        "pg_backend_memory_contexts" | "pg_shmem_allocations" if nsp == "pg_catalog" => {
+            vec![owner.into(), "pg_read_all_stats=r/postgres".into()]
+        }
+        "pg_settings" if nsp == "pg_catalog" => vec![owner.into(), "=rw/postgres".into()],
+        _ => vec![owner.into(), "=r/postgres".into()],
+    };
+    Bson::Array(items.into_iter().map(Bson::String).collect())
 }
 
 /// Install PostgreSQL's own relations in the planner, once: `'pg_statistic'
