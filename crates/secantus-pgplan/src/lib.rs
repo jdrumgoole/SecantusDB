@@ -29127,6 +29127,51 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
     ))
 }
 
+/// Whether a stored field name can only be addressed LITERALLY: MQL reads a
+/// dot as a path separator and a leading `$` as an operator, so a column named
+/// `"dot.s"` or `"$x"` (stored under exactly that top-level key) must never be
+/// written into a filter, a `$set` or an index key spec.
+pub fn is_literal_only_field(field: &str) -> bool {
+    field.contains('.') || field.starts_with('$')
+}
+
+/// Whether `field` is a column of `def` stored under exactly its own,
+/// literal-only name. A composite primary key's `_id.a` is a real path and
+/// is NOT one.
+pub fn is_literal_only_column_field(def: &TableDef, field: &str) -> bool {
+    is_literal_only_field(field)
+        && def
+            .columns
+            .iter()
+            .any(|c| c.name == field && c.field_override.is_none() && !c.pk)
+}
+
+/// Whether `node` reads a column of `def` whose field is literal-only.
+fn references_literal_only_column(node: &pg_query::protobuf::Node, def: &TableDef) -> bool {
+    if !def
+        .columns
+        .iter()
+        .any(|c| is_literal_only_field(&c.field()))
+    {
+        return false;
+    }
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    let literal_only = |c: &pg_query::protobuf::ColumnRef| {
+        column_ref_name(c)
+            .and_then(|name| def.field_of(&name))
+            .is_some_and(|f| is_literal_only_column_field(def, &f))
+    };
+    if let N::ColumnRef(c) = inner {
+        return literal_only(c);
+    }
+    inner.nodes().iter().any(|(n, _, _, _)| match n {
+        pg_query::NodeRef::ColumnRef(c) => literal_only(c),
+        _ => false,
+    })
+}
+
 /// Whether `node` reads a column anywhere beneath it.
 fn references_columns(node: &pg_query::protobuf::Node) -> bool {
     let mut probe = node.clone();
@@ -29216,6 +29261,17 @@ fn lower_where_plain(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<Document> {
+    // A column whose stored field is not a plain MQL field name -- `"dot.s"`,
+    // `"$x"` -- cannot be named in a filter: MQL reads the first as the path
+    // `dot` -> `s` and the second as an operator, so `WHERE "dot.s" = 'x'`
+    // matched nothing and an UPDATE through it changed nothing. Such a
+    // predicate is refused here and evaluated per row, which reads the
+    // literal key.
+    if references_literal_only_column(node, def) {
+        return Err(Error::Unsupported(
+            "a predicate over a column whose name is not a plain field".into(),
+        ));
+    }
     // A predicate over no column -- `WHERE false`, `WHERE $1` -- is decided
     // once: every row, or none (NULL is none).
     if matches!(
