@@ -1304,6 +1304,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
 dependencies = [
  "cc",
+ "libc",
  "pkg-config",
  "vcpkg",
 ]
@@ -2087,7 +2088,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "base64",
  "hmac 0.12.1",
@@ -2102,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "bson",
  "chrono",
@@ -2183,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "bson",
  "flate2",
@@ -2197,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "cc",
  "cmake",
@@ -2206,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]
