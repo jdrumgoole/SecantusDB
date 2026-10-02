@@ -99,4 +99,23 @@ impl PgHandler {
             entry.1 = kept.flatten();
         }
     }
+
+    /// `ROLLBACK TO SAVEPOINT`: put the settings back as they were when the
+    /// savepoint was established, reporting a reportable one that changes.
+    pub(crate) fn restore_savepoint_settings(&self, saved: HashMap<String, String>, gucs: TxnGucs) {
+        *self.txn_gucs.lock().unwrap_or_else(|e| e.into_inner()) = gucs;
+        let changed: Vec<(String, String)> = {
+            let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = saved
+                .iter()
+                .filter(|(k, v)| settings.get(*k) != Some(*v))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            *settings = saved;
+            changed
+        };
+        for (k, v) in changed {
+            self.note_reportable_guc(&k, &v);
+        }
+    }
 }

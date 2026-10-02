@@ -635,66 +635,79 @@ remain open:
       `search_path`; privilege checks see the bare relname; the SQLAlchemy
       gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp dir.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
-      2026-10-02; re-measured after batch 38).** pgx is clean (377 / 0 / 22,
+      2026-10-02; re-measured after batch 39).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips). pgjdbc:
-      7354 tests, 84 failed, 28 skipped (was 5637 / 133 / 28: BlobTest,
-      DatabaseMetaDataTest and RefCursorFetchTest now RUN instead of failing
-      at `initializationError`). Batch 38 landed `_pg_expandarray`, `money`,
-      `ALTER DATABASE ... SET` + `pg_settings`, large objects (the Fastpath
-      `FunctionCall` message, a vendored-pgwire patch, and the SQL `lo_*`
-      functions, stored as the Python server stores them), PL/pgSQL `OPEN`,
-      `SET LOCAL` restore + ParameterStatus at block end, named protocol
-      portals in `pg_cursors`, `pg_largeobject_metadata`, the encoding
-      functions, negative numeric scale, `DateStyle` keywords (`PostgreSQL`,
-      `euro`, `German` implying DMY), `interval + <datetime>`, the timestamp ->
-      time / timetz assignment casts, and `inet` / `cidr` / `bit` / `varbit` /
-      `money` / `refcursor` in `pg_type` (corpora `b38_*`). What still fails:
-      - DatabaseMetaDataTest (49 of 156, newly reachable): foreign keys,
-        index info, UDTs, privileges, `getSQLKeywords`, `types` -- uninvestigated.
+      7354 tests, 22 failed, 28 skipped (batch 38 left 84 failed). The gauge
+      harness now also creates the `test` ROLE pgjdbc's own CI creates (a
+      superuser, as an unknown user was already treated), so what the suite
+      creates is owned by a real role. Batch 39 fixed (corpora `b39_*`, and
+      `test_parallel_sessions_resolve_their_own_new_temp_table`): the temp
+      table race (the catalog version moved before the creating transaction
+      committed, so another session cached the pre-commit catalog on a shared
+      worker thread -- 42P01 on the creator's own table; also a session's
+      disconnect dropped its temp tables under a stale thread-local temp
+      schema), `ROLLBACK TO SAVEPOINT` undoing a SET, a volatile argument of
+      `pg_typeof()` running twice, prefix minus/plus on money, binary money
+      parameters, `LOCK TABLE` inside a function outside a block (allowed at
+      a nested level; its locks end with the implicit transaction) and
+      notices reaching the client while a statement waits (pgjdbc's
+      StatementTest cancels on them -- the "hang"), a timestamptz assigned
+      from a column / bound parameter / array parameter being re-read as a
+      wall clock (an hour off in a summer-time zone: `update t set b = a`
+      between two timestamptz columns moved the instant), timestamptz[] to
+      text, fractional seconds rounded (not truncated) to the microsecond,
+      `+hhmm` offsets, `timetz +/- interval`, an untyped operand beside an
+      interval, `(timestamptz + interval) - timestamptz`, binary BC date /
+      timestamp parameters, `LIKE`/`~` described as int4, binary varchar[] /
+      bpchar[] / name[], `max_index_keys` and the other internal settings,
+      `pg_get_keywords()`, a FOREIGN KEY's `conindid`, comma-join planning
+      (WHERE equalities hash each join; pgjdbc's getImportedKeys ran for
+      minutes and grew to 5 GB), expression and partial indexes in
+      `pg_index` / `pg_get_indexdef`, `ADD PRIMARY KEY USING INDEX`, the
+      constraint name of `ADD CONSTRAINT x PRIMARY KEY`, a domain CHECK
+      error's schema / datatype / constraint fields, `COMMENT ON DOMAIN`
+      (on the domain doc, the Python server's layout), a schema's composite
+      type's `typnamespace`, the pseudo-types in `pg_type`, `relowner`, PL/
+      pgSQL `$n` argument references, `lseg ?# box`, `COPY ... HEADER`.
+      What still fails:
+      - DatabaseMetaDataTest `types()`: `macaddr`, `txid_snapshot`, `pg_lsn`
+        are not types here at all (no I/O); `customArrayTypeInfo()` needs
+        `_custom` as a type name (`_custom[]` fails on PostgreSQL 15 too, so
+        part of that test is 16-only); `escaping()`: `relname LIKE 'a\'`
+        errors where pgjdbc expects no error -- PostgreSQL raises the same
+        error lazily, only when matching reaches the trailing escape;
+        uninvestigated why PostgreSQL never reaches it there.
+      - DateTest testSetDate x4: `makeDate(-100, 1, 1)` set by pgjdbc reads
+        back `0102-12-31`; text and binary BC parameters both decode right
+        now (measured), so what pgjdbc sends is still to be captured.
+      - TimezoneTest getTimestamp (binary getString of a timestamptz) and
+        ResultSetTest testMaxFieldSize / testGetBooleanJDBCCompliance (binary
+        mode only): pgjdbc gets a binary column it asked for as text; a raw
+        Bind with per-column result formats is honoured (measured), so the
+        path pgjdbc takes is still to be found.
+      - EnumTest enumArrayArray, ArrayTest testUnknownArrayType (no system
+        relation has a non-NULL `relacl`; `pg_class_system.tsv` carries none),
+        UpdateableResultTest testOidUpdatable (`pg_index` has no rows for the
+        system catalogs), DatabaseMetaDataCacheTest, LoginTimeoutInterruptTest.
       - `BlobTransactionTest` needs `CREATE FUNCTION lo_manage() ... AS
         '$libdir/lo' LANGUAGE C` (the `lo` extension's trigger).
-      - `LOCK TABLE` inside a PL/pgSQL function outside a block (StatementTest
-        closeInProgressStatement x2, warningsAreAvailableAsap): PostgreSQL
-        allows it. Allowing it here made the wait HANG (neither
-        statement_timeout nor a cancel ended it) when the lock holder was a
-        psycopg extended-protocol transaction, so it was reverted; the
-        refusal (25P01) stands. Repro: holder `autocommit=False; execute("lock
-        table t")` via psycopg, waiter calls a function that LOCKs t.
-      - date/time: DateTest year `0101` reads back `0102-12-31`, TimestampTest
-        (microseconds of a `timestamp` read via getTimestamp, timetz from SQL
-        time), TimezoneTest binary timestamptz rendering, PGTimeTest
-        `text + text` from typed parameters, UpdateableResultTest
-        testInsertRowWithJavaTimeValues (an OffsetDateTime inserted through
-        insertRow reads back an hour off).
-      - UpdateableResultTest testOidUpdatable: `pg_index` has no rows for the
-        system catalogs, so getPrimaryKeys over `pg_class` is empty.
-      - ServerErrorTest: a pk named by `CONSTRAINT x PRIMARY KEY` reports
-        `<table>_pkey`; testDatatype's error has no schema field.
-      - `lseg ?# box`; array-of-array (ArrayTest, EnumTest); ResultSetTest
-        testMaxFieldSize and getBoolean on bpchar (psycopg sees identical
-        descriptions, so it is something pgjdbc-specific); `COPY ... HEADER`;
-        `CallableStmtTest.testBatchCall` ("there is no parameter $1");
-        DatabaseMetaDataCacheTest / DatabaseMetaDataPropertiesTest /
-        DateStyleTest / LoginTimeoutInterruptTest (uninvestigated).
         ConnectionTest pGStreamSettings asserts the CLIENT socket's receive
         buffer and flickers independently of the server.
-      Also found: pgx's deferred-error tests (`TestConnExecDeferredError`,
-      `TestConnExecBatchDeferredError`, `TestConnExecParamsDeferredError`)
-      FLAKE under parallel sessions with 42P01 on their temp table `t` --
-      reproduced on an unmodified `main` build (2 of 3 `go test ./pgconn`
-      runs), so a temp-table visibility race, not batch 38; `pg_class` does
-      not list another session's temp tables; 42P16 for `create temp table
-      public.x` has no position; `search_path` is sent in startup
-      ParameterStatus (PG15 does not); extended Execute materialises the
-      whole result; a volatile call under `pg_typeof()` runs twice
-      (`pg_typeof(nextval('s'))` advances twice; `lo_create` too);
-      `set_config(x, v, true)` outside a block is not visible later in the
-      same statement; `ROLLBACK TO SAVEPOINT` does not undo a SET; SQL
-      `lo_open` in autocommit leaves its descriptor open after the statement;
-      prefix minus on money is not refused; a money PARAMETER in binary
-      format is not decoded; `pg_typeof(getdatabaseencoding())` says text,
-      not name; `pg_settings` fills only name / setting / source / context /
-      vartype / boot_val / reset_val.
+      Also found: `create function pg_temp.f()` is neither session-private
+      nor dropped at disconnect (a second run of pgx's
+      TestConnCopyFromNoticeResponseReceivedMidStream over one store fails
+      42723); `ADD PRIMARY KEY USING INDEX` drops the index's INCLUDE columns
+      from `indkey`; a `work_mem` the server has no default for answers 42704
+      on SHOW after a ROLLBACK resets it; `pg_class` does not list another
+      session's temp tables; 42P16 for `create temp table public.x` has no
+      position; `search_path` is sent in startup ParameterStatus (PG15 does
+      not); extended Execute materialises the whole result; `set_config(x,
+      v, true)` outside a block is not visible later in the same statement;
+      SQL `lo_open` in autocommit leaves its descriptor open after the
+      statement; `pg_typeof(getdatabaseencoding())` says text, not name;
+      `pg_settings` fills only name / setting / source / context / vartype /
+      boot_val / reset_val; a notice is sent early only while a statement
+      waits on a table lock.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
