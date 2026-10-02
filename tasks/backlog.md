@@ -624,16 +624,22 @@ remain open:
       (batches 35-36, 2026-10-02; the dialect suite is 978 / 0).** Dotted /
       `$`-named columns are fixed (corpus `dotted_columns`), with limits:
       predicates over them run per row (no index use); a plain CREATE INDEX
-      on one builds an unused path index; ALTER TABLE ADD UNIQUE on a dotted
-      column with existing rows fills the hidden `__sqlexpr_` field only at
-      the next open (weaker duplicate check until then, unprobed); `UNIQUE
-      NULLS NOT DISTINCT` there falls back to NULLs-distinct; the Python PG
-      server was not checked for these names. Also: index comments are keyed
-      by bare name;
-      `pg_get_viewdef` differs for views over schema tables; an unqualified
-      `'t'::regclass` / `nextval('t')` does not walk a non-default
-      `search_path`; privilege checks see the bare relname; the SQLAlchemy
-      gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp dir.
+      on one builds an unused path index; the Python PG server was not
+      checked for these names. (Batch 41 fixed -- corpora `b41_dotted`,
+      `b41_fixes`, `b41_privileges` -- ADD UNIQUE on a dotted column over
+      existing rows and `UNIQUE NULLS NOT DISTINCT` there, both of which
+      ACCEPTED duplicates; index comments per schema; `pg_get_viewdef` over
+      another schema's tables; `'t'::regclass` walking `search_path`
+      (`nextval` already did); privileges checked on the schema-qualified
+      table -- `SELECT` / `INSERT` on `s.t` were checked against a bare `t`
+      and so ALLOWED for any role; `has_table_privilege` answering true for
+      every role; and the gauge runner's temp dir.) Still open, found in
+      batch 41: schema `USAGE` is not enforced (`GRANT` / `REVOKE ... ON
+      SCHEMA` are accepted and ignored, so a role reads `s.t` where
+      PostgreSQL answers `42501 permission denied for schema s`);
+      `has_column_privilege` / `has_schema_privilege` / `has_sequence_privilege`
+      / `has_function_privilege` still answer true for every role;
+      `information_schema.role_table_grants` does not exist (42P01).
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
@@ -703,20 +709,25 @@ remain open:
         '$libdir/lo' LANGUAGE C` (the `lo` extension's trigger).
         ConnectionTest pGStreamSettings asserts the CLIENT socket's receive
         buffer and flickers independently of the server.
-      Also found and still open: a `pg_temp` function is callable
-      UNQUALIFIED (PostgreSQL never searches `pg_temp` for functions, 42883);
-      `min` / `max(macaddr)` answer where PostgreSQL has no such aggregate
-      (42883); a `pg_temp` function left by a crashed server process
-      reappears for the next session that gets the same serial (they are
-      dropped at a clean disconnect only); binary INPUT of `macaddr[]` /
-      `pg_lsn[]` parameters and of the snapshot / xid types is not decoded;
-      SET of a postmaster / sighup parameter from `pg15_settings.tsv`
-      (`shared_buffers`) is accepted where PostgreSQL refuses (55P02);
+      Batch 41 fixed (corpora `b41_fixes`, and the slice tests
+      `test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart`
+      / `test_binary_xid_and_snapshot_parameters_decode`): a `pg_temp`
+      function callable unqualified (now 42883), `min` / `max` over
+      `macaddr` / `macaddr8` / `uuid` / `bytea` / `json(b)` / geometry /
+      bit / xid / snapshot / tsvector (42883), a `pg_temp` function a killed
+      server left (dropped when the server opens the store), binary `xid` /
+      `cid` / `xid8` / snapshot parameters and their arrays (stored as their
+      raw bytes before; `macaddr[]` / `pg_lsn[]` already decoded), and SET /
+      `set_config` / ALTER DATABASE SET of a postmaster / sighup / backend
+      parameter (55P02). Still open:
       `pg_class` does not list another session's temp tables; extended
       Execute materialises the whole result; `set_config(x, v, true)` outside
       a block is not visible later in the same statement; SQL `lo_open` in
       autocommit leaves its descriptor open after the statement; a notice is
-      sent early only while a statement waits on a table lock.
+      sent early only while a statement waits on a table lock; the
+      `pg_snapshot_xmin` / `_xmax` / `_xip`, `pg_visible_in_snapshot` (and
+      `txid_` twins) and `pg_current_snapshot` functions do not exist
+      (0A000) though the types do.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
@@ -741,14 +752,6 @@ remain open:
       `agg_where`, `dt_input` (212 lines) and the numeric / catalog / misc /
       transactions / views / indexes / defaults / explain / casts corpora at 0
       against PostgreSQL 14. Left:
-      - An aggregate FILTER holding a subquery works since batch 24 for
-        the aggregates that skip NULL inputs (`count`, `sum`, `avg`, `min`,
-        `max`, `string_agg`, `bool_*`, `bit_*`, the variance family) by
-        rewriting it to the CASE argument it equals (`filter_sublink.rs`,
-        corpus `filter_sublink`). `array_agg` / `json_agg` / `jsonb_agg` and
-        the other NULL-keeping aggregates still answer `0A000 SubLink is not
-        supported yet` there, since the CASE form would add the filtered
-        rows back as NULLs.
       - EXPLAIN (batch 12) prints `Index Cond` / `Filter` / `Hash Cond` /
         `Join Filter` and scan aliases as PostgreSQL does (`explain_quals`
         corpus). What it cannot reproduce is PostgreSQL's COST MODEL: costs
@@ -897,6 +900,17 @@ remain open:
       `pg_get_constraintdef()` and `conbin` were re-measured working in
       batch 10.)
 
+- [ ] **OPEN — RUST pgserver: a COMMIT is not durable against a process
+      kill (found batch 41, 2026-10-02).** `secantusd-pg` opens WiredTiger
+      with `transaction_sync=(enabled=false)` (the storage default the
+      MongoDB server shares), so a SIGKILL loses the commits of roughly the
+      last second: measured with `SECANTUS_FORCE_DURABLE=1`, a `CREATE TABLE`
+      + `INSERT` acknowledged just before the kill were gone after restart,
+      while the same statements 2 s earlier survived. PostgreSQL's default
+      (`synchronous_commit = on`) makes an acknowledged COMMIT survive a
+      crash. Whether a test surrogate should pay a sync per commit is Joe's
+      call (the storage has a `sync_on_commit` knob; `secantusd-pg` does not
+      expose it).
 - [x] **RESOLVED (found and fixed 2026-09-28): a regclass/regtype operand
       inside a LIST matched NOTHING, silently.** A `regclass` value is a
       one-field document carrying its oid (`{__regclass_oid: N}`); the stored
@@ -7311,34 +7325,14 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       2BP01; `DROP INDEX a, b` works; `USING hash` and `INCLUDE (...)` render
       in `pg_indexes.indexdef`. The corpus runs WITHOUT `--rust`.
 
-- [ ] **OPEN — RUST pgserver: window functions -- the two known limits
-      (landed 2026-09-29: over an aggregate, over `generate_series`, over a
-      JOIN, and nested inside an expression).** `windows` / `windows2` /
-      `windows3` / `windows4` / the new `windows5` corpora are all at 0.
-
-      A window over an aggregate is planned as the two queries it is -- the
-      grouping, then the window over the grouped rows as a FROM-subquery
-      (`split_window_over_aggregate`). A window call nested in an expression
-      is hoisted into its own window item and the expression reads its field.
-
-      (Partitioning used to scan the distinct partition keys linearly,
-      O(partitions^2); since batch 14 it hashes a canonical encoding of each
-      key, with NaN and -0 grouped as PostgreSQL groups them.)
-
-      **Carried from the implementation, worth not re-deriving:** the DEFAULT
-      frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` whether or
-      not the window has an ORDER BY, and under RANGE a bound at CURRENT ROW
-      means the row AND ITS PEERS; `OVER w` and `OVER (w ORDER BY ...)` put
-      the referenced name in different parser fields (`name` / `refname`);
-      and a RANGE bound is always `key(current) + shift`, whichever way the
-      window is ordered.
-
-      **A corpus that agrees completely is evidence about the shapes it
-      contains and nothing else.** Two corpora of 75 lines agreed with
-      PostgreSQL while a RANGE frame whose bounds sat on ONE SIDE of the
-      current row was wrong on every row -- neither had such a frame. The
-      cheap way to find what a corpus is blind to is to enumerate the axes it
-      varies and write the combinations it skipped.
+- [x] **DONE — RUST pgserver: window functions, the two known limits**
+      (over an aggregate, over `generate_series`, over a JOIN, nested in an
+      expression) landed 2026-09-29; re-swept in batch 41: `windows` ..
+      `windows5` at 0, and one-sided RANGE / ROWS / GROUPS frames, EXCLUDE
+      and a FILTER-with-subquery window at 0 against PostgreSQL 15 (corpus
+      `b41_fixes`). Rules worth not re-deriving: the default frame is `RANGE
+      BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` with or without ORDER BY,
+      and under RANGE a CURRENT ROW bound includes the row's peers.
 
 - [x] ~~**Rust PG server: `numeric` DIVISION is refused (`0A000`).**~~ **FIXED
   — re-measured 2026-09-28** against a `secantusd-pg` built from `HEAD:crates`.

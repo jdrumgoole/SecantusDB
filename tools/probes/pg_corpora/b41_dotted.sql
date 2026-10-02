@@ -1,0 +1,30 @@
+# reference-version: 15
+# UNIQUE over a dotted / $-named column: NULLS NOT DISTINCT, and ADD UNIQUE
+# over existing rows, are enforced at once (they used to accept duplicates).
+INSERT INTO b41e VALUES (NULL)
+INSERT INTO b41e VALUES (NULL)
+SELECT count(*) FROM b41e
+ALTER TABLE b41d ADD UNIQUE ("a.b")
+INSERT INTO b41d VALUES (1, 9, 9)
+INSERT INTO b41d VALUES (3, 3, 3)
+UPDATE b41d SET "a.b" = 2 WHERE n = 3
+ALTER TABLE b41d ADD CONSTRAINT b41u UNIQUE NULLS NOT DISTINCT ("$c")
+INSERT INTO b41d VALUES (7, NULL, 7)
+INSERT INTO b41d VALUES (8, NULL, 8)
+CREATE INDEX b41di ON b41d ("a.b")
+SELECT * FROM b41d WHERE "a.b" = 2
+SELECT "a.b", "$c" FROM b41d ORDER BY 1
+# NULLS NOT DISTINCT on an expression index and on a dotted column.
+CREATE UNIQUE INDEX b41h_l ON b41h (lower(s)) NULLS NOT DISTINCT
+INSERT INTO b41h VALUES ('a', NULL, 2)
+INSERT INTO b41h VALUES ('b', 'X', 3)
+INSERT INTO b41h VALUES ('c', 'x', 4)
+CREATE UNIQUE INDEX b41h_p ON b41h ("p.q") NULLS NOT DISTINCT
+INSERT INTO b41h VALUES (NULL, 'y', 5)
+INSERT INTO b41h VALUES ('a', 'z', 6)
+CREATE UNIQUE INDEX b41h_n ON b41h (n, "p.q")
+INSERT INTO b41h VALUES ('q', 'w', 3)
+SELECT n, "p.q", s FROM b41h ORDER BY n
+DROP TABLE b41d
+DROP TABLE b41e
+DROP TABLE b41h

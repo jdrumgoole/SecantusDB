@@ -725,8 +725,19 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
                 .collect()
         })
         .unwrap_or_default();
+    // A `pg_temp` function is reached only by a call qualified with
+    // `pg_temp`, which the planner names `pg_temp.<name>`.
+    let name = d.get_str("name").unwrap_or_default();
+    let name = if d
+        .get_str("schema")
+        .is_ok_and(secantus_pgplan::is_pg_temp_schema)
+    {
+        format!("pg_temp.{name}")
+    } else {
+        name.to_string()
+    };
     secantus_pgplan::UserFn {
-        name: d.get_str("name").unwrap_or_default().to_string(),
+        name,
         arg_types: strings("param_types"),
         return_type: d.get_str("return_tag").unwrap_or("text").to_string(),
         returns_set: d.get_bool("returns_set").unwrap_or(false)
@@ -1714,6 +1725,106 @@ impl PgHandler {
             .unwrap_or_else(|_| self.session_user_name())
     }
 
+    /// Is `role` `other`, or a member of it?
+    fn role_is_member(&self, role: &str, other: &str) -> bool {
+        other == role
+            || self
+                .has_role_call(&[
+                    Bson::String(role.to_string()),
+                    Bson::String(other.to_string()),
+                    Bson::String("USAGE".into()),
+                ])
+                .is_ok_and(|b| b == Bson::Boolean(true))
+    }
+
+    /// Does `role` hold `privilege` on relation `table` (a catalog key)
+    /// itself -- as a superuser, its owner (or a member of the owning role),
+    /// or through a table-level GRANT to it, a role it is in, or PUBLIC?
+    /// `with_option` asks for the grant option too. Column privileges do not
+    /// count here.
+    fn privilege_held(
+        &self,
+        role: &str,
+        table: &str,
+        privilege: &str,
+        kind: &str,
+        with_option: bool,
+    ) -> bool {
+        if self.is_superuser(role) {
+            return true;
+        }
+        let owner = if kind == "view" {
+            self.view_owner(table)
+                .unwrap_or_else(|| self.session_user_name())
+        } else {
+            match self.lookup(table) {
+                Some(def) => self.table_owner(&def),
+                None => return true,
+            }
+        };
+        if self.role_is_member(role, &owner) {
+            return true;
+        }
+        self.storage
+            .find_matching(
+                self.db(),
+                Self::GRANT_COLLECTION,
+                &bson::doc! {"table": table},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .any(|g| {
+                let grantee = g.get_str("grantee").unwrap_or_default();
+                let list = if with_option {
+                    "option_privileges"
+                } else {
+                    "privileges"
+                };
+                (grantee.eq_ignore_ascii_case("PUBLIC") || self.role_is_member(role, grantee))
+                    && g.get_array(list)
+                        .is_ok_and(|ps| ps.iter().any(|p| p.as_str() == Some(privilege)))
+            })
+    }
+
+    /// `has_table_privilege([role,] table, privileges)`, called through the
+    /// planner's executor hook with the table already resolved to its catalog
+    /// key: true when the role holds ANY of the comma-separated privileges.
+    fn has_table_privilege_call(&self, args: &[Bson]) -> PgWireResult<Bson> {
+        if args.contains(&Bson::Null) {
+            return Ok(Bson::Null);
+        }
+        let text = |v: &Bson| secantus_pgplan::value_text(v);
+        let (role, table, privileges) = match args {
+            [t, p] => (self.current_role_name(), text(t), text(p)),
+            [r, t, p] => {
+                let r = text(r);
+                if self.role(&r)?.is_none() && r != self.session_user_name() {
+                    return Err(Self::user_error(
+                        "42704",
+                        format!("role \"{r}\" does not exist"),
+                    ));
+                }
+                (r, text(t), text(p))
+            }
+            _ => return Ok(Bson::Boolean(true)),
+        };
+        let kind = if self.view_owner(&table).is_some() || self.view_doc(&table).is_some() {
+            "view"
+        } else {
+            "table"
+        };
+        let held = privileges.split(',').any(|p| {
+            let p = p.trim().to_ascii_uppercase();
+            let (p, option) = match p.strip_suffix(" WITH GRANT OPTION") {
+                Some(base) => (base.trim().to_string(), true),
+                None => (p, false),
+            };
+            self.privilege_held(&role, &table, &p, kind, option)
+        });
+        Ok(Bson::Boolean(held))
+    }
+
     /// May `role` use `privilege` on `table` -- a table, or (`kind` "view") a
     /// view, whose owner is recorded on the view rather than a `TableDef`? A
     /// superuser and the owner (or a member of the owning role) may; anyone
@@ -1728,50 +1839,13 @@ impl PgHandler {
         sql: &str,
     ) -> PgWireResult<()> {
         let role = role.to_string();
-        if self.is_superuser(&role) {
+        if kind != "view" && self.lookup(table).is_none() {
             return Ok(());
         }
-        let owner = if kind == "view" {
-            self.view_owner(table)
-                .unwrap_or_else(|| self.session_user_name())
-        } else {
-            let Some(def) = self.lookup(table) else {
-                return Ok(());
-            };
-            self.table_owner(&def)
-        };
-        let member_of = |other: &str| -> bool {
-            other == role
-                || self
-                    .has_role_call(&[
-                        Bson::String(role.clone()),
-                        Bson::String(other.to_string()),
-                        Bson::String("USAGE".into()),
-                    ])
-                    .is_ok_and(|b| b == Bson::Boolean(true))
-        };
-        if member_of(&owner) {
+        if self.privilege_held(&role, table, privilege, kind, false) {
             return Ok(());
         }
-        let granted = self
-            .storage
-            .find_matching(
-                self.db(),
-                Self::GRANT_COLLECTION,
-                &bson::doc! {"table": table},
-            )
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|b| decode_doc(b).ok())
-            .any(|g| {
-                let grantee = g.get_str("grantee").unwrap_or_default();
-                (grantee.eq_ignore_ascii_case("PUBLIC") || member_of(grantee))
-                    && g.get_array("privileges")
-                        .is_ok_and(|ps| ps.iter().any(|p| p.as_str() == Some(privilege)))
-            });
-        if granted {
-            return Ok(());
-        }
+        let member_of = |other: &str| -> bool { self.role_is_member(&role, other) };
         // Without the table-level privilege, COLUMN privileges suffice when
         // they cover every column the statement needs it on -- and, for a
         // statement naming none (`select count(*) from t`), when the role
@@ -1799,9 +1873,14 @@ impl PgHandler {
                 }
             }
         }
+        // PostgreSQL names the relation bare (`permission denied for table
+        // t`), whatever its schema.
         Err(Self::user_error(
             "42501",
-            format!("permission denied for {kind} {table}"),
+            format!(
+                "permission denied for {kind} {}",
+                secantus_pgplan::schemas::split_key(table).1
+            ),
         ))
     }
 
@@ -3725,6 +3804,7 @@ impl PgHandler {
             for (expr, slot) in [
                 (item.expr.as_ref(), item.field.as_deref()),
                 (item.expr2.as_ref(), item.field2.as_deref()),
+                (item.filter_expr.as_ref(), item.filter_field.as_deref()),
             ] {
                 let (Some(expr), Some(slot)) = (expr, slot) else {
                     continue;
@@ -4857,10 +4937,22 @@ impl PgHandler {
     /// session ends.
     fn drop_own_temp_functions(&self) -> PgWireResult<()> {
         let own = self.temp_schema_name();
+        self.drop_temp_functions_where(|s| s == own)
+    }
+
+    /// Drop EVERY session's `pg_temp` functions. Run when the server opens a
+    /// store, before any session exists: a function a crashed process left
+    /// would otherwise reappear in the next session given the same serial
+    /// (PostgreSQL clears a temp namespace before reusing it).
+    pub(crate) fn drop_orphan_temp_functions(&self) -> PgWireResult<()> {
+        self.drop_temp_functions_where(|s| s.starts_with("pg_temp_"))
+    }
+
+    fn drop_temp_functions_where(&self, pick: impl Fn(&str) -> bool) -> PgWireResult<()> {
         let keys: Vec<String> = self
             .type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
             .iter()
-            .filter(|d| d.get_str("schema") == Ok(own.as_str()))
+            .filter(|d| d.get_str("schema").is_ok_and(&pick))
             .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
             .collect();
         if keys.is_empty() {
@@ -7520,6 +7612,10 @@ impl PgHandler {
         };
         if ci.unique {
             options.insert("unique", true);
+            // `NULLS NOT DISTINCT`: a NULL key is kept, and collides.
+            if ci.nulls_not_distinct {
+                options.insert("sqlNullsNotDistinct", true);
+            }
         }
         if let Some(sql) = &ci.predicate_sql {
             options.insert("sqlPredicate", sql.as_str());
@@ -7789,7 +7885,7 @@ impl PgHandler {
         for e in exprs.iter().filter_map(Bson::as_str) {
             let expr = secantus_pgplan::plan_check_expression(e, def).map_err(|e| Self::err(&e))?;
             let v = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
-            if v == Bson::Null {
+            if v == Bson::Null && !nulls_not_distinct(ix) {
                 return Ok(None);
             }
             // A collated key (`__coll_key('c', col)`) is SHOWN as its column's
@@ -8324,6 +8420,16 @@ impl PgHandler {
         Ok(())
     }
 
+    /// An index comment's key: the bare index name (the Python server's
+    /// layout) for an index in `public`, `schema.name` elsewhere -- two
+    /// schemas may each have an index of one name.
+    fn index_comment_key(ix: &IndexRelation) -> String {
+        match secantus_pgplan::schemas::split_key(&ix.table.name) {
+            (s, _) if s != "public" => format!("{s}.{}", ix.name),
+            _ => ix.name.clone(),
+        }
+    }
+
     /// A relation name from a `COMMENT ON` object's name parts: `public` is
     /// the default schema and drops out; another schema stays qualified.
     fn comment_relation(parts: &[String]) -> String {
@@ -8473,18 +8579,30 @@ impl PgHandler {
                     },
                     [] => (None, String::new()),
                 };
-                if !self.index_relations().iter().any(|ix| {
-                    ix.name == name
-                        && schema.as_ref().is_none_or(|s| {
-                            secantus_pgplan::schemas::split_key(&ix.table.name).0 == *s
-                        })
-                }) {
+                // An unqualified name is the index the search path finds.
+                let indexes = self.index_relations();
+                let found = match &schema {
+                    Some(s) => indexes.iter().find(|ix| {
+                        ix.name == name
+                            && secantus_pgplan::schemas::split_key(&ix.table.name).0 == *s
+                    }),
+                    None => secantus_pgplan::schemas::search_path()
+                        .iter()
+                        .find_map(|s| {
+                            indexes.iter().find(|ix| {
+                                ix.name == name
+                                    && secantus_pgplan::schemas::split_key(&ix.table.name).0 == *s
+                            })
+                        }),
+                };
+                let Some(ix) = found else {
                     return Err(missing_relation(&Self::comment_relation(names)));
-                }
+                };
+                let key = Self::index_comment_key(ix);
                 self.put_comment_doc(
                     Self::INDEX_COMMENT_COLLECTION,
-                    &name,
-                    comment.map(|c| bson::doc! {"_id": &name, "comment": c}),
+                    &key,
+                    comment.map(|c| bson::doc! {"_id": &key, "comment": c}),
                 )
             }
             "function" | "procedure" => {
@@ -10195,7 +10313,7 @@ impl PgHandler {
             for ix in self.index_relations() {
                 if let Some(c) = index_comments
                     .iter()
-                    .find(|d| d.get_str("_id") == Ok(ix.name.as_str()))
+                    .find(|d| d.get_str("_id") == Ok(Self::index_comment_key(&ix).as_str()))
                     .and_then(|d| d.get_str("comment").ok())
                 {
                     out.push((ix.oid, 0, c.to_string()));
@@ -14228,12 +14346,15 @@ impl PgHandler {
                 // key's value, which storage can index.
                 let quoted: Vec<String> = uq.columns.iter().map(|c| quote_ident(c)).collect();
                 let field = Self::expression_index_field(&uq.name);
-                let options = bson::doc! {
+                let mut options = bson::doc! {
                     "unique": true,
                     "partialFilterExpression": { field.clone(): { "$exists": true } },
                     "sqlExpressions": quoted.clone(),
                     "sqlKeys": quoted,
                 };
+                if uq.nulls_not_distinct {
+                    options.insert("sqlNullsNotDistinct", true);
+                }
                 storage
                     .create_index(
                         db,
@@ -14828,6 +14949,23 @@ pub(crate) fn is_internal_setting(key: &str) -> bool {
                 | "server_version"
                 | "server_version_num"
         )
+}
+
+/// Why `SET key` is refused (55P02), where PostgreSQL 15 refuses it: an
+/// `internal` setting never changes, a `postmaster` one only at a restart, a
+/// `sighup` one only in the configuration file, a `backend` one only at
+/// connection start. `None` for a setting a session may change.
+pub(crate) fn setting_change_refusal(key: &str) -> Option<String> {
+    if is_internal_setting(key) {
+        return Some(format!("parameter \"{key}\" cannot be changed"));
+    }
+    let why = match pg15_settings::pg15_setting(key)?.context {
+        "postmaster" => "cannot be changed without restarting the server",
+        "sighup" => "cannot be changed now",
+        "backend" | "superuser-backend" => "cannot be set after connection start",
+        _ => return None,
+    };
+    Some(format!("parameter \"{key}\" {why}"))
 }
 
 /// The PostgreSQL type a column's declared type maps onto over the wire.
@@ -16829,7 +16967,16 @@ impl PgHandler {
                     &uq.columns,
                     uq.nulls_not_distinct,
                 )?;
-                Self::create_unique_index(&self.storage, self.db(), def, uq)
+                Self::create_unique_index(&self.storage, self.db(), def, uq)?;
+                // A constraint over a `"dot.s"` / `"$x"` column is an
+                // expression index: the existing rows take its field now, or
+                // they would not collide with a new duplicate until the next
+                // open.
+                let field = Self::expression_index_field(&uq.name);
+                if self.expr_indexes(def)?.iter().any(|ix| ix.field == field) {
+                    self.refresh_expr_fields(table, &Document::new())?;
+                }
+                Ok(())
             }
             A::AddPrimaryKey {
                 name,
@@ -17769,6 +17916,9 @@ impl PgHandler {
         }
         if name == "pg_has_role" {
             return self.has_role_call(args);
+        }
+        if name == "has_table_privilege" {
+            return self.has_table_privilege_call(args);
         }
         if name.starts_with("lo") && largeobjects::is_sql_function(name) {
             return self.lo_sql_call(name, args);
@@ -19157,6 +19307,9 @@ impl PgHandler {
                     other => format!("{other}"),
                 };
                 let key = canonical_setting(name);
+                if let Some(msg) = setting_change_refusal(&key) {
+                    return Err(Self::user_error("55P02", msg));
+                }
                 if key == "client_encoding" {
                     // Same validation / canonicalisation / report as `SET`, and
                     // the value returned to the caller is the canonical spelling
@@ -25626,11 +25779,8 @@ impl PgHandler {
             }
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
-                if is_internal_setting(&key) {
-                    return Err(Self::user_error(
-                        "55P02",
-                        format!("parameter \"{key}\" cannot be changed"),
-                    ));
+                if let Some(msg) = setting_change_refusal(&key) {
+                    return Err(Self::user_error("55P02", msg));
                 }
                 if key == "role" {
                     // `SET ROLE r`: r must exist, and a non-superuser may take
@@ -31072,6 +31222,11 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         // stay the literal string, and a binary result then refused it as
         // `cannot send this value as a binary _oid`.
         1028 => "oid",
+        1011 => "xid",
+        1012 => "cid",
+        271 => "xid8",
+        2949 => "txid_snapshot",
+        5039 => "pg_snapshot",
         _ => return None,
     })
 }
@@ -31457,6 +31612,22 @@ fn copy_text_row(
     bytes::Bytes::from(out.into_bytes())
 }
 
+/// A snapshot's binary form as its text, `xmin:xmax:xip,...`.
+fn binary_snapshot(bytes: &[u8]) -> Option<String> {
+    let nxip = usize::try_from(i32::from_be_bytes(bytes.get(..4)?.try_into().ok()?)).ok()?;
+    let word = |i: usize| -> Option<u64> {
+        let at = 4 + 8 * i;
+        Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+    };
+    if bytes.len() != 4 + 8 * (2 + nxip) {
+        return None;
+    }
+    let xips: Vec<String> = (0..nxip)
+        .map(|i| word(2 + i).map(|x| x.to_string()))
+        .collect::<Option<_>>()?;
+    Some(format!("{}:{}:{}", word(0)?, word(1)?, xips.join(",")))
+}
+
 /// Decode one bound parameter into the value the planner will substitute.
 ///
 /// `None` is SQL NULL. A client may declare a parameter's type as oid 0
@@ -31531,6 +31702,28 @@ fn decode_parameter(
             Some(3220) if bytes.len() == 8 => Ok(secantus_pgplan::systypes::lsn_bson(
                 u64::from_be_bytes(bytes[..8].try_into().expect("checked")),
             )),
+            // `xid` / `cid` (4-byte) and `xid8` (8-byte) unsigned counters,
+            // and a snapshot (`int32 nxip, int64 xmin, int64 xmax, int64
+            // xip...` -- `pg_snapshot_send`), decoded to the text a text
+            // parameter carries so both take one path.
+            Some(28 | 29) if bytes.len() == 4 => {
+                Ok(secantus_pgplan::systypes::cast_xid(&Bson::String(
+                    u32::from_be_bytes(bytes[..4].try_into().expect("checked")).to_string(),
+                )))
+            }
+            Some(5069) if bytes.len() == 8 => {
+                Ok(secantus_pgplan::systypes::cast_xid8(&Bson::String(
+                    u64::from_be_bytes(bytes[..8].try_into().expect("checked")).to_string(),
+                )))
+            }
+            // `pg_snapshot_recv` checks what `pg_snapshot_in` does, under
+            // its own error (22P03).
+            Some(2970 | 5038) => binary_snapshot(bytes)
+                .and_then(|t| secantus_pgplan::systypes::parse_snapshot(&t, "pg_snapshot").ok())
+                .map(Bson::String)
+                .ok_or_else(|| {
+                    PgHandler::user_error("22P03", "invalid external pg_snapshot data".into())
+                }),
             // An oid is a 4-byte UNSIGNED integer; through i64 so the value
             // survives the top bit.
             Some(26) if bytes.len() == 4 => Ok(Bson::Int64(i64::from(u32::from_be_bytes(
@@ -31806,6 +31999,10 @@ fn decode_parameter(
         Some(1033) => {
             secantus_pgplan::cast_text_to(&text, "aclitem", tz).map_err(|e| PgHandler::err(&e))
         }
+        // A snapshot is checked as it arrives, as `pg_snapshot_in` does.
+        Some(2970 | 5038) => secantus_pgplan::systypes::parse_snapshot(&text, "pg_snapshot")
+            .map(Bson::String)
+            .map_err(|e| PgHandler::err(&e)),
         Some(603) => {
             secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
         }
@@ -33275,6 +33472,15 @@ mod idle_timeout_guc_tests {
             "1min"
         );
     }
+}
+
+/// Does an expression index keep NULL keys (`NULLS NOT DISTINCT`)? The
+/// option sits at the top of a listed index or under its `options`.
+pub(crate) fn nulls_not_distinct(ix: &Document) -> bool {
+    ix.get_bool("sqlNullsNotDistinct").unwrap_or(false)
+        || ix
+            .get_document("options")
+            .is_ok_and(|o| o.get_bool("sqlNullsNotDistinct").unwrap_or(false))
 }
 
 /// A column name as a quoted SQL identifier, for an expression over it.

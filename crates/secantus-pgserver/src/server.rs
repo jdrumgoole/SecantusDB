@@ -291,6 +291,9 @@ pub fn bind(
             if let Err(e) = handler.refresh_all_expression_indexes() {
                 eprintln!("secantusd-pg: could not rebuild the expression indexes: {e}");
             }
+            if let Err(e) = handler.drop_orphan_temp_functions() {
+                eprintln!("secantusd-pg: could not drop orphaned temp functions: {e}");
+            }
         }
     }
     let stop_flag = Arc::new(AtomicBool::new(false));
