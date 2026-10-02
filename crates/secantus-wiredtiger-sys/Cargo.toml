@@ -1,6 +1,6 @@
 [package]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 edition = "2021"
 description = "Builds the WiredTiger storage engine (mongodb-7.0.33, SecantusDB's patches) from bundled source as a static library. Internal to SecantusDB: no semver promise."
 license = "GPL-2.0-only"
@@ -31,7 +31,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 # rather than the host means the result needs nothing beyond libc (a macOS
 # binary once linked Homebrew's liblz4 by absolute path and would not start
 # elsewhere). lz4 is compiled here from `lz4/lz4.c` alone -- see build.rs.
-libz-sys = { version = "1", default-features = false, features = ["static"] }
+# zlib: the SYSTEM library where there is one (always on macOS, which ships it
+# in the SDK; normally on Linux), built from source only where there is not.
+# Not `static` by default: a static build compiles zlib with `cc`, which copies
+# rustc's PGO flags onto clang, and Apple clang's profile format is not
+# rustc's -- that mismatch broke the macOS PGO release build. The Linux release
+# lane sets LIBZ_SYS_STATIC=1 to link it statically (gcc, so no flags copied).
+libz-sys = { version = "1", default-features = false, features = ["libc"] }
 
 [build-dependencies]
 cmake = "0.1"

@@ -132,6 +132,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
 dependencies = [
  "cc",
+ "libc",
  "pkg-config",
  "vcpkg",
 ]
@@ -235,7 +236,7 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "cc",
  "cmake",
@@ -244,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.166"
+version = "0.5.3-beta.167"
 dependencies = [
  "bindgen",
  "secantus-wiredtiger-sys",
