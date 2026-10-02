@@ -35,6 +35,7 @@ mod plpgsql_fn;
 mod plpgsql_portals;
 mod procedures;
 mod renames;
+mod row_waits;
 mod rules;
 mod schema_rows;
 mod server;
@@ -2255,6 +2256,13 @@ pub struct PgHandler {
     /// The value this session's most recent `nextval` / `setval` produced,
     /// whichever sequence it was, for `lastval()`.
     session_lastval: Mutex<Option<i64>>,
+    /// The sequence `session_lastval` came from, for `lastval()`'s privilege check.
+    session_lastval_seq: Mutex<Option<String>>,
+    /// Described result columns by statement text and parameter types, so a
+    /// statement described before each Execute (psycopg describes every
+    /// portal) is planned once rather than twice. Valid while the catalog
+    /// version, the session's settings and its role are what they were.
+    describe_cache: Mutex<HashMap<DescribeKey, DescribeEntry>>,
     /// A password login in progress: the role, its stored credentials, and --
     /// once the client's first SASL message arrived -- the SCRAM exchange.
     auth: Mutex<
@@ -2666,6 +2674,8 @@ impl PgHandler {
             uncommitted: Mutex::new(HashMap::new()),
             session_currval: Mutex::new(HashMap::new()),
             session_lastval: Mutex::new(None),
+            session_lastval_seq: Mutex::new(None),
+            describe_cache: Mutex::new(HashMap::new()),
             auth: Mutex::new(None),
             md5_auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
@@ -14988,6 +14998,12 @@ impl PgHandler {
     }
 }
 
+/// `(statement text, parameter count, parameter types, binary results)`:
+/// a column's described FORMAT follows the Bind's result format.
+type DescribeKey = (String, usize, Vec<Option<String>>, bool);
+/// `(catalog version, settings generation, role, fields)`.
+type DescribeEntry = (u64, u64, String, Option<Vec<FieldInfo>>);
+
 /// PostgreSQL's canonical spelling for a setting name.
 ///
 /// `SHOW datestyle` answers a column called `DateStyle` -- lookups are
@@ -18214,6 +18230,10 @@ impl PgHandler {
             .session_lastval
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(value);
+        *self
+            .session_lastval_seq
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
     }
 
     /// A sequence function reached inside an EXPRESSION (`values
@@ -18315,22 +18335,37 @@ impl PgHandler {
                 self.note_currval(&seq, set);
                 Ok(Bson::Int64(set))
             }
-            "lastval" => self
-                .session_lastval
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .map(Bson::Int64)
-                .ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "55000".into(), // object_not_in_prerequisite_state
-                        "lastval is not yet defined in this session".into(),
-                    )))
-                }),
+            "lastval" => {
+                // PostgreSQL checks USAGE or SELECT on the sequence the
+                // value came from.
+                let last_seq = self
+                    .session_lastval_seq
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(last_seq) = last_seq {
+                    self.check_sequence_privilege(&last_seq, &["USAGE", "SELECT"])?;
+                }
+                self.lastval_value()
+            }
             other => Err(Self::err(&PlanError::Unsupported(format!(
                 "function {other}()"
             )))),
         }
+    }
+
+    fn lastval_value(&self) -> PgWireResult<Bson> {
+        self.session_lastval
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(Bson::Int64)
+            .ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "55000".into(), // object_not_in_prerequisite_state
+                    "lastval is not yet defined in this session".into(),
+                )))
+            })
     }
 
     /// A wire error as a planner error, keeping its SQLSTATE, for a callback
@@ -19391,6 +19426,7 @@ impl PgHandler {
                     // block's first write, which then "committed" as nothing.
                     let handle = self.with_isolation(handle)?;
                     let fresh = Self::row_write(&stmt) && !handle.has_written();
+                    let rebase = Self::row_write(&stmt) && !fresh;
                     let mut poll = fresh.then(|| self.lock_wait_poll());
                     let mut delay = std::time::Duration::from_millis(2);
                     loop {
@@ -19412,6 +19448,13 @@ impl PgHandler {
                                 poll()?;
                                 std::thread::sleep(delay);
                                 delay = (delay * 2).min(std::time::Duration::from_millis(20));
+                            }
+                            (Err(e), None)
+                                if rebase
+                                    && Self::is_write_conflict(e)
+                                    && self.read_committed_now() =>
+                            {
+                                break self.rerun_after_conflict(handle, &stmt, max_rows);
                             }
                             _ => break out,
                         }
@@ -19477,6 +19520,86 @@ impl PgHandler {
                 | Statement::Delete(_)
                 | Statement::Merge(_)
         )
+    }
+
+    /// A READ COMMITTED block that has ALREADY written lost a write conflict
+    /// on `stmt`. PostgreSQL waits for the other writer and re-checks the row
+    /// it left; WiredTiger cannot refresh the snapshot of a transaction that
+    /// has written, and the conflict leaves it able only to roll back. So the
+    /// block's transaction is MOVED onto a fresh snapshot with its writes
+    /// replayed (`Storage::rebase_user_transaction`, which takes the new
+    /// snapshot while the old transaction still holds its rows) and the
+    /// statement run again there -- after a wait, polled for a cancel,
+    /// `statement_timeout` and `lock_timeout`, and repeated while it still
+    /// collides. A cycle of such waits is 40P01, checked once
+    /// `deadlock_timeout` (1s) into the wait as PostgreSQL does. A block whose
+    /// writes cannot be replayed (DDL) keeps the old answer, 40001.
+    fn rerun_after_conflict(
+        &self,
+        handle: &mut UserTransactionHandle,
+        stmt: &Statement,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let waiting = row_waits::Waiting::new(pid);
+        let mut poll = self.lock_wait_poll();
+        let mut delay = std::time::Duration::from_millis(2);
+        let started = std::time::Instant::now();
+        let mut checked = false;
+        let conflict = || {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "40001".into(),
+                "could not serialize access due to concurrent update".into(),
+            )))
+        };
+        // The writers at the last attempt. Each attempt lets go of this
+        // block's rows for a moment (the rebase), so it is made only when one
+        // of them has ended -- or, for a holder that takes no table lock (an
+        // autocommit statement), when there are none, or after a while.
+        let mut held_at_attempt = row_waits::writers_other_than(pid);
+        let mut last_attempt = std::time::Instant::now();
+        loop {
+            let writers = row_waits::writers_other_than(pid);
+            waiting.set(writers.clone());
+            if !checked && started.elapsed() >= std::time::Duration::from_secs(1) {
+                checked = true;
+                if waiting.deadlocked() {
+                    return Err(Self::deadlock_error());
+                }
+            }
+            poll()?;
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(std::time::Duration::from_millis(20));
+            let one_ended = held_at_attempt.iter().any(|p| !writers.contains(p));
+            if !(writers.is_empty()
+                || one_ended
+                || last_attempt.elapsed() >= std::time::Duration::from_millis(500))
+            {
+                continue;
+            }
+            held_at_attempt = writers;
+            last_attempt = std::time::Instant::now();
+            match self.storage.rebase_user_transaction(handle) {
+                Ok(true) => {}
+                Ok(false) => return Err(conflict()),
+                // The old transaction is gone: the block fails, as it would
+                // have on the conflict itself, and nothing of it commits.
+                Err(e) => {
+                    eprintln!("secantusd-pg: could not move a transaction to a new snapshot: {e}");
+                    return Err(conflict());
+                }
+            }
+            let out = self
+                .storage
+                .with_user_transaction(handle, || self.execute(stmt.clone(), max_rows))
+                .map_err(|e| Self::storage_err("transaction failed", e))
+                .and_then(|r| r);
+            match out {
+                Err(e) if Self::is_write_conflict(&e) => continue,
+                other => return other,
+            }
+        }
     }
 
     /// Is `e` the serialization failure a write conflict surfaces as?
@@ -19648,6 +19771,16 @@ impl PgHandler {
                 .is_empty()
             {
                 table_locks::release(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+                // And its rows: PostgreSQL's abort releases the row locks too,
+                // so a session waiting on one (a deadlock's survivor) goes on
+                // without waiting for this block's ROLLBACK.
+                if let Ok(mut guard) = self.txn.try_lock() {
+                    if let Some(handle) = guard.as_mut() {
+                        if let Err(e) = self.storage.rollback_user_transaction(handle) {
+                            eprintln!("secantusd-pg: rolling back a failed block: {e}");
+                        }
+                    }
+                }
             }
         }
         // An error anywhere in an extended-protocol statement group -- a
@@ -21248,6 +21381,12 @@ impl PgHandler {
                 .filter(|(_, d)| !d.contains_key(&field))
                 .map(|(i, _)| i)
                 .collect();
+            // A SERIAL default is an ordinary `nextval` call, so PostgreSQL
+            // checks the inserting role's USAGE / UPDATE on its sequence; an
+            // IDENTITY column's sequence is the table's own and is not.
+            if !missing.is_empty() && column.identity.is_none() {
+                self.check_sequence_privilege(sequence, &["USAGE", "UPDATE"])?;
+            }
             let values = self.nextval(sequence, missing.len())?;
             // A serial INSERT defines this session's `currval` for the
             // column's sequence, exactly as an explicit `nextval` would --
@@ -25904,6 +26043,10 @@ impl PgHandler {
                         .session_lastval
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
+                    *self
+                        .session_lastval_seq
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 Ok(vec![Response::Execution(Tag::new(&format!(
                     "DISCARD {what}"
@@ -27148,6 +27291,16 @@ impl PgHandler {
             },
             _ => Self::storage_err("could not update", e),
         })?;
+        // A matched row the update left unchanged was not written, so it
+        // holds no row lock: PostgreSQL's UPDATE locks every row it matches,
+        // waiting for (and re-checking against) another session's
+        // uncommitted write to it. Take those locks now -- a conflict here is
+        // the same 40001 / wait-and-retry any write conflict is.
+        if outcome.modified < outcome.matched {
+            self.storage
+                .lock_matching(self.db(), table, filter)
+                .map_err(|e| Self::storage_err("could not lock the updated rows", e))?;
+        }
         Ok(outcome.matched)
     }
 }
@@ -32781,6 +32934,30 @@ impl PgHandler {
         if is_empty_query(sql.trim().trim_end_matches(';').trim()) {
             return Ok(None);
         }
+        let catalog_version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let role = self.current_role_name();
+        let binary = self
+            .binary_results
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let key: DescribeKey = (sql.to_string(), n_params, param_types.to_vec(), binary);
+        if let Some((v, g, r, fields)) = self
+            .describe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *v == catalog_version && *g == generation && *r == role {
+                return Ok(fields.clone());
+            }
+        }
+        let ran_subquery = std::cell::Cell::new(false);
         let params = vec![Bson::Null; n_params];
         // Describe resolves table names too, and against the same uncommitted
         // catalog, through `self.lookup`. The DECLARED parameter types
@@ -32795,6 +32972,7 @@ impl PgHandler {
         // planner -- otherwise unable to touch storage -- a way to evaluate
         // one.
         let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+            ran_subquery.set(true);
             self.subquery_rows(stmt)
         };
         let stmt = secantus_pgplan::plan_with_session_types_and_subqueries(
@@ -32832,6 +33010,35 @@ impl PgHandler {
                 .collect();
             return self.describe_fields(&query, declared.len(), &declared);
         }
+        // Only a statement whose description is a function of the catalog,
+        // the settings and the role: not a FETCH (the cursor's), and not one
+        // whose subqueries ran while planning (their values are inlined).
+        let cacheable = !ran_subquery.get()
+            && matches!(
+                stmt,
+                Statement::Select(_)
+                    | Statement::SetOp(_)
+                    | Statement::Aggregate(_)
+                    | Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
+            );
+        let fields = self.describe_planned(stmt)?;
+        if cacheable {
+            let mut cache = self
+                .describe_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(key, (catalog_version, generation, role, fields.clone()));
+        }
+        Ok(fields)
+    }
+
+    /// The result columns of a planned statement (see `describe_fields`).
+    fn describe_planned(&self, stmt: Statement) -> PgWireResult<Option<Vec<FieldInfo>>> {
         Ok(Some(match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any

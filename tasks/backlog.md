@@ -651,11 +651,17 @@ remain open:
       grants keyed per signature (the catalog key, `f(int)` and `f(text)`
       apart; a bare name that is ambiguous is 42725); `ON ALL SEQUENCES /
       FUNCTIONS / PROCEDURES / ROUTINES IN SCHEMA`; and a dropped sequence's
-      or function's grants go with it. Still open: a SERIAL column's
-      default `nextval` is not checked for the inserting role (PostgreSQL
-      checks it; an identity column it does not); `lastval()` is not
-      checked; `EXECUTE` is not checked on a trigger function at CREATE
-      TRIGGER; a built-in function's grants are keyed `name/nargs`.
+      or function's grants go with it. Batch 44 (corpus `b44_privileges`,
+      22/22 against PostgreSQL 15): a SERIAL default's `nextval` is checked
+      for the inserting role (an identity column's is not), `lastval()`
+      checks USAGE / SELECT on the sequence it came from, CREATE TRIGGER
+      checks EXECUTE on the trigger function, and a built-in function's
+      grant is keyed by its signature (`abs(int4)` apart from
+      `abs(numeric)`). Still open: EXECUTE on a BUILT-IN is recorded and
+      reported by `has_function_privilege` but never checked at a call
+      (PostgreSQL refuses `abs(-1)` after `REVOKE EXECUTE ON FUNCTION
+      abs(int) FROM PUBLIC`); checking it needs the overload the planner
+      chose at every built-in call site.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
@@ -758,6 +764,12 @@ remain open:
       (PostgreSQL also runs a writing portal to completion first), so only a
       read-only SELECT could stream. Size: a storage-cursor API plus a
       portal state machine -- days, not a patch.
+      Re-read 2026-10-02 (batch 44), unchanged: every Execute runs under
+      `block_in_place` on whichever tokio worker polls the connection, and a
+      block's WiredTiger session is installed per statement
+      (`with_user_transaction`), so a cursor left open between two Executes
+      would be used from another thread and outside the scope that installed
+      its transaction. Not attempted.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
@@ -973,14 +985,42 @@ remain open:
       does, polling for a cancel, `statement_timeout` (57014) and
       `lock_timeout` (55P03). (Before, an autocommit `UPDATE ... SET n = n + 1`
       could silently overwrite a concurrent commit -- a lost update.) Left:
-      - A block that has ALREADY written and then collides answers `40001`
-        where PostgreSQL waits: WiredTiger cannot refresh the snapshot of a
-        transaction that has written, and a conflict aborts the whole of it.
-        (Until 2026-09-30 it was WORSE: the "has it written?" check read a
-        flag before the snapshot refresh that sets it, so the colliding
-        statement rolled back and retried on a fresh transaction and the
-        block's EARLIER writes silently vanished while COMMIT reported
-        success. Fixed; `test_a_blocks_earlier_write_survives_a_later_conflict`.)
+      - (FIXED 2026-10-02, batch 44) A READ COMMITTED block that has ALREADY
+        written and then collides now WAITS and re-checks, as PostgreSQL
+        does, instead of answering `40001` at once. WiredTiger cannot refresh
+        a writer's snapshot and a conflict leaves the transaction able only
+        to roll back, so the block is MOVED: a new transaction pins a fresh
+        snapshot while the old one still holds its rows, the old one rolls
+        back, and its write set (its oplog entries, as PREPARE TRANSACTION
+        uses) is replayed into the new one (`Storage::rebase_user_transaction`);
+        then the statement runs again. A row another session committed in
+        the instant between the rollback and the replay is a conflict on the
+        replay -- the block fails 40001, nothing is overwritten. A cycle of
+        such waits is 40P01, checked once 1s (`deadlock_timeout`) into the
+        wait; a failed block now lets go of its rows at once (as PostgreSQL's
+        abort does). REPEATABLE READ / SERIALIZABLE still answer 40001 (PG 15
+        too, after waiting). Slice tests `test_read_committed_block_waits_*`,
+        `test_a_cycle_of_row_waits_is_a_deadlock`,
+        `test_a_row_wait_ends_on_lock_timeout`,
+        `test_concurrent_blocks_neither_lose_nor_duplicate_writes`. Limits:
+        WiredTiger does not say WHICH transaction holds the row, so the
+        waiter waits on every session holding a write lock (ROW EXCLUSIVE+)
+        and retries when one ends, or every 500ms -- a superset of
+        PostgreSQL's single blocker, so the 40P01 check can see a cycle
+        through an unrelated writer; each retry lets go of the block's rows
+        for a moment, and a block that did DDL is not moved (still 40001).
+      - (FIXED 2026-10-02, batch 44) An UPDATE whose new row equals the old
+        (`n = n * 2` over 0) wrote nothing and so took no row lock: it
+        neither waited for another session's uncommitted update nor
+        re-checked against it (`7` where PostgreSQL 15 gives `14`). The PG
+        server now rewrites each matched-but-unchanged row with its own
+        value inside the statement's transaction (`Storage::lock_matching`,
+        PG-only; the storage no-op detection the MongoDB server's
+        `nModified` relies on is unchanged).
+        `test_an_unchanging_update_still_waits_for_the_row`. Such a lock
+        write has no oplog entry, so a block moved by
+        `rebase_user_transaction` does not carry it over (the value is
+        unchanged; only the lock is lost until the row is written again).
       - (FIXED 2026-09-30) A prepared transaction recovered after a restart
         is revived at open as a LIVE transaction -- its write set replayed
         into an open WT transaction -- so it holds its rows as before the
@@ -991,13 +1031,6 @@ remain open:
         deletion is detected at the next `COMMIT PREPARED` by the first minted
         seq being readable (`prepared_already_committed`), not by a commit
         record.
-      - Re-measured 2026-10-02 (batch 43): still as described -- block A
-        updates row 1, B holds row 2, A's update of row 2 answers `40001`
-        at once (PostgreSQL waits for B, then gives `(1,1),(2,11)`); B's
-        commit stands and nothing of A's lands, so it is a refused
-        transaction, not a lost write. Fixing it needs WiredTiger to refresh
-        a snapshot that has written (or a statement-level savepoint WT does
-        not have), so it stays.
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
@@ -1289,6 +1322,17 @@ These work end-to-end but cut corners.
       where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
       general per-statement target; the protocol work above has taken the
       extended path as far as it goes cheaply.
+
+      **Batch 44 (2026-10-02): the portal Describe no longer re-plans.**
+      psycopg describes every portal, so each extended statement was
+      planned twice. A session now caches the described columns by
+      statement text and parameter types, valid while the catalog version,
+      its settings generation and its role are unchanged (not for FETCH,
+      nor a statement whose subqueries ran while planning). Release builds,
+      `bench43.py`, two interleaved runs on a loaded box: PK read 104 ->
+      77us, autocommit update 101 -> 84us, `select 1` 60 -> 60us (its plan
+      was already cheap). The EXECUTE plan cannot be shared with Describe:
+      it is planned with the bound values inlined.
 
       **RE-MEASURED 2026-10-02 (batch 43): the per-statement cost had
       tripled since this entry, and most of it is back.** Release builds of

@@ -6683,6 +6683,71 @@ impl Storage {
         Ok(())
     }
 
+    /// Move a READ COMMITTED transaction that has written onto a FRESH
+    /// snapshot, keeping its writes: PostgreSQL's wait-then-recheck after a
+    /// write conflict, which WiredTiger cannot do in place (a transaction that
+    /// has written keeps its snapshot, and a conflict leaves it able only to
+    /// roll back).
+    ///
+    /// The new transaction's snapshot is taken while the old one is still
+    /// open, so every row the old one wrote is still held; only then is the
+    /// old one rolled back and its write set (its oplog entries -- the same
+    /// complete record `PREPARE TRANSACTION` relies on) replayed into the new
+    /// one. A row someone else committed in the moment between the rollback
+    /// and the replay was committed AFTER the new snapshot, so its replay is a
+    /// write conflict -- an error, never an overwrite.
+    ///
+    /// `Ok(false)` leaves `handle` untouched: the transaction is not one this
+    /// can move (async oplog mode, a DDL entry, a write with no oplog entry).
+    /// On `Err` the old transaction is gone and `handle` is closed: the caller
+    /// must fail the block.
+    pub fn rebase_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<bool> {
+        if self.async_oplog.is_some() || !self.enable_oplog || handle.session.is_none() {
+            return Ok(false);
+        }
+        // A write the oplog did not record cannot be replayed.
+        if handle.snapshot_fixed && handle.minted_ranges.is_empty() {
+            return Ok(false);
+        }
+        let blobs = self.transaction_write_set(handle)?;
+        let mut ops = Vec::with_capacity(blobs.len());
+        for blob in &blobs {
+            let op = decode_doc(blob)?;
+            if !matches!(op.get_str("op"), Ok("i" | "u" | "d")) {
+                return Ok(false);
+            }
+            ops.push(op);
+        }
+        let mut fresh = self.begin_user_transaction()?;
+        fresh.opened_at = handle.opened_at;
+        // Pin the new snapshot NOW, before the old transaction lets go.
+        {
+            let session = fresh
+                .session
+                .as_ref()
+                .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
+            session.begin_transaction(None)?;
+            fresh.began = true;
+            // Any read takes the snapshot; the collection registry always
+            // exists.
+            let cur = session.open_cursor(COLL_TABLE, None)?;
+            cur.next()?;
+        }
+        self.rollback_user_transaction(handle)?;
+        let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
+            for op in &ops {
+                replay::apply_entry_strict(self, op)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = applied.and_then(|r| r) {
+            self.rollback_user_transaction(&mut fresh)?;
+            return Err(e);
+        }
+        *handle = fresh;
+        Ok(true)
+    }
+
     // -- prepared (two-phase) transactions ----------------------------------
     //
     // PostgreSQL's PREPARE TRANSACTION parks a block's work under a gid so a
@@ -11077,6 +11142,39 @@ impl Storage {
     /// wrapper, kept so the many callers that have no validator at all — tests,
     /// PITR replay, the adapter's plain path — need not thread a flag that
     /// cannot affect them.
+    /// Take the row lock on every document of `coll` matching `filter`, as
+    /// PostgreSQL's UPDATE does on each row it matches whether or not the new
+    /// row differs: each doc row is rewritten with its own value inside the
+    /// caller's user transaction, so a concurrent writer of any of them is a
+    /// write conflict here. A no-op outside a user transaction (nothing would
+    /// hold the lock). Writes no oplog entry -- the value does not change --
+    /// and is not used by the MongoDB server, whose no-op updates write
+    /// nothing (`nModified`).
+    pub fn lock_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<usize> {
+        if !self.in_user_txn() {
+            return Ok(0);
+        }
+        let lock = self.coll_lock(db, coll);
+        let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.op_session()?;
+        let vars = Document::new();
+        let mut rows = Vec::new();
+        for (recordid, id_k, blob) in self.candidate_docs(&session, db, coll, filter, false)? {
+            let raw =
+                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
+            if secantus_core::query::matches_raw(raw, filter, &vars, None).map_err(query_fault)? {
+                rows.push((recordid, id_k, blob));
+            }
+        }
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        for (recordid, id_k, blob) in &rows {
+            cur.set_key_ssq(db, coll, *recordid);
+            cur.set_value_u(&frame_doc_value(id_k, blob));
+            cur.update()?;
+        }
+        Ok(rows.len())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_matching_leveled(
         &self,

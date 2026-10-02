@@ -8765,12 +8765,201 @@ def test_a_blocks_earlier_write_survives_a_later_conflict(home: Path) -> None:
         t.join(10)
         b.execute("commit")
         rows = a.execute("select id, n from tq_c order by id").fetchall()
-        # Either the whole block (PostgreSQL waits and applies both) or
-        # none of it -- never its second write without its first.
-        assert (outcome["b"], rows) in [
-            ("ok", [(1, 11), (2, 1)]),
-            ("40001", [(1, 1), (2, 0)]),
-        ]
+        # PostgreSQL waits and applies both -- never the second write
+        # without the first.
+        assert (outcome["b"], rows) == ("ok", [(1, 11), (2, 1)])
+
+
+def _block_conflict_setup(a: psycopg.Connection, b: psycopg.Connection, table: str) -> None:
+    """A has written row 1 in a block; B holds row 2 in another."""
+    a.execute(f"create table {table} (id int primary key, n int)")
+    a.execute(f"insert into {table} values (1, 0), (2, 0)")
+    b.execute("begin")
+    b.execute(f"update {table} set n = n + 1 where id = 2")
+
+
+def test_read_committed_block_waits_for_a_row_then_rechecks(home: Path) -> None:
+    """A READ COMMITTED block that has written and then updates another
+    session's row waits for it and applies against the row it committed --
+    PostgreSQL 15's `(1,1),(2,11)` -- where it used to answer 40001 at once
+    (WiredTiger cannot refresh a writer's snapshot; the block is moved onto
+    a fresh one with its writes replayed). An earlier INSERT and DELETE in
+    the block survive the move."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _block_conflict_setup(a, b, "rc_w")
+        a.execute("begin")
+        a.execute("update rc_w set n = n + 1 where id = 1")
+        a.execute("insert into rc_w values (5, 5), (6, 6)")
+        a.execute("delete from rc_w where id = 5")
+        outcome: dict[str, str] = {}
+
+        def write() -> None:
+            outcome["a"] = _sqlstate(a, "update rc_w set n = n + 10 where id = 2") or "ok"
+
+        t = threading.Thread(target=write)
+        t.start()
+        time.sleep(0.5)
+        assert t.is_alive(), "the update should wait for the other block"
+        b.execute("commit")
+        t.join(10)
+        assert outcome["a"] == "ok"
+        a.execute("commit")
+        rows = b.execute("select id, n from rc_w order by id").fetchall()
+        assert rows == [(1, 1), (2, 11), (6, 6)]
+
+
+def test_read_committed_wait_ends_on_the_other_rollback(home: Path) -> None:
+    """When the session waited on rolls back, the update applies to the row
+    as it was, and the block's own rollback leaves nothing."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _block_conflict_setup(a, b, "rc_r")
+        a.execute("begin")
+        a.execute("update rc_r set n = n + 1 where id = 1")
+        outcome: dict[str, str] = {}
+
+        def write() -> None:
+            outcome["a"] = _sqlstate(a, "update rc_r set n = n + 10 where id = 2") or "ok"
+
+        t = threading.Thread(target=write)
+        t.start()
+        time.sleep(0.3)
+        b.execute("rollback")
+        t.join(10)
+        assert outcome["a"] == "ok"
+        assert a.execute("select id, n from rc_r order by id").fetchall() == [(1, 1), (2, 10)]
+        a.execute("rollback")
+        assert b.execute("select id, n from rc_r order by id").fetchall() == [(1, 0), (2, 0)]
+
+
+def test_repeatable_read_block_conflict_stays_40001(home: Path) -> None:
+    """REPEATABLE READ / SERIALIZABLE keep PostgreSQL's 40001 and nothing of
+    the block lands."""
+    for level, table in (("repeatable read", "rr_c"), ("serializable", "sz_c")):
+        (home / table).mkdir(parents=True, exist_ok=True)
+        with _Server(home / table) as server, server.connect() as a, server.connect() as b:
+            _block_conflict_setup(a, b, table)
+            a.execute(f"begin isolation level {level}")
+            a.execute(f"update {table} set n = n + 1 where id = 1")
+            assert _sqlstate(a, f"update {table} set n = n + 10 where id = 2") == "40001"
+            a.execute("rollback")
+            b.execute("commit")
+            assert a.execute(f"select id, n from {table} order by id").fetchall() == [
+                (1, 0),
+                (2, 1),
+            ]
+
+
+def test_a_cycle_of_row_waits_is_a_deadlock(home: Path) -> None:
+    """A waits for B's row, then B for A's: the session whose
+    `deadlock_timeout` check finds the cycle (A, waiting first) gets 40P01,
+    its block's rows are let go at once, and B's update goes through --
+    PostgreSQL 15's `(1,100),(2,1)`."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _block_conflict_setup(a, b, "dl_c")
+        a.execute("begin")
+        a.execute("update dl_c set n = n + 1 where id = 1")
+        outcome: dict[str, str] = {}
+
+        def write() -> None:
+            outcome["a"] = _sqlstate(a, "update dl_c set n = n + 10 where id = 2") or "ok"
+
+        t = threading.Thread(target=write)
+        t.start()
+        time.sleep(0.3)
+        assert _sqlstate(b, "update dl_c set n = n + 100 where id = 1") is None
+        t.join(10)
+        assert outcome["a"] == "40P01"
+        a.execute("rollback")
+        b.execute("commit")
+        assert a.execute("select id, n from dl_c order by id").fetchall() == [(1, 100), (2, 1)]
+
+
+def test_a_row_wait_ends_on_lock_timeout(home: Path) -> None:
+    """The wait is a lock wait: `lock_timeout` ends it with 55P03, and the
+    failed block commits nothing."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _block_conflict_setup(a, b, "lt_c")
+        a.execute("begin")
+        a.execute("set lock_timeout = '300ms'")
+        a.execute("update lt_c set n = n + 1 where id = 1")
+        assert _sqlstate(a, "update lt_c set n = n + 10 where id = 2") == "55P03"
+        a.execute("rollback")
+        b.execute("commit")
+        assert a.execute("select id, n from lt_c order by id").fetchall() == [(1, 0), (2, 1)]
+
+
+@pytest.mark.parametrize("autocommit", [True, False])
+def test_an_unchanging_update_still_waits_for_the_row(home: Path, autocommit: bool) -> None:
+    """`n = n * 2` over 0 changes nothing, but PostgreSQL's UPDATE locks
+    every row it matches: it waits for another session's uncommitted
+    update of that row and re-checks against what that session committed
+    -- 14 on PostgreSQL 15, where the skipped write used to take no lock
+    and leave 7. Autocommit, and inside a block that has already written."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table nu_c (id int primary key, n int)")
+        a.execute("insert into nu_c values (1, 0)")
+        if not autocommit:
+            a.execute("begin")
+            a.execute("insert into nu_c values (6, 6)")
+        b.execute("begin")
+        b.execute("update nu_c set n = 7 where id = 1")
+        outcome: dict[str, str] = {}
+
+        def write() -> None:
+            outcome["a"] = _sqlstate(a, "update nu_c set n = n * 2 where id = 1") or "ok"
+
+        t = threading.Thread(target=write)
+        t.start()
+        time.sleep(0.4)
+        assert t.is_alive(), "the update should wait for the other session"
+        b.execute("commit")
+        t.join(10)
+        assert outcome["a"] == "ok"
+        if not autocommit:
+            a.execute("commit")
+        rows = b.execute("select id, n from nu_c order by id").fetchall()
+        assert rows == ([(1, 14)] if autocommit else [(1, 14), (6, 6)])
+
+
+def test_concurrent_blocks_neither_lose_nor_duplicate_writes(home: Path) -> None:
+    """Six sessions each run blocks that write their own row, insert a row,
+    then update one shared row. Every block waits rather than failing, and
+    the shared counter, the per-session counters and the inserted rows all
+    agree with the number of commits."""
+    sessions, rounds = 6, 10
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table cc_s (id int primary key, n int)")
+        c.execute(f"insert into cc_s select g, 0 from generate_series(0, {sessions}) g")
+        results: list[str] = []
+        lock = threading.Lock()
+
+        def worker(k: int) -> None:
+            with server.connect() as w:
+                for i in range(rounds):
+                    try:
+                        w.execute("begin")
+                        w.execute("update cc_s set n = n + 1 where id = %s", (k,))
+                        w.execute("insert into cc_s values (%s, 1)", (1000 + k * 100 + i,))
+                        w.execute("update cc_s set n = n + 1 where id = 0")
+                        w.execute("commit")
+                        outcome = "ok"
+                    except psycopg.Error as e:
+                        outcome = e.sqlstate or "?"
+                        w.execute("rollback")
+                    with lock:
+                        results.append(outcome)
+
+        threads = [threading.Thread(target=worker, args=(k,)) for k in range(1, sessions + 1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(120)
+        assert results == ["ok"] * (sessions * rounds)
+        rows = dict(c.execute(f"select id, n from cc_s where id <= {sessions}").fetchall())
+        inserted = c.execute("select count(*) from cc_s where id >= 1000").fetchone()
+        assert rows[0] == sessions * rounds
+        assert sum(rows[k] for k in range(1, sessions + 1)) == sessions * rounds
+        assert inserted == (sessions * rounds,)
 
 
 def test_prepared_gid_is_byte_exact(home: Path) -> None:
