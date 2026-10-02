@@ -278,7 +278,9 @@ impl PgServer {
         std::fs::create_dir_all(storage_path).map_err(|e| {
             PyRuntimeError::new_err(format!("failed to create storage dir {storage_path}: {e}"))
         })?;
-        let storage = Storage::open(storage_path)
+        // The PG server's own open: a per-commit log sync in durable mode, so
+        // an acknowledged COMMIT survives a process kill (as `secantusd-pg`).
+        let storage = secantus_pgserver::open_storage(storage_path)
             .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         let registry = Arc::new(DatabaseRegistry::new(
             "postgres",

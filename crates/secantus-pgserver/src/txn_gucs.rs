@@ -23,7 +23,13 @@ impl PgHandler {
     /// Record a change to `key` the block is about to make. `local` for
     /// `SET LOCAL`; `value` is what a plain SET stores (kept on COMMIT).
     pub(crate) fn note_txn_guc(&self, key: &str, local: bool, value: &str) {
-        if !self.in_block() {
+        // An extended-protocol statement group is a transaction too: what it
+        // sets LOCAL ends at its `Sync`.
+        if !self.in_block()
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         let before = self
@@ -50,6 +56,42 @@ impl PgHandler {
             "SET LOCAL can only be used in transaction blocks".into(),
         );
         false
+    }
+
+    /// Remember `key`'s value before a statement-scoped `set_config`.
+    pub(crate) fn note_statement_guc(&self, key: &str) {
+        let before = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned();
+        self.statement_gucs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_insert(before);
+    }
+
+    /// The statement ended: put back what its `set_config(..., true)` set.
+    pub(crate) fn end_statement_gucs(&self) {
+        let changed: HashMap<String, Option<String>> = std::mem::take(
+            &mut *self
+                .statement_gucs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, before) in changed {
+            match before {
+                Some(v) => {
+                    settings.insert(key, v);
+                }
+                None => {
+                    settings.remove(&key);
+                }
+            }
+        }
     }
 
     /// The block ended: put back what it changed that it may not keep.
