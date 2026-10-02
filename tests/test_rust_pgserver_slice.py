@@ -15358,9 +15358,8 @@ def test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart(
         a.execute("create function pg_temp.f() returns int language sql as 'select 1'")
         # A permanent one beside it: proof the kill kept what was written.
         a.execute("create function b41_keep() returns int language sql as 'select 2'")
-        # Commits are not synced (`transaction_sync` is off), so give the log
-        # writer time to flush them before the kill; `b41_keep` proves it did.
-        time.sleep(3)
+        # Durable mode syncs every commit, so no wait before the kill;
+        # `b41_keep` proves the kill kept what was acknowledged.
         assert server.proc is not None
         server.proc.kill()
         server.proc.wait(timeout=10)
@@ -15403,3 +15402,101 @@ def test_binary_xid_and_snapshot_parameters_decode(home: Path) -> None:
         bad = be("iqq", 1, 10, 20) + be("q", 30)
         r = c.pgconn.exec_params(b"select $1::text", [bad], [5038], [1], 0)
         assert r.error_field(psycopg.pq.DiagnosticField.SQLSTATE) == b"22P03"
+
+
+@pytest.mark.skipif(_WINDOWS, reason="SIGKILL is a POSIX signal")
+def test_an_acknowledged_commit_survives_a_kill_in_durable_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In durable mode the server syncs the WiredTiger log on every commit, so
+    a COMMIT the client saw acknowledged survives a SIGKILL straight after it,
+    as PostgreSQL's (`synchronous_commit = on`) does. Measured 2026-10-02:
+    before the change, 20 of 20 such kills lost the row."""
+    monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
+    for i in range(5):
+        home = tmp_path / f"kill{i}"
+        home.mkdir()
+        with _Server(home) as server, server.connect() as c:
+            c.execute("create table t (id int primary key, v text)")
+            c.execute("insert into t values (1, 'acked')")
+            assert server.proc is not None
+            server.proc.kill()
+            server.proc.wait(timeout=10)
+        with _Server(home) as server, server.connect() as c:
+            assert c.execute("select id, v from t").fetchall() == [(1, "acked")]
+
+
+def test_schema_usage_and_object_privileges(home: Path) -> None:
+    """Schema USAGE is enforced (42501 before the table privilege is asked),
+    and has_schema / _sequence / _function / _column_privilege answer from the
+    GRANTs and owners rather than true for every role (PostgreSQL 15)."""
+    with _Server(home) as server, server.connect() as c:
+        for sql in [
+            "create role b42r",
+            "create schema b42s",
+            "create table b42s.t (a int, b int)",
+            "create sequence b42s.q",
+            "create function b42f() returns int language sql as 'select 1'",
+            "grant select on b42s.t to b42r",
+        ]:
+            c.execute(sql)
+        c.execute("set role b42r")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege, match="schema b42s"):
+            c.execute("select * from b42s.t")
+        c.execute("reset role")
+        assert c.execute(
+            "select has_schema_privilege('b42r', 'b42s', 'usage'),"
+            " has_schema_privilege('b42r', 'public', 'usage')"
+        ).fetchone() == (False, True)
+        c.execute("grant usage on schema b42s to b42r")
+        c.execute("set role b42r")
+        assert c.execute("select count(*) from b42s.t").fetchone() == (0,)
+        c.execute("reset role")
+        assert c.execute(
+            "select has_column_privilege('b42r', 'b42s.t', 'a', 'select'),"
+            " has_column_privilege('b42r', 'b42s.t', 'a', 'update')"
+        ).fetchone() == (True, False)
+        assert c.execute("select has_sequence_privilege('b42r', 'b42s.q', 'usage')").fetchone() == (
+            False,
+        )
+        c.execute("grant usage on sequence b42s.q to b42r")
+        assert c.execute("select has_sequence_privilege('b42r', 'b42s.q', 'usage')").fetchone() == (
+            True,
+        )
+        assert c.execute(
+            "select has_function_privilege('b42r', 'b42f()', 'execute')"
+        ).fetchone() == (True,)
+        c.execute("revoke execute on function b42f() from public")
+        assert c.execute(
+            "select has_function_privilege('b42r', 'b42f()', 'execute')"
+        ).fetchone() == (False,)
+        assert c.execute(
+            "select privilege_type from information_schema.role_table_grants"
+            " where grantee = 'b42r' and table_name = 't'"
+        ).fetchall() == [("SELECT",)]
+
+
+def test_statement_scoped_settings_and_descriptors(home: Path) -> None:
+    """`set_config(x, v, true)` outside a block is visible to the rest of its
+    statement and gone after it; a large-object descriptor opened in autocommit
+    closes with its statement, and the next transaction numbers from 0 again;
+    another session's temp table is listed in pg_class (PostgreSQL 15)."""
+    with _Server(home) as server, server.connect() as c, server.connect() as other:
+        c.execute("select set_config('b42.v', 'a', false)")
+        assert c.execute(
+            "select set_config('b42.v', 'b', true), current_setting('b42.v')"
+        ).fetchone() == ("b", "b")
+        assert c.execute("select current_setting('b42.v')").fetchone() == ("a",)
+        c.execute("select lo_from_bytea(424242, 'hello')")
+        assert c.execute("select lo_open(424242, 262144)").fetchone() == (0,)
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            c.execute("select loread(0, 10)")
+        assert c.execute("select lo_open(424242, 262144), loread(0, 2)").fetchone() == (0, b"he")
+        assert c.execute(
+            "select pg_snapshot_xmax('10:20:10,14,15'::pg_snapshot)::text,"
+            " txid_visible_in_snapshot(14, '10:20:10,14,15')"
+        ).fetchone() == ("20", False)
+        other.execute("create temp table b42tt (x int)")
+        assert c.execute(
+            "select relpersistence from pg_class where relname = 'b42tt'"
+        ).fetchall() == [("t",)]

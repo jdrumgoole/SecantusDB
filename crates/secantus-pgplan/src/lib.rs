@@ -85,6 +85,7 @@ pub mod pgtypes;
 pub mod range;
 pub mod range_ops;
 pub mod scalar;
+pub mod snapshots;
 pub mod user_agg;
 pub mod user_ops;
 pub mod view_deps;
@@ -10299,6 +10300,18 @@ fn srf_rows(
             };
             one(values, "int4")
         }
+        "pg_snapshot_xip" | "txid_snapshot_xip" if call.args.len() == 1 => {
+            let value = const_value(&call.args[0], params)?;
+            let values = match value {
+                Bson::Null => Vec::new(),
+                v => snapshots::parts(&v)?
+                    .2
+                    .into_iter()
+                    .map(|x| snapshots::xid_value(name, x))
+                    .collect(),
+            };
+            one(values, snapshots::result_type(name).unwrap_or("int8"))
+        }
         "regexp_split_to_table" => {
             if call.args.len() < 2 || call.args.len() > 3 {
                 return Err(Error::Parse(format!(
@@ -15913,6 +15926,10 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
         .objects
         .iter()
         .filter_map(|o| match o.node.as_ref() {
+            // A sequence keeps its schema: its catalog key is `s.q`.
+            Some(N::RangeVar(rv)) if kind == "sequence" && !rv.schemaname.is_empty() => {
+                Some(schemas::relation_key(&rv.schemaname, &rv.relname))
+            }
             Some(N::RangeVar(rv)) => Some(relation_name(rv)),
             Some(N::String(st)) => Some(st.sval.clone()),
             Some(N::ObjectWithArgs(ow)) => ow.objname.last().and_then(|n| match n.node.as_ref() {
@@ -19527,6 +19544,18 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f))
             if func_name(f)
                 .as_deref()
+                .and_then(snapshots::result_type)
+                .is_some() =>
+        {
+            func_name(f)
+                .as_deref()
+                .and_then(snapshots::result_type)
+                .unwrap_or("text")
+                .to_string()
+        }
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
                 .and_then(mathfn::result_type)
                 .is_some() =>
         {
@@ -21038,6 +21067,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
                             || mathfn::result_type(&name).is_some()
+                            || snapshots::result_type(&name).is_some()
                             || geom::result_type(&name).is_some()
                             || pgcrypto::result_type(&name).is_some()
                             || (trgm::is_function(&name) && trgm::result_type(&name).is_some())
@@ -30855,7 +30885,13 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 _ => 0.0,
             };
             if secs > 0.0 && secs.is_finite() && PLANNING_TO_EXECUTE.with(|p| p.get()) {
-                std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)));
+                // The executor's sleep is cancellable and sends the notices
+                // raised before it; without one, a plain sleep.
+                if correlated::executor_hook_installed() {
+                    correlated::call_sequence("pg_sleep", &[Bson::Double(secs)])?;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)));
+                }
             }
             return Ok(Bson::String(String::new()));
         }
@@ -31101,10 +31137,10 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 _ => Bson::Null,
             });
         }
-        // `has_*_privilege`: this server enforces no privileges (there is no
-        // GRANT), so every role holds every privilege -- which is the true
-        // answer here. The privilege names are still validated, and a table
-        // must exist, as on PostgreSQL.
+        // `has_*_privilege`: the privilege names are validated here, and a
+        // table must exist, as on PostgreSQL; the answer for a user table,
+        // column, schema, sequence or function is the executor's (its
+        // GRANTs and owners). A catalog relation is readable by everyone.
         if let Some(name) =
             func_name(f).filter(|n| n.starts_with("has_") && n.ends_with("_privilege"))
         {
@@ -31169,14 +31205,20 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                             .map(|(k, _, _)| k.clone())
                     })
                 });
-                if let (Some(key), "has_table_privilege", true) =
-                    (key, name.as_str(), correlated::executor_hook_installed())
-                {
+                if let (Some(key), true) = (key, correlated::executor_hook_installed()) {
                     let mut call = args.clone();
-                    let at = call.len() - 2;
+                    let at = call.len() - if name == "has_column_privilege" { 3 } else { 2 };
                     call[at] = Bson::String(key);
-                    return correlated::call_sequence("has_table_privilege", &call);
+                    return correlated::call_sequence(&name, &call);
                 }
+            } else if matches!(
+                name.as_str(),
+                "has_schema_privilege" | "has_sequence_privilege" | "has_function_privilege"
+            ) && correlated::executor_hook_installed()
+            {
+                // Schemas, sequences and functions carry ACLs the executor
+                // keeps (GRANT / REVOKE on them).
+                return correlated::call_sequence(&name, &args);
             }
             return Ok(Bson::Boolean(true));
         }

@@ -21,6 +21,7 @@ pub fn is_scalar(name: &str) -> bool {
         || crate::xml::is_function(name)
         || crate::jsonops::FUNCTIONS.contains(&name)
         || crate::mathfn::FUNCTIONS.contains(&name)
+        || crate::snapshots::FUNCTIONS.contains(&name)
         || crate::pgcrypto::is_function(name)
         || crate::trgm::is_function(name)
         || crate::geom::FUNCTIONS.contains(&name)
@@ -677,6 +678,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         return out;
     }
     if let Some(out) = crate::mathfn::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::snapshots::call(name, args) {
         return out;
     }
     if crate::trgm::is_function(name) {
@@ -2318,6 +2322,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         return t;
     }
     if let Some(t) = crate::mathfn::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::snapshots::result_type(name) {
         return t;
     }
     if crate::trgm::is_function(name) {

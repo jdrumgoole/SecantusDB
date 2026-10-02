@@ -44,13 +44,49 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use secantus_storage::Storage;
+use secantus_storage::{wt_config, Storage, StorageOptions};
 use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::{DatabaseRegistry, HandlerFactory, PgHandler};
+
+/// Whether a store this server opens syncs the WiredTiger log on every commit.
+///
+/// PostgreSQL's default (`synchronous_commit = on`) is that an acknowledged
+/// COMMIT survives a crash, and so does this server's DURABLE mode -- the
+/// shipped default. The precedence is the storage's own close-time `durable`
+/// rule: `SECANTUS_FORCE_DURABLE=1` always syncs; otherwise
+/// `SECANTUS_TEST_FAST_STORAGE=1` (the test suite's fast mode) does not, and
+/// anything else does. Pure over its inputs so it is testable without touching
+/// the process environment.
+pub fn sync_on_commit(force_durable: bool, fast_storage: bool) -> bool {
+    force_durable || !fast_storage
+}
+
+/// Open the store the PostgreSQL server serves, with a per-commit log sync in
+/// durable mode (see [`sync_on_commit`]).
+///
+/// The Rust MongoDB server shares `secantus-storage` and keeps its own
+/// default (`transaction_sync` off, `--sync-on-commit` to opt in); this is the
+/// PG server choosing the synced configuration, not a storage-wide change.
+/// Measured 2026-10-02: without it a `CREATE TABLE` + `INSERT` acknowledged
+/// just before a SIGKILL were gone after restart.
+pub fn open_storage(home: &str) -> secantus_storage::Result<Storage> {
+    let force = std::env::var("SECANTUS_FORCE_DURABLE").as_deref() == Ok("1");
+    let fast = std::env::var("SECANTUS_TEST_FAST_STORAGE").as_deref() == Ok("1");
+    // The same engine knobs as `Storage::open`'s default config, with only
+    // `transaction_sync` chosen here.
+    let config = wt_config("4G", 1000, sync_on_commit(force, fast), "128MB");
+    Storage::open_with_options(
+        home,
+        &StorageOptions {
+            wt_config: Some(config),
+            ..StorageOptions::default()
+        },
+    )
+}
 
 /// How long `stop` waits for live connection tasks to finish before giving up
 /// on a clean drain and tearing the runtime down anyway. A backstop, not the
@@ -358,5 +394,20 @@ async fn accept_loop(
                 _ = conn_shutdown.changed() => {}
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::sync_on_commit;
+
+    /// Durable (the shipped default) syncs per commit; the test suite's fast
+    /// mode does not; `SECANTUS_FORCE_DURABLE=1` wins over fast mode.
+    #[test]
+    fn sync_on_commit_follows_the_durable_precedence() {
+        assert!(sync_on_commit(false, false));
+        assert!(!sync_on_commit(false, true));
+        assert!(sync_on_commit(true, true));
+        assert!(sync_on_commit(true, false));
     }
 }
