@@ -9819,21 +9819,14 @@ def test_uncommitted_types_stay_private_and_stay_current(home: Path) -> None:
 def test_an_open_blocks_uncommitted_type_is_invisible_to_other_connections(
     home: Path,
 ) -> None:
-    """The isolation `may_fill_catalog_cache` is written to defend.
+    """The isolation `may_fill_catalog_cache` is written to defend, for types.
 
     That gate refuses to publish a catalog read taken on the transaction's own
     WiredTiger session, because such a read can see the block's uncommitted
-    writes and the cache it would fill is process-wide. Measured 2026-09-19,
-    the gate never actually fires -- catalog reads happen while planning,
-    outside the user transaction -- so forcing it open leaks nothing, and the
-    property below is held up by the per-connection `uncommitted_types`
-    overlay instead.
-
-    Which is exactly why this test exists. The gate is unfalsifiable on its
-    own; the BEHAVIOUR it protects is not. If some future change routes a
-    catalog read through the transaction's session, the `debug_assert` in that
-    gate fires first, and if the assert is ever removed this test is what
-    still notices.
+    writes and the cache it would fill is process-wide. For TYPES the
+    per-connection `uncommitted_types` overlay holds this up on its own (the
+    gate forced open leaked nothing here); the event-trigger test below is the
+    case where the gate itself is load-bearing.
     """
     with _Server(home) as server:
         writer = server.connect(autocommit=False)
@@ -9862,6 +9855,42 @@ def test_an_open_blocks_uncommitted_type_is_invisible_to_other_connections(
             ("mood",)
         ]
         assert fresh.execute("SELECT 'ok'::mood").fetchone() == ("ok",)
+
+
+def test_an_open_blocks_uncommitted_event_trigger_fires_for_no_one_else(
+    home: Path,
+) -> None:
+    """`may_fill_catalog_cache` is load-bearing (demonstrated 2026-10-02).
+
+    A plain read inside a block that has written takes its catalog reads on
+    the block's own WiredTiger session at the live catalog version, and an
+    event trigger's row is written inside the block. With the gate forced
+    open, the read published the uncommitted trigger to the process-wide
+    cache and ANOTHER connection's DDL fired it. PostgreSQL 15 fires nothing
+    for the other session until COMMIT.
+    """
+    with _Server(home) as server:
+        other = server.connect(autocommit=True)
+        other.execute("CREATE TABLE seed (x int)")
+        other.execute(
+            "CREATE FUNCTION b45_ef() RETURNS event_trigger LANGUAGE plpgsql"
+            " AS $$begin raise notice 'FIRED %', tg_tag; end$$"
+        )
+        notices: list[str] = []
+        other.add_notice_handler(lambda n: notices.append(n.message_primary or ""))
+
+        writer = server.connect(autocommit=False)
+        writer.execute("INSERT INTO seed VALUES (1)")
+        writer.execute("CREATE EVENT TRIGGER b45_et ON ddl_command_start EXECUTE FUNCTION b45_ef()")
+        writer.execute("SELECT 1")
+
+        other.execute("CREATE TABLE b45_other (x int)")
+        assert notices == []
+        assert other.execute("SELECT evtname FROM pg_event_trigger").fetchall() == []
+
+        writer.rollback()
+        other.execute("CREATE TABLE b45_after (x int)")
+        assert notices == []
 
 
 def test_a_rolled_back_type_never_becomes_visible(home: Path) -> None:
@@ -15393,6 +15422,43 @@ def test_runtime_and_static_errors_carry_postgres_positions(
             c.execute(sql)
         assert caught.value.sqlstate == sqlstate
         assert caught.value.diag.statement_position == str(position)
+
+
+@pytest.mark.parametrize(
+    ("sql", "sqlstate", "position", "hint"),
+    [
+        ("select a, count(*) from b45e", "42803", 8, None),
+        ("select coalesce(a, 0), count(*) from b45e", "42803", 17, None),
+        ("select a from b45e group by 5", "42P10", 29, None),
+        ("select a from b45e order by a, 7", "42P10", 32, None),
+        (
+            "select b45e.a from b45e x",
+            "42P01",
+            8,
+            'Perhaps you meant to reference the table alias "x".',
+        ),
+        ("select a from b45e where sum(a) > 1", "42803", 26, None),
+        ("delete from b45e where sum(a) > 0", "42803", 24, None),
+        (
+            "select sum(b) from b45e",
+            "42883",
+            8,
+            "No function matches the given name and argument types."
+            " You might need to add explicit type casts.",
+        ),
+    ],
+)
+def test_batch45_error_positions_and_hints(
+    home: Path, sql: str, sqlstate: str, position: int, hint: str | None
+) -> None:
+    """Positions and hints measured on PostgreSQL 15 (batch 45)."""
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table b45e (a int, b text, c int)")
+        with pytest.raises(psycopg.Error) as caught:
+            c.execute(sql)
+        assert caught.value.sqlstate == sqlstate
+        assert caught.value.diag.statement_position == str(position)
+        assert caught.value.diag.message_hint == hint
 
 
 def test_expression_index_rows_written_elsewhere_are_reindexed_at_open(home: Path) -> None:

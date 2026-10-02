@@ -319,6 +319,30 @@ fn sig_accepts(s: &Sig, args: &[String]) -> bool {
     }
 }
 
+/// The declared argument types of the overload a call of `name` with
+/// `args` resolves to: the one `func_select_candidate` picks, or else the
+/// only overload that takes them. `None` when that is not determined here.
+pub(crate) fn selected_args(name: &str, args: &[String]) -> Option<Vec<String>> {
+    let params = |s: &Sig| -> Vec<String> {
+        (0..args.len())
+            .map(|i| param_at(s, i).unwrap_or("any").to_string())
+            .collect()
+    };
+    if let Some(c) = select_candidates(name, args) {
+        return match c.as_slice() {
+            [s] if !s.variadic => Some(s.args.clone()),
+            [s] => Some(params(s)),
+            _ => None,
+        };
+    }
+    let overloads = sigs().get(name)?;
+    let mut takes = overloads.iter().filter(|s| sig_accepts(s, args));
+    match (takes.next(), takes.next()) {
+        (Some(s), None) if !s.variadic => Some(s.args.clone()),
+        _ => None,
+    }
+}
+
 /// Is `name` a PostgreSQL built-in function (any overload)?
 pub fn is_builtin_function_name(name: &str) -> bool {
     sigs().contains_key(name)
