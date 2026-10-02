@@ -318,3 +318,8 @@ fn sig_accepts(s: &Sig, args: &[String]) -> bool {
         })
     }
 }
+
+/// Is `name` a PostgreSQL built-in function (any overload)?
+pub fn is_builtin_function_name(name: &str) -> bool {
+    sigs().contains_key(name)
+}

@@ -266,6 +266,57 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A session's GUCs, carrying a generation that moves on every MUTABLE
+/// access (any `insert`, `remove`, assignment ...), so a reader can tell
+/// cheaply whether the map changed since it last looked. Generations are
+/// unique across sessions: a worker thread that serves several connections
+/// never mistakes one session's map for another's.
+#[derive(Clone, Debug)]
+pub(crate) struct GucMap {
+    map: HashMap<String, String>,
+    generation: u64,
+}
+
+static GUC_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl GucMap {
+    fn next_generation() -> u64 {
+        GUC_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl From<HashMap<String, String>> for GucMap {
+    fn from(map: HashMap<String, String>) -> Self {
+        Self {
+            map,
+            generation: Self::next_generation(),
+        }
+    }
+}
+
+impl std::ops::Deref for GucMap {
+    type Target = HashMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for GucMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.generation = Self::next_generation();
+        &mut self.map
+    }
+}
+
+thread_local! {
+    /// The settings generation this thread's planner holds a copy of.
+    static INSTALLED_SETTINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn catalog_cache() -> &'static CatalogCache {
     static CACHE: OnceLock<CatalogCache> = OnceLock::new();
     CACHE.get_or_init(|| CatalogCache {
@@ -1068,6 +1119,9 @@ impl plpgsql_fn::Host for PlHost<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(info);
+        // Out at once, as PostgreSQL sends a RAISE: a function that then
+        // runs on (a loop, a long query) does not hold it back.
+        self.h.send_live_notices();
     }
 }
 
@@ -1428,7 +1482,44 @@ impl PgHandler {
 
     /// Every role in `pg_roles` order: the bootstrap superuser, then the
     /// recorded ones by oid.
+    /// Every role. Read through a process-wide cache keyed on the catalog
+    /// version, which every role-changing statement moves -- after its
+    /// commit too (`catalog_changed_in_txn`). A miss reads the COMMITTED
+    /// roles on a fresh session, as PostgreSQL resolves a role against the
+    /// latest catalog snapshot. A connection whose open transaction changed
+    /// a role reads its own transaction's view, uncached, until it ends.
     fn roles(&self) -> PgWireResult<Vec<RoleInfo>> {
+        if self
+            .roles_written_in_txn
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return self.read_roles();
+        }
+        type RoleCache = Mutex<HashMap<usize, (u64, Arc<Vec<RoleInfo>>)>>;
+        static ROLE_CACHE: OnceLock<RoleCache> = OnceLock::new();
+        let cache = ROLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        // Read BEFORE the rows: a commit landing in between leaves an
+        // older version behind, which the next reader refetches past.
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let key = Arc::as_ptr(&self.storage) as usize;
+        if let Some((v, roles)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            if *v == version {
+                return Ok(roles.as_ref().clone());
+            }
+        }
+        let roles = self
+            .storage
+            .outside_user_transaction(|| self.read_roles())?;
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (version, Arc::new(roles.clone())));
+        Ok(roles)
+    }
+
+    fn read_roles(&self) -> PgWireResult<Vec<RoleInfo>> {
         let ns = DatabaseRegistry::NAMESPACE;
         let mut out = vec![RoleInfo::bootstrap()];
         let exists = self
@@ -1459,6 +1550,8 @@ impl PgHandler {
     /// Records a role, new or changed. A new one gets the next oid past every
     /// role and database, as PostgreSQL mints from one counter.
     fn write_role(&self, info: &RoleInfo, new: bool) -> PgWireResult<()> {
+        self.roles_written_in_txn
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let ns = DatabaseRegistry::NAMESPACE;
         let exists = self
             .storage
@@ -1501,6 +1594,8 @@ impl PgHandler {
     }
 
     fn delete_role(&self, name: &str) -> PgWireResult<()> {
+        self.roles_written_in_txn
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.storage
             .delete_matching(
                 DatabaseRegistry::NAMESPACE,
@@ -1840,6 +1935,21 @@ impl PgHandler {
         sql: &str,
     ) -> PgWireResult<()> {
         let role = role.to_string();
+        // A sequence read as a relation takes the SEQUENCE's SELECT.
+        if kind == "table" && privilege == "SELECT" && self.sequence_doc(table)?.is_some() {
+            if self.is_superuser(&role)
+                || self.object_privilege_held(&role, "sequence", table, "SELECT", false)
+            {
+                return Ok(());
+            }
+            return Err(Self::user_error(
+                "42501",
+                format!(
+                    "permission denied for sequence {}",
+                    secantus_pgplan::schemas::split_key(table).1
+                ),
+            ));
+        }
         if kind != "view" && self.lookup(table).is_none() {
             return Ok(());
         }
@@ -1897,15 +2007,7 @@ impl PgHandler {
     /// none recorded belongs to the login role). Empty when no table has RLS
     /// enabled, which is the common case and costs one catalog read.
     fn view_rls_tables(&self) -> Vec<(String, Vec<secantus_pgplan::rls::RlsTable>)> {
-        let any_enabled = self
-            .storage
-            .find_matching(
-                self.db(),
-                Self::RLS_COLLECTION,
-                &bson::doc! {"enabled": true},
-            )
-            .is_ok_and(|r| !r.is_empty());
-        if !any_enabled {
+        if self.rls_enabled_docs().is_empty() {
             return Vec::new();
         }
         let Ok(views) = self.type_catalog_docs(Self::VIEW_COLLECTION) else {
@@ -1928,19 +2030,90 @@ impl PgHandler {
             .collect()
     }
 
+    /// The tables with row-level security enabled (their RLS documents).
+    /// Read for every statement, so through `committed_cached`.
+    fn rls_enabled_docs(&self) -> Arc<Vec<Document>> {
+        self.committed_cached("rls_enabled", || {
+            Arc::new(
+                self.storage
+                    .find_matching(
+                        self.db(),
+                        Self::RLS_COLLECTION,
+                        &bson::doc! {"enabled": true},
+                    )
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|b| decode_doc(b).ok())
+                    .collect(),
+            )
+        })
+    }
+
+    /// A value derived from the COMMITTED catalog, cached process-wide per
+    /// `(storage, db, slot)` against the catalog version -- which every
+    /// catalog-changing statement moves, after its commit too. Used only
+    /// where the read would anyway have seen exactly the committed catalog:
+    /// outside the transaction's own WiredTiger session, with no uncommitted
+    /// table or type of this connection's to overlay. Anything else reads
+    /// afresh, uncached, as before.
+    fn committed_cached<T: Clone + Send + Sync + 'static>(
+        &self,
+        slot: &'static str,
+        read: impl FnOnce() -> T,
+    ) -> T {
+        type Slots =
+            HashMap<(usize, String, &'static str), (u64, Arc<dyn std::any::Any + Send + Sync>)>;
+        static CACHE: OnceLock<Mutex<Slots>> = OnceLock::new();
+        let shareable = !self.storage.in_user_txn()
+            && self
+                .uncommitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && self
+                .uncommitted_types
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+        if !shareable {
+            return read();
+        }
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        // The version BEFORE the read: a commit landing during it leaves
+        // the entry under the older version, which the next reader passes.
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let key = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            slot,
+        );
+        if let Some((v, value)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            if *v == version {
+                if let Some(value) = value.downcast_ref::<T>() {
+                    return value.clone();
+                }
+            }
+        }
+        let value = read();
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (version, Arc::new(value.clone())));
+        value
+    }
+
     fn rls_tables_for(&self, role: &str) -> Vec<secantus_pgplan::rls::RlsTable> {
         let role = role.to_string();
         if self.is_superuser(&role) || self.role(&role).ok().flatten().is_some_and(|r| r.bypassrls)
         {
             return Vec::new();
         }
-        let Ok(enabled) = self.storage.find_matching(
-            self.db(),
-            Self::RLS_COLLECTION,
-            &bson::doc! {"enabled": true},
-        ) else {
+        let enabled = self.rls_enabled_docs();
+        if enabled.is_empty() {
             return Vec::new();
-        };
+        }
         let policies = self.policy_docs();
         let member_of = |other: &str| -> bool {
             other.eq_ignore_ascii_case("PUBLIC")
@@ -1954,7 +2127,7 @@ impl PgHandler {
                     .is_ok_and(|b| b == Bson::Boolean(true))
         };
         let mut out = Vec::new();
-        for doc in enabled.iter().filter_map(|b| decode_doc(b).ok()) {
+        for doc in enabled.iter() {
             let table = doc.get_str("_id").unwrap_or_default().to_string();
             let forced = doc.get_bool("forced").unwrap_or(false);
             let Some(def) = self.lookup(&table) else {
@@ -2044,7 +2217,7 @@ pub struct PgHandler {
     /// wrong answer, which is worse than refusing `BEGIN` outright.
     txn: Mutex<Option<UserTransactionHandle>>,
     /// Session settings (GUCs), per connection as PostgreSQL's are.
-    settings: Arc<Mutex<HashMap<String, String>>>,
+    settings: Arc<Mutex<GucMap>>,
     /// NoticeResponses raised by the statement in flight (a `DO` block's
     /// `RAISE NOTICE` / `WARNING` / `INFO`), sent to the client by the query
     /// handlers before the statement's own result or error.
@@ -2232,6 +2405,9 @@ pub struct PgHandler {
     /// A statement of the open transaction changed the catalog: its commit
     /// bumps the catalog version again (see `commit_implicit`).
     catalog_changed_in_txn: AtomicBool,
+    /// This connection's open transaction wrote a role: its role reads see
+    /// that transaction's own view, not the shared committed cache.
+    roles_written_in_txn: AtomicBool,
     /// How many PL/pgSQL statements are running nested in this session's
     /// statement: `LOCK TABLE` needs a transaction block only at top level.
     nested_statements: std::sync::atomic::AtomicUsize,
@@ -2480,7 +2656,7 @@ impl PgHandler {
             db: OnceLock::new(),
             databases,
             txn: Mutex::new(None),
-            settings: Arc::new(Mutex::new(default_settings())),
+            settings: Arc::new(Mutex::new(GucMap::from(default_settings()))),
             pending_notices: Mutex::new(Vec::new()),
             live_notices: Mutex::new(None),
             pending_params: Mutex::new(Vec::new()),
@@ -2518,6 +2694,7 @@ impl PgHandler {
             pending_listens: Mutex::new(Vec::new()),
             touched_temp: AtomicBool::new(false),
             catalog_changed_in_txn: AtomicBool::new(false),
+            roles_written_in_txn: AtomicBool::new(false),
             nested_statements: std::sync::atomic::AtomicUsize::new(0),
             batch_partial: Mutex::new(Vec::new()),
             wire_dealloc: Mutex::new(Vec::new()),
@@ -2906,6 +3083,11 @@ impl PgHandler {
                 .clone(),
         ));
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
+        // Per statement, not per catalog version: SET ROLE changes which
+        // schemas the search path may use without changing the catalog.
+        secantus_pgplan::schemas::set_unusable_schemas(
+            self.unusable_schemas(&self.current_role_name()),
+        );
         secantus_pgplan::schemas::set_temp_schema(Some(self.temp_schema_name()));
         secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
         secantus_pgplan::user_ops::set_user_operators(self.user_operators());
@@ -2919,13 +3101,18 @@ impl PgHandler {
         // `current_setting()` reached INSIDE an expression -- where the
         // constant evaluator handles them rather than the server, and had
         // nowhere to ask before this.
-        secantus_pgplan::set_session_context(
-            self.db(),
-            self.settings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-        );
+        // Copied only when the session's settings changed since this thread
+        // last installed them: the map holds every PostgreSQL GUC, and
+        // cloning it per statement was a fifth of a `select 1`'s server time.
+        {
+            let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            if INSTALLED_SETTINGS.with(|g| g.get()) == settings.generation() {
+                secantus_pgplan::set_session_database(self.db());
+            } else {
+                secantus_pgplan::set_session_context(self.db(), settings.map.clone());
+                INSTALLED_SETTINGS.with(|g| g.set(settings.generation()));
+            }
+        }
         let overlay_empty = self
             .uncommitted_types
             .lock()
@@ -6602,6 +6789,7 @@ impl PgHandler {
                     u.name
                 )))
             })?;
+        self.check_function_execute(&key, &u.name)?;
         let out = self.with_call_depth(|| self.run_user_function(&doc, u, args))?;
         // The value comes back in the declared return type: `RETURN 1` from a
         // `RETURNS numeric` function is numeric 1, so `n * f(n - 1)` is
@@ -7304,6 +7492,10 @@ impl PgHandler {
     /// The inheritance tree, for the planner: `(child, parent)` pairs and
     /// each parent's columns.
     fn inheritance(&self) -> InheritanceTree {
+        self.committed_cached("inheritance", || self.read_inheritance())
+    }
+
+    fn read_inheritance(&self) -> InheritanceTree {
         let defs = self.all_table_defs().unwrap_or_default();
         let mut pairs = Vec::new();
         let mut columns: Vec<(String, Vec<String>)> = Vec::new();
@@ -7367,6 +7559,7 @@ impl PgHandler {
     /// subquery -- correlated or not -- is still part of the statement.
     fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
         let role = self.current_role_name();
+        self.check_schema_create(&role, sql)?;
         let views = self.views()?;
         // A superuser needs no check of its own -- but what a view reads is
         // checked as the view's OWNER even then, so views still expand.
@@ -8728,7 +8921,46 @@ impl PgHandler {
             .map(|g| self.grantee_name(g))
             .collect::<PgWireResult<Vec<_>>>()?;
         if kind != "table" {
-            if let (Some(acl), false) = (object_acl::acl_kind(kind), all_in_schema) {
+            // `ON ALL SEQUENCES / FUNCTIONS / PROCEDURES / ROUTINES IN SCHEMA
+            // s`: each one that exists now, as PostgreSQL expands it.
+            let expanded: Vec<String>;
+            let objects = if all_in_schema {
+                for schema in objects {
+                    if !secantus_pgplan::schemas::schema_exists(schema) {
+                        return Err(Self::user_error(
+                            "3F000",
+                            format!("schema \"{schema}\" does not exist"),
+                        ));
+                    }
+                }
+                let in_schemas = |s: &str| objects.iter().any(|o| o == s);
+                expanded = match kind {
+                    "sequence" => self
+                        .sequence_names()
+                        .into_iter()
+                        .filter(|n| in_schemas(&secantus_pgplan::schemas::split_key(n).0))
+                        .collect(),
+                    _ => {
+                        let docs = self.type_catalog_docs(Self::FUNCTION_COLLECTION)?;
+                        docs.iter()
+                            .filter(|d| in_schemas(d.get_str("schema").unwrap_or("public")))
+                            .filter(|d| {
+                                let procedure = d.get_bool("is_procedure").unwrap_or(false);
+                                match kind {
+                                    "procedure" => procedure,
+                                    "routine" => true,
+                                    _ => !procedure,
+                                }
+                            })
+                            .filter_map(|d| d.get_str("_id").ok().map(|k| format!("\0{k}")))
+                            .collect()
+                    }
+                };
+                &expanded[..]
+            } else {
+                objects
+            };
+            if let Some(acl) = object_acl::acl_kind(kind) {
                 self.grant_object(
                     is_grant,
                     privileges,
@@ -18055,6 +18287,7 @@ impl PgHandler {
                 let Some(seq) = seq(0)? else {
                     return Ok(Bson::Null);
                 };
+                self.check_sequence_privilege(&seq, &["USAGE", "UPDATE"])?;
                 let value = *self
                     .nextval(&seq, 1)?
                     .first()
@@ -18064,12 +18297,16 @@ impl PgHandler {
             }
             "currval" => match seq(0)? {
                 None => Ok(Bson::Null),
-                Some(seq) => Ok(Bson::Int64(self.currval(&seq)?)),
+                Some(seq) => {
+                    self.check_sequence_privilege(&seq, &["USAGE", "SELECT"])?;
+                    Ok(Bson::Int64(self.currval(&seq)?))
+                }
             },
             "setval" => {
                 let Some(seq) = seq(0)? else {
                     return Ok(Bson::Null);
                 };
+                self.check_sequence_privilege(&seq, &["UPDATE"])?;
                 let Some(value) = args.get(1).and_then(bson_i64) else {
                     return Ok(Bson::Null);
                 };
@@ -18132,8 +18369,25 @@ impl PgHandler {
         // one expression, no predicate. Listed once per table per statement.
         let memo: std::cell::RefCell<HashMap<String, Vec<(String, String)>>> =
             std::cell::RefCell::new(HashMap::new());
+        // And across statements, per catalog version (an index is created
+        // and dropped only by statements that move it).
+        type ExprIndexes = Arc<Mutex<HashMap<String, Vec<(String, String)>>>>;
+        // Not inside an explicit block, which may have created or dropped one
+        // of its own.
+        let shared: ExprIndexes = if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ExprIndexes::default()
+        } else {
+            self.committed_cached("expr_indexes", ExprIndexes::default)
+        };
         let expr_indexes = |table: &str| -> Vec<(String, String)> {
             if let Some(found) = memo.borrow().get(table) {
+                return found.clone();
+            }
+            if let Some(found) = shared.lock().unwrap_or_else(|e| e.into_inner()).get(table) {
+                memo.borrow_mut().insert(table.to_string(), found.clone());
                 return found.clone();
             }
             let found: Vec<(String, String)> = self
@@ -18157,6 +18411,13 @@ impl PgHandler {
                 })
                 .collect();
             memo.borrow_mut().insert(table.to_string(), found.clone());
+            // Shared only when read on a fresh session -- the committed list.
+            if !self.storage.in_user_txn() {
+                shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(table.to_string(), found.clone());
+            }
             found
         };
         secantus_pgplan::with_function_hook(&functions, || {
@@ -18548,6 +18809,8 @@ impl PgHandler {
         {
             bump_catalog_version();
         }
+        self.roles_written_in_txn
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.settle_notifies(true);
         Ok(())
     }
@@ -18579,6 +18842,8 @@ impl PgHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.in_transaction
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.roles_written_in_txn
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.clear_deferred();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -19516,6 +19781,7 @@ impl PgHandler {
                 let Some(name) = name else {
                     return Ok(Bson::Null);
                 };
+                self.check_sequence_privilege(&name, &["USAGE", "UPDATE"])?;
                 let value = *self
                     .nextval(&name, 1)?
                     .first()
@@ -19525,7 +19791,10 @@ impl PgHandler {
             }
             ConstCol::CurrVal(seq) => match self.sequence_name_arg(seq)? {
                 None => Ok(Bson::Null),
-                Some(name) => Ok(Bson::Int64(self.currval(&name)?)),
+                Some(name) => {
+                    self.check_sequence_privilege(&name, &["USAGE", "SELECT"])?;
+                    Ok(Bson::Int64(self.currval(&name)?))
+                }
             },
             ConstCol::SetVal {
                 sequence,
@@ -19535,6 +19804,7 @@ impl PgHandler {
                 let Some(name) = self.sequence_name_arg(sequence)? else {
                     return Ok(Bson::Null);
                 };
+                self.check_sequence_privilege(&name, &["UPDATE"])?;
                 let Some(value) = bson_i64(&self.resolve_const_col(value)?) else {
                     return Ok(Bson::Null);
                 };
@@ -20098,6 +20368,7 @@ impl PgHandler {
                             .settings
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
+                            .map
                             .clone(),
                         txn_gucs: self
                             .txn_gucs
@@ -23783,6 +24054,7 @@ impl PgHandler {
                     }
                     for id in &cascade_functions {
                         self.delete_type_doc(Self::FUNCTION_COLLECTION, id)?;
+                        self.drop_object_acl("function", id)?;
                     }
                 }
                 // An aggregate depends on its state and final functions.
@@ -23885,6 +24157,9 @@ impl PgHandler {
                     target.key.clone()
                 };
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id_key)?;
+                // A function recreated under the name starts with the
+                // default ACL, not the dropped one's grants.
+                self.drop_object_acl("function", &id_key)?;
                 tag()
             }
 
@@ -24354,6 +24629,7 @@ impl PgHandler {
                         .map_err(|e| Self::storage_err("could not drop the sequence", e))?;
                     self.note_uncommitted_type(SEQUENCE_COLLECTION, name, None);
                     self.note_txn_sequence(name);
+                    self.drop_object_acl("sequence", name)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP SEQUENCE"))])
             }
@@ -25605,7 +25881,8 @@ impl PgHandler {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clear();
-                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = default_settings();
+                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) =
+                        default_settings().into();
                     self.deallocate_all();
                     self.pending_listens
                         .lock()
@@ -26081,7 +26358,7 @@ impl PgHandler {
                 let db_defaults = self.db_setting_defaults();
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 if name.is_empty() {
-                    *settings = default_settings();
+                    *settings = default_settings().into();
                     settings.extend(db_defaults);
                 } else {
                     let key = canonical_setting(&name);

@@ -17,11 +17,11 @@ use super::*;
 /// relation, and a view's DEFINITION is not checked here: `CREATE VIEW`
 /// over a table the creator cannot read succeeds, and is refused on use.
 pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Ok(parsed) = parse_tree(sql) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for raw in &parsed.protobuf.stmts {
+    for raw in &parsed.stmts {
         let Some(stmt) = raw.stmt.as_ref() else {
             continue;
         };
@@ -107,7 +107,7 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
 /// columns without one). UPDATE: the SET targets. `columns` is the table's
 /// column list, which attributes an unqualified name.
 pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) -> Vec<String> {
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Ok(parsed) = parse_tree(sql) else {
         return columns.to_vec();
     };
     let mut out: Vec<String> = Vec::new();
@@ -124,7 +124,7 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
             })
             .collect()
     };
-    for raw in &parsed.protobuf.stmts {
+    for raw in &parsed.stmts {
         let Some(stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
@@ -240,12 +240,12 @@ fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static 
 /// not block). Empty for any other statement.
 pub fn ddl_locks(sql: &str) -> Vec<(String, i32)> {
     use pg_query::protobuf::ObjectType;
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Ok(parsed) = parse_tree(sql) else {
         return Vec::new();
     };
     let name = |r: &pg_query::protobuf::RangeVar| r.relname.clone();
     let mut out = Vec::new();
-    for raw in &parsed.protobuf.stmts {
+    for raw in &parsed.stmts {
         let Some(node) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
@@ -288,4 +288,89 @@ pub fn ddl_locks(sql: &str) -> Vec<(String, i32)> {
         }
     }
     out
+}
+
+/// The schema each object a `CREATE` statement in `sql` makes lands in --
+/// the one it names, else the first usable schema on the search path -- for
+/// the schema `CREATE` privilege PostgreSQL checks there. A temporary
+/// object needs none.
+pub fn sql_creation_schemas(sql: &str) -> Vec<String> {
+    let Ok(parsed) = parse_tree(sql) else {
+        return Vec::new();
+    };
+    let names_of = |list: &[pg_query::protobuf::Node]| -> Vec<String> {
+        list.iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for raw in &parsed.stmts {
+        let Some(stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        // `Some(schema written)` ("" when unqualified); `None`: no check.
+        let target: Option<String> = match stmt {
+            N::CreateStmt(c) => c.relation.as_ref().and_then(range_var_schema),
+            N::ViewStmt(v) => v.view.as_ref().and_then(range_var_schema),
+            N::CreateSeqStmt(c) => c.sequence.as_ref().and_then(range_var_schema),
+            N::CreateTableAsStmt(c) => c
+                .into
+                .as_ref()
+                .and_then(|i| i.rel.as_ref())
+                .and_then(range_var_schema),
+            N::CompositeTypeStmt(c) => c.typevar.as_ref().and_then(range_var_schema),
+            N::CreateFunctionStmt(f) => {
+                let names = names_of(&f.funcname);
+                Some(if names.len() > 1 {
+                    names[names.len() - 2].clone()
+                } else {
+                    String::new()
+                })
+            }
+            N::CreateEnumStmt(e) => {
+                let names = names_of(&e.type_name);
+                Some(if names.len() > 1 {
+                    names[names.len() - 2].clone()
+                } else {
+                    String::new()
+                })
+            }
+            N::CreateDomainStmt(d) => {
+                let names = names_of(&d.domainname);
+                Some(if names.len() > 1 {
+                    names[names.len() - 2].clone()
+                } else {
+                    String::new()
+                })
+            }
+            _ => None,
+        };
+        let Some(written) = target else {
+            continue;
+        };
+        if written == "pg_temp" || written.starts_with("pg_temp_") {
+            continue;
+        }
+        let schema = if written.is_empty() {
+            match crate::schemas::creation_schema() {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
+        } else {
+            written
+        };
+        if !out.contains(&schema) {
+            out.push(schema);
+        }
+    }
+    out
+}
+
+/// A CREATE target's written schema ("" when unqualified); `None` for a
+/// temporary relation, which needs no schema privilege.
+fn range_var_schema(r: &pg_query::protobuf::RangeVar) -> Option<String> {
+    (r.relpersistence != "t").then(|| r.schemaname.clone())
 }
