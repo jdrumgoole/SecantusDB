@@ -33,47 +33,44 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
             }
             Some(N::InsertStmt(i)) => {
                 if let Some(r) = &i.relation {
-                    targets.push((r.relname.clone(), "INSERT"));
+                    targets.push((key(r), "INSERT"));
                     let updates = i.on_conflict_clause.as_ref().is_some_and(|c| {
                         c.action == pg_query::protobuf::OnConflictAction::OnconflictUpdate as i32
                     });
                     if updates {
-                        targets.push((r.relname.clone(), "UPDATE"));
+                        targets.push((key(r), "UPDATE"));
                     }
                     if !i.returning_list.is_empty() {
-                        targets.push((r.relname.clone(), "SELECT"));
+                        targets.push((key(r), "SELECT"));
                     }
                 }
             }
             Some(N::UpdateStmt(u)) => {
                 if let Some(r) = &u.relation {
-                    targets.push((r.relname.clone(), "UPDATE"));
+                    targets.push((key(r), "UPDATE"));
                     if u.where_clause.is_some() || !u.returning_list.is_empty() {
-                        targets.push((r.relname.clone(), "SELECT"));
+                        targets.push((key(r), "SELECT"));
                     }
                 }
             }
             Some(N::DeleteStmt(d)) => {
                 if let Some(r) = &d.relation {
-                    targets.push((r.relname.clone(), "DELETE"));
+                    targets.push((key(r), "DELETE"));
                     if d.where_clause.is_some() || !d.returning_list.is_empty() {
-                        targets.push((r.relname.clone(), "SELECT"));
+                        targets.push((key(r), "SELECT"));
                     }
                 }
             }
             Some(N::TruncateStmt(t)) => {
                 for r in &t.relations {
                     if let Some(N::RangeVar(r)) = r.node.as_ref() {
-                        targets.push((r.relname.clone(), "TRUNCATE"));
+                        targets.push((key(r), "TRUNCATE"));
                     }
                 }
             }
             Some(N::CopyStmt(c)) => {
                 if let Some(r) = &c.relation {
-                    targets.push((
-                        r.relname.clone(),
-                        if c.is_from { "INSERT" } else { "SELECT" },
-                    ));
+                    targets.push((key(r), if c.is_from { "INSERT" } else { "SELECT" }));
                 }
             }
             _ => {}
@@ -94,7 +91,7 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
             if let pg_query::NodeRef::RangeVar(r) = node {
                 let catalog = matches!(r.schemaname.as_str(), "pg_catalog" | "information_schema");
                 if *context == pg_query::Context::Select && !catalog && !ctes.contains(&r.relname) {
-                    push(&mut out, &r.relname, "SELECT");
+                    push(&mut out, &key(r), "SELECT");
                 }
             }
         }
@@ -133,7 +130,7 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
         };
         match (privilege, stmt) {
             ("INSERT", N::InsertStmt(i))
-                if i.relation.as_ref().is_some_and(|r| r.relname == table) =>
+                if i.relation.as_ref().is_some_and(|r| key(r) == table) =>
             {
                 if i.cols.is_empty() {
                     return columns.to_vec();
@@ -143,14 +140,14 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
                 }
             }
             ("UPDATE", N::UpdateStmt(u))
-                if u.relation.as_ref().is_some_and(|r| r.relname == table) =>
+                if u.relation.as_ref().is_some_and(|r| key(r) == table) =>
             {
                 for c in target_names(&u.target_list) {
                     add(&c, &mut out);
                 }
             }
             ("UPDATE", N::InsertStmt(i))
-                if i.relation.as_ref().is_some_and(|r| r.relname == table) =>
+                if i.relation.as_ref().is_some_and(|r| key(r) == table) =>
             {
                 if let Some(oc) = &i.on_conflict_clause {
                     for c in target_names(&oc.target_list) {
@@ -161,9 +158,12 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
             ("SELECT", _) => {
                 // The names this table goes by in the statement.
                 let mut names = vec![table.to_string()];
+                if let Some((_, bare)) = table.split_once('.') {
+                    names.push(bare.to_string());
+                }
                 for (node, _, _, _) in stmt.nodes() {
                     if let pg_query::NodeRef::RangeVar(r) = node {
-                        if r.relname == table {
+                        if key(r) == table {
                             if let Some(a) = &r.alias {
                                 names.push(a.aliasname.clone());
                             }
@@ -205,6 +205,26 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
         }
     }
     out
+}
+
+/// The catalog key of the relation `r` names: `schema.name` for a table of
+/// a schema other than `public` (written qualified, or found first on the
+/// search path), else the bare name -- so a privilege is checked on the
+/// table the statement reads, not on whichever shares its bare name.
+fn key(r: &pg_query::protobuf::RangeVar) -> String {
+    let s = r.schemaname.as_str();
+    if s.is_empty() {
+        let found = crate::schemas::resolve_unqualified(&r.relname);
+        return if found.starts_with("pg_temp_") {
+            r.relname.clone()
+        } else {
+            found
+        };
+    }
+    if s == "pg_temp" || s.starts_with("pg_temp_") {
+        return r.relname.clone();
+    }
+    crate::schemas::relation_key(s, &r.relname)
 }
 
 fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static str) {

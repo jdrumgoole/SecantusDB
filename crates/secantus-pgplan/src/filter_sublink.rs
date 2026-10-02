@@ -112,7 +112,7 @@ fn rewrite_call(n: &mut pg_query::protobuf::Node) -> Result<()> {
     Ok(())
 }
 
-fn has_sublink(n: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn has_sublink(n: &pg_query::protobuf::Node) -> bool {
     let mut n = n.clone();
     let mut found = false;
     let _ = walk_expr(&mut n, &mut |x| {

@@ -6,7 +6,7 @@
 //! value (a document `{"0": .., "1": ..}` for several expressions), or no
 //! field at all when a value is NULL or the index's WHERE does not hold -- so
 //! NULLs stay distinct, as PostgreSQL's are, and the storage index enforces
-//! UNIQUE.
+//! UNIQUE. A `NULLS NOT DISTINCT` index keeps a NULL value as its key.
 //!
 //! Before this the field was never written: the index was empty and UNIQUE
 //! was checked by re-evaluating the expression over EVERY stored row on every
@@ -41,6 +41,8 @@ pub(crate) struct ExprIndex {
     pub field: String,
     exprs: Vec<secantus_pgplan::ColumnExpr>,
     predicate: Option<secantus_pgplan::ColumnExpr>,
+    /// `NULLS NOT DISTINCT`: a NULL value is a key like any other.
+    nulls_not_distinct: bool,
 }
 
 impl ExprIndex {
@@ -56,7 +58,7 @@ impl ExprIndex {
         let mut values = Vec::with_capacity(self.exprs.len());
         for e in &self.exprs {
             let v = secantus_pgplan::apply_row_expr(e, row).map_err(|e| PgHandler::err(&e))?;
-            if v == Bson::Null {
+            if v == Bson::Null && !self.nulls_not_distinct {
                 return Ok(None);
             }
             values.push(v);
@@ -111,6 +113,7 @@ impl PgHandler {
                 field: Self::expression_index_field(&name),
                 exprs: planned,
                 predicate,
+                nulls_not_distinct: crate::nulls_not_distinct(&ix),
             });
         }
         Ok(out)

@@ -20,6 +20,7 @@ import ipaddress
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -15342,3 +15343,63 @@ def test_startup_parameter_status_matches_postgresql_15(home: Path) -> None:
         assert c.pgconn.parameter_status(b"search_path") is None
         assert c.pgconn.parameter_status(b"scram_iterations") is None
         assert c.pgconn.parameter_status(b"TimeZone") is not None
+
+
+def test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `pg_temp` function is dropped at a clean disconnect; one a KILLED
+    server left used to reappear for the next session handed the same
+    serial. The server now drops every temp function when it opens a store,
+    before any session exists."""
+    # A killed server keeps only what reached the journal.
+    monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create function pg_temp.f() returns int language sql as 'select 1'")
+        # A permanent one beside it: proof the kill kept what was written.
+        a.execute("create function b41_keep() returns int language sql as 'select 2'")
+        # Commits are not synced (`transaction_sync` is off), so give the log
+        # writer time to flush them before the kill; `b41_keep` proves it did.
+        time.sleep(3)
+        assert server.proc is not None
+        server.proc.kill()
+        server.proc.wait(timeout=10)
+    with _Server(home) as server, server.connect() as c:
+        assert c.execute("select b41_keep()").fetchone() == (2,)
+        assert c.execute("select count(*) from pg_proc where proname = 'f'").fetchone() == (0,)
+        with pytest.raises(psycopg.errors.UndefinedFunction):
+            c.execute("select pg_temp.f()")
+
+
+def test_binary_xid_and_snapshot_parameters_decode(home: Path) -> None:
+    """Binary `xid` / `cid` / `xid8` / snapshot parameters (and their arrays)
+    used to be stored as their raw bytes, or refused; values measured on
+    PostgreSQL 15."""
+
+    def be(fmt: str, *v: int) -> bytes:
+        return struct.pack(">" + fmt, *v)
+
+    def arr(elem_oid: int, elems: list[bytes]) -> bytes:
+        out = be("iiI", 1, 0, elem_oid) + be("ii", len(elems), 1)
+        for e in elems:
+            out += be("i", len(e)) + e
+        return out
+
+    cases = [
+        ("select $1::text", 28, be("I", 4000000000), b"4000000000"),
+        ("select $1 = '4000000000'::xid", 28, be("I", 4000000000), b"t"),
+        ("select $1::text", 29, be("I", 7), b"7"),
+        ("select $1::text", 5069, be("Q", 2**40 + 5), b"1099511627781"),
+        ("select $1::text", 2970, be("iqq", 2, 10, 20) + be("qq", 12, 15), b"10:20:12,15"),
+        ("select $1::text", 5038, be("iqq", 0, 10, 20), b"10:20:"),
+        ("select $1::text", 1011, arr(28, [be("I", 5)]), b"{5}"),
+        ("select $1::text", 5039, arr(5038, [be("iqq", 1, 3, 9) + be("q", 4)]), b"{3:9:4}"),
+    ]
+    with _Server(home) as server, server.connect() as c:
+        for sql, oid, data, want in cases:
+            r = c.pgconn.exec_params(sql.encode(), [data], [oid], [1], 0)
+            assert r.get_value(0, 0) == want, (sql, oid)
+        # An xip outside [xmin, xmax) is PostgreSQL's 22P03.
+        bad = be("iqq", 1, 10, 20) + be("q", 30)
+        r = c.pgconn.exec_params(b"select $1::text", [bad], [5038], [1], 0)
+        assert r.error_field(psycopg.pq.DiagnosticField.SQLSTATE) == b"22P03"
