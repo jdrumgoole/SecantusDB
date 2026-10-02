@@ -836,6 +836,9 @@ pub enum Statement {
     /// PostgreSQL's tag — which is what a client asking to reset its cache
     /// needs.
     DeallocateAll,
+    /// `DISCARD ALL | PLANS | SEQUENCES | TEMP`, the word PostgreSQL's tag
+    /// carries after `DISCARD`.
+    Discard(String),
     /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
     /// answering 26000 when no statement of the name exists.
     Deallocate(String),
@@ -3084,6 +3087,7 @@ pub fn plan_with_subqueries(
     if let Some(e) = sql_json_absent(&node, sql, params) {
         return Err(e);
     }
+    drop_void_out_params(&mut node);
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
@@ -3607,6 +3611,16 @@ fn plan_node(
                 .collect::<Result<Vec<_>>>()?,
         }),
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
+        N::DiscardStmt(d) => Ok(Statement::Discard(
+            match d.target {
+                1 => "ALL",
+                2 => "PLANS",
+                3 => "SEQUENCES",
+                4 => "TEMP",
+                _ => return Err(Error::Parse("unrecognized DISCARD target".into())),
+            }
+            .into(),
+        )),
         N::DeallocateStmt(d) => Ok(Statement::Deallocate(d.name.clone())),
         // LISTEN / UNLISTEN / NOTIFY: the parser has already folded the
         // channel to lower case unless it was quoted, and `UNLISTEN *` comes
@@ -13240,7 +13254,16 @@ fn materialize_dml_ctes(
             lookup,
             &p,
         )?;
-        let rows = run(&plan)?;
+        // Only the plan that EXECUTES writes. A statement is also planned
+        // for its Parse and its Describe, and running the item there wrote
+        // the row two or three extra times per execution (pgjdbc's
+        // AutoRollbackTest: one `with x as (insert ...) select` left 7 rows
+        // where PostgreSQL leaves 3). Those plans need only the types.
+        let rows = if PLANNING_TO_EXECUTE.with(|p| p.get()) {
+            run(&plan)?
+        } else {
+            Vec::new()
+        };
         let cols: Vec<(String, String)> = match returning_output_def(&plan, lookup)? {
             Some(def) => def
                 .columns
@@ -19138,6 +19161,9 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             "regtype".to_string()
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("current_schemas") => {
+            "name[]".to_string()
+        }
         Some(N::FuncCall(f))
             if func_name(f).as_deref() == Some("pg_event_trigger_table_rewrite_oid") =>
         {
@@ -20710,6 +20736,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         } else if value == Bson::Null
                             || declared == "timestamptz"
                             || declared == "name"
+                            || declared == "name[]"
                             || fts::result_type(&name).is_some()
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
@@ -22345,7 +22372,11 @@ pub fn table_is_visible(oid: i64) -> Option<bool> {
             .map(|(n, _, tmp)| (n.clone(), *tmp))
     }) {
         if temp {
-            return Some(true);
+            // Only this session's own temp relations are on its path.
+            return Some(
+                schemas::temp_schema().is_none_or(|t| key.starts_with(&format!("{t}.")))
+                    || !key.starts_with("pg_temp_"),
+            );
         }
         let (schema, name) = schemas::split_key(&key);
         if system_relation("pg_catalog", &name).is_some() || !path.contains(&schema) {
@@ -22377,6 +22408,13 @@ pub fn regclass_text(oid: i64) -> String {
             .find(|(_, o, _)| *o == oid)
             .map(|(n, _, _)| n.clone())
     }) {
+        // This session's own temp relation prints bare, as PostgreSQL's
+        // visible relations do.
+        let own = schemas::temp_schema()
+            .and_then(|t| name.strip_prefix(&format!("{t}.")).map(str::to_string));
+        if let Some(bare) = own {
+            return scalar::quote_identifier(&bare);
+        }
         // A schema-qualified table is stored as `schema.name`; each part
         // quotes on its own (`"Order"`, `testschema."Order"`).
         return name
@@ -22496,13 +22534,23 @@ fn resolve_regclass(text: &str) -> Result<i64> {
             .find(|(n, _)| *n == name)
             .map(|(_, oid)| *oid)
     };
+    let own_temp = schemas::temp_schema().map(|t| schemas::relation_key(&t, name));
     let found = match schema {
-        None => user(name, Some(true))
+        None => own_temp
+            .as_deref()
+            .and_then(|k| user(k, Some(true)))
+            .or_else(|| user(name, Some(true)))
             .or_else(|| user(name, Some(false)))
             .or_else(catalog)
             .or_else(|| system_relation("pg_catalog", name)),
         Some("public") => user(name, Some(false)),
-        Some(s) if s == "pg_temp" || s.starts_with("pg_temp_") => user(name, Some(true)),
+        Some(s) if s == "pg_temp" || s.starts_with("pg_temp_") => {
+            let own = (s == "pg_temp" || schemas::temp_schema().as_deref() == Some(s))
+                .then(|| own_temp.as_deref().and_then(|k| user(k, Some(true))))
+                .flatten();
+            own.or_else(|| user(&format!("{s}.{name}"), Some(true)))
+                .or_else(|| user(name, Some(true)))
+        }
         Some("pg_catalog") => catalog().or_else(|| system_relation("pg_catalog", name)),
         Some(s @ ("information_schema" | "pg_toast")) => system_relation(s, name),
         // A table in another schema is stored under `schema.name`.
@@ -23768,6 +23816,36 @@ fn user_range_name(oid: i64) -> Option<String> {
 }
 
 /// The declared type of `$n`, when the client gave one.
+/// PostgreSQL's `ParseFuncOrColumn` drops a function argument that is a
+/// parameter of type `void`: it is JDBC's placeholder for an OUT parameter
+/// (`{? = call f(?)}` is sent as `select * from f($1, $2)` with `$1` typed
+/// void). Kept, it made `f(float8)` a call of `f(text, float8)` that no
+/// function matched.
+fn drop_void_out_params(node: &mut pg_query::protobuf::Node) {
+    let is_void_param = |a: &pg_query::protobuf::Node| match a.node.as_ref() {
+        Some(N::ParamRef(p)) => usize::try_from(p.number)
+            .ok()
+            .and_then(declared_param_type)
+            .is_some_and(|t| t == "void"),
+        _ => false,
+    };
+    let Some(inner) = node.node.as_mut() else {
+        return;
+    };
+    // SAFETY: `nodes_mut` hands out pointers into `inner`, which outlives
+    // the loop and is not otherwise touched while they are used.
+    unsafe {
+        for (n, _, _) in inner.nodes_mut() {
+            if let pg_query::NodeMut::FuncCall(f) = n {
+                let f = &mut *f;
+                if f.args.iter().any(is_void_param) {
+                    f.args.retain(|a| !is_void_param(a));
+                }
+            }
+        }
+    }
+}
+
 fn declared_param_type(n: usize) -> Option<String> {
     PLAN_PARAM_TYPES.with(|t| t.borrow().get(n.checked_sub(1)?).cloned().flatten())
 }
@@ -26474,6 +26552,21 @@ pub fn catalog_param_types_opt(
     declared: &[Option<String>],
     column_type: &dyn Fn(&str, ColumnRef<'_>) -> Option<String>,
 ) -> Vec<Option<String>> {
+    // A name as the statement wrote it resolves the way the statement's own
+    // plan resolves it -- the session's temp table first, then the search
+    // path -- before the bare name the catalog may also hold.
+    let column_type = |table: &str, column: ColumnRef<'_>| -> Option<String> {
+        if !table.contains('.') {
+            let key = schemas::resolve_unqualified(table);
+            if key != table {
+                if let Some(t) = column_type(&key, column) {
+                    return Some(t);
+                }
+            }
+        }
+        column_type(table, column)
+    };
+    let column_type: &dyn Fn(&str, ColumnRef<'_>) -> Option<String> = &column_type;
     let n = declared.len().max(max_param_number(sql));
     let mut padded = declared.to_vec();
     padded.resize(n, None);

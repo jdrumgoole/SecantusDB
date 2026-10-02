@@ -26,11 +26,54 @@ thread_local! {
     /// entry, so the regclass list alone does not see it.
     static RELATION_KEYS: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// The session's own temporary schema (`pg_temp_N`), installed per
+    /// statement. A TEMP relation is stored under `pg_temp_N.name`, so two
+    /// sessions' same-named temp tables are distinct relations -- as they
+    /// are in PostgreSQL, where every backend has its own temp namespace.
+    static TEMP_SCHEMA: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the session's temporary schema for the statements that follow.
+pub fn set_temp_schema(schema: Option<String>) {
+    TEMP_SCHEMA.with(|t| *t.borrow_mut() = schema);
+}
+
+/// The session's temporary schema, when one is installed.
+pub fn temp_schema() -> Option<String> {
+    TEMP_SCHEMA.with(|t| t.borrow().clone())
+}
+
+/// Does `schema` name the session's temp schema (`pg_temp`, its alias, or
+/// `pg_temp_N` itself)?
+fn names_temp_schema(schema: &str) -> Option<String> {
+    let t = temp_schema()?;
+    (schema == "pg_temp" || schema == t).then_some(t)
+}
+
+/// Does the session have a temporary relation?
+fn session_has_temp() -> bool {
+    let Some(t) = temp_schema() else {
+        return false;
+    };
+    let prefix = format!("{t}.");
+    RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
+        || PLAN_USER_RELATIONS.with(|r| r.borrow().iter().any(|(n, _, _)| n.starts_with(&prefix)))
 }
 
 /// Install every relation's catalog key for the statements that follow.
 pub fn set_relation_keys(keys: std::collections::HashSet<String>) {
     RELATION_KEYS.with(|k| *k.borrow_mut() = keys);
+}
+
+/// Add one relation key to the installed set: a TEMP table a statement
+/// created part-way through a larger one (a trigger's transition table, a
+/// function body's own temp table), which the next statement inside it must
+/// already resolve to.
+pub fn note_relation_key(key: &str) {
+    RELATION_KEYS.with(|k| {
+        k.borrow_mut().insert(key.to_string());
+    });
 }
 
 /// Install the database's user schemas for the statements that follow.
@@ -71,7 +114,7 @@ pub fn relation_key(schema: &str, name: &str) -> String {
 /// is a user schema, else `public`.
 pub fn split_key(key: &str) -> (String, String) {
     if let Some((s, n)) = key.split_once('.') {
-        if is_user_schema(s) {
+        if is_user_schema(s) || s.starts_with("pg_temp_") {
             return (s.to_string(), n.to_string());
         }
     }
@@ -103,7 +146,7 @@ pub fn search_path() -> Vec<String> {
 /// Is the path one that can only ever resolve to `public` -- nothing to
 /// rewrite?
 fn path_is_trivial(path: &[String]) -> bool {
-    path.iter().all(|s| !is_user_schema(s))
+    path.iter().all(|s| !is_user_schema(s)) && !session_has_temp()
 }
 
 fn relation_exists(key: &str) -> bool {
@@ -115,6 +158,14 @@ fn relation_exists(key: &str) -> bool {
 /// holding it, else the bare name (whose lookup then fails as PostgreSQL's
 /// does, naming what the user wrote).
 pub fn resolve_unqualified(name: &str) -> String {
+    // The session's temp schema is searched first for relations, as
+    // PostgreSQL's implicit `pg_temp` is.
+    if let Some(t) = temp_schema() {
+        let key = relation_key(&t, name);
+        if relation_exists(&key) {
+            return key;
+        }
+    }
     for schema in search_path() {
         if !schema_exists(schema.as_str()) || matches!(schema.as_str(), "pg_catalog") {
             continue;
@@ -136,7 +187,22 @@ pub fn creation_schema() -> Result<String> {
 }
 
 fn qualify_target(r: &mut RangeVar) -> Result<()> {
+    // `CREATE TABLE pg_temp.x` makes a temporary table, as TEMP does.
+    if r.relpersistence != "t" && names_temp_schema(&r.schemaname).is_some() {
+        r.relpersistence = "t".into();
+    }
     if r.relpersistence == "t" {
+        if let Some(t) = temp_schema() {
+            if r.schemaname.is_empty() || names_temp_schema(&r.schemaname).is_some() {
+                r.relname = relation_key(&t, &r.relname);
+                r.schemaname.clear();
+            } else {
+                return Err(Error::Sqlstate(
+                    "42P16",
+                    "cannot create temporary relation in non-temporary schema".into(),
+                ));
+            }
+        }
         return Ok(());
     }
     if r.schemaname.is_empty() {
@@ -176,6 +242,18 @@ fn qualify_reference(r: &mut RangeVar, ctes: &[String], trivial: bool) -> Option
             }
             r.relname = key;
         }
+        return None;
+    }
+    if let Some(t) = names_temp_schema(&r.schemaname) {
+        r.schemaname.clear();
+        r.catalogname.clear();
+        if r.alias.is_none() {
+            r.alias = Some(Alias {
+                aliasname: r.relname.clone(),
+                colnames: Vec::new(),
+            });
+        }
+        r.relname = relation_key(&t, &r.relname);
         return None;
     }
     if is_builtin(&r.schemaname) {
@@ -228,10 +306,13 @@ fn qualify_name_list(l: &mut pg_query::protobuf::List, rest: usize, trivial: boo
             resolve_unqualified(name)
         }
         [schema, name] | [_, schema, name] => {
-            if is_builtin(schema) {
+            if let Some(t) = names_temp_schema(schema) {
+                relation_key(&t, name)
+            } else if is_builtin(schema) {
                 return;
+            } else {
+                relation_key(schema, name)
             }
-            relation_key(schema, name)
         }
         _ => return,
     };
@@ -503,7 +584,10 @@ pub fn qualify(node: &mut N) -> Result<()> {
 /// name list of a DROP / COMMENT?
 fn node_mentions_schema(node: &N) -> bool {
     node.nodes().iter().any(|(n, _, _, _)| match n {
-        pg_query::NodeRef::RangeVar(r) => !r.schemaname.is_empty() && !is_builtin(&r.schemaname),
+        pg_query::NodeRef::RangeVar(r) => {
+            !r.schemaname.is_empty()
+                && (!is_builtin(&r.schemaname) || names_temp_schema(&r.schemaname).is_some())
+        }
         _ => false,
     }) || match node {
         N::DropStmt(d) => d.objects.iter().any(|o| match o.node.as_ref() {

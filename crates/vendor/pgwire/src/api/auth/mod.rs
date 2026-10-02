@@ -264,6 +264,26 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
+    // SecantusDB patch: the server reports PostgreSQL 15, which speaks only
+    // protocol 3.0. A 3.x request newer than that is answered as PostgreSQL
+    // 15 answers it -- a NegotiateProtocolVersion naming 3.0 and every
+    // `_pq_.` option it did not recognise -- not by switching to 3.2 (whose
+    // 32-byte cancel key a 3.2-aware client reads as "PostgreSQL 18").
+    if startup_message.protocol_number_major == 3 && startup_message.protocol_number_minor > 0 {
+        let unrecognized: Vec<String> = startup_message
+            .parameters
+            .keys()
+            .filter(|k| k.starts_with("_pq_."))
+            .cloned()
+            .collect();
+        client
+            .send(PgWireBackendMessage::NegotiateProtocolVersion(
+                NegotiateProtocolVersion::new(ProtocolVersion::PROTOCOL3_0.into(), unrecognized),
+            ))
+            .await?;
+        client.set_protocol_version(ProtocolVersion::PROTOCOL3_0);
+        return Ok(());
+    }
     if let Some(protocol_version) = ProtocolVersion::from_version_number(
         startup_message.protocol_number_major,
         startup_message.protocol_number_minor,

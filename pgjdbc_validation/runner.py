@@ -140,6 +140,20 @@ def _verify_secantus_identity(host: str, port: int) -> None:
         )
 
 
+def _ensure_test_database(host: str, port: int) -> None:
+    """Create the ``test`` database pgjdbc's suite connects to, as pgjdbc's
+    own CI setup does on a real PostgreSQL. A server that already has it (or
+    accepts any database name) is left alone."""
+    import psycopg
+
+    with psycopg.connect(
+        host=host, port=port, dbname="postgres", user="postgres", autocommit=True
+    ) as conn:
+        exists = conn.execute("select 1 from pg_database where datname = 'test'").fetchone()
+        if exists is None:
+            conn.execute("create database test")
+
+
 def _is_jdk21(home: str) -> bool:
     """True when ``home`` really is a JDK 21 (verified by running java
     -version — path heuristics lie; macOS's ``java_home -v 21`` happily
@@ -220,6 +234,7 @@ def main() -> int:
     try:
         _wait_for_listener(host, port)
         _verify_secantus_identity(host, port)
+        _ensure_test_database(host, port)
 
         # pgjdbc's stock local-config mechanism; *.local.properties is in the
         # submodule's own .gitignore, so this never dirties the vendored tree.

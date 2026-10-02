@@ -67,6 +67,7 @@ def test_timeout_aggregates_instead_of_reporting_nothing(results, monkeypatch, c
     monkeypatch.setattr(runner.subprocess, "run", _boom)
     monkeypatch.setattr(runner, "_verify_secantus_identity", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_wait_for_listener", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_ensure_test_database", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_find_jdk21", lambda: "/fake/jdk")
     monkeypatch.setattr(runner, "_test_classes", lambda: ["Some.Test"])
     monkeypatch.setattr(runner.shutil, "rmtree", lambda *a, **k: None)
