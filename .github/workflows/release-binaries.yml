@@ -308,6 +308,29 @@ jobs:
             #     profile itself (the `pgo-instrument` feature: __llvm_profile_
             #     set_filename + __llvm_profile_write_file to $SECANTUS_PGO_OUT on
             #     shutdown). Verified to yield a valid, mergeable profile.
+            #  3. Only Rust is profiled. The `cc` crate copies rustc's
+            #     -Cprofile-generate / -Cprofile-use onto clang, so every C
+            #     dependency built through it (ring, via rustls) would be
+            #     instrumented by Apple clang -- in Apple clang's profile format,
+            #     which rustc 1.99's runtime (LLVM 23) no longer reads. The
+            #     instrumented binary then died writing its profile ("Runtime and
+            #     instrumentation version mismatch: expected 11, but get 10") and
+            #     0.5.3-beta.166 / .167 shipped no macOS binary. A C compiler
+            #     wrapper that drops the -fprofile-* flags keeps C uninstrumented
+            #     whatever the Rust and Xcode versions. `cc` reads the
+            #     target-specific CC_<target> variable.
+            nopgo="$RUNNER_TEMP/cc-nopgo"
+            cat > "$nopgo" <<'WRAP'
+          #!/bin/bash
+          args=()
+          for a in "$@"; do
+            case "$a" in -fprofile-generate*|-fprofile-use*|-fprofile-instr-*) ;; *) args+=("$a") ;; esac
+          done
+          exec cc "${args[@]}"
+          WRAP
+            chmod +x "$nopgo"
+            export "CC_${target//-/_}=$nopgo"
+
             echo "=== macOS PGO stage 1: instrumented build (system allocator + self-written profile) ==="
             RUSTFLAGS="-Cprofile-generate=$profraw" \
               cargo build --release --locked --no-default-features --features bin,pgo-instrument --target "$target" --manifest-path "$manifest"

@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.167"
+version = "0.5.3-beta.168"
 dependencies = [
  "bson",
  "chrono",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.167"
+version = "0.5.3-beta.168"
 dependencies = [
  "bson",
  "flate2",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.167"
+version = "0.5.3-beta.168"
 dependencies = [
  "cc",
  "cmake",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.167"
+version = "0.5.3-beta.168"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]
