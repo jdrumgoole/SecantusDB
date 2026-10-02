@@ -620,22 +620,20 @@ remain open:
       `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
       `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
       port of one C function family, so the split is by table, not logic).
-- [ ] **OPEN — RUST pgserver: a column name containing a DOT is read as
-      a nested path -- SILENT WRITE LOSS (batch 35, 2026-10-02).** The last
-      SQLAlchemy dialect failure on the Rust server (977 passed / 1 failed,
-      `DifficultParametersTest::test_round_trip_same_named_column[dot.s]`).
-      `WHERE "dot.s" = 'x'` matches 0 rows and `UPDATE t SET "dot.s" = 'x'`
-      reports success and changes nothing; SELECT / INSERT work. PostgreSQL
-      15 handles it. The fix must keep the Python server's on-disk layout (a
-      literal dotted key), so it touches filter lowering and update. Also
-      left from batch 35: composite types are absent from the Rust
-      `pg_class`; index comments are keyed by bare name (two same-named
-      indexes in different schemas would share one); a view's stored text
-      names `"s.t"`, so `pg_get_viewdef` differs for views over schema
-      tables; an unqualified `'t'::regclass` / `nextval('t')` does not walk
-      a non-default `search_path`; privilege checks see the bare relname;
-      the gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp
-      directory.
+- [ ] **OPEN — RUST pgserver: leftovers after the SQLAlchemy campaign
+      (batches 35-36, 2026-10-02; the dialect suite is 978 / 0).** Dotted /
+      `$`-named columns are fixed (corpus `dotted_columns`), with limits:
+      predicates over them run per row (no index use); a plain CREATE INDEX
+      on one builds an unused path index; ALTER TABLE ADD UNIQUE on a dotted
+      column with existing rows fills the hidden `__sqlexpr_` field only at
+      the next open (weaker duplicate check until then, unprobed); `UNIQUE
+      NULLS NOT DISTINCT` there falls back to NULLs-distinct; the Python PG
+      server was not checked for these names. Also: composite types are
+      absent from the Rust `pg_class`; index comments are keyed by bare name;
+      `pg_get_viewdef` differs for views over schema tables; an unqualified
+      `'t'::regclass` / `nextval('t')` does not walk a non-default
+      `search_path`; privilege checks see the bare relname; the SQLAlchemy
+      gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp dir.
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First

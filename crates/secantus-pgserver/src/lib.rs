@@ -7163,7 +7163,14 @@ impl PgHandler {
     /// always empty: it exists for the catalog -- listing, naming, DROP --
     /// while the executor enforces its UNIQUE from `sqlExpressions`.
     fn expression_index_field(name: &str) -> String {
-        format!("__sqlexpr_{name}")
+        // The field is named in a storage key spec and a partial filter, both
+        // of which read a dot as a path: an index named `t_dot.s_key` would
+        // otherwise index nothing. A name with no dot keeps its old field.
+        if name.contains('.') {
+            format!("__sqlexpr_{}", name.replace('%', "%25").replace('.', "%2E"))
+        } else {
+            format!("__sqlexpr_{name}")
+        }
     }
 
     fn create_expression_index(
@@ -7548,6 +7555,18 @@ impl PgHandler {
             ))));
         }
         if !ci.expressions.is_empty() {
+            return self.create_expression_index(&def, &name, &ci);
+        }
+        if ci.unique
+            && ci.columns.iter().any(|(c, _)| {
+                def.field_of(c)
+                    .is_some_and(|f| secantus_pgplan::is_literal_only_column_field(&def, &f))
+            })
+        {
+            // A storage key spec reads `"dot.s"` as a path: the UNIQUE index
+            // is an expression index over the quoted columns instead.
+            let mut ci = ci;
+            ci.expressions = ci.columns.iter().map(|(c, _)| quote_ident(c)).collect();
             return self.create_expression_index(&def, &name, &ci);
         }
         let mut key_spec = Document::new();
@@ -13345,7 +13364,15 @@ impl PgHandler {
             return Ok(None);
         };
         let mark = secantus_pgplan::CONFLICT_EXPR_MARK;
-        if !cols.iter().any(|c| c.starts_with(mark)) {
+        // A column named `"dot.s"` / `"$x"` is enforced by an expression
+        // index over the quoted column (see `create_unique_index`).
+        let literal = self.lookup(table).is_some_and(|def| {
+            cols.iter().any(|c| {
+                def.field_of(c)
+                    .is_some_and(|f| secantus_pgplan::is_literal_only_column_field(&def, &f))
+            })
+        });
+        if !literal && !cols.iter().any(|c| c.starts_with(mark)) {
             return Ok(None);
         }
         let normalize = |e: &str| secantus_pgplan::normalized_expression(e).unwrap_or_default();
@@ -13353,7 +13380,7 @@ impl PgHandler {
             .iter()
             .map(|c| match c.strip_prefix(mark) {
                 Some(e) => normalize(e),
-                None => normalize(c),
+                None => normalize(&quote_ident(c)),
             })
             .collect();
         want.sort();
@@ -13490,6 +13517,34 @@ impl PgHandler {
             }
             let fields: Vec<String> = uq.columns.iter().filter_map(|c| def.field_of(c)).collect();
             if fields.len() != uq.columns.len() {
+                return Ok(());
+            }
+            if fields
+                .iter()
+                .any(|f| secantus_pgplan::is_literal_only_column_field(def, f))
+            {
+                // A storage index reads `"dot.s"` as a path and `"$x"` as
+                // nothing, so it would index every row as NULL and enforce
+                // nothing. Such a constraint is an EXPRESSION index over the
+                // quoted columns instead: a hidden field holding the literal
+                // key's value, which storage can index.
+                let quoted: Vec<String> = uq.columns.iter().map(|c| quote_ident(c)).collect();
+                let field = Self::expression_index_field(&uq.name);
+                let options = bson::doc! {
+                    "unique": true,
+                    "partialFilterExpression": { field.clone(): { "$exists": true } },
+                    "sqlExpressions": quoted.clone(),
+                    "sqlKeys": quoted,
+                };
+                storage
+                    .create_index(
+                        db,
+                        &def.name,
+                        &uq.name,
+                        &bson::doc! { field: 1_i32 },
+                        &options,
+                    )
+                    .map_err(|e| Self::storage_err("could not create the unique index", e))?;
                 return Ok(());
             }
             let mut key_spec = Document::new();
@@ -24991,17 +25046,57 @@ impl PgHandler {
         set: &Document,
         unset: &[String],
     ) -> PgWireResult<usize> {
-        let mut ops = bson::doc! { "$set": set.clone() };
-        if !unset.is_empty() {
-            let mut u = Document::new();
-            for f in unset {
-                u.insert(f.clone(), "");
+        let literal = set
+            .keys()
+            .chain(unset.iter())
+            .any(|f| secantus_pgplan::is_literal_only_field(f))
+            && self.lookup(table).is_some_and(|def| {
+                set.keys()
+                    .chain(unset.iter())
+                    .any(|f| secantus_pgplan::is_literal_only_column_field(&def, f))
+            });
+        let outcome = if literal {
+            // A column named `"dot.s"` or `"$x"` is ONE top-level key, which
+            // `$set` cannot address: it reads the first as a path and refuses
+            // the second. `$setField` writes the literal key, in place.
+            let mut expr = Bson::String("$$ROOT".into());
+            for (f, v) in set {
+                expr = Bson::Document(bson::doc! { "$setField": {
+                    "field": { "$literal": f.clone() },
+                    "input": expr,
+                    "value": { "$literal": v.clone() },
+                } });
             }
-            ops.insert("$unset", u);
-        }
-        let outcome = self
-            .storage
-            .update_matching(
+            for f in unset {
+                expr = Bson::Document(bson::doc! { "$setField": {
+                    "field": { "$literal": f.clone() },
+                    "input": expr,
+                    "value": "$$REMOVE",
+                } });
+            }
+            self.storage.update_matching_pipeline(
+                self.db(),
+                table,
+                filter,
+                &[Bson::Document(bson::doc! { "$replaceWith": expr })],
+                true,
+                false,
+                &Document::new(),
+                None,
+                None,
+                false,
+                false,
+            )
+        } else {
+            let mut ops = bson::doc! { "$set": set.clone() };
+            if !unset.is_empty() {
+                let mut u = Document::new();
+                for f in unset {
+                    u.insert(f.clone(), "");
+                }
+                ops.insert("$unset", u);
+            }
+            self.storage.update_matching(
                 self.db(),
                 table,
                 filter,
@@ -25014,25 +25109,26 @@ impl PgHandler {
                 None,
                 false,
             )
-            .map_err(|e| match &e {
-                // An UPDATE that collides with a unique constraint is the same
-                // 23505 an INSERT gets. Before this it fell through to the
-                // generic wrapper and reached the client as `could not update:
-                // E11000 duplicate key error on index ...` -- the MongoDB
-                // persona leaking through the PostgreSQL one, with no SQLSTATE
-                // a client could branch on.
-                secantus_storage::StorageError::DuplicateKey(c) => match self.lookup(table) {
-                    Some(def) => Self::unique_violation(
-                        table,
-                        &def,
-                        &c.key_pattern,
-                        &c.key_value,
-                        Some(c.index.as_str()),
-                    ),
-                    None => Self::storage_err("could not update", e),
-                },
-                _ => Self::storage_err("could not update", e),
-            })?;
+        }
+        .map_err(|e| match &e {
+            // An UPDATE that collides with a unique constraint is the same
+            // 23505 an INSERT gets. Before this it fell through to the
+            // generic wrapper and reached the client as `could not update:
+            // E11000 duplicate key error on index ...` -- the MongoDB
+            // persona leaking through the PostgreSQL one, with no SQLSTATE
+            // a client could branch on.
+            secantus_storage::StorageError::DuplicateKey(c) => match self.lookup(table) {
+                Some(def) => Self::unique_violation(
+                    table,
+                    &def,
+                    &c.key_pattern,
+                    &c.key_value,
+                    Some(c.index.as_str()),
+                ),
+                None => Self::storage_err("could not update", e),
+            },
+            _ => Self::storage_err("could not update", e),
+        })?;
         Ok(outcome.matched)
     }
 }
@@ -31424,4 +31520,9 @@ mod idle_timeout_guc_tests {
             "1min"
         );
     }
+}
+
+/// A column name as a quoted SQL identifier, for an expression over it.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
