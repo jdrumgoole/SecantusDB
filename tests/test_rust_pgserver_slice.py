@@ -8391,10 +8391,12 @@ def test_create_table_as_function_sources_and_expression_aggregates(home: Path) 
             "hastriggers",
             "rowsecurity",
         ]
-        assert cur.fetchall() == [
-            ("public", "t1", "test", None, False, False, False, False),
-            ("pg_temp_1", "tt", "test", None, False, False, False, False),
-        ]
+        rows = cur.fetchall()
+        # A temp table lives in its session's own pg_temp_N; PostgreSQL's N is
+        # the backend slot, so only the prefix is stable.
+        assert rows[0] == ("public", "t1", "test", None, False, False, False, False)
+        assert re.fullmatch(r"pg_temp_\d+", rows[1][0])
+        assert rows[1][1:] == ("tt", "test", None, False, False, False, False)
         cur = conn.execute("select count(*) from pg_tables where tablename = 'nope'")
         assert cur.fetchone() == (0,)
 

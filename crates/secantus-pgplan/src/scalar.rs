@@ -70,6 +70,7 @@ pub(crate) fn is_catalog_reader(name: &str) -> bool {
 const CATALOG_NAMES: &[&str] = &[
     "version",
     "current_schema",
+    "current_schemas",
     "current_database",
     "current_catalog",
     "current_setting",
@@ -1585,6 +1586,29 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "version" | "current_schema" => crate::session_function(name)
             .ok_or_else(|| Error::Unsupported(format!("function {name}()"))),
         "current_database" | "current_catalog" => Ok(Bson::String(crate::session_database())),
+        // The effective search path as `name[]`: the schemas on the path
+        // that exist, with the implicitly-searched `pg_catalog` first when
+        // the argument asks for it and the path does not already name it
+        // (measured on PostgreSQL 15: `{pg_catalog,public}` / `{public}`,
+        // a nonexistent schema left out).
+        "current_schemas" => {
+            let implicit = match args.first() {
+                Some(Bson::Boolean(b)) => *b,
+                _ => return Ok(Bson::Null),
+            };
+            let path: Vec<String> = crate::schemas::search_path()
+                .into_iter()
+                .filter(|s| {
+                    crate::schemas::schema_exists(s) && s != "pg_temp" && !s.starts_with("pg_temp_")
+                })
+                .collect();
+            let mut out: Vec<Bson> = Vec::new();
+            if implicit && !path.iter().any(|s| s == "pg_catalog") {
+                out.push(Bson::String("pg_catalog".into()));
+            }
+            out.extend(path.into_iter().map(Bson::String));
+            Ok(Bson::Array(out))
+        }
         "current_setting" => {
             let Some(Bson::String(key)) = args.first() else {
                 return Ok(Bson::Null);
@@ -2276,6 +2300,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "scale" | "min_scale" => "int4",
         "current_schema" | "current_database" | "current_user" | "session_user" => "name",
+        "current_schemas" => "name[]",
         "trim_scale" => "numeric",
         "numeric_send" => "bytea",
         "starts_with" => "bool",

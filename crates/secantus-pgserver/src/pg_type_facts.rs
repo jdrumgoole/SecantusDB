@@ -47,6 +47,12 @@ fn typed(column: &str, v: &str) -> Bson {
     match column {
         "typlen" => Bson::Int32(v.parse().unwrap_or(-1)),
         "typbyval" | "typispreferred" => Bson::Boolean(v == "true"),
+        // The I/O columns are `regproc`: an oid that renders as the name, so
+        // `typinput = 'pg_catalog.array_in'::regproc` compares oids (pgjdbc's
+        // type cache asks exactly that).
+        "typinput" | "typoutput" | "typreceive" | "typsend" | "typmodin" | "typmodout"
+        | "typanalyze" | "typsubscript" => secantus_pgplan::regobj::builtin_regproc(v)
+            .unwrap_or_else(|| Bson::String(v.to_string())),
         _ => Bson::String(v.to_string()),
     }
 }
@@ -66,8 +72,8 @@ pub(crate) fn by_kind(typtype: &str, base: Option<i64>, column: &str) -> Option<
             // A domain is its base type's representation, with its own I/O
             // entry points.
             return match c {
-                "typinput" => Some(Bson::String("domain_in".into())),
-                "typreceive" => Some(Bson::String("domain_recv".into())),
+                "typinput" => Some(typed(c, "domain_in")),
+                "typreceive" => Some(typed(c, "domain_recv")),
                 "typispreferred" => Some(Bson::Boolean(false)),
                 _ => base.and_then(|b| builtin(b, c)),
             };

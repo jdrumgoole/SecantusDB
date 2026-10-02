@@ -2089,6 +2089,18 @@ pub struct PgHandler {
     /// The open block touched a temporary table (any access, a SELECT
     /// included): PostgreSQL refuses to PREPARE such a transaction.
     touched_temp: AtomicBool,
+    /// The results a multi-command simple query produced BEFORE the command
+    /// that failed: PostgreSQL sends each of them, then the error.
+    batch_partial: Mutex<Vec<Response>>,
+    /// Protocol-level statements a SQL `DEALLOCATE` / `DISCARD ALL` removed,
+    /// to drop from the wire layer's statement store at the next message
+    /// that can reach it (the executor has no handle on the store).
+    wire_dealloc: Mutex<Vec<String>>,
+    /// The temporary tables this session created, dropped when it ends.
+    temp_tables: Mutex<Vec<String>>,
+    /// The sequences whose stored row the open transaction wrote (created,
+    /// altered, dropped, reset): `nextval` advances those inside it.
+    txn_sequences: Mutex<std::collections::HashSet<String>>,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -2239,6 +2251,10 @@ struct PreparedRecord {
     result_types: Option<Vec<String>>,
     /// Made by SQL `PREPARE` rather than a protocol `Parse`.
     from_sql: bool,
+    /// The catalog version `result_types` was read under: a later version
+    /// means DDL may have changed the statement's result shape, which
+    /// PostgreSQL refuses (`cached plan must not change result type`).
+    catalog_version: u64,
     /// The query `EXECUTE` runs, and its parameters' internal type names
     /// (empty where no type could be inferred).
     query: String,
@@ -2336,6 +2352,10 @@ impl PgHandler {
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
             touched_temp: AtomicBool::new(false),
+            batch_partial: Mutex::new(Vec::new()),
+            wire_dealloc: Mutex::new(Vec::new()),
+            temp_tables: Mutex::new(Vec::new()),
+            txn_sequences: Mutex::new(std::collections::HashSet::new()),
             holdable_declared: AtomicBool::new(false),
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
@@ -2714,6 +2734,7 @@ impl PgHandler {
                 .clone(),
         ));
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
+        secantus_pgplan::schemas::set_temp_schema(Some(self.temp_schema_name()));
         secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
         secantus_pgplan::user_ops::set_user_operators(self.user_operators());
         secantus_pgplan::user_casts::set_user_casts(self.user_casts());
@@ -3290,6 +3311,9 @@ impl PgHandler {
     /// reports the parse error at Parse time, and this server reports it at
     /// Describe, which is where psycopg sees it either way.
     fn prepared_record(&self, stmt: &StoredStatement<ParsedStatement>) -> PreparedRecord {
+        let catalog_version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
         let sql = stmt.statement.sql.clone();
         let declared = self.param_type_names(stmt);
         let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
@@ -3301,6 +3325,7 @@ impl PgHandler {
                 col.map(|c| c.pg_type.clone())
             })
         };
+        self.install_user_types();
         let arg_types = secantus_pgplan::catalog_param_types(&sql, &declared, &column_type);
         let parameter_types = arg_types
             .iter()
@@ -3330,7 +3355,89 @@ impl PgHandler {
             result_types,
             from_sql: false,
             arg_types,
+            catalog_version,
         }
+    }
+
+    /// `DEALLOCATE ALL`: every prepared statement, SQL and protocol alike --
+    /// a client that issues it (pgjdbc) expects its server-prepared
+    /// statements gone, and re-prepares on 26000.
+    fn deallocate_all(&self) {
+        let removed: Vec<String> = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .filter(|r| !r.from_sql)
+            .map(|r| r.name)
+            .collect();
+        self.wire_dealloc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(removed);
+    }
+
+    /// Drop from the wire store the statements a SQL DEALLOCATE removed.
+    fn apply_wire_dealloc<S>(&self, store: &S)
+    where
+        S: pgwire::api::store::PortalStore + ?Sized,
+    {
+        let names =
+            std::mem::take(&mut *self.wire_dealloc.lock().unwrap_or_else(|e| e.into_inner()));
+        for name in names {
+            store.rm_statement(&name);
+        }
+    }
+
+    /// PostgreSQL's refusal to run a protocol-prepared statement whose result
+    /// shape DDL has changed since its `Parse` (`select *` over a table that
+    /// gained a column): `0A000 cached plan must not change result type`.
+    /// Checked only when the catalog moved since the statement was described.
+    fn check_cached_result_type(
+        &self,
+        stmt: &StoredStatement<ParsedStatement>,
+    ) -> PgWireResult<()> {
+        let now = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let recorded = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|r| r.name == stmt.id && !r.from_sql)
+            .map(|r| (r.catalog_version, r.result_types.clone()));
+        let Some((version, before)) = recorded else {
+            return Ok(());
+        };
+        if version == now {
+            return Ok(());
+        }
+        let current = self.prepared_record(stmt);
+        if before.is_some() && current.result_types.is_some() && current.result_types != before {
+            self.note_failure();
+            // The ROUTINE is part of the answer: pgjdbc recognises this error
+            // by `RevalidateCachedQuery` and re-prepares and retries outside
+            // a transaction (or under autosave) -- without it the error
+            // surfaced to the application.
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "cached plan must not change result type".into(),
+            );
+            info.routine = Some("RevalidateCachedQuery".into());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        if let Some(r) = self
+            .prepared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .find(|r| r.name == stmt.id && !r.from_sql)
+        {
+            r.catalog_version = now;
+        }
+        Ok(())
     }
 
     /// The wire `Type` a RAW parameter oid names, when it is a user type. Used
@@ -4771,6 +4878,16 @@ impl PgHandler {
     /// transaction see it before it is committed. A no-op outside a
     /// transaction: an autocommit statement's write is committed at once and
     /// a plain read already finds it.
+    /// Record that the open transaction wrote sequence `name`'s row.
+    pub(crate) fn note_txn_sequence(&self, name: &str) {
+        if self.transaction_handle_open() {
+            self.txn_sequences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.to_string());
+        }
+    }
+
     fn note_uncommitted_type(&self, collection: &'static str, id: &str, doc: Option<Document>) {
         if !self.transaction_handle_open() {
             return;
@@ -5361,6 +5478,18 @@ impl PgHandler {
             ("information_schema".into(), 13),
             ("pg_toast".into(), 99),
         ];
+        // The session's temp namespace exists once it holds a relation, as
+        // PostgreSQL's `pg_temp_N` does.
+        if !self
+            .temp_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            let name = self.temp_schema_name();
+            let oid = Self::index_oid(&format!("ns:{name}"));
+            out.push((name, oid));
+        }
         if let Ok(docs) = self.type_catalog_docs(Self::SCHEMA_COLLECTION) {
             for d in docs.iter() {
                 if let Ok(name) = d.get_str("_id") {
@@ -7242,6 +7371,83 @@ impl PgHandler {
         let mut ix = options.clone();
         ix.insert("name", name);
         ix
+    }
+
+    /// Every DEFERRABLE UNIQUE constraint of `table`, after a statement
+    /// wrote it. Such a constraint has no storage index (a swap would trip
+    /// one mid-statement), so it is judged here over the whole table: at the
+    /// end of the statement when it is IMMEDIATE, and at COMMIT (queued with
+    /// the deferred foreign keys) when it is deferred. It used to be judged
+    /// nowhere at all, so `unique (n) deferrable` accepted duplicates.
+    fn check_deferrable_uniques(&self, table: &str) -> PgWireResult<()> {
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        for u in def
+            .unique_constraints
+            .iter()
+            .filter(|u| u.deferrable && u.exclusion_ops.is_empty())
+        {
+            if self.deferred_now(&u.name, true, u.initially_deferred) {
+                self.defer_fk(&def.name, &u.name);
+                continue;
+            }
+            self.check_unique_whole_table(&def, u)?;
+        }
+        Ok(())
+    }
+
+    /// No two stored rows of `def` share a non-NULL key of `u` (23505).
+    fn check_unique_whole_table(
+        &self,
+        def: &TableDef,
+        u: &secantus_pgcatalog::UniqueConstraint,
+    ) -> PgWireResult<()> {
+        let fields: Vec<String> = u.columns.iter().filter_map(|c| def.field_of(c)).collect();
+        if fields.len() != u.columns.len() {
+            return Ok(());
+        }
+        let rows = self
+            .storage
+            .find_matching(self.db(), &def.name, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+        for raw in &rows {
+            let row: Document =
+                decode_doc(raw).map_err(|e| Self::storage_err("could not decode", e))?;
+            let mut key = Vec::with_capacity(fields.len());
+            let mut has_null = false;
+            for f in &fields {
+                match row.get(f) {
+                    None | Some(Bson::Null) => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(v) => key.push(secantus_pgplan::value_text(v)),
+                }
+            }
+            if has_null {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                return Err(Self::constraint_error(
+                    "23505",
+                    format!(
+                        "duplicate key value violates unique constraint \"{}\"",
+                        u.name
+                    ),
+                    format!(
+                        "Key ({})=({}) already exists.",
+                        u.columns.join(", "),
+                        key.join(", ")
+                    ),
+                    def,
+                    Some(&u.name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// An expression index's key for `row`, with its display text -- `None`
@@ -11430,9 +11636,8 @@ impl PgHandler {
                             d.insert(f, false);
                         }
                     } else if let Some(raw) = raw.filter(|r| r.contains_key("typlen")) {
-                        let proc = |k: &str| -> Bson {
-                            Bson::String(raw.get_str(k).unwrap_or("-").to_string())
-                        };
+                        let proc =
+                            |k: &str| -> Bson { self.regproc_bson(raw.get_str(k).unwrap_or("-")) };
                         let put = |d: &mut Document, n: &str, v: Bson| {
                             if let Some(f) = def.field_of(n) {
                                 d.insert(f, v);
@@ -11463,12 +11668,12 @@ impl PgHandler {
                         put(
                             &mut d,
                             "typinput",
-                            Bson::String(b.input.clone().unwrap_or_default()),
+                            self.regproc_bson(b.input.as_deref().unwrap_or("-")),
                         );
                         put(
                             &mut d,
                             "typoutput",
-                            Bson::String(b.output.clone().unwrap_or_default()),
+                            self.regproc_bson(b.output.as_deref().unwrap_or("-")),
                         );
                         for k in [
                             "typreceive",
@@ -11678,14 +11883,17 @@ impl PgHandler {
                     a.insert(f("typstorage"), "x");
                     a.insert(f("typcategory"), "A");
                     a.insert(f("typispreferred"), false);
-                    a.insert(f("typinput"), "array_in");
-                    a.insert(f("typoutput"), "array_out");
-                    a.insert(f("typreceive"), "array_recv");
-                    a.insert(f("typsend"), "array_send");
-                    a.insert(f("typmodin"), "-");
-                    a.insert(f("typmodout"), "-");
-                    a.insert(f("typanalyze"), "array_typanalyze");
-                    a.insert(f("typsubscript"), "array_subscript_handler");
+                    a.insert(f("typinput"), self.regproc_bson("array_in"));
+                    a.insert(f("typoutput"), self.regproc_bson("array_out"));
+                    a.insert(f("typreceive"), self.regproc_bson("array_recv"));
+                    a.insert(f("typsend"), self.regproc_bson("array_send"));
+                    a.insert(f("typmodin"), self.regproc_bson("-"));
+                    a.insert(f("typmodout"), self.regproc_bson("-"));
+                    a.insert(f("typanalyze"), self.regproc_bson("array_typanalyze"));
+                    a.insert(
+                        f("typsubscript"),
+                        self.regproc_bson("array_subscript_handler"),
+                    );
                     arrays.push(a);
                 }
                 rows.extend(arrays);
@@ -14135,6 +14343,9 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             629 => "line[]",
             719 => "circle[]",
             2951 => "uuid[]",
+            // JDBC's OUT-parameter placeholder: the planner drops a `void`
+            // argument from a function call, as PostgreSQL does.
+            2278 => "void",
             oid => {
                 return secantus_pgplan::range::range_oid_name(oid)
                     .or_else(|| secantus_pgplan::range::multirange_oid_name(oid))
@@ -14621,6 +14832,12 @@ impl PgHandler {
         if let Some(ds) = defaults.get("DateStyle") {
             provider.date_style = ds.clone();
         }
+        // The version a client reads at startup is the one `SHOW
+        // server_version` answers -- pgwire's own default (`16.6-pgwire-...`)
+        // told pgjdbc and pgx this was PostgreSQL 16.
+        if let Some(v) = defaults.get("server_version") {
+            provider.server_version = v.clone();
+        }
         pgwire::api::auth::finish_authentication0(client, &provider).await?;
         self.post_startup(client).await?;
         client
@@ -14732,6 +14949,71 @@ impl PgHandler {
                 })?;
             self.report_pending_params(_c).await?;
         }
+        // A temp schema left behind by a server that stopped without ending
+        // its sessions belongs to nobody: PostgreSQL empties a backend's temp
+        // namespace before first use, and so does this.
+        let prefix = format!("{}.", self.temp_schema_name());
+        let stale: Vec<String> = self
+            .all_table_defs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.temp && d.name.starts_with(&prefix))
+            .map(|d| d.name)
+            .collect();
+        if !stale.is_empty() {
+            *self.temp_tables.lock().unwrap_or_else(|e| e.into_inner()) = stale;
+            self.drop_session_temp_tables().map_err(|e| match e {
+                PgWireError::UserError(info) => PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".into(),
+                    info.code,
+                    info.message,
+                ))),
+                other => other,
+            })?;
+        }
+        // Every other run-time parameter in the startup packet is a SET
+        // before the first query, as PostgreSQL applies it: libpq / pgx send
+        // `application_name`, `search_path`, `default_transaction_read_only`
+        // this way, and they used to be dropped, so `show search_path` still
+        // answered the default. A value the SET refuses fails the connection
+        // as PostgreSQL's does (FATAL, same SQLSTATE).
+        let mut startup: Vec<(String, String)> = _c
+            .metadata()
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.as_str(),
+                    "user" | "database" | "client_encoding" | "options" | "replication"
+                ) && !k.starts_with("_pq_.")
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        startup.sort();
+        // `options` carries command-line switches; the `-c name=value` /
+        // `--name=value` ones are settings (libpq's PGOPTIONS, pgjdbc's
+        // `options`), applied after the packet's own parameters as
+        // PostgreSQL applies them.
+        if let Some(options) = _c.metadata().get("options") {
+            startup.extend(startup_option_settings(options));
+        }
+        if !startup.is_empty() {
+            for (name, value) in startup {
+                let sql = format!(
+                    "SET \"{}\" TO '{}'",
+                    name.replace('"', "\"\""),
+                    value.replace('\'', "''")
+                );
+                self.run_typed_inner(&sql, &[], &[], 0)
+                    .await
+                    .map_err(|e| match e {
+                        PgWireError::UserError(info) => PgWireError::UserError(Box::new(
+                            ErrorInfo::new("FATAL".into(), info.code, info.message),
+                        )),
+                        other => other,
+                    })?;
+            }
+            self.report_pending_params(_c).await?;
+        }
         Ok(())
     }
 }
@@ -14741,6 +15023,15 @@ impl Drop for PgHandler {
         // Deregister so the map never signals a PID this connection has left
         // behind. `0` means startup never ran, so there is nothing to remove.
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        // A session's temporary tables die with it. Its open transaction (a
+        // client that disconnected mid-block) is abandoned first, so the
+        // drop is not written into a transaction nobody will commit.
+        drop(self.txn.lock().unwrap_or_else(|e| e.into_inner()).take());
+        self.in_transaction
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = self.drop_session_temp_tables() {
+            eprintln!("secantusd-pg: dropping session temp tables failed: {e:?}");
+        }
         // A session's advisory locks die with it, and its table locks.
         advisory::release_session(pid);
         table_locks::release(pid);
@@ -14803,6 +15094,10 @@ impl SimpleQueryHandler for PgHandler {
             }
         };
         let query = query.as_str();
+        self.batch_partial
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let stmts = match secantus_pgplan::split_statements(query) {
             Ok(stmts) => stmts,
             Err(e) => {
@@ -14862,7 +15157,19 @@ impl SimpleQueryHandler for PgHandler {
             }
             unreachable!("matched Err above");
         }
-        out
+        // The commands of a multi-command query that ran before the failing
+        // one have answered already, as far as PostgreSQL's client knows:
+        // `select 1; select 1/0` sends the first result and THEN the error.
+        let partial =
+            std::mem::take(&mut *self.batch_partial.lock().unwrap_or_else(|e| e.into_inner()));
+        match out {
+            Err(PgWireError::UserError(info)) if !partial.is_empty() => {
+                let mut resps = partial;
+                resps.push(Response::Error(info));
+                Ok(resps)
+            }
+            out => out,
+        }
     }
 }
 
@@ -14927,6 +15234,8 @@ impl PgHandler {
                     out.extend(responses);
                 }
                 Err(mut e) => {
+                    *self.batch_partial.lock().unwrap_or_else(|e| e.into_inner()) =
+                        std::mem::take(&mut out);
                     if implicit {
                         // Roll back whatever this batch opened. A failure to
                         // roll back must not mask the error that caused it.
@@ -15218,6 +15527,12 @@ impl PgHandler {
         let tz = self.session_timezone();
         let mut rows = Vec::new();
         loop {
+            // The end of the data where a tuple would start is the end of the
+            // copy, trailer or not: PostgreSQL's `NextCopyFrom` takes EOF in
+            // place of the `-1` (pgx sends no trailer).
+            if pos == buffer.len() {
+                break;
+            }
             let count = buffer
                 .get(pos..pos + 2)
                 .map(|s| i16::from_be_bytes(s.try_into().expect("2 bytes")))
@@ -16640,6 +16955,7 @@ impl PgHandler {
                 ),
             ))));
         }
+        self.note_txn_sequence(name);
         self.storage
             .update_matching(
                 self.db(),
@@ -16888,6 +17204,9 @@ impl PgHandler {
             //    it (`apply_string_syntax`), so libpq's `PQescapeString` may
             //    follow the report -- it switches its own escaping on it.
             "standard_conforming_strings" => (true, value.to_string()),
+            //  - application_name: PostgreSQL reports it (GUC_REPORT), and
+            //    pgjdbc reads its connection's name back from the report.
+            "application_name" => (true, value.to_string()),
             _ => (false, String::new()),
         };
         if report {
@@ -17123,9 +17442,20 @@ impl PgHandler {
             | self
                 .group_failed
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
+        // The group was a transaction of its own, and its locks end with it
+        // -- table locks and transaction-scoped advisory locks alike. They
+        // used to outlive the `Sync`: pgjdbc's `CREATE TABLE` (sent as a
+        // Parse/Bind/Execute group) left an ACCESS EXCLUSIVE lock behind on
+        // an idle connection, and the next session's TRUNCATE waited forever.
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         if !failed {
-            return self.commit_implicit();
+            let out = self.commit_implicit();
+            advisory::release_xact(pid);
+            table_locks::release(pid);
+            return out;
         }
+        advisory::release_xact(pid);
+        table_locks::release(pid);
         self.settle_notifies(false);
         // Not `rollback_implicit`: that closes every cursor, holdable ones
         // included, and a `WITH HOLD` cursor from an earlier, committed
@@ -17136,6 +17466,10 @@ impl PgHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.txn_sequences
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -17164,6 +17498,10 @@ impl PgHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.txn_sequences
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -17207,6 +17545,10 @@ impl PgHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.txn_sequences
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -17450,7 +17792,7 @@ impl PgHandler {
         max_rows: usize,
     ) -> PgWireResult<Vec<Response>> {
         let sql = query.trim().trim_end_matches(';').trim();
-        if sql.is_empty() {
+        if is_empty_query(sql) {
             return Ok(vec![Response::EmptyQuery]);
         }
 
@@ -17714,62 +18056,99 @@ impl PgHandler {
                 return out;
             }
         }
-        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-        let out = tokio::task::block_in_place(|| match guard.as_mut() {
-            Some(handle) => {
-                // A row write in a transaction that has not written yet --
-                // an extended-protocol group's first statement, or a block's
-                // first write -- can lose a conflict and be run again on a
-                // fresh transaction, invisibly at READ COMMITTED: PostgreSQL
-                // waits for the other writer and re-evaluates there.
-                //
-                // "Has not written" must be ASKED, not remembered: the
-                // snapshot refresh is what learns that the transaction wrote
-                // (WiredTiger refuses to refresh a writer's snapshot), so it
-                // runs FIRST. Deciding before it read a stale flag, and a
-                // block's SECOND write that lost a conflict rolled back and
-                // retried on a fresh transaction -- silently discarding the
-                // block's first write, which then "committed" as nothing.
-                let handle = self.with_isolation(handle)?;
-                let fresh = Self::row_write(&stmt) && !handle.has_written();
-                let mut poll = fresh.then(|| self.lock_wait_poll());
-                let mut delay = std::time::Duration::from_millis(2);
-                loop {
-                    let out = self
-                        .storage
-                        .with_user_transaction(self.with_isolation(handle)?, || {
-                            self.execute(stmt.clone(), max_rows)
-                        })
-                        .map_err(|e| Self::storage_err("transaction failed", e))
-                        .and_then(|r| r);
-                    match (&out, poll.as_mut()) {
-                        (Err(e), Some(poll))
-                            if Self::is_write_conflict(e) && self.read_committed_now() =>
-                        {
-                            self.storage
-                                .rollback_user_transaction(handle)
-                                .map_err(|e| Self::storage_err("could not roll back", e))?;
-                            *handle = self.open_transaction_handle()?;
-                            poll()?;
-                            std::thread::sleep(delay);
-                            delay = (delay * 2).min(std::time::Duration::from_millis(20));
+        let out = {
+            let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+            tokio::task::block_in_place(|| match guard.as_mut() {
+                Some(handle) => {
+                    // A row write in a transaction that has not written yet --
+                    // an extended-protocol group's first statement, or a block's
+                    // first write -- can lose a conflict and be run again on a
+                    // fresh transaction, invisibly at READ COMMITTED: PostgreSQL
+                    // waits for the other writer and re-evaluates there.
+                    //
+                    // "Has not written" must be ASKED, not remembered: the
+                    // snapshot refresh is what learns that the transaction wrote
+                    // (WiredTiger refuses to refresh a writer's snapshot), so it
+                    // runs FIRST. Deciding before it read a stale flag, and a
+                    // block's SECOND write that lost a conflict rolled back and
+                    // retried on a fresh transaction -- silently discarding the
+                    // block's first write, which then "committed" as nothing.
+                    let handle = self.with_isolation(handle)?;
+                    let fresh = Self::row_write(&stmt) && !handle.has_written();
+                    let mut poll = fresh.then(|| self.lock_wait_poll());
+                    let mut delay = std::time::Duration::from_millis(2);
+                    loop {
+                        let out = self
+                            .storage
+                            .with_user_transaction(self.with_isolation(handle)?, || {
+                                self.execute(stmt.clone(), max_rows)
+                            })
+                            .map_err(|e| Self::storage_err("transaction failed", e))
+                            .and_then(|r| r);
+                        match (&out, poll.as_mut()) {
+                            (Err(e), Some(poll))
+                                if Self::is_write_conflict(e) && self.read_committed_now() =>
+                            {
+                                self.storage
+                                    .rollback_user_transaction(handle)
+                                    .map_err(|e| Self::storage_err("could not roll back", e))?;
+                                *handle = self.open_transaction_handle()?;
+                                poll()?;
+                                std::thread::sleep(delay);
+                                delay = (delay * 2).min(std::time::Duration::from_millis(20));
+                            }
+                            _ => break out,
                         }
-                        _ => break out,
                     }
                 }
-            }
-            // Not when a transaction is already active on this thread: a
-            // trigger's or MERGE's own writes join the statement they serve.
-            None if Self::row_write(&stmt) && !self.storage.in_user_txn() => {
-                self.run_autocommit_write(stmt, max_rows)
-            }
-            None => self.execute(stmt, max_rows),
-        });
+                // Not when a transaction is already active on this thread: a
+                // trigger's or MERGE's own writes join the statement they serve.
+                None if Self::row_write(&stmt) && !self.storage.in_user_txn() => {
+                    self.run_autocommit_write(stmt, max_rows)
+                }
+                None => self.execute(stmt, max_rows),
+            })
+        };
         self.collect_planner_warnings();
+        // A row that fails to ENCODE (`select 0/0 from t`) is the statement's
+        // error, before the statement's transaction ends -- see
+        // `materialise_rows`.
+        let out = match out {
+            Ok(resps) => Self::materialise_rows(resps).await,
+            err => err,
+        };
         if out.is_err() {
             self.note_failure();
         }
         out
+    }
+
+    /// Drive every result's row stream to completion now. The rows are
+    /// produced lazily, and an expression that fails on a row (`0/0`) used to
+    /// fail only while pgwire sent them -- after the statement had been
+    /// counted a success, so the implicit transaction of a multi-command
+    /// query (or an extended-protocol group) committed the writes before it,
+    /// and an explicit block was not marked failed. PostgreSQL computes the
+    /// row inside the statement, so its error rolls those back.
+    async fn materialise_rows(resps: Vec<Response>) -> PgWireResult<Vec<Response>> {
+        let mut out = Vec::with_capacity(resps.len());
+        for r in resps {
+            match r {
+                Response::Query(mut q) => {
+                    let mut rows = Vec::new();
+                    while let Some(row) = q.data_rows().next().await {
+                        rows.push(row?);
+                    }
+                    let mut fresh =
+                        QueryResponse::new(q.row_schema(), stream::iter(rows.into_iter().map(Ok)));
+                    fresh.command_tag = q.command_tag.clone();
+                    fresh.tag_counts_rows = q.tag_counts_rows;
+                    out.push(Response::Query(fresh));
+                }
+                other => out.push(other),
+            }
+        }
+        Ok(out)
     }
 
     /// An INSERT / UPDATE / DELETE: what an autocommit statement runs in a
@@ -18708,7 +19087,9 @@ impl PgHandler {
                 // point of the nested-block pattern that uses it.
                 self.txn_failed
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                Ok(vec![Response::Execution(Tag::new("ROLLBACK"))])
+                // `TransactionStart`, not a bare tag: the block is healthy
+                // again, and the `ReadyForQuery` after this must say `T`.
+                Ok(vec![Response::TransactionStart(Tag::new("ROLLBACK"))])
             }
         }
     }
@@ -19157,6 +19538,21 @@ impl PgHandler {
         // duplicate-key INSERT consumes its serial value on PostgreSQL. A
         // sequence created in the open transaction is invisible outside it,
         // so it advances inside.
+        //
+        // So does one the open transaction REPLACED or changed -- `drop table
+        // t; create table t (k serial)` in one block leaves the OLD committed
+        // sequence visible outside, and advancing that wrote to a row the
+        // block had already rewritten: a write conflict with this session's
+        // own transaction, retried forever (pgjdbc's BatchExecuteTest hung
+        // on it). The block's row is the only one this session may advance.
+        if self
+            .txn_sequences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+        {
+            return self.nextval_in_scope(name, count);
+        }
         match self
             .storage
             .outside_user_transaction(|| self.nextval_in_scope(name, count))
@@ -20652,11 +21048,92 @@ impl PgHandler {
             self.touched_temp
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let out = self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows));
+        let written = match &stmt {
+            Statement::Insert(i) => Some(i.table.clone()),
+            Statement::Update(u) => Some(u.table.clone()),
+            _ => None,
+        };
+        let temp_created = match &stmt {
+            Statement::CreateTable(def, _) if def.temp => Some(def.name.clone()),
+            Statement::CreateTableAs {
+                table, temp: true, ..
+            } => Some(table.clone()),
+            _ => None,
+        };
+        let mut out = self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows));
+        if let (Some(table), Ok(_)) = (&written, &out) {
+            if let Err(e) = self.check_deferrable_uniques(table) {
+                out = Err(e);
+            }
+        }
         if may_change_catalog {
             bump_catalog_version();
         }
+        if let (Some(name), Ok(_)) = (temp_created, &out) {
+            secantus_pgplan::schemas::note_relation_key(&name);
+            let mut temps = self.temp_tables.lock().unwrap_or_else(|e| e.into_inner());
+            if !temps.contains(&name) {
+                temps.push(name);
+            }
+        }
         out
+    }
+
+    /// A `pg_type` I/O column's value: the regproc of the function `name`
+    /// names -- a built-in by PostgreSQL's oid, a user function by its own
+    /// (as `regproc` resolves it), `-` as 0 -- so it compares with a
+    /// `'name'::regproc`. A name that resolves to neither stays text.
+    pub(crate) fn regproc_bson(&self, name: &str) -> Bson {
+        if name.is_empty() {
+            return secantus_pgplan::regobj::builtin_regproc("-").unwrap_or(Bson::Null);
+        }
+        if let Some(v) = secantus_pgplan::regobj::builtin_regproc(name) {
+            return v;
+        }
+        if let Some(f) = self
+            .functions()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|f| f.name == name)
+        {
+            return secantus_pgplan::regobj::value(
+                "regproc",
+                Self::index_oid(&format!("fn:{}", f.key)),
+            );
+        }
+        Bson::String(name.to_string())
+    }
+
+    /// This session's temporary schema: `pg_temp_N`, unique to the
+    /// connection for the life of the process. Its TEMP relations are stored
+    /// under `pg_temp_N.name`, so no other session sees or collides with them.
+    pub(crate) fn temp_schema_name(&self) -> String {
+        format!("pg_temp_{}", self.session_serial)
+    }
+
+    /// Drop every temporary table this session created, as PostgreSQL does
+    /// at `DISCARD TEMP` and when the session ends. A temp table another
+    /// statement already dropped (or a rolled-back CREATE never made) is
+    /// skipped.
+    fn drop_session_temp_tables(&self) -> PgWireResult<()> {
+        let temps =
+            std::mem::take(&mut *self.temp_tables.lock().unwrap_or_else(|e| e.into_inner()));
+        let existing: Vec<String> = temps
+            .into_iter()
+            .filter(|t| self.lookup(t).is_some_and(|d| d.temp))
+            .collect();
+        if existing.is_empty() {
+            return Ok(());
+        }
+        self.execute(
+            Statement::DropTable(secantus_pgplan::DropTable {
+                tables: existing,
+                if_exists: true,
+                cascade: true,
+            }),
+            0,
+        )
+        .map(|_| ())
     }
 
     fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
@@ -20827,6 +21304,7 @@ impl PgHandler {
                     // name (a drop that did not know about sequences) would
                     // otherwise collide on `_id`.
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
+                        self.note_txn_sequence(seq);
                         self.storage
                             .delete_matching(
                                 self.db(),
@@ -22692,6 +23170,7 @@ impl PgHandler {
                 // sequence this block created is named to it by the overlay
                 // (`'s'::regclass`, `pg_table_is_visible`).
                 self.note_uncommitted_type(SEQUENCE_COLLECTION, &name, Some(doc));
+                self.note_txn_sequence(&name);
                 Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))])
             }
 
@@ -22724,6 +23203,7 @@ impl PgHandler {
                         None,
                     )
                     .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
+                self.note_txn_sequence(&name);
                 self.insert_checked(
                     SEQUENCE_COLLECTION,
                     vec![bytes],
@@ -22756,6 +23236,7 @@ impl PgHandler {
                         )
                         .map_err(|e| Self::storage_err("could not drop the sequence", e))?;
                     self.note_uncommitted_type(SEQUENCE_COLLECTION, name, None);
+                    self.note_txn_sequence(name);
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP SEQUENCE"))])
             }
@@ -23147,6 +23628,7 @@ impl PgHandler {
                         self.ensure_collection(SEQUENCE_COLLECTION)?;
                     }
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
+                        self.note_txn_sequence(seq);
                         self.storage
                             .delete_matching(
                                 self.db(),
@@ -23964,11 +24446,46 @@ impl PgHandler {
             // never reuses a deallocated name (its counter only climbs), and
             // the store is the connection's, dropped with it.
             Statement::DeallocateAll => {
-                self.prepared
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
+                self.deallocate_all();
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))])
+            }
+            Statement::Discard(what) => {
+                if what == "ALL" {
+                    self.refuse_in_transaction_block("DISCARD ALL")?;
+                    // PostgreSQL's DISCARD ALL: CLOSE ALL, SET SESSION
+                    // AUTHORIZATION DEFAULT, RESET ALL, DEALLOCATE ALL,
+                    // UNLISTEN *, pg_advisory_unlock_all(), DISCARD PLANS,
+                    // DISCARD TEMP, DISCARD SEQUENCES.
+                    self.cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = default_settings();
+                    self.deallocate_all();
+                    self.pending_listens
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(ListenOp::UnlistenAll);
+                    advisory::release_session(
+                        self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
+                if what == "ALL" || what == "TEMP" {
+                    self.drop_session_temp_tables()?;
+                }
+                if what == "ALL" || what == "SEQUENCES" {
+                    self.session_currval
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                    *self
+                        .session_lastval
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                Ok(vec![Response::Execution(Tag::new(&format!(
+                    "DISCARD {what}"
+                )))])
             }
             Statement::Merge(m) => self.execute_merge(m),
             Statement::Maintenance {
@@ -24134,6 +24651,9 @@ impl PgHandler {
                         from_sql: true,
                         query,
                         arg_types,
+                        catalog_version: catalog_cache()
+                            .version
+                            .load(std::sync::atomic::Ordering::SeqCst),
                     });
                 Ok(vec![Response::Execution(Tag::new("PREPARE"))])
             }
@@ -24202,7 +24722,13 @@ impl PgHandler {
                         format!("prepared statement \"{name}\" does not exist"),
                     ))));
                 };
-                prepared.remove(idx);
+                let removed = prepared.remove(idx);
+                if !removed.from_sql {
+                    self.wire_dealloc
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(removed.name);
+                }
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))])
             }
             Statement::Notify { channel, payload } => {
@@ -24287,6 +24813,25 @@ impl PgHandler {
                     };
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), value.clone());
+                    // A session default set outside a block is what the next
+                    // implicit transaction runs under, so its `transaction_*`
+                    // twin reads the same at once (PostgreSQL:
+                    // `set default_transaction_read_only = on; show
+                    // transaction_read_only` -> on) -- pgx's read-write
+                    // target check reads exactly that.
+                    if let Some(twin) = key.strip_prefix("default_") {
+                        if matches!(
+                            twin,
+                            "transaction_read_only"
+                                | "transaction_isolation"
+                                | "transaction_deferrable"
+                        ) && !self
+                            .in_transaction
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            settings.insert(twin.to_string(), value.clone());
+                        }
+                    }
                     drop(settings);
                     self.note_reportable_guc(&key, &value);
                 }
@@ -24474,6 +25019,17 @@ impl PgHandler {
                 );
 
                 let select = agg.select.clone();
+                // An expression over the aggregates that FAILS is the
+                // statement's error, as PostgreSQL's `5 / count(*)` over no
+                // rows is `22012` -- not a NULL. Evaluated here, before the
+                // first row goes out, so the client sees a clean error.
+                for (key, vals) in &groups {
+                    for (_, col) in &select {
+                        if let OutputCol::Expr(i) = col {
+                            Self::aggregate_expr_value(&agg, *i, key, vals)?;
+                        }
+                    }
+                }
                 // The closure outlives this scope, so it takes its own copy of
                 // the plan -- the expression outputs read the items and keys
                 // back out of it per group.
@@ -24982,6 +25538,7 @@ impl PgHandler {
                 let doc: Document = decode_doc(raw)
                     .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
                 let start = doc.get("start").and_then(bson_i64).unwrap_or(1);
+                self.note_txn_sequence(seq);
                 self.storage
                     .update_matching(
                         self.db(),
@@ -25248,7 +25805,10 @@ impl PgHandler {
     /// session's `pg_temp_N` namespace.
     fn schema_of(def: &TableDef) -> String {
         if def.temp {
-            "pg_temp_1".to_string()
+            match def.name.split_once('.') {
+                Some((schema, _)) if schema.starts_with("pg_temp_") => schema.to_string(),
+                _ => "pg_temp_1".to_string(),
+            }
         } else {
             "public".to_string()
         }
@@ -25892,6 +26452,9 @@ impl PgHandler {
                 continue;
             };
             let Some(fk) = def.foreign_keys.iter().find(|f| f.name == name) else {
+                if let Some(u) = def.unique_constraints.iter().find(|u| u.name == name) {
+                    self.check_unique_whole_table(&def, u)?;
+                }
                 continue;
             };
             let raw = self
@@ -29902,6 +30465,26 @@ fn decode_parameter(
     let Some(bytes) = raw else {
         return Ok(Bson::Null);
     };
+    // A NUL byte is never valid text: PostgreSQL's encoding check refuses it
+    // in every text-format parameter (and in a binary text / varchar one),
+    // `22021 invalid byte sequence for encoding "UTF8": 0x00`. Accepted, it
+    // stored a string no PostgreSQL could hold (pgjdbc's
+    // BatchExecuteTest.testBatchWithEmbeddedNulls).
+    let text_like = !binary || matches!(ty.map(|t| t.oid()), Some(25 | 1043 | 1042 | 19 | 705));
+    if text_like && bytes.contains(&0) {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22021".into(),
+            format!(
+                "invalid byte sequence for encoding \"{}\": 0x00",
+                match cenc {
+                    ClientEncoding::Latin1 => "LATIN1",
+                    ClientEncoding::Latin9 => "LATIN9",
+                    ClientEncoding::Utf8 | ClientEncoding::Passthrough => "UTF8",
+                }
+            ),
+        ))));
+    }
     if binary {
         // Binary format is width- and type-exact, so an unknown type here is a
         // genuine "cannot decode" rather than something to guess at.
@@ -30559,6 +31142,11 @@ impl PgHandler {
         n_params: usize,
         param_types: &[Option<String>],
     ) -> PgWireResult<Option<Vec<FieldInfo>>> {
+        // An empty query describes as NoData (and executes as
+        // EmptyQueryResponse): PostgreSQL accepts `Parse("")`.
+        if is_empty_query(sql.trim().trim_end_matches(';').trim()) {
+            return Ok(None);
+        }
         let params = vec![Bson::Null; n_params];
         // Describe resolves table names too, and against the same uncommitted
         // catalog, through `self.lookup`. The DECLARED parameter types
@@ -30785,6 +31373,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.apply_wire_dealloc(client.portal_store());
         let parser = <Self as ExtendedQueryHandler>::query_parser(self);
         let mut message = message;
         let decoded = <Self as ExtendedQueryHandler>::decode_query_text(self, client, &message)?;
@@ -30830,6 +31419,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.apply_wire_dealloc(client.portal_store());
         if message.target_type == pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT {
             if let Some(name) = message.name.as_deref().filter(|n| !n.is_empty()) {
                 self.prepared
@@ -30964,6 +31554,64 @@ impl ExtendedQueryHandler for PgHandler {
         Ok(())
     }
 
+    /// The default `Execute`, with a failure noted however it surfaced. A
+    /// row expression that fails WHILE the rows stream (`select 0/0 from t`)
+    /// errors after `do_query` returned, so `do_query` never saw it -- and the
+    /// statement group's `Sync` then committed the writes before it (pgjdbc's
+    /// `BatchExecuteTest.testSelectInBatchThrows`: an UPDATE ahead of the
+    /// failing SELECT survived, even inside an explicit block).
+    async fn on_execute<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Execute,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let out = self._on_execute(client, message).await;
+        if out.is_err() {
+            self.note_failure();
+        }
+        out
+    }
+
+    /// The default `Bind`, after dropping the statements a SQL `DEALLOCATE`
+    /// removed -- so binding one answers 26000, as PostgreSQL does.
+    async fn on_bind<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Bind,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.apply_wire_dealloc(client.portal_store());
+        let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
+        // A Bind that fails aborts the block (and the statement group) as
+        // any failed statement does: binding a deallocated statement is
+        // PostgreSQL's 26000, and the transaction is aborted after it.
+        let Some(statement) =
+            pgwire::api::store::PortalStore::get_statement(client.portal_store(), statement_name)
+        else {
+            self.note_failure();
+            return Err(PgWireError::StatementNotFound(statement_name.to_owned()));
+        };
+        let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
+        pgwire::api::store::PortalStore::put_portal(client.portal_store(), Arc::new(portal));
+        client
+            .send(PgWireBackendMessage::BindComplete(
+                pgwire::messages::extendedquery::BindComplete::new(),
+            ))
+            .await?;
+        Ok(())
+    }
+
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -30971,6 +31619,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.apply_wire_dealloc(client.portal_store());
         if message.target_type == TARGET_TYPE_BYTE_PORTAL {
             let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
             // A real portal of that name wins: a cursor only answers for a
@@ -31003,6 +31652,7 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&target.result_column_format);
+        self.check_cached_result_type(target.statement.as_ref())?;
         let param_types = self.param_type_names(target.statement.as_ref());
         let fields = self.describe_fields(
             &target.statement.statement.sql,
@@ -31041,16 +31691,17 @@ impl ExtendedQueryHandler for PgHandler {
         // pipelining client counts on the rollback: after an error, nothing
         // before it in the pipeline may have landed either.
         self.open_extended_group()?;
+        self.check_cached_result_type(portal.statement.as_ref())?;
         let params = self
             .portal_params(portal, &param_types)
             .inspect_err(|_| self.note_failure())?;
+        // The WHOLE result, not `max_rows` of it: the portal hands it out
+        // `max_rows` at a time and a later Execute resumes it, as
+        // PostgreSQL's does. Truncating here left the resumed portal empty
+        // -- pgjdbc's fetch-size cursors (CursorFetchTest) read 25 rows of 100.
+        let _ = max_rows;
         let result = self
-            .run_typed(
-                &portal.statement.statement.sql,
-                &params,
-                &param_types,
-                max_rows,
-            )
+            .run_typed(&portal.statement.statement.sql, &params, &param_types, 0)
             .await
             .inspect_err(|_| self.note_failure());
         // Notices go out before the result -- or the error -- they preceded.
@@ -31062,6 +31713,59 @@ impl ExtendedQueryHandler for PgHandler {
         // One portal is one statement, so exactly one response.
         self.apply_mixed_formats(responses.remove(0))
     }
+}
+
+/// Is `sql` a statement with nothing in it -- blank, or only comments
+/// (`--SELECT ?`, which pgjdbc sends as the last piece of a split query)?
+/// PostgreSQL answers that with EmptyQueryResponse, not an error.
+fn is_empty_query(sql: &str) -> bool {
+    let sql = sql.trim();
+    sql.is_empty()
+        || ((sql.starts_with("--") || sql.starts_with("/*"))
+            && secantus_pgplan::split_statements(sql).is_ok_and(|s| s.is_empty()))
+}
+
+/// The `name=value` settings in a startup packet's `options`: whitespace
+/// separates switches (a backslash escapes the next character), and a
+/// setting is `-c name=value`, `-cname=value` or `--name=value`. A
+/// switch of any other kind is not a setting and is left out.
+fn startup_option_settings(options: &str) -> Vec<(String, String)> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = options.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let mut out = Vec::new();
+    let mut it = words.into_iter();
+    while let Some(w) = it.next() {
+        let setting = if w == "-c" {
+            it.next()
+        } else if let Some(rest) = w.strip_prefix("--") {
+            Some(rest.to_string())
+        } else {
+            w.strip_prefix("-c").map(str::to_string)
+        };
+        if let Some((name, value)) = setting.as_deref().and_then(|s| s.split_once('=')) {
+            out.push((name.replace('-', "_"), value.to_string()));
+        }
+    }
+    out
 }
 
 /// Parse one COPY text field into the value its column stores.

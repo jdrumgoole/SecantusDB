@@ -634,6 +634,29 @@ remain open:
       `'t'::regclass` / `nextval('t')` does not walk a non-default
       `search_path`; privilege checks see the bare relname; the SQLAlchemy
       gauge runner never deletes its `secantus-sqlalchemy-gauge-*` temp dir.
+- [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
+      2026-10-02).** pgx is clean (377 / 0 / 22, the 22 are unset
+      `PGX_TEST_*_CONN_STRING` environment skips). pgjdbc: 5637 tests, 134
+      failed, 28 skipped; BlobTest, BlobTransactionTest, DatabaseMetaDataTest
+      and RefCursorFetchTest report only an `initializationError`. Every group
+      is a feature PG15 has: `information_schema._pg_expandarray(int2vector)`
+      (36, UpdateableResultTest); `ALTER DATABASE ... SET` (14); large-object
+      fastpath `lo_*` (11; BlobTransactionTest also needs `LANGUAGE c`, out of
+      scope); `money` and a client-side "Unknown type inet" (16); PL/pgSQL
+      `OPEN` refcursor (9); `SET LOCAL application_name` not restored or
+      reported at transaction end (3); portals absent from `pg_cursors` (3);
+      date/time (DateTest year 0101, TimestampTest, TimeTest, TimezoneTest,
+      PGTimeTest); `LOCK TABLE` / cancel; a pk named by constraint name in
+      ServerErrorTest; negative numeric scale; `lseg ?# box`; array-of-array
+      (ArrayTest, EnumTest); `getBoolean` on bpchar; `getdatabaseencoding()`,
+      `pg_settings`, `varbit`, `COPY ... HEADER`; `DateStyle=PostgreSQL`
+      should be refused; `CallableStmtTest.testBatchCall` ("there is no
+      parameter $1"); ConnectionTest `pGStreamSettings` and
+      LoginTimeoutInterruptTest (uninvestigated). Also found: `pg_class` does
+      not list another session's temp tables; 42P16 for `create temp table
+      public.x` has no position; `search_path` is sent in startup
+      ParameterStatus (PG15 does not); extended Execute now materialises the
+      whole result (memory scales with result size).
 - [ ] **OPEN — RUST pgserver: the sqllogictest gauge (batch 32,
       2026-10-01).** `slt_validation` can now drive the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). First
