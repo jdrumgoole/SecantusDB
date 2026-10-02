@@ -2249,7 +2249,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "base64",
  "hmac 0.12.1",
@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
  "rand 0.9.4",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
  "chrono",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-mdb"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
  "ctrlc",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
  "rustls",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
  "flate2",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage-adapter"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
  "secantus-commands",
@@ -2346,14 +2346,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "cc",
  "cmake",
@@ -2362,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.165"
+version = "0.5.3-beta.166"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]
