@@ -271,6 +271,8 @@ sdist.exclude = [
     "vendor/pgx/**",
     "pgx_validation/**",
     "pgtest_validation/**",
+    # The gauges' shared server switch (SECANTUS_GAUGE_SERVER); dev-only.
+    "pg_gauge_server.py",
     "vendor/pgjdbc/**",
     "pgjdbc_validation/**",
     "sqlstress_validation/**",

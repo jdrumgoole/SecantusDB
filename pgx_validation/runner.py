@@ -27,7 +27,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "pgx"
-RAW_OUT = REPO_ROOT / ".validation" / "pgx-raw.json"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import pg_gauge_server  # noqa: E402
+
+RAW_OUT = pg_gauge_server.raw_out(REPO_ROOT / ".validation" / "pgx-raw.json")
 
 GO_TEST_TIMEOUT = "600s"
 SUBPROCESS_TIMEOUT_SECONDS = 1800.0
@@ -83,17 +87,7 @@ def main() -> int:
     storage_dir = tempfile.mkdtemp(prefix="secantus-pgx-gauge-")
 
     daemon = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "secantus.sql.pgserver",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--storage-path",
-            storage_dir,
-        ],
+        pg_gauge_server.daemon_argv(host, port, storage_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

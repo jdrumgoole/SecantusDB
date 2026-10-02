@@ -359,9 +359,10 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
 }
 
 fn nondeterministic_collation_exists() -> bool {
-    crate::collation::user_collations()
-        .iter()
-        .any(|c| !c.deterministic)
+    crate::extension_installed("citext")
+        || crate::collation::user_collations()
+            .iter()
+            .any(|c| !c.deterministic)
 }
 
 struct Rewritten {

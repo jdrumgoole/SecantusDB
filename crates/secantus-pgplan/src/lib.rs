@@ -6227,7 +6227,7 @@ fn plan_create_index(
         // (`Apple` / `apple` under a case-insensitive one).
         let key_nondeterministic = key_collation
             .clone()
-            .or_else(|| column.extra.get_str("collation").ok().map(str::to_string))
+            .or_else(|| collation::column_collation(column))
             .filter(|c| collation::resolve(c).is_ok_and(|r| !r.deterministic()));
         match key_nondeterministic {
             Some(c) => {
@@ -12105,6 +12105,10 @@ fn plan_aggregate_item(
             item.source_type.as_deref(),
             Some("text" | "varchar" | "bpchar" | "name" | "char")
         )
+        && !item
+            .source_type
+            .as_deref()
+            .is_some_and(collation::is_citext)
         && item.expr.is_none()
     {
         // PostgreSQL has no `string_agg(integer, ...)`: it is a missing
@@ -18744,7 +18748,7 @@ fn node_print(node: &pg_query::protobuf::Node) -> String {
 }
 
 /// Is this call one of the aggregates this planner lowers?
-fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
+pub(crate) fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
     f.agg_star
         || func_name(f)
             .as_deref()
@@ -23390,7 +23394,7 @@ pub fn set_installed_extensions(names: Vec<String>) {
     PLAN_EXTENSIONS.with(|t| *t.borrow_mut() = names);
 }
 
-fn extension_installed(name: &str) -> bool {
+pub(crate) fn extension_installed(name: &str) -> bool {
     PLAN_EXTENSIONS.with(|t| t.borrow().iter().any(|n| n == name))
 }
 
@@ -23447,7 +23451,9 @@ fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
 fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Option<String> {
     let t = static_type(arg, value);
     let (name, _, defined) = user_base_type(&t)?;
-    (defined && extension_type(&t).is_none()).then_some(name)
+    // citext is text to every operator and function that does not
+    // define its own: it casts implicitly to text.
+    (defined && extension_type(&t).is_none() && !collation::is_citext(&name)).then_some(name)
 }
 
 /// A base type's resolution NAME by oid -- the reverse door, for rendering

@@ -3379,3 +3379,61 @@ fn arithmetic_over_a_numeric_aggregate_plans() {
         assert!(plan(q, &|_| None).is_ok(), "{q}");
     }
 }
+
+// citext: measured against PostgreSQL 15 (citext 1.6) on 2026-10-02.
+
+#[test]
+fn citext_collation_compares_lowercased_bytes() {
+    let r = collation::resolve(collation::CITEXT).unwrap();
+    assert!(r.is_locale());
+    assert!(!r.deterministic());
+    let k = |s: &str| collation::sort_key(collation::CITEXT, s).unwrap();
+    assert_eq!(k("Apple"), k("aPPLE"));
+    assert_eq!(k("É"), k("é"));
+    // `ß` lowercases to itself, so it is not `ss`.
+    assert_ne!(k("ß"), k("SS"));
+    // Byte order of the lowercased text: `_` (0x5f) sorts before `a`.
+    assert!(k("_x") < k("Apple"));
+    assert!(k("b") < k("BANANA"));
+}
+
+#[test]
+fn citext_column_collation_needs_the_extension() {
+    let col = Column::new("name", "citext", false);
+    set_installed_extensions(vec![]);
+    assert_eq!(collation::column_collation(&col), None);
+    set_installed_extensions(vec!["citext".into()]);
+    assert_eq!(
+        collation::column_collation(&col).as_deref(),
+        Some(collation::CITEXT)
+    );
+    // A declared collation wins.
+    let mut declared = Column::new("name", "citext", false);
+    declared.extra.insert("collation", "C");
+    assert_eq!(collation::column_collation(&declared).as_deref(), Some("C"));
+    set_installed_extensions(vec![]);
+}
+
+#[test]
+fn citext_internal_functions() {
+    let call = |name: &str, args: &[Bson]| scalar::call(name, args).unwrap().unwrap();
+    assert_eq!(
+        call("__regex_quote", &[Bson::String("a.B*_1".into())]),
+        Bson::String("a\\.B\\*_1".into())
+    );
+    assert_eq!(call("__regex_quote", &[Bson::Null]), Bson::Null);
+    let keys = call(
+        "__coll_keys",
+        &[
+            Bson::String(collation::CITEXT.into()),
+            Bson::Array(vec![Bson::String("A".into()), Bson::Null]),
+        ],
+    );
+    assert_eq!(
+        keys,
+        Bson::Array(vec![
+            Bson::String(collation::sort_key(collation::CITEXT, "a").unwrap()),
+            Bson::Null
+        ])
+    );
+}

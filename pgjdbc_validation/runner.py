@@ -30,7 +30,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "pgjdbc"
 RESULTS = VENDOR / "pgjdbc" / "build" / "test-results" / "test"
-RAW_OUT = REPO_ROOT / ".validation" / "pgjdbc-raw.json"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import pg_gauge_server  # noqa: E402
+
+RAW_OUT = pg_gauge_server.raw_out(REPO_ROOT / ".validation" / "pgjdbc-raw.json")
 
 #: Wall-clock budget for the whole gradle run. Overridable for slow hardware —
 #: CI runners are several times slower than a dev machine, and the suite grew
@@ -209,17 +213,7 @@ def main() -> int:
     port = _pick_ephemeral_port()
     storage_dir = tempfile.mkdtemp(prefix="secantus-pgjdbc-gauge-")
     daemon = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "secantus.sql.pgserver",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--storage-path",
-            storage_dir,
-        ],
+        pg_gauge_server.daemon_argv(host, port, storage_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
