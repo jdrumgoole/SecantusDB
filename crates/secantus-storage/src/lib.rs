@@ -9151,8 +9151,9 @@ impl Storage {
     /// `_id_` index first, then stored indexes), sorted by name. Empty when the
     /// collection doesn't exist. Mirrors `storage.list_indexes`.
     pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>> {
-        // Lock-free read (see the `lock` field's invariants).
-        let session = self.conn.open_session()?;
+        // Lock-free read outside a transaction; inside one, the transaction's own
+        // session, so a DROP / CREATE earlier in it is seen (see `op_session`).
+        let session = self.op_session()?;
         if !collection_registered(&session, db, coll)? {
             return Ok(Vec::new());
         }

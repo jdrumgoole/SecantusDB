@@ -1134,6 +1134,14 @@ fn rewrite_query(s: &mut pg_query::protobuf::SelectStmt, scope: &Scope) -> Resul
                     if let Some(last) = names_of(c).and_then(|p| p.last().cloned()) {
                         rt.name = last;
                     }
+                } else if let Some(v) = rt.val.as_deref() {
+                    // So does any expression named after a column inside
+                    // it (`a.x::text` is `x`), which the rewrite would
+                    // otherwise name after the key.
+                    let name = expression_column_name(v);
+                    if name != "?column?" {
+                        rt.name = name;
+                    }
                 }
             }
             if let Some(v) = rt.val.as_deref_mut() {
