@@ -29,7 +29,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SUITE_DIR = Path(__file__).resolve().parent / "suite"
-RAW_OUT = REPO_ROOT / ".validation" / "sqlalchemy-raw.json"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+import pg_gauge_server  # noqa: E402
+
+RAW_OUT = pg_gauge_server.raw_out(REPO_ROOT / ".validation" / "sqlalchemy-raw.json")
 
 #: The suite is ~1,600 tests and runs in a few minutes against a healthy
 #: server; per-test ``timeout=30`` plus this backstop contains hangs.
@@ -88,17 +92,7 @@ def main() -> int:
     storage_dir = tempfile.mkdtemp(prefix="secantus-sqlalchemy-gauge-")
 
     daemon = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "secantus.sql.pgserver",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--storage-path",
-            storage_dir,
-        ],
+        pg_gauge_server.daemon_argv(host, port, storage_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

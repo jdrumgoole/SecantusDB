@@ -5247,6 +5247,8 @@ impl PgHandler {
     fn available_extension(name: &str) -> Option<(&'static str, bool, &'static [&'static str])> {
         match name {
             "hstore" => Some(("1.8", true, &["hstore"])),
+            // Case-insensitive text (measured on 15).
+            "citext" => Some(("1.6", true, &["citext"])),
             // Operator classes only: GIN / GiST over the scalar types.
             "btree_gin" => Some(("1.3", true, &[])),
             "btree_gist" => Some(("1.6", true, &[])),
@@ -7143,14 +7145,9 @@ impl PgHandler {
         replacing: &[Bson],
     ) -> PgWireResult<()> {
         let nondeterministic = |col: &str| -> Option<String> {
-            def.column(col)?
-                .extra
-                .get_str("collation")
-                .ok()
-                .filter(|c| {
-                    secantus_pgplan::collation::resolve(c).is_ok_and(|r| !r.deterministic())
-                })
-                .map(str::to_string)
+            secantus_pgplan::collation::column_collation(def.column(col)?).filter(|c| {
+                secantus_pgplan::collation::resolve(c).is_ok_and(|r| !r.deterministic())
+            })
         };
         let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
         let pk: Vec<String> = def
@@ -23165,7 +23162,7 @@ impl PgHandler {
                 self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
                 for ty in types {
                     let oid = self.mint_base_type_oid()?;
-                    let doc = bson::doc! {
+                    let mut doc = bson::doc! {
                         "_id": *ty,
                         "base": *ty,
                         "schema": "public",
@@ -23175,6 +23172,19 @@ impl PgHandler {
                         "output": format!("{ty}_out"),
                         "extension": &name,
                     };
+                    if *ty == "citext" {
+                        // A string-category varlena (measured on 15).
+                        doc.extend(bson::doc! {
+                            "input": "citextin",
+                            "output": "citextout",
+                            "typlen": -1_i32,
+                            "typbyval": false,
+                            "typalign": "i",
+                            "typstorage": "x",
+                            "typcategory": "S",
+                            "typispreferred": false,
+                        });
+                    }
                     self.insert_type_doc(Self::BASE_TYPE_COLLECTION, ty, doc)?;
                 }
                 let doc = bson::doc! {

@@ -328,10 +328,62 @@ impl Rewriter<'_> {
             }
             Some(N::ColumnRef(c)) => self
                 .column_of(c)
-                .and_then(|col| col.extra.get_str("collation").ok())
-                .and_then(locale)
+                .and_then(crate::collation::column_collation)
+                .and_then(|n| locale(&n))
                 .map(|n| (n, false)),
+            Some(N::TypeCast(tc)) if Self::is_citext_cast(tc) => {
+                Some((crate::collation::CITEXT.to_string(), false))
+            }
             _ => None,
+        }
+    }
+
+    /// `x::citext`: a citext value, which carries citext's comparison.
+    fn is_citext_cast(tc: &pg_query::protobuf::TypeCast) -> bool {
+        tc.type_name.as_ref().is_some_and(|t| {
+            t.array_bounds.is_empty() && crate::collation::is_citext(&type_name_of(t))
+        })
+    }
+
+    /// Is `node` statically a `citext[]` -- a cast to one or a column of one?
+    fn citext_array(&self, node: &pg_query::protobuf::Node) -> bool {
+        let arr = |t: &str| {
+            t.trim()
+                .strip_suffix("[]")
+                .is_some_and(|e| crate::collation::is_citext(e.trim_end()))
+        };
+        match node.node.as_ref() {
+            Some(N::TypeCast(tc)) => tc.type_name.as_ref().is_some_and(|t| {
+                !t.array_bounds.is_empty() && crate::collation::is_citext(&type_name_of(t))
+                    || arr(&type_name_of(t))
+            }),
+            Some(N::ColumnRef(c)) => self.column_of(c).is_some_and(|col| arr(&col.pg_type)),
+            _ => false,
+        }
+    }
+
+    /// Is `node` statically a string of a type OTHER than citext -- a
+    /// `text` / `varchar` column or cast? PostgreSQL resolves `citext =
+    /// text` to text's operator (citext casts implicitly to text), so such
+    /// an operand takes citext's comparison away.
+    fn plain_string(&self, node: &pg_query::protobuf::Node) -> bool {
+        let plain = |t: &str| {
+            let t = t.trim();
+            !crate::collation::is_citext(t)
+                && matches!(
+                    t,
+                    "text" | "varchar" | "bpchar" | "name" | "character varying" | "character"
+                )
+                || t.starts_with("varchar(")
+                || t.starts_with("character varying(")
+        };
+        match node.node.as_ref() {
+            Some(N::TypeCast(tc)) => tc
+                .type_name
+                .as_ref()
+                .is_some_and(|t| t.array_bounds.is_empty() && plain(&type_name_of(t))),
+            Some(N::ColumnRef(c)) => self.column_of(c).is_some_and(|col| plain(&col.pg_type)),
+            _ => false,
         }
     }
 
@@ -352,12 +404,23 @@ impl Rewriter<'_> {
                 }
                 Some(N::ColumnRef(c)) => self
                     .column_of(c)
-                    .and_then(|col| col.extra.get_str("collation").ok())
-                    .map(|name| (name.to_string(), false)),
+                    .and_then(crate::collation::column_collation)
+                    .map(|name| (name, false)),
+                Some(N::TypeCast(tc)) if Self::is_citext_cast(tc) => {
+                    Some((crate::collation::CITEXT.to_string(), false))
+                }
                 _ => None,
             }
         };
         let found: Vec<(String, bool)> = nodes.iter().filter_map(|n| any(n)).collect();
+        // citext against a plain string type is text's comparison.
+        if found
+            .iter()
+            .all(|(n, e)| n == crate::collation::CITEXT && !e)
+            && nodes.iter().any(|n| self.plain_string(n))
+        {
+            return Ok(None);
+        }
         let winner = self.coll_winner(&found)?;
         Ok(winner.filter(|name| crate::collation::resolve(name).is_ok_and(|r| r.is_locale())))
     }
@@ -437,6 +500,104 @@ impl Rewriter<'_> {
                 funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
                 location: -1,
                 ..Default::default()
+            }))),
+        }
+    }
+
+    /// A call of one of the string functions the citext extension
+    /// overloads for a citext first argument, as the extension's SQL body
+    /// defines it (citext--1.4.sql): the match is case-insensitive.
+    fn citext_function(
+        &self,
+        f: &pg_query::protobuf::FuncCall,
+    ) -> Option<pg_query::protobuf::Node> {
+        if f.over.is_some() || f.agg_star || f.agg_distinct || f.funcname.len() > 2 {
+            return None;
+        }
+        let name = func_name(f)?;
+        let first = f.args.first()?;
+        let citext = crate::collation::CITEXT;
+        if !self.coll_of(first).is_some_and(|(c, x)| !x && c == citext) {
+            return None;
+        }
+        // A pattern written as a plain text value picks text's function.
+        if f.args.get(1).is_some_and(|a| self.plain_string(a)) {
+            return None;
+        }
+        const QUOTE: &str = "__regex_quote(($2)::text)";
+        let template = match (name.as_str(), f.args.len()) {
+            ("strpos", 2) => "strpos(lower(($1)::text), lower(($2)::text))".to_string(),
+            ("replace", 3) => format!("regexp_replace(($1)::text, {QUOTE}, ($3)::text, 'gi')"),
+            ("split_part", 3) => {
+                format!("(regexp_split_to_array(($1)::text, {QUOTE}, 'i'))[$3]")
+            }
+            (
+                "regexp_match" | "regexp_matches" | "regexp_split_to_array"
+                | "regexp_split_to_table",
+                2,
+            ) => format!("{name}(($1)::text, '(?i)' || ($2)::text)"),
+            ("regexp_replace", 3) => "regexp_replace(($1)::text, ($2)::text, ($3)::text, 'i')".into(),
+            ("translate", 3) => {
+                "translate(translate(($1)::text, lower(($2)::text), ($3)::text), upper(($2)::text), ($3)::text)"
+                    .into()
+            }
+            _ => return None,
+        };
+        let mut out = parse_expr(&format!("select {template}"))?;
+        fn subst(node: &mut pg_query::protobuf::Node, args: &[pg_query::protobuf::Node]) {
+            match node.node.as_mut() {
+                Some(N::ParamRef(p)) => {
+                    if let Some(a) = usize::try_from(p.number)
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .and_then(|n| args.get(n))
+                    {
+                        *node = a.clone();
+                    }
+                }
+                Some(N::FuncCall(f)) => f.args.iter_mut().for_each(|a| subst(a, args)),
+                Some(N::AExpr(e)) => {
+                    for side in [e.lexpr.as_deref_mut(), e.rexpr.as_deref_mut()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        subst(side, args);
+                    }
+                }
+                Some(N::TypeCast(tc)) => {
+                    if let Some(a) = tc.arg.as_deref_mut() {
+                        subst(a, args);
+                    }
+                }
+                Some(N::AIndirection(ind)) => {
+                    if let Some(a) = ind.arg.as_deref_mut() {
+                        subst(a, args);
+                    }
+                    for i in &mut ind.indirection {
+                        if let Some(N::AIndices(x)) = i.node.as_mut() {
+                            if let Some(u) = x.uidx.as_deref_mut() {
+                                subst(u, args);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        subst(&mut out, &f.args);
+        Some(out)
+    }
+
+    /// An extreme read back under citext's collation is a citext again.
+    fn typed_value(value: pg_query::protobuf::Node, collation: &str) -> pg_query::protobuf::Node {
+        if collation != crate::collation::CITEXT {
+            return value;
+        }
+        pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(value)),
+                type_name: Some(type_name_node("citext")),
+                location: -1,
             }))),
         }
     }
@@ -615,6 +776,76 @@ impl Rewriter<'_> {
             let op = operator_name(e).ok().map(str::to_string);
             let ordered = matches!(op.as_deref(), Some("<" | "<=" | ">" | ">="));
             let equality = matches!(op.as_deref(), Some("=" | "<>" | "!="));
+            // Two citext arrays compare element keys.
+            if kind == Ok(AExprKind::AexprOp) && (ordered || equality) {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    if self.citext_array(l) || self.citext_array(r) {
+                        let citext = crate::collation::CITEXT;
+                        let nl = Self::coll_call("__coll_keys", l, citext);
+                        let nr = Self::coll_call("__coll_keys", r, citext);
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(nl));
+                            e.rexpr = Some(Box::new(nr));
+                        }
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
+            // BETWEEN under a locale collation: as the comparisons it
+            // abbreviates, each then compared by key.
+            if matches!(
+                kind,
+                Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween)
+            ) {
+                if let (Some(l), Some(N::List(bounds))) = (
+                    e.lexpr.as_deref(),
+                    e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
+                ) {
+                    if let [lo, hi] = bounds.items.as_slice() {
+                        if self.coll_between(&[l, lo, hi])?.is_some() {
+                            let negated = kind == Ok(AExprKind::AexprNotBetween);
+                            let cmp =
+                                |op: &str,
+                                 a: &pg_query::protobuf::Node,
+                                 b: &pg_query::protobuf::Node| {
+                                    pg_query::protobuf::Node {
+                                        node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+                                            kind: AExprKind::AexprOp as i32,
+                                            name: vec![pg_query::protobuf::Node {
+                                                node: Some(N::String(pg_query::protobuf::String {
+                                                    sval: op.to_string(),
+                                                })),
+                                            }],
+                                            lexpr: Some(Box::new(a.clone())),
+                                            rexpr: Some(Box::new(b.clone())),
+                                            location: -1,
+                                        }))),
+                                    }
+                                };
+                            let (a, b) = if negated {
+                                (cmp("<", l, lo), cmp(">", l, hi))
+                            } else {
+                                (cmp(">=", l, lo), cmp("<=", l, hi))
+                            };
+                            *node = pg_query::protobuf::Node {
+                                node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                                    xpr: None,
+                                    boolop: if negated {
+                                        BoolExprType::OrExpr as i32
+                                    } else {
+                                        BoolExprType::AndExpr as i32
+                                    },
+                                    args: vec![a, b],
+                                    location: -1,
+                                }))),
+                            };
+                            self.changed = true;
+                            return self.expr(node);
+                        }
+                    }
+                }
+            }
             // A comparison under a LOCALE collation compares sort keys.
             if kind == Ok(AExprKind::AexprOp) && (ordered || equality) {
                 if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
@@ -630,6 +861,33 @@ impl Rewriter<'_> {
                     }
                 }
             }
+            // citext's pattern operators are case-insensitive: LIKE is
+            // ILIKE and `~` is `~*` over a citext left operand, whatever
+            // the pattern's type.
+            if matches!(kind, Ok(AExprKind::AexprLike))
+                || (kind == Ok(AExprKind::AexprOp)
+                    && matches!(op.as_deref(), Some("~~" | "!~~" | "~" | "!~")))
+            {
+                if let Some(l) = e.lexpr.as_deref() {
+                    if self
+                        .coll_of(l)
+                        .is_some_and(|(c, explicit)| !explicit && c == crate::collation::CITEXT)
+                    {
+                        let to = format!("{}*", op.clone().unwrap_or_default());
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            if e.kind == AExprKind::AexprLike as i32 {
+                                e.kind = AExprKind::AexprIlike as i32;
+                            }
+                            e.name = vec![pg_query::protobuf::Node {
+                                node: Some(N::String(pg_query::protobuf::String { sval: to })),
+                            }];
+                        }
+                        self.changed = true;
+                        // Still visit the operands (a pattern's own subquery).
+                        return self.expr(node);
+                    }
+                }
+            }
             // LIKE has no meaning under a nondeterministic collation.
             if matches!(kind, Ok(AExprKind::AexprLike | AExprKind::AexprIlike))
                 || (kind == Ok(AExprKind::AexprOp)
@@ -637,11 +895,32 @@ impl Rewriter<'_> {
             {
                 if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                     if let Some(collation) = self.coll_between(&[l, r])? {
-                        if !crate::collation::resolve(&collation)?.deterministic() {
+                        if collation != crate::collation::CITEXT
+                            && !crate::collation::resolve(&collation)?.deterministic()
+                        {
                             return Err(Error::FeatureNotSupported(
                                 "nondeterministic collations are not supported for LIKE".into(),
                             ));
                         }
+                    }
+                }
+            }
+            // `x = ANY(array)` over citext compares keys.
+            if matches!(kind, Ok(AExprKind::AexprOpAny | AExprKind::AexprOpAll))
+                && (ordered || equality)
+            {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    let citext = crate::collation::CITEXT;
+                    // `citext = ANY(ARRAY['A'])` is text's: the array is text[].
+                    if self.citext_array(r) && !self.plain_string(l) {
+                        let nl = Self::coll_key(l, citext);
+                        let nr = Self::coll_call("__coll_keys", r, citext);
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(nl));
+                            e.rexpr = Some(Box::new(nr));
+                        }
+                        self.changed = true;
+                        return Ok(());
                     }
                 }
             }
@@ -965,6 +1244,14 @@ impl Rewriter<'_> {
                 return Ok(());
             }
         }
+        // citext's own string functions: case-insensitive matching.
+        if let Some(N::FuncCall(f)) = node.node.as_ref() {
+            if let Some(rewritten) = self.citext_function(f) {
+                *node = rewritten;
+                self.changed = true;
+                return self.expr(node);
+            }
+        }
         // `min(e)` / `max(e)`: the extreme POSITION, mapped back.
         if let Some(N::FuncCall(f)) = node.node.as_ref() {
             let name = func_name(f);
@@ -976,7 +1263,7 @@ impl Rewriter<'_> {
                         let call = pg_query::protobuf::Node {
                             node: Some(N::FuncCall(Box::new(agg))),
                         };
-                        *node = Self::coll_value(call);
+                        *node = Self::typed_value(Self::coll_value(call), &collation);
                         self.changed = true;
                         return Ok(());
                     }
@@ -1015,7 +1302,7 @@ impl Rewriter<'_> {
                 let inner = pg_query::protobuf::Node {
                     node: Some(N::MinMaxExpr(Box::new(mm))),
                 };
-                *node = Self::coll_value(inner);
+                *node = Self::typed_value(Self::coll_value(inner), &collation);
                 self.changed = true;
                 return Ok(());
             }
@@ -1108,6 +1395,43 @@ fn parse_expr(sql: &str) -> Option<pg_query::protobuf::Node> {
     match sel.target_list.first()?.node.clone()? {
         N::ResTarget(rt) => rt.val.map(|v| *v),
         _ => None,
+    }
+}
+
+/// Replace the grouped columns inside `node` (outside aggregates) with
+/// their group's value.
+fn nested(
+    node: &mut pg_query::protobuf::Node,
+    grouped: &[(pg_query::protobuf::Node, String)],
+    first: &dyn Fn(&pg_query::protobuf::Node) -> pg_query::protobuf::Node,
+) {
+    if let Some((col, _)) = grouped
+        .iter()
+        .find(|(g, _)| crate::same_expression(g, node))
+    {
+        *node = first(col);
+        return;
+    }
+    match node.node.as_mut() {
+        Some(N::TypeCast(tc)) => {
+            if let Some(a) = tc.arg.as_deref_mut() {
+                nested(a, grouped, first);
+            }
+        }
+        Some(N::AExpr(e)) => {
+            for side in [e.lexpr.as_deref_mut(), e.rexpr.as_deref_mut()]
+                .into_iter()
+                .flatten()
+            {
+                nested(side, grouped, first);
+            }
+        }
+        Some(N::FuncCall(f)) if !crate::is_aggregate_call(f) && f.over.is_none() => {
+            for a in &mut f.args {
+                nested(a, grouped, first);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1274,6 +1598,11 @@ pub(crate) fn rewrite(
                 let value = first_of_group(col);
                 r.derived.borrow_mut().push((value.clone(), c.clone()));
                 rt.val = Some(Box::new(value));
+            } else if let Some(v) = rt.val.as_deref_mut() {
+                // The grouped column INSIDE an expression (`lower(x::text)`)
+                // reads the group's value too; an aggregate's argument
+                // still reads the rows.
+                nested(v, &grouped, &first_of_group);
             }
         }
         // A sort term naming the grouped column orders by the group's key.
@@ -1287,6 +1616,8 @@ pub(crate) fn rewrite(
             if let Some((col, c)) = grouped.iter().find(|(g, _)| crate::same_expression(g, key)) {
                 // By the group's collation key, which every member shares.
                 sb.node = Some(Box::new(fcall("min", vec![Rewriter::coll_key(col, c)])));
+            } else if let Some(k) = sb.node.as_deref_mut() {
+                nested(k, &grouped, &first_of_group);
             }
         }
     }
@@ -1352,6 +1683,24 @@ pub(crate) fn rewrite(
     }
     for item in &mut out.sort_clause {
         r.sort_by(item);
+    }
+    // A JOIN's ON condition compares like a WHERE.
+    fn join_quals(node: &mut pg_query::protobuf::Node, r: &mut Rewriter) -> Result<()> {
+        if let Some(N::JoinExpr(j)) = node.node.as_mut() {
+            for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                .into_iter()
+                .flatten()
+            {
+                join_quals(side, r)?;
+            }
+            if let Some(q) = j.quals.as_deref_mut() {
+                r.expr(q)?;
+            }
+        }
+        Ok(())
+    }
+    for item in &mut out.from_clause {
+        join_quals(item, &mut r)?;
     }
     for t in &mut out.target_list {
         r.expr(t)?;
