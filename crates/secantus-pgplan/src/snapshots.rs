@@ -6,9 +6,12 @@
 //! A snapshot is held in its canonical text (`xmin:xmax:xip,...`, see
 //! [`crate::systypes::parse_snapshot`]).
 //!
-//! This server exposes no transaction ids, so the CURRENT snapshot is the
-//! empty one at the first normal xid (`3:3:`): nothing in progress, every
-//! xid below 3 -- the bootstrap and frozen ones -- visible.
+//! Transaction ids (`txid_current()`, `pg_current_xact_id()` and their
+//! `_if_assigned` forms) and the CURRENT snapshot come from the server
+//! through [`set_xid_hook`]: an xid is assigned to a session's transaction
+//! when first asked for, and a snapshot lists the other sessions' assigned
+//! xids still running. Without a hook (a planner test) the current snapshot
+//! is the empty one at the first normal xid (`3:3:`).
 
 use bson::Bson;
 
@@ -25,7 +28,46 @@ pub const FUNCTIONS: &[&str] = &[
     "txid_visible_in_snapshot",
     "pg_current_snapshot",
     "txid_current_snapshot",
+    "txid_current",
+    "pg_current_xact_id",
+    "txid_current_if_assigned",
+    "pg_current_xact_id_if_assigned",
 ];
+
+/// What the server is asked for (see [`set_xid_hook`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XidOp {
+    /// The transaction's xid, assigning one if it has none.
+    Assign,
+    /// The transaction's xid, if it has one.
+    IfAssigned,
+    /// The current snapshot's text (`xmin:xmax:xip,...`).
+    Snapshot,
+}
+
+/// `(session pid, what) -> the answer`.
+pub type XidHook = fn(i32, XidOp) -> Option<String>;
+
+static XID_HOOK: std::sync::OnceLock<XidHook> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SESSION_PID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Install the server's transaction-id source (once per process).
+pub fn set_xid_hook(hook: XidHook) {
+    let _ = XID_HOOK.set(hook);
+}
+
+/// The session the statements on this thread belong to.
+pub fn set_session_pid(pid: i32) {
+    SESSION_PID.with(|c| c.set(pid));
+}
+
+fn ask(op: XidOp) -> Option<String> {
+    let hook = XID_HOOK.get()?;
+    hook(SESSION_PID.with(std::cell::Cell::get), op)
+}
 
 /// The set-returning ones.
 pub const SET_FUNCTIONS: &[&str] = &["pg_snapshot_xip", "txid_snapshot_xip"];
@@ -39,6 +81,8 @@ pub fn result_type(name: &str) -> Option<&'static str> {
         "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => "bool",
         "pg_current_snapshot" => "pg_snapshot",
         "txid_current_snapshot" => "txid_snapshot",
+        "txid_current" | "txid_current_if_assigned" => "int8",
+        "pg_current_xact_id" | "pg_current_xact_id_if_assigned" => "xid8",
         _ => return None,
     })
 }
@@ -87,13 +131,27 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         }
     };
     match name {
-        "pg_current_snapshot" => {
+        "pg_current_snapshot" | "txid_current_snapshot" => {
             arity(0)?;
-            Ok(Bson::String(CURRENT.into()))
+            Ok(Bson::String(
+                ask(XidOp::Snapshot).unwrap_or_else(|| CURRENT.into()),
+            ))
         }
-        "txid_current_snapshot" => {
+        "txid_current" | "pg_current_xact_id" => {
             arity(0)?;
-            Ok(Bson::String(CURRENT.into()))
+            let xid = ask(XidOp::Assign)
+                .and_then(|x| x.parse::<u64>().ok())
+                .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
+            Ok(xid_value(name, xid))
+        }
+        "txid_current_if_assigned" | "pg_current_xact_id_if_assigned" => {
+            arity(0)?;
+            Ok(
+                match ask(XidOp::IfAssigned).and_then(|x| x.parse::<u64>().ok()) {
+                    Some(xid) => xid_value(name, xid),
+                    None => Bson::Null,
+                },
+            )
         }
         "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => {
             arity(2)?;

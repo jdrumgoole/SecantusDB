@@ -265,6 +265,21 @@ impl<'p> Scope<'p> {
             .push((alias.clone(), TableDef::new(&alias, columns)));
     }
 
+    /// Does a bare column name resolve in this scope or an enclosing one?
+    /// `Some(false)` only when every scope on the way is complete.
+    fn knows(&self, name: &str) -> Option<bool> {
+        if self.tables.iter().any(|(_, d)| d.column(name).is_some()) {
+            return Some(true);
+        }
+        if !self.complete {
+            return None;
+        }
+        match self.parent {
+            Some(p) => p.knows(name),
+            None => Some(false),
+        }
+    }
+
     fn column_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
         self.column_type_raw(c).filter(|t| !t.is_empty())
     }
@@ -397,6 +412,41 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
         {
             operand_type(e.lexpr.as_deref()?, scope)
         }
+        // A built-in comparison, pattern match, IN, BETWEEN or IS [NOT]
+        // DISTINCT FROM is boolean, as are AND / OR / NOT and IS [NOT] NULL.
+        N::AExpr(e)
+            if op_of(e).is_some_and(|op| {
+                !user_ops::defines(&op)
+                    && match pg_query::protobuf::AExprKind::try_from(e.kind) {
+                        Ok(pg_query::protobuf::AExprKind::AexprOp) => matches!(
+                            op.as_str(),
+                            "=" | "<>"
+                                | "!="
+                                | "<"
+                                | "<="
+                                | ">"
+                                | ">="
+                                | "~~"
+                                | "!~~"
+                                | "~~*"
+                                | "!~~*"
+                        ),
+                        Ok(
+                            pg_query::protobuf::AExprKind::AexprDistinct
+                            | pg_query::protobuf::AExprKind::AexprNotDistinct
+                            | pg_query::protobuf::AExprKind::AexprLike
+                            | pg_query::protobuf::AExprKind::AexprIlike
+                            | pg_query::protobuf::AExprKind::AexprIn
+                            | pg_query::protobuf::AExprKind::AexprBetween
+                            | pg_query::protobuf::AExprKind::AexprNotBetween,
+                        ) => true,
+                        _ => false,
+                    }
+            }) =>
+        {
+            Some("bool".into())
+        }
+        N::BoolExpr(_) | N::NullTest(_) | N::BooleanTest(_) => Some("bool".into()),
         // `||` over a string is text; date arithmetic keeps its kind.
         N::AExpr(e)
             if pg_query::protobuf::AExprKind::try_from(e.kind)
@@ -606,6 +656,23 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // A prefix `-` / `+` exists for the numbers and `interval` only:
+    // `- text` is 42883, where the lowering answered it as `0 - text`.
+    if kind == Some(K::AexprOp) && e.lexpr.is_none() && matches!(op.as_str(), "+" | "-") {
+        if let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) {
+            if matches!(
+                category(&r),
+                Some("string" | "bool" | "datetime" | "bytea" | "uuid" | "jsonb")
+            ) || matches!(r.as_str(), "json")
+            {
+                set_error_location(e.location);
+                return Err(Error::UndefinedFunction(format!(
+                    "operator does not exist: {op} {}",
+                    display_type(&r)
+                )));
+            }
+        }
+    }
     // `boolean` has no arithmetic at all: `integer + boolean` is 42883.
     if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
@@ -746,6 +813,15 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         return Ok(());
     }
     match kind {
+        // `NULLIF(a, b)` and `a IS [NOT] DISTINCT FROM b` both resolve `a = b`.
+        Some(K::AexprNullif | K::AexprDistinct | K::AexprNotDistinct) => {
+            let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
+                return Ok(());
+            };
+            if category(&r).is_some_and(|rc| rc != lc) {
+                return Err(mismatch("=", &l, &r, e.location));
+            }
+        }
         Some(K::AexprOp) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => {
             // An untyped literal takes the other side's type when the
             // statement is analysed: one that is not valid input fails then.
@@ -823,6 +899,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
         }
         N::BoolExpr(b) => {
             for a in &b.args {
+                bool_argument(b, a, scope)?;
                 walk(a, scope, cx)?;
             }
         }
@@ -845,18 +922,38 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
         // when the statement is analysed, so a literal that is not valid
         // input for it fails then -- evaluated or not (`coalesce(id, 'x')`).
         N::CoalesceExpr(c) => {
-            literals_fit(&c.args, scope)?;
+            let parts = c.args.iter().collect::<Vec<_>>();
+            common_type_check("COALESCE", &parts, scope)?;
+            literals_fit(&parts, scope)?;
             for a in &c.args {
                 walk(a, scope, cx)?;
             }
         }
         N::MinMaxExpr(m) => {
-            literals_fit(&m.args, scope)?;
+            let label = if pg_query::protobuf::MinMaxOp::try_from(m.op)
+                == Ok(pg_query::protobuf::MinMaxOp::IsGreatest)
+            {
+                "GREATEST"
+            } else {
+                "LEAST"
+            };
+            let parts = m.args.iter().collect::<Vec<_>>();
+            common_type_check(label, &parts, scope)?;
+            literals_fit(&parts, scope)?;
             for a in &m.args {
                 walk(a, scope, cx)?;
             }
         }
         N::CaseExpr(c) => {
+            // PostgreSQL resolves the ELSE first, then each THEN in order.
+            let mut parts: Vec<&pg_query::protobuf::Node> =
+                c.defresult.as_deref().into_iter().collect();
+            parts.extend(c.args.iter().filter_map(|w| match w.node.as_ref() {
+                Some(N::CaseWhen(cw)) => cw.result.as_deref(),
+                _ => None,
+            }));
+            common_type_check("CASE", &parts, scope)?;
+            literals_fit(&parts, scope)?;
             for w in &c.args {
                 if let Some(N::CaseWhen(w)) = w.node.as_ref() {
                     for s in w.expr.iter().chain(w.result.iter()) {
@@ -877,6 +974,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             if let Some(t) = sl.testexpr.as_deref() {
                 walk(t, scope, cx)?;
             }
+            any_sublink_operator(sl, scope)?;
             if let Some(N::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
             {
                 check_select(sel, &cx.ctes, cx.lookup, Some(scope))?;
@@ -977,6 +1075,7 @@ fn check_select(
         walk(w, &scope, &cx)?;
     }
     if let Some(h) = s.having_clause.as_deref() {
+        having_names_resolve(h, &scope)?;
         walk(h, &scope, &cx)?;
     }
     for w in &s.window_clause {
@@ -1429,7 +1528,7 @@ fn common_type(parts: &[&pg_query::protobuf::Node], scope: &Scope) -> Option<Str
             None => t,
             Some(o) if o == t => o,
             Some(o) if category(&o) == Some("numeric") && category(&t) == Some("numeric") => {
-                "numeric".into()
+                numeric_meet(&o, &t)
             }
             Some(o) if category(&o) == Some("string") && category(&t) == Some("string") => {
                 "text".into()
@@ -1440,18 +1539,178 @@ fn common_type(parts: &[&pg_query::protobuf::Node], scope: &Scope) -> Option<Str
     out
 }
 
+/// A bare column in HAVING that no FROM item (nor an enclosing query) has is
+/// 42703, which PostgreSQL reports before any grouping error.
+fn having_names_resolve(h: &pg_query::protobuf::Node, scope: &Scope) -> Result<()> {
+    const SYSTEM: &[&str] = &["tableoid", "ctid", "xmin", "xmax", "cmin", "cmax", "oid"];
+    let mut probe = h.clone();
+    let mut missing: Option<(String, i32)> = None;
+    let _ = walk_expr(&mut probe, &mut |n| {
+        if missing.is_some() {
+            return Ok(());
+        }
+        // A subquery has a scope of its own.
+        if matches!(n.node.as_ref(), Some(N::SubLink(_))) {
+            n.node = None;
+            return Ok(());
+        }
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            if let [f] = c.fields.as_slice() {
+                if let Some(N::String(name)) = f.node.as_ref() {
+                    if !SYSTEM.contains(&name.sval.as_str())
+                        && scope.knows(&name.sval) == Some(false)
+                    {
+                        missing = Some((name.sval.clone(), c.location));
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+    match missing {
+        Some((name, location)) => {
+            if location >= 0 {
+                set_error_location(location);
+            }
+            Err(Error::UndefinedColumn(name))
+        }
+        None => Ok(()),
+    }
+}
+
+/// PostgreSQL's `select_common_type` over the parts of a CASE / COALESCE /
+/// GREATEST / LEAST, in its order: the first typed part sets the category,
+/// and a later one of ANOTHER category is 42804 at that part (where this
+/// server answered with whichever value came first). Untyped literals and
+/// NULLs take the common type; a part of a type this cannot judge skips the
+/// check.
+fn common_type_check(
+    label: &str,
+    parts: &[&pg_query::protobuf::Node],
+    scope: &Scope,
+) -> Result<()> {
+    use pg_query::protobuf::a_const::Val;
+    let mut first: Option<(String, &'static str)> = None;
+    for p in parts {
+        if matches!(p.node.as_ref(), Some(N::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))))
+        {
+            continue;
+        }
+        let Some(t) = operand_type(p, scope) else {
+            return Ok(());
+        };
+        let Some(cat) = category(&t) else {
+            return Ok(());
+        };
+        match &first {
+            None => first = Some((t, cat)),
+            Some((pt, pc)) if *pc != cat => {
+                if let Some(loc) = expr_location(p) {
+                    set_error_location(loc);
+                }
+                return Err(Error::DatatypeMismatch(format!(
+                    "{label} types {} and {} cannot be matched",
+                    display_type(pt),
+                    display_type(&t)
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// An argument of AND / OR / NOT must be boolean: a typed operand of
+/// another built-in type is 42804 at that operand.
+fn bool_argument(
+    b: &pg_query::protobuf::BoolExpr,
+    arg: &pg_query::protobuf::Node,
+    scope: &Scope,
+) -> Result<()> {
+    use pg_query::protobuf::BoolExprType;
+    let Some(t) = operand_type(arg, scope) else {
+        return Ok(());
+    };
+    if matches!(t.as_str(), "bool" | "boolean") || category(&t).is_none() {
+        return Ok(());
+    }
+    if let Some(loc) = expr_location(arg) {
+        set_error_location(loc);
+    }
+    Err(Error::DatatypeMismatch(format!(
+        "argument of {} must be type boolean, not type {}",
+        match BoolExprType::try_from(b.boolop) {
+            Ok(BoolExprType::AndExpr) => "AND",
+            Ok(BoolExprType::OrExpr) => "OR",
+            _ => "NOT",
+        },
+        display_type(&t)
+    )))
+}
+
+/// `x IN (SELECT y ...)` / `x op ANY (SELECT y ...)`: the operator between
+/// `x` and the subquery's column must exist (`integer = text` is 42883,
+/// where the lowering compared across types and matched nothing).
+fn any_sublink_operator(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Result<()> {
+    use pg_query::protobuf::SubLinkType;
+    if !matches!(
+        SubLinkType::try_from(sl.sub_link_type),
+        Ok(SubLinkType::AnySublink | SubLinkType::AllSublink)
+    ) {
+        return Ok(());
+    }
+    let op = match sl.oper_name.last().and_then(|n| n.node.as_ref()) {
+        Some(N::String(s)) => s.sval.clone(),
+        None => "=".to_string(),
+        _ => return Ok(()),
+    };
+    if !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        return Ok(());
+    }
+    let Some(l) = sl.testexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
+        return Ok(());
+    };
+    let mut as_scalar = sl.clone();
+    as_scalar.sub_link_type = SubLinkType::ExprSublink as i32;
+    as_scalar.testexpr = None;
+    let node = pg_query::protobuf::Node {
+        node: Some(N::SubLink(Box::new(as_scalar))),
+    };
+    let Some(r) = operand_type(&node, scope) else {
+        return Ok(());
+    };
+    if matches!((category(&l), category(&r)), (Some(lc), Some(rc)) if lc != rc) {
+        let op = if op == "!=" { "<>" } else { op.as_str() };
+        return Err(mismatch(op, &l, &r, sl.location));
+    }
+    Ok(())
+}
+
 /// Do the untyped string literals among `args` read as the type the typed
 /// ones share? The first literal that does not is its cast's error, at the
 /// literal.
-fn literals_fit(args: &[pg_query::protobuf::Node], scope: &Scope) -> Result<()> {
+fn literals_fit(args: &[&pg_query::protobuf::Node], scope: &Scope) -> Result<()> {
     use pg_query::protobuf::a_const::Val;
-    let typed: Vec<String> = args.iter().filter_map(|a| operand_type(a, scope)).collect();
-    let Some(first) = typed.first() else {
+    let untyped = |a: &pg_query::protobuf::Node| matches!(a.node.as_ref(), Some(N::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))));
+    // The common type of the typed parts -- every one of them typed here,
+    // or nothing is judged.
+    let mut common: Option<String> = None;
+    for a in args.iter().filter(|a| !untyped(a)) {
+        let Some(t) = operand_type(a, scope) else {
+            return Ok(());
+        };
+        common = Some(match common {
+            None => t,
+            Some(c) if c == t => c,
+            Some(c) if category(&c) == Some("numeric") && category(&t) == Some("numeric") => {
+                numeric_meet(&c, &t)
+            }
+            Some(_) => return Ok(()),
+        });
+    }
+    let Some(first) = common.as_ref() else {
         return Ok(());
     };
-    if typed.iter().any(|t| t != first) {
-        return Ok(());
-    }
     // Only the types whose input this check can judge exactly.
     if !matches!(
         first.as_str(),

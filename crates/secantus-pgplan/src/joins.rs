@@ -1105,7 +1105,12 @@ fn rewrite_expr(node: &mut pg_query::protobuf::Node, scope: &Scope, keep: &[Stri
         if parts.len() == 1 && keep.contains(&parts[0]) {
             return Ok(());
         }
-        if let Some(key) = scope.resolve(&parts)? {
+        let resolved = scope.resolve(&parts).inspect_err(|_| {
+            if c.location >= 0 {
+                set_error_location(c.location);
+            }
+        })?;
+        if let Some(key) = resolved {
             n.node = Some(key_ref(key, c.location));
         }
         Ok(())

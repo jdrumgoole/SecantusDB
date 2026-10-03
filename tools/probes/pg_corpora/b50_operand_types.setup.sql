@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS b50_ft;
+DROP FUNCTION IF EXISTS b50_f(int);
+DROP FUNCTION IF EXISTS b50_g(int);
+create table b50_ft (a int, b text, c numeric, d date, j jsonb, arr int[], ts timestamptz);
+insert into b50_ft values (1, 'x', 1.5, '2020-01-01', '{"k":1}', '{1,2}', '2020-01-01 00:00+00');
+create function b50_f(x int) returns int language sql as $$ select 1/x $$;
+create function b50_g(x int) returns int language sql as $$ select x + 1 $$;
+DROP TABLE IF EXISTS b50_names;
+create table b50_names (n name, t text, i int);
+insert into b50_names values ('a', 'b', 1);
+DROP VIEW IF EXISTS b50_rec;

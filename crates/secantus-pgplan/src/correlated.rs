@@ -920,6 +920,23 @@ pub(crate) fn with_row_params_from<R>(n: usize, f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Is every PostgreSQL 15 built-in `name` taking `nargs` arguments
+/// IMMUTABLE (`pg15_immutable_functions.tsv`, dumped from `pg_proc`)?
+fn immutable_builtin(name: &str, nargs: usize) -> bool {
+    static SET: std::sync::OnceLock<std::collections::HashSet<(&'static str, usize)>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        include_str!("pg15_immutable_functions.tsv")
+            .lines()
+            .filter_map(|l| {
+                let (n, a) = l.split_once('\t')?;
+                Some((n, a.trim().parse().ok()?))
+            })
+            .collect()
+    })
+    .contains(&(name, nargs))
+}
+
 /// Classify a call's arguments (see [`CallArgs`]).
 pub(crate) fn call_args_kind(args: &[pg_query::protobuf::Node]) -> CallArgs {
     let row_from = ROW_PARAMS_FROM.with(|c| c.get());
@@ -940,7 +957,16 @@ pub(crate) fn call_args_kind(args: &[pg_query::protobuf::Node]) -> CallArgs {
                     let user = func_name(f).is_some_and(|name| {
                         user_function_for(&name, &f.args).is_some_and(|u| !u.returns_set)
                     });
-                    if !user {
+                    // An IMMUTABLE built-in is folded over constants while
+                    // planning (`f(abs(0))` is inlined and folded); a stable
+                    // or volatile one, or an aggregate / window call, runs.
+                    let folded = f.over.is_none()
+                        && !f.agg_star
+                        && f.agg_order.is_empty()
+                        && func_name(f).is_some_and(|name| {
+                            !user_function_named(&name) && immutable_builtin(&name, f.args.len())
+                        });
+                    if !user && !folded {
                         kind = CallArgs::Runtime;
                     }
                 }

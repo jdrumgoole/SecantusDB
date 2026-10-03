@@ -839,6 +839,7 @@ fn plain_scalar(v: &Bson) -> bool {
             | Bson::ObjectId(_)
             | Bson::DateTime(_)
             | Bson::Boolean(_)
+            | Bson::Decimal128(_)
     )
 }
 
@@ -3418,7 +3419,10 @@ mod in_set_tests {
         list.push(Bson::Double(2.5));
         list.push(Bson::String("x".into()));
         list.push(Bson::Int64(9_007_199_254_740_993));
-        let values = vec![
+        for d in ["1.50", "-0.25", "NaN", "1E+40", "0.1"] {
+            list.push(Bson::Decimal128(d.parse::<Decimal128>().unwrap()));
+        }
+        let mut values = vec![
             Bson::Int32(3),
             Bson::Int64(3),
             Bson::Double(3.0),
@@ -3437,6 +3441,15 @@ mod in_set_tests {
             Bson::Decimal128("3".parse::<Decimal128>().unwrap()),
             Bson::Int32(100),
         ];
+        for d in [
+            "1.5", "1.500", "-0.250", "NaN", "1E+40", "1.0E+40", "0.1", "0.10", "4", "-0",
+            "Infinity",
+        ] {
+            values.push(Bson::Decimal128(d.parse::<Decimal128>().unwrap()));
+        }
+        values.push(Bson::Double(0.1));
+        values.push(Bson::Double(1.5));
+        values.push(Bson::Double(1e40));
         let empty = Document::new();
         for op in ["$in", "$nin"] {
             let filter = doc! { "a": { op: list.clone() } };
