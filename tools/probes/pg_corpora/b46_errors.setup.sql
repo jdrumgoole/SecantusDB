@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS b46e CASCADE
+CREATE TABLE b46e (a int, d date, s text)
+INSERT INTO b46e VALUES (1, '2024-03-04', 'x')

@@ -65,6 +65,31 @@ pub fn sync_on_commit(force_durable: bool, fast_storage: bool) -> bool {
     force_durable || !fast_storage
 }
 
+/// The commit-sync METHOD, matched to PostgreSQL's default on this platform.
+///
+/// `wt_config` asks for `method=fsync`, and on macOS WiredTiger's fsync is
+/// `fcntl(F_FULLFSYNC)` -- a drive-cache flush costing ~5-8 ms a commit.
+/// PostgreSQL's macOS default is `wal_sync_method = open_datasync` (an
+/// `O_DSYNC` WAL file, no `F_FULLFSYNC`), so there this server uses
+/// WiredTiger's `method=dsync`, which opens the log `O_DSYNC` the same way.
+///
+/// **The guarantee that buys, on macOS: an acknowledged COMMIT survives a
+/// process kill (and an OS crash the kernel survives far enough to flush),
+/// but NOT a power loss** -- the drive's volatile cache is not flushed. That
+/// is exactly PostgreSQL's default guarantee on macOS. Linux keeps
+/// `method=fsync` (fdatasync, which is PostgreSQL's Linux default too).
+/// Measured 2026-10-03 on an M-series Mac, durable autocommit UPDATE median:
+/// fsync 7.9 ms, dsync 149 us, PG15 82 us; a SIGKILL after 20 acked runs
+/// lost nothing. The Rust MongoDB
+/// server does not call this and is unchanged.
+pub fn commit_sync_method(config: &str) -> String {
+    if cfg!(target_os = "macos") {
+        config.replace("method=fsync", "method=dsync")
+    } else {
+        config.to_string()
+    }
+}
+
 /// Open the store the PostgreSQL server serves, with a per-commit log sync in
 /// durable mode (see [`sync_on_commit`]).
 ///
@@ -78,7 +103,7 @@ pub fn open_storage(home: &str) -> secantus_storage::Result<Storage> {
     let fast = std::env::var("SECANTUS_TEST_FAST_STORAGE").as_deref() == Ok("1");
     // The same engine knobs as `Storage::open`'s default config, with only
     // `transaction_sync` chosen here.
-    let config = wt_config("4G", 1000, sync_on_commit(force, fast), "128MB");
+    let config = commit_sync_method(&wt_config("4G", 1000, sync_on_commit(force, fast), "128MB"));
     Storage::open_with_options(
         home,
         &StorageOptions {
@@ -399,7 +424,7 @@ async fn accept_loop(
 
 #[cfg(test)]
 mod sync_tests {
-    use super::sync_on_commit;
+    use super::{commit_sync_method, sync_on_commit, wt_config};
 
     /// Durable (the shipped default) syncs per commit; the test suite's fast
     /// mode does not; `SECANTUS_FORCE_DURABLE=1` wins over fast mode.
@@ -409,5 +434,18 @@ mod sync_tests {
         assert!(!sync_on_commit(false, true));
         assert!(sync_on_commit(true, true));
         assert!(sync_on_commit(true, false));
+    }
+
+    /// macOS commits with `O_DSYNC` (PostgreSQL's `open_datasync`), not
+    /// WiredTiger's `F_FULLFSYNC`; elsewhere the config is untouched.
+    #[test]
+    fn commit_sync_method_matches_postgres_default() {
+        let cfg = wt_config("4G", 1000, true, "128MB");
+        let got = commit_sync_method(&cfg);
+        if cfg!(target_os = "macos") {
+            assert!(got.contains("transaction_sync=(enabled=true,method=dsync)"));
+        } else {
+            assert_eq!(got, cfg);
+        }
     }
 }

@@ -848,8 +848,9 @@ remain open:
         `sum` / `avg` / `stddev` / `variance` / `bool_*` / `bit_*` over a
         type no overload takes is 42883 (`sum(text)` answered 0), and an
         aggregate in WHERE is 42803 (corpus `b45_errors`). An operand of any
-        other shape is still not checked; of the 79 shapes probed, `a LIKE 'x'`
-        over an integer is the one left, and only its position is missing.
+        other shape is still not checked. (Batch 46: `a LIKE 'x'` over an
+        integer is 42883 at the operator in the select list too, where it
+        had answered NULL; corpus `b46_errors`.)
       - **Error positions** come from the parse location where the raising
         site records one, else from the first token the message names. Batch
         45 added the ungrouped-column 42803 (at the bare mention), `GROUP BY
@@ -857,17 +858,20 @@ remain open:
         FROM-clause entry` (at the qualifier, with PostgreSQL's alias HINT),
         and aggregate / window calls in WHERE (slice test
         `test_batch45_error_positions_and_hints`). A name mentioned twice may
-        still point at the wrong occurrence. Left, measured: an error inside
-        a function body carries no CONTEXT, internal position or internal
-        query (PostgreSQL sends `SQL function "f" during inlining`, `PL/pgSQL
-        function f() line 1 at RETURN`, `SQL statement "SELECT 1/0"` and the
-        failing expression's offset); and a FROM-less subquery naming an
-        outer FROM item it cannot see (`FROM t x, (SELECT x.a) s`) answers
-        42703 where PostgreSQL answers 42P01 `invalid reference to
-        FROM-clause entry for table "x"` with its HINT. Size: the CONTEXT
-        stack needs the PL/pgSQL interpreter to carry statement line numbers
-        out with an error -- a day; the 42P01 is a check in the subquery
-        resolver -- hours.
+        still point at the wrong occurrence. Batch 46: an error inside a
+        PL/pgSQL body carries PostgreSQL's CONTEXT stack (`SQL expression
+        "1/0"` / `SQL statement "..."` / `PL/pgSQL assignment "x := 1/0"`,
+        then `PL/pgSQL function f(integer) line N at RETURN` per function);
+        a FROM-less subquery naming a sibling FROM item is 42P01 with its
+        HINT (slice test `test_batch46_function_body_error_context`). Left,
+        measured on 15.19: a `LANGUAGE sql` body's error has no CONTEXT
+        (PostgreSQL sends `SQL function "f" during inlining` when it folds
+        the call while planning, `SQL function "f" statement 1` when it runs
+        it, and NOTHING once an inlined call fails at run time -- the three
+        depend on PostgreSQL's inlining rules); and the `SQL expression`
+        frame follows an approximation of PL/pgSQL's simple-expression rule
+        (a frame for a non-simple expression or one with no variable and no
+        volatile / user call, which PostgreSQL folds while planning).
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
         quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
@@ -892,15 +896,13 @@ remain open:
         checked when planned (42P20 for several ORDER BY columns, 0A000 for a
         text ordering or an integer offset over a date, 22P02 for a bad
         literal) where the server had accepted the first two and answered
-        22007 for the third. Left, measured: a
-        function whose argument PostgreSQL coerces implicitly
-        (`to_char(d, 'YYYY')` over a date prints
-        `to_char((b45r.d)::timestamp with time zone, 'YYYY'::text)`) and
-        `EXTRACT(year FROM d)` fall back; and the int wrap-column form of
-        `pg_get_viewdef` prints the pretty form without its wrapping rule.
-        Size: the implicit-cast printing needs the chosen overload's
-        declared argument types (`funcsig::selected_args`, added in batch 45,
-        has them) -- hours per function family.
+        22007 for the third. Batch 46 (corpus `b46_viewdefs`, 41/41) closed
+        the rest of what this entry named: a call PostgreSQL coerces
+        implicitly prints its overload's casts (`funcsig::resolved_args`
+        applies `func_select_candidate`'s unknown-literal step), `EXTRACT`
+        prints as its syntax, and the int wrap-column form wraps a target
+        or FROM item by width (`ruleutils::render_wrapped`). A shape the
+        printer cannot type still falls back to the text as written.
       Scope decisions, not bugs (each is PostgreSQL's own answer for the
       setup this server has):
       - **Foreign data**: no FDW handler exists here, so a foreign table
@@ -1352,6 +1354,19 @@ These work end-to-end but cut corners.
       would mean matching its (weaker) macOS durability; that is a
       durability decision for Joe, not a performance fix (not measured on
       Linux).
+
+      **Batch 46 (2026-10-03): Joe chose "match PostgreSQL".** On macOS the
+      server now opens the WiredTiger log `O_DSYNC` (`method=dsync`,
+      `commit_sync_method` in `server.rs`) -- PostgreSQL's
+      `open_datasync`. Guarantee: an acknowledged COMMIT survives a process
+      kill, NOT a power loss (the drive cache is not flushed) -- the same as
+      PostgreSQL's macOS default. Linux keeps `method=fsync`; the Rust
+      MongoDB server does not go through this and is unchanged. Release
+      build, durable mode, autocommit medians (`lat46.py`, two runs):
+      UPDATE 7902 -> 149 us, INSERT 5844 -> 86-95 us; PG 15 82 / 54 us.
+      Kill harness (50 acked inserts + an update, SIGKILL, reopen): 0 of
+      20 lost; with `transaction_sync` off, 5 of 5 lost (the harness
+      discriminates). What is left of the UPDATE gap is the query path.
 
       **Batch 44 (2026-10-02): the portal Describe no longer re-plans.**
       psycopg describes every portal, so each extended statement was
