@@ -134,32 +134,7 @@ pub(crate) fn plan_alter(a: &pg_query::protobuf::AlterFunctionStmt) -> Result<St
                 use pg_query::protobuf::VariableSetKind as K;
                 match K::try_from(v.kind) {
                     Ok(K::VarSetValue) => {
-                        let values: Vec<String> = v
-                            .args
-                            .iter()
-                            .filter_map(|a| match a.node.as_ref() {
-                                Some(N::AConst(c)) => match c.val.as_ref() {
-                                    Some(pg_query::protobuf::a_const::Val::Sval(s)) => {
-                                        Some(s.sval.clone())
-                                    }
-                                    Some(pg_query::protobuf::a_const::Val::Ival(i)) => {
-                                        Some(i.ival.to_string())
-                                    }
-                                    Some(pg_query::protobuf::a_const::Val::Fval(f)) => {
-                                        Some(f.fval.clone())
-                                    }
-                                    Some(pg_query::protobuf::a_const::Val::Boolval(b)) => {
-                                        Some(if b.boolval { "on" } else { "off" }.to_string())
-                                    }
-                                    _ => None,
-                                },
-                                _ => None,
-                            })
-                            .collect();
-                        options.push((
-                            "set".to_string(),
-                            format!("{}={}", v.name, values.join(", ")),
-                        ));
+                        options.push(("set".to_string(), config_entry(v)));
                     }
                     Ok(K::VarReset) => options.push(("reset".to_string(), v.name.clone())),
                     Ok(K::VarResetAll) => options.push(("reset".to_string(), "all".to_string())),
@@ -173,4 +148,26 @@ pub(crate) fn plan_alter(a: &pg_query::protobuf::AlterFunctionStmt) -> Result<St
         options.push((e.defname.to_ascii_lowercase(), text));
     }
     statement(kind, o, AlterFunctionAction::Options(options))
+}
+
+/// A routine's `SET name = value` clause as the `proconfig` entry
+/// (`name=value`) it records -- at CREATE and at ALTER alike.
+pub(crate) fn config_entry(v: &pg_query::protobuf::VariableSetStmt) -> String {
+    let values: Vec<String> = v
+        .args
+        .iter()
+        .filter_map(|a| match a.node.as_ref() {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                Some(pg_query::protobuf::a_const::Val::Ival(i)) => Some(i.ival.to_string()),
+                Some(pg_query::protobuf::a_const::Val::Fval(f)) => Some(f.fval.clone()),
+                Some(pg_query::protobuf::a_const::Val::Boolval(b)) => {
+                    Some(if b.boolval { "on" } else { "off" }.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    format!("{}={}", v.name, values.join(", "))
 }

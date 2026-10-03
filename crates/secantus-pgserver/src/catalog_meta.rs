@@ -214,7 +214,173 @@ pub(crate) fn install_system_relations() {
     });
 }
 
+const INDEXES: &str = include_str!("pg_index_system.tsv");
+
+/// `pg_index` rows for PostgreSQL 15.19's own indexes (`pg_index_system.tsv`,
+/// dumped with `indexrelid < 16384`; the same 162 indexes
+/// `pg_class_system.tsv` lists): indexrelid, indrelid, indnatts,
+/// indnkeyatts, the ten flags in catalog order, indkey, indcollation,
+/// indclass, indoption.
+pub(crate) fn index_rows(def: &TableDef) -> Vec<Document> {
+    let f = |name: &str| def.field_of(name);
+    let mut out = Vec::new();
+    for l in INDEXES.lines() {
+        let c: Vec<&str> = l.split('\t').collect();
+        let [indexrelid, indrelid, natts, nkeyatts, unique, nnd, primary, exclusion, immediate, clustered, valid, checkxmin, ready, live, replident, key, collation, class, option] =
+            c.as_slice()
+        else {
+            continue;
+        };
+        let int = |s: &str| s.parse::<i64>().unwrap_or(0);
+        let vector = |s: &str, wide: bool| {
+            Bson::Array(
+                s.split_whitespace()
+                    .map(|v| {
+                        if wide {
+                            Bson::Int64(int(v))
+                        } else {
+                            Bson::Int32(int(v) as i32)
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let mut d = Document::new();
+        let mut put = |name: &str, v: Bson| {
+            if let Some(field) = f(name) {
+                d.insert(field, v);
+            }
+        };
+        put("indexrelid", Bson::Int64(int(indexrelid)));
+        put("indrelid", Bson::Int64(int(indrelid)));
+        put("indnatts", Bson::Int32(int(natts) as i32));
+        put("indnkeyatts", Bson::Int32(int(nkeyatts) as i32));
+        for (name, v) in [
+            ("indisunique", unique),
+            ("indnullsnotdistinct", nnd),
+            ("indisprimary", primary),
+            ("indisexclusion", exclusion),
+            ("indimmediate", immediate),
+            ("indisclustered", clustered),
+            ("indisvalid", valid),
+            ("indcheckxmin", checkxmin),
+            ("indisready", ready),
+            ("indislive", live),
+            ("indisreplident", replident),
+        ] {
+            put(name, Bson::Boolean(*v == "1"));
+        }
+        put("indkey", vector(key, false));
+        put("indcollation", vector(collation, true));
+        put("indclass", vector(class, true));
+        put("indoption", vector(option, false));
+        put("indexprs", Bson::Null);
+        put("indpred", Bson::Null);
+        out.push(d);
+    }
+    out
+}
+
+/// One of PostgreSQL's own indexes as `pg_indexes` / `pg_get_indexdef`
+/// print it.
+pub(crate) struct SystemIndex {
+    pub oid: i64,
+    pub schema: String,
+    pub table: String,
+    pub name: String,
+    /// The table is shared across databases: its tablespace is `pg_global`.
+    pub shared: bool,
+    pub def: String,
+}
+
+/// Every system index's definition, built from the dumped catalogs: all
+/// are btree over plain columns with default operator classes and options
+/// (checked against PostgreSQL 15.19's `pg_get_indexdef`).
+pub(crate) fn system_indexes() -> &'static [SystemIndex] {
+    static OUT: std::sync::OnceLock<Vec<SystemIndex>> = std::sync::OnceLock::new();
+    OUT.get_or_init(|| {
+        let classes: Vec<Vec<&str>> = CLASSES.lines().map(|l| l.split('\t').collect()).collect();
+        let class = |oid: &str| classes.iter().find(|c| c.first() == Some(&oid));
+        let column = |rel: &str, num: &str| {
+            ATTRIBUTES.lines().find_map(|l| {
+                let c: Vec<&str> = l.split('\t').collect();
+                (c.first() == Some(&rel) && c.get(3) == Some(&num)).then(|| c[1].to_string())
+            })
+        };
+        INDEXES
+            .lines()
+            .filter_map(|l| {
+                let c: Vec<&str> = l.split('\t').collect();
+                let (index, table) = (class(c.first()?)?, class(c.get(1)?)?);
+                let columns: Vec<String> = c
+                    .get(15)?
+                    .split_whitespace()
+                    .map(|n| column(c[1], n))
+                    .collect::<Option<_>>()?;
+                let unique = if c.get(4) == Some(&"1") {
+                    "UNIQUE "
+                } else {
+                    ""
+                };
+                Some(SystemIndex {
+                    oid: c[0].parse().ok()?,
+                    schema: table[2].to_string(),
+                    table: table[1].to_string(),
+                    name: index[1].to_string(),
+                    shared: table[6] == "1",
+                    def: format!(
+                        "CREATE {unique}INDEX {} ON {}.{} USING btree ({})",
+                        index[1],
+                        table[2],
+                        table[1],
+                        columns.join(", ")
+                    ),
+                })
+            })
+            .collect()
+    })
+}
+
 const ATTRIBUTES: &str = include_str!("pg_attribute_system.tsv");
+
+/// `(relation oid, attnum)` of a column of one of PostgreSQL's own
+/// relations, by the name this server gives the relation (`pg_class`,
+/// `information_schema.tables`) and the column's name.
+pub(crate) fn system_column_source(relation: &str, column: &str) -> Option<(i64, i16)> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<(String, String), (i64, i16)>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut names = std::collections::HashMap::new();
+        for line in CLASSES.lines() {
+            let c: Vec<&str> = line.split('\t').collect();
+            let (Some(oid), Some(rel), Some(nsp)) = (c.first(), c.get(1), c.get(2)) else {
+                continue;
+            };
+            let key = match *nsp {
+                "pg_catalog" => (*rel).to_string(),
+                "information_schema" => format!("information_schema.{rel}"),
+                _ => continue,
+            };
+            names.insert(oid.to_string(), key);
+        }
+        let mut map = std::collections::HashMap::new();
+        for line in ATTRIBUTES.lines() {
+            let c: Vec<&str> = line.split('\t').collect();
+            let (Some(rel), Some(att), Some(num)) = (c.first(), c.get(1), c.get(3)) else {
+                continue;
+            };
+            let (Some(name), Ok(oid), Ok(num)) = (names.get(*rel), rel.parse(), num.parse()) else {
+                continue;
+            };
+            if num > 0 {
+                map.insert((name.clone(), (*att).to_string()), (oid, num));
+            }
+        }
+        map
+    })
+    .get(&(relation.to_string(), column.to_string()))
+    .copied()
+}
 
 /// `pg_attribute` rows for PostgreSQL's own relations' columns -- tables,
 /// views, indexes and TOAST relations -- dumped from PostgreSQL 15

@@ -916,6 +916,113 @@ fn wire_pl_error(e: plpgsql_fn::PlError) -> PgWireError {
     PgWireError::UserError(Box::new(info))
 }
 
+/// A routine's `SET` clauses and SECURITY DEFINER role, in force for one
+/// call and put back when it returns (or fails), as `fmgr_security_definer`
+/// does. Only the keys the routine names are restored: a `set_config` the
+/// body runs on another key outlives the call, as in PostgreSQL.
+struct RoutineSettings {
+    settings: Arc<Mutex<GucMap>>,
+    saved: Vec<(String, Option<String>)>,
+    db: String,
+    session_user: String,
+}
+
+impl RoutineSettings {
+    fn enter(h: &PgHandler, doc: &Document) -> Option<Self> {
+        let mut set: Vec<(String, String)> = doc
+            .get_array("config")
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|e| e.split_once('='))
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if doc.get_bool("security_definer").unwrap_or(false) {
+            if let Ok(owner) = doc.get_str("owner") {
+                set.push(("role".to_string(), owner.to_string()));
+            }
+        }
+        if set.is_empty() {
+            return None;
+        }
+        let mut map = h.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = set
+            .into_iter()
+            .map(|(k, v)| {
+                let previous = map.insert(k.clone(), v);
+                (k, previous)
+            })
+            .collect();
+        let copy = map.map.clone();
+        drop(map);
+        let out = Self {
+            settings: Arc::clone(&h.settings),
+            saved,
+            db: h.db().to_string(),
+            session_user: h.session_user_name(),
+        };
+        // The planner's copies: a statement nested in the body is planned
+        // without re-installing them.
+        out.install(copy);
+        Some(out)
+    }
+
+    fn install(&self, settings: HashMap<String, String>) {
+        let role = settings
+            .get("role")
+            .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none"))
+            .cloned()
+            .unwrap_or_else(|| self.session_user.clone());
+        secantus_pgplan::set_current_user(Some(role));
+        secantus_pgplan::set_session_context(&self.db, settings);
+        INSTALLED_SETTINGS.with(|g| g.set(0));
+    }
+}
+
+impl Drop for RoutineSettings {
+    fn drop(&mut self) {
+        let mut map = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, previous) in self.saved.drain(..).rev() {
+            match previous {
+                Some(v) => {
+                    map.insert(k, v);
+                }
+                None => {
+                    map.remove(&k);
+                }
+            }
+        }
+        let copy = map.map.clone();
+        drop(map);
+        self.install(copy);
+    }
+}
+
+thread_local! {
+    /// How many user function bodies this thread is running: inside one,
+    /// a `$n` is the body's variable, which PostgreSQL's planner does not
+    /// fold, rather than a bound parameter of the client's statement.
+    static FUNCTION_BODY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a user function body running on this thread for its duration.
+struct FunctionBody;
+
+impl FunctionBody {
+    fn enter() -> Self {
+        FUNCTION_BODY_DEPTH.with(|d| d.set(d.get() + 1));
+        FunctionBody
+    }
+}
+
+impl Drop for FunctionBody {
+    fn drop(&mut self) {
+        FUNCTION_BODY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// A wire error as the interpreter's.
 fn pl_error(e: &PgWireError) -> plpgsql_fn::PlError {
     match e {
@@ -6254,6 +6361,22 @@ impl PgHandler {
         if def.is_procedure {
             doc.insert("is_procedure", true);
         }
+        if def.security_definer {
+            doc.insert("security_definer", true);
+        }
+        // `proowner`: the role that created it, whose rights a SECURITY
+        // DEFINER call runs with.
+        doc.insert("owner", self.current_role_name());
+        if !def.config.is_empty() {
+            doc.insert(
+                "config",
+                def.config
+                    .iter()
+                    .cloned()
+                    .map(Bson::String)
+                    .collect::<Vec<_>>(),
+            );
+        }
         if let Some(schema) = &def.schema {
             doc.insert("schema", schema);
         }
@@ -6796,6 +6919,7 @@ impl PgHandler {
                 )))
             })?;
         self.check_function_execute(&key, &u.name)?;
+        let _settings = RoutineSettings::enter(self, &doc);
         let out = self.with_call_depth(|| self.run_user_function(&doc, u, args))?;
         // The value comes back in the declared return type: `RETURN 1` from a
         // `RETURNS numeric` function is numeric 1, so `n * f(n - 1)` is
@@ -6836,6 +6960,7 @@ impl PgHandler {
         match doc.get_str("language").unwrap_or_default() {
             "plpgsql" => {
                 let host = PlHost { h: self };
+                let _body = FunctionBody::enter();
                 // The inputs spread over the declared positions, a NULL for
                 // each OUT parameter: the interpreter binds in that order.
                 let (args, arg_types) = positional_args(doc, args, &u.arg_types);
@@ -6912,15 +7037,54 @@ impl PgHandler {
         }
         let host = PlHost { h: self };
         let mut last: Option<plpgsql_fn::QueryOut> = None;
+        // The CONTEXT frame PostgreSQL gives an error raised by the body: a
+        // body it inlines has none at run time and `during inlining` when
+        // the call was folded while planning; one it runs has `statement N`.
+        // A `LANGUAGE internal` wrapper is a C function: no frame.
+        let internal = doc.get_str("call_sql").is_ok();
+        let inlined = Self::sql_function_inlined(doc, u, &statements);
+        let folded = match secantus_pgplan::correlated::current_call_args() {
+            secantus_pgplan::correlated::CallArgs::Constant => true,
+            secantus_pgplan::correlated::CallArgs::WithParams => {
+                FUNCTION_BODY_DEPTH.with(|d| d.get()) == 0
+            }
+            secantus_pgplan::correlated::CallArgs::Runtime => false,
+        };
+        let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
             let sql = bind_parameter_names(stmt, &names, &u.arg_types);
             let head = sql.trim_start().to_ascii_lowercase();
             let is_query = head.starts_with("select")
                 || head.starts_with("with")
                 || head.starts_with("values");
+            let frame = if internal {
+                None
+            } else if !inlined {
+                Some(format!("SQL function \"{}\" statement {}", u.name, i + 1))
+            } else if folded && !u.returns_set {
+                Some(format!("SQL function \"{}\" during inlining", u.name))
+            } else {
+                None
+            };
             let to_wire = |e: plpgsql_fn::PlError| {
                 let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
                 info.detail = e.detail;
+                info.hint = e.hint;
+                // Folding while inlining runs only the immutable / stable
+                // part of the body: an error from a nested function that ran
+                // as itself (a frame other than `during inlining`) was raised
+                // at run time, after this function's inlining ended.
+                let frame = frame.clone().filter(|_| {
+                    !inlined
+                        || e.context
+                            .as_deref()
+                            .is_none_or(|c| c.ends_with("during inlining"))
+                });
+                info.where_context = match (e.context, &frame) {
+                    (Some(inner), Some(f)) => Some(format!("{inner}\n{f}")),
+                    (Some(inner), None) => Some(inner.into()),
+                    (None, f) => f.clone(),
+                };
                 PgWireError::UserError(Box::new(info))
             };
             if is_query {
@@ -6962,6 +7126,142 @@ impl PgHandler {
                 None => Bson::Null,
             })
         })
+    }
+
+    /// Whether PostgreSQL's planner inlines a call of this `LANGUAGE sql`
+    /// function (`inline_function` / `inline_set_returning_function` in
+    /// `clauses.c`): one plain SELECT, no SECURITY DEFINER, no SET clause; a
+    /// scalar function's SELECT must be a single expression with no FROM,
+    /// WHERE, grouping, ordering, limit, set operation or subquery, and a STRICT
+    /// one's expression must use every parameter and nothing non-strict; a
+    /// set-returning function must not be VOLATILE.
+    fn sql_function_inlined(
+        doc: &Document,
+        u: &secantus_pgplan::UserFn,
+        statements: &[&str],
+    ) -> bool {
+        use pg_query::NodeEnum as E;
+        if statements.len() != 1
+            || doc.get_bool("security_definer").unwrap_or(false)
+            || doc.get_array("config").is_ok_and(|c| !c.is_empty())
+        {
+            return false;
+        }
+        let Ok(parsed) = pg_query::parse(statements[0]) else {
+            return false;
+        };
+        let Some(E::SelectStmt(sel)) = parsed
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|s| s.node.clone())
+        else {
+            return false;
+        };
+        if sel.op != pg_query::protobuf::SetOperation::SetopNone as i32
+            || sel.with_clause.is_some()
+            || !sel.values_lists.is_empty()
+        {
+            return false;
+        }
+        let volatile = doc.get_str("volatility").unwrap_or("volatile") == "volatile";
+        if u.returns_set {
+            return !volatile;
+        }
+        if !sel.from_clause.is_empty()
+            || sel.where_clause.is_some()
+            || !sel.group_clause.is_empty()
+            || sel.having_clause.is_some()
+            || !sel.sort_clause.is_empty()
+            || sel.limit_count.is_some()
+            || sel.limit_offset.is_some()
+            || !sel.distinct_clause.is_empty()
+            || !sel.window_clause.is_empty()
+            || sel.target_list.len() != 1
+        {
+            return false;
+        }
+        let text = statements[0].to_ascii_lowercase();
+        let mut nonstrict = false;
+        let mut aggregate_or_sublink = false;
+        for (n, ..) in parsed.protobuf.nodes() {
+            match n {
+                pg_query::NodeRef::SubLink(_) => aggregate_or_sublink = true,
+                pg_query::NodeRef::FuncCall(f) => {
+                    let name = f
+                        .funcname
+                        .last()
+                        .and_then(|n| match n.node.as_ref() {
+                            Some(E::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    if f.over.is_some()
+                        || f.agg_star
+                        || matches!(
+                            name.as_str(),
+                            "count"
+                                | "sum"
+                                | "avg"
+                                | "min"
+                                | "max"
+                                | "array_agg"
+                                | "string_agg"
+                                | "bool_and"
+                                | "bool_or"
+                                | "every"
+                                | "generate_series"
+                                | "unnest"
+                        )
+                    {
+                        aggregate_or_sublink = true;
+                    }
+                    if name == "coalesce" {
+                        nonstrict = true;
+                    }
+                }
+                pg_query::NodeRef::CaseExpr(_)
+                | pg_query::NodeRef::CoalesceExpr(_)
+                | pg_query::NodeRef::NullTest(_)
+                | pg_query::NodeRef::BooleanTest(_)
+                | pg_query::NodeRef::BoolExpr(_)
+                | pg_query::NodeRef::MinMaxExpr(_)
+                | pg_query::NodeRef::NullIfExpr(_) => nonstrict = true,
+                _ => {}
+            }
+        }
+        if aggregate_or_sublink {
+            return false;
+        }
+        if u.strict {
+            if nonstrict {
+                return false;
+            }
+            // Every parameter must be used (by `$n`; a named reference is
+            // bound to `$n` before the body runs, so look for either).
+            let names: Vec<String> = doc
+                .get_array("params")
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_ascii_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for i in 0..u.arg_types.len() {
+                let by_number = text.contains(&format!("${}", i + 1));
+                let by_name = names.get(i).is_some_and(|n| {
+                    !n.is_empty()
+                        && text
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|w| w == n)
+                });
+                if !by_number && !by_name {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// PostgreSQL's 2BP01 for a RESTRICT drop that something depends on: one
@@ -7641,6 +7941,11 @@ impl PgHandler {
                     .find(|(n, _)| *n == ix.name)
                     .map(|(_, d)| (ix.oid, d.clone()))
             })
+            .chain(
+                catalog_meta::system_indexes()
+                    .iter()
+                    .map(|ix| (ix.oid, ix.def.clone())),
+            )
             .collect()
     }
 
@@ -10088,6 +10393,86 @@ impl PgHandler {
 
     /// PostgreSQL's 42809 for a write to a materialized view, which only
     /// REFRESH may change.
+    /// A relation this server COMPUTES (`pg_class`, `pg_am`, ...) rather
+    /// than stores. Writing one used to answer `UPDATE 0` / `DELETE 0`
+    /// whatever matched, and an INSERT created a stored table of that name
+    /// no catalog query reads -- silent, where PostgreSQL (for a superuser)
+    /// changes the catalog.
+    fn is_system_catalog(&self, table: &str) -> PgWireResult<bool> {
+        if Self::virtual_table(table).is_none() {
+            return Ok(false);
+        }
+        Ok(!self.all_table_defs()?.iter().any(|t| t.name == table))
+    }
+
+    /// Changing a system catalog is refused (a scope decision: the catalogs
+    /// here are computed from the store, so there is no row to change).
+    fn catalog_write_refused(table: &str) -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "0A000".into(),
+            format!("modifying the system catalog \"{table}\" is not supported"),
+        )))
+    }
+
+    /// An UPDATE of a system catalog: `Some(matched)` when every assignment
+    /// gives each matched row the value it already holds -- the row is
+    /// unchanged, as PostgreSQL leaves it (pgjdbc's updatable result set
+    /// writes a row back like this) -- else refused; `None` for a table.
+    fn system_catalog_update(&self, upd: &secantus_pgplan::Update) -> PgWireResult<Option<usize>> {
+        if !self.is_system_catalog(&upd.table)? {
+            return Ok(None);
+        }
+        let mut rows = self
+            .virtual_rows(&upd.table, &upd.filter)
+            .unwrap_or_default();
+        if let Some(residual) = &upd.residual {
+            let mut kept = Vec::new();
+            for r in rows {
+                if secantus_pgplan::apply_row_expr(residual, &r).map_err(|e| Self::err(&e))?
+                    == Bson::Boolean(true)
+                {
+                    kept.push(r);
+                }
+            }
+            rows = kept;
+        }
+        if rows.is_empty() {
+            return Ok(Some(0));
+        }
+        if !upd.set_subscripts.is_empty() || upd.returning.is_some() {
+            return Err(Self::catalog_write_refused(&upd.table));
+        }
+        let number = |v: &Bson| match v {
+            Bson::Int32(i) => Some(f64::from(*i)),
+            Bson::Int64(i) => Some(*i as f64),
+            Bson::Double(d) => Some(*d),
+            _ => None,
+        };
+        let same = |a: Option<&Bson>, b: &Bson| match (a, b) {
+            (None | Some(Bson::Null), Bson::Null) => true,
+            (Some(a), b) => {
+                a == b || matches!((number(a), number(b)), (Some(x), Some(y)) if x == y)
+            }
+            _ => false,
+        };
+        for r in &rows {
+            if !upd.set.iter().all(|(k, v)| same(r.get(k), v)) {
+                return Err(Self::catalog_write_refused(&upd.table));
+            }
+            for (field, _, _, expr) in &upd.set_exprs {
+                let v = secantus_pgplan::apply_row_expr(expr, r).map_err(|e| Self::err(&e))?;
+                if !same(r.get(field), &v) {
+                    return Err(Self::catalog_write_refused(&upd.table));
+                }
+            }
+        }
+        if !rows.is_empty() {
+            return Ok(Some(rows.len()));
+        }
+        Err(Self::catalog_write_refused(&upd.table))
+    }
+
     fn refuse_matview_write(&self, table: &str) -> PgWireResult<()> {
         if REFRESHING_MATVIEW.with(std::cell::Cell::get) {
             return Ok(());
@@ -10819,6 +11204,15 @@ impl PgHandler {
             if def.column(column).is_none() {
                 def.columns
                     .push(secantus_pgcatalog::Column::new(column, ty, false));
+            }
+        }
+        // `ftable` / `ftablecol`: PostgreSQL's own relation oid and the
+        // column's attnum there, as PostgreSQL describes a catalog column
+        // (pgjdbc's updatable result sets read the base column name back
+        // through them). A column PostgreSQL's relation lacks stays 0 / 0.
+        for column in &mut def.columns {
+            if column.source.is_none() {
+                column.source = catalog_meta::system_column_source(name, &column.name);
             }
         }
         Some(def)
@@ -12163,6 +12557,7 @@ impl PgHandler {
                         );
                         d
                     })
+                    .chain(catalog_meta::index_rows(&def))
                     .collect()
             }
             "pg_trigger" => {
@@ -12241,6 +12636,27 @@ impl PgHandler {
             "pg_indexes" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let mut rows = Vec::new();
+                // PostgreSQL's own indexes on its catalog tables (the view
+                // lists tables, so not TOAST relations' indexes).
+                for ix in catalog_meta::system_indexes() {
+                    if ix.schema != "pg_catalog" {
+                        continue;
+                    }
+                    let mut d = Document::new();
+                    d.insert(f("schemaname"), ix.schema.as_str());
+                    d.insert(f("tablename"), ix.table.as_str());
+                    d.insert(f("indexname"), ix.name.as_str());
+                    d.insert(
+                        f("tablespace"),
+                        if ix.shared {
+                            Bson::String("pg_global".into())
+                        } else {
+                            Bson::Null
+                        },
+                    );
+                    d.insert(f("indexdef"), ix.def.as_str());
+                    rows.push(d);
+                }
                 for t in self.all_table_defs().ok()? {
                     let schema = Self::schema_of(&t);
                     let pk: Vec<&str> = secantus_pgplan::ordered_pk_columns(&t)
@@ -23023,6 +23439,9 @@ impl PgHandler {
 
             Statement::Insert(mut ins) => {
                 self.refuse_matview_write(&ins.table)?;
+                if self.is_system_catalog(&ins.table)? {
+                    return Err(Self::catalog_write_refused(&ins.table));
+                }
                 let def = self
                     .lookup(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
@@ -26681,6 +27100,11 @@ impl PgHandler {
 
             Statement::Update(mut upd) => {
                 self.refuse_matview_write(&upd.table)?;
+                if let Some(matched) = self.system_catalog_update(&upd)? {
+                    return Ok(vec![Response::Execution(
+                        Tag::new("UPDATE").with_rows(matched),
+                    )]);
+                }
                 let view_checks = std::mem::take(&mut upd.view_checks);
                 upd.filter =
                     self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
@@ -26936,6 +27360,20 @@ impl PgHandler {
 
             Statement::Delete(mut del) => {
                 self.refuse_matview_write(&del.table)?;
+                if self.is_system_catalog(&del.table)? {
+                    // Nothing matched is PostgreSQL's answer too; removing a
+                    // catalog row is not something this server can do.
+                    let matched = match &del.residual {
+                        None => self
+                            .virtual_rows(&del.table, &del.filter)
+                            .map_or(0, |r| r.len()),
+                        Some(_) => 1,
+                    };
+                    if matched > 0 {
+                        return Err(Self::catalog_write_refused(&del.table));
+                    }
+                    return Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(0))]);
+                }
                 del.filter =
                     self.narrow_by_residual(&del.table, &del.filter, del.residual.take())?;
                 if let Some(def) = self.lookup(&del.table) {
@@ -33248,8 +33686,9 @@ impl ExtendedQueryHandler for PgHandler {
             prepared.push(record);
         }
         pgwire::api::store::PortalStore::put_statement(client.portal_store(), Arc::new(stmt));
+        // Buffered until Sync / Flush, as PostgreSQL does.
         client
-            .send(PgWireBackendMessage::ParseComplete(
+            .feed(PgWireBackendMessage::ParseComplete(
                 pgwire::messages::extendedquery::ParseComplete::new(),
             ))
             .await?;

@@ -878,6 +878,83 @@ pub fn with_function_hook<R>(hook: &FunctionHook<'_>, f: impl FnOnce() -> R) -> 
     f()
 }
 
+/// What a user function call's arguments are, as PostgreSQL's planner sees
+/// them -- which decides whether an inlinable `LANGUAGE sql` function is
+/// folded while planning (an error then carries `SQL function "f" during
+/// inlining`) or runs with the statement (no frame at all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallArgs {
+    /// Something only known per row or per call: a column, a volatile or
+    /// built-in function, a subquery. Not folded.
+    Runtime,
+    /// Constants only (and calls of user functions over constants).
+    Constant,
+    /// Constants and the statement's bound parameters, which a custom plan
+    /// folds like constants -- unless the statement runs inside a function
+    /// body, where they are that body's variables.
+    WithParams,
+}
+
+thread_local! {
+    static CALL_ARGS: std::cell::Cell<CallArgs> = const { std::cell::Cell::new(CallArgs::Runtime) };
+    static ROW_PARAMS_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// The kind of the user function call now running (`Runtime` outside one).
+pub fn current_call_args() -> CallArgs {
+    CALL_ARGS.with(|c| c.get())
+}
+
+pub(crate) fn with_call_args_kind<R>(kind: CallArgs, f: impl FnOnce() -> R) -> R {
+    let previous = CALL_ARGS.with(|c| c.replace(kind));
+    let out = f();
+    CALL_ARGS.with(|c| c.set(previous));
+    out
+}
+
+/// Evaluate `f` with parameters numbered past `n` being a row's columns.
+pub(crate) fn with_row_params_from<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    let previous = ROW_PARAMS_FROM.with(|c| c.replace(n));
+    let out = f();
+    ROW_PARAMS_FROM.with(|c| c.set(previous));
+    out
+}
+
+/// Classify a call's arguments (see [`CallArgs`]).
+pub(crate) fn call_args_kind(args: &[pg_query::protobuf::Node]) -> CallArgs {
+    let row_from = ROW_PARAMS_FROM.with(|c| c.get());
+    let mut kind = CallArgs::Constant;
+    for a in args {
+        let mut node = a.clone();
+        let _ = crate::walk_expr(&mut node, &mut |n| {
+            match n.node.as_ref() {
+                Some(N::ColumnRef(_)) | Some(N::SubLink(_)) => kind = CallArgs::Runtime,
+                Some(N::ParamRef(p)) => {
+                    if p.number as usize > row_from {
+                        kind = CallArgs::Runtime;
+                    } else if kind == CallArgs::Constant {
+                        kind = CallArgs::WithParams;
+                    }
+                }
+                Some(N::FuncCall(f)) => {
+                    let user = func_name(f).is_some_and(|name| {
+                        user_function_for(&name, &f.args).is_some_and(|u| !u.returns_set)
+                    });
+                    if !user {
+                        kind = CallArgs::Runtime;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        if kind == CallArgs::Runtime {
+            break;
+        }
+    }
+    kind
+}
+
 /// Call a user function. With no hook installed (a Describe), or while only
 /// a TYPE is wanted, nothing runs and the answer is NULL.
 pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {

@@ -2392,6 +2392,10 @@ pub struct UserFunctionDef {
     pub schema: Option<String>,
     /// `CREATE PROCEDURE`.
     pub is_procedure: bool,
+    /// `SECURITY DEFINER` (`prosecdef`).
+    pub security_definer: bool,
+    /// The `SET name = value` clauses, as `proconfig` entries.
+    pub config: Vec<String>,
 }
 
 /// One `ALTER VIEW` action.
@@ -4454,6 +4458,8 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
     let mut body = None;
     let mut volatility = "volatile".to_string();
     let mut strict = false;
+    let mut security_definer = false;
+    let mut config = Vec::new();
     for opt in &f.options {
         let Some(N::DefElem(e)) = opt.node.as_ref() else {
             continue;
@@ -4463,6 +4469,22 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         if e.defname.eq_ignore_ascii_case("strict") {
             strict = matches!(e.arg.as_ref().and_then(|a| a.node.as_ref()),
                 Some(N::Boolean(b)) if b.boolval);
+            continue;
+        }
+        if e.defname.eq_ignore_ascii_case("security") {
+            security_definer = matches!(e.arg.as_ref().and_then(|a| a.node.as_ref()),
+                Some(N::Boolean(b)) if b.boolval);
+            continue;
+        }
+        if e.defname.eq_ignore_ascii_case("set") {
+            if let Some(N::VariableSetStmt(v)) = e.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                if v.kind == pg_query::protobuf::VariableSetKind::VarSetValue as i32 {
+                    let entry = alter_routine::config_entry(v);
+                    let key = entry.split('=').next().unwrap_or_default().to_string();
+                    config.retain(|c: &String| c.split('=').next() != Some(key.as_str()));
+                    config.push(entry);
+                }
+            }
             continue;
         }
         let text = e.arg.as_ref().and_then(|a| type_name_of_node(a));
@@ -4574,6 +4596,8 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             all_params,
             schema,
             is_procedure: f.is_procedure,
+            security_definer,
+            config,
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
@@ -11302,7 +11326,7 @@ fn walk_column_refs(
 /// rewriting them as outer-row fields would bind the wrong values. The
 /// SubLink node itself is still visited, which is all the resolver needs --
 /// it recurses into the body on its own terms.
-fn walk_expr(
+pub(crate) fn walk_expr(
     node: &mut pg_query::protobuf::Node,
     visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
 ) -> Result<()> {
@@ -11468,7 +11492,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         pad_bpchar(v, widths.get(i).copied().flatten())
     }));
     let previous = declare_row_fields(params.len(), fields);
-    let out = const_value(expr, &all);
+    let out = correlated::with_row_params_from(params.len(), || const_value(expr, &all));
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
     out
 }
@@ -30907,7 +30931,11 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 .iter()
                 .map(|a| const_value(a, params))
                 .collect::<Result<Vec<_>>>()?;
-            return match correlated::call_user_function(&u, &args)? {
+            let kind = correlated::call_args_kind(&f.args);
+            let result = correlated::with_call_args_kind(kind, || {
+                correlated::call_user_function(&u, &args)
+            })?;
+            return match result {
                 correlated::FnResult::Value(v) => Ok(v),
                 correlated::FnResult::Rows(..) => Ok(Bson::Null),
             };

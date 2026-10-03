@@ -611,8 +611,9 @@ remain open:
       `wide_timestamptz` 7/35 and `tz_abbrevs` 6/8 still diverge; and
       `dtparse.py` is ~1,100 lines, over the 500-line guideline (a straight
       port of one C function family, so the split is by table, not logic).
-- [ ] **OPEN — RUST pgserver: leftovers after the SQLAlchemy campaign
-      (batches 35-36, 2026-10-02; the dialect suite is 978 / 0).** Dotted /
+- [x] **CLOSED (scope decision, batch 47, 2026-10-03) — RUST pgserver:
+      leftovers after the SQLAlchemy campaign (batches 35-36, 2026-10-02;
+      the dialect suite is 978 / 0).** Dotted /
       `$`-named columns are fixed (corpus `dotted_columns`), with limits:
       predicates over them run per row (no index use); a plain CREATE INDEX
       on one builds an unused path index; the Python PG server was not
@@ -659,9 +660,17 @@ remain open:
       whose overload the type analysis cannot determine (an argument of an
       unanalysed shape, a polymorphic overload) is not checked, and a call
       inside a view, a rule, a user function's body or a DEFAULT expression
-      is not either. Still open (performance only, same answers): a
-      predicate over a dotted / `$`-named column runs per row and a plain
-      CREATE INDEX on one builds a path index no query uses.
+      is not either. What remains is a COST, never an answer (re-measured
+      batch 47: `dotted_columns`, `b41_dotted` at 0 against PostgreSQL 15):
+      a predicate over a dotted / `$`-named column runs per row and a plain
+      CREATE INDEX on one builds a path index no query uses. Closed as a
+      scope decision: the shared storage reads a dot as a path separator
+      and a leading `$` as an operator in every filter and index key spec
+      (MQL semantics the Rust MongoDB server depends on), so an
+      index-backed read of such a column needs a literal-key index path in
+      `secantus-storage` or a stored-name escape -- the second changes the
+      on-disk format both PG servers share. Neither is justified by a
+      column name SQLAlchemy's suite uses only to prove quoting works.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
@@ -731,11 +740,44 @@ remain open:
       `pgjdbc_validation/baseline.json` predates it; origin/main answers the
       same `CREATE FUNCTION in language "c" is not supported yet` (checked
       on a release build of origin/main).
-      What still fails:
-      - UpdateableResultTest testOidUpdatable: `pg_index` has no rows for the
-        system catalogs, and an UPDATE of `pg_class` is not supported.
+      Re-measured 2026-10-03 (batch 47): 7354 tests, 1 failed
+      (`BlobTransactionTest`, below), 28 skipped; testOidUpdatable passes.
+      What failed / fails:
+      - UpdateableResultTest testOidUpdatable (PASSES since batch 47) --
+        batch 47 (2026-10-03, corpus
+        `b47_system_catalogs`, slice test `test_batch47_system_catalog_
+        writes_and_system_indexes`) fixed the three divergences under it:
+        `pg_index` / `pg_indexes` / `pg_get_indexdef` had no rows for
+        PostgreSQL's own 162 indexes (now dumped from 15.19,
+        `pg_index_system.tsv`, identical field for field); a catalog
+        column was described with `ftable` / `ftablecol` 0 / 0 where
+        PostgreSQL gives its relation oid and attnum (pgjdbc reads the base
+        column name through them -- the test's `""` identifier); and an
+        UPDATE / DELETE of a catalog answered a silent `UPDATE 0` /
+        `DELETE 0` and an INSERT created a stored table no catalog query
+        reads. Now an UPDATE that leaves every matched row as it is (the
+        test's write-back) reports its rows as PostgreSQL does; any real
+        change, a DELETE that matches, and an INSERT are refused 0A000 --
+        a SCOPE DECISION: the catalogs here are computed from the store,
+        so a superuser's direct catalog write has no row to change.
+        Found while measuring, still open: `SELECT *` over several
+        catalogs is not PostgreSQL's column list -- `pg_class` lacks
+        `relfrozenxid` / `relminmxid` and orders its columns differently,
+        `pg_attribute` lacks `attalign` / `attbyval` / `attcacheoff` /
+        `attmissingval`, `pg_type` `typowner` / `typdefaultbin`, `pg_proc`
+        `probin` / `pronargdefaults` / `proargdefaults` / `protrftypes`,
+        `pg_namespace` `nspacl`, `pg_constraint` `confdelsetcols`,
+        `pg_trigger` `tgargs` / `tgattr` / `tgqual` / `tgoldtable` /
+        `tgnewtable`; `pg_database` has an extra `daticurules` (a PG 16
+        column); `pg_index` and `pg_roles` have PostgreSQL's columns in
+        another order. A client reading by NAME is unaffected; one reading
+        `SELECT *` by position, or a missing column by name, is not.
       - `BlobTransactionTest` needs `CREATE FUNCTION lo_manage() ... AS
-        '$libdir/lo' LANGUAGE C` (the `lo` extension's trigger).
+        '$libdir/lo' LANGUAGE C` (the `lo` extension's trigger): CLOSED as a
+        scope decision (batch 47) -- `LANGUAGE C` loads a shared library
+        into the server process, which a server written in Rust has no
+        ABI to host; the `lo` contrib module is not shipped. The runner
+        flags it as a regression only because `baseline.json` predates it.
         ConnectionTest pGStreamSettings asserts the CLIENT socket's receive
         buffer and flickers independently of the server.
       Batch 41 fixed (corpora `b41_fixes`, and the slice tests
@@ -776,7 +818,13 @@ remain open:
       block's WiredTiger session is installed per statement
       (`with_user_transaction`), so a cursor left open between two Executes
       would be used from another thread and outside the scope that installed
-      its transaction. Not attempted.
+      its transaction. Not attempted. (Batch 47, 2026-10-03: not attempted
+      either; the design that keeps thread affinity is a dedicated thread
+      per open read-only portal owning its WiredTiger session, snapshot and
+      cursor, feeding row batches through a bounded channel -- Execute
+      then never touches WT itself -- but a portal inside a block must read
+      the BLOCK's snapshot, which lives on the block's own session, so the
+      portal thread cannot have one of its own there.)
 - [x] **CLOSED (scope decision, 2026-10-02, batch 45) — RUST pgserver: the
       sqllogictest gauge (batch 32).** `slt_validation` drives the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). The
@@ -863,14 +911,30 @@ remain open:
         "1/0"` / `SQL statement "..."` / `PL/pgSQL assignment "x := 1/0"`,
         then `PL/pgSQL function f(integer) line N at RETURN` per function);
         a FROM-less subquery naming a sibling FROM item is 42P01 with its
-        HINT (slice test `test_batch46_function_body_error_context`). Left,
-        measured on 15.19: a `LANGUAGE sql` body's error has no CONTEXT
-        (PostgreSQL sends `SQL function "f" during inlining` when it folds
-        the call while planning, `SQL function "f" statement 1` when it runs
-        it, and NOTHING once an inlined call fails at run time -- the three
-        depend on PostgreSQL's inlining rules); and the `SQL expression`
-        frame follows an approximation of PL/pgSQL's simple-expression rule
-        (a frame for a non-simple expression or one with no variable and no
+        HINT (slice test `test_batch46_function_body_error_context`). Batch
+        47 (slice test `test_batch47_sql_function_context_and_routine_
+        settings`, a 22-case probe identical to PostgreSQL 15.19): a
+        `LANGUAGE sql` body's error carries `SQL function "f" statement N`
+        when the body runs as itself, `SQL function "f" during inlining` when
+        PostgreSQL inlines the call and folds it over constants (or a
+        client's bound parameters, which a custom plan folds), and nothing
+        when an inlined call fails per row -- `inline_function`'s rules
+        (one plain SELECT of one expression with no FROM / WHERE / grouping
+        / sublink, not SECURITY DEFINER, no SET clause, a STRICT one
+        strict over every parameter; a set-returning one inlined in FROM
+        unless VOLATILE). The same batch made CREATE FUNCTION record
+        SECURITY DEFINER, SET clauses and the owner (pg_proc said
+        `prosecdef = f` / no `proconfig` after a CREATE that gave them) and
+        APPLY them: a definer's body runs as its owner, a SET is in force for
+        the call only (both had been ignored -- `current_user` was the
+        caller, `current_setting` the session's). Left: (a) a FROM item that
+        PostgreSQL pulls up into constants (a one-row `VALUES`) still counts
+        as per-row, so `select f(a) from (values (0)) v(a)` gets no frame
+        where PostgreSQL says `during inlining`; (b) whether a built-in
+        function argument is folded is not modelled -- any built-in call in
+        the arguments counts as run-time; and the `SQL expression` frame
+        follows an approximation of PL/pgSQL's simple-expression rule (a
+        frame for a non-simple expression or one with no variable and no
         volatile / user call, which PostgreSQL folds while planning).
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
@@ -1016,7 +1080,8 @@ remain open:
         storage write path, cascades and triggers included) and the
         conflicting key -- which WT_ROLLBACK does not carry -- recovered by
         re-probing the statement's candidate rows against those sets. Size:
-        days.
+        days. (Re-read batch 47, 2026-10-03: unchanged, `row_waits.rs` still
+        waits on every ROW EXCLUSIVE holder; not attempted this batch.)
       - (FIXED 2026-10-02, batch 44) An UPDATE whose new row equals the old
         (`n = n * 2` over 0) wrote nothing and so took no row lock: it
         neither waited for another session's uncommitted update nor
@@ -1355,6 +1420,36 @@ These work end-to-end but cut corners.
       durability decision for Joe, not a performance fix (not measured on
       Linux).
 
+      **RE-MEASURED 2026-10-03 (batch 47)**, release build, `bench43.py`,
+      two interleaved runs against PostgreSQL 15 on this box (load ~10):
+
+      | us / statement | before | batch 47 | PG 15 |
+      | --- | --- | --- | --- |
+      | ping | 18.7-19.4 | 19.3-19.8 | 18.1-18.4 |
+      | simple `select 1` | 36.0-37.0 | 36.9-37.4 | 22.8-23.2 |
+      | extended `select 1` | 60.5-61.2 | **53.3-53.8** | 26.7-27.4 |
+      | extended PK read | 75.4-75.7 | 74.2-74.6 | 32.5-33.6 |
+      | extended autocommit UPDATE | 98.2-98.9 | 95.7-96.6 | 53.8-55.3 |
+
+      The one fix: the extended protocol's replies were FLUSHED per message
+      (`send` in pgwire's ParseComplete / BindComplete / RowDescription /
+      NoData / ParameterDescription / CommandComplete / PortalSuspended and
+      our own ParseComplete) -- five write syscalls and client wakeups a
+      statement where PostgreSQL buffers until Sync / Flush. They are
+      `feed` now; Sync and Flush still flush, and CopyInResponse /
+      notices / errors still go at once. Measured and ruled out: dropping
+      `block_in_place` around the statement saves only ~2-3 us (not worth
+      losing cancel delivery). A `sample` of the PK read puts ~13.6 us of
+      the statement in PLANNING (`plan_with_subqueries`: ~25 rewrite
+      passes of 1-2 us each -- `check_select`, `refuse_foreign_access`,
+      `enum_order`, `whole_row_rewrite`, ...) and ~6.8 us in execution;
+      planning runs at every Execute because the bound values are inlined
+      into the plan. Plan reuse with the values as runtime parameters is
+      the lever left, and it is NOT a local change: the planner reads
+      values while planning (NULL comparisons, LIKE prefixes, casts of
+      literals, IN lists), so a template planned once would need every such
+      branch made parameter-aware. Not attempted.
+
       **Batch 46 (2026-10-03): Joe chose "match PostgreSQL".** On macOS the
       server now opens the WiredTiger log `O_DSYNC` (`method=dsync`,
       `commit_sync_method` in `server.rs`) -- PostgreSQL's
@@ -1520,7 +1615,11 @@ These work end-to-end but cut corners.
       extended path materially cheaper for ALL statements.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
-      layer, not the query engine (attributed 2026-09-20).** `select 1` costs
+      layer, not the query engine (attributed 2026-09-20).** (Batch 47,
+      2026-10-03: the extended protocol flushed every reply message --
+      five writes a statement; it buffers to Sync / Flush now, extended
+      `select 1` 60.5 -> 53.5 us against PostgreSQL 15's 27; table and the
+      planning-cost attribution in the PK-read entry above.) `select 1` costs
       ~55.8us against PostgreSQL 16's ~30us. (Re-measured 2026-10-02, batch
       45, release build: simple `select 1` 37.2us against PostgreSQL 15's
       23.0us, extended 60.2us against 27.0us, an empty query 20.8 against
@@ -7404,7 +7503,8 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       what is left (performance only; re-checked 2026-10-02, batch 45:
       `subqueries`, `correlated`, `correlated_hash`, `semi_join`,
       `not_in_large` all at 0 against PostgreSQL -- every item below is a
-      cost, none an answer).** `subqueries.sql` 5 of 50 -> 0 (53 lines now), `joins.sql`
+      cost, none an answer; still 0 in the batch-47 sweep, 2026-10-03,
+      costs not re-timed).** `subqueries.sql` 5 of 50 -> 0 (53 lines now), `joins.sql`
       0 of 38, and the new `correlated.sql` 1 of 24. A correlated subquery
       becomes an internal per-row call (`secantus-pgplan/src/correlated.rs`):
       its outer references are `$N` parameters of the stored inner SQL, and
