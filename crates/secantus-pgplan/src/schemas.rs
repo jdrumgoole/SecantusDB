@@ -352,6 +352,30 @@ fn qualify_constraint(c: &mut pg_query::protobuf::Constraint, ctes: &[String], t
     }
 }
 
+/// Point every REFERENCES to the unqualified `bare` at `key`.
+fn self_references(elts: &mut [pg_query::protobuf::Node], bare: &str, key: &str) {
+    let fix = |c: &mut pg_query::protobuf::Constraint| {
+        if let Some(pk) = c.pktable.as_mut() {
+            if pk.schemaname.is_empty() && pk.relname == bare {
+                pk.relname = key.to_string();
+            }
+        }
+    };
+    for e in elts {
+        match e.node.as_mut() {
+            Some(N::Constraint(c)) => fix(c),
+            Some(N::ColumnDef(cd)) => {
+                for c in &mut cd.constraints {
+                    if let Some(N::Constraint(c)) = c.node.as_mut() {
+                        fix(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn qualify_elts(elts: &mut [pg_query::protobuf::Node], ctes: &[String], trivial: bool) {
     for e in elts {
         match e.node.as_mut() {
@@ -391,8 +415,17 @@ pub fn qualify(node: &mut N) -> Result<()> {
     match node {
         N::CreateStmt(c) => {
             if let Some(r) = c.relation.as_mut() {
+                let bare = r.relname.clone();
                 qualify_target(r)?;
                 target = Some(r as *const _);
+                // A REFERENCES back to the table being created names the
+                // table itself: a temp table's own key, which no lookup can
+                // find before it exists (`create temp table t (... references
+                // t)` was 42P01).
+                if r.relname != bare && r.schemaname.is_empty() {
+                    let key = r.relname.clone();
+                    self_references(&mut c.table_elts, &bare, &key);
+                }
             }
         }
         N::CreateTableAsStmt(c) => {
