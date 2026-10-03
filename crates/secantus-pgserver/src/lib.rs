@@ -34251,6 +34251,13 @@ impl PgHandler {
     where
         S: Clone + Send + Sync,
     {
+        // A user type's oid resolves through the per-thread type registry,
+        // and this Execute may run on a worker that last served another
+        // session (or none): install this session's before decoding. Without
+        // it a binary custom-range parameter was `0A000 binary parameters of
+        // type oid ... are not supported yet` whenever the Bind landed on
+        // such a thread -- a scheduling accident, seen only in CI.
+        self.install_user_types();
         // Sized by the plan's list, which covers every `$n` in the SQL even
         // when the client's oid list is shorter (or empty).
         let n = portal
