@@ -74,6 +74,8 @@ impl PgHandler {
                 creation_time: bson::DateTime::now(),
                 typed_rows: Some(rows),
                 tz,
+                tail: None,
+                base: 0,
             },
         );
         Ok(name)

@@ -1266,9 +1266,14 @@ pub struct Select {
     /// which refuses it) and nowhere else, so a plain `SELECT DISTINCT`
     /// returned its duplicates.
     pub distinct: Distinct,
-    /// `FOR UPDATE` / `FOR NO KEY UPDATE` over the stored table: the rows
-    /// returned are locked for the rest of the transaction.
+    /// `FOR UPDATE` / `FOR NO KEY UPDATE` / `FOR SHARE` / `FOR KEY SHARE`
+    /// over the stored table: the rows returned are locked for the rest of
+    /// the transaction.
     pub lock: Option<RowLock>,
+    /// The locking clauses of a select whose source is NOT a stored table
+    /// (a join, a FROM-subquery, a view): the executor locks the base-table
+    /// rows behind the rows it returns (see [`lock_targets`]).
+    pub lock_clauses: Vec<LockClause>,
 }
 
 /// How a `SELECT ... FOR UPDATE` treats a row another transaction holds.
@@ -1282,57 +1287,570 @@ pub enum RowLockWait {
     SkipLocked,
 }
 
+/// A row lock's strength, weakest first (PostgreSQL's order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowLockStrength {
+    KeyShare,
+    Share,
+    NoKeyUpdate,
+    Update,
+}
+
 /// A row-locking clause the executor carries out (see `Select::lock`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowLock {
     pub wait: RowLockWait,
+    pub strength: RowLockStrength,
 }
 
-/// The row lock `s`'s locking clauses take on its table `table` (aliased
-/// `alias`). Only the exclusive strengths (`FOR UPDATE`, `FOR NO KEY
-/// UPDATE`) are carried out: a shared lock (`FOR SHARE`, `FOR KEY SHARE`)
-/// must not block another shared one, which an exclusive row write would.
-fn row_lock_of(s: &pg_query::protobuf::SelectStmt, table: &str, alias: &str) -> Option<RowLock> {
+impl RowLock {
+    /// Two clauses on one relation: the stronger lock, and the strictest
+    /// wait policy (NOWAIT over SKIP LOCKED over waiting), as in PostgreSQL.
+    fn merge(self, other: RowLock) -> RowLock {
+        let rank = |w: RowLockWait| match w {
+            RowLockWait::Block => 0,
+            RowLockWait::SkipLocked => 1,
+            RowLockWait::Nowait => 2,
+        };
+        RowLock {
+            wait: if rank(other.wait) > rank(self.wait) {
+                other.wait
+            } else {
+                self.wait
+            },
+            strength: self.strength.max(other.strength),
+        }
+    }
+}
+
+/// One `FOR ... [OF rel, ...]` clause: `rels` empty means every relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockClause {
+    pub rels: Vec<String>,
+    pub lock: RowLock,
+}
+
+/// The locking clauses of `s`, in the form the executor reads.
+fn lock_clauses_of(s: &pg_query::protobuf::SelectStmt) -> Vec<LockClause> {
     use pg_query::protobuf::{LockClauseStrength, LockWaitPolicy};
-    let mut out: Option<RowLock> = None;
+    let mut out = Vec::new();
     for c in &s.locking_clause {
         let Some(N::LockingClause(lc)) = c.node.as_ref() else {
             continue;
         };
-        let names_it = lc.locked_rels.is_empty()
-            || lc.locked_rels.iter().any(|r| {
-                matches!(r.node.as_ref(), Some(N::RangeVar(rv))
-                    if rv.relname == alias || rv.relname == table)
-            });
-        let exclusive = matches!(
-            LockClauseStrength::try_from(lc.strength),
-            Ok(LockClauseStrength::LcsForupdate | LockClauseStrength::LcsFornokeyupdate)
-        );
-        if !names_it || !exclusive {
-            continue;
-        }
+        let strength = match LockClauseStrength::try_from(lc.strength) {
+            Ok(LockClauseStrength::LcsForkeyshare) => RowLockStrength::KeyShare,
+            Ok(LockClauseStrength::LcsForshare) => RowLockStrength::Share,
+            Ok(LockClauseStrength::LcsFornokeyupdate) => RowLockStrength::NoKeyUpdate,
+            Ok(LockClauseStrength::LcsForupdate) => RowLockStrength::Update,
+            _ => continue,
+        };
         let wait = match LockWaitPolicy::try_from(lc.wait_policy) {
             Ok(LockWaitPolicy::LockWaitError) => RowLockWait::Nowait,
             Ok(LockWaitPolicy::LockWaitSkip) => RowLockWait::SkipLocked,
             _ => RowLockWait::Block,
         };
-        // Several clauses on one table: the strictest wait policy wins, as
-        // in PostgreSQL (NOWAIT over SKIP LOCKED over waiting).
-        out = Some(match out {
-            Some(RowLock {
-                wait: RowLockWait::Nowait,
-            }) => RowLock {
-                wait: RowLockWait::Nowait,
-            },
-            Some(RowLock {
-                wait: RowLockWait::SkipLocked,
-            }) if wait == RowLockWait::Block => RowLock {
-                wait: RowLockWait::SkipLocked,
-            },
-            _ => RowLock { wait },
+        let rels = lc
+            .locked_rels
+            .iter()
+            .filter_map(|r| match r.node.as_ref() {
+                Some(N::RangeVar(rv)) => Some(rv.relname.clone()),
+                _ => None,
+            })
+            .collect();
+        out.push(LockClause {
+            rels,
+            lock: RowLock { wait, strength },
         });
     }
     out
+}
+
+thread_local! {
+    /// `plan_select` nesting, so the locking check runs once per statement.
+    static PLAN_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The current top-level statement's locking clauses were checked.
+    static LOCKING_CHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One `plan_select` frame; the outermost one's end forgets the check.
+struct PlanDepth;
+
+impl PlanDepth {
+    fn enter() -> Self {
+        PLAN_DEPTH.with(|d| d.set(d.get() + 1));
+        PlanDepth
+    }
+}
+
+impl Drop for PlanDepth {
+    fn drop(&mut self) {
+        let left = PLAN_DEPTH.with(|d| {
+            let n = d.get().saturating_sub(1);
+            d.set(n);
+            n
+        });
+        if left == 0 {
+            LOCKING_CHECKED.with(|c| c.set(false));
+        }
+    }
+}
+
+/// `FOR UPDATE` / `FOR NO KEY UPDATE` / `FOR SHARE` / `FOR KEY SHARE`.
+fn lock_strength_name(strength: i32) -> &'static str {
+    use pg_query::protobuf::LockClauseStrength as S;
+    match S::try_from(strength) {
+        Ok(S::LcsForkeyshare) => "FOR KEY SHARE",
+        Ok(S::LcsForshare) => "FOR SHARE",
+        Ok(S::LcsFornokeyupdate) => "FOR NO KEY UPDATE",
+        _ => "FOR UPDATE",
+    }
+}
+
+/// PostgreSQL's `CheckSelectLocking`: the query shapes whose rows are not
+/// rows of a table, so cannot be locked -- 0A000, in its order.
+fn check_select_locking(s: &pg_query::protobuf::SelectStmt, name: &str) -> Result<()> {
+    let refuse = |what: &str| {
+        Err(Error::FeatureNotSupported(format!(
+            "{name} is not allowed with {what}"
+        )))
+    };
+    if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        return refuse("UNION/INTERSECT/EXCEPT");
+    }
+    if !s.distinct_clause.is_empty() {
+        return refuse("DISTINCT clause");
+    }
+    if !s.group_clause.is_empty() {
+        return refuse("GROUP BY clause");
+    }
+    if s.having_clause.is_some() {
+        return refuse("HAVING clause");
+    }
+    if has_aggregate(s) {
+        return refuse("aggregate functions");
+    }
+    if has_window(s) {
+        return refuse("window functions");
+    }
+    Ok(())
+}
+
+/// The names (alias, else table) a FROM item makes visible, and with each
+/// whether an outer join makes it nullable.
+fn from_rels(
+    node: &pg_query::protobuf::Node,
+    nullable: bool,
+    out: &mut Vec<(String, bool, Option<pg_query::protobuf::SelectStmt>)>,
+) {
+    match node.node.as_ref() {
+        Some(N::RangeVar(rv)) => {
+            let name = rv
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| rv.relname.clone());
+            out.push((name, nullable, None));
+        }
+        Some(N::RangeSubselect(rs)) => {
+            let name = rs
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_default();
+            let inner = match rs.subquery.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(N::SelectStmt(inner)) => Some(inner.as_ref().clone()),
+                _ => None,
+            };
+            out.push((name, nullable, inner));
+        }
+        Some(N::RangeFunction(rf)) => {
+            let name = rf
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .or_else(|| joins::range_function_name(rf))
+                .unwrap_or_default();
+            out.push((name, nullable, None));
+        }
+        Some(N::JoinExpr(j)) => {
+            use pg_query::protobuf::JoinType as J;
+            let kind = J::try_from(j.jointype).unwrap_or(J::JoinInner);
+            let (ln, rn) = match kind {
+                J::JoinLeft => (false, true),
+                J::JoinRight => (true, false),
+                J::JoinFull => (true, true),
+                _ => (false, false),
+            };
+            if let Some(l) = j.larg.as_deref() {
+                from_rels(l, nullable || ln, out);
+            }
+            if let Some(r) = j.rarg.as_deref() {
+                from_rels(r, nullable || rn, out);
+            }
+            if let Some(a) = j.alias.as_ref() {
+                out.push((a.aliasname.clone(), nullable, None));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A locking clause over a query with a WITH: PostgreSQL locks no row of a
+/// WITH query's -- an implicit clause passes over its references, and one
+/// that names it is 0A000 `cannot be applied to a WITH query`. The WITH is
+/// about to be inlined as FROM-subqueries, which a clause WOULD reach, so
+/// an implicit clause is made to name the other relations explicitly (and
+/// dropped when there are none).
+fn locking_past_ctes(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<std::borrow::Cow<'_, pg_query::protobuf::SelectStmt>> {
+    let Some(with) = s.with_clause.as_ref() else {
+        return Ok(std::borrow::Cow::Borrowed(s));
+    };
+    if s.locking_clause.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(s));
+    }
+    let ctes: Vec<String> = with
+        .ctes
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(c)) => Some(c.ctename.clone()),
+            _ => None,
+        })
+        .collect();
+    // The FROM list's relations: (visible name, is a WITH reference).
+    fn walk(node: &pg_query::protobuf::Node, ctes: &[String], out: &mut Vec<(String, bool)>) {
+        match node.node.as_ref() {
+            Some(N::RangeVar(rv)) => {
+                let name = rv
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| rv.relname.clone());
+                out.push((name, rv.schemaname.is_empty() && ctes.contains(&rv.relname)));
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), false));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(a) = rf.alias.as_ref() {
+                    out.push((a.aliasname.clone(), false));
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                if let Some(l) = j.larg.as_deref() {
+                    walk(l, ctes, out);
+                }
+                if let Some(r) = j.rarg.as_deref() {
+                    walk(r, ctes, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rels = Vec::new();
+    for item in &s.from_clause {
+        walk(item, &ctes, &mut rels);
+    }
+    let mut out = s.clone();
+    let mut clauses = Vec::new();
+    for c in &s.locking_clause {
+        let Some(N::LockingClause(lc)) = c.node.as_ref() else {
+            clauses.push(c.clone());
+            continue;
+        };
+        let name = lock_strength_name(lc.strength);
+        let mut lc = lc.clone();
+        if lc.locked_rels.is_empty() {
+            lc.locked_rels = rels
+                .iter()
+                .filter(|(_, cte)| !cte)
+                .map(|(n, _)| pg_query::protobuf::Node {
+                    node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
+                        relname: n.clone(),
+                        inh: true,
+                        relpersistence: "p".into(),
+                        location: -1,
+                        ..Default::default()
+                    })),
+                })
+                .collect();
+            if lc.locked_rels.is_empty() {
+                continue;
+            }
+        } else {
+            for r in &lc.locked_rels {
+                let Some(N::RangeVar(rv)) = r.node.as_ref() else {
+                    continue;
+                };
+                if rels.iter().any(|(n, cte)| *cte && *n == rv.relname) {
+                    set_error_location(rv.location);
+                    return Err(Error::FeatureNotSupported(format!(
+                        "{name} cannot be applied to a WITH query"
+                    )));
+                }
+            }
+        }
+        clauses.push(pg_query::protobuf::Node {
+            node: Some(N::LockingClause(lc)),
+        });
+    }
+    out.locking_clause = clauses;
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// PostgreSQL's checks of a locking SELECT: the shape (`check_select_locking`,
+/// applied to every FROM-subquery a clause reaches too), each `OF` relation
+/// in the FROM list (42P01), and no clause on the nullable side of an outer
+/// join (0A000).
+fn check_locking(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    let mut rels = Vec::new();
+    for item in &s.from_clause {
+        from_rels(item, false, &mut rels);
+    }
+    for c in &s.locking_clause {
+        let Some(N::LockingClause(lc)) = c.node.as_ref() else {
+            continue;
+        };
+        let name = lock_strength_name(lc.strength);
+        check_select_locking(s, name)?;
+        let mut named: Vec<&str> = Vec::new();
+        for r in &lc.locked_rels {
+            let Some(N::RangeVar(rv)) = r.node.as_ref() else {
+                continue;
+            };
+            if !rels.iter().any(|(n, ..)| *n == rv.relname) {
+                set_error_location(rv.location);
+                return Err(Error::Sqlstate(
+                    "42P01",
+                    format!(
+                        "relation \"{}\" in {name} clause not found in FROM clause",
+                        rv.relname
+                    ),
+                ));
+            }
+            named.push(&rv.relname);
+        }
+        for (rel, _, inner) in &rels {
+            if !(named.is_empty() || named.contains(&rel.as_str())) {
+                continue;
+            }
+            if let Some(inner) = inner {
+                check_select_locking(inner, name)?;
+            }
+        }
+    }
+    // The nullable side, checked after every clause's own checks (it is
+    // the planner's, in PostgreSQL).
+    for c in &s.locking_clause {
+        let Some(N::LockingClause(lc)) = c.node.as_ref() else {
+            continue;
+        };
+        let names: Vec<&str> = lc
+            .locked_rels
+            .iter()
+            .filter_map(|r| match r.node.as_ref() {
+                Some(N::RangeVar(rv)) => Some(rv.relname.as_str()),
+                _ => None,
+            })
+            .collect();
+        if rels
+            .iter()
+            .any(|(n, nullable, _)| *nullable && (names.is_empty() || names.contains(&n.as_str())))
+        {
+            return Err(Error::FeatureNotSupported(format!(
+                "{} cannot be applied to the nullable side of an outer join",
+                lock_strength_name(lc.strength)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The lock `clauses` take on a relation known by any of `names` (its alias
+/// and its table name).
+pub fn lock_for(clauses: &[LockClause], names: &[&str]) -> Option<RowLock> {
+    clauses
+        .iter()
+        .filter(|c| c.rels.is_empty() || c.rels.iter().any(|r| names.contains(&r.as_str())))
+        .map(|c| c.lock)
+        .reduce(RowLock::merge)
+}
+
+/// The row lock `s`'s locking clauses take on its table `table` (aliased
+/// `alias`).
+fn row_lock_of(s: &pg_query::protobuf::SelectStmt, table: &str, alias: &str) -> Option<RowLock> {
+    lock_for(&lock_clauses_of(s), &[alias, table])
+}
+
+/// A base table whose rows a locking select over a join / subquery / view
+/// locks: the rows are those whose `ident` fields equal the values the
+/// returned rows carry under the paired keys.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockTarget {
+    pub table: String,
+    pub lock: RowLock,
+    /// `(key in the select's source rows, the table's stored field)`: the
+    /// primary key when the table has one and the select carries it, else
+    /// every column it carries (a row equal in all of them is locked too).
+    pub ident: Vec<(String, String)>,
+}
+
+/// The base-table rows behind a locking select whose source is a join, a
+/// FROM-subquery or a view, as keys of the select's SOURCE rows (the
+/// documents `select_docs` holds before projecting). A relation whose rows
+/// cannot be told apart from the returned ones -- an aggregate, DISTINCT or
+/// computed column in between -- is not in the list.
+pub fn lock_targets(sel: &Select, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Vec<LockTarget> {
+    let Some(sub) = &sel.sub else {
+        return Vec::new();
+    };
+    if let Statement::JoinRows(j) = sub.plan.as_ref() {
+        return join_lock_targets(&j.tree, &sel.lock_clauses, None, lookup);
+    }
+    let inherited = lock_for(&sel.lock_clauses, &[&sub.alias]);
+    let keys: Vec<String> = sub.def.columns.iter().map(|c| c.field()).collect();
+    output_lock_targets(&sub.plan, &keys, inherited, lookup)
+}
+
+/// A join tree's targets, keyed by the joined rows' keys.
+fn join_lock_targets(
+    node: &joins::JoinNode,
+    clauses: &[LockClause],
+    inherited: Option<RowLock>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<LockTarget> {
+    match node {
+        joins::JoinNode::Leaf { plan, def, columns } => {
+            let Some(alias) = columns
+                .first()
+                .and_then(|(k, _)| k.split(joins::SEP).next())
+            else {
+                return Vec::new();
+            };
+            let table = match plan.as_ref() {
+                Statement::Select(s) if s.sub.is_none() && s.join.is_none() => s.table.clone(),
+                _ => String::new(),
+            };
+            let Some(lock) = inherited.or_else(|| lock_for(clauses, &[alias, &table])) else {
+                return Vec::new();
+            };
+            let keys: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
+            output_lock_targets(plan, &keys, Some(lock), lookup)
+                .into_iter()
+                .filter_map(|mut t| {
+                    for (k, _) in &mut t.ident {
+                        *k = columns.iter().find(|(_, f)| f == k)?.0.clone();
+                    }
+                    Some(t)
+                })
+                .collect()
+        }
+        joins::JoinNode::Join { left, right, .. } => {
+            let mut out = join_lock_targets(left, clauses, inherited, lookup);
+            out.extend(join_lock_targets(right, clauses, inherited, lookup));
+            out
+        }
+        joins::JoinNode::Lateral { .. } => Vec::new(),
+    }
+}
+
+/// The targets of `stmt`'s output rows, keyed by `out_keys` (one key per
+/// output column, the keys its consumer reads them by). `inherited` is the
+/// lock an enclosing clause put on everything inside.
+fn output_lock_targets(
+    stmt: &Statement,
+    out_keys: &[String],
+    inherited: Option<RowLock>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<LockTarget> {
+    let Statement::Select(sel) = stmt else {
+        return Vec::new();
+    };
+    if sel.distinct != Distinct::None || !sel.windows.is_empty() || sel.series.is_some() {
+        return Vec::new();
+    }
+    // The targets of this select's own SOURCE rows.
+    let source: Vec<LockTarget> = if sel.sub.is_some() {
+        let mut inner = sel.clone();
+        if let Some(lock) = inherited {
+            inner.lock_clauses.push(LockClause {
+                rels: Vec::new(),
+                lock,
+            });
+        }
+        lock_targets(&inner, lookup)
+    } else if !sel.table.is_empty() && sel.join.is_none() {
+        let Some(lock) = inherited.or(sel.lock) else {
+            return Vec::new();
+        };
+        let Some(def) = lookup(&sel.table) else {
+            return Vec::new();
+        };
+        let pk: Vec<String> = def
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .map(|c| c.field())
+            .collect();
+        let fields = if pk.is_empty() {
+            def.columns.iter().map(|c| c.field()).collect()
+        } else {
+            pk
+        };
+        vec![LockTarget {
+            table: sel.table.clone(),
+            lock,
+            ident: fields.into_iter().map(|f| (f.clone(), f)).collect(),
+        }]
+    } else {
+        return Vec::new();
+    };
+    // Through this select's projection: a source key it outputs unchanged.
+    source
+        .into_iter()
+        .filter_map(|mut t| {
+            let mapped: Vec<(String, String)> = t
+                .ident
+                .iter()
+                .filter_map(|(k, base)| {
+                    let i = sel.columns.iter().enumerate().position(|(i, (_, f))| {
+                        f == k && sel.casts.get(i).is_none_or(|c| c.is_none())
+                    })?;
+                    Some((out_keys.get(i)?.clone(), base.clone()))
+                })
+                .collect();
+            if mapped.is_empty() {
+                return None;
+            }
+            if mapped.len() < t.ident.len() {
+                // The key is not carried: identify by every column carried.
+                let def = lookup(&t.table)?;
+                t.ident = def
+                    .columns
+                    .iter()
+                    .filter_map(|c| {
+                        let f = c.field();
+                        let i = sel.columns.iter().enumerate().position(|(i, (_, sf))| {
+                            sel.sub.is_none()
+                                && *sf == f
+                                && sel.casts.get(i).is_none_or(|c| c.is_none())
+                        })?;
+                        Some((out_keys.get(i)?.clone(), f))
+                    })
+                    .collect();
+                if t.ident.is_empty() {
+                    t.ident = mapped;
+                }
+                return Some(t);
+            }
+            t.ident = mapped;
+            Some(t)
+        })
+        .collect()
 }
 
 /// One action of an `ALTER TABLE`.
@@ -10843,6 +11361,7 @@ fn plan_series_select(
         offset,
         distinct,
         lock: None,
+        lock_clauses: Vec::new(),
     }))
 }
 
@@ -16761,7 +17280,8 @@ fn plan_select(
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
     if s.with_clause.is_some() {
-        return plan_select(&inline_ctes(s)?, lookup, params);
+        let s = locking_past_ctes(s)?;
+        return plan_select(&inline_ctes(&s)?, lookup, params);
     }
     // A view is shorthand for the subquery it was defined as, so it is
     // rewritten away here, before any shape check looks at the FROM list.
@@ -16771,6 +17291,13 @@ fn plan_select(
     }
     let expanded = expand_views(s)?;
     let s = &expanded;
+    // The locking clauses, checked once per top-level statement, on the
+    // statement as written (views expanded): the rewrites below may move
+    // the relations a clause names.
+    let _depth = PlanDepth::enter();
+    if !s.locking_clause.is_empty() && !LOCKING_CHECKED.with(|c| c.replace(true)) {
+        check_locking(s)?;
+    }
     // `information_schema._pg_expandarray(arr)` in the select list.
     if let Some(rewritten) = pg_expandarray::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
@@ -16858,7 +17385,14 @@ fn plan_select(
     // becomes a planned SOURCE and the query is rewritten to read it, then
     // planned like any single-source query (see `joins`).
     let planned = if joins::is_join(s) {
-        match plan_select_rest(s, lookup, params) {
+        // A locking JOIN takes the general path, whose rows carry what the
+        // executor needs to find the base rows to lock (`lock_targets`).
+        let narrow = if s.locking_clause.is_empty() {
+            plan_select_rest(s, lookup, params)
+        } else {
+            Err(Error::Unsupported("a locking join".into()))
+        };
+        match narrow {
             Err(Error::Unsupported(_)) => joins::plan_join_source(s, lookup, params)
                 .and_then(|rewritten| plan_select(&rewritten, lookup, params))
                 .map_err(joins::unmangle),
@@ -17564,6 +18098,11 @@ fn plan_select_rest(
     } else {
         row_lock_of(s, &table, alias.as_deref().unwrap_or(&table))
     };
+    let lock_clauses = if sub.is_some() {
+        lock_clauses_of(s)
+    } else {
+        Vec::new()
+    };
 
     Ok(Statement::Select(Select {
         series: None,
@@ -17580,6 +18119,7 @@ fn plan_select_rest(
         offset,
         distinct,
         lock,
+        lock_clauses,
     }))
 }
 
@@ -18101,6 +18641,7 @@ fn plan_join_plain_select(
         offset,
         distinct,
         lock: None,
+        lock_clauses: Vec::new(),
     }))
 }
 
@@ -20818,6 +21359,7 @@ fn plan_select_srf(
         offset,
         distinct: plan_distinct(s, &|_| None)?,
         lock: None,
+        lock_clauses: Vec::new(),
     })))
 }
 
