@@ -775,6 +775,17 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         Some(K::AexprLike | K::AexprIlike) | Some(K::AexprOp)
             if matches!(op.as_str(), "~~" | "~~*" | "!~~" | "!~~*") =>
         {
+            // An untyped string literal is `unknown`, which resolves to the
+            // other side's type only if that type has a `~~`: only the
+            // string types and bytea do (`integer ~~ unknown` is 42883, and
+            // the per-row evaluator answered NULL for it).
+            let untyped = matches!(
+                e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+                Some(N::AConst(c)) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+            );
+            if untyped && lc != "string" && lc != "bytea" {
+                return Err(mismatch(&op, &l, "unknown", e.location));
+            }
             let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
                 return Ok(());
             };
@@ -948,6 +959,7 @@ fn check_select(
     if let Some(r) = s.rarg.as_deref() {
         check_select(r, &ctes, lookup, parent)?;
     }
+    sibling_reference(s, parent)?;
     let scope = Scope::new(&s.from_clause, &ctes, lookup, parent);
     let cx = Cx { lookup, ctes };
     for f in &s.from_clause {
@@ -977,6 +989,89 @@ fn check_select(
         _ => None,
     }) {
         walk(n, &scope, &cx)?;
+    }
+    Ok(())
+}
+
+/// A non-LATERAL FROM-less subquery in a FROM list cannot see its sibling
+/// FROM items: `FROM t x, (SELECT x.a) s` is PostgreSQL's 42P01 `invalid
+/// reference to FROM-clause entry for table "x"` with its HINT, at the
+/// reference. (Planned as it stood, it reached the lowering as an unknown
+/// column, 42703.) A name an enclosing query has is that query's, and a
+/// subquery with a FROM of its own is left to the planner.
+fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>) -> Result<()> {
+    fn item_name(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(rv)) => out.push(
+                rv.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| rv.relname.clone()),
+            ),
+            Some(N::RangeSubselect(rs)) => {
+                out.extend(rs.alias.as_ref().map(|a| a.aliasname.clone()))
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    item_name(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut siblings = Vec::new();
+    for item in &s.from_clause {
+        item_name(item, &mut siblings);
+    }
+    let in_outer = |name: &str| {
+        let mut p = parent;
+        while let Some(sc) = p {
+            if sc.tables.iter().any(|(n, _)| n == name) {
+                return true;
+            }
+            p = sc.parent;
+        }
+        false
+    };
+    for item in &s.from_clause {
+        let Some(N::RangeSubselect(rs)) = item.node.as_ref() else {
+            continue;
+        };
+        if rs.lateral {
+            continue;
+        }
+        let Some(N::SelectStmt(q)) = rs.subquery.as_deref().and_then(|n| n.node.as_ref()) else {
+            continue;
+        };
+        if !q.from_clause.is_empty() || q.larg.is_some() {
+            continue;
+        }
+        for t in &q.target_list {
+            let Some(inner) = t.node.as_ref() else {
+                continue;
+            };
+            for (n, _, _, _) in inner.nodes() {
+                let pg_query::NodeRef::ColumnRef(c) = n else {
+                    continue;
+                };
+                if c.fields.len() != 2 {
+                    continue;
+                }
+                let Some(N::String(q)) = c.fields[0].node.as_ref() else {
+                    continue;
+                };
+                let name = q.sval.as_str();
+                if siblings.iter().any(|n| n == name) && !in_outer(name) {
+                    set_error_location(c.location);
+                    return Err(Error::Sqlstate(
+                        "42P01",
+                        format!(
+                            "invalid reference to FROM-clause entry for table \"{name}\"\nHint: There is an entry for table \"{name}\", but it cannot be referenced from this part of the query."
+                        ),
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }

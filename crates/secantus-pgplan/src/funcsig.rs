@@ -251,6 +251,107 @@ fn select_candidates<'a>(name: &str, args: &[String]) -> Option<Vec<&'a Sig>> {
     Some(cands)
 }
 
+/// The declared argument types of the overload `func_select_candidate`
+/// picks when some arguments are untyped literals (`unknown`), for printing
+/// the analysed call (`to_char(d, 'YYYY')` over a date resolves to
+/// `to_char(timestamptz, text)`). Typed positions are narrowed as
+/// [`select_candidates`] does; then each unknown position takes the string
+/// category if any candidate offers it there, else the one category every
+/// candidate agrees on, keeping a preferred type where one is offered.
+/// `None` unless exactly one non-variadic, non-polymorphic overload is left.
+pub(crate) fn resolved_args(name: &str, args: &[String]) -> Option<Vec<String>> {
+    resolved_sig(name, args).map(|s| s.args.clone())
+}
+
+/// The concrete, non-set result type of [`resolved_args`]'s overload.
+pub(crate) fn resolved_result_type(name: &str, args: &[String]) -> Option<String> {
+    let s = resolved_sig(name, args)?;
+    if s.retset
+        || s.ret.starts_with("any")
+        || matches!(s.ret.as_str(), "record" | "internal" | "void" | "trigger")
+    {
+        return None;
+    }
+    Some(s.ret.clone())
+}
+
+fn resolved_sig(name: &str, args: &[String]) -> Option<&'static Sig> {
+    if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
+        return None;
+    }
+    let cats = categories();
+    if args
+        .iter()
+        .any(|a| a != "unknown" && !cats.contains_key(a.as_str()))
+    {
+        return None;
+    }
+    let overloads = sigs().get(name)?;
+    let mut cands: Vec<&Sig> = overloads
+        .iter()
+        .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
+        .collect();
+    if cands
+        .iter()
+        .flat_map(|s| s.args.iter())
+        .any(|p| p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring"))
+    {
+        return None;
+    }
+    let keep_best = |cands: &mut Vec<&Sig>, score: &dyn Fn(&str, &str) -> bool| {
+        let count = |s: &&Sig| {
+            s.args
+                .iter()
+                .zip(args)
+                .filter(|(p, a)| *a != "unknown" && score(p, a))
+                .count()
+        };
+        let best = cands.iter().map(count).max().unwrap_or(0);
+        cands.retain(|s| count(s) == best);
+    };
+    keep_best(&mut cands, &|p, a| p == a);
+    keep_best(&mut cands, &|p, a| {
+        p == a
+            || matches!(
+                (cats.get(p), cats.get(a)),
+                (Some((pc, true)), Some((ac, _))) if pc == ac
+            )
+    });
+    for (i, a) in args.iter().enumerate() {
+        if a != "unknown" || cands.len() < 2 {
+            continue;
+        }
+        let at = |s: &Sig| cats.get(s.args[i].as_str()).copied();
+        let mut chosen: Option<char> = None;
+        let mut conflict = false;
+        for s in &cands {
+            let (c, _) = at(s)?;
+            if c == 'S' {
+                chosen = Some('S');
+                conflict = false;
+                break;
+            }
+            match chosen {
+                None => chosen = Some(c),
+                Some(x) if x != c => conflict = true,
+                _ => {}
+            }
+        }
+        if conflict {
+            return None;
+        }
+        let chosen = chosen?;
+        cands.retain(|s| at(s).is_some_and(|(c, _)| c == chosen));
+        if cands.iter().any(|s| at(s).is_some_and(|(_, p)| p)) {
+            cands.retain(|s| at(s).is_some_and(|(_, p)| p));
+        }
+    }
+    match cands.as_slice() {
+        [s] => Some(*s),
+        _ => None,
+    }
+}
+
 /// Whether some overload of `name` declares exactly `args` (so a call
 /// prints with no casts).
 pub(crate) fn has_exact(name: &str, args: &[String]) -> bool {

@@ -71,7 +71,7 @@ impl PgHandler {
             Err(ParseError::Unsupported(_)) => {
                 let sql = format!(
                     "CREATE FUNCTION inline_code_block() RETURNS void AS \
-                     $secantus_do$\n{body}\n$secantus_do$ LANGUAGE plpgsql"
+                     $secantus_do${body}\n$secantus_do$ LANGUAGE plpgsql"
                 );
                 // Alone in its query string outside a block, the body may
                 // COMMIT; anywhere else it is atomic.

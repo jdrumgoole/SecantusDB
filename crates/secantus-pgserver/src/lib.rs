@@ -524,6 +524,12 @@ fn plpgsql_create_sql(doc: &Document) -> String {
         })
         .unwrap_or_default();
     let ret = doc.get_str("return_tag").unwrap_or("void");
+    // The function's own name: CONTEXT lines and the outer block's label
+    // carry it.
+    let fname = match doc.get_str("name") {
+        Ok(n) if !n.is_empty() => format!("\"{}\"", n.replace('"', "\"\"")),
+        _ => "f".to_string(),
+    };
     // A document with every parameter's MODE renders them as declared, in
     // order -- which is also the order the interpreter binds arguments in.
     let all_names = strings("all_params");
@@ -550,7 +556,7 @@ fn plpgsql_create_sql(doc: &Document) -> String {
         let body = doc.get_str("body").unwrap_or_default();
         if doc.get_bool("is_procedure").unwrap_or(false) {
             return format!(
-                "CREATE PROCEDURE f({}) AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
+                "CREATE PROCEDURE {fname}({}) AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
                 declared.join(", ")
             );
         }
@@ -560,7 +566,7 @@ fn plpgsql_create_sql(doc: &Document) -> String {
             ret.to_string()
         };
         return format!(
-            "CREATE FUNCTION f({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
+            "CREATE FUNCTION {fname}({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
             declared.join(", ")
         );
     }
@@ -577,7 +583,7 @@ fn plpgsql_create_sql(doc: &Document) -> String {
     };
     let body = doc.get_str("body").unwrap_or_default();
     format!(
-        "CREATE FUNCTION f({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
+        "CREATE FUNCTION {fname}({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
         params.join(", ")
     )
 }
@@ -906,6 +912,7 @@ fn wire_pl_error(e: plpgsql_fn::PlError) -> PgWireError {
     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
     info.detail = e.detail;
     info.hint = e.hint;
+    info.where_context = e.context.map(String::from);
     PgWireError::UserError(Box::new(info))
 }
 
@@ -916,6 +923,8 @@ fn pl_error(e: &PgWireError) -> plpgsql_fn::PlError {
             let mut p = plpgsql_fn::PlError::new(&info.code, info.message.clone());
             p.detail = info.detail.clone();
             p.hint = info.hint.clone();
+            p.context = info.where_context.as_deref().map(Box::from);
+            p.from_sql = true;
             p
         }
         other => plpgsql_fn::PlError::new("XX000", other.to_string()),
@@ -3223,7 +3232,8 @@ impl PgHandler {
         );
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
         secantus_pgplan::set_view_defs(self.view_defs());
-        secantus_pgplan::set_view_defs_pretty(self.view_defs_as(true));
+        secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
+        secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
         secantus_pgplan::set_index_defs(self.index_defs());
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
         secantus_pgplan::set_function_sigs(self.function_sigs());
@@ -7637,11 +7647,13 @@ impl PgHandler {
     /// Every view's and materialized view's `(regclass oid, name,
     /// definition)`, as `pg_get_viewdef` prints it (`pg_views.definition`).
     fn view_defs(&self) -> Vec<(i64, String, String)> {
-        self.view_defs_as(false)
+        self.view_defs_as(0)
     }
 
-    /// `view_defs`, pretty (`pg_get_viewdef(view, true)`) or not.
-    fn view_defs_as(&self, pretty: bool) -> Vec<(i64, String, String)> {
+    /// `view_defs`, plain (`mode` 0), pretty (1, `pg_get_viewdef(view,
+    /// true)`) or pretty with its line wraps left open (2, for the
+    /// wrap-column form).
+    fn view_defs_as(&self, mode: u8) -> Vec<(i64, String, String)> {
         let views = self.views().unwrap_or_default();
         let matviews = self
             .matviews()
@@ -7664,10 +7676,10 @@ impl PgHandler {
                     .unwrap_or_else(|| Self::view_oid(&name));
                 // As ruleutils prints the analysed query; the definition as
                 // written for a shape the printer does not reproduce.
-                let text = if pretty {
-                    secantus_pgplan::ruleutils::viewdef_pretty(&definition, &cat)
-                } else {
-                    secantus_pgplan::ruleutils::viewdef(&definition, &cat)
+                let text = match mode {
+                    1 => secantus_pgplan::ruleutils::viewdef_pretty(&definition, &cat),
+                    2 => secantus_pgplan::ruleutils::viewdef_marked(&definition, &cat),
+                    _ => secantus_pgplan::ruleutils::viewdef(&definition, &cat),
                 }
                 .unwrap_or_else(|| format!(" {definition};"));
                 (oid, name, text)
@@ -14215,6 +14227,10 @@ impl PgHandler {
         // A planner message may carry PostgreSQL's DETAIL / HINT line after
         // the primary one; each travels in its own field, not the message.
         let text = e.to_string();
+        let (text, context) = match text.split_once("\nContext: ") {
+            Some((m, c)) => (m.to_string(), Some(c.to_string())),
+            None => (text, None),
+        };
         let (message, hint) = match text.split_once("\nHint: ") {
             Some((m, h)) => (m.to_string(), Some(h.to_string())),
             None => (text, None),
@@ -14226,6 +14242,7 @@ impl PgHandler {
         let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), message);
         info.detail = detail;
         info.hint = hint.or_else(|| e.hint().map(str::to_string));
+        info.where_context = context;
         // A domain CHECK names its schema, type and constraint in the
         // error's fields, as PostgreSQL's `domain_check_input` reports them.
         if let Some((domain, constraint)) = info
@@ -18359,9 +18376,15 @@ impl PgHandler {
     /// the planner makes into the executor.
     fn to_plan_error(e: PgWireError) -> PlanError {
         match e {
+            // A CONTEXT stack (an error raised inside a PL/pgSQL body)
+            // rides after the message, as DETAIL / HINT lines do, and
+            // `err` splits it back out.
             PgWireError::UserError(info) => PlanError::Sqlstate(
                 Box::leak(info.code.clone().into_boxed_str()),
-                info.message.clone(),
+                match &info.where_context {
+                    Some(c) => format!("{}\nContext: {c}", info.message),
+                    None => info.message.clone(),
+                },
             ),
             other => PlanError::Internal(other.to_string()),
         }

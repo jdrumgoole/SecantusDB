@@ -15681,6 +15681,68 @@ def test_an_acknowledged_commit_survives_a_kill_in_durable_mode(
             assert c.execute("select id, v from t").fetchall() == [(1, "acked")]
 
 
+def test_batch46_function_body_error_context(home: Path) -> None:
+    """An error inside a PL/pgSQL body carries PostgreSQL's CONTEXT stack:
+    the statement's `SQL expression` / `SQL statement` / `PL/pgSQL
+    assignment` frame where PostgreSQL adds one, then one `PL/pgSQL function
+    f(args) line N at X` line per function, innermost first (measured on
+    PostgreSQL 15.19). A FROM-less subquery naming a sibling FROM item is
+    42P01 with its HINT and position; LIKE over an integer is 42883 in the
+    select list too, positioned at the operator."""
+    with _Server(home) as server, server.connect(autocommit=True) as c:
+        c.execute("create table t (a int)")
+        c.execute("create function f2() returns int language plpgsql as 'begin return 1/0; end'")
+        c.execute(
+            "create function f8() returns int language plpgsql as $$\nbegin\n  return f2();\nend$$"
+        )
+        c.execute(
+            "create function f10(n int, s text) returns int language plpgsql as $$\n"
+            "begin\n  if n > 0 then\n    return n / 0;\n  end if;\n  return 0;\nend$$"
+        )
+        c.execute(
+            "create function f11() returns void language plpgsql as $$\n"
+            "begin\n  execute 'select 1/0';\nend$$"
+        )
+        c.execute(
+            "create function f7() returns int language plpgsql as $$\n"
+            "declare x int;\nbegin\n  x := 1/0;\n  return x;\nend$$"
+        )
+        cases = [
+            (
+                "select f8()",
+                'SQL expression "1/0"\nPL/pgSQL function f2() line 1 at RETURN\n'
+                "PL/pgSQL function f8() line 3 at RETURN",
+            ),
+            ("select f10(3, 'x')", "PL/pgSQL function f10(integer,text) line 4 at RETURN"),
+            (
+                "select f11()",
+                'SQL statement "select 1/0"\nPL/pgSQL function f11() line 3 at EXECUTE',
+            ),
+            (
+                "select f7()",
+                'PL/pgSQL assignment "x := 1/0"\nPL/pgSQL function f7() line 4 at assignment',
+            ),
+        ]
+        for sql, context in cases:
+            with pytest.raises(psycopg.errors.DivisionByZero) as e:
+                c.execute(sql)
+            assert e.value.diag.context == context, sql
+        with pytest.raises(psycopg.errors.UndefinedTable) as e:
+            c.execute("select a from t x, (select x.a) s")
+        assert e.value.diag.message_primary == (
+            'invalid reference to FROM-clause entry for table "x"'
+        )
+        assert e.value.diag.message_hint == (
+            'There is an entry for table "x", but it cannot be referenced from this part'
+            " of the query."
+        )
+        assert e.value.diag.statement_position == "28"
+        with pytest.raises(psycopg.errors.UndefinedFunction) as e:
+            c.execute("select a like 'x' from t")
+        assert e.value.diag.message_primary == "operator does not exist: integer ~~ unknown"
+        assert e.value.diag.statement_position == "10"
+
+
 def test_schema_usage_and_object_privileges(home: Path) -> None:
     """Schema USAGE is enforced (42501 before the table privilege is asked),
     and has_schema / _sequence / _function / _column_privilege answer from the

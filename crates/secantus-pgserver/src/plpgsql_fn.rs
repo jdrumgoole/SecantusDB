@@ -30,6 +30,18 @@ pub struct PlError {
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
+    /// The CONTEXT stack, innermost first, as PostgreSQL prints it (boxed:
+    /// the error travels in every `Result` here and is kept small).
+    pub context: Option<Box<str>>,
+    /// Raised by a SQL statement the body ran (through the host), not by
+    /// the interpreter itself: only such an error gets a `SQL statement`
+    /// / `SQL expression` frame.
+    pub from_sql: bool,
+    /// This function's `SQL ...` frame is on the stack.
+    sql_framed: bool,
+    /// This function's `PL/pgSQL function f() line N at X` frame is on
+    /// the stack: an enclosing statement adds none.
+    framed: bool,
 }
 
 impl PlError {
@@ -39,7 +51,34 @@ impl PlError {
             message: message.into(),
             detail: None,
             hint: None,
+            context: None,
+            from_sql: false,
+            sql_framed: false,
+            framed: false,
         }
+    }
+
+    /// Add an outer frame to the CONTEXT stack.
+    fn push_context(&mut self, frame: String) {
+        self.context = Some(
+            match self.context.take() {
+                Some(inner) => format!("{inner}\n{frame}"),
+                None => frame,
+            }
+            .into_boxed_str(),
+        );
+    }
+
+    /// The `SQL statement "..."` style frame for a statement or expression
+    /// the body ran, once.
+    fn with_sql_frame(mut self, frame: impl FnOnce() -> Option<String>) -> Self {
+        if self.from_sql && !self.sql_framed && !self.framed {
+            if let Some(f) = frame() {
+                self.push_context(f);
+            }
+            self.sql_framed = true;
+        }
+        self
     }
 
     fn unsupported(what: &str) -> Self {
@@ -230,6 +269,11 @@ struct Interp<'a> {
     handling: Option<PlError>,
     /// Bound cursors' queries, by datum number (`open_cursor`).
     cursor_exprs: HashMap<usize, String>,
+    /// How CONTEXT names this function: `f(integer)`, or
+    /// `inline_code_block` for a DO block.
+    label: String,
+    /// The text of the EXECUTE statement being run, for its CONTEXT frame.
+    dyn_text: Option<String>,
 }
 
 impl Interp<'_> {
@@ -594,6 +638,8 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         found_no,
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
+        label: function_label(create_sql),
+        dyn_text: None,
     };
     if let Some(t) = &inv.trigger {
         let new_no = f
@@ -656,6 +702,172 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             "control reached end of function without RETURN",
         )),
     }
+}
+
+/// How CONTEXT names the function: `name(argument types)` as
+/// `format_procedure` prints it; a DO block is `inline_code_block`.
+fn function_label(create_sql: &str) -> String {
+    use pg_query::protobuf::node::Node as N;
+    use pg_query::protobuf::FunctionParameterMode as M;
+    let Some((name, args)) = pg_query::parse(create_sql).ok().and_then(|p| {
+        let stmt = p.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()?;
+        let N::CreateFunctionStmt(c) = stmt else {
+            return None;
+        };
+        let name = match c.funcname.last()?.node.as_ref()? {
+            N::String(s) => s.sval.clone(),
+            _ => return None,
+        };
+        let mut args = Vec::new();
+        for p in &c.parameters {
+            let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
+                continue;
+            };
+            if matches!(
+                M::try_from(fp.mode),
+                Ok(M::FuncParamOut | M::FuncParamTable)
+            ) {
+                continue;
+            }
+            let t = fp.arg_type.as_ref()?;
+            let base = match t.names.last()?.node.as_ref()? {
+                N::String(s) => s.sval.clone(),
+                _ => return None,
+            };
+            let array = if t.array_bounds.is_empty() { "" } else { "[]" };
+            args.push(format!(
+                "{}{array}",
+                secantus_pgplan::display_type(&canonical_type(&base))
+            ));
+        }
+        Some((name, args))
+    }) else {
+        return "inline_code_block".into();
+    };
+    if name == "inline_code_block" {
+        return name;
+    }
+    format!("{name}({})", args.join(","))
+}
+
+/// `plpgsql_stmt_typename`: what CONTEXT says a statement is.
+fn stmt_typename(kind: &str, body: &Value) -> &'static str {
+    let flag = |k: &str| body.get(k).and_then(Value::as_bool).unwrap_or(false);
+    match kind.strip_prefix("PLpgSQL_stmt_").unwrap_or(kind) {
+        "block" => "statement block",
+        "assign" => "assignment",
+        "if" => "IF",
+        "case" => "CASE",
+        "loop" => "LOOP",
+        "while" => "WHILE",
+        "fori" => "FOR with integer loop variable",
+        "fors" => "FOR over SELECT rows",
+        "forc" => "FOR over cursor",
+        "foreach_a" => "FOREACH over array",
+        "exit" if flag("is_exit") => "EXIT",
+        "exit" => "CONTINUE",
+        "return" => "RETURN",
+        "return_next" => "RETURN NEXT",
+        "return_query" => "RETURN QUERY",
+        "raise" => "RAISE",
+        "assert" => "ASSERT",
+        "execsql" => "SQL statement",
+        "dynexecute" => "EXECUTE",
+        "dynfors" => "FOR over EXECUTE statement",
+        "getdiag" if flag("is_stacked") => "GET STACKED DIAGNOSTICS",
+        "getdiag" => "GET DIAGNOSTICS",
+        "open" => "OPEN",
+        "fetch" if flag("is_move") => "MOVE",
+        "fetch" => "FETCH",
+        "close" => "CLOSE",
+        "perform" => "PERFORM",
+        "call" if flag("is_call") => "CALL",
+        "call" => "DO",
+        "commit" => "COMMIT",
+        "rollback" => "ROLLBACK",
+        _ => "unknown",
+    }
+}
+
+/// The CONTEXT frame for an expression whose evaluation failed (`sql` is
+/// the query it became, before its variables were bound), or `None`
+/// where PostgreSQL adds none. PL/pgSQL runs a SIMPLE expression (one
+/// target, no FROM, no subquery) outside SPI, so an error it raises while
+/// EXECUTING has no `SQL expression` frame; one raised while PLANNING it
+/// does -- in practice, an expression with no variables and no volatile or
+/// user function call, which the planner folds (`return 1/0`). A
+/// non-simple expression always runs through SPI and always has one.
+fn expr_frame(text: &str, mode: u64, sql: &str) -> Option<String> {
+    use pg_query::protobuf::node::Node as N;
+    let parsed = pg_query::parse(sql).ok()?;
+    let simple = match parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|n| n.node.as_ref())
+    {
+        Some(N::SelectStmt(s)) => {
+            s.from_clause.is_empty()
+                && s.where_clause.is_none()
+                && s.target_list.len() == 1
+                && s.larg.is_none()
+                && s.with_clause.is_none()
+        }
+        _ => false,
+    };
+    let nodes = parsed.protobuf.nodes();
+    let has_sublink = nodes
+        .iter()
+        .any(|(n, _, _, _)| matches!(n, pg_query::NodeRef::SubLink(_)));
+    // A bare identifier not called as a function is a variable or column.
+    let names_a_value = pg_query::scan(sql).ok().is_some_and(|scan| {
+        let t = &scan.tokens;
+        (0..t.len()).any(|i| {
+            let text_at = |j: usize| sql.get(t[j].start as usize..t[j].end as usize);
+            t[i].token == pg_query::protobuf::Token::Ident as i32
+                && (i == 0 || text_at(i - 1) != Some("::"))
+                && t.get(i + 1)
+                    .and_then(|n| sql.get(n.start as usize..n.end as usize))
+                    != Some("(")
+        })
+    });
+    let foldable = !names_a_value
+        && !nodes.iter().any(|(n, _, _, _)| match n {
+            pg_query::NodeRef::ParamRef(_) | pg_query::NodeRef::ColumnRef(_) => true,
+            pg_query::NodeRef::FuncCall(f) => {
+                let name = f
+                    .funcname
+                    .last()
+                    .and_then(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                !secantus_pgplan::is_known_function(name)
+                    || matches!(
+                        name,
+                        "random"
+                            | "now"
+                            | "nextval"
+                            | "currval"
+                            | "setval"
+                            | "clock_timestamp"
+                            | "timeofday"
+                            | "pg_sleep"
+                            | "gen_random_uuid"
+                    )
+            }
+            _ => false,
+        });
+    if simple && !has_sublink && !foldable {
+        return None;
+    }
+    Some(match mode {
+        3..=5 => format!("PL/pgSQL assignment \"{text}\""),
+        2 => format!("SQL expression \"{text}\""),
+        _ => format!("SQL statement \"{text}\""),
+    })
 }
 
 fn expr_query(e: &Value) -> Option<(&str, u64)> {
@@ -859,8 +1071,12 @@ impl Interp<'_> {
         } else {
             format!("SELECT {body}")
         };
+        let raw = sql.clone();
         let (sql, params, types) = self.bind(&sql)?;
-        let out = self.host.query(&sql, &params, &types)?;
+        let out = self
+            .host
+            .query(&sql, &params, &types)
+            .map_err(|e| e.with_sql_frame(|| expr_frame(text, mode, &raw)))?;
         if out.rows.len() > 1 {
             return Err(PlError::new("21000", "query returned more than one row"));
         }
@@ -892,8 +1108,12 @@ impl Interp<'_> {
             Some(ty) => format!("SELECT ({body})::{}", sql_type(&ty)),
             None => format!("SELECT {body}"),
         };
+        let raw = sql.clone();
         let (sql, params, types) = self.bind(&sql)?;
-        let out = self.host.query(&sql, &params, &types)?;
+        let out = self
+            .host
+            .query(&sql, &params, &types)
+            .map_err(|e| e.with_sql_frame(|| expr_frame(text, mode, &raw)))?;
         Ok(out
             .rows
             .into_iter()
@@ -992,7 +1212,47 @@ impl Interp<'_> {
         }
     }
 
+    /// Run one statement; an error leaving it gets this function's CONTEXT
+    /// frame (`PL/pgSQL function f() line N at RETURN`), plus the
+    /// `SQL statement "..."` frame of a statement it ran.
     fn stmt(&mut self, s: &Value) -> Result<Flow, PlError> {
+        let Some((kind, body)) = s.as_object().and_then(|o| o.iter().next()) else {
+            return Ok(Flow::Next);
+        };
+        let out = self.stmt_inner(s);
+        let Err(mut e) = out else {
+            return out;
+        };
+        if e.framed || kind == "PLpgSQL_stmt_block" {
+            return Err(e);
+        }
+        let text = |key: &str| {
+            body.get(key)
+                .and_then(|q| expr_query(q))
+                .map(|(t, _)| t.to_string())
+        };
+        let sql_text = match kind.as_str() {
+            "PLpgSQL_stmt_execsql" => text("sqlstmt"),
+            "PLpgSQL_stmt_perform" => text("expr"),
+            "PLpgSQL_stmt_return_query" => text("query").or_else(|| self.dyn_text.take()),
+            "PLpgSQL_stmt_fors" => text("query"),
+            "PLpgSQL_stmt_dynexecute" | "PLpgSQL_stmt_dynfors" => self.dyn_text.take(),
+            _ => None,
+        };
+        if let Some(t) = sql_text {
+            e = e.with_sql_frame(|| Some(format!("SQL statement \"{t}\"")));
+        }
+        let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);
+        e.push_context(format!(
+            "PL/pgSQL function {} line {line} at {}",
+            self.label,
+            stmt_typename(kind, body)
+        ));
+        e.framed = true;
+        Err(e)
+    }
+
+    fn stmt_inner(&mut self, s: &Value) -> Result<Flow, PlError> {
         let Some((kind, body)) = s.as_object().and_then(|o| o.iter().next()) else {
             return Ok(Flow::Next);
         };
@@ -1348,6 +1608,7 @@ impl Interp<'_> {
                     }
                     None => {
                         let sql = self.dynamic_sql(body.get("dynquery").unwrap_or(&Value::Null))?;
+                        self.dyn_text = Some(sql.clone());
                         self.host.query(&sql, &[], &[])?
                     }
                 };
@@ -1436,6 +1697,7 @@ impl Interp<'_> {
             }
             "PLpgSQL_stmt_dynexecute" => {
                 let sql = self.dynamic_sql(body.get("query").unwrap_or(&Value::Null))?;
+                self.dyn_text = Some(sql.clone());
                 let using: Vec<Bson> = body
                     .get("params")
                     .and_then(Value::as_array)

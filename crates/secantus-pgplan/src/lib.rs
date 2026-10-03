@@ -6439,6 +6439,10 @@ thread_local! {
     /// The same, as `pg_get_viewdef(view, true)` prints them.
     static VIEW_DEFS_PRETTY: std::cell::RefCell<Vec<(i64, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// As `VIEW_DEFS_PRETTY`, with each line wrap left open
+    /// (`ruleutils::viewdef_marked`) for the int wrap-column form.
+    static VIEW_DEFS_MARKED: std::cell::RefCell<Vec<(i64, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -6510,6 +6514,12 @@ pub fn set_index_defs(defs: Vec<(i64, String)>) {
 /// Install the view definitions `pg_get_viewdef` answers from.
 pub fn set_view_defs(defs: Vec<(i64, String, String)>) {
     VIEW_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
+/// Install the wrap-column (`pg_get_viewdef(view, 80)`) view definitions,
+/// as `ruleutils::viewdef_marked` prints them.
+pub fn set_view_defs_marked(defs: Vec<(i64, String, String)>) {
+    VIEW_DEFS_MARKED.with(|d| *d.borrow_mut() = defs);
 }
 
 /// Install the pretty (`pg_get_viewdef(view, true)`) view definitions.
@@ -31008,14 +31018,25 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 other => regclass_oid(other),
             };
             // `pg_get_viewdef(v, true)` (or a wrap column) prints pretty.
-            let pretty = match f.args.get(1) {
+            let (pretty, wrap) = match f.args.get(1) {
                 Some(a) => match const_value(a, params)? {
-                    Bson::Boolean(b) => b,
-                    Bson::Int32(_) | Bson::Int64(_) => true,
-                    _ => false,
+                    Bson::Boolean(b) => (b, None),
+                    Bson::Int32(w) => (true, Some(i64::from(w))),
+                    Bson::Int64(w) => (true, Some(w)),
+                    _ => (false, None),
                 },
-                None => false,
+                None => (false, None),
             };
+            if let Some(wrap) = wrap {
+                return Ok(VIEW_DEFS_MARKED.with(|d| {
+                    d.borrow()
+                        .iter()
+                        .find(|(o, n, _)| Some(*o) == oid || by_name.as_deref() == Some(n.as_str()))
+                        .map_or(Bson::Null, |(_, _, t)| {
+                            Bson::String(ruleutils::render_wrapped(t, wrap))
+                        })
+                }));
+            }
             let table = if pretty {
                 &VIEW_DEFS_PRETTY
             } else {

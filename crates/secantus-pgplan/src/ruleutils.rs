@@ -64,6 +64,10 @@ struct Printer<'a> {
     pretty: bool,
     /// `pg_get_expr` over one relation: columns print bare.
     unqualified: bool,
+    /// Leave each target-list / FROM-list line-wrap decision to
+    /// [`render_wrapped`] (the int `wrapColumn` form of `pg_get_viewdef`)
+    /// rather than wrapping every item, as the default column (0) does.
+    markers: bool,
 }
 
 /// What a sub-expression is printed inside, for `isSimpleNode`.
@@ -189,7 +193,23 @@ impl<'a> Printer<'a> {
             col_names_visible: true,
             pretty: false,
             unqualified: false,
+            markers: false,
         }
+    }
+
+    /// A list item whose line wrap [`render_wrapped`] decides: `kind` is
+    /// `T` / `t` for the first / a later target-list entry, `f` for a later
+    /// FROM item; the newline-and-indent a wrap would add rides along.
+    fn mark(&mut self, kind: char, item: &str) {
+        let saved = std::mem::take(&mut self.buf);
+        self.keyword("", -PRETTYINDENT_STD, PRETTYINDENT_STD, PRETTYINDENT_VAR);
+        let nl = std::mem::replace(&mut self.buf, saved);
+        self.buf.push(MARK_OPEN);
+        self.buf.push(kind);
+        self.buf.push_str(&nl);
+        self.buf.push(MARK_ITEM);
+        self.buf.push_str(item);
+        self.buf.push(MARK_CLOSE);
     }
 
     fn remove_trailing_spaces(&mut self) {
@@ -237,6 +257,7 @@ impl<'a> Printer<'a> {
         let mut inner = Printer::new(self.cat, 0);
         inner.depth = self.depth + 1;
         inner.pretty = self.pretty;
+        inner.markers = self.markers;
         inner.query_columns(&node)
     }
 
@@ -347,7 +368,8 @@ impl<'a> Printer<'a> {
                         .iter()
                         .map(|a| self.typ(a))
                         .collect::<Option<Vec<String>>>()?;
-                    return crate::funcsig::selected_result_type(&name, &types);
+                    return crate::funcsig::selected_result_type(&name, &types)
+                        .or_else(|| crate::funcsig::resolved_result_type(&name, &types));
                 };
                 match result {
                     Some(r) => r.to_string(),
@@ -1098,6 +1120,27 @@ impl<'a> Printer<'a> {
         if parts.len() > 1 && parts[0] != "pg_catalog" {
             return None;
         }
+        // `EXTRACT(field FROM x)` is SQL syntax over `extract(text, x)`, and
+        // prints as the syntax (`get_func_sql_syntax`).
+        if name == "extract"
+            && f.funcformat == pg_query::protobuf::CoercionForm::CoerceSqlSyntax as i32
+            && f.args.len() == 2
+            && f.over.is_none()
+        {
+            let field = match f.args[0].node.as_ref() {
+                Some(N::AConst(c)) => match &c.val {
+                    Some(pg_query::protobuf::a_const::Val::Sval(s)) => s.sval.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let types = vec!["text".to_string(), self.typ(&f.args[1])?];
+            let declared = crate::funcsig::selected_args("extract", &types)?;
+            self.buf.push_str(&format!("EXTRACT({} FROM ", field));
+            self.expr_as(&f.args[1], declared.get(1)?)?;
+            self.buf.push(')');
+            return Some(());
+        }
         let Some((arg_type, _)) = function_sig(&name) else {
             return self.call_by_signature(f, &name);
         };
@@ -1168,16 +1211,27 @@ impl<'a> Printer<'a> {
             .iter()
             .map(|a| self.typ(a))
             .collect::<Option<Vec<String>>>()?;
-        if !crate::funcsig::has_exact(name, &types) {
-            return None;
-        }
+        // Otherwise the overload PostgreSQL's `func_select_candidate` picks,
+        // with each argument coerced to its declared type as the analysed
+        // query carries it: `to_char(d, 'YYYY')` over a date is
+        // `to_char((d)::timestamp with time zone, 'YYYY'::text)`.
+        let declared = if crate::funcsig::has_exact(name, &types) {
+            vec![String::new(); types.len()]
+        } else {
+            let d = crate::funcsig::selected_args(name, &types)
+                .or_else(|| crate::funcsig::resolved_args(name, &types))?;
+            if d.len() != types.len() || d.iter().any(|t| t.starts_with("any") || t == "internal") {
+                return None;
+            }
+            d
+        };
         self.buf.push_str(&q(name));
         self.buf.push('(');
         for (i, a) in f.args.iter().enumerate() {
             if i > 0 {
                 self.buf.push_str(", ");
             }
-            self.expr(a)?;
+            self.expr_as(a, &declared[i])?;
         }
         self.buf.push(')');
         Some(())
@@ -1426,6 +1480,7 @@ impl<'a> Printer<'a> {
         inner.ctes = self.ctes.clone();
         inner.depth = self.depth + 1;
         inner.pretty = self.pretty;
+        inner.markers = self.markers;
         inner.query(sub, None)?;
         self.buf.push_str(&inner.buf);
         Some(())
@@ -1437,6 +1492,7 @@ impl<'a> Printer<'a> {
         inner.ctes = self.ctes.clone();
         inner.depth = self.depth + 1;
         inner.pretty = self.pretty;
+        inner.markers = self.markers;
         inner.query(sub, None)?;
         self.buf.push_str(&inner.buf);
         Some(())
@@ -1448,6 +1504,7 @@ impl<'a> Printer<'a> {
         inner.ctes = self.ctes.clone();
         inner.depth = self.depth + 1;
         inner.pretty = self.pretty;
+        inner.markers = self.markers;
         inner.query_columns(sub)
     }
 
@@ -1931,6 +1988,7 @@ impl Printer<'_> {
             inner.ctes = self.ctes.clone();
             inner.depth = self.depth + 1;
             inner.pretty = self.pretty;
+            inner.markers = self.markers;
             inner.query(body, None)?;
             self.buf.push_str(&inner.buf);
             self.keyword("", 0, 0, 0);
@@ -1993,6 +2051,7 @@ impl Printer<'_> {
             inner.ctes = self.ctes.clone();
             inner.depth = self.depth + 1;
             inner.pretty = self.pretty;
+            inner.markers = self.markers;
             inner.col_names_visible = self.col_names_visible;
             inner.query(
                 &Node {
@@ -2108,6 +2167,10 @@ impl Printer<'_> {
                 self.buf.push_str(&q(&name));
             }
             let item = std::mem::replace(&mut self.buf, saved);
+            if self.markers {
+                self.mark(if i == 0 { 'T' } else { 't' }, &item);
+                continue;
+            }
             if item.starts_with('\n') {
                 self.remove_trailing_spaces();
             } else if i > 0 {
@@ -2125,6 +2188,10 @@ impl Printer<'_> {
                 let saved = std::mem::take(&mut self.buf);
                 self.print_from_item(it)?;
                 let item = std::mem::replace(&mut self.buf, saved);
+                if self.markers {
+                    self.mark('f', &item);
+                    continue;
+                }
                 if item.starts_with('\n') {
                     self.remove_trailing_spaces();
                 } else {
@@ -2455,6 +2522,91 @@ fn viewdef_with(sql: &str, cat: &Catalog<'_>, pretty: bool) -> Option<String> {
     let node = parse_select(sql)?;
     let mut p = Printer::new(cat, 0);
     p.pretty = pretty;
+    p.query(&node, None)?;
+    Some(format!("{};", p.buf))
+}
+
+const MARK_OPEN: char = '\u{1}';
+const MARK_ITEM: char = '\u{2}';
+const MARK_CLOSE: char = '\u{3}';
+
+/// `pg_get_viewdef(view, wrap_column)`: pretty, with a target-list or FROM
+/// item moved to a new line only where ruleutils' `get_target_list` /
+/// `get_from_clause` would for that column. `marked` is
+/// [`viewdef_marked`]'s output.
+pub fn render_wrapped(marked: &str, wrap: i64) -> String {
+    let chars: Vec<char> = marked.chars().collect();
+    render_level(&chars, wrap)
+}
+
+/// One buffer's worth: each item is rendered into a buffer of its own
+/// first (as ruleutils prints it into `targetbuf` / `itembuf`), so a nested
+/// list's wrapping is measured from that buffer's own last line.
+fn render_level(s: &[char], wrap: i64) -> String {
+    let mut out = String::new();
+    let mut last_multiline = false;
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != MARK_OPEN {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let kind = s[i + 1];
+        let mut j = i + 2;
+        let mut nl = String::new();
+        while s[j] != MARK_ITEM {
+            nl.push(s[j]);
+            j += 1;
+        }
+        let start = j + 1;
+        let mut depth = 0;
+        let mut k = start;
+        loop {
+            match s[k] {
+                MARK_OPEN => depth += 1,
+                MARK_CLOSE if depth == 0 => break,
+                MARK_CLOSE => depth -= 1,
+                _ => {}
+            }
+            k += 1;
+        }
+        let item = render_level(&s[start..k], wrap);
+        if kind == 'T' {
+            last_multiline = false;
+        }
+        // A negative column turns wrapping off altogether.
+        if wrap >= 0 && item.starts_with('\n') {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+        } else if wrap >= 0 && kind != 'T' {
+            let line = out.rsplit('\n').next().unwrap_or("").len();
+            let overflow = (line + item.len()) as i64 > wrap;
+            if overflow || (kind == 't' && last_multiline) {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push_str(&nl);
+            }
+        }
+        if kind != 'f' {
+            // `strchr(targetbuf + leading_nl_pos + 1, '\n')`.
+            let rest = item.strip_prefix('\n').unwrap_or(&item);
+            last_multiline = rest.contains('\n');
+        }
+        out.push_str(&item);
+        i = k + 1;
+    }
+    out
+}
+
+/// `viewdef_pretty` with each wrap decision left to [`render_wrapped`].
+pub fn viewdef_marked(sql: &str, cat: &Catalog<'_>) -> Option<String> {
+    let node = parse_select(sql)?;
+    let mut p = Printer::new(cat, 0);
+    p.pretty = true;
+    p.markers = true;
     p.query(&node, None)?;
     Some(format!("{};", p.buf))
 }
