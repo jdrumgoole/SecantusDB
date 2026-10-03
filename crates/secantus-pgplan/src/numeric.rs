@@ -516,6 +516,41 @@ pub fn numeric_filter(field: &str, mql_op: &str, value: &Bson) -> Option<Documen
     })
 }
 
+/// `field IN (values)` (`negated`: `NOT IN`, the list holding no NULL) over a
+/// numeric column, as ONE `$in` / `$nin` per storage form: exactly the
+/// `$or` of [`numeric_filter`]`(field, "$eq", v)` arms (the `$and` of its
+/// `"$ne"` arms) it replaces, which a scan evaluated arm by arm -- a
+/// 2,000-value list made a 2,000 x 2,000 `IN (SELECT ...)` 0.6 s. `None`
+/// when a value is not a numeric operand (the caller builds the arms).
+pub fn numeric_in_filter(field: &str, values: &[Bson], negated: bool) -> Option<Document> {
+    let wide_field = format!("{field}.{WIDE_NUMERIC_SORT_KEY}");
+    let mut narrow: Vec<Bson> = Vec::new();
+    let mut keys: Vec<Bson> = Vec::new();
+    for v in values {
+        let canonical = numeric_operand_text(v)?;
+        if canonical == "NaN" {
+            narrow.push(Bson::Decimal128(decimal128("NaN")));
+            continue;
+        }
+        if let Bracket::Exact(d) = decimal128_bracket(&canonical)? {
+            narrow.push(Bson::Decimal128(d));
+        }
+        keys.push(Bson::String(numeric_sort_key(&canonical)));
+    }
+    Some(if negated {
+        doc! { "$and": [
+            { field: { "$nin": narrow } },
+            { &wide_field: { "$nin": keys } },
+            { field: { "$ne": Bson::Null } },
+        ]}
+    } else {
+        doc! { "$or": [
+            { field: { "$in": narrow } },
+            { field: { "$gte": Document::new() }, wide_field: { "$in": keys } },
+        ]}
+    })
+}
+
 /// Compare two canonical numeric texts EXACTLY, digit by digit.
 ///
 /// A `numeric` carries any number of digits and an `f64` holds 15, so routing

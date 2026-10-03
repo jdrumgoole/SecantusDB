@@ -1266,6 +1266,73 @@ pub struct Select {
     /// which refuses it) and nowhere else, so a plain `SELECT DISTINCT`
     /// returned its duplicates.
     pub distinct: Distinct,
+    /// `FOR UPDATE` / `FOR NO KEY UPDATE` over the stored table: the rows
+    /// returned are locked for the rest of the transaction.
+    pub lock: Option<RowLock>,
+}
+
+/// How a `SELECT ... FOR UPDATE` treats a row another transaction holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockWait {
+    /// Wait for it (the default).
+    Block,
+    /// `NOWAIT`: 55P03 at once.
+    Nowait,
+    /// `SKIP LOCKED`: leave the row out.
+    SkipLocked,
+}
+
+/// A row-locking clause the executor carries out (see `Select::lock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowLock {
+    pub wait: RowLockWait,
+}
+
+/// The row lock `s`'s locking clauses take on its table `table` (aliased
+/// `alias`). Only the exclusive strengths (`FOR UPDATE`, `FOR NO KEY
+/// UPDATE`) are carried out: a shared lock (`FOR SHARE`, `FOR KEY SHARE`)
+/// must not block another shared one, which an exclusive row write would.
+fn row_lock_of(s: &pg_query::protobuf::SelectStmt, table: &str, alias: &str) -> Option<RowLock> {
+    use pg_query::protobuf::{LockClauseStrength, LockWaitPolicy};
+    let mut out: Option<RowLock> = None;
+    for c in &s.locking_clause {
+        let Some(N::LockingClause(lc)) = c.node.as_ref() else {
+            continue;
+        };
+        let names_it = lc.locked_rels.is_empty()
+            || lc.locked_rels.iter().any(|r| {
+                matches!(r.node.as_ref(), Some(N::RangeVar(rv))
+                    if rv.relname == alias || rv.relname == table)
+            });
+        let exclusive = matches!(
+            LockClauseStrength::try_from(lc.strength),
+            Ok(LockClauseStrength::LcsForupdate | LockClauseStrength::LcsFornokeyupdate)
+        );
+        if !names_it || !exclusive {
+            continue;
+        }
+        let wait = match LockWaitPolicy::try_from(lc.wait_policy) {
+            Ok(LockWaitPolicy::LockWaitError) => RowLockWait::Nowait,
+            Ok(LockWaitPolicy::LockWaitSkip) => RowLockWait::SkipLocked,
+            _ => RowLockWait::Block,
+        };
+        // Several clauses on one table: the strictest wait policy wins, as
+        // in PostgreSQL (NOWAIT over SKIP LOCKED over waiting).
+        out = Some(match out {
+            Some(RowLock {
+                wait: RowLockWait::Nowait,
+            }) => RowLock {
+                wait: RowLockWait::Nowait,
+            },
+            Some(RowLock {
+                wait: RowLockWait::SkipLocked,
+            }) if wait == RowLockWait::Block => RowLock {
+                wait: RowLockWait::SkipLocked,
+            },
+            _ => RowLock { wait },
+        });
+    }
+    out
 }
 
 /// One action of an `ALTER TABLE`.
@@ -10775,6 +10842,7 @@ fn plan_series_select(
         limit,
         offset,
         distinct,
+        lock: None,
     }))
 }
 
@@ -12059,6 +12127,21 @@ fn having_subject(
         Some(N::ColumnRef(c)) => {
             let name =
                 column_ref_name(c).ok_or_else(|| Error::Unsupported("this HAVING term".into()))?;
+            // A column no FROM item has is 42703 before it is a grouping
+            // error, as PostgreSQL resolves the name first.
+            if def.column(&name).is_none()
+                && !group_by.iter().any(|k| k.name == name)
+                && !def.columns.iter().any(|col| {
+                    col.field() == name
+                        || col.name.rsplit('\u{1f}').next() == Some(name.as_str())
+                        || col.name.rsplit('.').next() == Some(name.as_str())
+                })
+            {
+                if c.location >= 0 {
+                    set_error_location(c.location);
+                }
+                return Err(Error::UndefinedColumn(name));
+            }
             group_by
                 .iter()
                 .position(|k| k.expr.is_none() && k.name == name)
@@ -15084,6 +15167,9 @@ const VOLATILE_FUNCTIONS: &[&str] = &[
     "pg_advisory_lock",
     "pg_try_advisory_lock",
     "txid_current",
+    "pg_current_xact_id",
+    "txid_current_if_assigned",
+    "pg_current_xact_id_if_assigned",
 ];
 
 fn calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
@@ -17304,6 +17390,7 @@ fn plan_select_rest(
     // table's, so everything downstream -- the targets, the WHERE, ORDER BY,
     // LIMIT -- plans against it unchanged and never learns the source was not
     // a table.
+    let mut alias: Option<String> = None;
     let (table, def, sub) = match s.from_clause[0].node.as_ref() {
         _ if srf.is_some() => {
             let src = srf.expect("checked");
@@ -17320,6 +17407,7 @@ fn plan_select_rest(
         Some(N::RangeVar(r)) => {
             let table = relation_name(r);
             let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+            alias = r.alias.as_ref().map(|a| a.aliasname.clone());
             (table, def, None)
         }
         Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -17471,6 +17559,11 @@ fn plan_select_rest(
     let (limit, offset) = limit_offset(s, params)?;
 
     let distinct = plan_distinct(s, &|name| def.field_of(name))?;
+    let lock = if table.is_empty() {
+        None
+    } else {
+        row_lock_of(s, &table, alias.as_deref().unwrap_or(&table))
+    };
 
     Ok(Statement::Select(Select {
         series: None,
@@ -17486,6 +17579,7 @@ fn plan_select_rest(
         limit,
         offset,
         distinct,
+        lock,
     }))
 }
 
@@ -18006,6 +18100,7 @@ fn plan_join_plain_select(
         limit,
         offset,
         distinct,
+        lock: None,
     }))
 }
 
@@ -19776,7 +19871,14 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         }
         Some(N::CoalesceExpr(c)) => common_type(&c.args.iter().collect::<Vec<_>>()),
         Some(N::CaseExpr(c)) => common_type(&case_results(c)),
-        Some(N::MinMaxExpr(_)) => inferred_type(value).to_string(),
+        Some(N::MinMaxExpr(m)) => {
+            let common = common_type(&m.args.iter().collect::<Vec<_>>());
+            if wider_datetime(&common, &common).is_some() {
+                common
+            } else {
+                inferred_type(value).to_string()
+            }
+        }
         Some(N::XmlExpr(x)) => {
             if x.op == pg_query::protobuf::XmlExprOp::IsDocument as i32 {
                 "bool".to_string()
@@ -20264,15 +20366,31 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
         out = Some(match out {
             None => t,
             Some(cur) if cur == t => cur,
-            Some(cur) => wider_numeric(&cur, &t).unwrap_or(cur),
+            Some(cur) => wider_numeric(&cur, &t)
+                .or_else(|| wider_datetime(&cur, &t))
+                .unwrap_or(cur),
         });
     }
     out.unwrap_or_else(|| "text".to_string())
 }
 
+/// The date/time type two of them meet as: `date` widens to `timestamp`,
+/// both to `timestamptz` (the category's preferred type), as PostgreSQL's
+/// `select_common_type` resolves `greatest(date, timestamptz)`.
+fn wider_datetime(a: &str, b: &str) -> Option<String> {
+    const LADDER: [&str; 3] = ["date", "timestamp", "timestamptz"];
+    let rank = |t: &str| LADDER.iter().position(|x| *x == t);
+    let (ra, rb) = (rank(a)?, rank(b)?);
+    Some(LADDER[ra.max(rb)].to_string())
+}
+
 /// A branch's value in the CASE / COALESCE common type, where that is a
 /// numeric one the value is not already.
 fn to_common_type(v: Bson, ty: &str) -> Result<Bson> {
+    // A date (its text) meeting a timestamp: the date's midnight.
+    if matches!(ty, "timestamp" | "timestamptz") && matches!(v, Bson::String(_)) {
+        return cast_value(v, ty);
+    }
     if v == Bson::Null || !matches!(ty, "int8" | "numeric" | "float4" | "float8") {
         return Ok(v);
     }
@@ -20699,6 +20817,7 @@ fn plan_select_srf(
         limit,
         offset,
         distinct: plan_distinct(s, &|_| None)?,
+        lock: None,
     })))
 }
 
@@ -31608,10 +31727,13 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         return cast_value(Bson::String(text), &target);
     }
     if let Some(N::MinMaxExpr(m)) = node.node.as_ref() {
+        // Every argument in the common type first (`greatest(date,
+        // timestamptz)` compares and answers timestamptz).
+        let common = common_type(&m.args.iter().collect::<Vec<_>>());
         let args = m
             .args
             .iter()
-            .map(|a| const_value(a, params))
+            .map(|a| to_common_type(const_value(a, params)?, &common))
             .collect::<Result<Vec<_>>>()?;
         let name = if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
             "greatest"
@@ -33368,6 +33490,15 @@ fn lower_scalar_array(
             return Ok(match_nothing());
         }
         let numeric = nonnull.iter().any(|v| needs_numeric_filter(def, &field, v));
+        if op == "="
+            && numeric
+            && !is_timestamp_field(def, &field)
+            && nonnull.iter().all(|v| needs_numeric_filter(def, &field, v))
+        {
+            if let Some(d) = numeric::numeric_in_filter(&field, &nonnull, false) {
+                return Ok(d);
+            }
+        }
         if op == "=" && !numeric {
             // Index-friendly and NULL-correct: `$in` excludes a NULL column.
             return Ok(doc! { &field: { "$in": nonnull } });
@@ -33394,6 +33525,15 @@ fn lower_scalar_array(
         return Ok(Document::new());
     }
     let numeric = nonnull.iter().any(|v| needs_numeric_filter(def, &field, v));
+    if op == "<>"
+        && numeric
+        && !is_timestamp_field(def, &field)
+        && nonnull.iter().all(|v| needs_numeric_filter(def, &field, v))
+    {
+        if let Some(d) = numeric::numeric_in_filter(&field, &nonnull, true) {
+            return Ok(d);
+        }
+    }
     if op == "<>" && !numeric {
         return Ok(doc! { "$and": [
             doc! { &field: { "$nin": nonnull } },
@@ -33447,6 +33587,17 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // per-value arms the numeric case already builds.
     let numeric = is_timestamp_field(def, &field)
         || values.iter().any(|v| needs_numeric_filter(def, &field, v));
+    // A list over a numeric column, every value a numeric operand: one
+    // `$in` per storage form rather than an arm per value.
+    if numeric
+        && !is_timestamp_field(def, &field)
+        && !(negated && saw_null)
+        && values.iter().all(|v| needs_numeric_filter(def, &field, v))
+    {
+        if let Some(d) = numeric::numeric_in_filter(&field, &values, negated) {
+            return Ok(d);
+        }
+    }
     if negated {
         if saw_null {
             // `NOT IN` over a list containing NULL is never true.

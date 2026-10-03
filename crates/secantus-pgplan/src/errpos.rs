@@ -155,10 +155,18 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             }
         }
         "42P01" => {
-            let name = quoted_between(m, "relation ")
+            let full = quoted_between(m, "relation ")
                 .or_else(|| quoted_between(m, "missing FROM-clause entry for table "))?;
-            let name = name.rsplit('.').next()?;
-            pos(toks[ident_at(name)?].start)
+            let name = full.rsplit('.').next()?;
+            match ident_at(name) {
+                Some(i) => pos(toks[i].start),
+                // A relation named by a string (`'t'::regclass`): at the
+                // literal.
+                None => {
+                    let quoted = format!("'{}'", full.replace('\'', "''"));
+                    pos(toks.iter().find(|t| t.text == quoted)?.start)
+                }
+            }
         }
         "42704" => {
             let name = quoted_between(m, "type ")?;
