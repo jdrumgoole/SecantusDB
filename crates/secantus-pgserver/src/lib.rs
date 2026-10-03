@@ -7003,7 +7003,11 @@ impl PgHandler {
         // Keep at least 1 MiB free for this level, moving onto a fresh 16 MiB
         // segment when less is left, so the depth guard above -- not a stack
         // overflow that aborts every connection -- is what stops recursion.
-        stacker::maybe_grow(1024 * 1024, 16 * 1024 * 1024, f)
+        // A body's statements may read its own earlier writes: they never
+        // share the calling statement's semi-join indexes.
+        stacker::maybe_grow(1024 * 1024, 16 * 1024 * 1024, || {
+            secantus_pgplan::with_fresh_subquery_cache(f)
+        })
     }
 
     /// Run one call of a user-defined function.
@@ -31775,15 +31779,24 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                 .iter()
                 .all(|v| matches!(v, Bson::Int32(_) | Bson::Int64(_)))
             {
-                let total: i64 = values
+                // In i128: a `bigint` column's sum is a `numeric` that may
+                // pass i64 -- it wrapped (release) or panicked (debug).
+                let total: i128 = values
                     .iter()
                     .map(|v| match v {
-                        Bson::Int32(x) => i64::from(*x),
-                        Bson::Int64(x) => *x,
+                        Bson::Int32(x) => i128::from(*x),
+                        Bson::Int64(x) => i128::from(*x),
                         _ => 0,
                     })
                     .sum();
-                Bson::Int64(total)
+                match i64::try_from(total) {
+                    Ok(t) => Bson::Int64(t),
+                    Err(_) => {
+                        let text = total.to_string();
+                        secantus_pgplan::numeric::sum_numeric_texts(std::iter::once(text.as_str()))
+                            .unwrap_or(Bson::Null)
+                    }
+                }
             } else {
                 let total: f64 = values
                     .iter()
@@ -34921,7 +34934,8 @@ impl ExtendedQueryHandler for PgHandler {
             _ => {}
         }
         client
-            .send(PgWireBackendMessage::CloseComplete(
+            // Buffered to the Sync / Flush that follows, as ParseComplete is.
+            .feed(PgWireBackendMessage::CloseComplete(
                 pgwire::messages::extendedquery::CloseComplete::new(),
             ))
             .await?;
@@ -34939,6 +34953,9 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Before anything reads the per-thread type registries: this
+        // message may land on a worker that last served another session.
+        self.install_user_types();
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
         let fields =
@@ -35103,7 +35120,8 @@ impl ExtendedQueryHandler for PgHandler {
         );
         pgwire::api::store::PortalStore::put_portal(client.portal_store(), Arc::new(portal));
         client
-            .send(PgWireBackendMessage::BindComplete(
+            // Buffered to the Sync / Flush that follows, as ParseComplete is.
+            .feed(PgWireBackendMessage::BindComplete(
                 pgwire::messages::extendedquery::BindComplete::new(),
             ))
             .await?;
@@ -35149,6 +35167,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.install_user_types();
         self.note_result_format(&target.result_column_format);
         self.check_cached_result_type(target.statement.as_ref())?;
         let param_types = self.param_type_names(target.statement.as_ref());
@@ -35388,6 +35407,9 @@ impl CopyHandler for PgHandler {
             Some(s) => s,
             None => return Ok(()),
         };
+        // The rows are parsed by type here, on whichever worker this
+        // message landed: the session's user types first.
+        self.install_user_types();
 
         use secantus_pgplan::CopyFormat;
         // Every format is parsed into the same shape -- rows of optional

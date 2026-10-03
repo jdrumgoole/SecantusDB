@@ -74,7 +74,7 @@ fn run_direct(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
     match RUNNER.with(|r| r.get()) {
         // SAFETY: set only inside `with_correlated_runner`, whose borrow is
         // still live while the pointer is installed.
-        Some(runner) => unsafe { (*runner)(sql, params) },
+        Some(runner) => semijoin_hash::as_subquery(|| unsafe { (*runner)(sql, params) }),
         None => Err(Error::Unsupported(
             "a correlated subquery evaluated outside a statement's execution".into(),
         )),
