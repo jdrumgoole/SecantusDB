@@ -671,15 +671,6 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
-- [ ] **OPEN — RUST pgserver: psycopg gauge regressed since 2026-09-18
-      (measured batch 48, 2026-10-03).** 5482 passed / 61 failed / 1 error
-      (was 5545 / 1). 60 of the failures fail identically on an origin/main
-      release build, so they predate batch 48: `test_range` /
-      `test_multirange` `test_dump_builtin_empty_wrapper`, `test_string`
-      (`dump_1byte`, `text_array`, `load_1char`) and 4 in `test_errors`.
-      `test_concurrency::test_commit_concurrency` and `test_cancel` failed
-      only under full-suite load and pass in isolation. Bisect which batch
-      introduced each group and fix against PostgreSQL 15.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs

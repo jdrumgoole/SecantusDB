@@ -16369,3 +16369,62 @@ def test_batch47_system_catalog_writes_and_system_indexes(home: Path) -> None:
         assert [(r.ftable(i), r.ftablecol(i)) for i in range(3)] == [(1259, 2), (0, 0), (1259, 1)]
         r = c.execute("select table_name from information_schema.tables limit 1").pgresult
         assert (r.ftable(0), r.ftablecol(0)) == (13897, 3)
+
+
+def test_client_encoding_set_inside_a_block_and_temp_table_diagnostics(home: Path) -> None:
+    """Batch 49, from psycopg's own suite (test_errors). A `SET
+    client_encoding` inside a block that COMMITs keeps the CANONICAL name:
+    kept as typed (`latin9`) it named no encoding, and every error after the
+    block went out as UTF-8 bytes. And a temp table's constraint error names
+    the bare relation in its message and `table_name`, with `pg_temp_N` in
+    `schema_name`, as PostgreSQL 15 does."""
+    with _Server(home) as server, server.connect(autocommit=True) as c:
+        with c.transaction():
+            c.execute("set client_encoding to latin9")
+        assert c.execute("show client_encoding").fetchone() == ("LATIN9",)
+        with pytest.raises(psycopg.errors.UndefinedTable) as exc:
+            c.execute('select * from "€"')
+        assert exc.value.diag.message_primary == 'relation "€" does not exist'
+        c.execute("set client_encoding to utf8")
+        c.execute("create temp table b49_exc (data int constraint b49_eq1 check (data = 1))")
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            c.execute("insert into b49_exc values (2)")
+        diag = exc.value.diag
+        assert diag.table_name == "b49_exc"
+        assert diag.schema_name.startswith("pg_temp_")
+        assert diag.message_primary == (
+            'new row for relation "b49_exc" violates check constraint "b49_eq1"'
+        )
+        c.execute("create temp table b49_u (a int primary key)")
+        c.execute("insert into b49_u values (1)")
+        with pytest.raises(psycopg.errors.UniqueViolation) as exc:
+            c.execute("insert into b49_u values (1)")
+        assert exc.value.diag.table_name == "b49_u"
+        assert exc.value.diag.schema_name.startswith("pg_temp_")
+
+
+def test_a_commit_that_changed_no_catalog_keeps_the_catalog_cache(home: Path) -> None:
+    """Batch 49. Every COMMIT bumped the process-wide catalog version, so the
+    next statement on every connection rebuilt the planner's catalog view
+    from every table definition: psycopg's `test_commit_concurrency` (1000
+    `select; commit`) ran past its 20s timeout on the gauge's store. Measured
+    over 100 tables: 60 `select; commit` took 31.9s, now 0.4s. The bound here
+    is loose (a regression is two orders of magnitude). A block that DID
+    change the catalog still publishes it: another connection sees the table
+    after COMMIT and not after ROLLBACK."""
+    with _Server(home) as server, server.connect(autocommit=True) as a:
+        for n in range(100):
+            a.execute(f"create table b49_t{n} (a int primary key, b text)")
+        with server.connect(autocommit=False) as c:
+            t0 = time.monotonic()
+            for i in range(60):
+                c.execute("select %s", (i,))
+                c.commit()
+            assert time.monotonic() - t0 < 10
+            c.execute("create table b49_new (a int)")
+            c.rollback()
+            with pytest.raises(psycopg.errors.UndefinedTable):
+                a.execute("select * from b49_new")
+            c.execute("create table b49_new (a int)")
+            c.commit()
+            assert a.execute("select count(*) from b49_new").fetchone() == (0,)

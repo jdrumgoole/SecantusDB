@@ -15234,7 +15234,7 @@ impl PgHandler {
                     keys.join(", ")
                 ));
                 info.schema = Some(Self::schema_of(def));
-                info.table = Some(table.to_string());
+                info.table = Some(table.split_once('.').map_or(table, |(_, n)| n).to_string());
                 info.constraint = Some(name);
                 return PgWireError::UserError(Box::new(info));
             }
@@ -15339,8 +15339,18 @@ impl PgHandler {
         // recorded limitation). Real PostgreSQL sends them on a 23505, and
         // pgjdbc surfaces them as
         // `PSQLException.getServerErrorMessage().getConstraint()`.
-        info.table = Some(table.to_string());
-        info.schema = Some("public".to_string());
+        // A temp table's key carries its `pg_temp_N` schema: the table field
+        // names the relation alone, the schema field the namespace.
+        match table.split_once('.') {
+            Some((schema, bare)) => {
+                info.table = Some(bare.to_string());
+                info.schema = Some(schema.to_string());
+            }
+            None => {
+                info.table = Some(table.to_string());
+                info.schema = Some("public".to_string());
+            }
+        }
         info.constraint = Some(name);
         // `column` stays UNSET: PostgreSQL identifies the offending column
         // through the constraint on a 23505, not through this field
@@ -19696,6 +19706,27 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
+            // Whether the block touched the catalog, read BEFORE the control
+            // statement (a COMMIT clears the flag as it publishes).
+            let catalog_touched = self
+                .catalog_changed_in_txn
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || self
+                    .roles_written_in_txn
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                || !self
+                    .uncommitted_types
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+                // A prepared transaction's DDL is published by whichever
+                // session finishes it, which never ran that DDL itself.
+                || matches!(
+                    control,
+                    TransactionControl::Prepare(_)
+                        | TransactionControl::CommitPrepared(_)
+                        | TransactionControl::RollbackPrepared(_)
+                );
             let out = match control {
                 TransactionControl::Savepoint(_)
                 | TransactionControl::Release(_)
@@ -19726,8 +19757,22 @@ impl PgHandler {
             };
             // A COMMIT publishes the block's DDL to every other connection;
             // a ROLLBACK (to a savepoint or of the block) restores rows the
-            // cache may have read past. See `CatalogCache`.
-            bump_catalog_version();
+            // cache may have read past. See `CatalogCache`. Only when the
+            // block touched the catalog: the cache is filled from committed
+            // reads alone (`may_fill_catalog_cache`), so a block that changed
+            // nothing in it leaves nothing to invalidate. Bumping on EVERY
+            // commit made every connection's next statement rebuild the
+            // planner's catalog view from every table definition -- a
+            // `select; commit` loop over a store of a few hundred tables ran
+            // at seconds a statement (psycopg's `test_commit_concurrency`).
+            if catalog_touched {
+                bump_catalog_version();
+                // The block is over: what it changed is published or gone.
+                if matches!(control, TransactionControl::Rollback { .. }) {
+                    self.catalog_changed_in_txn
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             return out;
         }
 
@@ -26919,7 +26964,13 @@ impl PgHandler {
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
                 }
                 if key == "client_encoding" {
-                    self.note_txn_guc(&key, false, &value);
+                    // What a COMMIT keeps is the CANONICAL name: kept as
+                    // typed (`latin9`) it named no encoding the transcoder
+                    // knows, and every message after the block went out
+                    // untranscoded.
+                    let kept = encoding::canonical_name(&value)
+                        .map_or_else(|_| value.clone(), str::to_string);
+                    self.note_txn_guc(&key, false, &kept);
                     // Validated, canonicalised, and reported separately: an
                     // invalid name must be refused (not stored), and the stored
                     // value must be the canonical spelling the client reads back.
@@ -28106,10 +28157,23 @@ impl PgHandler {
         constraint: Option<&str>,
         column: Option<&str>,
     ) -> PgWireError {
+        // A temp (or schema-qualified) table's catalog key carries its
+        // schema; PostgreSQL's message and `table_name` field name the
+        // relation alone, the schema going in its own field.
+        let bare = def
+            .name
+            .split_once('.')
+            .map_or(def.name.as_str(), |(_, n)| n)
+            .to_string();
+        let message = if bare == def.name {
+            message
+        } else {
+            message.replace(&format!("\"{}\"", def.name), &format!("\"{bare}\""))
+        };
         let mut info = ErrorInfo::new("ERROR".into(), code.into(), message);
         info.detail = Some(detail);
         info.schema = Some(Self::schema_of(def));
-        info.table = Some(def.name.clone());
+        info.table = Some(bare);
         info.constraint = constraint.map(str::to_string);
         info.column = column.map(str::to_string);
         PgWireError::UserError(Box::new(info))
