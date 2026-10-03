@@ -11162,6 +11162,23 @@ pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
 
 /// A `char(n)` value as `text`: its trailing blanks stripped, which is the
 /// bpchar-to-text cast every text operation applies first.
+/// `out` with the trailing blanks `source` had and the bpchar cast
+/// trimmed put back, element by element through an array.
+fn restore_bpchar_blanks(source: &Bson, out: Bson) -> Bson {
+    match (source, out) {
+        (Bson::String(src), Bson::String(t)) if src.trim_end_matches(' ') == t => {
+            Bson::String(src.clone())
+        }
+        (Bson::Array(src), Bson::Array(items)) if src.len() == items.len() => Bson::Array(
+            src.iter()
+                .zip(items)
+                .map(|(s, v)| restore_bpchar_blanks(s, v))
+                .collect(),
+        ),
+        (_, out) => out,
+    }
+}
+
 pub(crate) fn trim_bpchar(v: Bson) -> Bson {
     match v {
         Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
@@ -19280,7 +19297,29 @@ fn selected_call_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     if f.agg_star || f.over.is_some() || correlated::user_function_named(&name) {
         return None;
     }
-    let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+    // An untyped string literal is `unknown` to overload resolution (the
+    // empty name), not `text`: `set_byte('x', 0, 1)` is the bytea overload.
+    // Typed as text it matched no overload, and the call fell back to its
+    // (NULL, while describing) value -- `array[set_byte('x', 0, $1)]` was
+    // `text[]`, so `$2::bytea[] = array[...]` was a false 42883.
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                String::new()
+            }
+            _ => static_type(a, &Bson::Null),
+        })
+        .collect();
+    if types.iter().any(String::is_empty) {
+        // Overload selection proper refuses an unknown argument; the one
+        // concrete type every overload accepting these arguments returns is
+        // still the call's type.
+        return funcsig::result_type(&name, &types);
+    }
     funcsig::selected_result_type(&name, &types)
 }
 
@@ -30784,7 +30823,29 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 }
             }
         }
+        let source_value = value.clone();
         let out = cast_value(value, &target)?;
+        // A `bpchar` with NO length keeps its trailing blanks: `chr(32)::bpchar`
+        // is one blank, not the empty string the stored (trimmed) form is.
+        // Expressions trim a bpchar operand where PostgreSQL ignores the
+        // blanks, so only the value as the client sees it changes.
+        let out = if matches!(target.as_str(), "bpchar" | "bpchar[]")
+            && tc
+                .type_name
+                .as_ref()
+                .is_none_or(|tn| declared_typmod(tn) <= 4)
+        {
+            // An array literal's elements, as text, carry the blanks.
+            let source_value = match (&source_value, &out) {
+                (Bson::String(_), Bson::Array(_)) => {
+                    cast_value(source_value.clone(), "text[]").unwrap_or(source_value)
+                }
+                _ => source_value,
+            };
+            restore_bpchar_blanks(&source_value, out)
+        } else {
+            out
+        };
         // An explicit cast to `varchar(n)` / `char(n)` TRUNCATES (silently --
         // only an assignment raises), and `char(n)` pads: `123::char(2)` is
         // `12`, `'ab'::char(4)` is `ab  `.
@@ -31961,6 +32022,18 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 .as_deref()
                 .map(|n| static_type(n, &rhs))
                 .unwrap_or_default();
+            // An untyped literal takes the other side's range type, as
+            // PostgreSQL resolves `'empty' = $1::int4range` (psycopg's
+            // `test_dump_builtin_empty_wrapper`). Read as text it met the
+            // range with no operator at all.
+            let ranged = |t: &str| range::is_range_type(t) || range::is_multirange_type(t);
+            let (lt, rt) = if ranged(&rt) && !ranged(&lt) && unknown_operand(e.lexpr.as_deref()) {
+                (rt.clone(), rt)
+            } else if ranged(&lt) && !ranged(&rt) && unknown_operand(e.rexpr.as_deref()) {
+                (lt.clone(), lt)
+            } else {
+                (lt, rt)
+            };
             if let Some(out) = range_ops::binary(&op, &lhs, &rhs, &lt, &rt) {
                 return out;
             }
