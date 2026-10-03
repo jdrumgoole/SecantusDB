@@ -260,8 +260,12 @@ pub trait ExtendedQueryHandler: Send + Sync {
         };
         let stmt = StoredStatement::parse(client, &message, parser).await?;
         client.portal_store().put_statement(Arc::new(stmt));
+        // SecantusDB local patch: the extended protocol's replies are
+        // BUFFERED until Sync or Flush, as PostgreSQL buffers them -- a
+        // `send` here flushed (one write syscall, one client wakeup) per
+        // message, five per statement.
         client
-            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
 
         Ok(())
@@ -284,7 +288,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
             let portal = Portal::try_new(&message, statement)?;
             client.portal_store().put_portal(Arc::new(portal));
             client
-                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+                .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
                 .await?;
             Ok(())
         } else {
@@ -419,12 +423,12 @@ pub trait ExtendedQueryHandler: Send + Sync {
             }
             if fetch_result.suspended {
                 client
-                    .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
+                    .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended))
                     .await?;
             } else {
                 let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, row_count);
                 client
-                    .send(PgWireBackendMessage::CommandComplete(tag.into()))
+                    .feed(PgWireBackendMessage::CommandComplete(tag.into()))
                     .await?;
             }
         }
@@ -710,12 +714,12 @@ where
 
     if suspended {
         client
-            .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
+            .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended))
             .await?;
     } else {
         let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, rows);
         client
-            .send(PgWireBackendMessage::CommandComplete(tag.into()))
+            .feed(PgWireBackendMessage::CommandComplete(tag.into()))
             .await?;
     }
 
@@ -770,17 +774,17 @@ where
     if let Some(parameter_types) = describe_response.parameters() {
         // parameter type inference
         client
-            .send(PgWireBackendMessage::ParameterDescription(
+            .feed(PgWireBackendMessage::ParameterDescription(
                 ParameterDescription::new(parameter_types.iter().map(|t| t.oid()).collect()),
             ))
             .await?;
     }
     if describe_response.is_no_data() {
-        client.send(PgWireBackendMessage::NoData(NoData)).await?;
+        client.feed(PgWireBackendMessage::NoData(NoData)).await?;
     } else {
         let row_desc = into_row_description(describe_response.fields());
         client
-            .send(PgWireBackendMessage::RowDescription(row_desc))
+            .feed(PgWireBackendMessage::RowDescription(row_desc))
             .await?;
     }
 

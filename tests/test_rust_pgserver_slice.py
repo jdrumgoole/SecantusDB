@@ -15817,3 +15817,130 @@ def test_statement_scoped_settings_and_descriptors(home: Path) -> None:
         assert c.execute(
             "select relpersistence from pg_class where relname = 'b42tt'"
         ).fetchall() == [("t",)]
+
+
+def test_batch47_sql_function_context_and_routine_settings(home: Path) -> None:
+    """An error inside a LANGUAGE sql body carries PostgreSQL's CONTEXT frame:
+    `SQL function "f" during inlining` when the planner inlines the call and
+    folds it over constants (or bound parameters), nothing when an inlined
+    call fails per row, and `SQL function "f" statement N` when the body is
+    run as itself (several statements, a FROM, SECURITY DEFINER, a SET
+    clause, a volatile set-returning function). SECURITY DEFINER runs the
+    body as the owner and a SET clause is in force for the call only; both
+    are recorded in pg_proc at CREATE. Measured on PostgreSQL 15.19."""
+    with _Server(home) as server, server.connect(autocommit=True) as c:
+        for sql in [
+            "create table t (a int)",
+            "insert into t values (0)",
+            "create function f(x int) returns int language sql as 'select 1/x'",
+            "create function g(x int) returns int language sql"
+            " as 'insert into t values (1); select 1/x'",
+            "create function fsd(x int) returns int language sql security definer as 'select 1/x'",
+            "create function ffrom(x int) returns int language sql as 'select 1/x from t limit 1'",
+            "create function srf(x int) returns setof int language sql as 'select 1/x'",
+            "create function srfs(x int) returns setof int language sql stable as 'select 1/x'",
+            "create function outer_sql(x int) returns int language sql as 'select g(x)'",
+            "create function outer2(x int) returns int language sql as 'select 1; select f(x)'",
+            "create function pl(x int) returns int language plpgsql as 'begin return f(x); end'",
+            "create function cs(x int) returns int language sql strict"
+            " as 'select coalesce(1/x, 0)'",
+        ]:
+            c.execute(sql)
+        cases = [
+            ("select f(0)", None, 'SQL function "f" during inlining'),
+            ("select f(%s)", (0,), 'SQL function "f" during inlining'),
+            ("select f(a) from t", None, None),
+            ("select g(0)", None, 'SQL function "g" statement 2'),
+            ("select fsd(0)", None, 'SQL function "fsd" statement 1'),
+            ("select ffrom(0)", None, 'SQL function "ffrom" statement 1'),
+            ("select * from srf(0)", None, 'SQL function "srf" statement 1'),
+            ("select * from srfs(0)", None, None),
+            ("select outer_sql(0)", None, 'SQL function "g" statement 2'),
+            ("select outer2(0)", None, 'SQL function "outer2" statement 2'),
+            ("select pl(0)", None, "PL/pgSQL function pl(integer) line 1 at RETURN"),
+            ("select cs(0)", None, 'SQL function "cs" statement 1'),
+            ("select f(f(0))", None, 'SQL function "f" during inlining'),
+        ]
+        for sql, params, context in cases:
+            with pytest.raises(psycopg.errors.DivisionByZero) as e:
+                c.execute(sql, params)
+            assert e.value.diag.context == context, sql
+        c.execute("create role b47r")
+        c.execute("create table secret (a int)")
+        c.execute("insert into secret values (7)")
+        c.execute(
+            "create function definer() returns int language sql security definer"
+            " as 'select a from secret'"
+        )
+        c.execute("create function invoker() returns int language sql as 'select a from secret'")
+        c.execute(
+            "create function who() returns text language sql security definer"
+            " as 'select current_user::text'"
+        )
+        c.execute(
+            "create function wm() returns text language sql set work_mem = '64kB'"
+            " as 'select current_setting(''work_mem'')'"
+        )
+        assert c.execute(
+            "select prosecdef, proconfig from pg_proc where proname = 'wm'"
+        ).fetchone() == (False, ["work_mem=64kB"])
+        assert c.execute("select prosecdef from pg_proc where proname = 'who'").fetchone() == (
+            True,
+        )
+        c.execute("grant execute on function definer(), invoker(), who() to b47r")
+        owner = c.execute("select current_user").fetchone()[0]
+        c.execute("set role b47r")
+        assert c.execute("select who(), current_user").fetchone() == (owner, "b47r")
+        assert c.execute("select definer()").fetchone() == (7,)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege) as e:
+            c.execute("select invoker()")
+        assert e.value.diag.context == 'SQL function "invoker" statement 1'
+        c.execute("reset role")
+        assert c.execute("select wm(), current_setting('work_mem')").fetchone() == ("64kB", "4MB")
+
+
+def test_batch47_system_catalog_writes_and_system_indexes(home: Path) -> None:
+    """Writing a system catalog no longer answers a silent `UPDATE 0` (or,
+    for INSERT, creates a stored table no catalog query reads): an UPDATE
+    that leaves every matched row as it is reports the rows, as PostgreSQL
+    does (pgjdbc's updatable result set writes pg_class back like this), and
+    any real change is refused 0A000. pg_index / pg_indexes /
+    pg_get_indexdef carry PostgreSQL 15.19's own 162 indexes."""
+    with _Server(home) as server, server.connect(autocommit=True) as c:
+        assert (
+            c.execute(
+                "update pg_class set relname = %s where oid = %s", ("pg_class", 1259)
+            ).rowcount
+            == 1
+        )
+        assert c.execute("delete from pg_class where relname = 'no such'").rowcount == 0
+        for sql in [
+            "update pg_class set relname = 'x' where oid = 1259",
+            "delete from pg_class where oid = 1259",
+            "insert into pg_am (oid, amname) values (99999, 'x')",
+        ]:
+            with pytest.raises(psycopg.errors.FeatureNotSupported):
+                c.execute(sql)
+        assert c.execute("select count(*) from pg_index where indexrelid < 16384").fetchone() == (
+            162,
+        )
+        assert c.execute(
+            "select indnatts, indisunique, indkey::text, indclass::text"
+            " from pg_index where indexrelid = 'pg_class_relname_nsp_index'::regclass"
+        ).fetchone() == (2, True, "2 3", "10028 1981")
+        assert c.execute(
+            "select pg_get_indexdef('pg_toast.pg_toast_2600_index'::regclass)"
+        ).fetchone() == (
+            "CREATE UNIQUE INDEX pg_toast_2600_index ON pg_toast.pg_toast_2600"
+            " USING btree (chunk_id, chunk_seq)",
+        )
+        assert c.execute(
+            "select tablespace, count(*) from pg_indexes where schemaname = 'pg_catalog'"
+            " group by 1 order by 1 nulls last"
+        ).fetchall() == [("pg_global", 19), (None, 103)]
+        # A catalog column is described with PostgreSQL's relation oid and
+        # attnum (ftable / ftablecol), as for any table column.
+        r = c.execute("select relname, 1 as x, oid from pg_class limit 1").pgresult
+        assert [(r.ftable(i), r.ftablecol(i)) for i in range(3)] == [(1259, 2), (0, 0), (1259, 1)]
+        r = c.execute("select table_name from information_schema.tables limit 1").pgresult
+        assert (r.ftable(0), r.ftablecol(0)) == (13897, 3)
