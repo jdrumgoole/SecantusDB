@@ -693,13 +693,18 @@ remain open:
         15's answers). An xid is assigned when asked for, not at a
         transaction's first write: a writer that never asks is absent from
         others' snapshots (only the snapshot functions can see it).
-      - **Open: memory of a portal inside a block.** An extended-protocol
-        SELECT inside a transaction block, and any SQL `DECLARE CURSOR`,
-        still materialise the whole result (batch 48 streams only outside a
-        block): a block's snapshot lives on the block's own WiredTiger
-        session, which a reader thread cannot share, and sessions are
-        thread-affine. Size: a portal state machine over the block's session
-        resumed per Execute on the connection's thread -- days.
+      - **Fixed in batch 51: memory of a portal inside a block.** A plain
+        one-table SELECT run as an extended portal in a block, and a
+        `DECLARE CURSOR` (WITH HOLD or not) over one, read a batch per fetch
+        through the block's own transaction (`portal_stream::BlockScan`,
+        `CursorTail`; a session may be used by one thread at a time, so no
+        dedicated thread is needed). 100,000 rows of 2 KB fetched 1,000 at a
+        time: server RSS growth 668 -> 16 MB (portal), 895 -> 24 MB
+        (cursor), 695 -> 24 MB (WITH HOLD). Any statement other than FETCH /
+        MOVE / CLOSE first reads open ones whole (as before), and so does
+        COMMIT for a WITH HOLD cursor -- PostgreSQL materialises it there
+        too. Left: joins, ORDER BY, aggregates and other shapes still
+        materialise.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -806,8 +811,10 @@ remain open:
         VALUES up into constants and says `during inlining`; here the
         column is per-row, no CONTEXT. Diagnostic text only; size: the
         planner would have to know a column's source is a one-row VALUES.
-      - `pg_collation_for(x)` over a non-collatable type answers NULL where
-        PostgreSQL raises 42804 when evaluated.
+      - `pg_collation_for(x)` diverges in three ways (batch 51): over a
+        non-collatable type it answers NULL where PostgreSQL raises 42804;
+        its result column is misnamed; and over an unknown literal it
+        answers NULL where PostgreSQL answers "default".
       - The `SQL expression` frame of a PL/pgSQL error follows an
         approximation of PL/pgSQL's simple-expression rule (as before).
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
@@ -958,17 +965,35 @@ remain open:
         wait and re-read; `NOWAIT` is 55P03; `SKIP LOCKED` leaves held rows
         out before LIMIT; the locks survive the block being moved after a
         later conflict (`relock_row`).
-      Left, each a narrower case of the above:
-      - FOR UPDATE over a join, a subquery or a view locks nothing (0 rows
-        locked, the old behaviour); `FOR SHARE` / `FOR KEY SHARE` take no
-        lock (a shared lock must not block another, which a WiredTiger write
-        lock would). Size: a day for the join / view forms.
-      - ROLLBACK TO keeps the rewrite (rows still held, 40001 on a row
-        another session committed) where the move is not invisible: under
-        REPEATABLE READ (the move takes a new snapshot), inside a PL/pgSQL
-        EXCEPTION block, a table created after the savepoint, a block with
-        DDL in its write set, or one holding a row lock with no oplog entry
-        (an unchanging UPDATE, FOR UPDATE).
+      **Batch 51 (2026-10-03)** closed the next two residuals, each pinned by
+      a `test_batch51_*` slice test whose assertions also pass on PostgreSQL
+      15.19 (and a 30-scenario multi-session probe, all equal except the
+      pre-existing READ COMMITTED-after-a-write snapshot below):
+      - **Shared row locks.** `FOR SHARE` / `FOR KEY SHARE` take a shared
+        lock (`secantus_storage::share_locks`, a process-wide table a write
+        checks as it notes its row): sharers coexist, a writer and FOR
+        UPDATE wait, PostgreSQL's conflict table (KEY SHARE blocks only a
+        DELETE, a key-column UPDATE and FOR UPDATE), NOWAIT / SKIP LOCKED /
+        40P01, ROLLBACK TO lets go of one taken after the savepoint.
+      - **Locking joins, FROM-subqueries and views** lock the base rows
+        behind the rows returned (`secantus_pgplan::lock_targets`, matched
+        by primary key, else by every column carried), honour `OF`, skip a
+        WITH query's rows (`OF w` is 0A000), and give PostgreSQL's 0A000 /
+        42P01 for DISTINCT, GROUP BY, HAVING, aggregates, windows, UNION,
+        the nullable side of an outer join and an unknown `OF` (corpus
+        `b51_row_locks`).
+      - **ROLLBACK TO moves** under REPEATABLE READ (when nothing committed
+        since the snapshot), with row locks taken unchanged (the ones from
+        before the savepoint taken again), with DDL before the savepoint and
+        a table created after it. Where it still rewrites (a PL/pgSQL
+        EXCEPTION block, RR after a commit), it writes only the rows that
+        differ, so another session's commit no longer makes it 40001.
+      Left:
+      - A PL/pgSQL EXCEPTION block's undone rows stay held (the rewrite runs
+        inside the running statement's transaction).
+      - A FOR UPDATE over a table with no primary key, through a subquery
+        that does not carry every column, locks every row equal in the
+        columns it carries.
       - REPEATABLE READ answers 40001 after the wait when ANY transaction
         committed since its snapshot, where PostgreSQL goes on unless the
         ROW changed: WiredTiger cannot continue a transaction after a
@@ -1272,6 +1297,15 @@ These work end-to-end but cut corners.
       where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
       general per-statement target; the protocol work above has taken the
       extended path as far as it goes cheaply.
+
+      **Batch 51 (2026-10-03)**, release builds of base (`34aedc33`) and
+      batch 51, `bench43.py`, two interleaved runs, load ~11: no change
+      either way (ping 19.3 / 19.3-19.6, simple `select 1` 30.6 / 30.2-30.6,
+      extended `select 1` 43.2-43.5 / 43.2, PK read 53.6-55.0 / 53.2,
+      autocommit UPDATE 73.6-74.6 / 73.2-74.8 us; PG 15: 17.8, 22.9, 26.5,
+      33.3, 54.0). The batch's per-statement additions (the open-portal
+      check, the key-strength test of an UPDATE) are below the noise. No
+      bottleneck was worked this batch; the gap stands as measured.
 
       **Batch 50 (2026-10-03)**, release builds of the base (`HEAD`
       971579bc) and of batch 50, `bench43.py`, two interleaved runs, PG 15
@@ -7489,6 +7523,11 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       `$nin` per storage form instead of an arm per value (`numeric_in_filter`;
       `InSets` now hashes Decimal128 too, pinned by
       `hashed_lists_agree_with_the_ordinary_path`).
+      Re-timed batch 51 (release, 2,000 x 2,000, PG 15 alongside): inner
+      ORDER BY ... LIMIT 1 0.293 s (PG 0.131), count(DISTINCT) 0.008 s
+      (0.128), grouping 0.307 s (0.127), `sum` / `avg` under a filter 1.18 s
+      (0.145), and a NESTED correlated EXISTS 35.8 s (0.128) -- the nested
+      shape is the one worth working next.
       Still per outer value (each answer unchanged, only slower): an inner
       ORDER BY (`... ORDER BY y DESC LIMIT 1`: 0.29 s, PG 0.125 s), grouping
       or DISTINCT inside (0.31 s, PG 0.12 s), `sum` / `avg` under a filter,

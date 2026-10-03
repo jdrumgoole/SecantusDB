@@ -66,18 +66,60 @@ pub fn forget(pid: i32) {
         .remove(&pid);
 }
 
-/// The sessions other than `pid` whose open transaction holds `row`.
-pub fn holders_of(row: &WrittenRow, pid: i32) -> Vec<i32> {
+/// The lock strength the row wait of this thread is for: a statement that
+/// raises a conflict sets it (`set_wait_strength`) and the wait reads it
+/// once (`take_wait_strength`). A plain write's wait is FOR NO KEY UPDATE.
+type Strength = secantus_pgplan::RowLockStrength;
+
+thread_local! {
+    static WAIT_STRENGTH: std::cell::Cell<Option<Strength>> = const { std::cell::Cell::new(None) };
+}
+
+/// The next row wait of this thread is for a lock of `s`.
+pub fn set_wait_strength(s: Strength) {
+    WAIT_STRENGTH.with(|w| w.set(Some(s)));
+}
+
+/// The strength the current row wait is for (see `set_wait_strength`).
+pub fn wait_strength() -> Strength {
+    WAIT_STRENGTH.with(std::cell::Cell::get).unwrap_or(
+        if secantus_storage::share_locks::key_write_now() {
+            Strength::Update
+        } else {
+            Strength::NoKeyUpdate
+        },
+    )
+}
+
+/// The row wait is over.
+pub fn clear_wait_strength() {
+    WAIT_STRENGTH.with(|w| w.set(None));
+}
+
+/// Does a transaction holding `h` hold `row` in a mode a lock of `want`
+/// conflicts with? PostgreSQL's row-lock conflict table: KEY SHARE
+/// conflicts only with UPDATE; SHARE with NO KEY UPDATE and UPDATE; NO KEY
+/// UPDATE with SHARE and up; UPDATE with everything. A written row is held
+/// FOR NO KEY UPDATE, or FOR UPDATE when the write was a key-strength one.
+fn conflicts(h: &secantus_storage::Held, row: &WrittenRow, want: Strength) -> bool {
+    use secantus_storage::share_locks::ShareMode;
+    let shared = h.shared.get(row).copied();
+    match want {
+        Strength::KeyShare => h.key_rows.contains(row),
+        Strength::Share => h.rows.contains(row),
+        Strength::NoKeyUpdate => h.rows.contains(row) || shared == Some(ShareMode::Share),
+        Strength::Update => h.rows.contains(row) || shared.is_some(),
+    }
+}
+
+/// The sessions other than `pid` whose open transaction holds `row` in a
+/// mode a lock of `want` conflicts with.
+pub fn holders_in_mode(row: &WrittenRow, pid: i32, want: Strength) -> Vec<i32> {
     let map = holders().lock().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<i32> = map
         .iter()
         .filter(|(p, rows)| {
-            **p != pid
-                && rows
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .rows
-                    .contains(row)
+            **p != pid && conflicts(&rows.lock().unwrap_or_else(|e| e.into_inner()), row, want)
         })
         .map(|(p, _)| *p)
         .collect();
