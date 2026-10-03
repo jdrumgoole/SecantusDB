@@ -5849,12 +5849,12 @@ def test_boolean_casts_exist_only_for_integer_and_text(home: Path) -> None:
 
 def test_pg_prepared_statements_lists_protocol_prepared_statements(home: Path) -> None:
     """`pg_prepared_statements` shows the connection's NAMED protocol-level
-    statements with PG's columns: `parameter_types` as regtype display names,
-    `result_types` NULL for a statement that returns no rows, `from_sql`
-    false, and a statement without parameters counted as one generic plan
-    where a parameterised one counts as one custom plan (psycopg executes
-    once at prepare time). The unnamed statement never appears. Probed PG 16
-    with psycopg 3.3 / libpq 18."""
+    statements with PostgreSQL 15's columns (16's `result_types` is not one):
+    `parameter_types` as regtype display names, `from_sql` false, and a
+    statement without parameters counted as one generic plan where a
+    parameterised one counts as one custom plan (psycopg executes once at
+    prepare time). The unnamed statement never appears. Probed PG 16 with
+    psycopg 3.3 / libpq 18; the column set re-measured on PG 15.19."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("create table pp (id serial primary key, num int, s text, j jsonb)")
@@ -5869,7 +5869,7 @@ def test_pg_prepared_statements_lists_protocol_prepared_statements(home: Path) -
         cur.execute("select 1", prepare=True)
         cur.execute("select 2", prepare=False)
         cur.execute(
-            "select name, statement, parameter_types, result_types, from_sql, "
+            "select name, statement, parameter_types, from_sql, "
             "generic_plans, custom_plans from pg_prepared_statements order by name"
         )
         assert cur.fetchall() == [
@@ -5877,14 +5877,13 @@ def test_pg_prepared_statements_lists_protocol_prepared_statements(home: Path) -
                 "_pg3_0",
                 "select num + $1::smallint, s || $2 from pp",
                 ["smallint", "text"],
-                ["integer", "text"],
                 False,
                 0,
                 1,
             ),
-            ("_pg3_1", "update pp set num = $1", ["smallint"], None, False, 0, 1),
-            ("_pg3_2", "insert into pp (j) values ($1)", ["jsonb"], None, False, 0, 1),
-            ("_pg3_3", "select 1", [], ["integer"], False, 1, 0),
+            ("_pg3_1", "update pp set num = $1", ["smallint"], False, 0, 1),
+            ("_pg3_2", "insert into pp (j) values ($1)", ["jsonb"], False, 0, 1),
+            ("_pg3_3", "select 1", [], False, 1, 0),
         ]
         cur.execute("select * from pg_prepared_statements")
         assert [(d.name, d.type_code) for d in cur.description] == [
@@ -5892,7 +5891,6 @@ def test_pg_prepared_statements_lists_protocol_prepared_statements(home: Path) -
             ("statement", 25),
             ("prepare_time", 1184),
             ("parameter_types", 2211),
-            ("result_types", 2211),
             ("from_sql", 16),
             ("generic_plans", 20),
             ("custom_plans", 20),
@@ -8960,6 +8958,433 @@ def test_concurrent_blocks_neither_lose_nor_duplicate_writes(home: Path) -> None
         assert rows[0] == sessions * rounds
         assert sum(rows[k] for k in range(1, sessions + 1)) == sessions * rounds
         assert inserted == (sessions * rounds,)
+
+
+def test_a_chain_of_row_waits_is_not_a_deadlock(home: Path) -> None:
+    """C waits for A's row while A waits for B's: a chain, not a cycle.
+    The wait used to be on EVERY writing session, so A's wait counted C and
+    C's counted A, and one of them got 40P01 after `deadlock_timeout`.
+    PostgreSQL 15 waits on the row's holder only: both wait out B, and the
+    rows are PostgreSQL 15's `(1,11),(2,11),(3,1)`."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _block_conflict_setup(a, b, "ch_w")
+        a.execute("insert into ch_w values (3, 0)")
+        a.execute("begin")
+        a.execute("update ch_w set n = n + 1 where id = 1")
+        c.execute("begin")
+        c.execute("update ch_w set n = n + 1 where id = 3")
+        outcome: dict[str, str] = {}
+
+        def run(name: str, conn: psycopg.Connection, sql: str) -> None:
+            outcome[name] = _sqlstate(conn, sql) or "ok"
+
+        ta = threading.Thread(target=run, args=("a", a, "update ch_w set n = n + 10 where id = 2"))
+        ta.start()
+        time.sleep(0.3)
+        tc = threading.Thread(target=run, args=("c", c, "update ch_w set n = n + 10 where id = 1"))
+        tc.start()
+        # Well past `deadlock_timeout` (1s) for both waiters.
+        time.sleep(2.0)
+        assert ta.is_alive() and tc.is_alive(), outcome
+        b.execute("commit")
+        ta.join(10)
+        assert outcome["a"] == "ok"
+        a.execute("commit")
+        tc.join(10)
+        assert outcome["c"] == "ok"
+        c.execute("commit")
+        assert a.execute("select id, n from ch_w order by id").fetchall() == [
+            (1, 11),
+            (2, 11),
+            (3, 1),
+        ]
+
+
+def test_a_cycle_through_a_trigger_written_row_is_a_deadlock(home: Path) -> None:
+    """A's row in `tr_log` was written by a TRIGGER, not by A's own
+    statement; B waits for it and A then waits for B's row. The trigger's
+    write is in A's write set, so the cycle is seen and one session gets
+    40P01 -- the other goes on, as on PostgreSQL 15."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table tr_t (id int primary key, n int)")
+        a.execute("create table tr_log (id int primary key, n int)")
+        a.execute("insert into tr_t values (1, 0), (2, 0)")
+        a.execute("insert into tr_log values (1, 0)")
+        a.execute("create table tr_o (id int primary key, n int)")
+        a.execute("insert into tr_o values (1, 0)")
+        a.execute(
+            "create function tr_bump() returns trigger language plpgsql as "
+            "'begin update tr_log set n = n + 1 where id = 1; return new; end'"
+        )
+        a.execute(
+            "create trigger tr_trg after update on tr_t for each row execute function tr_bump()"
+        )
+        b.execute("begin")
+        b.execute("update tr_o set n = n + 1 where id = 1")
+        a.execute("begin")
+        a.execute("update tr_t set n = n + 1 where id = 1")  # the trigger writes tr_log 1
+        outcome: dict[str, str] = {}
+
+        def run(name: str, conn: psycopg.Connection, sql: str) -> None:
+            outcome[name] = _sqlstate(conn, sql) or "ok"
+
+        tb = threading.Thread(
+            target=run, args=("b", b, "update tr_log set n = n + 100 where id = 1")
+        )
+        tb.start()
+        time.sleep(0.3)
+        ta = threading.Thread(target=run, args=("a", a, "update tr_o set n = n + 10 where id = 1"))
+        ta.start()
+        ta.join(10)
+        tb.join(10)
+        assert sorted(outcome.values()) == ["40P01", "ok"], outcome
+        for name, conn in (("a", a), ("b", b)):
+            conn.execute("rollback" if outcome[name] == "40P01" else "commit")
+        log = a.execute("select n from tr_log").fetchone()
+        # No write was lost or doubled: the counters agree with who committed.
+        if outcome["a"] == "ok":
+            assert a.execute("select n from tr_t where id = 1").fetchone() == (1,)
+            assert a.execute("select n from tr_o").fetchone() == (10,)
+            assert log == (1,)
+        else:
+            assert a.execute("select n from tr_t where id = 1").fetchone() == (0,)
+            assert a.execute("select n from tr_o").fetchone() == (1,)
+            assert log == (100,)
+
+
+def test_a_cycle_through_a_cascaded_delete_is_a_deadlock(home: Path) -> None:
+    """A's DELETE of a parent cascades to a child row; B waits to update
+    that child row, then A waits for B's row: a real cycle through a row
+    only the FK cascade wrote, so one session gets 40P01."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table fk_p (id int primary key)")
+        a.execute(
+            "create table fk_c (id int primary key, p int references fk_p on delete cascade, n int)"
+        )
+        a.execute("create table fk_o (id int primary key, n int)")
+        a.execute("insert into fk_p values (1)")
+        a.execute("insert into fk_c values (10, 1, 0)")
+        a.execute("insert into fk_o values (1, 0)")
+        b.execute("begin")
+        b.execute("update fk_o set n = n + 1 where id = 1")
+        a.execute("begin")
+        a.execute("delete from fk_p where id = 1")  # cascades to fk_c 10
+        outcome: dict[str, str] = {}
+
+        def run(name: str, conn: psycopg.Connection, sql: str) -> None:
+            outcome[name] = _sqlstate(conn, sql) or "ok"
+
+        tb = threading.Thread(target=run, args=("b", b, "update fk_c set n = n + 1 where id = 10"))
+        tb.start()
+        time.sleep(0.3)
+        ta = threading.Thread(target=run, args=("a", a, "update fk_o set n = n + 10 where id = 1"))
+        ta.start()
+        ta.join(10)
+        tb.join(10)
+        assert sorted(outcome.values()) == ["40P01", "ok"], outcome
+        for name, conn in (("a", a), ("b", b)):
+            conn.execute("rollback" if outcome[name] == "40P01" else "commit")
+        if outcome["a"] == "ok":
+            assert a.execute("select count(*) from fk_c").fetchone() == (0,)
+            assert a.execute("select n from fk_o").fetchone() == (10,)
+        else:
+            assert a.execute("select n from fk_c").fetchone() == (1,)
+            assert a.execute("select n from fk_o").fetchone() == (1,)
+
+
+_PG15_CATALOG_COLUMNS = {
+    "pg_class": "oid,relname,relnamespace,reltype,reloftype,relowner,relam,relfilenode,"
+    "reltablespace,relpages,reltuples,relallvisible,reltoastrelid,relhasindex,relisshared,"
+    "relpersistence,relkind,relnatts,relchecks,relhasrules,relhastriggers,relhassubclass,"
+    "relrowsecurity,relforcerowsecurity,relispopulated,relreplident,relispartition,relrewrite,"
+    "relfrozenxid,relminmxid,relacl,reloptions,relpartbound",
+    "pg_attribute": "attrelid,attname,atttypid,attstattarget,attlen,attnum,attndims,"
+    "attcacheoff,atttypmod,attbyval,attalign,attstorage,attcompression,attnotnull,atthasdef,"
+    "atthasmissing,attidentity,attgenerated,attisdropped,attislocal,attinhcount,attcollation,"
+    "attacl,attoptions,attfdwoptions,attmissingval",
+    "pg_type": "oid,typname,typnamespace,typowner,typlen,typbyval,typtype,typcategory,"
+    "typispreferred,typisdefined,typdelim,typrelid,typsubscript,typelem,typarray,typinput,"
+    "typoutput,typreceive,typsend,typmodin,typmodout,typanalyze,typalign,typstorage,typnotnull,"
+    "typbasetype,typtypmod,typndims,typcollation,typdefaultbin,typdefault,typacl",
+    "pg_proc": "oid,proname,pronamespace,proowner,prolang,procost,prorows,provariadic,"
+    "prosupport,prokind,prosecdef,proleakproof,proisstrict,proretset,provolatile,proparallel,"
+    "pronargs,pronargdefaults,prorettype,proargtypes,proallargtypes,proargmodes,proargnames,"
+    "proargdefaults,protrftypes,prosrc,probin,prosqlbody,proconfig,proacl",
+    "pg_trigger": "oid,tgrelid,tgparentid,tgname,tgfoid,tgtype,tgenabled,tgisinternal,"
+    "tgconstrrelid,tgconstrindid,tgconstraint,tgdeferrable,tginitdeferred,tgnargs,tgattr,"
+    "tgargs,tgqual,tgoldtable,tgnewtable",
+    "pg_database": "oid,datname,datdba,encoding,datlocprovider,datistemplate,datallowconn,"
+    "datconnlimit,datfrozenxid,datminmxid,dattablespace,datcollate,datctype,daticulocale,"
+    "datcollversion,datacl",
+    "pg_namespace": "oid,nspname,nspowner,nspacl",
+    "pg_index": "indexrelid,indrelid,indnatts,indnkeyatts,indisunique,indnullsnotdistinct,"
+    "indisprimary,indisexclusion,indimmediate,indisclustered,indisvalid,indcheckxmin,"
+    "indisready,indislive,indisreplident,indkey,indcollation,indclass,indoption,indexprs,indpred",
+    "pg_roles": "rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,"
+    "rolreplication,rolconnlimit,rolpassword,rolvaliduntil,rolbypassrls,rolconfig,oid",
+    "pg_authid": "oid,rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,"
+    "rolreplication,rolbypassrls,rolconnlimit,rolpassword,rolvaliduntil",
+    "pg_enum": "oid,enumtypid,enumsortorder,enumlabel",
+    "pg_language": "oid,lanname,lanowner,lanispl,lanpltrusted,lanplcallfoid,laninline,"
+    "lanvalidator,lanacl",
+    "pg_prepared_statements": "name,statement,prepare_time,parameter_types,from_sql,"
+    "generic_plans,custom_plans",
+}
+
+
+def test_select_star_over_catalogs_has_pg15_columns(home: Path) -> None:
+    """`SELECT *` over a system catalog has PostgreSQL 15's columns in its
+    order (measured from 15.19's pg_attribute): a client reading by position
+    sees what it would see there. pg_class lacked relfrozenxid / relminmxid
+    and ordered its columns differently; pg_database carried 16's
+    daticurules; pg_attribute, pg_type, pg_proc, pg_trigger lacked columns."""
+    with _Server(home) as server, server.connect() as conn:
+        for rel, expected in _PG15_CATALOG_COLUMNS.items():
+            cur = conn.execute(f"select * from {rel} limit 0")
+            assert ",".join(d.name for d in cur.description) == expected, rel
+
+
+def test_a_reused_plan_takes_each_executions_values(home: Path) -> None:
+    """A prepared statement's plan is reused with the new values substituted
+    (`plan_cache`), never with the old ones: every answer is PostgreSQL 15's,
+    across value types, NULL, a char(n) padding, a LIKE (never templated),
+    an UPDATE / DELETE, a LIMIT parameter, a DDL change in between, and a
+    role whose row-level security sees other rows."""
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table pc_t (k int primary key, v text, c char(5), s smallint, f float8)")
+        for i in range(10):
+            c.execute(
+                "insert into pc_t values (%s, %s, %s, %s, %s)",
+                (i, f"v{i}", f"c{i}", i, i * 1.5),
+                prepare=True,
+            )
+
+        def q(sql: str, *args: object) -> list[tuple]:
+            return c.execute(sql, args, prepare=True).fetchall()
+
+        assert [q("select v from pc_t where k = %s", i) for i in (1, 2, 99, 70000, -1)] == [
+            [("v1",)],
+            [("v2",)],
+            [],
+            [],
+            [],
+        ]
+        assert [
+            q("select k from pc_t where c = %s::char(5)", v) for v in ("c1", "c2  ", " c3")
+        ] == [
+            [(1,)],
+            [(2,)],
+            [],
+        ]
+        assert [q("select k from pc_t where v = %s", v) for v in ("v1", "V3", "v4 ")] == [
+            [(1,)],
+            [],
+            [],
+        ]
+        assert [q("select k from pc_t where f = %s", v) for v in (1.5, 4.5, 4.4)] == [
+            [(1,)],
+            [(3,)],
+            [],
+        ]
+        assert [q("select k from pc_t where k = %s", v) for v in (None, 3, None)] == [
+            [],
+            [(3,)],
+            [],
+        ]
+        assert [q("select k from pc_t where v like %s order by k", v) for v in ("v1%", "v_")] == [
+            [(1,)],
+            [(i,) for i in range(10)],
+        ]
+        assert [q("select k from pc_t order by k limit %s", n) for n in (2, 3)] == [
+            [(0,), (1,)],
+            [(0,), (1,), (2,)],
+        ]
+        for i in range(3):
+            c.execute("update pc_t set v = %s where k = %s", (f"u{i}", i), prepare=True)
+        for i in range(3):
+            c.execute("delete from pc_t where k = %s", (i + 7,), prepare=True)
+        assert q("select k, v from pc_t order by k") == [
+            (0, "u0"),
+            (1, "u1"),
+            (2, "u2"),
+            (3, "v3"),
+            (4, "v4"),
+            (5, "v5"),
+            (6, "v6"),
+        ]
+        # A DDL change between two executions is seen.
+        c.execute("alter table pc_t rename column v to w")
+        assert q("select w from pc_t where k = %s", 4) == [("v4",)]
+        c.execute("create index pc_t_s on pc_t (s)")
+        assert [q("select k from pc_t where s = %s", n) for n in (5, 6)] == [[(5,)], [(6,)]]
+        # A view's function is evaluated per execution, not frozen into a
+        # reused plan.
+        c.execute("create view pc_now as select k, clock_timestamp() as t from pc_t")
+        stamps = []
+        for _ in range(3):
+            stamps.append(q("select t from pc_now where k = %s", 4)[0][0])
+            time.sleep(0.01)
+        assert len(set(stamps)) == 3
+        # A role under row-level security plans its own filter.
+        c.execute("create role pc_r")
+        c.execute("grant select on pc_t to pc_r")
+        c.execute("alter table pc_t enable row level security")
+        c.execute("create policy pc_p on pc_t for select to pc_r using (k < 4)")
+        assert [q("select k from pc_t where k >= %s order by k", 3)] == [[(3,), (4,), (5,), (6,)]]
+        c.execute("set role pc_r")
+        assert [q("select k from pc_t where k >= %s order by k", 3)] == [[(3,)]]
+        c.execute("reset role")
+        assert [q("select k from pc_t where k >= %s order by k", 3)] == [[(3,), (4,), (5,), (6,)]]
+        # A value bound for storage is checked against its column on every
+        # execution, however many came before it.
+        c.execute("create table pc_v (k int primary key, vc varchar(8), n int)")
+        c.execute("insert into pc_v values (1, 'a', 0)")
+
+        def state(sql: str, *args: object) -> str | None:
+            try:
+                c.execute(sql, args, prepare=True)
+            except psycopg.Error as e:
+                return e.sqlstate
+            return None
+
+        assert [state("update pc_v set vc = %s where k = 1", v) for v in ("ab", "cd", "x" * 9)] == [
+            None,
+            None,
+            "22001",
+        ]
+        assert [state("update pc_v set n = %s where k = 1", v) for v in (5, 6, 2**40)] == [
+            None,
+            None,
+            "22003",
+        ]
+        assert [
+            state("insert into pc_v values (%s, %s, 0)", k, v)
+            for k, v in ((2, "a"), (3, "b"), (4, "y" * 9))
+        ] == [None, None, "22001"]
+        assert q("select k, vc, n from pc_v order by k") == [(1, "cd", 6), (2, "a", 0), (3, "b", 0)]
+
+
+def test_a_portal_outside_a_block_streams_from_one_snapshot(home: Path) -> None:
+    """A SELECT fetched in pieces (Execute with a row cap) outside a block is
+    streamed from a reader thread over one snapshot: a row another session
+    inserts between two fetches is not in the result, the pieces and tags
+    are PostgreSQL 15's, and after Sync the unnamed portal is gone (34000).
+    Inside a block the portal reads the block's own snapshot as before."""
+    import socket
+    import struct
+
+    def msg(t: bytes, body: bytes) -> bytes:
+        return t + struct.pack("!I", len(body) + 4) + body
+
+    def cstr(x: str) -> bytes:
+        return x.encode() + b"\0"
+
+    class Raw:
+        def __init__(self, port: int) -> None:
+            self.s = socket.create_connection(("127.0.0.1", port))
+            self.buf = b""
+            body = (
+                struct.pack("!I", 196608)
+                + cstr("user")
+                + cstr("test")
+                + cstr("database")
+                + cstr("postgres")
+                + b"\0"
+            )
+            self.s.sendall(struct.pack("!I", len(body) + 4) + body)
+            self.until(b"Z")
+
+        def one(self) -> tuple[bytes, bytes]:
+            while len(self.buf) < 5:
+                self.buf += self.s.recv(65536)
+            n = struct.unpack("!I", self.buf[1:5])[0]
+            while len(self.buf) < 1 + n:
+                self.buf += self.s.recv(65536)
+            m = (self.buf[:1], self.buf[5 : 1 + n])
+            self.buf = self.buf[1 + n :]
+            return m
+
+        def until(self, *ends: bytes) -> list[tuple[bytes, bytes]]:
+            out = []
+            while True:
+                m = self.one()
+                if m[0] in (b"N", b"S", b"K"):
+                    continue
+                out.append(m)
+                if m[0] in ends:
+                    return out
+
+    def count(ms: list[tuple[bytes, bytes]]) -> int:
+        return sum(1 for t, _ in ms if t == b"D")
+
+    def tags(ms: list[tuple[bytes, bytes]]) -> list[str]:
+        return [
+            t.decode() + (":" + b[:-1].decode() if t == b"C" else "") for t, b in ms if t != b"D"
+        ]
+
+    def start(sql: str, n: int) -> bytes:
+        return (
+            msg(b"P", cstr("") + cstr(sql) + struct.pack("!H", 0))
+            + msg(b"B", cstr("") + cstr("") + struct.pack("!HHH", 0, 0, 0))
+            + msg(b"E", cstr("") + struct.pack("!I", n))
+        )
+
+    with _Server(home) as server, server.connect() as setup:
+        setup.execute("create table st_t (k int, v text)")
+        setup.execute("insert into st_t select g, 'v' || g from generate_series(1, 1000) g")
+        c = Raw(server.port)
+        c.s.sendall(start("select k, v from st_t", 300) + msg(b"H", b""))
+        a = c.until(b"s", b"C", b"E")
+        assert (count(a), tags(a)) == (300, ["1", "2", "s"])
+        setup.execute("insert into st_t values (5000, 'late')")
+        c.s.sendall(msg(b"E", cstr("") + struct.pack("!I", 300)) + msg(b"H", b""))
+        a = c.until(b"s", b"C", b"E")
+        assert (count(a), tags(a)) == (300, ["s"])
+        c.s.sendall(msg(b"E", cstr("") + struct.pack("!I", 0)) + msg(b"S", b""))
+        a = c.until(b"Z")
+        assert (count(a), tags(a)) == (400, ["C:SELECT 400", "Z"])
+        assert b"late" not in b"".join(b for t, b in a if t == b"D")
+        c.s.sendall(msg(b"E", cstr("") + struct.pack("!I", 0)) + msg(b"S", b""))
+        a = c.until(b"Z")
+        assert [t for t, _ in a] == [b"E", b"Z"] and b"C34000" in a[0][1]
+        sql = "select k from st_t where k % 100 = 0 limit 5 offset 2"
+        c.s.sendall(start(sql, 2) + msg(b"E", cstr("") + struct.pack("!I", 2)) * 2 + msg(b"S", b""))
+        a = c.until(b"Z")
+        values = [int(b[6:].decode()) for t, b in a if t == b"D"]
+        assert values == [300, 400, 500, 600, 700]
+        assert tags(a) == ["1", "2", "s", "s", "C:SELECT 1", "Z"]
+        c.s.sendall(msg(b"Q", cstr("begin")))
+        c.until(b"Z")
+        c.s.sendall(
+            start("select k from st_t", 400)
+            + msg(b"E", cstr("") + struct.pack("!I", 0))
+            + msg(b"S", b"")
+        )
+        a = c.until(b"Z")
+        assert (count(a), tags(a)) == (1001, ["1", "2", "s", "C:SELECT 601", "Z"])
+        c.s.sendall(msg(b"Q", cstr("commit")))
+        c.until(b"Z")
+        c.s.close()
+
+
+def test_a_streamed_portal_is_cancelled_by_statement_timeout(home: Path) -> None:
+    """A large streamed SELECT runs into `statement_timeout` while it reads
+    (the reader's working time, 200k rows, is well past 5ms): 57014, as on
+    PostgreSQL 15, and the connection carries on."""
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table sto_t (k int, v text)")
+        c.execute("insert into sto_t select g, repeat('x', 200) from generate_series(1, 200000) g")
+        c.execute("set statement_timeout = '5ms'")
+        with pytest.raises(psycopg.errors.QueryCanceled), c.cursor() as cur:
+            for _ in cur.stream("select k, v from sto_t"):
+                pass
+        c.execute("set statement_timeout = 0")
+        assert c.execute("select count(*) from sto_t").fetchone() == (200000,)
 
 
 def test_prepared_gid_is_byte_exact(home: Path) -> None:
