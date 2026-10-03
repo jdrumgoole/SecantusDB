@@ -1188,7 +1188,11 @@ impl Rewriter<'_> {
         // declared one, `"default"` for other text, NULL for a type that
         // takes none.
         if let Some(N::FuncCall(f)) = node.node.as_ref() {
-            if func_name(f).as_deref() == Some("pg_collation_for") && f.args.len() == 1 {
+            if func_name(f).as_deref() == Some("pg_collation_for")
+                && f.args.len() == 1
+                && !matches!(f.funcname.first().and_then(|n| n.node.as_ref()),
+                    Some(N::String(s)) if s.sval == crate::COLLATION_FOR_SCHEMA)
+            {
                 let arg = &f.args[0];
                 let rendered: Option<String> = match arg.node.as_ref() {
                     Some(N::CollateClause(cc)) => Some(crate::collation::clause_name(cc)),
@@ -1197,50 +1201,69 @@ impl Rewriter<'_> {
                             Ok(name) => Some(name.to_string()),
                             // `name` is collatable, and always "C".
                             Err(_) if col.pg_type == "name" => Some("C".into()),
-                            Err(_) if crate::collation::collatable(&col.pg_type) => {
-                                Some("default".into())
+                            // Text -- or a VALUES / subquery column whose
+                            // type is only settled when the statement runs.
+                            Err(_) if crate::collation::collatable(&col.pg_type) => None,
+                            // A parse-analysis error in PostgreSQL: raised
+                            // whether or not a row is read.
+                            Err(_) => {
+                                return Err(Error::DatatypeMismatch(format!(
+                                    "collations are not supported by type {}",
+                                    crate::display_type(&col.pg_type)
+                                )))
                             }
-                            Err(_) => None,
                         },
-                        None => Some("default".into()),
+                        None => None,
                     },
-                    Some(N::AConst(c))
-                        if matches!(
-                            c.val,
-                            Some(
-                                a_const::Val::Ival(_)
-                                    | a_const::Val::Fval(_)
-                                    | a_const::Val::Boolval(_)
-                            )
-                        ) =>
-                    {
-                        None
-                    }
-                    _ => Some("default".into()),
+                    _ => None,
                 };
-                *node = match rendered {
+                // Anything else is decided by the operand's static type when
+                // the statement runs (`collation_for_type`): NULL for an
+                // untyped literal, "C" for `name`, "default" for other text,
+                // 42804 for a type that takes no collation. A collation known
+                // here rides as a marked string. Either way the call keeps its
+                // name, so the column is still `pg_collation_for`.
+                let hidden_arg = match rendered {
                     Some(name) => pg_query::protobuf::Node {
                         node: Some(N::AConst(pg_query::protobuf::AConst {
                             isnull: false,
                             location: -1,
                             val: Some(a_const::Val::Sval(pg_query::protobuf::String {
-                                sval: crate::scalar::quote_identifier(&name),
+                                sval: format!("\u{1f}{name}"),
                             })),
                         })),
                     },
-                    None => pg_query::protobuf::Node {
-                        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-                            arg: Some(Box::new(pg_query::protobuf::Node {
-                                node: Some(N::AConst(pg_query::protobuf::AConst {
-                                    isnull: true,
-                                    location: -1,
-                                    val: None,
-                                })),
-                            })),
-                            type_name: Some(type_name_node("text")),
-                            location: -1,
-                        }))),
-                    },
+                    None => {
+                        let typeof_arg = pg_query::protobuf::Node {
+                            node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                                funcname: vec![string_node("pg_typeof")],
+                                args: vec![arg.clone()],
+                                funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall
+                                    as i32,
+                                location: -1,
+                                ..Default::default()
+                            }))),
+                        };
+                        pg_query::protobuf::Node {
+                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                arg: Some(Box::new(typeof_arg)),
+                                type_name: Some(type_name_node("text")),
+                                location: -1,
+                            }))),
+                        }
+                    }
+                };
+                *node = pg_query::protobuf::Node {
+                    node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                        funcname: vec![
+                            string_node(crate::COLLATION_FOR_SCHEMA),
+                            string_node("pg_collation_for"),
+                        ],
+                        args: vec![hidden_arg],
+                        funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+                        location: f.location,
+                        ..Default::default()
+                    }))),
                 };
                 self.changed = true;
                 return Ok(());

@@ -671,6 +671,15 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
+- [ ] **OPEN — RUST pgserver: psycopg `test_ctrl_c` fails under the full
+      suite (batch 52, 2026-10-04).** `test_concurrency.py::test_ctrl_c` and
+      `test_concurrency_async.py::test_ctrl_c` fail in two full psycopg runs
+      on batch 52 AND on its base `0c29ef2c` (batch 51 measured 5544 / 0),
+      while both pass 3/3 alone and the `test_concurrency*` files pass 3/3.
+      Under the full suite the cancel never reaches the running `pg_sleep`.
+      Server-side until proven otherwise -- likely in the cancel / wait path
+      batch 51 changed (shared row locks, in-block streaming). Bisect batch
+      51's commit against the full suite.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
@@ -811,10 +820,16 @@ remain open:
         VALUES up into constants and says `during inlining`; here the
         column is per-row, no CONTEXT. Diagnostic text only; size: the
         planner would have to know a column's source is a one-row VALUES.
-      - `pg_collation_for(x)` diverges in three ways (batch 51): over a
-        non-collatable type it answers NULL where PostgreSQL raises 42804;
-        its result column is misnamed; and over an unknown literal it
-        answers NULL where PostgreSQL answers "default".
+        (Batch 52: PostgreSQL pulls up `(select 0) v(a)` the same way; the
+        call's argument kind is decided over row parameters at evaluation
+        (`call_args_kind`), where a constant-sourced column is no longer
+        distinguishable -- left as measured.)
+      - `pg_collation_for(x)`: FIXED batch 52 (corpus `b52_collation_for`,
+        21 lines, 0 against PostgreSQL 15) -- 42804 over a non-collatable
+        type (a table column's at planning, as PostgreSQL's parse analysis
+        does; any other operand's by its `pg_typeof` when evaluated), NULL
+        for an untyped literal, "default" for a VALUES text column, and the
+        result column keeps the name `pg_collation_for`.
       - The `SQL expression` frame of a PL/pgSQL error follows an
         approximation of PL/pgSQL's simple-expression rule (as before).
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
@@ -988,12 +1003,27 @@ remain open:
         a table created after it. Where it still rewrites (a PL/pgSQL
         EXCEPTION block, RR after a commit), it writes only the rows that
         differ, so another session's commit no longer makes it 40001.
-      Left:
+      Left (re-measured batch 52 with the same 30-scenario probe: 28 equal,
+      the two that differ are `plpgsql_exception_prior_write` and
+      `plpgsql_exception_keep_inner`, both this first item):
       - A PL/pgSQL EXCEPTION block's undone rows stay held (the rewrite runs
-        inside the running statement's transaction).
+        inside the running statement's transaction). In both scenarios the
+        other session's UPDATE of the undone row waits for the block's
+        COMMIT where PostgreSQL's goes through at once, and so the block's
+        next READ COMMITTED read misses that commit (`(1, 10)` where
+        PostgreSQL reads `(1, 11)`). Not fixable by releasing the held-row
+        entry alone: WiredTiger still sees the row written by the running
+        transaction, so the other writer would conflict there; the move
+        (`rollback_to_by_move`) refuses inside a running statement
+        (`in_user_txn`). And even with the row let go, the block has written
+        before, so its snapshot cannot be refreshed (WiredTiger's
+        `reset_snapshot` refuses after a write) -- the READ COMMITTED
+        redesign the Python-side entry scopes.
       - A FOR UPDATE over a table with no primary key, through a subquery
         that does not carry every column, locks every row equal in the
-        columns it carries.
+        columns it carries (batch 52: unchanged -- exact locking needs a
+        hidden row id carried through the subquery's projection, which
+        `lock_targets` matches after the fact).
       - REPEATABLE READ answers 40001 after the wait when ANY transaction
         committed since its snapshot, where PostgreSQL goes on unless the
         ROW changed: WiredTiger cannot continue a transaction after a
@@ -1297,6 +1327,20 @@ These work end-to-end but cut corners.
       where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
       general per-statement target; the protocol work above has taken the
       extended path as far as it goes cheaply.
+
+      **Batch 52 (2026-10-03)**, release builds of base (`0c29ef2c`) and
+      batch 52, `bench43.py`, two interleaved runs, load ~3.6: ping 19.3-19.4
+      / 19.3-19.7, simple `select 1` 29.7-29.9 / 29.7-29.9, extended
+      `select 1` 43.3-43.4 / **41.1**, PK read 53.9-54.2 / **50.3-50.9**,
+      autocommit UPDATE 74.6 (one 83.7 outlier) / **72.2-72.6** us (PG 15:
+      18.5, 23.0, 27.3, 33.7, 54). `sample` showed BindComplete and
+      CloseComplete still FLUSHED (`send`, a `sendto` each) where batch 47
+      had buffered ParseComplete; both are fed to the Sync / Flush now. The
+      next measured costs in a PK read (~25 us of server time a statement):
+      the two socket syscalls (~7 us), `find_matching` (~5.6 us, of which
+      `is_timeseries` re-reads the collection options on every `_id` point
+      lookup, ~1.6 us -- a storage-crate cache the MongoDB server shares, so
+      left alone here), and tokio's `block_in_place` hand-off (~1 us).
 
       **Batch 51 (2026-10-03)**, release builds of base (`34aedc33`) and
       batch 51, `bench43.py`, two interleaved runs, load ~11: no change
@@ -7526,13 +7570,37 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       Re-timed batch 51 (release, 2,000 x 2,000, PG 15 alongside): inner
       ORDER BY ... LIMIT 1 0.293 s (PG 0.131), count(DISTINCT) 0.008 s
       (0.128), grouping 0.307 s (0.127), `sum` / `avg` under a filter 1.18 s
-      (0.145), and a NESTED correlated EXISTS 35.8 s (0.128) -- the nested
-      shape is the one worth working next.
-      Still per outer value (each answer unchanged, only slower): an inner
-      ORDER BY (`... ORDER BY y DESC LIMIT 1`: 0.29 s, PG 0.125 s), grouping
-      or DISTINCT inside (0.31 s, PG 0.12 s), `sum` / `avg` under a filter,
+      (0.145), and a NESTED correlated EXISTS 35.8 s (0.128).
+      **Batch 52 (2026-10-03)**, release, same 2,000 x 2,000 script, PG 15
+      alongside: nested EXISTS 36.7 -> **1.21 s** (PG 0.13), `sum` under a
+      filter 1.22 -> **0.027 s** (0.147), `avg` 1.24 -> **0.043 s** (0.146),
+      inner `ORDER BY y DESC, v LIMIT 1` 0.30 -> **0.008 s** (0.129); every
+      answer equal to PostgreSQL's (corpus `b52_correlated`, 24 lines). Three
+      causes, each found with `sample`: (1) every nested runner opened a FRESH
+      semi-join cache, so the inner level's index was rebuilt once per outer
+      row -- a scope entered while a subquery of the same statement runs now
+      shares the statement's cache (`semijoin_hash::as_subquery`), while a
+      user function / trigger / procedure body gets one of its own
+      (`with_fresh_subquery_cache`, in `with_call_depth`), since its
+      statements may read its own writes; (2) a WHERE with one conjunct that
+      does not lower (the inner EXISTS) was evaluated WHOLE per row, so the
+      correlated call ran against every row of the middle table -- the
+      conjuncts that lower are now the filter and only the rest is per row
+      (`split_lowerable_conjuncts`); (3) `sum` / `avg` of an `integer` /
+      `smallint` under a filter are computed per outer row (`Late::Sum` /
+      `Late::Avg`, `avg` as `numeric_div` of the bigint sum and count), and
+      an inner ORDER BY over the inner side is kept in the run-once query
+      (each key's rows are a subsequence of one ordered list; LIMIT / OFFSET
+      per key). Found on the way: `sum(bigint)` past i64 WRAPPED in a release
+      build (`-9223372036854775806` where PostgreSQL answers
+      `9223372036854775810`) and panicked a debug one -- summed in i128 and
+      answered as numeric now.
+      Still per outer value (each answer unchanged, only slower): the nested
+      shape's MIDDLE level (1.21 s -- one indexed-filter scan per outer row;
+      PostgreSQL hashes both levels), grouping inside a FROM subquery (0.31 s,
+      PG 0.13 s), `sum` / `avg` of bigint / numeric / float under a filter,
       an ordering filter over a numeric or a collated text, functions in the
-      inner select list, nested subqueries, a FROM function or subquery.
+      inner select list, a FROM function or subquery.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes

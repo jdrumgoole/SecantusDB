@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS b52_o;
+DROP TABLE IF EXISTS b52_t;
+DROP TABLE IF EXISTS b52_u;
+DROP TABLE IF EXISTS b52_log;
+DROP FUNCTION IF EXISTS b52_f(int);
+create table b52_o (id int primary key, a int, b int, sm smallint);
+create table b52_t (id int primary key, x int, y int, v int, sm smallint, bi bigint, s text);
+create table b52_u (id int primary key, tid int);
+create table b52_log (id int primary key, tid int);
+insert into b52_o values (1, 1, 0, 1), (2, 1, 5, 2), (3, 2, 0, null), (4, null, 1, 3), (5, 3, 100, 4), (6, 9, 0, 5), (7, 2, null, 6);
+insert into b52_t values (1, 1, 1, 10, 1, 9223372036854775807, 'b'), (2, 1, 3, null, 2, 1, 'a'), (3, 1, 3, 30, null, 2, 'c'), (4, 2, 7, 2147483647, 32767, 3, 'B'), (5, 2, 8, 2147483647, 32767, 4, 'a'), (6, 3, 2, -5, -1, 5, null), (7, null, 1, 70, 7, 6, 'z'), (8, 2, 7, 1, 1, 7, 'é');
+insert into b52_u values (1, 1), (2, 1), (3, 4), (4, 6), (5, 8), (6, null), (7, 3);
+create function b52_f(k int) returns bigint language plpgsql as $$ declare c bigint; d bigint; begin   select count(*) into c from b52_t t where exists (select 1 from b52_log l where l.tid = t.id and l.id > k);   insert into b52_log values (k + 100, k);   select count(*) into d from b52_t t where exists (select 1 from b52_log l where l.tid = t.id and l.id > k);   return c * 1000 + d; end $$;

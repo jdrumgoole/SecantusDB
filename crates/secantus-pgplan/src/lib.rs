@@ -43,6 +43,7 @@ mod optype;
 mod semijoin;
 mod semijoin_hash;
 pub use errpos::error_position;
+pub use semijoin_hash::with_fresh_subquery_cache;
 pub mod alter_routine;
 pub mod collation;
 pub mod geo;
@@ -17971,29 +17972,9 @@ fn plan_select_rest(
     // `Unsupported` falls back: an undefined column or a bad type is a real
     // error and must stay one, or a typo would become a silent full scan that
     // quietly returns nothing.
-    let mut residual = None;
-    let filter = match s.where_clause.as_ref() {
-        None => Document::new(),
-        Some(w) => match lower_where(w, &def, params) {
-            Ok(f) => f,
-            Err(Error::Unsupported(_)) => {
-                let fields: Vec<RowField> = def
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        note_bpchar_width(c);
-                        (c.name.clone(), c.field(), c.pg_type.clone())
-                    })
-                    .collect();
-                let mut sample = Document::new();
-                for c in &def.columns {
-                    sample.insert(c.field(), sample_value_for_type(&c.pg_type));
-                }
-                residual = Some(row_column_expr(w, &fields, params, &sample)?);
-                Document::new()
-            }
-            Err(e) => return Err(e),
-        },
+    let (filter, residual) = match s.where_clause.as_ref() {
+        None => (Document::new(), None),
+        Some(w) => lower_where_or_residual(w, &def, params)?,
     };
 
     let mut order = Vec::new();
@@ -21616,6 +21597,16 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         "0A000",
                         format!("could not determine row type for result of {name}"),
                     ));
+                }
+                // `pg_collation_for` as `enum_order` rewrote it.
+                if let Some(value) = collation_for_call(f, params) {
+                    columns.push((
+                        if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
+                        ConstCol::Value(value?),
+                        "text".to_string(),
+                        -1,
+                    ));
+                    continue;
                 }
                 // The enum functions: typed as the enum (or its array).
                 if matches!(name.as_str(), "enum_first" | "enum_last" | "enum_range") {
@@ -30726,6 +30717,50 @@ fn plan_truncate(
     })
 }
 
+/// The hidden schema of `pg_collation_for(x)` once its answer waits on the
+/// operand's static type: `enum_order` rewrites it to
+/// `"\u{1f}".pg_collation_for(pg_typeof(x)::text)`, keeping the column name.
+pub(crate) const COLLATION_FOR_SCHEMA: &str = "\u{1f}";
+
+/// Evaluate that rewritten call, or `None` when `f` is not one.
+fn collation_for_call(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Option<Result<Bson>> {
+    let [schema, name] = f.funcname.as_slice() else {
+        return None;
+    };
+    let is = |n: &pg_query::protobuf::Node, want: &str| matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == want);
+    if !is(schema, COLLATION_FOR_SCHEMA) || !is(name, "pg_collation_for") {
+        return None;
+    }
+    let [arg] = f.args.as_slice() else {
+        return None;
+    };
+    Some(match const_value(arg, params) {
+        Ok(Bson::String(ty)) => collation_for_type(&ty),
+        Ok(_) => Err(Error::Internal("a malformed pg_collation_for".into())),
+        Err(e) => Err(e),
+    })
+}
+
+/// `pg_collation_for` of a value of the type `pg_typeof` names.
+fn collation_for_type(ty: &str) -> Result<Bson> {
+    if let Some(known) = ty.strip_prefix('\u{1f}') {
+        return Ok(Bson::String(crate::scalar::quote_identifier(known)));
+    }
+    let base = ty.trim_end_matches("[]");
+    Ok(match base {
+        "unknown" => Bson::Null,
+        "name" => Bson::String("\"C\"".into()),
+        "text" | "character varying" | "character" | "citext" | "varchar" | "bpchar" => {
+            Bson::String("\"default\"".into())
+        }
+        _ => {
+            return Err(Error::DatatypeMismatch(format!(
+                "collations are not supported by type {ty}"
+            )))
+        }
+    })
+}
+
 /// A WHERE predicate as a Mongo filter over STORED FIELDS.
 pub fn lower_where(
     w: &pg_query::protobuf::Node,
@@ -31646,6 +31681,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if let Some(result) = correlated::eval_correlated(f, params) {
+            return result;
+        }
+        if let Some(result) = collation_for_call(f, params) {
             return result;
         }
         if let Some(e) = function_absent_in_reference(f, params) {
@@ -33831,6 +33869,16 @@ fn lower_where_or_residual(
     match lower_where(w, def, params) {
         Ok(f) => Ok((f, None)),
         Err(Error::Unsupported(_)) => {
+            // A top-level AND whose conjuncts partly lower: those become the
+            // filter, read through the index, and only the rest is evaluated
+            // per row -- over the rows the filter kept. Evaluating the whole
+            // WHERE per row ran a correlated subquery in one conjunct against
+            // every row of the table, which made a nested correlated EXISTS
+            // quadratic. PostgreSQL also applies the cheap quals first.
+            if let Some((f, rest)) = split_lowerable_conjuncts(w, def, params) {
+                let (_, residual) = lower_where_or_residual(&rest, def, params)?;
+                return Ok((f, residual));
+            }
             let fields: Vec<RowField> = def
                 .columns
                 .iter()
@@ -33850,6 +33898,65 @@ fn lower_where_or_residual(
         }
         Err(e) => Err(e),
     }
+}
+
+/// For a top-level `AND`, the conjuncts that lower to an MQL filter (ANDed)
+/// and the rest as one expression -- `None` unless both parts are non-empty
+/// and every conjunct either lowers or is merely `Unsupported` (a real error
+/// is left to the whole-WHERE path, which reports it as before).
+fn split_lowerable_conjuncts(
+    w: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Option<(Document, pg_query::protobuf::Node)> {
+    let mut conjuncts = Vec::new();
+    let mut stack = vec![w.clone()];
+    while let Some(n) = stack.pop() {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::AndExpr) =>
+            {
+                stack.extend(b.args.iter().rev().cloned());
+            }
+            _ => conjuncts.push(n),
+        }
+    }
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    let mut filters = Vec::new();
+    let mut rest = Vec::new();
+    for c in conjuncts {
+        match lower_where(&c, def, params) {
+            Ok(f) => filters.push(Bson::Document(f)),
+            Err(Error::Unsupported(_)) => rest.push(c),
+            Err(_) => return None,
+        }
+    }
+    if filters.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let filter = if filters.len() == 1 {
+        match filters.pop() {
+            Some(Bson::Document(d)) => d,
+            _ => return None,
+        }
+    } else {
+        doc! { "$and": filters }
+    };
+    let rest = if rest.len() == 1 {
+        rest.pop()?
+    } else {
+        pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                xpr: None,
+                boolop: BoolExprType::AndExpr as i32,
+                args: rest,
+                location: -1,
+            }))),
+        }
+    };
+    Some((filter, rest))
 }
 
 /// `col IS [NOT] DISTINCT FROM <constant>`. Anything else -- a column on

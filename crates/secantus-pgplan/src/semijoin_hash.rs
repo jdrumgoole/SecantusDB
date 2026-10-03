@@ -9,8 +9,9 @@
 //! equalities, debug build: 7.3 s per-row; PostgreSQL plans it as a hash
 //! semi-join.)
 //!
-//! Only shapes whose rows are a pure filter of the scan qualify: no
-//! aggregate, grouping, DISTINCT, LIMIT / OFFSET, ORDER BY, window, set
+//! Only shapes whose rows are a filter of the scan qualify -- optionally
+//! ordered (ORDER BY over the inner side, with LIMIT / OFFSET applied per
+//! key) or one groupable aggregate: no grouping, DISTINCT, window, set
 //! operation, CTE, locking clause, nested subquery or function in the select
 //! list (a volatile one could not be run once). And only key values whose
 //! hash equality IS SQL equality are hashed: integers, floats folded to their
@@ -230,6 +231,11 @@ enum Late {
     Count,
     Min,
     Max,
+    /// `sum` / `avg` of an `integer` / `smallint` column: a `bigint` sum,
+    /// and that sum divided by the count as `numeric` (PostgreSQL's
+    /// `int8_avg` is exactly `numeric_div` of the two).
+    Sum,
+    Avg,
 }
 
 impl Late {
@@ -255,6 +261,30 @@ impl Late {
                     });
                 }
                 Some(best.cloned().unwrap_or(Bson::Null))
+            }
+            Late::Sum | Late::Avg => {
+                let mut sum: i64 = 0;
+                let mut n: i64 = 0;
+                for v in present {
+                    let Bson::Int32(i) = v else {
+                        return None;
+                    };
+                    sum = sum.checked_add(i64::from(*i))?;
+                    n += 1;
+                }
+                if n == 0 {
+                    return Some(Bson::Null);
+                }
+                if self == Late::Sum {
+                    return Some(Bson::Int64(sum));
+                }
+                thread_local! {
+                    static DIV: Option<pg_query::protobuf::Node> =
+                        crate::domains::parse_default_sql("$1::numeric / $2::numeric").ok();
+                }
+                DIV.with(|d| {
+                    crate::const_value(d.as_ref()?, &[Bson::Int64(sum), Bson::Int64(n)]).ok()
+                })
             }
         }
     }
@@ -311,21 +341,71 @@ enum Entry {
 thread_local! {
     static CACHE: std::cell::RefCell<Option<HashMap<String, Entry>>> =
         const { std::cell::RefCell::new(None) };
+    /// Set while a correlated subquery of the running statement is being
+    /// run (`correlated::run_direct`), and cleared for a user-code body.
+    static IN_SUBQUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as a subquery of the running statement: a scope it enters shares
+/// the statement's cache.
+pub(crate) fn as_subquery<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_SUBQUERY.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(IN_SUBQUERY.with(|c| c.replace(true)));
+    f()
 }
 
 /// Enables the cache for one statement's execution and drops it after.
-pub(crate) struct Scope(Option<HashMap<String, Entry>>);
+///
+/// A scope entered while one is already active -- a subquery of the same
+/// statement run through a nested runner (`as_subquery`) -- SHARES the statement's cache: it
+/// reads the same data, and rebuilding an inner level's index for every
+/// outer row is what made a nested correlated `EXISTS` quadratic (2,000 x
+/// 2,000 rows: 36 s). User code (a function, trigger or procedure body) runs
+/// its statements under [`Scope::fresh`] instead, since they may read the
+/// body's own earlier writes.
+pub(crate) struct Scope(Option<Option<HashMap<String, Entry>>>);
 
 impl Scope {
     pub(crate) fn enter() -> Self {
-        Scope(CACHE.with(|c| c.replace(Some(HashMap::new()))))
+        if IN_SUBQUERY.with(std::cell::Cell::get) && CACHE.with(|c| c.borrow().is_some()) {
+            return Scope(None);
+        }
+        Self::fresh()
+    }
+
+    /// A cache of its own, whatever is active, restored on drop.
+    pub(crate) fn fresh() -> Self {
+        Scope(Some(CACHE.with(|c| c.replace(Some(HashMap::new())))))
     }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        CACHE.with(|c| *c.borrow_mut() = self.0.take());
+        if let Some(prev) = self.0.take() {
+            CACHE.with(|c| *c.borrow_mut() = prev);
+        }
     }
+}
+
+/// Run `f` -- a user function's, trigger's or procedure's body -- with a
+/// semi-join cache of its own, so its statements never read an index built
+/// before the body's own writes.
+pub fn with_fresh_subquery_cache<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_SUBQUERY.with(|c| c.set(self.0));
+        }
+    }
+    let _scope = Scope::fresh();
+    // Each statement of the body is a statement of its own.
+    let _restore = Restore(IN_SUBQUERY.with(|c| c.replace(false)));
+    f()
 }
 
 type Runner = fn(&str, &[Bson]) -> Result<Vec<Vec<Bson>>>;
@@ -453,6 +533,16 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
             let ty = row.pop().unwrap_or(Bson::Null);
             if matches!(late, Late::Min | Late::Max)
                 && !row.first().is_some_and(|v| orderable(v, &ty, text_ok))
+            {
+                return Ok(Entry::No);
+            }
+            // A sum / avg only over 32-bit-or-narrower integers, whose sum
+            // is a `bigint` computed exactly here.
+            if matches!(late, Late::Sum | Late::Avg)
+                && (!matches!(&ty, Bson::String(t) if t == "integer" || t == "smallint")
+                    || !row
+                        .first()
+                        .is_some_and(|v| matches!(v, Bson::Int32(_) | Bson::Null)))
             {
                 return Ok(Entry::No);
             }
@@ -591,7 +681,6 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         || !s.group_clause.is_empty()
         || s.having_clause.is_some()
         || !s.distinct_clause.is_empty()
-        || !s.sort_clause.is_empty()
         || s.with_clause.is_some()
         || !s.window_clause.is_empty()
         || !s.locking_clause.is_empty()
@@ -610,6 +699,18 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         .iter()
         .any(|t| contains(t, &is_groupable_aggregate));
     if aggregate && (limit.is_some() || offset > 0) {
+        return None;
+    }
+    // An ORDER BY is kept in the run-once query: each key's rows are then a
+    // subsequence of one ordered list, so they come out in the order the
+    // per-row query gives them (and LIMIT / OFFSET apply per key). Not with
+    // an aggregate, and only over the inner side.
+    if !s.sort_clause.is_empty()
+        && (aggregate
+            || s.sort_clause
+                .iter()
+                .any(|n| contains(n, &|n| matches!(n, N::ParamRef(_) | N::SubLink(_)))))
+    {
         return None;
     }
     s.limit_count = None;
@@ -790,6 +891,8 @@ fn late_aggregate(
         "count" => Late::Count,
         "min" => Late::Min,
         "max" => Late::Max,
+        "sum" => Late::Sum,
+        "avg" => Late::Avg,
         _ => return None,
     };
     Some((kind, arg.clone()))
@@ -906,13 +1009,49 @@ mod tests {
     }
 
     #[test]
+    fn an_order_by_is_kept_and_applied_per_key() {
+        let r = rewrite("SELECT t.v FROM t WHERE t.x = $1 ORDER BY t.y DESC, t.v LIMIT 1")
+            .expect("qualifies");
+        assert_eq!(r.sql, "SELECT t.v, t.x FROM t ORDER BY t.y DESC, t.v");
+        assert_eq!((r.limit, r.offset), (Some(1), 0));
+    }
+
+    #[test]
+    fn sum_and_avg_under_a_filter_are_late() {
+        for (sql, late) in [
+            (
+                "SELECT sum(t.v) FROM t WHERE t.x = $1 AND t.y > $2",
+                Late::Sum,
+            ),
+            (
+                "SELECT avg(t.v) FROM t WHERE t.x = $1 AND t.y > $2",
+                Late::Avg,
+            ),
+        ] {
+            assert_eq!(rewrite(sql).expect("qualifies").late, Some(late), "{sql}");
+        }
+        let one = Bson::Int32(1);
+        let two = Bson::Int32(2);
+        assert_eq!(
+            Late::Sum.over(&[&one, &Bson::Null, &two]),
+            Some(Bson::Int64(3))
+        );
+        assert_eq!(Late::Sum.over(&[&Bson::Null]), Some(Bson::Null));
+        assert_eq!(Late::Avg.over(&[]), Some(Bson::Null));
+        // Only 32-bit integers are summed here.
+        assert_eq!(Late::Sum.over(&[&Bson::Int64(1)]), None);
+    }
+
+    #[test]
     fn shapes_that_cannot_run_once_are_left_alone() {
         for sql in [
-            "SELECT sum(t.v) FROM t WHERE t.x = $1 AND t.y > $2",
+            "SELECT string_agg(t.v, ',') FROM t WHERE t.x = $1 AND t.y > $2",
             "SELECT count(DISTINCT t.v) FROM t WHERE t.x = $1 AND t.y > $2",
             "SELECT max(t.v + 1) FROM t WHERE t.x = $1 AND t.y > $2",
             "SELECT 1 FROM t WHERE t.y ~ $1",
-            "SELECT 1 FROM t WHERE t.x = $1 ORDER BY t.v",
+            "SELECT t.v FROM t WHERE t.x = $1 ORDER BY t.v + $1",
+            "SELECT count(*) FROM t WHERE t.x = $1 GROUP BY t.y ORDER BY 1",
+            "SELECT t.v FROM t WHERE t.x = $1 ORDER BY (SELECT 1)",
             "SELECT DISTINCT t.v FROM t WHERE t.x = $1",
             "SELECT random() FROM t WHERE t.x = $1",
             "SELECT string_agg(t.y, ',') FROM t WHERE t.x = $1",
