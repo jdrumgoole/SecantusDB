@@ -671,6 +671,15 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
+- [ ] **OPEN — RUST pgserver: psycopg `test_ctrl_c` fails under the full
+      suite (batch 52, 2026-10-04).** `test_concurrency.py::test_ctrl_c` and
+      `test_concurrency_async.py::test_ctrl_c` fail in two full psycopg runs
+      on batch 52 AND on its base `0c29ef2c` (batch 51 measured 5544 / 0),
+      while both pass 3/3 alone and the `test_concurrency*` files pass 3/3.
+      Under the full suite the cancel never reaches the running `pg_sleep`.
+      Server-side until proven otherwise -- likely in the cancel / wait path
+      batch 51 changed (shared row locks, in-block streaming). Bisect batch
+      51's commit against the full suite.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
