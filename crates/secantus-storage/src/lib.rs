@@ -168,6 +168,9 @@ pub struct UserTransactionHandle {
     /// When the transaction was opened, in Unix microseconds: SQL's
     /// transaction start (`now()`).
     opened_at: i64,
+    /// The document rows this transaction has written, in write order (a
+    /// row written twice appears twice). See `PENDING_ROWS`.
+    written_rows: Vec<WrittenRow>,
 }
 
 impl UserTransactionHandle {
@@ -177,6 +180,12 @@ impl UserTransactionHandle {
     /// When the transaction was opened, in Unix microseconds.
     pub fn opened_at_micros(&self) -> i64 {
         self.opened_at
+    }
+
+    /// The document rows this transaction has written (and so holds until
+    /// it ends), each `(db, collection, RecordId)`.
+    pub fn written_rows(&self) -> &[WrittenRow] {
+        &self.written_rows
     }
 
     pub fn has_written(&self) -> bool {
@@ -3257,6 +3266,15 @@ thread_local! {
     /// same pattern as `PENDING_MINTED`) to enforce the transaction dirty
     /// budget.
     static PENDING_DIRTY_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// Document rows written by the current user-transaction statement,
+    /// harvested onto the handle by `with_user_transaction` (the same pattern
+    /// as `PENDING_MINTED`): the transaction's row write set, which a server
+    /// can publish so a session that collides with one of them knows WHICH
+    /// transaction holds it (WiredTiger's `WT_ROLLBACK` does not say).
+    static PENDING_ROWS: RefCell<Vec<WrittenRow>> = const { RefCell::new(Vec::new()) };
+    /// The document row this thread last wrote (or tried to): the row a
+    /// write conflict surfacing from that write collided on.
+    static LAST_ROW: RefCell<Option<WrittenRow>> = const { RefCell::new(None) };
 
     /// Set by `with_statement_txn` for the duration of a sync-mode autocommit
     /// write statement. When true, `emit_oplog_entries` parks its minted range
@@ -3264,6 +3282,26 @@ thread_local! {
     /// false — and no user transaction is active — the emit's cursor inserts
     /// autocommit, so the range deregisters inline at the end of the emit.
     static IN_SYNC_STMT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A document row: `(db, collection, RecordId)` -- the doc table's own key.
+pub type WrittenRow = (String, String, i64);
+
+/// Record that this thread is writing the document row `(db, coll,
+/// recordid)`: always as the last row written (see [`last_row_written`]), and
+/// inside a user transaction into its write set ([`UserTransactionHandle::written_rows`]).
+fn note_row(db: &str, coll: &str, recordid: i64) {
+    let row = (db.to_string(), coll.to_string(), recordid);
+    if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        PENDING_ROWS.with(|p| p.borrow_mut().push(row.clone()));
+    }
+    LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
+}
+
+/// The document row this thread last wrote or tried to write. Read right
+/// after a write conflict, it is the row the conflict was on.
+pub fn last_row_written() -> Option<WrittenRow> {
+    LAST_ROW.with(|l| l.borrow().clone())
 }
 
 /// A contiguous run of oplog entries (one minted seq range, one shard) handed to
@@ -6390,6 +6428,7 @@ impl Storage {
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
             dirty_bytes: 0,
+            written_rows: Vec::new(),
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -6531,6 +6570,13 @@ impl Storage {
             }
         }
         let _harvest = Harvest(&mut handle.minted_ranges);
+        struct RowHarvest<'a>(&'a mut Vec<WrittenRow>);
+        impl Drop for RowHarvest<'_> {
+            fn drop(&mut self) {
+                PENDING_ROWS.with(|p| self.0.extend(p.borrow_mut().drain(..)));
+            }
+        }
+        let _row_harvest = RowHarvest(&mut handle.written_rows);
         // Async mode: hold `IN_ASYNC_STMT` across the statement so emits
         // buffer in `PENDING_OPLOG` instead of self-draining mid-transaction
         // (`with_statement_txn` early-returns for `OpSession::Txn`, so without
@@ -7159,6 +7205,7 @@ impl Storage {
                 let recordid = self.write_nat_entry(&session, db, coll, &key)?;
                 // Doc table keyed by the (unique) RecordId.
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                note_row(db, coll, recordid);
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
@@ -7375,6 +7422,7 @@ impl Storage {
                     };
                     // Doc table keyed by the (unique) RecordId.
                     doc_cur.reset()?;
+                    note_row(db, coll, recordid);
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
@@ -7506,6 +7554,7 @@ impl Storage {
                 }
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                note_row(db, coll, recordid);
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
@@ -7664,6 +7713,7 @@ impl Storage {
                     // entries first would make an index-routed read miss a still-live
                     // doc.
                     doc_cur.reset()?;
+                    note_row(db, coll, recordid);
                     doc_cur.set_key_ssq(db, coll, recordid);
                     match doc_cur.remove() {
                         Ok(()) => {}
@@ -9894,6 +9944,7 @@ impl Storage {
             // Doc row first, entries after — see prune_ttl for the lock-free
             // reader ordering rationale.
             doc_cur.reset()?;
+            note_row(db, coll, recordid);
             doc_cur.set_key_ssq(db, coll, recordid);
             match doc_cur.remove() {
                 Ok(()) => {}
@@ -10473,6 +10524,7 @@ impl Storage {
         }
         for recordid in &ids {
             cur.reset()?;
+            note_row(db, coll, *recordid);
             cur.set_key_ssq(db, coll, *recordid);
             match cur.remove() {
                 Ok(()) => {}
@@ -10670,6 +10722,7 @@ impl Storage {
             Ok(doc_cur) => {
                 for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
+                    note_row(db, coll, recordid);
                     doc_cur.set_key_ssq(db, coll, recordid);
                     match doc_cur.remove() {
                         Ok(()) => {}
@@ -10802,6 +10855,73 @@ impl Storage {
 
     /// Documents matching `filter`, as BSON bytes, in `_id`-natural / index order.
     /// Convenience wrapper for `find_matching_with(.., None, None)`.
+    /// Stream the documents of `(db, coll)` matching `filter`, in natural
+    /// (RecordId) order, to `sink` in batches of up to `batch` BSON blobs,
+    /// stopping early when `sink` returns `false`. The whole scan reads ONE
+    /// snapshot, taken when it starts, on a session of its own opened and
+    /// closed on the CALLING thread -- for a reader that keeps a scan open
+    /// across many hand-offs (a protocol portal fetched in pieces) without
+    /// ever holding more than a batch of it. Never index-routed: the order and
+    /// the memory bound are the point.
+    pub fn scan_matching_batches(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        batch: usize,
+        mut sink: impl FnMut(Vec<Vec<u8>>) -> bool,
+    ) -> Result<()> {
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        let session = self.conn.open_session()?;
+        session.begin_transaction(None)?;
+        let out = (|| -> Result<()> {
+            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let vars = Document::new();
+            let batch = batch.max(1);
+            let mut buf: Vec<Vec<u8>> = Vec::with_capacity(batch);
+            cur.set_key_ssq(db, coll, i64::MIN);
+            let mut more = match cur.search_near() {
+                Ok(cmp) => cmp >= 0 || cur.next()?,
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            while more {
+                let (d, c, _recordid) = cur.get_key_ssq()?;
+                if d != db || c != coll {
+                    break;
+                }
+                let value = cur.get_value_u()?;
+                let (_idk, blob) = unframe_doc_value(&value)?;
+                let keep = filter.is_empty() || {
+                    let raw = bson::RawDocument::from_bytes(blob)
+                        .map_err(|_| StorageError::QueryUnsupported)?;
+                    secantus_core::query::matches_raw(raw, filter, &vars, None)
+                        .map_err(query_fault)?
+                };
+                if keep {
+                    buf.push(blob.to_vec());
+                    if buf.len() >= batch && !sink(std::mem::take(&mut buf)) {
+                        return Ok(());
+                    }
+                }
+                more = cur.next()?;
+            }
+            if !buf.is_empty() {
+                sink(buf);
+            }
+            Ok(())
+        })();
+        // A read-only snapshot: nothing to commit, but a failure to end it
+        // is still reported.
+        let ended = session.rollback_transaction(None);
+        out.and(ended.map_err(StorageError::from))
+    }
+
     pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
         self.find_matching_with(db, coll, filter, None, None, None, &Document::new())
     }
@@ -11168,6 +11288,7 @@ impl Storage {
         }
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
         for (recordid, id_k, blob) in &rows {
+            note_row(db, coll, *recordid);
             cur.set_key_ssq(db, coll, *recordid);
             cur.set_value_u(&frame_doc_value(id_k, blob));
             cur.update()?;
@@ -11662,6 +11783,7 @@ impl Storage {
             let (additions, removals) = self.index_entry_diff(&doc, &new, &descs, recordid)?;
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
+            note_row(db, coll, recordid);
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
@@ -11822,6 +11944,7 @@ impl Storage {
                         // The doc stays at its RecordId (unchanged — `_id` is immutable);
                         // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                        note_row(db, coll, recordid);
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
@@ -11947,6 +12070,7 @@ impl Storage {
                     // doc row by that RecordId (framed value carries the id_key).
                     let recordid = self.write_nat_entry(&session, db, coll, &new_id_key)?;
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                    note_row(db, coll, recordid);
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
@@ -12128,6 +12252,7 @@ impl Storage {
             // Doc row first, entries after — see prune_ttl for the lock-free
             // reader ordering rationale.
             cur.reset()?;
+            note_row(db, coll, recordid);
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
@@ -12210,6 +12335,7 @@ impl Storage {
                     // Doc row first, entries after — see prune_ttl for the lock-free
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                    note_row(db, coll, recordid);
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;

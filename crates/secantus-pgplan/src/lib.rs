@@ -26362,9 +26362,18 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             Bson::Boolean(_) => Err(Error::CannotCoerce(
                 "cannot cast type boolean to smallint".to_string(),
             )),
-            Bson::Int64(i) => i32::try_from(*i)
-                .map(Bson::Int32)
-                .map_err(|_| Error::InvalidText(format!("integer out of range: \"{i}\""))),
+            // PostgreSQL's int84 / int82: 22003, and the message names no
+            // value (measured on 15.19).
+            Bson::Int64(i) => i32::try_from(*i).map(Bson::Int32).map_err(|_| {
+                Error::NumericOutOfRange(
+                    if matches!(target, "int2" | "smallint") {
+                        "smallint out of range"
+                    } else {
+                        "integer out of range"
+                    }
+                    .to_string(),
+                )
+            }),
             // float->integer rounds HALF TO EVEN in PostgreSQL (`2.5` -> 2,
             // `3.5` -> 4), which is NOT the half-away-from-zero rule it uses
             // for numeric->integer. Rust's `round()` is the latter, so using

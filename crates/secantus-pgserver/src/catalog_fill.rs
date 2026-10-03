@@ -36,6 +36,8 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("relrewrite", "oid"),
             ("reloptions", "text[]"),
             ("relacl", "aclitem[]"),
+            ("relfrozenxid", "xid"),
+            ("relminmxid", "xid"),
         ],
         "pg_index" => &[
             ("indnkeyatts", "int2"),
@@ -66,6 +68,9 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("attacl", "aclitem[]"),
             ("attoptions", "text[]"),
             ("attfdwoptions", "text[]"),
+            ("attcacheoff", "int4"),
+            ("attbyval", "bool"),
+            ("attalign", secantus_pgplan::QUOTED_CHAR),
         ],
         "pg_type" => &[
             ("typcollation", "oid"),
@@ -87,6 +92,7 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("typsubscript", "regproc"),
             ("typndims", "int4"),
             ("typacl", "text[]"),
+            ("typowner", "oid"),
         ],
         "pg_proc" => &[
             ("proparallel", secantus_pgplan::QUOTED_CHAR),
@@ -100,7 +106,17 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("prosqlbody", "text"),
             ("proargmodes", "\"char\"[]"),
             ("proallargtypes", "oid[]"),
+            ("pronargdefaults", "int2"),
         ],
+        "pg_trigger" => &[("tgattr", "int2vector"), ("tgargs", "bytea")],
+        "pg_language" => &[
+            ("lanowner", "oid"),
+            ("lanispl", "bool"),
+            ("lanplcallfoid", "oid"),
+            ("laninline", "oid"),
+            ("lanvalidator", "oid"),
+        ],
+        "pg_matviews" => &[("hasindexes", "bool")],
         "pg_extension" => &[
             ("extowner", "oid"),
             ("extnamespace", "oid"),
@@ -734,6 +750,16 @@ impl PgHandler {
         } else {
             Vec::new()
         };
+        // Enum types are passed by value (they are oids); attbyval needs it.
+        let enum_oids: Vec<i64> = if name == "pg_attribute" {
+            self.enums()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, oid, _)| oid)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let parents: Vec<String> = if name == "pg_class" {
             tables
                 .iter()
@@ -811,6 +837,15 @@ impl PgHandler {
                             ),
                             "relisshared" => Bson::Boolean(false),
                             "relpages" | "relallvisible" => Bson::Int32(0),
+                            // PostgreSQL 15 freezes a relation with storage at
+                            // the cluster's xid; one without has 0.
+                            "relfrozenxid" | "relminmxid" => {
+                                Bson::Int64(match (kind.as_str(), c) {
+                                    ("r" | "m" | "t", "relfrozenxid") => 722,
+                                    ("r" | "m" | "t", _) => 1,
+                                    _ => 0,
+                                })
+                            }
                             "relacl" => self.relation_acl(&relname, &kind),
                             "reloptions" => Bson::Null,
                             _ => Bson::Int64(0),
@@ -921,7 +956,21 @@ impl PgHandler {
                             },
                             "attoptions" | "attfdwoptions" => Bson::Null,
                             "attndims" | "attinhcount" => Bson::Int32(0),
-                            "attstattarget" => Bson::Int32(-1),
+                            "attstattarget" | "attcacheoff" => Bson::Int32(-1),
+                            "attbyval" | "attalign" => {
+                                let col = if c == "attbyval" {
+                                    "typbyval"
+                                } else {
+                                    "typalign"
+                                };
+                                crate::pg_type_facts::builtin(type_oid, col).unwrap_or_else(|| {
+                                    if c == "attbyval" {
+                                        Bson::Boolean(enum_oids.contains(&type_oid))
+                                    } else {
+                                        Bson::String("i".into())
+                                    }
+                                })
+                            }
                             "attislocal" => Bson::Boolean(true),
                             _ => Bson::Boolean(false),
                         }
@@ -929,6 +978,7 @@ impl PgHandler {
                     ("pg_type", "typisdefined") => Bson::Boolean(true),
                     ("pg_type", "typndims") => Bson::Int32(0),
                     ("pg_type", "typacl") => Bson::Null,
+                    ("pg_type", "typowner") => Bson::Int64(10),
                     ("pg_type", c) if crate::pg_type_facts::COLUMNS.contains(&c) => {
                         let oid = int(get(row, "oid"));
                         crate::pg_type_facts::builtin(oid, c)
@@ -963,8 +1013,35 @@ impl PgHandler {
                         ),
                         "proleakproof" => Bson::Boolean(false),
                         "prosupport" | "provariadic" => Bson::Int64(0),
+                        "pronargdefaults" => Bson::Int32(0),
                         _ => Bson::Null,
                     },
+                    // A trigger's column list and arguments: empty, as
+                    // PostgreSQL stores them for a trigger with neither.
+                    ("pg_trigger", "tgattr") => Bson::Array(Vec::new()),
+                    ("pg_trigger", "tgargs") => Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: Vec::new(),
+                    }),
+                    // PostgreSQL 15's own values for the languages it ships.
+                    ("pg_language", c) => {
+                        let lang = text(get(row, "lanname"));
+                        let (ispl, call, inline, validator) = match lang.as_str() {
+                            "internal" => (false, 0, 0, 2246),
+                            "c" => (false, 0, 0, 2247),
+                            "sql" => (false, 0, 0, 2248),
+                            "plpgsql" => (true, 14032, 14033, 14034),
+                            _ => (true, 0, 0, 0),
+                        };
+                        match c {
+                            "lanowner" => Bson::Int64(10),
+                            "lanispl" => Bson::Boolean(ispl),
+                            "lanplcallfoid" => Bson::Int64(call),
+                            "laninline" => Bson::Int64(inline),
+                            _ => Bson::Int64(validator),
+                        }
+                    }
+                    ("pg_matviews", _) => Bson::Boolean(false),
                     ("pg_extension", c) => match c {
                         "extowner" => Bson::Int64(10),
                         // plpgsql lives in pg_catalog, an installed extension

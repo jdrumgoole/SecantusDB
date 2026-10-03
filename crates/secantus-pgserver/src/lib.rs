@@ -15,6 +15,7 @@ mod casts;
 mod catalog_fill;
 mod catalog_meta;
 mod catalog_objects;
+mod catalog_order;
 mod collations;
 mod db_settings;
 mod do_block;
@@ -30,9 +31,11 @@ mod object_acl;
 mod partition;
 mod pg15_settings;
 mod pg_type_facts;
+mod plan_cache;
 mod plpgsql_do;
 mod plpgsql_fn;
 mod plpgsql_portals;
+mod portal_stream;
 mod procedures;
 mod renames;
 mod row_waits;
@@ -2379,6 +2382,16 @@ pub struct PgHandler {
     /// portal) is planned once rather than twice. Valid while the catalog
     /// version, the session's settings and its role are what they were.
     describe_cache: Mutex<HashMap<DescribeKey, DescribeEntry>>,
+    /// Plan templates by statement text, parameter types and the BSON types
+    /// of the values (see `plan_cache`): an Execute whose statement has one
+    /// substitutes its values instead of planning again.
+    plan_cache: Mutex<HashMap<PlanKey, PlanEntry>>,
+    /// What an extended Execute allows its statement (`portal_stream`):
+    /// requested before planning, armed for the top-level SELECT only, and
+    /// whether the result it produced is a stream (not to be materialised).
+    stream_request: std::sync::atomic::AtomicU8,
+    stream_portal: std::sync::atomic::AtomicU8,
+    streamed: AtomicBool,
     /// A password login in progress: the role, its stored credentials, and --
     /// once the client's first SASL message arrived -- the SCRAM exchange.
     auth: Mutex<
@@ -2792,6 +2805,10 @@ impl PgHandler {
             session_lastval: Mutex::new(None),
             session_lastval_seq: Mutex::new(None),
             describe_cache: Mutex::new(HashMap::new()),
+            plan_cache: Mutex::new(HashMap::new()),
+            stream_request: std::sync::atomic::AtomicU8::new(0),
+            stream_portal: std::sync::atomic::AtomicU8::new(0),
+            streamed: AtomicBool::new(false),
             auth: Mutex::new(None),
             md5_auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
@@ -11210,6 +11227,9 @@ impl PgHandler {
         // column's attnum there, as PostgreSQL describes a catalog column
         // (pgjdbc's updatable result sets read the base column name back
         // through them). A column PostgreSQL's relation lacks stays 0 / 0.
+        // PostgreSQL 15's column SET and ORDER, so `SELECT *` reads by
+        // position as it would there.
+        catalog_order::conform(name, &mut def);
         for column in &mut def.columns {
             if column.source.is_none() {
                 column.source = catalog_meta::system_column_source(name, &column.name);
@@ -11626,8 +11646,9 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("enumlabel", "name", false),
                 ],
             )),
-            // PostgreSQL 16's column set and types, measured: `parameter_types`
-            // and `result_types` are `regtype[]` (oid 2211) of DISPLAY names,
+            // PostgreSQL 15's column set and types, measured: `parameter_types`
+            // is `regtype[]` (oid 2211) of DISPLAY names (16's `result_types`
+            // is not a 15 column),
             // `from_sql` is false for a protocol-prepared statement, and the
             // plan counters are `int8` -- a statement with parameters has had
             // one custom plan and no generic one, a statement without has the
@@ -11639,7 +11660,6 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("statement", "text", false),
                     secantus_pgcatalog::Column::new("prepare_time", "timestamptz", false),
                     secantus_pgcatalog::Column::new("parameter_types", "regtype[]", false),
-                    secantus_pgcatalog::Column::new("result_types", "regtype[]", true),
                     secantus_pgcatalog::Column::new("from_sql", "bool", false),
                     secantus_pgcatalog::Column::new("generic_plans", "int8", false),
                     secantus_pgcatalog::Column::new("custom_plans", "int8", false),
@@ -11674,7 +11694,6 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datcollate", "name", false),
                     secantus_pgcatalog::Column::new("datctype", "name", false),
                     secantus_pgcatalog::Column::new("daticulocale", "text", false),
-                    secantus_pgcatalog::Column::new("daticurules", "text", false),
                     secantus_pgcatalog::Column::new("datcollversion", "text", false),
                     secantus_pgcatalog::Column::new("datacl", "text", false),
                 ],
@@ -13620,7 +13639,9 @@ impl PgHandler {
                         );
                         d.insert(field("rolvaliduntil"), r.valid_until);
                         d.insert(field("rolbypassrls"), Bson::Boolean(r.bypassrls));
-                        d.insert(field("rolconfig"), Bson::Null);
+                        if let Some(f) = def.field_of("rolconfig") {
+                            d.insert(f, Bson::Null);
+                        }
                         d
                     })
                     .collect()
@@ -13969,10 +13990,6 @@ impl PgHandler {
                             names(&rec.parameter_types),
                         );
                         d.insert(
-                            def.field_of("result_types").expect("column"),
-                            rec.result_types.as_deref().map_or(Bson::Null, names),
-                        );
-                        d.insert(
                             def.field_of("from_sql").expect("column"),
                             Bson::Boolean(rec.from_sql),
                         );
@@ -14013,7 +14030,6 @@ impl PgHandler {
                         d.insert(field("datcollate"), "C.UTF-8");
                         d.insert(field("datctype"), "C.UTF-8");
                         d.insert(field("daticulocale"), Bson::Null);
-                        d.insert(field("daticurules"), Bson::Null);
                         d.insert(field("datcollversion"), Bson::Null);
                         d.insert(field("datacl"), Bson::Null);
                         d
@@ -15421,6 +15437,11 @@ impl PgHandler {
 /// `(statement text, parameter count, parameter types, binary results)`:
 /// a column's described FORMAT follows the Bind's result format.
 type DescribeKey = (String, usize, Vec<Option<String>>, bool);
+/// `(statement text, parameter types, the values' BSON element types)`.
+type PlanKey = (String, Vec<Option<String>>, Vec<u8>);
+/// `(catalog version, settings generation, role, the template -- its
+/// stand-in values and plan -- or None when the statement is not templated)`.
+type PlanEntry = (u64, u64, String, Option<(Vec<Bson>, Statement)>);
 /// `(catalog version, settings generation, role, fields)`.
 type DescribeEntry = (u64, u64, String, Option<Vec<FieldInfo>>);
 
@@ -16544,6 +16565,7 @@ impl Drop for PgHandler {
         // A session's advisory locks die with it, and its table locks.
         advisory::release_session(pid);
         table_locks::release(pid);
+        row_waits::forget(pid);
         if pid != 0 {
             backend_registry()
                 .lock()
@@ -16803,6 +16825,7 @@ impl PgHandler {
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         advisory::release_xact(pid);
         table_locks::release(pid);
+        row_waits::forget(pid);
     }
 
     /// `FETCH` and `MOVE`, which differ only in whether the rows are returned.
@@ -19176,10 +19199,12 @@ impl PgHandler {
             let out = self.commit_implicit();
             advisory::release_xact(pid);
             table_locks::release(pid);
+            row_waits::forget(pid);
             return out;
         }
         advisory::release_xact(pid);
         table_locks::release(pid);
+        row_waits::forget(pid);
         self.end_txn_gucs(false);
         self.lo_close_all();
         self.settle_notifies(false);
@@ -19598,19 +19623,34 @@ impl PgHandler {
         // (nextval('s'))` is folded while planning, so the sequence moves
         // here -- once -- and never in a Describe's plan.
         let _ = secantus_pgplan::take_error_location();
-        let planned = self.with_executor_hooks(|| {
-            secantus_pgplan::planning_to_execute(|| {
-                secantus_pgplan::plan_with_session_types_and_subqueries(
-                    sql,
-                    &|n| self.lookup(n),
-                    params,
-                    param_types,
-                    &tz,
-                    Some(&run),
-                )
-            })
-        });
+        // A statement run before with values of the same types reuses its
+        // plan, the values substituted (`plan_cache`).
+        let plan_key = self.plan_key(sql, params, param_types);
+        let templated = plan_key
+            .as_ref()
+            .and_then(|k| self.templated_plan(k, params));
+        let reused = templated.is_some();
+        let planned = match templated {
+            Some(stmt) => Ok(stmt),
+            None => self.with_executor_hooks(|| {
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.lookup(n),
+                        params,
+                        param_types,
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            }),
+        };
         self.collect_planner_warnings();
+        if !reused && planned.is_ok() {
+            if let Some(key) = plan_key {
+                self.learn_plan_template(key, params, param_types, &tz);
+            }
+        }
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
                 &planned,
@@ -19629,6 +19669,16 @@ impl PgHandler {
         let stmt = planned
             .map_err(|e| Self::err_in(&e, sql))
             .inspect_err(|_| self.note_failure())?;
+        // Only the Execute's own top-level SELECT may stream; a statement
+        // it runs on the way (a trigger's, a function's) never does.
+        let stream = self.stream_request.swap(
+            portal_stream::STREAM_NEVER,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if matches!(stmt, Statement::Select(_)) {
+            self.stream_portal
+                .store(stream, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // An inline code block runs its statements back through this same
         // path one at a time, so it is neither a storage operation nor a
@@ -19669,6 +19719,7 @@ impl PgHandler {
                         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
                         advisory::release_xact(pid);
                         table_locks::release(pid);
+                        row_waits::forget(pid);
                     }
                     out
                 }
@@ -19855,7 +19906,7 @@ impl PgHandler {
                     let rebase = Self::row_write(&stmt) && !fresh;
                     let mut poll = fresh.then(|| self.lock_wait_poll());
                     let mut delay = std::time::Duration::from_millis(2);
-                    loop {
+                    let out = loop {
                         let out = self
                             .storage
                             .with_user_transaction(self.with_isolation(handle)?, || {
@@ -19884,7 +19935,14 @@ impl PgHandler {
                             }
                             _ => break out,
                         }
-                    }
+                    };
+                    // The rows this block now holds, for a session that
+                    // collides with one of them to know whom it waits on.
+                    row_waits::publish(
+                        self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+                        handle.written_rows(),
+                    );
+                    out
                 }
                 // Not when a transaction is already active on this thread: a
                 // trigger's or MERGE's own writes join the statement they serve.
@@ -19898,7 +19956,14 @@ impl PgHandler {
         // A row that fails to ENCODE (`select 0/0 from t`) is the statement's
         // error, before the statement's transaction ends -- see
         // `materialise_rows`.
+        // A streamed portal (`portal_stream`) is read-only and outside any
+        // block: there is nothing for a row error to roll back, and
+        // materialising it is exactly what streaming avoids.
+        let streamed = self
+            .streamed
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
         let out = match out {
+            Ok(resps) if streamed => Ok(resps),
             Ok(resps) => Self::materialise_rows(resps).await,
             err => err,
         };
@@ -19979,15 +20044,26 @@ impl PgHandler {
                 "could not serialize access due to concurrent update".into(),
             )))
         };
+        // The row the statement collided on, and the rows this block holds
+        // (its failed statement's included) for anyone colliding with it.
+        let mut target = secantus_storage::last_row_written();
+        row_waits::publish_waiting(pid, handle.written_rows(), target.as_ref());
         // The writers at the last attempt. Each attempt lets go of this
-        // block's rows for a moment (the rebase), so it is made only when one
-        // of them has ended -- or, for a holder that takes no table lock (an
-        // autocommit statement), when there are none, or after a while.
+        // block's rows for a moment (the rebase), so it is made only when the
+        // row's holder has let go of it -- or, when no session is known to
+        // hold it (an autocommit statement, or a block mid-statement), when
+        // one of the writers has ended, there are none, or after a while.
         let mut held_at_attempt = row_waits::writers_other_than(pid);
         let mut last_attempt = std::time::Instant::now();
         loop {
             let writers = row_waits::writers_other_than(pid);
-            waiting.set(writers.clone());
+            // PostgreSQL waits on the transaction holding the row; only that
+            // edge enters the deadlock check.
+            let blockers = target
+                .as_ref()
+                .map(|t| row_waits::holders_of(t, pid))
+                .unwrap_or_default();
+            waiting.set(blockers.clone());
             if !checked && started.elapsed() >= std::time::Duration::from_secs(1) {
                 checked = true;
                 if waiting.deadlocked() {
@@ -19997,22 +20073,31 @@ impl PgHandler {
             poll()?;
             std::thread::sleep(delay);
             delay = (delay * 2).min(std::time::Duration::from_millis(20));
-            let one_ended = held_at_attempt.iter().any(|p| !writers.contains(p));
-            if !(writers.is_empty()
-                || one_ended
-                || last_attempt.elapsed() >= std::time::Duration::from_millis(500))
-            {
+            let waited_long = last_attempt.elapsed() >= std::time::Duration::from_millis(500);
+            let ready = if blockers.is_empty() {
+                let one_ended = held_at_attempt.iter().any(|p| !writers.contains(p));
+                writers.is_empty() || one_ended || waited_long
+            } else {
+                // The holder let go of the row (committed or rolled back).
+                let still = target
+                    .as_ref()
+                    .map(|t| row_waits::holders_of(t, pid))
+                    .unwrap_or_default();
+                still.is_empty() || waited_long
+            };
+            if !ready {
                 continue;
             }
             held_at_attempt = writers;
             last_attempt = std::time::Instant::now();
             match self.storage.rebase_user_transaction(handle) {
-                Ok(true) => {}
+                Ok(true) => row_waits::publish_waiting(pid, handle.written_rows(), target.as_ref()),
                 Ok(false) => return Err(conflict()),
                 // The old transaction is gone: the block fails, as it would
                 // have on the conflict itself, and nothing of it commits.
                 Err(e) => {
                     eprintln!("secantusd-pg: could not move a transaction to a new snapshot: {e}");
+                    row_waits::forget(pid);
                     return Err(conflict());
                 }
             }
@@ -20022,7 +20107,11 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("transaction failed", e))
                 .and_then(|r| r);
             match out {
-                Err(e) if Self::is_write_conflict(&e) => continue,
+                Err(e) if Self::is_write_conflict(&e) => {
+                    target = secantus_storage::last_row_written();
+                    row_waits::publish_waiting(pid, handle.written_rows(), target.as_ref());
+                    continue;
+                }
                 other => return other,
             }
         }
@@ -20197,6 +20286,7 @@ impl PgHandler {
                 .is_empty()
             {
                 table_locks::release(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+                row_waits::forget(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
                 // And its rows: PostgreSQL's abort releases the row locks too,
                 // so a session waiting on one (a deadlock's survivor) goes on
                 // without waiting for this block's ROLLBACK.
@@ -20632,6 +20722,7 @@ impl PgHandler {
         let pid = self.backend_pid.load(Relaxed);
         advisory::release_xact(pid);
         table_locks::release(pid);
+        row_waits::forget(pid);
         bump_catalog_version();
         let handle = self.open_transaction_handle()?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -22639,6 +22730,21 @@ impl PgHandler {
                 Ok(())
             })?;
         }
+        let source = stream::iter(docs.into_iter().map(Ok::<Document, PgWireError>));
+        Ok(self.project_stream(source.boxed(), schema, fields, casts, env))
+    }
+
+    /// `project_rows` over a source of documents that arrive as the rows are
+    /// sent (a streamed portal's), with the schema and the column fields
+    /// already worked out. A source error ends the result with it.
+    fn project_stream(
+        &self,
+        source: futures::stream::BoxStream<'static, PgWireResult<Document>>,
+        schema: Arc<Vec<FieldInfo>>,
+        fields: Vec<String>,
+        casts: Vec<Option<secantus_pgplan::ColumnExpr>>,
+        env: &RowEnv,
+    ) -> QueryResponse {
         let (row_tz, row_ds, row_cenc) = (env.tz.clone(), env.ds, env.cenc);
         let tz = self.session_timezone();
         let schema_ref = schema.clone();
@@ -22653,7 +22759,8 @@ impl PgHandler {
                 .is_some();
             armed.then(|| self.cursor_capture.clone())
         };
-        let rows = stream::iter(docs).map(move |d| {
+        let rows = source.map(move |d| {
+            let d = d?;
             let mut enc = DataRowEncoder::new(schema_ref.clone());
             let mut captured: Option<Vec<Option<Bson>>> =
                 capture.as_ref().map(|_| Vec::with_capacity(fields.len()));
@@ -22734,7 +22841,7 @@ impl PgHandler {
             }
             Ok(enc.take_row())
         });
-        Ok(QueryResponse::new(schema, rows))
+        QueryResponse::new(schema, rows)
     }
 
     /// Execute one planned statement against storage.
@@ -23614,6 +23721,14 @@ impl PgHandler {
             }
 
             Statement::Select(sel) => {
+                let env = RowEnv {
+                    tz: row_tz.clone(),
+                    ds: row_ds,
+                    cenc: row_cenc,
+                };
+                if let Some(streamed) = self.try_stream_select(&sel, &env)? {
+                    return Ok(vec![streamed]);
+                }
                 let (docs, def) = self.select_docs(&sel, max_rows)?;
                 Ok(vec![Response::Query(self.project_rows(
                     docs,
@@ -33361,6 +33476,147 @@ impl PgHandler {
         }
     }
 
+    /// The plan-cache key for an Execute of `sql` with `params`, or `None`
+    /// when none may be used now: the session has uncommitted DDL (its
+    /// lookups see it), or the statement text is not one templated.
+    fn plan_key(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        param_types: &[Option<String>],
+    ) -> Option<PlanKey> {
+        if !self
+            .uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || !self
+                .uncommitted_types
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            return None;
+        }
+        let tags = params.iter().map(|p| p.element_type() as u8).collect();
+        Some((sql.to_string(), param_types.to_vec(), tags))
+    }
+
+    /// The cached plan for `key`, with `params` substituted -- `None` when
+    /// there is none valid now (a catalog / settings / role change, or a
+    /// statement found not templatable).
+    fn templated_plan(&self, key: &PlanKey, params: &[Bson]) -> Option<Statement> {
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (v, g, role, template) = cache.get(key)?;
+        if *v != version || *g != generation {
+            return None;
+        }
+        let (stand_ins, plan) = template.as_ref()?;
+        if !plan_cache::fits(params, stand_ins) {
+            return None;
+        }
+        if *role != self.current_role_name() {
+            return None;
+        }
+        if stand_ins.is_empty() {
+            return Some(plan.clone());
+        }
+        plan_cache::substitute(plan, stand_ins, params)
+    }
+
+    /// Learn whether `key`'s statement can be templated, planning it twice
+    /// with stand-in values (see `plan_cache`), and record the answer.
+    fn learn_plan_template(
+        &self,
+        key: PlanKey,
+        params: &[Bson],
+        param_types: &[Option<String>],
+        tz: &secantus_pgplan::TimeZoneSetting,
+    ) {
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let role = self.current_role_name();
+        {
+            let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((v, g, r, _)) = cache.get(&key) {
+                if *v == version && *g == generation && *r == role {
+                    return;
+                }
+            }
+        }
+        let template = (|| {
+            let relations = plan_cache::eligible_sql(&key.0)?;
+            // Every relation a plain table (or a catalog / sequence the
+            // executor reads afresh): a view expands to a query of its own,
+            // a rule rewrites the statement, and a row-security policy adds
+            // a condition -- any of them may carry a function the
+            // statement's text does not show, which a template would freeze.
+            if !self.rls_enabled_docs().is_empty() {
+                return None;
+            }
+            for name in &relations {
+                if self.lookup_inner(name).is_none() || self.has_rules(name) {
+                    return None;
+                }
+            }
+            let (a, b) = plan_cache::sentinels(params)?;
+            let ran_subquery = std::cell::Cell::new(false);
+            let touched_temp = std::cell::Cell::new(false);
+            let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+                ran_subquery.set(true);
+                self.subquery_rows(stmt)
+            };
+            let lookup = |n: &str| {
+                let def = self.lookup_inner(n);
+                if def.as_ref().is_some_and(|d| d.temp) {
+                    touched_temp.set(true);
+                }
+                def
+            };
+            let plan = |values: &[Bson]| {
+                secantus_pgplan::plan_with_session_types_and_subqueries(
+                    &key.0,
+                    &lookup,
+                    values,
+                    param_types,
+                    tz,
+                    Some(&run),
+                )
+                .ok()
+            };
+            let plan_a = plan(&a);
+            let plan_b = plan(&b);
+            // The stand-in plans' warnings and error positions are not the
+            // statement's.
+            let _ = secantus_pgplan::take_warnings();
+            let _ = secantus_pgplan::take_error_location();
+            let (plan_a, plan_b) = (plan_a?, plan_b?);
+            if ran_subquery.get() || touched_temp.get() {
+                return None;
+            }
+            plan_cache::is_template(&plan_a, &plan_b, &a, &b).then_some((a, plan_a))
+        })();
+        let mut cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key, (version, generation, role, template));
+    }
+
     /// The output columns a statement would produce, without running it, or
     /// `None` for a statement that produces no result set at all.
     ///
@@ -34015,12 +34271,22 @@ impl ExtendedQueryHandler for PgHandler {
         // `max_rows` at a time and a later Execute resumes it, as
         // PostgreSQL's does. Truncating here left the resumed portal empty
         // -- pgjdbc's fetch-size cursors (CursorFetchTest) read 25 rows of 100.
-        let _ = max_rows;
+        // ... except a read-only SELECT outside a block, which streams
+        // (`portal_stream`).
+        self.allow_portal_stream(max_rows);
         let live = live_notices::LiveNotices::install(self, _c);
         let result = self
             .run_typed(&portal.statement.statement.sql, &params, &param_types, 0)
             .await
             .inspect_err(|_| self.note_failure());
+        self.stream_request.store(
+            portal_stream::STREAM_NEVER,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.stream_portal.store(
+            portal_stream::STREAM_NEVER,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         drop(live);
         // Notices go out before the result -- or the error -- they preceded.
         self.flush_notices(_c).await?;
