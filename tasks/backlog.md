@@ -671,6 +671,15 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
+- [ ] **OPEN — RUST pgserver: psycopg gauge regressed since 2026-09-18
+      (measured batch 48, 2026-10-03).** 5482 passed / 61 failed / 1 error
+      (was 5545 / 1). 60 of the failures fail identically on an origin/main
+      release build, so they predate batch 48: `test_range` /
+      `test_multirange` `test_dump_builtin_empty_wrapper`, `test_string`
+      (`dump_1byte`, `text_array`, `load_1char`) and 4 in `test_errors`.
+      `test_concurrency::test_commit_concurrency` and `test_cancel` failed
+      only under full-suite load and pass in isolation. Bisect which batch
+      introduced each group and fix against PostgreSQL 15.
 - [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
       2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
       the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
@@ -760,7 +769,19 @@ remain open:
         change, a DELETE that matches, and an INSERT are refused 0A000 --
         a SCOPE DECISION: the catalogs here are computed from the store,
         so a superuser's direct catalog write has no row to change.
-        Found while measuring, still open: `SELECT *` over several
+        (FIXED 2026-10-03, batch 48: every catalog below now has
+        PostgreSQL 15.19's column set and order, from a measured list
+        `pg15_catalog_order.tsv` applied to each catalog's definition
+        (`catalog_order.rs`) -- 21 catalogs re-checked by `SELECT *`
+        column names against PG 15, all equal, plus the 30 others the
+        server serves; the added columns carry PG 15's values where they
+        are constants (`attcacheoff`, `attbyval` / `attalign`, `typowner`,
+        `relfrozenxid`, `pronargdefaults`, `tgattr` / `tgargs`, the
+        `pg_language` handler oids), NULL otherwise. `pg_database` lost
+        16's `daticurules` and `pg_prepared_statements` 16's
+        `result_types`. Slice test
+        `test_select_star_over_catalogs_has_pg15_columns`, corpus
+        `b48_catalog_columns`.) Was: `SELECT *` over several
         catalogs is not PostgreSQL's column list -- `pg_class` lacks
         `relfrozenxid` / `relminmxid` and orders its columns differently,
         `pg_attribute` lacks `attalign` / `attbyval` / `attcacheoff` /
@@ -825,6 +846,32 @@ remain open:
       then never touches WT itself -- but a portal inside a block must read
       the BLOCK's snapshot, which lives on the block's own session, so the
       portal thread cannot have one of its own there.)
+      (LANDED 2026-10-03, batch 48, for the case outside a block:
+      `portal_stream.rs`. An extended-protocol SELECT outside a transaction
+      block, whose implicit group has written nothing, at READ COMMITTED,
+      over one stored table of built-in types with no join / subquery /
+      window / DISTINCT / ORDER BY / residual / computed column, is read by
+      a pooled reader thread that owns its WiredTiger session, snapshot and
+      cursor (`Storage::scan_matching_batches`) and hands 256-row batches
+      through a bounded channel (2 in flight); pgwire's portal pulls
+      `max_rows` at a time and answers PortalSuspended, the thread parks
+      on the full channel between Executes, and dropping the portal ends
+      it. With a WHERE it streams only for a row-capped Execute (the
+      streamed read is a collection scan, not traded for an index lookup
+      when the whole result is wanted). Cancel and `statement_timeout`
+      are checked per batch (the timeout counts the reader's working time,
+      not the client's pause between fetches; a cancel sent while the
+      client is idle between two fetches is honoured at the next, where
+      PostgreSQL would ignore it). Inside a block a portal is materialised
+      as before (the block's snapshot is on its own session). Memory,
+      release builds, 400k rows of 1 KB streamed by psycopg after a
+      restart: server RSS +1620 MB on main, +436 MB with streaming (the
+      remainder is WiredTiger's cache filling with the 400 MB read). Slice
+      tests `test_a_portal_outside_a_block_streams_from_one_snapshot`
+      (pieces, tags, snapshot, 34000 after Sync, in-block unchanged -- the
+      same script run against PostgreSQL 15 gives the same transcript),
+      `test_a_streamed_portal_is_cancelled_by_statement_timeout`. Left:
+      the in-block portal, and a SQL `DECLARE CURSOR`, still materialise.)
 - [x] **CLOSED (scope decision, 2026-10-02, batch 45) — RUST pgserver: the
       sqllogictest gauge (batch 32).** `slt_validation` drives the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). The
@@ -1062,8 +1109,32 @@ remain open:
         too, after waiting). Slice tests `test_read_committed_block_waits_*`,
         `test_a_cycle_of_row_waits_is_a_deadlock`,
         `test_a_row_wait_ends_on_lock_timeout`,
-        `test_concurrent_blocks_neither_lose_nor_duplicate_writes`. Limits
-        (re-read 2026-10-02, batch 45 -- still open): WiredTiger does not say
+        `test_concurrent_blocks_neither_lose_nor_duplicate_writes`.
+        (FIXED 2026-10-03, batch 48: precise holders. The storage records
+        every document row a user transaction writes -- triggers' and FK
+        cascades' writes included, since they run in it --
+        (`UserTransactionHandle::written_rows`, `note_row` at each doc-table
+        write) and the row a write was on when it failed
+        (`last_row_written`); each block publishes its write set after
+        every statement (`row_waits::publish`), and a waiter waits on, and
+        enters into the deadlock check only, the session(s) holding the
+        row it collided on. A chain (C waits on A, A on B) no longer gives
+        40P01 after `deadlock_timeout` -- it did, the superset made A and C
+        wait on each other; a real cycle still does, through a
+        trigger-written or cascade-deleted row too. Slice tests
+        `test_a_chain_of_row_waits_is_not_a_deadlock`,
+        `test_a_cycle_through_a_trigger_written_row_is_a_deadlock`,
+        `test_a_cycle_through_a_cascaded_delete_is_a_deadlock`, all four
+        scenarios run on PostgreSQL 15 with the same answers. Left: a row
+        no session has published -- an autocommit statement's, or one a
+        block writes in the statement still running -- gives the waiter no
+        edge (it retries on the old schedule, never a false 40P01, but a
+        cycle closed only through such a row is not reported until
+        `lock_timeout`); `ROLLBACK TO SAVEPOINT` does not shrink the
+        published set, so a row it released can still be counted as held
+        for the deadlock check until the block ends; a unique-index
+        conflict on INSERT names the new row, which nobody holds, so it is
+        an edge-less wait as well.) Was: WiredTiger does not say
         WHICH transaction holds the row, so the waiter waits on every session
         holding a write lock (ROW EXCLUSIVE+) and retries when one ends, or
         every 500ms -- a superset of PostgreSQL's single blocker, so the
@@ -1449,6 +1520,47 @@ These work end-to-end but cut corners.
       values while planning (NULL comparisons, LIKE prefixes, casts of
       literals, IN lists), so a template planned once would need every such
       branch made parameter-aware. Not attempted.
+
+      **Batch 48 (2026-10-03): plan reuse by verified template**
+      (`plan_cache.rs`). Rather than making the planner parameter-aware, a
+      statement is planned with two distinct sets of stand-in values; if
+      substituting the second set for the first in the first plan gives
+      exactly the second plan (and every stand-in was found), the planner
+      copied each value verbatim and made no decision on it, and later
+      Executes substitute their values instead of planning. Cached per
+      session by (text, parameter types, the values' BSON types), valid
+      while catalog version / settings generation / role are unchanged and
+      never with uncommitted DDL. Only tried where the check cannot be
+      fooled: one SELECT / UPDATE / DELETE (or a parameterless statement)
+      with no function call, subquery, CTE, SQL value function, locking
+      or ON CONFLICT clause, and no planning-time subquery or temp table;
+      int32 / int64 / double / string values, never NULL (inline path);
+      substituted ONLY in the WHERE filter -- a value bound for storage
+      (SET, an INSERT row) is checked against its column while planning
+      (varchar length, int range, domain), which a passing stand-in proves
+      nothing about, so those statements keep planning per Execute. String
+      stand-ins carry blanks and mixed case so a trim / pad / fold shows in
+      the check. Slice test `test_a_reused_plan_takes_each_executions_values`
+      (values, NULL, char(n), LIKE, LIMIT param, DDL in between, RLS role
+      switch, over-long / out-of-range SET and INSERT values -- all
+      PostgreSQL 15's answers; it also found and fixed an int8 -> int4
+      overflow answering 22P02 where PG says 22003, corpus `b48_int_range`).
+      Release builds, `bench43.py`, two interleaved runs, PG 15 same box:
+
+      | us / statement | base (main) | batch 48 | PG 15 |
+      | --- | --- | --- | --- |
+      | ping | 19.5-19.9 | 19.3-19.9 | 18.5-18.6 |
+      | simple `select 1` | 36.7-37.1 | 31.8-32.2 | 23.0-23.1 |
+      | extended `select 1` | 53.4-53.6 | 49.0-51.0 | 27.0-27.1 |
+      | extended PK read | 73.9-74.7 | **54.9-56.0** | 33.5 |
+      | extended autocommit UPDATE | 95.8-96.1 | 86.1-89.6 | 55.7-56.1 |
+      | extended `select k, v` of 10 rows | 77.2 | 74.7 | 33.8 |
+      | extended `select k, v` of 1000 rows | 891 | 755 | 188 |
+
+      (The last two rows include batch 48's streamed portal, below.)
+
+      What is left of the PK-read gap (~21 us) is execution and the wire,
+      not planning.
 
       **Batch 46 (2026-10-03): Joe chose "match PostgreSQL".** On macOS the
       server now opens the WiredTiger log `O_DSYNC` (`method=dsync`,
