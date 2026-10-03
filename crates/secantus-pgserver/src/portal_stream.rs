@@ -139,7 +139,10 @@ impl PgHandler {
         if mode == STREAM_NEVER || (mode == STREAM_UNFILTERED && !sel.filter.is_empty()) {
             return Ok(None);
         }
-        let plain = sel.sub.is_none()
+        // A `FOR UPDATE` locks the rows it returns, which the reader
+        // thread's own session could not do for this transaction.
+        let plain = sel.lock.is_none()
+            && sel.sub.is_none()
             && sel.join.is_none()
             && sel.series.is_none()
             && sel.windows.is_empty()

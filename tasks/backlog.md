@@ -671,198 +671,48 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
-- [ ] **OPEN — RUST pgserver: what the pgjdbc gauge still fails (batch 37,
-      2026-10-02; re-measured after batch 40).** pgx is clean (377 / 0 / 22,
-      the 22 are unset `PGX_TEST_*_CONN_STRING` environment skips; two runs
-      over one store both pass). pgjdbc: 7354 tests, 3 failed, 28 skipped
-      (batch 39 left 22 failed, batch 38 84). The gauge
-      harness now also creates the `test` ROLE pgjdbc's own CI creates (a
-      superuser, as an unknown user was already treated), so what the suite
-      creates is owned by a real role. Batch 39 fixed (corpora `b39_*`, and
-      `test_parallel_sessions_resolve_their_own_new_temp_table`): the temp
-      table race (the catalog version moved before the creating transaction
-      committed, so another session cached the pre-commit catalog on a shared
-      worker thread -- 42P01 on the creator's own table; also a session's
-      disconnect dropped its temp tables under a stale thread-local temp
-      schema), `ROLLBACK TO SAVEPOINT` undoing a SET, a volatile argument of
-      `pg_typeof()` running twice, prefix minus/plus on money, binary money
-      parameters, `LOCK TABLE` inside a function outside a block (allowed at
-      a nested level; its locks end with the implicit transaction) and
-      notices reaching the client while a statement waits (pgjdbc's
-      StatementTest cancels on them -- the "hang"), a timestamptz assigned
-      from a column / bound parameter / array parameter being re-read as a
-      wall clock (an hour off in a summer-time zone: `update t set b = a`
-      between two timestamptz columns moved the instant), timestamptz[] to
-      text, fractional seconds rounded (not truncated) to the microsecond,
-      `+hhmm` offsets, `timetz +/- interval`, an untyped operand beside an
-      interval, `(timestamptz + interval) - timestamptz`, binary BC date /
-      timestamp parameters, `LIKE`/`~` described as int4, binary varchar[] /
-      bpchar[] / name[], `max_index_keys` and the other internal settings,
-      `pg_get_keywords()`, a FOREIGN KEY's `conindid`, comma-join planning
-      (WHERE equalities hash each join; pgjdbc's getImportedKeys ran for
-      minutes and grew to 5 GB), expression and partial indexes in
-      `pg_index` / `pg_get_indexdef`, `ADD PRIMARY KEY USING INDEX`, the
-      constraint name of `ADD CONSTRAINT x PRIMARY KEY`, a domain CHECK
-      error's schema / datatype / constraint fields, `COMMENT ON DOMAIN`
-      (on the domain doc, the Python server's layout), a schema's composite
-      type's `typnamespace`, the pseudo-types in `pg_type`, `relowner`, PL/
-      pgSQL `$n` argument references, `lseg ?# box`, `COPY ... HEADER`.
-      Batch 40 fixed (corpora `b40_fixes` / `b40_types`, and
-      `test_pg_temp_function_is_session_private_and_dropped_at_disconnect`):
-      the `macaddr` / `macaddr8` / `pg_lsn` / `txid_snapshot` / `pg_snapshot`
-      / `xid` / `xid8` / `cid` types (I/O, binary, arrays; `pg_lsn` stored as
-      its position so it sorts), `_custom`-style array type names
-      (`makeArrayTypeName`'s extra underscores) and composite / enum array
-      columns missing from `pg_attribute`, a LIKE pattern ending in its escape
-      (22025 only when matching reaches it; never over a catalog `name`
-      column, whose planner reads an exact prefix), a BC timestamptz with its
-      own offset (`0101-01-01 BC -05`, what pgjdbc sends) losing the offset,
-      a 2-D enum array sent as one quoted string, a Describe of a STATEMENT
-      reporting the previous Bind's binary formats (pgjdbc then decoded text
-      rows as binary -- TimezoneTest / ResultSetTest binary mode), `SHOW
-      timezone` not canonicalising a zone name's case (`gmt-3` is `GMT-3`;
-      Java read `gmt-3` as GMT), system relations' `relacl`, `xid` in
-      `pg_type` (DatabaseMetaDataCacheTest), every PostgreSQL 15 GUC
-      SHOW-able with its default (`pg15_settings.tsv`; `work_mem` answered
-      42704 after a ROLLBACK reset it), `pg_temp` functions now
-      session-private and dropped at disconnect, and `ADD PRIMARY KEY USING
-      INDEX` keeping INCLUDE columns and the index's name; also a standalone
-      composite type's `pg_class` row (relkind `c`), `pg_typeof` of a
-      built-in returning `name`, the 42P16 position, and no `search_path` /
-      `scram_iterations` in the startup ParameterStatus (PostgreSQL 15 sends
-      neither). The gauge harness
-      now gives the `test` role pgjdbc CI's password, so the suite
-      authenticates (LoginTimeoutInterruptTest).
-      Re-measured 2026-10-02 (batch 45, build of this batch): 7354 tests, 2
-      failed, 28 skipped -- the two below; ConnectionTest pGStreamSettings
-      passed this run. The runner flags `BlobTransactionTest::
-      initializationError` as a regression only because
-      `pgjdbc_validation/baseline.json` predates it; origin/main answers the
-      same `CREATE FUNCTION in language "c" is not supported yet` (checked
-      on a release build of origin/main).
-      Re-measured 2026-10-03 (batch 47): 7354 tests, 1 failed
-      (`BlobTransactionTest`, below), 28 skipped; testOidUpdatable passes.
-      What failed / fails:
-      - UpdateableResultTest testOidUpdatable (PASSES since batch 47) --
-        batch 47 (2026-10-03, corpus
-        `b47_system_catalogs`, slice test `test_batch47_system_catalog_
-        writes_and_system_indexes`) fixed the three divergences under it:
-        `pg_index` / `pg_indexes` / `pg_get_indexdef` had no rows for
-        PostgreSQL's own 162 indexes (now dumped from 15.19,
-        `pg_index_system.tsv`, identical field for field); a catalog
-        column was described with `ftable` / `ftablecol` 0 / 0 where
-        PostgreSQL gives its relation oid and attnum (pgjdbc reads the base
-        column name through them -- the test's `""` identifier); and an
-        UPDATE / DELETE of a catalog answered a silent `UPDATE 0` /
-        `DELETE 0` and an INSERT created a stored table no catalog query
-        reads. Now an UPDATE that leaves every matched row as it is (the
-        test's write-back) reports its rows as PostgreSQL does; any real
-        change, a DELETE that matches, and an INSERT are refused 0A000 --
-        a SCOPE DECISION: the catalogs here are computed from the store,
-        so a superuser's direct catalog write has no row to change.
-        (FIXED 2026-10-03, batch 48: every catalog below now has
-        PostgreSQL 15.19's column set and order, from a measured list
-        `pg15_catalog_order.tsv` applied to each catalog's definition
-        (`catalog_order.rs`) -- 21 catalogs re-checked by `SELECT *`
-        column names against PG 15, all equal, plus the 30 others the
-        server serves; the added columns carry PG 15's values where they
-        are constants (`attcacheoff`, `attbyval` / `attalign`, `typowner`,
-        `relfrozenxid`, `pronargdefaults`, `tgattr` / `tgargs`, the
-        `pg_language` handler oids), NULL otherwise. `pg_database` lost
-        16's `daticurules` and `pg_prepared_statements` 16's
-        `result_types`. Slice test
-        `test_select_star_over_catalogs_has_pg15_columns`, corpus
-        `b48_catalog_columns`.) Was: `SELECT *` over several
-        catalogs is not PostgreSQL's column list -- `pg_class` lacks
-        `relfrozenxid` / `relminmxid` and orders its columns differently,
-        `pg_attribute` lacks `attalign` / `attbyval` / `attcacheoff` /
-        `attmissingval`, `pg_type` `typowner` / `typdefaultbin`, `pg_proc`
-        `probin` / `pronargdefaults` / `proargdefaults` / `protrftypes`,
-        `pg_namespace` `nspacl`, `pg_constraint` `confdelsetcols`,
-        `pg_trigger` `tgargs` / `tgattr` / `tgqual` / `tgoldtable` /
-        `tgnewtable`; `pg_database` has an extra `daticurules` (a PG 16
-        column); `pg_index` and `pg_roles` have PostgreSQL's columns in
-        another order. A client reading by NAME is unaffected; one reading
-        `SELECT *` by position, or a missing column by name, is not.
-      - `BlobTransactionTest` needs `CREATE FUNCTION lo_manage() ... AS
-        '$libdir/lo' LANGUAGE C` (the `lo` extension's trigger): CLOSED as a
-        scope decision (batch 47) -- `LANGUAGE C` loads a shared library
-        into the server process, which a server written in Rust has no
-        ABI to host; the `lo` contrib module is not shipped. The runner
-        flags it as a regression only because `baseline.json` predates it.
-        ConnectionTest pGStreamSettings asserts the CLIENT socket's receive
-        buffer and flickers independently of the server.
-      Batch 41 fixed (corpora `b41_fixes`, and the slice tests
-      `test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart`
-      / `test_binary_xid_and_snapshot_parameters_decode`): a `pg_temp`
-      function callable unqualified (now 42883), `min` / `max` over
-      `macaddr` / `macaddr8` / `uuid` / `bytea` / `json(b)` / geometry /
-      bit / xid / snapshot / tsvector (42883), a `pg_temp` function a killed
-      server left (dropped when the server opens the store), binary `xid` /
-      `cid` / `xid8` / snapshot parameters and their arrays (stored as their
-      raw bytes before; `macaddr[]` / `pg_lsn[]` already decoded), and SET /
-      `set_config` / ALTER DATABASE SET of a postmaster / sighup / backend
-      parameter (55P02). Batch 42 fixed (corpus `b42_misc`): another
-      session's temp tables in `pg_class`, `set_config(x, v, true)` outside a
-      block (visible to the rest of its statement, then put back -- it had
-      leaked into the session, or not applied at all over the extended
-      protocol), SQL `lo_open` in autocommit (closed with its statement;
-      descriptors number from the lowest free slot again), a notice raised
-      before a `pg_sleep` sent while it sleeps, and the snapshot functions.
-      Batch 43: a PL/pgSQL / DO-block `RAISE` below EXCEPTION is now sent
-      the moment it is raised (not only during a lock wait or `pg_sleep`).
-      Still open: other notices (a CASCADE list, `... does not exist,
-      skipping`) still go at the statement's end, which only matters for a
-      statement that then runs long; `pg_current_snapshot()` is the fixed
-      `3:3:` (this server exposes no transaction ids); and extended Execute
-      still materialises the whole result. That last one is NOT a protocol
-      fix (re-read 2026-10-02): the executor itself returns a `Vec` of
-      documents (`select_docs`), so streaming the encoded rows would save
-      only the encoded copy; bounding memory needs a storage cursor that
-      outlives one handler call and resumes on whichever tokio thread runs
-      the next Execute, while WiredTiger sessions are thread-affine. And the
-      batch-37 `materialise_rows` rule must stay for anything that WRITES
-      (PostgreSQL also runs a writing portal to completion first), so only a
-      read-only SELECT could stream. Size: a storage-cursor API plus a
-      portal state machine -- days, not a patch.
-      Re-read 2026-10-02 (batch 44), unchanged: every Execute runs under
-      `block_in_place` on whichever tokio worker polls the connection, and a
-      block's WiredTiger session is installed per statement
-      (`with_user_transaction`), so a cursor left open between two Executes
-      would be used from another thread and outside the scope that installed
-      its transaction. Not attempted. (Batch 47, 2026-10-03: not attempted
-      either; the design that keeps thread affinity is a dedicated thread
-      per open read-only portal owning its WiredTiger session, snapshot and
-      cursor, feeding row batches through a bounded channel -- Execute
-      then never touches WT itself -- but a portal inside a block must read
-      the BLOCK's snapshot, which lives on the block's own session, so the
-      portal thread cannot have one of its own there.)
-      (LANDED 2026-10-03, batch 48, for the case outside a block:
-      `portal_stream.rs`. An extended-protocol SELECT outside a transaction
-      block, whose implicit group has written nothing, at READ COMMITTED,
-      over one stored table of built-in types with no join / subquery /
-      window / DISTINCT / ORDER BY / residual / computed column, is read by
-      a pooled reader thread that owns its WiredTiger session, snapshot and
-      cursor (`Storage::scan_matching_batches`) and hands 256-row batches
-      through a bounded channel (2 in flight); pgwire's portal pulls
-      `max_rows` at a time and answers PortalSuspended, the thread parks
-      on the full channel between Executes, and dropping the portal ends
-      it. With a WHERE it streams only for a row-capped Execute (the
-      streamed read is a collection scan, not traded for an index lookup
-      when the whole result is wanted). Cancel and `statement_timeout`
-      are checked per batch (the timeout counts the reader's working time,
-      not the client's pause between fetches; a cancel sent while the
-      client is idle between two fetches is honoured at the next, where
-      PostgreSQL would ignore it). Inside a block a portal is materialised
-      as before (the block's snapshot is on its own session). Memory,
-      release builds, 400k rows of 1 KB streamed by psycopg after a
-      restart: server RSS +1620 MB on main, +436 MB with streaming (the
-      remainder is WiredTiger's cache filling with the 400 MB read). Slice
-      tests `test_a_portal_outside_a_block_streams_from_one_snapshot`
-      (pieces, tags, snapshot, 34000 after Sync, in-block unchanged -- the
-      same script run against PostgreSQL 15 gives the same transcript),
-      `test_a_streamed_portal_is_cancelled_by_statement_timeout`. Left:
-      the in-block portal, and a SQL `DECLARE CURSOR`, still materialise.)
+- [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
+      left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
+      of batch 50, tests started vs reported checked: psycopg 5544 passed /
+      0 failed (149 skipped, 34 xfailed, 4 xpassed); pgx 377 / 0 / 22 (399
+      started, 399 reported; the 22 are unset `PGX_TEST_*_CONN_STRING`
+      environment skips); SQLAlchemy 978 / 0 (435 skipped); pgjdbc
+      7354 completed, 1 failed (`BlobTransactionTest`, below), 28 skipped. The fixes of batches 37-48 are in the git log and the
+      corpora `b39_*` .. `b48_*`; this entry keeps only what is open or
+      decided:
+      - **Fixed in batch 50:** a DROP's CASCADE list, `... does not exist,
+        skipping` and the other NOTICE / WARNING a DDL statement raises are
+        sent the moment they are raised when a client is listening (they
+        went at the statement's end); transaction ids exist --
+        `txid_current()` / `pg_current_xact_id()` (were 0A000) and their
+        `_if_assigned` forms, assigned on first ask, stable for the
+        transaction, from a counter that starts above anything an earlier
+        run handed out -- and `pg_current_snapshot()` reports the other
+        sessions' running xids instead of the fixed `3:3:` (slice test
+        `test_batch50_transaction_ids_and_the_current_snapshot`, PostgreSQL
+        15's answers). An xid is assigned when asked for, not at a
+        transaction's first write: a writer that never asks is absent from
+        others' snapshots (only the snapshot functions can see it).
+      - **Open: memory of a portal inside a block.** An extended-protocol
+        SELECT inside a transaction block, and any SQL `DECLARE CURSOR`,
+        still materialise the whole result (batch 48 streams only outside a
+        block): a block's snapshot lives on the block's own WiredTiger
+        session, which a reader thread cannot share, and sessions are
+        thread-affine. Size: a portal state machine over the block's session
+        resumed per Execute on the connection's thread -- days.
+      - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
+        `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
+        trigger): `LANGUAGE C` loads a shared library into the server
+        process, which a server written in Rust has no ABI to host; the `lo`
+        contrib module is not shipped. The runner flags it as a regression
+        only because `pgjdbc_validation/baseline.json` predates it.
+      - **CLOSED (scope decision, batch 47):** a direct UPDATE that changes a
+        catalog row, a DELETE that matches one, and an INSERT into a catalog
+        are 0A000: the catalogs here are computed from the store, so there is
+        no row to change (an UPDATE leaving rows as they are reports them, as
+        pgjdbc's updatable-result-set write-back needs).
+      - Not the server: ConnectionTest `pGStreamSettings` asserts the CLIENT
+        socket's receive buffer and flickers on its own.
 - [x] **CLOSED (scope decision, 2026-10-02, batch 45) — RUST pgserver: the
       sqllogictest gauge (batch 32).** `slt_validation` drives the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). The
@@ -918,62 +768,48 @@ remain open:
       STATISTICS / PUBLICATION, INHERITS, hash and expression partitioning,
       pg_trgm, ALTER VIEW, table locks, time input, wide timestamptz,
       operator resolution by type, error positions) leaves (re-measured
-      2026-10-02, batch 45).** Every corpus is at 0 against PostgreSQL. Left,
-      each measured with a probe that compares the error FIELDS (state,
-      message, position, hint, context) on PostgreSQL 15:
-      - **Operator resolution by type.** Batch 45 (corpus
-        `b45_operand_shapes`, 79/79; 16 diverged before, four of them SILENT
-        wrong answers) types an array beside a scalar (`arr = 1` had matched
-        the row), `x op ANY / ALL (ARRAY[...] | typed array)` (`a =
-        ANY(ARRAY['x'])` answered no rows), each `BETWEEN` / `NOT BETWEEN`
-        bound (`text >= integer`, where it answered no rows),
-        `current_date` and the other SQL value functions (`current_date =
-        'x'` answered no rows; PostgreSQL 22007), `->>` / `->`, `count(*)`,
-        operands in HAVING and ORDER BY, `int + float8` as float8, and a
-        window function in WHERE (42P20 before any operator check).
-        `sum` / `avg` / `stddev` / `variance` / `bool_*` / `bit_*` over a
-        type no overload takes is 42883 (`sum(text)` answered 0), and an
-        aggregate in WHERE is 42803 (corpus `b45_errors`). An operand of any
-        other shape is still not checked. (Batch 46: `a LIKE 'x'` over an
-        integer is 42883 at the operator in the select list too, where it
-        had answered NULL; corpus `b46_errors`.)
-      - **Error positions** come from the parse location where the raising
-        site records one, else from the first token the message names. Batch
-        45 added the ungrouped-column 42803 (at the bare mention), `GROUP BY
-        / ORDER BY position N` (at the number), `invalid reference to
-        FROM-clause entry` (at the qualifier, with PostgreSQL's alias HINT),
-        and aggregate / window calls in WHERE (slice test
-        `test_batch45_error_positions_and_hints`). A name mentioned twice may
-        still point at the wrong occurrence. Batch 46: an error inside a
-        PL/pgSQL body carries PostgreSQL's CONTEXT stack (`SQL expression
-        "1/0"` / `SQL statement "..."` / `PL/pgSQL assignment "x := 1/0"`,
-        then `PL/pgSQL function f(integer) line N at RETURN` per function);
-        a FROM-less subquery naming a sibling FROM item is 42P01 with its
-        HINT (slice test `test_batch46_function_body_error_context`). Batch
-        47 (slice test `test_batch47_sql_function_context_and_routine_
-        settings`, a 22-case probe identical to PostgreSQL 15.19): a
-        `LANGUAGE sql` body's error carries `SQL function "f" statement N`
-        when the body runs as itself, `SQL function "f" during inlining` when
-        PostgreSQL inlines the call and folds it over constants (or a
-        client's bound parameters, which a custom plan folds), and nothing
-        when an inlined call fails per row -- `inline_function`'s rules
-        (one plain SELECT of one expression with no FROM / WHERE / grouping
-        / sublink, not SECURITY DEFINER, no SET clause, a STRICT one
-        strict over every parameter; a set-returning one inlined in FROM
-        unless VOLATILE). The same batch made CREATE FUNCTION record
-        SECURITY DEFINER, SET clauses and the owner (pg_proc said
-        `prosecdef = f` / no `proconfig` after a CREATE that gave them) and
-        APPLY them: a definer's body runs as its owner, a SET is in force for
-        the call only (both had been ignored -- `current_user` was the
-        caller, `current_setting` the session's). Left: (a) a FROM item that
-        PostgreSQL pulls up into constants (a one-row `VALUES`) still counts
-        as per-row, so `select f(a) from (values (0)) v(a)` gets no frame
-        where PostgreSQL says `during inlining`; (b) whether a built-in
-        function argument is folded is not modelled -- any built-in call in
-        the arguments counts as run-time; and the `SQL expression` frame
-        follows an approximation of PL/pgSQL's simple-expression rule (a
-        frame for a non-simple expression or one with no variable and no
-        volatile / user call, which PostgreSQL folds while planning).
+      2026-10-03, batch 50).** Every corpus is at 0 against PostgreSQL 15.
+      Batch 50 probed the error FIELDS (state, message, position, hint,
+      detail, context) of 68 operand shapes on PostgreSQL 15.19 and fixed
+      every divergence but one (corpus `b50_operand_types`, 71 lines),
+      among them FIVE silent wrong answers:
+      - `CASE` / `COALESCE` / `GREATEST` / `LEAST` over types of different
+        categories (`coalesce(int, text)`) answered the first branch's value;
+        now PostgreSQL's 42804 `COALESCE types integer and text cannot be
+        matched` at the offending branch (`select_common_type`'s order: a
+        CASE's ELSE first). An untyped literal among mixed numeric branches
+        is checked against their common type (`coalesce(numeric, int, 'x')`
+        is 22P02; it answered).
+      - `x IN (SELECT y ...)` / `x op ANY|ALL (SELECT ...)` across categories
+        answered no rows; `NULLIF(a, b)` across categories answered; `a IS
+        [NOT] DISTINCT FROM b` was 0A000 -- all PostgreSQL's 42883 now.
+      - `greatest(date, timestamptz)` answered the date's TEXT; it is
+        timestamptz now (the datetime common type: date -> timestamp ->
+        timestamptz), `least(date, timestamp)` timestamp.
+      - An argument of AND / OR / NOT of a non-boolean type has its 42804 AT
+        that argument; a prefix `-` / `+` over text, a date, json ... is
+        `operator does not exist: - text` with the one-argument HINT (it was
+        `integer - text`); a comparison / IN / BETWEEN / IS DISTINCT is typed
+        boolean for these checks.
+      - A HAVING naming a column no FROM item has is 42703 (it was a 42803
+        grouping error), an ambiguous column in a JOIN has its position, a
+        relation named by a string (`'t'::regclass`) is 42P01 at the literal,
+        `CREATE VIEW` over `row(a, b)` is 42P16 `has pseudo-type record` (it
+        created the view), `pg_collation_for(name_col)` is `"C"`.
+      - An inlined `LANGUAGE sql` call over an IMMUTABLE built-in of
+        constants (`f(abs(0))`) is folded, as PostgreSQL folds it: its error
+        carries `SQL function "f" during inlining` (immutability from
+        `pg15_immutable_functions.tsv`, every built-in overload of a name
+        and arity immutable in PostgreSQL 15's `pg_proc`).
+      Left:
+      - `select f(a) from (values (0)) v(a)`: PostgreSQL pulls a one-row
+        VALUES up into constants and says `during inlining`; here the
+        column is per-row, no CONTEXT. Diagnostic text only; size: the
+        planner would have to know a column's source is a one-row VALUES.
+      - `pg_collation_for(x)` over a non-collatable type answers NULL where
+        PostgreSQL raises 42804 when evaluated.
+      - The `SQL expression` frame of a PL/pgSQL error follows an
+        approximation of PL/pgSQL's simple-expression rule (as before).
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
         quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
@@ -981,30 +817,31 @@ remain open:
         command takes 0.5 s alone and the test passes in 24 s. Not reproduced;
         the cause (what the nested collection blocked on) is unknown. If it
         recurs, capture the nested process's stack before the timeout kills it.
-- [ ] **OPEN — RUST pgserver: what batch 11 (rules, event triggers, foreign
-      data, CREATE CAST / COLLATION, pgcrypto PGP, ruleutils) leaves
-      (re-measured 2026-10-02, batch 45).** Corpora `rules`,
+- [x] **CLOSED (re-measured 2026-10-03, batch 50) — RUST pgserver: what
+      batch 11 (rules, event triggers, foreign data, CREATE CAST / COLLATION,
+      pgcrypto PGP, ruleutils) left.** Corpora `rules`,
       `event_triggers`, `fdw`, `collations`, `user_casts`, `views_ruleutils`,
       `expr_ruleutils`, `viewdef_shapes`, `internal_functions`, `catalog_b11`,
-      `pgcrypto_ciphers` are at 0 against PostgreSQL. Open, one item:
+      `pgcrypto_ciphers` are at 0 against PostgreSQL. Nothing is open:
       - **ruleutils** (`pg_get_viewdef`, `pg_views`, `pg_rules`,
         `pg_get_expr`) prints from a small analyser and falls back to the
-        text as written for a shape it cannot type. Batch 45 (corpus
-        `b45_viewdefs`, 23/23) closed three of the four fallbacks this entry
-        named: a cross-type date / timestamp / timestamptz comparison (no
-        cast, as PostgreSQL's cross-type operators print), `[NOT]
-        MATERIALIZED` CTEs, and a RANGE frame offset over a number or (an
-        interval over) a date/time ordering; and RANGE offsets are now
-        checked when planned (42P20 for several ORDER BY columns, 0A000 for a
-        text ordering or an integer offset over a date, 22P02 for a bad
-        literal) where the server had accepted the first two and answered
-        22007 for the third. Batch 46 (corpus `b46_viewdefs`, 41/41) closed
-        the rest of what this entry named: a call PostgreSQL coerces
-        implicitly prints its overload's casts (`funcsig::resolved_args`
-        applies `func_select_candidate`'s unknown-literal step), `EXTRACT`
-        prints as its syntax, and the int wrap-column form wraps a target
-        or FROM item by width (`ruleutils::render_wrapped`). A shape the
-        printer cannot type still falls back to the text as written.
+        text as written for a shape it cannot type. Batch 50 probed 60 more
+        view shapes on PostgreSQL 15.19 (plain, pretty and wrapped): 29
+        fell back or printed differently; all 60 now print PostgreSQL's text
+        (corpus `b50_viewdefs`, 140 lines): aggregate `FILTER` / `ORDER BY` /
+        `WITHIN GROUP`, `GROUPING SETS` / `ROLLUP` / `CUBE`, array subscripts
+        and slices, `||` over arrays and `textanycat`, `= ANY / ALL (array)`,
+        array `@>` / `<@` / `&&`, json and jsonb operators (a jsonb constant in
+        jsonb's output form), row comparisons (`=` expanded, `ROW() > ROW()`),
+        `^`, `interval * number`, date / timestamp arithmetic, interval and
+        timestamp constants in their output form, `SUBSTRING` / `TRIM` /
+        `POSITION` / `OVERLAY` / `AT TIME ZONE` syntax, `SIMILAR TO`,
+        `BETWEEN SYMMETRIC`, `IS NOT DISTINCT FROM` (`NOT ... IS DISTINCT`),
+        `> ALL (subquery)`, a one-element IN, `VARIADIC "any"` calls, a
+        set-returning function in FROM, polymorphic arguments, prefix
+        operators and set-operation `ORDER BY 1` in pretty form. A shape the
+        printer still cannot type falls back to the text as written (never a
+        wrong reconstruction); none is known.
       Scope decisions, not bugs (each is PostgreSQL's own answer for the
       setup this server has):
       - **Foreign data**: no FDW handler exists here, so a foreign table
@@ -1075,97 +912,75 @@ remain open:
       actually qualified, and the UPDATE path never reached the PostgreSQL
       error renderer at all, so any unique violation there (the PRIMARY KEY one
       included) leaked `E11000` with no SQLSTATE.
-- [ ] **OPEN — RUST pgserver: write conflicts, what is left (updated
-      2026-09-30).** An autocommit write -- and the first write of a block or
-      of an extended-protocol group -- now runs in a transaction it owns, so a
-      conflict with another transaction (a prepared one included) WAITS and
-      re-evaluates against the row that transaction left, as READ COMMITTED
-      does, polling for a cancel, `statement_timeout` (57014) and
-      `lock_timeout` (55P03). (Before, an autocommit `UPDATE ... SET n = n + 1`
-      could silently overwrite a concurrent commit -- a lost update.) Left:
-      - (FIXED 2026-10-02, batch 44) A READ COMMITTED block that has ALREADY
-        written and then collides now WAITS and re-checks, as PostgreSQL
-        does, instead of answering `40001` at once. WiredTiger cannot refresh
-        a writer's snapshot and a conflict leaves the transaction able only
-        to roll back, so the block is MOVED: a new transaction pins a fresh
-        snapshot while the old one still holds its rows, the old one rolls
-        back, and its write set (its oplog entries, as PREPARE TRANSACTION
-        uses) is replayed into the new one (`Storage::rebase_user_transaction`);
-        then the statement runs again. A row another session committed in
-        the instant between the rollback and the replay is a conflict on the
-        replay -- the block fails 40001, nothing is overwritten. A cycle of
-        such waits is 40P01, checked once 1s (`deadlock_timeout`) into the
-        wait; a failed block now lets go of its rows at once (as PostgreSQL's
-        abort does). REPEATABLE READ / SERIALIZABLE still answer 40001 (PG 15
-        too, after waiting). Slice tests `test_read_committed_block_waits_*`,
-        `test_a_cycle_of_row_waits_is_a_deadlock`,
-        `test_a_row_wait_ends_on_lock_timeout`,
-        `test_concurrent_blocks_neither_lose_nor_duplicate_writes`.
-        (FIXED 2026-10-03, batch 48: precise holders. The storage records
-        every document row a user transaction writes -- triggers' and FK
-        cascades' writes included, since they run in it --
-        (`UserTransactionHandle::written_rows`, `note_row` at each doc-table
-        write) and the row a write was on when it failed
-        (`last_row_written`); each block publishes its write set after
-        every statement (`row_waits::publish`), and a waiter waits on, and
-        enters into the deadlock check only, the session(s) holding the
-        row it collided on. A chain (C waits on A, A on B) no longer gives
-        40P01 after `deadlock_timeout` -- it did, the superset made A and C
-        wait on each other; a real cycle still does, through a
-        trigger-written or cascade-deleted row too. Slice tests
-        `test_a_chain_of_row_waits_is_not_a_deadlock`,
-        `test_a_cycle_through_a_trigger_written_row_is_a_deadlock`,
-        `test_a_cycle_through_a_cascaded_delete_is_a_deadlock`, all four
-        scenarios run on PostgreSQL 15 with the same answers. Left: a row
-        no session has published -- an autocommit statement's, or one a
-        block writes in the statement still running -- gives the waiter no
-        edge (it retries on the old schedule, never a false 40P01, but a
-        cycle closed only through such a row is not reported until
-        `lock_timeout`); `ROLLBACK TO SAVEPOINT` does not shrink the
-        published set, so a row it released can still be counted as held
-        for the deadlock check until the block ends; a unique-index
-        conflict on INSERT names the new row, which nobody holds, so it is
-        an edge-less wait as well.) Was: WiredTiger does not say
-        WHICH transaction holds the row, so the waiter waits on every session
-        holding a write lock (ROW EXCLUSIVE+) and retries when one ends, or
-        every 500ms -- a superset of PostgreSQL's single blocker, so the
-        40P01 check can see a cycle through an unrelated writer; each retry
-        lets go of the block's rows for a moment, and a block that did DDL is
-        not moved (still 40001). Narrowing the wait to the sessions holding
-        the statement's TARGET table was considered and rejected: this
-        server's table locks are taken from the statement's SQL text
-        (`wait_for_table_locks`), so a trigger's or an FK cascade's write to
-        another table holds no lock, and a narrowed wait set would MISS a
-        real blocker and with it a real deadlock (both sessions then retry
-        until `lock_timeout`). A precise holder needs each transaction's
-        written row keys recorded in this server's own registry (every
-        storage write path, cascades and triggers included) and the
-        conflicting key -- which WT_ROLLBACK does not carry -- recovered by
-        re-probing the statement's candidate rows against those sets. Size:
-        days. (Re-read batch 47, 2026-10-03: unchanged, `row_waits.rs` still
-        waits on every ROW EXCLUSIVE holder; not attempted this batch.)
-      - (FIXED 2026-10-02, batch 44) An UPDATE whose new row equals the old
-        (`n = n * 2` over 0) wrote nothing and so took no row lock: it
-        neither waited for another session's uncommitted update nor
-        re-checked against it (`7` where PostgreSQL 15 gives `14`). The PG
-        server now rewrites each matched-but-unchanged row with its own
-        value inside the statement's transaction (`Storage::lock_matching`,
-        PG-only; the storage no-op detection the MongoDB server's
-        `nModified` relies on is unchanged).
-        `test_an_unchanging_update_still_waits_for_the_row`. Such a lock
-        write has no oplog entry, so a block moved by
-        `rebase_user_transaction` does not carry it over (the value is
-        unchanged; only the lock is lost until the row is written again).
-      - (FIXED 2026-09-30) A prepared transaction recovered after a restart
-        is revived at open as a LIVE transaction -- its write set replayed
-        into an open WT transaction -- so it holds its rows as before the
-        restart: a conflicting write waits (55P03 under `lock_timeout`)
-        instead of committing and being overwritten by `COMMIT PREPARED`.
-        `test_a_recovered_prepared_transaction_still_holds_its_rows`.
-      - A crash between a live `COMMIT PREPARED`'s WT commit and the record's
-        deletion is detected at the next `COMMIT PREPARED` by the first minted
-        seq being readable (`prepared_already_committed`), not by a commit
-        record.
+- [ ] **OPEN — RUST pgserver: write conflicts and row locks, what is left
+      (updated 2026-10-03, batch 50).** A conflicting write WAITS for the
+      transaction holding the row -- holding its own rows meanwhile -- and
+      re-checks against what that transaction left, as PostgreSQL does;
+      a cycle of waits is 40P01 one `deadlock_timeout` (1s) in; `lock_timeout`
+      (55P03), `statement_timeout` (57014) and a cancel end a wait. Every
+      residual this entry named is FIXED in batch 50, each measured with two-
+      and three-session scripts that give PostgreSQL 15.19's answers (slice
+      tests `test_batch50_*`, which pass unchanged against PostgreSQL 15 too;
+      the probe was 24 two- and three-session scenarios, all equal):
+      - **Rows nobody published.** The storage now fills each transaction's
+        held-row set as every row is written (`UserTransactionHandle::
+        held_rows`, `Held`), including the `_id` index key an INSERT claims
+        (`ID_KEY_ROW_SUFFIX`); a session registers the set when it opens a
+        handle (`row_waits::register`). An autocommit statement and a
+        block's still-running statement now WAIT holding their rows
+        (`wait_for_row_holder`) instead of rolling back and retrying, so a
+        cycle through such a row is 40P01 after 1s (it was 55P03 at
+        `lock_timeout`, or a wait FOREVER with none), and two blocks
+        inserting each other's primary keys are 40P01 too.
+      - **ROLLBACK TO SAVEPOINT** at READ COMMITTED moves the block onto a
+        new WiredTiger transaction that replays its write set without the
+        entries after the savepoint's position that touch a restored table
+        (`rollback_to_by_move`, `Storage::rebase_user_transaction_keeping`).
+        So the rows written after the savepoint are LET GO (another session's
+        update went from 55P03 to immediate), a ROLLBACK TO no longer fails
+        40001 because another session committed any row of the same table
+        (it rewrote the whole table inside the transaction), and a block a
+        `lock_timeout` doomed inside a savepoint carries on after ROLLBACK TO
+        and commits (the rewrite left it unable to commit).
+      - **REPEATABLE READ / SERIALIZABLE wait first**, then go on when the
+        holder rolled back and nothing committed since the snapshot (a
+        commit counter, `Storage::no_commit_since`, proves a new snapshot
+        sees the same rows), else 40001 -- PostgreSQL's two outcomes, where
+        40001 came at once.
+      - A block's re-run after a conflict replays only what was written
+        BEFORE the failing statement (`write_set_len` at its start): the
+        failing attempt's partial writes are not replayed and then written
+        again.
+      - **`SELECT ... FOR UPDATE` / `FOR NO KEY UPDATE`** (new, found by the
+        probe: it was parsed and ignored, so two sessions both read-then-
+        update without waiting -- a lost update). The rows a single-table
+        SELECT returns are locked (rewritten unchanged); a holder makes it
+        wait and re-read; `NOWAIT` is 55P03; `SKIP LOCKED` leaves held rows
+        out before LIMIT; the locks survive the block being moved after a
+        later conflict (`relock_row`).
+      Left, each a narrower case of the above:
+      - FOR UPDATE over a join, a subquery or a view locks nothing (0 rows
+        locked, the old behaviour); `FOR SHARE` / `FOR KEY SHARE` take no
+        lock (a shared lock must not block another, which a WiredTiger write
+        lock would). Size: a day for the join / view forms.
+      - ROLLBACK TO keeps the rewrite (rows still held, 40001 on a row
+        another session committed) where the move is not invisible: under
+        REPEATABLE READ (the move takes a new snapshot), inside a PL/pgSQL
+        EXCEPTION block, a table created after the savepoint, a block with
+        DDL in its write set, or one holding a row lock with no oplog entry
+        (an unchanging UPDATE, FOR UPDATE).
+      - REPEATABLE READ answers 40001 after the wait when ANY transaction
+        committed since its snapshot, where PostgreSQL goes on unless the
+        ROW changed: WiredTiger cannot continue a transaction after a
+        conflict, and moving it to a new snapshot is only invisible when
+        nothing committed (closed as far as WiredTiger allows; a client must
+        retry a 40001 in any case).
+      - A prepared transaction's rows give no deadlock edge (it holds them
+        but waits on nothing, so it can close no cycle); a crash between a
+        live `COMMIT PREPARED`'s WiredTiger commit and the record's deletion
+        is detected at the next `COMMIT PREPARED` by its first minted seq
+        being readable (`prepared_already_committed`) -- a design note, not
+        a divergence.
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
@@ -1458,6 +1273,38 @@ These work end-to-end but cut corners.
       general per-statement target; the protocol work above has taken the
       extended path as far as it goes cheaply.
 
+      **Batch 50 (2026-10-03)**, release builds of the base (`HEAD`
+      971579bc) and of batch 50, `bench43.py`, two interleaved runs, PG 15
+      on the same box (load ~7):
+
+      | us / statement | base | batch 50 | PG 15 |
+      | --- | --- | --- | --- |
+      | ping | 17.6-19.3 | 18.4-19.4 | 18.1-18.9 |
+      | simple `select 1` | 31.8-31.9 | 28.9-29.8 | 23.2-23.5 |
+      | extended `select 1` | 49.3-49.4 | **42.2-42.5** | 26.3-27.4 |
+      | extended PK read | 53.7-53.9 | 51.9-52.7 | 33.3-33.4 |
+      | extended autocommit UPDATE | 85.9-86.6 | **72.9-75.5** | 55.1-55.9 |
+
+      Found with `sample`, each measured: (1) the per-session part of
+      `install_user_types` (unusable schemas, tablespaces, user operators /
+      casts / collations, inheritance, RLS tables) was re-read and re-cloned
+      twice a statement; it is now installed only when this thread last
+      installed it for another session, role or catalog version
+      (`INSTALLED_SESSION_TABLES`), ~6 us of `select 1`; (2) a constant
+      SELECT's Describe was planned every time (not cached like a table
+      SELECT); (3) every UPDATE / DELETE read and decoded the WHOLE catalog
+      inside its transaction to find referencing foreign keys
+      (`referencing_keys`) -- half the UPDATE's server time; the committed
+      table definitions are now shared per catalog version
+      (`committed_table_defs`) whenever the transaction has no catalog
+      changes of its own (`catalog_untouched`, from its written-collection
+      set); (4) a SELECT read the event-trigger catalog on its transaction's
+      session (uncached) before checking it was DDL at all; (5) the `_id`
+      point lookup, update and delete decoded the collection options three
+      times (now raw lookups). What is left of the PK-read gap is the
+      storage read (`find_matching`, ~3 us), the tokio worker hand-off of
+      `block_in_place` and two socket syscalls -- spread in pieces of 1-3 us.
+
       **RE-MEASURED 2026-10-02 (batch 45)**, release builds of `origin/main`
       and of batch 45 (identical within noise), `bench43.py`, two
       interleaved runs, load average ~7, PostgreSQL 15 on the same box:
@@ -1718,7 +1565,13 @@ These work end-to-end but cut corners.
       extended path materially cheaper for ALL statements.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
-      layer, not the query engine (attributed 2026-09-20).** (Batch 47,
+      layer, not the query engine (attributed 2026-09-20).** (Batch 50,
+      2026-10-03: extended `select 1` 49.4 -> 42.4 us against PostgreSQL
+      15's 26.8; simple 31.9 -> 29.4 against 23.4 -- see the PK-read
+      entry's batch-50 table. A `sample` of `select 1` now puts ~16 us a
+      statement on the connection's thread, of which ~5 us is the two
+      socket syscalls PostgreSQL also makes; the rest of the wall time is
+      the client and the tokio wake-ups and `block_in_place` hand-off.) (Batch 47,
       2026-10-03: the extended protocol flushed every reply message --
       five writes a statement; it buffers to Sync / Flush now, extended
       `select 1` 60.5 -> 53.5 us against PostgreSQL 15's 27; table and the
@@ -7602,49 +7455,45 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
   session-tz offset (`infinity` is correct for it), and the clock-dependent
   input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
-- [ ] **OPEN — RUST pgserver: correlated subqueries landed (2026-09-29);
-      what is left (performance only; re-checked 2026-10-02, batch 45:
-      `subqueries`, `correlated`, `correlated_hash`, `semi_join`,
-      `not_in_large` all at 0 against PostgreSQL -- every item below is a
-      cost, none an answer; still 0 in the batch-47 sweep, 2026-10-03,
-      costs not re-timed).** `subqueries.sql` 5 of 50 -> 0 (53 lines now), `joins.sql`
-      0 of 38, and the new `correlated.sql` 1 of 24. A correlated subquery
-      becomes an internal per-row call (`secantus-pgplan/src/correlated.rs`):
-      its outer references are `$N` parameters of the stored inner SQL, and
-      the executor plans and runs it per outer row, memoised by the bound
-      values. EXISTS / NOT EXISTS / IN / ANY / ALL / ARRAY / scalar, in WHERE,
-      the select list, ORDER BY, CASE, an UPDATE's SET and an UPDATE / DELETE
-      WHERE (which gained a per-row RESIDUAL for this).
+- [ ] **OPEN — RUST pgserver: correlated subqueries, what is left
+      (performance only; re-timed 2026-10-03, batch 50: `subqueries`,
+      `correlated`, `correlated_hash`, `semi_join`, `not_in_large`,
+      `b50_semijoin` all at 0 against PostgreSQL -- every item below is a
+      cost, none an answer).** A correlated subquery becomes an internal
+      per-row call (`secantus-pgplan/src/correlated.rs`), memoised by the
+      bound values; a WHERE-level `EXISTS` / `NOT EXISTS` over one equality
+      becomes `IN` / null-safe `NOT IN` (`semijoin.rs`); a subquery whose
+      outer references are equalities (plus `col op $N` filters) runs ONCE
+      with the columns appended and each outer row is a hash lookup
+      (`semijoin_hash.rs`). Batch 50 widened that hash path (release builds,
+      2,000 x 2,000 rows, one query each, base -> batch 50, PG 15
+      on the same box):
 
-      * **Cost**: O(distinct outer values) plans and scans. Since batch 14 a
-        WHERE-level `EXISTS` / `NOT EXISTS` over ONE `inner = outer`
-        equality (plus inner-only conjuncts) is rewritten to the uncorrelated
-        `IN` / null-safe `NOT IN` it equals (`semijoin.rs`, corpus
-        `semi_join`): 2,000 x 2,000 rows, debug build, EXISTS 7.2 s -> 46 ms,
-        NOT EXISTS 7.3 s -> 34 ms (batch 15: `NOT (x = ANY ...)`, how
-        `NOT IN` parses, now lowers to `$nin` instead of running per row,
-        and a scan hashes a `$in` / `$nin` list of 16+ plain scalars once
-        -- `InSets` in `secantus-core`, pinned against the element path by
-        `hashed_lists_agree_with_the_ordinary_path`; corpus
-        `not_in_large`). Other correlated shapes (two equalities, a correlated IN, a
-        select-list EXISTS) no longer run per outer value when every outer
-        reference is an equality: since batch 30 the inner query runs ONCE
-        per statement with those equalities removed and the columns
-        appended (grouped by, for an aggregate; LIMIT / OFFSET applied per
-        key), and each outer row is a hash lookup (`semijoin_hash.rs`,
-        corpus `correlated_hash`). 2,000 x 2,000 rows, debug build: EXISTS
-        over two equalities 7.3 s -> 36 ms, NOT EXISTS 7.4 s -> 47 ms, a
-        correlated scalar `count(*)` 1.1 s -> 227 ms, a correlated `LIMIT 1`
-        7.6 s -> 36 ms. Since batch 31 a comparison `col op $N` (`<`, `<=`,
-        `>`, `>=`, `<>`) filters a key's rows per outer row instead of
-        forcing the per-row path, for numbers and timestamps: `t.x = o.a
-        AND t.y > o.b` 7.6 s -> 40 ms. Still per outer value: a TEXT
-        comparison (its order is a collation's), an aggregate under a
-        comparison filter, a numeric / non-hashable key, a
-        nondeterministic collation on a text key, and inner queries with
-        ORDER BY, DISTINCT, grouping, joins written with JOIN, functions or
-        nested subqueries -- each falls back to the per-row path, which
-        gives the same answers.
+      | shape | base | batch 50 | PG 15 |
+      | --- | --- | --- | --- |
+      | `EXISTS (... t.x = o.a AND t.s > o.s)` (text filter) | 1.191 s | 0.020 s | 0.001 s |
+      | `(SELECT max(v) ... t.x = o.a AND t.y > o.b)` (aggregate under a filter) | 1.205 s | 0.028 s | 0.141 s |
+      | `EXISTS (... t.n = o.n)` (numeric key) | 0.637 s | 0.010 s | 0.001 s |
+      | `o.n IN (SELECT n FROM t)` (numeric list) | 0.636 s | 0.010 s | -- |
+      | `(SELECT count(*) ... t.n = o.n)` | 1.437 s | 0.010 s | -- |
+      | `EXISTS (... t JOIN u ON ... WHERE t.x = o.a)` | 1.533 s | 0.098 s | 0.001 s |
+
+      What landed: a text filter column ordered by its bytes (only plain
+      `text` / `varchar` / `name` -- `pg_typeof` is projected to check --
+      and only while no column declares a collation and no user collation
+      exists); `count(*)` / `count(col)` / `min` / `max` of one column under
+      filters, computed per outer row over the filtered rows (`Late`); a
+      numeric key by its exact value (never matched against a float, which
+      equals it in SQL but hashes apart); a FROM of tables joined with
+      JOIN; and a numeric `IN (list)` / `= ANY` / `<> ALL` as one `$in` /
+      `$nin` per storage form instead of an arm per value (`numeric_in_filter`;
+      `InSets` now hashes Decimal128 too, pinned by
+      `hashed_lists_agree_with_the_ordinary_path`).
+      Still per outer value (each answer unchanged, only slower): an inner
+      ORDER BY (`... ORDER BY y DESC LIMIT 1`: 0.29 s, PG 0.125 s), grouping
+      or DISTINCT inside (0.31 s, PG 0.12 s), `sum` / `avg` under a filter,
+      an ordering filter over a numeric or a collated text, functions in the
+      inner select list, nested subqueries, a FROM function or subquery.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes

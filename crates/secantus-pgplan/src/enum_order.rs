@@ -1195,6 +1195,8 @@ impl Rewriter<'_> {
                     Some(N::ColumnRef(c)) => match self.column_of(c) {
                         Some(col) => match col.extra.get_str("collation") {
                             Ok(name) => Some(name.to_string()),
+                            // `name` is collatable, and always "C".
+                            Err(_) if col.pg_type == "name" => Some("C".into()),
                             Err(_) if crate::collation::collatable(&col.pg_type) => {
                                 Some("default".into())
                             }

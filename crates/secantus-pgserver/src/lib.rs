@@ -46,6 +46,7 @@ mod table_locks;
 mod triggers;
 mod txn_gucs;
 mod wire_portals;
+mod xids;
 
 pub use server::{bind, open_storage, sync_on_commit, RunningPgServer};
 
@@ -316,7 +317,13 @@ impl std::ops::DerefMut for GucMap {
     }
 }
 
+/// Whose per-session planner tables (`install_user_types`) a thread holds:
+/// (storage, session, catalog version, role, database).
+type SessionTablesKey = (usize, u64, u64, String, String);
+
 thread_local! {
+    static INSTALLED_SESSION_TABLES: std::cell::RefCell<Option<SessionTablesKey>> =
+        const { std::cell::RefCell::new(None) };
     /// The settings generation this thread's planner holds a copy of.
     static INSTALLED_SETTINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -2677,6 +2684,11 @@ struct Savepoint {
     /// PostgreSQL's GUC stack does.
     settings: HashMap<String, String>,
     txn_gucs: txn_gucs::TxnGucs,
+    /// Where the block's write set stood (`UserTransactionHandle::
+    /// write_set_len`) when the savepoint was taken, for a ROLLBACK TO that
+    /// moves the block onto a transaction without the later writes (see
+    /// `rollback_to_by_move`); `None` when it could not be read.
+    write_pos: Option<usize>,
 }
 
 /// A declared cursor's materialised result.
@@ -3197,6 +3209,11 @@ impl PgHandler {
     /// Before the skip, every statement rebuilt every table's row type
     /// from BSON, and a used store made `select 1` twice as slow.
     fn install_user_types(&self) {
+        // Whose transaction a `txid_current()` planned on this thread asks
+        // about.
+        secantus_pgplan::snapshots::set_session_pid(
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+        );
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
@@ -3225,21 +3242,61 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         ));
-        secantus_pgplan::set_current_user(Some(self.current_role_name()));
-        // Per statement, not per catalog version: SET ROLE changes which
-        // schemas the search path may use without changing the catalog.
-        secantus_pgplan::schemas::set_unusable_schemas(
-            self.unusable_schemas(&self.current_role_name()),
+        let role = self.current_role_name();
+        secantus_pgplan::set_current_user(Some(role.clone()));
+        // The tables below are read from the committed catalog, per role:
+        // re-installed only when this thread last installed them for another
+        // session, role or catalog version -- or when this session has
+        // uncommitted catalog state or is inside a running statement, where
+        // the reads may differ (and then the record is cleared, so the next
+        // statement installs afresh). They were a sixth of a `select 1`.
+        let shareable = !self.storage.in_user_txn()
+            && self
+                .uncommitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && self
+                .uncommitted_types
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+        let session_key = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.session_serial,
+            catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            role.clone(),
+            self.db().to_string(),
         );
         secantus_pgplan::schemas::set_temp_schema(Some(self.temp_schema_name()));
-        secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
-        secantus_pgplan::user_ops::set_user_operators(self.user_operators());
-        secantus_pgplan::user_casts::set_user_casts(self.user_casts());
-        secantus_pgplan::collation::set_user_collations(self.user_collations());
-        let (pairs, columns) = self.inheritance();
-        secantus_pgplan::inherit::set_inheritance(pairs, columns);
-        secantus_pgplan::rls::set_rls(self.rls_tables());
-        secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
+        let fresh = !shareable
+            || INSTALLED_SESSION_TABLES.with(|c| c.borrow().as_ref() != Some(&session_key));
+        if fresh {
+            // Per statement, not per catalog version: SET ROLE changes which
+            // schemas the search path may use without changing the catalog.
+            secantus_pgplan::schemas::set_unusable_schemas(self.unusable_schemas(&role));
+            secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
+            secantus_pgplan::user_ops::set_user_operators(self.user_operators());
+            secantus_pgplan::user_casts::set_user_casts(self.user_casts());
+            secantus_pgplan::collation::set_user_collations(self.user_collations());
+            secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
+                true,
+                |defs| {
+                    defs.iter().any(|t| {
+                        t.columns
+                            .iter()
+                            .any(|c| c.extra.get_str("collation").is_ok())
+                    })
+                },
+            ));
+            let (pairs, columns) = self.inheritance();
+            secantus_pgplan::inherit::set_inheritance(pairs, columns);
+            secantus_pgplan::rls::set_rls(self.rls_tables());
+            secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
+            INSTALLED_SESSION_TABLES.with(|c| *c.borrow_mut() = shareable.then_some(session_key));
+        }
         // The database and the GUCs, for `current_database()` and
         // `current_setting()` reached INSIDE an expression -- where the
         // constant evaluator handles them rather than the server, and had
@@ -5179,9 +5236,16 @@ impl PgHandler {
         for coll in Self::CATALOG_COLLECTIONS {
             self.ensure_collection(coll)?;
         }
-        self.storage
+        let handle = self
+            .storage
             .begin_user_transaction()
-            .map_err(|e| Self::storage_err("could not begin a transaction", e))
+            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        // Its rows, as it writes them, for a session that collides with one.
+        row_waits::register(
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            handle.held_rows(),
+        );
+        Ok(handle)
     }
 
     /// Make sure a catalog collection exists before writing to it: a delete or
@@ -6199,7 +6263,9 @@ impl PgHandler {
             || secantus_pgplan::pgtypes::oid_of_name(name).is_some())
     }
 
-    /// Queue a NOTICE for the statement in flight.
+    /// Raise a NOTICE for the statement in flight: sent at once when a
+    /// client is listening (as PostgreSQL sends one -- a DROP's CASCADE list
+    /// arrives before the statement's long tail), else at its end.
     fn notice(&self, sqlstate: &str, message: String, detail: Option<String>) {
         let mut info = ErrorInfo::new("NOTICE".into(), sqlstate.into(), message);
         info.detail = detail;
@@ -6207,6 +6273,7 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(info);
+        self.send_live_notices();
     }
 
     /// PostgreSQL's CASCADE notice: one dependent is named in the message
@@ -8752,6 +8819,14 @@ impl PgHandler {
                         "ERROR".into(),
                         "42701".into(), // duplicate_column
                         format!("column \"{}\" specified more than once", f.name()),
+                    ))));
+                }
+                // A view column cannot be an anonymous record (`row(a, b)`).
+                if f.datatype().oid() == 2249 {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P16".into(),
+                        format!("column \"{}\" has pseudo-type record", f.name()),
                     ))));
                 }
             }
@@ -16576,6 +16651,7 @@ impl Drop for PgHandler {
         advisory::release_session(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        xids::end(pid);
         if pid != 0 {
             backend_registry()
                 .lock()
@@ -16836,6 +16912,7 @@ impl PgHandler {
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        xids::end(pid);
     }
 
     /// `FETCH` and `MOVE`, which differ only in whether the rows are returned.
@@ -19210,11 +19287,13 @@ impl PgHandler {
             advisory::release_xact(pid);
             table_locks::release(pid);
             row_waits::forget(pid);
+            xids::end(pid);
             return out;
         }
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        xids::end(pid);
         self.end_txn_gucs(false);
         self.lo_close_all();
         self.settle_notifies(false);
@@ -19414,6 +19493,17 @@ impl PgHandler {
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
+        // A statement outside any transaction (block or extended-protocol
+        // group) is its own: an xid it was given is complete now.
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            xids::end(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+        }
         // Outside a block the statement was its own transaction: its NOTIFYs
         // go out now, or nowhere if it failed. Inside a block (or an
         // extended-protocol statement group) they wait for the COMMIT.
@@ -19751,6 +19841,7 @@ impl PgHandler {
                         advisory::release_xact(pid);
                         table_locks::release(pid);
                         row_waits::forget(pid);
+                        xids::end(pid);
                     }
                     out
                 }
@@ -19949,9 +20040,13 @@ impl PgHandler {
                     let handle = self.with_isolation(handle)?;
                     let fresh = Self::row_write(&stmt) && !handle.has_written();
                     let rebase = Self::row_write(&stmt) && !fresh;
+                    // Where this statement's writes start in the block's write
+                    // set: a re-run must not replay what the failed attempt
+                    // wrote before it collided.
+                    let start = handle.write_set_len();
                     let mut poll = fresh.then(|| self.lock_wait_poll());
                     let mut delay = std::time::Duration::from_millis(2);
-                    let out = loop {
+                    loop {
                         let out = self
                             .storage
                             .with_user_transaction(self.with_isolation(handle)?, || {
@@ -19960,34 +20055,42 @@ impl PgHandler {
                             .map_err(|e| Self::storage_err("transaction failed", e))
                             .and_then(|r| r);
                         match (&out, poll.as_mut()) {
-                            (Err(e), Some(poll))
-                                if Self::is_write_conflict(e) && self.read_committed_now() =>
-                            {
+                            (Err(e), Some(poll)) if Self::is_write_conflict(e) => {
+                                // PostgreSQL waits for the transaction holding
+                                // the row -- holding this one's rows meanwhile,
+                                // so a cycle is a deadlock -- then re-checks it.
+                                let target = secantus_storage::last_row_written();
+                                if let Some(t) = &target {
+                                    handle.release_row(t);
+                                }
+                                let waited = self.wait_for_row_holder(target.as_ref(), poll)?;
+                                if !self.read_committed_now() {
+                                    // REPEATABLE READ: only when the holder
+                                    // went away WITHOUT committing (nothing
+                                    // committed at all since the snapshot)
+                                    // does the statement go on, on a snapshot
+                                    // that sees the same rows.
+                                    if !(waited && self.move_snapshot(handle, 0)?) {
+                                        break out;
+                                    }
+                                    continue;
+                                }
                                 self.storage
                                     .rollback_user_transaction(handle)
                                     .map_err(|e| Self::storage_err("could not roll back", e))?;
                                 *handle = self.open_transaction_handle()?;
-                                poll()?;
-                                std::thread::sleep(delay);
-                                delay = (delay * 2).min(std::time::Duration::from_millis(20));
+                                if !waited {
+                                    poll()?;
+                                    std::thread::sleep(delay);
+                                    delay = (delay * 2).min(std::time::Duration::from_millis(20));
+                                }
                             }
-                            (Err(e), None)
-                                if rebase
-                                    && Self::is_write_conflict(e)
-                                    && self.read_committed_now() =>
-                            {
-                                break self.rerun_after_conflict(handle, &stmt, max_rows);
+                            (Err(e), None) if rebase && Self::is_write_conflict(e) => {
+                                break self.rerun_after_conflict(handle, &stmt, max_rows, start);
                             }
                             _ => break out,
                         }
-                    };
-                    // The rows this block now holds, for a session that
-                    // collides with one of them to know whom it waits on.
-                    row_waits::publish(
-                        self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
-                        handle.written_rows(),
-                    );
-                    out
+                    }
                 }
                 // Not when a transaction is already active on this thread: a
                 // trigger's or MERGE's own writes join the statement they serve.
@@ -20055,96 +20158,65 @@ impl PgHandler {
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::Merge(_)
-        )
+        ) || matches!(stmt, Statement::Select(s) if s.lock.is_some())
     }
 
-    /// A READ COMMITTED block that has ALREADY written lost a write conflict
-    /// on `stmt`. PostgreSQL waits for the other writer and re-checks the row
-    /// it left; WiredTiger cannot refresh the snapshot of a transaction that
-    /// has written, and the conflict leaves it able only to roll back. So the
-    /// block's transaction is MOVED onto a fresh snapshot with its writes
-    /// replayed (`Storage::rebase_user_transaction`, which takes the new
-    /// snapshot while the old transaction still holds its rows) and the
-    /// statement run again there -- after a wait, polled for a cancel,
-    /// `statement_timeout` and `lock_timeout`, and repeated while it still
-    /// collides. A cycle of such waits is 40P01, checked once
-    /// `deadlock_timeout` (1s) into the wait as PostgreSQL does. A block whose
-    /// writes cannot be replayed (DDL) keeps the old answer, 40001.
+    /// A block that has ALREADY written lost a write conflict on `stmt`.
+    /// PostgreSQL waits for the transaction holding the row and re-checks the
+    /// row it left; WiredTiger cannot refresh the snapshot of a transaction
+    /// that has written, and the conflict leaves it able only to roll back.
+    /// So, once the holder has let go, the block's transaction is MOVED onto
+    /// a fresh snapshot with its writes from before this statement replayed
+    /// (`move_snapshot`, which takes the new snapshot while the old
+    /// transaction still holds its rows) and the statement run again there.
+    /// The wait is polled for a cancel, `statement_timeout` and
+    /// `lock_timeout`, and repeated while the statement still collides; a
+    /// cycle of waits is 40P01, checked once `deadlock_timeout` (1s) into the
+    /// wait as PostgreSQL does. Under REPEATABLE READ the statement goes on
+    /// only when nothing committed since the block's snapshot (the holder
+    /// rolled back), else 40001 as in PostgreSQL. A block whose writes cannot
+    /// be replayed (DDL) keeps the old answer, 40001.
     fn rerun_after_conflict(
         &self,
         handle: &mut UserTransactionHandle,
         stmt: &Statement,
         max_rows: usize,
+        start: usize,
     ) -> PgWireResult<Vec<Response>> {
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        let waiting = row_waits::Waiting::new(pid);
+        let read_committed = self.read_committed_now();
         let mut poll = self.lock_wait_poll();
-        let mut delay = std::time::Duration::from_millis(2);
-        let started = std::time::Instant::now();
-        let mut checked = false;
-        let conflict = || {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "40001".into(),
-                "could not serialize access due to concurrent update".into(),
-            )))
-        };
-        // The row the statement collided on, and the rows this block holds
-        // (its failed statement's included) for anyone colliding with it.
         let mut target = secantus_storage::last_row_written();
-        row_waits::publish_waiting(pid, handle.written_rows(), target.as_ref());
-        // The writers at the last attempt. Each attempt lets go of this
-        // block's rows for a moment (the rebase), so it is made only when the
-        // row's holder has let go of it -- or, when no session is known to
-        // hold it (an autocommit statement, or a block mid-statement), when
-        // one of the writers has ended, there are none, or after a while.
-        let mut held_at_attempt = row_waits::writers_other_than(pid);
-        let mut last_attempt = std::time::Instant::now();
         loop {
-            let writers = row_waits::writers_other_than(pid);
-            // PostgreSQL waits on the transaction holding the row; only that
-            // edge enters the deadlock check.
-            let blockers = target
-                .as_ref()
-                .map(|t| row_waits::holders_of(t, pid))
-                .unwrap_or_default();
-            waiting.set(blockers.clone());
-            if !checked && started.elapsed() >= std::time::Duration::from_secs(1) {
-                checked = true;
-                if waiting.deadlocked() {
-                    return Err(Self::deadlock_error());
+            if let Some(t) = &target {
+                handle.release_row(t);
+            }
+            if !self.wait_for_row_holder(target.as_ref(), &mut poll)? {
+                if !read_committed {
+                    return Err(Self::serialization_failure());
+                }
+                // No session is known to hold the row (a prepared
+                // transaction, say): retry when one of the writers ends,
+                // there are none, or after a while. Each attempt lets go of
+                // this block's rows for a moment (the move).
+                let held = row_waits::writers_other_than(pid);
+                let began = std::time::Instant::now();
+                let mut delay = std::time::Duration::from_millis(2);
+                loop {
+                    poll()?;
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(20));
+                    let writers = row_waits::writers_other_than(pid);
+                    if writers.is_empty()
+                        || held.iter().any(|p| !writers.contains(p))
+                        || began.elapsed() >= std::time::Duration::from_millis(500)
+                    {
+                        break;
+                    }
                 }
             }
-            poll()?;
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(std::time::Duration::from_millis(20));
-            let waited_long = last_attempt.elapsed() >= std::time::Duration::from_millis(500);
-            let ready = if blockers.is_empty() {
-                let one_ended = held_at_attempt.iter().any(|p| !writers.contains(p));
-                writers.is_empty() || one_ended || waited_long
-            } else {
-                // The holder let go of the row (committed or rolled back).
-                let still = target
-                    .as_ref()
-                    .map(|t| row_waits::holders_of(t, pid))
-                    .unwrap_or_default();
-                still.is_empty() || waited_long
-            };
-            if !ready {
-                continue;
-            }
-            held_at_attempt = writers;
-            last_attempt = std::time::Instant::now();
-            match self.storage.rebase_user_transaction(handle) {
-                Ok(true) => row_waits::publish_waiting(pid, handle.written_rows(), target.as_ref()),
-                Ok(false) => return Err(conflict()),
-                // The old transaction is gone: the block fails, as it would
-                // have on the conflict itself, and nothing of it commits.
-                Err(e) => {
-                    eprintln!("secantusd-pg: could not move a transaction to a new snapshot: {e}");
-                    row_waits::forget(pid);
-                    return Err(conflict());
-                }
+            if !self.move_snapshot(handle, start)? && !read_committed {
+                return Err(Self::serialization_failure());
             }
             let out = self
                 .storage
@@ -20154,11 +20226,81 @@ impl PgHandler {
             match out {
                 Err(e) if Self::is_write_conflict(&e) => {
                     target = secantus_storage::last_row_written();
-                    row_waits::publish_waiting(pid, handle.written_rows(), target.as_ref());
                     continue;
                 }
                 other => return other,
             }
+        }
+    }
+
+    /// PostgreSQL's answer to a write that collided under REPEATABLE READ.
+    fn serialization_failure() -> PgWireError {
+        Self::user_error(
+            "40001",
+            "could not serialize access due to concurrent update".into(),
+        )
+    }
+
+    /// Move the open transaction onto a fresh snapshot, keeping its first
+    /// `keep` write-set entries (`UserTransactionHandle::write_set_len`):
+    /// the writes before the statement (or savepoint) being undone. `true`
+    /// when nothing committed since the old snapshot, so the new one sees
+    /// the same rows (what REPEATABLE READ needs to carry on). A transaction
+    /// that cannot be moved (DDL, a write with no oplog entry) is 40001; one
+    /// lost in the move fails too, with nothing of it committed.
+    fn move_snapshot(&self, handle: &mut UserTransactionHandle, keep: usize) -> PgWireResult<bool> {
+        let epoch = handle.snapshot_epoch();
+        match self
+            .storage
+            .rebase_user_transaction_keeping(handle, &|i, _| i < keep)
+        {
+            Ok(true) => Ok(secantus_storage::Storage::no_commit_since(epoch)),
+            Ok(false) => Err(Self::serialization_failure()),
+            Err(e) => {
+                eprintln!("secantusd-pg: could not move a transaction to a new snapshot: {e}");
+                Err(Self::serialization_failure())
+            }
+        }
+    }
+
+    /// Wait -- holding this transaction's rows, as PostgreSQL's waiter keeps
+    /// its locks -- while another session's open transaction holds `target`,
+    /// the row a write just collided on. `Ok(true)` once every holder has
+    /// let go of it (committed or rolled back), `Ok(false)` at once when no
+    /// session is known to hold it. Polled with `poll` (cancel,
+    /// `statement_timeout`, `lock_timeout`); a wait that closes a cycle is
+    /// 40P01, checked once `deadlock_timeout` (1s) in, as PostgreSQL does.
+    fn wait_for_row_holder(
+        &self,
+        target: Option<&secantus_storage::WrittenRow>,
+        poll: &mut dyn FnMut() -> PgWireResult<()>,
+    ) -> PgWireResult<bool> {
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        if row_waits::holders_of(target, pid).is_empty() {
+            return Ok(false);
+        }
+        let waiting = row_waits::Waiting::new(pid);
+        let started = std::time::Instant::now();
+        let mut checked = false;
+        let mut delay = std::time::Duration::from_millis(1);
+        loop {
+            let blockers = row_waits::holders_of(target, pid);
+            if blockers.is_empty() {
+                return Ok(true);
+            }
+            waiting.set(blockers);
+            if !checked && started.elapsed() >= std::time::Duration::from_secs(1) {
+                checked = true;
+                if waiting.deadlocked() {
+                    return Err(Self::deadlock_error());
+                }
+            }
+            poll()?;
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(std::time::Duration::from_millis(10));
         }
     }
 
@@ -20215,8 +20357,9 @@ impl PgHandler {
         let read_committed = self.read_committed_default();
         let mut poll = self.lock_wait_poll();
         let mut delay = std::time::Duration::from_millis(2);
-        loop {
-            let mut handle = self.open_transaction_handle()?;
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let mut handle = self.open_transaction_handle()?;
+        let out = loop {
             let out = self
                 .storage
                 .with_user_transaction(&mut handle, || self.execute(stmt.clone(), max_rows))
@@ -20228,26 +20371,59 @@ impl PgHandler {
                         .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
                     Ok(r)
                 });
-            match out {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    // A handle that committed has nothing to roll back; one
-                    // that failed is rolled back before anything else.
-                    let _ = self
-                        .storage
-                        .rollback_user_transaction(&mut handle)
-                        .map_err(|re| {
-                            eprintln!("secantusd-pg: rolling back a failed statement: {re}")
-                        });
-                    if !(read_committed && Self::is_write_conflict(&e)) {
-                        return Err(e);
-                    }
+            let e = match out {
+                Ok(r) => break Ok(r),
+                Err(e) => e,
+            };
+            if !Self::is_write_conflict(&e) {
+                break Err(e);
+            }
+            // PostgreSQL waits for the transaction holding the row, keeping
+            // the rows this statement already wrote (so a cycle is a
+            // deadlock), then re-checks it.
+            let target = secantus_storage::last_row_written();
+            if let Some(t) = &target {
+                handle.release_row(t);
+            }
+            let waited = match self.wait_for_row_holder(target.as_ref(), &mut poll) {
+                Ok(w) => w,
+                Err(wait_err) => break Err(wait_err),
+            };
+            if !read_committed {
+                // REPEATABLE READ: the statement goes on only when the holder
+                // went away without anything committing since its snapshot.
+                match waited.then(|| self.move_snapshot(&mut handle, 0)) {
+                    Some(Ok(true)) => continue,
+                    Some(Err(other)) => break Err(other),
+                    _ => break Err(e),
                 }
             }
-            poll()?;
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(std::time::Duration::from_millis(20));
-        }
+            // A handle that committed has nothing to roll back; one that
+            // failed is rolled back before the statement runs again.
+            let _ = self
+                .storage
+                .rollback_user_transaction(&mut handle)
+                .map_err(|re| eprintln!("secantusd-pg: rolling back a failed statement: {re}"));
+            if !waited {
+                if let Err(poll_err) = poll() {
+                    break Err(poll_err);
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(20));
+            }
+            handle = match self.open_transaction_handle() {
+                Ok(h) => h,
+                Err(open_err) => break Err(open_err),
+            };
+        };
+        // Whatever happened, the statement's transaction is over.
+        let _ = self
+            .storage
+            .rollback_user_transaction(&mut handle)
+            .map_err(|re| eprintln!("secantusd-pg: rolling back a failed statement: {re}"));
+        row_waits::forget(pid);
+        xids::end(pid);
+        out
     }
 
     /// Queue the WARNINGs the planner raised on this thread (an `aclitem`
@@ -20768,6 +20944,7 @@ impl PgHandler {
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
+        xids::end(pid);
         bump_catalog_version();
         let handle = self.open_transaction_handle()?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -21017,6 +21194,75 @@ impl PgHandler {
         self.savepoint_op(control)
     }
 
+    /// The open block's write-set position (`UserTransactionHandle::
+    /// write_set_len`), when this is a top-level statement of a block --
+    /// not inside a running statement (a PL/pgSQL EXCEPTION block), whose
+    /// transaction cannot be moved under it.
+    fn block_write_pos(&self) -> Option<usize> {
+        if self.storage.in_user_txn() {
+            return None;
+        }
+        let guard = self.txn.try_lock().ok()?;
+        guard.as_ref().map(|h| h.write_set_len())
+    }
+
+    /// ROLLBACK TO SAVEPOINT as PostgreSQL's subtransaction abort: the writes
+    /// made since the savepoint are undone AND their rows let go, so a
+    /// session waiting on one goes on. The block is moved onto a new
+    /// WiredTiger transaction that replays its write set without the entries
+    /// after `write_pos` that touch a table being restored (`restore`): the
+    /// state at the savepoint. Rewriting those tables inside the same
+    /// transaction (the fallback, `restore_table`) keeps every row held,
+    /// collides with any row another session committed since the block's
+    /// snapshot (40001 on the ROLLBACK TO itself), and cannot heal a
+    /// transaction a write conflict has doomed.
+    ///
+    /// Taken only where the move is invisible: READ COMMITTED (a fresh
+    /// snapshot is what its next statement takes anyway), a top-level
+    /// statement, every restored table existing at the savepoint, no row
+    /// lock without an oplog entry. `false` leaves the fallback to run.
+    fn rollback_to_by_move(
+        &self,
+        write_pos: Option<usize>,
+        restore: &HashMap<String, Option<Vec<Vec<u8>>>>,
+    ) -> PgWireResult<bool> {
+        let Some(pos) = write_pos else {
+            return Ok(false);
+        };
+        if restore.is_empty()
+            || self.storage.in_user_txn()
+            || !self.read_committed_now()
+            || restore.values().any(Option::is_none)
+        {
+            return Ok(false);
+        }
+        let Ok(mut guard) = self.txn.try_lock() else {
+            return Ok(false);
+        };
+        let Some(handle) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if handle.has_lock_only_rows() {
+            return Ok(false);
+        }
+        let db = self.db();
+        let undone: HashSet<String> = restore
+            .keys()
+            .filter(|t| t.as_str() != SEQUENCE_COLLECTION)
+            .map(|t| format!("{db}.{t}"))
+            .collect();
+        let keep = |i: usize, op: &Document| -> bool {
+            i < pos || !op.get_str("ns").is_ok_and(|ns| undone.contains(ns))
+        };
+        match self.storage.rebase_user_transaction_keeping(handle, &keep) {
+            Ok(moved) => Ok(moved),
+            Err(e) => {
+                eprintln!("secantusd-pg: could not roll back to a savepoint: {e}");
+                Err(Self::serialization_failure())
+            }
+        }
+    }
+
     /// A savepoint statement, the block check already made; PL/pgSQL's
     /// EXCEPTION blocks use it for their subtransactions.
     fn savepoint_op(&self, control: &TransactionControl) -> PgWireResult<Vec<Response>> {
@@ -21041,6 +21287,7 @@ impl PgHandler {
 
         match control {
             TransactionControl::Savepoint(_) => {
+                let write_pos = self.block_write_pos();
                 let uncommitted = self
                     .uncommitted
                     .lock()
@@ -21070,6 +21317,7 @@ impl PgHandler {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone(),
+                        write_pos,
                     });
                 Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
             }
@@ -21095,9 +21343,17 @@ impl PgHandler {
                 // Restore from the OLDEST capture of each table among this
                 // savepoint and the ones nested inside it: that is the state at
                 // the named savepoint, whichever frame happened to capture it.
-                let (restore, uncommitted, uncommitted_types, saved_settings, saved_gucs) = {
+                let (
+                    restore,
+                    uncommitted,
+                    uncommitted_types,
+                    saved_settings,
+                    saved_gucs,
+                    write_pos,
+                ) = {
                     let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
                     let idx = index(&savepoints).ok_or_else(missing)?;
+                    let write_pos = savepoints[idx].write_pos;
                     let saved_settings = savepoints[idx].settings.clone();
                     let saved_gucs = savepoints[idx].txn_gucs.clone();
                     let uncommitted = savepoints[idx].uncommitted.clone();
@@ -21119,17 +21375,20 @@ impl PgHandler {
                         uncommitted_types,
                         saved_settings,
                         saved_gucs,
+                        write_pos,
                     )
                 };
-                self.in_open_transaction(|| {
-                    for (table, docs) in &restore {
-                        if table == SEQUENCE_COLLECTION {
-                            continue;
+                if !self.rollback_to_by_move(write_pos, &restore)? {
+                    self.in_open_transaction(|| {
+                        for (table, docs) in &restore {
+                            if table == SEQUENCE_COLLECTION {
+                                continue;
+                            }
+                            self.restore_table(table, docs.as_ref())?;
                         }
-                        self.restore_table(table, docs.as_ref())?;
-                    }
-                    Ok(())
-                })?;
+                        Ok(())
+                    })?;
+                }
                 *self.uncommitted.lock().unwrap_or_else(|e| e.into_inner()) = uncommitted;
                 *self
                     .uncommitted_types
@@ -21418,12 +21677,13 @@ impl PgHandler {
         }])
     }
 
-    /// Queue a WARNING for the statement in flight.
+    /// Raise a WARNING for the statement in flight (sent as `notice` is).
     fn warning(&self, sqlstate: &str, message: String) {
         self.pending_notices
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(ErrorInfo::new("WARNING".into(), sqlstate.into(), message));
+        self.send_live_notices();
     }
 
     /// The block's `PREPARE TRANSACTION '<gid>'`: every refusal PostgreSQL 16
@@ -22077,6 +22337,8 @@ impl PgHandler {
         sel: &secantus_pgplan::Select,
         max_rows: usize,
     ) -> PgWireResult<(Vec<Document>, TableDef)> {
+        // `FOR UPDATE` over the stored table: the rows returned are locked.
+        let mut row_lock: Option<secantus_pgplan::RowLock> = None;
         // A generated source stands in for the table. Everything after
         // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
         // on documents and does not care where they came from, which is
@@ -22168,11 +22430,25 @@ impl PgHandler {
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
                 // Decode once: ORDER BY, OFFSET and LIMIT all need the
                 // values, and re-decoding per comparison is quadratic.
-                let docs: Vec<Document> = raw
+                let mut docs: Vec<Document> = raw
                     .iter()
                     .map(|b| decode_doc(b))
                     .collect::<Result<_, _>>()
                     .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                if let Some(lock) = sel.lock.filter(|_| self.storage.in_user_txn()) {
+                    row_lock = Some(lock);
+                    if lock.wait == secantus_pgplan::RowLockWait::SkipLocked {
+                        // SKIP LOCKED: a row another transaction holds is left
+                        // out before LIMIT counts the rows, as PostgreSQL does.
+                        let mut kept = Vec::with_capacity(docs.len());
+                        for d in docs {
+                            if !self.row_held_by_another(&sel.table, &d)? {
+                                kept.push(d);
+                            }
+                        }
+                        docs = kept;
+                    }
+                }
                 (docs, def)
             }
         };
@@ -22284,7 +22560,68 @@ impl PgHandler {
         if max_rows > 0 {
             docs.truncate(max_rows);
         }
+        if let Some(lock) = row_lock {
+            self.lock_selected_rows(&sel.table, &docs, lock)?;
+        }
         Ok((docs, def))
+    }
+
+    /// Does another session's open transaction hold the row of `table`
+    /// holding `doc`?
+    fn row_held_by_another(&self, table: &str, doc: &Document) -> PgWireResult<bool> {
+        let Some(id) = doc.get("_id") else {
+            return Ok(false);
+        };
+        let row = self
+            .storage
+            .row_of_id(self.db(), table, id)
+            .map_err(|e| Self::storage_err("could not find a row", e))?;
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(row.is_some_and(|r| !row_waits::holders_of(&r, pid).is_empty()))
+    }
+
+    /// `SELECT ... FOR UPDATE`: take the row lock on every row `docs` returns
+    /// (each rewritten unchanged inside the transaction, as an UPDATE locks
+    /// a row it leaves as it was). A row another transaction holds is the
+    /// write conflict a writer gets -- waited for, and the statement run
+    /// again against what it left, by the row-write machinery -- or, under
+    /// NOWAIT, PostgreSQL's 55P03 at once.
+    fn lock_selected_rows(
+        &self,
+        table: &str,
+        docs: &[Document],
+        lock: secantus_pgplan::RowLock,
+    ) -> PgWireResult<()> {
+        let ids: Vec<Bson> = docs.iter().filter_map(|d| d.get("_id").cloned()).collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let nowait = || {
+            Self::user_error(
+                "55P03",
+                format!("could not obtain lock on row in relation \"{table}\""),
+            )
+        };
+        if lock.wait == secantus_pgplan::RowLockWait::Nowait {
+            for d in docs {
+                if self.row_held_by_another(table, d)? {
+                    return Err(nowait());
+                }
+            }
+        }
+        let filter = bson::doc! { "_id": { "$in": ids } };
+        match self.storage.lock_matching(self.db(), table, &filter) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err = Self::storage_err("could not lock the selected rows", e);
+                if lock.wait == secantus_pgplan::RowLockWait::Nowait
+                    && Self::is_write_conflict(&err)
+                {
+                    return Err(nowait());
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Which of a set-operation side's columns are a bare constant NULL.
@@ -28434,19 +28771,79 @@ impl PgHandler {
         &self,
         parent: &str,
     ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+        let pick = |d: &TableDef| -> Vec<(TableDef, secantus_pgcatalog::ForeignKey)> {
+            d.foreign_keys
+                .iter()
+                .filter(|fk| fk.ref_table == parent)
+                .map(|fk| (d.clone(), fk.clone()))
+                .collect()
+        };
+        // Every UPDATE and DELETE asks; reading and decoding the whole
+        // catalog for it was half an autocommit UPDATE's server time.
+        if let Some(defs) = self.committed_table_defs() {
+            return Ok(defs.iter().flat_map(pick).collect());
+        }
         let defs = self.all_table_defs()?;
-        Ok(defs
-            .into_iter()
-            .flat_map(|d| {
-                let fks: Vec<_> = d
-                    .foreign_keys
-                    .iter()
-                    .filter(|fk| fk.ref_table == parent)
-                    .cloned()
-                    .collect();
-                fks.into_iter().map(move |fk| (d.clone(), fk))
+        Ok(defs.iter().flat_map(pick).collect())
+    }
+
+    /// Has this session's open transaction left the catalog as committed:
+    /// no uncommitted table or type DDL, and no row written to any catalog
+    /// collection (every one is named `__...`)? Then the committed catalog
+    /// is what the transaction would read.
+    fn catalog_untouched(&self) -> bool {
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            && self
+                .uncommitted_types
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && !row_waits::wrote_collection(pid, |_, coll| coll.starts_with("__"))
+    }
+
+    /// Every table definition as committed, read once per catalog version
+    /// (on a session of its own) and shared; `None` while this session's
+    /// transaction has catalog changes of its own (`catalog_untouched`).
+    fn committed_table_defs(&self) -> Option<Arc<Vec<TableDef>>> {
+        type Cache = Mutex<HashMap<(usize, String), (u64, Arc<Vec<TableDef>>)>>;
+        static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+        if !self.catalog_untouched() {
+            return None;
+        }
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = (Arc::as_ptr(&self.storage) as usize, self.db().to_string());
+        // The version BEFORE the read: a commit landing during it leaves the
+        // entry under the older version, which the next reader passes over.
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((v, defs)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            if *v == version {
+                return Some(Arc::clone(defs));
+            }
+        }
+        let raw = self
+            .storage
+            .outside_user_transaction(|| {
+                self.storage
+                    .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
             })
-            .collect())
+            .ok()?;
+        let defs: Arc<Vec<TableDef>> = Arc::new(
+            raw.iter()
+                .filter_map(|b| decode_doc(b).ok())
+                .filter_map(|d| TableDef::from_document(&d))
+                .collect(),
+        );
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (version, Arc::clone(&defs)));
+        Some(defs)
     }
 
     /// The parent side of a DELETE from `def`: a row another table's row
@@ -33785,6 +34182,8 @@ impl PgHandler {
             && matches!(
                 stmt,
                 Statement::Select(_)
+                    | Statement::SelectConstant(_)
+                    | Statement::ValuesConstant(_)
                     | Statement::SetOp(_)
                     | Statement::Aggregate(_)
                     | Statement::Insert(_)

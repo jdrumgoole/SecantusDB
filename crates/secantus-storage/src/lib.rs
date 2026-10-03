@@ -147,6 +147,9 @@ pub struct UserTransactionHandle {
     /// appear), and on `Drop` as a backstop so a reaped or leaked handle
     /// cannot pin the tail forever.
     minted_ranges: Vec<(i64, i64)>,
+    /// How many seqs `minted_ranges` holds (kept, not summed: a transaction
+    /// of 50,000 statements would sum 50,000 ranges per statement).
+    minted_total: usize,
     /// Async-mode oplog entries buffered by this transaction's statements
     /// (`IN_ASYNC_STMT` is held across every `with_user_transaction` scope, so
     /// emits park in `PENDING_OPLOG` and are harvested here instead of
@@ -168,9 +171,23 @@ pub struct UserTransactionHandle {
     /// When the transaction was opened, in Unix microseconds: SQL's
     /// transaction start (`now()`).
     opened_at: i64,
-    /// The document rows this transaction has written, in write order (a
-    /// row written twice appears twice). See `PENDING_ROWS`.
-    written_rows: Vec<WrittenRow>,
+    /// The document rows this transaction holds (has written), shared so a
+    /// server can see them WHILE a statement is still running: a session
+    /// that collides with one of them learns which transaction holds it
+    /// (WiredTiger's `WT_ROLLBACK` does not say). Filled through
+    /// `ACTIVE_ROWS` as each row is written; emptied when the transaction
+    /// ends. Survives `rebase_user_transaction` (the replay refills it).
+    held: HeldRows,
+    /// `COMMITS_DONE` just before this transaction's snapshot was taken
+    /// (`None` until it begins): see [`Storage::no_commit_since`].
+    epoch: Option<u64>,
+    /// The transaction holds a row it took by REWRITING it unchanged
+    /// (`lock_matching`): a lock with no oplog entry, so a move onto a new
+    /// transaction (`rebase_user_transaction`) does not carry it over.
+    lock_only: bool,
+    /// The rows those locks are on, so a move onto a new transaction takes
+    /// them again (`rebase_user_transaction_keeping`).
+    locked: HashSet<WrittenRow>,
 }
 
 impl UserTransactionHandle {
@@ -183,15 +200,53 @@ impl UserTransactionHandle {
     }
 
     /// The document rows this transaction has written (and so holds until
-    /// it ends), each `(db, collection, RecordId)`.
-    pub fn written_rows(&self) -> &[WrittenRow] {
-        &self.written_rows
+    /// it ends), each `(db, collection, RecordId)` -- shared, and filled as
+    /// the rows are written, so another thread can read the set while a
+    /// statement of this transaction is still running.
+    pub fn held_rows(&self) -> HeldRows {
+        Arc::clone(&self.held)
+    }
+
+    /// Stop counting `row` as held: it is the row a write collided on, which
+    /// is recorded before the write is tried and so is in the set although
+    /// the write never happened.
+    pub fn release_row(&self, row: &WrittenRow) {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rows
+            .remove(row);
+    }
+
+    /// Does the transaction hold a row lock with no oplog entry behind it
+    /// (an UPDATE that matched a row and left it as it was)? A move onto a
+    /// new transaction would lose it.
+    pub fn has_lock_only_rows(&self) -> bool {
+        self.lock_only
+    }
+
+    /// The commit count just before this transaction's snapshot was taken,
+    /// for [`Storage::no_commit_since`]; `None` before it began.
+    pub fn snapshot_epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    /// How many oplog entries the transaction's writes have produced so far:
+    /// a position in its write set, for [`Storage::rebase_user_transaction_keeping`].
+    pub fn write_set_len(&self) -> usize {
+        if !self.pending_async.is_empty() {
+            return self.pending_async.len();
+        }
+        self.minted_total
     }
 
     pub fn has_written(&self) -> bool {
         // Any evidence counts: the sticky flag a snapshot refresh sets, or
         // what this transaction's statements have already emitted.
-        self.snapshot_fixed || self.dirty_bytes > 0 || !self.minted_ranges.is_empty()
+        self.snapshot_fixed
+            || self.dirty_bytes > 0
+            || !self.minted_ranges.is_empty()
+            || self.lock_only
     }
 }
 
@@ -203,6 +258,7 @@ impl UserTransactionHandle {
             return;
         }
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        self.minted_total = 0;
         for (start, end) in self.minted_ranges.drain(..) {
             let removed = st.in_flight.remove(&start);
             debug_assert_eq!(removed, Some(end), "in-flight window out of sync");
@@ -3271,7 +3327,13 @@ thread_local! {
     /// as `PENDING_MINTED`): the transaction's row write set, which a server
     /// can publish so a session that collides with one of them knows WHICH
     /// transaction holds it (WiredTiger's `WT_ROLLBACK` does not say).
-    static PENDING_ROWS: RefCell<Vec<WrittenRow>> = const { RefCell::new(Vec::new()) };
+    static ACTIVE_ROWS: RefCell<Option<HeldRows>> = const { RefCell::new(None) };
+    /// Set when `lock_matching` takes a row lock inside the current user
+    /// transaction statement; harvested onto the handle (`lock_only`).
+    static LOCKED_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// The rows `lock_matching` locked in the current user-transaction
+    /// statement; harvested onto the handle (`locked`).
+    static LOCKED_ROWS: RefCell<Vec<WrittenRow>> = const { RefCell::new(Vec::new()) };
     /// The document row this thread last wrote (or tried to): the row a
     /// write conflict surfacing from that write collided on.
     static LAST_ROW: RefCell<Option<WrittenRow>> = const { RefCell::new(None) };
@@ -3285,15 +3347,75 @@ thread_local! {
 }
 
 /// A document row: `(db, collection, RecordId)` -- the doc table's own key.
+/// The `_id` index key a write claims is recorded as a row too, under the
+/// collection name with [`ID_KEY_ROW_SUFFIX`] appended and a hash of the key
+/// for the RecordId: two transactions inserting one primary key collide
+/// there, before either has a document row the other could name.
 pub type WrittenRow = (String, String, i64);
+
+/// The rows a transaction holds, shared with whoever needs to know.
+pub type HeldRows = Arc<Mutex<Held>>;
+
+/// What a user transaction has written so far (see [`HeldRows`]).
+#[derive(Debug, Default)]
+pub struct Held {
+    /// Every document row (and claimed `_id` key) it holds.
+    pub rows: HashSet<WrittenRow>,
+    /// Every `(db, collection)` it has written a row of.
+    pub collections: Vec<(String, String)>,
+}
+
+impl Held {
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.collections.clear();
+    }
+}
+
+/// Appended to a collection name to make the [`WrittenRow`] of an `_id`
+/// index key.
+pub const ID_KEY_ROW_SUFFIX: &str = "\u{0}_id";
+
+/// Write-transaction commits (a user transaction's and an autocommit
+/// statement's) STARTED and FINISHED, successful or not: `COMMITS_STARTED`
+/// is bumped before WiredTiger's commit call and `COMMITS_DONE` after it, so
+/// a commit becomes visible somewhere between its two bumps. See
+/// [`Storage::no_commit_since`]; a spurious bump only makes it say `false`.
+static COMMITS_STARTED: AtomicU64 = AtomicU64::new(0);
+static COMMITS_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Run a WiredTiger commit call between the two commit counters' bumps.
+fn counted_commit<T>(commit: impl FnOnce() -> T) -> T {
+    COMMITS_STARTED.fetch_add(1, Ordering::SeqCst);
+    let out = commit();
+    COMMITS_DONE.fetch_add(1, Ordering::SeqCst);
+    out
+}
+
+/// Record that this thread is claiming the `_id` index key `id_key` of
+/// `(db, coll)` (see [`WrittenRow`]).
+fn note_id_key(db: &str, coll: &str, id_key: &[u8]) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id_key.hash(&mut h);
+    note_row(db, &format!("{coll}{ID_KEY_ROW_SUFFIX}"), h.finish() as i64);
+}
 
 /// Record that this thread is writing the document row `(db, coll,
 /// recordid)`: always as the last row written (see [`last_row_written`]), and
-/// inside a user transaction into its write set ([`UserTransactionHandle::written_rows`]).
+/// inside a user transaction into its write set ([`UserTransactionHandle::held_rows`]).
 fn note_row(db: &str, coll: &str, recordid: i64) {
     let row = (db.to_string(), coll.to_string(), recordid);
     if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
-        PENDING_ROWS.with(|p| p.borrow_mut().push(row.clone()));
+        ACTIVE_ROWS.with(|a| {
+            if let Some(held) = a.borrow().as_ref() {
+                let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+                if !held.collections.iter().any(|(d, c)| d == db && c == coll) {
+                    held.collections.push((db.to_string(), coll.to_string()));
+                }
+                held.rows.insert(row.clone());
+            }
+        });
     }
     LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
 }
@@ -4788,7 +4910,7 @@ impl Storage {
         session.begin_transaction(None)?;
         match f() {
             Ok(v) => {
-                if let Err(e) = session.commit_transaction(None) {
+                if let Err(e) = counted_commit(|| session.commit_transaction(None)) {
                     // Ask WHY before rolling back — the reason buffer belongs
                     // to the failing transaction and does not survive the next
                     // call on this session.
@@ -6424,11 +6546,15 @@ impl Storage {
             began: false,
             snapshot_fixed: false,
             minted_ranges: Vec::new(),
+            minted_total: 0,
             pending_async: Vec::new(),
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
             dirty_bytes: 0,
-            written_rows: Vec::new(),
+            held: HeldRows::default(),
+            epoch: None,
+            lock_only: false,
+            locked: HashSet::new(),
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -6520,8 +6646,12 @@ impl Storage {
         let Some(session) = handle.session.as_ref() else {
             return Ok(false);
         };
+        let epoch = COMMITS_DONE.load(Ordering::SeqCst);
         match session.reset_snapshot() {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                handle.epoch = Some(epoch);
+                Ok(true)
+            }
             // The transaction wrote without an oplog entry: WiredTiger's
             // refusal is the answer, and it is sticky.
             Err(e) if e.is_not_supported() => {
@@ -6547,6 +6677,7 @@ impl Storage {
             .as_ref()
             .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
         if !handle.began {
+            handle.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             session.begin_transaction(None)?;
             handle.began = true;
         }
@@ -6563,20 +6694,46 @@ impl Storage {
         // them from the in-flight window. A panicked statement must not leave
         // ranges stranded in the thread-local: that would pin the visible
         // tail forever.
-        struct Harvest<'a>(&'a mut Vec<(i64, i64)>);
+        struct Harvest<'a>(&'a mut Vec<(i64, i64)>, &'a mut usize);
         impl Drop for Harvest<'_> {
             fn drop(&mut self) {
-                PENDING_MINTED.with(|p| self.0.extend(p.borrow_mut().drain(..)));
+                PENDING_MINTED.with(|p| {
+                    for (start, end) in p.borrow_mut().drain(..) {
+                        *self.1 += (end - start).max(0) as usize;
+                        self.0.push((start, end));
+                    }
+                });
             }
         }
-        let _harvest = Harvest(&mut handle.minted_ranges);
-        struct RowHarvest<'a>(&'a mut Vec<WrittenRow>);
-        impl Drop for RowHarvest<'_> {
+        let _harvest = Harvest(&mut handle.minted_ranges, &mut handle.minted_total);
+        struct RowScope(Option<HeldRows>);
+        impl Drop for RowScope {
             fn drop(&mut self) {
-                PENDING_ROWS.with(|p| self.0.extend(p.borrow_mut().drain(..)));
+                ACTIVE_ROWS.with(|a| *a.borrow_mut() = self.0.take());
             }
         }
-        let _row_harvest = RowHarvest(&mut handle.written_rows);
+        let _row_scope = RowScope(ACTIVE_ROWS.with(|a| a.replace(Some(Arc::clone(&handle.held)))));
+        struct LockHarvest<'a>(&'a mut bool, bool);
+        impl Drop for LockHarvest<'_> {
+            fn drop(&mut self) {
+                *self.0 |= LOCKED_ONLY.with(|l| l.replace(self.1));
+            }
+        }
+        let _lock_harvest = LockHarvest(
+            &mut handle.lock_only,
+            LOCKED_ONLY.with(|l| l.replace(false)),
+        );
+        struct LockedHarvest<'a>(&'a mut HashSet<WrittenRow>, Vec<WrittenRow>);
+        impl Drop for LockedHarvest<'_> {
+            fn drop(&mut self) {
+                let mine = LOCKED_ROWS.with(|l| l.replace(std::mem::take(&mut self.1)));
+                self.0.extend(mine);
+            }
+        }
+        let _locked_harvest = LockedHarvest(
+            &mut handle.locked,
+            LOCKED_ROWS.with(|l| std::mem::take(&mut *l.borrow_mut())),
+        );
         // Async mode: hold `IN_ASYNC_STMT` across the statement so emits
         // buffer in `PENDING_OPLOG` instead of self-draining mid-transaction
         // (`with_statement_txn` early-returns for `OpSession::Txn`, so without
@@ -6640,10 +6797,16 @@ impl Storage {
     /// the uncommitted transaction).
     pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
         if let Some(session) = handle.session.take() {
+            // Whatever the outcome, the transaction holds no row after this.
+            handle
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             let began = handle.began;
             handle.began = false;
             if began {
-                if let Err(e) = session.commit_transaction(None) {
+                if let Err(e) = counted_commit(|| session.commit_transaction(None)) {
                     // Read WHY first: the reason belongs to the failing
                     // transaction and the next call on this session clears it.
                     let why = session.rollback_reason();
@@ -6713,6 +6876,11 @@ impl Storage {
     /// best-effort rollback (closing the session also rolls back).
     pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
         if let Some(session) = handle.session.take() {
+            handle
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             let began = handle.began;
             handle.began = false;
             if began {
@@ -6727,6 +6895,16 @@ impl Storage {
             // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
+    }
+
+    /// Has no write transaction committed since `epoch` (a
+    /// [`UserTransactionHandle::snapshot_epoch`])? Asked AFTER a new snapshot
+    /// is taken, `true` proves the new snapshot sees exactly what the one
+    /// taken at `epoch` saw: every commit started by now had finished before
+    /// that one -- so moving a REPEATABLE READ transaction onto the new one
+    /// is invisible. `None` (no snapshot yet) is `true`.
+    pub fn no_commit_since(epoch: Option<u64>) -> bool {
+        epoch.is_none_or(|e| COMMITS_STARTED.load(Ordering::SeqCst) == e)
     }
 
     /// Move a READ COMMITTED transaction that has written onto a FRESH
@@ -6748,11 +6926,26 @@ impl Storage {
     /// On `Err` the old transaction is gone and `handle` is closed: the caller
     /// must fail the block.
     pub fn rebase_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<bool> {
+        self.rebase_user_transaction_keeping(handle, &|_, _| true)
+    }
+
+    /// [`Self::rebase_user_transaction`], replaying only the write-set
+    /// entries `keep` accepts (`keep(position, entry)`, positions counted as
+    /// [`UserTransactionHandle::write_set_len`] counts them): with
+    /// `position < n` it is PostgreSQL's ROLLBACK TO SAVEPOINT, which undoes
+    /// the writes made since the savepoint AND lets go of their rows -- the
+    /// part a rewrite of the rows inside the same transaction cannot do.
+    pub fn rebase_user_transaction_keeping(
+        &self,
+        handle: &mut UserTransactionHandle,
+        keep: &dyn Fn(usize, &Document) -> bool,
+    ) -> Result<bool> {
         if self.async_oplog.is_some() || !self.enable_oplog || handle.session.is_none() {
             return Ok(false);
         }
-        // A write the oplog did not record cannot be replayed.
-        if handle.snapshot_fixed && handle.minted_ranges.is_empty() {
+        // A write the oplog did not record cannot be replayed -- except a
+        // row lock (`lock_matching`), which is taken again below.
+        if handle.snapshot_fixed && handle.minted_ranges.is_empty() && !handle.lock_only {
             return Ok(false);
         }
         let blobs = self.transaction_write_set(handle)?;
@@ -6764,14 +6957,24 @@ impl Storage {
             }
             ops.push(op);
         }
+        let ops: Vec<Document> = ops
+            .into_iter()
+            .enumerate()
+            .filter(|(i, op)| keep(*i, op))
+            .map(|(_, op)| op)
+            .collect();
         let mut fresh = self.begin_user_transaction()?;
         fresh.opened_at = handle.opened_at;
+        // The same shared set: whoever watches this transaction's rows keeps
+        // watching it. The rollback below empties it; the replay refills it.
+        fresh.held = Arc::clone(&handle.held);
         // Pin the new snapshot NOW, before the old transaction lets go.
         {
             let session = fresh
                 .session
                 .as_ref()
                 .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
+            fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             session.begin_transaction(None)?;
             fresh.began = true;
             // Any read takes the snapshot; the collection registry always
@@ -6780,9 +6983,15 @@ impl Storage {
             cur.next()?;
         }
         self.rollback_user_transaction(handle)?;
+        // The locks taken by rewriting a row unchanged have no oplog entry:
+        // they are taken again after the replay.
+        let relock = std::mem::take(&mut handle.locked);
         let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
             for op in &ops {
                 replay::apply_entry_strict(self, op)?;
+            }
+            for (db, coll, recordid) in &relock {
+                self.relock_row(db, coll, *recordid)?;
             }
             Ok(())
         });
@@ -7134,9 +7343,26 @@ impl Storage {
     /// Whether `(db, coll)` is a timeseries collection (its stored options carry
     /// a `timeseries` sub-document). Mirrors `storage._is_timeseries`.
     fn is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
-        Ok(coll_options(session, db, coll)?
-            .map(|o| o.contains_key("timeseries"))
-            .unwrap_or(false))
+        // On every `_id` point lookup: look the key up in the raw options
+        // rather than decoding the whole document.
+        let cur = session.open_cursor(COLL_TABLE, None)?;
+        cur.set_key_ss(db, coll);
+        match cur.search() {
+            Ok(()) => {
+                let blob = cur.get_value_u()?;
+                if blob.is_empty() {
+                    return Ok(false);
+                }
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|e| StorageError::Internal(format!("collection options: {e}")))?;
+                Ok(raw
+                    .get("timeseries")
+                    .map_err(|e| StorageError::Internal(format!("collection options: {e}")))?
+                    .is_some())
+            }
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// A doc-table key discriminator for a timeseries collection. Timeseries
@@ -9709,6 +9935,7 @@ impl Storage {
         // A wasted RecordId on the dup path is harmless — RecordIds only need to be
         // unique + monotonic; gaps are fine.
         let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        note_id_key(db, coll, id_key);
         rev.set_key_ssu(db, coll, id_key);
         rev.set_value_q(recordid);
         match rev.insert() {
@@ -9755,6 +9982,7 @@ impl Storage {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
+        note_id_key(db, coll, id_key);
         rev.remove()?;
         Ok(Some(recordid))
     }
@@ -11262,6 +11490,44 @@ impl Storage {
     /// wrapper, kept so the many callers that have no validator at all — tests,
     /// PITR replay, the adapter's plain path — need not thread a flag that
     /// cannot affect them.
+    /// Take the row lock on the document row `recordid` again by rewriting it
+    /// unchanged (see `lock_matching`); a row that is gone holds nothing.
+    fn relock_row(&self, db: &str, coll: &str, recordid: i64) -> Result<()> {
+        let session = self.op_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_ssq(db, coll, recordid);
+        match cur.search() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        let value = cur.get_value_u()?;
+        LOCKED_ONLY.with(|l| l.set(true));
+        LOCKED_ROWS.with(|l| {
+            l.borrow_mut()
+                .push((db.to_string(), coll.to_string(), recordid))
+        });
+        note_row(db, coll, recordid);
+        cur.set_key_ssq(db, coll, recordid);
+        cur.set_value_u(&value);
+        cur.update()?;
+        Ok(())
+    }
+
+    /// The document row holding the document whose `_id` is `id`, if any:
+    /// what a server compares with the rows other transactions hold.
+    pub fn row_of_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<WrittenRow>> {
+        let session = self.op_session()?;
+        let key = id_key(id)?;
+        Ok(self
+            .doc_recordid(&session, db, coll, &key)?
+            .map(|r| (db.to_string(), coll.to_string(), r)))
+    }
+
     /// Take the row lock on every document of `coll` matching `filter`, as
     /// PostgreSQL's UPDATE does on each row it matches whether or not the new
     /// row differs: each doc row is rewritten with its own value inside the
@@ -11287,7 +11553,14 @@ impl Storage {
             }
         }
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        if !rows.is_empty() {
+            LOCKED_ONLY.with(|l| l.set(true));
+        }
         for (recordid, id_k, blob) in &rows {
+            LOCKED_ROWS.with(|l| {
+                l.borrow_mut()
+                    .push((db.to_string(), coll.to_string(), *recordid))
+            });
             note_row(db, coll, *recordid);
             cur.set_key_ssq(db, coll, *recordid);
             cur.set_value_u(&frame_doc_value(id_k, blob));
@@ -14194,6 +14467,18 @@ fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) 
 /// The collection's UUID (16 bytes), minting + persisting one into the options on
 /// first use. Mirrors `storage._collection_uuid`.
 fn collection_uuid(session: &Session, db: &str, coll: &str) -> Result<Vec<u8>> {
+    // The common case, an existing UUID, read from the raw options.
+    if let Some(blob) = coll_options_raw(session, db, coll)? {
+        if !blob.is_empty() {
+            if let Ok(raw) = bson::RawDocument::from_bytes(&blob) {
+                if let Ok(Some(bson::RawBsonRef::Binary(b))) = raw.get("uuid") {
+                    if b.bytes.len() == 16 {
+                        return Ok(b.bytes.to_vec());
+                    }
+                }
+            }
+        }
+    }
     let mut opts = coll_options(session, db, coll)?.unwrap_or_default();
     if let Some(Bson::Binary(b)) = opts.get("uuid") {
         if b.bytes.len() == 16 {
@@ -14246,12 +14531,35 @@ fn meta_uuid(session: &Session, db: &str, coll: &str, meta: &CollMeta) -> Result
 
 /// Whether `changeStreamPreAndPostImages.enabled` is set on the collection.
 fn pre_post_images_enabled(session: &Session, db: &str, coll: &str) -> Result<bool> {
-    if let Some(opts) = coll_options(session, db, coll)? {
-        if let Ok(sub) = opts.get_document("changeStreamPreAndPostImages") {
-            return Ok(sub.get_bool("enabled").unwrap_or(false));
-        }
+    // Read from the raw options: this runs on every update and delete.
+    let Some(blob) = coll_options_raw(session, db, coll)? else {
+        return Ok(false);
+    };
+    if blob.is_empty() {
+        return Ok(false);
     }
-    Ok(false)
+    let raw = bson::RawDocument::from_bytes(&blob)
+        .map_err(|e| StorageError::Internal(format!("collection options: {e}")))?;
+    Ok(match raw.get("changeStreamPreAndPostImages") {
+        Ok(Some(bson::RawBsonRef::Document(sub))) => {
+            matches!(
+                sub.get("enabled"),
+                Ok(Some(bson::RawBsonRef::Boolean(true)))
+            )
+        }
+        _ => false,
+    })
+}
+
+/// The collection's options blob as stored (`None`: not registered).
+fn coll_options_raw(session: &Session, db: &str, coll: &str) -> Result<Option<Vec<u8>>> {
+    let cur = session.open_cursor(COLL_TABLE, None)?;
+    cur.set_key_ss(db, coll);
+    match cur.search() {
+        Ok(()) => Ok(Some(cur.get_value_u()?)),
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A fresh 16-byte UUID. No `uuid` crate dependency — two `ObjectId`s (which use

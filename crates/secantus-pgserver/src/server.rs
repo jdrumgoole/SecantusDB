@@ -325,6 +325,8 @@ pub fn bind(
     // connection with it. The stack is reserved, not committed, so a large
     // one costs address space only. `planning_depth_guard` refuses what even
     // this cannot hold, as PostgreSQL's 54001 does.
+    // Transaction ids start above anything an earlier run handed out.
+    crate::xids::install(&storage);
     let runtime = Builder::new_multi_thread()
         .thread_stack_size(WORKER_STACK_BYTES)
         .enable_all()

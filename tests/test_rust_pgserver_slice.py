@@ -8831,16 +8831,31 @@ def test_read_committed_wait_ends_on_the_other_rollback(home: Path) -> None:
 
 def test_repeatable_read_block_conflict_stays_40001(home: Path) -> None:
     """REPEATABLE READ / SERIALIZABLE keep PostgreSQL's 40001 and nothing of
-    the block lands."""
+    the block lands. As in PostgreSQL 15 the colliding write first WAITS for
+    the holder, and fails when the holder commits."""
     for level, table in (("repeatable read", "rr_c"), ("serializable", "sz_c")):
         (home / table).mkdir(parents=True, exist_ok=True)
         with _Server(home / table) as server, server.connect() as a, server.connect() as b:
             _block_conflict_setup(a, b, table)
             a.execute(f"begin isolation level {level}")
             a.execute(f"update {table} set n = n + 1 where id = 1")
-            assert _sqlstate(a, f"update {table} set n = n + 10 where id = 2") == "40001"
-            a.execute("rollback")
+            outcome: dict[str, str | None] = {}
+
+            def write(
+                table: str = table,
+                outcome: dict[str, str | None] = outcome,
+                a: psycopg.Connection = a,
+            ) -> None:
+                outcome["a"] = _sqlstate(a, f"update {table} set n = n + 10 where id = 2")
+
+            t = threading.Thread(target=write)
+            t.start()
+            time.sleep(0.5)
+            assert "a" not in outcome  # still waiting for B
             b.execute("commit")
+            t.join(10)
+            assert outcome["a"] == "40001"
+            a.execute("rollback")
             assert a.execute(f"select id, n from {table} order by id").fetchall() == [
                 (1, 0),
                 (2, 1),
@@ -16428,3 +16443,233 @@ def test_a_commit_that_changed_no_catalog_keeps_the_catalog_cache(home: Path) ->
             c.execute("create table b49_new (a int)")
             c.commit()
             assert a.execute("select count(*) from b49_new").fetchone() == (0,)
+
+
+# --- Batch 50: row waits, savepoints, REPEATABLE READ, FOR UPDATE ------------
+#
+# Every expectation below was measured with the same two- and three-session
+# scripts on PostgreSQL 15.19 (2026-10-03).
+
+
+def _b50_table(conn: psycopg.Connection, name: str) -> None:
+    conn.execute(f"create table {name} (k int primary key, v int)")
+    conn.execute(f"insert into {name} values (1, 0), (2, 0), (3, 0)")
+
+
+def _b50_in_thread(
+    conn: psycopg.Connection, sql: str, out: dict[str, str | None], key: str
+) -> threading.Thread:
+    t = threading.Thread(target=lambda: out.__setitem__(key, _sqlstate(conn, sql)))
+    t.start()
+    return t
+
+
+def test_batch50_rollback_to_savepoint_lets_go_of_rows_and_keeps_the_rest(home: Path) -> None:
+    """ROLLBACK TO SAVEPOINT undoes the later writes AND releases their rows
+    (another session's update of one goes through at once), keeps the writes
+    and sequence calls made before it, and does not fail because another
+    session committed a row of the same table meanwhile (it was 40001)."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b50_table(a, "b50_sp")
+        a.execute("create sequence b50_sq")
+        b.execute("set lock_timeout = '2s'")
+        a.execute("begin")
+        a.execute("update b50_sp set v = 1 where k = 1")
+        a.execute("select nextval('b50_sq')")
+        a.execute("savepoint s")
+        a.execute("update b50_sp set v = 2 where k = 2")
+        a.execute("select nextval('b50_sq')")
+        assert _sqlstate(b, "update b50_sp set v = 7 where k = 3") is None
+        a.execute("rollback to s")
+        assert _sqlstate(b, "update b50_sp set v = 8 where k = 2") is None
+        assert a.execute("select nextval('b50_sq')").fetchone() == (3,)
+        a.execute("commit")
+        assert b.execute("select k, v from b50_sp order by k").fetchall() == [
+            (1, 1),
+            (2, 8),
+            (3, 7),
+        ]
+
+
+def test_batch50_rollback_to_savepoint_after_a_lock_timeout(home: Path) -> None:
+    """A statement that ended on lock_timeout inside a savepoint, rolled back
+    to, leaves a block that carries on and commits (PostgreSQL's retry
+    pattern); its writes from before the savepoint commit with it."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b50_table(a, "b50_lt")
+        b.execute("begin")
+        b.execute("update b50_lt set v = 100 where k = 2")
+        a.execute("begin")
+        a.execute("update b50_lt set v = 5 where k = 3")
+        a.execute("savepoint s")
+        a.execute("set local lock_timeout = '300ms'")
+        assert _sqlstate(a, "update b50_lt set v = v + 1 where k in (1, 2)") == "55P03"
+        a.execute("rollback to s")
+        a.execute("update b50_lt set v = 9 where k = 1")
+        a.execute("commit")
+        b.execute("commit")
+        assert a.execute("select k, v from b50_lt order by k").fetchall() == [
+            (1, 9),
+            (2, 100),
+            (3, 5),
+        ]
+
+
+def test_batch50_repeatable_read_waits_and_goes_on_when_the_holder_rolls_back(home: Path) -> None:
+    """REPEATABLE READ waits for the row's holder; when the holder rolls
+    back, the update goes through (in a block that already wrote, too)."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b50_table(a, "b50_rr")
+        a.execute("begin")
+        a.execute("update b50_rr set v = 1 where k = 1")
+        b.execute("begin isolation level repeatable read")
+        b.execute("update b50_rr set v = 7 where k = 2")
+        out: dict[str, str | None] = {}
+        t = _b50_in_thread(b, "update b50_rr set v = v + 50 where k = 1", out, "b")
+        time.sleep(0.5)
+        assert "b" not in out
+        a.execute("rollback")
+        t.join(10)
+        assert out["b"] is None
+        b.execute("commit")
+        assert a.execute("select k, v from b50_rr order by k").fetchall() == [
+            (1, 50),
+            (2, 7),
+            (3, 0),
+        ]
+
+
+def test_batch50_cycles_through_unpublished_rows_are_deadlocks(home: Path) -> None:
+    """A cycle closed through an autocommit statement's row, through a row a
+    block's still-running statement wrote, or through a primary key two
+    blocks both insert, is 40P01 after deadlock_timeout -- it used to wait
+    for lock_timeout, or forever."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b50_table(a, "b50_dl")
+        for block in (False, True):
+            a.execute("update b50_dl set v = 0")
+            a.execute("begin")
+            a.execute("update b50_dl set v = 10 where k = 2")
+            if block:
+                b.execute("begin")
+                b.execute("select 1")
+            out: dict[str, str | None] = {}
+            tb = _b50_in_thread(b, "update b50_dl set v = v + 1 where k in (1, 2)", out, "b")
+            time.sleep(0.5)
+            ta = _b50_in_thread(a, "update b50_dl set v = 20 where k = 1", out, "a")
+            ta.join(10)
+            tb.join(10)
+            assert (out["a"], out["b"]) == (None, "40P01"), block
+            a.execute("commit")
+            if block:
+                b.execute("rollback")
+            assert a.execute("select k, v from b50_dl where k < 3 order by k").fetchall() == [
+                (1, 20),
+                (2, 10),
+            ]
+        a.execute("begin")
+        a.execute("insert into b50_dl values (5, 1)")
+        b.execute("begin")
+        b.execute("insert into b50_dl values (6, 1)")
+        out = {}
+        ta = _b50_in_thread(a, "insert into b50_dl values (6, 2)", out, "a")
+        time.sleep(0.3)
+        tb = _b50_in_thread(b, "insert into b50_dl values (5, 2)", out, "b")
+        ta.join(10)
+        tb.join(10)
+        assert (out["a"], out["b"]) == ("40P01", None)
+        a.execute("rollback")
+        b.execute("rollback")
+
+
+def test_batch50_select_for_update_locks_its_rows(home: Path) -> None:
+    """FOR UPDATE was parsed and ignored. It now locks the rows returned: a
+    writer waits for the block and re-reads what it left (no lost update),
+    NOWAIT is 55P03, SKIP LOCKED leaves held rows out before LIMIT, the lock
+    survives the block being moved after a later conflict, and FOR SHARE
+    does not block another FOR SHARE."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _b50_table(a, "b50_fu")
+        a.execute("begin")
+        assert a.execute("select v from b50_fu where k = 1 for update").fetchall() == [(0,)]
+        b.execute("begin")
+        rows: list[tuple[int]] = []
+        t = threading.Thread(
+            target=lambda: rows.extend(
+                b.execute("select v from b50_fu where k = 1 for update").fetchall()
+            )
+        )
+        t.start()
+        time.sleep(0.5)
+        assert not rows
+        a.execute("update b50_fu set v = v + 10 where k = 1")
+        a.execute("commit")
+        t.join(10)
+        assert rows == [(10,)]
+        b.execute("update b50_fu set v = v + 10 where k = 1")
+        b.execute("commit")
+        assert c.execute("select v from b50_fu where k = 1").fetchone() == (20,)
+
+        a.execute("begin")
+        a.execute("select * from b50_fu where k = 1 for update")
+        assert _sqlstate(c, "select * from b50_fu where k = 1 for update nowait") == "55P03"
+        b.execute("begin")
+        assert b.execute(
+            "select k from b50_fu order by k limit 1 for update skip locked"
+        ).fetchall() == [(2,)]
+        assert c.execute(
+            "select k from b50_fu order by k limit 1 for update skip locked"
+        ).fetchall() == [(3,)]
+        a.execute("rollback")
+        b.execute("rollback")
+
+        c.execute("set lock_timeout = '1s'")
+        b.execute("begin")
+        b.execute("update b50_fu set v = 9 where k = 2")
+        a.execute("begin")
+        a.execute("select * from b50_fu where k = 1 for update")
+        out: dict[str, str | None] = {}
+        t = _b50_in_thread(a, "update b50_fu set v = 7 where k = 2", out, "a")
+        time.sleep(0.4)
+        b.execute("commit")
+        t.join(10)
+        assert out["a"] is None
+        assert _sqlstate(c, "update b50_fu set v = 1 where k = 1") == "55P03"
+        a.execute("commit")
+
+        a.execute("begin")
+        a.execute("select * from b50_fu where k = 1 for share")
+        b.execute("begin")
+        assert b.execute("select k from b50_fu where k = 1 for share").fetchall() == [(1,)]
+        a.execute("rollback")
+        b.execute("rollback")
+
+
+def test_batch50_transaction_ids_and_the_current_snapshot(home: Path) -> None:
+    """txid_current() / pg_current_xact_id() were 0A000 and the current
+    snapshot the fixed `3:3:`. An xid is now assigned on first ask, stable
+    for the transaction, absent from an autocommit statement afterwards, and
+    another session's snapshot reports it running until it commits
+    (PostgreSQL 15's answers, relative to the xid)."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        first = a.execute("select txid_current()").fetchone()[0]
+        assert a.execute("select txid_current_if_assigned()").fetchone() == (None,)
+        a.execute("begin")
+        assert a.execute("select txid_current_if_assigned()").fetchone() == (None,)
+        xid = a.execute("select txid_current()").fetchone()[0]
+        assert xid > first
+        assert a.execute("select txid_current()").fetchone() == (xid,)
+        assert a.execute("select txid_current_snapshot()::text").fetchone() == (f"{xid}:{xid}:",)
+        assert b.execute(
+            "select txid_visible_in_snapshot(%s, txid_current_snapshot())", (xid,)
+        ).fetchone() == (False,)
+        a.execute("commit")
+        assert b.execute(
+            "select txid_visible_in_snapshot(%s, txid_current_snapshot())", (xid,)
+        ).fetchone() == (True,)
+        assert a.execute("select pg_typeof(pg_current_xact_id())::text").fetchone() == ("xid8",)

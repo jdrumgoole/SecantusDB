@@ -298,12 +298,18 @@ impl PgHandler {
         stmt: Statement,
         run: impl FnOnce(Statement) -> PgWireResult<Vec<Response>>,
     ) -> PgWireResult<Vec<Response>> {
-        if IN_COMMAND.with(Cell::get) || !self.has_event_triggers() {
+        // The tag first: it is the statement's shape, where the catalog read
+        // behind `has_event_triggers` runs on the transaction's own session
+        // (uncached) -- a quarter of a primary-key SELECT's time.
+        if IN_COMMAND.with(Cell::get) {
             return run(stmt);
         }
         let Some(tag) = Self::event_tag(&stmt) else {
             return run(stmt);
         };
+        if !self.has_event_triggers() {
+            return run(stmt);
+        }
         IN_COMMAND.with(|c| c.set(true));
         struct Reset;
         impl Drop for Reset {

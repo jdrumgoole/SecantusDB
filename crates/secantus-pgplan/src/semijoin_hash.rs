@@ -14,9 +14,11 @@
 //! operation, CTE, locking clause, nested subquery or function in the select
 //! list (a volatile one could not be run once). And only key values whose
 //! hash equality IS SQL equality are hashed: integers, floats folded to their
-//! numeric value, text, booleans, dates and timestamps. Anything else -- a
-//! numeric, a collation, a mixed-type comparison, NULL -- falls back to the
-//! per-row path, which keeps every answer it gave before.
+//! numeric value, numerics (by their exact value, never against a float),
+//! text, booleans, dates and timestamps. Anything else -- a collation, a
+//! mixed-type comparison, NULL -- falls back to the per-row path, which keeps
+//! every answer it gave before. The FROM clause may be tables joined with
+//! JOIN as well as with commas.
 
 use super::*;
 use std::collections::HashMap;
@@ -27,6 +29,9 @@ use std::collections::HashMap;
 enum Key {
     Int(i64),
     Float(u64),
+    /// A non-integral `numeric`, as its exact value: (negative, the digits
+    /// without leading or trailing zeros, the power of ten of the last one).
+    Dec(bool, String, i64),
     NaN,
     Text(String),
     Bool(bool),
@@ -44,7 +49,7 @@ enum Family {
 impl Key {
     fn family(&self) -> Family {
         match self {
-            Key::Int(_) | Key::Float(_) | Key::NaN => Family::Number,
+            Key::Int(_) | Key::Float(_) | Key::Dec(..) | Key::NaN => Family::Number,
             Key::Text(_) => Family::Text,
             Key::Bool(_) => Family::Bool,
             Key::Time(_) => Family::Time,
@@ -69,7 +74,80 @@ fn key_of(v: &Bson) -> Option<Key> {
         Bson::String(s) => Some(Key::Text(s.clone())),
         Bson::Boolean(b) => Some(Key::Bool(*b)),
         Bson::DateTime(d) => Some(Key::Time(d.timestamp_millis())),
+        Bson::Decimal128(d) => decimal_key(&d.to_string()),
         _ => None,
+    }
+}
+
+/// A `numeric`'s key: its exact value, folded to `Key::Int` when integral
+/// (so `5::numeric` meets `5`). `None` for an infinity or what does not parse.
+fn decimal_key(text: &str) -> Option<Key> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("nan") {
+        return Some(Key::NaN);
+    }
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (mantissa, exp) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], t[i + 1..].parse::<i64>().ok()?),
+        None => (t, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits: String = format!("{int_part}{frac_part}");
+    let mut exp = exp - i64::try_from(frac_part.len()).ok()?;
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    digits.drain(..lead);
+    if digits.is_empty() {
+        return Some(Key::Int(0));
+    }
+    while digits.ends_with('0') {
+        digits.pop();
+        exp += 1;
+    }
+    if exp >= 0 && i64::try_from(digits.len()).ok()? + exp <= 18 {
+        let mut v: i64 = digits.parse().ok()?;
+        for _ in 0..exp {
+            v *= 10;
+        }
+        return Some(Key::Int(if neg { -v } else { v }));
+    }
+    Some(Key::Dec(neg, digits, exp))
+}
+
+/// Which inexact number kinds a key column holds: a float and a `numeric`
+/// that are equal in SQL (`0.1::float8 = 0.1::numeric`) hash apart, so a
+/// lookup that would compare one with the other goes the per-row way.
+#[derive(Clone, Copy, Default)]
+struct Kinds {
+    float: bool,
+    dec: bool,
+}
+
+impl Kinds {
+    fn note(&mut self, k: &Key) {
+        match k {
+            Key::Float(_) => self.float = true,
+            Key::Dec(..) => self.dec = true,
+            _ => {}
+        }
+    }
+    /// Could `k` miss a row it equals in SQL?
+    fn clashes(self, k: &Key) -> bool {
+        match k {
+            Key::Float(_) => self.dec,
+            Key::Dec(..) => self.float,
+            _ => false,
+        }
     }
 }
 
@@ -84,11 +162,15 @@ struct Index {
     /// aggregate of nothing (`count` 0, `sum` NULL), which the per-row path
     /// answers.
     aggregate: bool,
+    /// An aggregate under comparison filters, computed per outer row.
+    late: Option<Late>,
     /// `LIMIT` / `OFFSET`, applied within each key's rows (scan order, as
     /// the per-row query would see them).
     limit: Option<usize>,
     offset: usize,
     families: Vec<Option<Family>>,
+    /// Per key column, the inexact number kinds it holds.
+    kinds: Vec<Kinds>,
     /// Non-equality conjuncts `col op $N`, applied to a key's rows per
     /// outer row (numbers and timestamps only; text order is a collation's).
     filters: Vec<Filter>,
@@ -138,15 +220,55 @@ impl Op {
     }
 }
 
+/// An aggregate computed per outer row over a key's FILTERED rows: the
+/// inner query runs un-aggregated, projecting the aggregate's argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Late {
+    /// `count(*)`.
+    CountStar,
+    /// `count(col)`: the non-NULL values.
+    Count,
+    Min,
+    Max,
+}
+
+impl Late {
+    /// The aggregate of `values` (one per filtered row), or `None` when two
+    /// of them cannot be ordered here.
+    fn over(self, values: &[&Bson]) -> Option<Bson> {
+        let present = values.iter().filter(|v| !matches!(v, Bson::Null));
+        match self {
+            Late::CountStar => Some(Bson::Int64(i64::try_from(values.len()).ok()?)),
+            Late::Count => Some(Bson::Int64(i64::try_from(present.count()).ok()?)),
+            Late::Min | Late::Max => {
+                let want = if self == Late::Min {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+                let mut best: Option<&Bson> = None;
+                for v in present {
+                    best = Some(match best {
+                        None => v,
+                        Some(b) if sql_order(v, b)? == want => v,
+                        Some(b) => b,
+                    });
+                }
+                Some(best.cloned().unwrap_or(Bson::Null))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Filter {
     param: usize,
     op: Op,
 }
 
-/// SQL's ordering of two numbers or two timestamps, or `None` for anything
-/// else (text, numeric, mixed families, NULL) -- which the per-row path then
-/// answers. NaN sorts above every number and equals NaN, as in PostgreSQL.
+/// SQL's ordering of two numbers, two timestamps or two byte-ordered texts,
+/// or `None` for anything else (numeric, mixed families, NULL) -- which the
+/// per-row path then answers. NaN sorts above every number and equals NaN, as in PostgreSQL.
 fn sql_order(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     let num = |v: &Bson| -> Option<(Option<i64>, f64)> {
@@ -162,6 +284,9 @@ fn sql_order(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
         (Bson::DateTime(x), Bson::DateTime(y)) => {
             Some(x.timestamp_millis().cmp(&y.timestamp_millis()))
         }
+        // Only reached for a filter column `build` found to be plain text
+        // under byte order (`text_order_allowed`).
+        (Bson::String(x), Bson::String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
         _ => {
             let ((ai, af), (bi, bf)) = (num(a)?, num(b)?);
             if let (Some(x), Some(y)) = (ai, bi) {
@@ -237,7 +362,7 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
             };
             // A comparison across families (text against a number) is the
             // per-row path's error or coercion, never a quiet miss here.
-            if ix.families[i].is_some_and(|f| f != k.family()) {
+            if ix.families[i].is_some_and(|f| f != k.family()) || ix.kinds[i].clashes(&k) {
                 return Ok(None);
             }
             key.push(k);
@@ -249,7 +374,10 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
             };
             if matches!(v, Bson::Null) {
                 // `col < NULL` is never true: no row qualifies.
-                return Ok(Some(Vec::new()));
+                return Ok(match ix.late {
+                    Some(late) => late.over(&[]).map(|v| vec![vec![v]]),
+                    None => Some(Vec::new()),
+                });
             }
             bounds.push(v);
         }
@@ -275,6 +403,10 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                         out.push(proj.clone());
                     }
                 }
+                if let Some(late) = ix.late {
+                    let values: Vec<&Bson> = out.iter().filter_map(|r| r.first()).collect();
+                    return Ok(late.over(&values).map(|v| vec![vec![v]]));
+                }
                 Ok(Some(
                     out.into_iter()
                         .skip(ix.offset)
@@ -282,8 +414,11 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                         .collect(),
                 ))
             }
-            None if ix.aggregate => Ok(None),
-            None => Ok(Some(Vec::new())),
+            None => match ix.late {
+                Some(late) => Ok(late.over(&[]).map(|v| vec![vec![v]])),
+                None if ix.aggregate => Ok(None),
+                None => Ok(Some(Vec::new())),
+            },
         }
     })
 }
@@ -294,6 +429,7 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         params,
         filters,
         aggregate,
+        late,
         limit,
         offset,
     }) = rewrite(sql)
@@ -303,20 +439,32 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
     let rows = run(&rewritten, &[])?;
     let nkeys = params.len();
     let mut families: Vec<Option<Family>> = vec![None; nkeys];
+    let mut kinds: Vec<Kinds> = vec![Kinds::default(); nkeys];
     let nfilters = filters.len();
+    let text_ok = crate::collation::text_is_byte_ordered();
     let mut index: Groups = HashMap::new();
     for mut row in rows {
-        if row.len() < nkeys + nfilters {
+        if row.len() < nkeys + 2 * nfilters + usize::from(late.is_some()) {
             return Ok(Entry::No);
         }
+        // A late min / max orders its argument here, so the argument must be
+        // orderable as a filter column is (its type is the last column).
+        if let Some(late) = late {
+            let ty = row.pop().unwrap_or(Bson::Null);
+            if matches!(late, Late::Min | Late::Max)
+                && !row.first().is_some_and(|v| orderable(v, &ty, text_ok))
+            {
+                return Ok(Entry::No);
+            }
+        }
+        // Each filter column, then its type's name (`pg_typeof(col)::text`).
+        let ftypes = row.split_off(row.len() - nfilters);
         let fvals = row.split_off(row.len() - nfilters);
-        // Text, numeric and anything else unorderable here: per-row path.
-        if fvals.iter().any(|v| {
-            !matches!(
-                v,
-                Bson::Null | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_)
-            )
-        }) {
+        if !fvals
+            .iter()
+            .zip(&ftypes)
+            .all(|(v, t)| orderable(v, t, text_ok))
+        {
             return Ok(Entry::No);
         }
         let keys = row.split_off(row.len() - nkeys);
@@ -341,6 +489,7 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
                 Some(f) if f != k.family() => return Ok(Entry::No),
                 Some(_) => {}
             }
+            kinds[i].note(&k);
             key.push(k);
         }
         if !null {
@@ -350,12 +499,29 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
     Ok(Entry::Built(Index {
         params,
         aggregate,
+        late,
         limit,
         offset,
         families,
+        kinds,
         filters,
         rows: index,
     }))
+}
+
+/// Can `v` (of the type named `ty`) be ordered by `sql_order`? Numbers and
+/// timestamps; text only when it is plain text ordered by its bytes. A
+/// numeric and anything else go the per-row way.
+fn orderable(v: &Bson, ty: &Bson, text_ok: bool) -> bool {
+    match v {
+        Bson::Null | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_) => true,
+        Bson::String(_) => {
+            text_ok
+                && matches!(ty, Bson::String(t)
+                    if matches!(t.as_str(), "text" | "character varying" | "name"))
+        }
+        _ => false,
+    }
 }
 
 fn nondeterministic_collation_exists() -> bool {
@@ -370,6 +536,7 @@ struct Rewritten {
     params: Vec<usize>,
     filters: Vec<Filter>,
     aggregate: bool,
+    late: Option<Late>,
     limit: Option<usize>,
     offset: usize,
 }
@@ -458,7 +625,7 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     for f in &s.from_clause {
         if contains(f, &|n| {
             matches!(n, N::ParamRef(_) | N::FuncCall(_) | N::SubLink(_))
-        }) || !matches!(f.node.as_ref(), Some(N::RangeVar(_)))
+        }) || !tables_only(f)
         {
             return None;
         }
@@ -487,10 +654,18 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         return None;
     }
     // A filter changes which rows an aggregate sees per outer row, which a
-    // grouping by the keys alone cannot express.
+    // grouping by the keys alone cannot express: `count` / `min` / `max`
+    // of one column are then computed per outer row (`Late`), the rows
+    // projecting the argument; any other aggregate goes the per-row way.
+    let mut late = None;
+    let mut late_arg = None;
     if aggregate && !filters.is_empty() {
-        return None;
+        let (kind, arg) = late_aggregate(&s.target_list)?;
+        late = Some(kind);
+        late_arg = Some(arg.clone());
+        s.target_list = vec![target(arg)];
     }
+    let aggregate = aggregate && late.is_none();
     s.where_clause = and_of(keep).map(Box::new);
     let mut params = Vec::new();
     for (col, p) in keys {
@@ -507,15 +682,15 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         params.push(p);
     }
     let mut filter_list = Vec::new();
+    let mut types = Vec::new();
     for (col, f) in filters {
-        s.target_list.push(pg_query::protobuf::Node {
-            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
-                val: Some(Box::new(col)),
-                location: -1,
-                ..Default::default()
-            }))),
-        });
+        types.push(type_name_of(col.clone())?);
+        s.target_list.push(target(col));
         filter_list.push(f);
+    }
+    s.target_list.extend(types.into_iter().map(target));
+    if let Some(arg) = late_arg {
+        s.target_list.push(target(type_name_of(arg)?));
     }
     let text = pg_query::deparse(&parsed).ok()?;
     Some(Rewritten {
@@ -523,6 +698,7 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         params,
         filters: filter_list,
         aggregate,
+        late,
         limit,
         offset,
     })
@@ -562,6 +738,104 @@ fn column_op_param(
         (true, Some(p), _, _) => Some((l.clone(), p, op)),
         (_, _, Some(p), true) => Some((r.clone(), p, op.map(Op::flipped))),
         _ => None,
+    }
+}
+
+/// The select list's ONE aggregate, when it is `count(*)`, or `count` / `min`
+/// / `max` of a column with no DISTINCT, FILTER or ORDER BY: its kind and
+/// the value to project in its place.
+fn late_aggregate(
+    targets: &[pg_query::protobuf::Node],
+) -> Option<(Late, pg_query::protobuf::Node)> {
+    let [t] = targets else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(f)) = rt.val.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    if !is_groupable_aggregate(&N::FuncCall(f.clone())) || f.agg_distinct || f.funcname.len() != 1 {
+        return None;
+    }
+    let name = match f.funcname[0].node.as_ref() {
+        Some(N::String(s)) => s.sval.as_str(),
+        _ => return None,
+    };
+    if f.agg_star {
+        return (name == "count").then(|| {
+            let one = pg_query::parse("SELECT 1")
+                .ok()?
+                .protobuf
+                .stmts
+                .pop()?
+                .stmt?;
+            let N::SelectStmt(mut sel) = one.node? else {
+                return None;
+            };
+            let N::ResTarget(rt) = sel.target_list.pop()?.node? else {
+                return None;
+            };
+            Some((Late::CountStar, *rt.val?))
+        })?;
+    }
+    let [arg] = f.args.as_slice() else {
+        return None;
+    };
+    if !matches!(arg.node.as_ref(), Some(N::ColumnRef(_))) {
+        return None;
+    }
+    let kind = match name {
+        "count" => Late::Count,
+        "min" => Late::Min,
+        "max" => Late::Max,
+        _ => return None,
+    };
+    Some((kind, arg.clone()))
+}
+
+/// A select-list entry for `val`.
+fn target(val: pg_query::protobuf::Node) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(val)),
+            location: -1,
+            ..Default::default()
+        }))),
+    }
+}
+
+/// `pg_typeof(col)::text`: a filter column's type, which decides whether
+/// its values may be ordered here.
+fn type_name_of(col: pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
+    let mut parsed = pg_query::parse("SELECT pg_typeof(x)::text").ok()?.protobuf;
+    let stmt = parsed.stmts.pop()?.stmt?;
+    let N::SelectStmt(mut sel) = stmt.node? else {
+        return None;
+    };
+    let N::ResTarget(rt) = sel.target_list.pop()?.node? else {
+        return None;
+    };
+    let mut cast = rt.val?;
+    let Some(N::TypeCast(tc)) = cast.node.as_mut() else {
+        return None;
+    };
+    let Some(N::FuncCall(fc)) = tc.arg.as_mut()?.node.as_mut() else {
+        return None;
+    };
+    fc.args = vec![col];
+    Some(*cast)
+}
+
+/// Is a FROM item stored tables only -- one, or several joined?
+fn tables_only(n: &pg_query::protobuf::Node) -> bool {
+    match n.node.as_ref() {
+        Some(N::RangeVar(_)) => true,
+        Some(N::JoinExpr(j)) => {
+            j.larg.as_deref().is_some_and(tables_only) && j.rarg.as_deref().is_some_and(tables_only)
+        }
+        _ => false,
     }
 }
 
@@ -634,7 +908,9 @@ mod tests {
     #[test]
     fn shapes_that_cannot_run_once_are_left_alone() {
         for sql in [
-            "SELECT count(*) FROM t WHERE t.x = $1 AND t.y > $2",
+            "SELECT sum(t.v) FROM t WHERE t.x = $1 AND t.y > $2",
+            "SELECT count(DISTINCT t.v) FROM t WHERE t.x = $1 AND t.y > $2",
+            "SELECT max(t.v + 1) FROM t WHERE t.x = $1 AND t.y > $2",
             "SELECT 1 FROM t WHERE t.y ~ $1",
             "SELECT 1 FROM t WHERE t.x = $1 ORDER BY t.v",
             "SELECT DISTINCT t.v FROM t WHERE t.x = $1",
@@ -649,7 +925,7 @@ mod tests {
     #[test]
     fn comparisons_become_filters() {
         let r = rewrite("SELECT 1 FROM t WHERE t.x = $1 AND $2 < t.y").expect("qualifies");
-        assert_eq!(r.sql, "SELECT 1, t.x, t.y FROM t");
+        assert_eq!(r.sql, "SELECT 1, t.x, t.y, pg_typeof(t.y)::text FROM t");
         assert_eq!(r.params, vec![0]);
         assert_eq!(r.filters.len(), 1);
         assert_eq!((r.filters[0].param, r.filters[0].op), (1, Op::Gt));
@@ -668,6 +944,59 @@ mod tests {
             Some(Equal)
         );
         assert_eq!(sql_order(&Bson::String("a".into()), &Bson::Int32(1)), None);
+        assert_eq!(
+            sql_order(&Bson::String("B".into()), &Bson::String("a".into())),
+            Some(Less)
+        );
+    }
+
+    #[test]
+    fn numerics_key_by_exact_value() {
+        let d = |s: &str| key_of(&Bson::Decimal128(s.parse().expect("decimal")));
+        assert_eq!(d("5"), key_of(&Bson::Int32(5)));
+        assert_eq!(d("5.000"), key_of(&Bson::Int64(5)));
+        assert_eq!(d("5E+1"), key_of(&Bson::Int32(50)));
+        assert_eq!(d("-0.00"), key_of(&Bson::Int32(0)));
+        assert_eq!(d("1.50"), d("1.5"));
+        assert_ne!(d("1.5"), d("1.05"));
+        assert_eq!(d("1.5"), Some(Key::Dec(false, "15".into(), -1)));
+        assert_ne!(d("-1.5"), d("1.5"));
+        assert_eq!(d("NaN"), key_of(&Bson::Double(f64::NAN)));
+        // A float and a numeric never meet in the hash.
+        let mut kinds = Kinds::default();
+        kinds.note(&d("0.1").expect("key"));
+        assert!(kinds.clashes(&key_of(&Bson::Double(0.1)).expect("key")));
+        assert!(!kinds.clashes(&key_of(&Bson::Int32(1)).expect("key")));
+    }
+
+    #[test]
+    fn an_aggregate_under_a_filter_runs_late() {
+        let r = rewrite("SELECT max(t.v) FROM t WHERE t.x = $1 AND t.y > $2").expect("qualifies");
+        assert_eq!(
+            r.sql,
+            "SELECT t.v, t.x, t.y, pg_typeof(t.y)::text, pg_typeof(t.v)::text FROM t"
+        );
+        assert_eq!(r.late, Some(Late::Max));
+        assert!(!r.aggregate);
+        let r = rewrite("SELECT count(*) FROM t WHERE t.x = $1 AND t.y > $2").expect("qualifies");
+        assert_eq!(r.late, Some(Late::CountStar));
+        let (a, b, n) = (Bson::Int32(3), Bson::Double(2.5), Bson::Null);
+        assert_eq!(Late::Max.over(&[&a, &n, &b]), Some(Bson::Int32(3)));
+        assert_eq!(Late::Min.over(&[&a, &n, &b]), Some(Bson::Double(2.5)));
+        assert_eq!(Late::Min.over(&[]), Some(Bson::Null));
+        assert_eq!(Late::Count.over(&[&a, &n]), Some(Bson::Int64(1)));
+        assert_eq!(Late::CountStar.over(&[&a, &n]), Some(Bson::Int64(2)));
+    }
+
+    #[test]
+    fn joined_tables_qualify() {
+        let r =
+            rewrite("SELECT 1 FROM t JOIN u ON u.tid = t.id WHERE t.x = $1").expect("qualifies");
+        assert_eq!(r.sql, "SELECT 1, t.x FROM t JOIN u ON u.tid = t.id");
+        assert!(
+            rewrite("SELECT 1 FROM t JOIN generate_series(1, 2) g ON true WHERE t.x = $1")
+                .is_none()
+        );
     }
 
     #[test]

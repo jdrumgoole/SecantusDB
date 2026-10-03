@@ -43,6 +43,26 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+thread_local! {
+    /// Does any column (or domain) of the database declare a collation?
+    /// `true` until the server says otherwise: see [`text_is_byte_ordered`].
+    static DECLARED_COLLATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Record whether any column or domain of the database declares a
+/// collation (the server installs it with the catalog).
+pub fn set_declared_collations(any: bool) {
+    DECLARED_COLLATIONS.with(|c| c.set(any));
+}
+
+/// Is a plain `text` / `varchar` / `name` value's order byte order -- no
+/// column or domain declaring a collation, no user collation? Then two such
+/// values compare as their bytes, whatever expression produced them.
+pub fn text_is_byte_ordered() -> bool {
+    !DECLARED_COLLATIONS.with(std::cell::Cell::get)
+        && USER_COLLATIONS.with(|c| c.borrow().is_empty())
+}
+
 /// Install the database's collations for the statements that follow.
 pub fn set_user_collations(collations: Vec<UserCollation>) {
     USER_COLLATIONS.with(|c| *c.borrow_mut() = collations);
