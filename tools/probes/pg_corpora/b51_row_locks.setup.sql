@@ -1,0 +1,10 @@
+DROP VIEW IF EXISTS b51_v;
+DROP VIEW IF EXISTS b51_va;
+DROP TABLE IF EXISTS b51_c;
+DROP TABLE IF EXISTS b51_p;
+create table b51_p (id int primary key, n int);
+create table b51_c (id int primary key, pid int, m int);
+insert into b51_p values (1, 10), (2, 20);
+insert into b51_c values (1, 1, 100), (2, 2, 200), (3, 9, 300);
+create view b51_v as select * from b51_p where id < 10;
+create view b51_va as select count(*) as k from b51_p;

@@ -395,6 +395,7 @@ type EnumWithSchema = (String, String, i64, Vec<String>);
 /// The session settings a row encoder needs, captured once per statement:
 /// pgwire may encode DataRows lazily on another worker thread, where the
 /// session state is not visible.
+#[derive(Clone)]
 struct RowEnv {
     tz: secantus_pgplan::TimeZoneSetting,
     ds: secantus_pgplan::DateStyle,
@@ -2342,7 +2343,13 @@ pub struct PgHandler {
     /// PostgreSQL's is. Held as a real `UserTransactionHandle` rather than a
     /// flag: a `ROLLBACK` that did not actually roll back would be a silent
     /// wrong answer, which is worse than refusing `BEGIN` outright.
-    txn: Mutex<Option<UserTransactionHandle>>,
+    /// Shared (an `Arc`) so a block's streamed portal can read its next
+    /// batch through the block's transaction after its Execute returned
+    /// (`portal_stream::BlockScan`).
+    txn: Arc<Mutex<Option<UserTransactionHandle>>>,
+    /// The streamed portals open in the block (`portal_stream`), drained
+    /// into memory before any other statement uses the block's transaction.
+    block_scans: Mutex<Vec<std::sync::Weak<Mutex<portal_stream::BlockScan>>>>,
     /// Session settings (GUCs), per connection as PostgreSQL's are.
     settings: Arc<Mutex<GucMap>>,
     /// NoticeResponses raised by the statement in flight (a `DO` block's
@@ -2399,6 +2406,8 @@ pub struct PgHandler {
     stream_request: std::sync::atomic::AtomicU8,
     stream_portal: std::sync::atomic::AtomicU8,
     streamed: AtomicBool,
+    /// The portal being allowed to stream is in a transaction block.
+    stream_in_block: AtomicBool,
     /// A password login in progress: the role, its stored credentials, and --
     /// once the client's first SASL message arrived -- the SCRAM exchange.
     auth: Mutex<
@@ -2689,6 +2698,14 @@ struct Savepoint {
     /// moves the block onto a transaction without the later writes (see
     /// `rollback_to_by_move`); `None` when it could not be read.
     write_pos: Option<usize>,
+    /// How many shared row locks (`FOR SHARE` / `FOR KEY SHARE`) the block
+    /// held then: a ROLLBACK TO lets go of the ones taken since, as a
+    /// subtransaction's abort does in PostgreSQL.
+    shared_pos: Option<usize>,
+    /// How many unchanged-rewrite row locks (`FOR UPDATE`, an UPDATE that
+    /// changed nothing) the block held then (`UserTransactionHandle::
+    /// locked_len`): a ROLLBACK TO by move takes only those again.
+    lock_pos: Option<usize>,
 }
 
 /// A declared cursor's materialised result.
@@ -2722,6 +2739,12 @@ struct CursorState {
     typed_rows: Option<CapturedRows>,
     /// The session time zone in force at DECLARE, for re-encoding `typed_rows`.
     tz: secantus_pgplan::TimeZoneSetting,
+    /// A cursor whose rows are still being read, a batch per FETCH, through
+    /// the block's transaction (`portal_stream::CursorTail`): `rows` (and
+    /// `typed_rows`) then hold only a window of the result, starting at
+    /// row `base + 1`.
+    tail: Option<portal_stream::CursorTail>,
+    base: usize,
 }
 
 /// One row of `pg_prepared_statements`.
@@ -2804,7 +2827,8 @@ impl PgHandler {
             storage,
             db: OnceLock::new(),
             databases,
-            txn: Mutex::new(None),
+            txn: Arc::new(Mutex::new(None)),
+            block_scans: Mutex::new(Vec::new()),
             settings: Arc::new(Mutex::new(GucMap::from(default_settings()))),
             pending_notices: Mutex::new(Vec::new()),
             live_notices: Mutex::new(None),
@@ -2821,6 +2845,7 @@ impl PgHandler {
             stream_request: std::sync::atomic::AtomicU8::new(0),
             stream_portal: std::sync::atomic::AtomicU8::new(0),
             streamed: AtomicBool::new(false),
+            stream_in_block: AtomicBool::new(false),
             auth: Mutex::new(None),
             md5_auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
@@ -16940,7 +16965,12 @@ impl PgHandler {
                 format!("cursor \"{name}\" does not exist"),
             ))));
         };
-        let len = cursor.rows.len() as i64;
+        // A streamed cursor reads what this FETCH reaches first.
+        if cursor.tail.is_some() {
+            self.fill_cursor(cursor, direction, count)?;
+        }
+        let base = cursor.base;
+        let len = (base + cursor.rows.len()) as i64;
         let pos = cursor.pos;
 
         // `FETCH ALL` arrives as a count of i64::MAX, so every step saturates.
@@ -17034,8 +17064,22 @@ impl PgHandler {
         };
 
         cursor.pos = new_pos.clamp(0, len + 1);
+        // A streamed cursor's window starts at row `base + 1`; `fill_cursor`
+        // read back from the start for anything below it.
+        if indices
+            .iter()
+            .any(|&i| i < base || i - base >= cursor.rows.len())
+        {
+            return Err(Self::user_error(
+                "XX000",
+                format!("cursor \"{name}\" lost its place"),
+            ));
+        }
         let n = indices.len();
         if is_move {
+            if cursor.tail.is_some() {
+                portal_stream::trim_cursor(cursor);
+            }
             return Ok(vec![Response::Execution(Tag::new(&format!("MOVE {n}")))]);
         }
         // A BINARY fetch re-encodes the captured typed values in binary; every
@@ -17062,7 +17106,7 @@ impl PgHandler {
                 for &i in &indices {
                     out.push(encode_typed_row(
                         &bin_schema,
-                        &values[i],
+                        &values[i - base],
                         &cursor.tz,
                         &fetch_ds,
                         cenc,
@@ -17072,9 +17116,15 @@ impl PgHandler {
             }
             _ => (
                 cursor.schema.clone(),
-                indices.iter().map(|&i| cursor.rows[i].clone()).collect(),
+                indices
+                    .iter()
+                    .map(|&i| cursor.rows[i - base].clone())
+                    .collect(),
             ),
         };
+        if cursor.tail.is_some() {
+            portal_stream::trim_cursor(cursor);
+        }
         drop(cursors);
         let mut response = QueryResponse::new(schema, stream::iter(rows.into_iter().map(Ok)));
         // The tag is just `FETCH`: the wire layer appends the row count, so
@@ -17522,20 +17572,105 @@ impl PgHandler {
                         .create_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not create the table", e))?;
                 }
-                self.storage
-                    .delete_matching(
-                        self.db(),
-                        table,
-                        &Document::new(),
-                        0,
-                        &Document::new(),
-                        None,
-                    )
-                    .map_err(|e| Self::storage_err("could not clear the table", e))?;
-                if !docs.is_empty() {
-                    self.insert_checked(table, docs.clone(), "could not restore the table")?;
-                }
+                self.restore_rows(table, docs)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Put `table`'s rows back to `saved` by writing only the rows that
+    /// differ: a row changed since is replaced in place, one added since is
+    /// deleted, one deleted since is inserted. Rewriting EVERY row (as this
+    /// once did) wrote rows the block never touched, so a row another
+    /// session committed since the block's snapshot made the ROLLBACK TO
+    /// itself fail 40001 -- a conflict PostgreSQL, which writes nothing on a
+    /// subtransaction abort, cannot have.
+    fn restore_rows(&self, table: &str, saved: &[Vec<u8>]) -> PgWireResult<()> {
+        let id_of = |raw: &[u8]| -> Option<Vec<u8>> {
+            let doc = bson::RawDocument::from_bytes(raw).ok()?;
+            let id: Bson = doc.get("_id").ok()??.to_raw_bson().try_into().ok()?;
+            bson::to_vec(&bson::doc! { "k": id }).ok()
+        };
+        let current = self
+            .storage
+            .find_matching(self.db(), table, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the table", e))?;
+        let mut now: HashMap<Vec<u8>, &[u8]> = HashMap::with_capacity(current.len());
+        let mut unkeyed = false;
+        for raw in &current {
+            match id_of(raw) {
+                Some(k) => {
+                    now.insert(k, raw.as_slice());
+                }
+                None => unkeyed = true,
+            }
+        }
+        let mut was: HashMap<Vec<u8>, &[u8]> = HashMap::with_capacity(saved.len());
+        for raw in saved {
+            match id_of(raw) {
+                Some(k) => {
+                    was.insert(k, raw.as_slice());
+                }
+                None => unkeyed = true,
+            }
+        }
+        if unkeyed {
+            // No `_id` to pair rows by: rewrite the table whole.
+            self.storage
+                .delete_matching(
+                    self.db(),
+                    table,
+                    &Document::new(),
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(|e| Self::storage_err("could not clear the table", e))?;
+            if !saved.is_empty() {
+                self.insert_checked(table, saved.to_vec(), "could not restore the table")?;
+            }
+            return Ok(());
+        }
+        let decode_id = |raw: &[u8]| -> PgWireResult<Bson> {
+            decode_doc(raw)
+                .map_err(|e| Self::storage_err("could not decode a row", e))?
+                .get("_id")
+                .cloned()
+                .ok_or_else(|| Self::err(&PlanError::Internal("a row without _id".into())))
+        };
+        let gone: Vec<Bson> = now
+            .iter()
+            .filter(|(k, _)| !was.contains_key(*k))
+            .map(|(_, raw)| decode_id(raw))
+            .collect::<PgWireResult<_>>()?;
+        if !gone.is_empty() {
+            self.storage
+                .delete_matching(
+                    self.db(),
+                    table,
+                    &bson::doc! { "_id": { "$in": gone } },
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(|e| Self::storage_err("could not restore the table", e))?;
+        }
+        let mut missing = Vec::new();
+        for raw in saved {
+            let Some(k) = id_of(raw) else { continue };
+            match now.get(&k) {
+                Some(cur) if *cur == raw.as_slice() => {}
+                Some(_) => {
+                    let id = decode_id(raw)?;
+                    self.storage
+                        .replace_by_id(self.db(), table, &id, raw)
+                        .map_err(|e| Self::storage_err("could not restore the table", e))?;
+                }
+                None => missing.push(raw.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            self.insert_checked(table, missing, "could not restore the table")?;
         }
         Ok(())
     }
@@ -19769,6 +19904,20 @@ impl PgHandler {
         let stmt = planned
             .map_err(|e| Self::err_in(&e, sql))
             .inspect_err(|_| self.note_failure())?;
+        // A portal or cursor of the block still streaming reads the snapshot
+        // of the statement that opened it: its rest is read NOW, before this
+        // statement refreshes the snapshot or writes. A FETCH / MOVE / CLOSE
+        // does neither, and is how such a cursor is read.
+        // A failed block reads nothing more, and a ROLLBACK closes them.
+        if !Self::cursor_op(&stmt)
+            && !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(
+                stmt,
+                Statement::Transaction(TransactionControl::Rollback { .. })
+            )
+        {
+            self.drain_block_scans()?;
+        }
         // Only the Execute's own top-level SELECT may stream; a statement
         // it runs on the way (a trigger's, a function's) never does.
         let stream = self.stream_request.swap(
@@ -19916,6 +20065,34 @@ impl PgHandler {
             let binary = self
                 .binary_results
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
+            // A plain read of one table is not run here: its rows are read
+            // a batch per FETCH through the block's transaction
+            // (`portal_stream::CursorTail`), so a large result is never
+            // held whole.
+            if !is_binary_cursor {
+                if let Statement::Select(sel) = &*query {
+                    let streamed = self.declare_streamed(sel, &statement, scrollable, holdable);
+                    if !matches!(streamed, Ok(None)) {
+                        self.binary_results
+                            .store(binary, std::sync::atomic::Ordering::Relaxed);
+                        self.cursor_capture
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take();
+                    }
+                    if let Some(state) = streamed? {
+                        self.cursors
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(name, state);
+                        if holdable {
+                            self.holdable_declared
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
+                    }
+                }
+            }
             // INSIDE the block's transaction, as every other statement runs:
             // a cursor over rows this block wrote must see them.
             let responses = {
@@ -19984,6 +20161,8 @@ impl PgHandler {
                         creation_time: bson::DateTime::now(),
                         typed_rows,
                         tz,
+                        tail: None,
+                        base: 0,
                     },
                 );
             if holdable {
@@ -20037,7 +20216,14 @@ impl PgHandler {
                     // block's SECOND write that lost a conflict rolled back and
                     // retried on a fresh transaction -- silently discarding the
                     // block's first write, which then "committed" as nothing.
-                    let handle = self.with_isolation(handle)?;
+                    // A FETCH / MOVE / CLOSE keeps the snapshot: a streamed
+                    // cursor reads on in the snapshot it was declared in.
+                    let cursor_op = Self::cursor_op(&stmt);
+                    let handle = if cursor_op {
+                        handle
+                    } else {
+                        self.with_isolation(handle)?
+                    };
                     let fresh = Self::row_write(&stmt) && !handle.has_written();
                     let rebase = Self::row_write(&stmt) && !fresh;
                     // Where this statement's writes start in the block's write
@@ -20047,11 +20233,14 @@ impl PgHandler {
                     let mut poll = fresh.then(|| self.lock_wait_poll());
                     let mut delay = std::time::Duration::from_millis(2);
                     loop {
+                        let handle = if cursor_op {
+                            &mut *handle
+                        } else {
+                            self.with_isolation(handle)?
+                        };
                         let out = self
                             .storage
-                            .with_user_transaction(self.with_isolation(handle)?, || {
-                                self.execute(stmt.clone(), max_rows)
-                            })
+                            .with_user_transaction(handle, || self.execute(stmt.clone(), max_rows))
                             .map_err(|e| Self::storage_err("transaction failed", e))
                             .and_then(|r| r);
                         match (&out, poll.as_mut()) {
@@ -20149,6 +20338,12 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// A FETCH / MOVE / CLOSE: reads no table, writes nothing, and keeps
+    /// the block's snapshot (see `portal_stream::CursorTail`).
+    fn cursor_op(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::Fetch { .. } | Statement::CloseCursor(_))
+    }
+
     /// An INSERT / UPDATE / DELETE: what an autocommit statement runs in a
     /// transaction of its own for (`run_autocommit_write`).
     fn row_write(stmt: &Statement) -> bool {
@@ -20158,7 +20353,7 @@ impl PgHandler {
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::Merge(_)
-        ) || matches!(stmt, Statement::Select(s) if s.lock.is_some())
+        ) || matches!(stmt, Statement::Select(s) if s.lock.is_some() || !s.lock_clauses.is_empty())
     }
 
     /// A block that has ALREADY written lost a write conflict on `stmt`.
@@ -20276,10 +20471,13 @@ impl PgHandler {
         poll: &mut dyn FnMut() -> PgWireResult<()>,
     ) -> PgWireResult<bool> {
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        // The strength this wait is for: what the colliding statement set.
+        let want = row_waits::wait_strength();
+        row_waits::clear_wait_strength();
         let Some(target) = target else {
             return Ok(false);
         };
-        if row_waits::holders_of(target, pid).is_empty() {
+        if row_waits::holders_in_mode(target, pid, want).is_empty() {
             return Ok(false);
         }
         let waiting = row_waits::Waiting::new(pid);
@@ -20287,7 +20485,7 @@ impl PgHandler {
         let mut checked = false;
         let mut delay = std::time::Duration::from_millis(1);
         loop {
-            let blockers = row_waits::holders_of(target, pid);
+            let blockers = row_waits::holders_in_mode(target, pid, want);
             if blockers.is_empty() {
                 return Ok(true);
             }
@@ -21206,6 +21404,47 @@ impl PgHandler {
         guard.as_ref().map(|h| h.write_set_len())
     }
 
+    /// How many shared row locks the block holds (a savepoint's mark): from
+    /// the transaction running on this thread inside a statement (a
+    /// PL/pgSQL EXCEPTION block), else from the block's handle.
+    fn shared_lock_mark(&self) -> Option<usize> {
+        if self.storage.in_user_txn() {
+            return secantus_storage::active_shared_len();
+        }
+        let guard = self.txn.try_lock().ok()?;
+        guard.as_ref().map(|h| {
+            h.held_rows()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shared_len()
+        })
+    }
+
+    /// Let go of the shared row locks taken after mark `pos`.
+    fn release_shared_locks_after(&self, pos: usize) {
+        if self.storage.in_user_txn() && secantus_storage::release_active_shared_after(pos) {
+            return;
+        }
+        if let Ok(guard) = self.txn.try_lock() {
+            if let Some(h) = guard.as_ref() {
+                h.held_rows()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .release_shared_after(pos);
+            }
+        }
+    }
+
+    /// The open block's unchanged-rewrite lock count (`UserTransactionHandle
+    /// ::locked_len`), on the same terms as `block_write_pos`.
+    fn block_lock_pos(&self) -> Option<usize> {
+        if self.storage.in_user_txn() {
+            return None;
+        }
+        let guard = self.txn.try_lock().ok()?;
+        guard.as_ref().map(|h| h.locked_len())
+    }
+
     /// ROLLBACK TO SAVEPOINT as PostgreSQL's subtransaction abort: the writes
     /// made since the savepoint are undone AND their rows let go, so a
     /// session waiting on one goes on. The block is moved onto a new
@@ -21217,23 +21456,24 @@ impl PgHandler {
     /// snapshot (40001 on the ROLLBACK TO itself), and cannot heal a
     /// transaction a write conflict has doomed.
     ///
-    /// Taken only where the move is invisible: READ COMMITTED (a fresh
-    /// snapshot is what its next statement takes anyway), a top-level
-    /// statement, every restored table existing at the savepoint, no row
-    /// lock without an oplog entry. `false` leaves the fallback to run.
+    /// Taken only where the move is invisible: a top-level statement (not
+    /// a PL/pgSQL EXCEPTION block, whose transaction a running statement
+    /// holds), and under REPEATABLE READ only while nothing committed since
+    /// the block's snapshot. Row locks taken by rewriting a row unchanged
+    /// (`FOR UPDATE`, an UPDATE that changed nothing) before the savepoint
+    /// are taken again, the later ones let go; a table created after the
+    /// savepoint is undone with the rest. `false` leaves the fallback
+    /// (`restore_table`) to run.
     fn rollback_to_by_move(
         &self,
         write_pos: Option<usize>,
+        lock_pos: Option<usize>,
         restore: &HashMap<String, Option<Vec<Vec<u8>>>>,
     ) -> PgWireResult<bool> {
-        let Some(pos) = write_pos else {
+        let (Some(pos), Some(lock_pos)) = (write_pos, lock_pos) else {
             return Ok(false);
         };
-        if restore.is_empty()
-            || self.storage.in_user_txn()
-            || !self.read_committed_now()
-            || restore.values().any(Option::is_none)
-        {
+        if self.storage.in_user_txn() {
             return Ok(false);
         }
         let Ok(mut guard) = self.txn.try_lock() else {
@@ -21242,19 +21482,31 @@ impl PgHandler {
         let Some(handle) = guard.as_mut() else {
             return Ok(false);
         };
-        if handle.has_lock_only_rows() {
+        // Nothing written and no row locked since the savepoint: nothing to
+        // undo or let go of.
+        if restore.is_empty() && handle.locked_len() <= lock_pos {
             return Ok(false);
         }
+        // REPEATABLE READ keeps its snapshot: the move is made only while no
+        // commit since it could make the new one see something else.
+        let unchanged = (!self.read_committed_now()).then(|| handle.snapshot_epoch());
         let db = self.db();
         let undone: HashSet<String> = restore
             .keys()
             .filter(|t| t.as_str() != SEQUENCE_COLLECTION)
             .map(|t| format!("{db}.{t}"))
             .collect();
+        // A command after the savepoint (a CREATE: the move refuses any
+        // other) is undone with the rest.
         let keep = |i: usize, op: &Document| -> bool {
-            i < pos || !op.get_str("ns").is_ok_and(|ns| undone.contains(ns))
+            i < pos
+                || (op.get_str("op") != Ok("c")
+                    && !op.get_str("ns").is_ok_and(|ns| undone.contains(ns)))
         };
-        match self.storage.rebase_user_transaction_keeping(handle, &keep) {
+        match self
+            .storage
+            .rebase_user_transaction_to(handle, &keep, lock_pos, unchanged)
+        {
             Ok(moved) => Ok(moved),
             Err(e) => {
                 eprintln!("secantusd-pg: could not roll back to a savepoint: {e}");
@@ -21288,6 +21540,8 @@ impl PgHandler {
         match control {
             TransactionControl::Savepoint(_) => {
                 let write_pos = self.block_write_pos();
+                let lock_pos = self.block_lock_pos();
+                let shared_pos = self.shared_lock_mark();
                 let uncommitted = self
                     .uncommitted
                     .lock()
@@ -21318,6 +21572,8 @@ impl PgHandler {
                             .unwrap_or_else(|e| e.into_inner())
                             .clone(),
                         write_pos,
+                        shared_pos,
+                        lock_pos,
                     });
                 Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
             }
@@ -21350,10 +21606,14 @@ impl PgHandler {
                     saved_settings,
                     saved_gucs,
                     write_pos,
+                    shared_pos,
+                    lock_pos,
                 ) = {
                     let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
                     let idx = index(&savepoints).ok_or_else(missing)?;
                     let write_pos = savepoints[idx].write_pos;
+                    let lock_pos = savepoints[idx].lock_pos;
+                    let shared_pos = savepoints[idx].shared_pos;
                     let saved_settings = savepoints[idx].settings.clone();
                     let saved_gucs = savepoints[idx].txn_gucs.clone();
                     let uncommitted = savepoints[idx].uncommitted.clone();
@@ -21376,9 +21636,14 @@ impl PgHandler {
                         saved_settings,
                         saved_gucs,
                         write_pos,
+                        shared_pos,
+                        lock_pos,
                     )
                 };
-                if !self.rollback_to_by_move(write_pos, &restore)? {
+                if let Some(pos) = shared_pos {
+                    self.release_shared_locks_after(pos);
+                }
+                if !self.rollback_to_by_move(write_pos, lock_pos, &restore)? {
                     self.in_open_transaction(|| {
                         for (table, docs) in &restore {
                             if table == SEQUENCE_COLLECTION {
@@ -22442,7 +22707,7 @@ impl PgHandler {
                         // out before LIMIT counts the rows, as PostgreSQL does.
                         let mut kept = Vec::with_capacity(docs.len());
                         for d in docs {
-                            if !self.row_held_by_another(&sel.table, &d)? {
+                            if !self.row_held_by_another(&sel.table, &d, lock.strength)? {
                                 kept.push(d);
                             }
                         }
@@ -22544,6 +22809,34 @@ impl PgHandler {
             }
             docs = kept;
         }
+        // The base rows behind a locking join / subquery / view.
+        let targets = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
+            secantus_pgplan::lock_targets(sel, &|n| self.lookup(n))
+        } else {
+            Vec::new()
+        };
+        if targets
+            .iter()
+            .any(|t| t.lock.wait == secantus_pgplan::RowLockWait::SkipLocked)
+        {
+            // SKIP LOCKED leaves out a returned row any of whose base rows
+            // another transaction holds, before OFFSET and LIMIT count.
+            let mut kept = Vec::with_capacity(docs.len());
+            'rows: for d in docs {
+                for t in &targets {
+                    if t.lock.wait != secantus_pgplan::RowLockWait::SkipLocked {
+                        continue;
+                    }
+                    for base in self.lock_target_rows(t, std::slice::from_ref(&d))? {
+                        if self.row_held_by_another(&t.table, &base, t.lock.strength)? {
+                            continue 'rows;
+                        }
+                    }
+                }
+                kept.push(d);
+            }
+            docs = kept;
+        }
         // OFFSET is applied before LIMIT, as PostgreSQL does.
         if sel.offset > 0 {
             let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
@@ -22563,12 +22856,21 @@ impl PgHandler {
         if let Some(lock) = row_lock {
             self.lock_selected_rows(&sel.table, &docs, lock)?;
         }
+        for t in &targets {
+            let base = self.lock_target_rows(t, &docs)?;
+            self.lock_selected_rows(&t.table, &base, t.lock)?;
+        }
         Ok((docs, def))
     }
 
     /// Does another session's open transaction hold the row of `table`
     /// holding `doc`?
-    fn row_held_by_another(&self, table: &str, doc: &Document) -> PgWireResult<bool> {
+    fn row_held_by_another(
+        &self,
+        table: &str,
+        doc: &Document,
+        want: secantus_pgplan::RowLockStrength,
+    ) -> PgWireResult<bool> {
         let Some(id) = doc.get("_id") else {
             return Ok(false);
         };
@@ -22577,7 +22879,7 @@ impl PgHandler {
             .row_of_id(self.db(), table, id)
             .map_err(|e| Self::storage_err("could not find a row", e))?;
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        Ok(row.is_some_and(|r| !row_waits::holders_of(&r, pid).is_empty()))
+        Ok(row.is_some_and(|r| !row_waits::holders_in_mode(&r, pid, want).is_empty()))
     }
 
     /// `SELECT ... FOR UPDATE`: take the row lock on every row `docs` returns
@@ -22592,6 +22894,7 @@ impl PgHandler {
         docs: &[Document],
         lock: secantus_pgplan::RowLock,
     ) -> PgWireResult<()> {
+        use secantus_pgplan::{RowLockStrength, RowLockWait};
         let ids: Vec<Bson> = docs.iter().filter_map(|d| d.get("_id").cloned()).collect();
         if ids.is_empty() {
             return Ok(());
@@ -22602,26 +22905,125 @@ impl PgHandler {
                 format!("could not obtain lock on row in relation \"{table}\""),
             )
         };
-        if lock.wait == secantus_pgplan::RowLockWait::Nowait {
+        if lock.wait == RowLockWait::Nowait {
             for d in docs {
-                if self.row_held_by_another(table, d)? {
+                if self.row_held_by_another(table, d, lock.strength)? {
                     return Err(nowait());
                 }
             }
         }
+        if lock.strength <= RowLockStrength::Share {
+            return self.share_selected_rows(table, docs, lock);
+        }
         let filter = bson::doc! { "_id": { "$in": ids } };
-        match self.storage.lock_matching(self.db(), table, &filter) {
+        let take = || self.storage.lock_matching(self.db(), table, &filter);
+        let out = if lock.strength == RowLockStrength::Update {
+            secantus_storage::share_locks::with_key_write(take)
+        } else {
+            take()
+        };
+        match out {
             Ok(_) => Ok(()),
             Err(e) => {
                 let err = Self::storage_err("could not lock the selected rows", e);
-                if lock.wait == secantus_pgplan::RowLockWait::Nowait
-                    && Self::is_write_conflict(&err)
-                {
-                    return Err(nowait());
+                if Self::is_write_conflict(&err) {
+                    if lock.wait == RowLockWait::Nowait {
+                        return Err(nowait());
+                    }
+                    row_waits::set_wait_strength(lock.strength);
                 }
                 Err(err)
             }
         }
+    }
+
+    /// `FOR SHARE` / `FOR KEY SHARE`: a shared lock on each row (see
+    /// `secantus_storage::share_locks`), which another sharer does not wait
+    /// for. A row another transaction holds in a conflicting mode is the
+    /// write conflict a writer gets -- waited for and the statement run
+    /// again -- or, under NOWAIT, 55P03.
+    fn share_selected_rows(
+        &self,
+        table: &str,
+        docs: &[Document],
+        lock: secantus_pgplan::RowLock,
+    ) -> PgWireResult<()> {
+        use secantus_storage::share_locks::ShareMode;
+        let mode = if lock.strength == secantus_pgplan::RowLockStrength::Share {
+            ShareMode::Share
+        } else {
+            ShareMode::KeyShare
+        };
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        for d in docs {
+            let Some(id) = d.get("_id") else {
+                continue;
+            };
+            let Some(row) = self
+                .storage
+                .row_of_id(self.db(), table, id)
+                .map_err(|e| Self::storage_err("could not find a row", e))?
+            else {
+                continue;
+            };
+            // Published BEFORE the holders are read: a writer publishes its
+            // row before reading the shared table, so of the two at least
+            // one sees the other.
+            let new = secantus_storage::share_row(&row, mode);
+            if !row_waits::holders_in_mode(&row, pid, lock.strength).is_empty() {
+                if new {
+                    secantus_storage::unshare_row(&row);
+                }
+                if lock.wait == secantus_pgplan::RowLockWait::Nowait {
+                    return Err(Self::user_error(
+                        "55P03",
+                        format!("could not obtain lock on row in relation \"{table}\""),
+                    ));
+                }
+                secantus_storage::set_last_row(row);
+                row_waits::set_wait_strength(lock.strength);
+                return Err(Self::serialization_failure());
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored rows of `t.table` behind `docs` (rows of a join, a
+    /// FROM-subquery or a view), found by the values they carry.
+    fn lock_target_rows(
+        &self,
+        t: &secantus_pgplan::LockTarget,
+        docs: &[Document],
+    ) -> PgWireResult<Vec<Document>> {
+        let mut arms: Vec<Bson> = Vec::new();
+        for d in docs {
+            let mut arm = Document::new();
+            for (key, field) in &t.ident {
+                match d.get(key) {
+                    Some(v) if *v != Bson::Null => {
+                        arm.insert(field.clone(), bson::doc! { "$eq": v.clone() });
+                    }
+                    // A NULL-extended side (an outer join's miss) has no row.
+                    _ => {
+                        arm.clear();
+                        break;
+                    }
+                }
+            }
+            if !arm.is_empty() && !arms.contains(&Bson::Document(arm.clone())) {
+                arms.push(Bson::Document(arm));
+            }
+        }
+        if arms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = bson::doc! { "$or": arms };
+        self.storage
+            .find_matching(self.db(), &t.table, &filter)
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .iter()
+            .map(|b| decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e)))
+            .collect()
     }
 
     /// Which of a set-operation side's columns are a bare constant NULL.
@@ -23127,20 +23529,35 @@ impl PgHandler {
         casts: Vec<Option<secantus_pgplan::ColumnExpr>>,
         env: &RowEnv,
     ) -> QueryResponse {
+        self.project_stream_into(source, schema, fields, casts, env, None)
+    }
+
+    /// `project_stream`, capturing each row's values into `capture_into`
+    /// when given (a streamed cursor's own buffer) rather than into the
+    /// DECLARE capture `cursor_capture` arms.
+    fn project_stream_into(
+        &self,
+        source: futures::stream::BoxStream<'static, PgWireResult<Document>>,
+        schema: Arc<Vec<FieldInfo>>,
+        fields: Vec<String>,
+        casts: Vec<Option<secantus_pgplan::ColumnExpr>>,
+        env: &RowEnv,
+        capture_into: Option<std::sync::Arc<Mutex<Option<CapturedRows>>>>,
+    ) -> QueryResponse {
         let (row_tz, row_ds, row_cenc) = (env.tz.clone(), env.ds, env.cenc);
         let tz = self.session_timezone();
         let schema_ref = schema.clone();
         // A `DECLARE CURSOR` over this SELECT arms row capture (see
         // `cursor_capture`); a plain SELECT leaves it disarmed and pays
         // only the `Option` check below -- no lock, no extra clone.
-        let capture = {
+        let capture = capture_into.or_else(|| {
             let armed = self
                 .cursor_capture
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
             armed.then(|| self.cursor_capture.clone())
-        };
+        });
         let rows = source.map(move |d| {
             let d = d?;
             let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -23400,7 +23817,46 @@ impl PgHandler {
     /// it, and that INSERT's lookup must not find the "no such table" the
     /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        if self.key_strength_write(&stmt) {
+            // A DELETE, or an UPDATE of a key column, takes PostgreSQL's FOR
+            // UPDATE row lock: it waits for a FOR KEY SHARE holder too.
+            let out = secantus_storage::share_locks::with_key_write(|| {
+                self.with_executor_hooks(|| self.execute_statement(stmt, max_rows))
+            });
+            if matches!(&out, Err(e) if Self::is_write_conflict(e)) {
+                row_waits::set_wait_strength(secantus_pgplan::RowLockStrength::Update);
+            }
+            return out;
+        }
         self.with_executor_hooks(|| self.execute_statement(stmt, max_rows))
+    }
+
+    /// Does `stmt` write rows with the KEY-strength lock: a DELETE, or an
+    /// UPDATE assigning a column of the primary key or a UNIQUE constraint?
+    fn key_strength_write(&self, stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Delete(_) => true,
+            Statement::Update(u) => {
+                let Some(def) = self.lookup(&u.table) else {
+                    return false;
+                };
+                let assigned = |field: &str| {
+                    u.set.contains_key(field)
+                        || u.set_exprs.iter().any(|(f, ..)| f == field)
+                        || u.set_subscripts.iter().any(|a| a.field == field)
+                };
+                def.columns.iter().any(|c| {
+                    let f = c.field();
+                    assigned(&f)
+                        && (c.pk
+                            || def
+                                .unique_constraints
+                                .iter()
+                                .any(|uc| !uc.exclusion && uc.columns.contains(&c.name)))
+                })
+            }
+            _ => false,
+        }
     }
 
     /// Run `f` able to evaluate CORRELATED subqueries: each is planned and

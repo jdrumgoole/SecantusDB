@@ -16673,3 +16673,374 @@ def test_batch50_transaction_ids_and_the_current_snapshot(home: Path) -> None:
             "select txid_visible_in_snapshot(%s, txid_current_snapshot())", (xid,)
         ).fetchone() == (True,)
         assert a.execute("select pg_typeof(pg_current_xact_id())::text").fetchone() == ("xid8",)
+
+
+# -- batch 51: shared row locks, locking joins / subqueries / views, ROLLBACK
+# TO by move in more cases, streamed in-block portals and cursors. Each test
+# gives PostgreSQL 15's answers (measured on 15.19 with the same assertions).
+
+
+def _b51_tables(conn: psycopg.Connection) -> None:
+    conn.execute("drop view if exists b51_v")
+    for t in ("b51_c", "b51_p", "b51_t2", "b51_t3", "b51_t4"):
+        conn.execute(f"drop table if exists {t} cascade")
+    conn.execute("create table b51_p (id int primary key, n int)")
+    conn.execute("create table b51_c (id int primary key, pid int, m int)")
+    conn.execute("create table b51_t2 (id int primary key, n int)")
+    conn.execute("insert into b51_p values (1, 10), (2, 20)")
+    conn.execute("insert into b51_c values (1, 1, 100), (2, 2, 200)")
+    conn.execute("insert into b51_t2 values (1, 1)")
+    conn.execute("create view b51_v as select * from b51_p where id < 10")
+
+
+class _B51Bg:
+    """A statement run on another thread: whether it was still waiting
+    after a moment, and the SQLSTATE it finished with (None: success)."""
+
+    def __init__(self, conn: psycopg.Connection, sql: str) -> None:
+        self.state: str | None = "pending"
+        self.rows: list[tuple] | None = None
+
+        def run() -> None:
+            try:
+                cur = conn.execute(sql)
+                self.rows = cur.fetchall() if cur.description else None
+                self.state = None
+            except psycopg.Error as e:
+                self.state = e.sqlstate
+
+        self.thread = threading.Thread(target=run)
+        self.thread.start()
+        time.sleep(0.6)
+        self.blocked = self.thread.is_alive()
+
+    def join(self) -> str | None:
+        self.thread.join(15)
+        return self.state
+
+
+def test_batch51_for_share_is_a_shared_lock(home: Path) -> None:
+    """FOR SHARE took no lock at all. It is now PostgreSQL's shared row lock:
+    another FOR SHARE goes on, a writer and a FOR UPDATE wait for it, it
+    waits for a writer (and reads what the writer left), NOWAIT / SKIP
+    LOCKED see it, two sharers upgrading is 40P01, and ROLLBACK TO lets go
+    of one taken after the savepoint."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _b51_tables(a)
+        for conn in (a, b, c):
+            conn.execute("set lock_timeout = '6s'")
+        a.execute("begin")
+        a.execute("select n from b51_p where id = 1 for share")
+        b.execute("begin")
+        bg = _B51Bg(b, "select n from b51_p where id = 1 for share")
+        assert not bg.blocked and bg.join() is None
+        b.execute("commit")
+        bg = _B51Bg(c, "update b51_p set n = n + 1 where id = 1")
+        assert bg.blocked
+        b.execute("begin")
+        assert _sqlstate(b, "select n from b51_p where id = 1 for update nowait") == "55P03"
+        b.execute("rollback")
+        a.execute("commit")
+        assert bg.join() is None
+        assert c.execute("select n from b51_p where id = 1").fetchone() == (11,)
+
+        a.execute("begin")
+        a.execute("update b51_p set n = n + 5 where id = 1")
+        b.execute("begin")
+        assert _sqlstate(b, "select n from b51_p where id = 1 for share nowait") == "55P03"
+        b.execute("rollback")
+        b.execute("begin")
+        bg = _B51Bg(b, "select n from b51_p where id = 1 for share")
+        assert bg.blocked
+        a.execute("commit")
+        assert bg.join() is None and bg.rows == [(16,)]
+        b.execute("commit")
+
+        a.execute("begin")
+        a.execute("select n from b51_p where id = 1 for share")
+        b.execute("begin")
+        assert b.execute("select id from b51_p order by id for update skip locked").fetchall() == [
+            (2,)
+        ]
+        c.execute("begin")
+        assert c.execute("select id from b51_p order by id for share skip locked").fetchall() == [
+            (1,)
+        ]
+        for conn in (a, b, c):
+            conn.execute("rollback")
+
+        a.execute("begin")
+        a.execute("select n from b51_p where id = 1 for share")
+        b.execute("begin")
+        b.execute("select n from b51_p where id = 1 for share")
+        first = _B51Bg(a, "update b51_p set n = 1 where id = 1")
+        second = _B51Bg(b, "update b51_p set n = 2 where id = 1")
+        assert sorted([str(first.join()), str(second.join())]) == ["40P01", "None"]
+        a.execute("rollback")
+        b.execute("rollback")
+
+        a.execute("begin")
+        a.execute("savepoint s")
+        a.execute("select n from b51_p where id = 1 for share")
+        a.execute("rollback to s")
+        bg = _B51Bg(b, "update b51_p set n = n + 1 where id = 1")
+        assert not bg.blocked and bg.join() is None
+        a.execute("rollback")
+
+
+def test_batch51_for_key_share_conflicts_only_with_key_writes(home: Path) -> None:
+    """FOR KEY SHARE blocks only what takes PostgreSQL's FOR UPDATE row lock:
+    a DELETE, an UPDATE of the key, FOR UPDATE. A plain UPDATE and FOR NO
+    KEY UPDATE go on."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b51_tables(a)
+        b.execute("set lock_timeout = '6s'")
+        a.execute("begin")
+        a.execute("select n from b51_p where id = 1 for key share")
+        bg = _B51Bg(b, "update b51_p set n = n + 1 where id = 1")
+        assert not bg.blocked and bg.join() is None
+        b.execute("begin")
+        assert _sqlstate(b, "select n from b51_p where id = 1 for no key update nowait") is None
+        assert _sqlstate(b, "select n from b51_p where id = 1 for update nowait") == "55P03"
+        b.execute("rollback")
+        bg = _B51Bg(b, "update b51_p set id = 5 where id = 1")
+        assert bg.blocked
+        a.execute("rollback")
+        assert bg.join() is None
+        a.execute("begin")
+        a.execute("select n from b51_p where id = 2 for key share")
+        bg = _B51Bg(b, "delete from b51_p where id = 2")
+        assert bg.blocked
+        a.execute("rollback")
+        assert bg.join() is None
+        assert a.execute("select id, n from b51_p order by id").fetchall() == [(5, 11)]
+
+
+def test_batch51_locking_joins_subqueries_and_views(home: Path) -> None:
+    """FOR UPDATE / FOR SHARE over a join, a FROM-subquery and a view locked
+    nothing. They now lock the base rows behind the rows returned -- only
+    those, and only the relations an OF list names -- and refuse the shapes
+    PostgreSQL refuses."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _b51_tables(a)
+        for conn in (a, b, c):
+            conn.execute("set lock_timeout = '6s'")
+        a.execute("begin")
+        assert a.execute(
+            "select p.n, c.m from b51_p p join b51_c c on c.pid = p.id where p.id = 1 for update"
+        ).fetchall() == [(10, 100)]
+        bg = _B51Bg(b, "update b51_c set m = m + 1 where id = 1")
+        assert bg.blocked
+        assert _sqlstate(c, "update b51_c set m = m + 1 where id = 2") is None
+        a.execute("commit")
+        assert bg.join() is None
+
+        a.execute("begin")
+        a.execute(
+            "select p.n from b51_p p join b51_c c on c.pid = p.id where p.id = 1 for update of p"
+        )
+        assert _sqlstate(c, "update b51_c set m = m + 1 where id = 1") is None
+        bg = _B51Bg(b, "update b51_p set n = n + 1 where id = 1")
+        assert bg.blocked
+        a.execute("commit")
+        assert bg.join() is None
+
+        a.execute("begin")
+        a.execute("update b51_c set m = m where id = 1")
+        b.execute("begin")
+        assert (
+            _sqlstate(
+                b,
+                "select p.n from b51_p p join b51_c c on c.pid = p.id"
+                " where p.id = 1 for update nowait",
+            )
+            == "55P03"
+        )
+        b.execute("rollback")
+        a.execute("rollback")
+
+        for sql in (
+            "select * from (select * from b51_p where id = 1) s for update",
+            "select * from (select * from b51_p where id = 1 for update) s",
+            "select n from b51_v where id = 1 for update",
+        ):
+            a.execute("begin")
+            a.execute(sql)
+            bg = _B51Bg(b, "update b51_p set n = n + 1 where id = 1")
+            assert bg.blocked, sql
+            assert _sqlstate(c, "update b51_p set n = n + 1 where id = 2") is None, sql
+            a.execute("commit")
+            assert bg.join() is None, sql
+
+        # A WITH query's rows are not locked, and naming one is 0A000.
+        a.execute("begin")
+        a.execute("with w as (select * from b51_p) select * from w where id = 1 for update")
+        assert _sqlstate(c, "update b51_p set n = n + 1 where id = 1") is None
+        assert (
+            _sqlstate(a, "with w as (select * from b51_p) select * from w for update of w")
+            == "0A000"
+        )
+        a.execute("rollback")
+
+        a.execute("begin")
+        a.execute("select n from b51_v where id = 2 for share")
+        b.execute("begin")
+        b.execute("select n from b51_v where id = 2 for share")
+        bg = _B51Bg(c, "delete from b51_p where id = 2")
+        a.execute("commit")
+        time.sleep(0.3)
+        assert bg.thread.is_alive()
+        b.execute("commit")
+        assert bg.join() is None
+
+        for sql, state in (
+            ("select p.n from b51_p p left join b51_c c on c.pid = p.id for update", "0A000"),
+            ("select p.n from b51_p p left join b51_c c on c.pid = p.id for update of p", None),
+            ("select count(*) from b51_p for update", "0A000"),
+            ("select distinct n from b51_p for share", "0A000"),
+            ("select n from b51_p group by n for update", "0A000"),
+            ("select * from b51_p for update of zz", "42P01"),
+            ("select * from b51_p union select * from b51_p for update", "0A000"),
+            ("select * from (select count(*) from b51_p) s for update", "0A000"),
+            ("select row_number() over () from b51_p for key share", "0A000"),
+        ):
+            a.execute("begin")
+            assert _sqlstate(a, sql) == state, sql
+            a.execute("rollback")
+
+
+def test_batch51_rollback_to_lets_go_where_it_used_to_rewrite(home: Path) -> None:
+    """ROLLBACK TO moved the block onto a new transaction only at READ
+    COMMITTED with no DDL, no row lock and no table created after the
+    savepoint; elsewhere it rewrote the tables and kept every row held. It
+    now lets go of the rows in all of those cases, takes again the locks
+    from before the savepoint, and a rewrite that remains writes only the
+    rows that differ (so another session's commit does not make it 40001)."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _b51_tables(a)
+        for conn in (a, b, c):
+            conn.execute("set lock_timeout = '6s'")
+
+        def released(setup: list[str], undo_after: list[str]) -> None:
+            a.execute("begin" if not setup or not setup[0].startswith("begin") else setup.pop(0))
+            for sql in setup:
+                a.execute(sql)
+            a.execute("savepoint s")
+            for sql in undo_after:
+                a.execute(sql)
+            a.execute("rollback to s")
+            bg = _B51Bg(b, "update b51_p set n = n + 1 where id = 1")
+            assert not bg.blocked and bg.join() is None, (setup, undo_after)
+
+        released([], ["select n from b51_p where id = 1 for update"])
+        a.execute("commit")
+        released(["update b51_p set n = n where id = 2"], ["update b51_p set n = 5 where id = 1"])
+        bg = _B51Bg(c, "update b51_p set n = n + 1 where id = 2")
+        assert bg.blocked
+        a.execute("commit")
+        assert bg.join() is None
+        released(
+            ["select * from b51_p where id = 2 for update"], ["update b51_p set n = 5 where id = 1"]
+        )
+        bg = _B51Bg(c, "update b51_p set n = n + 1 where id = 2")
+        assert bg.blocked
+        a.execute("commit")
+        assert bg.join() is None
+        released(["create table b51_t3 (x int)"], ["update b51_p set n = 5 where id = 1"])
+        a.execute("commit")
+        assert a.execute("select count(*) from b51_t3").fetchone() == (0,)
+        released([], ["create table b51_t4 (x int)", "update b51_p set n = 5 where id = 1"])
+        assert a.execute("select count(*) from pg_class where relname = 'b51_t4'").fetchone() == (
+            0,
+        )
+        a.execute("commit")
+        released(
+            ["begin isolation level repeatable read", "select n from b51_t2"],
+            ["update b51_p set n = 5 where id = 1"],
+        )
+        a.execute("commit")
+        assert a.execute("select id, n from b51_p order by id").fetchall() == [(1, 16), (2, 22)]
+
+        # REPEATABLE READ after another session committed: the rewrite
+        # writes only the row that differs.
+        a.execute("begin isolation level repeatable read")
+        a.execute("select n from b51_t2")
+        a.execute("savepoint s")
+        a.execute("update b51_p set n = 5 where id = 1")
+        c.execute("update b51_p set n = n + 1 where id = 2")
+        a.execute("rollback to s")
+        assert a.execute("select id, n from b51_p order by id").fetchall() == [(1, 16), (2, 22)]
+        a.execute("update b51_p set n = 7 where id = 1")
+        a.execute("commit")
+        assert a.execute("select id, n from b51_p order by id").fetchall() == [(1, 7), (2, 23)]
+
+        # A PL/pgSQL EXCEPTION block, another session having committed a row
+        # of the same table: no 40001.
+        a.execute("begin")
+        a.execute("update b51_p set n = n where id = 1")
+        c.execute("update b51_p set n = n + 1 where id = 2")
+        a.execute(
+            "do $$ begin begin update b51_p set n = 99 where id = 1;"
+            " raise exception 'x'; exception when others then null; end; end $$"
+        )
+        a.execute("commit")
+        assert a.execute("select id, n from b51_p order by id").fetchall() == [(1, 7), (2, 24)]
+
+
+def test_batch51_block_portals_and_cursors_read_in_batches(home: Path) -> None:
+    """An in-block portal and a DECLARE CURSOR read their rows a batch per
+    fetch (they held the whole result). The rows are the DECLARE's: a later
+    write of the block is not seen, a step back past the window reads the
+    rows again, another statement between fetches keeps the answer, and a
+    WITH HOLD cursor survives COMMIT."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("drop table if exists b51_big")
+        a.execute("create table b51_big (id int primary key, v text)")
+        a.execute("insert into b51_big select g, 'v' || g from generate_series(1, 1500) g")
+        a.execute("begin")
+        a.execute("declare k scroll cursor for select id from b51_big where id <= 1200")
+        got = [r[0] for r in a.execute("fetch 3 from k").fetchall()]
+        assert got == [1, 2, 3]
+        assert len(a.execute("fetch forward 700 from k").fetchall()) == 700
+        assert a.execute("fetch backward 2 from k").fetchall() == [(702,), (701,)]
+        a.execute("move backward 600 from k")
+        assert a.execute("fetch 2 from k").fetchall() == [(102,), (103,)]
+        assert a.execute("fetch absolute -1 from k").fetchall() == [(1200,)]
+        assert a.execute("fetch relative -1100 from k").fetchall() == [(100,)]
+        b.execute("insert into b51_big values (0, 'other')")
+        a.execute("insert into b51_big values (-1, 'mine')")
+        assert len(a.execute("fetch all from k").fetchall()) == 1100
+        assert a.execute("fetch absolute 1 from k").fetchall() == [(1,)]
+        a.execute("commit")
+
+        a.execute("begin")
+        a.execute(
+            "declare h cursor with hold for select id from b51_big where id between 1 and 600"
+        )
+        assert a.execute("fetch 2 from h").fetchall() == [(1,), (2,)]
+        a.execute("commit")
+        a.execute("delete from b51_big where id <= 10")
+        assert len(a.execute("fetch all from h").fetchall()) == 598
+        a.execute("close h")
+
+        with server.connect(autocommit=False) as c:
+            with c.cursor(name="srv") as cur:
+                cur.itersize = 100
+                cur.execute("select id from b51_big where id > 0")
+                assert sum(1 for _ in cur) == 1490
+            c.commit()

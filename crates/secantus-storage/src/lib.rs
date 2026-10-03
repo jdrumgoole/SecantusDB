@@ -49,6 +49,7 @@ pub mod admission;
 pub mod changestreams;
 pub mod pitr_archive;
 pub mod replay;
+pub mod share_locks;
 
 /// Filename of the advisory PITR manifest embedded in a backup archive.
 pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
@@ -187,7 +188,7 @@ pub struct UserTransactionHandle {
     lock_only: bool,
     /// The rows those locks are on, so a move onto a new transaction takes
     /// them again (`rebase_user_transaction_keeping`).
-    locked: HashSet<WrittenRow>,
+    locked: Vec<WrittenRow>,
 }
 
 impl UserTransactionHandle {
@@ -223,6 +224,12 @@ impl UserTransactionHandle {
     /// new transaction would lose it.
     pub fn has_lock_only_rows(&self) -> bool {
         self.lock_only
+    }
+
+    /// How many rows the transaction has locked by rewriting them unchanged
+    /// (a savepoint's mark for [`Storage::rebase_user_transaction_to`]).
+    pub fn locked_len(&self) -> usize {
+        self.locked.len()
     }
 
     /// The commit count just before this transaction's snapshot was taken,
@@ -3363,13 +3370,124 @@ pub struct Held {
     pub rows: HashSet<WrittenRow>,
     /// Every `(db, collection)` it has written a row of.
     pub collections: Vec<(String, String)>,
+    /// The rows of `rows` it took with the KEY-strength lock (a DELETE, a
+    /// `FOR UPDATE`): the ones a `FOR KEY SHARE` must wait for.
+    pub key_rows: HashSet<WrittenRow>,
+    /// The rows it holds a SHARED lock on (`FOR SHARE` / `FOR KEY SHARE`;
+    /// see [`share_locks`]), with the strongest mode taken.
+    pub shared: HashMap<WrittenRow, share_locks::ShareMode>,
+    /// `shared`'s rows in the order they were first taken, so a ROLLBACK TO
+    /// SAVEPOINT can let go of the ones taken after the savepoint.
+    shared_log: Vec<WrittenRow>,
 }
 
 impl Held {
+    /// The transaction's writes are gone (rolled back, committed, or about
+    /// to be replayed): its shared locks are NOT -- see `release_shared`.
     fn clear(&mut self) {
         self.rows.clear();
         self.collections.clear();
+        self.key_rows.clear();
     }
+
+    /// This set's identity in the shared-lock table.
+    fn holder(&self) -> usize {
+        self as *const Held as usize
+    }
+
+    /// How many shared locks have been taken so far (a savepoint's mark).
+    pub fn shared_len(&self) -> usize {
+        self.shared_log.len()
+    }
+
+    /// Let go of the shared locks taken after the first `keep`.
+    pub fn release_shared_after(&mut self, keep: usize) {
+        if keep >= self.shared_log.len() {
+            return;
+        }
+        let me = self.holder();
+        for row in self.shared_log.split_off(keep) {
+            share_locks::remove(&row, me);
+            self.shared.remove(&row);
+        }
+    }
+
+    /// Let go of every shared lock (the transaction ended).
+    fn release_shared(&mut self) {
+        self.release_shared_after(0);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.release_shared();
+    }
+}
+
+/// Take a shared lock on `row` in `mode` for the user transaction running
+/// on this thread. `true` when the transaction did not already share it (so
+/// a caller that backs out after finding an exclusive holder may release it
+/// with [`unshare_row`]); `false` too outside a user transaction.
+pub fn share_row(row: &WrittenRow, mode: share_locks::ShareMode) -> bool {
+    ACTIVE_ROWS.with(|a| {
+        let Some(held) = a.borrow().as_ref().cloned() else {
+            return false;
+        };
+        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+        let me = held.holder();
+        let new = share_locks::add(row, me, mode);
+        let prev = held.shared.get(row).copied();
+        held.shared
+            .insert(row.clone(), prev.map_or(mode, |p| p.max(mode)));
+        if prev.is_none() {
+            held.shared_log.push(row.clone());
+        }
+        new
+    })
+}
+
+/// The shared-lock mark ([`Held::shared_len`]) of the user transaction
+/// running on this thread, if any.
+pub fn active_shared_len() -> Option<usize> {
+    ACTIVE_ROWS.with(|a| {
+        a.borrow()
+            .as_ref()
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).shared_len())
+    })
+}
+
+/// [`Held::release_shared_after`] on the user transaction running on this
+/// thread; `false` when there is none.
+pub fn release_active_shared_after(keep: usize) -> bool {
+    ACTIVE_ROWS.with(|a| match a.borrow().as_ref() {
+        Some(h) => {
+            h.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release_shared_after(keep);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Back out a shared lock [`share_row`] just took.
+pub fn unshare_row(row: &WrittenRow) {
+    ACTIVE_ROWS.with(|a| {
+        if let Some(held) = a.borrow().as_ref() {
+            let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+            let me = held.holder();
+            share_locks::remove(row, me);
+            held.shared.remove(row);
+            held.shared_log.retain(|r| r != row);
+        }
+    });
+}
+
+/// Make `row` the row a write conflict is reported on (see
+/// [`last_row_written`]): a server that finds a row held before writing it
+/// raises the conflict itself.
+pub fn set_last_row(row: WrittenRow) {
+    LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
 }
 
 /// Appended to a collection name to make the [`WrittenRow`] of an `_id`
@@ -3394,30 +3512,44 @@ fn counted_commit<T>(commit: impl FnOnce() -> T) -> T {
 
 /// Record that this thread is claiming the `_id` index key `id_key` of
 /// `(db, coll)` (see [`WrittenRow`]).
-fn note_id_key(db: &str, coll: &str, id_key: &[u8]) {
+fn note_id_key(db: &str, coll: &str, id_key: &[u8]) -> Result<()> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     id_key.hash(&mut h);
-    note_row(db, &format!("{coll}{ID_KEY_ROW_SUFFIX}"), h.finish() as i64);
+    note_row(db, &format!("{coll}{ID_KEY_ROW_SUFFIX}"), h.finish() as i64)
 }
 
 /// Record that this thread is writing the document row `(db, coll,
 /// recordid)`: always as the last row written (see [`last_row_written`]), and
 /// inside a user transaction into its write set ([`UserTransactionHandle::held_rows`]).
-fn note_row(db: &str, coll: &str, recordid: i64) {
+///
+/// A row another transaction holds a conflicting SHARED lock on
+/// ([`share_locks`]) is a `WriteConflict` before anything is written, so
+/// the caller waits for that transaction as for any row holder.
+fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
     let row = (db.to_string(), coll.to_string(), recordid);
+    let mut me = 0usize;
     if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
         ACTIVE_ROWS.with(|a| {
             if let Some(held) = a.borrow().as_ref() {
                 let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+                me = held.holder();
                 if !held.collections.iter().any(|(d, c)| d == db && c == coll) {
                     held.collections.push((db.to_string(), coll.to_string()));
                 }
                 held.rows.insert(row.clone());
+                if share_locks::key_write() {
+                    held.key_rows.insert(row.clone());
+                }
             }
         });
     }
+    let blocked = share_locks::write_blocked(&row, me);
     LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
+    if blocked {
+        return Err(StorageError::WriteConflict);
+    }
+    Ok(())
 }
 
 /// The document row this thread last wrote or tried to write. Read right
@@ -6554,7 +6686,7 @@ impl Storage {
             held: HeldRows::default(),
             epoch: None,
             lock_only: false,
-            locked: HashSet::new(),
+            locked: Vec::new(),
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -6723,11 +6855,15 @@ impl Storage {
             &mut handle.lock_only,
             LOCKED_ONLY.with(|l| l.replace(false)),
         );
-        struct LockedHarvest<'a>(&'a mut HashSet<WrittenRow>, Vec<WrittenRow>);
+        struct LockedHarvest<'a>(&'a mut Vec<WrittenRow>, Vec<WrittenRow>);
         impl Drop for LockedHarvest<'_> {
             fn drop(&mut self) {
                 let mine = LOCKED_ROWS.with(|l| l.replace(std::mem::take(&mut self.1)));
-                self.0.extend(mine);
+                for row in mine {
+                    if !self.0.contains(&row) {
+                        self.0.push(row);
+                    }
+                }
             }
         }
         let _locked_harvest = LockedHarvest(
@@ -6798,15 +6934,26 @@ impl Storage {
     pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
         if let Some(session) = handle.session.take() {
             // Whatever the outcome, the transaction holds no row after this.
-            handle
-                .held
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
+            let wrote = {
+                let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
+                let wrote = !held.rows.is_empty();
+                held.clear();
+                held.release_shared();
+                wrote || handle.has_written() || !handle.pending_async.is_empty()
+            };
             let began = handle.began;
             handle.began = false;
             if began {
-                if let Err(e) = counted_commit(|| session.commit_transaction(None)) {
+                // A transaction that wrote nothing (a reader, a FOR SHARE
+                // holder) changes no row: its commit is not counted, so a
+                // waiter that outlived it may carry on its own snapshot
+                // (`no_commit_since`).
+                let committed = if wrote {
+                    counted_commit(|| session.commit_transaction(None))
+                } else {
+                    session.commit_transaction(None)
+                };
+                if let Err(e) = committed {
                     // Read WHY first: the reason belongs to the failing
                     // transaction and the next call on this session clears it.
                     let why = session.rollback_reason();
@@ -6875,12 +7022,25 @@ impl Storage {
     /// Roll back the transaction's WT session, then **close** it. Idempotent;
     /// best-effort rollback (closing the session also rolls back).
     pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        self.rollback_user_transaction_inner(handle, true)
+    }
+
+    /// `rollback_user_transaction`; `release_shared` false keeps the shared
+    /// row locks, for a transaction being MOVED onto a new one (which takes
+    /// the same held set).
+    fn rollback_user_transaction_inner(
+        &self,
+        handle: &mut UserTransactionHandle,
+        release_shared: bool,
+    ) -> Result<()> {
         if let Some(session) = handle.session.take() {
-            handle
-                .held
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
+            {
+                let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
+                held.clear();
+                if release_shared {
+                    held.release_shared();
+                }
+            }
             let began = handle.began;
             handle.began = false;
             if began {
@@ -6940,6 +7100,24 @@ impl Storage {
         handle: &mut UserTransactionHandle,
         keep: &dyn Fn(usize, &Document) -> bool,
     ) -> Result<bool> {
+        self.rebase_user_transaction_to(handle, keep, usize::MAX, None)
+    }
+
+    /// [`Self::rebase_user_transaction_keeping`], taking again only the
+    /// first `keep_locks` row locks the transaction took by rewriting a row
+    /// unchanged ([`UserTransactionHandle::locked_len`] counts them) -- a
+    /// ROLLBACK TO lets go of the ones taken after its savepoint. With
+    /// `unchanged_since: Some(epoch)` the move happens only if no commit
+    /// started since `epoch` by the time the new snapshot is pinned (so the
+    /// new snapshot sees what the old one did, as REPEATABLE READ needs);
+    /// otherwise nothing is moved and the answer is `Ok(false)`.
+    pub fn rebase_user_transaction_to(
+        &self,
+        handle: &mut UserTransactionHandle,
+        keep: &dyn Fn(usize, &Document) -> bool,
+        keep_locks: usize,
+        unchanged_since: Option<Option<u64>>,
+    ) -> Result<bool> {
         if self.async_oplog.is_some() || !self.enable_oplog || handle.session.is_none() {
             return Ok(false);
         }
@@ -6950,19 +7128,26 @@ impl Storage {
         }
         let blobs = self.transaction_write_set(handle)?;
         let mut ops = Vec::with_capacity(blobs.len());
-        for blob in &blobs {
+        for (i, blob) in blobs.iter().enumerate() {
             let op = decode_doc(blob)?;
-            if !matches!(op.get_str("op"), Ok("i" | "u" | "d")) {
-                return Ok(false);
+            let kept = keep(i, &op);
+            match op.get_str("op") {
+                Ok("i" | "u" | "d") => {}
+                // A command that CREATES something (a table, an index) is
+                // a registry row written inside this transaction: replaying
+                // it re-creates the object, leaving it out undoes it (a
+                // ROLLBACK TO past a CREATE). Any other command -- a drop
+                // among them -- is not a move's to make.
+                Ok("c")
+                    if op.get_document("o").is_ok_and(|o| {
+                        o.contains_key("create") || o.contains_key("createIndexes")
+                    }) => {}
+                _ => return Ok(false),
             }
-            ops.push(op);
+            if kept {
+                ops.push(op);
+            }
         }
-        let ops: Vec<Document> = ops
-            .into_iter()
-            .enumerate()
-            .filter(|(i, op)| keep(*i, op))
-            .map(|(_, op)| op)
-            .collect();
         let mut fresh = self.begin_user_transaction()?;
         fresh.opened_at = handle.opened_at;
         // The same shared set: whoever watches this transaction's rows keeps
@@ -6982,10 +7167,20 @@ impl Storage {
             let cur = session.open_cursor(COLL_TABLE, None)?;
             cur.next()?;
         }
-        self.rollback_user_transaction(handle)?;
+        if let Some(epoch) = unchanged_since {
+            if !Self::no_commit_since(epoch) {
+                // The fresh transaction shares the old one's held set, which
+                // stays the old one's: detach it before rolling back.
+                fresh.held = HeldRows::default();
+                self.rollback_user_transaction(&mut fresh)?;
+                return Ok(false);
+            }
+        }
+        self.rollback_user_transaction_inner(handle, false)?;
         // The locks taken by rewriting a row unchanged have no oplog entry:
         // they are taken again after the replay.
-        let relock = std::mem::take(&mut handle.locked);
+        let mut relock = std::mem::take(&mut handle.locked);
+        relock.truncate(keep_locks);
         let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
             for op in &ops {
                 replay::apply_entry_strict(self, op)?;
@@ -7431,7 +7626,7 @@ impl Storage {
                 let recordid = self.write_nat_entry(&session, db, coll, &key)?;
                 // Doc table keyed by the (unique) RecordId.
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                note_row(db, coll, recordid);
+                note_row(db, coll, recordid)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
@@ -7648,7 +7843,7 @@ impl Storage {
                     };
                     // Doc table keyed by the (unique) RecordId.
                     doc_cur.reset()?;
-                    note_row(db, coll, recordid);
+                    note_row(db, coll, recordid)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
@@ -7780,7 +7975,7 @@ impl Storage {
                 }
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                note_row(db, coll, recordid);
+                note_row(db, coll, recordid)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
@@ -7939,7 +8134,7 @@ impl Storage {
                     // entries first would make an index-routed read miss a still-live
                     // doc.
                     doc_cur.reset()?;
-                    note_row(db, coll, recordid);
+                    note_row(db, coll, recordid)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     match doc_cur.remove() {
                         Ok(()) => {}
@@ -9935,7 +10130,7 @@ impl Storage {
         // A wasted RecordId on the dup path is harmless — RecordIds only need to be
         // unique + monotonic; gaps are fine.
         let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
-        note_id_key(db, coll, id_key);
+        note_id_key(db, coll, id_key)?;
         rev.set_key_ssu(db, coll, id_key);
         rev.set_value_q(recordid);
         match rev.insert() {
@@ -9982,7 +10177,7 @@ impl Storage {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        note_id_key(db, coll, id_key);
+        note_id_key(db, coll, id_key)?;
         rev.remove()?;
         Ok(Some(recordid))
     }
@@ -10172,7 +10367,7 @@ impl Storage {
             // Doc row first, entries after — see prune_ttl for the lock-free
             // reader ordering rationale.
             doc_cur.reset()?;
-            note_row(db, coll, recordid);
+            note_row(db, coll, recordid)?;
             doc_cur.set_key_ssq(db, coll, recordid);
             match doc_cur.remove() {
                 Ok(()) => {}
@@ -10752,7 +10947,7 @@ impl Storage {
         }
         for recordid in &ids {
             cur.reset()?;
-            note_row(db, coll, *recordid);
+            note_row(db, coll, *recordid)?;
             cur.set_key_ssq(db, coll, *recordid);
             match cur.remove() {
                 Ok(()) => {}
@@ -10950,7 +11145,7 @@ impl Storage {
             Ok(doc_cur) => {
                 for (recordid, _id_k, _blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
-                    note_row(db, coll, recordid);
+                    note_row(db, coll, recordid)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     match doc_cur.remove() {
                         Ok(()) => {}
@@ -11148,6 +11343,66 @@ impl Storage {
         // is still reported.
         let ended = session.rollback_transaction(None);
         out.and(ended.map_err(StorageError::from))
+    }
+
+    /// The next up-to-`batch` documents of `coll` matching `filter`, in
+    /// RecordId (insertion) order, after RecordId `after` (`None`: from the
+    /// start), read on the CURRENT session -- inside `with_user_transaction`
+    /// that is the user transaction's, with its snapshot and its own
+    /// uncommitted writes. Returns the documents and the RecordId to resume
+    /// after, `None` once the collection is exhausted. A resumable scan: a
+    /// portal reads a block's result one batch per fetch rather than all of
+    /// it up front.
+    pub fn scan_batch_after(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        after: Option<i64>,
+        batch: usize,
+    ) -> Result<(Vec<Vec<u8>>, Option<i64>)> {
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        let session = self.op_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok((Vec::new(), None)),
+            Err(e) => return Err(e.into()),
+        };
+        let vars = Document::new();
+        let batch = batch.max(1);
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(batch);
+        let start = after.map_or(i64::MIN, |a| a.saturating_add(1));
+        if after == Some(i64::MAX) {
+            return Ok((out, None));
+        }
+        cur.set_key_ssq(db, coll, start);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => cmp >= 0 || cur.next()?,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            let value = cur.get_value_u()?;
+            let (_idk, blob) = unframe_doc_value(&value)?;
+            let keep = filter.is_empty() || {
+                let raw = bson::RawDocument::from_bytes(blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                secantus_core::query::matches_raw(raw, filter, &vars, None).map_err(query_fault)?
+            };
+            if keep {
+                out.push(blob.to_vec());
+                if out.len() >= batch {
+                    return Ok((out, Some(recordid)));
+                }
+            }
+            more = cur.next()?;
+        }
+        Ok((out, None))
     }
 
     pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
@@ -11511,7 +11766,7 @@ impl Storage {
             l.borrow_mut()
                 .push((db.to_string(), coll.to_string(), recordid))
         });
-        note_row(db, coll, recordid);
+        note_row(db, coll, recordid)?;
         cur.set_key_ssq(db, coll, recordid);
         cur.set_value_u(&value);
         cur.update()?;
@@ -11561,7 +11816,7 @@ impl Storage {
                 l.borrow_mut()
                     .push((db.to_string(), coll.to_string(), *recordid))
             });
-            note_row(db, coll, *recordid);
+            note_row(db, coll, *recordid)?;
             cur.set_key_ssq(db, coll, *recordid);
             cur.set_value_u(&frame_doc_value(id_k, blob));
             cur.update()?;
@@ -12056,7 +12311,7 @@ impl Storage {
             let (additions, removals) = self.index_entry_diff(&doc, &new, &descs, recordid)?;
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
-            note_row(db, coll, recordid);
+            note_row(db, coll, recordid)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
@@ -12217,7 +12472,7 @@ impl Storage {
                         // The doc stays at its RecordId (unchanged — `_id` is immutable);
                         // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                        note_row(db, coll, recordid);
+                        note_row(db, coll, recordid)?;
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
@@ -12343,7 +12598,7 @@ impl Storage {
                     // doc row by that RecordId (framed value carries the id_key).
                     let recordid = self.write_nat_entry(&session, db, coll, &new_id_key)?;
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                    note_row(db, coll, recordid);
+                    note_row(db, coll, recordid)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
@@ -12525,7 +12780,7 @@ impl Storage {
             // Doc row first, entries after — see prune_ttl for the lock-free
             // reader ordering rationale.
             cur.reset()?;
-            note_row(db, coll, recordid);
+            note_row(db, coll, recordid)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
@@ -12608,7 +12863,7 @@ impl Storage {
                     // Doc row first, entries after — see prune_ttl for the lock-free
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                    note_row(db, coll, recordid);
+                    note_row(db, coll, recordid)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
