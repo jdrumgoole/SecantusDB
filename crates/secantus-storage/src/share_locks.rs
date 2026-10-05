@@ -91,8 +91,16 @@ pub(crate) fn write_blocked(row: &WrittenRow, me: usize) -> bool {
         .get(row)
         .is_some_and(|hs| {
             hs.iter()
-                .any(|(h, m)| *h != me && (key || *m == ShareMode::Share))
+                .any(|(h, m)| *h != me && *h != mover_of(me) && (key || *m == ShareMode::Share))
         })
+}
+
+/// The identity a transaction's rows are guarded under while it moves onto
+/// a new WiredTiger transaction (`MoveGuard` in `lib.rs`): its own holder
+/// with the low bit set -- a `Held` is word-aligned, so no real holder has
+/// it -- which its own replay is not blocked by.
+pub(crate) fn mover_of(holder: usize) -> usize {
+    holder | 1
 }
 
 /// Record that `holder` shares `row` in `mode` (an existing entry is

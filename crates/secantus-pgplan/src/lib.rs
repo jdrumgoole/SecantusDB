@@ -1760,11 +1760,20 @@ fn join_lock_targets(
                 return Vec::new();
             };
             let keys: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
-            output_lock_targets(plan, &keys, Some(lock), lookup, false)
+            // A plain table leaf's joined rows carry each stored row id under
+            // `alias<SEP>LOCK_ROW_ID` while a locking select reads them
+            // (`join_rows` in the server), so a table with no primary key is
+            // locked by exactly the rows returned.
+            let carry = join_leaf_carries_row_id(plan);
+            output_lock_targets(plan, &keys, Some(lock), lookup, carry)
                 .into_iter()
                 .filter_map(|mut t| {
                     for (k, _) in &mut t.ident {
-                        *k = columns.iter().find(|(_, f)| f == k)?.0.clone();
+                        *k = if k == LOCK_ROW_ID {
+                            format!("{alias}{}{LOCK_ROW_ID}", joins::SEP)
+                        } else {
+                            columns.iter().find(|(_, f)| f == k)?.0.clone()
+                        };
                     }
                     Some(t)
                 })
@@ -1777,6 +1786,15 @@ fn join_lock_targets(
         }
         joins::JoinNode::Lateral { .. } => Vec::new(),
     }
+}
+
+/// Does a JOIN leaf of this plan carry its rows' stored ids into the joined
+/// rows while a locking select reads them? Only a plain one-table select:
+/// the server reads exactly those leaves with their row ids
+/// (`materialise_with_row_ids`).
+pub fn join_leaf_carries_row_id(plan: &Statement) -> bool {
+    matches!(plan, Statement::Select(s)
+        if s.sub.is_none() && s.join.is_none() && s.series.is_none() && !s.table.is_empty())
 }
 
 /// The targets of `stmt`'s output rows, keyed by `out_keys` (one key per
@@ -27668,6 +27686,11 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// what PostgreSQL does for a parameter with no context: an error.
 pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
     let mut inferred = declared.to_vec();
+    // Only an undeclared parameter is inferred: with none, there is nothing
+    // to walk the statement for (most clients declare every one).
+    if inferred.iter().all(Option::is_some) {
+        return inferred;
+    }
     let Ok(parsed) = parse_tree(sql) else {
         return inferred;
     };
