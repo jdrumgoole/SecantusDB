@@ -671,6 +671,13 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
+- [ ] **OPEN — RUST pgserver: `secantusd-pg` ignores SIGTERM when started as
+      a background job (batch 54, 2026-10-05).** Seen by a probe harness,
+      not investigated: a bare SIGTERM did not stop it; SIGINT did. Likely
+      the same inherited-disposition trap as the psycopg `test_ctrl_c`
+      runner fix (batch 53), but a server that cannot be stopped by SIGTERM
+      under a supervisor is a real defect -- reset SIGTERM/SIGINT to their
+      defaults at startup (POSIX only) and add a test.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
@@ -1002,22 +1009,54 @@ remain open:
         a table created after it. Where it still rewrites (a PL/pgSQL
         EXCEPTION block, RR after a commit), it writes only the rows that
         differ, so another session's commit no longer makes it 40001.
-      Left (re-measured batch 52 with the same 30-scenario probe: 28 equal,
-      the two that differ are `plpgsql_exception_prior_write` and
-      `plpgsql_exception_keep_inner`, both this first item):
-      - A PL/pgSQL EXCEPTION block's undone rows stay held (the rewrite runs
-        inside the running statement's transaction). In both scenarios the
-        other session's UPDATE of the undone row waits for the block's
-        COMMIT where PostgreSQL's goes through at once, and so the block's
-        next READ COMMITTED read misses that commit (`(1, 10)` where
-        PostgreSQL reads `(1, 11)`). Not fixable by releasing the held-row
-        entry alone: WiredTiger still sees the row written by the running
-        transaction, so the other writer would conflict there; the move
-        (`rollback_to_by_move`) refuses inside a running statement
-        (`in_user_txn`). And even with the row let go, the block has written
-        before, so its snapshot cannot be refreshed (WiredTiger's
-        `reset_snapshot` refuses after a write) -- the READ COMMITTED
-        redesign the Python-side entry scopes.
+      **Batch 54 (2026-10-05)** closed the two that remained of the
+      30-scenario probe (now 35 scenarios with five READ COMMITTED ones, all
+      equal to PostgreSQL 15.19; slice tests `test_batch54_*`, whose
+      assertions also pass against PostgreSQL 15.19):
+      - FIXED: a PL/pgSQL EXCEPTION block's undone rows stayed held. The
+        running statement now moves its OWN transaction onto a new one
+        replaying only the writes before the block
+        (`Storage::rebase_active_transaction_to`, through the thread's
+        `ACTIVE_HANDLE`; the savepoint marks come from
+        `active_write_set_len` / `active_locked_len`), so the undone rows are
+        let go at once. A move that fails part-way leaves a stand-in
+        transaction whose COMMIT is refused (`doomed`): nothing of it commits
+        even if user code swallows the error.
+      - FIXED: a READ COMMITTED block that had written kept its first
+        write's snapshot. When anything committed since (`no_commit_since`),
+        each statement now moves the block onto a fresh snapshot replaying
+        its write set (`with_isolation`); past 256 write-set entries
+        (`RC_MOVE_MAX_WRITES`), or for a write the move cannot carry (DDL
+        other than CREATE, async oplog), the block keeps its snapshot as
+        before (a replay per statement is quadratic: at 10,000, pgjdbc's
+        1,000-row batch timed out beside concurrent commits). Left: a block
+        past that size still reads its first write's snapshot. Every move --
+        this one, ROLLBACK TO's and the conflict
+        re-run's -- now keeps its rows held through the gap between rolling
+        back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
+        identity, and `Held::moving` for waiters), where another writer
+        could take one before.
+      - FIXED (CI, PR #1733): the shared-row-lock table is process-wide
+        and keyed rows by `(db, collection, RecordId)` only, so a lock --
+        FOR SHARE, or a moving transaction's guard -- in one store blocked
+        the same-named row of ANOTHER store open in the process; under the
+        READ COMMITTED move a lone client got 40001 (`embedded.rs`
+        `dropping_inside_a_multi_thread_runtime_is_safe`). Rows are keyed by
+        store (`Held::store`) now, and a move's replay that loses a write
+        conflict on a key its locks do not cover retries on a newer snapshot
+        (bounded) instead of failing the block. Tests
+        `a_row_lock_in_one_store_does_not_block_another_store` (fails on the
+        old code with 55P03) and `concurrent_writers_under_the_read_committed_move`.
+      - FIXED (found by the SQLAlchemy gauge on the move above, and present
+        before it in ROLLBACK TO's move): a moved transaction lost the
+        OPTIONS of an index it had created -- the `createIndexes` oplog
+        entry the move replays carried only key and name, so a UNIQUE index
+        came back plain and duplicates were accepted silently after COMMIT
+        (`begin; create table; create unique index; savepoint s; ...;
+        rollback to s; commit` then a duplicate insert). The entry now
+        carries the index's options, as mongod's does (the change-stream
+        projector still reads only `v` / `key` / `name`); slice test
+        `test_batch54_a_moved_transaction_keeps_its_unique_index`.
       - FIXED in batch 53: a FOR UPDATE through a FROM-subquery over a
         table with no primary key locked every row equal in the columns the
         subquery carried. A locking select now reads its subquery's rows
@@ -1025,8 +1064,12 @@ remain open:
         (`secantus_pgplan::LOCK_ROW_ID`, `materialise_with_row_ids`), so it
         locks exactly the rows behind the result (slice test
         `test_batch53_for_update_through_a_subquery_locks_only_the_rows_returned`,
-        PostgreSQL 15.19's answers). Through a JOIN leaf a no-PK table is
-        still matched by the columns carried.
+        PostgreSQL 15.19's answers). FIXED in batch 54 through a JOIN too: a
+        plain table leaf of a locking join carries each row's stored id
+        (`join_leaf_carries_row_id`), so of two identical rows only the one
+        returned is locked (slice test
+        `test_batch54_for_update_through_a_join_locks_only_the_rows_returned`).
+      Left (design notes, not divergences the probe shows):
       - REPEATABLE READ answers 40001 after the wait when ANY transaction
         committed since its snapshot, where PostgreSQL goes on unless the
         ROW changed: WiredTiger cannot continue a transaction after a
@@ -1345,6 +1388,20 @@ These work end-to-end but cut corners.
       lookup, ~1.6 us -- a storage-crate cache the MongoDB server shares, so
       left alone here), and tokio's `block_in_place` hand-off (~1 us).
 
+      **Batch 54 (2026-10-05):** `is_timeseries` caches its answer per
+      collection once a timeseries collection exists (`TIMESERIES_CACHE`),
+      transaction-aware: valid while `COLL_TABLE_GEN` -- moved on by every
+      registry write and again when a transaction that wrote the registry
+      ends -- is unchanged, and inside a transaction only while its
+      snapshot was taken under the current generation and it has not
+      written the registry. `infer_param_types` no longer parses a
+      statement whose every parameter is declared (~0.7 us a PK read in
+      `sample`). Release, `bench43.py`, interleaved, load ~6.5: PK read
+      base 50.9 / 50.6 -> 50.3-51.0 us (PG 15: 33.0) -- within noise. A
+      `sample` of 225k PK reads puts ~17 us a statement on the server's
+      thread, spread in pieces under 1 us beyond the two socket syscalls
+      (~5 us) and the storage read (~3.5 us: `_id` index probe 1.4, row
+      read 1.1); the rest of the wall time is the client and the hand-offs.
       **Batch 53 (2026-10-04):** `is_timeseries` answers `false` without a
       read until a timeseries collection has been written in the process or
       found in a store it opened (`TIMESERIES_SEEN`, sticky, set before the
@@ -7622,9 +7679,29 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       answered Infinity), and a user error inside a subquery reached the
       client as XX000 "could not read a subquery" -- both fixed (corpora
       `b53_late_sums`, `b53_scan_partitions`).
+      **Batch 54 (2026-10-05)**, release, 2,000 x 2,000, base `e9862ceb`
+      -> batch 54 (PG 15): numeric ordering filter 0.141 -> **0.038 s**
+      (0.301), numeric EXISTS 0.116 -> **0.027 s** (0.001), an IMMUTABLE
+      built-in in the select list 0.034 -> **0.011 s** (0.136) and under an
+      aggregate 0.046 -> **0.018 s** (0.130), a FROM function of constants
+      0.041 -> **0.005 s** (0.000), `sum` / `avg` of `real` 0.135 ->
+      **0.031 s** (0.146). Exact `numeric` ordering (`numeric_order`;
+      against a float it stays per row, as PostgreSQL compares as float8),
+      `SumOf::Real` (single-precision `float4pl`), `immutable_call` (a
+      built-in IMMUTABLE for its arity and no user function of the name).
+      Found on the way (corpora `b54_correlated`, `b54_round`): a run-once
+      query raised a data error from its select list on rows no outer value
+      reaches (`8 / t.x` with an unmatched `x = 0`: 22012 where PostgreSQL
+      answers) -- such an error now falls back to the per-row path, while
+      one from the WHERE still stands; `sum(real)` summed in double (a
+      wrong last digit, and Infinity where PostgreSQL raises 22003);
+      `round` / `trunc(numeric, n)` ignored a negative `n` (`round(1250,
+      -2)` answered 1250) and failed on NaN / Infinity.
       Still per outer value (each answer unchanged, only slower): an
-      ordering filter over a numeric or a collated text, functions in the
-      inner select list, a FROM function, `sum` / `avg` of `real`.
+      ordering filter over a COLLATED text (0.104 s against PostgreSQL's
+      0.001 -- the comparison's collation is derived from both sides, and
+      the hash path sees only the inner one), and a numeric `min` / `max`
+      under a filter.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes

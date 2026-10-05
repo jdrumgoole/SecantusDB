@@ -4749,13 +4749,45 @@ impl PgHandler {
                 "a LATERAL item with no left side".into(),
             ))),
             JoinNode::Leaf { plan, def, columns } => {
-                let docs = self.materialise_sub(plan, def)?;
+                // A locking select's plain table leaf: each joined row also
+                // carries the stored id of its base row (see
+                // `secantus_pgplan::join_leaf_carries_row_id`).
+                let row_id_key = match plan.as_ref() {
+                    Statement::Select(sel)
+                        if LOCK_ROW_IDS.with(|c| c.get())
+                            && secantus_pgplan::join_leaf_carries_row_id(plan) =>
+                    {
+                        columns
+                            .first()
+                            .and_then(|(k, _)| k.split(secantus_pgplan::joins::SEP).next())
+                            .map(|alias| {
+                                (
+                                    sel,
+                                    format!(
+                                        "{alias}{}{}",
+                                        secantus_pgplan::joins::SEP,
+                                        secantus_pgplan::LOCK_ROW_ID
+                                    ),
+                                )
+                            })
+                    }
+                    _ => None,
+                };
+                let docs = match &row_id_key {
+                    Some((sel, _)) => self.materialise_with_row_ids(sel, def)?,
+                    None => self.materialise_sub(plan, def)?,
+                };
                 Ok(docs
                     .into_iter()
                     .map(|d| {
                         let mut out = Document::new();
                         for (key, field) in columns {
                             out.insert(key.clone(), d.get(field).cloned().unwrap_or(Bson::Null));
+                        }
+                        if let Some((_, key)) = &row_id_key {
+                            if let Some(id) = d.get(secantus_pgplan::LOCK_ROW_ID) {
+                                out.insert(key.clone(), id.clone());
+                            }
                         }
                         out
                     })
@@ -4793,6 +4825,7 @@ impl PgHandler {
                     );
                 }
                 let rrows = self.join_rows(right)?;
+                let carry_ids = LOCK_ROW_IDS.with(|c| c.get());
                 let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
                     let mut d = Document::new();
                     for (key, lk, rk) in merged {
@@ -4820,6 +4853,16 @@ impl PgHandler {
                             k.clone(),
                             r.and_then(|r| r.get(k)).cloned().unwrap_or(Bson::Null),
                         );
+                    }
+                    if carry_ids {
+                        // The base row ids a locking select's leaves carry.
+                        for side in [l, r].into_iter().flatten() {
+                            for (k, v) in side {
+                                if k.ends_with(secantus_pgplan::LOCK_ROW_ID) {
+                                    d.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
                     }
                     d
                 };
@@ -15775,6 +15818,13 @@ const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warn
 /// The `max_prepared_transactions` this server runs with: how many
 /// `PREPARE TRANSACTION`s may be outstanding at once (53200 past it).
 const MAX_PREPARED_TRANSACTIONS: usize = 100;
+/// The longest write set (oplog entries) a READ COMMITTED block replays to
+/// take a fresh snapshot at a statement's start (`with_isolation`). Past it
+/// the block keeps the snapshot its first write fixed: a replay per
+/// statement makes a long transaction quadratic while other sessions commit
+/// -- at 10,000, pgjdbc's 1,000-row batch with generated keys took over 10 s
+/// beside the gauge's parallel tests (`BatchDeadlockTest`).
+const RC_MOVE_MAX_WRITES: usize = 256;
 const MAX_PREPARED_TRANSACTIONS_TEXT: &str = "100";
 /// PostgreSQL's `GIDSIZE`: a transaction identifier is at most 199 BYTES.
 const MAX_GID_BYTES: usize = 200;
@@ -21156,9 +21206,33 @@ impl PgHandler {
             None | Some("read committed" | "read uncommitted")
         );
         if read_committed {
-            self.storage
+            let refreshed = self
+                .storage
                 .refresh_user_snapshot(handle)
                 .map_err(|e| Self::storage_err("could not refresh the snapshot", e))?;
+            // A transaction that has written keeps its WiredTiger snapshot
+            // (`reset_snapshot` refuses after a write). When anything has
+            // committed since it was taken, the statement would read stale
+            // rows: the block is moved onto a new transaction with a fresh
+            // snapshot, its writes replayed (holding its rows throughout --
+            // `Storage::rebase_user_transaction_to`), as PostgreSQL's READ
+            // COMMITTED takes a snapshot per statement. A long write set is
+            // left on its snapshot rather than replayed per statement
+            // (`RC_MOVE_MAX_WRITES`), as is a write the move cannot carry.
+            if !refreshed
+                && !secantus_storage::Storage::no_commit_since(handle.snapshot_epoch())
+                && handle.write_set_len() <= RC_MOVE_MAX_WRITES
+            {
+                match self.storage.rebase_user_transaction(handle) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "secantusd-pg: could not move a transaction to a new snapshot: {e}"
+                        );
+                        return Err(Self::serialization_failure());
+                    }
+                }
+            }
         }
         Ok(handle)
     }
@@ -21496,7 +21570,7 @@ impl PgHandler {
     /// transaction cannot be moved under it.
     fn block_write_pos(&self) -> Option<usize> {
         if self.storage.in_user_txn() {
-            return None;
+            return self.storage.active_write_set_len();
         }
         let guard = self.txn.try_lock().ok()?;
         guard.as_ref().map(|h| h.write_set_len())
@@ -21537,7 +21611,7 @@ impl PgHandler {
     /// ::locked_len`), on the same terms as `block_write_pos`.
     fn block_lock_pos(&self) -> Option<usize> {
         if self.storage.in_user_txn() {
-            return None;
+            return self.storage.active_locked_len();
         }
         let guard = self.txn.try_lock().ok()?;
         guard.as_ref().map(|h| h.locked_len())
@@ -21554,10 +21628,10 @@ impl PgHandler {
     /// snapshot (40001 on the ROLLBACK TO itself), and cannot heal a
     /// transaction a write conflict has doomed.
     ///
-    /// Taken only where the move is invisible: a top-level statement (not
-    /// a PL/pgSQL EXCEPTION block, whose transaction a running statement
-    /// holds), and under REPEATABLE READ only while nothing committed since
-    /// the block's snapshot. Row locks taken by rewriting a row unchanged
+    /// Taken only where the move is invisible: under REPEATABLE READ only
+    /// while nothing committed since the block's snapshot. A PL/pgSQL
+    /// EXCEPTION block, whose transaction the running statement holds,
+    /// moves it in place (`Storage::rebase_active_transaction_to`). Row locks taken by rewriting a row unchanged
     /// (`FOR UPDATE`, an UPDATE that changed nothing) before the savepoint
     /// are taken again, the later ones let go; a table created after the
     /// savepoint is undone with the rest. `false` leaves the fallback
@@ -21571,8 +21645,42 @@ impl PgHandler {
         let (Some(pos), Some(lock_pos)) = (write_pos, lock_pos) else {
             return Ok(false);
         };
+        let db = self.db();
+        let undone: HashSet<String> = restore
+            .keys()
+            .filter(|t| t.as_str() != SEQUENCE_COLLECTION)
+            .map(|t| format!("{db}.{t}"))
+            .collect();
+        // A command after the savepoint (a CREATE: the move refuses any
+        // other) is undone with the rest.
+        let keep = |i: usize, op: &Document| -> bool {
+            i < pos
+                || (op.get_str("op") != Ok("c")
+                    && !op.get_str("ns").is_ok_and(|ns| undone.contains(ns)))
+        };
         if self.storage.in_user_txn() {
-            return Ok(false);
+            // A PL/pgSQL EXCEPTION block: the statement running it holds
+            // the transaction, and moves it in place.
+            if restore.is_empty()
+                && self
+                    .storage
+                    .active_locked_len()
+                    .is_none_or(|n| n <= lock_pos)
+            {
+                return Ok(false);
+            }
+            let require_unchanged = !self.read_committed_now();
+            return match self.storage.rebase_active_transaction_to(
+                &keep,
+                lock_pos,
+                require_unchanged,
+            ) {
+                Ok(moved) => Ok(moved),
+                Err(e) => {
+                    eprintln!("secantusd-pg: could not roll back to a savepoint: {e}");
+                    Err(Self::serialization_failure())
+                }
+            };
         }
         let Ok(mut guard) = self.txn.try_lock() else {
             return Ok(false);
@@ -21588,19 +21696,6 @@ impl PgHandler {
         // REPEATABLE READ keeps its snapshot: the move is made only while no
         // commit since it could make the new one see something else.
         let unchanged = (!self.read_committed_now()).then(|| handle.snapshot_epoch());
-        let db = self.db();
-        let undone: HashSet<String> = restore
-            .keys()
-            .filter(|t| t.as_str() != SEQUENCE_COLLECTION)
-            .map(|t| format!("{db}.{t}"))
-            .collect();
-        // A command after the savepoint (a CREATE: the move refuses any
-        // other) is undone with the rest.
-        let keep = |i: usize, op: &Document| -> bool {
-            i < pos
-                || (op.get_str("op") != Ok("c")
-                    && !op.get_str("ns").is_ok_and(|ns| undone.contains(ns)))
-        };
         match self
             .storage
             .rebase_user_transaction_to(handle, &keep, lock_pos, unchanged)
@@ -31572,6 +31667,20 @@ fn float_sum(values: impl Iterator<Item = f64>) -> Option<f64> {
     Some(total)
 }
 
+/// [`float_sum`] in single precision, as `sum(real)`'s `float4pl` adds.
+fn real_sum(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut total = 0.0_f32;
+    for v in values {
+        let next = total + v;
+        if next.is_infinite() && !total.is_infinite() && !v.is_infinite() {
+            FLOAT_SUM_OVERFLOW.with(|c| c.set(true));
+            return None;
+        }
+        total = next;
+    }
+    Some(total)
+}
+
 /// The 22003 a float `sum` / `avg` overflow raised, if one did since the
 /// last call.
 fn take_float_sum_overflow() -> Option<PlanError> {
@@ -31932,6 +32041,17 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                             .unwrap_or(Bson::Null)
                     }
                 }
+            } else if matches!(item.source_type.as_deref(), Some("real" | "float4")) {
+                // `sum(real)` is `float4pl`: a `real` total, rounded to
+                // single precision at every step, and 22003 when it
+                // overflows -- where a `double precision` total would not.
+                real_sum(values.iter().map(|v| match v {
+                    Bson::Int32(x) => *x as f32,
+                    Bson::Int64(x) => *x as f32,
+                    Bson::Double(x) => *x as f32,
+                    _ => 0.0,
+                }))
+                .map_or(Bson::Null, |t| Bson::Double(f64::from(t)))
             } else {
                 float_sum(values.iter().map(|v| match v {
                     Bson::Int32(x) => f64::from(*x),

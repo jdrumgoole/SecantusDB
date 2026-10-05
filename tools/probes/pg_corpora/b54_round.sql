@@ -1,0 +1,33 @@
+# round / trunc of a numeric to a number of places: negative places round to
+# the left of the point, NaN and the infinities pass through.
+select round(1234.5678, -2);
+select trunc(1234.5678, -2);
+select round(-1250, -2);
+select round(1250::numeric, -2);
+select round(1249.999::numeric, -2);
+select round(99.5, -2);
+select round(49.5, -2);
+select round(1.5e3, -5);
+select round(5e4::numeric, -5);
+select round(1e20::numeric, -21);
+select round(-0.4::numeric, 0);
+select round(-0.04::numeric, 1);
+select trunc(-0.04::numeric, 1);
+select round('Infinity'::numeric, 2);
+select trunc('-Infinity'::numeric, 2);
+select trunc('NaN'::numeric, 2);
+select round('NaN'::numeric, -3);
+select round('NaN'::numeric);
+select round('Infinity'::numeric);
+select ceil('NaN'::numeric), floor('-Infinity'::numeric);
+select round(2.5::numeric, 0);
+select round(-2.5::numeric);
+select round(12.345::numeric, 2);
+select round(0.0005::numeric, 3);
+select round(9.999::numeric, 2);
+select round(1e-20::numeric, 5);
+select round(123.456::numeric, -1), round(123.456::numeric, -3), round(523.456::numeric, -3);
+select trunc(987.654::numeric, -1), trunc(-987.654::numeric, -2);
+select round(n, -1) from (values (15::numeric), (-15), (14.9), (null)) v(n);
+select round(12.3::numeric(10,1), 3);
+select pg_typeof(round(12.3, -1));

@@ -255,6 +255,10 @@ enum SumOf {
     /// `float8_avg`, the sum over the count; an overflow PostgreSQL would
     /// raise is left to the per-row path.
     Float,
+    /// `real`: `float4pl` row by row (a `real` sum, rounded to single
+    /// precision at every step), and `float4_accum`'s `double precision`
+    /// sum over the count for `avg`.
+    Real,
 }
 
 impl SumOf {
@@ -265,6 +269,7 @@ impl SumOf {
             "bigint" => Some(SumOf::BigInt),
             "numeric" => Some(SumOf::Numeric),
             "double precision" => Some(SumOf::Float),
+            "real" => Some(SumOf::Real),
             _ => None,
         }
     }
@@ -275,7 +280,7 @@ impl SumOf {
             (_, Bson::Null) => true,
             (SumOf::Int, Bson::Int32(_)) => true,
             (SumOf::BigInt, Bson::Int32(_) | Bson::Int64(_)) => true,
-            (SumOf::Float, Bson::Double(_)) => true,
+            (SumOf::Float | SumOf::Real, Bson::Double(_)) => true,
             // Any stored numeric form; `numeric_add` reads it.
             (SumOf::Numeric, _) => true,
             _ => false,
@@ -393,6 +398,33 @@ impl Late {
                     numeric_op(DIV, sum, Bson::Int64(n))
                 }
             }
+            SumOf::Real => {
+                let mut sum = 0.0_f32;
+                let mut wide = 0.0_f64;
+                let mut any_inf = false;
+                for v in &present {
+                    let Bson::Double(d) = v else {
+                        return None;
+                    };
+                    any_inf |= d.is_infinite();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let f = *d as f32;
+                    sum += f;
+                    wide += f64::from(f);
+                }
+                if self == Late::Sum {
+                    if sum.is_infinite() && !any_inf {
+                        return None; // PostgreSQL's 22003: the per-row path raises it
+                    }
+                    Some(Bson::Double(f64::from(sum)))
+                } else {
+                    if wide.is_infinite() && !any_inf {
+                        return None;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(Bson::Double(wide / n as f64))
+                }
+            }
             SumOf::Float => {
                 let mut sum = 0.0_f64;
                 let mut any_inf = false;
@@ -421,6 +453,85 @@ impl Late {
 struct Filter {
     param: usize,
     op: Op,
+    /// The column is `numeric`: compared by exact value (`numeric_order`).
+    numeric: bool,
+}
+
+/// SQL's ordering of two `numeric` (or integer) values by their exact
+/// value, or `None` for anything else -- a float (PostgreSQL compares a
+/// `numeric` with one as `double precision`), an infinity, NULL -- which the
+/// per-row path answers. NaN sorts above every number and equals NaN.
+fn numeric_order(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    fn exact(v: &Bson) -> Option<Key> {
+        match v {
+            Bson::Int32(i) => Some(Key::Int(i64::from(*i))),
+            Bson::Int64(i) => Some(Key::Int(*i)),
+            Bson::Decimal128(d) => decimal_key(&d.to_string()),
+            Bson::String(s) => decimal_key(s),
+            _ => None,
+        }
+    }
+    // (negative, digits without leading or trailing zeros, power of ten of
+    // the last digit); zero has no digits.
+    fn parts(k: Key) -> Option<(bool, String, i64)> {
+        match k {
+            Key::Int(0) => Some((false, String::new(), 0)),
+            Key::Int(i) => {
+                let mut digits = i.unsigned_abs().to_string();
+                let mut exp = 0;
+                while digits.ends_with('0') {
+                    digits.pop();
+                    exp += 1;
+                }
+                Some((i < 0, digits, exp))
+            }
+            Key::Dec(neg, digits, exp) => Some((neg, digits, exp)),
+            _ => None,
+        }
+    }
+    let (ka, kb) = (exact(a)?, exact(b)?);
+    match (&ka, &kb) {
+        (Key::NaN, Key::NaN) => return Some(Ordering::Equal),
+        (Key::NaN, _) => return Some(Ordering::Greater),
+        (_, Key::NaN) => return Some(Ordering::Less),
+        _ => {}
+    }
+    let (na, da, ea) = parts(ka)?;
+    let (nb, db, eb) = parts(kb)?;
+    let sign = |neg: bool, d: &str| -> i8 {
+        if d.is_empty() {
+            0
+        } else if neg {
+            -1
+        } else {
+            1
+        }
+    };
+    let (sa, sb) = (sign(na, &da), sign(nb, &db));
+    if sa != sb {
+        return Some(sa.cmp(&sb));
+    }
+    if sa == 0 {
+        return Some(Ordering::Equal);
+    }
+    // Same sign: compare magnitudes -- first by the position of the leading
+    // digit, then digit by digit.
+    let lead = |d: &str, e: i64| i64::try_from(d.len()).unwrap_or(i64::MAX) + e;
+    let mag = lead(&da, ea).cmp(&lead(&db, eb)).then_with(|| {
+        let (x, y) = (da.as_bytes(), db.as_bytes());
+        for i in 0..x.len().max(y.len()) {
+            let (p, q) = (
+                x.get(i).copied().unwrap_or(b'0'),
+                y.get(i).copied().unwrap_or(b'0'),
+            );
+            if p != q {
+                return p.cmp(&q);
+            }
+        }
+        Ordering::Equal
+    });
+    Some(if sa < 0 { mag.reverse() } else { mag })
 }
 
 /// SQL's ordering of two numbers, two timestamps or two byte-ordered texts,
@@ -623,7 +734,12 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                             pass = false;
                             break;
                         }
-                        let Some(o) = sql_order(v, bound) else {
+                        let o = if f.numeric {
+                            numeric_order(v, bound)
+                        } else {
+                            sql_order(v, bound)
+                        };
+                        let Some(o) = o else {
                             return Ok(None); // not comparable here: per-row path
                         };
                         if !f.op.holds(o) {
@@ -668,8 +784,25 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
     else {
         return Ok(Entry::No);
     };
-    let rows = run(&rewritten, &[])?;
+    // Run once, the select list is evaluated over EVERY row -- also rows
+    // no outer value reaches, where PostgreSQL never evaluates it. A data
+    // error from it (a division by zero, a bad cast) is not the query's:
+    // the per-row path answers instead, raising only what PostgreSQL does.
+    // One from the WHERE stands, as PostgreSQL's hashed semi-join scans the
+    // inner side whole too: the query is run again without its select list
+    // to tell the two apart.
+    let rows = match run(&rewritten, &[]) {
+        Ok(rows) => rows,
+        Err(e) if e.sqlstate().starts_with("22") => {
+            return match without_select_list(&rewritten) {
+                Some(probe) if run(&probe, &[]).is_ok() => Ok(Entry::No),
+                _ => Err(e),
+            };
+        }
+        Err(e) => return Err(e),
+    };
     let nkeys = params.len();
+    let mut filters = filters;
     let mut sum_of: Option<SumOf> = None;
     let mut families: Vec<Option<Family>> = vec![None; nkeys];
     let mut kinds: Vec<Kinds> = vec![Kinds::default(); nkeys];
@@ -707,12 +840,16 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         // Each filter column, then its type's name (`pg_typeof(col)::text`).
         let ftypes = row.split_off(row.len() - nfilters);
         let fvals = row.split_off(row.len() - nfilters);
-        if !fvals
-            .iter()
-            .zip(&ftypes)
-            .all(|(v, t)| orderable(v, t, text_ok))
-        {
-            return Ok(Entry::No);
+        for ((v, t), f) in fvals.iter().zip(&ftypes).zip(filters.iter_mut()) {
+            if matches!(t, Bson::String(t) if t == "numeric") {
+                // A `numeric` column orders by exact value.
+                if !matches!(v, Bson::Null) && numeric_order(v, v).is_none() {
+                    return Ok(Entry::No);
+                }
+                f.numeric = true;
+            } else if !orderable(v, t, text_ok) {
+                return Ok(Entry::No);
+            }
         }
         let keys = row.split_off(row.len() - nkeys);
         let mut key = Vec::with_capacity(nkeys);
@@ -876,7 +1013,7 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     s.limit_offset = None;
     for t in &s.target_list {
         let other_call = contains(t, &|n| {
-            matches!(n, N::FuncCall(_)) && !is_groupable_aggregate(n)
+            matches!(n, N::FuncCall(_)) && !is_groupable_aggregate(n) && !immutable_call(n)
         });
         if other_call || contains(t, &|n| matches!(n, N::ParamRef(_) | N::SubLink(_))) {
             return None;
@@ -884,7 +1021,8 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     }
     for f in &s.from_clause {
         if contains(f, &|n| {
-            matches!(n, N::ParamRef(_) | N::FuncCall(_) | N::SubLink(_))
+            matches!(n, N::ParamRef(_) | N::SubLink(_))
+                || (matches!(n, N::FuncCall(_)) && !immutable_call(n))
         }) || !tables_only(f)
         {
             return None;
@@ -900,7 +1038,14 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         if let Some((col, p, op)) = column_op_param(&c) {
             match op {
                 None => keys.push((col, p)),
-                Some(op) => filters.push((col, Filter { param: p, op })),
+                Some(op) => filters.push((
+                    col,
+                    Filter {
+                        param: p,
+                        op,
+                        numeric: false,
+                    },
+                )),
             }
             continue;
         }
@@ -962,6 +1107,27 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         limit,
         offset,
     })
+}
+
+/// `sql` (a SELECT) selecting the constant `1` instead of its select list.
+fn without_select_list(sql: &str) -> Option<String> {
+    let mut parsed = pg_query::parse(sql).ok()?.protobuf;
+    let one = pg_query::parse("SELECT 1")
+        .ok()?
+        .protobuf
+        .stmts
+        .pop()?
+        .stmt?;
+    let N::SelectStmt(one) = one.node? else {
+        return None;
+    };
+    let stmt = parsed.stmts.first_mut()?.stmt.as_mut()?;
+    let Some(N::SelectStmt(s)) = stmt.node.as_mut() else {
+        return None;
+    };
+    s.target_list = one.target_list;
+    s.sort_clause.clear();
+    pg_query::deparse(&parsed).ok()
 }
 
 /// `col op $N` or `$N op col`, as (col, N - 1, op) -- `None` for the op
@@ -1091,9 +1257,56 @@ fn type_name_of(col: pg_query::protobuf::Node) -> Option<pg_query::protobuf::Nod
 }
 
 /// Is a FROM item stored tables only -- one, or several joined?
+/// A call of a PostgreSQL built-in every overload of which (for its
+/// argument count) is IMMUTABLE, and no user function of that name: running
+/// it once over the inner rows gives what running it per outer row does.
+fn immutable_call(n: &N) -> bool {
+    let N::FuncCall(f) = n else {
+        return false;
+    };
+    f.over.is_none()
+        && !f.agg_star
+        && !f.agg_distinct
+        && f.agg_order.is_empty()
+        && f.agg_filter.is_none()
+        && crate::func_name(f).is_some_and(|name| {
+            !crate::correlated::user_function_named(&name)
+                && (crate::correlated::immutable_builtin(&name, f.args.len())
+                    // Set-returning built-ins the list leaves out, IMMUTABLE in
+                    // every overload of this arity (PostgreSQL 15 `pg_proc`:
+                    // the int4 / int8 / numeric `generate_series`, and `unnest`
+                    // of one array; the three-argument `generate_series` has
+                    // a STABLE timestamptz overload).
+                    || matches!((name.as_str(), f.args.len()), ("generate_series", 2) | ("unnest", 1)))
+        })
+}
+
 fn tables_only(n: &pg_query::protobuf::Node) -> bool {
     match n.node.as_ref() {
         Some(N::RangeVar(_)) => true,
+        // A FROM function of constants (its calls are checked IMMUTABLE by
+        // the caller): the same rows for every outer row.
+        Some(N::RangeFunction(rf)) => {
+            // `walk_expr` does not descend into a FROM function's calls, so
+            // they are checked here: each an IMMUTABLE built-in of
+            // arguments that read neither the outer row nor a subquery.
+            !rf.lateral
+                && !rf.is_rowsfrom
+                && !rf.functions.is_empty()
+                && rf.functions.iter().all(|item| {
+                    let call = match item.node.as_ref() {
+                        Some(N::List(l)) => l.items.first(),
+                        _ => Some(item),
+                    };
+                    call.is_some_and(|c| {
+                        c.node.as_ref().is_some_and(immutable_call)
+                            && !contains(c, &|n| {
+                                matches!(n, N::ParamRef(_) | N::SubLink(_) | N::ColumnRef(_))
+                                    || (matches!(n, N::FuncCall(_)) && !immutable_call(n))
+                            })
+                    })
+                })
+        }
         Some(N::JoinExpr(j)) => {
             j.larg.as_deref().is_some_and(tables_only) && j.rarg.as_deref().is_some_and(tables_only)
         }
@@ -1200,7 +1413,19 @@ mod tests {
             Late::Sum.over(&[&Bson::Null], SumOf::Numeric),
             Some(Bson::Null)
         );
-        assert_eq!(SumOf::of("real"), None);
+        assert_eq!(SumOf::of("real"), Some(SumOf::Real));
+        assert_eq!(SumOf::of("money"), None);
+        // real: float4pl in single precision; an overflow is the per-row 22003.
+        let (r1, r2) = (
+            Bson::Double(f64::from(0.1_f32)),
+            Bson::Double(f64::from(0.2_f32)),
+        );
+        assert_eq!(
+            Late::Sum.over(&[&r1, &r2], SumOf::Real),
+            Some(Bson::Double(f64::from(0.1_f32 + 0.2_f32)))
+        );
+        let big = Bson::Double(f64::from(f32::MAX));
+        assert_eq!(Late::Sum.over(&[&big, &big], SumOf::Real), None);
         assert!(!SumOf::Float.accepts(&Bson::Int32(1)));
     }
 
@@ -1332,10 +1557,17 @@ mod tests {
         let r =
             rewrite("SELECT 1 FROM t JOIN u ON u.tid = t.id WHERE t.x = $1").expect("qualifies");
         assert_eq!(r.sql, "SELECT 1, t.x FROM t JOIN u ON u.tid = t.id");
+        // A FROM function of constants is the same rows for every outer row.
         assert!(
             rewrite("SELECT 1 FROM t JOIN generate_series(1, 2) g ON true WHERE t.x = $1")
+                .is_some()
+        );
+        // One reading the outer row, or a volatile one, is not.
+        assert!(
+            rewrite("SELECT 1 FROM t JOIN generate_series(1, $2) g ON true WHERE t.x = $1")
                 .is_none()
         );
+        assert!(rewrite("SELECT 1 FROM t, random() r WHERE t.x = $1").is_none());
     }
 
     #[test]

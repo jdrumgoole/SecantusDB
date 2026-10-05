@@ -1861,60 +1861,92 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
     })
 }
 
-/// Round or truncate a decimal to `places`, on the DIGITS. Rounding is half
-/// away from zero, which is what PostgreSQL does for `numeric`.
+/// Round or truncate a decimal to `places` decimal places, on the DIGITS --
+/// `numeric_round` / `numeric_trunc`. Rounding is half away from zero, as
+/// PostgreSQL rounds a `numeric`. A NEGATIVE `places` rounds to the left of
+/// the point (`round(1250, -2)` is 1300), and the result's scale is
+/// `max(places, 0)`. NaN and the infinities come back as they are.
 fn round_decimal_text(text: &str, places: i64, round: bool) -> Option<Bson> {
-    let (neg, body) = match text.trim().strip_prefix('-') {
+    let t = text.trim();
+    let bare = t.trim_start_matches(['-', '+']);
+    if bare.eq_ignore_ascii_case("nan") || bare.eq_ignore_ascii_case("infinity") {
+        return parse_numeric(t).ok();
+    }
+    let (neg, body) = match t.strip_prefix('-') {
         Some(r) => (true, r),
-        None => (false, text.trim()),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
-    let places = places.max(0) as usize;
+    let (mantissa, exp) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], body[i + 1..].parse::<i64>().ok()?),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return None;
+    }
+    // value = digits x 10^e
     let mut digits: Vec<u8> = format!("{int_part}{frac_part}").into_bytes();
-    let frac_len = frac_part.len();
-    if places >= frac_len {
-        // Nothing to remove; pad so the scale is exactly `places`.
-        let mut out = String::new();
-        if neg {
-            out.push('-');
+    let e = exp - i64::try_from(frac_part.len()).ok()?;
+    // The exponent of the last digit kept.
+    let target = -places;
+    if e < target {
+        let drop = usize::try_from(target - e).ok()?;
+        let round_up = round
+            && drop <= digits.len()
+            && digits.get(digits.len() - drop).is_some_and(|d| *d >= b'5');
+        digits.truncate(digits.len().saturating_sub(drop));
+        if digits.is_empty() {
+            digits.push(b'0');
         }
-        out.push_str(int_part);
-        if places > 0 {
-            out.push('.');
-            out.push_str(&format!("{frac_part:0<places$}"));
-        }
-        return parse_numeric(&out).ok();
-    }
-    let drop = frac_len - places;
-    let keep = digits.len() - drop;
-    let round_up = round && digits.get(keep).is_some_and(|d| *d >= b'5');
-    digits.truncate(keep);
-    if round_up {
-        let mut i = digits.len();
-        loop {
-            if i == 0 {
-                digits.insert(0, b'1');
-                break;
-            }
-            i -= 1;
-            if digits[i] == b'9' {
-                digits[i] = b'0';
-            } else {
-                digits[i] += 1;
-                break;
+        if round_up {
+            let mut i = digits.len();
+            loop {
+                if i == 0 {
+                    digits.insert(0, b'1');
+                    break;
+                }
+                i -= 1;
+                if digits[i] == b'9' {
+                    digits[i] = b'0';
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
             }
         }
+    } else {
+        // Exact already: append zeros down to the target exponent.
+        let pad = usize::try_from(e - target).ok()?;
+        if pad > 1_000_000 {
+            return None;
+        }
+        digits.extend(std::iter::repeat_n(b'0', pad));
     }
-    let s: String = String::from_utf8(digits).ok()?;
-    let split = s.len().saturating_sub(places);
-    let (whole, frac) = s.split_at(split);
-    let whole = if whole.is_empty() { "0" } else { whole };
+    // `digits` x 10^target now; the result keeps max(places, 0) decimals.
+    if target > 0 {
+        digits.extend(std::iter::repeat_n(b'0', usize::try_from(target).ok()?));
+    }
+    let scale = usize::try_from(places.max(0)).ok()?;
+    let s = String::from_utf8(digits).ok()?;
+    let s = s.trim_start_matches('0');
+    let s = if s.len() <= scale {
+        format!("{}{s}", "0".repeat(scale + 1 - s.len()))
+    } else {
+        s.to_string()
+    };
+    let (whole, frac) = s.split_at(s.len() - scale);
+    let zero = whole.bytes().chain(frac.bytes()).all(|b| b == b'0');
     let mut out = String::new();
-    if neg {
+    if neg && !zero {
         out.push('-');
     }
     out.push_str(whole);
-    if places > 0 {
+    if scale > 0 {
         out.push('.');
         out.push_str(frac);
     }
