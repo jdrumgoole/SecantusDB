@@ -583,6 +583,7 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let mut reply = dispatch_inner(doc, ctx);
     attach_write_concern_error(doc, &mut reply);
     attach_cluster_time_gossip(doc, &mut reply, ctx);
+    order_write_reply(doc, &mut reply);
     reply
 }
 
@@ -1687,6 +1688,70 @@ fn finish_txn_statement(
 /// preserve a handler that already attached a more specific value (e.g. the
 /// change-stream `aggregate` reply). The keyless signature (20 zero bytes,
 /// keyId 0) is what auth-less replica sets send. Mirrors `commands.py::dispatch`.
+/// mongod's field order for an insert / update / delete reply, standalone and
+/// replica set alike (measured 8.2.11, 2026-10-05): `n`, then `electionId` /
+/// `opTime` (replica set only), then `upserted` or `writeErrors`, then
+/// `nModified`, then `ok` and whatever follows it. This server put `ok` before
+/// `writeErrors`. Drivers read by name; this is for a byte-faithful reply.
+fn order_write_reply(req: &Document, reply: &mut Document) {
+    let Some(cmd) = req.keys().next() else { return };
+    if !matches!(cmd.as_str(), "insert" | "update" | "delete") || !reply.contains_key("n") {
+        return;
+    }
+    const LEADING: [&str; 6] = [
+        "n",
+        "electionId",
+        "opTime",
+        "upserted",
+        "writeErrors",
+        "nModified",
+    ];
+    let mut rest = std::mem::take(reply);
+    let mut out = Document::new();
+    for key in LEADING {
+        if let Some(v) = rest.remove(key) {
+            out.insert(key, v);
+        }
+    }
+    for (k, v) in rest {
+        out.insert(k, v);
+    }
+    *reply = out;
+}
+
+/// On a replica set, mongod's insert / update / delete reply carries
+/// `electionId` and `opTime: {ts, t}` straight after `n` -- on every such
+/// reply, one that wrote nothing or carries `writeErrors` included, but not on
+/// a command error and not on `findAndModify` (measured 8.2.11, 2026-10-05).
+/// `ts` is the reply's `operationTime`; `t` is the term, an int64, and
+/// `electionId` the one `hello` reports.
+fn attach_write_op_time(req: &Document, reply: &mut Document) {
+    let Some(cmd) = req.keys().next() else { return };
+    if !matches!(cmd.as_str(), "insert" | "update" | "delete") {
+        return;
+    }
+    let ok = matches!(reply.get("ok"), Some(Bson::Double(v)) if *v == 1.0)
+        || matches!(reply.get("ok"), Some(Bson::Int32(1)));
+    if !ok || !reply.contains_key("n") || reply.contains_key("opTime") {
+        return;
+    }
+    let Some(Bson::Timestamp(ts)) = reply.get("operationTime").cloned() else {
+        return;
+    };
+    let election = bson::oid::ObjectId::parse_str("7fffffff0000000000000001")
+        .expect("static electionId hex is valid");
+    let mut out = Document::new();
+    for (k, v) in std::mem::take(reply) {
+        let is_n = k == "n";
+        out.insert(k, v);
+        if is_n {
+            out.insert("electionId", election);
+            out.insert("opTime", doc! {"ts": Bson::Timestamp(ts), "t": 1_i64});
+        }
+    }
+    *reply = out;
+}
+
 fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &CommandContext) {
     if ctx.replica_set_name.is_none() {
         return;
@@ -1717,6 +1782,7 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
     if !reply.contains_key("operationTime") {
         reply.insert("operationTime", Bson::Timestamp(ts));
     }
+    attach_write_op_time(req, reply);
     // Snapshot sessions: pymongo pins the session's read timestamp from the
     // FIRST snapshot read's reply — `cursor.atClusterTime` for cursor commands,
     // top-level `atClusterTime` otherwise — and echoes it as

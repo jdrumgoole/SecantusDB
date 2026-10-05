@@ -137,6 +137,30 @@ pub fn require_array(doc: &Document, field: &str, path: &str) -> Result<(), Comm
     }
 }
 
+/// [`require_array`], then every element must be a document: mongod names the
+/// first that is not, `BSON field '<path>.<i>' is the wrong type ...` (14),
+/// failing the whole command (measured 8.2.11 for `arrayFilters`, 2026-10-05).
+/// A non-document filter used to be dropped, and the update then reported a
+/// missing identifier instead.
+pub fn require_array_of_objects(
+    doc: &Document,
+    field: &str,
+    path: &str,
+) -> Result<(), CommandError> {
+    require_array(doc, field, path)?;
+    if let Some(Bson::Array(items)) = doc.get(field) {
+        for (i, v) in items.iter().enumerate() {
+            if !matches!(v, Bson::Document(_)) {
+                return Err(type_mismatch(format!(
+                    "BSON field '{path}.{i}' is the wrong type '{}', expected type 'object'",
+                    bson_type_name(v)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `BSON field '<path>' is the wrong type '<t>', expected type 'string'`.
 pub fn require_string(doc: &Document, field: &str, path: &str) -> Result<(), CommandError> {
     match doc.get(field) {
@@ -269,6 +293,51 @@ pub fn require_index_spec_ttl(spec: &Document, field: &str) -> Result<(), Comman
             ),
         )),
     }
+}
+
+/// mongod's parse of the `arrayFilters` themselves, before any `$[<id>]` in the
+/// update is matched to one (measured 8.2.11, 2026-10-05). Each filter is
+/// parsed in turn -- an unknown operator, then exactly one top-level
+/// identifier, then a well-formed one -- and the identifiers must be unique
+/// across filters. Every one of these used to surface as the generic
+/// "construct the Rust server does not support" (2) or as a missing
+/// identifier.
+pub fn array_filters_problem(filters: &[Document]) -> Option<CommandError> {
+    const PARSE: &str = "Error parsing array filter :: caused by :: ";
+    let failed = |m: String| CommandError::new(9, "FailedToParse", m);
+    let mut seen: Vec<String> = Vec::new();
+    for f in filters {
+        if let Some(op) = secantus_core::query::first_unknown_operator(f) {
+            return Some(bad_value(format!("{PARSE}unknown operator: {op}")));
+        }
+        let idents = secantus_core::update::extract_af_identifiers(f);
+        let ident = match idents.as_slice() {
+            [] => {
+                return Some(failed(
+                    "Cannot use an expression without a top-level field name in arrayFilters"
+                        .to_string(),
+                ))
+            }
+            [one] => one.clone(),
+            [a, b, ..] => {
+                return Some(failed(format!(
+                    "{PARSE}Expected a single top-level field name, found '{a}' and '{b}'"
+                )))
+            }
+        };
+        if !secantus_core::update::is_valid_af_ident(&ident) {
+            return Some(bad_value(format!(
+                "{PARSE}The top-level field name must be an alphanumeric string beginning with a lowercase letter, found '{ident}'"
+            )));
+        }
+        if seen.contains(&ident) {
+            return Some(failed(format!(
+                "Found multiple array filters with the same top-level field name {ident}"
+            )));
+        }
+        seen.push(ident);
+    }
+    None
 }
 
 /// A `$[<identifier>]` in an update path with no matching `arrayFilters` entry:
@@ -805,41 +874,226 @@ mod tests {
 /// mongod's rendering of a stage argument inside an error message: strings are
 /// quoted, bools lowercase, arrays spaced (`[ 1 ]`), an empty document `{}`.
 /// Probed on 6.0.16 via `$skip`'s message, which echoes the offending value.
-/// mongod's check of a sort specification (measured 8.2.11, 2026-10-01): each
-/// value is a number that truncates to 1 or -1 (`1.5` is ascending), or a
-/// `{$meta: ...}` document; any other number is 15975 and anything else 15974.
-/// `sort: {a: 2}` used to sort ascending.
-pub(crate) fn require_sort_spec(sort: &Document) -> Result<(), CommandError> {
+/// mongod's check of a sort specification, shared by `find` (and the other
+/// commands that take a `sort`) and the aggregation `$sort` stage. Measured on
+/// 8.2.11, 2026-10-05; both answer identically except that an EMPTY spec is
+/// fine for `find` and 15976 for `$sort` (handled by `stage_spec_error`).
+///
+/// - The key is a field path: empty is 40352, a trailing `.` 40353, an empty
+///   component 15998, a component starting with `$` 16410.
+/// - A number is a direction. A double is TRUNCATED toward zero (`1.9` is
+///   ascending, `0.5` is 15975); a Decimal128 is ROUNDED half to even (`1.4`
+///   and `0.9` are ascending, `1.5` is 15975); NaN and the infinities are 15975.
+///   Anything but ±1 after that is 15975.
+/// - A document must be exactly `{$meta: <name>}`: no `$meta` is 17312, extra
+///   keys 9, an unknown name 31138.
+/// - Anything else (a string, a bool, null) is 15974.
+pub(crate) fn sort_spec_problem(sort: &Document) -> Option<(i32, String)> {
+    const DOLLAR: &str =
+        "Consider using $getField or $setField for a field path with '.' or '$'. :: caused by :: ";
     for (field, v) in sort {
-        let n = match v {
-            Bson::Int32(n) => Some(*n as f64),
-            Bson::Int64(n) => Some(*n as f64),
-            Bson::Double(d) => Some(*d),
-            Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
-            Bson::Document(d) if d.contains_key("$meta") => None,
+        if field.is_empty() {
+            return Some((
+                40352,
+                "FieldPath cannot be constructed with empty string".into(),
+            ));
+        }
+        if field.ends_with('.') {
+            return Some((40353, "FieldPath must not end with a '.'.".into()));
+        }
+        for part in field.split('.') {
+            if part.is_empty() {
+                return Some((
+                    15998,
+                    format!("{DOLLAR}FieldPath field names may not be empty strings."),
+                ));
+            }
+            if part.starts_with('$') {
+                return Some((
+                    16410,
+                    format!(
+                        "{DOLLAR}FieldPath field names may not start with '$', given '{part}'."
+                    ),
+                ));
+            }
+        }
+        match v {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                if sort_direction(v).is_none() {
+                    return Some((
+                        15975,
+                        "$sort key ordering must be 1 (for ascending) or -1 (for descending)"
+                            .into(),
+                    ));
+                }
+            }
+            Bson::Document(d) => match d.get("$meta") {
+                None => {
+                    return Some((
+                        17312,
+                        "$meta is the only expression supported by $sort right now".into(),
+                    ))
+                }
+                Some(_) if d.len() > 1 => {
+                    return Some((
+                        9,
+                        "Cannot have additional keys in a $meta sort specification".into(),
+                    ))
+                }
+                Some(Bson::String(name))
+                    if matches!(name.as_str(), "textScore" | "randVal" | "searchScore") => {}
+                Some(other) => {
+                    return Some((
+                        31138,
+                        format!("Illegal $meta sort: $meta: {}", render_stage_value(other)),
+                    ))
+                }
+            },
             other => {
-                return Err(CommandError::new(
+                return Some((
                     15974,
-                    "Location15974",
                     format!(
                         "Illegal key in $sort specification: {field}: {}",
                         render_stage_value(other)
                     ),
                 ))
             }
-        };
-        if let Some(n) = n {
-            let t = n.trunc();
-            if t != 1.0 && t != -1.0 {
-                return Err(CommandError::new(
-                    15975,
-                    "Location15975",
-                    "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
-                ));
-            }
         }
     }
-    Ok(())
+    None
+}
+
+/// The direction a numeric sort value means, by mongod's rule (see
+/// [`sort_spec_problem`]): `Some(1)` / `Some(-1)`, or `None` if it is not one.
+pub(crate) fn sort_direction(v: &Bson) -> Option<i32> {
+    let n: f64 = match v {
+        Bson::Int32(n) => *n as f64,
+        Bson::Int64(n) => *n as f64,
+        Bson::Double(d) if d.is_finite() => d.trunc(),
+        // A decimal is rounded half to even. Going through f64 is exact for
+        // every value that can round to ±1 except a decimal within ~1e-16 of
+        // ±0.5 or ±1.5, which no client writes as a sort direction.
+        Bson::Decimal128(d) => match d.to_string().parse::<f64>() {
+            Ok(f) if f.is_finite() => f.round_ties_even(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match n {
+        1.0 => Some(1),
+        -1.0 => Some(-1),
+        _ => None,
+    }
+}
+
+/// `sort` with every numeric direction rewritten to an `Int32` 1 or -1, so the
+/// engines below -- which read only integers and whole doubles -- order it the
+/// way mongod does. A decimal `-1` used to sort ASCENDING. Call only on a spec
+/// [`sort_spec_problem`] accepted.
+pub(crate) fn normalise_sort_spec(sort: &Document) -> Document {
+    sort.iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                sort_direction(v)
+                    .map(Bson::Int32)
+                    .unwrap_or_else(|| v.clone()),
+            )
+        })
+        .collect()
+}
+
+/// [`normalise_sort_spec`] applied to every `$sort` stage of a pipeline,
+/// including the sub-pipelines of `$facet`, `$lookup` and `$unionWith`.
+pub(crate) fn normalise_pipeline_sorts(pipeline: &mut [Bson]) {
+    for stage in pipeline.iter_mut() {
+        let Bson::Document(stage) = stage else {
+            continue;
+        };
+        let Some((name, spec)) = stage.iter_mut().next() else {
+            continue;
+        };
+        match (name.as_str(), spec) {
+            ("$sort", Bson::Document(d)) if sort_spec_problem(d).is_none() => {
+                *d = normalise_sort_spec(d);
+            }
+            ("$facet", Bson::Document(facets)) => {
+                for (_, sub) in facets.iter_mut() {
+                    if let Bson::Array(sub) = sub {
+                        normalise_pipeline_sorts(sub);
+                    }
+                }
+            }
+            ("$lookup" | "$unionWith", Bson::Document(d)) => {
+                if let Some(Bson::Array(sub)) = d.get_mut("pipeline") {
+                    normalise_pipeline_sorts(sub);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The first bad `$sort` spec inside a `$facet`, `$lookup` or `$unionWith`
+/// sub-pipeline, at any depth. `stage_spec_error` checks the top level only,
+/// so a nested one surfaced as "stage not supported" (2) instead of mongod's
+/// 15975 / 15974 / ... (measured 8.2.11, 2026-10-05).
+pub(crate) fn nested_sort_problem(pipeline: &[Bson]) -> Option<(i32, String)> {
+    let check = |sub: &[Bson]| -> Option<(i32, String)> {
+        for stage in sub {
+            if let Bson::Document(st) = stage {
+                if let Some(Bson::Document(spec)) = st.get("$sort") {
+                    if spec.is_empty() {
+                        return Some((15976, "$sort stage must have at least one sort key".into()));
+                    }
+                    if let Some(p) = sort_spec_problem(spec) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        nested_sort_problem(sub)
+    };
+    for stage in pipeline {
+        let Bson::Document(stage) = stage else {
+            continue;
+        };
+        let Some((name, spec)) = stage.iter().next() else {
+            continue;
+        };
+        match (name.as_str(), spec) {
+            ("$facet", Bson::Document(facets)) => {
+                for (_, sub) in facets {
+                    if let Bson::Array(sub) = sub {
+                        if let Some(p) = check(sub) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+            ("$lookup" | "$unionWith", Bson::Document(d)) => {
+                if let Some(Bson::Array(sub)) = d.get("pipeline") {
+                    if let Some(p) = check(sub) {
+                        return Some(p);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// [`sort_spec_problem`] as a command error.
+pub(crate) fn require_sort_spec(sort: &Document) -> Result<(), CommandError> {
+    match sort_spec_problem(sort) {
+        None => Ok(()),
+        Some((code, msg)) => Err(CommandError::new(
+            code,
+            crate::util::error_code_name(code),
+            msg,
+        )),
+    }
 }
 
 pub(crate) fn render_stage_value(v: &Bson) -> String {
@@ -2238,6 +2492,10 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                 15976,
                 "$sort stage must have at least one sort key".to_string(),
             )),
+            "$sort" => match spec {
+                Bson::Document(d) => sort_spec_problem(d),
+                _ => None,
+            },
             "$count" if matches!(spec, Bson::String(s) if s.is_empty()) => Some((
                 40157,
                 "the count field must be a non-empty string".to_string(),
@@ -3872,5 +4130,118 @@ mod parse_time_required_keys {
         ] {
             assert_eq!(probe(expr.clone()), None, "expr={expr:?}");
         }
+    }
+}
+
+/// The sort-spec, arrayFilters and write-namespace rules, each value measured
+/// on mongod 8.2.11 (2026-10-05) by `tools/probes/write_and_sort_validation.py`.
+#[cfg(test)]
+mod write_and_sort_validation_tests {
+    use super::*;
+    use bson::{doc, Decimal128};
+    use std::str::FromStr;
+
+    fn dec(s: &str) -> Bson {
+        Bson::Decimal128(Decimal128::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn sort_direction_truncates_doubles_and_rounds_decimals() {
+        assert_eq!(sort_direction(&Bson::Double(1.5)), Some(1));
+        assert_eq!(sort_direction(&Bson::Double(-1.9)), Some(-1));
+        assert_eq!(sort_direction(&Bson::Double(0.5)), None);
+        assert_eq!(sort_direction(&Bson::Double(f64::NAN)), None);
+        assert_eq!(sort_direction(&Bson::Double(f64::INFINITY)), None);
+        assert_eq!(sort_direction(&dec("1.4")), Some(1));
+        assert_eq!(sort_direction(&dec("0.9")), Some(1));
+        assert_eq!(sort_direction(&dec("1.5")), None); // half to even: 2
+        assert_eq!(sort_direction(&dec("-1")), Some(-1)); // used to sort ascending
+        assert_eq!(sort_direction(&Bson::Int64(-1)), Some(-1));
+        assert_eq!(sort_direction(&Bson::Int32(2)), None);
+    }
+
+    #[test]
+    fn normalise_turns_every_direction_into_an_int32() {
+        let spec = doc! {"a": dec("-1"), "b": 1.9_f64, "c": {"$meta": "randVal"}};
+        let n = normalise_sort_spec(&spec);
+        assert_eq!(n, doc! {"a": -1_i32, "b": 1_i32, "c": {"$meta": "randVal"}});
+    }
+
+    #[test]
+    fn sort_spec_problems_carry_mongods_codes() {
+        let code = |d: Document| sort_spec_problem(&d).map(|(c, _)| c);
+        assert_eq!(code(doc! {"": 1}), Some(40352));
+        assert_eq!(code(doc! {"a.": 1}), Some(40353));
+        assert_eq!(code(doc! {"a..b": 1}), Some(15998));
+        assert_eq!(code(doc! {".a": 1}), Some(15998));
+        assert_eq!(code(doc! {"$a": 1}), Some(16410));
+        assert_eq!(code(doc! {"a.$b": 1}), Some(16410));
+        assert_eq!(code(doc! {"a": 0}), Some(15975));
+        assert_eq!(code(doc! {"a": "x"}), Some(15974));
+        assert_eq!(code(doc! {"a": true}), Some(15974));
+        assert_eq!(code(doc! {"a": {}}), Some(17312));
+        assert_eq!(code(doc! {"a": {"x": 1}}), Some(17312));
+        assert_eq!(code(doc! {"a": {"$meta": "randVal", "x": 1}}), Some(9));
+        assert_eq!(code(doc! {"a": {"$meta": "x"}}), Some(31138));
+        assert_eq!(code(doc! {"a": 1, "b": {"$meta": "randVal"}}), None);
+        assert_eq!(
+            sort_spec_problem(&doc! {"a": {"$meta": "x"}}).unwrap().1,
+            "Illegal $meta sort: $meta: \"x\""
+        );
+    }
+
+    #[test]
+    fn nested_sort_problems_are_found_in_facet_and_lookup() {
+        let facet = vec![Bson::Document(
+            doc! {"$facet": {"x": [{"$sort": {"a": 0.5}}]}},
+        )];
+        assert_eq!(nested_sort_problem(&facet).map(|p| p.0), Some(15975));
+        let lookup = vec![Bson::Document(
+            doc! {"$lookup": {"from": "o", "as": "o", "pipeline": [{"$sort": {}}]}},
+        )];
+        assert_eq!(nested_sort_problem(&lookup).map(|p| p.0), Some(15976));
+        let ok = vec![Bson::Document(
+            doc! {"$facet": {"x": [{"$sort": {"a": -1}}]}},
+        )];
+        assert!(nested_sort_problem(&ok).is_none());
+    }
+
+    #[test]
+    fn array_filters_problems_in_mongods_order() {
+        let p = |fs: Vec<Document>| array_filters_problem(&fs).map(|e| (e.code, e.errmsg));
+        assert_eq!(p(vec![doc! {}]).unwrap().0, 9);
+        let (c, m) = p(vec![doc! {"e.x": 1, "f.x": 2}]).unwrap();
+        assert_eq!(c, 9);
+        assert!(m.ends_with("Expected a single top-level field name, found 'e' and 'f'"));
+        let (c, m) = p(vec![doc! {"E.x": 1}]).unwrap();
+        assert_eq!(c, 2);
+        assert!(m.ends_with("beginning with a lowercase letter, found 'E'"));
+        assert_eq!(
+            p(vec![doc! {"e": {"$gt": 0}}, doc! {"e.x": 1}]),
+            Some((
+                9,
+                "Found multiple array filters with the same top-level field name e".into()
+            ))
+        );
+        assert_eq!(
+            p(vec![doc! {"e.x": {"$bad": 1}}]),
+            Some((
+                2,
+                "Error parsing array filter :: caused by :: unknown operator: $bad".into()
+            ))
+        );
+        assert!(p(vec![doc! {"e.x": 1}, doc! {"f": {"$in": [1]}}]).is_none());
+    }
+
+    #[test]
+    fn array_filters_must_all_be_documents() {
+        let spec = doc! {"arrayFilters": [{"e": 1}, 1]};
+        let e = require_array_of_objects(&spec, "arrayFilters", "update.updates.arrayFilters")
+            .unwrap_err();
+        assert_eq!(e.code, 14);
+        assert_eq!(
+            e.errmsg,
+            "BSON field 'update.updates.arrayFilters.1' is the wrong type 'int', expected type 'object'"
+        );
     }
 }

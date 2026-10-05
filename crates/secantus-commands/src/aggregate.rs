@@ -168,6 +168,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let code_name = crate::util::error_code_name(code);
         return Ok(CommandError::new(code, code_name, errmsg).into_reply());
     }
+    // Every `$sort` spec is valid by now; hand the engine plain 1 / -1, which
+    // is all it reads (a decimal or fractional direction was "unsupported").
+    if let Some((code, errmsg)) = argtypes::nested_sort_problem(&pipeline) {
+        let code_name = crate::util::error_code_name(code);
+        return Ok(CommandError::new(code, code_name, errmsg).into_reply());
+    }
+    let mut pipeline = pipeline;
+    argtypes::normalise_pipeline_sorts(&mut pipeline);
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct
     // from the top-level `explain` wrapper): return the plan instead of running
