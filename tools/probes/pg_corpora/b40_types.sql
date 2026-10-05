@@ -56,10 +56,13 @@ SET timezone = 'utc'
 SHOW timezone
 RESET timezone
 # System relations carry initdb's ACL.
-SELECT relacl FROM pg_class WHERE relname = 'pg_class'
-SELECT relacl FROM pg_class WHERE relname = 'pg_authid'
-SELECT relacl FROM pg_class WHERE relname = 'pg_settings'
-SELECT relacl FROM pg_class WHERE relname = 'tables' AND relnamespace = 'information_schema'::regnamespace
+# The bootstrap superuser (oid 10) is named by whoever ran initdb, so its
+# name is masked; the type is checked on its own line.
+SELECT pg_typeof(relacl) FROM pg_class WHERE relname = 'pg_class'
+SELECT replace(relacl::text, (SELECT rolname FROM pg_roles WHERE oid = 10), 'BOOTSTRAP') FROM pg_class WHERE relname = 'pg_class'
+SELECT replace(relacl::text, (SELECT rolname FROM pg_roles WHERE oid = 10), 'BOOTSTRAP') FROM pg_class WHERE relname = 'pg_authid'
+SELECT replace(relacl::text, (SELECT rolname FROM pg_roles WHERE oid = 10), 'BOOTSTRAP') FROM pg_class WHERE relname = 'pg_settings'
+SELECT replace(relacl::text, (SELECT rolname FROM pg_roles WHERE oid = 10), 'BOOTSTRAP') FROM pg_class WHERE relname = 'tables' AND relnamespace = 'information_schema'::regnamespace
 SELECT relacl FROM pg_class WHERE relname = 'pg_class_oid_index'
 DROP TABLE b40_ct
 DROP TYPE _b40_custom

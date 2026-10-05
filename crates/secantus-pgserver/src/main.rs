@@ -11,6 +11,29 @@ use std::sync::Arc;
 
 use secantus_pgserver::{bind, DatabaseRegistry};
 
+/// Unblock SIGINT / SIGTERM in the calling thread and give them their
+/// default disposition, undoing whatever the parent left. POSIX only:
+/// Windows has neither a signal mask nor inherited dispositions, and its
+/// console control events reach the `ctrlc` handler as they are.
+#[cfg(unix)]
+fn reset_stop_signals() {
+    // SAFETY: plain libc calls on a zeroed sigset, made before any other
+    // thread exists; their failure modes are an invalid signal number, which
+    // these are not.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            libc::sigaddset(&mut set, sig);
+            libc::signal(sig, libc::SIG_DFL);
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_stop_signals() {}
+
 /// `--version` output: the version, and the source tree it was built from.
 fn version_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -24,6 +47,15 @@ fn version_text() -> String {
 // drops it -- which panics if it happens inside a runtime context. `main` is a
 // plain blocking function that waits on a signal.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // FIRST, before any thread exists (a thread inherits the mask it is
+    // spawned with): take back SIGINT and SIGTERM. A process inherits its
+    // parent's blocked-signal mask and any SIG_IGN disposition across exec --
+    // a shell starts a background job with SIGINT ignored, and a supervisor
+    // that blocks SIGTERM around its own fork leaves it blocked in the child.
+    // Measured 2026-10-05: launched with SIGTERM blocked, `secantusd-pg`
+    // ignored SIGTERM entirely (the `ctrlc` handler below was installed but
+    // the signal was never delivered) and stopped only on SIGINT.
+    reset_stop_signals();
     // `secantusd-pg [<home> [<addr>]] [--database NAME]...`: every
     // `--database` is one more name a client may connect to without a
     // `CREATE DATABASE` first; the builtin `postgres` / `template1` always are.

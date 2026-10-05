@@ -3257,7 +3257,9 @@ impl PgHandler {
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
-        secantus_pgplan::set_session_datestyle(self.session_datestyle());
+        let datestyle = self.session_datestyle();
+        let order = datestyle.order;
+        secantus_pgplan::set_session_datestyle(datestyle);
         // The clocks: `now()` is the transaction's start (the open handle's,
         // or this statement's outside one) and `statement_timestamp()` the
         // statement's. `try_lock`: planning NESTED in a running statement (a
@@ -3271,7 +3273,7 @@ impl PgHandler {
         // The zone too: a row expression runs AFTER planning, and a stored
         // timestamptz cast to `timestamp` is the session zone's wall clock.
         secantus_pgplan::set_session_timezone(self.session_timezone());
-        secantus_pgplan::dtparse::set_date_order(match self.session_datestyle().order {
+        secantus_pgplan::dtparse::set_date_order(match order {
             secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
             secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
             secantus_pgplan::DateStyleOrder::Mdy => secantus_pgplan::dtparse::DateOrder::Mdy,
@@ -3618,6 +3620,41 @@ impl PgHandler {
     /// takes a custom oid, and psycopg matches it against what EnumInfo
     /// registered.
     fn user_wire_type(&self, pg_type: &str) -> Option<Type> {
+        // A built-in name is never a user type: PostgreSQL resolves it in
+        // `pg_catalog`, which every search path reads first. Answered without
+        // the catalog reads below, which a result's every column used to pay.
+        if matches!(
+            pg_type,
+            "int2"
+                | "int4"
+                | "int8"
+                | "integer"
+                | "int"
+                | "bigint"
+                | "smallint"
+                | "float4"
+                | "float8"
+                | "numeric"
+                | "bool"
+                | "boolean"
+                | "text"
+                | "varchar"
+                | "bpchar"
+                | "name"
+                | "bytea"
+                | "date"
+                | "time"
+                | "timetz"
+                | "timestamp"
+                | "timestamptz"
+                | "interval"
+                | "uuid"
+                | "json"
+                | "jsonb"
+                | "oid"
+        ) {
+            return None;
+        }
         // A domain goes out as its base type, as PostgreSQL sends it.
         if let Some(base) = secantus_pgplan::domains::domain_base(pg_type) {
             return Some(wire_type(&base));
@@ -15818,14 +15855,37 @@ const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warn
 /// The `max_prepared_transactions` this server runs with: how many
 /// `PREPARE TRANSACTION`s may be outstanding at once (53200 past it).
 const MAX_PREPARED_TRANSACTIONS: usize = 100;
-/// The longest write set (oplog entries) a READ COMMITTED block replays to
-/// take a fresh snapshot at a statement's start (`with_isolation`). Past it
-/// the block keeps the snapshot its first write fixed: a replay per
-/// statement makes a long transaction quadratic while other sessions commit
-/// -- at 10,000, pgjdbc's 1,000-row batch with generated keys took over 10 s
-/// beside the gauge's parallel tests (`BatchDeadlockTest`).
-const RC_MOVE_MAX_WRITES: usize = 256;
 const MAX_PREPARED_TRANSACTIONS_TEXT: &str = "100";
+/// What a READ COMMITTED statement can read ([`PgHandler::rc_read_set`]):
+/// the namespaces (`db.collection`) of its tables, and every catalog.
+struct RcReadSet {
+    /// Read any way.
+    all: Vec<String>,
+    /// Read only by keys the statement also writes.
+    changes: Vec<String>,
+}
+
+impl RcReadSet {
+    /// How the statement reads `(db, coll)`. Compared as the joined
+    /// namespace, so a dotted database name cannot split it wrongly; every
+    /// `__` collection (the catalogs, grants, ...) is read. (The sequences
+    /// are decided by the caller: see `read_sequences`.)
+    fn reads(&self, db: &str, coll: &str) -> secantus_storage::NsRead {
+        use secantus_storage::NsRead;
+        let ns = format!("{db}.{coll}");
+        if self.all.contains(&ns) {
+            return NsRead::All;
+        }
+        if self.changes.contains(&ns) {
+            return NsRead::Changes;
+        }
+        if ns.contains(".__") {
+            return NsRead::All;
+        }
+        NsRead::No
+    }
+}
+
 /// PostgreSQL's `GIDSIZE`: a transaction identifier is at most 199 BYTES.
 const MAX_GID_BYTES: usize = 200;
 
@@ -18689,8 +18749,36 @@ impl PgHandler {
         )
     }
 
+    /// Read sequence rows as they stand NOW, outside the open transaction --
+    /// a sequence is not transactional (another session's `nextval` is seen
+    /// at once, whatever the snapshot), and its advances are committed
+    /// outside every block -- unless the block itself wrote sequence rows
+    /// (created, altered or dropped one), which only its own transaction
+    /// sees. Because of this, a block's snapshot never needs refreshing for
+    /// another session's (or its own) `nextval` (`with_isolation_for`).
+    fn read_sequences<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.storage.in_user_txn()
+            && !self
+                .storage
+                .active_txn_wrote(self.db(), SEQUENCE_COLLECTION)
+            && self
+                .txn_sequences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            self.storage.outside_user_transaction(f)
+        } else {
+            f()
+        }
+    }
+
     /// Every sequence this database holds.
     fn all_sequence_docs(&self) -> PgWireResult<Vec<Document>> {
+        self.read_sequences(|| self.all_sequence_docs_here())
+    }
+
+    fn all_sequence_docs_here(&self) -> PgWireResult<Vec<Document>> {
         if !self
             .storage
             .collection_exists(self.db(), SEQUENCE_COLLECTION)
@@ -18823,6 +18911,10 @@ impl PgHandler {
 
     /// A sequence's stored document, or `None` when there is no such sequence.
     fn sequence_doc(&self, name: &str) -> PgWireResult<Option<Document>> {
+        self.read_sequences(|| self.sequence_doc_here(name))
+    }
+
+    fn sequence_doc_here(&self, name: &str) -> PgWireResult<Option<Document>> {
         let raw = self
             .storage
             .find_matching(self.db(), SEQUENCE_COLLECTION, &bson::doc! { "_id": name })
@@ -20370,7 +20462,7 @@ impl PgHandler {
                     let handle = if cursor_op {
                         handle
                     } else {
-                        self.with_isolation(handle)?
+                        self.with_isolation_for(handle, Some(&stmt))?
                     };
                     let fresh = Self::row_write(&stmt) && !handle.has_written();
                     let rebase = Self::row_write(&stmt) && !fresh;
@@ -20384,7 +20476,7 @@ impl PgHandler {
                         let handle = if cursor_op {
                             &mut *handle
                         } else {
-                            self.with_isolation(handle)?
+                            self.with_isolation_for(handle, Some(&stmt))?
                         };
                         let out = self
                             .storage
@@ -21197,6 +21289,19 @@ impl PgHandler {
         &self,
         handle: &'h mut UserTransactionHandle,
     ) -> PgWireResult<&'h mut UserTransactionHandle> {
+        self.with_isolation_for(handle, None)
+    }
+
+    /// [`Self::with_isolation`] for `stmt`: a READ COMMITTED block is moved
+    /// onto a fresh snapshot only when something the statement can read has
+    /// committed since its snapshot ([`Self::rc_read_set`]) -- a commit to
+    /// another table, or a sequence advance (made outside the block, as
+    /// `nextval` is), cannot change its answer.
+    fn with_isolation_for<'h>(
+        &self,
+        handle: &'h mut UserTransactionHandle,
+        stmt: Option<&Statement>,
+    ) -> PgWireResult<&'h mut UserTransactionHandle> {
         let read_committed = matches!(
             self.settings
                 .lock()
@@ -21217,12 +21322,33 @@ impl PgHandler {
             // snapshot, its writes replayed (holding its rows throughout --
             // `Storage::rebase_user_transaction_to`), as PostgreSQL's READ
             // COMMITTED takes a snapshot per statement. A long write set is
-            // left on its snapshot rather than replayed per statement
-            // (`RC_MOVE_MAX_WRITES`), as is a write the move cannot carry.
-            if !refreshed
+            // A move replays the whole write set, so it is made only when a
+            // commit since the snapshot touched something the statement may
+            // read (`rc_read_set`); a write the move cannot carry keeps the
+            // snapshot.
+            let stale = !refreshed
                 && !secantus_storage::Storage::no_commit_since(handle.snapshot_epoch())
-                && handle.write_set_len() <= RC_MOVE_MAX_WRITES
-            {
+                && {
+                    // Sequence rows are read outside the block unless it wrote
+                    // some (`read_sequences`): then a `nextval` committed since
+                    // the snapshot -- every serial INSERT commits one -- changes
+                    // no answer.
+                    let own_sequences = handle.wrote_collection(self.db(), SEQUENCE_COLLECTION);
+                    let narrow = stmt.and_then(|s| self.rc_read_set(s));
+                    !secantus_storage::Storage::no_commit_touching_since(
+                        handle.snapshot_epoch(),
+                        &|db, coll| {
+                            if coll == SEQUENCE_COLLECTION && !own_sequences {
+                                return secantus_storage::NsRead::No;
+                            }
+                            match &narrow {
+                                Some(reads) => reads.reads(db, coll),
+                                None => secantus_storage::NsRead::All,
+                            }
+                        },
+                    )
+                };
+            if stale {
                 match self.storage.rebase_user_transaction(handle) {
                     Ok(_) => {}
                     Err(e) => {
@@ -21235,6 +21361,96 @@ impl PgHandler {
             }
         }
         Ok(handle)
+    }
+
+    /// The collections `stmt` can read, when that is provably narrower than
+    /// "everything": a plain `INSERT ... VALUES` (no RETURNING expression, no
+    /// ON CONFLICT, no view check) into an ordinary table reads only that
+    /// table (its unique checks), the tables its foreign keys name, and the
+    /// catalogs. Anything that could run user code or reach another table --
+    /// a user function (a default, a trigger, a check), a rule, row-level
+    /// security, inheritance or partitioning -- is `None`: everything. (A
+    /// user function elsewhere in the database cannot run: a function is
+    /// reached only through the table's own expressions or its triggers.)
+    fn rc_read_set(&self, stmt: &Statement) -> Option<RcReadSet> {
+        let Statement::Insert(ins) = stmt else {
+            return None;
+        };
+        if ins.source.is_some()
+            || !ins.view_checks.is_empty()
+            || ins.on_conflict.is_some()
+            || ins
+                .returning
+                .as_ref()
+                .is_some_and(|r| r.casts.iter().any(Option::is_some))
+        {
+            return None;
+        }
+        let def = self.lookup(&ins.table)?;
+        if def.temp
+            || partition::parent_of(&def).is_some()
+            || partition::is_partitioned(&def)
+            || !Self::inherited_parents(&def).is_empty()
+            || self.has_triggers(&ins.table).ok()?
+            || self.has_rules(&ins.table)
+            || !self.rls_enabled_docs().is_empty()
+        {
+            return None;
+        }
+        // A user function can run only from the table's own expressions (a
+        // default, a generated column, a check) or a domain's check: when any
+        // exists, none of its names may appear anywhere in the definition,
+        // and no column may be of a domain.
+        let functions = self.user_function_docs().ok()?;
+        if !functions.is_empty() {
+            let text = format!("{def:?}").to_lowercase();
+            let named = functions.iter().any(|f| {
+                f.get_str("name")
+                    .map_or(true, |n| text.contains(&n.to_lowercase()))
+            });
+            let domain = def
+                .columns
+                .iter()
+                .any(|c| secantus_pgplan::domains::domain_base(&c.pg_type).is_some());
+            // A user operator or cast calls a function its expression does
+            // not name.
+            if named || domain || !self.user_operators().is_empty() || !self.user_casts().is_empty()
+            {
+                return None;
+            }
+        }
+        let db = self.db();
+        // The target is read for its unique checks. When its only unique key
+        // is the primary key -- the `_id` -- and that compares by its bytes,
+        // a row another session INSERTED under a key this one writes is a
+        // write conflict WiredTiger reports (and the re-run then answers
+        // 23505), so only a change of existing rows there (an update or a
+        // delete, which the snapshot would miss) needs a fresh snapshot. Any
+        // other unique index or constraint, or a PK under a collation, is
+        // checked by reading: any commit there matters.
+        let pk_by_bytes = def
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .all(|c| secantus_pgplan::collation::column_collation(c).is_none());
+        let only_id = def.unique_constraints.is_empty()
+            && pk_by_bytes
+            && self
+                .storage
+                .list_indexes(db, &ins.table)
+                .ok()?
+                .iter()
+                .all(|ix| ix.get_str("name") == Ok("_id_"));
+        let target = format!("{db}.{}", ins.table);
+        let (mut all, changes) = if only_id {
+            (Vec::new(), vec![target])
+        } else {
+            (vec![target], Vec::new())
+        };
+        for fk in &def.foreign_keys {
+            all.push(format!("{db}.{}", fk.ref_table));
+        }
+        Some(RcReadSet { all, changes })
     }
 
     fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {

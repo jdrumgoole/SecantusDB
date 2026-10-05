@@ -2295,6 +2295,7 @@ dependencies = [
  "bytes",
  "ctrlc",
  "futures",
+ "libc",
  "pg_query",
  "pgwire",
  "postgres-types",
