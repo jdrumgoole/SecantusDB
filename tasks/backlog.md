@@ -1044,15 +1044,25 @@ remain open:
         session's insert under the same key is a WiredTiger write conflict
         the re-run answers 23505, so an insert-only commit there is not
         waited for; with any other unique index or constraint every commit
-        there counts) -- a sequence advance (which `nextval` commits
-        outside the block on EVERY serial insert, the actual cause of the
-        quadratic) or another table's commit no longer forces a replay. Any
-        other statement moves whenever anything committed. 500 inserts of
+        there counts) -- another table's commit no longer forces a replay.
+        Any other statement moves whenever anything but a sequence
+        committed. Sequence rows are now read OUTSIDE the block
+        (`read_sequences`) unless it wrote some itself, as PostgreSQL's
+        sequences are not transactional (a block's `SELECT last_value`
+        missed another session's `nextval`; corpus-checked against PG 15),
+        so the `nextval` every serial INSERT commits outside the block --
+        the actual cause of the quadratic -- never forces a move. A block
+        alternating 400 serial INSERTs and SELECTs: 2.54 s (base, debug) ->
+        0.44 s (PG 15: 0.04). 500 inserts of
         30 KB in one block beside a writer on another table: 0.42 s (debug);
         `a_long_read_committed_block_sees_later_commits` and
         `a_block_insert_sees_concurrent_deletes_and_duplicate_keys`
-        (embedded) pin a 300-write block seeing a later commit and the
-        insert-only rule against PostgreSQL 15's answers. (A first version
+        and `a_block_reads_sequences_as_they_stand` (embedded) pin a
+        300-write block seeing a later commit, the insert-only rule and the
+        sequence reads against PostgreSQL 15's answers. (With a user
+        function anywhere in the database the INSERT gate first fell back to
+        "everything", and pgjdbc's BatchDeadlockTest timed out 8 of 8; it
+        now looks only at the target's own expressions, triggers and rules.) (A first version
         counted every commit to the target: three sessions' pipelined
         inserts into one table then replayed thousand-entry write sets and
         psycopg's `test_type_error_shadow` went 10.8 -> 14.4 s, near its

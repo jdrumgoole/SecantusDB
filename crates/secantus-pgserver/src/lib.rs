@@ -15868,8 +15868,8 @@ struct RcReadSet {
 impl RcReadSet {
     /// How the statement reads `(db, coll)`. Compared as the joined
     /// namespace, so a dotted database name cannot split it wrongly; every
-    /// `__` collection (the catalogs, grants, ...) is read except the
-    /// sequences, which `nextval` reads and writes outside the transaction.
+    /// `__` collection (the catalogs, grants, ...) is read. (The sequences
+    /// are decided by the caller: see `read_sequences`.)
     fn reads(&self, db: &str, coll: &str) -> secantus_storage::NsRead {
         use secantus_storage::NsRead;
         let ns = format!("{db}.{coll}");
@@ -15879,7 +15879,7 @@ impl RcReadSet {
         if self.changes.contains(&ns) {
             return NsRead::Changes;
         }
-        if ns.contains(".__") && !ns.ends_with(&format!(".{SEQUENCE_COLLECTION}")) {
+        if ns.contains(".__") {
             return NsRead::All;
         }
         NsRead::No
@@ -18749,8 +18749,36 @@ impl PgHandler {
         )
     }
 
+    /// Read sequence rows as they stand NOW, outside the open transaction --
+    /// a sequence is not transactional (another session's `nextval` is seen
+    /// at once, whatever the snapshot), and its advances are committed
+    /// outside every block -- unless the block itself wrote sequence rows
+    /// (created, altered or dropped one), which only its own transaction
+    /// sees. Because of this, a block's snapshot never needs refreshing for
+    /// another session's (or its own) `nextval` (`with_isolation_for`).
+    fn read_sequences<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.storage.in_user_txn()
+            && !self
+                .storage
+                .active_txn_wrote(self.db(), SEQUENCE_COLLECTION)
+            && self
+                .txn_sequences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            self.storage.outside_user_transaction(f)
+        } else {
+            f()
+        }
+    }
+
     /// Every sequence this database holds.
     fn all_sequence_docs(&self) -> PgWireResult<Vec<Document>> {
+        self.read_sequences(|| self.all_sequence_docs_here())
+    }
+
+    fn all_sequence_docs_here(&self) -> PgWireResult<Vec<Document>> {
         if !self
             .storage
             .collection_exists(self.db(), SEQUENCE_COLLECTION)
@@ -18883,6 +18911,10 @@ impl PgHandler {
 
     /// A sequence's stored document, or `None` when there is no such sequence.
     fn sequence_doc(&self, name: &str) -> PgWireResult<Option<Document>> {
+        self.read_sequences(|| self.sequence_doc_here(name))
+    }
+
+    fn sequence_doc_here(&self, name: &str) -> PgWireResult<Option<Document>> {
         let raw = self
             .storage
             .find_matching(self.db(), SEQUENCE_COLLECTION, &bson::doc! { "_id": name })
@@ -21296,12 +21328,25 @@ impl PgHandler {
             // snapshot.
             let stale = !refreshed
                 && !secantus_storage::Storage::no_commit_since(handle.snapshot_epoch())
-                && match stmt.and_then(|s| self.rc_read_set(s)) {
-                    Some(reads) => !secantus_storage::Storage::no_commit_touching_since(
+                && {
+                    // Sequence rows are read outside the block unless it wrote
+                    // some (`read_sequences`): then a `nextval` committed since
+                    // the snapshot -- every serial INSERT commits one -- changes
+                    // no answer.
+                    let own_sequences = handle.wrote_collection(self.db(), SEQUENCE_COLLECTION);
+                    let narrow = stmt.and_then(|s| self.rc_read_set(s));
+                    !secantus_storage::Storage::no_commit_touching_since(
                         handle.snapshot_epoch(),
-                        &|db, coll| reads.reads(db, coll),
-                    ),
-                    None => true,
+                        &|db, coll| {
+                            if coll == SEQUENCE_COLLECTION && !own_sequences {
+                                return secantus_storage::NsRead::No;
+                            }
+                            match &narrow {
+                                Some(reads) => reads.reads(db, coll),
+                                None => secantus_storage::NsRead::All,
+                            }
+                        },
+                    )
                 };
             if stale {
                 match self.storage.rebase_user_transaction(handle) {
@@ -21324,7 +21369,9 @@ impl PgHandler {
     /// table (its unique checks), the tables its foreign keys name, and the
     /// catalogs. Anything that could run user code or reach another table --
     /// a user function (a default, a trigger, a check), a rule, row-level
-    /// security, inheritance or partitioning -- is `None`: everything.
+    /// security, inheritance or partitioning -- is `None`: everything. (A
+    /// user function elsewhere in the database cannot run: a function is
+    /// reached only through the table's own expressions or its triggers.)
     fn rc_read_set(&self, stmt: &Statement) -> Option<RcReadSet> {
         let Statement::Insert(ins) = stmt else {
             return None;
@@ -21344,12 +21391,33 @@ impl PgHandler {
             || partition::parent_of(&def).is_some()
             || partition::is_partitioned(&def)
             || !Self::inherited_parents(&def).is_empty()
-            || !self.user_function_docs().ok()?.is_empty()
             || self.has_triggers(&ins.table).ok()?
-            || self.any_rules()
+            || self.has_rules(&ins.table)
             || !self.rls_enabled_docs().is_empty()
         {
             return None;
+        }
+        // A user function can run only from the table's own expressions (a
+        // default, a generated column, a check) or a domain's check: when any
+        // exists, none of its names may appear anywhere in the definition,
+        // and no column may be of a domain.
+        let functions = self.user_function_docs().ok()?;
+        if !functions.is_empty() {
+            let text = format!("{def:?}").to_lowercase();
+            let named = functions.iter().any(|f| {
+                f.get_str("name")
+                    .map_or(true, |n| text.contains(&n.to_lowercase()))
+            });
+            let domain = def
+                .columns
+                .iter()
+                .any(|c| secantus_pgplan::domains::domain_base(&c.pg_type).is_some());
+            // A user operator or cast calls a function its expression does
+            // not name.
+            if named || domain || !self.user_operators().is_empty() || !self.user_casts().is_empty()
+            {
+                return None;
+            }
         }
         let db = self.db();
         // The target is read for its unique checks. When its only unique key

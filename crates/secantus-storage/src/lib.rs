@@ -262,6 +262,19 @@ impl UserTransactionHandle {
         self.epoch
     }
 
+    /// Has the transaction written `(db, coll)` -- a row there, or an
+    /// oplog entry naming it?
+    pub fn wrote_collection(&self, db: &str, coll: &str) -> bool {
+        self.written_ns.iter().any(|(d, c, _)| d == db && c == coll)
+            || self
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .collections
+                .iter()
+                .any(|(d, c)| d == db && c == coll)
+    }
+
     /// How many oplog entries the transaction's writes have produced so far:
     /// a position in its write set, for [`Storage::rebase_user_transaction_keeping`].
     pub fn write_set_len(&self) -> usize {
@@ -7627,6 +7640,15 @@ impl Storage {
         let handle = unsafe { &*hp };
         let session = handle.session.as_ref()?;
         std::ptr::eq(session, ACTIVE_TXN_SESSION.with(|c| c.get())).then_some(hp)
+    }
+
+    /// [`UserTransactionHandle::wrote_collection`] of the transaction whose
+    /// statement is running on this thread; `false` outside one.
+    pub fn active_txn_wrote(&self, db: &str, coll: &str) -> bool {
+        Self::active_handle().is_some_and(|hp| {
+            // SAFETY: see `active_handle`; a shared read.
+            unsafe { &*hp }.wrote_collection(db, coll)
+        })
     }
 
     /// [`UserTransactionHandle::write_set_len`] of the transaction whose

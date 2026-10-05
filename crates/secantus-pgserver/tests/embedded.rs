@@ -544,3 +544,65 @@ fn a_block_insert_sees_concurrent_deletes_and_duplicate_keys() {
     });
     server.stop();
 }
+
+/// A sequence is not transactional: inside a READ COMMITTED block that has
+/// written, another session's `nextval` is seen at once (PostgreSQL 15:
+/// `last_value` 2 here), and its own serial INSERTs' advances -- committed
+/// outside the block -- do not make each later statement replay the block.
+#[test]
+fn a_block_reads_sequences_as_they_stand() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE SEQUENCE q",
+            "CREATE TABLE s (id serial PRIMARY KEY, v int)",
+        ],
+    );
+    let dsn = server.dsn();
+    rt.block_on(async move {
+        let connect = || async {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let a = connect().await;
+        let b = connect().await;
+        a.batch_execute("BEGIN; INSERT INTO s (v) VALUES (1)")
+            .await
+            .unwrap();
+        b.batch_execute("SELECT nextval('q'); SELECT nextval('q')")
+            .await
+            .unwrap();
+        let last: i64 = a
+            .query_one("SELECT last_value FROM q", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(last, 2);
+        b.batch_execute("INSERT INTO s (v) VALUES (2)")
+            .await
+            .unwrap();
+        let n: i64 = a
+            .query_one("SELECT count(*) FROM s", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 2);
+        let next: i64 = a
+            .query_one("SELECT nextval('q')", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(next, 3);
+        a.batch_execute("COMMIT").await.unwrap();
+    });
+    server.stop();
+}
