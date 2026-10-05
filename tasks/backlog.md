@@ -1038,14 +1038,25 @@ remain open:
         registry write counts as every collection), and a plain `INSERT ...
         VALUES` into an ordinary table (no user function, trigger, rule, RLS,
         inheritance or partitioning; `rc_read_set`) moves only when a commit
-        since its snapshot touched that table, a table its foreign keys
-        name, or a catalog -- a sequence advance (which `nextval` commits
+        since its snapshot touched a table its foreign keys name or a
+        catalog, or CHANGED rows of the target (an update or a delete; when
+        the target's only unique key is a byte-compared primary key, another
+        session's insert under the same key is a WiredTiger write conflict
+        the re-run answers 23505, so an insert-only commit there is not
+        waited for; with any other unique index or constraint every commit
+        there counts) -- a sequence advance (which `nextval` commits
         outside the block on EVERY serial insert, the actual cause of the
         quadratic) or another table's commit no longer forces a replay. Any
         other statement moves whenever anything committed. 500 inserts of
         30 KB in one block beside a writer on another table: 0.42 s (debug);
-        `a_long_read_committed_block_sees_later_commits` (embedded) pins a
-        300-write block seeing a later commit. Left: a long block whose
+        `a_long_read_committed_block_sees_later_commits` and
+        `a_block_insert_sees_concurrent_deletes_and_duplicate_keys`
+        (embedded) pin a 300-write block seeing a later commit and the
+        insert-only rule against PostgreSQL 15's answers. (A first version
+        counted every commit to the target: three sessions' pipelined
+        inserts into one table then replayed thousand-entry write sets and
+        psycopg's `test_type_error_shadow` went 10.8 -> 14.4 s, near its
+        20 s timeout; it is 10.8 s again.) Left: a long block whose
         statements READ a table others keep committing to still replays
         its write set per statement (correct, quadratic). Every move --
         this one, ROLLBACK TO's and the conflict

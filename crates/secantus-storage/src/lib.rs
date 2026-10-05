@@ -207,7 +207,7 @@ pub struct UserTransactionHandle {
     /// The `(db, collection)`s its oplog entries name, and whether it wrote
     /// anything an entry does not attribute to one collection (a command
     /// entry): what its commit is recorded as touching ([`NS_COMMITS`]).
-    written_ns: Vec<(String, String)>,
+    written_ns: Vec<WrittenNs>,
     unattributed: bool,
     /// [`COLL_TABLE_GEN`] just before the transaction's snapshot was taken:
     /// while it is still current, the registry this snapshot sees is the
@@ -3595,22 +3595,41 @@ pub const ID_KEY_ROW_SUFFIX: &str = "\u{0}_id";
 static COMMITS_STARTED: AtomicU64 = AtomicU64::new(0);
 static COMMITS_DONE: AtomicU64 = AtomicU64::new(0);
 
+/// How a statement reads a collection ([`Storage::no_commit_touching_since`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsRead {
+    /// Not at all.
+    No,
+    /// Only by keys it also writes: just a change of existing rows matters.
+    Changes,
+    /// Any way at all.
+    All,
+}
+
+/// One collection a commit wrote, and whether it CHANGED rows there (an
+/// update or a delete, or a write not known to be an insert) rather than
+/// only inserting new ones.
+pub type WrittenNs = (String, String, bool);
+
 /// Run a WiredTiger commit call between the two commit counters' bumps.
-/// `written` names the `(db, collection)`s the commit wrote ([`NS_COMMITS`]),
-/// `None` when that is not known -- which counts as having written every one.
-fn counted_commit<T>(written: Option<&[(String, String)]>, commit: impl FnOnce() -> T) -> T {
-    let keys: Vec<(String, String)> = match written {
+/// `written` names the collections the commit wrote ([`NS_COMMITS`]),
+/// `None` when that is not known -- which counts as having changed every one.
+fn counted_commit<T>(written: Option<&[WrittenNs]>, commit: impl FnOnce() -> T) -> T {
+    let keys: Vec<WrittenNs> = match written {
         Some(w) if !w.is_empty() => w.to_vec(),
-        _ => vec![(String::new(), String::new())],
+        _ => vec![(String::new(), String::new(), true)],
     };
     {
         let mut map = NS_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
-        for k in &keys {
-            match map.get_mut(k) {
-                Some(e) => e.0 += 1,
-                None => {
-                    map.insert(k.clone(), (1, 0));
-                }
+        for (db, coll, changed) in &keys {
+            let k = (db.clone(), coll.clone());
+            let e = match map.get_mut(&k) {
+                Some(e) => e,
+                None => map.entry(k).or_default(),
+            };
+            e.inflight += 1;
+            if *changed {
+                e.inflight_changed += 1;
             }
         }
     }
@@ -3619,31 +3638,67 @@ fn counted_commit<T>(written: Option<&[(String, String)]>, commit: impl FnOnce()
     let done = COMMITS_DONE.fetch_add(1, Ordering::SeqCst) + 1;
     {
         let mut map = NS_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
-        for k in &keys {
-            if let Some(e) = map.get_mut(k) {
-                e.0 -= 1;
-                e.1 = e.1.max(done);
+        for (db, coll, changed) in &keys {
+            if let Some(e) = map.get_mut(&(db.clone(), coll.clone())) {
+                e.inflight -= 1;
+                e.done = e.done.max(done);
+                if *changed {
+                    e.inflight_changed -= 1;
+                    e.done_changed = e.done_changed.max(done);
+                }
             }
         }
     }
     out
 }
 
-/// Per `(db, collection)` a commit wrote: how many such commits are in
-/// flight, and the `COMMITS_DONE` value just after the last one finished.
-/// The key `("", "")` stands for a commit whose collections are not known,
-/// which counts as having written every collection. Entered BEFORE the
-/// commit call (so a commit can never be visible before it is recorded) and
-/// settled after it. See [`Storage::no_commit_touching_since`].
-type NsCommits = HashMap<(String, String), (u32, u64)>;
+/// Per collection, the commits that wrote it: how many are in flight, and
+/// the `COMMITS_DONE` value just after the last one finished -- for every
+/// commit, and again for the ones that changed rows (not only inserted).
+#[derive(Default)]
+struct NsCommit {
+    inflight: u32,
+    inflight_changed: u32,
+    done: u64,
+    done_changed: u64,
+}
+
+/// Per `(db, collection)`, [`NsCommit`]. The key `("", "")` stands for a
+/// commit whose collections are not known, which counts as having changed
+/// every collection. Entered BEFORE the commit call (so a commit can never
+/// be visible before it is recorded) and settled after it. See
+/// [`Storage::no_commit_touching_since`].
+type NsCommits = HashMap<(String, String), NsCommit>;
 static NS_COMMITS: std::sync::LazyLock<Mutex<NsCommits>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Add `(db, coll)` to `w`; `changed` is sticky.
+fn add_written(w: &mut Vec<WrittenNs>, db: &str, coll: &str, changed: bool) {
+    match w.iter_mut().find(|(d, c, _)| d == db && c == coll) {
+        Some(e) => e.2 |= changed,
+        None => w.push((db.to_string(), coll.to_string(), changed)),
+    }
+}
+
+/// `oplog`'s collections, and every collection of `rows` (written rows) it
+/// does not name -- a row no entry accounts for is counted as a change.
+fn merge_written(oplog: &[WrittenNs], rows: &[(String, String)]) -> Vec<WrittenNs> {
+    let mut out = oplog.to_vec();
+    for (db, coll) in rows {
+        if !out.iter().any(|(d, c, _)| d == db && c == coll) {
+            out.push((db.clone(), coll.clone(), true));
+        }
+    }
+    out
+}
 
 thread_local! {
     /// The `(db, collection)`s written by the statement transaction
     /// ([`Storage::with_statement_txn`]) running on this thread -- outside a
     /// user transaction, whose own record is [`Held::collections`].
     static STMT_WRITTEN: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    /// The same statement transaction's oplog entries' collections.
+    static STMT_OPLOG_NS: RefCell<Vec<WrittenNs>> = const { RefCell::new(Vec::new()) };
     /// The statement transaction wrote something no collection accounts for.
     static STMT_UNATTRIBUTED: Cell<bool> = const { Cell::new(false) };
 }
@@ -3653,26 +3708,23 @@ thread_local! {
 /// command, a no-op) is unattributed. Into the running user transaction when
 /// there is one, else the statement transaction's thread-local record.
 fn note_written_entries(entries: &[OplogEntry]) {
-    let mut ns: Vec<(String, String)> = Vec::new();
+    let mut ns: Vec<WrittenNs> = Vec::new();
     let mut unattributed = false;
     for e in entries {
-        let named = match e {
-            OplogEntry::Doc(d) => match (d.get_str("op"), d.get_str("ns")) {
-                (Ok("i" | "u" | "d"), Ok(n)) => Some(n.to_string()),
-                _ => None,
-            },
-            OplogEntry::Raw(r) => match (r.get_str("op"), r.get_str("ns")) {
-                (Ok("i" | "u" | "d"), Ok(n)) => Some(n.to_string()),
-                _ => None,
-            },
+        let (op, name) = match e {
+            OplogEntry::Doc(d) => (d.get_str("op").ok(), d.get_str("ns").ok()),
+            OplogEntry::Raw(r) => (r.get_str("op").ok(), r.get_str("ns").ok()),
         };
-        match named.as_deref().and_then(|n| n.split_once('.')) {
-            Some((db, coll)) => {
-                let k = (db.to_string(), coll.to_string());
-                if !ns.contains(&k) {
-                    ns.push(k);
-                }
+        let changed = match op {
+            Some("i") => false,
+            Some("u" | "d") => true,
+            _ => {
+                unattributed = true;
+                continue;
             }
+        };
+        match name.and_then(|n| n.split_once('.')) {
+            Some((db, coll)) => add_written(&mut ns, db, coll, changed),
             None => unattributed = true,
         }
     }
@@ -3683,10 +3735,8 @@ fn note_written_entries(entries: &[OplogEntry]) {
         // running on this thread, as `note_coll_table_write` uses it.
         let h = unsafe { &mut *hp };
         h.unattributed |= unattributed;
-        for k in ns {
-            if !h.written_ns.contains(&k) {
-                h.written_ns.push(k);
-            }
+        for (db, coll, changed) in ns {
+            add_written(&mut h.written_ns, &db, &coll, changed);
         }
     } else if in_txn {
         // A user transaction whose handle is not reachable: its commit
@@ -3695,12 +3745,10 @@ fn note_written_entries(entries: &[OplogEntry]) {
         STMT_UNATTRIBUTED.with(|u| u.set(true));
     } else {
         STMT_UNATTRIBUTED.with(|u| u.set(u.get() || unattributed));
-        STMT_WRITTEN.with(|w| {
+        STMT_OPLOG_NS.with(|w| {
             let mut w = w.borrow_mut();
-            for k in ns {
-                if !w.contains(&k) {
-                    w.push(k);
-                }
+            for (db, coll, changed) in ns {
+                add_written(&mut w, &db, &coll, changed);
             }
         });
     }
@@ -5259,23 +5307,19 @@ impl Storage {
         };
         // The collections this statement writes, for `NS_COMMITS`: the
         // enclosing scope's are kept aside and put back after.
-        struct WrittenScope(Vec<(String, String)>, bool);
+        // Restored on drop: a statement transaction nested in another's
+        // scope (`outside_user_transaction`) records its own writes only.
+        struct WrittenScope(Vec<(String, String)>, Vec<WrittenNs>, bool);
         impl Drop for WrittenScope {
             fn drop(&mut self) {
-                STMT_UNATTRIBUTED.with(|u| u.set(u.get() || self.1));
-                STMT_WRITTEN.with(|w| {
-                    let mut w = w.borrow_mut();
-                    let mine = std::mem::replace(&mut *w, std::mem::take(&mut self.0));
-                    for k in mine {
-                        if !w.contains(&k) {
-                            w.push(k);
-                        }
-                    }
-                });
+                STMT_UNATTRIBUTED.with(|u| u.set(self.2));
+                STMT_WRITTEN.with(|w| *w.borrow_mut() = std::mem::take(&mut self.0));
+                STMT_OPLOG_NS.with(|w| *w.borrow_mut() = std::mem::take(&mut self.1));
             }
         }
         let _written_scope = WrittenScope(
             STMT_WRITTEN.with(|w| std::mem::take(&mut *w.borrow_mut())),
+            STMT_OPLOG_NS.with(|w| std::mem::take(&mut *w.borrow_mut())),
             STMT_UNATTRIBUTED.with(|u| u.replace(false)),
         );
         session.begin_transaction(None)?;
@@ -5286,7 +5330,10 @@ impl Storage {
                 let written = (self.enable_oplog
                     && self.async_oplog.is_none()
                     && !STMT_UNATTRIBUTED.with(|u| u.get()))
-                .then(|| STMT_WRITTEN.with(|w| w.borrow().clone()));
+                .then(|| {
+                    STMT_OPLOG_NS
+                        .with(|o| STMT_WRITTEN.with(|w| merge_written(&o.borrow(), &w.borrow())))
+                });
                 if let Err(e) =
                     counted_commit(written.as_deref(), || session.commit_transaction(None))
                 {
@@ -7222,15 +7269,7 @@ impl Storage {
                     && !handle.unattributed
                     && self.enable_oplog
                     && self.async_oplog.is_none())
-                .then(|| {
-                    let mut w = handle.written_ns.clone();
-                    for k in &held.collections {
-                        if !w.contains(k) {
-                            w.push(k.clone());
-                        }
-                    }
-                    w
-                });
+                .then(|| merge_written(&handle.written_ns, &held.collections));
                 held.clear();
                 held.release_shared();
                 (
@@ -7365,15 +7404,18 @@ impl Storage {
         epoch.is_none_or(|e| COMMITS_STARTED.load(Ordering::SeqCst) == e)
     }
 
-    /// [`Self::no_commit_since`] narrowed to the collections `reads`
-    /// accepts (`reads(db, collection)`): `true` when no commit that wrote
-    /// one of them -- nor any commit whose collections are not known -- may
-    /// have become visible since `epoch`. A commit still in flight counts as
-    /// visible. So a snapshot taken at `epoch` still sees exactly what a new
-    /// one would, as far as those collections go.
+    /// [`Self::no_commit_since`] narrowed to what a statement reads:
+    /// `reads(db, collection)` says how it reads a collection --
+    /// [`NsRead::No`], [`NsRead::Changes`] (only an update or a delete there
+    /// can change its answer: a row inserted under a key it also writes is a
+    /// write conflict WiredTiger reports itself) or [`NsRead::All`]. `true`
+    /// when no commit that matters, nor any commit whose collections are not
+    /// known, may have become visible since `epoch`; a commit still in
+    /// flight counts as visible. So a snapshot taken at `epoch` still gives
+    /// the statement the answer a new one would.
     pub fn no_commit_touching_since(
         epoch: Option<u64>,
-        reads: &dyn Fn(&str, &str) -> bool,
+        reads: &dyn Fn(&str, &str) -> NsRead,
     ) -> bool {
         let Some(e) = epoch else {
             return true;
@@ -7382,9 +7424,17 @@ impl Storage {
             return true;
         }
         let map = NS_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
-        map.iter().all(|((db, coll), (inflight, done))| {
-            let changed = *inflight > 0 || *done > e;
-            !changed || (!(db.is_empty() && coll.is_empty()) && !reads(db, coll))
+        map.iter().all(|((db, coll), c)| {
+            let any = c.inflight > 0 || c.done > e;
+            let changed = c.inflight_changed > 0 || c.done_changed > e;
+            if db.is_empty() && coll.is_empty() {
+                return !any;
+            }
+            match reads(db, coll) {
+                NsRead::No => true,
+                NsRead::Changes => !changed,
+                NsRead::All => !any,
+            }
         })
     }
 

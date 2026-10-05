@@ -469,3 +469,78 @@ fn a_long_read_committed_block_sees_later_commits() {
     });
     server.stop();
 }
+
+/// An INSERT into a table whose only unique key is its primary key keeps its
+/// block's snapshot across another session's INSERTs there (a clash on the
+/// key is a write conflict, re-run to PostgreSQL's 23505) but not across an
+/// UPDATE or DELETE: re-inserting a key another session deleted succeeds, as
+/// on PostgreSQL 15.
+#[test]
+fn a_block_insert_sees_concurrent_deletes_and_duplicate_keys() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE d (id int PRIMARY KEY, v text)",
+            "INSERT INTO d VALUES (1, 'old'), (2, 'x')",
+        ],
+    );
+    let dsn = server.dsn();
+    rt.block_on(async move {
+        let connect = || async {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let a = connect().await;
+        let b = connect().await;
+        a.batch_execute("BEGIN; INSERT INTO d VALUES (10, 'a')")
+            .await
+            .unwrap();
+        b.batch_execute("DELETE FROM d WHERE id = 1").await.unwrap();
+        a.batch_execute("INSERT INTO d VALUES (1, 'new')")
+            .await
+            .expect("the deleted key is free again");
+        a.batch_execute("COMMIT").await.unwrap();
+
+        a.batch_execute("BEGIN; INSERT INTO d VALUES (11, 'a')")
+            .await
+            .unwrap();
+        b.batch_execute("INSERT INTO d VALUES (3, 'b')")
+            .await
+            .unwrap();
+        let err = a
+            .batch_execute("INSERT INTO d VALUES (3, 'a')")
+            .await
+            .expect_err("a committed duplicate key");
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        );
+        a.batch_execute("ROLLBACK").await.unwrap();
+        let rows: Vec<(i32, String)> = b
+            .query("SELECT id, v FROM d ORDER BY id", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "new".to_string()),
+                (2, "x".to_string()),
+                (3, "b".to_string()),
+                (10, "a".to_string())
+            ]
+        );
+    });
+    server.stop();
+}

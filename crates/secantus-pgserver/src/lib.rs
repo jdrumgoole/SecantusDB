@@ -15859,20 +15859,30 @@ const MAX_PREPARED_TRANSACTIONS_TEXT: &str = "100";
 /// What a READ COMMITTED statement can read ([`PgHandler::rc_read_set`]):
 /// the namespaces (`db.collection`) of its tables, and every catalog.
 struct RcReadSet {
-    tables: Vec<String>,
+    /// Read any way.
+    all: Vec<String>,
+    /// Read only by keys the statement also writes.
+    changes: Vec<String>,
 }
 
 impl RcReadSet {
-    /// Can the statement read `(db, coll)`? Compared as the joined
+    /// How the statement reads `(db, coll)`. Compared as the joined
     /// namespace, so a dotted database name cannot split it wrongly; every
-    /// `__` collection (the catalogs, grants, ...) counts except the
+    /// `__` collection (the catalogs, grants, ...) is read except the
     /// sequences, which `nextval` reads and writes outside the transaction.
-    fn reads(&self, db: &str, coll: &str) -> bool {
+    fn reads(&self, db: &str, coll: &str) -> secantus_storage::NsRead {
+        use secantus_storage::NsRead;
         let ns = format!("{db}.{coll}");
-        if self.tables.contains(&ns) {
-            return true;
+        if self.all.contains(&ns) {
+            return NsRead::All;
         }
-        ns.contains(".__") && !ns.ends_with(&format!(".{SEQUENCE_COLLECTION}"))
+        if self.changes.contains(&ns) {
+            return NsRead::Changes;
+        }
+        if ns.contains(".__") && !ns.ends_with(&format!(".{SEQUENCE_COLLECTION}")) {
+            return NsRead::All;
+        }
+        NsRead::No
     }
 }
 
@@ -21342,11 +21352,37 @@ impl PgHandler {
             return None;
         }
         let db = self.db();
-        let mut tables = vec![format!("{db}.{}", ins.table)];
+        // The target is read for its unique checks. When its only unique key
+        // is the primary key -- the `_id` -- and that compares by its bytes,
+        // a row another session INSERTED under a key this one writes is a
+        // write conflict WiredTiger reports (and the re-run then answers
+        // 23505), so only a change of existing rows there (an update or a
+        // delete, which the snapshot would miss) needs a fresh snapshot. Any
+        // other unique index or constraint, or a PK under a collation, is
+        // checked by reading: any commit there matters.
+        let pk_by_bytes = def
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .all(|c| secantus_pgplan::collation::column_collation(c).is_none());
+        let only_id = def.unique_constraints.is_empty()
+            && pk_by_bytes
+            && self
+                .storage
+                .list_indexes(db, &ins.table)
+                .ok()?
+                .iter()
+                .all(|ix| ix.get_str("name") == Ok("_id_"));
+        let target = format!("{db}.{}", ins.table);
+        let (mut all, changes) = if only_id {
+            (Vec::new(), vec![target])
+        } else {
+            (vec![target], Vec::new())
+        };
         for fk in &def.foreign_keys {
-            tables.push(format!("{db}.{}", fk.ref_table));
+            all.push(format!("{db}.{}", fk.ref_table));
         }
-        Some(RcReadSet { tables })
+        Some(RcReadSet { all, changes })
     }
 
     fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
