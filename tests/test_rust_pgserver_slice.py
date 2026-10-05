@@ -17300,3 +17300,81 @@ def _b54_unique_after_move(a: psycopg.Connection, b: psycopg.Connection) -> None
         assert a.execute(
             "select indisunique from pg_index where indexrelid = 'b54_u_bc'::regclass"
         ).fetchone() == (True,), variant
+
+
+def test_batch56_read_committed_reads_another_table_without_moving(home: Path) -> None:
+    """A READ COMMITTED block that has written and then READS a table it has
+    not written, while other sessions keep committing there, used to be
+    moved onto a new snapshot -- replaying its whole write set -- before
+    every such read (quadratic). A plain read of a table the block has not
+    written now runs in a fresh read-only transaction of its own: the same
+    rows a per-statement snapshot sees, with the block's writes kept.
+    Where the block HAS written the table it reads, it still moves.
+    PostgreSQL 15.19 gives these answers."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table b56_w (id int primary key, v text)")
+        a.execute("create table b56_r (id int primary key, n int)")
+        a.execute("insert into b56_r values (1, 0)")
+        a.execute("begin")
+        for i in range(1, 30):
+            a.execute("insert into b56_w values (%s, 'x')", (i,))
+            b.execute("update b56_r set n = %s where id = 1", (i,))
+            assert a.execute("select n from b56_r where id = 1").fetchone() == (i,)
+        # Its own writes are still there, and a read of the written table
+        # sees them together with another session's commit.
+        b.execute("insert into b56_r values (2, 7)")
+        assert a.execute("select count(*) from b56_w").fetchone() == (29,)
+        a.execute("update b56_r set n = 100 where id = 1")
+        b.execute("insert into b56_r values (3, 8)")
+        assert a.execute("select id, n from b56_r order by id").fetchall() == [
+            (1, 100),
+            (2, 7),
+            (3, 8),
+        ]
+        a.execute("commit")
+        assert b.execute("select count(*) from b56_w").fetchone() == (29,)
+        assert b.execute("select n from b56_r where id = 1").fetchone() == (100,)
+
+
+def test_batch56_a_streamed_portal_with_order_by(home: Path) -> None:
+    """An extended-protocol SELECT with ORDER BY outside a block is now
+    streamed, sorted by the reader in bounded memory (it was read whole).
+    The rows, NULL placement, OFFSET and LIMIT are those of the materialised
+    path -- PostgreSQL 15.19's answers."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b56_s (id int primary key, k int, t text)")
+        conn.execute(
+            "insert into b56_s select g, case when g % 7 = 0 then null else (g * 37) % 11 end,"
+            " 'r' || g from generate_series(1, 300) g"
+        )
+        q = "select id, k from b56_s order by k desc nulls last, id limit %s offset %s"
+        with conn.cursor() as cur:
+            got = list(cur.stream(q, (50, 20)))
+        expected = sorted(
+            [(g, None if g % 7 == 0 else (g * 37) % 11) for g in range(1, 301)],
+            key=lambda r: (r[1] is None, -(r[1] or 0), r[0]),
+        )[20:70]
+        assert got == expected
+        with conn.cursor() as cur:
+            whole = list(cur.stream("select t from b56_s order by t limit %s", (1000,)))
+        assert whole == sorted(whole) and len(whole) == 300
+
+
+def test_batch56_an_immutable_sql_function_over_constants_runs_as_itself(home: Path) -> None:
+    """PostgreSQL's planner tries `evaluate_function` before `inline_function`:
+    an IMMUTABLE function called over constants is RUN, so its error has the
+    `statement 1` frame, where a volatile one is inlined and folded (`during
+    inlining`). Both said `during inlining` here. PostgreSQL 15.19's answers."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "create function b56_g(int) returns int language sql immutable as 'select 1 / $1'"
+        )
+        conn.execute("create function b56_f(x int) returns int language sql as $$ select 1/x $$")
+        for sql, context in (
+            ("select b56_g(0)", 'SQL function "b56_g" statement 1'),
+            ("select b56_g(abs(0))", 'SQL function "b56_g" statement 1'),
+            ("select b56_f(0)", 'SQL function "b56_f" during inlining'),
+        ):
+            with pytest.raises(psycopg.errors.DivisionByZero) as err:
+                conn.execute(sql)
+            assert err.value.diag.context == context, sql

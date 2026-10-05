@@ -21,9 +21,11 @@
 //!   block the portal must read the BLOCK's snapshot, which lives on the
 //!   block's session, so a block's portal is materialised as before;
 //! - a plain SELECT of stored columns from one stored table of built-in
-//!   types: no join, subquery source, series, window, DISTINCT, ORDER BY,
-//!   per-row WHERE residual or computed column (each of those needs every row,
-//!   or thread-local session state, before the first row can go out);
+//!   types: no join, subquery source, series, window, DISTINCT, per-row
+//!   WHERE residual or computed column (each of those needs every row, or
+//!   thread-local session state, before the first row can go out). An ORDER
+//!   BY of stored columns is sorted by the reader in bounded memory
+//!   (`external_sort`) outside a block; a block's scan streams without one;
 //! - with a WHERE, only when the client fetches in pieces (`max_rows > 0`):
 //!   the streamed read is a collection scan, which an indexed lookup should
 //!   not be traded for when the whole result is wanted at once.
@@ -150,7 +152,12 @@ impl PgHandler {
         if mode == STREAM_NEVER || (mode == STREAM_UNFILTERED && !sel.filter.is_empty()) {
             return Ok(None);
         }
-        let Some(def) = self.streamable(sel) else {
+        // Outside a block an ORDER BY is sorted by the reader
+        // (`external_sort`); a block's scan reads a batch per fetch.
+        let in_block = self
+            .stream_in_block
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let Some(def) = self.streamable(sel, !in_block) else {
             return Ok(None);
         };
         // A `DECLARE CURSOR` capture needs the rows as they are encoded on
@@ -168,7 +175,7 @@ impl PgHandler {
 
     /// The table definition of `sel` when it is a plain read of one stored
     /// table that can be streamed (see the module doc), else `None`.
-    fn streamable(&self, sel: &secantus_pgplan::Select) -> Option<TableDef> {
+    fn streamable(&self, sel: &secantus_pgplan::Select, sorted: bool) -> Option<TableDef> {
         // A `FOR UPDATE` locks the rows it returns, which the reader
         // thread's own session could not do for this transaction.
         let plain = sel.lock.is_none()
@@ -177,7 +184,7 @@ impl PgHandler {
             && sel.join.is_none()
             && sel.series.is_none()
             && sel.windows.is_empty()
-            && sel.order.is_empty()
+            && (sel.order.is_empty() || (sorted && sel.order.iter().all(|k| k.expr.is_none())))
             && sel.distinct == secantus_pgplan::Distinct::None
             && sel.residual.is_none()
             && sel.casts.iter().all(Option::is_none)
@@ -246,6 +253,7 @@ impl PgHandler {
         let db = self.db().to_string();
         let table = sel.table.clone();
         let filter = sel.filter.clone();
+        let order = sel.order.clone();
         let mut skip = usize::try_from(sel.offset).unwrap_or(0);
         let mut left = sel
             .limit
@@ -285,6 +293,50 @@ impl PgHandler {
                 // closed): then nobody is waiting for the error either.
                 err.map(|e| tx.blocking_send(Err(e)).is_ok())
             };
+            if !order.is_empty() {
+                // An ORDER BY: every row is read before the first goes out,
+                // sorted in bounded memory (`external_sort`).
+                let stopped = std::cell::Cell::new(false);
+                let worked = std::cell::Cell::new(worked);
+                let since = std::cell::Cell::new(since);
+                // Work since the last hand-off; `false` once stopped.
+                let tick = || {
+                    worked.set(worked.get() + since.get().elapsed());
+                    since.set(std::time::Instant::now());
+                    if stop(&tx, worked.get()).is_some() {
+                        stopped.set(true);
+                    }
+                    !stopped.get()
+                };
+                let sorted = crate::external_sort::sorted_rows(
+                    |sink| {
+                        storage
+                            .scan_matching_batches(&db, &table, &filter, BATCH, |blobs| {
+                                tick() && sink(blobs)
+                            })
+                            .map_err(|e| e.to_string())
+                    },
+                    &order,
+                    skip,
+                    left,
+                    BATCH,
+                    |docs| {
+                        if !tick() {
+                            return false;
+                        }
+                        let sent = tx.blocking_send(Ok(docs)).is_ok();
+                        // Waiting for the client to fetch is not work.
+                        since.set(std::time::Instant::now());
+                        sent
+                    },
+                );
+                if let Err(e) = sorted {
+                    if !stopped.get() {
+                        let _sent = tx.blocking_send(Err(PgHandler::user_error("XX000", e)));
+                    }
+                }
+                return;
+            }
             let scanned = storage.scan_matching_batches(&db, &table, &filter, BATCH, |blobs| {
                 worked += since.elapsed();
                 since = std::time::Instant::now();
@@ -464,7 +516,7 @@ impl PgHandler {
         scrollable: bool,
         holdable: bool,
     ) -> PgWireResult<Option<CursorState>> {
-        let Some(def) = self.streamable(sel) else {
+        let Some(def) = self.streamable(sel, false) else {
             return Ok(None);
         };
         let tz = self.session_timezone();

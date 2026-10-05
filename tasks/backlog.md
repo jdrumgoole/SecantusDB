@@ -721,8 +721,16 @@ remain open:
         (cursor), 695 -> 24 MB (WITH HOLD). Any statement other than FETCH /
         MOVE / CLOSE first reads open ones whole (as before), and so does
         COMMIT for a WITH HOLD cursor -- PostgreSQL materialises it there
-        too. Left: joins, ORDER BY, aggregates and other shapes still
-        materialise.
+        too. **Batch 56:** an extended portal OUTSIDE a block with an ORDER
+        BY of stored columns streams too: the reader sorts runs of at most
+        16 MB, spills them to anonymous temporary files and merges them
+        stably (`external_sort.rs`; a LIMIT of at most 100,000 rows keeps a
+        top-k in memory). 300,000 rows of 2 KB, `order by k desc, id`, after
+        a restart: server RSS growth 1432 MB (base `742b9134`) -> 636 MB, the
+        same as the unordered stream (629 MB -- WiredTiger's cache filling).
+        Left: joins, aggregates, DISTINCT, ORDER BY over an expression, and
+        ORDER BY in a block's portal or cursor still materialise (a join
+        would stream its outer side; an aggregate's memory is its groups).
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -832,7 +840,19 @@ remain open:
         (Batch 52: PostgreSQL pulls up `(select 0) v(a)` the same way; the
         call's argument kind is decided over row parameters at evaluation
         (`call_args_kind`), where a constant-sourced column is no longer
-        distinguishable -- left as measured.)
+        distinguishable -- left as measured.) (Batch 56, re-measured on
+        PostgreSQL 15.19: still open, and wider than one shape --
+        `(values (0)) v(a)`, `(select 0) v(a)`, `(select 0 as a) v`, an
+        argument `a + 0`, a WHERE beside it and the call inside a further
+        FROM-subquery all say `during inlining` there and give no CONTEXT
+        here; a TWO-row VALUES has none on both. The projection that
+        evaluates the call is a lazy row stream, so the "this field is a
+        pulled-up constant" fact has to travel on the `ColumnExpr` itself.)
+        FIXED in batch 56: an IMMUTABLE SQL function over constants
+        (`g(0)`, `g(abs(0))`) said `during inlining`; PostgreSQL's planner
+        tries `evaluate_function` first and RUNS it, so its error has
+        `statement 1` (slice test `test_batch56_an_immutable_sql_function_
+        over_constants_runs_as_itself`).
       - `pg_collation_for(x)`: FIXED batch 52 (corpus `b52_collation_for`,
         21 lines, 0 against PostgreSQL 15) -- 42804 over a non-collatable
         type (a table column's at planning, as PostgreSQL's parse analysis
@@ -1066,9 +1086,20 @@ remain open:
         counted every commit to the target: three sessions' pipelined
         inserts into one table then replayed thousand-entry write sets and
         psycopg's `test_type_error_shadow` went 10.8 -> 14.4 s, near its
-        20 s timeout; it is 10.8 s again.) Left: a long block whose
-        statements READ a table others keep committing to still replays
-        its write set per statement (correct, quadratic). Every move --
+        20 s timeout; it is 10.8 s again.) **Batch 56:** a long block
+        whose statements READ a table others keep committing to replayed its
+        write set per statement (quadratic: 200 / 400 / 800 insert-then-read
+        pairs beside a committing writer took 3.2 / 12.8 / 54.3 s, debug). A
+        plain one-table SELECT (no join, subquery, window, residual WHERE,
+        computed column or row lock) of a table the block has not written --
+        nor any catalog -- with no rules, RLS, inheritance or partitioning
+        now runs in a fresh read-only transaction of its own (`rc_reads_apart`,
+        `read_apart`; not registered for row waits, rolled back after), which
+        is the per-statement snapshot itself, and the block keeps its own:
+        0.33 / 0.63 / 1.25 s, linear (PG 15: 0.08 s at 800); slice test
+        `test_batch56_read_committed_reads_another_table_without_moving`
+        (PostgreSQL 15.19's answers). Left: any other shape of read (a join,
+        an aggregate, a read of a table the block wrote) still moves. Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
@@ -1108,12 +1139,17 @@ remain open:
         returned is locked (slice test
         `test_batch54_for_update_through_a_join_locks_only_the_rows_returned`).
       Left (design notes, not divergences the probe shows):
-      - REPEATABLE READ answers 40001 after the wait when ANY transaction
-        committed since its snapshot, where PostgreSQL goes on unless the
-        ROW changed: WiredTiger cannot continue a transaction after a
-        conflict, and moving it to a new snapshot is only invisible when
-        nothing committed (closed as far as WiredTiger allows; a client must
-        retry a 40001 in any case).
+      - CLOSED (scope decision, batch 56): REPEATABLE READ answers 40001
+        after the wait when ANY transaction committed since its snapshot,
+        where PostgreSQL goes on unless the ROW changed. WiredTiger cannot
+        continue a transaction after a conflict, so going on means a new
+        snapshot, and under REPEATABLE READ that is invisible only when
+        nothing it could read later committed -- which is unknowable for the
+        rest of the transaction (narrowing to "nothing committed to the
+        conflicting table" would let a later read of another table see
+        rows committed after the snapshot: a wrong answer, worse than a
+        40001 every client must retry anyway). The holder committing the row
+        itself is 40001 in PostgreSQL too.
       - A prepared transaction's rows give no deadlock edge (it holds them
         but waits on nothing, so it can close no cycle); a crash between a
         live `COMMIT PREPARED`'s WiredTiger commit and the record's deletion
@@ -7656,8 +7692,12 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
   session-tz offset (`infinity` is correct for it), and the clock-dependent
   input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
-- [ ] **OPEN — RUST pgserver: correlated subqueries, what is left
-      (performance only; re-timed 2026-10-03, batch 50: `subqueries`,
+- [x] **CLOSED (batch 56, 2026-10-06: batch 55 left nothing per outer
+      value, and the full corpus sweep on batch 56's build has `subqueries`,
+      `correlated`, `correlated_hash`, `semi_join`, `not_in_large` and
+      `b50`-`b55` correlated corpora at 0 against PostgreSQL 15; a new
+      cost shape gets a new entry) — RUST pgserver: correlated subqueries,
+      what is left (performance only; re-timed 2026-10-03, batch 50: `subqueries`,
       `correlated`, `correlated_hash`, `semi_join`, `not_in_large`,
       `b50_semijoin` all at 0 against PostgreSQL -- every item below is a
       cost, none an answer).** A correlated subquery becomes an internal

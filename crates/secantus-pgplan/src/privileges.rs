@@ -36,6 +36,52 @@ pub fn builtin_calls(
 /// relation, and a view's DEFINITION is not checked here: `CREATE VIEW`
 /// over a table the creator cannot read succeeds, and is refused on use.
 pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
+    // Asked for every statement (the table locks, the privilege check): the
+    // parse-tree walk is remembered per thread by text.
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(String, &'static str)>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    // The names are resolved through the search path afterwards: only the
+    // parse-tree walk is a function of the text alone.
+    let raw = memoised(&MEMO, sql, sql_relations_uncached);
+    let mut out = Vec::with_capacity(raw.len());
+    for (r, p) in raw {
+        let (schema, name) = r.split_once('\u{1f}').unwrap_or(("", r.as_str()));
+        push(&mut out, &key_parts(schema, name), p);
+    }
+    out
+}
+
+/// A relation as written -- `schema<U+001F>name` -- for `sql_relations`'
+/// memo, resolved by `key_parts` on every call.
+fn raw_key(r: &pg_query::protobuf::RangeVar) -> String {
+    format!("{}\u{1f}{}", r.schemaname, r.relname)
+}
+
+/// `f(sql)`, remembered in `memo` (at most `MEMO_MAX` texts; emptied when
+/// full).
+fn memoised<V: Clone>(
+    memo: &'static std::thread::LocalKey<std::cell::RefCell<std::collections::HashMap<String, V>>>,
+    sql: &str,
+    f: impl FnOnce(&str) -> V,
+) -> V {
+    const MEMO_MAX: usize = 512;
+    if let Some(v) = memo.with(|m| m.borrow().get(sql).cloned()) {
+        return v;
+    }
+    let v = f(sql);
+    memo.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= MEMO_MAX {
+            m.clear();
+        }
+        m.insert(sql.to_string(), v.clone());
+    });
+    v
+}
+
+fn sql_relations_uncached(sql: &str) -> Vec<(String, &'static str)> {
     let Ok(parsed) = parse_tree(sql) else {
         return Vec::new();
     };
@@ -52,44 +98,44 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
             }
             Some(N::InsertStmt(i)) => {
                 if let Some(r) = &i.relation {
-                    targets.push((key(r), "INSERT"));
+                    targets.push((raw_key(r), "INSERT"));
                     let updates = i.on_conflict_clause.as_ref().is_some_and(|c| {
                         c.action == pg_query::protobuf::OnConflictAction::OnconflictUpdate as i32
                     });
                     if updates {
-                        targets.push((key(r), "UPDATE"));
+                        targets.push((raw_key(r), "UPDATE"));
                     }
                     if !i.returning_list.is_empty() {
-                        targets.push((key(r), "SELECT"));
+                        targets.push((raw_key(r), "SELECT"));
                     }
                 }
             }
             Some(N::UpdateStmt(u)) => {
                 if let Some(r) = &u.relation {
-                    targets.push((key(r), "UPDATE"));
+                    targets.push((raw_key(r), "UPDATE"));
                     if u.where_clause.is_some() || !u.returning_list.is_empty() {
-                        targets.push((key(r), "SELECT"));
+                        targets.push((raw_key(r), "SELECT"));
                     }
                 }
             }
             Some(N::DeleteStmt(d)) => {
                 if let Some(r) = &d.relation {
-                    targets.push((key(r), "DELETE"));
+                    targets.push((raw_key(r), "DELETE"));
                     if d.where_clause.is_some() || !d.returning_list.is_empty() {
-                        targets.push((key(r), "SELECT"));
+                        targets.push((raw_key(r), "SELECT"));
                     }
                 }
             }
             Some(N::TruncateStmt(t)) => {
                 for r in &t.relations {
                     if let Some(N::RangeVar(r)) = r.node.as_ref() {
-                        targets.push((key(r), "TRUNCATE"));
+                        targets.push((raw_key(r), "TRUNCATE"));
                     }
                 }
             }
             Some(N::CopyStmt(c)) => {
                 if let Some(r) = &c.relation {
-                    targets.push((key(r), if c.is_from { "INSERT" } else { "SELECT" }));
+                    targets.push((raw_key(r), if c.is_from { "INSERT" } else { "SELECT" }));
                 }
             }
             _ => {}
@@ -110,7 +156,7 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
             if let pg_query::NodeRef::RangeVar(r) = node {
                 let catalog = matches!(r.schemaname.as_str(), "pg_catalog" | "information_schema");
                 if *context == pg_query::Context::Select && !catalog && !ctes.contains(&r.relname) {
-                    push(&mut out, &key(r), "SELECT");
+                    push(&mut out, &raw_key(r), "SELECT");
                 }
             }
         }
@@ -231,19 +277,22 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
 /// search path), else the bare name -- so a privilege is checked on the
 /// table the statement reads, not on whichever shares its bare name.
 fn key(r: &pg_query::protobuf::RangeVar) -> String {
-    let s = r.schemaname.as_str();
+    key_parts(&r.schemaname, &r.relname)
+}
+
+fn key_parts(s: &str, relname: &str) -> String {
     if s.is_empty() {
-        let found = crate::schemas::resolve_unqualified(&r.relname);
+        let found = crate::schemas::resolve_unqualified(relname);
         return if found.starts_with("pg_temp_") {
-            r.relname.clone()
+            relname.to_string()
         } else {
             found
         };
     }
     if s == "pg_temp" || s.starts_with("pg_temp_") {
-        return r.relname.clone();
+        return relname.to_string();
     }
-    crate::schemas::relation_key(s, &r.relname)
+    crate::schemas::relation_key(s, relname)
 }
 
 fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static str) {
@@ -258,6 +307,14 @@ fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static 
 /// still reading the table; `CREATE INDEX` takes SHARE (which a reader does
 /// not block). Empty for any other statement.
 pub fn ddl_locks(sql: &str) -> Vec<(String, i32)> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(String, i32)>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    memoised(&MEMO, sql, ddl_locks_uncached)
+}
+
+fn ddl_locks_uncached(sql: &str) -> Vec<(String, i32)> {
     use pg_query::protobuf::ObjectType;
     let Ok(parsed) = parse_tree(sql) else {
         return Vec::new();
