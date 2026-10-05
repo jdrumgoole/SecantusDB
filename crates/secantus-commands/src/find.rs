@@ -340,7 +340,13 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let skip = doc.get("skip").and_then(as_i64).unwrap_or(0).max(0) as usize;
     let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).max(0) as usize; // 0 ⇒ no limit
-    let sort = doc.get("sort").and_then(Bson::as_document);
+                                                                                // Validated above; normalised so a decimal or fractional direction reaches
+                                                                                // storage as the 1 / -1 mongod reads it as (a decimal -1 sorted ascending).
+    let sort_owned = doc
+        .get("sort")
+        .and_then(Bson::as_document)
+        .map(argtypes::normalise_sort_spec);
+    let sort = sort_owned.as_ref();
     // An empty projection means "no projection" (return full docs). Mutable
     // because `returnKey` / `showRecordId` rewrite the result set and then
     // suppress any normal projection (mongod ignores `projection` for them).

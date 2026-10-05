@@ -40,7 +40,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     ] {
         argtypes::require_object(doc, field, path)?;
     }
-    argtypes::require_array(doc, "arrayFilters", "findAndModify.arrayFilters")?;
+    argtypes::require_array_of_objects(doc, "arrayFilters", "findAndModify.arrayFilters")?;
     argtypes::require_hint(doc, "hint")?;
     // An undefined `$$variable` is a PARSE error (17276). The `update` may be a
     // PIPELINE, whose stages carry mongod's `Invalid $<stage> :: caused by ::`
@@ -86,6 +86,9 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             ))
         }
     };
+    if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
     // `query` must be a document. mongod rejects a bare value (e.g. an ObjectId
     // passed as a findOneAnd* filter) with TypeMismatch (14) rather than treating
     // it as an empty filter — mongo-node-driver's "object ids as a query
@@ -186,7 +189,9 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
         .unwrap_or_default();
     if let Some(Bson::Document(u)) = doc.get("update") {
-        if let Some(e) = argtypes::array_filter_identifier_error(u, &array_filters) {
+        if let Some(e) = argtypes::array_filters_problem(&array_filters)
+            .or_else(|| argtypes::array_filter_identifier_error(u, &array_filters))
+        {
             return Ok(e.into_reply());
         }
     }

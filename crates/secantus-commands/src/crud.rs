@@ -190,6 +190,9 @@ fn empty_batch(doc: &Document, field: &str) -> Result<(), CommandError> {
 
 pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "insert")?;
+    if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
     argtypes::require_bool_field(doc, "ordered", "insert.ordered")?;
     argtypes::require_object(doc, "writeConcern", "insert.writeConcern")?;
     // `bypassDocumentValidation` is the bool-OR-number family (`1.5` is valid),
@@ -328,6 +331,9 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `delete` — batch delete, one entry per `{q, limit}` spec.
 pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "delete")?;
+    if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
     argtypes::require_bool_field(doc, "ordered", "delete.ordered")?;
     empty_batch(doc, "deletes")?;
     for spec in array_field(doc, "deletes").iter() {
@@ -610,6 +616,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
     empty_batch(doc, "updates")?;
     let coll = coll_arg(doc, "update")?;
+    if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
     let storage = ctx.storage()?;
     let updates = array_field(doc, "updates");
     // NOTE: an unresolvable `hint` is a PER-STATEMENT writeError, not a
@@ -675,7 +684,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // number. Adjacent slots, different rules -- probed, not inferred.
         argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
         argtypes::require_object(spec, "collation", "update.updates.collation")?;
-        argtypes::require_array(spec, "arrayFilters", "update.updates.arrayFilters")?;
+        argtypes::require_array_of_objects(spec, "arrayFilters", "update.updates.arrayFilters")?;
         argtypes::require_hint(spec, "hint")?;
 
         // An unresolvable `hint` fails THIS statement, not the batch (see the
@@ -890,7 +899,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // statements still apply. It used to fail the whole command, which
             // a driver sees as a different exception class entirely
             // (`OperationFailure` rather than `WriteError`).
-            if let Some(e) = argtypes::array_filter_identifier_error(&u, &array_filters) {
+            if let Some(e) = argtypes::array_filters_problem(&array_filters)
+                .or_else(|| argtypes::array_filter_identifier_error(&u, &array_filters))
+            {
                 write_errors.push(Bson::Document(doc! {
                     "index": index as i32,
                     "code": e.code,

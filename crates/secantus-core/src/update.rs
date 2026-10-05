@@ -99,7 +99,7 @@ fn rename_array_field<'a>(doc: &'a Document, path: &'a str) -> Option<&'a str> {
 
 /// An arrayFilter identifier: begins with a lowercase ASCII letter, then ASCII
 /// alphanumerics (mirrors Python's `^[a-z][a-zA-Z0-9]*$`).
-fn is_valid_af_ident(s: &str) -> bool {
+pub fn is_valid_af_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_alphanumeric())
