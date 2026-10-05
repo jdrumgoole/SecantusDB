@@ -317,11 +317,17 @@ impl Late {
                 } else {
                     std::cmp::Ordering::Greater
                 };
+                // `SumOf::Numeric` marks a `numeric` argument: exact order.
+                let order = if of == SumOf::Numeric {
+                    numeric_order
+                } else {
+                    sql_order
+                };
                 let mut best: Option<&Bson> = None;
                 for v in present {
                     best = Some(match best {
                         None => v,
-                        Some(b) if sql_order(v, b)? == want => v,
+                        Some(b) if order(v, b)? == want => v,
                         Some(b) => b,
                     });
                 }
@@ -449,12 +455,16 @@ impl Late {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Filter {
     param: usize,
     op: Op,
     /// The column is `numeric`: compared by exact value (`numeric_order`).
     numeric: bool,
+    /// The column is text under a collation other than byte order: its
+    /// values are held as that collation's sort keys
+    /// (`collation::sort_key`), and a bound is keyed the same way.
+    collation: Option<String>,
 }
 
 /// SQL's ordering of two `numeric` (or integer) values by their exact
@@ -710,7 +720,7 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
             }
             key.push(k);
         }
-        let mut bounds = Vec::with_capacity(ix.filters.len());
+        let mut bounds: Vec<std::borrow::Cow<'_, Bson>> = Vec::with_capacity(ix.filters.len());
         for f in &ix.filters {
             let Some(v) = params.get(f.param) else {
                 return Ok(None);
@@ -722,7 +732,15 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                     None => Some(Vec::new()),
                 });
             }
-            bounds.push(v);
+            match (&f.collation, v) {
+                (None, _) => bounds.push(std::borrow::Cow::Borrowed(v)),
+                (Some(c), Bson::String(t)) => match crate::collation::sort_key(c, t) {
+                    Ok(k) => bounds.push(std::borrow::Cow::Owned(Bson::String(k))),
+                    Err(_) => return Ok(None),
+                },
+                // A bound that is not text: the per-row path's coercion.
+                (Some(_), _) => return Ok(None),
+            }
         }
         match ix.rows.get(&key) {
             Some(rows) => {
@@ -734,6 +752,7 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                             pass = false;
                             break;
                         }
+                        let bound: &Bson = bound;
                         let o = if f.numeric {
                             numeric_order(v, bound)
                         } else {
@@ -776,6 +795,7 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         sql: rewritten,
         params,
         filters,
+        probes,
         aggregate,
         late,
         limit,
@@ -808,6 +828,9 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
     let mut kinds: Vec<Kinds> = vec![Kinds::default(); nkeys];
     let nfilters = filters.len();
     let text_ok = crate::collation::text_is_byte_ordered();
+    // Per filter, once learned: the column's collation (`Some(None)` for
+    // byte order).
+    let mut collations: Vec<Option<Option<String>>> = vec![None; nfilters];
     let mut index: Groups = HashMap::new();
     for mut row in rows {
         if row.len() < nkeys + 2 * nfilters + usize::from(late.is_some()) {
@@ -817,10 +840,21 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         // orderable as a filter column is (its type is the last column).
         if let Some(late) = late {
             let ty = row.pop().unwrap_or(Bson::Null);
-            if matches!(late, Late::Min | Late::Max)
-                && !row.first().is_some_and(|v| orderable(v, &ty, text_ok))
-            {
-                return Ok(Entry::No);
+            if matches!(late, Late::Min | Late::Max) {
+                // A `numeric` argument orders by exact value (`SumOf::Numeric`
+                // tells `Late::over` so); anything else as a filter column.
+                let numeric = matches!(&ty, Bson::String(t) if t == "numeric");
+                let ok = if numeric {
+                    row.first()
+                        .is_some_and(|v| matches!(v, Bson::Null) || numeric_order(v, v).is_some())
+                } else {
+                    row.first().is_some_and(|v| orderable(v, &ty, text_ok))
+                };
+                let of = if numeric { SumOf::Numeric } else { SumOf::Int };
+                if !ok || sum_of.is_some_and(|s| s != of) {
+                    return Ok(Entry::No);
+                }
+                sum_of = Some(of);
             }
             // A sum / avg only over the types `SumOf` adds up exactly as
             // PostgreSQL does, all of one type.
@@ -839,8 +873,13 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         }
         // Each filter column, then its type's name (`pg_typeof(col)::text`).
         let ftypes = row.split_off(row.len() - nfilters);
-        let fvals = row.split_off(row.len() - nfilters);
-        for ((v, t), f) in fvals.iter().zip(&ftypes).zip(filters.iter_mut()) {
+        let mut fvals = row.split_off(row.len() - nfilters);
+        for (i, ((v, t), f)) in fvals
+            .iter_mut()
+            .zip(&ftypes)
+            .zip(filters.iter_mut())
+            .enumerate()
+        {
             if matches!(t, Bson::String(t) if t == "numeric") {
                 // A `numeric` column orders by exact value.
                 if !matches!(v, Bson::Null) && numeric_order(v, v).is_none() {
@@ -848,7 +887,28 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
                 }
                 f.numeric = true;
             } else if !orderable(v, t, text_ok) {
-                return Ok(Entry::No);
+                // Plain text when some collation exists: ordered by the
+                // column's own collation, as the per-row comparison is.
+                let Bson::String(text) = &*v else {
+                    return Ok(Entry::No);
+                };
+                if !plain_text(t) {
+                    return Ok(Entry::No);
+                }
+                if collations[i].is_none() {
+                    let Some(c) = probes.get(i).and_then(|p| column_collation(p, run)) else {
+                        return Ok(Entry::No);
+                    };
+                    collations[i] = Some(c);
+                }
+                let c = collations[i].clone().flatten();
+                f.collation.clone_from(&c);
+                if let Some(c) = c {
+                    match crate::collation::sort_key(&c, text) {
+                        Ok(k) => *v = Bson::String(k),
+                        Err(_) => return Ok(Entry::No),
+                    }
+                }
             }
         }
         let keys = row.split_off(row.len() - nkeys);
@@ -910,6 +970,37 @@ fn orderable(v: &Bson, ty: &Bson, text_ok: bool) -> bool {
     }
 }
 
+/// Is `ty` (`pg_typeof(...)::text`) a plain text type?
+fn plain_text(ty: &Bson) -> bool {
+    matches!(ty, Bson::String(t) if matches!(t.as_str(), "text" | "character varying" | "name"))
+}
+
+/// The collation a filter column compares under, from its probe
+/// (`pg_collation_for(col)` over the FROM): `Some(None)` for the default --
+/// byte order -- or `C` / `POSIX`, `Some(Some(name))` for another one, and
+/// `None` when it cannot be learned (the per-row path then answers).
+fn column_collation(probe: &str, run: Runner) -> Option<Option<String>> {
+    let rows = run(probe, &[]).ok()?;
+    let Some(row) = rows.first() else {
+        // No rows: nothing will be compared.
+        return Some(None);
+    };
+    let Some(Bson::String(name)) = row.first() else {
+        return None;
+    };
+    let name = name
+        .strip_prefix('"')
+        .and_then(|n| n.strip_suffix('"'))
+        .map_or_else(|| name.clone(), |n| n.replace("\"\"", "\""));
+    match name.as_str() {
+        "default" | "C" | "POSIX" | "ucs_basic" => Some(None),
+        _ => {
+            crate::collation::resolve(&name).ok()?;
+            Some(Some(name))
+        }
+    }
+}
+
 fn nondeterministic_collation_exists() -> bool {
     crate::extension_installed("citext")
         || crate::collation::user_collations()
@@ -921,6 +1012,9 @@ struct Rewritten {
     sql: String,
     params: Vec<usize>,
     filters: Vec<Filter>,
+    /// Per filter, a query answering its column's collation
+    /// (`SELECT pg_collation_for(col) FROM ... LIMIT 1`).
+    probes: Vec<String>,
     aggregate: bool,
     late: Option<Late>,
     limit: Option<usize>,
@@ -1044,6 +1138,7 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
                         param: p,
                         op,
                         numeric: false,
+                        collation: None,
                     },
                 )),
             }
@@ -1088,8 +1183,10 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     }
     let mut filter_list = Vec::new();
     let mut types = Vec::new();
+    let mut probes = Vec::new();
     for (col, f) in filters {
         types.push(type_name_of(col.clone())?);
+        probes.push(collation_probe(s, &col)?);
         s.target_list.push(target(col));
         filter_list.push(f);
     }
@@ -1102,11 +1199,38 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
         sql: text,
         params,
         filters: filter_list,
+        probes,
         aggregate,
         late,
         limit,
         offset,
     })
+}
+
+/// `SELECT pg_collation_for(col) FROM <s's FROM> LIMIT 1`: the collation a
+/// filter column compares under. Asked only when the column is text and
+/// some collation exists (`pg_collation_for` of a non-collatable column is
+/// an error, which the build never reaches).
+fn collation_probe(
+    s: &pg_query::protobuf::SelectStmt,
+    col: &pg_query::protobuf::Node,
+) -> Option<String> {
+    let mut parsed = pg_query::parse("SELECT pg_collation_for(x) FROM t LIMIT 1")
+        .ok()?
+        .protobuf;
+    let stmt = parsed.stmts.first_mut()?.stmt.as_mut()?;
+    let Some(N::SelectStmt(p)) = stmt.node.as_mut() else {
+        return None;
+    };
+    let N::ResTarget(rt) = p.target_list.first_mut()?.node.as_mut()? else {
+        return None;
+    };
+    let Some(N::FuncCall(fc)) = rt.val.as_mut()?.node.as_mut() else {
+        return None;
+    };
+    fc.args = vec![col.clone()];
+    p.from_clause.clone_from(&s.from_clause);
+    pg_query::deparse(&parsed).ok()
 }
 
 /// `sql` (a SELECT) selecting the constant `1` instead of its select list.
@@ -1542,6 +1666,29 @@ mod tests {
             Some(Bson::Double(2.5))
         );
         assert_eq!(Late::Min.over(&[], SumOf::Int), Some(Bson::Null));
+        // A `numeric` argument orders by exact value, NaN above every number;
+        // a float among them is not orderable here (the per-row path's).
+        let (d1, d2, nan) = (
+            Bson::String("10.250".into()),
+            Bson::String("9.99".into()),
+            Bson::String("NaN".into()),
+        );
+        assert_eq!(
+            Late::Max.over(&[&d1, &d2], SumOf::Numeric),
+            Some(d1.clone())
+        );
+        assert_eq!(
+            Late::Min.over(&[&d1, &d2], SumOf::Numeric),
+            Some(d2.clone())
+        );
+        assert_eq!(
+            Late::Max.over(&[&d1, &nan], SumOf::Numeric),
+            Some(nan.clone())
+        );
+        assert_eq!(
+            Late::Min.over(&[&d1, &Bson::Double(1.0)], SumOf::Numeric),
+            None
+        );
         assert_eq!(
             Late::Count.over(&[&a, &n], SumOf::Int),
             Some(Bson::Int64(1))

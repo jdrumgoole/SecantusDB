@@ -401,3 +401,71 @@ fn a_row_lock_in_one_store_does_not_block_another_store() {
     a.stop();
     b.stop();
 }
+
+/// A READ COMMITTED block sees every commit made before its statement,
+/// however much it has written: batch 54 left a block past 256 written
+/// entries on its first write's snapshot. And a commit to a table the
+/// statement does not read (or a sequence advance) does not make it replay
+/// its writes -- the moves that remain are the ones a statement needs.
+#[test]
+fn a_long_read_committed_block_sees_later_commits() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE t (id serial PRIMARY KEY, data text)",
+            "CREATE TABLE other (id serial PRIMARY KEY, v int)",
+        ],
+    );
+    let dsn = server.dsn();
+    rt.block_on(async move {
+        let connect = || async {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let a = connect().await;
+        let b = connect().await;
+        a.batch_execute("BEGIN").await.unwrap();
+        for _ in 0..300 {
+            // Each draws from the serial's sequence, advanced (and committed)
+            // outside the block.
+            a.execute("INSERT INTO t (data) VALUES ('a')", &[])
+                .await
+                .unwrap();
+        }
+        b.batch_execute("INSERT INTO t (data) VALUES ('b'); INSERT INTO other (v) VALUES (1)")
+            .await
+            .unwrap();
+        // This INSERT reads `t` (its key), which b wrote: the block moves
+        // onto a fresh snapshot, its 300 writes replayed, and carries on.
+        a.execute("INSERT INTO t (data) VALUES ('a')", &[])
+            .await
+            .unwrap();
+        let seen_t: i64 = a
+            .query_one("SELECT count(*) FROM t WHERE data = 'b'", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let seen_other: i64 = a
+            .query_one("SELECT count(*) FROM other", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let own: i64 = a
+            .query_one("SELECT count(*) FROM t WHERE data = 'a'", &[])
+            .await
+            .unwrap()
+            .get(0);
+        a.batch_execute("COMMIT").await.unwrap();
+        assert_eq!((seen_t, seen_other, own), (1, 1, 301));
+    });
+    server.stop();
+}

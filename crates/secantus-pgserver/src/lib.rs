@@ -3257,7 +3257,9 @@ impl PgHandler {
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
-        secantus_pgplan::set_session_datestyle(self.session_datestyle());
+        let datestyle = self.session_datestyle();
+        let order = datestyle.order;
+        secantus_pgplan::set_session_datestyle(datestyle);
         // The clocks: `now()` is the transaction's start (the open handle's,
         // or this statement's outside one) and `statement_timestamp()` the
         // statement's. `try_lock`: planning NESTED in a running statement (a
@@ -3271,7 +3273,7 @@ impl PgHandler {
         // The zone too: a row expression runs AFTER planning, and a stored
         // timestamptz cast to `timestamp` is the session zone's wall clock.
         secantus_pgplan::set_session_timezone(self.session_timezone());
-        secantus_pgplan::dtparse::set_date_order(match self.session_datestyle().order {
+        secantus_pgplan::dtparse::set_date_order(match order {
             secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
             secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
             secantus_pgplan::DateStyleOrder::Mdy => secantus_pgplan::dtparse::DateOrder::Mdy,
@@ -3618,6 +3620,41 @@ impl PgHandler {
     /// takes a custom oid, and psycopg matches it against what EnumInfo
     /// registered.
     fn user_wire_type(&self, pg_type: &str) -> Option<Type> {
+        // A built-in name is never a user type: PostgreSQL resolves it in
+        // `pg_catalog`, which every search path reads first. Answered without
+        // the catalog reads below, which a result's every column used to pay.
+        if matches!(
+            pg_type,
+            "int2"
+                | "int4"
+                | "int8"
+                | "integer"
+                | "int"
+                | "bigint"
+                | "smallint"
+                | "float4"
+                | "float8"
+                | "numeric"
+                | "bool"
+                | "boolean"
+                | "text"
+                | "varchar"
+                | "bpchar"
+                | "name"
+                | "bytea"
+                | "date"
+                | "time"
+                | "timetz"
+                | "timestamp"
+                | "timestamptz"
+                | "interval"
+                | "uuid"
+                | "json"
+                | "jsonb"
+                | "oid"
+        ) {
+            return None;
+        }
         // A domain goes out as its base type, as PostgreSQL sends it.
         if let Some(base) = secantus_pgplan::domains::domain_base(pg_type) {
             return Some(wire_type(&base));
@@ -15818,14 +15855,27 @@ const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warn
 /// The `max_prepared_transactions` this server runs with: how many
 /// `PREPARE TRANSACTION`s may be outstanding at once (53200 past it).
 const MAX_PREPARED_TRANSACTIONS: usize = 100;
-/// The longest write set (oplog entries) a READ COMMITTED block replays to
-/// take a fresh snapshot at a statement's start (`with_isolation`). Past it
-/// the block keeps the snapshot its first write fixed: a replay per
-/// statement makes a long transaction quadratic while other sessions commit
-/// -- at 10,000, pgjdbc's 1,000-row batch with generated keys took over 10 s
-/// beside the gauge's parallel tests (`BatchDeadlockTest`).
-const RC_MOVE_MAX_WRITES: usize = 256;
 const MAX_PREPARED_TRANSACTIONS_TEXT: &str = "100";
+/// What a READ COMMITTED statement can read ([`PgHandler::rc_read_set`]):
+/// the namespaces (`db.collection`) of its tables, and every catalog.
+struct RcReadSet {
+    tables: Vec<String>,
+}
+
+impl RcReadSet {
+    /// Can the statement read `(db, coll)`? Compared as the joined
+    /// namespace, so a dotted database name cannot split it wrongly; every
+    /// `__` collection (the catalogs, grants, ...) counts except the
+    /// sequences, which `nextval` reads and writes outside the transaction.
+    fn reads(&self, db: &str, coll: &str) -> bool {
+        let ns = format!("{db}.{coll}");
+        if self.tables.contains(&ns) {
+            return true;
+        }
+        ns.contains(".__") && !ns.ends_with(&format!(".{SEQUENCE_COLLECTION}"))
+    }
+}
+
 /// PostgreSQL's `GIDSIZE`: a transaction identifier is at most 199 BYTES.
 const MAX_GID_BYTES: usize = 200;
 
@@ -20370,7 +20420,7 @@ impl PgHandler {
                     let handle = if cursor_op {
                         handle
                     } else {
-                        self.with_isolation(handle)?
+                        self.with_isolation_for(handle, Some(&stmt))?
                     };
                     let fresh = Self::row_write(&stmt) && !handle.has_written();
                     let rebase = Self::row_write(&stmt) && !fresh;
@@ -20384,7 +20434,7 @@ impl PgHandler {
                         let handle = if cursor_op {
                             &mut *handle
                         } else {
-                            self.with_isolation(handle)?
+                            self.with_isolation_for(handle, Some(&stmt))?
                         };
                         let out = self
                             .storage
@@ -21197,6 +21247,19 @@ impl PgHandler {
         &self,
         handle: &'h mut UserTransactionHandle,
     ) -> PgWireResult<&'h mut UserTransactionHandle> {
+        self.with_isolation_for(handle, None)
+    }
+
+    /// [`Self::with_isolation`] for `stmt`: a READ COMMITTED block is moved
+    /// onto a fresh snapshot only when something the statement can read has
+    /// committed since its snapshot ([`Self::rc_read_set`]) -- a commit to
+    /// another table, or a sequence advance (made outside the block, as
+    /// `nextval` is), cannot change its answer.
+    fn with_isolation_for<'h>(
+        &self,
+        handle: &'h mut UserTransactionHandle,
+        stmt: Option<&Statement>,
+    ) -> PgWireResult<&'h mut UserTransactionHandle> {
         let read_committed = matches!(
             self.settings
                 .lock()
@@ -21217,12 +21280,20 @@ impl PgHandler {
             // snapshot, its writes replayed (holding its rows throughout --
             // `Storage::rebase_user_transaction_to`), as PostgreSQL's READ
             // COMMITTED takes a snapshot per statement. A long write set is
-            // left on its snapshot rather than replayed per statement
-            // (`RC_MOVE_MAX_WRITES`), as is a write the move cannot carry.
-            if !refreshed
+            // A move replays the whole write set, so it is made only when a
+            // commit since the snapshot touched something the statement may
+            // read (`rc_read_set`); a write the move cannot carry keeps the
+            // snapshot.
+            let stale = !refreshed
                 && !secantus_storage::Storage::no_commit_since(handle.snapshot_epoch())
-                && handle.write_set_len() <= RC_MOVE_MAX_WRITES
-            {
+                && match stmt.and_then(|s| self.rc_read_set(s)) {
+                    Some(reads) => !secantus_storage::Storage::no_commit_touching_since(
+                        handle.snapshot_epoch(),
+                        &|db, coll| reads.reads(db, coll),
+                    ),
+                    None => true,
+                };
+            if stale {
                 match self.storage.rebase_user_transaction(handle) {
                     Ok(_) => {}
                     Err(e) => {
@@ -21235,6 +21306,47 @@ impl PgHandler {
             }
         }
         Ok(handle)
+    }
+
+    /// The collections `stmt` can read, when that is provably narrower than
+    /// "everything": a plain `INSERT ... VALUES` (no RETURNING expression, no
+    /// ON CONFLICT, no view check) into an ordinary table reads only that
+    /// table (its unique checks), the tables its foreign keys name, and the
+    /// catalogs. Anything that could run user code or reach another table --
+    /// a user function (a default, a trigger, a check), a rule, row-level
+    /// security, inheritance or partitioning -- is `None`: everything.
+    fn rc_read_set(&self, stmt: &Statement) -> Option<RcReadSet> {
+        let Statement::Insert(ins) = stmt else {
+            return None;
+        };
+        if ins.source.is_some()
+            || !ins.view_checks.is_empty()
+            || ins.on_conflict.is_some()
+            || ins
+                .returning
+                .as_ref()
+                .is_some_and(|r| r.casts.iter().any(Option::is_some))
+        {
+            return None;
+        }
+        let def = self.lookup(&ins.table)?;
+        if def.temp
+            || partition::parent_of(&def).is_some()
+            || partition::is_partitioned(&def)
+            || !Self::inherited_parents(&def).is_empty()
+            || !self.user_function_docs().ok()?.is_empty()
+            || self.has_triggers(&ins.table).ok()?
+            || self.any_rules()
+            || !self.rls_enabled_docs().is_empty()
+        {
+            return None;
+        }
+        let db = self.db();
+        let mut tables = vec![format!("{db}.{}", ins.table)];
+        for fk in &def.foreign_keys {
+            tables.push(format!("{db}.{}", fk.ref_table));
+        }
+        Some(RcReadSet { tables })
     }
 
     fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
