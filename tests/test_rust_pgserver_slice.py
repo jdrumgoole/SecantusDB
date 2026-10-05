@@ -17078,3 +17078,225 @@ def test_batch53_for_update_through_a_subquery_locks_only_the_rows_returned(home
             a.execute(lock)
             assert _sqlstate(b, other) == want, lock
             a.execute("rollback")
+
+
+def _b54_tables(conn: psycopg.Connection) -> None:
+    for t in ("b54_p", "b54_t2", "b54_n", "b54_k"):
+        conn.execute(f"drop table if exists {t} cascade")
+    conn.execute("create table b54_p (id int primary key, n int)")
+    conn.execute("create table b54_t2 (id int primary key, n int)")
+    conn.execute("insert into b54_p values (1, 10), (2, 20)")
+    conn.execute("insert into b54_t2 values (1, 1)")
+
+
+def test_batch54_read_committed_reads_commits_after_its_own_writes(home: Path) -> None:
+    """A READ COMMITTED block that had written kept the snapshot of its first
+    write (WiredTiger refuses to refresh a writer's snapshot), so a later
+    statement missed what other sessions committed since. Each statement now
+    starts on a fresh snapshot: the block is moved onto a new transaction
+    that replays its writes, holding its rows throughout. REPEATABLE READ is
+    unchanged. PostgreSQL 15.19 gives these answers."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _b54_tables(a)
+        for conn in (a, b, c):
+            conn.execute("set lock_timeout = '6s'")
+        _b54_read_committed(a, b, c)
+
+
+def _b54_read_committed(
+    a: psycopg.Connection, b: psycopg.Connection, c: psycopg.Connection
+) -> None:
+    rows = "select id, n from b54_p order by id"
+    a.execute("begin")
+    a.execute("update b54_p set n = 50 where id = 2")
+    b.execute("update b54_p set n = n + 1 where id = 1")
+    assert a.execute(rows).fetchall() == [(1, 11), (2, 50)]
+    # An UPDATE reads the committed row too, and its own earlier write stays.
+    b.execute("update b54_p set n = n + 1 where id = 1")
+    assert a.execute("update b54_p set n = n * 2 where id = 1 returning n").fetchall() == [(24,)]
+    a.execute("commit")
+    assert a.execute(rows).fetchall() == [(1, 24), (2, 50)]
+
+    # A row the block wrote stays held while it moves: the other writer
+    # waits for the COMMIT and then sees the block's value.
+    a.execute("begin")
+    a.execute("update b54_p set n = n + 100 where id = 1")
+    b.execute("update b54_p set n = n + 1 where id = 2")
+    bg = _B51Bg(c, "update b54_p set n = n + 1 where id = 1")
+    assert bg.blocked
+    assert a.execute(rows).fetchall() == [(1, 124), (2, 51)]
+    time.sleep(0.3)
+    assert bg.thread.is_alive()
+    a.execute("commit")
+    assert bg.join() is None
+    assert a.execute(rows).fetchall() == [(1, 125), (2, 51)]
+
+    # Inserts other sessions committed are seen; ROLLBACK still undoes the
+    # block's own.
+    a.execute("begin")
+    a.execute("insert into b54_t2 values (5, 5)")
+    b.execute("insert into b54_t2 values (6, 6)")
+    assert a.execute("select id from b54_t2 order by id").fetchall() == [(1,), (5,), (6,)]
+    a.execute("rollback")
+    assert a.execute("select id from b54_t2 order by id").fetchall() == [(1,), (6,)]
+
+    # REPEATABLE READ keeps its snapshot.
+    a.execute("begin isolation level repeatable read")
+    a.execute("update b54_p set n = 0 where id = 2")
+    b.execute("update b54_p set n = n + 1 where id = 1")
+    assert a.execute(rows).fetchall() == [(1, 125), (2, 0)]
+    a.execute("commit")
+    assert a.execute(rows).fetchall() == [(1, 126), (2, 0)]
+
+
+def test_batch54_exception_block_lets_go_of_the_rows_it_undoes(home: Path) -> None:
+    """A PL/pgSQL EXCEPTION block's implicit ROLLBACK TO rewrote the undone
+    rows inside the running statement's transaction, so they stayed held: a
+    session updating one waited for the block's COMMIT, where PostgreSQL's
+    goes through at once. The running statement now moves its own
+    transaction onto a new one (`Storage::rebase_active_transaction_to`),
+    keeping only the writes made before the block; with the READ COMMITTED
+    move above, the block's next read sees that commit. PostgreSQL 15.19
+    gives these answers."""
+    with (
+        _Server(home) as server,
+        server.connect() as a,
+        server.connect() as b,
+        server.connect() as c,
+    ):
+        _b54_tables(a)
+        for conn in (a, b, c):
+            conn.execute("set lock_timeout = '6s'")
+        _b54_exception_blocks(a, b, c)
+
+
+def _b54_exception_blocks(
+    a: psycopg.Connection, b: psycopg.Connection, c: psycopg.Connection
+) -> None:
+    rows = "select id, n from b54_p order by id"
+    undo = (
+        "begin update b54_p set n = 99 where id = 1;"
+        " raise exception 'x'; exception when others then null; end;"
+    )
+    a.execute("begin")
+    a.execute("update b54_p set n = 50 where id = 2")
+    a.execute(f"do $$ begin {undo} end $$")
+    bg = _B51Bg(b, "update b54_p set n = n + 1 where id = 1")
+    assert not bg.blocked and bg.join() is None
+    assert a.execute(rows).fetchall() == [(1, 11), (2, 50)]
+    # The write before the block stays held.
+    bg = _B51Bg(c, "update b54_p set n = n + 1 where id = 2")
+    assert bg.blocked
+    a.execute("commit")
+    assert bg.join() is None
+    assert a.execute(rows).fetchall() == [(1, 11), (2, 51)]
+
+    # A write inside the DO before the inner block is kept and held.
+    a.execute("begin")
+    a.execute(f"do $$ begin update b54_p set n = 60 where id = 2; {undo} end $$")
+    bg = _B51Bg(b, "update b54_p set n = n + 1 where id = 1")
+    bg2 = _B51Bg(c, "update b54_p set n = n + 1 where id = 2")
+    assert not bg.blocked and bg.join() is None
+    assert bg2.blocked
+    assert a.execute(rows).fetchall() == [(1, 12), (2, 60)]
+    a.execute("commit")
+    assert bg2.join() is None
+    assert a.execute(rows).fetchall() == [(1, 12), (2, 61)]
+
+    # Nested blocks: the inner undo keeps the outer block's write, the
+    # function goes on writing after it, and an autocommit DO commits it all.
+    a.execute(
+        "do $$ begin begin update b54_p set n = 70 where id = 2;"
+        f" {undo} update b54_p set n = n + 1 where id = 2;"
+        " exception when others then raise; end; end $$"
+    )
+    assert a.execute(rows).fetchall() == [(1, 12), (2, 71)]
+
+    # A caught error after a unique violation inside the block.
+    a.execute("begin")
+    a.execute(
+        "do $$ begin insert into b54_t2 values (7, 7); begin insert into b54_t2 values (1, 1);"
+        " exception when unique_violation then insert into b54_t2 values (8, 8); end; end $$"
+    )
+    a.execute("commit")
+    assert a.execute("select id from b54_t2 order by id").fetchall() == [(1,), (7,), (8,)]
+
+
+def test_batch54_for_update_through_a_join_locks_only_the_rows_returned(home: Path) -> None:
+    """A locking join over a table with no primary key matched its rows by
+    the columns carried, so of two identical rows it locked both: another
+    session's SKIP LOCKED found neither. The join leaf now carries each base
+    row's stored id (`LOCK_ROW_ID`) and exactly the rows returned are locked.
+    PostgreSQL 15.19 gives these answers."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b54_join_locks(a, b)
+
+
+def _b54_join_locks(a: psycopg.Connection, b: psycopg.Connection) -> None:
+    a.execute("drop table if exists b54_n")
+    a.execute("drop table if exists b54_k")
+    a.execute("create table b54_n (k int, v int, w text)")
+    a.execute("insert into b54_n values (1, 1, 'x'), (1, 1, 'x'), (2, 3, 'z')")
+    a.execute("create table b54_k (k int primary key, name text)")
+    a.execute("insert into b54_k values (1, 'one'), (2, 'two')")
+    b.execute("set lock_timeout = '300ms'")
+    for lock in [
+        "select n.v from b54_n n join b54_k k on n.k = k.k where n.w = 'x' limit 1 for update of n",
+        "select k.name from b54_n n join b54_k k on n.k = k.k where n.w = 'x' limit 1 for update",
+        "select n.k from b54_n n join b54_k k using (k) where n.w = 'x' limit 1 for share of n",
+        "select n.k from b54_n n, b54_k k where n.k = k.k and n.w = 'x' limit 1 for no key update",
+    ]:
+        a.execute("begin")
+        assert len(a.execute(lock).fetchall()) == 1
+        b.execute("begin")
+        got = b.execute("select k, v, w from b54_n where w = 'x' for update skip locked").fetchall()
+        b.execute("rollback")
+        assert got == [(1, 1, "x")], lock
+        # The row of the other side is locked too where the clause covers it.
+        a.execute("rollback")
+    a.execute("begin")
+    a.execute("select n.k from b54_n n join b54_k k on n.k = k.k where n.w = 'z' for update")
+    assert _sqlstate(b, "update b54_k set name = name where k = 2") == "55P03"
+    assert _sqlstate(b, "update b54_n set v = v where w = 'z'") == "55P03"
+    assert _sqlstate(b, "update b54_n set v = v where w = 'x'") is None
+    a.execute("rollback")
+
+
+def test_batch54_a_moved_transaction_keeps_its_unique_index(home: Path) -> None:
+    """A block moved onto a new transaction (ROLLBACK TO SAVEPOINT, or a READ
+    COMMITTED statement after another session committed) replays its write
+    set, and a CREATE UNIQUE INDEX in it came back as a PLAIN index: the
+    oplog entry it replays from carried only the key and name. Duplicates
+    were then accepted -- silently -- after COMMIT. PostgreSQL 15.19 refuses
+    them (23505) in every case here."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _b54_unique_after_move(a, b)
+
+
+def _b54_unique_after_move(a: psycopg.Connection, b: psycopg.Connection) -> None:
+    b.execute("drop table if exists b54_other")
+    b.execute("create table b54_other (x int)")
+    for variant in ("rollback_to", "read_committed", "expression_index"):
+        a.execute("drop table if exists b54_u")
+        a.execute("begin")
+        a.execute("create table b54_u (id int primary key, b text, c int)")
+        a.execute("create unique index b54_u_bc on b54_u (b, c)")
+        if variant == "rollback_to":
+            a.execute("savepoint s")
+            a.execute("insert into b54_u values (1, 'x', 1)")
+            a.execute("rollback to s")
+        elif variant == "read_committed":
+            b.execute("insert into b54_other values (1)")
+            a.execute("select 1")
+        else:
+            a.execute("create index b54_u_lower on b54_u (lower(b))")
+        a.execute("commit")
+        assert _sqlstate(a, "insert into b54_u values (1, 'x', 1), (2, 'x', 1)") == "23505", variant
+        assert a.execute(
+            "select indisunique from pg_index where indexrelid = 'b54_u_bc'::regclass"
+        ).fetchone() == (True,), variant

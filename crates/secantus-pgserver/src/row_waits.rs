@@ -104,6 +104,11 @@ pub fn clear_wait_strength() {
 fn conflicts(h: &secantus_storage::Held, row: &WrittenRow, want: Strength) -> bool {
     use secantus_storage::share_locks::ShareMode;
     let shared = h.shared.get(row).copied();
+    // A row of a transaction moving onto a new WiredTiger transaction is
+    // held throughout the move, whatever the mode.
+    if h.moving.contains(row) {
+        return true;
+    }
     match want {
         Strength::KeyShare => h.key_rows.contains(row),
         Strength::Share => h.rows.contains(row),

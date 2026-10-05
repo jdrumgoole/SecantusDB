@@ -64,6 +64,11 @@ thread_local! {
     /// transaction's WT session (read-your-own-writes + the pinned snapshot fall
     /// out for free). Cleared (RAII, panic-safe) before the call returns.
     static ACTIVE_TXN_SESSION: Cell<*const Session> = const { Cell::new(std::ptr::null()) };
+    /// The handle whose session `ACTIVE_TXN_SESSION` is, installed alongside
+    /// it, so a statement still running can move its own transaction onto a
+    /// new one ([`Storage::rebase_active_transaction_to`]: a PL/pgSQL
+    /// EXCEPTION block's subtransaction abort).
+    static ACTIVE_HANDLE: Cell<*mut UserTransactionHandle> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// The WT session one storage operation runs on: either a borrowed
@@ -189,6 +194,20 @@ pub struct UserTransactionHandle {
     /// The rows those locks are on, so a move onto a new transaction takes
     /// them again (`rebase_user_transaction_keeping`).
     locked: Vec<WrittenRow>,
+    /// A move of a RUNNING statement's transaction failed part-way
+    /// ([`Storage::rebase_active_transaction_to`]): the work before it is
+    /// gone, so the transaction can only fail. Its statement carries on
+    /// against an empty stand-in transaction, and the commit is refused.
+    doomed: bool,
+    /// The transaction has written the collection registry (created,
+    /// dropped or renamed a collection, or changed its options): its commit
+    /// or rollback changes what other sessions see there, so it moves
+    /// [`COLL_TABLE_GEN`] on again when it ends.
+    wrote_registry: bool,
+    /// [`COLL_TABLE_GEN`] just before the transaction's snapshot was taken:
+    /// while it is still current, the registry this snapshot sees is the
+    /// one every other session sees too (see `is_timeseries`).
+    registry_gen: u64,
 }
 
 impl UserTransactionHandle {
@@ -254,6 +273,25 @@ impl UserTransactionHandle {
             || self.dirty_bytes > 0
             || !self.minted_ranges.is_empty()
             || self.lock_only
+    }
+}
+
+/// Move the seq ranges this thread's running statement minted onto `handle`.
+fn harvest_minted(handle: &mut UserTransactionHandle) {
+    PENDING_MINTED.with(|p| {
+        for (start, end) in p.borrow_mut().drain(..) {
+            handle.minted_total += (end - start).max(0) as usize;
+            handle.minted_ranges.push((start, end));
+        }
+    });
+}
+
+/// Add the rows a statement locked by rewriting them unchanged to `handle`'s.
+fn harvest_locked(handle: &mut UserTransactionHandle, rows: Vec<WrittenRow>) {
+    for row in rows {
+        if !handle.locked.contains(&row) {
+            handle.locked.push(row);
+        }
     }
 }
 
@@ -3379,6 +3417,14 @@ pub struct Held {
     /// `shared`'s rows in the order they were first taken, so a ROLLBACK TO
     /// SAVEPOINT can let go of the ones taken after the savepoint.
     shared_log: Vec<WrittenRow>,
+    /// The rows the transaction held when a move onto a new WiredTiger
+    /// transaction began ([`Storage::rebase_user_transaction_to`]), still
+    /// counted as held while the old transaction is rolled back and its
+    /// write set replayed -- a waiter must not take one in that moment.
+    pub moving: HashSet<WrittenRow>,
+    /// The store the transaction runs in (its `Storage`'s address): the
+    /// shared-lock table is process-wide and keys rows by store too.
+    pub store: usize,
 }
 
 impl Held {
@@ -3407,7 +3453,7 @@ impl Held {
         }
         let me = self.holder();
         for row in self.shared_log.split_off(keep) {
-            share_locks::remove(&row, me);
+            share_locks::remove(self.store, &row, me);
             self.shared.remove(&row);
         }
     }
@@ -3424,6 +3470,48 @@ impl Drop for Held {
     }
 }
 
+/// Keeps a moving transaction's rows held across the gap between rolling
+/// back its old WiredTiger transaction and replaying its writes into the new
+/// one: in that moment WiredTiger knows of no writer of them, so each is
+/// also entered in the shared-lock table ([`share_locks`]) as FOR SHARE by
+/// the transaction's move identity -- any other write of it is a conflict
+/// before anything is written, and waits as for any holder ([`Held::moving`]
+/// names the holder). Dropped (every exit path) when the replay is over.
+struct MoveGuard {
+    held: HeldRows,
+    added: Vec<WrittenRow>,
+}
+
+impl MoveGuard {
+    fn new(held: &HeldRows) -> Self {
+        let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        let mover = share_locks::mover_of(h.holder());
+        let rows: Vec<WrittenRow> = h.rows.iter().cloned().collect();
+        let mut added = Vec::new();
+        for row in &rows {
+            if share_locks::add(h.store, row, mover, share_locks::ShareMode::Share) {
+                added.push(row.clone());
+            }
+        }
+        h.moving = rows.into_iter().collect();
+        MoveGuard {
+            held: Arc::clone(held),
+            added,
+        }
+    }
+}
+
+impl Drop for MoveGuard {
+    fn drop(&mut self) {
+        let mut h = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mover = share_locks::mover_of(h.holder());
+        for row in &self.added {
+            share_locks::remove(h.store, row, mover);
+        }
+        h.moving.clear();
+    }
+}
+
 /// Take a shared lock on `row` in `mode` for the user transaction running
 /// on this thread. `true` when the transaction did not already share it (so
 /// a caller that backs out after finding an exclusive holder may release it
@@ -3435,7 +3523,7 @@ pub fn share_row(row: &WrittenRow, mode: share_locks::ShareMode) -> bool {
         };
         let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
         let me = held.holder();
-        let new = share_locks::add(row, me, mode);
+        let new = share_locks::add(held.store, row, me, mode);
         let prev = held.shared.get(row).copied();
         held.shared
             .insert(row.clone(), prev.map_or(mode, |p| p.max(mode)));
@@ -3476,7 +3564,7 @@ pub fn unshare_row(row: &WrittenRow) {
         if let Some(held) = a.borrow().as_ref() {
             let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
             let me = held.holder();
-            share_locks::remove(row, me);
+            share_locks::remove(held.store, row, me);
             held.shared.remove(row);
             held.shared_log.retain(|r| r != row);
         }
@@ -3529,11 +3617,15 @@ fn note_id_key(db: &str, coll: &str, id_key: &[u8]) -> Result<()> {
 fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
     let row = (db.to_string(), coll.to_string(), recordid);
     let mut me = 0usize;
+    // Outside a user transaction (a MongoDB-server write) no store is
+    // known, and no shared lock -- a PostgreSQL-server feature -- applies.
+    let mut store = 0usize;
     if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
         ACTIVE_ROWS.with(|a| {
             if let Some(held) = a.borrow().as_ref() {
                 let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
                 me = held.holder();
+                store = held.store;
                 if !held.collections.iter().any(|(d, c)| d == db && c == coll) {
                     held.collections.push((db.to_string(), coll.to_string()));
                 }
@@ -3544,7 +3636,7 @@ fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
             }
         });
     }
-    let blocked = share_locks::write_blocked(&row, me);
+    let blocked = store != 0 && share_locks::write_blocked(store, &row, me);
     LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
     if blocked {
         return Err(StorageError::WriteConflict);
@@ -6674,6 +6766,8 @@ impl Storage {
                 self.conn.open_session()?
             }
         };
+        let held = HeldRows::default();
+        held.lock().unwrap_or_else(|e| e.into_inner()).store = self as *const Storage as usize;
         Ok(UserTransactionHandle {
             session: Some(session),
             began: false,
@@ -6684,10 +6778,13 @@ impl Storage {
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
             dirty_bytes: 0,
-            held: HeldRows::default(),
+            held,
             epoch: None,
             lock_only: false,
             locked: Vec::new(),
+            doomed: false,
+            wrote_registry: false,
+            registry_gen: 0,
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -6780,9 +6877,11 @@ impl Storage {
             return Ok(false);
         };
         let epoch = COMMITS_DONE.load(Ordering::SeqCst);
+        let registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
         match session.reset_snapshot() {
             Ok(()) => {
                 handle.epoch = Some(epoch);
+                handle.registry_gen = registry_gen;
                 Ok(true)
             }
             // The transaction wrote without an oplog entry: WiredTiger's
@@ -6811,15 +6910,24 @@ impl Storage {
             .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
         if !handle.began {
             handle.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
+            handle.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
             session.begin_transaction(None)?;
             handle.began = true;
         }
-        struct Restore(*const Session);
+        let session_ptr = session as *const Session;
+        struct Restore(*const Session, *mut UserTransactionHandle);
         impl Drop for Restore {
             fn drop(&mut self) {
                 ACTIVE_TXN_SESSION.with(|c| c.set(self.0));
+                ACTIVE_HANDLE.with(|c| c.set(self.1));
             }
         }
+        // Every guard below reaches the handle through this pointer, never a
+        // `&mut` held across `f`: a statement may MOVE its own transaction
+        // onto a new handle value while it runs (`rebase_active_transaction_to`
+        // writes through `ACTIVE_HANDLE`), and the guards must then harvest
+        // into the new one.
+        let hp: *mut UserTransactionHandle = handle;
         // Emits inside this statement park their minted seq ranges in
         // `PENDING_MINTED` (they see the active txn session). Move them onto
         // the handle — on normal return AND on unwind — so the transaction's
@@ -6827,48 +6935,43 @@ impl Storage {
         // them from the in-flight window. A panicked statement must not leave
         // ranges stranded in the thread-local: that would pin the visible
         // tail forever.
-        struct Harvest<'a>(&'a mut Vec<(i64, i64)>, &'a mut usize);
-        impl Drop for Harvest<'_> {
+        struct Harvest(*mut UserTransactionHandle);
+        impl Drop for Harvest {
             fn drop(&mut self) {
-                PENDING_MINTED.with(|p| {
-                    for (start, end) in p.borrow_mut().drain(..) {
-                        *self.1 += (end - start).max(0) as usize;
-                        self.0.push((start, end));
-                    }
-                });
+                // SAFETY: the handle outlives this scope (borrowed `&mut` by
+                // the caller for the whole call) and nothing else touches it
+                // while the guards drop.
+                harvest_minted(unsafe { &mut *self.0 });
             }
         }
-        let _harvest = Harvest(&mut handle.minted_ranges, &mut handle.minted_total);
+        let _harvest = Harvest(hp);
         struct RowScope(Option<HeldRows>);
         impl Drop for RowScope {
             fn drop(&mut self) {
                 ACTIVE_ROWS.with(|a| *a.borrow_mut() = self.0.take());
             }
         }
-        let _row_scope = RowScope(ACTIVE_ROWS.with(|a| a.replace(Some(Arc::clone(&handle.held)))));
-        struct LockHarvest<'a>(&'a mut bool, bool);
-        impl Drop for LockHarvest<'_> {
+        // SAFETY: a shared read of the handle `hp` points at.
+        let held = Arc::clone(unsafe { &(*hp).held });
+        let _row_scope = RowScope(ACTIVE_ROWS.with(|a| a.replace(Some(held))));
+        struct LockHarvest(*mut UserTransactionHandle, bool);
+        impl Drop for LockHarvest {
             fn drop(&mut self) {
-                *self.0 |= LOCKED_ONLY.with(|l| l.replace(self.1));
+                // SAFETY: as `Harvest`.
+                unsafe { &mut *self.0 }.lock_only |= LOCKED_ONLY.with(|l| l.replace(self.1));
             }
         }
-        let _lock_harvest = LockHarvest(
-            &mut handle.lock_only,
-            LOCKED_ONLY.with(|l| l.replace(false)),
-        );
-        struct LockedHarvest<'a>(&'a mut Vec<WrittenRow>, Vec<WrittenRow>);
-        impl Drop for LockedHarvest<'_> {
+        let _lock_harvest = LockHarvest(hp, LOCKED_ONLY.with(|l| l.replace(false)));
+        struct LockedHarvest(*mut UserTransactionHandle, Vec<WrittenRow>);
+        impl Drop for LockedHarvest {
             fn drop(&mut self) {
                 let mine = LOCKED_ROWS.with(|l| l.replace(std::mem::take(&mut self.1)));
-                for row in mine {
-                    if !self.0.contains(&row) {
-                        self.0.push(row);
-                    }
-                }
+                // SAFETY: as `Harvest`.
+                harvest_locked(unsafe { &mut *self.0 }, mine);
             }
         }
         let _locked_harvest = LockedHarvest(
-            &mut handle.locked,
+            hp,
             LOCKED_ROWS.with(|l| std::mem::take(&mut *l.borrow_mut())),
         );
         // Async mode: hold `IN_ASYNC_STMT` across the statement so emits
@@ -6880,42 +6983,51 @@ impl Storage {
         // buffered entries onto the handle on every exit, panic included; the
         // transaction's resolution point (commit / rollback / Drop) owns them
         // from there.
-        struct AsyncHarvest<'a> {
-            pending: &'a mut Vec<(OplogEntry, Option<Vec<u8>>)>,
+        struct AsyncHarvest {
+            handle: *mut UserTransactionHandle,
             prev: bool,
             active: bool,
         }
-        impl Drop for AsyncHarvest<'_> {
+        impl Drop for AsyncHarvest {
             fn drop(&mut self) {
                 if self.active {
                     IN_ASYNC_STMT.with(|f| f.set(self.prev));
-                    PENDING_OPLOG.with(|p| self.pending.extend(p.borrow_mut().drain(..)));
+                    // SAFETY: as `Harvest`.
+                    let pending = &mut unsafe { &mut *self.handle }.pending_async;
+                    PENDING_OPLOG.with(|p| pending.extend(p.borrow_mut().drain(..)));
                 }
             }
         }
         let async_scope = AsyncHarvest {
-            pending: &mut handle.pending_async,
+            handle: hp,
             prev: IN_ASYNC_STMT.with(|f| f.get()),
             active: self.async_oplog.is_some(),
         };
         if async_scope.active {
             IN_ASYNC_STMT.with(|f| f.set(true));
         }
-        let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.get()));
-        ACTIVE_TXN_SESSION.with(|c| c.set(session as *const Session));
+        let _restore = Restore(
+            ACTIVE_TXN_SESSION.with(|c| c.get()),
+            ACTIVE_HANDLE.with(|c| c.get()),
+        );
+        ACTIVE_TXN_SESSION.with(|c| c.set(session_ptr));
+        ACTIVE_HANDLE.with(|c| c.set(hp));
         // Statement dirty accounting: zero the thread-local counter on entry
         // (a panicked prior scope must not leak bytes into this one) and
         // harvest it onto the handle on every exit, panic included.
-        struct DirtyHarvest<'a>(&'a mut u64);
-        impl Drop for DirtyHarvest<'_> {
+        struct DirtyHarvest(*mut UserTransactionHandle);
+        impl Drop for DirtyHarvest {
             fn drop(&mut self) {
-                *self.0 += PENDING_DIRTY_BYTES.with(|c| c.replace(0));
+                // SAFETY: as `Harvest`.
+                unsafe { &mut *self.0 }.dirty_bytes += PENDING_DIRTY_BYTES.with(|c| c.replace(0));
             }
         }
         PENDING_DIRTY_BYTES.with(|c| c.set(0));
-        let dirty_scope = DirtyHarvest(&mut handle.dirty_bytes);
+        let dirty_scope = DirtyHarvest(hp);
         let out = f();
         drop(dirty_scope);
+        // SAFETY: `hp` came from `handle`, unused since; back to the borrow.
+        let handle = unsafe { &mut *hp };
         // Transaction dirty budget — mongod's `TransactionTooLargeForCache`
         // guard: a transaction's dirty content is unevictable, so letting it
         // approach WT's dirty trigger livelocks the engine. Engine-side dirty
@@ -6933,6 +7045,13 @@ impl Storage {
     /// no-op. A commit failure still closes the session (its `Drop` rolls back
     /// the uncommitted transaction).
     pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        if handle.doomed {
+            self.rollback_user_transaction(handle)?;
+            return Err(StorageError::WriteConflict);
+        }
+        // Whatever the outcome, the registry others see may change here --
+        // moved on AFTER the commit call (the guard drops last).
+        let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         if let Some(session) = handle.session.take() {
             // Whatever the outcome, the transaction holds no row after this.
             let wrote = {
@@ -7034,6 +7153,7 @@ impl Storage {
         handle: &mut UserTransactionHandle,
         release_shared: bool,
     ) -> Result<()> {
+        let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         if let Some(session) = handle.session.take() {
             {
                 let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
@@ -7161,6 +7281,7 @@ impl Storage {
                 .as_ref()
                 .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
             fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
+            fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
             session.begin_transaction(None)?;
             fresh.began = true;
             // Any read takes the snapshot; the collection registry always
@@ -7177,26 +7298,179 @@ impl Storage {
                 return Ok(false);
             }
         }
+        let _moving = MoveGuard::new(&handle.held);
         self.rollback_user_transaction_inner(handle, false)?;
         // The locks taken by rewriting a row unchanged have no oplog entry:
         // they are taken again after the replay.
         let mut relock = std::mem::take(&mut handle.locked);
         relock.truncate(keep_locks);
-        let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
-            for op in &ops {
-                replay::apply_entry_strict(self, op)?;
+        // The replay can lose a write conflict on a key no row lock covers
+        // -- storage bookkeeping (the oplog's meta row, a registry or index
+        // entry) that a background thread or another session committed after
+        // the new snapshot was pinned. That is not a conflict with the
+        // transaction's own rows, which the guard keeps held throughout, so
+        // the replay is tried again on a newer snapshot rather than failing
+        // the block: a statement PostgreSQL would run must not become a 40001
+        // here. Bounded, so a replay that cannot succeed still ends.
+        let mut attempt = 0u32;
+        loop {
+            let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
+                for op in &ops {
+                    replay::apply_entry_strict(self, op)?;
+                }
+                for (db, coll, recordid) in &relock {
+                    self.relock_row(db, coll, *recordid)?;
+                }
+                Ok(())
+            });
+            match applied.and_then(|r| r) {
+                Ok(()) => break,
+                Err(StorageError::WriteConflict) if attempt < MOVE_REPLAY_ATTEMPTS => {
+                    attempt += 1;
+                    // Detach the shared held set (the guard keeps the rows),
+                    // let the failed attempt go, and start on a newer snapshot.
+                    fresh.held = HeldRows::default();
+                    self.rollback_user_transaction(&mut fresh)?;
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                        attempt.min(20),
+                    )));
+                    fresh = self.begin_user_transaction()?;
+                    fresh.opened_at = handle.opened_at;
+                    fresh.held = Arc::clone(&handle.held);
+                    let session = fresh.session.as_ref().ok_or_else(|| {
+                        StorageError::Internal("transaction already closed".into())
+                    })?;
+                    fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
+                    fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+                    session.begin_transaction(None)?;
+                    fresh.began = true;
+                    // REPEATABLE READ may move only onto a snapshot that sees
+                    // what the old one did.
+                    if let Some(epoch) = unchanged_since {
+                        if !Self::no_commit_since(epoch) {
+                            fresh.held = HeldRows::default();
+                            self.rollback_user_transaction(&mut fresh)?;
+                            return Err(StorageError::WriteConflict);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.rollback_user_transaction(&mut fresh)?;
+                    return Err(e);
+                }
             }
-            for (db, coll, recordid) in &relock {
-                self.relock_row(db, coll, *recordid)?;
-            }
-            Ok(())
-        });
-        if let Err(e) = applied.and_then(|r| r) {
-            self.rollback_user_transaction(&mut fresh)?;
-            return Err(e);
         }
         *handle = fresh;
         Ok(true)
+    }
+
+    /// The transaction whose statement is running on this thread, when its
+    /// own scope is the innermost one ([`Self::with_user_transaction`]).
+    fn active_handle() -> Option<*mut UserTransactionHandle> {
+        let hp = ACTIVE_HANDLE.with(|c| c.get());
+        if hp.is_null() {
+            return None;
+        }
+        // SAFETY: installed by `with_user_transaction` for the statement
+        // running on this thread, which reaches the handle only by this
+        // pointer until it returns.
+        let handle = unsafe { &*hp };
+        let session = handle.session.as_ref()?;
+        std::ptr::eq(session, ACTIVE_TXN_SESSION.with(|c| c.get())).then_some(hp)
+    }
+
+    /// [`UserTransactionHandle::write_set_len`] of the transaction whose
+    /// statement is running on this thread (counting what the statement has
+    /// written so far); `None` outside one, or in async oplog mode.
+    pub fn active_write_set_len(&self) -> Option<usize> {
+        if self.async_oplog.is_some() {
+            return None;
+        }
+        let hp = Self::active_handle()?;
+        // SAFETY: see `active_handle`; a shared read.
+        let handle = unsafe { &*hp };
+        let pending: usize = PENDING_MINTED.with(|p| {
+            p.borrow()
+                .iter()
+                .map(|(s, e)| (e - s).max(0) as usize)
+                .sum()
+        });
+        Some(handle.minted_total + pending)
+    }
+
+    /// [`UserTransactionHandle::locked_len`] of the transaction whose
+    /// statement is running on this thread, on the same terms.
+    pub fn active_locked_len(&self) -> Option<usize> {
+        let hp = Self::active_handle()?;
+        // SAFETY: see `active_handle`; a shared read.
+        let handle = unsafe { &*hp };
+        let mut n = handle.locked.len();
+        LOCKED_ROWS.with(|l| {
+            n += l
+                .borrow()
+                .iter()
+                .filter(|r| !handle.locked.contains(r))
+                .count();
+        });
+        Some(n)
+    }
+
+    /// [`Self::rebase_user_transaction_to`] for the transaction whose
+    /// statement is STILL RUNNING on this thread -- a PL/pgSQL EXCEPTION
+    /// block's subtransaction abort, which must let go of the rows it undoes
+    /// as PostgreSQL does. What the statement has written so far is moved
+    /// onto the handle first, and the thread's transaction session is the
+    /// new one afterwards, so the statement carries on in the moved
+    /// transaction. Safe because every storage call is self-contained: none
+    /// keeps a cursor of the transaction's session across a return.
+    ///
+    /// `Ok(false)`: nothing moved (no running transaction of this thread's
+    /// own, async oplog mode, or one the move cannot carry). On `Err` the
+    /// transaction's work is gone: the statement carries on against an empty
+    /// stand-in whose commit is refused ([`UserTransactionHandle::doomed`]),
+    /// so nothing of it can commit, even if the caller swallows the error.
+    pub fn rebase_active_transaction_to(
+        &self,
+        keep: &dyn Fn(usize, &Document) -> bool,
+        keep_locks: usize,
+        require_unchanged: bool,
+    ) -> Result<bool> {
+        if self.async_oplog.is_some() {
+            return Ok(false);
+        }
+        let Some(hp) = Self::active_handle() else {
+            return Ok(false);
+        };
+        // SAFETY: see `active_handle`. The statement's guards reach the
+        // handle through the same pointer, and only when its scope ends.
+        let handle = unsafe { &mut *hp };
+        harvest_minted(handle);
+        handle.dirty_bytes += PENDING_DIRTY_BYTES.with(|c| c.replace(0));
+        handle.lock_only |= LOCKED_ONLY.with(|l| l.replace(false));
+        let rows = LOCKED_ROWS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        harvest_locked(handle, rows);
+        let unchanged = require_unchanged.then(|| handle.snapshot_epoch());
+        let moved = self.rebase_user_transaction_to(handle, keep, keep_locks, unchanged);
+        if moved.is_err() {
+            // The old transaction is gone and the handle closed: give the
+            // statement a stand-in to run against, which cannot commit.
+            handle.doomed = true;
+            let mut standin = self.begin_user_transaction()?;
+            standin.held = Arc::clone(&handle.held);
+            standin.opened_at = handle.opened_at;
+            standin.doomed = true;
+            if let Some(session) = standin.session.as_ref() {
+                session.begin_transaction(None)?;
+                standin.began = true;
+            }
+            *handle = standin;
+        }
+        let session = handle
+            .session
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s as *const Session);
+        ACTIVE_TXN_SESSION.with(|c| c.set(session));
+        moved
     }
 
     // -- prepared (two-phase) transactions ----------------------------------
@@ -7546,6 +7820,52 @@ impl Storage {
         if !TIMESERIES_SEEN.load(Ordering::SeqCst) {
             return Ok(false);
         }
+        // A cached answer, when this read sees the registry every session
+        // does: the generation it was cached under is current and -- inside
+        // a user transaction -- the transaction's snapshot was taken under
+        // it too, and it has not written the registry itself. A fresh
+        // (autocommit) session's snapshot is taken by the read below, after
+        // the generation is loaded.
+        let gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+        let shared_view = if std::ptr::eq(session, ACTIVE_TXN_SESSION.with(|c| c.get())) {
+            Self::active_handle().is_some_and(|hp| {
+                // SAFETY: see `active_handle`; a shared read.
+                let h = unsafe { &*hp };
+                !h.wrote_registry && h.registry_gen == gen
+            })
+        } else {
+            true
+        };
+        if shared_view {
+            let hit = TIMESERIES_CACHE.with(|c| {
+                c.borrow()
+                    .get(db)
+                    .and_then(|m| m.get(coll))
+                    .filter(|(g, _)| *g == gen)
+                    .map(|(_, ts)| *ts)
+            });
+            if let Some(ts) = hit {
+                return Ok(ts);
+            }
+        }
+        let answer = self.read_is_timeseries(session, db, coll)?;
+        if shared_view && COLL_TABLE_GEN.load(Ordering::SeqCst) == gen {
+            TIMESERIES_CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                // One generation's answers at a time.
+                if c.values().flat_map(|m| m.values()).any(|(g, _)| *g != gen) {
+                    c.clear();
+                }
+                c.entry(db.to_string())
+                    .or_default()
+                    .insert(coll.to_string(), (gen, answer));
+            });
+        }
+        Ok(answer)
+    }
+
+    /// `is_timeseries` read from the registry.
+    fn read_is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
         // On every `_id` point lookup: look the key up in the raw options
         // rather than decoding the whole document.
         let cur = session.open_cursor(COLL_TABLE, None)?;
@@ -8370,7 +8690,10 @@ impl Storage {
                     let c = session.open_cursor(COLL_TABLE, None)?;
                     c.set_key_ss(db, coll);
                     match c.search() {
-                        Ok(()) => c.remove()?,
+                        Ok(()) => {
+                            c.remove()?;
+                            note_coll_table_write();
+                        }
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
@@ -8413,7 +8736,10 @@ impl Storage {
                 let c = session.open_cursor(COLL_TABLE, None)?;
                 c.set_key_ss(db, coll);
                 match c.search() {
-                    Ok(()) => c.remove()?,
+                    Ok(()) => {
+                        c.remove()?;
+                        note_coll_table_write();
+                    }
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -8596,7 +8922,10 @@ impl Storage {
                         let rc = session.open_cursor(COLL_TABLE, None)?;
                         rc.set_key_ss(db, c);
                         match rc.search() {
-                            Ok(()) => rc.remove()?,
+                            Ok(()) => {
+                                rc.remove()?;
+                                note_coll_table_write();
+                            }
                             Err(e) if e.is_not_found() => {}
                             Err(e) => return Err(e.into()),
                         }
@@ -8623,7 +8952,10 @@ impl Storage {
                     let rc = session.open_cursor(COLL_TABLE, None)?;
                     rc.set_key_ss(db, c);
                     match rc.search() {
-                        Ok(()) => rc.remove()?,
+                        Ok(()) => {
+                            rc.remove()?;
+                            note_coll_table_write();
+                        }
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
@@ -8772,7 +9104,10 @@ impl Storage {
                     let c = session.open_cursor(COLL_TABLE, None)?;
                     c.set_key_ss(dst_db, dst_coll);
                     match c.search() {
-                        Ok(()) => c.remove()?,
+                        Ok(()) => {
+                            c.remove()?;
+                            note_coll_table_write();
+                        }
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
@@ -8877,7 +9212,10 @@ impl Storage {
                 let rc = session.open_cursor(COLL_TABLE, None)?;
                 rc.set_key_ss(src_db, src_coll);
                 match rc.search() {
-                    Ok(()) => rc.remove()?,
+                    Ok(()) => {
+                        rc.remove()?;
+                        note_coll_table_write();
+                    }
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -8960,7 +9298,10 @@ impl Storage {
             let c = session.open_cursor(COLL_TABLE, None)?;
             c.set_key_ss(dst_db, dst_coll);
             match c.search() {
-                Ok(()) => c.remove()?,
+                Ok(()) => {
+                    c.remove()?;
+                    note_coll_table_write();
+                }
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
@@ -9013,7 +9354,10 @@ impl Storage {
         let rc = session.open_cursor(COLL_TABLE, None)?;
         rc.set_key_ss(src_db, src_coll);
         match rc.search() {
-            Ok(()) => rc.remove()?,
+            Ok(()) => {
+                rc.remove()?;
+                note_coll_table_write();
+            }
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(e.into()),
         }
@@ -9698,6 +10042,18 @@ impl Storage {
             idx.insert("v", 2i32);
             idx.insert("key", Bson::Document(key_spec.clone()));
             idx.insert("name", name);
+            // The index's own options (`unique`, `sparse`, a partial filter,
+            // a collation ...), as mongod's oplog spec carries them: a replay
+            // of this entry (`replay::apply_command` -- a transaction moved
+            // onto a new snapshot, a prepared transaction committed after a
+            // restart) must rebuild the SAME index. Without them a UNIQUE
+            // index came back plain and stopped refusing duplicates. The
+            // change-stream projector reads only `v` / `key` / `name`.
+            for (k, v) in options {
+                if !matches!(k.as_str(), "v" | "key" | "name") {
+                    idx.insert(k.clone(), v.clone());
+                }
+            }
             let mut o = Document::new();
             o.insert("createIndexes", coll);
             o.insert("indexes", Bson::Array(vec![Bson::Document(idx)]));
@@ -14702,6 +15058,7 @@ fn ensure_collection(session: &Session, db: &str, coll: &str, data_nonlogged: bo
             cur.set_key_ss(db, coll);
             cur.set_value_u(&opts);
             cur.insert()?;
+            note_coll_table_write();
             // Lazy shard creation: make the collection's documents shard on first
             // creation (not all DOC_SHARDS at open). This branch runs only when the
             // collection is new, so it is the natural once-per-collection hook that
@@ -14746,6 +15103,55 @@ fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Docume
 /// another store's collection, merely keeps the lookup on.
 static TIMESERIES_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// How many times a move onto a new transaction replays its write set after
+/// losing a write conflict on a key its row locks do not cover
+/// (`rebase_user_transaction_to`), before it gives up.
+const MOVE_REPLAY_ATTEMPTS: u32 = 100;
+
+/// Moved on by every write of the collection registry (`COLL_TABLE`) --
+/// and again when a user transaction that wrote it commits or rolls back,
+/// since that is when the change reaches (or leaves) other sessions. An
+/// answer read from the registry under one value stays true while it holds.
+static COLL_TABLE_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// A write of the collection registry is being made on this thread: move
+/// [`COLL_TABLE_GEN`] on, and mark the user transaction it is part of.
+fn note_coll_table_write() {
+    COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return;
+    }
+    let hp = ACTIVE_HANDLE.with(|c| c.get());
+    if !hp.is_null() {
+        // SAFETY: installed by `with_user_transaction` for the statement
+        // running on this thread; one flag, written through the same
+        // pointer its guards use.
+        unsafe { (*hp).wrote_registry = true };
+    }
+}
+
+/// Moves [`COLL_TABLE_GEN`] on when dropped, if the transaction ending
+/// wrote the registry.
+struct RegistryEnd(bool);
+
+impl Drop for RegistryEnd {
+    fn drop(&mut self) {
+        if self.0 {
+            COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// `db -> coll -> (COLL_TABLE_GEN, is a timeseries collection)`.
+type TimeseriesAnswers = HashMap<String, HashMap<String, (u64, bool)>>;
+
+thread_local! {
+    /// `is_timeseries` answers, each valid while the generation it was read
+    /// under is current.
+    static TIMESERIES_CACHE: std::cell::RefCell<TimeseriesAnswers> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 /// Do these raw collection options name a `timeseries` sub-document?
 fn options_name_timeseries(blob: &[u8]) -> Result<bool> {
     let raw = bson::RawDocument::from_bytes(blob)
@@ -14766,6 +15172,7 @@ fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) 
     cur.set_key_ss(db, coll);
     cur.set_value_u(&blob);
     cur.insert()?; // overwrite cursor (default) -> upsert
+    note_coll_table_write();
     Ok(())
 }
 

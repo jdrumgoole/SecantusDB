@@ -245,3 +245,159 @@ async fn dropping_inside_a_current_thread_runtime_is_safe() {
 async fn dropping_inside_a_multi_thread_runtime_is_safe() {
     serve_write_and_drop_inside_a_runtime().await;
 }
+
+/// READ COMMITTED blocks that have written are moved onto a fresh snapshot
+/// at a statement's start whenever anything committed since -- here,
+/// constantly, from autocommit writers on other connections. Every move
+/// replays the block's writes; none of it may fail a statement PostgreSQL
+/// would run (a 40001 here was the regression), lose a write, or apply one
+/// twice. The counter row is updated by both sides, so a lost or doubled
+/// update shows in its final value.
+#[test]
+fn concurrent_writers_under_the_read_committed_move() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE noise (k int)",
+            "CREATE TABLE hot (id int PRIMARY KEY, n int)",
+            "INSERT INTO hot SELECT g, 0 FROM generate_series(1, 8) g",
+        ],
+    );
+    let dsn = server.dsn();
+    let (noise_n, mover_n) = rt.block_on(async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut tasks = Vec::new();
+        for w in 0..3i32 {
+            let dsn = dsn.clone();
+            tasks.push(tokio::spawn(async move {
+                let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .expect("connect");
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let mut n = 0i64;
+                while std::time::Instant::now() < deadline {
+                    c.batch_execute(&format!(
+                        "INSERT INTO noise VALUES ({w}); UPDATE hot SET n = n + 1 WHERE id = {}",
+                        n % 8 + 1
+                    ))
+                    .await
+                    .expect("autocommit writer");
+                    n += 1;
+                }
+                (n, 0i64)
+            }));
+        }
+        for m in 0..3i32 {
+            let dsn = dsn.clone();
+            tasks.push(tokio::spawn(async move {
+                let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .expect("connect");
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let mut j = 0i64;
+                while std::time::Instant::now() < deadline {
+                    let t = format!("m{m}_{j}");
+                    c.batch_execute(&format!(
+                        "CREATE TABLE {t} (n int); INSERT INTO {t} VALUES (7)"
+                    ))
+                    .await
+                    .expect("create in an implicit block");
+                    c.batch_execute("BEGIN").await.expect("begin");
+                    for step in [
+                        format!("INSERT INTO {t} VALUES (8)"),
+                        format!("UPDATE hot SET n = n + 1 WHERE id = {}", j % 8 + 1),
+                        format!("INSERT INTO {t} VALUES (9)"),
+                    ] {
+                        c.batch_execute(&step).await.expect("statement in a block");
+                    }
+                    c.batch_execute("COMMIT").await.expect("commit");
+                    let rows = c
+                        .query(&format!("SELECT count(*) FROM {t}"), &[])
+                        .await
+                        .expect("count");
+                    assert_eq!(rows[0].get::<_, i64>(0), 3, "{t}");
+                    j += 1;
+                }
+                (0i64, j)
+            }));
+        }
+        let mut totals = (0i64, 0i64);
+        for t in tasks {
+            let (a, b) = t.await.expect("task");
+            totals.0 += a;
+            totals.1 += b;
+        }
+        totals
+    });
+    let hot = query_i32_column(&rt, &server, "SELECT n FROM hot");
+    let sum: i64 = hot.iter().map(|v| i64::from(*v)).sum();
+    assert_eq!(
+        sum,
+        noise_n + mover_n,
+        "an update was lost or applied twice"
+    );
+    let noise = query_i32_column(&rt, &server, "SELECT k FROM noise");
+    assert_eq!(noise.len() as i64, noise_n);
+    drop(rt);
+    server.stop();
+}
+
+/// The shared-row-lock table is process-wide, and two stores open in one
+/// process name their rows alike (`postgres`, the collection, the RecordId).
+/// A FOR SHARE lock -- or the guard a moving transaction puts on its rows --
+/// in one store blocked a write of the same-named row in the OTHER: under the
+/// READ COMMITTED move that surfaced as a 40001 on a lone client
+/// (`dropping_inside_a_multi_thread_runtime_is_safe`, beside the stress test
+/// above). Rows are keyed by store now.
+#[test]
+fn a_row_lock_in_one_store_does_not_block_another_store() {
+    let (da, db) = (
+        TempDir::new().expect("tempdir"),
+        TempDir::new().expect("tempdir"),
+    );
+    let mut a = start(da.path());
+    let mut b = start(db.path());
+    let rt = Runtime::new().expect("runtime");
+    for s in [&a, &b] {
+        run(
+            &rt,
+            s,
+            &[
+                "CREATE TABLE t (id int PRIMARY KEY, n int)",
+                "INSERT INTO t VALUES (1, 0)",
+            ],
+        );
+    }
+    let (adsn, bdsn) = (a.dsn(), b.dsn());
+    rt.block_on(async move {
+        let connect = |dsn: String| async move {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let ca = connect(adsn).await;
+        let cb = connect(bdsn).await;
+        ca.batch_execute("BEGIN; SELECT n FROM t WHERE id = 1 FOR SHARE")
+            .await
+            .expect("share lock in store A");
+        cb.batch_execute("SET lock_timeout = '1s'; UPDATE t SET n = 1 WHERE id = 1")
+            .await
+            .expect("a write in store B is not blocked by store A's lock");
+        ca.batch_execute("COMMIT").await.expect("commit");
+    });
+    drop(rt);
+    a.stop();
+    b.stop();
+}

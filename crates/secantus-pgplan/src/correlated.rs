@@ -922,7 +922,7 @@ pub(crate) fn with_row_params_from<R>(n: usize, f: impl FnOnce() -> R) -> R {
 
 /// Is every PostgreSQL 15 built-in `name` taking `nargs` arguments
 /// IMMUTABLE (`pg15_immutable_functions.tsv`, dumped from `pg_proc`)?
-fn immutable_builtin(name: &str, nargs: usize) -> bool {
+pub(crate) fn immutable_builtin(name: &str, nargs: usize) -> bool {
     static SET: std::sync::OnceLock<std::collections::HashSet<(&'static str, usize)>> =
         std::sync::OnceLock::new();
     SET.get_or_init(|| {
