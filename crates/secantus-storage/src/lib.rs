@@ -3422,6 +3422,9 @@ pub struct Held {
     /// counted as held while the old transaction is rolled back and its
     /// write set replayed -- a waiter must not take one in that moment.
     pub moving: HashSet<WrittenRow>,
+    /// The store the transaction runs in (its `Storage`'s address): the
+    /// shared-lock table is process-wide and keys rows by store too.
+    pub store: usize,
 }
 
 impl Held {
@@ -3450,7 +3453,7 @@ impl Held {
         }
         let me = self.holder();
         for row in self.shared_log.split_off(keep) {
-            share_locks::remove(&row, me);
+            share_locks::remove(self.store, &row, me);
             self.shared.remove(&row);
         }
     }
@@ -3486,7 +3489,7 @@ impl MoveGuard {
         let rows: Vec<WrittenRow> = h.rows.iter().cloned().collect();
         let mut added = Vec::new();
         for row in &rows {
-            if share_locks::add(row, mover, share_locks::ShareMode::Share) {
+            if share_locks::add(h.store, row, mover, share_locks::ShareMode::Share) {
                 added.push(row.clone());
             }
         }
@@ -3503,7 +3506,7 @@ impl Drop for MoveGuard {
         let mut h = self.held.lock().unwrap_or_else(|e| e.into_inner());
         let mover = share_locks::mover_of(h.holder());
         for row in &self.added {
-            share_locks::remove(row, mover);
+            share_locks::remove(h.store, row, mover);
         }
         h.moving.clear();
     }
@@ -3520,7 +3523,7 @@ pub fn share_row(row: &WrittenRow, mode: share_locks::ShareMode) -> bool {
         };
         let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
         let me = held.holder();
-        let new = share_locks::add(row, me, mode);
+        let new = share_locks::add(held.store, row, me, mode);
         let prev = held.shared.get(row).copied();
         held.shared
             .insert(row.clone(), prev.map_or(mode, |p| p.max(mode)));
@@ -3561,7 +3564,7 @@ pub fn unshare_row(row: &WrittenRow) {
         if let Some(held) = a.borrow().as_ref() {
             let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
             let me = held.holder();
-            share_locks::remove(row, me);
+            share_locks::remove(held.store, row, me);
             held.shared.remove(row);
             held.shared_log.retain(|r| r != row);
         }
@@ -3614,11 +3617,15 @@ fn note_id_key(db: &str, coll: &str, id_key: &[u8]) -> Result<()> {
 fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
     let row = (db.to_string(), coll.to_string(), recordid);
     let mut me = 0usize;
+    // Outside a user transaction (a MongoDB-server write) no store is
+    // known, and no shared lock -- a PostgreSQL-server feature -- applies.
+    let mut store = 0usize;
     if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
         ACTIVE_ROWS.with(|a| {
             if let Some(held) = a.borrow().as_ref() {
                 let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
                 me = held.holder();
+                store = held.store;
                 if !held.collections.iter().any(|(d, c)| d == db && c == coll) {
                     held.collections.push((db.to_string(), coll.to_string()));
                 }
@@ -3629,7 +3636,7 @@ fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
             }
         });
     }
-    let blocked = share_locks::write_blocked(&row, me);
+    let blocked = store != 0 && share_locks::write_blocked(store, &row, me);
     LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
     if blocked {
         return Err(StorageError::WriteConflict);
@@ -6759,6 +6766,8 @@ impl Storage {
                 self.conn.open_session()?
             }
         };
+        let held = HeldRows::default();
+        held.lock().unwrap_or_else(|e| e.into_inner()).store = self as *const Storage as usize;
         Ok(UserTransactionHandle {
             session: Some(session),
             began: false,
@@ -6769,7 +6778,7 @@ impl Storage {
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
             dirty_bytes: 0,
-            held: HeldRows::default(),
+            held,
             epoch: None,
             lock_only: false,
             locked: Vec::new(),
@@ -7295,18 +7304,61 @@ impl Storage {
         // they are taken again after the replay.
         let mut relock = std::mem::take(&mut handle.locked);
         relock.truncate(keep_locks);
-        let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
-            for op in &ops {
-                replay::apply_entry_strict(self, op)?;
+        // The replay can lose a write conflict on a key no row lock covers
+        // -- storage bookkeeping (the oplog's meta row, a registry or index
+        // entry) that a background thread or another session committed after
+        // the new snapshot was pinned. That is not a conflict with the
+        // transaction's own rows, which the guard keeps held throughout, so
+        // the replay is tried again on a newer snapshot rather than failing
+        // the block: a statement PostgreSQL would run must not become a 40001
+        // here. Bounded, so a replay that cannot succeed still ends.
+        let mut attempt = 0u32;
+        loop {
+            let applied = self.with_user_transaction(&mut fresh, || -> Result<()> {
+                for op in &ops {
+                    replay::apply_entry_strict(self, op)?;
+                }
+                for (db, coll, recordid) in &relock {
+                    self.relock_row(db, coll, *recordid)?;
+                }
+                Ok(())
+            });
+            match applied.and_then(|r| r) {
+                Ok(()) => break,
+                Err(StorageError::WriteConflict) if attempt < MOVE_REPLAY_ATTEMPTS => {
+                    attempt += 1;
+                    // Detach the shared held set (the guard keeps the rows),
+                    // let the failed attempt go, and start on a newer snapshot.
+                    fresh.held = HeldRows::default();
+                    self.rollback_user_transaction(&mut fresh)?;
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                        attempt.min(20),
+                    )));
+                    fresh = self.begin_user_transaction()?;
+                    fresh.opened_at = handle.opened_at;
+                    fresh.held = Arc::clone(&handle.held);
+                    let session = fresh.session.as_ref().ok_or_else(|| {
+                        StorageError::Internal("transaction already closed".into())
+                    })?;
+                    fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
+                    fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
+                    session.begin_transaction(None)?;
+                    fresh.began = true;
+                    // REPEATABLE READ may move only onto a snapshot that sees
+                    // what the old one did.
+                    if let Some(epoch) = unchanged_since {
+                        if !Self::no_commit_since(epoch) {
+                            fresh.held = HeldRows::default();
+                            self.rollback_user_transaction(&mut fresh)?;
+                            return Err(StorageError::WriteConflict);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.rollback_user_transaction(&mut fresh)?;
+                    return Err(e);
+                }
             }
-            for (db, coll, recordid) in &relock {
-                self.relock_row(db, coll, *recordid)?;
-            }
-            Ok(())
-        });
-        if let Err(e) = applied.and_then(|r| r) {
-            self.rollback_user_transaction(&mut fresh)?;
-            return Err(e);
         }
         *handle = fresh;
         Ok(true)
@@ -15050,6 +15102,11 @@ fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Docume
 /// wide and sticky, so it errs only towards looking: a rolled-back create, or
 /// another store's collection, merely keeps the lookup on.
 static TIMESERIES_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// How many times a move onto a new transaction replays its write set after
+/// losing a write conflict on a key its row locks do not cover
+/// (`rebase_user_transaction_to`), before it gives up.
+const MOVE_REPLAY_ATTEMPTS: u32 = 100;
 
 /// Moved on by every write of the collection registry (`COLL_TABLE`) --
 /// and again when a user transaction that wrote it commits or rolls back,

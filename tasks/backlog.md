@@ -1036,6 +1036,17 @@ remain open:
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
         identity, and `Held::moving` for waiters), where another writer
         could take one before.
+      - FIXED (CI, PR #1733): the shared-row-lock table is process-wide
+        and keyed rows by `(db, collection, RecordId)` only, so a lock --
+        FOR SHARE, or a moving transaction's guard -- in one store blocked
+        the same-named row of ANOTHER store open in the process; under the
+        READ COMMITTED move a lone client got 40001 (`embedded.rs`
+        `dropping_inside_a_multi_thread_runtime_is_safe`). Rows are keyed by
+        store (`Held::store`) now, and a move's replay that loses a write
+        conflict on a key its locks do not cover retries on a newer snapshot
+        (bounded) instead of failing the block. Tests
+        `a_row_lock_in_one_store_does_not_block_another_store` (fails on the
+        old code with 55P03) and `concurrent_writers_under_the_read_committed_move`.
       - FIXED (found by the SQLAlchemy gauge on the move above, and present
         before it in ROLLBACK TO's move): a moved transaction lost the
         OPTIONS of an index it had created -- the `createIndexes` oplog
