@@ -1240,6 +1240,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         }
     }
     let coll = coll_arg(doc, "createIndexes")?;
+    if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
     let storage = ctx.storage()?;
     let specs: Vec<Bson> = match doc.get("indexes") {
         Some(Bson::Array(a)) => a.clone(),
@@ -1515,6 +1518,39 @@ fn invalid_collection_name(db: &str, coll: &str) -> Option<CommandError> {
         if !allowed {
             return err(format!("Invalid system namespace: {db}.{coll}"));
         }
+    }
+    None
+}
+
+/// mongod's refusal of a namespace a WRITE command (insert, update, delete,
+/// findAndModify, createIndexes) may not touch -- measured 8.2.11,
+/// 2026-10-05. These were accepted, and an insert created a collection mongod
+/// cannot hold (`a$b`, `system.foo`, a 300-character name). Stricter than
+/// `create` in two ways: the 255-character namespace limit, and the system
+/// collections a client may not write (`system.views` / `system.profile`,
+/// and `system.roles` / `system.version` outside `admin`).
+/// `system.buckets.*` is left to the existing timeseries handling.
+pub(crate) fn invalid_write_namespace(db: &str, coll: &str) -> Option<CommandError> {
+    let err = |m: String| Some(CommandError::new(73, "InvalidNamespace", m));
+    if let Some(e) = invalid_collection_name(db, coll) {
+        if !coll.starts_with("system.") {
+            return Some(e);
+        }
+    }
+    if let Some(rest) = coll.strip_prefix("system.") {
+        match rest {
+            "js" | "users" => {}
+            "roles" | "version" if db == "admin" => {}
+            "views" | "profile" => return err(format!("cannot write to {db}.{coll}")),
+            _ if rest.starts_with("buckets.") => {}
+            _ => return err(format!("Invalid system namespace: {db}.{coll}")),
+        }
+    }
+    let ns = format!("{db}.{coll}");
+    if ns.len() > 255 {
+        return err(format!(
+            "Fully qualified namespace is too long. Namespace: {ns} Max: 255"
+        ));
     }
     None
 }
@@ -2538,5 +2574,76 @@ mod parity_tests {
                 "{k} is a real mongod index option and must be accepted"
             );
         }
+    }
+}
+
+/// `invalid_write_namespace`, each answer measured on mongod 8.2.11
+/// (2026-10-05) by `tools/probes/write_and_sort_validation.py`.
+#[cfg(test)]
+mod write_namespace_tests {
+    use super::invalid_write_namespace;
+
+    fn msg(db: &str, coll: &str) -> Option<String> {
+        invalid_write_namespace(db, coll).map(|e| {
+            assert_eq!(e.code, 73);
+            e.errmsg
+        })
+    }
+
+    #[test]
+    fn refuses_what_mongod_will_not_write() {
+        assert_eq!(
+            msg("p", "a$b").as_deref(),
+            Some("Invalid collection name: a$b")
+        );
+        assert_eq!(
+            msg("p", ".a").as_deref(),
+            Some("Collection names cannot start with '.': .a")
+        );
+        assert_eq!(
+            msg("p", "system.foo").as_deref(),
+            Some("Invalid system namespace: p.system.foo")
+        );
+        assert_eq!(
+            msg("p", "system.views").as_deref(),
+            Some("cannot write to p.system.views")
+        );
+        assert_eq!(
+            msg("p", "system.profile").as_deref(),
+            Some("cannot write to p.system.profile")
+        );
+        assert_eq!(
+            msg("p", "system.roles").as_deref(),
+            Some("Invalid system namespace: p.system.roles")
+        );
+    }
+
+    #[test]
+    fn accepts_what_mongod_writes() {
+        for coll in [
+            "a b",
+            "é",
+            "a.",
+            "a..b",
+            "system.js",
+            "system.users",
+            "system.buckets.x",
+        ] {
+            assert_eq!(msg("p", coll), None, "{coll}");
+        }
+        assert_eq!(msg("admin", "system.roles"), None);
+        assert_eq!(msg("admin", "system.version"), None);
+    }
+
+    #[test]
+    fn the_namespace_limit_is_255() {
+        assert_eq!(msg("probe", &"x".repeat(249)), None); // probe. + 249 = 255
+        let long = "x".repeat(250);
+        assert_eq!(
+            msg("probe", &long),
+            Some(format!(
+                "Fully qualified namespace is too long. Namespace: probe.{long} Max: 255"
+            ))
+        );
     }
 }

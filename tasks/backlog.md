@@ -7345,15 +7345,33 @@ failures, the whole reply compared) 29 -> 0; `error_labels.py` stays 0 of 540.
   `limit`, `aggregate` without `cursor` (9), and `distinct`'s IDL names.
 - [x] **Code 330 crashes mongod** when injected (recorded in §7.01).
 
-**Still open on the Rust server:**
+**Closed on the Rust server, 2026-10-05** (`tools/probes/write_and_sort_validation.py`,
+mongod 8.2.11 as a replica set: 28 of 35 shapes differed when first measured,
+0 of 84 after):
 
-- [ ] Collection-name validation runs on `create` only; an insert into `a$b`
-  (implicit creation) was not measured.
-- [ ] `find` sort-spec validation runs on `find`; the aggregation `$sort`
-  stage's own checks were not probed this batch.
-- [ ] Write replies on a replica set omit mongod's `opTime` / `electionId`
-  (drivers ignore them; field order differs too).
-- [ ] Invalid-arrayFilter shapes other than an unused identifier still defer.
+- [x] **A decimal sort direction sorted the wrong way.** `find` with
+  `sort: {a: Decimal128("-1")}` returned ASCENDING order; `1.4` / `0.9` were
+  mishandled too. mongod truncates a double (`1.9` ascending, `0.5` 15975) and
+  rounds a decimal half to even (`0.9` ascending, `1.5` 15975). Every sort spec
+  is now checked by one rule (`argtypes::sort_spec_problem`) and reaches storage
+  normalised to `Int32` ±1. The aggregation `$sort` stage, top level and inside
+  `$facet` / `$lookup` / `$unionWith`, shares it: key paths (40352 / 40353 /
+  15998 / 16410), `$meta` (17312 / 9 / 31138), values (15974 / 15975) used to
+  be "stage not supported" (2), and `{a: 1.5}` was refused outright.
+- [x] **Writes created collections mongod cannot hold.** An insert into `a$b`,
+  `$a`, `.a`, `system.foo`, `system.views`, `system.profile` or a namespace over
+  255 characters succeeded. The five write commands now refuse them with 73 and
+  mongod's messages (`admin::invalid_write_namespace`); `system.js` /
+  `system.users` stay writable, `system.roles` / `system.version` only in
+  `admin`. `system.buckets.*` is left to the timeseries path (mongod: 20).
+- [x] **arrayFilters shapes** -- empty, two identifiers, a bad identifier, a
+  duplicate, an unknown operator, and a non-object entry (14, whole command) --
+  answer mongod's code and wording on `update` and `findAndModify`
+  (`argtypes::array_filters_problem`).
+- [x] **Write replies on a replica set** carry `electionId` and
+  `opTime: {ts, t: int64}` after `n`, and every insert / update / delete reply
+  orders `n`, `upserted` / `writeErrors`, `nModified`, `ok` as mongod does
+  (`ok` used to come before `writeErrors`).
 
 **Found and NOT fixed -- Python-server divergences** (out of scope):
 
