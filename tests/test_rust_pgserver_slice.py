@@ -17044,3 +17044,37 @@ def test_batch51_block_portals_and_cursors_read_in_batches(home: Path) -> None:
                 cur.execute("select id from b51_big where id > 0")
                 assert sum(1 for _ in cur) == 1490
             c.commit()
+
+
+def test_batch53_for_update_through_a_subquery_locks_only_the_rows_returned(home: Path) -> None:
+    """A FOR UPDATE through a FROM-subquery over a table with NO primary key
+    locked every row equal in the columns the subquery carried -- (1, 2)
+    as well as (1, 1) when only `k` came out. Each returned row now carries
+    the stored row id of its base row, so exactly the rows behind the result
+    are locked. Every assertion gives PostgreSQL 15.19's answer."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table b53n (k int, v int, w text)")
+        a.execute("insert into b53n values (1, 1, 'x'), (1, 2, 'y'), (2, 3, 'z'), (1, 1, 'x')")
+        b.execute("set lock_timeout = '300ms'")
+        for lock, other, want in [
+            (
+                "select k from (select k, v from b53n where v = 1) s limit 1 for update",
+                "update b53n set w = w where v = 2",
+                None,
+            ),
+            (
+                "select k from (select k from (select k, v from b53n) s1 where v = 2) s2"
+                " for update",
+                "update b53n set w = w where v = 1 and w = 'x'",
+                None,
+            ),
+            (
+                "select k from (select k from b53n where v = 2) s for update",
+                "update b53n set w = w where v = 2",
+                "55P03",
+            ),
+        ]:
+            a.execute("begin")
+            a.execute(lock)
+            assert _sqlstate(b, other) == want, lock
+            a.execute("rollback")

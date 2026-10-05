@@ -165,6 +165,8 @@ struct Index {
     aggregate: bool,
     /// An aggregate under comparison filters, computed per outer row.
     late: Option<Late>,
+    /// What a late `sum` / `avg` adds up.
+    sum_of: SumOf,
     /// `LIMIT` / `OFFSET`, applied within each key's rows (scan order, as
     /// the per-row query would see them).
     limit: Option<usize>,
@@ -231,17 +233,75 @@ enum Late {
     Count,
     Min,
     Max,
-    /// `sum` / `avg` of an `integer` / `smallint` column: a `bigint` sum,
-    /// and that sum divided by the count as `numeric` (PostgreSQL's
-    /// `int8_avg` is exactly `numeric_div` of the two).
+    /// `sum` / `avg`, of the column type [`SumOf`] names.
     Sum,
     Avg,
+}
+
+/// What a late `sum` / `avg` adds up, from the argument's type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SumOf {
+    /// `integer` / `smallint`: a `bigint` sum, and that sum divided by the
+    /// count as `numeric` (PostgreSQL's `int8_avg` is exactly
+    /// `numeric_div` of the two).
+    Int,
+    /// `bigint`: a `numeric` sum (exact, in i128 here), and `numeric_div`
+    /// of it by the count (`int8_avg` again).
+    BigInt,
+    /// `numeric`: `numeric_add` row by row, and `numeric_avg` -- which is
+    /// `numeric_div` of that sum by the count.
+    Numeric,
+    /// `double precision`: `float8pl` row by row in scan order, and
+    /// `float8_avg`, the sum over the count; an overflow PostgreSQL would
+    /// raise is left to the per-row path.
+    Float,
+}
+
+impl SumOf {
+    /// The kind for a column of type `ty` (`pg_typeof(...)::text`).
+    fn of(ty: &str) -> Option<SumOf> {
+        match ty {
+            "integer" | "smallint" => Some(SumOf::Int),
+            "bigint" => Some(SumOf::BigInt),
+            "numeric" => Some(SumOf::Numeric),
+            "double precision" => Some(SumOf::Float),
+            _ => None,
+        }
+    }
+
+    /// Can a value of this kind be summed here?
+    fn accepts(self, v: &Bson) -> bool {
+        match (self, v) {
+            (_, Bson::Null) => true,
+            (SumOf::Int, Bson::Int32(_)) => true,
+            (SumOf::BigInt, Bson::Int32(_) | Bson::Int64(_)) => true,
+            (SumOf::Float, Bson::Double(_)) => true,
+            // Any stored numeric form; `numeric_add` reads it.
+            (SumOf::Numeric, _) => true,
+            _ => false,
+        }
+    }
+}
+
+/// `$1 <op> $2` over `numeric`, evaluated by the expression engine.
+fn numeric_op(sql: &'static str, a: Bson, b: Bson) -> Option<Bson> {
+    thread_local! {
+        static PARSED: std::cell::RefCell<HashMap<&'static str, Option<pg_query::protobuf::Node>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let node = PARSED.with(|p| {
+        p.borrow_mut()
+            .entry(sql)
+            .or_insert_with(|| crate::domains::parse_default_sql(sql).ok())
+            .clone()
+    })?;
+    crate::const_value(&node, &[a, b]).ok()
 }
 
 impl Late {
     /// The aggregate of `values` (one per filtered row), or `None` when two
     /// of them cannot be ordered here.
-    fn over(self, values: &[&Bson]) -> Option<Bson> {
+    fn over(self, values: &[&Bson], of: SumOf) -> Option<Bson> {
         let present = values.iter().filter(|v| !matches!(v, Bson::Null));
         match self {
             Late::CountStar => Some(Bson::Int64(i64::try_from(values.len()).ok()?)),
@@ -262,6 +322,7 @@ impl Late {
                 }
                 Some(best.cloned().unwrap_or(Bson::Null))
             }
+            Late::Sum | Late::Avg if of != SumOf::Int => self.sum_or_avg(values, of),
             Late::Sum | Late::Avg => {
                 let mut sum: i64 = 0;
                 let mut n: i64 = 0;
@@ -285,6 +346,72 @@ impl Late {
                 DIV.with(|d| {
                     crate::const_value(d.as_ref()?, &[Bson::Int64(sum), Bson::Int64(n)]).ok()
                 })
+            }
+        }
+    }
+
+    /// `sum` / `avg` of a `bigint`, `numeric` or `double precision` column.
+    fn sum_or_avg(self, values: &[&Bson], of: SumOf) -> Option<Bson> {
+        const DIV: &str = "$1::numeric / $2::numeric";
+        const ADD: &str = "$1::numeric + $2::numeric";
+        let present: Vec<&Bson> = values
+            .iter()
+            .copied()
+            .filter(|v| !matches!(v, Bson::Null))
+            .collect();
+        if present.is_empty() {
+            return Some(Bson::Null);
+        }
+        let n = i64::try_from(present.len()).ok()?;
+        match of {
+            SumOf::Int => None,
+            SumOf::BigInt => {
+                let mut sum: i128 = 0;
+                for v in &present {
+                    sum += match v {
+                        Bson::Int32(i) => i128::from(*i),
+                        Bson::Int64(i) => i128::from(*i),
+                        _ => return None,
+                    };
+                }
+                let sum = Bson::String(sum.to_string());
+                if self == Late::Sum {
+                    numeric_op(ADD, sum, Bson::Int32(0))
+                } else {
+                    numeric_op(DIV, sum, Bson::Int64(n))
+                }
+            }
+            SumOf::Numeric => {
+                // `+ 0` makes a lone value numeric-typed like any sum.
+                let mut sum = numeric_op(ADD, present[0].clone(), Bson::Int32(0))?;
+                for v in &present[1..] {
+                    sum = numeric_op(ADD, sum, (*v).clone())?;
+                }
+                if self == Late::Sum {
+                    Some(sum)
+                } else {
+                    numeric_op(DIV, sum, Bson::Int64(n))
+                }
+            }
+            SumOf::Float => {
+                let mut sum = 0.0_f64;
+                let mut any_inf = false;
+                for v in &present {
+                    let Bson::Double(d) = v else {
+                        return None;
+                    };
+                    any_inf |= d.is_infinite();
+                    sum += d;
+                }
+                if sum.is_infinite() && !any_inf {
+                    return None; // PostgreSQL's 22003: the per-row path raises it
+                }
+                if self == Late::Sum {
+                    Some(Bson::Double(sum))
+                } else {
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(Bson::Double(sum / n as f64))
+                }
             }
         }
     }
@@ -344,6 +471,24 @@ thread_local! {
     /// Set while a correlated subquery of the running statement is being
     /// run (`correlated::run_direct`), and cleared for a user-code body.
     static IN_SUBQUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The executor's own per-statement entries (see [`with_scan_cache`]),
+    /// living exactly as long as `CACHE`.
+    static SCANS: std::cell::RefCell<Option<ScanCache>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Entries the executor keeps for the running statement, by its own keys.
+pub type ScanCache = HashMap<String, Box<dyn std::any::Any>>;
+
+/// Run `f` over the running statement's scan cache -- `None` unless a
+/// correlated subquery of the statement is running, the only time a scan
+/// repeats with different parameters often enough to be worth keeping.
+/// It is dropped with the statement's semi-join cache, and a user-code body
+/// gets its own (it may read its own writes).
+pub fn with_scan_cache<R>(f: impl FnOnce(&mut ScanCache) -> R) -> Option<R> {
+    if !IN_SUBQUERY.with(std::cell::Cell::get) {
+        return None;
+    }
+    SCANS.with(|c| c.borrow_mut().as_mut().map(f))
 }
 
 /// Run `f` as a subquery of the running statement: a scope it enters shares
@@ -368,7 +513,10 @@ pub(crate) fn as_subquery<R>(f: impl FnOnce() -> R) -> R {
 /// 2,000 rows: 36 s). User code (a function, trigger or procedure body) runs
 /// its statements under [`Scope::fresh`] instead, since they may read the
 /// body's own earlier writes.
-pub(crate) struct Scope(Option<Option<HashMap<String, Entry>>>);
+/// What a scope replaced, restored when it ends.
+type Saved = (Option<HashMap<String, Entry>>, Option<ScanCache>);
+
+pub(crate) struct Scope(Option<Saved>);
 
 impl Scope {
     pub(crate) fn enter() -> Self {
@@ -380,14 +528,18 @@ impl Scope {
 
     /// A cache of its own, whatever is active, restored on drop.
     pub(crate) fn fresh() -> Self {
-        Scope(Some(CACHE.with(|c| c.replace(Some(HashMap::new())))))
+        Scope(Some((
+            CACHE.with(|c| c.replace(Some(HashMap::new()))),
+            SCANS.with(|c| c.replace(Some(HashMap::new()))),
+        )))
     }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        if let Some(prev) = self.0.take() {
+        if let Some((prev, scans)) = self.0.take() {
             CACHE.with(|c| *c.borrow_mut() = prev);
+            SCANS.with(|c| *c.borrow_mut() = scans);
         }
     }
 }
@@ -455,7 +607,7 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
             if matches!(v, Bson::Null) {
                 // `col < NULL` is never true: no row qualifies.
                 return Ok(match ix.late {
-                    Some(late) => late.over(&[]).map(|v| vec![vec![v]]),
+                    Some(late) => late.over(&[], ix.sum_of).map(|v| vec![vec![v]]),
                     None => Some(Vec::new()),
                 });
             }
@@ -485,7 +637,7 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                 }
                 if let Some(late) = ix.late {
                     let values: Vec<&Bson> = out.iter().filter_map(|r| r.first()).collect();
-                    return Ok(late.over(&values).map(|v| vec![vec![v]]));
+                    return Ok(late.over(&values, ix.sum_of).map(|v| vec![vec![v]]));
                 }
                 Ok(Some(
                     out.into_iter()
@@ -495,7 +647,7 @@ pub(crate) fn lookup(sql: &str, params: &[Bson], run: Runner) -> Result<Option<V
                 ))
             }
             None => match ix.late {
-                Some(late) => Ok(late.over(&[]).map(|v| vec![vec![v]])),
+                Some(late) => Ok(late.over(&[], ix.sum_of).map(|v| vec![vec![v]])),
                 None if ix.aggregate => Ok(None),
                 None => Ok(Some(Vec::new())),
             },
@@ -518,6 +670,7 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
     };
     let rows = run(&rewritten, &[])?;
     let nkeys = params.len();
+    let mut sum_of: Option<SumOf> = None;
     let mut families: Vec<Option<Family>> = vec![None; nkeys];
     let mut kinds: Vec<Kinds> = vec![Kinds::default(); nkeys];
     let nfilters = filters.len();
@@ -536,15 +689,19 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
             {
                 return Ok(Entry::No);
             }
-            // A sum / avg only over 32-bit-or-narrower integers, whose sum
-            // is a `bigint` computed exactly here.
-            if matches!(late, Late::Sum | Late::Avg)
-                && (!matches!(&ty, Bson::String(t) if t == "integer" || t == "smallint")
-                    || !row
-                        .first()
-                        .is_some_and(|v| matches!(v, Bson::Int32(_) | Bson::Null)))
-            {
-                return Ok(Entry::No);
+            // A sum / avg only over the types `SumOf` adds up exactly as
+            // PostgreSQL does, all of one type.
+            if matches!(late, Late::Sum | Late::Avg) {
+                let Some(of) = (match &ty {
+                    Bson::String(t) => SumOf::of(t),
+                    _ => None,
+                }) else {
+                    return Ok(Entry::No);
+                };
+                if sum_of.is_some_and(|s| s != of) || !row.first().is_some_and(|v| of.accepts(v)) {
+                    return Ok(Entry::No);
+                }
+                sum_of = Some(of);
             }
         }
         // Each filter column, then its type's name (`pg_typeof(col)::text`).
@@ -590,6 +747,8 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
         params,
         aggregate,
         late,
+        // No rows at all: every sum / avg is NULL whatever the type.
+        sum_of: sum_of.unwrap_or(SumOf::Int),
         limit,
         offset,
         families,
@@ -1017,6 +1176,35 @@ mod tests {
     }
 
     #[test]
+    fn wider_sums_follow_the_column_type() {
+        let big = Bson::Int64(i64::MAX);
+        let one = Bson::Int64(1);
+        // bigint: an exact numeric past i64, never a wrap.
+        let sum = Late::Sum
+            .over(&[&big, &one], SumOf::BigInt)
+            .expect("summed");
+        assert_eq!(
+            crate::numeric::numeric_operand_text(&sum).as_deref(),
+            Some("9223372036854775808")
+        );
+        // double precision: float8pl in order; an overflow of finite values
+        // is left to the per-row path (which raises 22003).
+        let (a, b) = (Bson::Double(1e308), Bson::Double(1e308));
+        assert_eq!(Late::Sum.over(&[&a, &b], SumOf::Float), None);
+        let (x, y) = (Bson::Double(0.5), Bson::Double(0.25));
+        assert_eq!(
+            Late::Avg.over(&[&x, &y], SumOf::Float),
+            Some(Bson::Double(0.375))
+        );
+        assert_eq!(
+            Late::Sum.over(&[&Bson::Null], SumOf::Numeric),
+            Some(Bson::Null)
+        );
+        assert_eq!(SumOf::of("real"), None);
+        assert!(!SumOf::Float.accepts(&Bson::Int32(1)));
+    }
+
+    #[test]
     fn sum_and_avg_under_a_filter_are_late() {
         for (sql, late) in [
             (
@@ -1033,13 +1221,13 @@ mod tests {
         let one = Bson::Int32(1);
         let two = Bson::Int32(2);
         assert_eq!(
-            Late::Sum.over(&[&one, &Bson::Null, &two]),
+            Late::Sum.over(&[&one, &Bson::Null, &two], SumOf::Int),
             Some(Bson::Int64(3))
         );
-        assert_eq!(Late::Sum.over(&[&Bson::Null]), Some(Bson::Null));
-        assert_eq!(Late::Avg.over(&[]), Some(Bson::Null));
+        assert_eq!(Late::Sum.over(&[&Bson::Null], SumOf::Int), Some(Bson::Null));
+        assert_eq!(Late::Avg.over(&[], SumOf::Int), Some(Bson::Null));
         // Only 32-bit integers are summed here.
-        assert_eq!(Late::Sum.over(&[&Bson::Int64(1)]), None);
+        assert_eq!(Late::Sum.over(&[&Bson::Int64(1)], SumOf::Int), None);
     }
 
     #[test]
@@ -1120,11 +1308,23 @@ mod tests {
         let r = rewrite("SELECT count(*) FROM t WHERE t.x = $1 AND t.y > $2").expect("qualifies");
         assert_eq!(r.late, Some(Late::CountStar));
         let (a, b, n) = (Bson::Int32(3), Bson::Double(2.5), Bson::Null);
-        assert_eq!(Late::Max.over(&[&a, &n, &b]), Some(Bson::Int32(3)));
-        assert_eq!(Late::Min.over(&[&a, &n, &b]), Some(Bson::Double(2.5)));
-        assert_eq!(Late::Min.over(&[]), Some(Bson::Null));
-        assert_eq!(Late::Count.over(&[&a, &n]), Some(Bson::Int64(1)));
-        assert_eq!(Late::CountStar.over(&[&a, &n]), Some(Bson::Int64(2)));
+        assert_eq!(
+            Late::Max.over(&[&a, &n, &b], SumOf::Int),
+            Some(Bson::Int32(3))
+        );
+        assert_eq!(
+            Late::Min.over(&[&a, &n, &b], SumOf::Int),
+            Some(Bson::Double(2.5))
+        );
+        assert_eq!(Late::Min.over(&[], SumOf::Int), Some(Bson::Null));
+        assert_eq!(
+            Late::Count.over(&[&a, &n], SumOf::Int),
+            Some(Bson::Int64(1))
+        );
+        assert_eq!(
+            Late::CountStar.over(&[&a, &n], SumOf::Int),
+            Some(Bson::Int64(2))
+        );
     }
 
     #[test]

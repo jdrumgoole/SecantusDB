@@ -43,7 +43,7 @@ mod optype;
 mod semijoin;
 mod semijoin_hash;
 pub use errpos::error_position;
-pub use semijoin_hash::with_fresh_subquery_cache;
+pub use semijoin_hash::{with_fresh_subquery_cache, with_scan_cache, ScanCache};
 pub mod alter_routine;
 pub mod collation;
 pub mod geo;
@@ -1706,6 +1706,26 @@ pub struct LockTarget {
 /// cannot be told apart from the returned ones -- an aggregate, DISTINCT or
 /// computed column in between -- is not in the list.
 pub fn lock_targets(sel: &Select, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Vec<LockTarget> {
+    lock_targets_with(sel, lookup, true)
+}
+
+/// The key a FROM-subquery's materialised rows carry the stored row id of
+/// a table WITHOUT a primary key under, while a locking select reads them
+/// (`with_lock_row_ids` in the server): it is in no column list, so no
+/// projection reads it, and it lets the lock find exactly the base row
+/// behind each returned one. Without it such a row could only be matched
+/// by the columns the subquery carries, which locked every row equal in
+/// those columns.
+pub const LOCK_ROW_ID: &str = "\u{1f}lockrow";
+
+/// `lock_targets`, where `carry` says the subquery rows on this chain carry
+/// [`LOCK_ROW_ID`] (they do when every level is a FROM-subquery the server
+/// materialises; a join leaf's rows do not).
+fn lock_targets_with(
+    sel: &Select,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    carry: bool,
+) -> Vec<LockTarget> {
     let Some(sub) = &sel.sub else {
         return Vec::new();
     };
@@ -1714,7 +1734,7 @@ pub fn lock_targets(sel: &Select, lookup: &dyn Fn(&str) -> Option<TableDef>) -> 
     }
     let inherited = lock_for(&sel.lock_clauses, &[&sub.alias]);
     let keys: Vec<String> = sub.def.columns.iter().map(|c| c.field()).collect();
-    output_lock_targets(&sub.plan, &keys, inherited, lookup)
+    output_lock_targets(&sub.plan, &keys, inherited, lookup, carry)
 }
 
 /// A join tree's targets, keyed by the joined rows' keys.
@@ -1740,7 +1760,7 @@ fn join_lock_targets(
                 return Vec::new();
             };
             let keys: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
-            output_lock_targets(plan, &keys, Some(lock), lookup)
+            output_lock_targets(plan, &keys, Some(lock), lookup, false)
                 .into_iter()
                 .filter_map(|mut t| {
                     for (k, _) in &mut t.ident {
@@ -1767,6 +1787,7 @@ fn output_lock_targets(
     out_keys: &[String],
     inherited: Option<RowLock>,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    carry: bool,
 ) -> Vec<LockTarget> {
     let Statement::Select(sel) = stmt else {
         return Vec::new();
@@ -1783,7 +1804,7 @@ fn output_lock_targets(
                 lock,
             });
         }
-        lock_targets(&inner, lookup)
+        lock_targets_with(&inner, lookup, carry)
     } else if !sel.table.is_empty() && sel.join.is_none() {
         let Some(lock) = inherited.or(sel.lock) else {
             return Vec::new();
@@ -1797,7 +1818,11 @@ fn output_lock_targets(
             .filter(|c| c.pk)
             .map(|c| c.field())
             .collect();
-        let fields = if pk.is_empty() {
+        let fields = if pk.is_empty() && carry {
+            // Identified by its stored row id, carried out of the subquery
+            // under `LOCK_ROW_ID`.
+            vec!["_id".to_string()]
+        } else if pk.is_empty() {
             def.columns.iter().map(|c| c.field()).collect()
         } else {
             pk
@@ -1818,6 +1843,11 @@ fn output_lock_targets(
                 .ident
                 .iter()
                 .filter_map(|(k, base)| {
+                    // The row id rides along under its own key (see
+                    // `LOCK_ROW_ID`), whatever the projection outputs.
+                    if carry && base == "_id" && (k == "_id" || k == LOCK_ROW_ID) {
+                        return Some((LOCK_ROW_ID.to_string(), base.clone()));
+                    }
                     let i = sel.columns.iter().enumerate().position(|(i, (_, f))| {
                         f == k && sel.casts.get(i).is_none_or(|c| c.is_none())
                     })?;

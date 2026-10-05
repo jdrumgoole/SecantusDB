@@ -671,15 +671,6 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
-- [ ] **OPEN — RUST pgserver: psycopg `test_ctrl_c` fails under the full
-      suite (batch 52, 2026-10-04).** `test_concurrency.py::test_ctrl_c` and
-      `test_concurrency_async.py::test_ctrl_c` fail in two full psycopg runs
-      on batch 52 AND on its base `0c29ef2c` (batch 51 measured 5544 / 0),
-      while both pass 3/3 alone and the `test_concurrency*` files pass 3/3.
-      Under the full suite the cancel never reaches the running `pg_sleep`.
-      Server-side until proven otherwise -- likely in the cancel / wait path
-      batch 51 changed (shared row locks, in-block streaming). Bisect batch
-      51's commit against the full suite.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
@@ -689,6 +680,14 @@ remain open:
       7354 completed, 1 failed (`BlobTransactionTest`, below), 28 skipped. The fixes of batches 37-48 are in the git log and the
       corpora `b39_*` .. `b48_*`; this entry keeps only what is open or
       decided:
+      - **Not a server bug (batch 53):** psycopg's two `test_ctrl_c` failed
+        in background-launched gauge runs since batch 51 and passed in
+        foreground ones. A shell starts a background job with SIGINT
+        IGNORED, and that survives exec, so the suite's Ctrl-C never
+        reached its client: no CancelRequest arrived at all (logged), and
+        batch 50's binary fails the same way launched the same way. The
+        runner now gives pytest the default disposition
+        (`psycopg_validation/runner.py`, `tests/test_psycopg_gauge_sigint.py`).
       - **Fixed in batch 50:** a DROP's CASCADE list, `... does not exist,
         skipping` and the other NOTICE / WARNING a DDL statement raises are
         sent the moment they are raised when a client is listening (they
@@ -1019,11 +1018,15 @@ remain open:
         before, so its snapshot cannot be refreshed (WiredTiger's
         `reset_snapshot` refuses after a write) -- the READ COMMITTED
         redesign the Python-side entry scopes.
-      - A FOR UPDATE over a table with no primary key, through a subquery
-        that does not carry every column, locks every row equal in the
-        columns it carries (batch 52: unchanged -- exact locking needs a
-        hidden row id carried through the subquery's projection, which
-        `lock_targets` matches after the fact).
+      - FIXED in batch 53: a FOR UPDATE through a FROM-subquery over a
+        table with no primary key locked every row equal in the columns the
+        subquery carried. A locking select now reads its subquery's rows
+        with each base row's stored id under a hidden key
+        (`secantus_pgplan::LOCK_ROW_ID`, `materialise_with_row_ids`), so it
+        locks exactly the rows behind the result (slice test
+        `test_batch53_for_update_through_a_subquery_locks_only_the_rows_returned`,
+        PostgreSQL 15.19's answers). Through a JOIN leaf a no-PK table is
+        still matched by the columns carried.
       - REPEATABLE READ answers 40001 after the wait when ANY transaction
         committed since its snapshot, where PostgreSQL goes on unless the
         ROW changed: WiredTiger cannot continue a transaction after a
@@ -1341,6 +1344,13 @@ These work end-to-end but cut corners.
       `is_timeseries` re-reads the collection options on every `_id` point
       lookup, ~1.6 us -- a storage-crate cache the MongoDB server shares, so
       left alone here), and tokio's `block_in_place` hand-off (~1 us).
+
+      **Batch 53 (2026-10-04):** `is_timeseries` answers `false` without a
+      read until a timeseries collection has been written in the process or
+      found in a store it opened (`TIMESERIES_SEEN`, sticky, set before the
+      options are written -- so it can only err towards reading). Release,
+      `bench43.py`, two interleaved runs, load ~3.8: PK read 51.9 / 52.5 ->
+      50.7 / 51.9 us, the rest unchanged within noise (PG 15: 33.6).
 
       **Batch 51 (2026-10-03)**, release builds of base (`34aedc33`) and
       batch 51, `bench43.py`, two interleaved runs, load ~11: no change
@@ -7595,12 +7605,26 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       build (`-9223372036854775806` where PostgreSQL answers
       `9223372036854775810`) and panicked a debug one -- summed in i128 and
       answered as numeric now.
-      Still per outer value (each answer unchanged, only slower): the nested
-      shape's MIDDLE level (1.21 s -- one indexed-filter scan per outer row;
-      PostgreSQL hashes both levels), grouping inside a FROM subquery (0.31 s,
-      PG 0.13 s), `sum` / `avg` of bigint / numeric / float under a filter,
-      an ordering filter over a numeric or a collated text, functions in the
-      inner select list, a FROM function or subquery.
+      **Batch 53 (2026-10-04)**, release, same script, base `05ae7bfa` ->
+      batch 53 (PG 15): nested EXISTS 1.234 -> **0.147 s** (0.128),
+      grouping inside a FROM subquery 0.318 -> **0.045 s** (0.128), `sum` /
+      `avg` under a filter of bigint 1.23 -> **0.047 s**, numeric 1.24-1.29
+      -> **0.058-0.074 s**, double precision 1.24 -> **0.029 s** (all
+      0.145). The middle level and the grouped subquery were a FULL scan of
+      the inner table per outer row (the filter pins an unindexed column):
+      the statement now reads such a table once and groups it by that
+      column (`secantus-pgserver/src/scan_partitions.rs`, built after the
+      4th run of one scan, dropped with the statement's semi-join cache).
+      `sum` / `avg` are late over `bigint` (i128, numeric result),
+      `numeric` (`numeric_add` row by row) and `double precision`
+      (`SumOf`). Found on the way: `sum` / `avg` of `double precision`
+      never raised PostgreSQL's 22003 on an overflow (`1e308 + 1e308`
+      answered Infinity), and a user error inside a subquery reached the
+      client as XX000 "could not read a subquery" -- both fixed (corpora
+      `b53_late_sums`, `b53_scan_partitions`).
+      Still per outer value (each answer unchanged, only slower): an
+      ordering filter over a numeric or a collated text, functions in the
+      inner select list, a FROM function, `sum` / `avg` of `real`.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes
