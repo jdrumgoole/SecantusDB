@@ -671,6 +671,13 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
+- [ ] **OPEN — RUST pgserver: `secantusd-pg` ignores SIGTERM when started as
+      a background job (batch 54, 2026-10-05).** Seen by a probe harness,
+      not investigated: a bare SIGTERM did not stop it; SIGINT did. Likely
+      the same inherited-disposition trap as the psycopg `test_ctrl_c`
+      runner fix (batch 53), but a server that cannot be stopped by SIGTERM
+      under a supervisor is a real defect -- reset SIGTERM/SIGINT to their
+      defaults at startup (POSIX only) and add a test.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
