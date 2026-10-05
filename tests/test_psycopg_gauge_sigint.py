@@ -10,10 +10,13 @@ The runner now gives the suite's process the default disposition.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from psycopg_validation import runner  # noqa: E402
@@ -32,6 +35,11 @@ def _child_hears_sigint(preexec_fn) -> bool:
     return out.stdout.strip() == "True"
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX signal inheritance: a background job's ignored SIGINT survives exec; "
+    "Windows has no such inheritance and subprocess rejects preexec_fn there",
+)
 def test_suite_process_gets_the_default_sigint_even_from_a_background_launch():
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:

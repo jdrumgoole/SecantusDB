@@ -221,7 +221,9 @@ def main() -> int:
             cwd=VENDOR,
             env=env,
             timeout=PYTEST_TIMEOUT_SECONDS,
-            preexec_fn=_default_sigint,
+            # POSIX only: Windows has no inherited signal dispositions, and
+            # subprocess rejects preexec_fn there.
+            preexec_fn=_default_sigint if os.name == "posix" else None,
         )
         return proc.returncode
     finally:
