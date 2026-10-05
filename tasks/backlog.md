@@ -671,13 +671,16 @@ remain open:
       `secantus-storage` or a stored-name escape -- the second changes the
       on-disk format both PG servers share. Neither is justified by a
       column name SQLAlchemy's suite uses only to prove quoting works.
-- [ ] **OPEN — RUST pgserver: `secantusd-pg` ignores SIGTERM when started as
-      a background job (batch 54, 2026-10-05).** Seen by a probe harness,
-      not investigated: a bare SIGTERM did not stop it; SIGINT did. Likely
-      the same inherited-disposition trap as the psycopg `test_ctrl_c`
-      runner fix (batch 53), but a server that cannot be stopped by SIGTERM
-      under a supervisor is a real defect -- reset SIGTERM/SIGINT to their
-      defaults at startup (POSIX only) and add a test.
+- [x] **FIXED (batch 55, 2026-10-05) — RUST pgserver: `secantusd-pg` ignored
+      SIGTERM when its parent left SIGTERM BLOCKED.** Reproduced: a blocked
+      signal mask survives exec, so the `ctrlc` handler was installed but
+      SIGTERM was never delivered (an inherited SIG_IGN was already
+      overridden by the handler). `main` now unblocks SIGINT / SIGTERM and
+      resets their dispositions before any thread exists (POSIX only; a
+      no-op on Windows). `tests/signals.rs` starts the binary with SIGTERM
+      blocked and with it ignored, and requires a clean exit on SIGTERM
+      (the blocked case fails on the old binary); CI runs it beside
+      `embedded`.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
@@ -1029,8 +1032,43 @@ remain open:
         (`RC_MOVE_MAX_WRITES`), or for a write the move cannot carry (DDL
         other than CREATE, async oplog), the block keeps its snapshot as
         before (a replay per statement is quadratic: at 10,000, pgjdbc's
-        1,000-row batch timed out beside concurrent commits). Left: a block
-        past that size still reads its first write's snapshot. Every move --
+        1,000-row batch timed out beside concurrent commits). FIXED in batch
+        55: the cap is gone. Every commit records the collections it wrote
+        (`NS_COMMITS`, from its oplog entries and rows; a command entry or a
+        registry write counts as every collection), and a plain `INSERT ...
+        VALUES` into an ordinary table (no user function, trigger, rule, RLS,
+        inheritance or partitioning; `rc_read_set`) moves only when a commit
+        since its snapshot touched a table its foreign keys name or a
+        catalog, or CHANGED rows of the target (an update or a delete; when
+        the target's only unique key is a byte-compared primary key, another
+        session's insert under the same key is a WiredTiger write conflict
+        the re-run answers 23505, so an insert-only commit there is not
+        waited for; with any other unique index or constraint every commit
+        there counts) -- another table's commit no longer forces a replay.
+        Any other statement moves whenever anything but a sequence
+        committed. Sequence rows are now read OUTSIDE the block
+        (`read_sequences`) unless it wrote some itself, as PostgreSQL's
+        sequences are not transactional (a block's `SELECT last_value`
+        missed another session's `nextval`; corpus-checked against PG 15),
+        so the `nextval` every serial INSERT commits outside the block --
+        the actual cause of the quadratic -- never forces a move. A block
+        alternating 400 serial INSERTs and SELECTs: 2.54 s (base, debug) ->
+        0.44 s (PG 15: 0.04). 500 inserts of
+        30 KB in one block beside a writer on another table: 0.42 s (debug);
+        `a_long_read_committed_block_sees_later_commits` and
+        `a_block_insert_sees_concurrent_deletes_and_duplicate_keys`
+        and `a_block_reads_sequences_as_they_stand` (embedded) pin a
+        300-write block seeing a later commit, the insert-only rule and the
+        sequence reads against PostgreSQL 15's answers. (With a user
+        function anywhere in the database the INSERT gate first fell back to
+        "everything", and pgjdbc's BatchDeadlockTest timed out 8 of 8; it
+        now looks only at the target's own expressions, triggers and rules.) (A first version
+        counted every commit to the target: three sessions' pipelined
+        inserts into one table then replayed thousand-entry write sets and
+        psycopg's `test_type_error_shadow` went 10.8 -> 14.4 s, near its
+        20 s timeout; it is 10.8 s again.) Left: a long block whose
+        statements READ a table others keep committing to still replays
+        its write set per statement (correct, quadratic). Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
@@ -1387,6 +1425,24 @@ These work end-to-end but cut corners.
       `is_timeseries` re-reads the collection options on every `_id` point
       lookup, ~1.6 us -- a storage-crate cache the MongoDB server shares, so
       left alone here), and tokio's `block_in_place` hand-off (~1 us).
+
+      **Batch 55 (2026-10-05)**, release, `bench43.py`, two interleaved
+      runs, load ~6-7, base `821f8acb` -> batch 55 (PG 15): simple `select
+      1` 31.6 / 31.4 -> **29.3 / 28.6**, extended `select 1` 42.5 / 42.5 ->
+      41.8 / 41.9, PK read 51.2 / 51.9 -> **50.3 / 50.0**, autocommit
+      UPDATE 72.9 / 73.7 -> 72.5 / 74.5 us (PG 15: 23.1, 27.1, 33.2,
+      81.8). A `sample` of 225k PK reads put ~21 us a statement on the
+      connection's thread; the two measured hot spots fixed:
+      `user_wire_type` read five catalog lists (enums, composites, ranges,
+      base types, domains) for EVERY result column, built-in types included
+      (~0.55 us) -- a built-in name now answers at once, as PostgreSQL
+      resolves it in `pg_catalog` first; and `install_user_types` parsed the
+      DateStyle GUC twice. What remains is spread under 1 us apiece: the
+      catalog `TableDef` clone per lookup (~0.6), the Describe (~1.2),
+      `sql_relations` for the table locks (~0.5; it resolves names through
+      the search path, so it cannot be memoised by text), the extended
+      group's open / commit (~1), the `_id` probe (~1.5), the two socket
+      syscalls (~5) and the tokio hand-offs.
 
       **Batch 54 (2026-10-05):** `is_timeseries` caches its answer per
       collection once a timeseries collection exists (`TIMESERIES_CACHE`),
@@ -7697,11 +7753,19 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       wrong last digit, and Infinity where PostgreSQL raises 22003);
       `round` / `trunc(numeric, n)` ignored a negative `n` (`round(1250,
       -2)` answered 1250) and failed on NaN / Infinity.
-      Still per outer value (each answer unchanged, only slower): an
-      ordering filter over a COLLATED text (0.104 s against PostgreSQL's
-      0.001 -- the comparison's collation is derived from both sides, and
-      the hash path sees only the inner one), and a numeric `min` / `max`
-      under a filter.
+      **Batch 55 (2026-10-05)**, release, 2,000 x 2,000, base `821f8acb`
+      -> batch 55 (PG 15), load ~11-18: an ordering filter over a COLLATED
+      inner text column, `C` 0.119 -> **0.029 s** (0.001), ICU 0.557 ->
+      **0.031 s** (0.002), `count(*)` under one 0.682 -> **0.041 s**
+      (0.489); a numeric `min` / `max` under a filter 0.146 / 0.162 ->
+      **0.036 / 0.042 s** (0.147 / 0.305). The filter column's collation is
+      learned once (`collation_probe`: `pg_collation_for(col)` over the
+      FROM) and its values are held as that collation's sort keys, the
+      outer bound keyed the same way per lookup -- the per-row path also
+      compares under the inner column's collation, so every answer is the
+      one it gave (corpus `b55_correlated`, 17 lines, 0 against PostgreSQL
+      15). A numeric `min` / `max` orders by `numeric_order`. Nothing named
+      by this entry is per outer value any more.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes

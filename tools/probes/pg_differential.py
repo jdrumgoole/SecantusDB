@@ -230,15 +230,20 @@ def _reference_locale(path: str) -> str | None:
     return None
 
 
-def _reference_in_locale(ref: psycopg.Connection, locale: str) -> psycopg.Connection:
-    """A connection to a reference database whose collation and ctype are
-    `locale`, created from `template0` on first use."""
-    dbname = "secantus_ref_" + "".join(c if c.isalnum() else "_" for c in locale.lower())
+def _reference_in_locale(
+    ref: psycopg.Connection, locale: str, ctype: str | None = None
+) -> psycopg.Connection:
+    """A connection to a reference database whose collation is `locale` and
+    whose ctype is `ctype` (default: `locale` too), created from `template0`
+    on first use."""
+    ctype = ctype or locale
+    tag = locale if ctype == locale else f"{locale}_{ctype}"
+    dbname = "secantus_ref_" + "".join(c if c.isalnum() else "_" for c in tag.lower())
     exists = ref.execute("SELECT 1 FROM pg_database WHERE datname = %s", [dbname]).fetchone()
     if not exists:
         ref.execute(
             f"CREATE DATABASE {dbname} TEMPLATE template0 ENCODING 'UTF8' "
-            f"LC_COLLATE '{locale}' LC_CTYPE '{locale}'"
+            f"LC_COLLATE '{locale}' LC_CTYPE '{ctype}'"
         )
     host, port, user = ref.info.host, ref.info.port, ref.info.user
     ref.close()
@@ -310,6 +315,17 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
     locale = _reference_locale(corpus_path)
     if locale:
         ref = _reference_in_locale(ref, locale)
+    else:
+        # The default COLLATION a corpus is measured under is `C`: this
+        # server's text order is bytewise, and a reference cluster initialised
+        # under a linguistic locale (en_US.UTF-8 orders `'a' < 'B'` and skips
+        # punctuation) would report its configuration as divergences. Its
+        # ctype is kept: case mapping is what `reference-locale` is for.
+        collate, ctype = ref.execute(
+            "SELECT datcollate, datctype FROM pg_database WHERE datname = current_database()"
+        ).fetchone()
+        if collate != "C":
+            ref = _reference_in_locale(ref, "C", ctype)
     scur, rcur = sec.cursor(), ref.cursor()
 
     for stmt in _read(setup_path):

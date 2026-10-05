@@ -401,3 +401,208 @@ fn a_row_lock_in_one_store_does_not_block_another_store() {
     a.stop();
     b.stop();
 }
+
+/// A READ COMMITTED block sees every commit made before its statement,
+/// however much it has written: batch 54 left a block past 256 written
+/// entries on its first write's snapshot. And a commit to a table the
+/// statement does not read (or a sequence advance) does not make it replay
+/// its writes -- the moves that remain are the ones a statement needs.
+#[test]
+fn a_long_read_committed_block_sees_later_commits() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE t (id serial PRIMARY KEY, data text)",
+            "CREATE TABLE other (id serial PRIMARY KEY, v int)",
+        ],
+    );
+    let dsn = server.dsn();
+    rt.block_on(async move {
+        let connect = || async {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let a = connect().await;
+        let b = connect().await;
+        a.batch_execute("BEGIN").await.unwrap();
+        for _ in 0..300 {
+            // Each draws from the serial's sequence, advanced (and committed)
+            // outside the block.
+            a.execute("INSERT INTO t (data) VALUES ('a')", &[])
+                .await
+                .unwrap();
+        }
+        b.batch_execute("INSERT INTO t (data) VALUES ('b'); INSERT INTO other (v) VALUES (1)")
+            .await
+            .unwrap();
+        // This INSERT reads `t` (its key), which b wrote: the block moves
+        // onto a fresh snapshot, its 300 writes replayed, and carries on.
+        a.execute("INSERT INTO t (data) VALUES ('a')", &[])
+            .await
+            .unwrap();
+        let seen_t: i64 = a
+            .query_one("SELECT count(*) FROM t WHERE data = 'b'", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let seen_other: i64 = a
+            .query_one("SELECT count(*) FROM other", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let own: i64 = a
+            .query_one("SELECT count(*) FROM t WHERE data = 'a'", &[])
+            .await
+            .unwrap()
+            .get(0);
+        a.batch_execute("COMMIT").await.unwrap();
+        assert_eq!((seen_t, seen_other, own), (1, 1, 301));
+    });
+    server.stop();
+}
+
+/// An INSERT into a table whose only unique key is its primary key keeps its
+/// block's snapshot across another session's INSERTs there (a clash on the
+/// key is a write conflict, re-run to PostgreSQL's 23505) but not across an
+/// UPDATE or DELETE: re-inserting a key another session deleted succeeds, as
+/// on PostgreSQL 15.
+#[test]
+fn a_block_insert_sees_concurrent_deletes_and_duplicate_keys() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE d (id int PRIMARY KEY, v text)",
+            "INSERT INTO d VALUES (1, 'old'), (2, 'x')",
+        ],
+    );
+    let dsn = server.dsn();
+    rt.block_on(async move {
+        let connect = || async {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let a = connect().await;
+        let b = connect().await;
+        a.batch_execute("BEGIN; INSERT INTO d VALUES (10, 'a')")
+            .await
+            .unwrap();
+        b.batch_execute("DELETE FROM d WHERE id = 1").await.unwrap();
+        a.batch_execute("INSERT INTO d VALUES (1, 'new')")
+            .await
+            .expect("the deleted key is free again");
+        a.batch_execute("COMMIT").await.unwrap();
+
+        a.batch_execute("BEGIN; INSERT INTO d VALUES (11, 'a')")
+            .await
+            .unwrap();
+        b.batch_execute("INSERT INTO d VALUES (3, 'b')")
+            .await
+            .unwrap();
+        let err = a
+            .batch_execute("INSERT INTO d VALUES (3, 'a')")
+            .await
+            .expect_err("a committed duplicate key");
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        );
+        a.batch_execute("ROLLBACK").await.unwrap();
+        let rows: Vec<(i32, String)> = b
+            .query("SELECT id, v FROM d ORDER BY id", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "new".to_string()),
+                (2, "x".to_string()),
+                (3, "b".to_string()),
+                (10, "a".to_string())
+            ]
+        );
+    });
+    server.stop();
+}
+
+/// A sequence is not transactional: inside a READ COMMITTED block that has
+/// written, another session's `nextval` is seen at once (PostgreSQL 15:
+/// `last_value` 2 here), and its own serial INSERTs' advances -- committed
+/// outside the block -- do not make each later statement replay the block.
+#[test]
+fn a_block_reads_sequences_as_they_stand() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE SEQUENCE q",
+            "CREATE TABLE s (id serial PRIMARY KEY, v int)",
+        ],
+    );
+    let dsn = server.dsn();
+    rt.block_on(async move {
+        let connect = || async {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        };
+        let a = connect().await;
+        let b = connect().await;
+        a.batch_execute("BEGIN; INSERT INTO s (v) VALUES (1)")
+            .await
+            .unwrap();
+        b.batch_execute("SELECT nextval('q'); SELECT nextval('q')")
+            .await
+            .unwrap();
+        let last: i64 = a
+            .query_one("SELECT last_value FROM q", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(last, 2);
+        b.batch_execute("INSERT INTO s (v) VALUES (2)")
+            .await
+            .unwrap();
+        let n: i64 = a
+            .query_one("SELECT count(*) FROM s", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 2);
+        let next: i64 = a
+            .query_one("SELECT nextval('q')", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(next, 3);
+        a.batch_execute("COMMIT").await.unwrap();
+    });
+    server.stop();
+}

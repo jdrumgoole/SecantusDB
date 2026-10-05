@@ -2240,6 +2240,8 @@ jobs:
       # stop those writes are gone while the client was told they succeeded, so
       # this is gated in CI rather than left to whoever remembers to run
       # `cargo test` locally. `cargo build --bin` above does not build tests.
+      # `signals` starts the binary with SIGTERM blocked / ignored, as a
+      # supervisor may leave it, and requires it to stop on SIGTERM.
       - name: Run the embedded pgserver tests
         shell: bash
         run: |
@@ -2248,7 +2250,7 @@ jobs:
           lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           export LIBCLANG_PATH="$(dirname "$lc")"
-          (cd crates/secantus-pgserver && cargo test --test embedded)
+          (cd crates/secantus-pgserver && cargo test --test embedded --test signals)
 
       - name: Verify the reference server is reachable
         # Fail CLOSED. The whole point of this job is that these suites stop
