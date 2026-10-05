@@ -1,0 +1,10 @@
+select id from b53p_o o where exists (select 1 from b53p_t t where t.x = o.a and exists (select 1 from b53p_u u where u.tid = t.id and u.id > o.b * 20)) order by 1;
+select id from b53p_o o where not exists (select 1 from b53p_t t where t.x = o.a and exists (select 1 from b53p_u u where u.tid = t.id and u.id > o.b * 20)) order by 1;
+select id, (select count(*) from (select y from b53p_t t where t.x = o.a group by y) g) from b53p_o o order by 1;
+select id, (select sum(c) from (select y, count(*) c from b53p_t t where t.x = o.a and t.v > o.b group by y) g) from b53p_o o order by 1;
+select id, (select count(*) from b53p_t t where t.s = o.s and exists (select 1 from b53p_u u where u.tid = t.id and u.id > o.id)) from b53p_o o order by 1;
+select id, (select count(*) from b53p_t t where t.f = o.f and exists (select 1 from b53p_u u where u.tid = t.id and u.id > o.id)) from b53p_o o order by 1;
+select id, (select count(*) from b53p_t t where t.d = o.d and exists (select 1 from b53p_u u where u.tid = t.id and u.id > o.id)) from b53p_o o order by 1;
+select id, (select max(v) from (select v from b53p_t t where t.x = o.a order by v desc limit 2) g) from b53p_o o order by 1;
+select id, (select string_agg(s, ',' order by s) from (select distinct s from b53p_t t where t.x = o.a) g) from b53p_o o order by 1;
+select id, (select array_agg(t.id order by t.id) from b53p_t t where t.x = o.a and (t.y = o.b or exists (select 1 from b53p_u u where u.tid = t.id and u.id < o.id))) from b53p_o o order by 1;

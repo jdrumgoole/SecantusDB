@@ -4817,6 +4817,7 @@ impl Storage {
         // gone; the leftover rows must not resurface under a re-created name).
         storage.recover_pending_drops()?;
         storage.revive_prepared_xacts()?;
+        storage.note_existing_timeseries()?;
         Ok(storage)
     }
 
@@ -7538,6 +7539,13 @@ impl Storage {
     /// Whether `(db, coll)` is a timeseries collection (its stored options carry
     /// a `timeseries` sub-document). Mirrors `storage._is_timeseries`.
     fn is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
+        // No timeseries collection was ever written in this process, nor
+        // found in a store it opened: nothing to look up. (The flag is
+        // sticky and set BEFORE such options are written, so it can never
+        // answer `false` for a timeseries collection.)
+        if !TIMESERIES_SEEN.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         // On every `_id` point lookup: look the key up in the raw options
         // rather than decoding the whole document.
         let cur = session.open_cursor(COLL_TABLE, None)?;
@@ -7558,6 +7566,26 @@ impl Storage {
             Err(e) if e.is_not_found() => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Set `TIMESERIES_SEEN` when this store already holds a timeseries
+    /// collection (its options carry `timeseries`).
+    fn note_existing_timeseries(&self) -> Result<()> {
+        if TIMESERIES_SEEN.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(COLL_TABLE, None)?;
+        let mut more = cur.next()?;
+        while more {
+            let blob = cur.get_value_u()?;
+            if !blob.is_empty() && options_name_timeseries(&blob)? {
+                TIMESERIES_SEEN.store(true, Ordering::SeqCst);
+                break;
+            }
+            more = cur.next()?;
+        }
+        Ok(())
     }
 
     /// A doc-table key discriminator for a timeseries collection. Timeseries
@@ -14709,8 +14737,30 @@ fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Docume
     }
 }
 
+/// Set once any collection options carrying `timeseries` are written in this
+/// process or found in a store it opens, and never cleared. Until then every
+/// collection is known not to be a timeseries one, and `is_timeseries` -- run
+/// on every `_id` point lookup -- answers without reading the options (a
+/// cursor search a lookup, ~1.6 us of a PostgreSQL primary-key read). Process
+/// wide and sticky, so it errs only towards looking: a rolled-back create, or
+/// another store's collection, merely keeps the lookup on.
+static TIMESERIES_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Do these raw collection options name a `timeseries` sub-document?
+fn options_name_timeseries(blob: &[u8]) -> Result<bool> {
+    let raw = bson::RawDocument::from_bytes(blob)
+        .map_err(|e| StorageError::Internal(format!("collection options: {e}")))?;
+    Ok(raw
+        .get("timeseries")
+        .map_err(|e| StorageError::Internal(format!("collection options: {e}")))?
+        .is_some())
+}
+
 /// Overwrite the collection's options blob (caller has ensured registration).
 fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) -> Result<()> {
+    if opts.contains_key("timeseries") {
+        TIMESERIES_SEEN.store(true, Ordering::SeqCst);
+    }
     let blob = encode_doc(opts)?;
     let cur = session.open_cursor(COLL_TABLE, None)?;
     cur.set_key_ss(db, coll);

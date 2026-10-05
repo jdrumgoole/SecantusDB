@@ -26,6 +26,7 @@ pytest-randomly, pytest-cov) ride the ``dev`` extra.
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -101,6 +102,22 @@ def _verify_secantus_identity(host: str, port: int) -> None:
             f"daemon at {host}:{port} does not identify as SecantusDB "
             f"(version(): {version!r}) — refusing to run the gauge against it"
         )
+
+
+def _default_sigint() -> None:
+    """Give the suite's process the DEFAULT SIGINT disposition.
+
+    A shell starts a background job (`cmd &`, a detached run) with SIGINT
+    ignored, and an ignored signal stays ignored across fork and exec -- so
+    every process of the suite inherited SIG_IGN, and `test_ctrl_c` (twice:
+    sync and async), which Ctrl-Cs a client in the middle of `pg_sleep`,
+    found its client deaf to the signal: no cancel was ever sent, and the
+    sync test hung for its 20 s budget. Measured 2026-10-04: the two tests
+    fail 2/2 launched in the background and pass 2/2 in the foreground,
+    against the same server binary. A gauge number must not depend on how
+    it was launched.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def main() -> int:
@@ -199,7 +216,13 @@ def main() -> int:
             *marker,
             *INCLUDE,
         ]
-        proc = subprocess.run(cmd, cwd=VENDOR, env=env, timeout=PYTEST_TIMEOUT_SECONDS)
+        proc = subprocess.run(
+            cmd,
+            cwd=VENDOR,
+            env=env,
+            timeout=PYTEST_TIMEOUT_SECONDS,
+            preexec_fn=_default_sigint,
+        )
         return proc.returncode
     finally:
         daemon.terminate()
