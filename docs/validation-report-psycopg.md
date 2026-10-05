@@ -1,8 +1,8 @@
 # psycopg conformance report
 
-- SecantusDB (Python server) 0.6.0b16
+- SecantusDB (Python server) 0.6.0b17
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-09-21 06:49 UTC
+- generated: 2026-10-05 06:55 UTC
 
 | category | passed | failed | expected | skipped | total | pass rate | adjusted |
 |---|---|---|---|---|---|---|---|

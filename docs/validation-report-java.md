@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report
 
-Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-10-05 — SecantusDB 0.6.0b17 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver gauges for the official Java driver — the language enterprise MongoDB consumers most often use.
 
@@ -13,17 +13,16 @@ Run `uv run python -m invoke validate-java` to refresh. The pass rate is the ana
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
-| `driver-sync__0` | 405 | 1 | 354 | 760 | 99.7% |
+| `driver-sync__0` | 406 | 0 | 354 | 760 | 100.0% |
 | `driver-sync__1` | 79 | 1 | 50 | 130 | 98.7% |
-| **Overall** | **494** | **2** | **404** | **900** | **99.5%** |
+| **Overall** | **495** | **1** | **404** | **900** | **99.7%** |
 
-## Failures (2)
+## Failures (1)
 
 First 30 failed tests for triage:
 
 ```
-driver-sync__1 :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): find and getMore append API version
-driver-sync__0 :: com.mongodb.client.MongoCollectionTest#testObjectIdToStringConversion()
+driver-sync__1 :: com.mongodb.client.ClientMetadataTest#client metadata is not propagated to the server: metadata append does not create new connections or close existing ones and no hello command is sent
 ```
 
 ## How this is generated

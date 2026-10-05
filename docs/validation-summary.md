@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-09-21 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-10-05 — SecantusDB 0.6.0b17. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -8,20 +8,20 @@ Generated 2026-09-21 — SecantusDB 0.6.0b16. Each per-driver gauge runs the dri
 
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `pymongo` | Python | `f2103a95870a` | 1501 | 1072 | 0 | 5 | 424 | 99.5% | 100.0% |
-| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 977 | 0 | 6 | 440 | 99.3% | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 493 | 1 | 1 | 405 | 99.5% | 99.7% |
+| `pymongo` | Python | `f2103a95870a` | 1501 | 1206 | 0 | 5 | 290 | 99.5% | 100.0% |
+| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 1111 | 0 | 6 | 306 | 99.4% | 100.0% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 495 | 0 | 1 | 404 | 99.7% | 100.0% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 340 | 0 | 0 | 198 | 100.0% | 100.0% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 476 | 439 | 0 | 0 | 37 | 100.0% | 100.0% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 659 | 596 | 14 | 0 | 49 | 97.7% | 97.7% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 357 | 0 | 1 | 6 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
 | `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 104 | 1 | 0 | 0 | 99.0% | 99.0% |
-| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2185 | 0 | 0 | 36 | 100.0% | 100.0% |
-| `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 248 | 0 | 0 | 22 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 841 | 784 | 1 | 6 | 50 | 99.1% | 99.8% |
-| `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
+| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2197 | 1 | 0 | 23 | 99.9% | 99.9% |
+| `mongo-php-driver` | PHP | `06be1f01bb4c` | 271 | 253 | 1 | 0 | 17 | 99.6% | 99.6% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 790 | 1 | 2 | 48 | 99.6% | 99.8% |
+| `mongo-cxx-driver` | C++ | `24852b68a3d1` | 901 | 892 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 228 | 0 | 0 | 0 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10049** | **8375** | **3** | **20** | **1651** | **99.7%** | **99.9%** |
+| **All drivers** | — | — | **10235** | **8827** | **18** | **16** | **1374** | **99.6%** | **99.7%** |
 
 ## Per-driver scope
 
@@ -72,14 +72,10 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 
 - **Mongo::Collection#create when the collection has options when the collection has a write concern when write concern passed in as an option applies the write concern passed in as an option** — The test passes `w: 2` and expects success — it assumes the canonical multi-node replica-set test cluster the Ruby driver's own CI runs against. SecantusDB advertises as a single-node replica set, so `w: 2` returns `CannotSatisfyWriteConcern` (the correct mongod emulation). Documented in tasks/backlog.md §5.
 
-### `mongo-c-driver` (6)
+### `mongo-c-driver` (2)
 
 - **/Client/ipv6/single** — Requires an IPv6 listener (`MONGOC_TEST_IPV6`); the gauge daemon binds IPv4 `127.0.0.1` only. Environment-specific, not a protocol gap.
 - **/Client/ipv6/single** — Requires an IPv6 listener (`MONGOC_TEST_IPV6`); the gauge daemon binds IPv4 `127.0.0.1` only. Environment-specific, not a protocol gap.
-- **/Client/select_server/single** — libmongoc asserts the selected server is standalone / mongos / RS-secondary, but SecantusDB advertises itself as an RS *primary* in `hello` (deliberate — pymongo's change-stream topology machinery needs a replica-set primary). RSPrimary fails the test's `is_standalone_or_(rs_secondary_or_)mongos` check. A consequence of the single-node-replica-set advertisement, not a CRUD/wire gap.
-- **/Client/select_server/pooled** — libmongoc asserts the selected server is standalone / mongos / RS-secondary, but SecantusDB advertises itself as an RS *primary* in `hello` (deliberate — pymongo's change-stream topology machinery needs a replica-set primary). RSPrimary fails the test's `is_standalone_or_(rs_secondary_or_)mongos` check. A consequence of the single-node-replica-set advertisement, not a CRUD/wire gap.
-- **/Client/select_server/err/single** — libmongoc asserts the selected server is standalone / mongos / RS-secondary, but SecantusDB advertises itself as an RS *primary* in `hello` (deliberate — pymongo's change-stream topology machinery needs a replica-set primary). RSPrimary fails the test's `is_standalone_or_(rs_secondary_or_)mongos` check. A consequence of the single-node-replica-set advertisement, not a CRUD/wire gap.
-- **/Client/select_server/err/pooled** — libmongoc asserts the selected server is standalone / mongos / RS-secondary, but SecantusDB advertises itself as an RS *primary* in `hello` (deliberate — pymongo's change-stream topology machinery needs a replica-set primary). RSPrimary fails the test's `is_standalone_or_(rs_secondary_or_)mongos` check. A consequence of the single-node-replica-set advertisement, not a CRUD/wire gap.
 
 ## Per-driver reports
 

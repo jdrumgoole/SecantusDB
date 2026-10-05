@@ -1,6 +1,6 @@
 # mongo-php-driver Validation Report
 
-Generated 2026-09-27 — SecantusDB 0.6.0b17 vs mongo-php-driver 06be1f01bb4c (`vendor/mongo-php-driver/`).
+Generated 2026-10-05 — SecantusDB 0.6.0b17 vs mongo-php-driver 06be1f01bb4c (`vendor/mongo-php-driver/`).
 
 Run `uv run python -m invoke validate-php-ext` to refresh. This is the low-level PHP extension (the PECL `mongodb` package that wraps libmongoc) — the strictest wire-protocol gauge, alongside mongo-go-driver, for catching bugs pymongo's permissive client misses.
 
@@ -23,7 +23,7 @@ Run `uv run python -m invoke validate-php-ext` to refresh. This is the low-level
 | `tests/writeResult` | 21 | 0 | 2 | 23 | 100.0% |
 | **Overall** | **679** | **1** | **35** | **715** | **99.8%** |
 
-Run time: 144.48s.
+Run time: 52.76s.
 
 ## Failures (1)
 

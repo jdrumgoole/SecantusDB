@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-c-driver 57dba9c049 (`vendor/mongo-c-driver/`).
+Generated 2026-10-05 — SecantusDB 0.6.0b17 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -9,8 +9,8 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | Suite | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 93 | 0 | 10 | 103 | 100.0% |
-| `/Client` | 102 | 2 | 15 | 119 | 98.0% |
-| `/Collection` | 144 | 0 | 12 | 156 | 100.0% |
+| `/Client` | 102 | 2 | 17 | 121 | 98.0% |
+| `/Collection` | 145 | 0 | 12 | 157 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
@@ -19,7 +19,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/WriteConcern` | 13 | 0 | 0 | 13 | 100.0% |
 | `/bulkwrite` | 12 | 0 | 1 | 13 | 100.0% |
 | `/change_stream` | 23 | 0 | 2 | 25 | 100.0% |
-| `/change_streams` | 11 | 0 | 0 | 11 | 100.0% |
+| `/change_streams` | 10 | 1 | 0 | 11 | 90.9% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 34 | 0 | 1 | 35 | 100.0% |
 | `/crud` | 171 | 0 | 1 | 172 | 100.0% |
@@ -28,15 +28,16 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **790** | **2** | **46** | **838** | **99.7%** |
+| **Overall** | **790** | **3** | **48** | **841** | **99.6%** |
 
-## Failures (2)
+## Failures (3)
 
 First 30 failed tests for triage:
 
 ```
 /Client/ipv6/single
 /Client/ipv6/single
+/change_streams/unified/change-streams-disambiguatedPaths
 ```
 
 ## How this is generated

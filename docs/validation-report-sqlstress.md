@@ -1,8 +1,8 @@
 # pgbench + psql stress/smoke report
 
-- SecantusDB (Python server) 0.6.0b16
+- SecantusDB (Python server) 0.6.0b17
 - pgbench TPC-B (simple / extended / prepared) + select-only + psql catalog smoke
-- generated: 2026-09-21 06:36 UTC
+- generated: 2026-10-05 06:42 UTC
 
 **0/6 lanes clean.** Any error or dropped connection is a bug;
 tps figures are smoke-level indicators, not benchmarks.

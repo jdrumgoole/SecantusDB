@@ -1,6 +1,6 @@
 # pymongo async Validation Report (Rust server)
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Generated 2026-10-05 — SecantusDB 0.6.0b17 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. This is the async-driver analogue of the R8 conformance gate: pymongo's native `AsyncMongoClient` suite pointed at the **Rust server**.
 
@@ -9,7 +9,7 @@ Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. T
 | Test file | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
-| `test_change_stream.py` | 122 | 0 | 0 | 33 | 155 | 100.0% |
+| `test_change_stream.py` | 120 | 2 | 0 | 33 | 155 | 98.3% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
 | `test_collection.py` | 86 | 2 | 0 | 3 | 91 | 97.7% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
@@ -28,13 +28,15 @@ Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. T
 | `test_run_command.py` | 17 | 0 | 0 | 4 | 21 | 100.0% |
 | `test_transactions_unified.py` | 181 | 0 | 0 | 83 | 264 | 100.0% |
 | `test_versioned_api_integration.py` | 40 | 0 | 0 | 3 | 43 | 100.0% |
-| **Overall** | **1111** | **6** | **0** | **306** | **1423** | **99.4%** |
+| **Overall** | **1109** | **8** | **0** | **306** | **1423** | **99.2%** |
 
-## Failures (6)
+## Failures (8)
 
 First 30 failure node-ids for manual triage:
 
 ```
+vendor/pymongo-tests/test/asynchronous/test_change_stream.py::TestUnifiedChangeStreamsDisambiguatedPaths::test_disambiguatedPaths_is_present_on_updateDescription_when_an_ambiguous_path_is_present
+vendor/pymongo-tests/test/asynchronous/test_change_stream.py::TestUnifiedChangeStreamsDisambiguatedPaths::test_disambiguatedPaths_returns_array_indices_as_integers
 vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_index_hashed
 vendor/pymongo-tests/test/asynchronous/test_collection.py::AsyncTestCollection::test_index_text
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_maxtime_ms_message

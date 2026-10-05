@@ -1,6 +1,6 @@
 # sqllogictest conformance report
 
-SecantusDB (Python server) 0.6.0b16 · corpus `gregrahn/sqllogictest` @ `c67f97bf3ca7` · sqllogictest-rs over pgwire · 2026-09-21
+SecantusDB (Python server) 0.6.0b17 · corpus `gregrahn/sqllogictest` @ `c67f97bf3ca7` · sqllogictest-rs over pgwire · 2026-10-05
 
 **52/60 files pass end-to-end** (8 expected divergences, 0 unexpected failures).
 
@@ -9,65 +9,65 @@ Regenerate with `uv run python -m invoke validate-slt`.
 | lane | file | result | seconds |
 |---|---|---|---:|
 | postgres | `evidence/in1.test` | pass | 0.0 |
-| postgres | `evidence/in2.test` | pass | 0.16 |
-| postgres | `evidence/slt_lang_aggfunc.test` | pass | 0.16 |
-| postgres | `evidence/slt_lang_createtrigger.test` | pass | 0.14 |
-| postgres | `evidence/slt_lang_createview.test` | expected divergence | 0.03 |
-| postgres | `evidence/slt_lang_dropindex.test` | pass | 0.07 |
+| postgres | `evidence/in2.test` | pass | 0.08 |
+| postgres | `evidence/slt_lang_aggfunc.test` | pass | 0.01 |
+| postgres | `evidence/slt_lang_createtrigger.test` | pass | 0.01 |
+| postgres | `evidence/slt_lang_createview.test` | expected divergence | 0.02 |
+| postgres | `evidence/slt_lang_dropindex.test` | pass | 0.02 |
 | postgres | `evidence/slt_lang_droptable.test` | pass | 0.02 |
-| postgres | `evidence/slt_lang_droptrigger.test` | pass | 0.11 |
-| postgres | `evidence/slt_lang_dropview.test` | pass | 0.03 |
-| postgres | `evidence/slt_lang_reindex.test` | pass | 0.35 |
+| postgres | `evidence/slt_lang_droptrigger.test` | pass | 0.02 |
+| postgres | `evidence/slt_lang_dropview.test` | pass | 0.02 |
+| postgres | `evidence/slt_lang_reindex.test` | pass | 0.01 |
 | postgres | `evidence/slt_lang_replace.test` | pass | 0.0 |
-| postgres | `evidence/slt_lang_update.test` | pass | 0.41 |
-| postgres | `index/orderby/10/slt_good_0.test` | pass | 47.0 |
-| postgres | `index/between/1/slt_good_0.test` | pass | 115.37 |
-| postgres | `index/commute/10/slt_good_0.test` | pass | 44.67 |
-| postgres | `index/delete/1/slt_good_0.test` | pass | 26.84 |
-| postgres | `index/in/10/slt_good_0.test` | pass | 117.51 |
-| postgres | `random/aggregates/slt_good_0.test` | expected divergence | 5.6 |
-| postgres | `random/aggregates/slt_good_1.test` | pass | 20.92 |
-| postgres | `random/aggregates/slt_good_10.test` | pass | 22.18 |
-| postgres | `random/expr/slt_good_0.test` | expected divergence | 10.51 |
-| postgres | `random/expr/slt_good_1.test` | pass | 7.4 |
-| postgres | `random/expr/slt_good_10.test` | pass | 13.08 |
-| postgres | `random/groupby/slt_good_0.test` | pass | 19.99 |
-| postgres | `random/groupby/slt_good_1.test` | pass | 19.53 |
-| postgres | `random/select/slt_good_0.test` | expected divergence | 15.3 |
-| postgres | `random/select/slt_good_1.test` | pass | 21.92 |
-| postgres | `select1.test` | pass | 23.84 |
-| postgres | `select2.test` | pass | 13.79 |
-| postgres | `select3.test` | pass | 51.72 |
+| postgres | `evidence/slt_lang_update.test` | pass | 0.06 |
+| postgres | `index/orderby/10/slt_good_0.test` | pass | 39.2 |
+| postgres | `index/between/1/slt_good_0.test` | pass | 96.5 |
+| postgres | `index/commute/10/slt_good_0.test` | pass | 38.2 |
+| postgres | `index/delete/1/slt_good_0.test` | pass | 26.29 |
+| postgres | `index/in/10/slt_good_0.test` | pass | 97.26 |
+| postgres | `random/aggregates/slt_good_0.test` | expected divergence | 4.83 |
+| postgres | `random/aggregates/slt_good_1.test` | pass | 17.82 |
+| postgres | `random/aggregates/slt_good_10.test` | pass | 18.41 |
+| postgres | `random/expr/slt_good_0.test` | expected divergence | 8.69 |
+| postgres | `random/expr/slt_good_1.test` | pass | 6.01 |
+| postgres | `random/expr/slt_good_10.test` | pass | 10.38 |
+| postgres | `random/groupby/slt_good_0.test` | pass | 16.66 |
+| postgres | `random/groupby/slt_good_1.test` | pass | 16.55 |
+| postgres | `random/select/slt_good_0.test` | expected divergence | 12.9 |
+| postgres | `random/select/slt_good_1.test` | pass | 18.7 |
+| postgres | `select1.test` | pass | 19.64 |
+| postgres | `select2.test` | pass | 11.98 |
+| postgres | `select3.test` | pass | 43.7 |
 | postgres-extended | `evidence/in1.test` | pass | 0.0 |
-| postgres-extended | `evidence/in2.test` | pass | 0.18 |
+| postgres-extended | `evidence/in2.test` | pass | 0.16 |
 | postgres-extended | `evidence/slt_lang_aggfunc.test` | pass | 0.02 |
 | postgres-extended | `evidence/slt_lang_createtrigger.test` | pass | 0.02 |
-| postgres-extended | `evidence/slt_lang_createview.test` | expected divergence | 0.13 |
-| postgres-extended | `evidence/slt_lang_dropindex.test` | pass | 0.04 |
-| postgres-extended | `evidence/slt_lang_droptable.test` | pass | 0.03 |
-| postgres-extended | `evidence/slt_lang_droptrigger.test` | pass | 0.08 |
-| postgres-extended | `evidence/slt_lang_dropview.test` | pass | 0.06 |
-| postgres-extended | `evidence/slt_lang_reindex.test` | pass | 0.03 |
+| postgres-extended | `evidence/slt_lang_createview.test` | expected divergence | 0.04 |
+| postgres-extended | `evidence/slt_lang_dropindex.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_droptable.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_droptrigger.test` | pass | 0.02 |
+| postgres-extended | `evidence/slt_lang_dropview.test` | pass | 0.03 |
+| postgres-extended | `evidence/slt_lang_reindex.test` | pass | 0.02 |
 | postgres-extended | `evidence/slt_lang_replace.test` | pass | 0.0 |
-| postgres-extended | `evidence/slt_lang_update.test` | pass | 0.09 |
-| postgres-extended | `index/orderby/10/slt_good_0.test` | pass | 78.65 |
-| postgres-extended | `index/between/1/slt_good_0.test` | pass | 152.15 |
-| postgres-extended | `index/commute/10/slt_good_0.test` | pass | 68.72 |
-| postgres-extended | `index/delete/1/slt_good_0.test` | pass | 42.05 |
-| postgres-extended | `index/in/10/slt_good_0.test` | pass | 155.44 |
-| postgres-extended | `random/aggregates/slt_good_0.test` | expected divergence | 9.47 |
-| postgres-extended | `random/aggregates/slt_good_1.test` | pass | 36.0 |
-| postgres-extended | `random/aggregates/slt_good_10.test` | pass | 35.79 |
-| postgres-extended | `random/expr/slt_good_0.test` | expected divergence | 15.17 |
-| postgres-extended | `random/expr/slt_good_1.test` | pass | 11.51 |
-| postgres-extended | `random/expr/slt_good_10.test` | pass | 19.66 |
-| postgres-extended | `random/groupby/slt_good_0.test` | pass | 32.86 |
-| postgres-extended | `random/groupby/slt_good_1.test` | pass | 33.34 |
-| postgres-extended | `random/select/slt_good_0.test` | expected divergence | 25.65 |
-| postgres-extended | `random/select/slt_good_1.test` | pass | 36.88 |
-| postgres-extended | `select1.test` | pass | 26.85 |
-| postgres-extended | `select2.test` | pass | 17.58 |
-| postgres-extended | `select3.test` | pass | 62.28 |
+| postgres-extended | `evidence/slt_lang_update.test` | pass | 0.08 |
+| postgres-extended | `index/orderby/10/slt_good_0.test` | pass | 65.71 |
+| postgres-extended | `index/between/1/slt_good_0.test` | pass | 132.76 |
+| postgres-extended | `index/commute/10/slt_good_0.test` | pass | 58.2 |
+| postgres-extended | `index/delete/1/slt_good_0.test` | pass | 38.98 |
+| postgres-extended | `index/in/10/slt_good_0.test` | pass | 129.92 |
+| postgres-extended | `random/aggregates/slt_good_0.test` | expected divergence | 7.83 |
+| postgres-extended | `random/aggregates/slt_good_1.test` | pass | 30.55 |
+| postgres-extended | `random/aggregates/slt_good_10.test` | pass | 31.36 |
+| postgres-extended | `random/expr/slt_good_0.test` | expected divergence | 12.88 |
+| postgres-extended | `random/expr/slt_good_1.test` | pass | 9.69 |
+| postgres-extended | `random/expr/slt_good_10.test` | pass | 15.66 |
+| postgres-extended | `random/groupby/slt_good_0.test` | pass | 28.45 |
+| postgres-extended | `random/groupby/slt_good_1.test` | pass | 27.52 |
+| postgres-extended | `random/select/slt_good_0.test` | expected divergence | 21.9 |
+| postgres-extended | `random/select/slt_good_1.test` | pass | 31.93 |
+| postgres-extended | `select1.test` | pass | 22.57 |
+| postgres-extended | `select2.test` | pass | 14.44 |
+| postgres-extended | `select3.test` | pass | 51.39 |
 
 ## Expected divergences
 
