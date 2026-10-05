@@ -40,6 +40,7 @@ mod procedures;
 mod renames;
 mod row_waits;
 mod rules;
+mod scan_partitions;
 mod schema_rows;
 mod server;
 mod table_locks;
@@ -201,6 +202,20 @@ impl BackendEntry {
     fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+thread_local! {
+    /// Set while a locking select reads its FROM-subquery (see
+    /// `materialise_with_row_ids`).
+    static LOCK_ROW_IDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with FROM-subquery rows carrying their base row ids.
+fn with_lock_row_ids<T>(f: impl FnOnce() -> T) -> T {
+    let prev = LOCK_ROW_IDS.with(|c| c.replace(true));
+    let out = f();
+    LOCK_ROW_IDS.with(|c| c.set(prev));
+    out
 }
 
 /// Process-wide map of every live backend's PID to its entry. One handler
@@ -4153,6 +4168,42 @@ impl PgHandler {
             .collect()
     }
 
+    /// The stored rows of `table` matching `filter`. A correlated
+    /// subquery's repeated scan is served from the statement's partition of
+    /// the table when `partition` allows and one applies (see
+    /// `scan_partitions`); otherwise the storage reads, as always.
+    fn scan_table(
+        &self,
+        table: &str,
+        filter: &Document,
+        partition: bool,
+    ) -> PgWireResult<Vec<Vec<u8>>> {
+        if partition {
+            let rows = scan_partitions::rows_matching(
+                self.db(),
+                table,
+                filter,
+                || {
+                    self.storage
+                        .find_matching(self.db(), table, &Document::new())
+                        .ok()
+                },
+                || {
+                    !matches!(
+                        self.storage.explain_plan(self.db(), table, filter),
+                        Ok(secantus_storage::ExplainPlan::CollScan)
+                    )
+                },
+            );
+            if let Some(rows) = rows {
+                return Ok(rows);
+            }
+        }
+        self.storage
+            .find_matching(self.db(), table, filter)
+            .map_err(|e| Self::storage_err("could not read", e))
+    }
+
     /// Materialise a joined subquery's rows, keyed by its OUTPUT names.
     ///
     /// Nested-loop over two materialised sides -- the catalog tables this
@@ -4203,10 +4254,7 @@ impl PgHandler {
                 self.virtual_rows(&agg.table, &agg.filter).expect("checked")
             }
             None => {
-                let raw = self
-                    .storage
-                    .find_matching(self.db(), &agg.table, &agg.filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
+                let raw = self.scan_table(&agg.table, &agg.filter, true)?;
                 raw.iter()
                     .map(|b| decode_doc(b))
                     .collect::<Result<_, _>>()
@@ -4606,8 +4654,9 @@ impl PgHandler {
             },
             Err(_) => read(),
         };
-        let (_, rows) =
-            rows.map_err(|e| PlanError::Internal(format!("could not read a subquery: {e}")))?;
+        // A user error inside (a division by zero, a float overflow) keeps
+        // its SQLSTATE, as PostgreSQL raises it from the subquery.
+        let (_, rows) = rows.map_err(Self::plan_error_of)?;
         Ok(rows
             .into_iter()
             .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
@@ -4623,6 +4672,46 @@ impl PgHandler {
     /// without touching the inner plan -- so matching by name would read the
     /// pre-rename name and find nothing. Two outputs may also share a name,
     /// which a name-keyed rebuild would collapse into one.
+    /// `materialise_sub` of a plain SELECT, each row also carrying the
+    /// stored row id of the base row behind it under `LOCK_ROW_ID` (taken
+    /// from the source row's `_id`, or passed up from a subquery below).
+    fn materialise_with_row_ids(
+        &self,
+        sel: &secantus_pgplan::Select,
+        def: &TableDef,
+    ) -> PgWireResult<Vec<Document>> {
+        use secantus_pgplan::LOCK_ROW_ID;
+        self.with_executor_hooks(|| {
+            let (docs, src_def) = self.select_docs(sel, 0)?;
+            let schema = self.row_schema(&src_def, &sel.columns, &sel.casts);
+            let tz = self.session_timezone();
+            docs.iter()
+                .map(|d| {
+                    let mut out = Document::new();
+                    for (i, ((_, field), c)) in sel.columns.iter().zip(&def.columns).enumerate() {
+                        let v = resolve_cell(
+                            d,
+                            field,
+                            sel.casts.get(i).and_then(|c| c.as_ref()),
+                            schema[i].datatype(),
+                            &tz,
+                        )?;
+                        out.insert(c.field(), v.unwrap_or(Bson::Null));
+                    }
+                    let id = if sel.sub.is_some() {
+                        d.get(LOCK_ROW_ID)
+                    } else {
+                        d.get("_id")
+                    };
+                    if let Some(id) = id {
+                        out.insert(LOCK_ROW_ID, id.clone());
+                    }
+                    Ok(out)
+                })
+                .collect()
+        })
+    }
+
     fn materialise_sub(&self, stmt: &Statement, def: &TableDef) -> PgWireResult<Vec<Document>> {
         if let Statement::JoinRows(join) = stmt {
             return self.join_rows(&join.tree);
@@ -4963,7 +5052,12 @@ impl PgHandler {
         sub: &secantus_pgplan::SubSource,
         filter: &Document,
     ) -> PgWireResult<Vec<Document>> {
-        let docs = self.materialise_sub(&sub.plan, &sub.def)?;
+        let docs = match sub.plan.as_ref() {
+            Statement::Select(inner) if LOCK_ROW_IDS.with(|c| c.get()) => {
+                self.materialise_with_row_ids(inner, &sub.def)?
+            }
+            other => self.materialise_sub(other, &sub.def)?,
+        };
         if filter.is_empty() {
             return Ok(docs);
         }
@@ -22618,7 +22712,13 @@ impl PgHandler {
             // select carries neither a series nor a join.
             _ if sel.sub.is_some() => {
                 let sub = sel.sub.as_ref().expect("checked");
-                let docs = self.sub_source_docs(sub, &sel.filter)?;
+                // A locking select reads its subquery's rows with the stored
+                // row id of each base row along (see `LOCK_ROW_ID`).
+                let docs = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
+                    with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))?
+                } else {
+                    self.sub_source_docs(sub, &sel.filter)?
+                };
                 (docs, sub.def.clone())
             }
             // A top-level JOIN source: materialise it, treat its
@@ -22690,10 +22790,7 @@ impl PgHandler {
                 (vec![d], Self::sequence_table_def(&sel.table))
             }
             (None, _) => {
-                let raw = self
-                    .storage
-                    .find_matching(self.db(), &sel.table, &sel.filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
+                let raw = self.scan_table(&sel.table, &sel.filter, sel.lock.is_none())?;
                 let def = self
                     .lookup(&sel.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
@@ -31451,12 +31548,49 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
     }
 }
 
+thread_local! {
+    /// Set by `float_sum` when an addition overflowed; read (and cleared)
+    /// by whoever turns the aggregate's value into a statement result.
+    static FLOAT_SUM_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The float8 sum of `values` in order, as `sum` / `avg` of a
+/// `double precision` add them -- or `None`, with `FLOAT_SUM_OVERFLOW` set,
+/// when an addition of two finite values overflows: PostgreSQL's `float8pl`
+/// / `float8_accum` raise 22003 there ("value out of range: overflow"),
+/// even when a later value would have brought the total back.
+fn float_sum(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut total = 0.0_f64;
+    for v in values {
+        let next = total + v;
+        if next.is_infinite() && !total.is_infinite() && !v.is_infinite() {
+            FLOAT_SUM_OVERFLOW.with(|c| c.set(true));
+            return None;
+        }
+        total = next;
+    }
+    Some(total)
+}
+
+/// The 22003 a float `sum` / `avg` overflow raised, if one did since the
+/// last call.
+fn take_float_sum_overflow() -> Option<PlanError> {
+    FLOAT_SUM_OVERFLOW
+        .with(|c| c.replace(false))
+        .then(|| PlanError::NumericOutOfRange("value out of range: overflow".into()))
+}
+
 /// One aggregate over a group's rows. The extended families
 /// (`aggregates.rs`) see the rows after FILTER and the aggregate's own
 /// ordering, exactly as the basic ones do.
 fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
     if !aggregates::is_extended(item.func) {
-        return Ok(compute_basic_aggregate(item, rows));
+        take_float_sum_overflow();
+        let v = compute_basic_aggregate(item, rows);
+        if let Some(e) = take_float_sum_overflow() {
+            return Err(PgHandler::err(&e));
+        }
+        return Ok(v);
     }
     let mut rows: Vec<Document> = match item.filter.as_ref() {
         None => rows.to_vec(),
@@ -31720,17 +31854,18 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             }
             let count = values.len();
             if values.iter().any(|v| matches!(v, Bson::Double(_))) {
-                let total: f64 = values
-                    .iter()
-                    .map(|v| match v {
+                let Some(total) = float_sum(values.iter().map(|v| {
+                    match v {
                         Bson::Int32(x) => f64::from(*x),
                         Bson::Int64(x) => *x as f64,
                         Bson::Double(x) => *x,
                         other => secantus_pgplan::numeric::numeric_text(other)
                             .and_then(|t| t.parse::<f64>().ok())
                             .unwrap_or(0.0),
-                    })
-                    .sum();
+                    }
+                })) else {
+                    return Bson::Null;
+                };
                 return Bson::Double(total / count as f64);
             }
             let texts: Vec<String> = values
@@ -31798,16 +31933,13 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                     }
                 }
             } else {
-                let total: f64 = values
-                    .iter()
-                    .map(|v| match v {
-                        Bson::Int32(x) => f64::from(*x),
-                        Bson::Int64(x) => *x as f64,
-                        Bson::Double(x) => *x,
-                        _ => 0.0,
-                    })
-                    .sum();
-                Bson::Double(total)
+                float_sum(values.iter().map(|v| match v {
+                    Bson::Int32(x) => f64::from(*x),
+                    Bson::Int64(x) => *x as f64,
+                    Bson::Double(x) => *x,
+                    _ => 0.0,
+                }))
+                .map_or(Bson::Null, Bson::Double)
             }
         }
         AggFunc::Min | AggFunc::Max => {
@@ -32154,7 +32286,14 @@ fn window_value(
             Some(u) => secantus_pgplan::user_agg::compute(u, &frame, w.source_type.as_deref())?,
             None => Bson::Null,
         },
-        _ => window_aggregate(w, &frame),
+        _ => {
+            take_float_sum_overflow();
+            let v = window_aggregate(w, &frame);
+            if let Some(e) = take_float_sum_overflow() {
+                return Err(e);
+            }
+            v
+        }
     })
 }
 

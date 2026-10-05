@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS b53p_o;
+DROP TABLE IF EXISTS b53p_t;
+DROP TABLE IF EXISTS b53p_u;
+create table b53p_o (id int primary key, a int, b int, s text, f float8, d date);
+create table b53p_t (id int primary key, x int, y int, s text, f float8, d date, v int);
+create table b53p_u (id int primary key, tid int);
+insert into b53p_o select g, g % 7, g % 5, 's' || (g % 4), (g % 3) / 2.0, date '2024-01-01' + (g % 6) from generate_series(1, 60) g;
+insert into b53p_o values (61, null, null, null, null, null), (62, 3, 2, 'S1', 'NaN', '2024-01-02'), (63, 0, 0, 's0', -0.0, '2024-01-01');
+insert into b53p_t select g, g % 9, g % 4, 's' || (g % 5), (g % 4) / 2.0, date '2024-01-01' + (g % 8), g from generate_series(1, 90) g;
+insert into b53p_t values (91, null, 1, null, null, null, 91), (92, 3, null, 'S1', 'NaN', '2024-01-02', 92), (93, 0, 0, 's0', 0.0, '2024-01-01', 93);
+insert into b53p_u select g, (g * 7) % 95 from generate_series(1, 120) g;
