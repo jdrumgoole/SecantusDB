@@ -380,7 +380,13 @@ pub(crate) fn correlate(
             {
                 outer_refs.push(vec![name]);
             }
-            Err(e) => return Err(e),
+            // An untyped NULL parameter is `text`, which a call over the
+            // outer value may not take (`max(s.x) over ()`): typed by the
+            // outer columns, it plans.
+            Err(e) => match typed_probe(inner, &outer_refs, first, lookup, params) {
+                Some(p) => break (p, body),
+                None => return Err(e),
+            },
         }
     };
     let result_type = match kind {
@@ -388,7 +394,15 @@ pub(crate) fn correlate(
             "bool".to_string()
         }
         _ => {
-            let def = sub_plan_def(&planned, lookup)?;
+            // The parameters were planned as untyped NULLs, so an output
+            // that IS an outer column (`(select s.x)`) came out `text`.
+            // Planned again with each parameter cast to its outer column's
+            // type, only for the type: the stored SQL keeps bare `$N`s.
+            let typed = typed_probe(inner, &outer_refs, first, lookup, params);
+            let def = match typed {
+                Some(p) => sub_plan_def(&p, lookup).or_else(|_| sub_plan_def(&planned, lookup))?,
+                None => sub_plan_def(&planned, lookup)?,
+            };
             let first = def
                 .columns
                 .first()
@@ -456,6 +470,160 @@ pub(crate) fn correlate(
             ..Default::default()
         }))),
     })
+}
+
+thread_local! {
+    /// The FROM lists of the queries whose subqueries are being resolved,
+    /// outermost first: where an outer reference's TYPE is found.
+    static OUTER_FROM: std::cell::RefCell<Vec<Vec<pg_query::protobuf::Node>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn push_outer_from(from: &[pg_query::protobuf::Node]) -> usize {
+    OUTER_FROM.with(|o| {
+        let mut o = o.borrow_mut();
+        o.push(from.to_vec());
+        o.len() - 1
+    })
+}
+
+pub(crate) fn pop_outer_from(depth: usize) {
+    OUTER_FROM.with(|o| o.borrow_mut().truncate(depth));
+}
+
+/// The columns (name, type) of one FROM item, and the names it answers to.
+fn from_item_def(
+    item: &pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<(Vec<String>, TableDef)> {
+    match item.node.as_ref()? {
+        N::RangeVar(r) => {
+            let def = lookup(&relation_name(r))?;
+            let name = r
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| r.relname.clone());
+            Some((vec![name], def))
+        }
+        N::RangeSubselect(rs) => {
+            let alias = rs.alias.as_ref()?;
+            let Some(N::SelectStmt(b)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+            else {
+                return None;
+            };
+            let planned = without_side_effects(|| plan_select(b, lookup, params)).ok()?;
+            let mut def = sub_plan_def(&planned, lookup).ok()?;
+            for (c, n) in def.columns.iter_mut().zip(&alias.colnames) {
+                if let Some(N::String(s)) = n.node.as_ref() {
+                    c.name = s.sval.clone();
+                }
+            }
+            Some((vec![alias.aliasname.clone()], def))
+        }
+        _ => None,
+    }
+}
+
+/// The type of an outer reference, innermost enclosing query first.
+fn outer_ref_type(
+    parts: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<String> {
+    let levels = OUTER_FROM.with(|o| o.borrow().clone());
+    let (qualifier, col) = match parts {
+        [.., q, c] => (Some(q), c),
+        [c] => (None, c),
+        _ => return None,
+    };
+    for level in levels.iter().rev() {
+        for item in level {
+            if let Some(N::RangeVar(r)) = item.node.as_ref() {
+                let name = r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname);
+                if qualifier.is_some_and(|q| q != name) {
+                    continue;
+                }
+            } else if let Some(N::RangeSubselect(rs)) = item.node.as_ref() {
+                if qualifier.is_some_and(|q| rs.alias.as_ref().is_none_or(|a| &a.aliasname != q)) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            if let Some((_, def)) = from_item_def(item, lookup, params) {
+                if let Some(c) = def.columns.iter().find(|c| &c.name == col) {
+                    return Some(c.pg_type.clone());
+                }
+            }
+            if qualifier.is_some() {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// `inner` planned with each outer reference a `$N` cast to its type.
+fn typed_probe(
+    inner: &pg_query::protobuf::SelectStmt,
+    outer_refs: &[Vec<String>],
+    first: usize,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<Statement> {
+    let types: Vec<Option<String>> = outer_refs
+        .iter()
+        .map(|p| outer_ref_type(p, lookup, params))
+        .collect();
+    if types.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut body = substitute(inner, outer_refs, first);
+    let _ = walk_select(&mut body, &mut |n| {
+        let Some(N::ParamRef(p)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        // Already wrapped (the walk descends into the cast it just made).
+        if p.location == i32::MIN {
+            return Ok(());
+        }
+        let mut p = *p;
+        p.location = i32::MIN;
+        let i = usize::try_from(p.number)
+            .ok()
+            .and_then(|n| n.checked_sub(first));
+        if let Some(Some(t)) = i.and_then(|i| types.get(i)) {
+            if let Ok(N::SelectStmt(cast)) = pg_query::parse(&format!("select null::{t}"))
+                .map_err(|_| ())
+                .and_then(|r| {
+                    r.protobuf
+                        .stmts
+                        .first()
+                        .and_then(|s| s.stmt.as_ref())
+                        .and_then(|s| s.node.clone())
+                        .ok_or(())
+                })
+            {
+                if let Some(N::ResTarget(rt)) =
+                    cast.target_list.first().and_then(|t| t.node.as_ref())
+                {
+                    if let Some(N::TypeCast(tc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                        let mut tc = tc.clone();
+                        tc.arg = Some(Box::new(pg_query::protobuf::Node {
+                            node: Some(N::ParamRef(p)),
+                        }));
+                        n.node = Some(N::TypeCast(tc));
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+    let mut probe_params = params.to_vec();
+    probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
+    without_side_effects(|| plan_select(&body, lookup, &probe_params)).ok()
 }
 
 fn is_correlated(f: &pg_query::protobuf::FuncCall) -> bool {

@@ -74,6 +74,30 @@ fn plans_alone(body: &pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) -> bool {
     ok
 }
 
+/// `plans_alone` for a trial FROM list holding a LATERAL body: planning a
+/// lateral join evaluates its body over NULL stand-ins for the left side,
+/// so a DATA error (class 22, `s.a / 0`) there is evaluation, not the
+/// parse analysis this check is for, and does not count.
+fn lateral_plans(trial: &pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) -> bool {
+    let joins = crate::joins::planned_joins_len();
+    let warnings = crate::warnings_len();
+    let notices = crate::fts::notices_len();
+    let out = crate::correlated::without_side_effects(|| {
+        crate::plan_node(
+            N::SelectStmt(Box::new(trial.clone())),
+            ctx.lookup,
+            ctx.params,
+        )
+    });
+    crate::joins::truncate_planned_joins(joins);
+    crate::truncate_warnings(warnings);
+    crate::fts::truncate_notices(notices);
+    match out {
+        Ok(_) => true,
+        Err(e) => e.sqlstate().starts_with("22"),
+    }
+}
+
 fn rewrite_select(sel: &mut pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) {
     for side in [sel.larg.as_deref_mut(), sel.rarg.as_deref_mut()]
         .into_iter()
@@ -438,10 +462,11 @@ fn join_uses(item: &pg_query::protobuf::Node, used: &mut Used) {
 /// Prune the `i`th FROM-subquery of `sel`. True when an output changed.
 fn prune_one(sel: &mut pg_query::protobuf::SelectStmt, i: usize, ctx: &Ctx<'_>) -> bool {
     // Take the body out, so its own references do not count as readers.
-    let (alias, colnames, mut body) = {
+    let (alias, colnames, mut body, lateral) = {
         let Some(rs) = nth_subquery(&mut sel.from_clause, i) else {
             return false;
         };
+        let lateral = rs.lateral;
         let Some(alias) = rs.alias.as_ref() else {
             return false;
         };
@@ -457,7 +482,7 @@ fn prune_one(sel: &mut pg_query::protobuf::SelectStmt, i: usize, ctx: &Ctx<'_>) 
         let Some(body) = rs.subquery.take() else {
             return false;
         };
-        (name, colnames, body)
+        (name, colnames, body, lateral)
     };
     let used = used_names(sel, &alias);
     let mut changed = false;
@@ -469,7 +494,37 @@ fn prune_one(sel: &mut pg_query::protobuf::SelectStmt, i: usize, ctx: &Ctx<'_>) 
                     .iter()
                     .map(|n| n.as_ref().is_none_or(|n| used.names.contains(n)))
                     .collect();
-                changed = prune_checked(inner, &keep, ctx);
+                changed = if lateral {
+                    // A LATERAL body reads its left siblings, so it never
+                    // plans alone: it is tried where it stands, in the
+                    // FROM list it belongs to.
+                    let mut pruned = (**inner).clone();
+                    if prune_arms(&mut pruned, &keep) {
+                        let mut from = sel.from_clause.clone();
+                        if let Some(rs) = nth_subquery(&mut from, i) {
+                            rs.subquery = Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::SelectStmt(inner.clone())),
+                            }));
+                        }
+                        let trial = pg_query::protobuf::SelectStmt {
+                            target_list: vec![one_target()],
+                            from_clause: from,
+                            op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                            limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                            ..Default::default()
+                        };
+                        if lateral_plans(&trial, ctx) {
+                            **inner = pruned;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    prune_checked(inner, &keep, ctx)
+                };
             }
         }
     }
@@ -636,6 +691,24 @@ fn prune_select(s: &mut pg_query::protobuf::SelectStmt, keep: &[bool]) -> bool {
         changed = true;
     }
     changed
+}
+
+/// `1`, as a select-list item.
+fn one_target() -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::AConst(pg_query::protobuf::AConst {
+                    val: Some(pg_query::protobuf::a_const::Val::Ival(
+                        pg_query::protobuf::Integer { ival: 1 },
+                    )),
+                    ..Default::default()
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    }
 }
 
 fn count_star() -> Option<pg_query::protobuf::Node> {

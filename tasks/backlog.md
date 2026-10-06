@@ -958,7 +958,32 @@ remain open:
         (8.7 -> 10.9 s); GROUPING SETS over the table 4626 -> 221 MB (9.6 ->
         22.6 s); ROLLUP over the join 5854 -> 290 MB (15.5 -> 54.2 s: the
         join is read once per set). The grace join and per-set grouping are
-        slower than holding everything; they bound memory instead. Corpus
+        slower than holding everything; they bound memory instead. **Batch
+        67 (2026-10-06), re-measured in RELEASE builds, one server per
+        query, 64 MB cache, median of 3 (2 at 300k), `bench67.py`; base
+        `ffb798c1` / batch 66 `c7544eed` / batch 67, seconds, output
+        md5-identical across all three:** below the bound (1k / 10k rows)
+        nothing had slowed except grouping sets, whose bounded attempt read
+        the input and handed it back for the materialised path to read
+        AGAIN (ROLLUP over a join at 10k 0.163 / 0.242 / 0.153 now, CUBE
+        0.145 / 0.177 / 0.147). An input that fits is now read once and
+        handed over. Past the bound, grouping sets read the input ONCE: each
+        row is reduced to its keys and aggregate inputs (in memory while
+        those fit, else spooled) and every set is grouped from those --
+        ROLLUP over the join 100k 1.10 / 2.60 / 0.81, 300k 3.17 / 7.61 /
+        2.25; CUBE 300k 2.87 / 5.79 / 1.72. The grace join restores the
+        materialised order by sorting an INDEX of `(left no., right no.,
+        offset)` over one spool of the joined rows, not the rows themselves
+        (an external sort only once the index would outgrow the bound): right
+        side 300k 3.00 / 4.91 / 4.71, its aggregate 2.42 / 3.69 / 3.41.
+        **Left (open, measured not fixed):** grouping sets whose slim rows
+        are as wide as the rows (`max(pad)`, 2 KB) gain nothing from one
+        read, so they keep batch 66's per-set reads (300k 2.15 / 3.74 /
+        3.82, 100k 0.76 / 1.28 / 1.40: the read to the bound that discovers
+        it is wasted); and the grace join still writes the right side to
+        its partitions before it knows the left side fits in memory (a
+        left-built hash join would skip that spool). Both are the memory
+        bound's price, not a below-bound regression. Corpus
         `b66_join_stream` (50 lines, 0 against 15.19 also with the join
         bound at 1 byte, the group bound at 1 byte, and streaming off --
         `SECANTUS_PG_JOIN_STREAM=0`, new), slice test
@@ -1189,14 +1214,31 @@ remain open:
         list runs for the skipped rows (`select_docs`).
       Corpus `b65_residuals` (46 lines, 0 against 15.19), slice test
       `test_batch65_collate_distinct_on_and_offset_errors`.
-- [ ] **OPEN — RUST pgserver: an aggregate over ONLY an outer query's
-      columns, inside a scalar subquery, is not the outer query's (found
-      batch 66 while writing `b66_unused_outputs`, PostgreSQL 15.19).**
+- [x] **FIXED (batch 67, 2026-10-06) — RUST pgserver: an aggregate over
+      ONLY an outer query's columns, inside a scalar subquery, is not the
+      outer query's (found batch 66 while writing `b66_unused_outputs`,
+      PostgreSQL 15.19).** `agg_hoist` now applies PostgreSQL's
+      `agglevelsup` rule -- an aggregate belongs to the LOWEST level whose
+      columns it reads, resolved through a stack of the levels between
+      (qualified names by alias, unqualified ones by the catalog's columns;
+      unknown means the inner level) -- at the statement and at every
+      subquery before its own subqueries are resolved
+      (`split_for_outer_aggregates`). Such an aggregate makes its level an
+      aggregate query (one row; 21000 from a scalar subquery that then
+      returns several), its stray columns are 42803, and one placed in
+      WHERE / JOIN ON / GROUP BY / a LATERAL FROM item is 42803 with
+      PostgreSQL's message. Each split's FROM alias is unique (`__grp`,
+      `__grp2`, ...) so a nested split cannot shadow an outer one's slots.
+      Found on the way and fixed: a correlated scalar subquery returning an
+      outer column was typed `text` (now planned once more with each `$N`
+      cast to its outer column's type, for the type only), and a window in
+      a FROM-less SELECT was 0A000. Corpus `b67_outer_aggs` (63 lines, 0
+      against 15.19), slice test
+      `test_batch67_aggregate_belongs_to_the_level_of_its_variables`.
+      Formerly: 
       `select (select max(s.x) from t) from (select a * 2 as x from t) s`
-      answers one row per outer row (2, 4, 6) where PostgreSQL makes
-      `max(s.x)` an aggregate of the OUTER query and raises 21000 (more than
-      one row returned by a subquery). A wrong answer, predates batch 66
-      (not reached by its changes). Not started.
+      answered one row per outer row (2, 4, 6) where PostgreSQL makes
+      `max(s.x)` an aggregate of the OUTER query and raises 21000.
 
 - [x] **FIXED (batch 66, 2026-10-06) — RUST pgserver: an unused
       FROM-subquery output was still computed (found batch 65, measured
@@ -1216,9 +1258,13 @@ remain open:
       plans on its own (`plans_alone`, a trial plan with side effects off),
       so an unknown column, a grouping error or a bad FROM reference in an
       unread output still fails as before (`b46_errors` caught the first
-      version dropping 42P01). Left: a LATERAL body reads its left siblings,
-      so it never plans alone and keeps its outputs -- `(select a/b x ...)
-      s, lateral (select s.x) l` still raises where PostgreSQL answers.
+      version dropping 42P01). **Batch 67:** the LATERAL residual is fixed
+      -- a LATERAL body reads its left siblings, so it never planned alone
+      and kept its outputs; it is now trial-planned where it stands, in its
+      FROM list (`lateral_plans`, where a class-22 data error from planning
+      over NULL stand-ins does not count), so `(select a/b x ...) s,
+      lateral (select s.x) l` answers as PostgreSQL does (corpus
+      `b67_lateral_prune`, 19 lines, 0 against 15.19).
       Corpus `b66_unused_outputs` (67 lines, 0 against 15.19), slice test
       `test_batch66_unused_subquery_outputs_are_not_computed`.
 

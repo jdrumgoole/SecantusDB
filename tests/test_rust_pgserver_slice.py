@@ -18347,3 +18347,45 @@ def test_batch66_streamed_joins_match_the_materialised_rows(home: Path) -> None:
         else:
             assert p == m, q
     assert len(streamed[3]) > 100
+
+
+def test_batch67_aggregate_belongs_to_the_level_of_its_variables(home: Path) -> None:
+    """Batch 67: an aggregate inside a subquery that reads only an OUTER
+    query's columns is the outer query's aggregate (PostgreSQL's
+    agglevelsup): `select (select max(s.x) from t) from s` is ONE row, or
+    21000 when the subquery returns several; misplaced in WHERE / JOIN ON /
+    GROUP BY / a LATERAL FROM item it is 42803. Answers measured on
+    PostgreSQL 15.19."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b67_t (a int)")
+        a.execute("insert into b67_t values (1), (2), (3)")
+        a.execute("create table b67_s (x int, y int)")
+        a.execute("insert into b67_s values (10, 1), (20, 1), (30, 2)")
+        one = lambda q: a.execute(q).fetchall()  # noqa: E731
+        assert one("select (select max(s.x)) from b67_s s") == [(30,)]
+        assert one("select (select sum(s.x) from b67_t where a = 1) from b67_s s") == [(60,)]
+        assert one("select (select count(*) from b67_t where a < max(s.x) / 10) from b67_s s") == [
+            (2,)
+        ]
+        assert one("select s.y, (select max(s.x)) from b67_s s group by s.y order by 1") == [
+            (1, 20),
+            (2, 30),
+        ]
+        assert one(
+            "select (select (select max(t1.a) from b67_t t2 limit 1) from b67_t t1 limit 1) "
+            "from b67_s s"
+        ) == [(3,), (3,), (3,)]
+        assert one("select (select s.x) from b67_s s order by 1") == [(10,), (20,), (30,)]
+        assert one(
+            "select count(*) from (select a / 0 as q from b67_t) s, lateral (select s.q) l"
+        ) == [(3,)]
+        for q, code in [
+            ("select (select max(s.x) from b67_t) from b67_s s", "21000"),
+            ("select s.x from b67_s s where (select max(s.x)) > 0", "42803"),
+            ("select (select max(s.x)), s.y from b67_s s", "42803"),
+            ("select count(*) from b67_s s, lateral (select sum(s.x)) l", "42803"),
+        ]:
+            with pytest.raises(psycopg.Error) as e:
+                a.execute(q)
+            assert e.value.sqlstate == code, q
+            a.rollback()

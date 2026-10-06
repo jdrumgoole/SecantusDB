@@ -424,7 +424,11 @@ impl PgHandler {
                                 let g = grace.get_or_insert_with(|| {
                                     crate::grace_join::GraceRight::new(*budget)
                                 });
-                                if !held.is_empty() && !g.add(std::mem::take(&mut held), &|d| crate::grace_join::general_key(d, &rk))? {
+                                if !held.is_empty()
+                                    && !g.add(std::mem::take(&mut held), &|d| {
+                                        crate::grace_join::general_key(d, &rk)
+                                    })?
+                                {
                                     declined = true;
                                     return Ok(false);
                                 }
@@ -697,9 +701,8 @@ impl PgHandler {
                 declined = true;
                 return Ok(false);
             }
-            let g = grace.get_or_insert_with(|| {
-                crate::grace_join::GraceRight::new(join_inner_bytes())
-            });
+            let g =
+                grace.get_or_insert_with(|| crate::grace_join::GraceRight::new(join_inner_bytes()));
             if !held.is_empty() && !g.add(std::mem::take(&mut held), &key)? {
                 declined = true;
                 return Ok(false);
@@ -778,7 +781,9 @@ impl PgHandler {
                            feed: &mut dyn FnMut(Sink<'_>) -> PgWireResult<()>,
                            emit: Sink<'_>,
                            _as_left: bool|
-                 -> PgWireResult<()> { self.join_docs_core(join, feed, rrows, emit) };
+                 -> PgWireResult<()> {
+                    self.join_docs_core(join, feed, rrows, emit)
+                };
                 let ops = crate::grace_join::GraceOps {
                     left_key: &left_key,
                     right_key: &right_key,
@@ -913,6 +918,7 @@ impl PgHandler {
         };
         Ok(self.prepared_join_rows(&sub.plan)?.map(|p| JoinFeed {
             prepared: Some(p),
+            spooled: None,
             filter: &agg.filter,
         }))
     }
@@ -923,6 +929,15 @@ impl PgHandler {
         feed: &mut JoinFeed<'_>,
         sink: &mut dyn FnMut(RowBatch) -> bool,
     ) -> PgWireResult<()> {
+        if let Some(mut rows) = feed.spooled.take() {
+            loop {
+                self.check_cancel()?;
+                let batch = rows.next_batch(JOIN_BATCH)?;
+                if batch.is_empty() || !sink(RowBatch::Docs(batch)) {
+                    return Ok(());
+                }
+            }
+        }
         let Some(prepared) = feed.prepared.take() else {
             return Ok(());
         };
@@ -944,7 +959,21 @@ impl PgHandler {
 /// A join prepared as an aggregate's input (see `join_aggregate_source`).
 pub(crate) struct JoinFeed<'a> {
     prepared: Option<Prepared<'a>>,
+    /// Rows read back from a spool instead (`spooled`), already filtered.
+    spooled: Option<crate::grace_join::SpoolReader>,
     filter: &'a Document,
+}
+
+impl JoinFeed<'_> {
+    /// A feed of rows read back from a spool, already through any WHERE.
+    pub(crate) fn spooled(rows: crate::grace_join::SpoolReader) -> JoinFeed<'static> {
+        static EMPTY: std::sync::OnceLock<Document> = std::sync::OnceLock::new();
+        JoinFeed {
+            prepared: None,
+            spooled: Some(rows),
+            filter: EMPTY.get_or_init(Document::new),
+        }
+    }
 }
 
 /// Rows handed to the bounded aggregates: stored blobs from a table scan,
