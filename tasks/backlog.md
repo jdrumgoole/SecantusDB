@@ -4281,8 +4281,12 @@ These are explicit non-goals. Don't add them without a reason.
       `code` and message — which is the general lesson: **compare `codeName`
       too, or a correct code hides a wrong name.**
 
-- [ ] **OPEN — three server-side defects found by the 2026-09-28 Rust gauge
-      sweep, none of them in pymongo.** The pymongo gauge is at 1,205 / 5 with
+- [x] **Three server-side defects found by the 2026-09-28 Rust gauge sweep:
+      resolved (re-measured 2026-10-06).** The Java gauge against the Rust
+      server is 496 / 0 / 404 of 900 (tree `f945d296`, full `--auth` run).
+      The sort divergence below was a document-comparator bug, fixed on
+      2026-10-06 (see §7.00). The C `ipv6` pair is inherent. The original
+      record follows, none of them in pymongo. The pymongo gauge is at 1,205 / 5 with
       only declared non-goals left, so these came from the other-language
       gauges — which is the argument for running them.
 

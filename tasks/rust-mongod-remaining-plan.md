@@ -57,7 +57,7 @@ extra write-path and `w` shapes was widened in the same slice; see backlog
 missing tree builder this plan assumed. The regex, `$project` and positional
 items were Python-server entries.
 
-## Phase 3 -- gauge residue: DONE where it is ours (2026-10-06)
+## Phase 3 -- gauge residue: DONE (2026-10-06)
 
 Re-reading the gauge entries before running anything:
 - **Go:** the one undiagnosed failure, `heartbeats_processed_more_frequently`,
@@ -69,9 +69,12 @@ Re-reading the gauge entries before running anything:
   that compared field names before value types, not anything geo. 14 of 28 on
   the Java fixture before, and only the unordered `$geoIntersects` result (no
   order guaranteed) after. `nested_value_sort.py` 4 of 24 -> 0.
-- **Still open:** the Java gauge's three stable failures, which reproduce only
-  inside a full gauge run (the real test class passes 4 of 4 alone). They need
-  a full `validate-java --server rust`, run in a sub-agent.
+- **The Java gauge's three stable failures are gone.** A full run against the
+  Rust binary built from this branch (tree `f945d296`), with the `--auth`
+  two-phase spawn and one shared daemon, gave 496 / 0 / 404 of 900, with every
+  test reporting a result. Both geo classes passed inside it. The committed
+  2026-09-30 report already shows 0, so they were fixed between 2026-09-28
+  and 2026-09-30.
 
 ## Phase 4 -- the embedded server (`secantus_mdb::Server`)
 
