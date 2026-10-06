@@ -956,6 +956,7 @@ dependencies = [
  "libc",
  "rand",
  "regex",
+ "regex-automata",
  "unicode-normalization",
  "unicode-properties",
 ]

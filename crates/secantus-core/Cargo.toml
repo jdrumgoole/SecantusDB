@@ -29,6 +29,11 @@ geo = "0.28"
 # backtrack; it's tried first for every pattern. Patterns it can't compile
 # (backreferences / lookaround) fall back to `fancy-regex` below.
 regex = "1"
+# The longest-match, rule-ordered scanner of `timelib` (the date parser mongod
+# uses for `$dateFromString` / `$toDate`) needs a DFA that reports EVERY
+# pattern matching at each length; `regex` only offers leftmost-first. Already
+# in the lock tree as a dependency of `regex`.
+regex-automata = "0.4"
 # NFKD decomposition for accent-insensitive collation (strength 1). Already in
 # the lock tree transitively, so this is a direct edge rather than a new crate.
 # `char::is_combining_mark` is the `category == Mn` test `collation.py` uses.

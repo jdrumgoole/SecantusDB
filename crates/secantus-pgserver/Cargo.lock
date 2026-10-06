@@ -2113,6 +2113,7 @@ dependencies = [
  "libc",
  "rand 0.9.5",
  "regex",
+ "regex-automata",
  "unicode-normalization",
  "unicode-properties",
 ]

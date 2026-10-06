@@ -4342,6 +4342,201 @@ fn bounded_datetime(millis: i128) -> R {
 /// microseconds), a space separator or other non-canonical/offset shape, an
 /// out-of-range/invalid field, or a non-string `dateString`. A null `dateString`
 /// returns `onNull` (or null).
+/// Why a free-form date string did not convert.
+enum FreeFormError {
+    /// mongod's `ConversionFailure` (241) with this message: a parse error,
+    /// an incomplete string, or a zone in the string alongside a `timezone`.
+    /// `onError` catches these.
+    Conversion(String),
+    /// Anything else -- an unknown `timezone`, a non-string one.
+    Other(Fallback),
+}
+
+/// A `timezone` argument as mongod's `TimeZoneDatabase::getTimeZone`
+/// classifies it: `"UTC"` and a zero offset are the UTC zone (`isUtcZone`);
+/// any other name in the zone database -- `GMT` and `Etc/UTC` included -- is
+/// a zone ID; then `±HH`, `±HHMM`, `±HH:MM` are fixed offsets.
+enum MongoTz {
+    Utc,
+    Offset(i64),
+    Named(chrono_tz::Tz),
+}
+
+fn mongo_tz(spec: Option<&Bson>) -> Result<MongoTz, FreeFormError> {
+    let name = match spec {
+        None | Some(Bson::Null) => return Ok(MongoTz::Utc),
+        Some(Bson::String(s)) => s.as_str(),
+        Some(_) => return Err(FreeFormError::Other(Fallback::Defer)),
+    };
+    if name == "UTC" {
+        return Ok(MongoTz::Utc);
+    }
+    if let Ok(tz) = name.parse::<chrono_tz::Tz>() {
+        return Ok(MongoTz::Named(tz));
+    }
+    let b = name.as_bytes();
+    let sign = match b.first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return Err(FreeFormError::Other(tz_error(name, None))),
+    };
+    let digits = |r: std::ops::Range<usize>| {
+        name.get(r)
+            .filter(|d| d.bytes().all(|c| c.is_ascii_digit()))
+            .and_then(|d| d.parse::<i64>().ok())
+    };
+    let secs = match b.len() {
+        3 => digits(1..3).map(|h| h * 3600),
+        5 => digits(1..3)
+            .zip(digits(3..5))
+            .map(|(h, m)| h * 3600 + m * 60),
+        6 if b[3] == b':' => digits(1..3)
+            .zip(digits(4..6))
+            .map(|(h, m)| h * 3600 + m * 60),
+        _ => None,
+    };
+    match secs {
+        Some(0) => Ok(MongoTz::Utc),
+        Some(s) => Ok(MongoTz::Offset(sign * s)),
+        None => Err(FreeFormError::Other(tz_error(name, None))),
+    }
+}
+
+/// mongod's `TimeZoneDatabase::fromString` without a format, then
+/// `TimeZone::adjustTimeZone`: timelib's free-form parser (`crate::timelib`),
+/// the `timezone` argument's rules, and the resolved instant in milliseconds.
+fn free_form_date(text: &str, tz_spec: Option<&Bson>) -> Result<i64, FreeFormError> {
+    use crate::timelib;
+    // The zone is resolved first, as mongod evaluates `timezone` before it
+    // parses: an unknown zone wins over a bad string.
+    let tz = mongo_tz(tz_spec)?;
+    let mut t = timelib::mongo_parse(text).map_err(FreeFormError::Conversion)?;
+    if !matches!(tz, MongoTz::Utc) {
+        let refuse = |m: String| Err(FreeFormError::Conversion(m));
+        match t.zone_type {
+            0 => {}
+            timelib::ZONETYPE_OFFSET => {
+                return refuse("you cannot pass in a date/time string with GMT offset together with a timezone argument".into())
+            }
+            timelib::ZONETYPE_ABBR => {
+                return refuse(format!(
+                    "you cannot pass in a date/time string with time zone information ('{}') together with a timezone argument",
+                    t.tz_abbr
+                ))
+            }
+            _ => {
+                return refuse("you cannot pass in a date/time string with time zone information and a timezone argument at the same time".into())
+            }
+        }
+    }
+    match tz {
+        MongoTz::Utc => timelib::update_ts(&mut t),
+        MongoTz::Offset(secs) => {
+            // timelib_set_timezone_from_offset
+            t.zone_type = timelib::ZONETYPE_OFFSET;
+            t.z = secs;
+            t.dst = 0;
+            timelib::update_ts(&mut t);
+        }
+        MongoTz::Named(zone) => {
+            // timelib_set_timezone reads the zone at `t->sse`, still 0 here
+            // because update_ts has not run: the DST flag is the zone's at the
+            // epoch. Then update_ts resolves the wall clock, and the zone-ID
+            // branch of do_adjust_timezone maps it to an instant.
+            let dst_at_epoch = zone_offset_info(zone, 0).2;
+            t.zone_type = 0;
+            timelib::update_ts(&mut t);
+            t.sse += timelib_zone_adjustment(zone, t.sse, dst_at_epoch);
+        }
+    }
+    timelib::millis(&t).map_err(|()| {
+        FreeFormError::Other(Fallback::mongo(
+            159,
+            "Overflow casting from a lower-precision duration to a higher-precision duration",
+        ))
+    })
+}
+
+/// `timelib_get_time_zone_offset_info` over chrono-tz: the UTC offset in
+/// effect at `ts`, the instant that offset took effect (`i64::MIN` if none
+/// was found within a year and a day), and whether it is daylight time.
+fn zone_offset_info(zone: chrono_tz::Tz, ts: i64) -> (i64, i64, bool) {
+    use chrono::{Offset, TimeZone};
+    use chrono_tz::OffsetComponents;
+    let at = |s: i64| {
+        let off = zone.offset_from_utc_datetime(
+            &chrono::DateTime::from_timestamp(s, 0)
+                .unwrap_or_default()
+                .naive_utc(),
+        );
+        (
+            i64::from(off.fix().local_minus_utc()),
+            off.dst_offset().num_seconds() != 0,
+        )
+    };
+    let (offset, is_dst) = at(ts);
+    // Walk back a day at a time to the first day with another offset, then
+    // bisect that day to the second.
+    let mut same = ts;
+    let mut transition = i64::MIN;
+    for _ in 0..367 {
+        let earlier = same - 86_400;
+        if at(earlier).0 != offset {
+            let (mut lo, mut hi) = (earlier, same);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if at(mid).0 == offset {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            transition = hi;
+            break;
+        }
+        same = earlier;
+    }
+    (offset, transition, is_dst)
+}
+
+/// The zone-ID branch of timelib's `do_adjust_timezone`: the seconds to add
+/// to a wall clock read as UTC (`sse`) to reach the instant it names. In a DST
+/// gap or overlap this picks what mongod picks -- measured, a London `02:30`
+/// on the spring-forward day is 01:30Z and `01:30` on the fall-back day is
+/// 01:30Z -- which a plain "earliest local match" does not.
+fn timelib_zone_adjustment(zone: chrono_tz::Tz, sse: i64, dst: bool) -> i64 {
+    let (current_offset, _, current_is_dst) = zone_offset_info(zone, sse);
+    let (after_offset, after_transition_time, _) = zone_offset_info(zone, sse - current_offset);
+    let mut actual_offset = after_offset;
+    let mut actual_transition_time = after_transition_time;
+    // `tz->have_zone` is always set by timelib_set_timezone.
+    if current_offset == after_offset {
+        if current_offset >= 0 && dst && !current_is_dst {
+            let (earlier_offset, earlier_transition_time, _) =
+                zone_offset_info(zone, sse - current_offset - 7200);
+            if earlier_offset != after_offset && sse - earlier_offset < after_transition_time {
+                actual_offset = earlier_offset;
+                actual_transition_time = earlier_transition_time;
+            }
+        } else if current_offset <= 0 && current_is_dst && !dst {
+            let (later_offset, later_transition_time, _) =
+                zone_offset_info(zone, sse - current_offset + 7200);
+            if later_offset != after_offset && sse - later_offset >= later_transition_time {
+                actual_offset = later_offset;
+                actual_transition_time = later_transition_time;
+            }
+        }
+    }
+    let in_transition = actual_transition_time != i64::MIN
+        && (sse - actual_offset) >= actual_transition_time + (current_offset - actual_offset)
+        && (sse - actual_offset) < actual_transition_time;
+    if current_offset != actual_offset && !in_transition {
+        -actual_offset
+    } else {
+        -current_offset
+    }
+}
+
 fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let spec = arg.as_document().ok_or(Fallback::Defer)?;
     // A string `format` selects strptime; a null/absent format uses ISO parsing.
@@ -4372,17 +4567,23 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
     let Bson::String(s) = raw else {
         return Err(Fallback::Defer); // Python raises "dateString must be a string"
     };
-    // strptime always yields a naive instant, so the tz always applies; the ISO
-    // path applies it only when the string carries no offset of its own (the pure
-    // oracle's `parsed.tzinfo is None` guard).
-    let (millis, apply_tz) = match format {
-        Some(fmt) => (strptime_millis(&s, fmt).ok_or(Fallback::Defer)?, true),
-        None => {
-            let has_embedded_offset =
-                s.ends_with('Z') || (s.len() == 25 && matches!(s.as_bytes()[19], b'+' | b'-'));
-            (parse_iso(&s).ok_or(Fallback::Defer)?, !has_embedded_offset)
-        }
+    let Some(fmt) = format else {
+        // No `format`: mongod's free-form timelib parse. A failure -- a parse
+        // error, or a zone in the string alongside a `timezone` -- is what
+        // `onError` catches; an unknown `timezone` is not (it is resolved
+        // first, outside the conversion).
+        return match free_form_date(&s, tz_spec) {
+            // Any i64 of milliseconds is a date to mongod; no year-1..9999 bound.
+            Ok(ms) => Ok(Bson::DateTime(bson::DateTime::from_millis(ms))),
+            Err(FreeFormError::Conversion(msg)) => match spec.get("onError") {
+                Some(e) => eval(e, ctx),
+                None => Err(Fallback::mongo(241, msg)),
+            },
+            Err(FreeFormError::Other(f)) => Err(f),
+        };
     };
+    // strptime always yields a naive instant, so the tz always applies.
+    let (millis, apply_tz) = (strptime_millis(&s, fmt).ok_or(Fallback::Defer)?, true);
     let millis = match tz_spec {
         Some(tz) if apply_tz => {
             // The parsed value is a local wall clock; ask the zone which
@@ -4550,362 +4751,6 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
         }
     }
     Ok(out)
-}
-
-/// Parse ISO-8601 into epoch milliseconds (UTC). Accepts the naive canonical
-/// forms treated as UTC, plus a full datetime with a trailing `Z` or a fixed
-/// `±HH:MM` offset (`utc = wall - offset`). Fractional seconds / other shapes →
-/// `None` (defer).
-/// timelib's MILITARY timezone letters, which mongod inherits: `A`-`I` are
-/// UTC+1..+9, `J` is invalid ("local"), `K`-`M` are +10..+12, `N`-`Y` are
-/// -1..-12 and `Z` is UTC.
-///
-/// This is why `{$toDate: "2020-01-01T"}` answers `07:00:00` rather than
-/// midnight: the trailing `T` is not the ISO date/time separator there, it is
-/// the zone UTC-7. Deterministic, and NOT host-local -- a `TZ=UTC` mongod
-/// answers the same (measured 8.2.11, 2026-09-09, across ten letters).
-fn military_zone_hours(c: char) -> Option<i64> {
-    let up = c.to_ascii_uppercase();
-    match up {
-        'A'..='I' => Some(up as i64 - 'A' as i64 + 1),
-        'K'..='M' => Some(up as i64 - 'K' as i64 + 10),
-        'N'..='Y' => Some(-(up as i64 - 'N' as i64 + 1)),
-        'Z' => Some(0),
-        _ => None, // 'J' is deliberately absent -- mongod rejects it too.
-    }
-}
-
-const MONTH_NAMES: [&str; 12] = [
-    "january",
-    "february",
-    "march",
-    "april",
-    "may",
-    "june",
-    "july",
-    "august",
-    "september",
-    "october",
-    "november",
-    "december",
-];
-
-fn month_from_name(name: &str) -> Option<i64> {
-    let lower = name.to_ascii_lowercase();
-    MONTH_NAMES
-        .iter()
-        .position(|full| *full == lower || (lower.len() == 3 && full.starts_with(&lower)))
-        .map(|i| i as i64 + 1)
-}
-
-/// Assemble epoch milliseconds, rejecting an out-of-range month or day.
-///
-/// mongod REFUSES `13/01/2020` and `12/32/2020`, so this is a parse failure
-/// rather than a rollover.
-fn civil_millis(y: i64, m: i64, d: i64, hh: i64, mi: i64, se: i64, ms: i64) -> Option<i128> {
-    if !(1..=12).contains(&m) || d < 1 {
-        return None;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let dim = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if d > dim[(m - 1) as usize] {
-        return None;
-    }
-    if !(0..24).contains(&hh) || !(0..60).contains(&mi) || !(0..=60).contains(&se) {
-        return None;
-    }
-    let days = days_from_civil(y, m, d);
-    Some((days as i128) * 86_400_000 + (hh * 3_600_000 + mi * 60_000 + se * 1_000 + ms) as i128)
-}
-
-/// `HH[:MM[:SS[.frac]]]` -> `(h, m, s, ms)`.
-fn parse_clock(text: &str) -> Option<(i64, i64, i64, i64)> {
-    let (main, ms) = match text.split_once('.') {
-        Some((head, frac)) => {
-            let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() || digits.len() != frac.len() {
-                return None;
-            }
-            let mut three = digits.clone();
-            three.truncate(3);
-            while three.len() < 3 {
-                three.push('0');
-            }
-            (head, three.parse::<i64>().ok()?)
-        }
-        None => (text, 0),
-    };
-    let mut it = main.split(':');
-    let h = it.next()?.parse::<i64>().ok()?;
-    let m = it
-        .next()
-        .map(str::parse::<i64>)
-        .transpose()
-        .ok()?
-        .unwrap_or(0);
-    let s = it
-        .next()
-        .map(str::parse::<i64>)
-        .transpose()
-        .ok()?
-        .unwrap_or(0);
-    if it.next().is_some() {
-        return None;
-    }
-    Some((h, m, s, ms))
-}
-
-/// The non-ISO date shapes mongod accepts, or `None` if this is not one.
-///
-/// mongod's `$toDate` runs **timelib's** parser, not an ISO-8601 one, and takes
-/// a whole format table this server used to reject: the US `MM/DD/YYYY` slash
-/// form (`31/12/2020` is REFUSED, so it is a locale rule and not
-/// ambiguity-resolution), `YYYY/MM/DD`, month NAMES in either order, non-padded
-/// ISO components, and `@<unix seconds>`. Measured against 8.2.11, 2026-09-09;
-/// mirrors `secantus.expressions._parse_timelib_forms`.
-///
-/// The month-NAME forms are matched before any split on whitespace, because
-/// their date part contains spaces.
-fn parse_timelib_forms(text: &str) -> Option<i128> {
-    if let Some(rest) = text.strip_prefix('@') {
-        let (whole, frac) = match rest.split_once('.') {
-            Some((w, f)) => (w, Some(f)),
-            None => (rest, None),
-        };
-        let secs = whole.parse::<i64>().ok()?;
-        let mut ms = 0i64;
-        if let Some(f) = frac {
-            if f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            let mut three = f.to_string();
-            three.truncate(3);
-            while three.len() < 3 {
-                three.push('0');
-            }
-            ms = three.parse::<i64>().ok()?;
-        }
-        return Some((secs as i128) * 1000 + ms as i128);
-    }
-    // Month-name forms, either order, with an optional comma.
-    let cleaned = text.replace(',', " ");
-    let words: Vec<&str> = cleaned.split_whitespace().collect();
-    if words.len() == 3 {
-        let numeric = |w: &str| w.parse::<i64>().ok();
-        if let (Some(month), Some(day), Some(year)) = (
-            month_from_name(words[0]),
-            numeric(words[1]),
-            numeric(words[2]),
-        ) {
-            return civil_millis(year, month, day, 0, 0, 0, 0);
-        }
-        if let (Some(day), Some(month), Some(year)) = (
-            numeric(words[0]),
-            month_from_name(words[1]),
-            numeric(words[2]),
-        ) {
-            return civil_millis(year, month, day, 0, 0, 0, 0);
-        }
-    }
-    // Numeric forms, with an optional trailing clock.
-    let (body, clock) = match text.split_once(' ') {
-        Some((b, c)) => (b, c.trim()),
-        None => (text, ""),
-    };
-    let (hh, mi, se, ms) = if clock.is_empty() {
-        (0, 0, 0, 0)
-    } else {
-        parse_clock(clock)?
-    };
-    let nums: Vec<&str> = if body.contains('/') {
-        body.split('/').collect()
-    } else if body.matches('-').count() == 2 {
-        body.split('-').collect()
-    } else {
-        return None;
-    };
-    if nums.len() != 3
-        || !nums
-            .iter()
-            .all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-    {
-        return None;
-    }
-    let a = nums[0].parse::<i64>().ok()?;
-    let b = nums[1].parse::<i64>().ok()?;
-    let c = nums[2].parse::<i64>().ok()?;
-    if nums[0].len() == 4 {
-        // Year first: `YYYY/MM/DD` and non-padded `YYYY-M-D`.
-        civil_millis(a, b, c, hh, mi, se, ms)
-    } else if body.contains('/') && nums[2].len() == 4 {
-        // US month-first slash form.
-        civil_millis(c, a, b, hh, mi, se, ms)
-    } else {
-        None
-    }
-}
-
-/// `YYYY-Www-D` -- the ISO week date. Week 1 contains the first Thursday of the
-/// year and day 1 is Monday, so `2020-W01-1` is 2019-12-30.
-fn parse_iso_week(text: &str) -> Option<i128> {
-    let bytes = text.as_bytes();
-    if text.len() != 10 || bytes[4] != b'-' || !(bytes[5] == b'W' || bytes[5] == b'w') {
-        return None;
-    }
-    if bytes[8] != b'-' {
-        return None;
-    }
-    let year = text[0..4].parse::<i64>().ok()?;
-    let week = text[6..8].parse::<i64>().ok()?;
-    let day = text[9..10].parse::<i64>().ok()?;
-    if !(1..=53).contains(&week) || !(1..=7).contains(&day) {
-        return None;
-    }
-    // The Monday of ISO week 1: back up from Jan 4th, which is always in it.
-    let jan4 = days_from_civil(year, 1, 4);
-    // `days_from_civil(1970,1,1)` is 0, a Thursday, so weekday = (days+3) mod 7
-    // with Monday = 0.
-    let jan4_dow = (jan4 + 3).rem_euclid(7);
-    let week1_monday = jan4 - jan4_dow;
-    let days = week1_monday + (week - 1) * 7 + (day - 1);
-    Some((days as i128) * 86_400_000)
-}
-
-/// Every string shape `$toDate` accepts: ISO-8601, a trailing MILITARY zone
-/// letter, then timelib's other forms. Mirrors
-/// `secantus.expressions._parse_date_string`'s order.
-fn parse_date_text(text: &str) -> Option<i128> {
-    if let Some(ms) = parse_iso(text) {
-        return Some(ms);
-    }
-    // Surrounding whitespace is tolerated. A whitespace-ONLY string trims to
-    // empty and still fails, which is what mongod does with it.
-    let trimmed = text.trim();
-    if trimmed != text && !trimmed.is_empty() {
-        return parse_date_text(trimmed);
-    }
-    // `YYYY-MM-DDTHH` -- an hour with no minutes, which `parse_iso`'s
-    // fixed-length forms do not cover.
-    if let Some((date, hour)) = text.split_once(['T', 't']) {
-        if hour.len() == 2 && hour.chars().all(|c| c.is_ascii_digit()) {
-            for filled in [format!("{date}T{hour}:00:00"), format!("{date}T{hour}:00")] {
-                if let Some(ms) = parse_date_text(&filled) {
-                    return Some(ms);
-                }
-            }
-        }
-    }
-    // Compact `YYYYMMDDTHHMMSS` -- the basic-format ISO timestamp, which the
-    // fixed-length forms in `parse_iso` do not cover.
-    if text.len() == 15 {
-        let (date, rest) = text.split_at(8);
-        if let Some(time) = rest.strip_prefix(['T', 't']) {
-            if date.chars().all(|c| c.is_ascii_digit()) && time.chars().all(|c| c.is_ascii_digit())
-            {
-                let hh = time[0..2].parse::<i64>().ok();
-                let mi = time[2..4].parse::<i64>().ok();
-                let se = time[4..6].parse::<i64>().ok();
-                if let (Some(hh), Some(mi), Some(se)) = (hh, mi, se) {
-                    let y = date[0..4].parse::<i64>().ok();
-                    let m = date[4..6].parse::<i64>().ok();
-                    let d = date[6..8].parse::<i64>().ok();
-                    if let (Some(y), Some(m), Some(d)) = (y, m, d) {
-                        if let Some(ms) = civil_millis(y, m, d, hh, mi, se, 0) {
-                            return Some(ms);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Compact `YYYYMMDD`.
-    if text.len() == 8 && text.chars().all(|c| c.is_ascii_digit()) {
-        let y = text[0..4].parse::<i64>().ok()?;
-        let m = text[4..6].parse::<i64>().ok()?;
-        let d = text[6..8].parse::<i64>().ok()?;
-        if let Some(ms) = civil_millis(y, m, d, 0, 0, 0, 0) {
-            return Some(ms);
-        }
-    }
-    // ISO WEEK date, `YYYY-Www-D`: week 1 is the one holding the first
-    // Thursday, and day 1 is Monday -- so `2020-W01-1` is 2019-12-30.
-    if let Some(ms) = parse_iso_week(text) {
-        return Some(ms);
-    }
-    // A trailing military zone letter -- see `military_zone_hours`.
-    if text.chars().count() > 1 {
-        if let Some(last) = text.chars().last() {
-            if let Some(hours) = military_zone_hours(last) {
-                let head = text[..text.len() - last.len_utf8()].trim_end();
-                if !head.is_empty() {
-                    if let Some(ms) = parse_date_text(head) {
-                        return Some(ms - (hours as i128) * 3_600_000);
-                    }
-                }
-            }
-        }
-    }
-    parse_timelib_forms(text)
-}
-
-fn parse_iso(s: &str) -> Option<i128> {
-    // A FRACTIONAL second is truncated to milliseconds and then removed, so the
-    // exact-length checks below still see the plain forms. mongod takes 1..n
-    // digits and keeps three: `.1` is 100 ms, `.1234567` is 123 (measured
-    // 8.2.11, 2026-09-08). Without this, every ISO timestamp carrying
-    // milliseconds -- the ordinary form for a BSON date -- failed to parse.
-    if let Some(dot) = s.find('.') {
-        let digits: String = s[dot + 1..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if !digits.is_empty() {
-            let millis: i128 = digits
-                .chars()
-                .chain("000".chars())
-                .take(3)
-                .collect::<String>()
-                .parse()
-                .ok()?;
-            let stripped = format!("{}{}", &s[..dot], &s[dot + 1 + digits.len()..]);
-            return parse_iso(&stripped).map(|ms| ms + millis);
-        }
-    }
-    if let Some(base) = s.strip_suffix('Z') {
-        // A `Z` designator only follows a full datetime.
-        return if base.len() == 19 {
-            parse_naive(base)
-        } else {
-            None
-        };
-    }
-    // A full datetime followed by a `±HH:MM` offset is exactly 25 chars.
-    if s.len() == 25 && matches!(s.as_bytes()[19], b'+' | b'-') {
-        let (base, tz) = s.split_at(19);
-        let off_min = parse_offset(tz)?;
-        return parse_naive(base).map(|ms| ms - off_min as i128 * 60_000);
-    }
-    // `YYYY-MM` is the first of that month for mongod (`2020-01` is
-    // 2020-01-01T00:00:00Z, measured 8.2.11). A bare `YYYY` is NOT -- it answers
-    // the incomplete-string error -- so only the 7-character form is widened.
-    // Mirrors `secantus.expressions._parse_date_string`.
-    if s.len() == 7 && s.as_bytes()[4] == b'-' {
-        return parse_naive(&format!("{s}-01"));
-    }
-    parse_naive(s)
 }
 
 /// `$dateFromString` `format` (strptime) for the bounded numeric-directive subset
@@ -5102,69 +4947,6 @@ fn timezone_offset_ms(tz: Option<&Bson>, utc_millis: i64) -> Result<i64, Fallbac
         },
         Some(_) => Err(Fallback::Defer), // Python raises "timezone must be a string"
     }
-}
-
-/// A fixed `±HH:MM` UTC offset in signed minutes, or `None` if malformed.
-fn parse_offset(tz: &str) -> Option<i64> {
-    let b = tz.as_bytes();
-    if b.len() != 6 || b[3] != b':' {
-        return None;
-    }
-    let sign = match b[0] {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let hh: i64 = tz.get(1..3)?.parse().ok()?;
-    let mm: i64 = tz.get(4..6)?.parse().ok()?;
-    if hh > 23 || mm > 59 {
-        return None;
-    }
-    Some(sign * (hh * 60 + mm))
-}
-
-/// Parse strict canonical naive ISO-8601 (`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM:SS`)
-/// into epoch milliseconds (treating the wall clock as UTC), or `None` for a
-/// non-fixed-width shape or out-of-range field. Fixed-width so it can't drift
-/// from `fromisoformat`.
-fn parse_naive(s: &str) -> Option<i128> {
-    let b = s.as_bytes();
-    // Only date-only or whole-second forms (fractional seconds defer — see above).
-    if b.len() != 10 && b.len() != 19 {
-        return None;
-    }
-    let digits = |lo: usize, hi: usize| -> Option<i64> {
-        let part = s.get(lo..hi)?;
-        if part.bytes().all(|c| c.is_ascii_digit()) {
-            part.parse().ok()
-        } else {
-            None
-        }
-    };
-    if b[4] != b'-' || b[7] != b'-' {
-        return None;
-    }
-    let y = digits(0, 4)?;
-    let m = digits(5, 7)?;
-    let d = digits(8, 10)?;
-    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
-        return None;
-    }
-    let (mut hh, mut mi, mut ss) = (0i64, 0i64, 0i64);
-    if b.len() == 19 {
-        if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-            return None;
-        }
-        hh = digits(11, 13)?;
-        mi = digits(14, 16)?;
-        ss = digits(17, 19)?;
-        if hh > 23 || mi > 59 || ss > 59 {
-            return None;
-        }
-    }
-    let day_ms = days_from_civil(y, m, d) as i128 * 86_400_000;
-    let time_ms = ((hh * 3600 + mi * 60 + ss) * 1000) as i128;
-    Some(day_ms + time_ms)
 }
 
 fn shift_ms(start: i64, amount: i128, unit_ms: i128) -> R {
@@ -6359,41 +6141,15 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // abbreviation tables and its per-position error accumulation. This
             // matches `secantus.expressions._parse_date_string`, so the two
             // servers agree; the shared gap is documented in `tasks/backlog.md`.
-            Bson::String(text) => match parse_date_text(text) {
-                Some(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms as i64))),
-                None => Conv::Named(date_string_parse_error(text)),
+            Bson::String(text) => match free_form_date(text, None) {
+                Ok(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms))),
+                Err(FreeFormError::Conversion(msg)) => Conv::Named(Fallback::mongo(241, msg)),
+                Err(FreeFormError::Other(f)) => Conv::Named(f),
             },
             _ => Conv::Unsupported,
         },
         _ => Conv::Unsupported,
     }
-}
-
-/// mongod's `241 ConversionFailure` for a string `$toDate` cannot parse.
-///
-/// Two shapes are reproducible exactly and are measured on 8.2.11 (2026-09-08):
-/// an EMPTY string names a literal NUL, and everything else that reaches here
-/// gets the incomplete-string text. WHITESPACE-ONLY is *not* empty -- `''` is
-/// "Empty string" but `'  '` is the incomplete message -- so this tests the raw
-/// value, not a trimmed one.
-///
-/// mongod says more than this for a string its scanner got partway through
-/// (`'abc'` names the offending character and position). That needs timelib
-/// itself; inventing a position here would look authoritative and be wrong.
-fn date_string_parse_error(text: &str) -> Fallback {
-    if text.is_empty() {
-        return Fallback::mongo(
-            241,
-            // A literal NUL, not a space -- mongod's own byte.
-            format!("Error parsing date string '{text}'; 0: Empty string '\0'"),
-        );
-    }
-    Fallback::mongo(
-        241,
-        format!(
-            r#"an incomplete date/time string has been found, with elements missing: "{text}""#
-        ),
-    )
 }
 
 fn wrap_int(n: i128, code: i32) -> Conv {
