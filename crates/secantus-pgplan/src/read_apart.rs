@@ -52,9 +52,12 @@ const PURE: &[&str] = &[
 
 /// The relations (as written, `schema.name` or `name`) a single plain
 /// `SELECT` reads, when it is a read that may run apart: no row lock, no
-/// `INTO`, no subquery (one runs at planning, in the block), no
-/// set-returning FROM function, no CTE, no SQL value function (`now()`'s
-/// spelled forms) and no function call outside [`PURE`]. Catalog relations
+/// `INTO`, no set-returning FROM function, no recursive or data-modifying
+/// CTE, no SQL value function (`now()`'s spelled forms) and no function
+/// call outside [`PURE`] -- at any depth. Subqueries and plain-SELECT CTEs
+/// are allowed: their relations are listed too, and the server runs the
+/// ones evaluated at planning in the same snapshot as the statement
+/// (`isolate_for_planning`). Catalog relations
 /// refuse it. `None` otherwise.
 pub fn relations(sql: &str) -> Option<Vec<String>> {
     let parsed = parse_tree(sql).ok()?;
@@ -65,21 +68,48 @@ pub fn relations(sql: &str) -> Option<Vec<String>> {
     let N::SelectStmt(sel) = node else {
         return None;
     };
-    if sel.into_clause.is_some() || sel.with_clause.is_some() || !sel.locking_clause.is_empty() {
+    if sel.into_clause.is_some() || !sel.locking_clause.is_empty() {
         return None;
+    }
+    // A recursive WITH, at any depth (the parse tree's walk does not show
+    // its clause): refused on the keyword, which only costs a replay.
+    if sql
+        .as_bytes()
+        .windows(9)
+        .any(|w| w.eq_ignore_ascii_case(b"recursive"))
+    {
+        return None;
+    }
+    // A WITH item's name is not a stored relation: every reference to one
+    // (anywhere -- a CTE is visible in its subqueries) is skipped below.
+    let mut ctes: Vec<String> = Vec::new();
+    for (n, _, _, _) in node.nodes() {
+        match n {
+            // The walk does not enter a SELECT's locking or INTO clause:
+            // checked on each nested SELECT itself.
+            pg_query::NodeRef::SelectStmt(s)
+                if !s.locking_clause.is_empty() || s.into_clause.is_some() =>
+            {
+                return None;
+            }
+            pg_query::NodeRef::CommonTableExpr(c) => {
+                // Only a plain SELECT body: a data-modifying WITH item writes.
+                match c.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+                    Some(N::SelectStmt(_)) => ctes.push(c.ctename.clone()),
+                    _ => return None,
+                }
+            }
+            _ => {}
+        }
     }
     let mut out: Vec<String> = Vec::new();
     for (n, _, _, _) in node.nodes() {
         match n {
             pg_query::NodeRef::LockingClause(_)
             | pg_query::NodeRef::IntoClause(_)
-            | pg_query::NodeRef::SubLink(_)
-            | pg_query::NodeRef::RangeSubselect(_)
             | pg_query::NodeRef::RangeFunction(_)
             | pg_query::NodeRef::RangeTableSample(_)
-            | pg_query::NodeRef::CommonTableExpr(_)
-            | pg_query::NodeRef::SqlvalueFunction(_)
-            | pg_query::NodeRef::WithClause(_) => return None,
+            | pg_query::NodeRef::SqlvalueFunction(_) => return None,
             pg_query::NodeRef::FuncCall(f) => {
                 let parts: Vec<&str> = f
                     .funcname
@@ -104,6 +134,9 @@ pub fn relations(sql: &str) -> Option<Vec<String>> {
                 {
                     return None;
                 }
+                if r.schemaname.is_empty() && ctes.contains(&r.relname) {
+                    continue;
+                }
                 let name = if r.schemaname.is_empty() {
                     r.relname.clone()
                 } else {
@@ -117,6 +150,49 @@ pub fn relations(sql: &str) -> Option<Vec<String>> {
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Does `sql` hold a subquery or a WITH item anywhere -- something the
+/// planner may RUN while planning? A cheap textual test first: no `select`
+/// beyond a SELECT's own keyword, and no `with`, means no subquery.
+pub fn has_subquery(sql: &str) -> bool {
+    // Run on every statement, so no allocation on the way to "no".
+    let bytes = sql.as_bytes();
+    let count = |word: &[u8]| {
+        bytes
+            .windows(word.len())
+            .filter(|w| w.eq_ignore_ascii_case(word))
+            .take(2)
+            .count()
+    };
+    // A SELECT's own keyword is one; any other statement has none of its own.
+    let own = usize::from(
+        sql.trim_start()
+            .as_bytes()
+            .get(..6)
+            .is_some_and(|w| w.eq_ignore_ascii_case(b"select")),
+    );
+    if count(b"select") <= own && count(b"with") == 0 {
+        return false;
+    }
+    let Ok(parsed) = parse_tree(sql) else {
+        return false;
+    };
+    parsed.stmts.iter().any(|raw| {
+        raw.stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+            .is_some_and(|node| {
+                node.nodes().into_iter().any(|(n, _, _, _)| {
+                    matches!(
+                        n,
+                        pg_query::NodeRef::SubLink(_)
+                            | pg_query::NodeRef::RangeSubselect(_)
+                            | pg_query::NodeRef::CommonTableExpr(_)
+                    )
+                })
+            })
+    })
 }
 
 #[cfg(test)]
@@ -136,17 +212,47 @@ mod read_apart_tests {
     }
 
     #[test]
+    fn has_subquery_finds_them() {
+        assert!(super::has_subquery("select (select 1) from a"));
+        assert!(super::has_subquery("with w as (select 1) select * from w"));
+        assert!(super::has_subquery(
+            "update a set x = (select max(y) from b)"
+        ));
+        assert!(!super::has_subquery("select * from a where id = 1"));
+        assert!(!super::has_subquery("select 'select' from a"));
+    }
+
+    #[test]
+    fn subqueries_and_ctes_list_their_relations() {
+        assert_eq!(
+            relations("select * from a where x in (select y from b)"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            relations("with w as (select max(y) m from b) select m, (select sum(x) from a) from w"),
+            Some(vec!["b".to_string(), "a".to_string()])
+        );
+        assert_eq!(
+            relations("select sum(x) from (select x from a) s"),
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
     fn anything_else_is_not() {
         for sql in [
             "select 1",
             "select * from a for update",
-            "select * from a where x in (select y from b)",
             "select nextval('s') from a",
             "select f(x) from a",
             "select now(), x from a",
             "select current_timestamp from a",
-            "with w as (select 1) select * from a, w",
-            "select * from (select * from a) s",
+            "with recursive w as (select 1) select * from a, w",
+            "with w as (insert into b values (1) returning 1) select * from a, w",
+            "select * from a where x in (select nextval('s') from b)",
+            "select * from a where x in (select y from b for update)",
+            "with w as (select * from b for update) select * from a, w",
+            "select * from a where x = (select max(y) from b where y = f(1))",
             "select * from pg_class",
             "select row_number() over () from a",
             "insert into a values (1)",

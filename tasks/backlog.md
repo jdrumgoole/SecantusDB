@@ -801,7 +801,25 @@ remain open:
         (only extended portals and cursors stream); and a DISTINCT
         over a timestamp / timestamptz / tsvector output column (its
         identity is the reassembled text, so it keeps the materialised
-        path).
+        path). **Batch 62 (2026-10-06):** a lone simple-protocol SELECT with
+        no WHERE outside any transaction streams from a reader thread
+        (`allow_simple_stream`); 300,000 rows of 2 KB after a restart, debug,
+        WiredTiger cache capped at 64 MB (`SECANTUS_WT_CONFIG_EXTRA=
+        cache_size=64M`, so the cache does not mask the result -- with the
+        default 4 GB cap the scanned pages alone reach ~0.9 GB either way):
+        1884 -> 175 MB, answers identical to PostgreSQL 15.19 through psql. A
+        DISTINCT over a timestamp / timestamptz column streams (the hidden
+        sub-millisecond companion joins its identity), corpus
+        `b62_distinct_ts`. Still materialised (OPEN, not started -- each
+        needs a new streaming source, not a gate): a JOIN's outer side
+        (`join_docs` reads every side whole); an aggregate with grouping
+        sets (each set would need its own sorted pass over the input),
+        over a join or a subquery, or over an INDEXED filter (the index
+        route returns every match at once; the bounded paths read only a
+        collection scan); a DISTINCT over a tsvector / tsquery (a Python-
+        written value is a document); a simple-protocol SELECT with a
+        WHERE (it keeps the index route, as an extended Execute of the
+        whole result does) or inside a block.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -1332,7 +1350,29 @@ remain open:
         and slice test `test_batch61_read_committed_reads_its_own_table_
         beside_commits_to_it`, whose scenario also ran against PostgreSQL
         15.19 unchanged. Left: a read with a subquery / user function still
-        replays (the gate's shapes). Every move --
+        replays (the gate's shapes). **Batch 62 (2026-10-06):** subqueries
+        (uncorrelated and correlated) and plain-SELECT CTEs now read apart /
+        overlaid too (`read_apart::relations` lists their relations; a
+        recursive or data-modifying WITH, a row lock or INTO at any depth
+        still refuses). That needed a fix first, a SILENT WRONG ANSWER: an
+        uncorrelated subquery RUNS at planning, before `with_isolation_for`
+        moved the block, so the first read after another session's commit
+        answered the subquery from the block's old snapshot (`select (select
+        max(x) from t)` 2 where PostgreSQL 15.19 answers 300).
+        `isolate_for_planning` now makes the isolation decision from the text
+        before planning: a read that may go apart opens its fresh transaction
+        then (`plan_apart`), the subquery reads there under the overlays,
+        and `read_apart` takes the same transaction, so the subquery and the
+        statement share one snapshot; anything else moves the block before
+        planning. 200 / 400 / 800 insert-then-subquery-read pairs beside a
+        session committing to the same table, debug: 4.0 / 15.5 / 59.8 s
+        (forced to move) -> 1.1 / 3.3 / 12.2 s. Slice test
+        `test_batch62_read_committed_subquery_sees_commits` (its scenario
+        also ran against PostgreSQL 15.19 unchanged). Left (OPEN): a read
+        calling a USER function still replays -- this server does not
+        refuse a write inside a STABLE / IMMUTABLE function (PostgreSQL's
+        "not allowed in a non-volatile function"), so no declared
+        volatility makes one safe to run apart. Every move --
 Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
@@ -1790,6 +1830,25 @@ These work end-to-end but cut corners.
       pgwire's framed loop: `crates/vendor/pgwire/src/tokio/server.rs`'s
       per-message `select!`) or no per-statement WiredTiger transaction for
       a single point read -- each worth at most ~1-2 us.
+      **Batch 62 (2026-10-06): both levers measured and CLOSED.** (1) The
+      `recvfrom`s: an instrumented `MaybeTls::poll_read` over 9,000 PK reads
+      counted ONE read with data per statement and one `Pending` poll that
+      makes no syscall -- tokio 1.53 already clears readiness after a short
+      read (`poll_evented.rs`: `0 < n && n < len`), which IS "read until
+      EAGAIN once"; only 0.6% of reads filled the buffer and read again. The
+      three `recvfrom` stack sites in the sample were call sites, not calls.
+      Nothing to cut. (2) No per-statement transaction for a point read: the
+      extended group's open + commit is ~0.6 us (batch 60's sample), and
+      skipping it means opening the group's handle lazily, which every path
+      that reads the `txn` guard to keep the group atomic would have to
+      honour -- not safe for ~1.3%. Release, `bench43.py`, two interleaved
+      runs, load ~9-11, base `c656de96` -> batch 62: ping 19.3 / 19.4 ->
+      19.7 / 19.4, simple `select 1` 27.2 / 27.1 -> 27.7 / 27.7, extended
+      `select 1` 39.6 / 39.6 -> 40.0 / 40.0, PK read 45.7 / 44.8 -> 45.8 /
+      44.4, autocommit UPDATE 70.7 / 68.3 -> 70.7 / 70.2 us (PG 15.19: 18.1,
+      22.6, 26.0, 32.9, 105.5). The ~12 us gap left is tokio's wake-ups and
+      the client-visible scheduling, with no single server cost above ~1 us;
+      this entry stays open only as the record of that gap.
       **Batch 54 (2026-10-05):** `is_timeseries` caches its answer per
       collection once a timeseries collection exists (`TIMESERIES_CACHE`),
       transaction-aware: valid while `COLL_TABLE_GEN` -- moved on by every

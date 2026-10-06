@@ -2792,6 +2792,12 @@ pub struct PgHandler {
     /// snapshot (`secantus_storage::with_read_overlay`) instead of the block
     /// replaying its write set onto a new one.
     rc_overlay: Mutex<Option<secantus_storage::ReadOverlays>>,
+    /// The fresh read-only transaction a READ COMMITTED statement with a
+    /// subquery reads in when it reads apart ([`PgHandler::isolate_for_planning`]):
+    /// opened BEFORE planning, because an uncorrelated subquery runs then,
+    /// and taken by `read_apart` so the subquery and the statement share
+    /// one snapshot, as PostgreSQL's per-statement snapshot is one.
+    plan_apart: Mutex<Option<UserTransactionHandle>>,
     /// Names the savepoints a PL/pgSQL block with EXCEPTION handlers opens.
     subtxn_seq: std::sync::atomic::AtomicU64,
 }
@@ -3085,6 +3091,7 @@ impl PgHandler {
             sole_implicit: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
             rc_overlay: Mutex::new(None),
+            plan_apart: Mutex::new(None),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -4574,7 +4581,7 @@ impl PgHandler {
                         let v = match &k.expr {
                             Some(expr) => secantus_pgplan::apply_row_expr(expr, d)
                                 .map_err(|e| Self::err(&e))?,
-                            None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                            None => secantus_pgplan::field_value(d, &k.field),
                         };
                         key[i] = match v {
                             Bson::Null => None,
@@ -4618,7 +4625,7 @@ impl PgHandler {
                         Some(expr) => {
                             secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?
                         }
-                        None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                        None => secantus_pgplan::field_value(&d, &k.field),
                     };
                     key.push(match v {
                         Bson::Null => None,
@@ -4928,6 +4935,33 @@ impl PgHandler {
         // inside the transaction scope -- and then the plain read is already
         // the right one. A blocking lock there would deadlock the connection.
         let read = || self.rows_with_schema(stmt);
+        // Planned to read apart (`isolate_for_planning`): in that snapshot.
+        let planned = self
+            .plan_apart
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut tmp) = planned {
+            let overlays = self
+                .rc_overlay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let rows = self
+                .storage
+                .with_user_transaction(&mut tmp, || match overlays {
+                    Some(ov) => secantus_storage::with_read_overlay(ov, read),
+                    None => read(),
+                });
+            *self.plan_apart.lock().unwrap_or_else(|e| e.into_inner()) = Some(tmp);
+            let (_, rows) = rows
+                .map_err(|e| PlanError::Internal(format!("could not read a subquery: {e}")))?
+                .map_err(Self::plan_error_of)?;
+            return Ok(rows
+                .into_iter()
+                .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
+                .collect());
+        }
         let rows = match self.txn.try_lock() {
             Ok(mut guard) => match guard.as_mut() {
                 Some(handle) => self
@@ -17275,7 +17309,19 @@ impl SimpleQueryHandler for PgHandler {
         };
         let live = live_notices::LiveNotices::install(self, _c);
         let out = if stmts.len() <= 1 && !self.runs_user_code(query) {
-            self.run(query, &[], 0).await
+            // A lone SELECT outside any transaction streams its rows as
+            // pgwire sends them (`portal_stream`), as an extended portal does.
+            self.allow_simple_stream();
+            let out = self.run(query, &[], 0).await;
+            self.stream_request.store(
+                portal_stream::STREAM_NEVER,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.stream_portal.store(
+                portal_stream::STREAM_NEVER,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            out
         } else if stmts.len() <= 1 {
             // A statement that can run user code is ONE transaction, as every
             // statement is in PostgreSQL: a trigger or a DO block that raises
@@ -20388,7 +20434,17 @@ impl PgHandler {
         if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.check_sql_privileges(sql)?;
             self.wait_for_table_locks(sql)?;
+            self.isolate_for_planning(sql)?;
         }
+        // Whatever path the statement takes, a planning transaction it left
+        // untaken is rolled back when it ends.
+        struct PlanApartGuard<'a>(&'a PgHandler);
+        impl Drop for PlanApartGuard<'_> {
+            fn drop(&mut self) {
+                self.0.drop_plan_apart();
+            }
+        }
+        let _plan_apart = PlanApartGuard(self);
         // An uncorrelated subquery is RUN during planning and replaced by the
         // values it returned, so the lowering below never sees a `SubLink`.
         // The runner is this handler's own row reader, which is what gives the
@@ -21637,6 +21693,19 @@ impl PgHandler {
             Some((s, q)) => (Some(s), Some(q)),
             None => (None, None),
         };
+        self.with_isolation_judged(handle, stmt, sql)
+    }
+
+    /// [`Self::with_isolation_for`] judged from `sql` alone when `stmt` is
+    /// `None` and `sql` is not: the statement has not been planned yet
+    /// ([`Self::isolate_for_planning`]), and only its text -- a lone plain
+    /// SELECT, which `read_apart::relations` checks -- may narrow the move.
+    fn with_isolation_judged<'h>(
+        &self,
+        handle: &'h mut UserTransactionHandle,
+        stmt: Option<&Statement>,
+        sql: Option<&str>,
+    ) -> PgWireResult<&'h mut UserTransactionHandle> {
         self.rc_apart
             .store(false, std::sync::atomic::Ordering::Relaxed);
         *self.rc_overlay.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -21672,10 +21741,13 @@ impl PgHandler {
                     // the snapshot -- every serial INSERT commits one -- changes
                     // no answer.
                     let own_sequences = handle.wrote_collection(self.db(), SEQUENCE_COLLECTION);
-                    let narrow = stmt.and_then(|s| {
-                        self.rc_read_set(s)
-                            .or_else(|| sql.and_then(|q| self.rc_select_read_set(s, q)))
-                    });
+                    let narrow = match (stmt, sql) {
+                        (Some(s), _) => self
+                            .rc_read_set(s)
+                            .or_else(|| sql.and_then(|q| self.rc_select_read_set(Some(s), q))),
+                        (None, Some(q)) => self.rc_select_read_set(None, q),
+                        (None, None) => None,
+                    };
                     !secantus_storage::Storage::no_commit_touching_since(
                         handle.snapshot_epoch(),
                         &|db, coll| {
@@ -21689,16 +21761,17 @@ impl PgHandler {
                         },
                     )
                 };
-            if stale && stmt.is_some_and(|s| self.rc_reads_apart(handle, s, sql)) {
+            if stale && (stmt.is_some() || sql.is_some()) && self.rc_reads_apart(handle, stmt, sql)
+            {
                 // Nothing it reads was written by the block: it reads in a
                 // fresh transaction of its own, which IS the per-statement
                 // snapshot, and the block keeps its own (no replay).
                 self.rc_apart
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             } else if let Some(overlays) = stale
-                .then_some(stmt.zip(sql))
+                .then_some(sql)
                 .flatten()
-                .and_then(|(s, q)| self.rc_overlays(handle, s, q))
+                .and_then(|q| self.rc_overlays(handle, stmt, q))
             {
                 // It reads tables the block wrote, through read paths that
                 // all honour an overlay: it reads in a fresh transaction with
@@ -21734,10 +21807,10 @@ impl PgHandler {
     fn rc_reads_apart(
         &self,
         handle: &UserTransactionHandle,
-        stmt: &Statement,
+        stmt: Option<&Statement>,
         sql: Option<&str>,
     ) -> bool {
-        let Statement::Select(sel) = stmt else {
+        let Some(Statement::Select(sel)) = stmt else {
             return sql.is_some_and(|q| self.rc_reads_apart_general(handle, stmt, q));
         };
         // A plain read of one stored table: nothing that can run user code
@@ -21782,10 +21855,10 @@ impl PgHandler {
     fn rc_reads_apart_general(
         &self,
         handle: &UserTransactionHandle,
-        stmt: &Statement,
+        stmt: Option<&Statement>,
         sql: &str,
     ) -> bool {
-        if !matches!(stmt, Statement::Select(_) | Statement::Aggregate(_)) {
+        if !stmt.is_none_or(|s| matches!(s, Statement::Select(_) | Statement::Aggregate(_))) {
             return false;
         }
         let Some(names) = secantus_pgplan::read_apart::relations(sql) else {
@@ -21834,7 +21907,7 @@ impl PgHandler {
     fn rc_overlays(
         &self,
         handle: &mut UserTransactionHandle,
-        stmt: &Statement,
+        stmt: Option<&Statement>,
         sql: &str,
     ) -> Option<secantus_storage::ReadOverlays> {
         // Gated exactly as `rc_select_read_set` gates a narrowed move: no
@@ -21863,8 +21936,8 @@ impl PgHandler {
         (!map.is_empty()).then(|| std::sync::Arc::new(map))
     }
 
-    fn rc_select_read_set(&self, stmt: &Statement, sql: &str) -> Option<RcReadSet> {
-        if !matches!(stmt, Statement::Select(_) | Statement::Aggregate(_)) {
+    fn rc_select_read_set(&self, stmt: Option<&Statement>, sql: &str) -> Option<RcReadSet> {
+        if !stmt.is_none_or(|s| matches!(s, Statement::Select(_) | Statement::Aggregate(_))) {
             return None;
         }
         let names = secantus_pgplan::read_apart::relations(sql)?;
@@ -22011,6 +22084,57 @@ impl PgHandler {
             && Self::virtual_table(&sel.table).is_none()
     }
 
+    /// Before a statement with a subquery is planned, give it the snapshot
+    /// it will read in. An uncorrelated subquery RUNS during planning, which
+    /// is before `with_isolation_for` moves a READ COMMITTED block onto a
+    /// fresh snapshot -- so `select (select max(x) from t)` in a block that
+    /// had written answered from the block's old snapshot, missing a row
+    /// another session had committed since (measured against PostgreSQL
+    /// 15.19, batch 62). The same decision is made here from the text: a
+    /// read that may run apart opens its fresh transaction now (laid over
+    /// with the block's own rows where it wrote the table) and `read_apart`
+    /// takes it, so the subquery and the statement share one snapshot; any
+    /// other statement moves the block now.
+    fn isolate_for_planning(&self, sql: &str) -> PgWireResult<()> {
+        self.drop_plan_apart();
+        if !secantus_pgplan::read_apart::has_subquery(sql) {
+            return Ok(());
+        }
+        let Ok(mut guard) = self.txn.try_lock() else {
+            return Ok(());
+        };
+        let Some(handle) = guard.as_mut() else {
+            return Ok(());
+        };
+        self.with_isolation_judged(handle, None, Some(sql))?;
+        if self
+            .rc_apart
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            let tmp = self
+                .storage
+                .begin_user_transaction()
+                .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+            *self.plan_apart.lock().unwrap_or_else(|e| e.into_inner()) = Some(tmp);
+        }
+        Ok(())
+    }
+
+    /// Roll back a planning transaction nothing took (the statement failed,
+    /// or ran some other way).
+    fn drop_plan_apart(&self) {
+        let left = self
+            .plan_apart
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut tmp) = left {
+            if let Err(e) = self.storage.rollback_user_transaction(&mut tmp) {
+                eprintln!("secantusd-pg: could not roll back a read transaction: {e}");
+            }
+        }
+    }
+
     /// Run a READ COMMITTED block's read ([`Self::rc_reads_apart`]) in a
     /// fresh read-only transaction: it holds no rows and is not registered
     /// for row waits, and is rolled back once the rows are read.
@@ -22020,10 +22144,18 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        let mut tmp = self
-            .storage
-            .begin_user_transaction()
-            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        let planned = self
+            .plan_apart
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let mut tmp = match planned {
+            Some(tmp) => tmp,
+            None => self
+                .storage
+                .begin_user_transaction()
+                .map_err(|e| Self::storage_err("could not begin a transaction", e))?,
+        };
         let out = self
             .storage
             .with_user_transaction(&mut tmp, || match overlays {
@@ -23798,7 +23930,12 @@ impl PgHandler {
             for d in docs {
                 let ident: Vec<Option<Bson>> = keys
                     .iter()
-                    .map(|k| typed_ident(&d.get(k).cloned(), jsonb_field(&def, k)))
+                    .map(|k| {
+                        typed_ident(
+                            &Some(secantus_pgplan::field_value(&d, k)),
+                            jsonb_field(&def, k),
+                        )
+                    })
                     .collect();
                 if seen.insert(ident) {
                     kept.push(d);
@@ -32547,8 +32684,8 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
         let jb2 = item.source_type2.as_deref() == Some("jsonb");
         rows.retain(|d| {
             let k = (
-                typed_ident(&d.get(field).cloned(), jb1),
-                field2.and_then(|f| typed_ident(&d.get(f).cloned(), jb2)),
+                typed_ident(&Some(secantus_pgplan::field_value(d, field)), jb1),
+                field2.and_then(|f| typed_ident(&Some(secantus_pgplan::field_value(d, f)), jb2)),
             );
             seen.insert(k)
         });
@@ -32657,13 +32794,31 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     } else {
         rows
     };
-    let mut values: Vec<&Bson> = rows
-        .iter()
-        .filter_map(|d| match d.get(field) {
-            None | Some(Bson::Null) => None,
-            Some(v) => Some(v),
-        })
-        .collect();
+    // A timestamp argument is its date with the hidden sub-millisecond
+    // companion folded back in: `max(ts)` dropped the microseconds of a
+    // `.002006`, and `count(DISTINCT ts)` merged values one millisecond held.
+    let stamped = item
+        .source_type
+        .as_deref()
+        .and_then(secantus_pgplan::pgtypes::oid_of_name)
+        .is_some_and(|o| o == 1114 || o == 1184);
+    let owned: Vec<Bson> = if stamped {
+        rows.iter()
+            .map(|d| secantus_pgplan::field_value(d, field))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut values: Vec<&Bson> = if stamped {
+        owned.iter().filter(|v| !matches!(v, Bson::Null)).collect()
+    } else {
+        rows.iter()
+            .filter_map(|d| match d.get(field) {
+                None | Some(Bson::Null) => None,
+                Some(v) => Some(v),
+            })
+            .collect()
+    };
     // `count(DISTINCT col)` -- PostgreSQL dedups the group's values, NULLs
     // already dropped, before the function sees them. By VALUE, so a numeric
     // spelled `1.5` and `1.50` counts once.
@@ -33700,7 +33855,23 @@ fn compare_rows(a: &Document, b: &Document, order: &[OrderKey]) -> Ordering {
                 Nulls::Last => Ordering::Less,
             },
             (false, false) => {
-                let cmp = compare_values(l.unwrap(), r.unwrap());
+                let (l, r) = (l.unwrap(), r.unwrap());
+                let mut cmp = compare_values(l, r);
+                // A stored timestamp is a millisecond date plus its hidden
+                // sub-millisecond companion: equal dates are ordered by it
+                // (a missing one is 0). Sorting on the date alone put
+                // `.002006` before `.002000`.
+                if cmp == Ordering::Equal
+                    && matches!((l, r), (Bson::DateTime(_), Bson::DateTime(_)))
+                {
+                    let companion = secantus_pgplan::companion_field(&key.field);
+                    let rem = |d: &Document| match d.get(&companion) {
+                        Some(Bson::Int32(v)) => i64::from(*v),
+                        Some(Bson::Int64(v)) => *v,
+                        _ => 0,
+                    };
+                    cmp = rem(a).cmp(&rem(b));
+                }
                 if key.ascending {
                     cmp
                 } else {
@@ -37167,7 +37338,7 @@ impl PgHandler {
                 for (i, k) in agg.group_by.iter().enumerate() {
                     let v = match &k.expr {
                         Some(expr) => secantus_pgplan::apply_row_expr(expr, d)?,
-                        None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                        None => secantus_pgplan::field_value(d, &k.field),
                     };
                     if k.pg_type == "jsonb" {
                         let key = match &v {
