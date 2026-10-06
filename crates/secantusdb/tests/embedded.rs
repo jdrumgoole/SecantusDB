@@ -144,3 +144,99 @@ fn fifty_servers_in_parallel() {
     assert_eq!(ports.len(), 50, "every server got its own port");
     std::thread::sleep(Duration::from_millis(10));
 }
+
+#[test]
+fn a_ttl_index_expires_documents_in_an_embedded_server() {
+    // The embedded server used to run no sweeper, so a TTL index never
+    // expired anything in it.
+    let server = Server::builder()
+        .ttl_sweep(Some(Duration::from_millis(100)))
+        .start()
+        .expect("start");
+    let coll = client(&server).database("t").collection::<Document>("ttl");
+    coll.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! {"at": 1})
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .expire_after(Duration::from_secs(0))
+                    .build(),
+            )
+            .build(),
+    )
+    .run()
+    .expect("TTL index");
+    let past = mongodb::bson::DateTime::from_millis(0);
+    coll.insert_many([
+        doc! {"_id": 1, "at": past},
+        doc! {"_id": 2, "no_date": true},
+    ])
+    .run()
+    .expect("insert");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while coll.count_documents(doc! {"_id": 1}).run().unwrap() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the expired document was never swept"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A document without the indexed date is never expired.
+    assert_eq!(coll.count_documents(doc! {"_id": 2}).run().unwrap(), 1);
+}
+
+#[test]
+fn a_disabled_sweeper_expires_nothing_and_a_zero_period_is_refused() {
+    let server = Server::builder().ttl_sweep(None).start().expect("start");
+    let coll = client(&server).database("t").collection::<Document>("ttl");
+    coll.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! {"at": 1})
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .expire_after(Duration::from_secs(0))
+                    .build(),
+            )
+            .build(),
+    )
+    .run()
+    .expect("TTL index");
+    coll.insert_one(doc! {"_id": 1, "at": mongodb::bson::DateTime::from_millis(0)})
+        .run()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(coll.count_documents(doc! {}).run().unwrap(), 1);
+
+    let err = Server::builder()
+        .ttl_sweep(Some(Duration::ZERO))
+        .start()
+        .expect_err("a zero period is refused");
+    assert!(
+        err.to_string().contains("ttl_sweep must be positive"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_noop_heartbeat_writes_to_the_oplog_and_stops_with_the_server() {
+    let server = Server::builder()
+        .noop_heartbeat(Some(Duration::from_millis(100)))
+        .start()
+        .expect("start");
+    let path = server.storage_path().to_path_buf();
+    let oplog = client(&server)
+        .database("local")
+        .collection::<Document>("oplog.rs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while oplog.count_documents(doc! {"op": "n"}).run().unwrap() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no noop heartbeat reached the oplog"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Stopping joins the sweepers before the store closes, so the temporary
+    // store is removed rather than left behind as still open.
+    drop(server);
+    assert!(!path.exists(), "{} survived drop", path.display());
+}
