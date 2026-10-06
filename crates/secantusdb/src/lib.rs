@@ -15,8 +15,13 @@
 //!
 //! [`Server::start`] gives each server its own temporary store, removed when
 //! the server is dropped, and an OS-assigned port, so any number can run in
-//! parallel. [`Server::builder`] sets a persistent store, a port, auth, TLS and
-//! the WiredTiger cache.
+//! parallel. [`Server::builder`] sets a persistent store, a port, auth, TLS,
+//! the WiredTiger cache and the background sweepers.
+//!
+//! Like the `secantusd-rs` daemon, a server expires TTL-indexed documents
+//! every 60 seconds ([`Builder::ttl_sweep`]). The noop oplog heartbeat, which
+//! also prunes the oplog, is off by default, as on the daemon
+//! ([`Builder::noop_heartbeat`]).
 //!
 //! Like the embedded Python handle, `start()` advertises a single-node replica
 //! set named `secantus` (so drivers accept change streams and transactions)
@@ -30,9 +35,10 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 pub use secantus_server::TlsOptions;
@@ -47,6 +53,10 @@ pub const DEFAULT_REPLICA_SET: &str = "secantus";
 /// 4G because a test suite starts many of these; WiredTiger fills it lazily
 /// either way.
 pub const DEFAULT_CACHE_SIZE: &str = "256M";
+
+/// How often a server expires TTL-indexed documents unless told otherwise:
+/// mongod's and the daemon's 60 seconds.
+pub const DEFAULT_TTL_SWEEP: Duration = Duration::from_secs(60);
 
 /// The crate version, which is the server's version (`buildInfo` reports it).
 pub const VERSION: &str = secantus_server::VERSION;
@@ -98,6 +108,9 @@ pub struct Server {
     /// live reference means a connection thread outlived the drain, and the
     /// directory must not be removed under an open WiredTiger.
     storage: Weak<Storage>,
+    /// The sweeper threads and the flag that stops them.
+    sweepers: Vec<JoinHandle<()>>,
+    stop_sweepers: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -142,6 +155,12 @@ impl Server {
         let Some(mut running) = self.running.take() else {
             return;
         };
+        // The sweepers first: joined, they have released the store and are
+        // not mid-write when the connections drain and WiredTiger closes.
+        self.stop_sweepers.store(true, Ordering::SeqCst);
+        for sweeper in self.sweepers.drain(..) {
+            let _ = sweeper.join();
+        }
         running.stop();
         // Dropping the server drops its reference to the store; the store
         // closes when the last reference goes.
@@ -197,6 +216,8 @@ pub struct Builder {
     tls: Option<TlsOptions>,
     cache_size: String,
     test_commands: bool,
+    ttl_sweep: Option<Duration>,
+    noop_heartbeat: Option<Duration>,
 }
 
 impl Default for Builder {
@@ -210,6 +231,8 @@ impl Default for Builder {
             tls: None,
             cache_size: DEFAULT_CACHE_SIZE.to_string(),
             test_commands: true,
+            ttl_sweep: Some(DEFAULT_TTL_SWEEP),
+            noop_heartbeat: None,
         }
     }
 }
@@ -266,8 +289,34 @@ impl Builder {
         self
     }
 
+    /// How often to delete documents a TTL index has expired, or `None` to
+    /// never sweep. Default [`DEFAULT_TTL_SWEEP`], 60 seconds, as on mongod;
+    /// a test that waits for an expiry sets a shorter one.
+    pub fn ttl_sweep(mut self, every: Option<Duration>) -> Self {
+        self.ttl_sweep = every;
+        self
+    }
+
+    /// How often to write a noop oplog entry, or `None` (the default) for
+    /// never. The heartbeat keeps a quiet change stream's resume token
+    /// advancing, and each beat also prunes the oplog to its retention bounds.
+    pub fn noop_heartbeat(mut self, every: Option<Duration>) -> Self {
+        self.noop_heartbeat = every;
+        self
+    }
+
     /// Open the store and start serving.
     pub fn start(self) -> Result<Server, Error> {
+        for (name, every) in [
+            ("ttl_sweep", self.ttl_sweep),
+            ("noop_heartbeat", self.noop_heartbeat),
+        ] {
+            if every == Some(Duration::ZERO) {
+                return Err(Error::Config(format!(
+                    "{name} must be positive; use None to disable it"
+                )));
+            }
+        }
         if self.cache_size.trim().is_empty() || self.cache_size.contains([',', '(', ')', '=']) {
             return Err(Error::Config(format!(
                 "cache_size {:?} is not a WiredTiger size",
@@ -305,7 +354,7 @@ impl Builder {
         .map_err(|e| Error::Storage(e.to_string()))?;
         let storage = Arc::new(storage);
         let weak = Arc::downgrade(&storage);
-        let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(storage));
+        let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(storage.clone()));
         let config = ServerConfig {
             replica_set_name: self.replica_set.clone(),
             require_auth: self.auth,
@@ -315,14 +364,59 @@ impl Builder {
         };
         let addr = format!("{}:{}", self.host, self.port);
         let running = bind(&addr, config, adapter, Arc::new(CursorRegistry::new()))?;
+        let stop_sweepers = Arc::new(AtomicBool::new(false));
+        let mut sweepers = Vec::new();
+        if let Some(every) = self.ttl_sweep {
+            let storage = storage.clone();
+            sweepers.push(spawn_sweeper(every, stop_sweepers.clone(), move || {
+                let now = bson::DateTime::now();
+                if let Err(e) = storage.prune_ttl_all_collections(now) {
+                    eprintln!("secantus-mdb: TTL sweep failed: {e}");
+                }
+            }));
+        }
+        if let Some(every) = self.noop_heartbeat {
+            let storage = storage.clone();
+            sweepers.push(spawn_sweeper(every, stop_sweepers.clone(), move || {
+                if let Err(e) = storage.emit_noop_heartbeat() {
+                    eprintln!("secantus-mdb: noop heartbeat failed: {e}");
+                }
+                if let Err(e) = storage.prune_oplog(None) {
+                    eprintln!("secantus-mdb: oplog prune failed: {e}");
+                }
+            }));
+        }
+        // Only the server and the sweepers hold the store from here.
+        drop(storage);
         Ok(Server {
             address: running.address(),
             running: Some(running),
             storage_path: storage_path.to_path_buf(),
             temporary,
             storage: weak,
+            sweepers,
+            stop_sweepers,
         })
     }
+}
+
+/// Run `task` every `every` until `stop` is set, checking the flag at least
+/// every 200 ms so a server stops promptly.
+fn spawn_sweeper<F>(every: Duration, stop: Arc<AtomicBool>, mut task: F) -> JoinHandle<()>
+where
+    F: FnMut() + Send + 'static,
+{
+    let tick = every.min(Duration::from_millis(200));
+    thread::spawn(move || {
+        let mut next = Instant::now() + every;
+        while !stop.load(Ordering::SeqCst) {
+            if Instant::now() >= next {
+                task();
+                next = Instant::now() + every;
+            }
+            thread::sleep(tick);
+        }
+    })
 }
 
 /// A new, empty directory under the system temp dir, unique to this process

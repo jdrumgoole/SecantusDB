@@ -78,15 +78,12 @@ items were Python-server entries.
 
 Gauges run in a sub-agent and report counts only (CLAUDE.md, "Tooling").
 
-## Phase 4 -- the embedded server (`secantus_mdb::Server`)
+## Phase 4 -- the embedded server (`secantus_mdb::Server`): DONE (2026-10-06)
 
-Add builder options for the two sweepers the daemon runs and the embedded
-server does not:
-- TTL expiry;
-- the noop heartbeat, which also prunes the oplog.
-
-The defaults should match the daemon's. Without them, TTL indexes never expire
-documents in an embedded server. Test through the crate's public API.
+`Builder::ttl_sweep` (default 60 seconds, as on the daemon and mongod) and
+`Builder::noop_heartbeat` (default off, as on the daemon) run the daemon's two
+sweepers. The server joins them before it closes the store. They're tested
+through the public API with the official driver.
 
 ## Not in this plan
 
