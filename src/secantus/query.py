@@ -1457,12 +1457,48 @@ def _re_flags(flags_input: Any) -> int:
 _MAX_REGEX_PATTERN_LEN = 1000
 
 
+def pcre_to_python(pattern: str) -> str:
+    """mongod's PCRE end anchors in Python's dialect.
+
+    PCRE's ``\\Z`` matches at the end OR before a final newline; Python's
+    ``\\Z`` is the absolute end, so ``/foo\\Z/`` missed ``"foo\\n"``. PCRE's
+    ``\\z`` (the absolute end) does not exist in Python and was refused as a
+    bad escape (measured 8.2.11, 2026-10-07; ``regex_value_semantics.py``).
+    Escapes and character classes are walked so only a real anchor is
+    rewritten."""
+    if "\\" not in pattern:
+        return pattern
+    out: list[str] = []
+    i, n, in_class = 0, len(pattern), False
+    while i < n:
+        c = pattern[i]
+        if c == "\\" and i + 1 < n:
+            nxt = pattern[i + 1]
+            if not in_class and nxt == "Z":
+                out.append("(?=\\n?\\Z)")
+            elif not in_class and nxt == "z":
+                out.append("\\Z")
+            else:
+                out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if c == "[" and not in_class:
+            in_class = True
+        elif c == "]" and in_class:
+            in_class = False
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 @lru_cache(maxsize=1024)
 def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
     if hasattr(pattern, "__len__") and len(pattern) > _MAX_REGEX_PATTERN_LEN:
         raise QueryError(
             f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
         )
+    if isinstance(pattern, str):
+        pattern = pcre_to_python(pattern)
     return re.compile(pattern, flags)
 
 
@@ -1514,7 +1550,10 @@ def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = 
         # Unhashable pattern (e.g. a non-str/bytes input) — fall back to
         # an uncached compile so the caller still gets a real re.error.
         try:
-            compiled = re.compile(regex_pattern, flags)
+            compiled = re.compile(
+                pcre_to_python(regex_pattern) if isinstance(regex_pattern, str) else regex_pattern,
+                flags,
+            )
         except re.error as e:
             raise QueryError(f"invalid regex: {e}") from e
         except Exception as e:

@@ -5121,6 +5121,11 @@ def _mark_time_limited_cursor(result: Mapping[str, Any], ctx: CommandContext) ->
         ctx.cursors.mark_time_limited(int(cursor_id))
 
 
+#: Read commands whose execution-time `maxTimeMS` expiry carries mongod's
+#: read executor prefix.
+_READ_EXECUTOR_COMMANDS = frozenset({"find", "aggregate", "distinct", "count"})
+
+
 def _max_time_expired_reply(
     exc: _deadline.MaxTimeMSExpired,
     command: str,
@@ -5135,6 +5140,28 @@ def _max_time_expired_reply(
     failure envelope naming the collection and its UUID.
     """
     message = str(exc)
+    coll = doc.get(command)
+    if (
+        getattr(exc, "during_execution", False)
+        and command in _READ_EXECUTOR_COMMANDS
+        and isinstance(coll, str)
+    ):
+        # A READ command whose budget ran out mid-execution names itself and
+        # the namespace (measured 8.2.11 on a replica set, 2026-10-07;
+        # `tools/probes/max_time_expiry.py`). An expiry before execution, and
+        # the write commands, stay bare.
+        ns = _ns(ctx.db_name, coll)
+        prefix = (
+            f"Executor error during find command: {ns}"
+            if command == "find"
+            else f"Executor error during {command} command on namespace: {ns}"
+        )
+        return {
+            "ok": 0.0,
+            "errmsg": f"{prefix} :: caused by :: {message}",
+            "code": 50,
+            "codeName": "MaxTimeMSExpired",
+        }
     if command == "createIndexes":
         coll = doc.get(command)
         ns = _ns(ctx.db_name, coll) if isinstance(coll, str) else ctx.db_name
@@ -10532,10 +10559,16 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         with _deadline.arm(budget_ms):
             if _max_time_forced_to_expire(name, doc, budget_ms, ctx):
                 raise _deadline.MaxTimeMSExpired()
-            if txn is not None:
-                result = _run_txn_statement(txn, handler, doc, ctx)
-            else:
-                result = handler(doc, ctx)
+            try:
+                if txn is not None:
+                    result = _run_txn_statement(txn, handler, doc, ctx)
+                else:
+                    result = handler(doc, ctx)
+            except _deadline.MaxTimeMSExpired as exc:
+                # Ran out DURING execution: a read command reports it under its
+                # executor prefix (see `_max_time_expired_reply`).
+                exc.during_execution = True  # type: ignore[attr-defined]
+                raise
             if budget_ms and ctx.cursors is not None:
                 _mark_time_limited_cursor(result, ctx)
     except _deadline.MaxTimeMSExpired as exc:

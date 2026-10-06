@@ -2703,6 +2703,13 @@ def _op_switch(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
 _MAX_REGEX_PATTERN_LEN = 1000
 
 
+def _pcre(pattern: str) -> str:
+    """PCRE's end anchors in Python's dialect (``query.pcre_to_python``)."""
+    from secantus.query import pcre_to_python
+
+    return pcre_to_python(pattern)
+
+
 def _resolve_regex(arg: Any, ctx: _Ctx) -> tuple[str, int]:
 
     from bson import Regex
@@ -2740,7 +2747,7 @@ def _op_regex_match(arg: Any, ctx: _Ctx) -> Any:
             "$regexMatch needs 'input' to be of type string", code=51104, code_name="Location51104"
         )
     pattern, flags = _resolve_regex(arg, ctx)
-    return bool(_re.compile(pattern, flags).search(s))
+    return bool(_re.compile(_pcre(pattern), flags).search(s))
 
 
 def _op_regex_find(arg: Any, ctx: _Ctx) -> Any:
@@ -2756,7 +2763,7 @@ def _op_regex_find(arg: Any, ctx: _Ctx) -> Any:
             "$regexFind needs 'input' to be of type string", code=51104, code_name="Location51104"
         )
     pattern, flags = _resolve_regex(arg, ctx)
-    m = _re.compile(pattern, flags).search(s)
+    m = _re.compile(_pcre(pattern), flags).search(s)
     if m is None:
         return None
     return {"match": m.group(0), "idx": m.start(), "captures": list(m.groups())}
@@ -3487,7 +3494,7 @@ def _op_regex_find_all(arg: Any, ctx: _Ctx) -> Any:
         )
     pattern, flags = _resolve_regex(arg, ctx)
     out: list[dict[str, Any]] = []
-    for m in _re.compile(pattern, flags).finditer(s):
+    for m in _re.compile(_pcre(pattern), flags).finditer(s):
         out.append({"match": m.group(0), "idx": m.start(), "captures": list(m.groups())})
     return out
 
