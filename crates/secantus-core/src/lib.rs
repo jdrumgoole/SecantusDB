@@ -30,6 +30,7 @@ pub mod geo;
 pub mod projection;
 pub mod query;
 pub mod sortkey;
+pub(crate) mod timelib;
 pub mod update;
 
 // Internal shared helpers — implementation details of the engines above, not
