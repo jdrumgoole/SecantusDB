@@ -680,7 +680,17 @@ remain open:
       no-op on Windows). `tests/signals.rs` starts the binary with SIGTERM
       blocked and with it ignored, and requires a clean exit on SIGTERM
       (the blocked case fails on the old binary); CI runs it beside
-      `embedded`.
+      `embedded`. **Batch 58:** the MongoDB binary `secantusd-rs` had both
+      halves of this: no mask / disposition reset, and its `ctrlc` handler
+      installed after the "listening on" line. Launched with SIGTERM
+      blocked it ignored a SIGTERM sent at the banner (timed out at 20 s);
+      it now resets both and installs the handler before opening storage
+      (`tests/test_rust_binary_smoke.py::test_stops_on_sigterm_sent_at_the_
+      banner_whatever_the_parent_left`, blocked and ignored; the blocked
+      case fails on the base binary). The embedded handles
+      (`secantus-server-py`'s Mongo and PG servers) install no signal
+      handler -- the host Python process owns its signals -- so they have no
+      such window.
 - [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
       left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
@@ -734,10 +744,19 @@ remain open:
         top-k in memory). 300,000 rows of 2 KB, `order by k desc, id`, after
         a restart: server RSS growth 1432 MB (base `742b9134`) -> 636 MB, the
         same as the unordered stream (629 MB -- WiredTiger's cache filling).
-        Left: joins, aggregates, DISTINCT, ORDER BY over an expression, and
-        ORDER BY in a block's portal or cursor still materialise (a join
-        would stream its outer side; an aggregate's memory is its groups).
-        Not worked in batch 57.
+        **Batch 58:** ORDER BY of stored columns in a BLOCK's portal or
+        `DECLARE CURSOR` streams too: the first fetch reads the rows through
+        the block's transaction into `external_sort`'s runs (now a pull-based
+        `Sorted` merge), and each fetch takes a batch from the merge. 300,000
+        rows of 2 KB, `order by k desc, id`, fetched 1,000 at a time, after a
+        restart, debug: server RSS growth 2700 MB (base `9dd2e7b4`) -> 47 MB
+        (cursor) and 2699 -> 45 MB (psycopg named cursor). Corpus
+        `b58_block_order` (23 lines, 0 against PostgreSQL 15.19), slice test
+        `test_batch58_block_cursors_and_portals_with_order_by`. Left (OPEN):
+        joins, aggregates, DISTINCT and ORDER BY over an expression still
+        materialise (a join would stream its outer side; an aggregate's
+        memory is its groups; the materialised DISTINCT is also a quadratic
+        `Vec::contains` over the kept rows) -- not worked in batch 58.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -852,7 +871,8 @@ remain open:
         function call's ARGUMENTS before planning (`secantus_pgplan::pullup`,
         an AST rewrite, so output names are untouched): 12 of 13 probed shapes
         give PostgreSQL 15.19's CONTEXT (slice test `test_batch57_a_one_row_
-        constant_from_item_is_pulled_up`). Left (OPEN): PostgreSQL folds a
+        constant_from_item_is_pulled_up`). **CLOSED (scope decision, batch
+        58)** -- see the end of this bullet. PostgreSQL folds a
         call over constants at PLANNING, so `select f(0) from (values (1))
         v(a) where a = 2` (and `... where false`) raises its error with no
         row reaching the call; here they answer zero rows. (Batch 56, re-measured on
@@ -868,6 +888,23 @@ remain open:
         tries `evaluate_function` first and RUNS it, so its error has
         `statement 1` (slice test `test_batch56_an_immutable_sql_function_
         over_constants_runs_as_itself`).
+        **Batch 58, re-measured on PostgreSQL 15.19 and CLOSED as a scope
+        decision:** the shape is not about user functions at all. PostgreSQL
+        raises `select 1/0 from (values (1)) v(a) where false` and `select
+        f(0) from t where false` (an ordinary table, a two-row VALUES too)
+        because `eval_const_expressions` folds EVERY immutable subexpression
+        over constants -- CASE arms included -- while planning, whether or not
+        a row will ever reach it; here each answers zero rows (the FROM-less
+        `select f(0) where false` already raises on both). PostgreSQL's own
+        manual (4.2.14, "Expression Evaluation Rules") calls this planning-
+        time error a quirk applications must not rely on. Reproducing it
+        means a planning pass that evaluates PostgreSQL's exact set of
+        foldable expressions (immutability per overload, strictness, its
+        inlining rules for SQL functions); folding anything it does not would
+        raise errors PostgreSQL does not -- a worse divergence than the zero
+        rows returned for a query whose rows are all filtered out. Only an
+        error that PostgreSQL raises where we return no rows is affected; no
+        answer a query returns differs.
       - `pg_collation_for(x)`: FIXED batch 52 (corpus `b52_collation_for`,
         21 lines, 0 against PostgreSQL 15) -- 42804 over a non-collatable
         type (a table column's at planning, as PostgreSQL's parse analysis
@@ -1125,12 +1162,26 @@ remain open:
         statement made to move by a `random()`) -> 1.1 / 3.4 / 11.8 s (the
         rest grows with the joined table itself; PG 15.19: 0.05 / 0.08 / 0.17
         s). Slice test `test_batch57_read_committed_joins_and_aggregates_read_
-        apart`, whose assertions pass unchanged on PostgreSQL 15.19. Left
-        (OPEN): a read of a table the block HAS written (or one with a
-        subquery / user function) still moves, replaying the write set per
-        statement; a sub-quadratic mechanism (overlaying the block's own
-        writes on a fresh read-only snapshot, or replaying only what changed)
-        needs storage work not started in batch 57. Every move --
+        apart`, whose assertions pass unchanged on PostgreSQL 15.19.
+        **Batch 58:** a read of a table the block HAS written (the same
+        shapes `read_apart::relations` accepts: no subquery, CTE, row lock or
+        function but pure built-ins; ordinary stored tables; no RLS policy,
+        user operator or user cast) now moves only when a commit since the
+        block's snapshot touched a table it reads or a catalog
+        (`rc_select_read_set`, the INSERT gate's `RcReadSet`) -- a commit to
+        another table cannot change its answer, and the block's own writes
+        are in its own transaction. 200 / 400 / 800 insert-then-aggregate
+        pairs on the block's own table beside a writer committing to another,
+        debug: 3.24 / 12.96 / 52.72 s (base `9dd2e7b4`, quadratic) -> 1.04 /
+        2.08 / 3.16 s. Slice test `test_batch58_read_committed_reads_its_
+        own_table_beside_other_commits` (its assertions checked on PostgreSQL
+        15.19). Left (OPEN): when other sessions commit to the SAME table
+        the block wrote and reads (or the read has a subquery / user
+        function), each such statement still replays the write set; the
+        overlay (the block's own rows over a fresh read-only snapshot) needs
+        every storage read path of the table -- scan, `_id` probe, index
+        lookups, counts -- to merge the write set, which batch 58 did not
+        start. Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
@@ -1511,8 +1562,24 @@ These work end-to-end but cut corners.
       group's open / commit (~1), the `_id` probe (~1.5), the two socket
       syscalls (~5) and the tokio hand-offs.
 
-      **Batch 57 (2026-10-06):** not profiled or changed; the batch-56
-      figures stand.
+      **Batch 58 (2026-10-06)**, release, `bench43.py`, two interleaved
+      runs, load ~3.5-5, base `9dd2e7b4` -> batch 58 (PG 15.19): ping 19.1 /
+      19.5 -> 19.7 / 19.6, simple `select 1` 26.7 / 27.6 -> 27.5 / 28.7,
+      extended `select 1` 40.2 / 39.8 -> 40.2 / 40.5, **PK read 49.6 / 48.5
+      -> 45.8 / 44.9**, autocommit UPDATE 69.6 / 69.9 -> 70.7 / 79.7 (one
+      outlier; 71.4 / 70.4 in an earlier pair) us (PG 15: 18.5, 22.8, 26.5,
+      33.9, 122.6). A `sample` of 500k PK reads puts ~17 us a statement on
+      the connection's thread: `execute` ~4.9 (the storage read ~2.7), the
+      `recvfrom` / `sendto` pair ~4.6, the rest in pieces under 1 us
+      (`install_user_types` 0.8, `wait_for_table_locks` 0.75 with
+      `sql_relations` 0.65, the role list cloned for `is_superuser` /
+      `role` ~0.7, Describe 0.8). `block_in_place` shows only ~0.1 us of
+      CPU there, but taking it out of a PK read measured 48.4 -> 45.4 us
+      (its hand-off of the worker's core wakes a blocking-pool thread every
+      statement): a single-table read by primary-key equality with nothing
+      that can run user code or wait (`point_read`; no RLS policy) now runs
+      on the worker itself. The rest of the wall time is the client and the
+      tokio wake-ups; the remaining gap to PostgreSQL is ~11 us.
 
       **Batch 56 (2026-10-06)**, release, `bench43.py`, two interleaved
       runs, load ~7, base `742b9134` -> batch 56 (PG 15.19): simple `select

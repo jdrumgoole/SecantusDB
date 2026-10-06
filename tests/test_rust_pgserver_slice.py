@@ -17432,6 +17432,78 @@ def test_batch56_a_streamed_portal_with_order_by(home: Path) -> None:
         assert whole == sorted(whole) and len(whole) == 300
 
 
+def test_batch58_block_cursors_and_portals_with_order_by(home: Path) -> None:
+    """Inside a block, a DECLARE CURSOR / portal over one table with an
+    ORDER BY of stored columns is now sorted in bounded memory at its first
+    fetch (it was read whole). The rows are the materialised path's: NULL
+    placement, ties in scan order, OFFSET / LIMIT, the block's own writes
+    before the DECLARE, a step back past the window, another statement
+    between fetches. Every assertion gives PostgreSQL 15.19's answer."""
+
+    def key(r: tuple) -> tuple:
+        return (r[1] is None, -(r[1] or 0), r[0])
+
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b58_o (id int primary key, k int, t text)")
+        a.execute(
+            "insert into b58_o select g, case when g % 7 = 0 then null else (g * 37) % 11 end,"
+            " 'r' || g from generate_series(1, 1500) g"
+        )
+        rows = [(g, None if g % 7 == 0 else (g * 37) % 11) for g in range(1, 1501)]
+        a.execute("begin")
+        a.execute("insert into b58_o values (2000, 99, 'mine')")
+        expected = sorted([*rows, (2000, 99)], key=key)
+        a.execute(
+            "declare k scroll cursor for select id, k from b58_o order by k desc nulls last, id"
+        )
+        got = a.execute("fetch 300 from k").fetchall()
+        assert got == expected[:300]
+        a.execute("insert into b58_o values (2001, 100, 'later')")
+        assert a.execute("fetch all from k").fetchall() == expected[300:]
+        assert a.execute("fetch absolute 2 from k").fetchall() == [expected[1]]
+        a.execute(
+            "declare l cursor for select id, k from b58_o where id <= 1500"
+            " order by k desc nulls last, id offset 10 limit 25"
+        )
+        assert a.execute("fetch all from l").fetchall() == sorted(rows, key=key)[10:35]
+        a.execute("rollback")
+
+        with server.connect(autocommit=False) as c:
+            with c.cursor(name="srv") as cur:
+                cur.itersize = 100
+                cur.execute("select id, k from b58_o order by k desc nulls last, id")
+                assert list(cur) == sorted(rows, key=key)
+            c.commit()
+
+
+def test_batch58_read_committed_reads_its_own_table_beside_other_commits(home: Path) -> None:
+    """A READ COMMITTED block that wrote a table and reads it again moved
+    onto a fresh snapshot (replaying its write set) whenever ANYTHING had
+    committed since its snapshot. A read now moves only when a commit
+    touched a table it reads: a commit to another table cannot change its
+    answer. The answers are PostgreSQL 15.19's: the block sees its own rows
+    and every commit to the tables it reads, never a later one to others'."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table b58_t (id int primary key, v int)")
+        a.execute("create table b58_u (id int primary key, v int)")
+        a.execute("insert into b58_t values (1, 10)")
+        a.execute("begin")
+        a.execute("insert into b58_t values (2, 20)")
+        for i in range(3, 50):
+            b.execute("insert into b58_u values (%s, 1)", (i,))
+            a.execute("insert into b58_t values (%s, %s)", (100 + i, i))
+            got = a.execute("select count(*), sum(v) from b58_t").fetchone()
+            assert got == (i, 30 + sum(range(3, i + 1)))
+        b.execute("insert into b58_t values (1000, 5)")
+        assert a.execute("select count(*) from b58_t").fetchone() == (50,)
+        b.execute("update b58_t set v = 11 where id = 1")
+        assert a.execute("select v from b58_t where id = 1").fetchone() == (11,)
+        assert a.execute(
+            "select count(*) from b58_t t join b58_u u on u.id = t.id - 100"
+        ).fetchone() == (47,)
+        a.execute("commit")
+
+
 def test_batch56_an_immutable_sql_function_over_constants_runs_as_itself(home: Path) -> None:
     """PostgreSQL's planner tries `evaluate_function` before `inline_function`:
     an IMMUTABLE function called over constants is RUN, so its error has the

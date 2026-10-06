@@ -2299,6 +2299,7 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "futures-util",
+ "libc",
  "log",
  "mimalloc",
  "mongodb",
