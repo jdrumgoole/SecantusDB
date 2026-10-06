@@ -53,7 +53,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.169"
+version = "0.5.3-beta.170"
 dependencies = [
  "cc",
  "cmake",
