@@ -244,3 +244,41 @@ def test_binary_was_built_from_this_tree() -> None:
     if os.environ.get("SECANTUSDB_BIN"):
         pytest.fail(message)
     print(f"\nNOTE: {message}")
+
+
+def _block_stop_signals() -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+
+
+def _ignore_stop_signals() -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+# POSIX only: Windows has no signal mask or inherited dispositions, so there
+# is nothing to reproduce there.
+@pytest.mark.skipif(_WINDOWS, reason="no signal mask or inherited dispositions")
+@pytest.mark.parametrize("inherit", [_block_stop_signals, _ignore_stop_signals])
+def test_stops_on_sigterm_sent_at_the_banner_whatever_the_parent_left(
+    tmp_path: pathlib.Path, inherit: object
+) -> None:
+    """A parent may leave SIGTERM blocked or ignored (both survive exec), and
+    a harness sends SIGTERM the moment it reads the banner. Before batch 58
+    the stop handler was installed AFTER the banner, so that SIGTERM was
+    ignored (blocked / SIG_IGN) or killed the process with no checkpoint."""
+    assert _BIN is not None
+    proc = subprocess.Popen(
+        [str(_BIN), "--port", "0", "--storage-path", str(tmp_path / "data")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        preexec_fn=inherit,  # type: ignore[arg-type]
+    )
+    try:
+        _bound_address(proc)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=20) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)

@@ -20516,7 +20516,8 @@ impl PgHandler {
         }
         let out = {
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-            tokio::task::block_in_place(|| match guard.as_mut() {
+            let inline = Self::point_read(&stmt) && self.rls_enabled_docs().is_empty();
+            let work = || match guard.as_mut() {
                 Some(handle) => {
                     // A row write in a transaction that has not written yet --
                     // an extended-protocol group's first statement, or a block's
@@ -20620,7 +20621,16 @@ impl PgHandler {
                     self.run_autocommit_write(stmt, max_rows)
                 }
                 None => self.execute(stmt, max_rows),
-            })
+            };
+            // A point read by primary key runs on the worker itself: handing
+            // the worker's core to another thread costs ~3 us a statement
+            // (measured, release, batch 58: a PK read 48.4 -> 45.4 us), more
+            // than the read. Anything that may run long keeps the hand-off.
+            if inline {
+                work()
+            } else {
+                tokio::task::block_in_place(work)
+            }
         };
         self.collect_planner_warnings();
         // A row that fails to ENCODE (`select 0/0 from t`) is the statement's
@@ -21433,7 +21443,10 @@ impl PgHandler {
                     // the snapshot -- every serial INSERT commits one -- changes
                     // no answer.
                     let own_sequences = handle.wrote_collection(self.db(), SEQUENCE_COLLECTION);
-                    let narrow = stmt.and_then(|s| self.rc_read_set(s));
+                    let narrow = stmt.and_then(|s| {
+                        self.rc_read_set(s)
+                            .or_else(|| sql.and_then(|q| self.rc_select_read_set(s, q)))
+                    });
                     !secantus_storage::Storage::no_commit_touching_since(
                         handle.snapshot_epoch(),
                         &|db, coll| {
@@ -21569,6 +21582,50 @@ impl PgHandler {
         !handle.wrote_any(|d, c| d == db && tables.iter().any(|t| t == c))
     }
 
+    /// The collections a SELECT reads, judged as `rc_reads_apart_general`
+    /// judges a read apart (no subquery, CTE, row lock or function but pure
+    /// built-ins; ordinary stored tables only; no RLS policy, user operator
+    /// or user cast) -- but here the block MAY have written them. Such a
+    /// read moves the block onto a fresh snapshot only when a commit since
+    /// its snapshot touched one of them (or a catalog): a commit to another
+    /// table cannot change its answer, and its own writes are in its own
+    /// transaction either way.
+    fn rc_select_read_set(&self, stmt: &Statement, sql: &str) -> Option<RcReadSet> {
+        if !matches!(stmt, Statement::Select(_) | Statement::Aggregate(_)) {
+            return None;
+        }
+        let names = secantus_pgplan::read_apart::relations(sql)?;
+        if !self.rls_enabled_docs().is_empty()
+            || !self.user_operators().is_empty()
+            || !self.user_casts().is_empty()
+        {
+            return None;
+        }
+        let inheritance = self.inheritance().0;
+        let db = self.db();
+        let mut all = Vec::with_capacity(names.len());
+        for name in &names {
+            if Self::virtual_table(name).is_some() || self.view_doc(name).is_some() {
+                return None;
+            }
+            let def = self.lookup(name)?;
+            if def.temp
+                || partition::parent_of(&def).is_some()
+                || partition::is_partitioned(&def)
+                || !Self::inherited_parents(&def).is_empty()
+                || inheritance.iter().any(|(_, p)| *p == def.name)
+                || self.has_rules(&def.name)
+            {
+                return None;
+            }
+            all.push(format!("{db}.{}", def.name));
+        }
+        Some(RcReadSet {
+            all,
+            changes: Vec::new(),
+        })
+    }
+
     fn rc_read_set(&self, stmt: &Statement) -> Option<RcReadSet> {
         let Statement::Insert(ins) = stmt else {
             return None;
@@ -21648,6 +21705,37 @@ impl PgHandler {
             all.push(format!("{db}.{}", fk.ref_table));
         }
         Some(RcReadSet { all, changes })
+    }
+
+    /// A read of one stored table by primary-key equality: a single
+    /// `_id` probe, with nothing that can run user code or wait (no
+    /// computed column, residual WHERE, row lock, join or subquery source).
+    /// Short enough to run without `block_in_place`'s hand-off.
+    fn point_read(stmt: &Statement) -> bool {
+        let Statement::Select(sel) = stmt else {
+            return false;
+        };
+        let by_key = sel.filter.len() == 1
+            && match sel.filter.get("_id") {
+                Some(Bson::Document(d)) => {
+                    d.len() == 1
+                        && d.get("$eq")
+                            .is_some_and(|v| !matches!(v, Bson::Document(_) | Bson::Array(_)))
+                }
+                Some(Bson::Array(_)) | None => false,
+                Some(_) => true,
+            };
+        by_key
+            && sel.sub.is_none()
+            && sel.join.is_none()
+            && sel.series.is_none()
+            && sel.windows.is_empty()
+            && sel.residual.is_none()
+            && sel.casts.iter().all(Option::is_none)
+            && sel.lock.is_none()
+            && sel.lock_clauses.is_empty()
+            && !sel.table.is_empty()
+            && Self::virtual_table(&sel.table).is_none()
     }
 
     /// Run a READ COMMITTED block's read ([`Self::rc_reads_apart`]) in a

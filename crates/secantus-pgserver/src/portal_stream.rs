@@ -24,8 +24,9 @@
 //!   types: no join, subquery source, series, window, DISTINCT, per-row
 //!   WHERE residual or computed column (each of those needs every row, or
 //!   thread-local session state, before the first row can go out). An ORDER
-//!   BY of stored columns is sorted by the reader in bounded memory
-//!   (`external_sort`) outside a block; a block's scan streams without one;
+//!   BY of stored columns is sorted in bounded memory (`external_sort`): by
+//!   the reader outside a block, and inside one (a portal or a `DECLARE
+//!   CURSOR`) at the first fetch, through the block's transaction;
 //! - with a WHERE, only when the client fetches in pieces (`max_rows > 0`):
 //!   the streamed read is a collection scan, which an indexed lookup should
 //!   not be traded for when the whole result is wanted at once.
@@ -152,12 +153,10 @@ impl PgHandler {
         if mode == STREAM_NEVER || (mode == STREAM_UNFILTERED && !sel.filter.is_empty()) {
             return Ok(None);
         }
-        // Outside a block an ORDER BY is sorted by the reader
-        // (`external_sort`); a block's scan reads a batch per fetch.
-        let in_block = self
-            .stream_in_block
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let Some(def) = self.streamable(sel, !in_block) else {
+        // An ORDER BY of stored columns is sorted in bounded memory
+        // (`external_sort`): outside a block by the reader thread, inside
+        // one at the portal's first fetch through the block's transaction.
+        let Some(def) = self.streamable(sel, true) else {
             return Ok(None);
         };
         // A `DECLARE CURSOR` capture needs the rows as they are encoded on
@@ -411,12 +410,25 @@ pub(crate) struct BlockScan {
     pending: std::collections::VecDeque<Document>,
     skip: usize,
     left: Option<usize>,
+    /// The ORDER BY (stored columns only); empty for scan order.
+    order: Vec<OrderKey>,
+    /// With an ORDER BY: the rows sorted in bounded memory
+    /// (`external_sort`), read whole at the first batch.
+    sorted: Option<Arc<Mutex<crate::external_sort::Sorted>>>,
 }
 
 impl BlockScan {
     /// Read the next batch on the CURRENT session (inside the block's
-    /// transaction), applying OFFSET and LIMIT.
-    fn read_batch(&mut self, storage: &Storage) -> PgWireResult<Vec<Document>> {
+    /// transaction), applying OFFSET and LIMIT. `check` is called between
+    /// batches read from storage (a cancel, a terminate).
+    fn read_batch(
+        &mut self,
+        storage: &Storage,
+        check: &dyn Fn() -> PgWireResult<()>,
+    ) -> PgWireResult<Vec<Document>> {
+        if !self.order.is_empty() {
+            return self.read_sorted_batch(storage, check);
+        }
         let mut docs = Vec::new();
         while docs.is_empty() && !self.done {
             let (blobs, next) = storage
@@ -446,6 +458,63 @@ impl BlockScan {
         }
         Ok(docs)
     }
+
+    /// An ordered scan's next batch: the first reads every row of the
+    /// snapshot into sorted runs (spilled past `external_sort`'s run size,
+    /// so memory stays bounded), the rest are handed out of their merge.
+    fn read_sorted_batch(
+        &mut self,
+        storage: &Storage,
+        check: &dyn Fn() -> PgWireResult<()>,
+    ) -> PgWireResult<Vec<Document>> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        if self.sorted.is_none() {
+            let mut stopped: Option<PgWireError> = None;
+            let sorted = crate::external_sort::sort_runs(
+                |sink| {
+                    let mut after = None;
+                    loop {
+                        if let Err(e) = check() {
+                            stopped = Some(e);
+                            return Ok(());
+                        }
+                        let (blobs, next) = storage
+                            .scan_batch_after(&self.db, &self.table, &self.filter, after, BATCH)
+                            .map_err(|e| e.to_string())?;
+                        if !sink(blobs) || next.is_none() {
+                            return Ok(());
+                        }
+                        after = next;
+                    }
+                },
+                &self.order,
+                self.skip,
+                self.left,
+                BATCH,
+            );
+            if let Some(e) = stopped {
+                return Err(e);
+            }
+            let sorted = sorted
+                .map_err(|e| PgHandler::user_error("XX000", format!("could not sort: {e}")))?;
+            self.sorted = Some(Arc::new(Mutex::new(sorted)));
+        }
+        let docs = self
+            .sorted
+            .as_ref()
+            .expect("set above")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_batch()
+            .map_err(|e| PgHandler::user_error("XX000", e))?;
+        if docs.is_empty() {
+            self.done = true;
+            self.sorted = None;
+        }
+        Ok(docs)
+    }
 }
 
 impl BlockScan {
@@ -462,6 +531,8 @@ impl BlockScan {
             left: sel
                 .limit
                 .map(|l| usize::try_from(l.max(0)).unwrap_or(usize::MAX)),
+            order: sel.order.clone(),
+            sorted: None,
         }
     }
 }
@@ -516,7 +587,7 @@ impl PgHandler {
         scrollable: bool,
         holdable: bool,
     ) -> PgWireResult<Option<CursorState>> {
-        let Some(def) = self.streamable(sel, false) else {
+        let Some(def) = self.streamable(sel, true) else {
             return Ok(None);
         };
         let tz = self.session_timezone();
@@ -585,7 +656,9 @@ impl PgHandler {
         if tail.exhausted {
             return Ok(false);
         }
-        let docs = tail.scan.read_batch(&self.storage)?;
+        let docs = tail
+            .scan
+            .read_batch(&self.storage, &|| self.check_cancel())?;
         tail.exhausted = tail.scan.done && tail.scan.pending.is_empty();
         let exhausted = tail.exhausted;
         if !docs.is_empty() {
@@ -716,8 +789,17 @@ impl PgHandler {
                             "portal does not exist".into(),
                         ));
                     };
+                    let check = || {
+                        if backend.terminate.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(PgHandler::admin_shutdown());
+                        }
+                        if backend.cancelled() {
+                            return Err(PgHandler::query_canceled());
+                        }
+                        Ok(())
+                    };
                     storage
-                        .with_user_transaction(handle, || st.read_batch(&storage))
+                        .with_user_transaction(handle, || st.read_batch(&storage, &check))
                         .map_err(|e| PgHandler::storage_err("transaction failed", e))?
                 });
                 match out {
@@ -756,7 +838,7 @@ impl PgHandler {
             for scan in open {
                 let mut st = scan.lock().unwrap_or_else(|e| e.into_inner());
                 while !st.done {
-                    let docs = st.read_batch(&self.storage)?;
+                    let docs = st.read_batch(&self.storage, &|| self.check_cancel())?;
                     st.pending.extend(docs);
                 }
             }
