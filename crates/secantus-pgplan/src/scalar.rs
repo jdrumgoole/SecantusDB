@@ -1980,37 +1980,112 @@ fn decimal_ceil_floor(text: &str, up: bool) -> Option<Bson> {
 fn float_math(name: &str, args: &[Bson]) -> Result<Bson> {
     let f =
         |i: usize| -> Result<f64> { args.get(i).and_then(as_f64).ok_or_else(|| wrong_args(name)) };
+    // PostgreSQL's float.c: `dsqrt`, `dlog1`, `dlog10`, `dexp`, `dpow`, with
+    // their SQLSTATEs (2201F / 2201E / 22003).
+    let range = |what: &str| Error::Sqlstate("22003", format!("value out of range: {what}"));
+    let log_of = |x: f64| -> Result<f64> {
+        if x == 0.0 {
+            return Err(Error::Sqlstate(
+                "2201E",
+                "cannot take logarithm of zero".into(),
+            ));
+        }
+        if x < 0.0 {
+            return Err(Error::Sqlstate(
+                "2201E",
+                "cannot take logarithm of a negative number".into(),
+            ));
+        }
+        Ok(x)
+    };
     let out = match name {
         "sqrt" => {
             let x = f(0)?;
             if x < 0.0 {
-                return Err(Error::InvalidText(
+                return Err(Error::Sqlstate(
+                    "2201F",
                     "cannot take square root of a negative number".into(),
                 ));
             }
             x.sqrt()
         }
-        "exp" => f(0)?.exp(),
-        "ln" => {
+        "exp" => {
             let x = f(0)?;
-            if x <= 0.0 {
-                return Err(Error::InvalidText(
-                    "cannot take logarithm of a non-positive number".into(),
-                ));
+            let r = x.exp();
+            if r.is_infinite() && !x.is_infinite() {
+                return Err(range("overflow"));
             }
-            x.ln()
-        }
-        "log" | "log10" if args.len() == 1 => {
-            let x = f(0)?;
-            if x <= 0.0 {
-                return Err(Error::InvalidText(
-                    "cannot take logarithm of a non-positive number".into(),
-                ));
+            if r == 0.0 && !x.is_infinite() {
+                return Err(range("underflow"));
             }
-            x.log10()
+            r
         }
+        "ln" => log_of(f(0)?)?.ln(),
+        "log" | "log10" if args.len() == 1 => log_of(f(0)?)?.log10(),
         "log" => f(1)?.log(f(0)?),
-        "power" | "pow" => f(0)?.powf(f(1)?),
+        "power" | "pow" => {
+            let (x, y) = (f(0)?, f(1)?);
+            if x.is_nan() {
+                if y.is_nan() || y != 0.0 {
+                    f64::NAN
+                } else {
+                    1.0
+                }
+            } else if y.is_nan() {
+                if x != 1.0 {
+                    f64::NAN
+                } else {
+                    1.0
+                }
+            } else if x == 0.0 && y < 0.0 {
+                return Err(Error::Sqlstate(
+                    "2201F",
+                    "zero raised to a negative power is undefined".into(),
+                ));
+            } else if x < 0.0 && y.floor() != y {
+                return Err(Error::Sqlstate(
+                    "2201F",
+                    "a negative number raised to a non-integer power yields a complex result"
+                        .into(),
+                ));
+            } else if y.is_infinite() {
+                let ax = x.abs();
+                if ax == 1.0 {
+                    1.0
+                } else if (y > 0.0) == (ax > 1.0) {
+                    f64::INFINITY
+                } else {
+                    0.0
+                }
+            } else if x.is_infinite() {
+                if y == 0.0 {
+                    1.0
+                } else if x > 0.0 {
+                    if y > 0.0 {
+                        f64::INFINITY
+                    } else {
+                        0.0
+                    }
+                } else {
+                    let odd = (y % 2.0).abs() == 1.0;
+                    match (y > 0.0, odd) {
+                        (true, true) => f64::NEG_INFINITY,
+                        (true, false) => f64::INFINITY,
+                        (false, true) => -0.0,
+                        (false, false) => 0.0,
+                    }
+                }
+            } else {
+                let r = x.powf(y);
+                if r.is_infinite() {
+                    return Err(range("overflow"));
+                }
+                if r == 0.0 && x != 0.0 {
+                    return Err(range("underflow"));
+                }
+                r
+            }
+        }
         _ => return Err(Error::Unsupported(format!("function {name}()"))),
     };
     Ok(Bson::Double(out))

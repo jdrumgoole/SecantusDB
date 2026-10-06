@@ -867,14 +867,48 @@ fn stmt_typename(kind: &str, body: &Value) -> &'static str {
 
 /// The CONTEXT frame for an expression whose evaluation failed (`sql` is
 /// the query it became, before its variables were bound), or `None`
-/// where PostgreSQL adds none. PL/pgSQL runs a SIMPLE expression (one
-/// target, no FROM, no subquery) outside SPI, so an error it raises while
-/// EXECUTING has no `SQL expression` frame; one raised while PLANNING it
-/// does -- in practice, an expression with no variables and no volatile or
-/// user function call, which the planner folds (`return 1/0`). A
-/// non-simple expression always runs through SPI and always has one.
-fn expr_frame(text: &str, mode: u64, sql: &str) -> Option<String> {
+/// where PostgreSQL adds none.
+///
+/// PostgreSQL adds `SQL expression "..."` (`_SPI_error_callback`) to an
+/// error raised while SPI parses, plans or runs the query -- except one
+/// that carries a cursor position (an unreadable literal, `'x'::int`),
+/// which becomes an internal query position instead. PL/pgSQL runs a
+/// SIMPLE expression (one target, no FROM, no subquery) outside SPI once
+/// it is planned, so an error it raises while EXECUTING has no frame;
+/// one raised while PLANNING it does. Planning folds every immutable
+/// subexpression over constants (`eval_const_expressions`), so the error
+/// is a planning one exactly when one of those subexpressions fails on
+/// its own: `fails` evaluates such a subexpression (`SELECT <it>`) and
+/// answers whether it raised the error's SQLSTATE. Measured against PostgreSQL 15.19 over 60
+/// shapes (batch 64).
+fn expr_frame(
+    text: &str,
+    mode: u64,
+    sql: &str,
+    err: &PlError,
+    fails: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     use pg_query::protobuf::node::Node as N;
+    let frame = || {
+        Some(match mode {
+            3..=5 => format!("PL/pgSQL assignment \"{text}\""),
+            2 => format!("SQL expression \"{text}\""),
+            _ => format!("SQL statement \"{text}\""),
+        })
+    };
+    // An input error on a literal of the text has a position: no frame.
+    if err.sqlstate.starts_with("22") {
+        if let Some(lit) = err
+            .message
+            .strip_suffix('"')
+            .and_then(|m| m.rsplit_once(": \""))
+            .map(|(_, v)| v)
+        {
+            if sql.contains(&format!("'{}'", lit.replace('\'', "''"))) {
+                return None;
+            }
+        }
+    }
     let parsed = pg_query::parse(sql).ok()?;
     let simple = match parsed
         .protobuf
@@ -896,21 +930,15 @@ fn expr_frame(text: &str, mode: u64, sql: &str) -> Option<String> {
     let has_sublink = nodes
         .iter()
         .any(|(n, _, _, _)| matches!(n, pg_query::NodeRef::SubLink(_)));
-    // A bare identifier not called as a function is a variable or column.
-    let names_a_value = pg_query::scan(sql).ok().is_some_and(|scan| {
-        let t = &scan.tokens;
-        (0..t.len()).any(|i| {
-            let text_at = |j: usize| sql.get(t[j].start as usize..t[j].end as usize);
-            t[i].token == pg_query::protobuf::Token::Ident as i32
-                && (i == 0 || text_at(i - 1) != Some("::"))
-                && t.get(i + 1)
-                    .and_then(|n| sql.get(n.start as usize..n.end as usize))
-                    != Some("(")
-        })
-    });
-    let foldable = !names_a_value
-        && !nodes.iter().any(|(n, _, _, _)| match n {
-            pg_query::NodeRef::ParamRef(_) | pg_query::NodeRef::ColumnRef(_) => true,
+    if !simple || has_sublink {
+        return frame();
+    }
+    // Every operator / call / cast subexpression that folds, tried alone.
+    let folds = |expr: &N| -> bool {
+        !expr.nodes().iter().any(|(n, _, _, _)| match n {
+            pg_query::NodeRef::ParamRef(_)
+            | pg_query::NodeRef::ColumnRef(_)
+            | pg_query::NodeRef::SubLink(_) => true,
             pg_query::NodeRef::FuncCall(f) => {
                 let name = f
                     .funcname
@@ -921,6 +949,8 @@ fn expr_frame(text: &str, mode: u64, sql: &str) -> Option<String> {
                     })
                     .unwrap_or("");
                 !secantus_pgplan::is_known_function(name)
+                    || !f.agg_order.is_empty()
+                    || f.over.is_some()
                     || matches!(
                         name,
                         "random"
@@ -932,18 +962,58 @@ fn expr_frame(text: &str, mode: u64, sql: &str) -> Option<String> {
                             | "timeofday"
                             | "pg_sleep"
                             | "gen_random_uuid"
+                            | "statement_timestamp"
+                            | "transaction_timestamp"
+                            | "current_setting"
+                            | "set_config"
                     )
             }
             _ => false,
-        });
-    if simple && !has_sublink && !foldable {
-        return None;
+        })
+    };
+    for (n, _, _, _) in &nodes {
+        if !matches!(
+            n,
+            pg_query::NodeRef::AExpr(_)
+                | pg_query::NodeRef::FuncCall(_)
+                | pg_query::NodeRef::TypeCast(_)
+                | pg_query::NodeRef::BoolExpr(_)
+                | pg_query::NodeRef::CaseExpr(_)
+                | pg_query::NodeRef::CoalesceExpr(_)
+                | pg_query::NodeRef::MinMaxExpr(_)
+                | pg_query::NodeRef::NullTest(_)
+                | pg_query::NodeRef::AArrayExpr(_)
+                | pg_query::NodeRef::AIndirection(_)
+        ) {
+            continue;
+        }
+        // The statement as parsed (every enum field valid, which the
+        // deparser asserts), its one target replaced by the subexpression.
+        let mut wrapped = parsed.protobuf.clone();
+        let Some(N::SelectStmt(sel)) = wrapped
+            .stmts
+            .first_mut()
+            .and_then(|s| s.stmt.as_mut())
+            .and_then(|n| n.node.as_mut())
+        else {
+            continue;
+        };
+        let Some(N::ResTarget(rt)) = sel.target_list.first_mut().and_then(|t| t.node.as_mut())
+        else {
+            continue;
+        };
+        rt.name.clear();
+        rt.val = Some(Box::new(pg_query::protobuf::Node {
+            node: Some(n.to_enum()),
+        }));
+        let Ok(text) = pg_query::deparse(&wrapped) else {
+            continue;
+        };
+        if folds(&n.to_enum()) && fails(&text) {
+            return frame();
+        }
     }
-    Some(match mode {
-        3..=5 => format!("PL/pgSQL assignment \"{text}\""),
-        2 => format!("SQL expression \"{text}\""),
-        _ => format!("SQL statement \"{text}\""),
-    })
+    None
 }
 
 fn expr_query(e: &Value) -> Option<(&str, u64)> {
@@ -1149,10 +1219,19 @@ impl Interp<'_> {
         };
         let raw = sql.clone();
         let (sql, params, types) = self.bind(&sql)?;
-        let out = self
-            .host
-            .query(&sql, &params, &types)
-            .map_err(|e| e.with_sql_frame(|| expr_frame(text, mode, &raw)))?;
+        let out = self.host.query(&sql, &params, &types).map_err(|e| {
+            let fails = |q: &str| {
+                self.host
+                    .query(q, &[], &[])
+                    .is_err_and(|f| f.sqlstate == e.sqlstate)
+            };
+            let frame = if e.from_sql && !e.sql_framed && !e.framed {
+                expr_frame(text, mode, &raw, &e, &fails)
+            } else {
+                None
+            };
+            e.with_sql_frame(|| frame)
+        })?;
         if out.rows.len() > 1 {
             return Err(PlError::new("21000", "query returned more than one row"));
         }
@@ -1186,10 +1265,19 @@ impl Interp<'_> {
         };
         let raw = sql.clone();
         let (sql, params, types) = self.bind(&sql)?;
-        let out = self
-            .host
-            .query(&sql, &params, &types)
-            .map_err(|e| e.with_sql_frame(|| expr_frame(text, mode, &raw)))?;
+        let out = self.host.query(&sql, &params, &types).map_err(|e| {
+            let fails = |q: &str| {
+                self.host
+                    .query(q, &[], &[])
+                    .is_err_and(|f| f.sqlstate == e.sqlstate)
+            };
+            let frame = if e.from_sql && !e.sql_framed && !e.framed {
+                expr_frame(text, mode, &raw, &e, &fails)
+            } else {
+                None
+            };
+            e.with_sql_frame(|| frame)
+        })?;
         Ok(out
             .rows
             .into_iter()

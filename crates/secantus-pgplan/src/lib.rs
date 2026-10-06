@@ -10042,6 +10042,161 @@ fn over_one_row(s: &pg_query::protobuf::SelectStmt) -> Option<pg_query::protobuf
     Some(out)
 }
 
+/// PostgreSQL's `simplify_EXISTS_query`: an EXISTS subquery's select list,
+/// DISTINCT and ORDER BY cannot change whether it has a row, so they are
+/// dropped before it runs -- `exists(select 1/0)` is true, never an error.
+/// Not done (as PostgreSQL does not) for a set operation, an aggregate,
+/// GROUP BY, HAVING, a window, LIMIT / OFFSET, or a set-returning call in
+/// the list; a call this server does not know might be any of those, so it
+/// keeps the list too.
+pub(crate) fn simplify_exists(s: &mut pg_query::protobuf::SelectStmt) {
+    const AGGREGATE_OR_SRF: &[&str] = &[
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "array_agg",
+        "string_agg",
+        "bool_and",
+        "bool_or",
+        "every",
+        "json_agg",
+        "jsonb_agg",
+        "json_object_agg",
+        "jsonb_object_agg",
+        "stddev",
+        "stddev_pop",
+        "stddev_samp",
+        "variance",
+        "var_pop",
+        "var_samp",
+        "corr",
+        "covar_pop",
+        "covar_samp",
+        "regr_avgx",
+        "regr_avgy",
+        "regr_count",
+        "regr_intercept",
+        "regr_r2",
+        "regr_slope",
+        "regr_sxx",
+        "regr_sxy",
+        "regr_syy",
+        "percentile_cont",
+        "percentile_disc",
+        "mode",
+        "bit_and",
+        "bit_or",
+        "bit_xor",
+        "xmlagg",
+        "range_agg",
+        "range_intersect_agg",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "grouping",
+        "generate_series",
+        "generate_subscripts",
+        "unnest",
+        "regexp_matches",
+        "regexp_split_to_table",
+        "string_to_table",
+        "json_array_elements",
+        "json_array_elements_text",
+        "jsonb_array_elements",
+        "jsonb_array_elements_text",
+        "json_each",
+        "json_each_text",
+        "jsonb_each",
+        "jsonb_each_text",
+        "json_object_keys",
+        "jsonb_object_keys",
+        "json_populate_recordset",
+        "jsonb_populate_recordset",
+        "json_to_recordset",
+        "jsonb_to_recordset",
+        "jsonb_path_query",
+        "ts_stat",
+        "ts_debug",
+        "ts_parse",
+        "ts_token_type",
+        "pg_get_keywords",
+        "aclexplode",
+        "pg_options_to_table",
+        "txid_snapshot_xip",
+        "pg_snapshot_xip",
+        "pg_listening_channels",
+        "pg_lock_status",
+    ];
+    if s.op != pg_query::protobuf::SetOperation::SetopNone as i32
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.window_clause.is_empty()
+        || s.limit_offset.is_some()
+        || s.target_list.is_empty()
+    {
+        return;
+    }
+    // A LIMIT of a positive constant (or NULL / ALL) cannot empty it.
+    let limit_keeps_a_row = match s.limit_count.as_deref().and_then(|n| n.node.as_ref()) {
+        None => true,
+        Some(N::AConst(c)) => match c.val.as_ref() {
+            None => c.isnull,
+            Some(a_const::Val::Ival(v)) => v.ival > 0,
+            _ => false,
+        },
+        Some(_) => false,
+    };
+    if !limit_keeps_a_row {
+        return;
+    }
+    let plain = s.target_list.iter().all(|t| {
+        t.node.as_ref().is_some_and(|n| {
+            !n.nodes().iter().any(|(n, _, _, _)| match n {
+                pg_query::NodeRef::FuncCall(f) => {
+                    let name = f
+                        .funcname
+                        .last()
+                        .and_then(|n| match n.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    f.over.is_some()
+                        || f.agg_star
+                        || f.agg_distinct
+                        || f.agg_filter.is_some()
+                        || !f.agg_order.is_empty()
+                        || AGGREGATE_OR_SRF.contains(&name.as_str())
+                        || !is_known_function(&name)
+                }
+                pg_query::NodeRef::GroupingFunc(_) => true,
+                _ => false,
+            })
+        })
+    });
+    if !plain {
+        return;
+    }
+    s.target_list = vec![pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::AConst(pg_query::protobuf::AConst {
+                    val: Some(a_const::Val::Ival(pg_query::protobuf::Integer { ival: 1 })),
+                    ..Default::default()
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    }];
+    s.distinct_clause.clear();
+    s.sort_clause.clear();
+    s.limit_count = None;
+}
+
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
@@ -13989,6 +14144,104 @@ fn distinct_on_over_expressions(
     })
 }
 
+/// PostgreSQL's rule for a plain `SELECT DISTINCT`: every ORDER BY
+/// expression must be one of the select list's (`transformDistinctClause`),
+/// else 42P10 at the expression. Checked on the statement as written, with
+/// a column reference compared by its column name (`t.v` and `v` are one
+/// column to PostgreSQL); an ORDER BY of an output name or a position is
+/// always in the list, and a bare column is when the list has a `*`.
+/// Without the check the rows came back de-duplicated on the select list
+/// and sorted on something else.
+fn check_distinct_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    if !(s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none()) {
+        return Ok(());
+    }
+    fn normalised(n: &pg_query::protobuf::Node) -> pg_query::protobuf::Node {
+        let mut n = n.clone();
+        if let Some(N::ColumnRef(c)) = n.node.as_mut() {
+            if c.fields.len() > 1 {
+                let last = c.fields.last().cloned();
+                c.fields = last.into_iter().collect();
+            }
+        }
+        n
+    }
+    let mut star = false;
+    let mut names: Vec<String> = Vec::new();
+    let mut targets: Vec<pg_query::protobuf::Node> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(val) = rt.val.as_deref() else {
+            return Ok(());
+        };
+        if let Some(N::ColumnRef(c)) = val.node.as_ref() {
+            if c.fields
+                .last()
+                .is_some_and(|f| matches!(f.node, Some(N::AStar(_))))
+            {
+                star = true;
+                continue;
+            }
+            if let Some(name) = column_ref_name(c) {
+                names.push(name);
+            }
+        }
+        if !rt.name.is_empty() {
+            names.push(rt.name.clone());
+        }
+        targets.push(normalised(val));
+    }
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            continue;
+        };
+        let Some(expr) = sb.node.as_deref() else {
+            continue;
+        };
+        let listed = match expr.node.as_ref() {
+            // A position (or another constant: its own error elsewhere).
+            Some(N::AConst(_)) => true,
+            Some(N::ColumnRef(c)) => {
+                star || column_ref_name(c).is_none_or(|name| names.contains(&name))
+            }
+            // A COLLATE PostgreSQL checks on its own terms first (`collations
+            // are not supported by type integer`), which is decided here only
+            // when a row is sorted: let through, as before (backlog).
+            Some(N::CollateClause(_)) => true,
+            Some(_) => {
+                let e = normalised(expr);
+                // Column references inside are compared as written, so a
+                // qualified spelling of a listed expression is not caught
+                // here (it is let through, as before).
+                targets.iter().any(|t| same_expression(t, &e))
+                    || mentions_qualified(expr)
+                    || targets.iter().any(mentions_qualified)
+            }
+            None => true,
+        };
+        if !listed {
+            if let Some(loc) = expr_location(expr) {
+                set_error_location(loc);
+            }
+            return Err(Error::InvalidColumnReference(
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does `node` contain a qualified column reference (`t.v`) anywhere?
+fn mentions_qualified(node: &pg_query::protobuf::Node) -> bool {
+    static QUAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    QUAL.get_or_init(|| {
+        regex::Regex::new(r"ColumnRef \{ fields: \[Node \{[^\]]*\}, Node").expect("a fixed pattern")
+    })
+    .is_match(&format!("{node:?}"))
+}
+
 /// Are two expressions the same, ignoring where in the text each was
 /// written? (`ORDER BY sum(v)` names the select list's `sum(v)`.)
 pub(crate) fn same_expression(a: &pg_query::protobuf::Node, b: &pg_query::protobuf::Node) -> bool {
@@ -15848,6 +16101,9 @@ fn resolve_one_sublink(
     // A subquery may itself contain subqueries and CTEs; both are resolved
     // before it is planned, innermost first.
     let mut inner = (**inner).clone();
+    if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
+        simplify_exists(&mut inner);
+    }
     resolve_sublinks_in_select(&mut inner, lookup, params, run)?;
     // The enclosing statements' CTEs are in scope, behind the subquery's own
     // (inlining takes the first definition of a name, so its own win). Added
@@ -17434,6 +17690,7 @@ fn plan_select(
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
+    check_distinct_order(s)?;
     // A set-returning function over a column in the select list is a
     // LATERAL join (see `joins::select_list_srf`).
     if let Some(rewritten) = joins::select_list_srf(s)? {

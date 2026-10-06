@@ -86,6 +86,9 @@ def _run_nested_pytest(
     (tmp_path / "test_nested.py").write_text(textwrap.dedent(body))
 
     env = dict(os.environ)
+    # A nested pytest is its own controller: without this it reaps the
+    # whole stale temp backlog at sessionstart (see test_tmp_retention_guard).
+    env["SECANTUS_NO_TMP_REAP"] = "1"
     env["SECANTUS_STALL_SECONDS"] = stall_seconds
 
     cmd = [sys.executable, "-m", "pytest", str(tmp_path)]
@@ -304,6 +307,9 @@ def _run_nested_with_fault_dir(
     (tmp_path / "conftest.py").write_text(_CONFTEST_UNDER_TEST.read_text())
     (tmp_path / "test_nested.py").write_text(textwrap.dedent(body))
     env = dict(os.environ)
+    # A nested pytest is its own controller: without this it reaps the
+    # whole stale temp backlog at sessionstart (see test_tmp_retention_guard).
+    env["SECANTUS_NO_TMP_REAP"] = "1"
     env["SECANTUS_FAULTHANDLER_DIR"] = str(fault_dir)
     cmd = [sys.executable, "-m", "pytest", str(tmp_path)]
     cmd += ["-n", "2"] if xdist else ["-p", "no:xdist"]

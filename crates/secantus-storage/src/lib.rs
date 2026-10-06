@@ -12241,6 +12241,94 @@ impl Storage {
         out.and(ended.map_err(StorageError::from))
     }
 
+    /// [`Self::scan_matching_batches`], but routed as [`Self::find_matching`]
+    /// routes `filter` (the index, then a residual index, then an all-index
+    /// `$or`): the documents come in the order `find_matching` returns them,
+    /// a batch of up to `batch` at a time. Only the matching RecordIds are
+    /// held whole (8 bytes each, plus their de-duplication set); the
+    /// documents are fetched a batch at a time from the same snapshot. With
+    /// no index route, a read overlay, or an empty filter it IS
+    /// `scan_matching_batches`.
+    pub fn scan_routed_batches(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        batch: usize,
+        mut sink: impl FnMut(Vec<Vec<u8>>) -> bool,
+    ) -> Result<()> {
+        if filter.is_empty() || overlay_for(db, coll).is_some() || self.is_oplog_rs(db, coll) {
+            return self.scan_matching_batches(db, coll, filter, batch, sink);
+        }
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        let vars = Document::new();
+        let session = self.conn.open_session()?;
+        session.begin_transaction(None)?;
+        let routed = (|| -> Result<Option<Vec<i64>>> {
+            if let Some(ids) = self.try_index_id_keys(&session, db, coll, filter)? {
+                return Ok(Some(ids));
+            }
+            if let Some(ids) = self.try_residual_index_id_keys(&session, db, coll, filter)? {
+                return Ok(Some(ids));
+            }
+            self.try_or_index_id_keys(&session, db, coll, filter)
+        })();
+        let ids = match routed {
+            Ok(Some(ids)) => ids,
+            Ok(None) => {
+                session.rollback_transaction(None)?;
+                drop(session);
+                return self.scan_matching_batches(db, coll, filter, batch, sink);
+            }
+            Err(e) => {
+                let _ended = session.rollback_transaction(None);
+                return Err(e);
+            }
+        };
+        let out = (|| -> Result<()> {
+            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let batch = batch.max(1);
+            let mut seen: HashSet<i64> = HashSet::with_capacity(ids.len());
+            let mut buf: Vec<Vec<u8>> = Vec::with_capacity(batch);
+            for recordid in ids {
+                if !seen.insert(recordid) {
+                    continue;
+                }
+                cur.reset()?;
+                cur.set_key_ssq(db, coll, recordid);
+                match cur.search() {
+                    Ok(()) => {
+                        let value = cur.get_value_u()?;
+                        let (_idk, blob) = unframe_doc_value(&value)?;
+                        let raw = bson::RawDocument::from_bytes(blob)
+                            .map_err(|_| StorageError::QueryUnsupported)?;
+                        if secantus_core::query::matches_raw(raw, filter, &vars, None)
+                            .map_err(query_fault)?
+                        {
+                            buf.push(blob.to_vec());
+                            if buf.len() >= batch && !sink(std::mem::take(&mut buf)) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !buf.is_empty() {
+                sink(buf);
+            }
+            Ok(())
+        })();
+        let ended = session.rollback_transaction(None);
+        out.and(ended.map_err(StorageError::from))
+    }
+
     /// The next up-to-`batch` documents of `coll` matching `filter`, in
     /// RecordId (insertion) order, after RecordId `after` (`None`: from the
     /// start), read on the CURRENT session -- inside `with_user_transaction`
