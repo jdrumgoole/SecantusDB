@@ -1,0 +1,333 @@
+"""The shapes left open for the Rust MongoDB server, against mongod.
+
+Written for phase 0 of `tasks/rust-mongod-remaining-plan.md` (2026-10-06):
+backlog entries with no probe of their own -- `$jsonSchema` (parse and the
+failure `errInfo`), write concern, `$project: {_id: 1}`, the positional update,
+and the section 7.00 expression entries (negative `$slice`, decimal operands,
+`$bucketAuto` over decimals). It compares whole command replies.
+
+**Point it at a REPLICA-SET mongod.** The Rust server presents itself as a
+single-node replica set, so a standalone mongod answers write concern
+differently (`w: 2` is a pre-flight BadValue there) and the comparison is
+wrong rather than informative.
+
+    mongod --replSet rs0 --port 27045 --dbpath <dir>   # then replSetInitiate
+    python tools/probes/remaining_shapes.py \\
+        "mongodb://127.0.0.1:27045/?directConnection=true" \\
+        "mongodb://127.0.0.1:27055/?directConnection=true"
+
+Measured on 8.2.11, 2026-10-06: 6 of 38 divergent -- `$jsonSchema`
+`type: "integer"` accepted (x2), an update's schema failure without `errInfo`,
+an array `w`, decimal `$log` refused, and the authorised last digit of decimal
+`$sin`.
+"""
+
+import json
+import sys
+
+import pymongo
+from bson import Decimal128, json_util
+from bson.codec_options import CodecOptions, DatetimeConversion
+
+CO = CodecOptions(datetime_conversion=DatetimeConversion.DATETIME_AUTO)
+D = Decimal128
+
+
+def norm(x):
+    return json.loads(json_util.dumps(x, json_options=json_util.CANONICAL_JSON_OPTIONS))
+
+
+def cases():
+    S = {
+        "bsonType": "object",
+        "required": ["a"],
+        "properties": {"a": {"bsonType": "int", "minimum": 5}},
+    }
+    yield (
+        "jsonSchema type integer",
+        [("create", {"create": "js1", "validator": {"$jsonSchema": {"type": "integer"}}})],
+    )
+    yield (
+        "jsonSchema properties type integer",
+        [
+            (
+                "create",
+                {
+                    "create": "js1b",
+                    "validator": {"$jsonSchema": {"properties": {"a": {"type": "integer"}}}},
+                },
+            )
+        ],
+    )
+    yield (
+        "jsonSchema find type integer",
+        [
+            (
+                "find",
+                {
+                    "find": "c",
+                    "filter": {"$jsonSchema": {"properties": {"a": {"type": "integer"}}}},
+                },
+            )
+        ],
+    )
+    for name, doc in [
+        ("missing required", {"b": 1}),
+        ("wrong type", {"a": "x"}),
+        ("below minimum", {"a": 2}),
+    ]:
+        yield (
+            f"jsonSchema validation {name}",
+            [
+                ("create", {"create": "js2", "validator": {"$jsonSchema": S}}),
+                ("insert", {"insert": "js2", "documents": [dict(doc, _id=1)]}),
+            ],
+        )
+    yield (
+        "jsonSchema enum+pattern+array",
+        [
+            (
+                "create",
+                {
+                    "create": "js3",
+                    "validator": {
+                        "$jsonSchema": {
+                            "properties": {
+                                "e": {"enum": [1, 2]},
+                                "p": {"bsonType": "string", "pattern": "^a"},
+                                "l": {
+                                    "bsonType": "array",
+                                    "maxItems": 1,
+                                    "items": {"bsonType": "int"},
+                                },
+                                "o": {
+                                    "bsonType": "object",
+                                    "additionalProperties": False,
+                                    "properties": {"x": {}},
+                                },
+                            }
+                        }
+                    },
+                },
+            ),
+            (
+                "insert",
+                {
+                    "insert": "js3",
+                    "documents": [
+                        {"_id": 1, "e": 3, "p": "b", "l": [1, "x"], "o": {"x": 1, "y": 2}}
+                    ],
+                },
+            ),
+        ],
+    )
+    yield (
+        "jsonSchema update failure",
+        [
+            ("create", {"create": "js4", "validator": {"$jsonSchema": S}}),
+            ("insert", {"insert": "js4", "documents": [{"_id": 1, "a": 9}]}),
+            ("update", {"update": "js4", "updates": [{"q": {"_id": 1}, "u": {"$set": {"a": 1}}}]}),
+        ],
+    )
+    yield (
+        "write concern unknown tag",
+        [
+            (
+                "insert",
+                {"insert": "wc", "documents": [{"_id": 1}], "writeConcern": {"w": "noSuchTag"}},
+            )
+        ],
+    )
+    yield (
+        "write concern w:2 wtimeout",
+        [
+            (
+                "insert",
+                {
+                    "insert": "wc2",
+                    "documents": [{"_id": 1}],
+                    "writeConcern": {"w": 2, "wtimeout": 50},
+                },
+            )
+        ],
+    )
+    yield (
+        "write concern w:majority",
+        [
+            (
+                "insert",
+                {"insert": "wc3", "documents": [{"_id": 1}], "writeConcern": {"w": "majority"}},
+            )
+        ],
+    )
+    yield (
+        "write concern bad type",
+        [("insert", {"insert": "wc4", "documents": [{"_id": 1}], "writeConcern": {"w": []}})],
+    )
+    yield (
+        "write concern update w:2",
+        [
+            (
+                "update",
+                {
+                    "update": "wc5",
+                    "updates": [{"q": {"_id": 7}, "u": {"$set": {"a": 1}}, "upsert": True}],
+                    "writeConcern": {"w": 2, "wtimeout": 50},
+                },
+            )
+        ],
+    )
+    yield (
+        "project _id only",
+        [
+            ("insert", {"insert": "pj", "documents": [{"_id": 1, "a": 1, "b": 2}]}),
+            (
+                "aggregate",
+                {"aggregate": "pj", "pipeline": [{"$project": {"_id": 1}}], "cursor": {}},
+            ),
+        ],
+    )
+    yield (
+        "project _id:1 a:0 mixed",
+        [
+            (
+                "aggregate",
+                {"aggregate": "pj", "pipeline": [{"$project": {"_id": 1, "a": 0}}], "cursor": {}},
+            )
+        ],
+    )
+    yield (
+        "project _id:0 only",
+        [("aggregate", {"aggregate": "pj", "pipeline": [{"$project": {"_id": 0}}], "cursor": {}})],
+    )
+    yield "find projection _id only", [("find", {"find": "pj", "projection": {"_id": 1}})]
+    yield (
+        "positional update",
+        [
+            ("insert", {"insert": "pos", "documents": [{"_id": 1, "a": [1, 2, 3]}]}),
+            ("update", {"update": "pos", "updates": [{"q": {"a": 2}, "u": {"$set": {"a.$": 9}}}]}),
+            ("find", {"find": "pos"}),
+        ],
+    )
+    exprs = {
+        "slice neg position": {"$slice": [[1, 2, 3, 4, 5], -2, 1]},
+        "slice neg position big": {"$slice": [[1, 2, 3, 4, 5], -9, 2]},
+        "pow decimal": {"$pow": [D("2"), D("0.5")]},
+        "pow decimal int": {"$pow": [D("1.5"), 3]},
+        "pow decimal neg": {"$pow": [D("-8"), D("0.3333333333333333333333333333333333")]},
+        "exp decimal": {"$exp": D("1")},
+        "sqrt decimal": {"$sqrt": D("2")},
+        "log decimal": {"$log": [D("100"), D("10")]},
+        "round decimal": {"$round": [D("2.555"), 2]},
+        "trunc decimal": {"$trunc": [D("-2.555"), 1]},
+        "mod decimal": {"$mod": [D("7.5"), 2]},
+        "abs decimal": {"$abs": D("-1.5")},
+        "sin decimal": {"$sin": D("1")},
+        "toInt decimal": {"$toInt": D("7.9")},
+        "range decimal": {"$range": [0, D("3")]},
+        "arrayElemAt decimal": {"$arrayElemAt": [[1, 2, 3], D("1")]},
+        "substrCP decimal": {"$substrCP": ["hello", D("1"), D("2")]},
+        "ln decimal neg": {"$ln": D("-1")},
+    }
+    for k, e in exprs.items():
+        yield (
+            f"expr {k}",
+            [
+                (
+                    "aggregate",
+                    {
+                        "aggregate": "one",
+                        "pipeline": [{"$project": {"_id": 0, "r": e}}],
+                        "cursor": {},
+                    },
+                )
+            ],
+        )
+    yield (
+        "bucketAuto decimal granularity",
+        [
+            (
+                "insert",
+                {
+                    "insert": "ba",
+                    "documents": [{"_id": i, "v": D(str(i * 1.5))} for i in range(1, 9)],
+                },
+            ),
+            (
+                "aggregate",
+                {
+                    "aggregate": "ba",
+                    "pipeline": [
+                        {"$bucketAuto": {"groupBy": "$v", "buckets": 3, "granularity": "R5"}}
+                    ],
+                    "cursor": {},
+                },
+            ),
+        ],
+    )
+    yield (
+        "bucketAuto decimal plain",
+        [
+            (
+                "aggregate",
+                {
+                    "aggregate": "ba",
+                    "pipeline": [{"$bucketAuto": {"groupBy": "$v", "buckets": 3}}],
+                    "cursor": {},
+                },
+            )
+        ],
+    )
+
+
+STRIP = {
+    "$clusterTime",
+    "operationTime",
+    "electionId",
+    "opTime",
+    "lastCommittedOpTime",
+    "$configTime",
+    "$topologyTime",
+}
+
+
+def clean(r):
+    if isinstance(r, dict):
+        return {k: clean(v) for k, v in r.items() if k not in STRIP}
+    if isinstance(r, list):
+        return [clean(v) for v in r]
+    return r
+
+
+def run(uri):
+    c = pymongo.MongoClient(uri)
+    c.drop_database("p0m")
+    db = c.get_database("p0m", codec_options=CO)
+    db.one.insert_one({"_id": 1})
+    out = []
+    for name, steps in cases():
+        res = []
+        for _, cmd in steps:
+            try:
+                r = db.command(cmd)
+            except pymongo.errors.OperationFailure as e:
+                r = e.details
+            if "cursor" in r:
+                r = {"ok": r.get("ok"), "batch": r["cursor"]["firstBatch"]}
+            res.append(clean(norm(r)))
+        out.append((name, res))
+    c.drop_database("p0m")
+    return out
+
+
+a, b = run(sys.argv[1]), run(sys.argv[2])
+bad = 0
+for (n, x), (_, y) in zip(a, b, strict=True):
+    if x != y:
+        bad += 1
+        print(f"DIFF {n}")
+        for i, (p, q) in enumerate(zip(x, y, strict=True)):
+            if p != q:
+                want, got = json.dumps(p)[:600], json.dumps(q)[:600]
+                print(f"  step {i}\n    mongod {want}\n    rust   {got}")
+print(f"=== misc: {bad} of {len(a)} divergent ===")
