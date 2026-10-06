@@ -737,6 +737,7 @@ remain open:
         Left: joins, aggregates, DISTINCT, ORDER BY over an expression, and
         ORDER BY in a block's portal or cursor still materialise (a join
         would stream its outer side; an aggregate's memory is its groups).
+        Not worked in batch 57.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -846,7 +847,15 @@ remain open:
         (Batch 52: PostgreSQL pulls up `(select 0) v(a)` the same way; the
         call's argument kind is decided over row parameters at evaluation
         (`call_args_kind`), where a constant-sourced column is no longer
-        distinguishable -- left as measured.) (Batch 56, re-measured on
+        distinguishable -- left as measured.) FIXED in batch 57: a one-row
+        `VALUES` or constant `SELECT` in FROM is pulled up into a user
+        function call's ARGUMENTS before planning (`secantus_pgplan::pullup`,
+        an AST rewrite, so output names are untouched): 12 of 13 probed shapes
+        give PostgreSQL 15.19's CONTEXT (slice test `test_batch57_a_one_row_
+        constant_from_item_is_pulled_up`). Left (OPEN): PostgreSQL folds a
+        call over constants at PLANNING, so `select f(0) from (values (1))
+        v(a) where a = 2` (and `... where false`) raises its error with no
+        row reaching the call; here they answer zero rows. (Batch 56, re-measured on
         PostgreSQL 15.19: still open, and wider than one shape --
         `(values (0)) v(a)`, `(select 0) v(a)`, `(select 0 as a) v`, an
         argument `a + 0`, a WHERE beside it and the call inside a further
@@ -1104,8 +1113,24 @@ remain open:
         is the per-statement snapshot itself, and the block keeps its own:
         0.33 / 0.63 / 1.25 s, linear (PG 15: 0.08 s at 800); slice test
         `test_batch56_read_committed_reads_another_table_without_moving`
-        (PostgreSQL 15.19's answers). Left: any other shape of read (a join,
-        an aggregate, a read of a table the block wrote) still moves. Every move --
+        (PostgreSQL 15.19's answers). **Batch 57:** a JOIN, an aggregate, GROUP
+        BY or an ORDER BY over an expression reads apart too when every
+        relation it names is an ordinary stored table the block has not
+        written (no rule, inheritance, partitioning; no RLS policy, user
+        operator or user cast anywhere; no catalog written by the block), and
+        its text has no subquery, CTE, row lock, SQL value function or call
+        outside a short list of pure built-ins (`secantus_pgplan::read_apart`,
+        `rc_reads_apart_general`). 200 / 400 / 800 insert-then-join-aggregate
+        pairs beside a committing writer, debug: 4.5 / 17.0 / 66.5 s (the same
+        statement made to move by a `random()`) -> 1.1 / 3.4 / 11.8 s (the
+        rest grows with the joined table itself; PG 15.19: 0.05 / 0.08 / 0.17
+        s). Slice test `test_batch57_read_committed_joins_and_aggregates_read_
+        apart`, whose assertions pass unchanged on PostgreSQL 15.19. Left
+        (OPEN): a read of a table the block HAS written (or one with a
+        subquery / user function) still moves, replaying the write set per
+        statement; a sub-quadratic mechanism (overlaying the block's own
+        writes on a fresh read-only snapshot, or replaying only what changed)
+        needs storage work not started in batch 57. Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
@@ -1485,6 +1510,9 @@ These work end-to-end but cut corners.
       the search path, so it cannot be memoised by text), the extended
       group's open / commit (~1), the `_id` probe (~1.5), the two socket
       syscalls (~5) and the tokio hand-offs.
+
+      **Batch 57 (2026-10-06):** not profiled or changed; the batch-56
+      figures stand.
 
       **Batch 56 (2026-10-06)**, release, `bench43.py`, two interleaved
       runs, load ~7, base `742b9134` -> batch 56 (PG 15.19): simple `select

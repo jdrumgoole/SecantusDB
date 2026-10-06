@@ -20537,7 +20537,7 @@ impl PgHandler {
                     let handle = if cursor_op {
                         handle
                     } else {
-                        self.with_isolation_for(handle, Some(&stmt))?
+                        self.with_isolation_for(handle, Some((&stmt, sql)))?
                     };
                     let fresh = Self::row_write(&stmt) && !handle.has_written();
                     let rebase = Self::row_write(&stmt) && !fresh;
@@ -20551,7 +20551,7 @@ impl PgHandler {
                         let handle = if cursor_op {
                             &mut *handle
                         } else {
-                            self.with_isolation_for(handle, Some(&stmt))?
+                            self.with_isolation_for(handle, Some((&stmt, sql)))?
                         };
                         let apart = self
                             .rc_apart
@@ -21393,8 +21393,12 @@ impl PgHandler {
     fn with_isolation_for<'h>(
         &self,
         handle: &'h mut UserTransactionHandle,
-        stmt: Option<&Statement>,
+        stmt: Option<(&Statement, &str)>,
     ) -> PgWireResult<&'h mut UserTransactionHandle> {
+        let (stmt, sql) = match stmt {
+            Some((s, q)) => (Some(s), Some(q)),
+            None => (None, None),
+        };
         self.rc_apart
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let read_committed = matches!(
@@ -21443,7 +21447,7 @@ impl PgHandler {
                         },
                     )
                 };
-            if stale && stmt.is_some_and(|s| self.rc_reads_apart(handle, s)) {
+            if stale && stmt.is_some_and(|s| self.rc_reads_apart(handle, s, sql)) {
                 // Nothing it reads was written by the block: it reads in a
                 // fresh transaction of its own, which IS the per-statement
                 // snapshot, and the block keeps its own (no replay).
@@ -21473,9 +21477,14 @@ impl PgHandler {
     /// security, inheritance or partitioning -- is `None`: everything. (A
     /// user function elsewhere in the database cannot run: a function is
     /// reached only through the table's own expressions or its triggers.)
-    fn rc_reads_apart(&self, handle: &UserTransactionHandle, stmt: &Statement) -> bool {
+    fn rc_reads_apart(
+        &self,
+        handle: &UserTransactionHandle,
+        stmt: &Statement,
+        sql: Option<&str>,
+    ) -> bool {
         let Statement::Select(sel) = stmt else {
-            return false;
+            return sql.is_some_and(|q| self.rc_reads_apart_general(handle, stmt, q));
         };
         // A plain read of one stored table: nothing that can run user code
         // (an expression in the select list, a residual WHERE, a window), no
@@ -21489,7 +21498,7 @@ impl PgHandler {
             || sel.lock.is_some()
             || !sel.lock_clauses.is_empty()
         {
-            return false;
+            return sql.is_some_and(|q| self.rc_reads_apart_general(handle, stmt, q));
         }
         let Some(def) = self.lookup(&sel.table) else {
             return false;
@@ -21506,6 +21515,58 @@ impl PgHandler {
         // nor any catalog written (a table created, altered ... in it).
         let db = self.db();
         !handle.wrote_any(|d, c| d == db && (c == sel.table || c.starts_with("__")))
+    }
+
+    /// [`Self::rc_reads_apart`] for any other read shape -- a join, an
+    /// aggregate, GROUP BY, an ORDER BY over an expression -- judged from
+    /// its text ([`secantus_pgplan::read_apart::relations`]: no subquery, no
+    /// CTE, no row lock, no function but pure built-ins). Every relation it
+    /// names must be an ordinary stored table the block has not written,
+    /// with no rule, inheritance or partitioning; no RLS policy, user
+    /// operator or user cast may exist, and the block must not have written
+    /// any catalog.
+    fn rc_reads_apart_general(
+        &self,
+        handle: &UserTransactionHandle,
+        stmt: &Statement,
+        sql: &str,
+    ) -> bool {
+        if !matches!(stmt, Statement::Select(_) | Statement::Aggregate(_)) {
+            return false;
+        }
+        let Some(names) = secantus_pgplan::read_apart::relations(sql) else {
+            return false;
+        };
+        if !self.rls_enabled_docs().is_empty()
+            || !self.user_operators().is_empty()
+            || !self.user_casts().is_empty()
+        {
+            return false;
+        }
+        let db = self.db();
+        if handle.wrote_any(|d, c| d == db && c.starts_with("__")) {
+            return false;
+        }
+        let inheritance = self.inheritance().0;
+        let mut tables = Vec::with_capacity(names.len());
+        for name in &names {
+            if Self::virtual_table(name).is_some() || self.view_doc(name).is_some() {
+                return false;
+            }
+            let Some(def) = self.lookup(name) else {
+                return false;
+            };
+            if partition::parent_of(&def).is_some()
+                || partition::is_partitioned(&def)
+                || !Self::inherited_parents(&def).is_empty()
+                || inheritance.iter().any(|(_, p)| *p == def.name)
+                || self.has_rules(&def.name)
+            {
+                return false;
+            }
+            tables.push(def.name);
+        }
+        !handle.wrote_any(|d, c| d == db && tables.iter().any(|t| t == c))
     }
 
     fn rc_read_set(&self, stmt: &Statement) -> Option<RcReadSet> {

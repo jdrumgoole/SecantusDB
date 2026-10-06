@@ -17336,6 +17336,78 @@ def test_batch56_read_committed_reads_another_table_without_moving(home: Path) -
         assert b.execute("select n from b56_r where id = 1").fetchone() == (100,)
 
 
+def test_batch57_read_committed_joins_and_aggregates_read_apart(home: Path) -> None:
+    """A READ COMMITTED block that has written and then reads, by a JOIN or
+    an aggregate, tables it has not written runs that read in a fresh
+    read-only transaction (it replayed its write set first). The read sees
+    every commit since, the block's own writes stay, and a join that
+    includes a table the block wrote still sees both. PostgreSQL 15.19
+    gives these answers."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table b57_w (id int primary key, v text)")
+        a.execute("create table b57_p (id int primary key, g int)")
+        a.execute("create table b57_c (id int primary key, pid int, n int)")
+        a.execute("insert into b57_p values (1, 1), (2, 2)")
+        a.execute("begin")
+        for i in range(1, 25):
+            a.execute("insert into b57_w values (%s, 'x')", (i,))
+            b.execute("insert into b57_c values (%s, %s, %s)", (i, 1 + i % 2, i))
+            got = a.execute(
+                "select p.g, count(*), sum(c.n) from b57_p p join b57_c c on c.pid = p.id"
+                " group by p.g order by p.g"
+            ).fetchall()
+            odd = [k for k in range(1, i + 1) if k % 2 == 1]
+            even = [k for k in range(1, i + 1) if k % 2 == 0]
+            expect = []
+            if even:
+                expect.append((1, len(even), sum(even)))
+            if odd:
+                expect.append((2, len(odd), sum(odd)))
+            assert got == expect
+            assert a.execute("select max(n) from b57_c").fetchone() == (i,)
+        assert a.execute("select count(*) from b57_w w join b57_c c on c.id = w.id").fetchone() == (
+            24,
+        )
+        b.execute("insert into b57_c values (100, 1, 0)")
+        a.execute("insert into b57_w values (100, 'y')")
+        assert a.execute("select count(*) from b57_w w join b57_c c on c.id = w.id").fetchone() == (
+            25,
+        )
+        a.execute("rollback")
+        assert b.execute("select count(*) from b57_w").fetchone() == (0,)
+
+
+def test_batch57_a_one_row_constant_from_item_is_pulled_up(home: Path) -> None:
+    """PostgreSQL pulls a one-row constant FROM-subquery up into its parent,
+    so an inlinable SQL function over its column is folded while planning:
+    the error says `during inlining`. A two-row VALUES is not pulled up.
+    PostgreSQL 15.19's answers."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create function b57_f(x int) returns int language sql as $$ select 1/x $$")
+        conn.execute(
+            "create function b57_g(x text) returns int language sql as $$ select 1/(length(x)-1) $$"
+        )
+        inlining = 'SQL function "b57_f" during inlining'
+        for sql, context in (
+            ("select b57_f(a) from (values (0)) v(a)", inlining),
+            ("select b57_f(a) from (select 0) v(a)", inlining),
+            ("select b57_f(a) from (select 0 as a) v", inlining),
+            ("select b57_f(a + 0) from (values (0)) v(a)", inlining),
+            ("select b57_f(a) from (values (0)) v(a) where a = 0", inlining),
+            ("select * from (select b57_f(a) from (values (0)) v(a)) s", inlining),
+            ("select b57_f(v.a) from (values (0)) v(a)", inlining),
+            ("select a, b57_f(a) from (values (0)) v(a)", inlining),
+            ("select b57_f(a::int) from (values ('0')) v(a)", inlining),
+            ("select b57_f(a) from (values (0)) v(a), (values (1)) w(b)", inlining),
+            ("select b57_g(a) from (values ('x')) v(a)", 'SQL function "b57_g" during inlining'),
+            ("select b57_f(a) from (values (0), (1)) v(a)", None),
+        ):
+            with pytest.raises(psycopg.errors.DivisionByZero) as err:
+                conn.execute(sql)
+            assert err.value.diag.context == context, sql
+        assert conn.execute("select a, b57_f(a) from (values (1)) v(a)").fetchall() == [(1, 1)]
+
+
 def test_batch56_a_streamed_portal_with_order_by(home: Path) -> None:
     """An extended-protocol SELECT with ORDER BY outside a block is now
     streamed, sorted by the reader in bounded memory (it was read whole).

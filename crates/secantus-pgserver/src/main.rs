@@ -126,6 +126,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is the first thing to drive this binary the way a new user would.
     std::fs::create_dir_all(&home)
         .map_err(|e| format!("could not create storage path {home}: {e}"))?;
+
+    // Install the stop handler BEFORE opening storage or announcing
+    // readiness. It used to be installed after the "listening on" line, so a
+    // SIGTERM sent the moment a harness saw that line hit the default
+    // disposition `reset_stop_signals` had just restored and killed the
+    // process outright -- no `stop`, no close-checkpoint (caught by CI's
+    // `stops_on_sigterm_when_the_parent_left_it_ignored`, exit status 15).
+    // A stop requested during startup is honoured once the server is up.
+    let (tx, rx) = mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })?;
+
     let storage = secantus_pgserver::open_storage(&home)?;
     let mut server = bind(&addr, storage, databases)?;
 
@@ -146,11 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CREATE TABLE + INSERT left the catalog document and the rows both gone,
     // while the client had been told the writes succeeded. `stop` drains the
     // connections and drops the last `Arc<Storage>`, which is where the
-    // close-checkpoint runs.
-    let (tx, rx) = mpsc::channel::<()>();
-    ctrlc::set_handler(move || {
-        let _ = tx.send(());
-    })?;
+    // close-checkpoint runs. The handler was installed above, before startup.
     let _ = rx.recv();
 
     server.stop();
