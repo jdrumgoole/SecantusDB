@@ -4624,7 +4624,10 @@ fn civil_millis(y: i64, m: i64, d: i64, hh: i64, mi: i64, se: i64, ms: i64) -> O
     if d > dim[(m - 1) as usize] {
         return None;
     }
-    if !(0..24).contains(&hh) || !(0..60).contains(&mi) || !(0..=60).contains(&se) {
+    // Second 60 is refused in every form -- mongod has no leap seconds (`23:59:60`
+    // is "The parsed time was invalid", measured 8.2.11, 2026-10-06). It used
+    // to be accepted and roll over into the next day.
+    if !(0..24).contains(&hh) || !(0..60).contains(&mi) || !(0..60).contains(&se) {
         return None;
     }
     let days = days_from_civil(y, m, d);
@@ -4784,10 +4787,311 @@ fn parse_iso_week(text: &str) -> Option<i128> {
     Some((days as i128) * 86_400_000)
 }
 
+/// timelib's zone abbreviations as mongod 8.2.11 reads them, in seconds east
+/// of UTC -- MEASURED, not looked up (2026-10-06): several are timelib's
+/// historical values rather than today's (`IST` is +2, `KST` +8:30, `NDT`
+/// -2:30:52, `GST` +10). Abbreviations mongod refuses (`SGT`, `BRT`, `ICT`,
+/// `UT`, ...) are absent, so they are refused here too.
+fn zone_abbreviation(word: &str) -> Option<i64> {
+    const TABLE: &[(&str, i64)] = &[
+        ("UTC", 0),
+        ("GMT", 0),
+        ("EST", -18000),
+        ("EDT", -14400),
+        ("CST", -21600),
+        ("CDT", -18000),
+        ("MST", -25200),
+        ("MDT", -21600),
+        ("PST", -28800),
+        ("PDT", -25200),
+        ("AKST", -32400),
+        ("AKDT", -28800),
+        ("HST", -36000),
+        ("HDT", -34200),
+        ("AST", -14400),
+        ("ADT", -10800),
+        ("NST", -12600),
+        ("NDT", -9052),
+        ("WET", 0),
+        ("WEST", 3600),
+        ("CET", 3600),
+        ("CEST", 7200),
+        ("MET", 3600),
+        ("MEST", 7200),
+        ("EET", 7200),
+        ("EEST", 10800),
+        ("MSK", 10800),
+        ("MSD", 14400),
+        ("IST", 7200),
+        ("BST", 3600),
+        ("IDT", 10800),
+        ("JST", 32400),
+        ("KST", 30600),
+        ("HKT", 28800),
+        ("WIB", 25200),
+        ("WITA", 28800),
+        ("WIT", 32400),
+        ("AEST", 36000),
+        ("AEDT", 39600),
+        ("ACST", 34200),
+        ("ACDT", 37800),
+        ("AWST", 28800),
+        ("NZST", 43200),
+        ("NZDT", 46800),
+        ("SAST", 7200),
+        ("WAT", 3600),
+        ("CAT", 7200),
+        ("EAT", 10800),
+        ("GST", 36000),
+        ("PKT", 18000),
+        ("NPT", -9000),
+    ];
+    let upper = word.to_ascii_uppercase();
+    TABLE.iter().find(|(n, _)| *n == upper).map(|(_, s)| *s)
+}
+
+/// `<datetime>[ ]±HH[[:]MM]` where the datetime part carries a time (a `:`).
+fn parse_trailing_offset(text: &str) -> Option<i128> {
+    let pos = text.rfind(['+', '-'])?;
+    let (head, tz) = (text[..pos].trim_end(), &text[pos..]);
+    let digits: String = tz[1..].chars().filter(|c| *c != ':').collect();
+    // The offset must follow a TIME: the token before it ends `HH:MM[:SS]`.
+    // Without this the `-01` of `22:00 2024-01-01` was read as -1 hour.
+    let last_token = head.rsplit(char::is_whitespace).next().unwrap_or("");
+    let time_part = last_token.rsplit(['T', 't']).next().unwrap_or("");
+    let is_time = time_part.contains(':')
+        && time_part
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ':' || c == '.');
+    if !is_time || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (hh, mm) = match digits.len() {
+        2 => (digits.parse::<i64>().ok()?, 0),
+        4 => (
+            digits[..2].parse::<i64>().ok()?,
+            digits[2..].parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    if tz[1..].contains(':') && digits.len() != 4 {
+        return None;
+    }
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    let sign = if tz.starts_with('-') { -1 } else { 1 };
+    let base = parse_date_text(head)?;
+    Some(base - sign as i128 * (hh * 3600 + mm * 60) as i128 * 1000)
+}
+
+/// A 24-hour `HH:MM[:SS]` given apart from a date with no time of its own --
+/// before it (`22:00 2024-01-01`) or after it (`Jan 1 2024 22:00`).
+fn parse_separate_time(text: &str) -> Option<i128> {
+    fn time_of_day(t: &str) -> Option<i64> {
+        let parts: Vec<&str> = t.split(':').collect();
+        if !(2..=3).contains(&parts.len()) || parts.iter().any(|p| p.len() != 2 && p.len() != 1) {
+            return None;
+        }
+        if parts[1..].iter().any(|p| p.len() != 2) {
+            return None;
+        }
+        let nums: Option<Vec<i64>> = parts.iter().map(|p| p.parse::<i64>().ok()).collect();
+        let nums = nums?;
+        let (h, m, s) = (nums[0], nums[1], *nums.get(2).unwrap_or(&0));
+        if h > 23 || m > 59 || s > 59 {
+            return None;
+        }
+        Some((h * 3600 + m * 60 + s) * 1000)
+    }
+    let (first, rest) = text.split_once(char::is_whitespace)?;
+    if let Some(tod) = time_of_day(first) {
+        let date = rest.trim_start();
+        if !date.contains(':') {
+            return parse_date_text(date).map(|ms| ms + tod as i128);
+        }
+    }
+    let (date, last) = text.rsplit_once(char::is_whitespace)?;
+    let date = date.trim_end();
+    if let Some(tod) = time_of_day(last) {
+        if !date.contains(':') && !date.contains(['T', 't']) {
+            return parse_date_text(date).map(|ms| ms + tod as i128);
+        }
+    }
+    None
+}
+
+/// timelib forms built from words, measured on mongod 8.2.11 (2026-10-06):
+///
+/// - a leading WEEKDAY (`Mon`, `Monday`, optional comma) is RELATIVE: the date
+///   moves forward to the next such weekday on or after it, so
+///   `Tue, 01 Jan 2024` (a Monday) is 2 January and `Sun, 01 Jan 2024` the 7th;
+/// - month and year alone (`Jan 2024`, `2024 Jan`, `Sept 2024`) is the 1st;
+/// - ctime order, `Jan 1 10:00:00 2024`, puts the time before the year.
+fn parse_word_forms(text: &str) -> Option<i128> {
+    const WEEKDAYS: [&str; 7] = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    let month = |w: &str| -> Option<i64> {
+        if w.eq_ignore_ascii_case("sept") {
+            Some(9)
+        } else {
+            month_from_name(w)
+        }
+    };
+    let year = |w: &str| -> Option<i64> {
+        (w.len() == 4 && w.chars().all(|c| c.is_ascii_digit())).then(|| w.parse().ok())?
+    };
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    // A leading weekday.
+    if let Some(first) = tokens.first() {
+        let word = first.trim_end_matches(',').to_ascii_lowercase();
+        let target = WEEKDAYS
+            .iter()
+            .position(|d| *d == word || (word.len() == 3 && d.starts_with(&word)));
+        if let Some(target) = target {
+            if tokens.len() > 1 {
+                let rest = text.trim_start()[first.len()..].trim_start();
+                let ms = parse_date_text(rest)?;
+                let days = ms.div_euclid(86_400_000);
+                let current = (days + 3).rem_euclid(7); // Monday = 0
+                let ahead = (target as i128 - current).rem_euclid(7);
+                return Some(ms + ahead * 86_400_000);
+            }
+        }
+    }
+    match tokens.as_slice() {
+        [a, b] => {
+            let (m, y) = match (month(a), year(b), year(a), month(b)) {
+                (Some(m), Some(y), _, _) => (m, y),
+                (_, _, Some(y), Some(m)) => (m, y),
+                _ => return None,
+            };
+            civil_millis(y, m, 1, 0, 0, 0, 0)
+        }
+        [mon, day, time, yr]
+            if month(mon).is_some() && year(yr).is_some() && time.contains(':') =>
+        {
+            parse_date_text(&format!("{mon} {day} {yr} {time}"))
+        }
+        _ => None,
+    }
+}
+
+enum Meridian {
+    /// No `am` / `pm` in the string.
+    Absent,
+    /// An `am` / `pm` mongod refuses: hour 0 or over 12, a fractional second,
+    /// or a time joined to the date by `T`.
+    Invalid,
+    /// The string with the 12-hour time rewritten as `HH:MM:SS`.
+    Rewritten(String),
+}
+
+/// timelib's 12-hour time, measured on mongod 8.2.11 (2026-10-06): an hour of
+/// 1-12 (one or two digits), optional `:MM` and `:SS`, optional whitespace,
+/// then `am` / `pm` / `a.m.` / `p.m.` in any case, ending the word. 12 AM is
+/// 0:00 and 12 PM is noon. The time may stand before or after the date, and a
+/// zone may follow it. A lone `A` / `P` with no `M` is a military zone, not a
+/// meridian, and is left alone.
+fn rewrite_meridian(text: &str) -> Meridian {
+    let b = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // A meridian: [ap] .? m .? then end-of-string or whitespace.
+        if (lb[i] == b'a' || lb[i] == b'p') && i > 0 {
+            let mut j = i + 1;
+            if j < lb.len() && lb[j] == b'.' {
+                j += 1;
+            }
+            if j < lb.len() && lb[j] == b'm' {
+                j += 1;
+                if j < lb.len() && lb[j] == b'.' {
+                    j += 1;
+                }
+                if j == lb.len() || lb[j].is_ascii_whitespace() {
+                    // Walk back over optional whitespace to the time.
+                    let mut k = i;
+                    while k > 0 && b[k - 1].is_ascii_whitespace() {
+                        k -= 1;
+                    }
+                    let end = k;
+                    while k > 0
+                        && (b[k - 1].is_ascii_digit() || b[k - 1] == b':' || b[k - 1] == b'.')
+                    {
+                        k -= 1;
+                    }
+                    let time = &text[k..end];
+                    if time.is_empty() || !time.as_bytes()[0].is_ascii_digit() {
+                        i += 1;
+                        continue; // not a time: e.g. a month name ending in "am"
+                    }
+                    // The time must start a word: a `T`-joined time is ISO,
+                    // which mongod refuses to read as 12-hour.
+                    if k > 0 && !b[k - 1].is_ascii_whitespace() {
+                        return Meridian::Invalid;
+                    }
+                    if time.contains('.') {
+                        return Meridian::Invalid; // a fractional second
+                    }
+                    let parts: Vec<&str> = time.split(':').collect();
+                    if parts.len() > 3 || parts.iter().any(|p| p.is_empty()) {
+                        return Meridian::Invalid;
+                    }
+                    if parts[0].len() > 2 || parts[1..].iter().any(|p| p.len() != 2) {
+                        return Meridian::Invalid;
+                    }
+                    let Ok(hour) = parts[0].parse::<u32>() else {
+                        return Meridian::Invalid;
+                    };
+                    if !(1..=12).contains(&hour) {
+                        return Meridian::Invalid;
+                    }
+                    let pm = lb[i] == b'p';
+                    let h24 = match (hour, pm) {
+                        (12, false) => 0,
+                        (12, true) => 12,
+                        (h, false) => h,
+                        (h, true) => h + 12,
+                    };
+                    let mm = parts.get(1).copied().unwrap_or("00");
+                    let ss = parts.get(2).copied().unwrap_or("00");
+                    let rewritten = format!("{}{h24:02}:{mm}:{ss}{}", &text[..k], &text[j..]);
+                    return Meridian::Rewritten(rewritten);
+                }
+            }
+        }
+        i += 1;
+    }
+    Meridian::Absent
+}
+
 /// Every string shape `$toDate` accepts: ISO-8601, a trailing MILITARY zone
 /// letter, then timelib's other forms. Mirrors
 /// `secantus.expressions._parse_date_string`'s order.
 fn parse_date_text(text: &str) -> Option<i128> {
+    // A 12-hour time (`10:00 PM`) is rewritten to 24-hour form first. Without
+    // this the trailing-military-zone rule below read `PM` as two zone
+    // letters, so every AM/PM time came back shifted by hours -- often onto
+    // another day (`12:00 AM` was 23:00 the day before) -- with no error.
+    match rewrite_meridian(text) {
+        Meridian::Absent => {}
+        Meridian::Invalid => return None,
+        Meridian::Rewritten(t) => return parse_date_text(&t),
+    }
+    // timelib's word forms, ahead of the zone-abbreviation rule below (which
+    // would read the month in `2024 Jan` as an unknown zone and refuse it).
+    if let Some(ms) = parse_word_forms(text) {
+        return Some(ms);
+    }
     if let Some(ms) = parse_iso(text) {
         return Some(ms);
     }
@@ -4845,8 +5149,41 @@ fn parse_date_text(text: &str) -> Option<i128> {
     if let Some(ms) = parse_iso_week(text) {
         return Some(ms);
     }
-    // A trailing military zone letter -- see `military_zone_hours`.
-    if text.chars().count() > 1 {
+    // A trailing zone ABBREVIATION (`UTC`, `EST`, `CEST`, ...), case-blind,
+    // with the offset mongod's timelib gives it -- see `zone_abbreviation`.
+    // An alphabetic word timelib does not know is refused, as mongod refuses
+    // `SGT` or `BRT`.
+    if let Some((head, word)) = text.rsplit_once(char::is_whitespace) {
+        if word.len() >= 2 && word.chars().all(|c| c.is_ascii_alphabetic()) {
+            let head = head.trim_end();
+            return match zone_abbreviation(word) {
+                Some(secs) if !head.is_empty() => {
+                    parse_date_text(head).map(|ms| ms - secs as i128 * 1000)
+                }
+                _ => None,
+            };
+        }
+    }
+    // A trailing numeric offset after a time: `+02:00`, `+0200`, `-05`, with
+    // or without a space.
+    if let Some(ms) = parse_trailing_offset(text) {
+        return Some(ms);
+    }
+    // A time and a date given apart: `22:00 2024-01-01` (time first) or
+    // `Jan 1 2024 22:00` (a month-name date, then the time).
+    if let Some(ms) = parse_separate_time(text) {
+        return Some(ms);
+    }
+    // A trailing military zone letter -- see `military_zone_hours`. Only a
+    // letter that stands alone or follows a digit: the LAST letter of a word
+    // is not one. Reading `UTC` as `C` (UTC+3) put `22:30 UTC` twelve hours
+    // out, and `GMT` / `EST` / `PST` were all wrong the same way.
+    let alpha_before_last = text
+        .chars()
+        .rev()
+        .nth(1)
+        .is_some_and(|c| c.is_ascii_alphabetic());
+    if text.chars().count() > 1 && !alpha_before_last {
         if let Some(last) = text.chars().last() {
             if let Some(hours) = military_zone_hours(last) {
                 let head = text[..text.len() - last.len_utf8()].trim_end();
@@ -9843,5 +10180,170 @@ mod int32_argument_tests {
         );
         // Opposite directions build nothing, so estimate nothing.
         assert_eq!(run(bson!({"$range": [0, -7000000, 1]})), Ok(bson!([])));
+    }
+}
+
+/// Date strings, each answer measured on mongod 8.2.11 (2026-10-06) by
+/// `tools/probes/date_string_parsing.py`. Every AM/PM time and every zone
+/// abbreviation used to come back hours out -- a silent wrong value.
+#[cfg(test)]
+mod date_string_tests {
+    use super::parse_date_text;
+
+    /// Milliseconds since the epoch for a UTC wall-clock time.
+    fn at(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<i128> {
+        super::civil_millis(y, mo, d, h, mi, s, 0)
+    }
+
+    #[test]
+    fn twelve_hour_times() {
+        assert_eq!(
+            parse_date_text("2024-01-01 10:00 PM"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+        assert_eq!(parse_date_text("2024-01-01 10pm"), at(2024, 1, 1, 22, 0, 0));
+        assert_eq!(
+            parse_date_text("2024-01-01 10 pm"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 10:00:00 am"),
+            at(2024, 1, 1, 10, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 12:00 AM"),
+            at(2024, 1, 1, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 12:00 PM"),
+            at(2024, 1, 1, 12, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 10:30 p.m."),
+            at(2024, 1, 1, 22, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("Jan 1 2024 10:00 PM"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("10:00 PM 2024-01-01"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 10:00 PM +02:00"),
+            at(2024, 1, 1, 20, 0, 0)
+        );
+        // Refused by mongod.
+        for s in [
+            "2024-01-01 13:00 PM",
+            "2024-01-01 0:30 am",
+            "2024-01-01 10:00:30.5 pm",
+            "2024-01-01T10:00 PM",
+            "10:00 PM",
+        ] {
+            assert_eq!(parse_date_text(s), None, "{s}");
+        }
+        // A lone letter is still a military zone, not a meridian.
+        assert_eq!(
+            parse_date_text("2024-01-01 10:00 P"),
+            at(2024, 1, 1, 13, 0, 0)
+        );
+    }
+
+    #[test]
+    fn zone_abbreviations_use_mongods_offsets() {
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 UTC"),
+            at(2024, 1, 1, 22, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 utc"),
+            at(2024, 1, 1, 22, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 GMT"),
+            at(2024, 1, 1, 22, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 EST"),
+            at(2024, 1, 2, 3, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 PST"),
+            at(2024, 1, 2, 6, 30, 0)
+        );
+        // timelib's historical values, not today's.
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 IST"),
+            at(2024, 1, 1, 20, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 NDT"),
+            at(2024, 1, 2, 1, 0, 52)
+        );
+        // Abbreviations mongod does not know are refused.
+        assert_eq!(parse_date_text("2024-01-01 22:30:00 SGT"), None);
+    }
+
+    #[test]
+    fn offsets_and_separate_times() {
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 +02:00"),
+            at(2024, 1, 1, 20, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00+0200"),
+            at(2024, 1, 1, 20, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("2024-01-01 22:30:00 -05"),
+            at(2024, 1, 2, 3, 30, 0)
+        );
+        assert_eq!(
+            parse_date_text("22:00 2024-01-01"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("Jan 1 2024 22:00:00"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+        // The date's own `-01` is not an offset.
+        assert_eq!(
+            parse_date_text("22:00:00 2024-01-01"),
+            at(2024, 1, 1, 22, 0, 0)
+        );
+    }
+
+    #[test]
+    fn word_forms() {
+        // A leading weekday moves the date FORWARD to that weekday.
+        assert_eq!(
+            parse_date_text("Mon, 01 Jan 2024 10:00:00 GMT"),
+            at(2024, 1, 1, 10, 0, 0)
+        );
+        assert_eq!(
+            parse_date_text("Tue, 01 Jan 2024 10:00:00 GMT"),
+            at(2024, 1, 2, 10, 0, 0)
+        );
+        assert_eq!(parse_date_text("Sun, 01 Jan 2024"), at(2024, 1, 7, 0, 0, 0));
+        assert_eq!(
+            parse_date_text("Tue Jan 1 10:00:00 2024"),
+            at(2024, 1, 2, 10, 0, 0)
+        );
+        assert_eq!(parse_date_text("Jan 2024"), at(2024, 1, 1, 0, 0, 0));
+        assert_eq!(parse_date_text("2024 Jan"), at(2024, 1, 1, 0, 0, 0));
+        assert_eq!(parse_date_text("Sept 2024"), at(2024, 9, 1, 0, 0, 0));
+        assert_eq!(
+            parse_date_text("Jan 1 10:00:00 2024"),
+            at(2024, 1, 1, 10, 0, 0)
+        );
+        assert_eq!(parse_date_text("Jan, 2024"), None);
+    }
+
+    #[test]
+    fn second_sixty_is_refused() {
+        assert_eq!(parse_date_text("2024-01-01 23:59:60"), None);
+        assert_eq!(parse_date_text("2024-01-01T23:59:60"), None);
     }
 }

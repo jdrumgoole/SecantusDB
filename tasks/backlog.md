@@ -7677,6 +7677,36 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.04 Rust MongoDB server: `$toDate` / `$dateFromString` strings -- 2026-10-06
+
+`tools/probes/date_string_parsing.py` (123 strings, mongod 8.2.11): **61
+divergent on `main` before this batch, 0 after.**
+
+- [x] **Every 12-hour time came back wrong, silently.** `10:00 PM` was 01:00,
+  `12:00 AM` 23:00 the day before: the trailing-military-zone rule read `P`,
+  `M` and `A` as zone letters. A 12-hour time (`10pm`, `10:00 p.m.`, 1-12
+  only, no fraction, not `T`-joined) is now rewritten to 24-hour first.
+- [x] **Every zone abbreviation came back wrong, silently.** `UTC` was read as
+  military `C` (twelve hours out), and `GMT` / `EST` / `PST` the same way. A
+  military letter now counts only when not glued to other letters, and 51
+  abbreviations carry the offsets mongod MEASURED -- timelib's historical
+  values (`IST` +2, `KST` +8:30, `NDT` -2:30:52, `GST` +10); unknown ones
+  (`SGT`, `BRT`, `UT`) are refused, as mongod refuses them.
+- [x] A numeric offset after a space (`22:30 +02:00`, `+0200`, `-05`), a time
+  before the date, a month-name date then a time, ctime order, month-and-year
+  (`Jan 2024`, `2024 Jan`, `Sept 2024`), and a leading weekday -- which is
+  RELATIVE (`Tue, 01 Jan 2024` is 2 January) -- all parse as mongod does.
+- [x] Second 60 (`23:59:60`) is refused in every form; it used to roll over
+  into the next day.
+- [ ] **Error TEXT: 26 of 123 strings.** The code (241) is right everywhere;
+  the message is not. mongod's is timelib's scanner diagnostic --
+  `Error parsing date string '<s>'; <pos>: <reason> '<char>'`, several joined
+  by `; `, positions not always ascending (`abc def ghi` reports 0, 8, 4) --
+  where ours is the generic "incomplete date/time". Matching it means porting
+  timelib's `parse_date.re` scanner, not adding rules: the reasons depend on
+  which scanner state rejected which byte. Joe asked for these to be matched
+  (2026-10-06); scoped here before starting.
+
 ### 7.03 Rust packages (crates.io) -- open items, 2026-10-01
 
 Phases A and B are merged for the MongoDB side and Phase C's MongoDB half is
@@ -8521,6 +8551,11 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   wrong — keeping it bought that one case at the price of every no-op update on
   a NaN document.
 
+- [x] **RE-MEASURED 2026-10-06 against the RUST server: 9 of 6,628 differ** --
+  0 wrong codes, 2 messages (`$toDate` of an unparseable string; timelib's
+  scanner text, section 7.04) and 7 last-digit decimal transcendentals (the
+  authorised divergence above). The entry below, and the 925-of-3,968 one
+  after it, are history.
 - [ ] **Aggregation expression error surface: 50 codes + 212 messages left
   (2026-09-02).** `tools/probes/agg_expressions.py` had never been reported on;
   running it found **551 wrong codes** across 58 operators on 3,968 cases, now
@@ -8942,7 +8977,14 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   34 strings: 18 exact, 16 message-only, 0 with a wrong value or code (from 0
   exact, all 25 failures carrying the wrong code). Rust and Python agree 23 of
   23. Pinned by `tests/test_rust_todate_parse_failure.py`.
-- [ ] **DECISION NEEDED (not a coding task): `Decimal128` FINITE operands in the
+- [x] **DECIDED by Joe, 2026-10-06: keep CORRECT ROUNDING.** The last digit of a
+  Decimal128 transcendental (`$ln`, `$log10`, `$sin`, `$tan`, `$sinh`, `$cosh`,
+  `$acosh`, ...) is the correctly rounded value, and where mongod's own last
+  digit differs (7 of 6,628 cases in `agg_expressions.py`, 1-2 units in the
+  34th digit) that is an AUTHORISED divergence -- this narrow one only: the
+  last digit of a finite decimal transcendental. Do not "fix" it toward
+  mongod. The history below is kept for the reasoning.
+- [x] ~~DECISION NEEDED (not a coding task): `Decimal128` FINITE operands in the
   transcendentals — 15 shapes, re-measured 2026-09-08.**
 
   **`$sqrt`, `$degreesToRadians`, `$radiansToDegrees` and `$exp` are DONE
@@ -9545,7 +9587,10 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   field/value pairs. Reproducing it would mean reimplementing mongod's string
   hash and table growth.
 
-- [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
+- [x] **STALE (re-measured 2026-10-06): the trig and hyperbolic operators now
+  answer a finite decimal** (`agg_expressions.py`); only the last-digit
+  divergence above remains.
+- [x] ~~The other decimal transcendentals still refuse (2026-09-08).~~ The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,
   `$atan`, `$sinh`, `$cosh`, `$tanh`, `$acosh`, `$atanh`) still decline a finite
   non-zero decimal on the Rust server. The machinery above would serve them —
