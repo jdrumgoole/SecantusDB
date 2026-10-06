@@ -14206,10 +14206,6 @@ fn check_distinct_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
             Some(N::ColumnRef(c)) => {
                 star || column_ref_name(c).is_none_or(|name| names.contains(&name))
             }
-            // A COLLATE PostgreSQL checks on its own terms first (`collations
-            // are not supported by type integer`), which is decided here only
-            // when a row is sorted: let through, as before (backlog).
-            Some(N::CollateClause(_)) => true,
             Some(_) => {
                 let e = normalised(expr);
                 // Column references inside are compared as written, so a
@@ -14227,6 +14223,120 @@ fn check_distinct_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
             }
             return Err(Error::InvalidColumnReference(
                 "for SELECT DISTINCT, ORDER BY expressions must appear in select list".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `transformDistinctOnClause`: the leading ORDER BY items
+/// must be DISTINCT ON expressions until every one of those is matched, else
+/// 42P10 at the first DISTINCT ON expression. A position or an output name
+/// on either side stands for its select-list expression; a column reference
+/// is compared by its column name. Anything this cannot compare with
+/// confidence (a qualified reference inside a larger expression) is let
+/// through, as before.
+fn check_distinct_on_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    if s.distinct_clause.is_empty()
+        || s.distinct_clause.iter().any(|n| n.node.is_none())
+        || s.sort_clause.is_empty()
+    {
+        return Ok(());
+    }
+    let mut targets: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(val) = rt.val.as_deref() else {
+            return Ok(());
+        };
+        if let Some(N::ColumnRef(c)) = val.node.as_ref() {
+            if c.fields
+                .last()
+                .is_some_and(|f| matches!(f.node, Some(N::AStar(_))))
+            {
+                return Ok(());
+            }
+        }
+        targets.push((rt.name.clone(), val.clone()));
+    }
+    // The comparable form of an item, or None when it cannot be compared.
+    let key = |n: &pg_query::protobuf::Node| -> Option<String> {
+        let n = match n.node.as_ref() {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(a_const::Val::Ival(i)) => {
+                    let i = usize::try_from(i.ival).ok()?.checked_sub(1)?;
+                    targets.get(i).map(|(_, v)| v.clone())?
+                }
+                _ => return None,
+            },
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+                let name = column_ref_name(c)?;
+                // A rewrite's own hidden column (`__dk0`): already checked
+                // on the statement as written.
+                if name.starts_with("__") {
+                    return None;
+                }
+                targets
+                    .iter()
+                    .find(|(alias, _)| !alias.is_empty() && *alias == name)
+                    .map_or_else(|| n.clone(), |(_, v)| v.clone())
+            }
+            _ => n.clone(),
+        };
+        let n = match n.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let mut c = c.clone();
+                if c.fields.len() > 1 {
+                    c.fields = c.fields.last().cloned().into_iter().collect();
+                }
+                pg_query::protobuf::Node {
+                    node: Some(N::ColumnRef(c)),
+                }
+            }
+            _ if mentions_qualified(&n) => return None,
+            _ => n,
+        };
+        static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = LOCATION
+            .get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"));
+        Some(re.replace_all(&format!("{n:?}"), "").into_owned())
+    };
+    let mut on: Vec<String> = Vec::new();
+    for n in &s.distinct_clause {
+        match key(n) {
+            Some(k) => on.push(k),
+            None => return Ok(()),
+        }
+    }
+    let mut matched: Vec<bool> = vec![false; on.len()];
+    for item in &s.sort_clause {
+        if matched.iter().all(|m| *m) {
+            break;
+        }
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(expr) = sb.node.as_deref() else {
+            return Ok(());
+        };
+        let Some(k) = key(expr) else {
+            return Ok(());
+        };
+        let mut hit = false;
+        for (i, o) in on.iter().enumerate() {
+            if *o == k {
+                matched[i] = true;
+                hit = true;
+            }
+        }
+        if !hit {
+            if let Some(loc) = s.distinct_clause.first().and_then(expr_location) {
+                set_error_location(loc);
+            }
+            return Err(Error::InvalidColumnReference(
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions".into(),
             ));
         }
     }
@@ -17690,7 +17800,9 @@ fn plan_select(
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
+    enum_order::check_collate_operands(s, lookup)?;
     check_distinct_order(s)?;
+    check_distinct_on_order(s)?;
     // A set-returning function over a column in the select list is a
     // LATERAL join (see `joins::select_list_srf`).
     if let Some(rewritten) = joins::select_list_srf(s)? {
