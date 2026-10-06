@@ -57,16 +57,21 @@ extra write-path and `w` shapes was widened in the same slice; see backlog
 missing tree builder this plan assumed. The regex, `$project` and positional
 items were Python-server entries.
 
-## Phase 3 -- gauge residue
+## Phase 3 -- gauge residue: DONE where it is ours (2026-10-06)
 
-- The "three server-side defects" from the 2026-09-28 Rust gauge sweep: re-run
-  the Java and Node gauges with `--server rust` and re-triage. One of the three
-  was already re-diagnosed as not a `$geoIntersects` bug.
-- The Go gauge's 7 remaining failures (backlog triage, 2026-09-30).
-- `failCommand` labels and code names: measure against mongod with the
-  failpoint enabled (`--setParameter enableTestCommands=1`).
-
-Gauges run in a sub-agent and report counts only (CLAUDE.md, "Tooling").
+Re-reading the gauge entries before running anything:
+- **Go:** the one undiagnosed failure, `heartbeats_processed_more_frequently`,
+  was fixed on the Rust server on 2026-09-30. The other six need `$where`, a
+  `mongocryptd` binary, or a second replica-set member, all out of scope here.
+- **C:** the two `ipv6` failures hard-code `[::1]:27017` (inherent).
+- **The "sort by the 2dsphere-indexed field" divergence** from the Java
+  gauge's investigation was real and is FIXED. It was a document comparator
+  that compared field names before value types, not anything geo. 14 of 28 on
+  the Java fixture before, and only the unordered `$geoIntersects` result (no
+  order guaranteed) after. `nested_value_sort.py` 4 of 24 -> 0.
+- **Still open:** the Java gauge's three stable failures, which reproduce only
+  inside a full gauge run (the real test class passes 4 of 4 alone). They need
+  a full `validate-java --server rust`, run in a sub-agent.
 
 ## Phase 4 -- the embedded server (`secantus_mdb::Server`)
 

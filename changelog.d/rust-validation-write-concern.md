@@ -24,3 +24,6 @@ parsing. Decimal `$log` is answered rather than refused.
   (the empty tag) and a tag set, and refuses bool / array / an empty tag set
   with mongod's 9.
 - Rust server: `$log` with a decimal operand returns a decimal result.
+- Rust server: documents sort as mongod sorts them, comparing each element's
+  value type before its field name. GeoJSON with a `crs` member used to sort
+  after a point without one.

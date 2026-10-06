@@ -8373,7 +8373,19 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   - **Decimal `$log`** is answered as `ln(n) / ln(base)` in decimal. A NaN
     gives a double NaN.
 
-- [ ] **Known, not fixed:** a `w` tag set with more than one key. mongod
+- [x] **Documents sorted by field NAME before value TYPE (fixed 2026-10-06,
+  Rust server).** mongod's `woCompare` compares each element's type rank, then
+  its name, then its value. The Rust comparators (`order::cmp` and
+  `bson_lt`) compared the name first, so GeoJSON with a `crs` member sorted
+  after a point without one. That was the "sort by the 2dsphere field" divergence
+  in the 2026-09-28 gauge entry, and it has nothing to do with the index.
+  `nested_value_sort.py` gained the shape: 4 of 24 divergent before, 0 after.
+  The on-disk index encoding was already type-first (entry format 4).
+- [ ] **OPEN — the PYTHON engine sorts documents by field name before value type**
+  (`ordering._bson_lt`), the bug fixed on the Rust server above.
+  `nested_value_sort.py` with `PROBE_SERVER` at a Python server sizes it.
+  Parity did not catch it: the curated corpus has no such pair.
+- [ ] **OPEN — a `w` tag set with more than one key (known divergence).** mongod
   echoes it, and names the key in its `NoSuchKey` message, in hash-map order
   (`{a, b, c, d}` comes back `{d, b, a, c}` and names `c`), which is not
   reproducible without its hash function. One key matches exactly.
