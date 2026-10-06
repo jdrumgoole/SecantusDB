@@ -45,6 +45,12 @@ SHAPES = [
         {"a": 9, "z": {"q": [1, 2, 3, 4, 5, 6]}},
     ],
     [{"a": {"b": 1}}, {"a": {"b": 1, "c": 2}}, {"a": {"a": 9}}, {"a": 1}],
+    # TYPE rank before field NAME, element by element (mongod's woCompare):
+    # an object under `crs` sorts before an array under `coordinates`, although
+    # `coordinates` is the smaller name. Found through GeoJSON with and without
+    # a `crs` member (2026-10-06).
+    [{"t": "P", "coordinates": [3]}, {"t": "P", "crs": {"n": "b"}}, {"t": "P", "crs": {"n": "a"}}],
+    [{"z": 1}, {"a": "s"}, {"m": None}, {"b": [1]}],
 ]
 
 

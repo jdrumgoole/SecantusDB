@@ -84,6 +84,12 @@ pub enum StorageError {
         /// handlers apply the wrapper because only they know the command name.
         exec: bool,
     },
+    /// A write left a document failing the collection validator: mongod's
+    /// `DocumentValidationFailure` (121). It is raised by the update executor,
+    /// so an update or findAndModify reports it under `Plan executor error
+    /// during <command> :: caused by ::` (measured 8.2.11, 2026-10-06), with an
+    /// `errInfo` the handler builds from this document and the validator.
+    ValidationFailure(Box<Document>),
     /// An unexpected internal failure — surfaces as a command-level
     /// `InternalError` (`code: 1`), not a per-op write error.
     Internal(String),

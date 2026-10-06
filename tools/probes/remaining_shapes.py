@@ -16,13 +16,14 @@ wrong rather than informative.
         "mongodb://127.0.0.1:27045/?directConnection=true" \\
         "mongodb://127.0.0.1:27055/?directConnection=true"
 
-Measured on 8.2.11, 2026-10-06: 6 of 38 divergent -- `$jsonSchema`
-`type: "integer"` accepted (x2), an update's schema failure without `errInfo`,
-an array `w`, decimal `$log` refused, and the authorised last digit of decimal
-`$sin`.
+Measured on 8.2.11, 2026-10-06, after phase 1: 3 of 72 divergent, all
+known -- the authorised last digit of decimal `$sin` and of a decimal `$log`
+over a double base, and a multi-key `w` tag set, which mongod echoes (and names
+in its error) in hash-map order. Before phase 1 it was 25 of 58.
 """
 
 import json
+import re
 import sys
 
 import pymongo
@@ -177,6 +178,179 @@ def cases():
             )
         ],
     )
+    # Validation failure on every write path that can hit it.
+    vs = {"$jsonSchema": S}
+    seed = ("insert", {"documents": [{"_id": 1, "a": 9}, {"_id": 2, "a": 8}]})
+
+    def wpath(c, *steps):
+        return [
+            ("create", {"create": c, "validator": vs}),
+            (seed[0], {"insert": c, **{k: v for k, v in seed[1].items() if k != "insert"}}),
+            *steps,
+        ]
+
+    yield (
+        "validation update replacement",
+        wpath("v1", ("update", {"update": "v1", "updates": [{"q": {"_id": 1}, "u": {"a": 1}}]})),
+    )
+    yield (
+        "validation update multi",
+        wpath(
+            "v2",
+            (
+                "update",
+                {"update": "v2", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "multi": True}]},
+            ),
+        ),
+    )
+    yield (
+        "validation update pipeline",
+        wpath(
+            "v3",
+            ("update", {"update": "v3", "updates": [{"q": {"_id": 1}, "u": [{"$set": {"a": 1}}]}]}),
+        ),
+    )
+    yield (
+        "validation upsert insert",
+        wpath(
+            "v4",
+            (
+                "update",
+                {
+                    "update": "v4",
+                    "updates": [{"q": {"_id": 5}, "u": {"$set": {"a": 1}}, "upsert": True}],
+                },
+            ),
+        ),
+    )
+    yield (
+        "validation update ordered:false",
+        wpath(
+            "v5",
+            (
+                "update",
+                {
+                    "update": "v5",
+                    "ordered": False,
+                    "updates": [
+                        {"q": {"_id": 1}, "u": {"$set": {"a": 1}}},
+                        {"q": {"_id": 2}, "u": {"$set": {"a": 10}}},
+                    ],
+                },
+            ),
+        ),
+    )
+    yield (
+        "validation findAndModify update",
+        wpath(
+            "v6",
+            (
+                "findAndModify",
+                {"findAndModify": "v6", "query": {"_id": 1}, "update": {"$set": {"a": 1}}},
+            ),
+        ),
+    )
+    yield (
+        "validation findAndModify replace",
+        wpath(
+            "v7",
+            ("findAndModify", {"findAndModify": "v7", "query": {"_id": 1}, "update": {"a": 1}}),
+        ),
+    )
+    yield (
+        "validation findAndModify pipeline",
+        wpath(
+            "v8",
+            (
+                "findAndModify",
+                {"findAndModify": "v8", "query": {"_id": 1}, "update": [{"$set": {"a": 1}}]},
+            ),
+        ),
+    )
+    yield (
+        "validation findAndModify upsert",
+        wpath(
+            "v9",
+            (
+                "findAndModify",
+                {
+                    "findAndModify": "v9",
+                    "query": {"_id": 7},
+                    "update": {"$set": {"a": 1}},
+                    "upsert": True,
+                },
+            ),
+        ),
+    )
+    yield (
+        "validation insert ordered:false",
+        wpath(
+            "v10",
+            (
+                "insert",
+                {
+                    "insert": "v10",
+                    "ordered": False,
+                    "documents": [{"_id": 3, "a": 1}, {"_id": 4, "a": 7}],
+                },
+            ),
+        ),
+    )
+    # Validator parse errors on create / collMod.
+    yield (
+        "create validator integer nested",
+        [
+            (
+                "create",
+                {"create": "cv1", "validator": {"$and": [{"$jsonSchema": {"type": "integer"}}]}},
+            )
+        ],
+    )
+    yield (
+        "create validator unknown keyword",
+        [("create", {"create": "cv2", "validator": {"$jsonSchema": {"nope": 1}}})],
+    )
+    yield (
+        "create validator bad operator",
+        [("create", {"create": "cv3", "validator": {"a": {"$nope": 1}}})],
+    )
+    yield (
+        "collMod validator integer",
+        [
+            ("create", {"create": "cv4"}),
+            ("collMod", {"collMod": "cv4", "validator": {"$jsonSchema": {"type": "integer"}}}),
+        ],
+    )
+    yield (
+        "create existing validator integer",
+        [
+            ("create", {"create": "cv5"}),
+            ("create", {"create": "cv5", "validator": {"$jsonSchema": {"type": "integer"}}}),
+        ],
+    )
+    # writeConcern.w of each wrong type.
+    for name, w in [
+        ("bool", True),
+        ("double", 1.5),
+        ("null", None),
+        ("object", {"dc1": 1}),
+        ("negative", -1),
+        ("double 2.5", 2.5),
+        ("double -1.5", -1.5),
+        ("decimal 3", D("3")),
+        ("51", 51),
+        ("empty object", {}),
+        ("two tags", {"dc1": 1, "rack": 2}),
+    ]:
+        yield (
+            f"write concern w {name}",
+            [
+                (
+                    "insert",
+                    {"insert": f"wc_{name}", "documents": [{"_id": 1}], "writeConcern": {"w": w}},
+                )
+            ],
+        )
     yield (
         "project _id only",
         [
@@ -228,6 +402,14 @@ def cases():
         "arrayElemAt decimal": {"$arrayElemAt": [[1, 2, 3], D("1")]},
         "substrCP decimal": {"$substrCP": ["hello", D("1"), D("2")]},
         "ln decimal neg": {"$ln": D("-1")},
+        "log decimal base int": {"$log": [D("8"), 2]},
+        "log int base decimal": {"$log": [8, D("2")]},
+        "log decimal double": {"$log": [D("10"), 2.5]},
+        "log decimal exact": {"$log": [D("1000"), D("10")]},
+        "log decimal nan": {"$log": [D("NaN"), D("10")]},
+        "log decimal inf": {"$log": [D("Infinity"), D("10")]},
+        "log decimal base 1": {"$log": [D("10"), D("1")]},
+        "log decimal zero": {"$log": [D("0"), D("10")]},
     }
     for k, e in exprs.items():
         yield (
@@ -291,7 +473,12 @@ STRIP = {
 }
 
 
+UUID_RE = re.compile(r'UUID\("[0-9a-f-]{36}"\)')
+
+
 def clean(r):
+    if isinstance(r, str):
+        return UUID_RE.sub('UUID("<uuid>")', r)
     if isinstance(r, dict):
         return {k: clean(v) for k, v in r.items() if k not in STRIP}
     if isinstance(r, list):

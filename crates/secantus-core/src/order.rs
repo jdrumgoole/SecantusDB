@@ -200,8 +200,17 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
 /// Field-by-field document comparison in insertion order (matches `_bson_lt`'s
 /// Mapping branch): first differing key compares as strings, else recurse into
 /// values; finally the shorter document sorts first.
+/// mongod's `BSONObj::woCompare`: element by element, the value's TYPE rank
+/// first, then the field name, then the value -- so `{t: 1, crs: {}}` sorts
+/// before `{t: 1, coordinates: []}` (object before array) although
+/// `coordinates` is the smaller name. Measured 8.2.11 (2026-10-06); comparing
+/// the name first put a GeoJSON point without a `crs` ahead of those with one.
 fn doc_cmp(a: &bson::Document, b: &bson::Document) -> Ordering {
     for ((ak, av), (bk, bv)) in a.iter().zip(b.iter()) {
+        let r = type_rank(av).cmp(&type_rank(bv));
+        if r != Ordering::Equal {
+            return r;
+        }
         if ak != bk {
             return ak.cmp(bk);
         }
@@ -308,7 +317,12 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
         }
         (Bson::MinKey, Bson::MinKey) | (Bson::MaxKey, Bson::MaxKey) => Some(false),
         (Bson::Document(x), Bson::Document(y)) => {
+            // Type rank, then name, then value -- see `doc_cmp`.
             for ((ak, av), (bk, bv)) in x.iter().zip(y.iter()) {
+                let (ra, rb) = (lt_rank(av), lt_rank(bv));
+                if ra != rb {
+                    return Some(ra < rb);
+                }
                 if ak != bk {
                     return Some(ak < bk);
                 }

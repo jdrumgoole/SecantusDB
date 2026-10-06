@@ -314,7 +314,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                     )
                 } {
                     Ok(o) => o,
-                    Err(e) => return Ok(storage_err_reply(e)),
+                    Err(e) => return Ok(storage_err_reply(e, validator.as_ref())),
                 };
                 let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
                 let value = if return_new && upserted_id != Bson::Null {
@@ -367,7 +367,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 collation.as_ref(),
             ) {
                 Ok(n) => n,
-                Err(e) => return Ok(storage_err_reply(e)),
+                Err(e) => return Ok(storage_err_reply(e, validator.as_ref())),
             };
             if deleted == 0 {
                 // A concurrent writer removed or changed the doc first — the
@@ -404,7 +404,11 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                     {
                         return Ok(doc! {
                             "ok": 0.0,
-                            "errmsg": "Document failed validation",
+                            "errmsg": crate::util::exec_wrapped(
+                                "Document failed validation".into(),
+                                true,
+                                "findAndModify",
+                            ),
                             "code": 121,
                             "codeName": "DocumentValidationFailure",
                             "errInfo": crate::crud::validation_error_info(v, &post),
@@ -451,7 +455,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         };
         let outcome = match update_result {
             Ok(o) => o,
-            Err(e) => return Ok(storage_err_reply(e)),
+            Err(e) => return Ok(storage_err_reply(e, validator.as_ref())),
         };
         if outcome.matched == 0 {
             // Lost the race — the doc no longer satisfies the query. Re-pick.
@@ -520,8 +524,19 @@ fn project_value(
 /// Shape a storage error into an `ok: 0` reply (findAndModify is single-doc, so
 /// errors are command-level, not per-op `writeErrors`). Preserves the E11000
 /// `keyPattern` / `keyValue`.
-fn storage_err_reply(e: StorageError) -> Document {
+fn storage_err_reply(e: StorageError, validator: Option<&Document>) -> Document {
     match e {
+        StorageError::ValidationFailure(failing) => {
+            let mut r = command_error_during(
+                StorageError::ValidationFailure(failing.clone()),
+                "findAndModify",
+            )
+            .into_reply();
+            if let Some(v) = validator {
+                r.insert("errInfo", crate::crud::validation_error_info(v, &failing));
+            }
+            r
+        }
         StorageError::DuplicateKey(info) => {
             let mut r = doc! {
                 "ok": 0.0,

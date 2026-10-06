@@ -945,7 +945,15 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // label and drivers retry the transaction.
             Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
-                write_errors.push(Bson::Document(write_error(index, e, "update")));
+                let failing = match &e {
+                    StorageError::ValidationFailure(d) => Some(d.clone()),
+                    _ => None,
+                };
+                let mut we = write_error(index, e, "update");
+                if let (Some(d), Some(v)) = (failing, &validator) {
+                    we.insert("errInfo", validation_error_info(v, &d));
+                }
+                write_errors.push(Bson::Document(we));
                 if ordered {
                     break;
                 }
