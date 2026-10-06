@@ -11,6 +11,7 @@ order is part of the data: never sort or dedupe it.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -60,6 +61,9 @@ def main() -> None:
         "    pub full: &'static str,\n"
         "}\n\n" + render("TIMEZONE_MAP", zones) + "\n"
     )
+    # Format as `cargo fmt` would, so a regeneration can never fail CI's
+    # `cargo fmt --check` (a raw regeneration once did).
+    subprocess.run(["rustfmt", "--edition", "2021", str(OUT)], check=True)
     print(f"{OUT}: {len(zones)} zones")
 
 
