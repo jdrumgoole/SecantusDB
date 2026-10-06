@@ -313,6 +313,63 @@ fn write_jsonb(v: &Json, out: &mut String) {
     }
 }
 
+/// A `jsonb` value's IDENTITY: its normalised text with every number
+/// reduced to its value (`1.0`, `1.00` and `1` alike), so two jsonb values are
+/// equal exactly when their keys are -- PostgreSQL's jsonb equality compares
+/// numbers as `numeric`s, scale ignored (15.19: `'{"x":1}' = '{"x":1.0}'`).
+/// `None` when the text is not JSON.
+pub fn jsonb_value_key(text: &str) -> Option<String> {
+    let parsed = parse(text).ok()?;
+    let mut out = String::new();
+    write_value_key(&parsed, &mut out);
+    Some(out)
+}
+
+fn write_value_key(v: &Json, out: &mut String) {
+    match v {
+        Json::Number(n) => {
+            let t = normalise_number(n);
+            let t = if t.contains('.') {
+                t.trim_end_matches('0').trim_end_matches('.').to_string()
+            } else {
+                t
+            };
+            out.push_str(if t == "-0" { "0" } else { &t });
+        }
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value_key(item, out);
+            }
+            out.push(']');
+        }
+        Json::Object(pairs) => {
+            let mut kept: Vec<(&String, &Json)> = Vec::new();
+            for (k, val) in pairs {
+                match kept.iter_mut().find(|(existing, _)| *existing == k) {
+                    Some(slot) => slot.1 = val,
+                    None => kept.push((k, val)),
+                }
+            }
+            kept.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
+            out.push('{');
+            for (i, (k, val)) in kept.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                write_value_key(val, out);
+            }
+            out.push('}');
+        }
+        other => write_jsonb(other, out),
+    }
+}
+
 fn write_json_string(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {

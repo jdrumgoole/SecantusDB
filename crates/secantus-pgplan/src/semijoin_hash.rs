@@ -833,7 +833,14 @@ fn build(sql: &str, run: Runner) -> Result<Entry> {
     let mut collations: Vec<Option<Option<String>>> = vec![None; nfilters];
     let mut index: Groups = HashMap::new();
     for mut row in rows {
-        if row.len() < nkeys + 2 * nfilters + usize::from(late.is_some()) {
+        if row.len() < 2 * nkeys + 2 * nfilters + usize::from(late.is_some()) {
+            return Ok(Entry::No);
+        }
+        let ktypes = row.split_off(row.len() - nkeys);
+        if ktypes
+            .iter()
+            .any(|t| matches!(t, Bson::String(t) if t == "jsonb"))
+        {
             return Ok(Entry::No);
         }
         // A late min / max orders its argument here, so the argument must be
@@ -1168,7 +1175,9 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     let aggregate = aggregate && late.is_none();
     s.where_clause = and_of(keep).map(Box::new);
     let mut params = Vec::new();
+    let mut key_types = Vec::new();
     for (col, p) in keys {
+        key_types.push(type_name_of(col.clone())?);
         if aggregate {
             s.group_clause.push(col.clone());
         }
@@ -1194,6 +1203,9 @@ fn rewrite(sql: &str) -> Option<Rewritten> {
     if let Some(arg) = late_arg {
         s.target_list.push(target(type_name_of(arg)?));
     }
+    // Each key column's type, last: a jsonb key compares by value
+    // (`{"x":1}` = `{"x":1.0}`), which its text does not hash.
+    s.target_list.extend(key_types.into_iter().map(target));
     let text = pg_query::deparse(&parsed).ok()?;
     Some(Rewritten {
         sql: text,
@@ -1485,7 +1497,10 @@ mod tests {
     #[test]
     fn equalities_become_appended_key_columns() {
         let r = rewrite("SELECT 1 FROM t WHERE t.x = $1 AND $2 = t.y AND t.f").expect("qualifies");
-        assert_eq!(r.sql, "SELECT 1, t.x, t.y FROM t WHERE t.f");
+        assert_eq!(
+            r.sql,
+            "SELECT 1, t.x, t.y, pg_typeof(t.x)::text, pg_typeof(t.y)::text FROM t WHERE t.f"
+        );
         assert_eq!(r.params, vec![0, 1]);
         assert!(!r.aggregate);
     }
@@ -1493,14 +1508,17 @@ mod tests {
     #[test]
     fn an_aggregate_is_grouped_by_its_keys() {
         let r = rewrite("SELECT count(*) FROM t WHERE t.x = $1").expect("qualifies");
-        assert_eq!(r.sql, "SELECT count(*), t.x FROM t GROUP BY t.x");
+        assert_eq!(
+            r.sql,
+            "SELECT count(*), t.x, pg_typeof(t.x)::text FROM t GROUP BY t.x"
+        );
         assert!(r.aggregate);
     }
 
     #[test]
     fn limit_and_offset_are_applied_per_key() {
         let r = rewrite("SELECT t.v FROM t WHERE t.x = $1 LIMIT 1 OFFSET 2").expect("qualifies");
-        assert_eq!(r.sql, "SELECT t.v, t.x FROM t");
+        assert_eq!(r.sql, "SELECT t.v, t.x, pg_typeof(t.x)::text FROM t");
         assert_eq!((r.limit, r.offset), (Some(1), 2));
     }
 
@@ -1508,7 +1526,10 @@ mod tests {
     fn an_order_by_is_kept_and_applied_per_key() {
         let r = rewrite("SELECT t.v FROM t WHERE t.x = $1 ORDER BY t.y DESC, t.v LIMIT 1")
             .expect("qualifies");
-        assert_eq!(r.sql, "SELECT t.v, t.x FROM t ORDER BY t.y DESC, t.v");
+        assert_eq!(
+            r.sql,
+            "SELECT t.v, t.x, pg_typeof(t.x)::text FROM t ORDER BY t.y DESC, t.v"
+        );
         assert_eq!((r.limit, r.offset), (Some(1), 0));
     }
 
@@ -1601,7 +1622,10 @@ mod tests {
     #[test]
     fn comparisons_become_filters() {
         let r = rewrite("SELECT 1 FROM t WHERE t.x = $1 AND $2 < t.y").expect("qualifies");
-        assert_eq!(r.sql, "SELECT 1, t.x, t.y, pg_typeof(t.y)::text FROM t");
+        assert_eq!(
+            r.sql,
+            "SELECT 1, t.x, t.y, pg_typeof(t.y)::text, pg_typeof(t.x)::text FROM t"
+        );
         assert_eq!(r.params, vec![0]);
         assert_eq!(r.filters.len(), 1);
         assert_eq!((r.filters[0].param, r.filters[0].op), (1, Op::Gt));
@@ -1650,7 +1674,7 @@ mod tests {
         let r = rewrite("SELECT max(t.v) FROM t WHERE t.x = $1 AND t.y > $2").expect("qualifies");
         assert_eq!(
             r.sql,
-            "SELECT t.v, t.x, t.y, pg_typeof(t.y)::text, pg_typeof(t.v)::text FROM t"
+            "SELECT t.v, t.x, t.y, pg_typeof(t.y)::text, pg_typeof(t.v)::text, pg_typeof(t.x)::text FROM t"
         );
         assert_eq!(r.late, Some(Late::Max));
         assert!(!r.aggregate);
@@ -1703,7 +1727,10 @@ mod tests {
     fn joined_tables_qualify() {
         let r =
             rewrite("SELECT 1 FROM t JOIN u ON u.tid = t.id WHERE t.x = $1").expect("qualifies");
-        assert_eq!(r.sql, "SELECT 1, t.x FROM t JOIN u ON u.tid = t.id");
+        assert_eq!(
+            r.sql,
+            "SELECT 1, t.x, pg_typeof(t.x)::text FROM t JOIN u ON u.tid = t.id"
+        );
         // A FROM function of constants is the same rows for every outer row.
         assert!(
             rewrite("SELECT 1 FROM t JOIN generate_series(1, 2) g ON true WHERE t.x = $1")
