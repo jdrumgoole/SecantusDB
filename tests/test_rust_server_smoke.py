@@ -697,8 +697,10 @@ def test_lookup_index_order_against_rust_server(tmp_path) -> None:
 
 def test_write_concern_validation_against_rust_server(tmp_path) -> None:
     """The Rust server rejects a malformed `writeConcern` before running a write
-    command, with mongod's codes: negative/too-large integer `w` → FailedToParse
-    (9), a bool / non-number-or-string `w` → TypeMismatch (14). A well-formed (or
+    command, with mongod's codes: a negative/too-large `w` → FailedToParse (9),
+    a bool / array `w` → FailedToParse (9, "w has to be a number, string, or
+    object"), a non-bool `j` → TypeMismatch (14). A double `w` is a number
+    (truncated), measured on a replica-set 8.2.11 (2026-10-06). A well-formed (or
     absent) writeConcern is accepted; `w > 1` and an unknown tag still succeed,
     with a writeConcernError attached (100 / 79) -- mongod 8.2.11 runs the write
     for an unknown tag and reports it afterwards (measured 2026-09-30)."""
@@ -710,8 +712,8 @@ def test_write_concern_validation_against_rust_server(tmp_path) -> None:
         rejects = [
             ({"w": -5}, 9),
             ({"w": 99}, 9),
-            ({"w": 1.5}, 14),
-            ({"w": True}, 14),
+            ({"w": True}, 9),
+            ({"w": []}, 9),
             ({"j": "x"}, 14),
         ]
         for wc, code in rejects:
@@ -720,7 +722,14 @@ def test_write_concern_validation_against_rust_server(tmp_path) -> None:
             assert exc.value.code == code, f"wc={wc} expected {code} got {exc.value.code}"
 
         # Well-formed / satisfiable writeConcerns are accepted.
-        for wc in [{"w": 1}, {"w": "majority"}, {"j": True}, {"wtimeout": 100}, {"w": 2}]:
+        for wc in [
+            {"w": 1},
+            {"w": 1.5},
+            {"w": "majority"},
+            {"j": True},
+            {"wtimeout": 100},
+            {"w": 2},
+        ]:
             r = db.command("insert", "c", documents=[{"x": 1}], writeConcern=wc)
             assert r["ok"] == 1.0, f"wc={wc} should succeed"
 
