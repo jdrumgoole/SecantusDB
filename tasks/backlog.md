@@ -835,7 +835,54 @@ remain open:
         storage does not keep), and one inside a block (its rows must be read
         through the block's session, which pgwire's simple-query response
         stream does not run on -- the extended path's `BlockScan` is driven
-        per Execute). None started in batch 63.
+        per Execute). None started in batch 63. **Batch 64 (2026-10-06):** four of
+        those stream now. (1) A simple-protocol SELECT (and an extended
+        Execute of the whole result) with an INDEXED WHERE walks the index
+        route a batch at a time on the reader thread
+        (`Storage::scan_routed_batches`: the RecordIds the index gives --
+        8 bytes a match -- then the documents a batch at a time from the
+        same snapshot, in the order `find_matching` returns them; no
+        cardinality estimate needed). A primary-key point lookup alone keeps
+        the direct path. (2) An aggregate (ungrouped, or a large GROUP BY)
+        over an indexed filter reads through the same route. (3) A
+        simple-protocol SELECT inside a REPEATABLE READ / SERIALIZABLE block
+        streams through the block's transaction (`BlockScan`, polled as
+        pgwire sends the response; the next statement drains it first, as
+        for a portal); an indexed WHERE there keeps the index route, since
+        `BlockScan` reads by collection scan. A READ COMMITTED block keeps
+        the materialised path: its statement takes a fresh snapshot around
+        its own run, which a scan polled after the statement returns does
+        not read through (the first version streamed there and four RC
+        slice tests caught the stale reads). (4) A DISTINCT over a tsvector / tsquery column de-duplicates
+        on its TEXT, computed per row into a hidden sort key
+        (`fts_text_key`), so a Python-written document and a Rust-written
+        string of the same value are one row (by construction -- only
+        Rust-written values were measured). 300,000 rows of 2 KB through
+        psql after a restart, debug, WiredTiger cache capped at 64 MB, base
+        `cee0df83` -> batch 64, output md5-identical: `where k >= 500`
+        (index on k) 1298 -> 27 MB (3.5 -> 2.4 s); `count(*), sum(id),
+        max(pad) ... where k >= 100` 1598 -> 111 MB; inside a REPEATABLE
+        READ block, the whole table 2577 -> 47 MB, `where g = 3` (no index)
+        1051 -> 79 MB;
+        `where k = 7` and `where id = 5` unchanged (~15 MB). Corpus
+        `b64_stream` (33 lines, 0 against PostgreSQL 15.19), slice test
+        `test_batch64_streams_indexed_where_and_inside_a_block`. The probe
+        also found a wrong answer, fixed: a plain SELECT DISTINCT whose
+        ORDER BY names something outside its select list (`order by v + 1`,
+        `order by w`, `order by 1::text`) answered where PostgreSQL is
+        42P10 (`check_distinct_order`; corpus `b64_distinct_order`, 28
+        lines). **Still materialised (OPEN, not started):** a JOIN's outer
+        side and an aggregate over a join, a FROM-subquery, or grouping
+        sets; a simple-protocol SELECT inside a READ COMMITTED block (it
+        needs the statement's fresh snapshot kept for the scan's polls).
+        Measured why a join is not a gate: a join is consumed only as an
+        outer SELECT's FROM-subquery (`materialise_sub` -> `join_rows`,
+        which recurses over whole sides), the outer select over a `sub`
+        never streams, and the ON / residual expressions are evaluated with
+        session state only the statement's thread has installed -- so a
+        streamed join needs a pull-based join operator whose ON runs where
+        `sorted_here` runs its ORDER BY expressions, plus an outer-select
+        stream over it; grouping sets need one sorted pass per set.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -900,11 +947,13 @@ remain open:
         everything else with 0A000) is a Python-server limitation, recorded
         here only because the store is shared.
       - The ruleutils fallbacks are tracked in the batch 11 entry below.
-- [ ] **OPEN — RUST pgserver: what batch 10 (CREATE AGGREGATE / OPERATOR /
-      STATISTICS / PUBLICATION, INHERITS, hash and expression partitioning,
-      pg_trgm, ALTER VIEW, table locks, time input, wide timestamptz,
-      operator resolution by type, error positions) leaves (re-measured
-      2026-10-03, batch 50).** Every corpus is at 0 against PostgreSQL 15.
+- [x] **CLOSED (batch 64, 2026-10-06) — RUST pgserver: what batch 10
+      (CREATE AGGREGATE / OPERATOR / STATISTICS / PUBLICATION, INHERITS, hash
+      and expression partitioning, pg_trgm, ALTER VIEW, table locks, time
+      input, wide timestamptz, operator resolution by type, error positions)
+      leaves (re-measured 2026-10-03, batch 50).** Its last two items were
+      settled in batch 64 (below); the new residuals that work found are in
+      the batch-64 entry that follows this one. Every corpus is at 0 against PostgreSQL 15.
       Batch 50 probed the error FIELDS (state, message, position, hint,
       detail, context) of 68 operand shapes on PostgreSQL 15.19 and fixed
       every divergence but one (corpus `b50_operand_types`, 71 lines),
@@ -992,6 +1041,30 @@ remain open:
         result column keeps the name `pg_collation_for`.
       - The `SQL expression` frame of a PL/pgSQL error follows an
         approximation of PL/pgSQL's simple-expression rule (as before).
+        **MEASURED and made exact up to a 2-shape residual (batch 64):**
+        `tools/probes/plpgsql_expr_context.py` compares (SQLSTATE, message,
+        CONTEXT) over 60 expression shapes against PostgreSQL 15.19: 50 of
+        60 identical before, 58 after. PostgreSQL's rule, now implemented
+        (`expr_frame`): the frame is `_SPI_error_callback`'s, so an error
+        carrying a cursor position (an unreadable literal, `'x'::int`) gets
+        none; a simple expression's error raised while PLANNING gets it, and
+        planning folds EVERY immutable subexpression over constants -- so
+        `1/0 + x`, `case when x > 0 then 1/0 end`, `f(1/0)` have it and `x/0`
+        does not. Each foldable subexpression is now tried alone and the
+        frame added when one raises the error's SQLSTATE. Residual (closed,
+        measured): `(array[1,2])[1]/0` (libpg_query deparses the
+        subexpression without its parentheses, so the probe cannot run it)
+        and `immutable_sql_fn()/0` (PostgreSQL inlines an IMMUTABLE SQL
+        function before folding; a user function is not folded here). The
+        matrix also found three real bugs, fixed: float `sqrt` / `ln` /
+        `log` raised 22P02 (PostgreSQL 2201F / 2201E, and `ln(0)` says
+        `of zero`), float `power` answered NaN / Infinity where float.c
+        raises 2201F / 22003 and `exp` overflow answered Infinity (22003);
+        and `exists(select 1/0)` raised where PostgreSQL answers true -- its
+        planner drops an EXISTS subquery's select list
+        (`simplify_EXISTS_query`, `secantus_pgplan::simplify_exists`).
+        Corpus `b64_exists_math` (38 lines), slice tests
+        `test_batch64_exists_*` / `test_batch64_plpgsql_*`.
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
         quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
@@ -999,6 +1072,34 @@ remain open:
         command takes 0.5 s alone and the test passes in 24 s. Not reproduced;
         the cause (what the nested collection blocked on) is unknown. If it
         recurs, capture the nested process's stack before the timeout kills it.
+        **FIXED (batch 64), cause found by reproduction:** the nested pytest
+        is its own CONTROLLER, so `tests/conftest.py`'s sessionstart sweep
+        (`_reap_abandoned_pytest_tmp`) ran in it and `rmtree`d every
+        abandoned run's WiredTiger stores (~100 GiB a run, per
+        `python_tasks._sweep_stale_pytest_tmp`) before collecting one file,
+        inside the 300 s budget and under the full suite's I/O. Reproduced
+        in miniature with a private `TMPDIR` holding one stale 100k-file
+        tree: the nested command took 0.5 -> 5.6 s and deleted it; with
+        `SECANTUS_NO_TMP_REAP=1` 1.0 s and left it alone. The nested runs in
+        `test_tmp_retention_guard.py`, `test_crash_stall_watchdog.py` and
+        `test_worker_death_fails_run.py` now set it (the outer controller
+        already sweeps).
+- [ ] **OPEN — RUST pgserver: residuals batch 64's probes found (measured
+      against PostgreSQL 15.19, 2026-10-06).** Each is a missing ERROR, not
+      a wrong row; each was left out of its corpus with this entry as the
+      record:
+      - `select distinct t from x order by t collate "C"` answers; PostgreSQL
+        is 42P10 (a COLLATE makes it another expression). The new DISTINCT /
+        ORDER BY check (`check_distinct_order`) lets every COLLATE through,
+        because the error PostgreSQL raises FIRST for `int collate "C"`
+        (42804 `collations are not supported by type integer`) is raised
+        here only when a row is sorted -- `select v from x order by v
+        collate "C"` over an EMPTY table answers. Fixing the second (type the
+        COLLATE at planning) makes the first a one-line change.
+      - `exists(select a/b from t limit 1 offset 5)` answers false; PostgreSQL
+        evaluates the select list of the rows OFFSET skips, so it raises
+        22012. The executor never computes a skipped row's outputs.
+
 - [x] **CLOSED (re-measured 2026-10-03, batch 50) — RUST pgserver: what
       batch 11 (rules, event triggers, foreign data, CREATE CAST / COLLATION,
       pgcrypto PGP, ruleutils) left.** Corpora `rules`,
@@ -1758,7 +1859,35 @@ These work end-to-end but cut corners.
 - [ ] **OPEN — RUST pgserver: reading ONE ROW BY PRIMARY KEY costs ~10.7us
       where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
       general per-statement target; the protocol work above has taken the
-      extended path as far as it goes cheaply.
+      extended path as far as it goes cheaply. **Batch 64: this is now the
+      ONE record of the per-statement gap** -- the separate "autocommit
+      per-statement gap is in the WIRE layer" entry below was the same gap
+      measured from `select 1`, and is closed into this one.
+
+      **Batch 64 (2026-10-06), the measured breakdown.** One lever above
+      1 us was left, and it was not in the wire layer: every extended
+      Execute of a filtered SELECT asked `explain_plan` (a WiredTiger session
+      open and an index pick) whether the WHERE was a collection scan, to
+      decide whether to stream -- a PK read included. A primary-key point
+      lookup is now recognised from the filter alone (`primary_key_point`)
+      and never streams. Release, `bench43.py`, two interleaved runs, load
+      ~5-6, base `cee0df83` -> batch 64: ping 19.5 / 19.7 -> 19.8 / 19.7,
+      simple `select 1` 27.7 / 27.8 -> 28.1 / 28.4, extended `select 1` 39.8 /
+      40.5 -> 40.3 / 41.1, **PK read 49.4 / 51.1 -> 46.5 / 47.6**, autocommit
+      UPDATE 70.1 / 70.9 -> 68.1 / 71.2 us (PG 15.19: 18.7, 22.9, 26.5, 33.3,
+      86.1). A `sample` of ~250k PK reads (12 s, release): the connection
+      thread is on CPU ~21.8 us a statement -- Execute 11.8 (`execute` 4.3,
+      of which `find_matching` 1.7, `decode_doc` 0.56, `lookup` 0.44; the
+      rest of `run_typed` ~3.0 in pieces under 0.8 -- the row projection
+      0.8, `templated_plan` 0.3, dropping the response 0.2; Execute's own
+      response building ~3.4 in pieces), Sync 3.5 (`sendto` 2.45, the
+      implicit commit ~0.6), the reads 2.9 (`recvfrom`: one call with data a
+      statement, batch 62), Describe 0.95. No server cost above ~1 us remains
+      outside the two socket syscalls PostgreSQL also makes; the rest of the
+      ~14 us gap is the client and tokio's wake-ups. The WiredTiger log
+      threads' own `gettimeofday` in `__wt_cond_wait_signal` (their timed
+      waits) is the largest top-of-stack symbol and is NOT on a statement's
+      path. This entry stays open only as the record of that gap.
 
       **Batch 52 (2026-10-03)**, release builds of base (`0c29ef2c`) and
       batch 52, `bench43.py`, two interleaved runs, load ~3.6: ping 19.3-19.4
@@ -2208,8 +2337,12 @@ These work end-to-end but cut corners.
       rather than a micro-fix, and is only worth it if someone wants the
       extended path materially cheaper for ALL statements.
 
-- [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
-      layer, not the query engine (attributed 2026-09-20).** (Batch 50,
+- [x] **CLOSED (merged, batch 64, 2026-10-06) — RUST pgserver: the
+      autocommit per-statement gap is in the WIRE layer, not the query
+      engine (attributed 2026-09-20).** The same gap as the PK-read entry
+      above, measured from `select 1`; batch 64's release `sample` of the
+      PK read (in that entry) is the current breakdown and that entry is
+      the one record of it. What follows is history. (Batch 50,
       2026-10-03: extended `select 1` 49.4 -> 42.4 us against PostgreSQL
       15's 26.8; simple 31.9 -> 29.4 against 23.4 -- see the PK-read
       entry's batch-50 table. A `sample` of `select 1` now puts ~16 us a

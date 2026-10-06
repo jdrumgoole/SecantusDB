@@ -37437,15 +37437,8 @@ impl PgHandler {
         if !combinable {
             return Ok(None);
         }
-        if !agg.filter.is_empty()
-            && !matches!(
-                self.storage
-                    .explain_plan(self.db(), &agg.table, &agg.filter),
-                Ok(secantus_storage::ExplainPlan::CollScan)
-            )
-        {
-            return Ok(None);
-        }
+        // An indexed filter reads through its index a batch at a time
+        // (`scan_routed_batches`), in the order the materialised path reads.
         let chunk_bytes = group_in_memory_bytes().min(16 << 20);
         let mut partials: Vec<Vec<Bson>> = vec![Vec::new(); agg.items.len()];
         let mut chunk: Vec<Vec<u8>> = Vec::new();
@@ -37541,7 +37534,7 @@ impl PgHandler {
             }
         } else {
             self.storage
-                .scan_matching_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
+                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
         };
         drop(sink);
         if let Some(e) = stopped.or(failed) {
@@ -37632,15 +37625,8 @@ impl PgHandler {
         {
             return Ok(None);
         }
-        if !agg.filter.is_empty()
-            && !matches!(
-                self.storage
-                    .explain_plan(self.db(), &agg.table, &agg.filter),
-                Ok(secantus_storage::ExplainPlan::CollScan)
-            )
-        {
-            return Ok(None);
-        }
+        // An indexed filter reads through its index a batch at a time
+        // (`scan_routed_batches`), in the order the materialised path reads.
         // The group key, each into a hidden field the sort compares.
         // A jsonb key sorts on its VALUE key (`__grpk`), so value-equal
         // spellings (`{"x": 1}`, `{"x": 1.0}`) are adjacent in the merge.
@@ -37740,7 +37726,7 @@ impl PgHandler {
             }
         } else {
             self.storage
-                .scan_matching_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
+                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
         };
         drop(sink);
         if let Some(e) = stopped.or(failed) {

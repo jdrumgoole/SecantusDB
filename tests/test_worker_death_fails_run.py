@@ -164,6 +164,9 @@ def test_real_worker_death_is_detected_end_to_end(tmp_path) -> None:
         )
     )
     env = dict(os.environ)
+    # A nested pytest is its own controller: without this it reaps the
+    # whole stale temp backlog at sessionstart (see test_tmp_retention_guard).
+    env["SECANTUS_NO_TMP_REAP"] = "1"
     # Don't let the OUTER run's xdist/pytest state leak into the nested one --
     # this test runs inside an xdist worker during a full-suite run, and that
     # inherited state is the difference between the nested run finishing in ~1s

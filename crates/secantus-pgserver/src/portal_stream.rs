@@ -153,6 +153,25 @@ impl PgHandler {
     /// reader's collection scan.
     pub(crate) fn allow_simple_stream(&self) {
         let idle = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let in_block = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let failed = self.txn_failed.load(std::sync::atomic::Ordering::Relaxed);
+        // Batch 64: inside a block the SELECT streams through the block's
+        // own transaction, a batch each time pgwire polls the response
+        // (`BlockScan`, as an extended portal in a block) -- the response is
+        // sent in full before the next message is read, and any statement
+        // first drains a scan still open (`drain_block_scans`). Only under
+        // REPEATABLE READ / SERIALIZABLE: a READ COMMITTED statement takes a
+        // fresh snapshot around its own run, which a scan polled after the
+        // statement returns would not read through.
+        if in_block && !idle && !failed && !self.read_committed_now() {
+            self.stream_in_block
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.stream_request
+                .store(STREAM_UNFILTERED, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let mode = if idle
             && !self
                 .in_transaction
@@ -186,14 +205,27 @@ impl PgHandler {
         // the whole result is wanted at once; one it would answer by a
         // collection scan anyway streams (batch 63) -- the reader's scan is
         // the same read, in bounded memory.
+        // Batch 64: an indexed WHERE streams too -- the reader walks the
+        // same index route a batch at a time (`scan_routed_batches`), so no
+        // cardinality estimate is needed. A primary-key point lookup alone
+        // keeps the direct path: one row, and a reader thread would only
+        // add its hand-off.
+        // Inside a block the scan reads through the block's transaction
+        // by collection scan (`BlockScan`), so there an indexed WHERE keeps
+        // the index route when the whole result is wanted at once.
+        let block_indexed = mode == STREAM_UNFILTERED
+            && self
+                .stream_in_block
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !sel.filter.is_empty()
+            && !matches!(
+                self.storage
+                    .explain_plan(self.db(), &sel.table, &sel.filter),
+                Ok(secantus_storage::ExplainPlan::CollScan)
+            );
         if mode == STREAM_NEVER
-            || (mode == STREAM_UNFILTERED
-                && !sel.filter.is_empty()
-                && !matches!(
-                    self.storage
-                        .explain_plan(self.db(), &sel.table, &sel.filter),
-                    Ok(secantus_storage::ExplainPlan::CollScan)
-                ))
+            || block_indexed
+            || (mode == STREAM_UNFILTERED && self.primary_key_point(sel))
         {
             return Ok(None);
         }
@@ -214,6 +246,21 @@ impl PgHandler {
             return Ok(None);
         }
         self.stream_select_of(sel, &def, env)
+    }
+
+    /// Is `sel`'s WHERE an equality (or `IN` list) on the `_id` field alone,
+    /// which the storage answers by a point lookup?
+    fn primary_key_point(&self, sel: &secantus_pgplan::Select) -> bool {
+        if sel.filter.len() != 1 {
+            return false;
+        }
+        match sel.filter.get("_id") {
+            Some(Bson::Document(d)) => {
+                d.len() == 1 && (d.contains_key("$eq") || d.contains_key("$in"))
+            }
+            Some(_) => true,
+            None => false,
+        }
     }
 
     /// The table definition of `sel` when it is a plain read of one stored
@@ -307,19 +354,35 @@ impl PgHandler {
         match &sel.distinct {
             secantus_pgplan::Distinct::None => Some((sel.order.clone(), None)),
             secantus_pgplan::Distinct::All => {
-                // The identity is the stored value: not for a type whose
-                // output the materialised path reassembles from a document
-                // (a tsvector / tsquery the Python server wrote).
+                // The identity is the stored value, except for a tsvector /
+                // tsquery, whose output the materialised path reassembles
+                // from a document when the Python server wrote it: there the
+                // identity is its TEXT, computed per row into a hidden field
+                // (`fts_text_key`) that the sort and the de-duplication use
+                // in the column's place (batch 64).
                 let schema = self.row_schema(def, &sel.columns, &sel.casts);
-                if schema.iter().any(|f| {
-                    let t = f.datatype();
-                    *t == Type::TS_VECTOR || *t == Type::TSQUERY
-                }) {
-                    return None;
-                }
-                let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                let mut fields: Vec<String> = Vec::new();
                 let mut order = sel.order.clone();
-                for f in &fields {
+                for (i, (_, f)) in sel.columns.iter().enumerate() {
+                    let fts = schema.get(i).is_some_and(|c| {
+                        let t = c.datatype();
+                        *t == Type::TS_VECTOR || *t == Type::TSQUERY
+                    });
+                    if fts {
+                        // An ORDER BY of the column itself sorts by the
+                        // stored value, which would keep equal texts of two
+                        // spellings apart: materialised, as before.
+                        if sel.order.iter().any(|k| k.expr.is_none() && k.field == *f) {
+                            return None;
+                        }
+                        let key = fts_text_key(i, f);
+                        fields.push(key.field.clone());
+                        if !order.iter().any(|k| k.field == key.field) {
+                            order.push(key);
+                        }
+                        continue;
+                    }
+                    fields.push(f.clone());
                     if !order.iter().any(|k| k.expr.is_none() && k.field == *f) {
                         order.push(asc(f));
                     }
@@ -361,7 +424,7 @@ impl PgHandler {
         };
         let source: futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> = if in_block {
             self.block_scan_stream(sel, order, dedup)?
-        } else if sel.order.iter().any(|k| k.expr.is_some()) {
+        } else if order.iter().any(|k| k.expr.is_some()) {
             // An ORDER BY expression is evaluated with this session's state,
             // which only this thread has installed: the rows are read and
             // sorted here, now, in bounded memory, and handed out of the
@@ -407,7 +470,7 @@ impl PgHandler {
         let sorted = crate::external_sort::sort_runs_with(
             |sink| {
                 self.storage
-                    .scan_matching_batches(self.db(), &sel.table, &sel.filter, BATCH, |blobs| {
+                    .scan_routed_batches(self.db(), &sel.table, &sel.filter, BATCH, |blobs| {
                         if let Err(e) = self.check_cancel() {
                             stopped = Some(e);
                             return false;
@@ -523,7 +586,7 @@ impl PgHandler {
                 let sorted = crate::external_sort::sort_runs_with(
                     |sink| {
                         storage
-                            .scan_matching_batches(&db, &table, &filter, BATCH, |blobs| {
+                            .scan_routed_batches(&db, &table, &filter, BATCH, |blobs| {
                                 tick() && sink(blobs)
                             })
                             .map_err(|e| e.to_string())
@@ -553,7 +616,7 @@ impl PgHandler {
                 }
                 return;
             }
-            let scanned = storage.scan_matching_batches(&db, &table, &filter, BATCH, |blobs| {
+            let scanned = storage.scan_routed_batches(&db, &table, &filter, BATCH, |blobs| {
                 worked += since.elapsed();
                 since = std::time::Instant::now();
                 if stop(&tx, worked).is_some() {
@@ -639,6 +702,26 @@ pub(crate) struct BlockScan {
 /// Compute each ORDER BY expression into its synthetic field, as the
 /// materialised path does before it sorts. The first error is kept in
 /// `failed` with its SQLSTATE; the sort sees only that it stopped.
+/// The hidden sort / DISTINCT key holding a tsvector / tsquery column's
+/// TEXT (`compute_order_keys`): a value the Python server wrote is a
+/// document, one this server wrote is that text already. The marker is a
+/// `Casts` whose `source` names the stored field and whose chain is
+/// [`FTS_TEXT`].
+fn fts_text_key(i: usize, field: &str) -> OrderKey {
+    OrderKey {
+        field: format!("__dfts{i}"),
+        ascending: true,
+        nulls: secantus_pgplan::Nulls::Last,
+        expr: Some(secantus_pgplan::ColumnExpr::Casts {
+            source: Some(field.to_string()),
+            chain: vec![FTS_TEXT.to_string()],
+        }),
+    }
+}
+
+/// See [`fts_text_key`].
+const FTS_TEXT: &str = "\u{0}fts_text";
+
 pub(crate) fn compute_order_keys(
     order: &[OrderKey],
     d: &mut Document,
@@ -648,6 +731,22 @@ pub(crate) fn compute_order_keys(
         let Some(expr) = key.expr.as_ref() else {
             continue;
         };
+        if let secantus_pgplan::ColumnExpr::Casts {
+            source: Some(field),
+            chain,
+        } = expr
+        {
+            if chain.len() == 1 && chain[0] == FTS_TEXT {
+                let v = match d.get(field) {
+                    Some(v) => secantus_pgplan::fts::python_text(v)
+                        .map(Bson::String)
+                        .unwrap_or_else(|| v.clone()),
+                    None => Bson::Null,
+                };
+                d.insert(key.field.clone(), v);
+                continue;
+            }
+        }
         match secantus_pgplan::apply_row_expr(expr, d) {
             Ok(v) => {
                 d.insert(key.field.clone(), v);
@@ -868,7 +967,7 @@ impl PgHandler {
         // which only a statement's own thread has installed: sorted now.
         // (A re-read from the start happens in a FETCH or a statement too.)
         let mut first = start.clone();
-        if sel.order.iter().any(|k| k.expr.is_some()) {
+        if start.order.iter().any(|k| k.expr.is_some()) {
             self.in_open_transaction(|| first.prime(&self.storage, &|| self.check_cancel()))?;
             start.sorted = None;
         }
@@ -1026,10 +1125,11 @@ impl PgHandler {
         order: Vec<OrderKey>,
         dedup: Option<Vec<String>>,
     ) -> PgWireResult<futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>>> {
+        let primed = order.iter().any(|k| k.expr.is_some());
         let mut first = BlockScan::of(self.db(), sel, order, dedup);
         // An ORDER BY expression needs this statement's thread (see
         // `declare_streamed`): sorted now, through the block.
-        if sel.order.iter().any(|k| k.expr.is_some()) {
+        if primed {
             self.in_open_transaction(|| first.prime(&self.storage, &|| self.check_cancel()))?;
         }
         let scan = Arc::new(Mutex::new(first));
