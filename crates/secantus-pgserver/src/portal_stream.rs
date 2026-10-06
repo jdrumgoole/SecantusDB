@@ -183,8 +183,8 @@ impl PgHandler {
             && sel.join.is_none()
             && sel.series.is_none()
             && sel.windows.is_empty()
-            && (sel.order.is_empty() || (sorted && sel.order.iter().all(|k| k.expr.is_none())))
-            && sel.distinct == secantus_pgplan::Distinct::None
+            && (sel.order.is_empty() || sorted)
+            && (sel.distinct == secantus_pgplan::Distinct::None || sorted)
             && sel.residual.is_none()
             && sel.casts.iter().all(Option::is_none)
             && sel.offset >= 0
@@ -203,7 +203,71 @@ impl PgHandler {
         if !builtin || def.column("is_called").is_some() || def.temp {
             return None;
         }
+        self.stream_order(sel, &def)?;
         Some(def)
+    }
+
+    /// The order a streamed `sel` is sorted in, and the fields its DISTINCT
+    /// (or DISTINCT ON) de-duplicates on, or `None` when it cannot stream.
+    ///
+    /// A DISTINCT is sorted on its ORDER BY and then on every output field,
+    /// so equal rows meet and the first of each run is kept
+    /// (`external_sort::sort_runs_with`): the sort-based DISTINCT
+    /// PostgreSQL's planner also uses, in bounded memory. Without an ORDER
+    /// BY its rows come out in that field order, which PostgreSQL leaves
+    /// unspecified too. A DISTINCT ON's keys lead its ORDER BY (PostgreSQL
+    /// requires it), or are the order when there is none.
+    pub(crate) fn stream_order(
+        &self,
+        sel: &secantus_pgplan::Select,
+        def: &TableDef,
+    ) -> Option<(Vec<OrderKey>, Option<Vec<String>>)> {
+        let asc = |f: &str| OrderKey {
+            field: f.to_string(),
+            ascending: true,
+            nulls: secantus_pgplan::Nulls::Last,
+            expr: None,
+        };
+        match &sel.distinct {
+            secantus_pgplan::Distinct::None => Some((sel.order.clone(), None)),
+            secantus_pgplan::Distinct::All => {
+                // The identity is the stored value: not for a type whose
+                // output the materialised path reassembles first.
+                let schema = self.row_schema(def, &sel.columns, &sel.casts);
+                if schema.iter().any(|f| {
+                    let t = f.datatype();
+                    *t == Type::TIMESTAMP
+                        || *t == Type::TIMESTAMPTZ
+                        || *t == Type::TS_VECTOR
+                        || *t == Type::TSQUERY
+                }) {
+                    return None;
+                }
+                let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                let mut order = sel.order.clone();
+                for f in &fields {
+                    if !order.iter().any(|k| k.expr.is_none() && k.field == *f) {
+                        order.push(asc(f));
+                    }
+                }
+                Some((order, Some(fields)))
+            }
+            secantus_pgplan::Distinct::On(keys) => {
+                let stored = |k: &String| def.columns.iter().any(|c| c.field() == *k);
+                if !keys.iter().all(stored) {
+                    return None;
+                }
+                if sel.order.is_empty() {
+                    return Some((keys.iter().map(|k| asc(k)).collect(), Some(keys.clone())));
+                }
+                let lead = sel.order.get(..keys.len())?;
+                let leads = lead
+                    .iter()
+                    .all(|k| k.expr.is_none() && keys.contains(&k.field))
+                    && keys.iter().all(|k| lead.iter().any(|o| o.field == *k));
+                leads.then(|| (sel.order.clone(), Some(keys.clone())))
+            }
+        }
     }
 
     /// `sel` (see `streamable`) as a streamed result.
@@ -218,10 +282,19 @@ impl PgHandler {
         let in_block = self
             .stream_in_block
             .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let Some((order, dedup)) = self.stream_order(sel, def) else {
+            return Ok(None);
+        };
         let source: futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> = if in_block {
-            self.block_scan_stream(sel)
+            self.block_scan_stream(sel, order, dedup)?
+        } else if sel.order.iter().any(|k| k.expr.is_some()) {
+            // An ORDER BY expression is evaluated with this session's state,
+            // which only this thread has installed: the rows are read and
+            // sorted here, now, in bounded memory, and handed out of the
+            // merge a batch per fetch.
+            self.sorted_here(sel, order, dedup)?
         } else {
-            let rx = self.spawn_portal_reader(sel)?;
+            let rx = self.spawn_portal_reader(sel, order, dedup)?;
             futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
             })
@@ -242,17 +315,83 @@ impl PgHandler {
         ))))
     }
 
+    /// `sel`'s rows read and sorted on this thread (outside a block), then
+    /// handed out of the merge a batch at a time.
+    fn sorted_here(
+        &self,
+        sel: &secantus_pgplan::Select,
+        order: Vec<OrderKey>,
+        dedup: Option<Vec<String>>,
+    ) -> PgWireResult<futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>>> {
+        let skip = usize::try_from(sel.offset).unwrap_or(0);
+        let left = sel
+            .limit
+            .map(|l| usize::try_from(l.max(0)).unwrap_or(usize::MAX));
+        let mut stopped: Option<PgWireError> = None;
+        let mut failed: Option<PgWireError> = None;
+        let keys = order.clone();
+        let sorted = crate::external_sort::sort_runs_with(
+            |sink| {
+                self.storage
+                    .scan_matching_batches(self.db(), &sel.table, &sel.filter, BATCH, |blobs| {
+                        if let Err(e) = self.check_cancel() {
+                            stopped = Some(e);
+                            return false;
+                        }
+                        sink(blobs)
+                    })
+                    .map_err(|e| e.to_string())
+            },
+            &order,
+            skip,
+            left,
+            BATCH,
+            dedup,
+            &mut |d| compute_order_keys(&keys, d, &mut failed),
+        );
+        if let Some(e) = stopped.or(failed) {
+            return Err(e);
+        }
+        let sorted =
+            sorted.map_err(|e| PgHandler::user_error("XX000", format!("could not sort: {e}")))?;
+        let backend = self.backend.clone();
+        Ok(futures::stream::unfold(Some(sorted), move |state| {
+            let backend = backend.clone();
+            async move {
+                let mut sorted = state?;
+                let out = tokio::task::block_in_place(|| -> PgWireResult<Vec<Document>> {
+                    if backend.terminate.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(PgHandler::admin_shutdown());
+                    }
+                    if backend.cancelled() {
+                        return Err(PgHandler::query_canceled());
+                    }
+                    sorted
+                        .next_batch()
+                        .map_err(|e| PgHandler::user_error("XX000", e))
+                });
+                match out {
+                    Ok(docs) if docs.is_empty() => None,
+                    Ok(docs) => Some((Ok(docs), Some(sorted))),
+                    Err(e) => Some((Err(e), None)),
+                }
+            }
+        })
+        .boxed())
+    }
+
     /// Start the thread that reads `sel`'s rows and hands them over.
     fn spawn_portal_reader(
         &self,
         sel: &secantus_pgplan::Select,
+        order: Vec<OrderKey>,
+        dedup: Option<Vec<String>>,
     ) -> PgWireResult<tokio::sync::mpsc::Receiver<PgWireResult<Vec<Document>>>> {
         let (tx, rx) = tokio::sync::mpsc::channel::<PgWireResult<Vec<Document>>>(IN_FLIGHT);
         let storage = self.storage.clone();
         let db = self.db().to_string();
         let table = sel.table.clone();
         let filter = sel.filter.clone();
-        let order = sel.order.clone();
         let mut skip = usize::try_from(sel.offset).unwrap_or(0);
         let mut left = sel
             .limit
@@ -307,7 +446,7 @@ impl PgHandler {
                     }
                     !stopped.get()
                 };
-                let sorted = crate::external_sort::sorted_rows(
+                let sorted = crate::external_sort::sort_runs_with(
                     |sink| {
                         storage
                             .scan_matching_batches(&db, &table, &filter, BATCH, |blobs| {
@@ -319,16 +458,20 @@ impl PgHandler {
                     skip,
                     left,
                     BATCH,
-                    |docs| {
-                        if !tick() {
-                            return false;
-                        }
-                        let sent = tx.blocking_send(Ok(docs)).is_ok();
-                        // Waiting for the client to fetch is not work.
-                        since.set(std::time::Instant::now());
-                        sent
-                    },
-                );
+                    dedup,
+                    &mut |_| Ok(()),
+                )
+                .and_then(|mut sorted| loop {
+                    let docs = sorted.next_batch()?;
+                    if docs.is_empty() || !tick() {
+                        return Ok(());
+                    }
+                    if tx.blocking_send(Ok(docs)).is_err() {
+                        return Ok(());
+                    }
+                    // Waiting for the client to fetch is not work.
+                    since.set(std::time::Instant::now());
+                });
                 if let Err(e) = sorted {
                     if !stopped.get() {
                         let _sent = tx.blocking_send(Err(PgHandler::user_error("XX000", e)));
@@ -415,6 +558,33 @@ pub(crate) struct BlockScan {
     /// With an ORDER BY: the rows sorted in bounded memory
     /// (`external_sort`), read whole at the first batch.
     sorted: Option<Arc<Mutex<crate::external_sort::Sorted>>>,
+    /// A DISTINCT's fields (`stream_order`).
+    dedup: Option<Vec<String>>,
+}
+
+/// Compute each ORDER BY expression into its synthetic field, as the
+/// materialised path does before it sorts. The first error is kept in
+/// `failed` with its SQLSTATE; the sort sees only that it stopped.
+pub(crate) fn compute_order_keys(
+    order: &[OrderKey],
+    d: &mut Document,
+    failed: &mut Option<PgWireError>,
+) -> Result<(), String> {
+    for key in order {
+        let Some(expr) = key.expr.as_ref() else {
+            continue;
+        };
+        match secantus_pgplan::apply_row_expr(expr, d) {
+            Ok(v) => {
+                d.insert(key.field.clone(), v);
+            }
+            Err(e) => {
+                *failed = Some(PgHandler::err(&e));
+                return Err("an ORDER BY expression failed".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 impl BlockScan {
@@ -470,9 +640,33 @@ impl BlockScan {
         if self.done {
             return Ok(Vec::new());
         }
-        if self.sorted.is_none() {
+        self.prime(storage, check)?;
+        let docs = self
+            .sorted
+            .as_ref()
+            .expect("set by prime")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_batch()
+            .map_err(|e| PgHandler::user_error("XX000", e))?;
+        if docs.is_empty() {
+            self.done = true;
+            self.sorted = None;
+        }
+        Ok(docs)
+    }
+
+    /// Read every row into the sorted runs, once (see `read_sorted_batch`).
+    fn prime(
+        &mut self,
+        storage: &Storage,
+        check: &dyn Fn() -> PgWireResult<()>,
+    ) -> PgWireResult<()> {
+        if self.sorted.is_none() && !self.done {
             let mut stopped: Option<PgWireError> = None;
-            let sorted = crate::external_sort::sort_runs(
+            let mut failed: Option<PgWireError> = None;
+            let order = self.order.clone();
+            let sorted = crate::external_sort::sort_runs_with(
                 |sink| {
                     let mut after = None;
                     loop {
@@ -493,33 +687,28 @@ impl BlockScan {
                 self.skip,
                 self.left,
                 BATCH,
+                self.dedup.clone(),
+                &mut |d| compute_order_keys(&order, d, &mut failed),
             );
-            if let Some(e) = stopped {
+            if let Some(e) = stopped.or(failed) {
                 return Err(e);
             }
             let sorted = sorted
                 .map_err(|e| PgHandler::user_error("XX000", format!("could not sort: {e}")))?;
             self.sorted = Some(Arc::new(Mutex::new(sorted)));
         }
-        let docs = self
-            .sorted
-            .as_ref()
-            .expect("set above")
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .next_batch()
-            .map_err(|e| PgHandler::user_error("XX000", e))?;
-        if docs.is_empty() {
-            self.done = true;
-            self.sorted = None;
-        }
-        Ok(docs)
+        Ok(())
     }
 }
 
 impl BlockScan {
-    /// A scan of `sel`'s rows from the start.
-    fn of(db: &str, sel: &secantus_pgplan::Select) -> Self {
+    /// A scan of `sel`'s rows from the start, in `order` (`stream_order`).
+    fn of(
+        db: &str,
+        sel: &secantus_pgplan::Select,
+        order: Vec<OrderKey>,
+        dedup: Option<Vec<String>>,
+    ) -> Self {
         BlockScan {
             db: db.to_string(),
             table: sel.table.clone(),
@@ -531,8 +720,9 @@ impl BlockScan {
             left: sel
                 .limit
                 .map(|l| usize::try_from(l.max(0)).unwrap_or(usize::MAX)),
-            order: sel.order.clone(),
+            order,
             sorted: None,
+            dedup,
         }
     }
 }
@@ -596,7 +786,18 @@ impl PgHandler {
             ds: self.session_datestyle(),
             cenc: self.client_encoding(),
         };
-        let start = BlockScan::of(self.db(), sel);
+        let Some((order, dedup)) = self.stream_order(sel, &def) else {
+            return Ok(None);
+        };
+        let mut start = BlockScan::of(self.db(), sel, order, dedup);
+        // An ORDER BY expression is evaluated with this session's state,
+        // which only a statement's own thread has installed: sorted now.
+        // (A re-read from the start happens in a FETCH or a statement too.)
+        let mut first = start.clone();
+        if sel.order.iter().any(|k| k.expr.is_some()) {
+            self.in_open_transaction(|| first.prime(&self.storage, &|| self.check_cancel()))?;
+            start.sorted = None;
+        }
         Ok(Some(CursorState {
             schema: Arc::new(self.row_schema(&def, &sel.columns, &sel.casts)),
             rows: Vec::new(),
@@ -610,7 +811,7 @@ impl PgHandler {
             tz,
             tail: Some(CursorTail {
                 exhausted: false,
-                scan: start.clone(),
+                scan: first,
                 start,
                 schema: Arc::new(self.row_schema(&def, &sel.columns, &sel.casts)),
                 fields: sel.columns.iter().map(|(_, f)| f.clone()).collect(),
@@ -748,8 +949,16 @@ impl PgHandler {
     fn block_scan_stream(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> {
-        let scan = Arc::new(Mutex::new(BlockScan::of(self.db(), sel)));
+        order: Vec<OrderKey>,
+        dedup: Option<Vec<String>>,
+    ) -> PgWireResult<futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>>> {
+        let mut first = BlockScan::of(self.db(), sel, order, dedup);
+        // An ORDER BY expression needs this statement's thread (see
+        // `declare_streamed`): sorted now, through the block.
+        if sel.order.iter().any(|k| k.expr.is_some()) {
+            self.in_open_transaction(|| first.prime(&self.storage, &|| self.check_cancel()))?;
+        }
+        let scan = Arc::new(Mutex::new(first));
         {
             let mut open = self.block_scans.lock().unwrap_or_else(|e| e.into_inner());
             open.retain(|w| w.strong_count() > 0);
@@ -758,7 +967,7 @@ impl PgHandler {
         let txn = Arc::clone(&self.txn);
         let storage = self.storage.clone();
         let backend = self.backend.clone();
-        futures::stream::unfold(Some(scan), move |state| {
+        Ok(futures::stream::unfold(Some(scan), move |state| {
             let txn = Arc::clone(&txn);
             let storage = storage.clone();
             let backend = backend.clone();
@@ -810,7 +1019,7 @@ impl PgHandler {
                 }
             }
         })
-        .boxed()
+        .boxed())
     }
 
     /// Read the rest of every streamed portal still open in the block into

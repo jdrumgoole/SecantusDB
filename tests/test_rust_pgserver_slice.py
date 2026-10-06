@@ -17522,3 +17522,105 @@ def test_batch56_an_immutable_sql_function_over_constants_runs_as_itself(home: P
             with pytest.raises(psycopg.errors.DivisionByZero) as err:
                 conn.execute(sql)
             assert err.value.diag.context == context, sql
+
+
+def test_batch59_distinct_and_set_operations_hash_by_value(home: Path) -> None:
+    """DISTINCT, GROUP BY, INTERSECT and EXCEPT de-duplicated through a hash
+    on the value identity (they scanned every kept row: quadratic). The
+    identity is PostgreSQL's equality: a numeric by value, an integer
+    literal meeting a numeric column in a set operation, a float array's
+    NaN equal to itself. PostgreSQL 15.19's answers."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b59_h (id int primary key, n numeric, f float8)")
+        conn.execute(
+            "insert into b59_h values (1, 1.0, 'NaN'), (2, 1, 'NaN'), (3, 1.00, 0), (4, 2.5, -0.0)"
+        )
+        conn.execute("insert into b59_h select g, g % 1000, g from generate_series(10, 20009) g")
+        assert conn.execute(
+            "select count(*) from (select distinct id % 5000, n from b59_h) s"
+        ).fetchone() == (5003,)
+        assert conn.execute(
+            "select count(*) from (select n from b59_h group by n) s"
+        ).fetchone() == (1001,)
+        assert conn.execute(
+            "select n from b59_h where id < 5 union select 1 order by 1"
+        ).fetchall() == [(Decimal("1.0"),), (Decimal("2.5"),)]
+        assert conn.execute(
+            "select n from b59_h where id < 5 except select 1 order by 1"
+        ).fetchall() == [(Decimal("2.5"),)]
+        assert conn.execute(
+            "select count(*) from (select distinct array[f] from b59_h where id < 5) s"
+        ).fetchone() == (2,)
+        assert conn.execute(
+            "select count(*) from (select id from b59_h intersect all"
+            " select id from b59_h where id % 2 = 0) s"
+        ).fetchone() == (10002,)
+
+
+def test_batch59_streamed_distinct_and_expression_order(home: Path) -> None:
+    """A block's DECLARE CURSOR with DISTINCT, DISTINCT ON or an ORDER BY
+    over an expression is sorted in bounded memory (it was read whole):
+    the same rows as PostgreSQL 15.19, with OFFSET / LIMIT, the block's own
+    writes, a step back and an expression error raised as itself."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b59_c (id int primary key, k int, t text)")
+        a.execute(
+            "insert into b59_c select g, g % 13, 'r' || (g % 7) from generate_series(1, 3000) g"
+        )
+        a.execute("begin")
+        a.execute("insert into b59_c values (5000, 99, 'mine')")
+        a.execute("declare c scroll cursor for select id, k from b59_c order by k * -1, id")
+        rows = [(g, g % 13) for g in range(1, 3001)] + [(5000, 99)]
+        expected = sorted(rows, key=lambda r: (-r[1], r[0]))
+        assert a.execute("fetch 100 from c").fetchall() == expected[:100]
+        assert a.execute("fetch all from c").fetchall() == expected[100:]
+        assert a.execute("fetch absolute 3 from c").fetchall() == [expected[2]]
+        a.execute(
+            "declare d cursor for select distinct t, k from b59_c order by t, k offset 3 limit 9"
+        )
+        pairs = sorted({("r" + str(g % 7), g % 13) for g in range(1, 3001)} | {("mine", 99)})
+        assert a.execute("fetch all from d").fetchall() == pairs[3:12]
+        a.execute(
+            "declare e cursor for select distinct on (k) k, id from b59_c order by k, id desc"
+        )
+        last = {}
+        for i, k in rows:
+            last[k] = max(last.get(k, 0), i)
+        assert a.execute("fetch all from e").fetchall() == sorted(last.items())
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            a.execute("declare f cursor for select id from b59_c order by 1 / (id - 7)")
+            a.execute("fetch 1 from f")
+        a.execute("rollback")
+
+
+def test_batch59_group_by_past_its_memory_budget(home: Path, monkeypatch) -> None:
+    """A GROUP BY whose input passes its byte budget sorts on the group key
+    and aggregates one group at a time, through a block's transaction too.
+    `SECANTUS_PG_GROUP_MEMORY_BYTES` lowers the budget so a small table
+    takes that path; the answers are PostgreSQL 15.19's."""
+    monkeypatch.setenv("SECANTUS_PG_GROUP_MEMORY_BYTES", "2000")
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b59_g (id int primary key, k int, n numeric)")
+        a.execute(
+            "insert into b59_g select g, case when g % 9 = 0 then null else g % 23 end,"
+            " ((g % 4) || '.' || repeat('0', g % 3))::numeric from generate_series(1, 2000) g"
+        )
+        got = a.execute(
+            "select k, count(*), sum(id) from b59_g group by k order by k nulls first"
+        ).fetchall()
+        groups: dict = {}
+        for g in range(1, 2001):
+            k = None if g % 9 == 0 else g % 23
+            c, s = groups.get(k, (0, 0))
+            groups[k] = (c + 1, s + g)
+        want = [(None, *groups[None])] + [
+            (k, *groups[k]) for k in sorted(x for x in groups if x is not None)
+        ]
+        assert got == want
+        assert a.execute("select count(*) from (select n from b59_g group by n) s").fetchone() == (
+            4,
+        )
+        a.execute("begin")
+        a.execute("insert into b59_g values (9999, 500, 1)")
+        assert a.execute("select count(*) from b59_g where k = 500 group by k").fetchall() == [(1,)]
+        a.execute("rollback")

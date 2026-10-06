@@ -22,6 +22,7 @@ const TOP_K_MAX: usize = 100_000;
 /// batches of `batch`, after `skip` rows and at most `limit`. `scan` calls
 /// its sink with each batch of stored rows and stops when the sink answers
 /// `false`; `emit` answers `false` to stop. Errors are messages.
+#[cfg(test)]
 pub(crate) fn sorted_rows(
     scan: impl FnOnce(&mut dyn FnMut(Vec<Vec<u8>>) -> bool) -> Result<(), String>,
     order: &[OrderKey],
@@ -41,6 +42,7 @@ pub(crate) fn sorted_rows(
 
 /// Read every row `scan` hands over into sorted runs (see `sorted_rows`)
 /// and return the merge, which hands the rows out a batch at a time.
+#[cfg(test)]
 pub(crate) fn sort_runs(
     scan: impl FnOnce(&mut dyn FnMut(Vec<Vec<u8>>) -> bool) -> Result<(), String>,
     order: &[OrderKey],
@@ -48,87 +50,160 @@ pub(crate) fn sort_runs(
     limit: Option<usize>,
     batch: usize,
 ) -> Result<Sorted, String> {
+    sort_runs_with(scan, order, skip, limit, batch, None, &mut |_| Ok(()))
+}
+
+/// `sort_runs`, with each row first passed through `prepare` (an ORDER BY
+/// over an expression computes its key into the row there), and with
+/// `dedup`: the fields of a DISTINCT (or the keys of a DISTINCT ON), whose
+/// equal rows `order` must make ADJACENT -- the first of each run of rows
+/// equal on them (by `group_key_ident`, the materialised path's identity)
+/// is kept, before OFFSET and LIMIT count.
+pub(crate) fn sort_runs_with(
+    scan: impl FnOnce(&mut dyn FnMut(Vec<Vec<u8>>) -> bool) -> Result<(), String>,
+    order: &[OrderKey],
+    skip: usize,
+    limit: Option<usize>,
+    batch: usize,
+    dedup: Option<Vec<String>>,
+    prepare: &mut dyn FnMut(&mut Document) -> Result<(), String>,
+) -> Result<Sorted, String> {
     let cap = limit.map(|l| l.saturating_add(skip));
-    let top_k = cap.filter(|c| *c <= TOP_K_MAX);
-    let mut chunk: Vec<Document> = Vec::new();
-    let mut bytes = 0usize;
-    let mut runs: Vec<std::fs::File> = Vec::new();
+    // A top-k would drop rows the de-duplication has not yet seen.
+    let top_k = cap.filter(|c| *c <= TOP_K_MAX && dedup.is_none());
+    let mut runs = RunBuilder::new(order, top_k, batch);
     let mut failed: Option<String> = None;
     {
         let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
-            for blob in blobs {
-                bytes += blob.len();
-                match decode_doc(&blob) {
-                    Ok(d) => chunk.push(d),
-                    Err(e) => {
-                        failed = Some(format!("could not decode a row: {e}"));
-                        return false;
-                    }
+            match runs.push_blobs(blobs, prepare) {
+                Ok(()) => true,
+                Err(e) => {
+                    failed = Some(e);
+                    false
                 }
             }
-            if let Some(k) = top_k {
-                // Keep the first k in order: the earlier rows stay ahead of
-                // equal later ones, as a stable sort keeps them.
-                if chunk.len() >= k.max(batch) * 2 {
-                    chunk.sort_by(|a, b| compare_rows(a, b, order));
-                    chunk.truncate(k);
-                }
-                return true;
-            }
-            if bytes >= RUN_BYTES {
-                chunk.sort_by(|a, b| compare_rows(a, b, order));
-                match spill(std::mem::take(&mut chunk)) {
-                    Ok(f) => runs.push(f),
-                    Err(e) => {
-                        failed = Some(e);
-                        return false;
-                    }
-                }
-                bytes = 0;
-            }
-            true
         };
         scan(&mut sink)?;
     }
     if let Some(e) = failed {
         return Err(e);
     }
-    chunk.sort_by(|a, b| compare_rows(a, b, order));
-    if let Some(k) = top_k {
-        chunk.truncate(k);
-    }
-    let order: Arc<[OrderKey]> = order.to_vec().into();
-    let mut sorted = Sorted {
-        order: order.clone(),
-        skip,
-        left: limit,
-        batch,
-        mem: Vec::new().into_iter(),
-        readers: Vec::new(),
-        heap: std::collections::BinaryHeap::new(),
-    };
-    if runs.is_empty() {
-        sorted.mem = chunk.into_iter();
-        return Ok(sorted);
-    }
-    if !chunk.is_empty() {
-        runs.push(spill(chunk)?);
-    }
-    for mut f in runs {
-        f.rewind()
-            .map_err(|e| format!("could not read a sort run: {e}"))?;
-        sorted.readers.push(BufReader::with_capacity(64 << 10, f));
-    }
-    for run in 0..sorted.readers.len() {
-        if let Some(doc) = read_one(&mut sorted.readers[run])? {
-            sorted.heap.push(Head {
-                doc,
-                run,
-                order: order.clone(),
-            });
+    runs.finish(skip, limit, dedup)
+}
+
+/// Rows gathered into sorted runs, spilled past `RUN_BYTES` (see
+/// `sort_runs_with`), for a caller that drives its own scan.
+pub(crate) struct RunBuilder {
+    order: Vec<OrderKey>,
+    top_k: Option<usize>,
+    batch: usize,
+    chunk: Vec<Document>,
+    bytes: usize,
+    runs: Vec<std::fs::File>,
+}
+
+impl RunBuilder {
+    pub(crate) fn new(order: &[OrderKey], top_k: Option<usize>, batch: usize) -> Self {
+        RunBuilder {
+            order: order.to_vec(),
+            top_k,
+            batch,
+            chunk: Vec::new(),
+            bytes: 0,
+            runs: Vec::new(),
         }
     }
-    Ok(sorted)
+
+    /// Decode, prepare and add stored rows.
+    pub(crate) fn push_blobs(
+        &mut self,
+        blobs: Vec<Vec<u8>>,
+        prepare: &mut dyn FnMut(&mut Document) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for blob in blobs {
+            let mut d = decode_doc(&blob).map_err(|e| format!("could not decode a row: {e}"))?;
+            prepare(&mut d)?;
+            self.push(d, blob.len())?;
+        }
+        Ok(())
+    }
+
+    /// Add one row of about `bytes` bytes.
+    pub(crate) fn push(&mut self, d: Document, bytes: usize) -> Result<(), String> {
+        self.chunk.push(d);
+        self.bytes += bytes;
+        let order = &self.order;
+        if let Some(k) = self.top_k {
+            // Keep the first k in order: the earlier rows stay ahead of
+            // equal later ones, as a stable sort keeps them.
+            if self.chunk.len() >= k.max(self.batch) * 2 {
+                self.chunk.sort_by(|a, b| compare_rows(a, b, order));
+                self.chunk.truncate(k);
+            }
+            return Ok(());
+        }
+        if self.bytes >= RUN_BYTES {
+            self.chunk.sort_by(|a, b| compare_rows(a, b, order));
+            self.runs.push(spill(std::mem::take(&mut self.chunk))?);
+            self.bytes = 0;
+        }
+        Ok(())
+    }
+
+    /// The merge of the runs.
+    pub(crate) fn finish(
+        self,
+        skip: usize,
+        limit: Option<usize>,
+        dedup: Option<Vec<String>>,
+    ) -> Result<Sorted, String> {
+        let RunBuilder {
+            order,
+            top_k,
+            batch,
+            mut chunk,
+            runs: mut runs_in,
+            ..
+        } = self;
+        chunk.sort_by(|a, b| compare_rows(a, b, &order));
+        if let Some(k) = top_k {
+            chunk.truncate(k);
+        }
+        let order: Arc<[OrderKey]> = order.into();
+        let mut sorted = Sorted {
+            order: order.clone(),
+            skip,
+            left: limit,
+            batch,
+            mem: Vec::new().into_iter(),
+            readers: Vec::new(),
+            heap: std::collections::BinaryHeap::new(),
+            dedup,
+            last: None,
+        };
+        if runs_in.is_empty() {
+            sorted.mem = chunk.into_iter();
+            return Ok(sorted);
+        }
+        if !chunk.is_empty() {
+            runs_in.push(spill(chunk)?);
+        }
+        for mut f in runs_in {
+            f.rewind()
+                .map_err(|e| format!("could not read a sort run: {e}"))?;
+            sorted.readers.push(BufReader::with_capacity(64 << 10, f));
+        }
+        for run in 0..sorted.readers.len() {
+            if let Some(doc) = read_one(&mut sorted.readers[run])? {
+                sorted.heap.push(Head {
+                    doc,
+                    run,
+                    order: order.clone(),
+                });
+            }
+        }
+        Ok(sorted)
+    }
 }
 
 /// Sorted rows going out: the merge of the runs (or the one run kept in
@@ -141,10 +216,15 @@ pub(crate) struct Sorted {
     mem: std::vec::IntoIter<Document>,
     readers: Vec<BufReader<std::fs::File>>,
     heap: std::collections::BinaryHeap<Head>,
+    /// DISTINCT's fields (see `sort_runs_with`) and the identity of the
+    /// last row kept.
+    dedup: Option<Vec<String>>,
+    last: Option<Vec<Option<Bson>>>,
 }
 
 impl Sorted {
-    fn next_row(&mut self) -> Result<Option<Document>, String> {
+    /// The next row of the merge (no OFFSET, LIMIT or DISTINCT applied).
+    pub(crate) fn next_row(&mut self) -> Result<Option<Document>, String> {
         if self.readers.is_empty() {
             return Ok(self.mem.next());
         }
@@ -166,6 +246,16 @@ impl Sorted {
         let mut docs = Vec::new();
         while docs.len() < self.batch && self.left != Some(0) {
             let Some(d) = self.next_row()? else { break };
+            if let Some(fields) = self.dedup.as_ref() {
+                let ident: Vec<Option<Bson>> = fields
+                    .iter()
+                    .map(|f| group_key_ident(&d.get(f).cloned()))
+                    .collect();
+                if self.last.as_ref() == Some(&ident) {
+                    continue;
+                }
+                self.last = Some(ident);
+            }
             if self.skip > 0 {
                 self.skip -= 1;
                 continue;
@@ -295,6 +385,64 @@ mod tests {
             .skip(skip)
             .take(limit.unwrap_or(usize::MAX))
             .collect()
+    }
+
+    #[test]
+    fn dedup_keeps_the_first_of_each_equal_run_before_offset_and_limit() {
+        let order = vec![OrderKey {
+            field: "k".into(),
+            ascending: true,
+            nulls: Nulls::Last,
+            expr: None,
+        }];
+        // 120,000 rows over 101 keys: spilled runs, duplicates across them.
+        let data = rows(120_000);
+        for (skip, limit) in [(0, None), (3, Some(10)), (100, Some(5))] {
+            let mut sorted = sort_runs_with(
+                |sink| {
+                    for c in data.chunks(256) {
+                        if !sink(c.to_vec()) {
+                            break;
+                        }
+                    }
+                    Ok(())
+                },
+                &order,
+                skip,
+                limit,
+                64,
+                Some(vec!["k".into()]),
+                &mut |d| {
+                    let k = d.get_i32("k").unwrap();
+                    d.insert("k2", k * 2);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let mut got = Vec::new();
+            loop {
+                let b = sorted.next_batch().unwrap();
+                if b.is_empty() {
+                    break;
+                }
+                got.extend(b.iter().map(|d| {
+                    assert_eq!(d.get_i32("k2").unwrap(), d.get_i32("k").unwrap() * 2);
+                    (d.get_i32("k").unwrap(), d.get_i32("i").unwrap())
+                }));
+            }
+            // The first row (in scan order) of each key.
+            let mut want: Vec<(i32, i32)> = Vec::new();
+            for k in 0..101 {
+                let i = (0..120_000).find(|i| (i * 7919) % 101 == k).unwrap();
+                want.push((k, i));
+            }
+            let want: Vec<_> = want
+                .into_iter()
+                .skip(skip)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
+            assert_eq!(got, want, "{skip} {limit:?}");
+        }
     }
 
     #[test]

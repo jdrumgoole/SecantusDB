@@ -752,11 +752,36 @@ remain open:
         restart, debug: server RSS growth 2700 MB (base `9dd2e7b4`) -> 47 MB
         (cursor) and 2699 -> 45 MB (psycopg named cursor). Corpus
         `b58_block_order` (23 lines, 0 against PostgreSQL 15.19), slice test
-        `test_batch58_block_cursors_and_portals_with_order_by`. Left (OPEN):
-        joins, aggregates, DISTINCT and ORDER BY over an expression still
-        materialise (a join would stream its outer side; an aggregate's
-        memory is its groups; the materialised DISTINCT is also a quadratic
-        `Vec::contains` over the kept rows) -- not worked in batch 58.
+        `test_batch58_block_cursors_and_portals_with_order_by`. **Batch 59
+        (2026-10-06):** the quadratic `Vec::contains` de-duplication is gone
+        everywhere it was (SELECT DISTINCT, DISTINCT ON, GROUP BY, grouping
+        sets, aggregate DISTINCT, INTERSECT / EXCEPT [ALL]): a hash on the
+        `group_key_ident` identity with `==` deciding inside a bucket
+        (`distinct_set.rs`), so no answer can change. DISTINCT, DISTINCT ON
+        and an ORDER BY over an expression now stream (`stream_order`: a
+        DISTINCT sorts on its ORDER BY then every output field and keeps the
+        first of each equal run, before OFFSET / LIMIT; an expression key is
+        computed on the statement's own thread, so outside a block the sort
+        runs at Execute and inside one at DECLARE / Execute). A plain GROUP
+        BY over one stored table whose input passes 64 MB sorts on the group
+        key and aggregates a group at a time (`grouped_in_bounded_memory`;
+        smaller inputs group as before). 300,000 rows of 2 KB fetched 1,000
+        at a time after a restart, release, base `0e01382f` -> batch 59:
+        expression ORDER BY outside a block 1719 -> 40 MB, in a named cursor
+        2384 -> 44 MB, DISTINCT 1371 -> 33 MB, DISTINCT ON 1372 -> 37 MB,
+        GROUP BY 1430 -> 106 MB; same wall clock (GROUP BY 0.9 -> 1.1 s).
+        Corpora `b59_distinct`, `b59_stream`, `b59_group_spill` (the last
+        also with `SECANTUS_PG_GROUP_MEMORY_BYTES=1000`), slice tests
+        `test_batch59_*`. Left (OPEN), each still materialised: a JOIN
+        (streaming its outer side needs the join planner's leaves to read
+        in batches -- `join_docs` reads every side whole); an aggregate
+        with no GROUP BY, with grouping sets, or over a join / subquery /
+        indexed filter (its memory is the input: it needs incremental
+        accumulators, not a sort); anything run through the SIMPLE query
+        protocol (only extended portals and cursors stream); and a DISTINCT
+        over a timestamp / timestamptz / tsvector output column (its
+        identity is the reassembled text, so it keeps the materialised
+        path).
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -1015,6 +1040,21 @@ remain open:
       actually qualified, and the UPDATE path never reached the PostgreSQL
       error renderer at all, so any unique violation there (the PRIMARY KEY one
       included) leaked `E11000` with no SQLSTATE.
+- [ ] **OPEN — RUST pgserver: two DISTINCT / GROUP BY divergences found by
+      batch 59's corpus (2026-10-06, PostgreSQL 15.19), both older than it
+      (the hashed de-duplication keeps `==`, so it changed neither):**
+      - `jsonb` is grouped by its stored TEXT: `'{"x": 1}'` and
+        `'{"x": 1.0}'` are two groups in DISTINCT, GROUP BY, DISTINCT ON,
+        `count(DISTINCT j)` and UNION, where PostgreSQL compares jsonb
+        numbers by value (13 groups vs 14 over `b59_distinct`'s table). The
+        identity needs the column's type (a jsonb value is a string like a
+        text one): `group_key_ident` would take a parsed, number-normalised
+        form for jsonb only, at each site that knows the type
+        (`row_schema` for SELECT DISTINCT, `AggItem::source_type`, the
+        group key's declared type, the set operation's column types).
+      - `SELECT DISTINCT count(*) FROM t GROUP BY k ORDER BY 1` is 0A000
+        `ORDER BY over an aggregate result is not supported yet`;
+        PostgreSQL orders the distinct counts.
 - [ ] **OPEN — RUST pgserver: write conflicts and row locks, what is left
       (updated 2026-10-03, batch 50).** A conflicting write WAITS for the
       transaction holding the row -- holding its own rows meanwhile -- and
@@ -1181,7 +1221,31 @@ remain open:
         overlay (the block's own rows over a fresh read-only snapshot) needs
         every storage read path of the table -- scan, `_id` probe, index
         lookups, counts -- to merge the write set, which batch 58 did not
-        start. Every move --
+        start. **Batch 59 (2026-10-06), not implemented; the design as
+        measured:** `read_apart` runs the WHOLE statement in a fresh
+        WiredTiger transaction (`with_user_transaction(&mut tmp, ...)`), and
+        every read below it goes to that session: `find_matching_with`'s
+        index pickers and `docs_by_recordids`, `find_by_id` / the point read,
+        `scan_matching_batches` / `scan_batch_after`, `count_matching`, and
+        the pgserver's own `table_docs` / `scan_table` / join leaves. An
+        overlay must give each of them, for each table the block wrote, the
+        fresh snapshot's rows MINUS the RecordIds the block wrote or deleted
+        PLUS the block's own current versions of them, with the filter
+        re-applied to those (an index lookup cannot be trusted for them: the
+        fresh snapshot's index entries describe the committed version). The
+        block's written RecordIds are in its oplog write set
+        (`transaction_write_set`, by `_id`, which maps to a RecordId only
+        through the block's own `_id` index), so the overlay needs, per
+        table, a `(RecordId -> Option<doc>)` map built from the block's
+        transaction before the read and threaded to every one of those read
+        paths -- a storage-wide change shared with the MongoDB server's
+        read paths, which must stay byte-for-byte unchanged. PostgreSQL
+        semantics would hold: a row the block wrote is row-locked by it, so
+        no other session can have committed a newer version of it (a
+        concurrent INSERT of the same key is a write conflict the re-run
+        answers 23505). Not started in batch 59 for that breadth; the
+        replay it would replace costs the block's write-set length per
+        statement only while such commits keep arriving. Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
@@ -1598,6 +1662,26 @@ These work end-to-end but cut corners.
       now most of what is left of `wait_for_table_locks`, ~3% of the
       connection thread). What remains has no single cost above ~1 us
       beyond the socket syscalls and the storage read.
+
+      **Batch 59 (2026-10-06)**, release, `bench43.py`, two interleaved
+      runs, load ~4.4, base `0e01382f` -> batch 59 (PG 15.19): ping 19.4 /
+      19.6 -> 19.4 / 19.5, simple `select 1` 28.1 / 28.4 -> 26.8 / 27.0,
+      extended `select 1` 41.3 / 40.9 -> 39.5 / 39.0, **PK read 47.4 / 49.0
+      -> 45.4 / 45.3**, autocommit UPDATE 71.8 / 73.0 -> 70.0 / 70.7 us
+      (PG 15: 18.2, 22.3, 26.2, 33.1, 106.6). A `sample` of 290k PK reads
+      put `install_user_types` at ~1.5 us and `sql_relations` at ~1 us of
+      the connection thread's ~23 us; fixed: the role list was copied whole
+      for every `role()` lookup (`roles_shared`), the session user, role
+      and temp-schema name were cloned into the planner's thread-locals and
+      into two cache keys every statement (now compared in place,
+      `set_session_user_str` / `set_current_user_str` /
+      `set_temp_schema_serial`), and `sql_relations` re-resolved its names
+      through the search path every call (now remembered per text while a
+      resolution epoch -- bumped by every setter of what resolution reads,
+      `schemas::resolve_epoch` -- stands). The remaining ~12 us gap: the
+      `recvfrom` / `sendto` pair (~4 us; one of each per Sync already),
+      `find_matching`'s `_id` probe (~2 us), the extended group's open /
+      commit, Describe, and tokio's wake-ups.
       **Batch 54 (2026-10-05):** `is_timeseries` caches its answer per
       collection once a timeseries collection exists (`TIMESERIES_CACHE`),
       transaction-aware: valid while `COLL_TABLE_GEN` -- moved on by every
