@@ -772,13 +772,28 @@ remain open:
         GROUP BY 1430 -> 106 MB; same wall clock (GROUP BY 0.9 -> 1.1 s).
         Corpora `b59_distinct`, `b59_stream`, `b59_group_spill` (the last
         also with `SECANTUS_PG_GROUP_MEMORY_BYTES=1000`), slice tests
-        `test_batch59_*`. Left (OPEN), each still materialised: a JOIN
+        `test_batch59_*`. **Batch 60 (2026-10-06):** an aggregate with NO
+        GROUP BY over one stored table (a collection-scan filter, or none;
+        outside or inside a block; either protocol) is computed a chunk of
+        at most 16 MB at a time and the chunks' partials combined, for the
+        aggregates whose partials combine exactly: `count`, `min` / `max`,
+        `bool_and` / `bool_or`, and `sum` over int2 / int4 / int8 / numeric
+        (`ungrouped_in_bounded_memory`). 300,000 rows of 2 KB after a
+        restart, release, base `e53ea4f0` -> batch 60: `count(*), sum(i),
+        max(t), min(n)` 1755 -> 58 MB (0.74 -> 0.56 s); with a WHERE 1762
+        -> 59 MB; the same through the extended protocol 1755 -> 58 MB.
+        Corpus `b60_agg_stream` (also run with
+        `SECANTUS_PG_GROUP_MEMORY_BYTES=1000`), slice test
+        `test_batch60_ungrouped_aggregates_in_bounded_memory`. Left (OPEN),
+        each still materialised: an ungrouped `avg`, a float `sum`, any
+        other aggregate, or one with DISTINCT / FILTER / ORDER BY inside
+        (avg needs a (sum, count) partial; a float sum's rounding depends on
+        the order of additions, so chunking would change its last bits); a JOIN
         (streaming its outer side needs the join planner's leaves to read
         in batches -- `join_docs` reads every side whole); an aggregate
-        with no GROUP BY, with grouping sets, or over a join / subquery /
-        indexed filter (its memory is the input: it needs incremental
-        accumulators, not a sort); anything run through the SIMPLE query
-        protocol (only extended portals and cursors stream); and a DISTINCT
+        with grouping sets, or over a join / subquery / indexed filter;
+        a row-returning statement run through the SIMPLE query protocol
+        (only extended portals and cursors stream); and a DISTINCT
         over a timestamp / timestamptz / tsvector output column (its
         identity is the reassembled text, so it keeps the materialised
         path).
@@ -1040,21 +1055,35 @@ remain open:
       actually qualified, and the UPDATE path never reached the PostgreSQL
       error renderer at all, so any unique violation there (the PRIMARY KEY one
       included) leaked `E11000` with no SQLSTATE.
-- [ ] **OPEN — RUST pgserver: two DISTINCT / GROUP BY divergences found by
-      batch 59's corpus (2026-10-06, PostgreSQL 15.19), both older than it
-      (the hashed de-duplication keeps `==`, so it changed neither):**
-      - `jsonb` is grouped by its stored TEXT: `'{"x": 1}'` and
-        `'{"x": 1.0}'` are two groups in DISTINCT, GROUP BY, DISTINCT ON,
-        `count(DISTINCT j)` and UNION, where PostgreSQL compares jsonb
-        numbers by value (13 groups vs 14 over `b59_distinct`'s table). The
-        identity needs the column's type (a jsonb value is a string like a
-        text one): `group_key_ident` would take a parsed, number-normalised
-        form for jsonb only, at each site that knows the type
-        (`row_schema` for SELECT DISTINCT, `AggItem::source_type`, the
-        group key's declared type, the set operation's column types).
-      - `SELECT DISTINCT count(*) FROM t GROUP BY k ORDER BY 1` is 0A000
-        `ORDER BY over an aggregate result is not supported yet`;
-        PostgreSQL orders the distinct counts.
+- [x] **FIXED (batch 60, 2026-10-06) — RUST pgserver: two DISTINCT / GROUP
+      BY divergences found by batch 59's corpus (PostgreSQL 15.19):**
+      - `jsonb` was compared by its stored TEXT, which keeps each number's
+        scale, where PostgreSQL compares jsonb numbers as numerics. Worse
+        than the entry said: not only DISTINCT / GROUP BY / DISTINCT ON /
+        `count(DISTINCT j)` / UNION, but `WHERE j = '{"x":1.0}'` matched
+        NOTHING (the literal was not even normalised), and IN, `= ANY`, a
+        join, an IN / EXISTS semi-join, INTERSECT / EXCEPT, a window's
+        PARTITION BY and a UNIQUE constraint (INSERT and UPDATE) all
+        answered wrongly. Now: `json::jsonb_value_key` (normalised text,
+        each number by value) is the identity; a WHERE comparison on a
+        jsonb column is a residual evaluated per row by value (the
+        evaluator's `=` / `<>` / `= ANY` on a jsonb operand); every
+        grouping site takes the key's declared type (`typed_ident`; the
+        GROUP BY spill sorts a jsonb key on its value key, `__grpk`); the
+        join hash puts JSON-shaped strings in a value bucket (ON decides);
+        the hashed semi-join refuses a jsonb key (per-row path); a UNIQUE /
+        PK over a jsonb or nondeterministically collated column is checked
+        per written row, UPDATE included (`value_unique` -- the UPDATE path
+        skipped `check_collated_unique` for nondeterministic collations
+        too). Corpus `b60_jsonb_eq` (33 lines, 0 against PostgreSQL 15.19),
+        slice test `test_batch60_jsonb_compares_by_value`. What it costs:
+        an equality on a jsonb column no longer uses a btree index on it
+        (the stored text cannot find `1.0` for `1`), and a jsonb UNIQUE
+        constraint reads the table per write statement.
+      - `SELECT DISTINCT count(*) ... GROUP BY k ORDER BY 1` (or by the
+        aggregate's alias) was 0A000: a plain DISTINCT over bare aggregates
+        now goes through the DISTINCT-over-groups subquery when the ORDER
+        BY sorts on an aggregate (`sorts_on_aggregate`).
 - [ ] **OPEN — RUST pgserver: write conflicts and row locks, what is left
       (updated 2026-10-03, batch 50).** A conflicting write WAITS for the
       transaction holding the row -- holding its own rows meanwhile -- and
@@ -1245,7 +1274,21 @@ remain open:
         concurrent INSERT of the same key is a write conflict the re-run
         answers 23505). Not started in batch 59 for that breadth; the
         replay it would replace costs the block's write-set length per
-        statement only while such commits keep arriving. Every move --
+        statement only while such commits keep arriving. **Batch 60
+        (2026-10-06): still not started, for the reason above -- recorded
+        rather than half-built.** The safe first step is NOT the read paths
+        but the map: `Storage::block_overlay(handle, table) -> Option<
+        BTreeMap<RecordId, Option<Vec<u8>>>>`, built inside the block's
+        transaction from `transaction_write_set` (`_id` -> RecordId through
+        its own `_id` index), unit-tested alone in `secantus-storage`; then
+        ONE consumer -- `scan_matching_batches` under an opt-in thread-local
+        the PG server sets in `read_apart` only, the MongoDB server never
+        setting it (so its tests are unaffected by construction) -- with
+        the multi-session RC slice tests run against PostgreSQL 15.19 too;
+        and only then the `_id` point read, the index pickers and the
+        counts, each behind the same opt-in. Until every path a statement
+        can reach honours it, `rc_select_read_set` must keep refusing the
+        overlay for that statement shape. Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
@@ -1682,6 +1725,26 @@ These work end-to-end but cut corners.
       `recvfrom` / `sendto` pair (~4 us; one of each per Sync already),
       `find_matching`'s `_id` probe (~2 us), the extended group's open /
       commit, Describe, and tokio's wake-ups.
+      **Batch 60 (2026-10-06), measured, nothing above 1 us left to cut.**
+      Release, `bench43.py`, two interleaved runs, load ~6-10, base
+      `e53ea4f0` -> batch 60 (no PK-read change): ping 19.2 / 19.3 -> 19.5 /
+      19.3, simple `select 1` 27.4 / 27.0 -> 27.4 / 27.2, extended `select
+      1` 39.9 / 39.8 -> 39.6 / 39.7, PK read 43.7 / 44.0 -> 44.2 / 44.7,
+      autocommit UPDATE 70.4 / 70.5 -> 70.5 / 69.8 us (PG 15.19: 18.4,
+      22.7, 26.7, 33.3, 116.9). A `sample` of ~216k PK reads (10 s): the
+      connection thread is on CPU ~22 us a statement and parked in `kevent`
+      the rest (the client's side and the loopback). Of the ~22 us:
+      `recvfrom` ~2.7 (THREE call sites a statement, ~0.9 each -- the
+      framed reader's read that finds data, then reads that find none
+      before it parks), `sendto` ~1.7, `execute` ~4.3 (the `_id` probe and
+      row read ~1.7, `decode_doc` 0.65, `lookup` 0.57), the implicit
+      commit 0.25 and open 0.33, Describe ~0.1, `wait_for_table_locks` +
+      `sql_relations` ~0.2, `idle_timeout` ~0.1. No single cost above
+      ~1 us remains outside the syscalls; the next lever is structural --
+      fewer `recvfrom`s a statement (read until EAGAIN once, in the vendored
+      pgwire's framed loop: `crates/vendor/pgwire/src/tokio/server.rs`'s
+      per-message `select!`) or no per-statement WiredTiger transaction for
+      a single point read -- each worth at most ~1-2 us.
       **Batch 54 (2026-10-05):** `is_timeseries` caches its answer per
       collection once a timeseries collection exists (`TIMESERIES_CACHE`),
       transaction-aware: valid while `COLL_TABLE_GEN` -- moved on by every

@@ -17624,3 +17624,89 @@ def test_batch59_group_by_past_its_memory_budget(home: Path, monkeypatch) -> Non
         a.execute("insert into b59_g values (9999, 500, 1)")
         assert a.execute("select count(*) from b59_g where k = 500 group by k").fetchall() == [(1,)]
         a.execute("rollback")
+
+
+def test_batch60_jsonb_compares_by_value(home: Path) -> None:
+    """jsonb equality is by VALUE: a number inside compares as a numeric, so
+    `{"x": 1}` and `{"x": 1.0}` are one value in WHERE, IN, a join, a
+    semi-join, DISTINCT, GROUP BY, a set operation, a window partition and
+    a UNIQUE constraint (INSERT and UPDATE) -- PostgreSQL 15.19's answers.
+    The stored text keeps each number's scale, which compared them apart."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b60_j (id int primary key, j jsonb)")
+        conn.execute(
+            "insert into b60_j values (1, '{\"x\":1}'), (2, '{\"x\":1.0}'), (3, '[1.00]'),"
+            " (4, '[1]'), (5, '\"s\"')"
+        )
+        conn.execute("create table b60_k (id int primary key, j jsonb)")
+        conn.execute("insert into b60_k values (1, '{\"x\":1.000}'), (2, '[1.0]')")
+        assert conn.execute(
+            "select id from b60_j where j = '{\"x\":1.00}' order by id"
+        ).fetchall() == [(1,), (2,)]
+        assert conn.execute(
+            "select id from b60_j where j in ('[1.0]', '\"s\"') order by id"
+        ).fetchall() == [(3,), (4,), (5,)]
+        assert conn.execute("select count(distinct j) from b60_j").fetchone() == (3,)
+        assert conn.execute(
+            "select count(*) from (select j from b60_j group by j) s"
+        ).fetchone() == (3,)
+        assert conn.execute(
+            "select count(*) from (select j from b60_j union select j from b60_k) s"
+        ).fetchone() == (3,)
+        assert conn.execute(
+            "select a.id, b.id from b60_j a join b60_k b on a.j = b.j order by 1"
+        ).fetchall() == [(1, 1), (2, 1), (3, 2), (4, 2)]
+        assert conn.execute(
+            "select a.id from b60_j a where exists (select 1 from b60_k b where b.j = a.j)"
+            " order by 1"
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        assert conn.execute(
+            "select id, count(*) over (partition by j) from b60_j order by id"
+        ).fetchall() == [(1, 2), (2, 2), (3, 2), (4, 2), (5, 1)]
+        conn.execute("create table b60_u (id int primary key, j jsonb unique)")
+        conn.execute("insert into b60_u values (1, '{\"x\":1}'), (2, '{\"x\":2}')")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute("insert into b60_u values (3, '{\"x\":1.0}')")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute("update b60_u set j = '{\"x\":1.00}' where id = 2")
+        assert conn.execute(
+            "select distinct count(*) from b60_j group by j order by 1"
+        ).fetchall() == [(1,), (2,)]
+
+
+def test_batch60_ungrouped_aggregates_in_bounded_memory(home: Path, monkeypatch) -> None:
+    """An aggregate with no GROUP BY is computed a chunk at a time and the
+    chunks' partials combined (count, min / max, bool_and / bool_or, an exact
+    sum), outside and inside a block. The budget is lowered so a small table
+    takes many chunks; the answers are PostgreSQL 15.19's."""
+    monkeypatch.setenv("SECANTUS_PG_GROUP_MEMORY_BYTES", "1000")
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b60_s (id int primary key, i int, b bigint, n numeric, t text)")
+        a.execute(
+            "insert into b60_s select g, case when g % 7 = 0 then null else g % 50 - 20 end,"
+            " 9000000000000000000 - g, (g % 4) * 1.25, 'v' || (g * 37 % 1000)"
+            " from generate_series(1, 3000) g"
+        )
+        assert a.execute(
+            "select count(*), count(i), sum(i), sum(b), sum(n), min(t), max(i), bool_or(i > 28)"
+            " from b60_s"
+        ).fetchone() == (
+            3000,
+            2572,
+            sum(g % 50 - 20 for g in range(1, 3001) if g % 7),
+            Decimal(sum(9000000000000000000 - g for g in range(1, 3001))),
+            Decimal("5625.00"),
+            "v0",
+            29,
+            True,
+        )
+        a.execute("create table b60_e (id int primary key, i int)")
+        assert a.execute("select count(*), sum(i), max(i) from b60_e").fetchone() == (0, None, None)
+        a.execute("begin")
+        a.execute("insert into b60_s values (9999, 1000, 0, 0, 'zz')")
+        assert a.execute("select max(i), max(t), count(*) from b60_s").fetchone() == (
+            1000,
+            "zz",
+            3001,
+        )
+        a.execute("rollback")
