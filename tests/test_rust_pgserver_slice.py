@@ -17,6 +17,7 @@ import contextlib
 import datetime as dt
 import decimal as dc
 import ipaddress
+import os
 import re
 import shutil
 import signal
@@ -67,11 +68,18 @@ _STOP_SIGNAL = signal.CTRL_BREAK_EVENT if _WINDOWS else signal.SIGTERM
 class _Server:
     """A `secantusd-pg` subprocess over one storage home."""
 
-    def __init__(self, home: Path, *, databases: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        home: Path,
+        *,
+        databases: tuple[str, ...] = (),
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.home = home
         self.port = 0
         self.proc: subprocess.Popen[str] | None = None
         self.databases = databases
+        self.env = env
 
     def __enter__(self) -> _Server:
         # Bind port 0 and let the KERNEL name the port, then read it back from
@@ -95,6 +103,7 @@ class _Server:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=None if self.env is None else {**os.environ, **self.env},
             **_SPAWN_KWARGS,
         )
         line = self._readline(timeout=30)
@@ -18108,3 +18117,121 @@ def test_batch64_plpgsql_expression_context_frame(home: Path) -> None:
                 assert "SQL expression" not in ctx, ctx
             else:
                 assert ctx.startswith(frame), ctx
+
+
+def test_batch65_collate_distinct_on_and_offset_errors(home: Path) -> None:
+    """Batch 65: a COLLATE on a column of a type that takes none is 42804 at
+    planning, over an empty table too; a COLLATE makes an ORDER BY item
+    another expression, so a plain DISTINCT over the bare column is 42P10;
+    a DISTINCT ON whose leading ORDER BY items are not its expressions is
+    42P10; and a row OFFSET skips still has its select list computed, so
+    `exists(select a/b ... offset 5)` raises 22012 (PostgreSQL 15.19)."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b65_e (v int, t text, a int, b int)")
+
+        def state(sql: str) -> str | None:
+            try:
+                a.execute(sql).fetchall()
+            except psycopg.Error as e:
+                return e.sqlstate
+            return None
+
+        assert state('select v from b65_e order by v collate "C"') == "42804"
+        assert state('select t from b65_e order by t collate "C"') is None
+        a.execute("insert into b65_e values (1, 'a', 1, 0), (2, 'b', 2, 0)")
+        assert state('select distinct t from b65_e order by t collate "C"') == "42P10"
+        assert state('select distinct t collate "C" from b65_e order by t collate "C"') is None
+        assert state("select distinct on (t) t from b65_e order by v") == "42P10"
+        assert state("select distinct on (t) t, v from b65_e order by t, v") is None
+        assert state("select exists(select a/b from b65_e limit 1 offset 5)") == "22012"
+        assert state("select a/b from b65_e offset 2") == "22012"
+        assert a.execute("select exists(select a from b65_e offset 5)").fetchone() == (False,)
+
+
+def test_batch65_streamed_join_matches_the_materialised_rows(home: Path) -> None:
+    """Batch 65: a join of stored tables reads its left side a batch at a
+    time against the hashed right side (`stream_join`). The rows AND THEIR
+    ORDER are the materialised path's: the same unordered queries run by a
+    server whose join memory bound is 1 byte (every join falls back) give
+    the same lists, as do the aggregates over the join."""
+    queries = [
+        "select a.id, b.name from b65_ja a join b65_jb b on a.k = b.id",
+        "select a.id, b.name from b65_ja a left join b65_jb b on a.k = b.id where a.g = 1",
+        "select a.id, b.name, c.tag from b65_ja a join b65_jb b on a.k = b.id "
+        "join b65_jc c on c.bid = b.id",
+        "select * from b65_ja a join b65_jb b on a.k = b.id where a.f + b.v > 30",
+        "select a.id, b.name from b65_ja a right join b65_jb b on a.k = b.id",
+        "select a.id, b.name from b65_ja a join b65_jb b on a.k = b.id limit 7 offset 3",
+        "select count(*), sum(a.id), max(b.name) from b65_ja a join b65_jb b on a.k = b.id",
+        "select b.name, count(*) from b65_ja a join b65_jb b on a.k = b.id group by b.name",
+    ]
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b65_ja (id int primary key, k int, g int, f float8)")
+        a.execute("create table b65_jb (id int primary key, name text, v numeric)")
+        a.execute("create table b65_jc (bid int, tag text)")
+        a.execute(
+            "insert into b65_ja select g, (g * 7919) % 11, g % 3, g / 4.0 "
+            "from generate_series(1, 2000) g"
+        )
+        a.execute("insert into b65_ja values (2001, null, 1, null)")
+        a.execute(
+            "insert into b65_jb select g, 'n' || (g % 4), g * 1.5 from generate_series(0, 8) g"
+        )
+        a.execute("insert into b65_jc values (1, 'a'), (1, 'b'), (3, 'c'), (null, 'd')")
+        streamed = [a.execute(q).fetchall() for q in queries]
+    with _Server(home, env={"SECANTUS_PG_JOIN_INNER_BYTES": "1"}) as server, server.connect() as a:
+        materialised = [a.execute(q).fetchall() for q in queries]
+    for q, s, m in zip(queries, streamed, materialised, strict=True):
+        assert s == m, q
+    assert len(streamed[0]) == 1636
+
+
+def test_batch65_read_committed_block_streams_and_sees_commits(home: Path) -> None:
+    """Batch 65: a simple-protocol SELECT inside a READ COMMITTED block
+    streams through the block's transaction when the statement's snapshot is
+    the block's own (refreshed for it, or the block moved), and keeps the
+    materialised path when it runs apart from the block. Each answer is
+    PostgreSQL 15.19's for the same two-session script: another session's
+    commits are seen statement by statement, before and after the block's
+    own write, and an error part-way through a streamed read fails the
+    block."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table b65_rc (id int primary key, k int)")
+        a.execute("insert into b65_rc select g, g % 10 from generate_series(1, 3000) g")
+        pg = a.pgconn
+
+        def simple(sql: str) -> object:
+            r = pg.exec_(sql.encode())
+            if r.status != psycopg.pq.ExecStatus.TUPLES_OK:
+                code = r.error_field(psycopg.pq.DiagnosticField.SQLSTATE) or b""
+                return ("ERR", code.decode())
+            rows = [int(r.get_value(i, 0).decode()) for i in range(r.ntuples)]
+            return (len(rows), sum(rows))
+
+        pg.exec_(b"begin")
+        assert simple("select id from b65_rc") == (3000, 4501500)
+        b.execute("insert into b65_rc values (5000, 1)")
+        assert simple("select id from b65_rc") == (3001, 4506500)
+        assert simple("select id from b65_rc where k = 1") == (301, 453800)
+        b.execute("delete from b65_rc where id <= 100")
+        assert simple("select id from b65_rc") == (2901, 4501450)
+        pg.exec_(b"insert into b65_rc values (6000, 2)")
+        assert simple("select id from b65_rc") == (2902, 4507450)
+        b.execute("insert into b65_rc values (7000, 3)")
+        assert simple("select id from b65_rc") == (2903, 4514450)
+        b.execute("update b65_rc set k = 9 where id = 7000")
+        assert simple("select id from b65_rc where k = 9") == (291, 457660)
+        assert simple("select id from b65_rc order by id desc limit 3") == (3, 18000)
+        b.execute("insert into b65_rc values (8000, 4)")
+        assert simple("select id from b65_rc order by k, id") == (2904, 4522450)
+        assert simple("select id / (id - 2500) from b65_rc") == ("ERR", "22012")
+        assert simple("select 1") == ("ERR", "25P02")
+        pg.exec_(b"rollback")
+        assert simple("select id from b65_rc") == (2903, 4516450)
+        pg.exec_(b"begin")
+        assert simple("select id from b65_rc") == (2903, 4516450)
+        b.execute("insert into b65_rc values (9000, 5)")
+        b.execute("insert into b65_rc values (9001, 5)")
+        assert simple("select id from b65_rc") == (2905, 4534451)
+        assert simple("select id from b65_rc where id > 8999") == (2, 18001)
+        pg.exec_(b"commit")

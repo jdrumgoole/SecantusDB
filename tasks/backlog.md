@@ -883,6 +883,49 @@ remain open:
         streamed join needs a pull-based join operator whose ON runs where
         `sorted_here` runs its ORDER BY expressions, plus an outer-select
         stream over it; grouping sets need one sorted pass per set.
+        **Batch 65 (2026-10-06):** both stream now. (1) A JOIN of stored
+        tables (`stream_join`): every right side is read and hashed first,
+        within `SECANTUS_PG_JOIN_INNER_BYTES` (64 MB) in all, then the
+        leftmost table is read a batch at a time ON THE STATEMENT'S THREAD
+        -- so the ON / WHERE expressions run with the session state, which
+        is what kept the pull-based design from working on the reader
+        thread -- each batch joined by the code the materialised path uses
+        (`join_docs_core` / `join_rows_core`, factored out of it), filtered,
+        and written to `external_sort` runs that pgwire reads a batch per
+        poll; an aggregate over the join feeds the bounded aggregates
+        instead. A right side past the bound declines before any row goes
+        out and the statement takes the materialised path. Both the narrow
+        two-table path and the general planner's joins (several tables,
+        LEFT / RIGHT / FULL, USING) stream; not inside a transaction block,
+        under row-level security, for a locking select or a correlated
+        re-scan. The narrow path's nested loop over every pair became a hash
+        on its ON equality (`NarrowIndex`, exactly `eq`'s matches), so a
+        fallback is fast too. (2) A simple-protocol SELECT inside a READ
+        COMMITTED block streams through the block's transaction unless the
+        statement runs APART from the block (`read_apart`, a transaction
+        that ends when the statement returns -- the stale reads batch 64's
+        four RC slice tests caught); `running_apart` keeps those
+        materialised. 300,000 rows of 2 KB joined to 1,000 small rows through
+        psql after a restart, debug, cache capped at 64 MB, base `c406e4da`
+        -> batch 65, output md5-identical: `select b.id, b.pad, s.name ...
+        join` 3494 -> 25 MB (119 -> 11 s); LEFT JOIN with `where b.g = 3`
+        1823 -> 26 MB (19 -> 3.4 s); `count(*), sum, max` over the join 3249
+        -> 68 MB (12.7 -> 15.5 s); GROUP BY over it 2116 -> 197 MB (13 ->
+        23 s; the joined rows are re-encoded for the bounded aggregates); a
+        join whose right side is 300,000 rows (over the bound) still
+        materialises, 4.8 s where base's nested loop did not finish in 30
+        min. Inside a READ COMMITTED block, the whole table 1571 -> 42 MB,
+        `where g = 3` 646 -> 3 MB. Corpus `b65_join_stream` (33 lines, 0
+        against 15.19, also 0 with the bound at 1 byte), slice tests
+        `test_batch65_streamed_join_matches_the_materialised_rows` (streamed
+        and materialised rows equal, in order) and
+        `test_batch65_read_committed_block_streams_and_sees_commits` (a
+        two-session script whose answers are PostgreSQL 15.19's). **Still
+        materialised (OPEN):** a join inside a transaction block (each side
+        would have to read through the block's transaction a batch at a
+        time), a join with a subquery / LATERAL / function side or a right
+        side over the bound (a spilling hash join would lift that), and an
+        aggregate with grouping sets.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -1084,21 +1127,37 @@ remain open:
         `test_tmp_retention_guard.py`, `test_crash_stall_watchdog.py` and
         `test_worker_death_fails_run.py` now set it (the outer controller
         already sweeps).
-- [ ] **OPEN — RUST pgserver: residuals batch 64's probes found (measured
-      against PostgreSQL 15.19, 2026-10-06).** Each is a missing ERROR, not
-      a wrong row; each was left out of its corpus with this entry as the
-      record:
-      - `select distinct t from x order by t collate "C"` answers; PostgreSQL
-        is 42P10 (a COLLATE makes it another expression). The new DISTINCT /
-        ORDER BY check (`check_distinct_order`) lets every COLLATE through,
-        because the error PostgreSQL raises FIRST for `int collate "C"`
-        (42804 `collations are not supported by type integer`) is raised
-        here only when a row is sorted -- `select v from x order by v
-        collate "C"` over an EMPTY table answers. Fixing the second (type the
-        COLLATE at planning) makes the first a one-line change.
-      - `exists(select a/b from t limit 1 offset 5)` answers false; PostgreSQL
-        evaluates the select list of the rows OFFSET skips, so it raises
-        22012. The executor never computes a skipped row's outputs.
+- [x] **FIXED (batch 65, 2026-10-06) — RUST pgserver: residuals batch 64's
+      probes found (measured against PostgreSQL 15.19).** Each was a missing
+      ERROR:
+      - A COLLATE over a column of a type that takes no collation (`order by
+        v collate "C"` for an int) is 42804 at PLANNING now
+        (`enum_order::check_collate_operands`), so over an empty table too;
+        it was raised only when a row was sorted. Then a COLLATE makes an
+        ORDER BY item another expression, so `select distinct t ... order by
+        t collate "C"` is 42P10 (`check_distinct_order` no longer lets a
+        COLLATE through).
+      - Found by the same corpus: a DISTINCT ON whose leading ORDER BY items
+        are not its expressions (`distinct on (t) ... order by v`, `... order
+        by t collate "C"`) answered; it is 42P10 now
+        (`check_distinct_on_order`, PostgreSQL's
+        `transformDistinctOnClause`).
+      - A row OFFSET skips has its select list computed (PostgreSQL's Limit
+        node sits above the projection), so `exists(select a/b ... offset 5)`
+        and `select a/b ... offset 2` raise 22012 and a volatile call in the
+        list runs for the skipped rows (`select_docs`).
+      Corpus `b65_residuals` (46 lines, 0 against 15.19), slice test
+      `test_batch65_collate_distinct_on_and_offset_errors`.
+- [ ] **OPEN — RUST pgserver: an unused FROM-subquery output is still
+      computed (found batch 65, measured against PostgreSQL 15.19).**
+      `select count(*) from (select a/b from t) s` and `select a from (select
+      a/b x, a from t) s` raise 22012 here; PostgreSQL answers, because the
+      planner replaces a subquery output nothing reads with NULL
+      (`remove_unused_subquery_outputs`; not for a set-returning or volatile
+      output, or under DISTINCT). Predates batch 65 (the same with or without
+      an OFFSET). A spurious error, never a wrong row; the fix is a planning
+      rewrite of the inner select list from the outer statement's
+      references. Not started.
 
 - [x] **CLOSED (re-measured 2026-10-03, batch 50) — RUST pgserver: what
       batch 11 (rules, event triggers, foreign data, CREATE CAST / COLLATION,
