@@ -8062,12 +8062,14 @@ What is left, recorded so the PG session and the release work find it:
       `secantus-pg` rename, `secantus_pg::PgServer`. Deliberately not done by
       the session that did the Mongo half (asked to keep clear of the PG
       server). Its `Cargo.lock` already carries the bundled-WiredTiger deps.
-- [ ] **`secantus_mdb::Server` runs no background sweepers.** The daemon runs
-      a noop heartbeat (keeps quiet change-stream resume tokens advancing and
-      prunes the oplog) and a TTL sweeper; the embedded server, like the Python
-      embedded handle, runs neither, so TTL indexes never expire documents in
-      it and the oplog only prunes opportunistically. Add builder knobs if a
-      user needs them.
+- [x] **`secantus_mdb::Server` runs the daemon's sweepers (2026-10-06).** It
+      expires TTL-indexed documents every 60 seconds, the daemon's and mongod's
+      default (`Builder::ttl_sweep`, `None` to disable). The noop heartbeat,
+      which also prunes the oplog, is off by default as on the daemon
+      (`Builder::noop_heartbeat`). The server joins both threads before it
+      closes the store. `tests/embedded.rs` covers an expiry seen through the
+      driver, a disabled sweeper, and a heartbeat reaching the oplog. The
+      Python embedded handle still runs neither.
 
 - [ ] **`test_replset_step_down_refusals_match_mongod[unforced, catch-up
       overridden]` depends on mongod's timing (seen 2026-10-02, Windows CI).**
