@@ -884,6 +884,28 @@ impl PlHost<'_> {
         out
     }
 
+    /// Refuse a statement a STABLE / IMMUTABLE function may not run
+    /// ([`non_volatile_refusal`]); nothing to check in a VOLATILE one.
+    fn check_volatility(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<(), plpgsql_fn::PlError> {
+        if !NON_VOLATILE.with(|v| v.get()) {
+            return Ok(());
+        }
+        let plan = || {
+            self.plan(sql, params, types)
+                .ok()
+                .and_then(|s| PgHandler::write_verb(&s))
+        };
+        match non_volatile_refusal(sql, &plan) {
+            Some(tag) => Err(pl_error(&non_volatile_error(&tag))),
+            None => Ok(()),
+        }
+    }
+
     fn subtxn_name(token: u64) -> String {
         format!("\u{1}plpgsql subtransaction {token}")
     }
@@ -912,6 +934,142 @@ impl PlHost<'_> {
         })
         .map_err(|e| pl_error(&PgHandler::err(&e)))
     }
+}
+
+thread_local! {
+    /// Whether the innermost user function running on this thread is
+    /// STABLE or IMMUTABLE: PostgreSQL runs such a body read-only, and any
+    /// statement but a plain SELECT is 0A000 `... is not allowed in a
+    /// non-volatile function` (`CommandIsReadOnly`, checked by `functions.c`
+    /// at the SQL function's startup and by `_SPI_execute_plan` per
+    /// PL/pgSQL statement). A VOLATILE function it calls runs read-write.
+    static NON_VOLATILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks one user function call's volatility for its duration.
+struct VolatilityScope(bool);
+
+impl VolatilityScope {
+    fn enter(non_volatile: bool) -> Self {
+        Self(NON_VOLATILE.with(|v| v.replace(non_volatile)))
+    }
+}
+
+impl Drop for VolatilityScope {
+    fn drop(&mut self) {
+        NON_VOLATILE.with(|v| v.set(self.0));
+    }
+}
+
+/// The command name PostgreSQL refuses `sql` as inside a non-volatile
+/// function, or `None` for a read-only statement (a SELECT / VALUES with no
+/// row lock and no data-modifying WITH item). `plan` names the commands
+/// this list does not (by the planned statement's write verb).
+fn non_volatile_refusal(sql: &str, plan: &dyn Fn() -> Option<&'static str>) -> Option<String> {
+    use pg_query::protobuf::node::Node as N;
+    use pg_query::protobuf::LockClauseStrength as S;
+    let parsed = pg_query::parse(sql).ok()?;
+    let node = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())?;
+    let tag = match node {
+        N::SelectStmt(sel) => {
+            if let Some(N::LockingClause(lc)) =
+                sel.locking_clause.first().and_then(|c| c.node.as_ref())
+            {
+                return Some(
+                    match S::try_from(lc.strength) {
+                        Ok(S::LcsForkeyshare) => "SELECT FOR KEY SHARE",
+                        Ok(S::LcsForshare) => "SELECT FOR SHARE",
+                        Ok(S::LcsFornokeyupdate) => "SELECT FOR NO KEY UPDATE",
+                        _ => "SELECT FOR UPDATE",
+                    }
+                    .into(),
+                );
+            }
+            let modifying = sel.with_clause.as_ref().is_some_and(|w| {
+                w.ctes.iter().any(|c| match c.node.as_ref() {
+                    Some(N::CommonTableExpr(cte)) => !matches!(
+                        cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+                        Some(N::SelectStmt(_))
+                    ),
+                    _ => false,
+                })
+            });
+            return modifying.then(|| "SELECT".into());
+        }
+        N::InsertStmt(_) => "INSERT",
+        N::UpdateStmt(_) => "UPDATE",
+        N::DeleteStmt(_) => "DELETE",
+        N::MergeStmt(_) => "MERGE",
+        N::VariableSetStmt(v) => {
+            if v.kind == pg_query::protobuf::VariableSetKind::VarReset as i32
+                || v.kind == pg_query::protobuf::VariableSetKind::VarResetAll as i32
+            {
+                "RESET"
+            } else {
+                "SET"
+            }
+        }
+        N::VariableShowStmt(_) => "SHOW",
+        N::NotifyStmt(_) => "NOTIFY",
+        N::ListenStmt(_) => "LISTEN",
+        N::UnlistenStmt(_) => "UNLISTEN",
+        N::TruncateStmt(_) => "TRUNCATE TABLE",
+        N::CallStmt(_) => "CALL",
+        N::DoStmt(_) => "DO",
+        N::ExplainStmt(_) => "EXPLAIN",
+        N::LockStmt(_) => "LOCK TABLE",
+        N::CreateStmt(_) => "CREATE TABLE",
+        N::CreateTableAsStmt(_) => "CREATE TABLE AS",
+        N::IndexStmt(_) => "CREATE INDEX",
+        N::ViewStmt(_) => "CREATE VIEW",
+        N::CreateSeqStmt(_) => "CREATE SEQUENCE",
+        N::AlterTableStmt(_) => "ALTER TABLE",
+        N::CopyStmt(c) => {
+            if c.is_from {
+                "COPY FROM"
+            } else {
+                "COPY"
+            }
+        }
+        N::PrepareStmt(_) => "PREPARE",
+        N::ExecuteStmt(_) => "EXECUTE",
+        N::DeallocateStmt(_) => "DEALLOCATE",
+        N::DeclareCursorStmt(_) => "DECLARE CURSOR",
+        N::FetchStmt(f) => {
+            if f.ismove {
+                "MOVE"
+            } else {
+                "FETCH"
+            }
+        }
+        N::ClosePortalStmt(_) => "CLOSE CURSOR",
+        _ => match plan() {
+            Some(verb) => verb,
+            None => {
+                return Some(
+                    sql.split_whitespace()
+                        .next()
+                        .unwrap_or("statement")
+                        .to_ascii_uppercase(),
+                )
+            }
+        },
+    };
+    Some(tag.into())
+}
+
+/// PostgreSQL's 0A000 for `tag` run inside a non-volatile function.
+fn non_volatile_error(tag: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "0A000".into(),
+        format!("{tag} is not allowed in a non-volatile function"),
+    )))
 }
 
 /// The command tag of a transaction-control statement (`COMMIT`,
@@ -1104,6 +1262,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
         scroll: bool,
     ) -> Result<String, plpgsql_fn::PlError> {
+        self.check_volatility(sql, params, types)?;
         self.open_portal(name, statement, sql, params, types, scroll)
     }
 
@@ -1113,6 +1272,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         params: &[Bson],
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
+        self.check_volatility(sql, params, types)?;
         let (schema, rows) = self.joined(|| {
             self.atomic(|| {
                 let stmt = self.plan(sql, params, types)?;
@@ -1140,6 +1300,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         params: &[Bson],
         types: &[String],
     ) -> Result<u64, plpgsql_fn::PlError> {
+        self.check_volatility(sql, params, types)?;
         let stmt = self.plan(sql, params, types)?;
         let _nested = NestedStatement::enter(self.h);
         // A nested CALL keeps the non-atomic context, and its statements
@@ -1175,6 +1336,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         params: &[Bson],
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
+        self.check_volatility(sql, params, types)?;
         let stmt = self.plan(sql, params, types)?;
         let (columns, rows) = self.joined(|| {
             self.atomic(|| {
@@ -1193,6 +1355,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         params: &[Bson],
         types: &[String],
     ) -> Result<(Vec<(usize, String)>, Vec<Bson>), plpgsql_fn::PlError> {
+        self.check_volatility(sql, params, types)?;
         let Statement::Call {
             name,
             args,
@@ -7561,6 +7724,8 @@ impl PgHandler {
         u: &secantus_pgplan::UserFn,
         args: &[Bson],
     ) -> PgWireResult<secantus_pgplan::FnResult> {
+        let _volatility =
+            VolatilityScope::enter(doc.get_str("volatility").unwrap_or("volatile") != "volatile");
         match doc.get_str("language").unwrap_or_default() {
             "plpgsql" => {
                 let host = PlHost { h: self };
@@ -7640,6 +7805,28 @@ impl PgHandler {
             }
         }
         let host = PlHost { h: self };
+        // A STABLE / IMMUTABLE body is checked whole before any statement
+        // runs, as `functions.c` checks it at the function's startup.
+        if NON_VOLATILE.with(|v| v.get()) && doc.get_str("call_sql").is_err() {
+            for stmt in &statements {
+                let sql = bind_parameter_names(stmt, &names, &u.arg_types);
+                let plan = || {
+                    host.plan(&sql, args, &u.arg_types)
+                        .ok()
+                        .and_then(|s| Self::write_verb(&s))
+                };
+                if let Some(tag) = non_volatile_refusal(&sql, &plan) {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "0A000".into(),
+                        format!("{tag} is not allowed in a non-volatile function"),
+                    );
+                    info.where_context =
+                        Some(format!("SQL function \"{}\" during startup", u.name));
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+            }
+        }
         let mut last: Option<plpgsql_fn::QueryOut> = None;
         // The CONTEXT frame PostgreSQL gives an error raised by the body: a
         // body it inlines has none at run time and `during inlining` when
@@ -21858,10 +22045,15 @@ impl PgHandler {
         stmt: Option<&Statement>,
         sql: &str,
     ) -> bool {
-        if !stmt.is_none_or(|s| matches!(s, Statement::Select(_) | Statement::Aggregate(_))) {
+        if !stmt.is_none_or(|s| {
+            matches!(
+                s,
+                Statement::Select(_) | Statement::Aggregate(_) | Statement::SelectConstant(_)
+            )
+        }) {
             return false;
         }
-        let Some(names) = secantus_pgplan::read_apart::relations(sql) else {
+        let Some(names) = self.read_apart_relations(sql) else {
             return false;
         };
         if !self.rls_enabled_docs().is_empty()
@@ -21936,11 +22128,100 @@ impl PgHandler {
         (!map.is_empty()).then(|| std::sync::Arc::new(map))
     }
 
-    fn rc_select_read_set(&self, stmt: Option<&Statement>, sql: &str) -> Option<RcReadSet> {
-        if !stmt.is_none_or(|s| matches!(s, Statement::Select(_) | Statement::Aggregate(_))) {
+    /// The stored relations a READ COMMITTED read may run apart over
+    /// ([`secantus_pgplan::read_apart::relations_with`]), where a call of a
+    /// user function is allowed when the function is STABLE or IMMUTABLE --
+    /// so it cannot write (0A000 `... is not allowed in a non-volatile
+    /// function`) -- has no SECURITY DEFINER or SET clause, and its body,
+    /// seen through whole, reads only such relations and calls only pure
+    /// built-ins or other such functions (no dynamic SQL, cursor, CALL or
+    /// EXCEPTION block; recursion refuses). A VOLATILE function anywhere
+    /// refuses: a STABLE one may still call one that writes.
+    fn read_apart_relations(&self, sql: &str) -> Option<Vec<String>> {
+        let functions = std::cell::OnceCell::new();
+        let visiting = std::cell::RefCell::new(Vec::<String>::new());
+        let user = |name: &str| self.user_fn_reads(name, &functions, &visiting);
+        secantus_pgplan::read_apart::relations_with(sql, &user)
+    }
+
+    fn user_fn_reads(
+        &self,
+        name: &str,
+        functions: &std::cell::OnceCell<Vec<Document>>,
+        visiting: &std::cell::RefCell<Vec<String>>,
+    ) -> Option<Option<Vec<String>>> {
+        let docs = functions.get_or_init(|| self.user_function_docs().unwrap_or_default());
+        let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+        let matching: Vec<&Document> = docs
+            .iter()
+            .filter(|d| {
+                d.get_str("name")
+                    .is_ok_and(|n| n.eq_ignore_ascii_case(&bare))
+            })
+            .collect();
+        if matching.is_empty() {
             return None;
         }
-        let names = secantus_pgplan::read_apart::relations(sql)?;
+        if visiting.borrow().contains(&bare) || visiting.borrow().len() > 16 {
+            return Some(None);
+        }
+        visiting.borrow_mut().push(bare.clone());
+        let user = |n: &str| self.user_fn_reads(n, functions, visiting);
+        let mut out: Vec<String> = Vec::new();
+        let mut ok = true;
+        for doc in matching {
+            let safe = doc.get_str("volatility").unwrap_or("volatile") != "volatile"
+                && !doc.get_bool("security_definer").unwrap_or(false)
+                && !doc.get_array("config").is_ok_and(|c| !c.is_empty())
+                && !doc.get_bool("is_procedure").unwrap_or(false);
+            let statements: Option<Vec<String>> = if !safe {
+                None
+            } else {
+                match doc.get_str("language").unwrap_or_default() {
+                    "sql" if doc.get_str("call_sql").is_err() => {
+                        pg_query::split_with_parser(doc.get_str("body").unwrap_or_default())
+                            .ok()
+                            .map(|v| v.into_iter().map(str::to_string).collect())
+                    }
+                    "plpgsql" => plpgsql_fn::static_queries(&plpgsql_create_sql(doc)),
+                    _ => None,
+                }
+            };
+            let reads = statements.and_then(|stmts| {
+                let mut reads = Vec::new();
+                for st in stmts {
+                    reads.extend(secantus_pgplan::read_apart::body_relations_with(
+                        &st, &user,
+                    )?);
+                }
+                Some(reads)
+            });
+            match reads {
+                Some(r) => out.extend(r),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        visiting.borrow_mut().pop();
+        if !ok {
+            return Some(None);
+        }
+        out.dedup();
+        Some(Some(out))
+    }
+
+    fn rc_select_read_set(&self, stmt: Option<&Statement>, sql: &str) -> Option<RcReadSet> {
+        if !stmt.is_none_or(|s| {
+            matches!(
+                s,
+                Statement::Select(_) | Statement::Aggregate(_) | Statement::SelectConstant(_)
+            )
+        }) {
+            return None;
+        }
+        let names = self.read_apart_relations(sql)?;
         if !self.rls_enabled_docs().is_empty()
             || !self.user_operators().is_empty()
             || !self.user_casts().is_empty()
@@ -22097,7 +22378,10 @@ impl PgHandler {
     /// other statement moves the block now.
     fn isolate_for_planning(&self, sql: &str) -> PgWireResult<()> {
         self.drop_plan_apart();
-        if !secantus_pgplan::read_apart::has_subquery(sql) {
+        // A user function over constants is RUN while planning too (folded,
+        // as PostgreSQL folds an IMMUTABLE call -- and this planner folds
+        // STABLE ones as well): `select f()` read the block's old snapshot.
+        if !secantus_pgplan::read_apart::has_subquery(sql) && !self.may_call_user_function(sql) {
             return Ok(());
         }
         let Ok(mut guard) = self.txn.try_lock() else {
@@ -22118,6 +22402,23 @@ impl PgHandler {
             *self.plan_apart.lock().unwrap_or_else(|e| e.into_inner()) = Some(tmp);
         }
         Ok(())
+    }
+
+    /// Might `sql` call a user function? Textually: some user function's
+    /// name appears in it (a false "yes" costs only the planning-time
+    /// isolation decision).
+    fn may_call_user_function(&self, sql: &str) -> bool {
+        let Ok(docs) = self.user_function_docs() else {
+            return false;
+        };
+        if docs.is_empty() {
+            return false;
+        }
+        let text = sql.to_ascii_lowercase();
+        docs.iter().any(|d| {
+            d.get_str("name")
+                .is_ok_and(|n| text.contains(&n.to_ascii_lowercase()))
+        })
     }
 
     /// Roll back a planning transaction nothing took (the statement failed,
@@ -22183,6 +22484,29 @@ impl PgHandler {
         // autocommit statement), from inside which this was reached. Waiting
         // for it would deadlock the connection -- a DO block's REFRESH
         // MATERIALIZED VIEW did -- and there is no transaction to join.
+        // Planning a read that runs apart (`isolate_for_planning`): a user
+        // function folded while planning reads in that snapshot, as the
+        // statement will -- not the block's own older one.
+        let planned = self
+            .plan_apart
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut tmp) = planned {
+            let overlays = self
+                .rc_overlay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let out = self
+                .storage
+                .with_user_transaction(&mut tmp, || match overlays {
+                    Some(ov) => secantus_storage::with_read_overlay(ov, f),
+                    None => f(),
+                });
+            *self.plan_apart.lock().unwrap_or_else(|e| e.into_inner()) = Some(tmp);
+            return out.map_err(|e| Self::storage_err("transaction failed", e))?;
+        }
         let mut guard = match self.txn.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),

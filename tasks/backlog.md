@@ -819,7 +819,23 @@ remain open:
         collection scan); a DISTINCT over a tsvector / tsquery (a Python-
         written value is a document); a simple-protocol SELECT with a
         WHERE (it keeps the index route, as an extended Execute of the
-        whole result does) or inside a block.
+        whole result does) or inside a block. **Batch 63 (2026-10-06):** a
+        simple-protocol SELECT (and an extended Execute of the whole result)
+        whose WHERE the storage would answer by a COLLECTION SCAN anyway
+        (`explain_plan` is `CollScan`) streams from the reader thread; only
+        an indexed WHERE keeps the materialised index route. 300,000 rows of
+        2 KB, `select id, k, pad from big where k >= 500` (no index on k)
+        through psql, after a restart, debug, WiredTiger cache capped at
+        64 MB: server RSS growth 704 / 998 MB (base `1802d8b9`) -> 22 / 16
+        MB, 3.1 -> 2.4 s, output byte-identical. Still materialised (OPEN):
+        a JOIN's outer side, an aggregate with grouping sets or over a join
+        / subquery / indexed filter, a DISTINCT over tsvector / tsquery, a
+        simple-protocol SELECT with an INDEXED WHERE (a range over an index
+        can return most of the table; deciding needs a cardinality the
+        storage does not keep), and one inside a block (its rows must be read
+        through the block's session, which pgwire's simple-query response
+        stream does not run on -- the extended path's `BlockScan` is driven
+        per Execute). None started in batch 63.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -1116,8 +1132,9 @@ remain open:
         aggregate's alias) was 0A000: a plain DISTINCT over bare aggregates
         now goes through the DISTINCT-over-groups subquery when the ORDER
         BY sorts on an aggregate (`sorts_on_aggregate`).
-- [ ] **OPEN — RUST pgserver: write conflicts and row locks, what is left
-      (updated 2026-10-03, batch 50).** A conflicting write WAITS for the
+- [x] **CLOSED (batch 63, 2026-10-06; what is left below is two scope
+      decisions / design notes) — RUST pgserver: write conflicts and row
+      locks, what is left (updated 2026-10-03, batch 50).** A conflicting write WAITS for the
       transaction holding the row -- holding its own rows meanwhile -- and
       re-checks against what that transaction left, as PostgreSQL does;
       a cycle of waits is 40P01 one `deadlock_timeout` (1s) in; `lock_timeout`
@@ -1368,12 +1385,33 @@ remain open:
         session committing to the same table, debug: 4.0 / 15.5 / 59.8 s
         (forced to move) -> 1.1 / 3.3 / 12.2 s. Slice test
         `test_batch62_read_committed_subquery_sees_commits` (its scenario
-        also ran against PostgreSQL 15.19 unchanged). Left (OPEN): a read
-        calling a USER function still replays -- this server does not
-        refuse a write inside a STABLE / IMMUTABLE function (PostgreSQL's
-        "not allowed in a non-volatile function"), so no declared
-        volatility makes one safe to run apart. Every move --
-Every move --
+        also ran against PostgreSQL 15.19 unchanged). **Batch 63
+        (2026-10-06), FIXED:** a write -- any statement but a plain SELECT
+        (DML, DDL, SET, SHOW, NOTIFY, a row-locking SELECT, a data-modifying
+        WITH) -- inside a STABLE / IMMUTABLE function is PostgreSQL 15.19's
+        0A000 `... is not allowed in a non-volatile function` (checked over
+        the whole body at a SQL function's startup, per statement in
+        PL/pgSQL; `NON_VOLATILE`, `non_volatile_refusal`; corpus
+        `b63_nonvolatile`, 0 against PG 15.19). It was accepted and the
+        write ran. With that, a read calling STABLE / IMMUTABLE user
+        functions reads apart / overlaid (`read_apart::relations_with`,
+        `user_fn_reads`): the function's body is seen through -- SQL, or
+        PL/pgSQL with no dynamic SQL, cursor, CALL or EXCEPTION block --
+        and its relations join the read set; a VOLATILE function anywhere
+        in the call tree refuses (PostgreSQL lets a STABLE function call a
+        VOLATILE one that writes; measured). That work found a SILENT WRONG
+        ANSWER, present on the base: a function over constants is RUN while
+        planning, before the block took its fresh snapshot, so `select f()`
+        with `f` counting a table missed another session's commit (2 where
+        PG 15.19 answers 3). `isolate_for_planning` now also fires when the
+        text names a user function, and a function body run while planning
+        reads in the planning transaction (`in_open_transaction`). 200 / 400
+        / 800 insert-then-`select f(0)` pairs beside a session committing to
+        the same table, debug: 1.82 / 7.05 / 28.98 s (base `1802d8b9`, and
+        the WRONG count) -> 1.04 / 3.79 / 15.08 s (PG 15.19: 0.05 / 0.08 /
+        0.18; what is left is the function's own scan of a growing table).
+        Slice tests `test_batch63_non_volatile_functions_refuse_writes`,
+        `test_batch63_read_committed_function_reads_see_commits`. Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's

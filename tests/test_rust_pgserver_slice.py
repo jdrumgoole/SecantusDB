@@ -17873,3 +17873,87 @@ def test_batch62_simple_query_select_streams(home: Path) -> None:
         assert len(simple("select id from b62_s")) == 3001
         a.execute("rollback")
         assert len(simple("select id from b62_s")) == 3000
+
+
+def test_batch63_non_volatile_functions_refuse_writes(home: Path) -> None:
+    """A STABLE or IMMUTABLE function runs read-only, as PostgreSQL 15.19
+    runs it: any statement but a plain SELECT is 0A000 `... is not allowed in
+    a non-volatile function` -- checked over the whole body at a SQL
+    function's startup (nothing runs), per statement in PL/pgSQL. A VOLATILE
+    function such a function calls may still write. (Both were accepted:
+    the write ran.)"""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b63_t (x int)")
+        a.execute(
+            "create function b63_s() returns int language sql stable as"
+            " $$ select 1; insert into b63_t values (1); select 2 $$"
+        )
+        a.execute(
+            "create function b63_p() returns int language plpgsql immutable as"
+            " $$ begin perform x from b63_t for update; return 1; end $$"
+        )
+        a.execute(
+            "create function b63_w() returns int language plpgsql volatile as"
+            " $$ begin insert into b63_t values (2); return 1; end $$"
+        )
+        a.execute(
+            "create function b63_sw() returns int language plpgsql stable as"
+            " $$ begin perform b63_w(); return 1; end $$"
+        )
+        for call, tag in (("b63_s()", "INSERT"), ("b63_p()", "SELECT FOR UPDATE")):
+            with pytest.raises(psycopg.errors.FeatureNotSupported) as err:
+                a.execute(f"select {call}")
+            assert str(err.value).startswith(f"{tag} is not allowed in a non-volatile function")
+        assert err.value.diag.context is not None
+        assert "PL/pgSQL function b63_p() line 1 at PERFORM" in err.value.diag.context
+        assert a.execute("select b63_sw()").fetchone() == (1,)
+        assert a.execute("select x from b63_t").fetchall() == [(2,)]
+
+
+def test_batch63_read_committed_function_reads_see_commits(home: Path) -> None:
+    """A user function over constants is run while the statement is
+    PLANNED, which was before a READ COMMITTED block that had written took a
+    fresh snapshot: `select f()` with a STABLE `f` counting a table missed a
+    row another session had committed (2 where PostgreSQL 15.19 answers 3).
+    Such a read now gets its snapshot before planning, and -- the function
+    being STABLE, so unable to write -- reads apart under the block's own
+    rows instead of replaying the block's write set."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table b63_r (id int primary key, v int)")
+        a.execute("insert into b63_r values (1, 10)")
+        a.execute(
+            "create function b63_cnt() returns bigint language sql stable as"
+            " $$ select count(*) from b63_r $$"
+        )
+        a.execute(
+            "create function b63_pcnt(k int) returns bigint language plpgsql stable as"
+            " $$ declare n bigint; begin select count(*) into n from b63_r; return n + k; end $$"
+        )
+        a.execute("begin")
+        a.execute("insert into b63_r values (2, 1)")
+        b.execute("insert into b63_r values (3, 2)")
+        assert a.execute("select b63_cnt()").fetchone() == (3,)
+        b.execute("insert into b63_r values (4, 2)")
+        assert a.execute("select b63_pcnt(0), b63_cnt()").fetchone() == (4, 4)
+        assert a.execute("select id, b63_pcnt(id) from b63_r order by id").fetchall() == [
+            (1, 5),
+            (2, 6),
+            (3, 7),
+            (4, 8),
+        ]
+        a.execute("rollback")
+        assert a.execute("select b63_cnt()").fetchone() == (3,)
+
+
+def test_batch63_insert_values_subquery(home: Path) -> None:
+    """A subquery inside INSERT ... VALUES was 0A000 `SubLink is not
+    supported yet`; every row's subquery reads the table as it was before
+    the statement (PostgreSQL 15.19's answers)."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b63_v (id int primary key, v int)")
+        a.execute("insert into b63_v values (1, (select 5))")
+        a.execute(
+            "insert into b63_v values (2, (select count(*) from b63_v)),"
+            " (3, (select count(*) from b63_v))"
+        )
+        assert a.execute("select * from b63_v order by id").fetchall() == [(1, 5), (2, 1), (3, 1)]
