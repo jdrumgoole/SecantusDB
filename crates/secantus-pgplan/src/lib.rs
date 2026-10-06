@@ -63,6 +63,8 @@ pub mod pgcrypto_raw;
 pub mod pgp;
 pub mod pgp_pub;
 pub mod privileges;
+mod pullup;
+pub mod read_apart;
 pub mod regobj;
 pub mod rls;
 mod rowsfrom;
@@ -3738,6 +3740,7 @@ pub fn plan_with_params(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
+    pullup::rewrite(&mut node);
     event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
@@ -3782,6 +3785,7 @@ pub fn plan_with_subqueries(
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
+    pullup::rewrite(&mut node);
     event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
