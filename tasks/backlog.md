@@ -925,7 +925,48 @@ remain open:
         would have to read through the block's transaction a batch at a
         time), a join with a subquery / LATERAL / function side or a right
         side over the bound (a spilling hash join would lift that), and an
-        aggregate with grouping sets.
+        aggregate with grouping sets. **Batch 66 (2026-10-06): all four stream
+        now.** (1) Inside a transaction block a stored table is read a batch
+        at a time on the block's session (`scan_batch_after`, so its snapshot
+        and own writes), where its WHERE is a collection scan anyway (an
+        indexed one is built whole, as the materialised path builds it, to
+        keep its order). (2) A subquery / function / join right side is
+        built whole and held within the bound; a non-table LEFT side is
+        built whole and the join streamed over it; a LATERAL right side runs
+        per left batch (its memo dropped past the bound); the narrow
+        two-table path takes a subquery on either side too. (3) A right
+        stored table past the bound is a grace hash join (`grace_join`): 32
+        partitions on disk by the join key's hash, each joined in memory,
+        split again (3 levels) while past the bound; rows are numbered on
+        both sides and sorted on the numbers (`external_sort`) so the order
+        is the materialised one; a right key the hash does not model
+        declines before any row goes out. The narrow path partitions too.
+        (4) GROUPING SETS / ROLLUP / CUBE: each set grouped in bounded
+        memory over its own read (the empty set by the chunked ungrouped
+        aggregates). Aggregates over a join take the joined documents
+        directly (`RowBatch::Docs`) instead of encoding and decoding them.
+        300,000 rows of 2 KB, 1,000 small rows, debug, cache capped at 64 MB,
+        each query after a restart, base `ffb798c1` -> batch 66, peak RSS
+        growth / time, output md5-identical in every case: join 82 -> 96 MB
+        (11.0 -> 10.9 s); `count, sum, max` over the join 128 -> 75 MB
+        (16.6 -> 12.1 s); GROUP BY over it 215 -> 162 MB (22.6 -> 19.0 s; the
+        re-encoding batch 65 added is gone); right side 300,000 rows 3312 ->
+        156 MB (8.7 -> 19.7 s), its aggregate 3459 -> 229 MB (12.7 -> 22.9
+        s); subquery side 2878 -> 103 MB (5.4 -> 6.2 s); function side 3731
+        -> 77 MB (10.3 -> 11.2 s); LATERAL 4985 -> 109 MB (9.9 -> 12.7 s);
+        inside a REPEATABLE READ / READ COMMITTED block 4042 -> 71 / 52 MB
+        (8.7 -> 10.9 s); GROUPING SETS over the table 4626 -> 221 MB (9.6 ->
+        22.6 s); ROLLUP over the join 5854 -> 290 MB (15.5 -> 54.2 s: the
+        join is read once per set). The grace join and per-set grouping are
+        slower than holding everything; they bound memory instead. Corpus
+        `b66_join_stream` (50 lines, 0 against 15.19 also with the join
+        bound at 1 byte, the group bound at 1 byte, and streaming off --
+        `SECANTUS_PG_JOIN_STREAM=0`, new), slice test
+        `test_batch66_streamed_joins_match_the_materialised_rows` (streamed,
+        all-spilled and materialised rows equal in order). Found on the way
+        and fixed: the narrow join compared a `float8` / `numeric` key with
+        an int one structurally, so `a.f = b.k` matched NOTHING (a wrong
+        answer, in base too).
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -1148,16 +1189,38 @@ remain open:
         list runs for the skipped rows (`select_docs`).
       Corpus `b65_residuals` (46 lines, 0 against 15.19), slice test
       `test_batch65_collate_distinct_on_and_offset_errors`.
-- [ ] **OPEN — RUST pgserver: an unused FROM-subquery output is still
-      computed (found batch 65, measured against PostgreSQL 15.19).**
-      `select count(*) from (select a/b from t) s` and `select a from (select
-      a/b x, a from t) s` raise 22012 here; PostgreSQL answers, because the
-      planner replaces a subquery output nothing reads with NULL
-      (`remove_unused_subquery_outputs`; not for a set-returning or volatile
-      output, or under DISTINCT). Predates batch 65 (the same with or without
-      an OFFSET). A spurious error, never a wrong row; the fix is a planning
-      rewrite of the inner select list from the outer statement's
-      references. Not started.
+- [ ] **OPEN — RUST pgserver: an aggregate over ONLY an outer query's
+      columns, inside a scalar subquery, is not the outer query's (found
+      batch 66 while writing `b66_unused_outputs`, PostgreSQL 15.19).**
+      `select (select max(s.x) from t) from (select a * 2 as x from t) s`
+      answers one row per outer row (2, 4, 6) where PostgreSQL makes
+      `max(s.x)` an aggregate of the OUTER query and raises 21000 (more than
+      one row returned by a subquery). A wrong answer, predates batch 66
+      (not reached by its changes). Not started.
+
+- [x] **FIXED (batch 66, 2026-10-06) — RUST pgserver: an unused
+      FROM-subquery output was still computed (found batch 65, measured
+      against PostgreSQL 15.19).** `select count(*) from (select a/b from t)
+      s` raised 22012 where PostgreSQL answers. `secantus_pgplan::
+      prune_outputs` now replaces an output the enclosing SELECT cannot name
+      with NULL before planning -- for a FROM-subquery, an inlined CTE (read
+      once, not MATERIALIZED, no volatile call) and every arm of a UNION ALL,
+      to a fixpoint across FROM items. PostgreSQL's exceptions are kept
+      (volatile / set-returning outputs, a plain DISTINCT, outputs the
+      subquery's own ORDER BY / GROUP BY / DISTINCT ON / WINDOW name; an
+      aggregate whose removal would turn a one-row query into a per-row one
+      becomes `count(*)`), and anything not classified is kept (a STABLE or
+      user function, a string literal -- PostgreSQL coerces it during parse
+      analysis, `'a' + 1` is 22P02 -- a whole-row reference, NATURAL, a join
+      alias with column names). An output is removed only from a body that
+      plans on its own (`plans_alone`, a trial plan with side effects off),
+      so an unknown column, a grouping error or a bad FROM reference in an
+      unread output still fails as before (`b46_errors` caught the first
+      version dropping 42P01). Left: a LATERAL body reads its left siblings,
+      so it never plans alone and keeps its outputs -- `(select a/b x ...)
+      s, lateral (select s.x) l` still raises where PostgreSQL answers.
+      Corpus `b66_unused_outputs` (67 lines, 0 against 15.19), slice test
+      `test_batch66_unused_subquery_outputs_are_not_computed`.
 
 - [x] **CLOSED (re-measured 2026-10-03, batch 50) — RUST pgserver: what
       batch 11 (rules, event triggers, foreign data, CREATE CAST / COLLATION,

@@ -274,6 +274,14 @@ fn notice(msg: &str) {
 }
 
 /// NOTICEs raised since the last call (a stop-word-only query's).
+pub(crate) fn notices_len() -> usize {
+    NOTICES.with(|n| n.borrow().len())
+}
+
+pub(crate) fn truncate_notices(n: usize) {
+    NOTICES.with(|v| v.borrow_mut().truncate(n));
+}
+
 pub fn take_notices() -> Vec<String> {
     NOTICES.with(|n| std::mem::take(&mut *n.borrow_mut()))
 }

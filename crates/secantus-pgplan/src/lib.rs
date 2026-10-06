@@ -63,6 +63,7 @@ pub mod pgcrypto_raw;
 pub mod pgp;
 pub mod pgp_pub;
 pub mod privileges;
+mod prune_outputs;
 mod pullup;
 pub mod read_apart;
 pub mod regobj;
@@ -3227,7 +3228,7 @@ pub fn is_catalog_function(name: &str) -> bool {
 }
 
 /// The bare (schema-less) name of a called function, as PostgreSQL prints it.
-fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+pub(crate) fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     let parts: Vec<&str> = f
         .funcname
         .iter()
@@ -3744,6 +3745,7 @@ pub fn plan_with_params(
         node: Some(parse_one(sql)?),
     };
     pullup::rewrite(&mut node);
+    prune_outputs::rewrite(&mut node, lookup, params);
     event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
@@ -3789,6 +3791,7 @@ pub fn plan_with_subqueries(
     // the list the statement is finally planned with is longer than the one
     // the client bound.
     pullup::rewrite(&mut node);
+    prune_outputs::rewrite(&mut node, lookup, params);
     event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
@@ -10197,7 +10200,7 @@ pub(crate) fn simplify_exists(s: &mut pg_query::protobuf::SelectStmt) {
     s.limit_count = None;
 }
 
-fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
+pub(crate) fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
     // aggregate planner, whose refusal came out as a GROUPING error -- the
@@ -12901,7 +12904,7 @@ fn same_aggregate(a: &AggItem, b: &AggItem) -> bool {
 
 /// The aggregate a function name calls, with how many ordinary arguments it
 /// takes. `None`: not an aggregate this server computes.
-fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc, usize)> {
+pub(crate) fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc, usize)> {
     if within_group {
         return Some(match name {
             "percentile_cont" => (AggFunc::PercentileCont, 1),
@@ -25052,6 +25055,16 @@ pub(crate) fn current_user() -> Option<String> {
 
 pub(crate) fn warn(sqlstate: &str, message: String) {
     PLAN_WARNINGS.with(|w| w.borrow_mut().push((sqlstate.to_string(), message)));
+}
+
+/// How many WARNINGs are pending, and dropping those raised after the
+/// first `n` (a trial plan's).
+pub(crate) fn warnings_len() -> usize {
+    PLAN_WARNINGS.with(|w| w.borrow().len())
+}
+
+pub(crate) fn truncate_warnings(n: usize) {
+    PLAN_WARNINGS.with(|w| w.borrow_mut().truncate(n));
 }
 
 /// The WARNINGs raised since the last call, as `(sqlstate, message)`.
