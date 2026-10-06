@@ -26,6 +26,7 @@ mod explain;
 mod expr_index;
 mod external_sort;
 mod fdw;
+mod grace_join;
 mod largeobjects;
 mod live_notices;
 mod merge;
@@ -1510,6 +1511,26 @@ fn jsonb_ident(v: &Option<Bson>) -> Option<Bson> {
 /// array or object hashes by its number-normalised value: `{"x": 1}` and
 /// `{"x": 1.0}` are equal jsonb (PostgreSQL 15.19) and must meet. A text
 /// value that merely parses as JSON shares a bucket and is rejected by ON.
+/// A row's general-join hash key over `keys` (`join_rows_core`): `None`
+/// when a value is NULL / missing (it matches nothing) or of a type the hash
+/// does not model (compared against every candidate instead).
+pub(crate) fn join_hash_key(d: &Document, keys: &[&String]) -> Option<Vec<String>> {
+    keys.iter()
+        .map(|k| match d.get(k.as_str()) {
+            Some(Bson::Int32(v)) => Some(format!("n{v}")),
+            Some(Bson::Int64(v)) => Some(format!("n{v}")),
+            // An integral float8 equals the int of its value; any other
+            // float compares against every candidate.
+            Some(Bson::Double(v)) if v.fract() == 0.0 && v.abs() < 9.0e15 => {
+                Some(format!("n{}", *v as i64))
+            }
+            Some(Bson::String(v)) => Some(join_text_hash(v)),
+            Some(Bson::Boolean(v)) => Some(format!("b{v}")),
+            _ => None,
+        })
+        .collect()
+}
+
 fn join_text_hash(v: &str) -> String {
     if v.starts_with([
         '{', '[', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
@@ -4668,6 +4689,11 @@ impl PgHandler {
                 // A join under the aggregate is read in bounded memory
                 // where it can be (`stream_join`), into the same bounded
                 // aggregates a stored table's rows go to.
+                if agg.grouping_sets.is_some() {
+                    if let Some(groups) = self.grouping_sets_in_bounded_memory(agg, true)? {
+                        return self.finish_groups(agg, groups, max_rows);
+                    }
+                }
                 let streamed = match self.join_aggregate_source(agg)? {
                     Some(mut feed) if agg.group_by.is_empty() && agg.grouping_sets.is_none() => {
                         self.ungrouped_in_bounded_memory_from(agg, Some(&mut feed))?
@@ -4694,6 +4720,18 @@ impl PgHandler {
                     Some(vals) => {
                         return self.finish_groups(agg, vec![(Vec::new(), vals)], max_rows)
                     }
+                    None => {
+                        let raw = self.scan_table(&agg.table, &agg.filter, true)?;
+                        raw.iter()
+                            .map(|b| decode_doc(b))
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?
+                    }
+                }
+            }
+            None if agg.grouping_sets.is_some() => {
+                match self.grouping_sets_in_bounded_memory(agg, false)? {
+                    Some(groups) => return self.finish_groups(agg, groups, max_rows),
                     None => {
                         let raw = self.scan_table(&agg.table, &agg.filter, true)?;
                         raw.iter()
@@ -4999,7 +5037,7 @@ impl PgHandler {
     /// Materialise a JOIN subquery side (`... JOIN (SELECT ...) a`) to rows.
     /// Only the shapes the planner emits as a `*_sub` are reachable here (an
     /// aggregate subquery today); anything else is a planner/executor mismatch.
-    fn sub_plan_rows(&self, stmt: &Statement) -> PgWireResult<Vec<Document>> {
+    pub(crate) fn sub_plan_rows(&self, stmt: &Statement) -> PgWireResult<Vec<Document>> {
         match stmt {
             // An aggregate's rows are already keyed by output name, so they
             // need no positional rebuild.
@@ -5247,7 +5285,10 @@ impl PgHandler {
     /// has any, and ALWAYS decided by the ON itself: the hash only narrows
     /// the candidates, so a value it cannot normalise (a numeric, a date)
     /// falls back to comparing every pair rather than to a wrong answer.
-    fn join_rows(&self, node: &secantus_pgplan::joins::JoinNode) -> PgWireResult<Vec<Document>> {
+    pub(crate) fn join_rows(
+        &self,
+        node: &secantus_pgplan::joins::JoinNode,
+    ) -> PgWireResult<Vec<Document>> {
         use secantus_pgplan::joins::JoinNode;
         match node {
             // A LATERAL item only ever sits on a join's right; alone, with
@@ -5319,6 +5360,7 @@ impl PgHandler {
                 } = right.as_ref()
                 {
                     return self.lateral_rows(
+                        &mut HashMap::new(),
                         &lrows,
                         sql,
                         params,
@@ -5431,17 +5473,7 @@ impl PgHandler {
         };
         // Candidates per left row: every right row, or those sharing
         // the equality keys' hash.
-        let hash_key = |d: &Document, keys: &[&String]| -> Option<Vec<String>> {
-            keys.iter()
-                .map(|k| match d.get(k.as_str()) {
-                    Some(Bson::Int32(v)) => Some(format!("n{v}")),
-                    Some(Bson::Int64(v)) => Some(format!("n{v}")),
-                    Some(Bson::String(v)) => Some(join_text_hash(v)),
-                    Some(Bson::Boolean(v)) => Some(format!("b{v}")),
-                    _ => None,
-                })
-                .collect()
-        };
+        let hash_key = join_hash_key;
         let lk: Vec<&String> = equi.iter().map(|(l, _)| l).collect();
         let rk: Vec<&String> = equi.iter().map(|(_, r)| r).collect();
         let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
@@ -5557,8 +5589,9 @@ impl PgHandler {
     /// parameters, and each result row joined to it. A LEFT join keeps a
     /// left row the item produced nothing for.
     #[allow(clippy::too_many_arguments)]
-    fn lateral_rows(
+    pub(crate) fn lateral_rows(
         &self,
+        cache: &mut HashMap<String, Vec<Document>>,
         lrows: &[Document],
         sql: &str,
         params: &[Bson],
@@ -5570,7 +5603,6 @@ impl PgHandler {
         left_keys: &[String],
         right_keys: &[String],
     ) -> PgWireResult<Vec<Document>> {
-        let mut cache: HashMap<String, Vec<Document>> = HashMap::new();
         let mut out = Vec::new();
         for l in lrows {
             let mut bound = params.to_vec();
@@ -5894,6 +5926,13 @@ impl PgHandler {
                             }
                         };
                         doc.insert("__join_order", value);
+                    }
+                    // A grace join's row numbers (`grace_join`), when it runs.
+                    if let Some(v) = l.get(crate::grace_join::LSEQ) {
+                        doc.insert(crate::grace_join::LSEQ, v.clone());
+                        if let Some(v) = r.and_then(|r| r.get(crate::grace_join::RSEQ)) {
+                            doc.insert(crate::grace_join::RSEQ, v.clone());
+                        }
                     }
                     out.push(doc);
                 }
@@ -37596,18 +37635,13 @@ impl PgHandler {
         // (`scan_routed_batches`), in the order the materialised path reads.
         let chunk_bytes = group_in_memory_bytes().min(16 << 20);
         let mut partials: Vec<Vec<Bson>> = vec![Vec::new(); agg.items.len()];
-        let mut chunk: Vec<Vec<u8>> = Vec::new();
+        let mut chunk: Vec<Document> = Vec::new();
         let mut bytes = 0usize;
         let mut failed: Option<PgWireError> = None;
         let folds = std::cell::Cell::new(0usize);
-        let mut fold = |chunk: &mut Vec<Vec<u8>>| -> PgWireResult<()> {
+        let mut fold = |chunk: &mut Vec<Document>| -> PgWireResult<()> {
             folds.set(folds.get() + 1);
-            let mut docs: Vec<Document> = chunk
-                .iter()
-                .map(|b| decode_doc(b))
-                .collect::<Result<_, _>>()
-                .map_err(|e| Self::storage_err("could not decode a row", e))?;
-            chunk.clear();
+            let mut docs: Vec<Document> = std::mem::take(chunk);
             for item in &agg.items {
                 if let (Some(expr), Some(slot)) = (item.expr.as_ref(), item.field.as_deref()) {
                     for d in docs.iter_mut() {
@@ -37659,13 +37693,21 @@ impl PgHandler {
             Ok(())
         };
         let mut stopped: Option<PgWireError> = None;
-        let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
+        let mut sink = |rows: stream_join::RowBatch| -> bool {
             if let Err(e) = self.check_cancel() {
                 stopped = Some(e);
                 return false;
             }
-            bytes += blobs.iter().map(Vec::len).sum::<usize>();
-            chunk.extend(blobs);
+            match rows.into_docs() {
+                Ok((docs, n)) => {
+                    bytes += n;
+                    chunk.extend(docs);
+                }
+                Err(e) => {
+                    stopped = Some(e);
+                    return false;
+                }
+            }
             if bytes > chunk_bytes {
                 bytes = 0;
                 if let Err(e) = fold(&mut chunk) {
@@ -37685,14 +37727,16 @@ impl PgHandler {
                     .storage
                     .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
                     .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(blobs) || next.is_none() {
+                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
                     break Ok(());
                 }
                 after = next;
             }
         } else {
             self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
+                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
+                    sink(stream_join::RowBatch::Blobs(b))
+                })
         };
         drop(sink);
         if let Some(e) = stopped.or(failed) {
@@ -37773,6 +37817,106 @@ impl PgHandler {
         Ok(Some(vals))
     }
 
+    /// GROUPING SETS / ROLLUP / CUBE in bounded memory: each set grouped by
+    /// `grouped_in_bounded_memory` over its own read of the input (a stored
+    /// table, or -- `join` -- the join under the aggregate, prepared again),
+    /// its keys widened to the full GROUP BY with NULL where the set leaves
+    /// one out, and each `GROUPING()` value computed as the materialised
+    /// path computes it. The sets come out in order, as there. `None` where
+    /// the materialised path applies: an input small enough to group in
+    /// memory, or one `grouped_in_bounded_memory` declines.
+    #[allow(clippy::type_complexity)]
+    fn grouping_sets_in_bounded_memory(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        join: bool,
+    ) -> PgWireResult<Option<Vec<(Vec<Option<Bson>>, Vec<Bson>)>>> {
+        let Some(sets) = agg.grouping_sets.as_ref() else {
+            return Ok(None);
+        };
+        let width = agg.group_by.len();
+        let mut out = Vec::new();
+        for set in sets {
+            let mut one = agg.clone();
+            one.grouping_sets = None;
+            one.groupings = Vec::new();
+            one.order = Vec::new();
+            one.group_by = if set.is_empty() {
+                // The empty set is one group: a key no row has.
+                vec![secantus_pgplan::GroupKey {
+                    name: String::new(),
+                    field: "\u{1f}no_key".into(),
+                    expr: None,
+                    pg_type: "int4".into(),
+                    typmod: -1,
+                }]
+            } else {
+                set.iter().map(|&i| agg.group_by[i].clone()).collect()
+            };
+            // The empty set over aggregates whose chunks combine: one pass,
+            // a chunk at a time (one group would hold its whole input).
+            if set.is_empty() {
+                let mut whole = one.clone();
+                whole.group_by = Vec::new();
+                let vals = if join {
+                    match self.join_aggregate_source(&whole)? {
+                        Some(mut feed) => {
+                            self.ungrouped_in_bounded_memory_from(&whole, Some(&mut feed))?
+                        }
+                        None => return Ok(None),
+                    }
+                } else {
+                    self.ungrouped_in_bounded_memory(&whole)?
+                };
+                if let Some(mut vals) = vals {
+                    for args in &agg.groupings {
+                        vals.push(Bson::Int32((1 << args.len()) - 1));
+                    }
+                    out.push((vec![None; width], vals));
+                    continue;
+                }
+            }
+            let grouped = if join {
+                match self.join_aggregate_source(&one)? {
+                    Some(mut feed) => self.grouped_in_bounded_memory_from(&one, Some(&mut feed))?,
+                    None => return Ok(None),
+                }
+            } else {
+                self.grouped_in_bounded_memory(&one)?
+            };
+            let Some(Bounded::Grouped(mut groups)) = grouped else {
+                return Ok(None);
+            };
+            if set.is_empty() && groups.is_empty() {
+                let vals = agg
+                    .items
+                    .iter()
+                    .map(|item| compute_aggregate(item, &[]))
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                groups.push((Vec::new(), vals));
+            }
+            for (key, mut vals) in groups {
+                let mut full: Vec<Option<Bson>> = vec![None; width];
+                if !set.is_empty() {
+                    for (j, &i) in set.iter().enumerate() {
+                        full[i] = key.get(j).cloned().flatten();
+                    }
+                }
+                for args in &agg.groupings {
+                    let n = args.len();
+                    let bits = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| !set.contains(a))
+                        .fold(0_i32, |acc, (i, _)| acc | (1 << (n - 1 - i)));
+                    vals.push(Bson::Int32(bits));
+                }
+                out.push((full, vals));
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn grouped_in_bounded_memory(
         &self,
         agg: &secantus_pgplan::Aggregate,
@@ -37847,26 +37991,42 @@ impl PgHandler {
                 "a GROUP BY expression failed".to_string()
             })
         };
-        let mut small: Vec<Vec<u8>> = Vec::new();
+        let mut small: Vec<(Document, usize)> = Vec::new();
         let mut bytes = 0usize;
         let mut runs: Option<crate::external_sort::RunBuilder> = None;
         let mut sort_err: Option<String> = None;
         let mut stopped: Option<PgWireError> = None;
-        let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
+        let mut sink = |rows: stream_join::RowBatch| -> bool {
             if let Err(e) = self.check_cancel() {
                 stopped = Some(e);
                 return false;
             }
+            let rows = match rows.into_sized_docs() {
+                Ok(r) => r,
+                Err(e) => {
+                    stopped = Some(e);
+                    return false;
+                }
+            };
+            let mut push_all = |r: &mut crate::external_sort::RunBuilder,
+                                rows: Vec<(Document, usize)>|
+             -> Result<(), String> {
+                for (mut d, n) in rows {
+                    prepare(&mut d)?;
+                    r.push(d, n)?;
+                }
+                Ok(())
+            };
             let pushed = match runs.as_mut() {
-                Some(r) => r.push_blobs(blobs, &mut prepare),
+                Some(r) => push_all(r, rows),
                 None => {
-                    bytes += blobs.iter().map(Vec::len).sum::<usize>();
-                    small.extend(blobs);
+                    bytes += rows.iter().map(|(_, n)| n).sum::<usize>();
+                    small.extend(rows);
                     if bytes <= group_in_memory_bytes() {
                         return true;
                     }
                     let mut r = crate::external_sort::RunBuilder::new(&order, None, 256);
-                    let pushed = r.push_blobs(std::mem::take(&mut small), &mut prepare);
+                    let pushed = push_all(&mut r, std::mem::take(&mut small));
                     runs = Some(r);
                     pushed
                 }
@@ -37890,14 +38050,16 @@ impl PgHandler {
                     .storage
                     .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
                     .map_err(|e| Self::storage_err("could not read", e))?;
-                if !sink(blobs) || next.is_none() {
+                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
                     break Ok(());
                 }
                 after = next;
             }
         } else {
             self.storage
-                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
+                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
+                    sink(stream_join::RowBatch::Blobs(b))
+                })
         };
         drop(sink);
         if let Some(e) = stopped.or(failed) {
@@ -37908,11 +38070,7 @@ impl PgHandler {
             return Err(Self::user_error("XX000", format!("could not sort: {e}")));
         }
         let Some(runs) = runs else {
-            let docs = small
-                .iter()
-                .map(|b| decode_doc(b))
-                .collect::<Result<_, _>>()
-                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            let docs = small.into_iter().map(|(d, _)| d).collect();
             return Ok(Some(Bounded::Small(docs)));
         };
         let mut sorted = runs

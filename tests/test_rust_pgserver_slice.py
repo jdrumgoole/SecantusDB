@@ -18179,7 +18179,10 @@ def test_batch65_streamed_join_matches_the_materialised_rows(home: Path) -> None
         )
         a.execute("insert into b65_jc values (1, 'a'), (1, 'b'), (3, 'c'), (null, 'd')")
         streamed = [a.execute(q).fetchall() for q in queries]
-    with _Server(home, env={"SECANTUS_PG_JOIN_INNER_BYTES": "1"}) as server, server.connect() as a:
+    # Batch 66: a 1-byte bound partitions every join to disk (grace hash
+    # join) rather than falling back, so the materialised path is asked for
+    # by name.
+    with _Server(home, env={"SECANTUS_PG_JOIN_STREAM": "0"}) as server, server.connect() as a:
         materialised = [a.execute(q).fetchall() for q in queries]
     for q, s, m in zip(queries, streamed, materialised, strict=True):
         assert s == m, q
@@ -18235,3 +18238,112 @@ def test_batch65_read_committed_block_streams_and_sees_commits(home: Path) -> No
         assert simple("select id from b65_rc") == (2905, 4534451)
         assert simple("select id from b65_rc where id > 8999") == (2, 18001)
         pg.exec_(b"commit")
+
+
+def test_batch66_unused_subquery_outputs_are_not_computed(home: Path) -> None:
+    """Batch 66: a FROM-subquery output nothing reads is never computed, as
+    PostgreSQL's planner removes it (`remove_unused_subquery_outputs`), so
+    an error it would raise is not raised. A volatile or set-returning
+    output is still computed, and one that does not parse still fails.
+    Answers measured on PostgreSQL 15.19."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b66_u (a int, b int)")
+        a.execute("insert into b66_u values (1, 0), (2, 0), (3, 0)")
+        a.execute("create sequence b66_us")
+        one = lambda q: a.execute(q).fetchall()  # noqa: E731
+        assert one("select count(*) from (select a/b from b66_u) s") == [(3,)]
+        assert one("select a from (select a/b x, a from b66_u) s order by a") == [(1,), (2,), (3,)]
+        assert one("select n from (select count(*) n, sum(a/b) z from b66_u) s") == [(3,)]
+        assert one("with w as (select a/b from b66_u) select count(*) from w") == [(3,)]
+        assert one("select count(*) from (select a/b from b66_u union all select 1) s") == [(4,)]
+        assert one("select count(*) from (select nextval('b66_us') from b66_u) s") == [(3,)]
+        assert one("select currval('b66_us')") == [(3,)]
+        assert one("select count(*) from (select a, generate_series(1, 2) from b66_u) s") == [(6,)]
+        for q, code in [
+            ("select x from (select a/b as x from b66_u) s", "22012"),
+            ("select count(*) from (select distinct a/b from b66_u) s", "22012"),
+            ("select count(*) from (select nosuch from b66_u) s", "42703"),
+            ("select count(*) from (select a, sum(b) from b66_u) s", "42803"),
+        ]:
+            with pytest.raises(psycopg.Error) as e:
+                a.execute(q)
+            assert e.value.sqlstate == code, q
+            a.rollback()
+
+
+def test_batch66_streamed_joins_match_the_materialised_rows(home: Path) -> None:
+    """Batch 66: joins with a subquery / function / LATERAL side, joins
+    whose right side is past the bound (partitioned to disk: a grace hash
+    join), joins inside a transaction block and grouping sets all read in
+    bounded memory. The rows AND THEIR ORDER are the materialised path's:
+    the same unordered queries give the same lists streamed, with every
+    join partitioned (a 1-byte bound) and grouping spilled, and with
+    streaming switched off."""
+    queries = [
+        "select a.id, s.name from b66_ja a join (select id, name from b66_jb where id < 6) s "
+        "on a.k = s.id",
+        "select a.id, gs from b66_ja a join generate_series(0, 4) gs on a.k = gs where a.id < 300",
+        "select a.id, l.x from b66_ja a, lateral (select a.k * 2 as x) l where a.id < 50",
+        "select a.id, d.id from b66_ja a join b66_jd d on a.k = d.k where a.id < 40",
+        "select a.id, d.id from b66_ja a left join b66_jd d on a.k = d.k where a.id > 1990",
+        "select a.id, d.id from b66_ja a right join b66_jd d on a.k = d.k where d.id < 30",
+        "select a.id, d.id from b66_ja a full join b66_jd d on a.id = d.id "
+        "where a.id is null or d.id is null",
+        "select a.id, d.id from b66_ja a join b66_jd d on a.f = d.k",
+        "select a.id, b.name, d.id from b66_ja a join b66_jb b on a.k = b.id "
+        "join b66_jd d on d.k = b.id where a.id < 25",
+        "select count(*), sum(d.id), max(a.g) from b66_ja a join b66_jd d on a.k = d.k",
+        "select a.g, b.name, count(*) from b66_ja a join b66_jb b on a.k = b.id "
+        "group by grouping sets ((a.g), (b.name), ())",
+        "select g, k, count(*), grouping(g, k) from b66_ja group by rollup (g, k)",
+        # two-table joins with no WHERE take the narrow join path
+        "select a.id, d.id from b66_ja a join b66_jd d on a.k = d.k",
+        "select a.id, d.id from b66_ja a left join b66_jd d on a.f = d.k",
+        "select a.id, s.name from b66_ja a join (select id, name from b66_jb) s on a.k = s.id",
+        "select s.id, d.id from (select id, k from b66_ja where g = 1) s "
+        "join b66_jd d on s.k = d.k",
+    ]
+    block = [
+        "select a.id, b.name from b66_ja a join b66_jb b on a.k = b.id",
+        "select count(*), sum(a.id) from b66_ja a join b66_jd d on a.k = d.k",
+    ]
+
+    def run(env: dict[str, str] | None) -> list[list[tuple]]:
+        with _Server(home, env=env) as server, server.connect() as a:
+            out = [a.execute(q).fetchall() for q in queries]
+            a.execute("begin isolation level repeatable read")
+            a.execute("insert into b66_jb values (11, 'own', 0)")
+            a.execute("delete from b66_ja where id < 100")
+            out += [a.execute(q).fetchall() for q in block]
+            a.execute("rollback")
+            return out
+
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b66_ja (id int primary key, k int, g int, f float8)")
+        a.execute("create table b66_jb (id int primary key, name text, v numeric)")
+        a.execute("create table b66_jd (id int, k int, pad text)")
+        a.execute(
+            "insert into b66_ja select g, (g * 7919) % 11, g % 3, g % 13 "
+            "from generate_series(1, 2000) g"
+        )
+        a.execute("insert into b66_ja values (2001, null, 1, null), (2002, 3, 2, 2.5)")
+        a.execute(
+            "insert into b66_jb select g, 'n' || (g % 4), g * 1.5 from generate_series(0, 8) g"
+        )
+        a.execute(
+            "insert into b66_jd select g, (g * 31) % 97, repeat('p', 20) "
+            "from generate_series(1, 1000) g"
+        )
+        a.execute("insert into b66_jd values (1001, null, 'n')")
+    streamed = run(None)
+    spilled = run({"SECANTUS_PG_JOIN_INNER_BYTES": "1", "SECANTUS_PG_GROUP_MEMORY_BYTES": "1"})
+    materialised = run({"SECANTUS_PG_JOIN_STREAM": "0"})
+    for q, s, p, m in zip(queries + block, streamed, spilled, materialised, strict=True):
+        assert s == m, q
+        if "group by" in q:
+            # A spilled grouping comes out in key order (PostgreSQL leaves
+            # the order unspecified without ORDER BY too): the same groups.
+            assert sorted(map(repr, p)) == sorted(map(repr, m)), q
+        else:
+            assert p == m, q
+    assert len(streamed[3]) > 100
