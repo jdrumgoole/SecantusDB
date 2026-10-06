@@ -346,6 +346,16 @@ pub(crate) fn placeholder_from(name: String) -> pg_query::protobuf::Node {
     }
 }
 
+/// How many join sources are planned so far (see [`truncate_planned_joins`]).
+pub(crate) fn planned_joins_len() -> usize {
+    PLANNED_JOINS.with(|j| j.borrow().len())
+}
+
+/// Forget the join sources planned after the first `n`: a trial plan's.
+pub(crate) fn truncate_planned_joins(n: usize) {
+    PLANNED_JOINS.with(|j| j.borrow_mut().truncate(n));
+}
+
 /// Forget the join sources of the statement just planned.
 pub(crate) fn clear_planned_joins() {
     PLANNED_JOINS.with(|j| j.borrow_mut().clear());
