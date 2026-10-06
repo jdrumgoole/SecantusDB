@@ -41,7 +41,25 @@ thread_local! {
 
 /// Install the schemas the current role cannot use (no `USAGE`).
 pub fn set_unusable_schemas(schemas: Vec<String>) {
+    bump_resolve_epoch();
     UNUSABLE_SCHEMAS.with(|s| *s.borrow_mut() = schemas);
+}
+
+thread_local! {
+    /// Moves whenever anything a name's resolution reads is installed
+    /// anew on this thread (the search path, the user, the schemas, the
+    /// relations, the temp schema): what may be remembered under it.
+    static RESOLVE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Note that name resolution's inputs changed on this thread.
+pub(crate) fn bump_resolve_epoch() {
+    RESOLVE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+}
+
+/// The current resolution epoch (see `RESOLVE_EPOCH`).
+pub(crate) fn resolve_epoch() -> u64 {
+    RESOLVE_EPOCH.with(std::cell::Cell::get)
 }
 
 fn schema_usable(schema: &str) -> bool {
@@ -50,7 +68,24 @@ fn schema_usable(schema: &str) -> bool {
 
 /// Install the session's temporary schema for the statements that follow.
 pub fn set_temp_schema(schema: Option<String>) {
+    bump_resolve_epoch();
     TEMP_SCHEMA.with(|t| *t.borrow_mut() = schema);
+}
+
+/// Install the session's temporary schema `pg_temp_<serial>`, allocating
+/// only when another session's is installed (every statement installs it).
+pub fn set_temp_schema_serial(serial: u64) {
+    TEMP_SCHEMA.with(|t| {
+        let mut t = t.borrow_mut();
+        let same = t
+            .as_deref()
+            .and_then(|s| s.strip_prefix("pg_temp_"))
+            .is_some_and(|n| n.parse::<u64>().ok() == Some(serial));
+        if !same {
+            bump_resolve_epoch();
+            *t = Some(format!("pg_temp_{serial}"));
+        }
+    });
 }
 
 /// The session's temporary schema, when one is installed.
@@ -77,6 +112,7 @@ fn session_has_temp() -> bool {
 
 /// Install every relation's catalog key for the statements that follow.
 pub fn set_relation_keys(keys: std::collections::HashSet<String>) {
+    bump_resolve_epoch();
     RELATION_KEYS.with(|k| *k.borrow_mut() = keys);
 }
 
@@ -85,6 +121,7 @@ pub fn set_relation_keys(keys: std::collections::HashSet<String>) {
 /// function body's own temp table), which the next statement inside it must
 /// already resolve to.
 pub fn note_relation_key(key: &str) {
+    bump_resolve_epoch();
     RELATION_KEYS.with(|k| {
         k.borrow_mut().insert(key.to_string());
     });
@@ -92,6 +129,7 @@ pub fn note_relation_key(key: &str) {
 
 /// Install the database's user schemas for the statements that follow.
 pub fn set_user_schemas(schemas: Vec<String>) {
+    bump_resolve_epoch();
     USER_SCHEMAS.with(|s| *s.borrow_mut() = schemas);
 }
 

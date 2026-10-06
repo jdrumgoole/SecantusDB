@@ -18,6 +18,7 @@ mod catalog_objects;
 mod catalog_order;
 mod collations;
 mod db_settings;
+mod distinct_set;
 mod do_block;
 mod encoding;
 mod event_triggers;
@@ -1315,7 +1316,84 @@ fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
             )));
         }
     }
+    // An array or a jsonb value compares its elements by VALUE too: `{1.0}`
+    // and `{1.00}` are one numeric[], `{NaN}` equals `{NaN}` in a float8[],
+    // and jsonb's `{"x": 1}` is `{"x": 1.0}` (PostgreSQL 15.19, corpus
+    // `b59_distinct`). Each number inside becomes its value's key, marked
+    // so it cannot meet a string.
+    if matches!(b, Bson::Array(_) | Bson::Document(_)) {
+        return Some(nested_ident(b));
+    }
     Some(b.clone())
+}
+
+/// The value key of a number, for comparing by value across its spellings
+/// and types (an integer, a float, a numeric of either width).
+fn number_value_key(v: &Bson) -> Option<String> {
+    let text = match v {
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(d) if d.is_nan() => "NaN".to_string(),
+        Bson::Double(d) if d.is_infinite() => {
+            if *d > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+        }
+        // Rust prints a float in plain decimal, shortest round-trip: equal
+        // floats print alike and different ones differently.
+        Bson::Double(d) => format!("{d}"),
+        other if secantus_pgplan::numeric::is_numeric(other) => {
+            secantus_pgplan::numeric::numeric_text(other)?
+        }
+        _ => return None,
+    };
+    Some(secantus_pgplan::numeric::numeric_sort_key(&text))
+}
+
+/// An array or document with every number inside it reduced to its value.
+fn nested_ident(v: &Bson) -> Bson {
+    if let Some(k) = number_value_key(v) {
+        return Bson::Document(bson::doc! { "\u{1}n": k });
+    }
+    match v {
+        Bson::Array(a) => Bson::Array(a.iter().map(nested_ident).collect()),
+        Bson::Document(d) => Bson::Document(
+            d.iter()
+                .map(|(k, e)| (k.clone(), nested_ident(e)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// A set operation's identity: its two sides were resolved to ONE type, so
+/// an integer literal meets a numeric or a float column by value (`select n
+/// ... union select 1`), which the stored forms do not.
+fn set_op_ident(v: &Option<Bson>) -> Option<Bson> {
+    match v.as_ref().and_then(number_value_key) {
+        Some(k) => Some(Bson::String(k)),
+        None => group_key_ident(v),
+    }
+}
+
+/// A GROUP BY's input read with its memory bounded (`grouped_in_bounded_memory`).
+enum Bounded {
+    /// The input fitted: grouped as always, from these rows.
+    Small(Vec<Document>),
+    /// It did not: grouped from sorted runs, one group at a time.
+    #[allow(clippy::type_complexity)]
+    Grouped(Vec<(Vec<Option<Bson>>, Vec<Bson>)>),
+}
+
+/// The input bytes a GROUP BY groups in memory; past them it sorts.
+/// `SECANTUS_PG_GROUP_MEMORY_BYTES` lowers it, so a test can reach the
+/// sorted path with a small table.
+fn group_in_memory_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("SECANTUS_PG_GROUP_MEMORY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 << 20)
+    })
 }
 
 /// One row of `pg_database`: a database this server will accept a connection to.
@@ -1642,11 +1720,18 @@ impl PgHandler {
     /// latest catalog snapshot. A connection whose open transaction changed
     /// a role reads its own transaction's view, uncached, until it ends.
     fn roles(&self) -> PgWireResult<Vec<RoleInfo>> {
+        self.roles_shared().map(|r| r.as_ref().clone())
+    }
+
+    /// `roles`, shared rather than copied: a statement's privilege check
+    /// looks one role up, and copying every role for it was ~0.7 us of a
+    /// primary-key read (batch 58's `sample`).
+    fn roles_shared(&self) -> PgWireResult<Arc<Vec<RoleInfo>>> {
         if self
             .roles_written_in_txn
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            return self.read_roles();
+            return self.read_roles().map(Arc::new);
         }
         type RoleCache = Mutex<HashMap<usize, (u64, Arc<Vec<RoleInfo>>)>>;
         static ROLE_CACHE: OnceLock<RoleCache> = OnceLock::new();
@@ -1659,16 +1744,17 @@ impl PgHandler {
         let key = Arc::as_ptr(&self.storage) as usize;
         if let Some((v, roles)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             if *v == version {
-                return Ok(roles.as_ref().clone());
+                return Ok(Arc::clone(roles));
             }
         }
-        let roles = self
-            .storage
-            .outside_user_transaction(|| self.read_roles())?;
+        let roles = Arc::new(
+            self.storage
+                .outside_user_transaction(|| self.read_roles())?,
+        );
         cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (version, Arc::new(roles.clone())));
+            .insert(key, (version, Arc::clone(&roles)));
         Ok(roles)
     }
 
@@ -1697,7 +1783,11 @@ impl PgHandler {
     }
 
     fn role(&self, name: &str) -> PgWireResult<Option<RoleInfo>> {
-        Ok(self.roles()?.into_iter().find(|r| r.name == name))
+        Ok(self
+            .roles_shared()?
+            .iter()
+            .find(|r| r.name == name)
+            .cloned())
     }
 
     /// Records a role, new or changed. A new one gets the next oid past every
@@ -3310,14 +3400,11 @@ impl PgHandler {
             let start = guard.as_ref().map_or(now, |h| h.opened_at_micros());
             secantus_pgplan::scalar::set_clocks(start, now);
         }
-        secantus_pgplan::set_session_user(Some(
-            self.session_user
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-        ));
+        secantus_pgplan::set_session_user_str(
+            &self.session_user.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         let role = self.current_role_name();
-        secantus_pgplan::set_current_user(Some(role.clone()));
+        secantus_pgplan::set_current_user_str(&role);
         // The tables below are read from the committed catalog, per role:
         // re-installed only when this thread last installed them for another
         // session, role or catalog version -- or when this session has
@@ -3335,19 +3422,31 @@ impl PgHandler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty();
-        let session_key = (
-            Arc::as_ptr(&self.storage) as usize,
-            self.session_serial,
-            catalog_cache()
-                .version
-                .load(std::sync::atomic::Ordering::SeqCst),
-            role.clone(),
-            self.db().to_string(),
-        );
-        secantus_pgplan::schemas::set_temp_schema(Some(self.temp_schema_name()));
+        let storage_ptr = Arc::as_ptr(&self.storage) as usize;
+        let catalog_version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        secantus_pgplan::schemas::set_temp_schema_serial(self.session_serial);
+        // Compared in place: building the key allocated the role and the
+        // database name on every statement.
         let fresh = !shareable
-            || INSTALLED_SESSION_TABLES.with(|c| c.borrow().as_ref() != Some(&session_key));
+            || !INSTALLED_SESSION_TABLES.with(|c| {
+                c.borrow().as_ref().is_some_and(|k| {
+                    k.0 == storage_ptr
+                        && k.1 == self.session_serial
+                        && k.2 == catalog_version
+                        && k.3 == role
+                        && k.4 == self.db()
+                })
+            });
         if fresh {
+            let session_key = (
+                storage_ptr,
+                self.session_serial,
+                catalog_version,
+                role.clone(),
+                self.db().to_string(),
+            );
             // Per statement, not per catalog version: SET ROLE changes which
             // schemas the search path may use without changing the catalog.
             secantus_pgplan::schemas::set_unusable_schemas(self.unusable_schemas(&role));
@@ -3395,19 +3494,19 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let held = (
-            Arc::as_ptr(&self.storage) as usize,
-            self.db().to_string(),
-            version,
-            if overlay_empty && !self.any_temp_function() {
-                0
-            } else {
-                self.session_serial
-            },
-        );
-        if INSTALLED_USER_TYPES.with(|c| c.borrow().as_ref() == Some(&held)) {
+        let serial = if overlay_empty && !self.any_temp_function() {
+            0
+        } else {
+            self.session_serial
+        };
+        if INSTALLED_USER_TYPES.with(|c| {
+            c.borrow().as_ref().is_some_and(|k| {
+                k.0 == storage_ptr && k.1 == self.db() && k.2 == version && k.3 == serial
+            })
+        }) {
             return;
         }
+        let held = (storage_ptr, self.db().to_string(), version, serial);
         self.publish_user_types();
         // A view assembled from reads taken under a transaction's own
         // snapshot is that block's private one and is not reusable (see
@@ -4322,13 +4421,19 @@ impl PgHandler {
             None if Self::virtual_table(&agg.table).is_some() => {
                 self.virtual_rows(&agg.table, &agg.filter).expect("checked")
             }
-            None => {
-                let raw = self.scan_table(&agg.table, &agg.filter, true)?;
-                raw.iter()
-                    .map(|b| decode_doc(b))
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| Self::storage_err("could not decode a row", e))?
-            }
+            None => match self.grouped_in_bounded_memory(agg)? {
+                Some(Bounded::Small(docs)) => docs,
+                Some(Bounded::Grouped(groups)) => {
+                    return self.finish_groups(agg, groups, max_rows);
+                }
+                None => {
+                    let raw = self.scan_table(&agg.table, &agg.filter, true)?;
+                    raw.iter()
+                        .map(|b| decode_doc(b))
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| Self::storage_err("could not decode a row", e))?
+                }
+            },
         };
 
         // An aggregate over an expression reads a hidden per-row slot
@@ -4353,7 +4458,7 @@ impl PgHandler {
         // Group, preserving first-seen order so output is deterministic
         // even with no ORDER BY.
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
-        let mut idents: Vec<Vec<Option<Bson>>> = Vec::new();
+        let mut group_index = distinct_set::IdentIndex::new();
         let mut buckets: Vec<Vec<Document>> = Vec::new();
         // The grouping set that produced each group, for `GROUPING()`; a plain
         // GROUP BY groups on every key.
@@ -4371,7 +4476,7 @@ impl PgHandler {
             let width = agg.group_by.len();
             for set in sets {
                 let mut set_keys: Vec<Vec<Option<Bson>>> = Vec::new();
-                let mut set_idents: Vec<Vec<Option<Bson>>> = Vec::new();
+                let mut set_index = distinct_set::IdentIndex::new();
                 let mut set_buckets: Vec<Vec<Document>> = Vec::new();
                 for d in &docs {
                     // Full width, so the projection reads the same positions
@@ -4391,11 +4496,10 @@ impl PgHandler {
                         };
                     }
                     let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
-                    match set_idents.iter().position(|k| *k == ident) {
-                        Some(i) => set_buckets[i].push(d.clone()),
-                        None => {
+                    match set_index.find_or_add(ident) {
+                        Ok(i) => set_buckets[i].push(d.clone()),
+                        Err(_) => {
                             set_keys.push(key);
-                            set_idents.push(ident);
                             set_buckets.push(vec![d.clone()]);
                         }
                     }
@@ -4409,7 +4513,6 @@ impl PgHandler {
                 }
                 group_sets.extend(std::iter::repeat_n(set.clone(), set_keys.len()));
                 keys.extend(set_keys);
-                idents.extend(set_idents);
                 buckets.extend(set_buckets);
             }
         } else if agg.group_by.is_empty() {
@@ -4440,11 +4543,10 @@ impl PgHandler {
                 // The DISPLAY key stays the first row's, which is the text
                 // PostgreSQL prints for the group.
                 let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
-                match idents.iter().position(|k| *k == ident) {
-                    Some(i) => buckets[i].push(d),
-                    None => {
+                match group_index.find_or_add(ident) {
+                    Ok(i) => buckets[i].push(d),
+                    Err(_) => {
                         keys.push(key);
-                        idents.push(ident);
                         buckets.push(vec![d]);
                     }
                 }
@@ -4455,7 +4557,7 @@ impl PgHandler {
         // `SELECT count(*), count(n)` yields two columns both named
         // `count`, so a name-keyed row silently drops one.
         let all_keys: Vec<usize> = (0..agg.group_by.len()).collect();
-        let mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = keys
+        let groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = keys
             .iter()
             .zip(buckets.iter())
             .enumerate()
@@ -4481,6 +4583,17 @@ impl PgHandler {
             })
             .collect::<PgWireResult<_>>()?;
 
+        self.finish_groups(agg, groups, max_rows)
+    }
+
+    /// The grouped rows' ORDER BY, HAVING, DISTINCT, OFFSET and LIMIT.
+    #[allow(clippy::type_complexity)]
+    fn finish_groups(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)>,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
         // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
         // works even when `s` is not projected.
         if !agg.order.is_empty() {
@@ -4524,7 +4637,7 @@ impl PgHandler {
         // after grouping and before the ORDER BY, as PostgreSQL does.
         if agg.distinct {
             use secantus_pgplan::OutputCol;
-            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut seen = distinct_set::DistinctSet::<Vec<Option<Bson>>>::new();
             let mut kept = Vec::with_capacity(groups.len());
             for (key, vals) in groups {
                 let ident: Vec<Option<Bson>> = agg
@@ -4542,8 +4655,7 @@ impl PgHandler {
                         group_key_ident(&v)
                     })
                     .collect();
-                if !seen.contains(&ident) {
-                    seen.push(ident);
+                if seen.insert(ident) {
                     kept.push((key, vals));
                 }
             }
@@ -23482,7 +23594,7 @@ impl PgHandler {
         if sel.distinct == secantus_pgplan::Distinct::All {
             let schema = self.row_schema(&def, &sel.columns, &sel.casts);
             let tz = self.session_timezone();
-            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut seen = distinct_set::DistinctSet::<Vec<Option<Bson>>>::new();
             let mut kept = Vec::with_capacity(docs.len());
             for d in docs {
                 let mut ident = Vec::with_capacity(sel.columns.len());
@@ -23496,8 +23608,7 @@ impl PgHandler {
                     )?;
                     ident.push(group_key_ident(&v));
                 }
-                if !seen.contains(&ident) {
-                    seen.push(ident);
+                if seen.insert(ident) {
                     kept.push(d);
                 }
             }
@@ -23511,15 +23622,14 @@ impl PgHandler {
         // `DISTINCT ON (keys)` keeps one row per key, the FIRST in the sort
         // order -- which is why it runs after the sort and DISTINCT does not.
         if let secantus_pgplan::Distinct::On(keys) = &sel.distinct {
-            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut seen = distinct_set::DistinctSet::<Vec<Option<Bson>>>::new();
             let mut kept = Vec::with_capacity(docs.len());
             for d in docs {
                 let ident: Vec<Option<Bson>> = keys
                     .iter()
                     .map(|k| group_key_ident(&d.get(k).cloned()))
                     .collect();
-                if !seen.contains(&ident) {
-                    seen.push(ident);
+                if seen.insert(ident) {
                     kept.push(d);
                 }
             }
@@ -24051,7 +24161,7 @@ impl PgHandler {
             schema.push(self.field(l.name().to_string(), ty));
         }
         let ident = |row: &Vec<Option<Bson>>| -> Vec<Option<Bson>> {
-            row.iter().map(group_key_ident).collect()
+            row.iter().map(set_op_ident).collect()
         };
         let mut out: Vec<Vec<Option<Bson>>> = Vec::new();
         match set.kind {
@@ -24060,39 +24170,37 @@ impl PgHandler {
                 out.extend(right);
             }
             secantus_pgplan::SetOpKind::Intersect => {
-                let mut pool: Vec<Vec<Option<Bson>>> = right.iter().map(ident).collect();
+                let mut pool = distinct_set::IdentCounts::new();
+                for r in &right {
+                    pool.add(ident(r));
+                }
                 for row in left {
                     let k = ident(&row);
-                    if let Some(i) = pool.iter().position(|p| *p == k) {
-                        // ALL pairs each right-side row with one left-side row.
-                        if set.all {
-                            pool.remove(i);
-                        }
+                    // ALL pairs each right-side row with one left-side row.
+                    if pool.take(&k, set.all) {
                         out.push(row);
                     }
                 }
             }
             secantus_pgplan::SetOpKind::Except => {
-                let mut pool: Vec<Vec<Option<Bson>>> = right.iter().map(ident).collect();
+                let mut pool = distinct_set::IdentCounts::new();
+                for r in &right {
+                    pool.add(ident(r));
+                }
                 for row in left {
                     let k = ident(&row);
-                    match pool.iter().position(|p| *p == k) {
-                        Some(i) if set.all => {
-                            pool.remove(i);
-                        }
-                        Some(_) => {}
-                        None => out.push(row),
+                    if !pool.take(&k, set.all) {
+                        out.push(row);
                     }
                 }
             }
         }
         if !set.all {
-            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut seen = distinct_set::DistinctSet::<Vec<Option<Bson>>>::new();
             let mut kept = Vec::with_capacity(out.len());
             for row in out {
                 let k = ident(&row);
-                if !seen.contains(&k) {
-                    seen.push(k);
+                if seen.insert(k) {
                     kept.push(row);
                 }
             }
@@ -32239,18 +32347,14 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
     if item.distinct {
         let field = item.field.as_deref().unwrap_or("");
         let field2 = item.field2.as_deref();
-        let mut seen: Vec<(Option<Bson>, Option<Bson>)> = Vec::new();
+        let mut seen: distinct_set::DistinctSet<(Option<Bson>, Option<Bson>)> =
+            distinct_set::DistinctSet::new();
         rows.retain(|d| {
             let k = (
                 group_key_ident(&d.get(field).cloned()),
                 field2.and_then(|f| group_key_ident(&d.get(f).cloned())),
             );
-            if seen.contains(&k) {
-                false
-            } else {
-                seen.push(k);
-                true
-            }
+            seen.insert(k)
         });
     }
     if !item.order.is_empty() {
@@ -32368,12 +32472,11 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     // already dropped, before the function sees them. By VALUE, so a numeric
     // spelled `1.5` and `1.50` counts once.
     if item.distinct {
-        let mut seen: Vec<Option<Bson>> = Vec::new();
+        let mut seen = distinct_set::DistinctSet::<Option<Bson>>::new();
         let mut kept = Vec::with_capacity(values.len());
         for v in values {
             let k = group_key_ident(&Some(v.clone()));
-            if !seen.contains(&k) {
-                seen.push(k);
+            if seen.insert(k) {
                 kept.push(v);
             }
         }
@@ -32408,13 +32511,12 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // answers NULL where this answered an empty ARRAY.
         AggFunc::ArrayAgg if rows.is_empty() => Bson::Null,
         AggFunc::ArrayAgg if item.distinct => {
-            let mut seen: Vec<Option<Bson>> = Vec::new();
+            let mut seen = distinct_set::DistinctSet::<Option<Bson>>::new();
             let mut kept: Vec<Bson> = Vec::new();
             for d in rows {
                 let v = d.get(field).cloned().unwrap_or(Bson::Null);
                 let k = group_key_ident(&Some(v.clone()));
-                if !seen.contains(&k) {
-                    seen.push(k);
+                if seen.insert(k) {
                     kept.push(v);
                 }
             }
@@ -36552,4 +36654,194 @@ pub(crate) fn nulls_not_distinct(ix: &Document) -> bool {
 /// A column name as a quoted SQL identifier, for an expression over it.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+impl PgHandler {
+    /// A plain GROUP BY over one stored table read in bounded memory: the
+    /// rows are gathered as they are read and, when they pass
+    /// `group_in_memory_bytes`, go instead to sorted runs on the group key
+    /// (`external_sort`), and each group is aggregated as the merge reaches
+    /// its end -- the sort-based grouping PostgreSQL uses when a hash table
+    /// would not fit. Memory is a run, the largest group and the results.
+    /// A smaller input comes back whole and is grouped as before (the
+    /// groups in first-seen order); a larger one's groups come out in key
+    /// order, which PostgreSQL leaves unspecified too without ORDER BY.
+    ///
+    /// `None` where the ordinary read applies: grouping sets, no GROUP BY
+    /// (one group: its memory is the input), an indexed filter, or a
+    /// correlated subquery's repeated scan (`scan_partitions`).
+    fn grouped_in_bounded_memory(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+    ) -> PgWireResult<Option<Bounded>> {
+        if agg.grouping_sets.is_some()
+            || agg.group_by.is_empty()
+            || secantus_pgplan::with_scan_cache(|_| ()).is_some()
+        {
+            return Ok(None);
+        }
+        if !agg.filter.is_empty()
+            && !matches!(
+                self.storage
+                    .explain_plan(self.db(), &agg.table, &agg.filter),
+                Ok(secantus_storage::ExplainPlan::CollScan)
+            )
+        {
+            return Ok(None);
+        }
+        // The group key, each into a hidden field the sort compares.
+        let order: Vec<OrderKey> = (0..agg.group_by.len())
+            .map(|i| OrderKey {
+                field: format!("__grp{i}"),
+                ascending: true,
+                nulls: Nulls::Last,
+                expr: None,
+            })
+            .collect();
+        let mut failed: Option<PgWireError> = None;
+        let mut prepare = |d: &mut Document| -> Result<(), String> {
+            let mut fill = || -> Result<(), PlanError> {
+                for (i, k) in agg.group_by.iter().enumerate() {
+                    let v = match &k.expr {
+                        Some(expr) => secantus_pgplan::apply_row_expr(expr, d)?,
+                        None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                    };
+                    d.insert(format!("__grp{i}"), v);
+                }
+                for item in &agg.items {
+                    for (expr, slot) in [
+                        (item.expr.as_ref(), item.field.as_deref()),
+                        (item.expr2.as_ref(), item.field2.as_deref()),
+                        (item.filter_expr.as_ref(), item.filter_field.as_deref()),
+                    ] {
+                        if let (Some(expr), Some(slot)) = (expr, slot) {
+                            let v = secantus_pgplan::apply_row_expr(expr, d)?;
+                            d.insert(slot, v);
+                        }
+                    }
+                }
+                Ok(())
+            };
+            fill().map_err(|e| {
+                failed = Some(Self::err(&e));
+                "a GROUP BY expression failed".to_string()
+            })
+        };
+        let mut small: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut runs: Option<crate::external_sort::RunBuilder> = None;
+        let mut sort_err: Option<String> = None;
+        let mut stopped: Option<PgWireError> = None;
+        let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
+            if let Err(e) = self.check_cancel() {
+                stopped = Some(e);
+                return false;
+            }
+            let pushed = match runs.as_mut() {
+                Some(r) => r.push_blobs(blobs, &mut prepare),
+                None => {
+                    bytes += blobs.iter().map(Vec::len).sum::<usize>();
+                    small.extend(blobs);
+                    if bytes <= group_in_memory_bytes() {
+                        return true;
+                    }
+                    let mut r = crate::external_sort::RunBuilder::new(&order, None, 256);
+                    let pushed = r.push_blobs(std::mem::take(&mut small), &mut prepare);
+                    runs = Some(r);
+                    pushed
+                }
+            };
+            match pushed {
+                Ok(()) => true,
+                Err(e) => {
+                    sort_err = Some(e);
+                    false
+                }
+            }
+        };
+        let scanned = if self.storage.in_user_txn() {
+            // Through the block's transaction, a batch at a time.
+            let mut after = None;
+            loop {
+                let (blobs, next) = self
+                    .storage
+                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                if !sink(blobs) || next.is_none() {
+                    break Ok(());
+                }
+                after = next;
+            }
+        } else {
+            self.storage
+                .scan_matching_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
+        };
+        drop(sink);
+        if let Some(e) = stopped.or(failed) {
+            return Err(e);
+        }
+        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        if let Some(e) = sort_err {
+            return Err(Self::user_error("XX000", format!("could not sort: {e}")));
+        }
+        let Some(runs) = runs else {
+            let docs = small
+                .iter()
+                .map(|b| decode_doc(b))
+                .collect::<Result<_, _>>()
+                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            return Ok(Some(Bounded::Small(docs)));
+        };
+        let mut sorted = runs
+            .finish(0, None, None)
+            .map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;
+        let mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = Vec::new();
+        // (the group's key, its identity)
+        #[allow(clippy::type_complexity)]
+        let mut current: Option<(Vec<Option<Bson>>, Vec<Option<Bson>>)> = None;
+        let mut bucket: Vec<Document> = Vec::new();
+        let flush = |key: Vec<Option<Bson>>,
+                     bucket: &mut Vec<Document>,
+                     groups: &mut Vec<(Vec<Option<Bson>>, Vec<Bson>)>|
+         -> PgWireResult<()> {
+            let mut vals = agg
+                .items
+                .iter()
+                .map(|item| compute_aggregate(item, bucket))
+                .collect::<PgWireResult<Vec<_>>>()?;
+            // Every key is in a plain GROUP BY's set: no GROUPING() bit.
+            for _ in &agg.groupings {
+                vals.push(Bson::Int32(0));
+            }
+            bucket.clear();
+            groups.push((key, vals));
+            Ok(())
+        };
+        loop {
+            self.check_cancel()?;
+            let row = sorted
+                .next_row()
+                .map_err(|e| Self::user_error("XX000", e))?;
+            let Some(mut d) = row else { break };
+            let key: Vec<Option<Bson>> = (0..agg.group_by.len())
+                .map(|i| match d.remove(format!("__grp{i}")) {
+                    None | Some(Bson::Null) => None,
+                    Some(v) => Some(v),
+                })
+                .collect();
+            let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
+            if current.as_ref().is_some_and(|(_, id)| *id != ident) {
+                let (k, _) = current.take().expect("checked");
+                flush(k, &mut bucket, &mut groups)?;
+            }
+            if current.is_none() {
+                current = Some((key, ident));
+            }
+            bucket.push(d);
+        }
+        if let Some((k, _)) = current {
+            flush(k, &mut bucket, &mut groups)?;
+        }
+        Ok(Some(Bounded::Grouped(groups)))
+    }
 }

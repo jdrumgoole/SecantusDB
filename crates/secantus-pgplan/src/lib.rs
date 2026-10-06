@@ -23408,6 +23408,7 @@ thread_local! {
 
 /// Relations: `(name, oid, temp)`.
 pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
+    schemas::bump_resolve_epoch();
     PLAN_USER_RELATIONS.with(|t| *t.borrow_mut() = relations);
 }
 
@@ -24528,7 +24529,20 @@ thread_local! {
 
 /// Install the session user for the statements that follow on this thread.
 pub fn set_session_user(user: Option<String>) {
+    schemas::bump_resolve_epoch();
     PLAN_SESSION_USER.with(|u| *u.borrow_mut() = user);
+}
+
+/// `set_session_user(Some(user))` without an allocation when it is already
+/// installed (every statement installs it).
+pub fn set_session_user_str(user: &str) {
+    PLAN_SESSION_USER.with(|u| {
+        let mut u = u.borrow_mut();
+        if u.as_deref() != Some(user) {
+            schemas::bump_resolve_epoch();
+            *u = Some(user.to_string());
+        }
+    });
 }
 
 thread_local! {
@@ -24559,6 +24573,7 @@ pub fn set_session_database(database: &str) {
 
 pub fn set_session_context(database: &str, settings: std::collections::HashMap<String, String>) {
     PLAN_SESSION_DB.with(|d| *d.borrow_mut() = database.to_string());
+    schemas::bump_resolve_epoch();
     PLAN_SETTINGS.with(|s| *s.borrow_mut() = settings);
 }
 
@@ -24582,6 +24597,17 @@ thread_local! {
 /// Install the EFFECTIVE role (`SET ROLE`'s), for `current_user`.
 pub fn set_current_user(user: Option<String>) {
     PLAN_CURRENT_USER.with(|u| *u.borrow_mut() = user);
+}
+
+/// `set_current_user(Some(user))` without an allocation when it is already
+/// installed.
+pub fn set_current_user_str(user: &str) {
+    PLAN_CURRENT_USER.with(|u| {
+        let mut u = u.borrow_mut();
+        if u.as_deref() != Some(user) {
+            *u = Some(user.to_string());
+        }
+    });
 }
 
 /// The effective role: `SET ROLE`'s, else the session's.

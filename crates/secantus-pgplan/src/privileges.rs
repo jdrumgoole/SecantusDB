@@ -42,6 +42,23 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
         static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(String, &'static str)>>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
     }
+    // The names resolved through the search path, remembered too while
+    // nothing resolution reads has been installed anew on this thread
+    // (`schemas::resolve_epoch`): resolving was most of this call.
+    type Resolved = std::collections::HashMap<String, (u64, Vec<(String, &'static str)>)>;
+    thread_local! {
+        static RESOLVED: std::cell::RefCell<Resolved> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let epoch = crate::schemas::resolve_epoch();
+    if let Some(hit) = RESOLVED.with(|m| {
+        m.borrow()
+            .get(sql)
+            .filter(|(e, _)| *e == epoch)
+            .map(|(_, v)| v.clone())
+    }) {
+        return hit;
+    }
     // The names are resolved through the search path afterwards: only the
     // parse-tree walk is a function of the text alone.
     let raw = memoised(&MEMO, sql, sql_relations_uncached);
@@ -50,6 +67,14 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
         let (schema, name) = r.split_once('\u{1f}').unwrap_or(("", r.as_str()));
         push(&mut out, &key_parts(schema, name), p);
     }
+    // Resolving installs nothing, so the epoch read above still holds.
+    RESOLVED.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 512 {
+            m.clear();
+        }
+        m.insert(sql.to_string(), (epoch, out.clone()));
+    });
     out
 }
 
