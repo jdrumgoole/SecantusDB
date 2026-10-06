@@ -1232,10 +1232,21 @@ _TIMEZONE_OPERATORS = frozenset(
 
 def _literal_timezone_problem(spec: Any) -> tuple[int, str] | None:
     """The first date operator in `spec` carrying an unusable literal timezone."""
+    from secantus import timelib
     from secantus.expressions import ExpressionError, resolve_timezone_argument
 
     if isinstance(spec, Mapping):
         for key, value in spec.items():
+            if (
+                key == "$dateFromString"
+                and isinstance(value, Mapping)
+                and isinstance(value.get("format"), str)
+            ):
+                # mongod checks a literal `format` before the zone: `%Q` with
+                # `Bad/Zone` is 18536, not 40485 (measured 8.2.11).
+                bad_format = timelib.validate_format(value["format"])
+                if bad_format is not None:
+                    return bad_format
             if (
                 key in _TIMEZONE_OPERATORS
                 and isinstance(value, Mapping)

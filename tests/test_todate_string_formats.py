@@ -142,13 +142,14 @@ def test_these_are_still_refused(coll, text):
     assert excinfo.value.code == 241
 
 
-# --- the version-independent paths ----------------------------------------
+# --- the parser called directly ----------------------------------------------
 #
+# These once pinned a hand-written fallback parser that existed because
 # `datetime.fromisoformat` accepts the compact and week forms only from Python
-# 3.11, so on 3.12 they never reach the explicit parser below and the tests
-# above would exercise the stdlib instead. CI's 3.10 lane caught exactly that:
-# `20200101` parsed locally and raised there. These call the parser DIRECTLY so
-# the code that runs on 3.10 is covered on every interpreter.
+# 3.11. The server now runs a port of timelib (`secantus.timelib`), which owes
+# nothing to `fromisoformat`, so the same strings are checked against it on
+# every interpreter -- each expectation re-measured on mongod 8.2.11
+# (2026-10-07) with `{$toDate: <string>}`.
 
 
 @pytest.mark.parametrize(
@@ -162,16 +163,44 @@ def test_these_are_still_refused(coll, text):
         ("12/31/2020", dt.datetime(2020, 12, 31)),
         ("Dec 31 2020", dt.datetime(2020, 12, 31)),
         ("@1577836800", dt.datetime(2020, 1, 1)),
+        # NOT a rejection, though it was once pinned as one: a day of week is
+        # `[0-7]`, so timelib reads `2020-W01` and then `-8` as a UTC offset of
+        # -8 hours -- mongod answers 08:00Z on the Monday.
+        ("2020-W01-8", dt.datetime(2019, 12, 30, 8)),
     ],
 )
-def test_the_explicit_parser_does_not_depend_on_fromisoformat(text, expected):
-    from secantus.expressions import _parse_timelib_forms
+def test_the_parser_matches_mongod(text, expected):
+    from secantus.expressions import _parse_date_string
 
-    assert _parse_timelib_forms(text) == expected
+    assert _parse_date_string(text) == expected
 
 
-@pytest.mark.parametrize("text", ["2020-W54-1", "2020-W01-8", "2020-W00-1", "20201332"])
-def test_the_explicit_parser_rejects_out_of_range_components(text):
-    from secantus.expressions import _parse_timelib_forms
+@pytest.mark.parametrize(
+    "text,message",
+    [
+        (
+            "2020-W54-1",
+            "Error parsing date string '2020-W54-1'; 4: Unexpected character '-';"
+            " 6: Unexpected character '5'; 7: Unexpected character '4';"
+            " 8: Double timezone specification '-'",
+        ),
+        (
+            "2020-W00-1",
+            "Error parsing date string '2020-W00-1'; 4: Unexpected character '-';"
+            " 6: Unexpected character '0'; 7: Unexpected character '0';"
+            " 8: Double timezone specification '-'",
+        ),
+        (
+            "20201332",
+            "Error parsing date string '20201332'; 7: Unexpected character '2';"
+            " 9: The parsed date was invalid '\x00'",
+        ),
+    ],
+)
+def test_the_parser_rejects_out_of_range_components(text, message):
+    from secantus.expressions import ExpressionError, _parse_date_string
 
-    assert _parse_timelib_forms(text) is None
+    with pytest.raises(ExpressionError) as excinfo:
+        _parse_date_string(text)
+    assert excinfo.value.code == 241
+    assert str(excinfo.value) == message

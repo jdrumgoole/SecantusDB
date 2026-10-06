@@ -728,17 +728,15 @@ CURATED = [
     ({"$dateFromString": {"dateString": "2024-01-15T00:30:00+05:00"}}, {}),  # crosses to prev day
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.123456"}}, {}),  # frac -> defer
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.5Z"}}, {}),  # frac+Z -> defer
-    # REMOVED 2026-10-06, a scope decision, not a skip: the Rust engine now
-    # parses free-form date strings with a port of timelib, the parser mongod
-    # uses, and on these two mongod 8.2.11 and the Python engine disagree --
-    #   "2024-13-01"                  mongod 241 "...; 6: Unexpected character '3'",
-    #                                 Python 14 "month must be in 1..12";
-    #   "...Z" with timezone "+05:00" mongod 241 (a zone in the string together
-    #                                 with a timezone argument), Python a value.
-    # Parity would pin the Rust server to the Python answer, away from mongod.
-    # What is lost: a drift check on these two shapes. mongod-vs-Rust coverage
-    # is tools/probes/date_string_parsing.py (318 cases, 0 divergent); the
-    # Python divergence is backlog section 7.04.
+    # Both engines now run a port of timelib, the parser mongod uses, so the
+    # two shapes once excluded here (Python had diverged from mongod 8.2.11)
+    # are back: mongod answers 241 for both -- "...; 6: Unexpected character
+    # '3'", and a zone in the string together with a timezone argument.
+    # Agreement here is a DRIFT check only; correctness is
+    # tools/probes/date_string_parsing.py against mongod (433 cases, 0
+    # divergent on either server).
+    ({"$dateFromString": {"dateString": "2024-13-01"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z", "timezone": "+05:00"}}, {}),
     (
         {"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}},
         {},
@@ -750,19 +748,23 @@ CURATED = [
     ({"$dateFromString": {"dateString": "2024-01-15", "timezone": "-08:00"}}, {}),
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "+0530"}}, {}),
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "UTC"}}, {}),
-    # A string that already carries an offset ignores the timezone field.
-    # (the "...Z" + timezone case: see the REMOVED note above)
-    # $dateFromString `format`: the Rust server runs mongod's parser (timelib's
-    # parse-from-format under mongod's specifier map), the Python server runs
-    # strptime. They agree on the plain shapes below. REMOVED, because the
-    # Rust answer is mongod's and the Python answer is not (each measured on
-    # 8.2.11, 2026-10-06): `%y` (not a mongod specifier: 18536), `%j` (zero-
-    # based in mongod: "2024-100" is 10 April), `%j` alone (incomplete), a
-    # leap second and 29 February 2023 (invalid, 241), a trailing `%z` with no
-    # zone left ("Not enough data"), and a literal mismatch (241, not a defer).
-    # What is lost: a drift check on those shapes. mongod-vs-Rust coverage is
-    # tools/probes/date_string_parsing.py (`FORMAT_CASES`, 0 divergent); the
-    # Python divergence is backlog section 7.04.
+    # $dateFromString `format`: both engines run timelib's parse-from-format
+    # under mongod's specifier map. The shapes once excluded here because the
+    # Python engine ran strptime are back (mongod 8.2.11, 2026-10-06): `%y`
+    # (not a mongod specifier: 18536), `%j` (zero-based: "2024-100" is 10
+    # April), `%j` alone (incomplete), a leap second and 29 February 2023
+    # (invalid, 241), a trailing `%z` with no zone left ("Not enough data"),
+    # and a literal mismatch (241).
+    ({"$dateFromString": {"dateString": "24-01-15", "format": "%y-%m-%d"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-100", "format": "%Y-%j"}}, {}),
+    ({"$dateFromString": {"dateString": "100", "format": "%j"}}, {}),
+    (
+        {"$dateFromString": {"dateString": "2024-01-15T23:59:60", "format": "%Y-%m-%dT%H:%M:%S"}},
+        {},
+    ),
+    ({"$dateFromString": {"dateString": "2023-02-29", "format": "%Y-%m-%d"}}, {}),
+    ({"$dateFromString": {"dateString": "2024-01-15", "format": "%Y-%m-%d%z"}}, {}),
+    ({"$dateFromString": {"dateString": "2024/01/15", "format": "%Y-%m-%d"}}, {}),
     ({"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}}, {}),
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:45", "format": "%Y-%m-%dT%H:%M:%S"}}, {}),
     ({"$dateFromString": {"dateString": "20240115", "format": "%Y%m%d"}}, {}),  # adjacent
@@ -1667,9 +1669,9 @@ def test_string_typeguard_defers_and_raises(expr, code):
     [
         ({"$dateToString": {"date": "x"}}, 16006),
         ({"$dateToParts": {"date": "x"}}, 16006),
-        # REMOVED `$dateFromString` of a non-string dateString: mongod (and the
-        # Rust server) end the 241 message "found: int with value 5"; the Python
-        # server stops at "found: int" (backlog section 7.04).
+        # mongod ends the 241 message "found: int with value 5"; both engines
+        # now do (the Python one once stopped at "found: int").
+        ({"$dateFromString": {"dateString": 5}}, 241),
         ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
         ({"$switch": {"branches": []}}, 40068),
         ({"$ifNull": [1]}, 1257300),

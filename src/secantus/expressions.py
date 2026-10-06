@@ -15,7 +15,8 @@ from typing import Any
 import bson
 from bson import Binary, Decimal128, Int64, ObjectId, Timestamp
 
-from secantus.bsontypes import fmt_double_value, is_bson_string
+from secantus import timelib
+from secantus.bsontypes import bson_value_repr_stage, fmt_double_value, is_bson_string
 from secantus.numerics import IntegerOverflowError, bson_int_width
 from secantus.ordering import bson_equal as _bson_equal
 from secantus.paths import get_path
@@ -4298,32 +4299,56 @@ def _known_timezones() -> frozenset[str]:
 
 
 def _op_date_from_string(arg: Any, ctx: _Ctx) -> Any:
+    """``ExpressionDateFromString::evaluate``, in mongod's order: the format's
+    type (40684) and validity (18535 / 18536) before a nullish ``dateString``
+    wins, then the timezone (40517 / 40485), then ``onNull``, then ``onError``
+    around the ``dateString`` type check and the parse (241)."""
     if not isinstance(arg, Mapping):
         raise ExpressionError("$dateFromString requires a document spec")
-    raw = _eval(arg.get("dateString"), ctx)
-    if raw is None:
-        return _eval(arg["onNull"], ctx) if "onNull" in arg else None
-    if not isinstance(raw, str):
-        raise ExpressionError(
-            "$dateFromString requires that 'dateString' be a string, found: "
-            f"{_bson_type_name(raw)}",
-            code=241,
-            code_name="ConversionFailure",
-        )
-    fmt = arg.get("format")
-    tz = _resolve_timezone(arg.get("timezone"))
-    try:
-        if isinstance(fmt, str):
-            parsed = _dt.datetime.strptime(raw, fmt)
+    date_string = _eval(arg["dateString"], ctx) if "dateString" in arg else None
+    fmt = _eval(arg["format"], ctx) if "format" in arg else None
+    if fmt is not None:
+        if not is_bson_string(fmt):
+            raise ExpressionError(
+                "$dateFromString requires that 'format' be a string, found: "
+                f"{_bson_type_name(fmt)} with value {bson_value_repr_stage(fmt)}",
+                code=40684,
+            )
+        bad = timelib.validate_format(fmt)
+        if bad is not None:
+            raise ExpressionError(bad[1], code=bad[0])
+    # The zone is resolved next: an unknown one is an error even for a nullish
+    # dateString, and onError does not catch it.
+    tz: tuple[str, Any] | None = ("utc", None)
+    if "timezone" in arg:
+        tz_value = _eval(arg["timezone"], ctx)
+        if tz_value is None:
+            tz = None
+        elif is_bson_string(tz_value):
+            tz = _mongo_tz(str(tz_value))
         else:
-            parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError as exc:
+            raise ExpressionError(
+                f"timezone must evaluate to a string, found {_bson_type_name(tz_value)}",
+                code=40517,
+            )
+    if date_string is None:
+        return _eval(arg["onNull"], ctx) if "onNull" in arg else None
+    # Everything from here is a ConversionFailure that onError catches.
+    try:
+        if not is_bson_string(date_string):
+            raise _DateStringError(
+                "$dateFromString requires that 'dateString' be a string, found: "
+                f"{_bson_type_name(date_string)} with value {bson_value_repr_stage(date_string)}"
+            )
+        # A nullish `timezone` or a PRESENT but nullish `format` is null.
+        if tz is None or ("format" in arg and fmt is None):
+            return None
+        ms = _resolve_date_string(str(date_string), None if fmt is None else str(fmt), tz)
+    except _DateStringError as exc:
         if "onError" in arg:
             return _eval(arg["onError"], ctx)
-        raise ExpressionError(f"$dateFromString cannot parse {raw!r}: {exc}") from exc
-    if tz is not None and parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=tz)
-    return parsed
+        raise _date_string_conversion_error(str(exc)) from None
+    return _millis_to_bson_date(ms)
 
 
 #: The month names `%b` / `%B` render. Hard-coded English: mongod does not
@@ -5166,229 +5191,216 @@ def _epoch_millis_to_date(millis: float) -> Any:
         return DatetimeMS(int(millis))
 
 
-#: timelib's MILITARY timezone letters, which mongod inherits: `A`-`I` are
-#: UTC+1..+9, `J` is invalid ("local"), `K`-`M` are +10..+12, `N`-`Y` are
-#: -1..-12 and `Z` is UTC. Measured on 8.2.11 (2026-09-09) across ten letters --
-#: this is why `{$toDate: "2020-01-01T"}` answers `07:00:00` rather than
-#: midnight: the trailing `T` is not the ISO date/time separator there, it is
-#: the zone UTC-7. The value is deterministic, NOT host-local (a `TZ=UTC` server
-#: answers the same).
-_MILITARY_ZONES = {
-    **{chr(ord("A") + i): i + 1 for i in range(9)},  # A..I -> +1..+9
-    **{"K": 10, "L": 11, "M": 12},
-    **{chr(ord("N") + i): -(i + 1) for i in range(12)},  # N..Y -> -1..-12
-    "Z": 0,
-}
-
-_MONTH_NAMES = {
-    m: i + 1
-    for i, full in enumerate(
-        [
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-        ]
-    )
-    for m in (full, full[:3])
-}
-
-#: The non-ISO shapes timelib accepts, tried in order after the ISO path.
-#: Each returns `(year, month, day)`; the optional time is parsed separately.
-_DATE_PATTERNS = [
-    # US month-first slash form. `31/12/2020` is REFUSED by mongod, so this is
-    # a locale RULE and not ambiguity-resolution (measured 2026-09-09).
-    (re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$"), ("m", "d", "y")),
-    # Year-first slash form, disambiguated by the four-digit leading field.
-    (re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})$"), ("y", "m", "d")),
-    # Non-padded ISO. `fromisoformat` requires two digits.
-    (re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$"), ("y", "m", "d")),
-]
-
-_MONTH_FIRST = re.compile(r"^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$")
-_DAY_FIRST = re.compile(r"^(\d{1,2})\s+([A-Za-z]{3,9}),?\s+(\d{4})$")
-_AT_EPOCH = re.compile(r"^@(-?\d+)(\.\d+)?$")
+class _DateStringError(Exception):
+    """mongod's ``ConversionFailure`` (241) for a date string: a parse error, an
+    incomplete string, or a zone in the string alongside a ``timezone``.
+    ``$dateFromString``'s ``onError`` catches it; anything else is not."""
 
 
-def _parse_clock(text: str) -> tuple[int, int, int, int] | None:
-    """`HH[:MM[:SS[.frac]]]` -> `(h, m, s, microseconds)`, or None."""
-    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?(\.\d+)?$", text)
-    if not m:
-        return None
-    h, mi, se, frac = m.groups()
-    micro = 0
-    if frac:
-        # A BSON date holds whole milliseconds; timelib truncates past three.
-        micro = int(round(float(frac) * 1000)) * 1000
-    return int(h), int(mi or 0), int(se or 0), micro
+def _date_string_conversion_error(msg: str) -> ExpressionError:
+    return ExpressionError(msg, code=241, code_name="ConversionFailure")
 
 
-def _parse_timelib_forms(text: str) -> _dt.datetime | None:
-    """The non-ISO date shapes mongod accepts, or None if this is not one.
+def _mongo_tz(name: str) -> tuple[str, Any]:
+    """A ``timezone`` argument as mongod's ``TimeZoneDatabase::getTimeZone``
+    classifies it: ``"UTC"`` and a zero offset are the UTC zone
+    (``isUtcZone``); any other name in the zone database -- ``GMT`` and
+    ``Etc/UTC`` included -- is a zone ID; then ``+HH``, ``+HHMM``, ``+HH:MM``
+    are fixed offsets. Returns ``("utc", None)``, ``("offset", seconds)`` or
+    ``("named", ZoneInfo)``; an unknown name is 40485."""
+    if name == "UTC":
+        return "utc", None
+    if name in _known_timezones():
+        return "named", zoneinfo.ZoneInfo(name)
+    sign = {"+": 1, "-": -1}.get(name[:1])
+    secs = None
+    if sign is not None:
+        b = name
 
-    mongod's `$toDate` runs **timelib's** parser, not an ISO-8601 one, and
-    accepts a whole format table this server used to reject outright: the US
-    `MM/DD/YYYY` slash form, `YYYY/MM/DD`, month NAMES in either order,
-    non-padded ISO, and `@<unix seconds>`. Each shape was measured against
-    8.2.11 on 2026-09-09; the shapes NOT here (an ISO week date, the compact
-    `YYYYMMDD`) are already handled by `fromisoformat`.
+        def digits(lo: int, hi: int) -> int | None:
+            part = b[lo:hi]
+            return int(part) if len(part) == hi - lo and part.isascii() and part.isdigit() else None
 
-    Order matters: the month-NAME forms are matched against the whole string
-    before any split on whitespace, because their date part contains spaces --
-    a first version split first and could never see `Dec 31 2020`.
-    """
-    # These four are covered by `fromisoformat` on Python 3.11+ and NOT on
-    # 3.10, where it accepts only the strict ISO forms. Relying on it made the
-    # server's answer depend on which interpreter it runs under -- `20200101`
-    # parsed on 3.12 and raised on 3.10 -- which mongod's does not. Parsed
-    # explicitly here so every supported Python agrees (caught by CI's 3.10
-    # lane, 2026-09-09; the same trap `tasks`/the probe skill records for
-    # `TIMESTAMP '...'` in the SQL engine).
-    compact = re.match(r"^(\d{4})(\d{2})(\d{2})(?:[Tt](\d{2})(\d{2})(\d{2}))?$", text)
-    if compact:
-        y, mo, d, hh, mi, se = compact.groups()
-        return _build_datetime(int(y), int(mo), int(d), f"{hh}:{mi}:{se}" if hh is not None else "")
-    week = re.match(r"^(\d{4})-[Ww](\d{2})-(\d)$", text)
-    if week:
-        year, wk, day = (int(g) for g in week.groups())
-        if 1 <= wk <= 53 and 1 <= day <= 7:
-            # Week 1 holds the first Thursday and day 1 is Monday, so
-            # `2020-W01-1` is 2019-12-30.
-            jan4 = _dt.date(year, 1, 4)
-            week1_monday = jan4 - _dt.timedelta(days=jan4.weekday())
-            resolved = week1_monday + _dt.timedelta(weeks=wk - 1, days=day - 1)
-            return _dt.datetime(resolved.year, resolved.month, resolved.day)
-        return None
-    hour_only = re.match(r"^(\d{4}-\d{2}-\d{2})[Tt](\d{2})$", text)
-    if hour_only:
-        date_part, hour = hour_only.groups()
-        y, mo, d = (int(g) for g in date_part.split("-"))
-        return _build_datetime(y, mo, d, f"{hour}:00:00")
-    epoch = _AT_EPOCH.match(text)
-    if epoch:
-        whole, frac = epoch.groups()
-        seconds = int(whole) + (float(frac) if frac else 0.0)
-        return _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=seconds)
-    for pattern, day_first in ((_MONTH_FIRST, False), (_DAY_FIRST, True)):
-        m = pattern.match(text)
-        if not m:
-            continue
-        a, b, year = m.groups()
-        name, day = (b, a) if day_first else (a, b)
-        month = _MONTH_NAMES.get(name.lower())
-        if month:
-            return _build_datetime(int(year), month, int(day), "")
-    # The numeric forms may carry a trailing clock: `12/31/2020 10:30`.
-    body, _, clock = text.partition(" ")
-    for pattern, order in _DATE_PATTERNS:
-        m = pattern.match(body)
-        if not m:
-            continue
-        parts = dict(zip(order, (int(g) for g in m.groups()), strict=True))
-        return _build_datetime(parts["y"], parts["m"], parts["d"], clock.strip())
-    return None
+        if len(b) == 3:
+            h = digits(1, 3)
+            secs = None if h is None else h * 3600
+        elif len(b) == 5:
+            h, m = digits(1, 3), digits(3, 5)
+            secs = None if h is None or m is None else h * 3600 + m * 60
+        elif len(b) == 6 and b[3] == ":":
+            h, m = digits(1, 3), digits(4, 6)
+            secs = None if h is None or m is None else h * 3600 + m * 60
+    if secs is None:
+        raise ExpressionError(_bad_timezone(name, None), code=40485)
+    if secs == 0:
+        return "utc", None
+    return "offset", sign * secs
 
 
-def _build_datetime(year: int, month: int, day: int, clock: str) -> _dt.datetime | None:
-    """Assemble a datetime, or None when a component is out of range.
-
-    mongod REFUSES `13/01/2020` and `12/32/2020`, so an out-of-range month or
-    day is a parse failure rather than a rollover.
-    """
-    hh = mm = ss = micro = 0
-    if clock:
-        parsed = _parse_clock(clock)
-        if parsed is None:
-            return None
-        hh, mm, ss, micro = parsed
+def _resolve_date_string(text: str, fmt: str | None, tz: tuple[str, Any]) -> int:
+    """``TimeZoneDatabase::fromString(text, tz, format)`` then
+    ``TimeZone::adjustTimeZone``: timelib's free-form parser, or its
+    parse-from-format under mongod's specifier map (``secantus.timelib``), then
+    the ``timezone`` argument's rules, as milliseconds since the epoch. The
+    format is already validated. Raises :class:`_DateStringError` for what
+    ``onError`` catches, ``ExpressionError`` (159) on overflow."""
     try:
-        return _dt.datetime(year, month, day, hh, mm, ss, micro)
-    except ValueError:
-        return None
-
-
-def _parse_date_string(value: str) -> _dt.datetime:
-    """mongod's string -> date conversion.
-
-    The VALUE rules are reproduced (ISO-8601 with an optional time, an optional
-    fractional second truncated to milliseconds, ``Z`` or an offset, and
-    surrounding whitespace tolerated). The failure TEXT is not: mongod's parser
-    reports a per-character diagnosis (``Error parsing date string '20'; 0:
-    Unexpected character '2'; 1: Unexpected character '0'``) that depends on how
-    far its own state machine got, and a half-right imitation of that would look
-    authoritative while being wrong. Every failure here answers the code (241)
-    and the general wording mongod uses for a string it cannot start to read.
-    """
-    text = value.strip()
-    if not value:
+        t = timelib.mongo_parse(text) if fmt is None else timelib.mongo_parse_format(text, fmt)
+    except timelib.TimelibError as exc:
+        raise _DateStringError(str(exc)) from None
+    kind, zone = tz
+    if kind != "utc":
+        if t.zone_type == timelib.ZONETYPE_OFFSET:
+            raise _DateStringError(
+                "you cannot pass in a date/time string with GMT offset together with a"
+                " timezone argument"
+            )
+        if t.zone_type == timelib.ZONETYPE_ABBR:
+            raise _DateStringError(
+                "you cannot pass in a date/time string with time zone information"
+                f" ('{t.tz_abbr}') together with a timezone argument"
+            )
+        if t.zone_type != 0:
+            raise _DateStringError(
+                "you cannot pass in a date/time string with time zone information and a"
+                " timezone argument at the same time"
+            )
+    if kind == "utc":
+        timelib.update_ts(t)
+    elif kind == "offset":
+        # timelib_set_timezone_from_offset
+        t.zone_type = timelib.ZONETYPE_OFFSET
+        t.z = zone
+        t.dst = 0
+        timelib.update_ts(t)
+    else:
+        # timelib_set_timezone reads the zone at `t->sse`, still 0 here because
+        # update_ts has not run: the DST flag is the zone's at the epoch. Then
+        # update_ts resolves the wall clock, and the zone-ID branch of
+        # do_adjust_timezone maps it to an instant.
+        dst_at_epoch = _zone_offset_info(zone, 0)[2]
+        t.zone_type = 0
+        timelib.update_ts(t)
+        t.sse += _timelib_zone_adjustment(zone, t.sse, dst_at_epoch)
+    ms = timelib.millis(t)
+    if ms is None:
         raise ExpressionError(
-            # The character in mongod's message is a literal NUL, not a space.
-            f"Error parsing date string '{value}'; 0: Empty string '\x00'",
-            code=241,
-            code_name="ConversionFailure",
+            "Overflow casting from a lower-precision duration to a higher-precision duration",
+            code=159,
+            code_name="DurationOverflow",
         )
-    if not text:
-        # WHITESPACE-ONLY is not empty for mongod: `''` is "Empty string" but
-        # `'  '` is the incomplete-string message (measured 8.2.11, 2026-09-08).
-        # Testing the STRIPPED text conflated them and gave `'  '` the empty
-        # message.
-        raise ExpressionError(
-            f'an incomplete date/time string has been found, with elements missing: "{value}"',
-            code=241,
-            code_name="ConversionFailure",
-        )
-    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
-    # mongod truncates a sub-millisecond fraction rather than rejecting it;
-    # `fromisoformat` accepts only 3 or 6 fractional digits.
-    if "." in candidate:
-        head, _, tail = candidate.partition(".")
-        digits = ""
-        while tail and tail[0].isdigit():
-            digits, tail = digits + tail[0], tail[1:]
-        if digits:
-            # BSON dates hold MILLISECONDS, so mongod truncates the fraction to
-            # three digits rather than rejecting a longer one:
-            # ``...00.1234567Z`` is 123 ms, not 123456 us.
-            candidate = f"{head}.{digits[:3].ljust(3, '0')}000{tail}"
-    for form in (candidate, f"{candidate}-01" if len(candidate) == 7 else candidate):
-        try:
-            parsed = _dt.datetime.fromisoformat(form)
-        except ValueError:
-            continue
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(_dt.timezone.utc).replace(tzinfo=None)
-        return parsed
-    # A trailing MILITARY zone letter, which is why `"2020-01-01T"` is 07:00:00
-    # and not midnight -- see `_MILITARY_ZONES`. Stripped and re-parsed, then
-    # the offset applied; `J` is deliberately absent from the table so it stays
-    # a parse error, as it is on mongod.
-    stripped = text[:-1].rstrip()
-    if len(text) > 1 and text[-1].upper() in _MILITARY_ZONES and stripped:
-        offset = _MILITARY_ZONES[text[-1].upper()]
-        try:
-            inner = _parse_date_string(stripped)
-        except ExpressionError:
-            inner = None
-        if inner is not None:
-            return inner - _dt.timedelta(hours=offset)
-    # The non-ISO shapes timelib accepts -- slash forms, month names,
-    # non-padded components, `@<unix seconds>`.
-    other = _parse_timelib_forms(text)
-    if other is not None:
-        return other
-    raise ExpressionError(
-        f'an incomplete date/time string has been found, with elements missing: "{value}"',
-        code=241,
-        code_name="ConversionFailure",
+    return ms
+
+
+#: 400 Gregorian years in seconds: the calendar, and so every zone's rules,
+#: repeat with this period.
+_TZ_PERIOD = 146_097 * 86_400
+_TZ_LO = -62_135_596_800 + 2 * 86_400
+_TZ_HI = 253_402_300_799 - 2 * 86_400
+
+
+def _offset_at(zone: _dt.tzinfo, ts: int) -> tuple[int, bool]:
+    """The UTC offset in effect at ``ts`` and whether it is daylight time.
+
+    Python's ``datetime`` stops at years 1 and 9999; outside them the instant
+    is moved by whole 400-year periods, which leaves the answer unchanged (a
+    zone is in local mean time before its first transition and on a periodic
+    rule after its last)."""
+    if ts < _TZ_LO:
+        ts += -((ts - _TZ_LO) // _TZ_PERIOD) * _TZ_PERIOD
+    elif ts > _TZ_HI:
+        ts -= -((_TZ_HI - ts) // _TZ_PERIOD) * _TZ_PERIOD
+    d = _dt.datetime.fromtimestamp(ts, tz=zone)
+    off = d.utcoffset() or _dt.timedelta(0)
+    return int(off.total_seconds()), bool(d.dst())
+
+
+def _zone_offset_info(zone: _dt.tzinfo, ts: int) -> tuple[int, int | None, bool]:
+    """``timelib_get_time_zone_offset_info``: the UTC offset in effect at
+    ``ts``, the instant that offset took effect (``None`` if none was found
+    within a year and a day), and whether it is daylight time."""
+    offset, is_dst = _offset_at(zone, ts)
+    # Walk back a day at a time to the first day with another offset, then
+    # bisect that day to the second.
+    same = ts
+    transition = None
+    for _ in range(367):
+        earlier = same - 86_400
+        if _offset_at(zone, earlier)[0] != offset:
+            lo, hi = earlier, same
+            while hi - lo > 1:
+                mid = lo + (hi - lo) // 2
+                if _offset_at(zone, mid)[0] == offset:
+                    hi = mid
+                else:
+                    lo = mid
+            transition = hi
+            break
+        same = earlier
+    return offset, transition, is_dst
+
+
+def _timelib_zone_adjustment(zone: _dt.tzinfo, sse: int, dst: bool) -> int:
+    """The zone-ID branch of timelib's ``do_adjust_timezone``: the seconds to
+    add to a wall clock read as UTC (``sse``) to reach the instant it names.
+    In a DST gap or overlap this picks what mongod picks -- measured, a London
+    ``02:30`` on the spring-forward day is 01:30Z and ``01:30`` on the
+    fall-back day is 01:30Z -- which a plain "earliest local match" does not."""
+    current_offset, _, current_is_dst = _zone_offset_info(zone, sse)
+    after_offset, after_transition_time, _ = _zone_offset_info(zone, sse - current_offset)
+    actual_offset = after_offset
+    actual_transition_time = after_transition_time
+    # `tz->have_zone` is always set by timelib_set_timezone.
+    if current_offset == after_offset:
+        if current_offset >= 0 and dst and not current_is_dst:
+            earlier_offset, earlier_transition_time, _ = _zone_offset_info(
+                zone, sse - current_offset - 7200
+            )
+            if (
+                earlier_offset != after_offset
+                and after_transition_time is not None
+                and sse - earlier_offset < after_transition_time
+            ):
+                actual_offset = earlier_offset
+                actual_transition_time = earlier_transition_time
+        elif current_offset <= 0 and current_is_dst and not dst:
+            later_offset, later_transition_time, _ = _zone_offset_info(
+                zone, sse - current_offset + 7200
+            )
+            if later_offset != after_offset and (
+                later_transition_time is None or sse - later_offset >= later_transition_time
+            ):
+                actual_offset = later_offset
+                actual_transition_time = later_transition_time
+    in_transition = (
+        actual_transition_time is not None
+        and (sse - actual_offset) >= actual_transition_time + (current_offset - actual_offset)
+        and (sse - actual_offset) < actual_transition_time
     )
+    if current_offset != actual_offset and not in_transition:
+        return -actual_offset
+    return -current_offset
+
+
+def _millis_to_bson_date(ms: int) -> Any:
+    """Whole epoch milliseconds -> a naive UTC datetime, exactly, or pymongo's
+    ``DatetimeMS`` outside ``datetime``'s range (a BSON date is any int64)."""
+    try:
+        return _dt.datetime(1970, 1, 1) + _dt.timedelta(milliseconds=ms)
+    except OverflowError:
+        from bson.datetime_ms import DatetimeMS
+
+        return DatetimeMS(ms)
+
+
+def _parse_date_string(value: str) -> Any:
+    """mongod's string -> date conversion for ``$toDate`` / ``$convert``:
+    ``fromString`` with no format and no timezone, through the timelib port --
+    values AND the full error text."""
+    try:
+        return _millis_to_bson_date(_resolve_date_string(value, None, ("utc", None)))
+    except _DateStringError as exc:
+        raise _date_string_conversion_error(str(exc)) from None
 
 
 def _convert_value(value: Any, target: Any) -> Any:
@@ -5640,9 +5652,9 @@ def _op_convert(arg: Any, ctx: _Ctx) -> Any:
     except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
         if "onError" in arg:
             return _eval(arg["onError"], ctx)
-        # Preserve the overflow code (mongod 241); other failures stay the
-        # generic $convert error.
-        if isinstance(exc, ExpressionError) and exc.code == 241:
+        # Preserve the overflow code (mongod 241), and a date string's
+        # DurationOverflow (159); other failures stay the generic $convert error.
+        if isinstance(exc, ExpressionError) and exc.code in (241, 159):
             raise
         raise ExpressionError(f"$convert failed: {exc}") from exc
 
@@ -5685,8 +5697,9 @@ def _op_to_date(arg: Any, ctx: _Ctx) -> Any:
     try:
         return _convert_value(value, "date")
     except (ValueError, TypeError, InvalidOperation, ExpressionError) as exc:
-        # Preserve mongod's ConversionFailure code (241, e.g. bool -> date).
-        if isinstance(exc, ExpressionError) and exc.code == 241:
+        # Preserve mongod's ConversionFailure code (241, e.g. bool -> date)
+        # and a date string's DurationOverflow (159, beyond ~292,000 years).
+        if isinstance(exc, ExpressionError) and exc.code in (241, 159):
             raise
         raise ExpressionError(f"$toDate cannot convert {type(value).__name__}") from exc
 
