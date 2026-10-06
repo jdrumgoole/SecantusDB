@@ -8338,6 +8338,42 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
 
 **Still open on the Rust server after this batch:**
 
+- [ ] **Rust server, re-measured 2026-10-06 (phase 0 of
+  `tasks/rust-mongod-remaining-plan.md`).** The entries in the
+  Python-server list above were run against the Rust binary built from `main`
+  (`0.5.3-beta.170`), against mongod 8.2.11. Most do NOT apply to the Rust
+  server:
+  - **Clean (0 divergent):** regex `\Z` / `\z`, `$project: {_id: 1}`, `$slice`
+    with a negative position, `$bucketAuto` over decimals, decimal `$pow`, the
+    positional `a.$` update, and the write-concern `errInfo` / unknown `w`
+    tag. Change streams are 0 of 41 (`change_streams.py`) and 0 of 60
+    (`change_stream_fuzz.py`).
+  - **Still divergent on the Rust server:**
+    - `maxTimeMS`: 3 of 11 (`max_time_expiry.py`). `findAndModify` / `update`
+      / `delete` send the bare message where mongod prefixes
+      `Plan executor error during <cmd> :: caused by ::`.
+    - awaitable `hello`: 2 of 33 (`awaitable_hello.py`). A newer
+      `topologyVersion` counter is code 31382 where mongod answers 51764,
+      plain and exhaust.
+    - `$jsonSchema` `type: "integer"` is accepted, where mongod answers 9
+      `$jsonSchema type 'integer' is not currently supported.`. This holds at
+      the top level and in `properties`.
+    - A schema failure on UPDATE is a bare `Document failed validation` with
+      no `errInfo`. mongod sends `Plan executor error during update :: caused
+      by :: Document failed validation` with the full
+      `schemaRulesNotSatisfied` tree. INSERT failures already match, tree
+      included.
+    - `writeConcern: {w: []}` is 14 `writeConcern.w must be a number or
+      string`, where mongod answers 9 `w has to be a number, string, or
+      object; found: array`.
+    - Decimal `$log` (with a base) is refused. mongod answers
+      `$log: [100, 10]` = `2`.
+  - **Authorised, not a defect:** the last digit of decimal `$sin`.
+
+  The new probe is `tools/probes/remaining_shapes.py`: 6 of 38 divergent. Run
+  it against a REPLICA-SET mongod, because the Rust server is a single-node
+  replica set and a standalone answers write concern differently.
+
 - [ ] **A mongod plan artifact, recorded not matched:** with a multikey index,
   `$sort: {x: -1, _id: 1}` over `[[3], [1, 2, 3]]` returns `[1, 0]` on mongod,
   contradicting its own `_id` tiebreak (without the index it returns `[0, 1]`).
