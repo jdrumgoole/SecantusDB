@@ -141,6 +141,36 @@ impl PgHandler {
             .store(mode, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set by a simple Query of ONE statement that runs no user code, before
+    /// it runs: outside any transaction (no block, no extended group open)
+    /// at READ COMMITTED, the SELECT it plans may stream on a reader thread
+    /// of its own snapshot -- the statement's snapshot, as PostgreSQL's --
+    /// and pgwire sends its rows as they arrive instead of the whole result
+    /// being built first. Only without a WHERE (`STREAM_UNFILTERED`): the
+    /// whole result is wanted at once, so an indexed lookup is not traded
+    /// for the reader's collection scan.
+    pub(crate) fn allow_simple_stream(&self) {
+        let idle = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let mode = if idle
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed)
+            && self.read_committed_default()
+        {
+            STREAM_UNFILTERED
+        } else {
+            STREAM_NEVER
+        };
+        self.stream_in_block
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stream_request
+            .store(mode, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The SELECT as a streamed result, or `None` to run it as before.
     pub(crate) fn try_stream_select(
         &self,
@@ -222,6 +252,38 @@ impl PgHandler {
         sel: &secantus_pgplan::Select,
         def: &TableDef,
     ) -> Option<(Vec<OrderKey>, Option<Vec<String>>)> {
+        let (order, mut dedup) = self.stream_order_of(sel, def)?;
+        // A timestamp is its millisecond date plus the hidden
+        // sub-millisecond companion (present only when non-zero, as every
+        // write path keeps it), so the companion is part of a DISTINCT's
+        // identity; the sort already orders equal dates by it
+        // (`compare_rows`), so equal timestamps meet.
+        let stamp = |f: &str| {
+            def.columns.iter().any(|c| {
+                c.field() == f
+                    && matches!(
+                        secantus_pgplan::pgtypes::oid_of_name(&c.pg_type),
+                        Some(1114 | 1184)
+                    )
+            })
+        };
+        if let Some(fields) = dedup.as_mut() {
+            let extra: Vec<String> = fields
+                .iter()
+                .filter(|f| stamp(f))
+                .map(|f| secantus_pgplan::companion_field(f))
+                .filter(|c| !fields.contains(c))
+                .collect();
+            fields.extend(extra);
+        }
+        Some((order, dedup))
+    }
+
+    fn stream_order_of(
+        &self,
+        sel: &secantus_pgplan::Select,
+        def: &TableDef,
+    ) -> Option<(Vec<OrderKey>, Option<Vec<String>>)> {
         let asc = |f: &str| OrderKey {
             field: f.to_string(),
             ascending: true,
@@ -232,14 +294,12 @@ impl PgHandler {
             secantus_pgplan::Distinct::None => Some((sel.order.clone(), None)),
             secantus_pgplan::Distinct::All => {
                 // The identity is the stored value: not for a type whose
-                // output the materialised path reassembles first.
+                // output the materialised path reassembles from a document
+                // (a tsvector / tsquery the Python server wrote).
                 let schema = self.row_schema(def, &sel.columns, &sel.casts);
                 if schema.iter().any(|f| {
                     let t = f.datatype();
-                    *t == Type::TIMESTAMP
-                        || *t == Type::TIMESTAMPTZ
-                        || *t == Type::TS_VECTOR
-                        || *t == Type::TSQUERY
+                    *t == Type::TS_VECTOR || *t == Type::TSQUERY
                 }) {
                     return None;
                 }

@@ -17777,3 +17777,99 @@ def test_batch61_read_committed_reads_its_own_table_beside_commits_to_it(home: P
     function ran against it)."""
     with _Server(home) as server, server.connect() as a, server.connect() as b:
         _batch61_overlay_scenario(a, b)
+
+
+def _batch62_subquery_scenario(a: psycopg.Connection, b: psycopg.Connection) -> None:
+    """Statements and PostgreSQL 15.19's answers, shared with the probe that
+    ran them against PostgreSQL itself. Every read follows a commit by the
+    other session, so each one is the first to see it."""
+    a.execute("create table b62_t (id int primary key, x int)")
+    a.execute("create table b62_u (id int primary key, y int)")
+    a.execute("insert into b62_t values (1, 1)")
+    a.execute("insert into b62_u values (1, 10)")
+    a.execute("begin")
+    a.execute("insert into b62_t values (2, 2)")
+    b.execute("insert into b62_t values (3, 300)")
+    assert a.execute("select (select max(x) from b62_t), count(*) from b62_t").fetchone() == (
+        300,
+        3,
+    )
+    b.execute("insert into b62_u values (2, 20)")
+    assert a.execute("select count(*) from b62_t where x in (select id from b62_u)").fetchone() == (
+        2,
+    )
+    b.execute("update b62_t set x = 5 where id = 1")
+    assert a.execute(
+        "with w as (select max(y) m from b62_u) select m, (select sum(x) from b62_t) from w"
+    ).fetchone() == (20, 307)
+    b.execute("insert into b62_t values (4, 40)")
+    assert a.execute("select sum(x) from (select x from b62_t) s").fetchone() == (347,)
+    b.execute("delete from b62_u where id = 2")
+    assert a.execute(
+        "select id from b62_t t where exists (select 1 from b62_u u where u.id = t.id) order by id"
+    ).fetchall() == [(1,)]
+    a.execute("rollback")
+
+
+def test_batch62_read_committed_subquery_sees_commits(home: Path) -> None:
+    """An uncorrelated subquery runs while the statement is PLANNED, which
+    was before a READ COMMITTED block moved onto a fresh snapshot: the first
+    read after another session committed answered the subquery from the
+    block's old snapshot (`(select max(x) ...)` was 2 where PostgreSQL
+    answers 300). Such a read now gets its snapshot before planning, and
+    reads apart with the block's own rows laid over it rather than replaying
+    the block's write set."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _batch62_subquery_scenario(a, b)
+
+
+def test_batch62_simple_query_select_streams(home: Path) -> None:
+    """A lone SELECT sent through the SIMPLE query protocol, outside any
+    transaction, streams its rows from a reader thread as pgwire sends them
+    (it built the whole result first). The answers are unchanged: plain,
+    ordered (rows of one millisecond ordered by their microseconds, as
+    PostgreSQL 15.19 orders them), DISTINCT over a timestamp, and the same
+    statement inside a block, which keeps the materialised path."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b62_s (id int primary key, ts timestamp, t text)")
+        a.execute(
+            "insert into b62_s select g,"
+            " timestamp '2024-01-01' + (g % 5) * interval '1 microsecond',"
+            " repeat('x', g % 7) from generate_series(1, 3000) g"
+        )
+        pg = a.pgconn
+
+        def simple(sql: str) -> list[tuple]:
+            res = pg.exec_(sql.encode())
+            assert res.status == psycopg.pq.ExecStatus.TUPLES_OK, res.error_message
+            return [
+                tuple(
+                    None if res.get_value(r, c) is None else res.get_value(r, c).decode()
+                    for c in range(res.nfields)
+                )
+                for r in range(res.ntuples)
+            ]
+
+        rows = simple("select id, t from b62_s")
+        assert len(rows) == 3000
+        assert rows[:2] == [("1", "x"), ("2", "xx")]
+        assert simple("select id, ts from b62_s order by ts desc, id limit 3") == [
+            ("4", "2024-01-01 00:00:00.000004"),
+            ("9", "2024-01-01 00:00:00.000004"),
+            ("14", "2024-01-01 00:00:00.000004"),
+        ]
+        assert simple("select distinct ts from b62_s order by ts") == [
+            ("2024-01-01 00:00:00",),
+            ("2024-01-01 00:00:00.000001",),
+            ("2024-01-01 00:00:00.000002",),
+            ("2024-01-01 00:00:00.000003",),
+            ("2024-01-01 00:00:00.000004",),
+        ]
+        assert simple("select count(*), max(ts) from b62_s") == [
+            ("3000", "2024-01-01 00:00:00.000004")
+        ]
+        a.execute("begin")
+        a.execute("insert into b62_s values (9999, null, 'mine')")
+        assert len(simple("select id from b62_s")) == 3001
+        a.execute("rollback")
+        assert len(simple("select id from b62_s")) == 3000
