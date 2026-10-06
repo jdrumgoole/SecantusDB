@@ -7878,6 +7878,30 @@ divergent on `main` before this batch, 0 after.**
   zone-abbreviation wrong values fixed on the Rust server almost certainly
   exist there too; run `tools/probes/date_string_parsing.py` with
   `PROBE_SERVER` at a Python server to size it.
+- [x] **`$dateFromString` with a `format` ported too (2026-10-06).** The
+  Rust server used a hand-written strptime that refused 30 of 44 probed shapes
+  mongod parses (`%L`, ISO weeks `%G`/`%V`/`%u`, `%z`, every parse error) and
+  answered wrongly on others -- `%j` a day early (mongod's day of year is
+  ZERO-based), a lone `%Y` accepted where mongod reports the string
+  incomplete. It is now a literal port of `timelib_parse_from_format_with_map`
+  under mongod's `kDateFromStringFormatMap` and `%` prefix
+  (`crates/secantus-core/src/timelib/format.rs`), behind the same `fromString`
+  wrapper, with mongod's format validation (18535 / 18536) and
+  `ExpressionDateFromString::evaluate`'s order: format type (40684) and
+  validity before a nullish `dateString` wins, then the zone (40517 / 40485),
+  then `onNull`, then `onError` around the `dateString` type check and the
+  parse. `format` and `timezone` are now evaluated as expressions rather than
+  read as literals. `date_string_parsing.py` gained `FORMAT_CASES`: **433
+  cases, 0 divergent, values and error text**; a full-`errmsg` comparison of
+  every format case (prefix, code and codeName) is 0 of 111.
+- [ ] **PYTHON server: `$dateFromString` with a `format` diverges from mongod.**
+  It runs Python's `strptime`, a different grammar. Measured shapes, each
+  excluded from the parity suite with a written reason: `%y` accepted (mongod
+  18536, not a specifier), `%j` one-based (mongod zero-based: `2024-100` is
+  10 April), a lone `%j` / `%Y` accepted (mongod: incomplete), and a
+  non-string `dateString` reported as "found: int" without mongod's
+  " with value 5". The fix is the same port; `FORMAT_CASES` with
+  `PROBE_SERVER` at a Python server sizes it.
 - [x] **Error TEXT matched by PORTING timelib (2026-10-06).** The Rust server's
   free-form date parsing is now a literal port of timelib 2022.13's scanner
   (`parse_date.re`), `timelib_update_ts`, and mongod's `fromString` wrapper --

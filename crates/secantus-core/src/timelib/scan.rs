@@ -260,16 +260,16 @@ struct Scanner {
 }
 
 /// A token copy with C-string semantics: reading past the end yields NUL.
-struct Tok<'a> {
-    b: &'a [u8],
-    p: usize,
+pub(super) struct Tok<'a> {
+    pub(super) b: &'a [u8],
+    pub(super) p: usize,
 }
 
 impl Tok<'_> {
-    fn at(&self, i: usize) -> u8 {
+    pub(super) fn at(&self, i: usize) -> u8 {
         self.b.get(i).copied().unwrap_or(0)
     }
-    fn cur(&self) -> u8 {
+    pub(super) fn cur(&self) -> u8 {
         self.at(self.p)
     }
 }
@@ -1057,7 +1057,7 @@ fn meridian(t: &mut Tok, h: i64) -> i64 {
 }
 
 /// `timelib_get_nr_ex`: the number and how many digits it had.
-fn get_nr_ex(t: &mut Tok, max_length: usize) -> (i64, usize) {
+pub(super) fn get_nr_ex(t: &mut Tok, max_length: usize) -> (i64, usize) {
     while !t.cur().is_ascii_digit() {
         if t.cur() == 0 {
             return (UNSET, 0);
@@ -1073,7 +1073,7 @@ fn get_nr_ex(t: &mut Tok, max_length: usize) -> (i64, usize) {
 }
 
 /// `timelib_get_nr`.
-fn get_nr(t: &mut Tok, max_length: usize) -> i64 {
+pub(super) fn get_nr(t: &mut Tok, max_length: usize) -> i64 {
     get_nr_ex(t, max_length).0
 }
 
@@ -1142,7 +1142,7 @@ fn get_relative_text(t: &mut Tok, behavior: &mut i64) -> i64 {
 }
 
 /// `timelib_lookup_month`.
-fn lookup_month(t: &mut Tok) -> i64 {
+pub(super) fn lookup_month(t: &mut Tok) -> i64 {
     let begin = t.p;
     while t.cur().is_ascii_alphabetic() {
         t.p += 1;
@@ -1275,7 +1275,7 @@ fn parse_tz_cor(t: &mut Tok) -> (i64, bool) {
 
 /// `timelib_parse_zone` with mongod's `tz_get_wrapper`, which never finds a
 /// zone identifier. Returns (offset, not_found).
-fn parse_zone(t: &mut Tok, time: &mut Time) -> (i64, bool) {
+pub(super) fn parse_zone(t: &mut Tok, time: &mut Time) -> (i64, bool) {
     while matches!(t.cur(), b' ' | b'\t' | b'(') {
         t.p += 1;
     }

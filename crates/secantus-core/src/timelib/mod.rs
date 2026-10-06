@@ -16,11 +16,13 @@
 //! relative jump), because mongod's answer -- including the position and
 //! character in every error -- falls out of exactly those steps.
 
+mod format;
 mod patterns;
 mod scan;
 mod update;
 mod zones;
 
+pub(crate) use format::validate_format;
 pub(crate) use scan::strtotime;
 pub(crate) use update::update_ts;
 
@@ -37,7 +39,7 @@ const SPECIAL_FIRST_DAY_OF_MONTH: i64 = 0x01;
 const SPECIAL_LAST_DAY_OF_MONTH: i64 = 0x02;
 
 /// The error code mongod rewrites the message for.
-const ERR_TZID_NOT_FOUND: i32 = 0x202;
+pub(crate) const ERR_TZID_NOT_FOUND: i32 = 0x202;
 
 /// `timelib_rel_time`, the fields the parser and `update_ts` use.
 #[derive(Debug, Default, Clone)]
@@ -129,7 +131,21 @@ pub(crate) struct Parsed {
 /// missing any date or time part. Returns the parsed time, ready for the
 /// caller's zone handling and `update_ts`.
 pub(crate) fn mongo_parse(text: &str) -> Result<Time, String> {
-    let parsed = strtotime(text.as_bytes());
+    from_string(text, strtotime(text.as_bytes()))
+}
+
+/// The same with a `format`: `timelib_parse_from_format_with_map` under
+/// mongod's map, then the same wrapper. The caller has already validated the
+/// format with [`validate_format`].
+pub(crate) fn mongo_parse_format(text: &str, format: &str) -> Result<Time, String> {
+    from_string(
+        text,
+        format::parse_from_format(format.as_bytes(), text.as_bytes()),
+    )
+}
+
+/// `TimeZoneDatabase::fromString` after the timelib call.
+fn from_string(text: &str, parsed: Parsed) -> Result<Time, String> {
     if !parsed.errors.is_empty() || !parsed.warnings.is_empty() {
         let mut sb = format!("Error parsing date string '{text}'");
         for e in &parsed.errors {

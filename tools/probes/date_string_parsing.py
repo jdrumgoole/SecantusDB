@@ -9,7 +9,8 @@ military-zone rule read `PM` and the last letter of `UTC` as zone letters.
 
 Since the timelib port (`crates/secantus-core/src/timelib`) the comparison is
 EXACT: values and the full error text, through `$toDate` and `$dateFromString`,
-plus `$dateFromString`'s `timezone` and `onError` cases (`TZ_CASES`).
+plus `$dateFromString`'s `timezone` and `onError` cases (`TZ_CASES`) and
+`$dateFromString` with a `format` (`FORMAT_CASES`).
 
     PROBE_MONGOD="mongodb://127.0.0.1:27095/?directConnection=true" \\
     PROBE_SERVER="mongodb://127.0.0.1:27096/?directConnection=true" \\
@@ -18,10 +19,12 @@ plus `$dateFromString`'s `timezone` and `onError` cases (`TZ_CASES`).
 
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 
 import pymongo
+from bson import ObjectId
 from bson.codec_options import CodecOptions, DatetimeConversion
 
 MONGOD = os.environ.get("PROBE_MONGOD")
@@ -210,11 +213,138 @@ TZ_CASES = [
 ]
 
 
+#: `$dateFromString` with a `format` (timelib_parse_from_format under mongod's
+#: specifier map): whole specs, so the type checks, the format validation and
+#: their order against `onError` / `onNull` / `timezone` are measured too.
+#: `$s` / `$f` / `$bad` / `$n` read the probe document.
+FORMAT_CASES = [
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d"},
+    {"dateString": "15/01/2024", "format": "%d/%m/%Y"},
+    {"dateString": "2024-01-15 10:30:45", "format": "%Y-%m-%d %H:%M:%S"},
+    {"dateString": "2024-01-15T10:30:45.123", "format": "%Y-%m-%dT%H:%M:%S.%L"},
+    {"dateString": "2024-01-15T10:30:45.1", "format": "%Y-%m-%dT%H:%M:%S.%L"},
+    {"dateString": "2024-01-15 10:30:45.5", "format": "%Y-%m-%d %H:%M:%S.%L"},
+    {"dateString": "2024-01-15 10:30:45.12345", "format": "%Y-%m-%d %H:%M:%S.%L"},
+    {"dateString": "2024-01-15 10:30:45.x", "format": "%Y-%m-%d %H:%M:%S.%L"},
+    {"dateString": "2024-015", "format": "%Y-%j"},
+    {"dateString": "2024-366", "format": "%Y-%j"},
+    {"dateString": "2023-366", "format": "%Y-%j"},
+    {"dateString": "2024-000", "format": "%Y-%j"},
+    {"dateString": "2024-999", "format": "%Y-%j"},
+    {"dateString": "015-2024", "format": "%j-%Y"},
+    {"dateString": "2024-W03-1", "format": "%G-W%V-%u"},
+    {"dateString": "2020-W53-7", "format": "%G-W%V-%u"},
+    {"dateString": "2024-W53-1", "format": "%G-W%V-%u"},
+    {"dateString": "2024-W54-1", "format": "%G-W%V-%u"},
+    {"dateString": "2024-W01-8", "format": "%G-W%V-%u"},
+    {"dateString": "2024-W01", "format": "%G-W%V"},
+    {"dateString": "2024", "format": "%G"},
+    {"dateString": "W01-1", "format": "W%V-%u"},
+    {"dateString": "2024 2024-W01-1", "format": "%Y %G-W%V-%u"},
+    {"dateString": "2024-01-15 +0530", "format": "%Y-%m-%d %z"},
+    {"dateString": "2024-01-15 -08:00", "format": "%Y-%m-%d %z"},
+    {"dateString": "2024-01-15 EST", "format": "%Y-%m-%d %Z"},
+    {"dateString": "2024-01-15 Europe/Dublin", "format": "%Y-%m-%d %Z"},
+    {"dateString": "2024-01-15 Europe/Dublin", "format": "%Y-%m-%d %z"},
+    {"dateString": "2024-01-15 10:30 EST", "format": "%Y-%m-%d %H:%M %z"},
+    {"dateString": "2024-01-15 10:30 +60", "format": "%Y-%m-%d %H:%M %Z"},
+    {"dateString": "2024-01-15 10:30 -90", "format": "%Y-%m-%d %H:%M %Z"},
+    {"dateString": "2024-01-15T00:00:00Z", "format": "%Y-%m-%dT%H:%M:%S%z"},
+    {"dateString": "15 jan 2024", "format": "%d %b %Y"},
+    {"dateString": "15 January 2024", "format": "%d %B %Y"},
+    {"dateString": "15 Janu 2024", "format": "%d %b %Y"},
+    {"dateString": "100%", "format": "%Y%%"},
+    {"dateString": "2024%", "format": "%Y%%"},
+    {"dateString": "2024-1-5", "format": "%Y-%m-%d"},
+    {"dateString": "24-01-15", "format": "%Y-%m-%d"},
+    {"dateString": "2024-13-01", "format": "%Y-%m-%d"},
+    {"dateString": "2024-02-30", "format": "%Y-%m-%d"},
+    {"dateString": "2024-01-15 25:00:00", "format": "%Y-%m-%d %H:%M:%S"},
+    {"dateString": "2024-01-15 10:30:60", "format": "%Y-%m-%d %H:%M:%S"},
+    {"dateString": "2024-01-15 10:5", "format": "%Y-%m-%d %H:%M"},
+    {"dateString": "2024-01-15 1:05", "format": "%Y-%m-%d %H:%M"},
+    {"dateString": "2024-01-15", "format": "%Y/%m/%d"},
+    {"dateString": "2024-01-15 extra", "format": "%Y-%m-%d"},
+    {"dateString": "2024-01", "format": "%Y-%m-%d"},
+    {"dateString": "2024", "format": "%Y"},
+    {"dateString": "10:30", "format": "%H:%M"},
+    {"dateString": "", "format": "%Y"},
+    {"dateString": "2024-01-15", "format": ""},
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d %H"},
+    {"dateString": "abc", "format": "%Y"},
+    {"dateString": "x2024-01-15", "format": "%Y-%m-%d"},
+    {"dateString": "2024x01-15", "format": "%Y-%m-%d"},
+    {"dateString": "02024-01-15", "format": "%Y-%m-%d"},
+    {"dateString": "-2024-01-15", "format": "%Y-%m-%d"},
+    {"dateString": "9999-12-31", "format": "%Y-%m-%d"},
+    {"dateString": "0000-01-01", "format": "%Y-%m-%d"},
+    {"dateString": "2024-01-15\u00e9", "format": "%Y-%m-%d\u00e9"},
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d\u00e9"},
+    {"dateString": "68-06-15", "format": "%y-%m-%d"},
+    {"dateString": "2024-100", "format": "%Y-%j"},
+    {"dateString": "100", "format": "%j"},
+    {"dateString": "2023-02-29", "format": "%Y-%m-%d"},
+    {"dateString": "10:30:60", "format": "%H:%M:%S"},
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d%z"},
+    {"dateString": "2024/01/15", "format": "%Y-%m-%d"},
+    {"dateString": "20240115", "format": "%Y%m%d"},
+    {"dateString": "date: 2024-01-15", "format": "date: %Y-%m-%d"},
+    {"dateString": "2024-01-15", "format": "%Q"},
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d%"},
+    {"dateString": "Monday", "format": "%A"},
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d%n"},
+    {"dateString": None, "format": "%Q"},
+    {"dateString": None, "format": 5},
+    {"dateString": "x", "format": 5},
+    {"dateString": "x", "format": 5, "onError": "E"},
+    {"dateString": "x", "format": "%Q", "onError": "E"},
+    {"dateString": "x", "format": "%", "onError": "E"},
+    {"dateString": "$s", "format": "$bad"},
+    {"dateString": "$s", "format": "$bad", "onError": "E"},
+    {"dateString": "$s", "format": "$f"},
+    {"dateString": "$s", "format": "$n"},
+    {"dateString": "$s", "format": None},
+    {"dateString": "$s", "format": "$missing"},
+    {"dateString": 5, "format": "%Y"},
+    {"dateString": 5, "format": "%Y", "onError": "E"},
+    {"dateString": 5.5, "format": "%Y"},
+    {"dateString": True, "format": "%Y"},
+    {"dateString": {"a": 1}, "format": "%Y"},
+    {"dateString": [1, "a"], "format": "%Y"},
+    {"dateString": ObjectId("0123456789abcdef01234567"), "format": "%Y"},
+    {"dateString": datetime.datetime(2024, 1, 15), "format": "%Y"},
+    {"dateString": "2024", "format": {"a": 1}},
+    {"dateString": "2024", "format": [1, "a"]},
+    {"dateString": "2024", "format": True},
+    {"dateString": "2024", "format": 5.5},
+    {"dateString": "x", "format": "%Y", "onNull": 1},
+    {"dateString": "bad", "format": "%Y", "onError": "fallback"},
+    {"dateString": "x", "format": "%Y", "timezone": "Bad/Zone", "onError": "E"},
+    {"dateString": "2024", "format": "%Q", "timezone": "Bad/Zone"},
+    {"dateString": "2024-01-15", "format": "%Y-%m-%d", "timezone": 5},
+    {"dateString": "2024-01-15 10:30", "format": "%Y-%m-%d %H:%M", "timezone": "+02:00"},
+    {"dateString": "2024-01-15 10:30", "format": "%Y-%m-%d %H:%M", "timezone": "Europe/Dublin"},
+    {"dateString": "2024-01-15 10:30", "format": "%Y-%m-%d %H:%M", "timezone": "America/New_York"},
+    {"dateString": "2024-07-15 10:30", "format": "%Y-%m-%d %H:%M", "timezone": "America/New_York"},
+    {"dateString": "2024-03-31 01:30", "format": "%Y-%m-%d %H:%M", "timezone": "Europe/London"},
+    {"dateString": "2024-10-27 01:30", "format": "%Y-%m-%d %H:%M", "timezone": "Europe/London"},
+    {"dateString": "2024-01-15 10:30 +0100", "format": "%Y-%m-%d %H:%M %z", "timezone": "+02:00"},
+    {"dateString": "2024-01-15 10:30 +0100", "format": "%Y-%m-%d %H:%M %z", "timezone": "UTC"},
+    {"dateString": "2024-01-15 10:30 EST", "format": "%Y-%m-%d %H:%M %z", "timezone": "+02:00"},
+    {"dateString": "2024-01-15 10:30 UTC", "format": "%Y-%m-%d %H:%M %z", "timezone": "UTC"},
+    {
+        "dateString": "2024-01-15 10:30 GMT",
+        "format": "%Y-%m-%d %H:%M %z",
+        "timezone": "Europe/Dublin",
+    },
+]
+
+
 def measure(uri: str) -> list[tuple]:
     client = pymongo.MongoClient(uri)
     db = client.date_parse_probe
     db.c.drop()
-    db.c.insert_one({"_id": 1})
+    db.c.insert_one({"_id": 1, "s": "2024-01-15", "f": "%Y-%m-%d", "bad": "%Q", "n": 5})
     out = []
     for s in STRINGS:
         for expr in ({"$toDate": s}, {"$dateFromString": {"dateString": s}}):
@@ -225,6 +355,8 @@ def measure(uri: str) -> list[tuple]:
             spec["timezone"] = tz
         if on_error is not None:
             spec["onError"] = on_error
+        out.append(run(db, {"$dateFromString": spec}))
+    for spec in FORMAT_CASES:
         out.append(run(db, {"$dateFromString": spec}))
     client.drop_database("date_parse_probe")
     client.close()
@@ -245,6 +377,7 @@ def labels() -> list[str]:
     for s in STRINGS:
         out += [f"$toDate {s!r}", f"$dateFromString {s!r}"]
     out += [f"$dateFromString {s!r} tz={tz!r} onError={oe!r}" for s, tz, oe in TZ_CASES]
+    out += [f"$dateFromString {spec!r}" for spec in FORMAT_CASES]
     return out
 
 

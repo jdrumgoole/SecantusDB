@@ -1,7 +1,7 @@
 //! Each expectation measured on mongod 8.2.11 (2026-10-06) with
 //! `$toDate: <string>` -- the full error text, or the resulting instant.
 
-use super::{millis, mongo_parse, update_ts};
+use super::{millis, mongo_parse, mongo_parse_format, update_ts, validate_format};
 
 fn parse_ms(s: &str) -> Result<i128, String> {
     let mut t = mongo_parse(s)?;
@@ -287,4 +287,107 @@ fn cases_carried_over_from_the_old_parser() {
         "2024-01-01T10:00 PM"
     );
     assert!(parse_ms("10:00 PM").is_err(), "10:00 PM");
+}
+
+fn format_ms(s: &str, f: &str) -> Result<i128, String> {
+    let mut t = mongo_parse_format(s, f)?;
+    update_ts(&mut t);
+    Ok(millis(&t).expect("in range") as i128)
+}
+
+/// `$dateFromString` with a `format`, measured on mongod 8.2.11 (2026-10-06).
+#[test]
+fn format_values_match_mongod() {
+    let ok = |s: &str, f: &str| format_ms(s, f).unwrap();
+    assert_eq!(ok("2024-01-15", "%Y-%m-%d"), at(2024, 1, 15, 0, 0, 0));
+    assert_eq!(
+        ok("2024-01-15T10:30:45.1", "%Y-%m-%dT%H:%M:%S.%L"),
+        at(2024, 1, 15, 10, 30, 45) + 100
+    );
+    // %j is zero-based: day 15 is the 16th.
+    assert_eq!(ok("2024-015", "%Y-%j"), at(2024, 1, 16, 0, 0, 0));
+    assert_eq!(ok("2023-366", "%Y-%j"), at(2024, 1, 2, 0, 0, 0));
+    assert_eq!(ok("2024-999", "%Y-%j"), at(2026, 9, 26, 0, 0, 0));
+    assert_eq!(ok("2024-W03-1", "%G-W%V-%u"), at(2024, 1, 15, 0, 0, 0));
+    assert_eq!(ok("2020-W53-7", "%G-W%V-%u"), at(2021, 1, 3, 0, 0, 0));
+    assert_eq!(ok("2024", "%G"), at(2024, 1, 1, 0, 0, 0));
+    assert_eq!(
+        ok("2024-01-15 +0530", "%Y-%m-%d %z"),
+        at(2024, 1, 14, 18, 30, 0)
+    );
+    assert_eq!(
+        ok("2024-01-15 10:30 EST", "%Y-%m-%d %H:%M %z"),
+        at(2024, 1, 15, 15, 30, 0)
+    );
+    // %Z is an offset in MINUTES.
+    assert_eq!(
+        ok("2024-01-15 10:30 -90", "%Y-%m-%d %H:%M %Z"),
+        at(2024, 1, 15, 12, 0, 0)
+    );
+    assert_eq!(ok("15 January 2024", "%d %B %Y"), at(2024, 1, 15, 0, 0, 0));
+    assert_eq!(ok("24-01-15", "%Y-%m-%d"), at(24, 1, 15, 0, 0, 0));
+    assert_eq!(
+        ok("2024-01-15 1:05", "%Y-%m-%d %H:%M"),
+        at(2024, 1, 15, 1, 5, 0)
+    );
+}
+
+#[test]
+fn format_error_text_matches_mongod() {
+    let err = |s: &str, f: &str| format_ms(s, f).unwrap_err();
+    assert_eq!(
+        err("2024", "%Y"),
+        r#"an incomplete date/time string has been found, with elements missing: "2024""#
+    );
+    assert_eq!(
+        err("2024-13-01", "%Y-%m-%d"),
+        "Error parsing date string '2024-13-01'; 10: The parsed date was invalid '\0'"
+    );
+    assert_eq!(
+        err("2024-01-15", "%Y/%m/%d"),
+        "Error parsing date string '2024-01-15'; 4: Format literal not found '-'; 7: Format literal not found '-'"
+    );
+    assert_eq!(
+        err("2024-01", "%Y-%m-%d"),
+        "Error parsing date string '2024-01'; 7: Not enough data available to satisfy format '\0'"
+    );
+    assert_eq!(
+        err("abc", "%Y"),
+        "Error parsing date string 'abc'; 0: Unexpected data found. 'a'; 0: A four digit year could not be found 'a'"
+    );
+    assert_eq!(
+        err("2024-01-15 EST", "%Y-%m-%d %Z"),
+        "Error parsing date string '2024-01-15 EST'; 11: Invalid timezone offset in minutes 'E'; 11: Trailing data 'E'"
+    );
+    assert_eq!(
+        err("2024-01-15 Europe/Dublin", "%Y-%m-%d %z"),
+        "Error parsing date string '2024-01-15 Europe/Dublin'; 11: passing a time zone identifier as part of the string is not allowed 'E'"
+    );
+    assert_eq!(
+        err("2024 2024-W01-1", "%Y %G-W%V-%u"),
+        "Error parsing date string '2024 2024-W01-1'; 15: Mixing of ISO dates with natural dates is not allowed '\0'; 15: Mixing of ISO dates with natural dates is not allowed '\0'"
+    );
+    assert_eq!(
+        err("015-2024", "%j-%Y"),
+        "Error parsing date string '015-2024'; 0: A 'day of year' can only come after a year has been found '0'"
+    );
+}
+
+#[test]
+fn format_validation_matches_mongod() {
+    assert_eq!(
+        validate_format("%Y-%m-%d %H:%M:%S.%L%z%Z%G%V%u%j%b%B%%"),
+        Ok(())
+    );
+    assert_eq!(
+        validate_format("%Y-%m-%d%"),
+        Err((18535, "Unmatched '%' at end of format string".into()))
+    );
+    assert_eq!(
+        validate_format("%A"),
+        Err((
+            18536,
+            "Invalid format character '%A' in format string".into()
+        ))
+    );
 }
