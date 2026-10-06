@@ -74,6 +74,18 @@ fn collection_option_subset(doc: &Document) -> Document {
     out
 }
 
+/// Why mongod would refuse to parse `validator` as a collection validator:
+/// an invalid `$jsonSchema` (9 / 14 / 2, the same check `find` runs) or an
+/// unknown query operator (2 `unknown operator: $x`). Measured 8.2.11,
+/// 2026-10-06 -- both used to be accepted and stored.
+fn validator_problem(v: &Document) -> Option<CommandError> {
+    if let Some((code, name, msg)) = crate::find::json_schema_error_in_filter(v) {
+        return Some(CommandError::new(code, name, msg));
+    }
+    secantus_core::query::first_unknown_operator(v)
+        .map(|op| CommandError::new(2, "BadValue", format!("unknown operator: {op}")))
+}
+
 /// `create` — create a collection, persisting recognised options.
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Before the namespace checks: mongod parses the command before executing it,
@@ -176,6 +188,20 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         );
     }
     let storage = ctx.storage()?;
+    // The validator is parsed as the collection is created, so an existing
+    // collection still answers 48 first (measured 8.2.11, 2026-10-06).
+    if let Some(Bson::Document(v)) = doc.get("validator") {
+        if let Some(problem) = validator_problem(v) {
+            let exists = storage
+                .list_collections(&ctx.db_name)
+                .map_err(command_error)?
+                .iter()
+                .any(|c| c == &coll);
+            if !exists {
+                return Ok(problem.into_reply());
+            }
+        }
+    }
     let created = storage
         .create_collection_with_options(&ctx.db_name, &coll, &opts)
         .map_err(command_error)?;
@@ -263,6 +289,15 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("ns does not exist: {}.{}", ctx.db_name, coll),
         )
         .into_reply());
+    }
+    if let Some(Bson::Document(v)) = doc.get("validator") {
+        if let Some(mut problem) = validator_problem(v) {
+            problem.errmsg = format!(
+                "Parsing of collection validator failed :: caused by :: {}",
+                problem.errmsg
+            );
+            return Ok(problem.into_reply());
+        }
     }
     let mut reply = doc! { "ok": 1.0 };
     // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
@@ -2644,6 +2679,38 @@ mod write_namespace_tests {
             Some(format!(
                 "Fully qualified namespace is too long. Namespace: probe.{long} Max: 255"
             ))
+        );
+    }
+}
+
+#[cfg(test)]
+mod validator_problem_tests {
+    //! A collection validator is parsed when it is set: `create` / `collMod`
+    //! used to store one mongod refuses (measured 8.2.11, 2026-10-06).
+    use super::validator_problem;
+    use bson::doc;
+
+    #[test]
+    fn refuses_what_mongod_will_not_parse() {
+        let p = |v| validator_problem(&v).map(|e| (e.code, e.errmsg));
+        assert_eq!(
+            p(doc! {"$jsonSchema": {"type": "integer"}}),
+            Some((
+                9,
+                "$jsonSchema type 'integer' is not currently supported.".into()
+            ))
+        );
+        assert_eq!(
+            p(doc! {"$and": [{"$jsonSchema": {"nope": 1}}]}),
+            Some((9, "Unknown $jsonSchema keyword: nope".into()))
+        );
+        assert_eq!(
+            p(doc! {"a": {"$nope": 1}}),
+            Some((2, "unknown operator: $nope".into()))
+        );
+        assert_eq!(
+            p(doc! {"$jsonSchema": {"required": ["a"]}, "b": {"$gt": 1}}),
+            None
         );
     }
 }

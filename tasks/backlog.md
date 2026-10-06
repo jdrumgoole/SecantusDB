@@ -8338,41 +8338,45 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
 
 **Still open on the Rust server after this batch:**
 
-- [ ] **Rust server, re-measured 2026-10-06 (phase 0 of
+- [x] **Rust server, re-measured and fixed 2026-10-06 (phases 0 and 1 of
   `tasks/rust-mongod-remaining-plan.md`).** The entries in the
-  Python-server list above were run against the Rust binary built from `main`
-  (`0.5.3-beta.170`), against mongod 8.2.11. Most do NOT apply to the Rust
-  server:
-  - **Clean (0 divergent):** regex `\Z` / `\z`, `$project: {_id: 1}`, `$slice`
-    with a negative position, `$bucketAuto` over decimals, decimal `$pow`, the
-    positional `a.$` update, and the write-concern `errInfo` / unknown `w`
-    tag. Change streams are 0 of 41 (`change_streams.py`) and 0 of 60
-    (`change_stream_fuzz.py`).
-  - **Still divergent on the Rust server:**
-    - `maxTimeMS`: 3 of 11 (`max_time_expiry.py`). `findAndModify` / `update`
-      / `delete` send the bare message where mongod prefixes
-      `Plan executor error during <cmd> :: caused by ::`.
-    - awaitable `hello`: 2 of 33 (`awaitable_hello.py`). A newer
-      `topologyVersion` counter is code 31382 where mongod answers 51764,
-      plain and exhaust.
-    - `$jsonSchema` `type: "integer"` is accepted, where mongod answers 9
-      `$jsonSchema type 'integer' is not currently supported.`. This holds at
-      the top level and in `properties`.
-    - A schema failure on UPDATE is a bare `Document failed validation` with
-      no `errInfo`. mongod sends `Plan executor error during update :: caused
-      by :: Document failed validation` with the full
-      `schemaRulesNotSatisfied` tree. INSERT failures already match, tree
-      included.
-    - `writeConcern: {w: []}` is 14 `writeConcern.w must be a number or
-      string`, where mongod answers 9 `w has to be a number, string, or
-      object; found: array`.
-    - Decimal `$log` (with a base) is refused. mongod answers
-      `$log: [100, 10]` = `2`.
-  - **Authorised, not a defect:** the last digit of decimal `$sin`.
+  Python-server list above were run against the Rust binary
+  (`0.5.3-beta.170`) and mongod 8.2.11. Most do NOT apply to the Rust server:
+  regex `\Z` / `\z`, `$project: {_id: 1}`, negative `$slice`, `$bucketAuto`
+  over decimals, decimal `$pow`, the positional update, change streams (0 of
+  41, 0 of 60), awaitable `hello` (0 of 33) and `maxTimeMS` (0 of 11) were all
+  clean. **Compare against a REPLICA-SET mongod.** The Rust server is a
+  single-node replica set, and a standalone answers `hello`, `maxTimeMS` on
+  writes and write concern differently. That is how phase 0 first reported
+  `hello` and `maxTimeMS` as divergent.
 
-  The new probe is `tools/probes/remaining_shapes.py`: 6 of 38 divergent. Run
-  it against a REPLICA-SET mongod, because the Rust server is a single-node
-  replica set and a standalone answers write concern differently.
+  Fixed in phase 1 (`tools/probes/remaining_shapes.py`, 25 of 58 -> 3 of 72):
+  - **A validation failure on update / upsert / `findAndModify`** (operator,
+    replacement, pipeline, multi, unordered) now carries `Plan executor error
+    during <cmd> :: caused by ::` and mongod's `errInfo`. Storage's
+    `DocumentValidationFailure` carries the failing post-image for it.
+    Updates had no `errInfo` at all, nor did `findAndModify`'s pipeline and
+    upsert paths.
+  - **`create` / `collMod` parse the validator.** An invalid `$jsonSchema`
+    (`type: "integer"`, an unknown keyword) or an unknown operator used to be
+    stored. Now it is refused, `collMod` with mongod's `Parsing of collection
+    validator failed :: caused by ::`. An existing collection still answers
+    48 first.
+  - **`writeConcern.w`**:
+    - a double or decimal is a number (truncated, echoed as an int);
+    - null is the empty tag;
+    - a tag set is accepted and reported after the write as 4 `NoSuchKey`;
+    - an empty tag set is 9;
+    - bool / array are 9 `w has to be a number, string, or object; found:
+      <type>`;
+    - an out-of-range `w` names the value.
+  - **Decimal `$log`** is answered as `ln(n) / ln(base)` in decimal. A NaN
+    gives a double NaN.
+
+- [ ] **Known, not fixed:** a `w` tag set with more than one key. mongod
+  echoes it, and names the key in its `NoSuchKey` message, in hash-map order
+  (`{a, b, c, d}` comes back `{d, b, a, c}` and names `c`), which is not
+  reproducible without its hash function. One key matches exactly.
 
 - [ ] **A mongod plan artifact, recorded not matched:** with a multikey index,
   `$sort: {x: -1, _id: 1}` over `[[3], [1, 2, 3]]` returns `[1, 0]` on mongod,

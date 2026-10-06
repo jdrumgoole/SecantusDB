@@ -616,13 +616,33 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     let Some(wc) = doc.get("writeConcern").and_then(bson::Bson::as_document) else {
         return;
     };
-    let (code, code_name, errmsg) = match wc.get("w") {
-        Some(bson::Bson::Int32(n)) if *n > 1 => (
-            100,
-            "UnsatisfiableWriteConcern",
-            "Not enough data-bearing nodes".to_string(),
-        ),
-        Some(bson::Bson::Int64(n)) if *n > 1 => (
+    // A null `w` is the empty tag; a tag set echoes its counts as longs.
+    let w = match wc.get("w") {
+        Some(bson::Bson::Null) => Some(bson::Bson::String(String::new())),
+        Some(bson::Bson::Document(tags)) => Some(bson::Bson::Document(
+            tags.iter()
+                .map(|(k, v)| (k.clone(), bson::Bson::Int64(write_concern_w_number(v))))
+                .collect(),
+        )),
+        // A number is echoed as mongod stores it: truncated, as an int.
+        Some(
+            n @ (bson::Bson::Int32(_)
+            | bson::Bson::Int64(_)
+            | bson::Bson::Double(_)
+            | bson::Bson::Decimal128(_)),
+        ) => {
+            let v = write_concern_w_number(n);
+            Some(i32::try_from(v).map_or(bson::Bson::Int64(v), bson::Bson::Int32))
+        }
+        other => other.cloned(),
+    };
+    let (code, code_name, errmsg) = match &w {
+        Some(
+            n @ (bson::Bson::Int32(_)
+            | bson::Bson::Int64(_)
+            | bson::Bson::Double(_)
+            | bson::Bson::Decimal128(_)),
+        ) if write_concern_w_number(n) > 1 => (
             100,
             "UnsatisfiableWriteConcern",
             "Not enough data-bearing nodes".to_string(),
@@ -632,11 +652,19 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
             "UnknownReplWriteConcern",
             format!("No write concern mode named '{tag}' found in replica set configuration"),
         ),
+        Some(bson::Bson::Document(tags)) => match tags.keys().next() {
+            Some(key) => (
+                4,
+                "NoSuchKey",
+                format!("No replica set tag key {key} in config"),
+            ),
+            None => return,
+        },
         _ => return,
     };
     let mut echoed = Document::new();
-    if let Some(w) = wc.get("w") {
-        echoed.insert("w", w.clone());
+    if let Some(w) = w {
+        echoed.insert("w", w);
     }
     if let Some(j) = wc.get("j") {
         let j = match j {
@@ -664,6 +692,23 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     reply.insert("writeConcernError", wce);
     if let Some(ok) = ok {
         reply.insert("ok", ok);
+    }
+}
+
+/// A numeric `w` as mongod reads it: `safeNumberLong` (truncated toward
+/// zero, NaN as 0, saturating).
+fn write_concern_w_number(w: &bson::Bson) -> i64 {
+    match w {
+        bson::Bson::Int32(n) => i64::from(*n),
+        bson::Bson::Int64(n) => *n,
+        bson::Bson::Double(d) if d.is_nan() => 0,
+        bson::Bson::Double(d) => *d as i64,
+        bson::Bson::Decimal128(d) => {
+            d.to_string()
+                .parse::<f64>()
+                .map_or(0, |f| if f.is_nan() { 0 } else { f as i64 })
+        }
+        _ => 0,
     }
 }
 
@@ -719,30 +764,39 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
     };
     if let Some(w) = wc.get("w") {
         match w {
-            Bson::Int32(_) | Bson::Int64(_) => {
-                let n = if let Bson::Int32(x) = w {
-                    *x as i64
-                } else if let Bson::Int64(x) = w {
-                    *x
-                } else {
-                    0
-                };
+            // Any number: mongod reads it as `safeNumberLong` and bounds that
+            // (measured 8.2.11, 2026-10-06: a double `w: 1.5` is accepted).
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                let n = write_concern_w_number(w);
                 if !(0..=50).contains(&n) {
                     return Some(CommandError::new(
                         9,
                         "FailedToParse",
-                        "w has to be a non-negative number and not greater than 50",
+                        format!(
+                            "w has to be a non-negative number and not greater than 50; found: {n}"
+                        ),
                     ));
                 }
             }
-            // Any tag parses; an unknown one is reported AFTER the write, as a
+            // Any tag parses, and so does a tag set or a null (the empty
+            // tag); an unknown one is reported AFTER the write, as a
             // `writeConcernError` (see `attach_write_concern_error`).
-            Bson::String(_) => {}
-            _ => {
+            Bson::Document(tags) if tags.is_empty() => {
                 return Some(CommandError::new(
-                    14,
-                    "TypeMismatch",
-                    "writeConcern.w must be a number or string",
+                    9,
+                    "FailedToParse",
+                    "tagged write concern requires tags",
+                ))
+            }
+            Bson::String(_) | Bson::Document(_) | Bson::Null => {}
+            other => {
+                return Some(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!(
+                        "w has to be a number, string, or object; found: {}",
+                        secantus_core::query::bson_type_name(other)
+                    ),
                 ))
             }
         }
@@ -2966,5 +3020,60 @@ mod tests {
             &mut ctx(),
         );
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod write_concern_w_tests {
+    //! `writeConcern.w` as mongod parses it (measured 8.2.11 on a replica set,
+    //! 2026-10-06).
+    use super::validate_write_concern;
+    use bson::{doc, Bson, Document};
+
+    fn refusal(w: Bson) -> Option<(i32, String)> {
+        let cmd = doc! {"insert": "c", "writeConcern": {"w": w}};
+        validate_write_concern(&cmd, "insert").map(|e| (e.code, e.errmsg))
+    }
+
+    #[test]
+    fn accepts_any_number_a_tag_a_tag_set_and_null() {
+        for w in [
+            Bson::Int32(1),
+            Bson::Double(1.5),
+            Bson::String("majority".into()),
+            Bson::Document(doc! {"dc1": 1}),
+            Bson::Null,
+        ] {
+            assert_eq!(refusal(w.clone()), None, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn refuses_what_mongod_refuses() {
+        assert_eq!(
+            refusal(Bson::Boolean(true)),
+            Some((
+                9,
+                "w has to be a number, string, or object; found: bool".into()
+            ))
+        );
+        assert_eq!(
+            refusal(Bson::Array(vec![])),
+            Some((
+                9,
+                "w has to be a number, string, or object; found: array".into()
+            ))
+        );
+        assert_eq!(
+            refusal(Bson::Double(-1.5)),
+            Some((
+                9,
+                "w has to be a non-negative number and not greater than 50; found: -1".into()
+            ))
+        );
+        assert_eq!(
+            refusal(Bson::Document(Document::new())),
+            Some((9, "tagged write concern requires tags".into()))
+        );
     }
 }

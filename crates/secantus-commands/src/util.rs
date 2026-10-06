@@ -302,6 +302,12 @@ pub(crate) fn write_error(index: usize, err: StorageError, command: &str) -> Doc
         }
         // Internal is handled by callers (command-level error); shouldn't reach
         // here, but degrade gracefully to a generic write error if it does.
+        // The handler attaches `errInfo` (it holds the validator).
+        StorageError::ValidationFailure(_) => doc! {
+            "index": index as i32,
+            "code": 121,
+            "errmsg": exec_wrapped("Document failed validation".into(), true, command),
+        },
         StorageError::Internal(msg) => {
             doc! { "index": index as i32, "code": 1, "errmsg": msg }
         }
@@ -365,6 +371,11 @@ pub(crate) fn command_error_during(err: StorageError, command: &str) -> CommandE
             exec_wrapped(errmsg, exec, command),
         ),
         StorageError::DuplicateKey(info) => CommandError::new(11000, "DuplicateKey", info.errmsg),
+        StorageError::ValidationFailure(_) => CommandError::new(
+            121,
+            "DocumentValidationFailure",
+            exec_wrapped("Document failed validation".into(), true, command),
+        ),
         StorageError::WriteConflict => CommandError::new(
             112,
             "WriteConflict",

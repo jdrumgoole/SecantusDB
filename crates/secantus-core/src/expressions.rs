@@ -6731,8 +6731,7 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
 }
 
 // `$log`: [number, base] -> log_base(number). Null if any arg is null; an
-// out-of-domain arg (n <= 0, base <= 0, base == 1) defers so Python raises
-// mongod's Location28758/28759. Mirrors `expressions._op_log`.
+// out-of-domain arg (n <= 0, base <= 0, base == 1) is mongod's 28758 / 28759.
 fn op_log(arg: &Bson, ctx: &Ctx) -> R {
     let vals = eval_args(arg, ctx)?;
     if vals.len() != 2 {
@@ -6767,10 +6766,22 @@ fn op_log(arg: &Bson, ctx: &Ctx) -> R {
             ),
         ));
     }
-    // Only now: a decimal operand needs decimal logarithms, which this engine
-    // does not have. The ERRORS above are exact either way.
+    // A decimal operand makes both decimal, and mongod's answer is
+    // `ln(n) / ln(base)` in Decimal128 (`Decimal128::logarithm(base)`). Each
+    // `ln` is correctly rounded here -- the authorised last-digit divergence
+    // of the decimal transcendentals.
     if vals.iter().any(|v| matches!(v, Bson::Decimal128(_))) {
-        return Err(Fallback::Defer);
+        let dn = crate::decimal::from_bson(&vals[0]).ok_or(Fallback::Defer)?;
+        let db = crate::decimal::from_bson(&vals[1]).ok_or(Fallback::Defer)?;
+        // A NaN answers a DOUBLE nan, as `$ln` does (measured 8.2.11).
+        if matches!(dn, crate::decimal::Dec::Nan) || matches!(db, crate::decimal::Dec::Nan) {
+            return Ok(Bson::Double(f64::NAN));
+        }
+        let r = crate::decimal::ln(&dn)
+            .zip(crate::decimal::ln(&db))
+            .and_then(|(a, b)| crate::decimal::div(&a, &b))
+            .ok_or(Fallback::Defer)?;
+        return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
     }
     // CPython's math.log(n, base) is log(n)/log(base); same operations -> same
     // result under the shared platform libm.
@@ -9536,5 +9547,45 @@ mod int32_argument_tests {
         );
         // Opposite directions build nothing, so estimate nothing.
         assert_eq!(run(bson!({"$range": [0, -7000000, 1]})), Ok(bson!([])));
+    }
+}
+
+#[cfg(test)]
+mod log_decimal_tests {
+    //! `$log` with a decimal operand used to be refused outright. Measured on
+    //! mongod 8.2.11 (2026-10-06).
+    use super::*;
+    use bson::{bson, Decimal128};
+    use std::str::FromStr;
+
+    fn run(expr: Bson) -> Bson {
+        evaluate(&Document::new(), &expr, &Document::new()).expect("evaluates")
+    }
+
+    fn dec(s: &str) -> Bson {
+        Bson::Decimal128(Decimal128::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn answers_a_decimal_logarithm_as_mongod_does() {
+        // The quantum is mongod's: `2` exactly, but `3.000...` (34 digits).
+        assert_eq!(run(bson!({"$log": [dec("100"), dec("10")]})), dec("2"));
+        assert_eq!(
+            run(bson!({"$log": [dec("1000"), dec("10")]})),
+            dec("3.000000000000000000000000000000000")
+        );
+        assert_eq!(
+            run(bson!({"$log": [dec("8"), 2]})),
+            dec("3.000000000000000000000000000000000")
+        );
+        assert_eq!(
+            run(bson!({"$log": [8, dec("2")]})),
+            dec("3.000000000000000000000000000000000")
+        );
+        // A NaN answers a DOUBLE nan, as `$ln` does.
+        assert!(matches!(
+            run(bson!({"$log": [dec("NaN"), dec("10")]})),
+            Bson::Double(d) if d.is_nan()
+        ));
     }
 }
