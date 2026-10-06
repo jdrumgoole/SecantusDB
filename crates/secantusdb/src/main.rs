@@ -55,6 +55,27 @@ can't be opened — WiredTiger holds a single-writer lock). Start a new server o
   --help                Show this help.
 ";
 
+/// Unblock SIGINT / SIGTERM in the calling thread and give them their
+/// default disposition (the `ctrlc` handler installed next replaces it).
+/// POSIX only: Windows has no signal mask or inherited dispositions.
+#[cfg(unix)]
+fn reset_stop_signals() {
+    // SAFETY: plain libc calls on a zeroed sigset, made before any other
+    // thread exists.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            libc::sigaddset(&mut set, sig);
+            libc::signal(sig, libc::SIG_DFL);
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_stop_signals() {}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("restore") {
@@ -135,6 +156,20 @@ fn init_logger(level: &str) {
 }
 
 fn run(cli: CliArgs) -> Result<(), String> {
+    // Take back SIGINT / SIGTERM, then install the stop handler, BEFORE
+    // opening storage or announcing readiness. A parent may leave SIGTERM
+    // blocked or ignored (both survive exec), and with the handler installed
+    // after the "listening on" line a SIGTERM sent the moment a harness saw
+    // that line hit the default disposition and killed the process with no
+    // close-checkpoint -- the window `secantusd-pg` had until batch 57. A stop
+    // requested during startup is honoured once the server is up.
+    reset_stop_signals();
+    let (tx, rx) = mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .map_err(|e| format!("failed to install signal handler: {e}"))?;
+
     // WiredTiger requires the home directory to exist; create it so any path
     // "just works" (matching the embedded handle).
     std::fs::create_dir_all(&cli.storage_path)
@@ -232,13 +267,9 @@ fn run(cli: CliArgs) -> Result<(), String> {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
-    // Block until SIGINT (Ctrl-C) or SIGTERM, then stop cleanly so WiredTiger
+    // Block until SIGINT (Ctrl-C) or SIGTERM -- the handler was installed at
+    // the top of `run`, before startup -- then stop cleanly so WiredTiger
     // closes via drop.
-    let (tx, rx) = mpsc::channel::<()>();
-    ctrlc::set_handler(move || {
-        let _ = tx.send(());
-    })
-    .map_err(|e| format!("failed to install signal handler: {e}"))?;
     let _ = rx.recv();
 
     // Signal the maintenance threads first and join them so they've released

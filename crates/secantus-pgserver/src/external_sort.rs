@@ -30,13 +30,30 @@ pub(crate) fn sorted_rows(
     batch: usize,
     mut emit: impl FnMut(Vec<Document>) -> bool,
 ) -> Result<(), String> {
+    let mut sorted = sort_runs(scan, order, skip, limit, batch)?;
+    loop {
+        let docs = sorted.next_batch()?;
+        if docs.is_empty() || !emit(docs) {
+            return Ok(());
+        }
+    }
+}
+
+/// Read every row `scan` hands over into sorted runs (see `sorted_rows`)
+/// and return the merge, which hands the rows out a batch at a time.
+pub(crate) fn sort_runs(
+    scan: impl FnOnce(&mut dyn FnMut(Vec<Vec<u8>>) -> bool) -> Result<(), String>,
+    order: &[OrderKey],
+    skip: usize,
+    limit: Option<usize>,
+    batch: usize,
+) -> Result<Sorted, String> {
     let cap = limit.map(|l| l.saturating_add(skip));
     let top_k = cap.filter(|c| *c <= TOP_K_MAX);
     let mut chunk: Vec<Document> = Vec::new();
     let mut bytes = 0usize;
     let mut runs: Vec<std::fs::File> = Vec::new();
     let mut failed: Option<String> = None;
-    let mut stopped = false;
     {
         let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
             for blob in blobs {
@@ -80,116 +97,110 @@ pub(crate) fn sorted_rows(
     if let Some(k) = top_k {
         chunk.truncate(k);
     }
-    let mut out = Output {
+    let order: Arc<[OrderKey]> = order.to_vec().into();
+    let mut sorted = Sorted {
+        order: order.clone(),
         skip,
         left: limit,
         batch,
-        pending: Vec::new(),
+        mem: Vec::new().into_iter(),
+        readers: Vec::new(),
+        heap: std::collections::BinaryHeap::new(),
     };
     if runs.is_empty() {
-        for d in chunk {
-            if !out.push(d, &mut emit) {
-                stopped = true;
-                break;
-            }
-        }
-    } else {
-        if !chunk.is_empty() {
-            runs.push(spill(chunk)?);
-        }
-        let mut readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(runs.len());
-        for mut f in runs {
-            f.rewind()
-                .map_err(|e| format!("could not read a sort run: {e}"))?;
-            readers.push(BufReader::with_capacity(64 << 10, f));
-        }
-        let mut heap = std::collections::BinaryHeap::new();
-        for (run, r) in readers.iter_mut().enumerate() {
-            if let Some(doc) = read_one(r)? {
-                heap.push(Head { doc, run, order });
-            }
-        }
-        while let Some(Head { doc, run, .. }) = heap.pop() {
-            if let Some(next) = read_one(&mut readers[run])? {
-                heap.push(Head {
-                    doc: next,
-                    run,
-                    order,
-                });
-            }
-            if !out.push(doc, &mut emit) {
-                stopped = true;
-                break;
-            }
+        sorted.mem = chunk.into_iter();
+        return Ok(sorted);
+    }
+    if !chunk.is_empty() {
+        runs.push(spill(chunk)?);
+    }
+    for mut f in runs {
+        f.rewind()
+            .map_err(|e| format!("could not read a sort run: {e}"))?;
+        sorted.readers.push(BufReader::with_capacity(64 << 10, f));
+    }
+    for run in 0..sorted.readers.len() {
+        if let Some(doc) = read_one(&mut sorted.readers[run])? {
+            sorted.heap.push(Head {
+                doc,
+                run,
+                order: order.clone(),
+            });
         }
     }
-    if !stopped {
-        out.flush(&mut emit);
-    }
-    Ok(())
+    Ok(sorted)
 }
 
-/// Rows going out: OFFSET, LIMIT and batching.
-struct Output {
+/// Sorted rows going out: the merge of the runs (or the one run kept in
+/// memory), then OFFSET, LIMIT and batching.
+pub(crate) struct Sorted {
+    order: Arc<[OrderKey]>,
     skip: usize,
     left: Option<usize>,
     batch: usize,
-    pending: Vec<Document>,
+    mem: std::vec::IntoIter<Document>,
+    readers: Vec<BufReader<std::fs::File>>,
+    heap: std::collections::BinaryHeap<Head>,
 }
 
-impl Output {
-    /// `false` once nothing more is wanted.
-    fn push(&mut self, d: Document, emit: &mut impl FnMut(Vec<Document>) -> bool) -> bool {
-        if self.left == Some(0) {
-            return false;
+impl Sorted {
+    fn next_row(&mut self) -> Result<Option<Document>, String> {
+        if self.readers.is_empty() {
+            return Ok(self.mem.next());
         }
-        if self.skip > 0 {
-            self.skip -= 1;
-            return true;
+        let Some(Head { doc, run, .. }) = self.heap.pop() else {
+            return Ok(None);
+        };
+        if let Some(next) = read_one(&mut self.readers[run])? {
+            self.heap.push(Head {
+                doc: next,
+                run,
+                order: self.order.clone(),
+            });
         }
-        self.pending.push(d);
-        if let Some(n) = self.left.as_mut() {
-            *n -= 1;
-        }
-        if self.pending.len() >= self.batch && !emit(std::mem::take(&mut self.pending)) {
-            return false;
-        }
-        if self.left == Some(0) {
-            self.flush(emit);
-            return false;
-        }
-        true
+        Ok(Some(doc))
     }
 
-    fn flush(&mut self, emit: &mut impl FnMut(Vec<Document>) -> bool) {
-        if !self.pending.is_empty() {
-            let _more = emit(std::mem::take(&mut self.pending));
+    /// The next batch of rows; empty once there are no more.
+    pub(crate) fn next_batch(&mut self) -> Result<Vec<Document>, String> {
+        let mut docs = Vec::new();
+        while docs.len() < self.batch && self.left != Some(0) {
+            let Some(d) = self.next_row()? else { break };
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            docs.push(d);
+            if let Some(n) = self.left.as_mut() {
+                *n -= 1;
+            }
         }
+        Ok(docs)
     }
 }
 
 /// A run's next row in the merge, ordered so that the max-heap pops the
 /// smallest row, and of equal rows the earliest run's.
-struct Head<'o> {
+struct Head {
     doc: Document,
     run: usize,
-    order: &'o [OrderKey],
+    order: Arc<[OrderKey]>,
 }
 
-impl PartialEq for Head<'_> {
+impl PartialEq for Head {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
-impl Eq for Head<'_> {}
-impl PartialOrd for Head<'_> {
+impl Eq for Head {}
+impl PartialOrd for Head {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for Head<'_> {
+impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        compare_rows(&self.doc, &other.doc, self.order)
+        compare_rows(&self.doc, &other.doc, &self.order)
             .then(self.run.cmp(&other.run))
             .reverse()
     }
