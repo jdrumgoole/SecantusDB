@@ -1288,7 +1288,27 @@ remain open:
         and only then the `_id` point read, the index pickers and the
         counts, each behind the same opt-in. Until every path a statement
         can reach honours it, `rc_select_read_set` must keep refusing the
-        overlay for that statement shape. Every move --
+        overlay for that statement shape. **Batch 61 (2026-10-06): step one
+        landed, the consumer half did not.** `Storage::block_overlay(handle,
+        db, coll) -> Option<TableOverlay>` exists and is unit-tested
+        (`crates/secantus-storage/tests/read_overlay.rs`, sync and async
+        lanes); it is keyed by `_id` KEY, not RecordId, because a row the
+        block deleted is gone from its own `_id` index, so its RecordId is
+        unreachable from the block -- the fresh snapshot's row carries the
+        `_id` key in its frame. It answers `None` for a write set holding a
+        command on the table and for the async oplog (no readable rows).
+        `with_read_overlay` installs overlays per thread and
+        `scan_matching_batches` honours one (unit-tested). NOT wired into
+        the PG server, for a reason found while wiring it: `read_apart` runs
+        the statement inside a fresh user transaction, so the streaming
+        aggregate path there calls `scan_batch_after` (the in-transaction
+        resumable scan), never `scan_matching_batches`; and a plain SELECT
+        goes through `find_matching_with`. So the next steps are
+        `scan_batch_after` (resume after a RecordId: own rows above it,
+        merged), then `find_by_id`, the pickers and the counts, and only then
+        an opt-in in `read_apart` with `rc_select_read_set` admitting a
+        written table. The replay case was therefore not re-measured (no
+        statement shape changes path). Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's
