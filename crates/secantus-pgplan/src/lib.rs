@@ -2033,6 +2033,9 @@ pub struct WindowItem {
     /// `OrderKey` so one comparator serves partitioning and ordering both;
     /// the direction and null placement are unused here.
     pub partition_by: Vec<OrderKey>,
+    /// Per `partition_by` key, whether it is a `jsonb` column -- partitioned
+    /// by VALUE (`{"x":1}` and `{"x":1.0}` are one partition).
+    pub partition_jsonb: Vec<bool>,
     pub order_by: Vec<OrderKey>,
     pub frame: WindowFrame,
     /// Fixed at plan time, for the DESCRIBE pass that never sees a row.
@@ -9794,12 +9797,17 @@ fn plan_window_call(
         }
     };
     extra.push(Column::new(&field, &result_type, false));
+    let partition_jsonb = partition_by
+        .iter()
+        .map(|k| k.expr.is_none() && field_type(def, &k.field) == Some("jsonb"))
+        .collect();
     windows.push(WindowItem {
         field: field.clone(),
         func,
         arg,
         args,
         partition_by,
+        partition_jsonb,
         order_by,
         frame,
         result_type,
@@ -13617,6 +13625,45 @@ fn expand_star_in_grouped(
     Some(out)
 }
 
+/// Whether an ORDER BY item names an aggregate call: directly, by its
+/// output position, or by its output alias.
+fn sorts_on_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
+    let is_agg = |n: Option<&pg_query::protobuf::Node>| {
+        matches!(n.and_then(|n| n.node.as_ref()), Some(N::FuncCall(f))
+            if func_name(f).as_deref().is_some_and(|name| aggregate_func(name, f.agg_within_group).is_some()))
+    };
+    let targets: Vec<&pg_query::protobuf::ResTarget> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(&**rt),
+            _ => None,
+        })
+        .collect();
+    s.sort_clause.iter().any(|item| {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return false;
+        };
+        let node = sb.node.as_deref();
+        match node.and_then(|n| n.node.as_ref()) {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(a_const::Val::Ival(i)) => usize::try_from(i.ival)
+                    .ok()
+                    .and_then(|k| k.checked_sub(1))
+                    .and_then(|k| targets.get(k))
+                    .is_some_and(|rt| is_agg(rt.val.as_deref())),
+                _ => false,
+            },
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => column_ref_name(c).is_some_and(|n| {
+                targets
+                    .iter()
+                    .any(|rt| rt.name == n && is_agg(rt.val.as_deref()))
+            }),
+            _ => is_agg(node),
+        }
+    })
+}
+
 fn distinct_on_over_groups(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
@@ -13651,7 +13698,10 @@ fn distinct_on_over_groups(
         },
         _ => false,
     });
-    if plain && simple {
+    // ...unless the ORDER BY sorts on an aggregate's result (`SELECT
+    // DISTINCT count(*) ... GROUP BY k ORDER BY 1`), which the aggregate
+    // planner's ORDER BY cannot; the subquery's outer ORDER BY can.
+    if plain && simple && !sorts_on_aggregate(s) {
         return None;
     }
     if s.group_clause.is_empty() && !has_aggregate(s) {
@@ -32565,6 +32615,20 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?,
                 params,
             )?;
+            // A jsonb compares by value: both sides as their value keys.
+            if matches!(op.as_str(), "=" | "<>" | "!=")
+                && static_json_type(e.lexpr.as_deref(), &lhs).as_deref() == Some("jsonb")
+            {
+                let key = |v: Bson| match &v {
+                    Bson::String(t) => json::jsonb_value_key(t).map_or(v, Bson::String),
+                    _ => v,
+                };
+                let rhs = match arrays::strip(&rhs) {
+                    Bson::Array(items) => Bson::Array(items.into_iter().map(key).collect()),
+                    other => other,
+                };
+                return eval_scalar_array_const(&op, key(lhs), rhs, is_any);
+            }
             return eval_scalar_array_const(&op, lhs, arrays::strip(&rhs), is_any);
         }
         // `LIKE` / `ILIKE` as a VALUE (`select a like 'a%'`), not just as a
@@ -32929,6 +32993,23 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             };
             let rhs_hstore = rhs_unknown || static_hstore_operand(e.rexpr.as_deref(), &rhs);
             return hstore_operator(&op, &lhs, &rhs, rhs_hstore);
+        }
+        // jsonb EQUALITY is by value: a number inside compares as a numeric,
+        // so `'{"x":1}' = '{"x":1.0}'` (PostgreSQL 15.19). The stored text
+        // keeps each number's scale, so the text compare below would differ.
+        if matches!(op.as_str(), "=" | "<>" | "!=") {
+            let jb = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+                static_json_type(n, v).as_deref() == Some("jsonb")
+            };
+            if jb(e.lexpr.as_deref(), &lhs) || jb(e.rexpr.as_deref(), &rhs) {
+                if let (Bson::String(a), Bson::String(b)) = (&lhs, &rhs) {
+                    if let (Some(ka), Some(kb)) =
+                        (json::jsonb_value_key(a), json::jsonb_value_key(b))
+                    {
+                        return Ok(Bson::Boolean((ka == kb) == (op == "=")));
+                    }
+                }
+            }
         }
         // jsonb's changing operators: `-` (a key, keys, or an index), `#-`
         // (a path) and `||` (merge / concatenate). By the operands' static
@@ -33443,6 +33524,9 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         return Ok(value);
     };
     match field_type(def, field) {
+        // A jsonb compares by VALUE (`{"x":1}` = `{"x":1.0}`), which the
+        // stored text cannot -- evaluated per row instead.
+        Some("jsonb") => Err(Error::Unsupported("a jsonb comparison".into())),
         Some(
             ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
             | "timestamptz" | "interval" | "oid" | "money"),
@@ -34068,6 +34152,9 @@ fn lower_distinct(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document
     let field = def
         .field_of(&col)
         .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+    if field_type(def, &field) == Some("jsonb") {
+        return Err(Error::Unsupported("a jsonb comparison".into()));
+    }
     if value == Bson::Null {
         return Ok(if not_distinct {
             doc! { field: Bson::Null }
@@ -34197,6 +34284,9 @@ fn lower_scalar_array(
         .find(|c| c.name == field)
         .map(|c| c.pg_type.as_str())
         .unwrap_or("text");
+    if elem_type == "jsonb" || field_type(def, &field) == Some("jsonb") {
+        return Err(Error::Unsupported("a jsonb comparison".into()));
+    }
     let rhs = coerce_any_array(rhs, elem_type);
     let elems = match rhs {
         Bson::Array(v) => v,

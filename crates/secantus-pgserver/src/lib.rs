@@ -1327,6 +1327,72 @@ fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
     Some(b.clone())
 }
 
+/// `group_key_ident` for a value whose type is KNOWN to be `jsonb`: its
+/// stored text keeps each number's scale, and jsonb equality does not
+/// (`{"x":1}` and `{"x":1.0}` are one value, PostgreSQL 15.19), so the
+/// identity is the value key, number-normalised. Any other value, and a
+/// jsonb that does not parse, keeps its plain identity.
+fn jsonb_ident(v: &Option<Bson>) -> Option<Bson> {
+    if let Some(Bson::String(text)) = v {
+        if let Some(k) = secantus_pgplan::json::jsonb_value_key(text) {
+            return Some(Bson::Document(bson::doc! { "\u{1}jsonb": k }));
+        }
+    }
+    group_key_ident(v)
+}
+
+/// A join key's hash for a string. The hash only picks CANDIDATES -- the ON
+/// condition decides each -- so a string that could be a jsonb number,
+/// array or object hashes by its number-normalised value: `{"x": 1}` and
+/// `{"x": 1.0}` are equal jsonb (PostgreSQL 15.19) and must meet. A text
+/// value that merely parses as JSON shares a bucket and is rejected by ON.
+fn join_text_hash(v: &str) -> String {
+    if v.starts_with([
+        '{', '[', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    ]) {
+        if let Some(k) = secantus_pgplan::json::jsonb_value_key(v) {
+            return format!("j{k}");
+        }
+    }
+    format!("s{v}")
+}
+
+/// Whether a UNIQUE / PRIMARY KEY constraint covers a column whose equality
+/// the storage index over the stored form cannot see -- a `jsonb` (equal by
+/// value) or a nondeterministic collation -- so `check_collated_unique`
+/// must check each written row, an UPDATE included.
+fn value_unique(def: &TableDef) -> bool {
+    let special = |col: &str| {
+        def.column(col).is_some_and(|c| {
+            c.pg_type == "jsonb"
+                || secantus_pgplan::collation::column_collation(c).is_some_and(|coll| {
+                    secantus_pgplan::collation::resolve(&coll).is_ok_and(|r| !r.deterministic())
+                })
+        })
+    };
+    def.columns.iter().any(|c| c.pk && special(&c.name))
+        || def
+            .unique_constraints
+            .iter()
+            .any(|u| u.exclusion_ops.is_empty() && u.columns.iter().any(|c| special(c)))
+}
+
+/// Whether `field` (a stored field or a column name) is a `jsonb` column.
+fn jsonb_field(def: &TableDef, field: &str) -> bool {
+    def.columns
+        .iter()
+        .any(|c| (c.field() == field || c.name == field) && c.pg_type == "jsonb")
+}
+
+/// `group_key_ident`, or `jsonb_ident` when `is_jsonb`.
+fn typed_ident(v: &Option<Bson>, is_jsonb: bool) -> Option<Bson> {
+    if is_jsonb {
+        jsonb_ident(v)
+    } else {
+        group_key_ident(v)
+    }
+}
+
 /// The value key of a number, for comparing by value across its spellings
 /// and types (an integer, a float, a numeric of either width).
 fn number_value_key(v: &Bson) -> Option<String> {
@@ -4421,6 +4487,20 @@ impl PgHandler {
             None if Self::virtual_table(&agg.table).is_some() => {
                 self.virtual_rows(&agg.table, &agg.filter).expect("checked")
             }
+            None if agg.group_by.is_empty() && agg.grouping_sets.is_none() => {
+                match self.ungrouped_in_bounded_memory(agg)? {
+                    Some(vals) => {
+                        return self.finish_groups(agg, vec![(Vec::new(), vals)], max_rows)
+                    }
+                    None => {
+                        let raw = self.scan_table(&agg.table, &agg.filter, true)?;
+                        raw.iter()
+                            .map(|b| decode_doc(b))
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?
+                    }
+                }
+            }
             None => match self.grouped_in_bounded_memory(agg)? {
                 Some(Bounded::Small(docs)) => docs,
                 Some(Bounded::Grouped(groups)) => {
@@ -4495,7 +4575,11 @@ impl PgHandler {
                             v => Some(v),
                         };
                     }
-                    let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
+                    let ident: Vec<Option<Bson>> = key
+                        .iter()
+                        .zip(&agg.group_by)
+                        .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                        .collect();
                     match set_index.find_or_add(ident) {
                         Ok(i) => set_buckets[i].push(d.clone()),
                         Err(_) => {
@@ -4542,7 +4626,11 @@ impl PgHandler {
                 // where PostgreSQL has one (probed against 14.24, 2026-09-20).
                 // The DISPLAY key stays the first row's, which is the text
                 // PostgreSQL prints for the group.
-                let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
+                let ident: Vec<Option<Bson>> = key
+                    .iter()
+                    .zip(&agg.group_by)
+                    .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                    .collect();
                 match group_index.find_or_add(ident) {
                     Ok(i) => buckets[i].push(d),
                     Err(_) => {
@@ -4652,7 +4740,16 @@ impl PgHandler {
                                 Self::aggregate_expr_value(agg, *i, &key, &vals).ok()
                             }
                         };
-                        group_key_ident(&v)
+                        let jsonb = match col {
+                            OutputCol::Group(i) => {
+                                agg.group_by.get(*i).is_some_and(|k| k.pg_type == "jsonb")
+                            }
+                            OutputCol::Agg(i) => agg.items.get(*i).is_some_and(|it| {
+                                secantus_pgplan::aggregate_item_type(it) == "jsonb"
+                            }),
+                            _ => false,
+                        };
+                        typed_ident(&v, jsonb)
                     })
                     .collect();
                 if seen.insert(ident) {
@@ -5063,7 +5160,7 @@ impl PgHandler {
                         .map(|k| match d.get(k.as_str()) {
                             Some(Bson::Int32(v)) => Some(format!("n{v}")),
                             Some(Bson::Int64(v)) => Some(format!("n{v}")),
-                            Some(Bson::String(v)) => Some(format!("s{v}")),
+                            Some(Bson::String(v)) => Some(join_text_hash(v)),
                             Some(Bson::Boolean(v)) => Some(format!("b{v}")),
                             _ => None,
                         })
@@ -8790,7 +8887,13 @@ impl PgHandler {
                 constraints.push((u.name.clone(), u.columns.clone()));
             }
         }
-        constraints.retain(|(_, cols)| cols.iter().any(|c| nondeterministic(c).is_some()));
+        // A jsonb column is equal by VALUE (`{"x":1}` = `{"x":1.0}`), which the
+        // storage index over its stored text cannot see either.
+        let jsonb = |col: &str| def.column(col).is_some_and(|c| c.pg_type == "jsonb");
+        constraints.retain(|(_, cols)| {
+            cols.iter()
+                .any(|c| nondeterministic(c).is_some() || jsonb(c))
+        });
         if constraints.is_empty() {
             return Ok(());
         }
@@ -8817,22 +8920,29 @@ impl PgHandler {
                         secantus_pgplan::collation::sort_key(&coll, text)
                             .map_err(|e| Self::err(&e))?,
                     ),
-                    _ => v,
+                    (None, Bson::String(text)) if jsonb(c) => {
+                        secantus_pgplan::json::jsonb_value_key(text)
+                            .map_or_else(|| v.clone(), Bson::String)
+                    }
+                    _ => group_key_ident(&Some(v.clone())).unwrap_or(v),
                 });
             }
             Ok(Some(out))
         };
+        // Keys compared ENCODED, so a batch is one hash probe per row.
+        let enc = |k: Vec<Bson>| bson::to_vec(&bson::doc! { "k": k }).unwrap_or_default();
         for (name, cols) in &constraints {
-            let mut taken: Vec<Vec<Bson>> = Vec::new();
+            let mut taken: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for row in &stored {
                 if let Some(k) = key(row, cols)? {
-                    taken.push(k);
+                    taken.insert(enc(k));
                 }
             }
             for row in rows {
                 let Some(k) = key(row, cols)? else {
                     continue;
                 };
+                let k = enc(k);
                 if taken.contains(&k) {
                     let shown: Vec<String> = cols
                         .iter()
@@ -8856,7 +8966,7 @@ impl PgHandler {
                         None,
                     ));
                 }
-                taken.push(k);
+                taken.insert(k);
             }
         }
         Ok(())
@@ -23606,7 +23716,7 @@ impl PgHandler {
                         schema[i].datatype(),
                         &tz,
                     )?;
-                    ident.push(group_key_ident(&v));
+                    ident.push(typed_ident(&v, *schema[i].datatype() == Type::JSONB));
                 }
                 if seen.insert(ident) {
                     kept.push(d);
@@ -23627,7 +23737,7 @@ impl PgHandler {
             for d in docs {
                 let ident: Vec<Option<Bson>> = keys
                     .iter()
-                    .map(|k| group_key_ident(&d.get(k).cloned()))
+                    .map(|k| typed_ident(&d.get(k).cloned(), jsonb_field(&def, k)))
                     .collect();
                 if seen.insert(ident) {
                     kept.push(d);
@@ -24160,8 +24270,21 @@ impl PgHandler {
             };
             schema.push(self.field(l.name().to_string(), ty));
         }
+        let jsonb_cols: Vec<bool> = schema
+            .iter()
+            .map(|f| *f.datatype() == Type::JSONB)
+            .collect();
         let ident = |row: &Vec<Option<Bson>>| -> Vec<Option<Bson>> {
-            row.iter().map(set_op_ident).collect()
+            row.iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if jsonb_cols.get(i).copied().unwrap_or(false) {
+                        jsonb_ident(v)
+                    } else {
+                        set_op_ident(v)
+                    }
+                })
+                .collect()
         };
         let mut out: Vec<Vec<Option<Bson>>> = Vec::new();
         match set.kind {
@@ -28906,7 +29029,8 @@ impl PgHandler {
                         d.unique_constraints
                             .iter()
                             .any(|u| !u.exclusion_ops.is_empty())
-                    });
+                    })
+                    || def.as_ref().is_some_and(value_unique);
                 // The columns the SET list assigns, for `UPDATE OF` triggers.
                 let targets: Vec<String> = match (&def, triggered) {
                     (Some(def), true) => {
@@ -32349,10 +32473,12 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
         let field2 = item.field2.as_deref();
         let mut seen: distinct_set::DistinctSet<(Option<Bson>, Option<Bson>)> =
             distinct_set::DistinctSet::new();
+        let jb1 = item.source_type.as_deref() == Some("jsonb");
+        let jb2 = item.source_type2.as_deref() == Some("jsonb");
         rows.retain(|d| {
             let k = (
-                group_key_ident(&d.get(field).cloned()),
-                field2.and_then(|f| group_key_ident(&d.get(f).cloned())),
+                typed_ident(&d.get(field).cloned(), jb1),
+                field2.and_then(|f| typed_ident(&d.get(f).cloned(), jb2)),
             );
             seen.insert(k)
         });
@@ -32474,8 +32600,9 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     if item.distinct {
         let mut seen = distinct_set::DistinctSet::<Option<Bson>>::new();
         let mut kept = Vec::with_capacity(values.len());
+        let jb = item.source_type.as_deref() == Some("jsonb");
         for v in values {
-            let k = group_key_ident(&Some(v.clone()));
+            let k = typed_ident(&Some(v.clone()), jb);
             if seen.insert(k) {
                 kept.push(v);
             }
@@ -32515,7 +32642,10 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             let mut kept: Vec<Bson> = Vec::new();
             for d in rows {
                 let v = d.get(field).cloned().unwrap_or(Bson::Null);
-                let k = group_key_ident(&Some(v.clone()));
+                let k = typed_ident(
+                    &Some(v.clone()),
+                    item.source_type.as_deref() == Some("jsonb"),
+                );
                 if seen.insert(k) {
                     kept.push(v);
                 }
@@ -32755,7 +32885,7 @@ fn materialise_windows(
             None => vec![true; docs.len()],
         };
 
-        for partition in window_partitions(docs, &w.partition_by) {
+        for partition in window_partitions(docs, &w.partition_by, &w.partition_jsonb) {
             window_partition_values(docs, &partition, w, &values, &included)?;
         }
     }
@@ -32769,7 +32899,7 @@ fn materialise_windows(
 /// second), a numeric by its value (`group_key_ident`). Each row's key is
 /// that canonical form ENCODED, so partitioning is one hash lookup per row
 /// rather than a scan of the partitions seen so far.
-fn window_partitions(docs: &[Document], keys: &[OrderKey]) -> Vec<Vec<usize>> {
+fn window_partitions(docs: &[Document], keys: &[OrderKey], jsonb: &[bool]) -> Vec<Vec<usize>> {
     if keys.is_empty() {
         return vec![(0..docs.len()).collect()];
     }
@@ -32786,7 +32916,13 @@ fn window_partitions(docs: &[Document], keys: &[OrderKey]) -> Vec<Vec<usize>> {
     let key = |d: &Document| -> Vec<u8> {
         let values: Vec<Bson> = keys
             .iter()
-            .map(|k| canonical(group_key_ident(&d.get(&k.field).cloned())))
+            .enumerate()
+            .map(|(i, k)| {
+                canonical(typed_ident(
+                    &d.get(&k.field).cloned(),
+                    jsonb.get(i).copied().unwrap_or(false),
+                ))
+            })
             .collect();
         bson::to_vec(&bson::doc! { "k": values }).unwrap_or_default()
     };
@@ -36670,6 +36806,161 @@ impl PgHandler {
     /// `None` where the ordinary read applies: grouping sets, no GROUP BY
     /// (one group: its memory is the input), an indexed filter, or a
     /// correlated subquery's repeated scan (`scan_partitions`).
+    /// An aggregate with no GROUP BY over one stored table, read in bounded
+    /// memory: the rows are aggregated a chunk at a time and the chunks'
+    /// partial results combined -- for the aggregates whose partials combine
+    /// EXACTLY to the one-pass answer: `count`, `min` / `max`, `bool_and` /
+    /// `bool_or`, and `sum` over integers or numerics (an exact sum; a float
+    /// sum is left whole, its rounding depends on the order of additions).
+    /// `None` where the ordinary read applies: any other aggregate, DISTINCT,
+    /// FILTER or ORDER BY inside one, an indexed filter, or a correlated
+    /// subquery's repeated scan.
+    fn ungrouped_in_bounded_memory(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+    ) -> PgWireResult<Option<Vec<Bson>>> {
+        use secantus_pgplan::AggFunc;
+        if secantus_pgplan::with_scan_cache(|_| ()).is_some() || agg.items.is_empty() {
+            return Ok(None);
+        }
+        let combinable = agg.items.iter().all(|it| {
+            !it.distinct
+                && it.filter.is_none()
+                && it.filter_expr.is_none()
+                && it.order.is_empty()
+                && it.field2.is_none()
+                && match it.func {
+                    AggFunc::CountStar
+                    | AggFunc::Count
+                    | AggFunc::Min
+                    | AggFunc::Max
+                    | AggFunc::BoolAnd
+                    | AggFunc::BoolOr => true,
+                    AggFunc::Sum => {
+                        it.expr.is_none()
+                            && matches!(
+                                it.source_type.as_deref(),
+                                Some("int2" | "int4" | "int8" | "numeric")
+                            )
+                    }
+                    _ => false,
+                }
+        });
+        if !combinable {
+            return Ok(None);
+        }
+        if !agg.filter.is_empty()
+            && !matches!(
+                self.storage
+                    .explain_plan(self.db(), &agg.table, &agg.filter),
+                Ok(secantus_storage::ExplainPlan::CollScan)
+            )
+        {
+            return Ok(None);
+        }
+        let chunk_bytes = group_in_memory_bytes().min(16 << 20);
+        let mut partials: Vec<Vec<Bson>> = vec![Vec::new(); agg.items.len()];
+        let mut chunk: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut failed: Option<PgWireError> = None;
+        let folds = std::cell::Cell::new(0usize);
+        let mut fold = |chunk: &mut Vec<Vec<u8>>| -> PgWireResult<()> {
+            folds.set(folds.get() + 1);
+            let mut docs: Vec<Document> = chunk
+                .iter()
+                .map(|b| decode_doc(b))
+                .collect::<Result<_, _>>()
+                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            chunk.clear();
+            for item in &agg.items {
+                if let (Some(expr), Some(slot)) = (item.expr.as_ref(), item.field.as_deref()) {
+                    for d in docs.iter_mut() {
+                        let v =
+                            secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                        d.insert(slot, v);
+                    }
+                }
+            }
+            for (i, item) in agg.items.iter().enumerate() {
+                partials[i].push(compute_aggregate(item, &docs)?);
+            }
+            Ok(())
+        };
+        let mut stopped: Option<PgWireError> = None;
+        let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
+            if let Err(e) = self.check_cancel() {
+                stopped = Some(e);
+                return false;
+            }
+            bytes += blobs.iter().map(Vec::len).sum::<usize>();
+            chunk.extend(blobs);
+            if bytes > chunk_bytes {
+                bytes = 0;
+                if let Err(e) = fold(&mut chunk) {
+                    failed = Some(e);
+                    return false;
+                }
+            }
+            true
+        };
+        let scanned = if self.storage.in_user_txn() {
+            let mut after = None;
+            loop {
+                let (blobs, next) = self
+                    .storage
+                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                if !sink(blobs) || next.is_none() {
+                    break Ok(());
+                }
+                after = next;
+            }
+        } else {
+            self.storage
+                .scan_matching_batches(self.db(), &agg.table, &agg.filter, 256, &mut sink)
+        };
+        drop(sink);
+        if let Some(e) = stopped.or(failed) {
+            return Err(e);
+        }
+        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        // The last (or only) chunk; an empty input still runs once, so each
+        // aggregate answers its empty-input value.
+        if !chunk.is_empty() || folds.get() == 0 {
+            fold(&mut chunk)?;
+        }
+        drop(fold);
+        let mut vals = Vec::with_capacity(agg.items.len() + agg.groupings.len());
+        for (item, parts) in agg.items.iter().zip(partials) {
+            vals.push(match item.func {
+                AggFunc::CountStar | AggFunc::Count => {
+                    Bson::Int64(parts.iter().filter_map(bson_i64).sum())
+                }
+                _ => {
+                    // The partials are values of the aggregate's own result,
+                    // combined by the same aggregate over a one-column input.
+                    let field = item.field.clone().unwrap_or_else(|| "__p".into());
+                    let docs: Vec<Document> = parts
+                        .into_iter()
+                        .map(|v| {
+                            let mut d = Document::new();
+                            d.insert(field.clone(), v);
+                            d
+                        })
+                        .collect();
+                    let mut combine = item.clone();
+                    combine.expr = None;
+                    combine.field = Some(field);
+                    compute_aggregate(&combine, &docs)?
+                }
+            });
+        }
+        for _ in &agg.groupings {
+            vals.push(Bson::Int32(0));
+        }
+        Ok(Some(vals))
+    }
+
     fn grouped_in_bounded_memory(
         &self,
         agg: &secantus_pgplan::Aggregate,
@@ -36690,9 +36981,15 @@ impl PgHandler {
             return Ok(None);
         }
         // The group key, each into a hidden field the sort compares.
+        // A jsonb key sorts on its VALUE key (`__grpk`), so value-equal
+        // spellings (`{"x": 1}`, `{"x": 1.0}`) are adjacent in the merge.
         let order: Vec<OrderKey> = (0..agg.group_by.len())
             .map(|i| OrderKey {
-                field: format!("__grp{i}"),
+                field: if agg.group_by[i].pg_type == "jsonb" {
+                    format!("__grpk{i}")
+                } else {
+                    format!("__grp{i}")
+                },
                 ascending: true,
                 nulls: Nulls::Last,
                 expr: None,
@@ -36706,6 +37003,14 @@ impl PgHandler {
                         Some(expr) => secantus_pgplan::apply_row_expr(expr, d)?,
                         None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
                     };
+                    if k.pg_type == "jsonb" {
+                        let key = match &v {
+                            Bson::String(t) => secantus_pgplan::json::jsonb_value_key(t)
+                                .map_or(Bson::Null, Bson::String),
+                            _ => Bson::Null,
+                        };
+                        d.insert(format!("__grpk{i}"), key);
+                    }
                     d.insert(format!("__grp{i}"), v);
                 }
                 for item in &agg.items {
@@ -36823,13 +37128,20 @@ impl PgHandler {
                 .next_row()
                 .map_err(|e| Self::user_error("XX000", e))?;
             let Some(mut d) = row else { break };
+            for i in 0..agg.group_by.len() {
+                d.remove(format!("__grpk{i}"));
+            }
             let key: Vec<Option<Bson>> = (0..agg.group_by.len())
                 .map(|i| match d.remove(format!("__grp{i}")) {
                     None | Some(Bson::Null) => None,
                     Some(v) => Some(v),
                 })
                 .collect();
-            let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
+            let ident: Vec<Option<Bson>> = key
+                .iter()
+                .zip(&agg.group_by)
+                .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                .collect();
             if current.as_ref().is_some_and(|(_, id)| *id != ident) {
                 let (k, _) = current.take().expect("checked");
                 flush(k, &mut bucket, &mut groups)?;
