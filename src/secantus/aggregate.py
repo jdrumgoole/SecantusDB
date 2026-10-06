@@ -1591,8 +1591,11 @@ def _project_one(
         else:
             computed[key] = value
 
-    has_inclusion = bool(inclusions) or bool(computed)
     has_exclusion = bool(exclusions)
+    # `{_id: 1}` alone is an INCLUSION projection of just `_id` (measured
+    # 8.2.11): without this rule it fell through and returned the whole
+    # document. Beside an exclusion it stays an exclusion projection.
+    has_inclusion = bool(inclusions) or bool(computed) or (id_handling == 1 and not has_exclusion)
     if has_inclusion and has_exclusion:
         raise AggregateError(
             "$project cannot mix inclusion and exclusion (other than excluding _id)"
@@ -4958,6 +4961,68 @@ def _round_down_series(number: float, series: list[float]) -> float:
     return series[idx - 1] * multiplier
 
 
+def _bound(v: Any) -> Any:
+    """A rounded boundary as the BSON value it is: a decimal one stays decimal."""
+    return Decimal128(v) if isinstance(v, _decimal.Decimal) else v
+
+
+def _dec_series(series: list[float]) -> list[_decimal.Decimal]:
+    """The series as mongod's Decimal128 of a double: 15 significant digits
+    (`1.00000000000000`)."""
+    return [_decimal.Decimal(f"{f:.14e}") for f in series]
+
+
+def _dec_product(s: _decimal.Decimal, k: int) -> _decimal.Decimal:
+    """``s * 10**k`` as mongod forms it: a positive ``k`` appends coefficient
+    zeros, a negative one shifts the exponent."""
+    sign, digits, exp = s.as_tuple()
+    if k >= 1:
+        return _decimal.Decimal((sign, digits + (0,) * k, exp))
+    return _decimal.Decimal((sign, digits, int(exp) + k))
+
+
+_GRANULARITY_MAX_STEPS = 6_200
+
+
+def _round_dec(number: _decimal.Decimal, granularity: str, *, up: bool) -> _decimal.Decimal:
+    """mongod's granularity rounders on a Decimal128 (``roundUp`` / ``roundDown``),
+    computed in decimal. Ported from ``secantus_core::decimal``."""
+    if number == 0 or number.is_infinite():
+        return number
+    if granularity == "POWERSOF2":
+        lg = math.log2(float(number))
+        n = math.floor(lg) + 1 if up else math.ceil(lg) - 1
+        with _decimal.localcontext(_decimal.Context(prec=34, traps=[])):
+            r = _decimal.Decimal(2) ** n
+            # The exact power of two, padded to 34 digits.
+            return r.quantize(_decimal.Decimal(1).scaleb(r.adjusted() - 33))
+    ser = _dec_series(_BUCKET_AUTO_SERIES[granularity])
+    front, back = ser[0], ser[-1]
+    k = 0
+    if up:
+        while not number < _dec_product(back, k):
+            k += 1
+            if k > _GRANULARITY_MAX_STEPS:
+                return number
+        while number < _dec_product(front, k):
+            previous_min = _dec_product(front, k)
+            k -= 1
+            if not number < _dec_product(back, k):
+                return previous_min
+        return next(_dec_product(s, k) for s in ser if number < _dec_product(s, k))
+    while not number > _dec_product(front, k):
+        k -= 1
+        if k < -_GRANULARITY_MAX_STEPS:
+            return number
+    while number > _dec_product(back, k):
+        previous_max = _dec_product(back, k)
+        k += 1
+        if not number > _dec_product(front, k):
+            return previous_max
+    idx = next(i for i, s in enumerate(ser) if not number > _dec_product(s, k))
+    return _dec_product(ser[idx - 1], k)
+
+
 def _round_up_pow2(v: float) -> float:
     """mongod `GranularityRounderPowersOfTwo::roundUp` (double path)."""
     if v == 0.0 or v == math.inf:
@@ -4996,15 +5061,25 @@ def _bisect_left(a: list[float], x: float) -> int:
 
 def _granularity_coerce(v: Any) -> float:
     """Coerce a groupBy value to the double mongod's rounder operates on, or
-    raise mongod's granularity error. Decimal128 is deferred (the standing
-    Decimal128 precision deferral) rather than approximated in f64."""
+    raise mongod's granularity error. A Decimal128 stays a decimal, and is
+    rounded in decimal (`_round_dec`) -- it used to be refused."""
     if isinstance(v, Decimal128):
-        raise AggregateError(
-            "$bucketAuto 'granularity' over Decimal128 boundaries is not yet "
-            "supported by SecantusDB (the double-valued series ships hex-exact; "
-            "Decimal128 rounding is the standing precision deferral)",
-            code=2,
-        )
+        d = v.to_decimal()
+        if d.is_nan():
+            raise AggregateError(
+                "$bucketAuto can specify a 'granularity' with numeric boundaries only, "
+                "but found a NaN",
+                code=40259,
+                code_name="Location40259",
+            )
+        if d < 0:
+            raise AggregateError(
+                "$bucketAuto can specify a 'granularity' with non-negative numbers "
+                "only, but found a negative number",
+                code=40260,
+                code_name="Location40260",
+            )
+        return d  # type: ignore[return-value]
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise AggregateError(
             "$bucketAuto can specify a 'granularity' with numeric boundaries "
@@ -5073,11 +5148,21 @@ def _bucket_auto_granular(
     values = [_granularity_coerce(v) for v, _ in pairs]
     docs = [d for _, d in pairs]
     if granularity == "POWERSOF2":
-        rup, rdn = _round_up_pow2, _round_down_pow2
+        rup_f, rdn_f = _round_up_pow2, _round_down_pow2
     else:
         series = _BUCKET_AUTO_SERIES[granularity]
-        rup = lambda x: _round_up_series(x, series)  # noqa: E731
-        rdn = lambda x: _round_down_series(x, series)  # noqa: E731
+        rup_f = lambda x: _round_up_series(x, series)  # noqa: E731
+        rdn_f = lambda x: _round_down_series(x, series)  # noqa: E731
+
+    def rup(x: Any) -> Any:
+        if isinstance(x, _decimal.Decimal):
+            return _round_dec(x, granularity, up=True)
+        return rup_f(x)
+
+    def rdn(x: Any) -> Any:
+        if isinstance(x, _decimal.Decimal):
+            return _round_dec(x, granularity, up=False)
+        return rdn_f(x)
 
     n = len(pairs)
     approx = math.floor(n / n_buckets + 0.5)  # std::round (positive) — fixed for all buckets
@@ -5126,7 +5211,7 @@ def _bucket_auto_granular(
             bucket_max: float = rdn(values[next_i])
         else:
             bucket_max = boundary
-        bucket: dict[str, Any] = {"_id": {"min": cur_min, "max": bucket_max}}
+        bucket: dict[str, Any] = {"_id": {"min": _bound(cur_min), "max": _bound(bucket_max)}}
         for field_name, accumulator in output_spec.items():
             for ci in chunk:
                 _accumulate(bucket, field_name, accumulator, docs[ci], ctx.vars)

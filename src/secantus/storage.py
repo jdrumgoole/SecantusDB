@@ -1452,9 +1452,12 @@ class DocumentValidationError(Exception):
     with the ``errInfo.failingDocumentId`` field drivers' errorResponse
     tests assert on."""
 
-    def __init__(self, doc_id: Any) -> None:
+    def __init__(self, doc_id: Any, doc: dict[str, Any] | None = None) -> None:
         super().__init__("Document failed validation")
         self.doc_id = doc_id
+        # The document that failed, from which the command layer builds
+        # mongod's `errInfo.details` (it holds the validator).
+        self.doc = doc
 
 
 class CreateIndexUnsupported(Exception):
@@ -5033,17 +5036,28 @@ class Storage:
                         and not next(iter(filter)).startswith("$")
                         and next(iter(filter)) == sort_field
                     ):
-                        in_sort_order = True
                         idx = self._find_leading_field_index(
                             db, coll, sort_field, filter, collation=collation_obj
                         )
-                        idx_dir = idx[1] if idx else 1
-                        if sort_dir != idx_dir:
-                            candidates = list(reversed(candidates))
+                        # A multikey index's order is not the sort's: an array
+                        # is placed by whichever element is seen first. The
+                        # post-sort below orders those.
+                        if idx is not None and not self.index_is_multikey(db, coll, idx[0]):
+                            in_sort_order = True
+                            if sort_dir != idx[1]:
+                                candidates = list(reversed(candidates))
                 elif candidates is None and not filter and sort_field is not None:
                     idx = self._find_leading_field_index(
                         db, coll, sort_field, filter, collation=collation_obj
                     )
+                    # Walking a MULTIKEY index is not a sort, and loses
+                    # documents: an empty array writes no entry, and a nested
+                    # array's entries are skipped by the walk, so
+                    # `find({}).sort({x: 1})` dropped `{x: [[5]]}` from the
+                    # result (measured 8.2.11 2026-10-07; the Rust server's
+                    # `sort_walk_index` refuses the same way).
+                    if idx is not None and self.index_is_multikey(db, coll, idx[0]):
+                        idx = None
                     if idx is not None:
                         idx_name, idx_dir, _is_compound = idx
                         # If the index direction matches the sort direction,
@@ -5375,11 +5389,52 @@ class Storage:
                 leading = first
                 leading_dir = int(key_spec[first])
                 break
+        mk = self._multikey_hint_docs(db, coll, resolved)
+        if mk is not None:
+            # Already in the index's own order; only a sort on its leading
+            # field in the index's direction is satisfied by that.
+            return mk, sort_field is not None and sort_field == leading and sort_dir == leading_dir
         candidates = self._walk_index_in_order(db, coll, resolved, reverse=False)
         in_order = sort_field is not None and sort_field == leading
         if in_order and sort_dir != leading_dir:
             candidates = list(reversed(candidates))
         return candidates, in_order
+
+    def _multikey_hint_docs(self, db: str, coll: str, name: str) -> list[dict[str, Any]] | None:
+        """The documents a hinted MULTIKEY index holds, in its order, read from
+        the collection -- or ``None`` for any other index, whose walk is exact.
+
+        The entries table cannot answer this for a multikey index: a document
+        whose indexed field is an EMPTY ARRAY writes no entry, where mongod
+        indexes it as ``undefined``, so ``find({}).hint("a_1")`` silently
+        dropped it (mongod: first in index order; measured 8.2.11 2026-10-07,
+        found on the Rust server 2026-09-30). Writing an entry would change the
+        on-disk layout the two servers share, so membership is recomputed with
+        the index's own rules (sparse: an indexed field present; partial: the
+        document matches the filter) and ordered by the key pattern. Geo
+        indexes keep their walk: their entries are cells, not values."""
+        if not self.index_is_multikey(db, coll, name):
+            return None
+        key_spec = self._key_spec_for(db, coll, name)
+        if not key_spec or not all(
+            isinstance(d, (int, float)) and not isinstance(d, bool) and int(d) in (1, -1)
+            for d in key_spec.values()
+        ):
+            return None
+        opts = self._index_options_map(db, coll).get(name) or {}
+        sparse = bool(opts.get("sparse"))
+        partial = opts.get("partialFilterExpression") or None
+        docs = []
+        for _rid, _idk, blob in self._scan_docs(db, coll):
+            d = bson.decode(blob)
+            if sparse and not _sparse_covers(d, key_spec):
+                continue
+            if partial and not matches(d, partial):
+                continue
+            docs.append(d)
+        from secantus.ordering import sort_docs
+
+        return sort_docs(docs, {f: int(v) for f, v in key_spec.items()})
 
     @staticmethod
     def _single_sort_spec(sort: Mapping[str, Any] | None) -> tuple[str | None, int]:
@@ -5478,6 +5533,13 @@ class Storage:
                 continue
             if any(d not in (-1, 1) for _, d in idx_pairs):
                 continue
+            # A PARTIAL index omits every document its filter rejects, and an
+            # empty filter cannot imply that filter, so walking it dropped
+            # rows: `find({}).sort({a: 1, b: 1})` over an index partial on
+            # `{a: {$gt: 0}}` returned 1 document of 14 (measured 8.2.11,
+            # 2026-10-07, `index_result_sets.py`).
+            if index_options.get(name, {}).get("partialFilterExpression"):
+                continue
             idx_coll = _parse_index_collation(index_options.get(name, {}).get("collation"))
             if idx_coll != collation:
                 continue
@@ -5566,6 +5628,9 @@ class Storage:
         )
         if plan["kind"] == "IXSCAN":
             plan["multikey"] = self.index_is_multikey(db, coll, plan["index_name"])
+            # A multikey walk never satisfies a sort (see `find_matching`).
+            if plan["multikey"]:
+                plan["sorted_by_index"] = False
         return plan
 
     def index_is_multikey(self, db: str, coll: str, name: str) -> bool:
@@ -5633,7 +5698,8 @@ class Storage:
                 idx = self._find_leading_field_index(
                     db, coll, sort_field, filter, collation=collation_obj
                 )
-                if idx is not None:
+                # As in `find_matching`: a multikey index is not walked for a sort.
+                if idx is not None and not self.index_is_multikey(db, coll, idx[0]):
                     name, _idx_dir, _is_compound = idx
                     key_spec = self._key_spec_for(db, coll, name)
                     if key_spec is not None:
@@ -6102,7 +6168,7 @@ class Storage:
                         and not matches(new, validator)
                         and not was_already_invalid
                     ):
-                        raise DocumentValidationError(new.get("_id"))
+                        raise DocumentValidationError(new.get("_id"), new)
                     conflict = self._unique_conflict(
                         db, coll, new, indexes, exclude_recordid=recordid, partials=partials
                     )
@@ -6270,7 +6336,7 @@ class Storage:
                         and not matches(new, validator)
                         and not was_already_invalid
                     ):
-                        raise DocumentValidationError(new.get("_id"))
+                        raise DocumentValidationError(new.get("_id"), new)
                     # _id is immutable, so the row's RecordId is the right write
                     # target and its id_key is unchanged. For timeseries the
                     # id_key carries a uniqueness suffix that a recompute would
@@ -6391,7 +6457,7 @@ class Storage:
                 if not isinstance(update, list) and is_operator_form(update):
                     new = _order_upserted_doc(new, seeded)
                 if validator is not None and not matches(new, validator):
-                    raise DocumentValidationError(new.get("_id"))
+                    raise DocumentValidationError(new.get("_id"), new)
                 upserted_id = new["_id"]
                 did_upsert = True
                 conflict = self._unique_conflict(
@@ -8425,12 +8491,25 @@ class Storage:
         # Multi-field filter: a single-field index can still serve it when every
         # other filter field is absorbed by the index's (implied) partial filter.
         match = self._single_field_partial_residual_match(db, coll, filter, collation=collation)
-        if match is None:
-            return None
-        _field, value, idx_match = match
-        return self._lookup_id_keys_via_leading_field(
-            db, coll, idx_match, value, collation=collation
-        )
+        if match is not None:
+            _field, value, idx_match = match
+            return self._lookup_id_keys_via_leading_field(
+                db, coll, idx_match, value, collation=collation
+            )
+        # Otherwise one CLAUSE can still ride an index: look the clause up
+        # alone, and the caller's `matches()` pass applies the rest. mongod
+        # plans `{b: {$gt: MinKey()}, a: {$exists: false}}` on an index over
+        # `b` -- which, for a SPARSE index, is what decides that a document
+        # without `b` is not returned (measured 8.2.11, 2026-10-07; the Rust
+        # server plans it the same way). Without this the Python server
+        # scanned the collection and returned it.
+        for field, clause in filter.items():
+            if not isinstance(field, str) or field.startswith("$"):
+                continue
+            result = self._try_index_id_keys(db, coll, {field: clause}, collation=collation)
+            if result is not None:
+                return result
+        return None
 
     def _candidates_iter(
         self, db: str, coll: str, filter: dict[str, Any] | None

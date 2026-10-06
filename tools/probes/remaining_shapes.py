@@ -352,6 +352,58 @@ def cases():
             ],
         )
     yield (
+        "bucketAuto decimal powers of two",
+        [
+            (
+                "insert",
+                {
+                    "insert": "ba2",
+                    "documents": [{"_id": i, "v": D(str(i * 1.5))} for i in range(1, 9)],
+                },
+            ),
+            (
+                "aggregate",
+                {
+                    "aggregate": "ba2",
+                    "pipeline": [
+                        {"$bucketAuto": {"groupBy": "$v", "buckets": 3, "granularity": "POWERSOF2"}}
+                    ],
+                    "cursor": {},
+                },
+            ),
+        ],
+    )
+    for name, arr, q in [
+        ("scalar eq", [1, 2, 3], {"a": 2}),
+        ("scalar gt", [1, 2, 3], {"a": {"$gt": 1}}),
+        ("elemMatch scalar", [1, 2, 3], {"a": {"$elemMatch": {"$gte": 3}}}),
+        ("elemMatch doc", [{"k": 1}, {"k": 2}], {"a": {"$elemMatch": {"k": 2}}}),
+        ("dotted", [{"k": 1}, {"k": 2}], {"a.k": 2}),
+    ]:
+        c = "pos_" + name.replace(" ", "_")
+        yield (
+            f"positional update {name}",
+            [
+                ("insert", {"insert": c, "documents": [{"_id": 1, "a": arr}]}),
+                ("update", {"update": c, "updates": [{"q": q, "u": {"$set": {"a.$": 9}}}]}),
+                ("find", {"find": c}),
+            ],
+        )
+    yield (
+        "create existing with different options",
+        [
+            ("create", {"create": "cx1", "capped": True, "size": 4096}),
+            ("create", {"create": "cx1", "validator": {"a": {"$gt": 1}}}),
+        ],
+    )
+    yield (
+        "create existing same options",
+        [
+            ("create", {"create": "cx2", "validator": {"a": {"$gt": 1}}}),
+            ("create", {"create": "cx2", "validator": {"a": {"$gt": 1}}}),
+        ],
+    )
+    yield (
         "project _id only",
         [
             ("insert", {"insert": "pj", "documents": [{"_id": 1, "a": 1, "b": 2}]}),
@@ -402,6 +454,13 @@ def cases():
         "arrayElemAt decimal": {"$arrayElemAt": [[1, 2, 3], D("1")]},
         "substrCP decimal": {"$substrCP": ["hello", D("1"), D("2")]},
         "ln decimal neg": {"$ln": D("-1")},
+        "slice count zero": {"$slice": [[1, 2, 3], 1, 0]},
+        "slice count negative": {"$slice": [[1, 2, 3], 1, -1]},
+        "slice neg position past end": {"$slice": [[1, 2, 3, 4, 5], -1, 5]},
+        "range decimal start": {"$range": [D("1"), 4]},
+        "range decimal step": {"$range": [0, 6, D("2")]},
+        "range decimal fractional start": {"$range": [D("1.5"), 4]},
+        "pow decimal exact square": {"$pow": [D("2.5"), 2]},
         "log decimal base int": {"$log": [D("8"), 2]},
         "log int base decimal": {"$log": [8, D("2")]},
         "log decimal double": {"$log": [D("10"), 2.5]},

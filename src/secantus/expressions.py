@@ -802,10 +802,15 @@ def _range_int32(v: Any) -> Any:
 
     A long that fits in 64 bits still fails here: `{$range: [2**40, 1]}` is
     mongod's 34444, where accepting it built a range of a trillion elements.
-    A Decimal128 never represents as a 32-bit int for this purpose.
+    A Decimal128 counts when it is whole: mongod answers
+    `{$range: [0, Decimal128("3")]}` with `[0, 1, 2]` (measured 8.2.11,
+    2026-10-07); a fractional one is the per-argument "32-bit integer" error.
     """
     if isinstance(v, Decimal128):
-        raise _FractionalIndex
+        d = v.to_decimal()
+        if not d.is_finite() or d != d.to_integral_value():
+            raise _FractionalIndex
+        v = int(d)
     coerced = _int_index(v)
     if (
         isinstance(coerced, int)
@@ -1503,6 +1508,14 @@ def _to_decimal128(d: _decimal.Decimal) -> Decimal128:
         return Decimal128(_DEC128_IEEE_CTX.plus(d))
 
 
+def _correctly_rounded(fn: Any) -> _decimal.Decimal:
+    """``fn()`` evaluated at 80 digits, then rounded once to decimal128's 34."""
+    with _decimal.localcontext(_decimal.Context(prec=80, traps=[])):
+        exact = fn()
+    with _decimal.localcontext(_DEC128_CTX):
+        return +exact
+
+
 def _decimal_result(fn: Any, *vals: Any) -> Decimal128:
     """Run `fn` over the operands as `Decimal`s, at decimal128 precision."""
     with _decimal.localcontext(_DEC128_CTX):
@@ -1867,11 +1880,16 @@ def _op_pow(arg: Any, ctx: _Ctx) -> Any:
     if base == 0 and exponent < 0:
         raise ExpressionError("$pow cannot take a base of 0 and a negative exponent", code=28764)
     if _has_decimal(base, exponent):
-        # `exp(e * ln(b))`, not `b ** e`. mongod computes it that way and the
-        # rounding shows: `2.5 ** 2` is exactly 6.25, but mongod answers
-        # 6.249999999999999999999999999999999, and matching the reference
-        # server is the point. A zero base has no `ln`, so it is handled first.
-        return _decimal_result(lambda b, e: b**e if b == 0 else (e * b.ln()).exp(), base, exponent)
+        # Correctly rounded: computed at high precision and rounded once to 34
+        # digits, the authorised behaviour of the decimal transcendentals. Over
+        # 183 finite pairs that matched mongod 8.2.11 on 130, where `exp(e *
+        # ln b)` at 34 digits matched on 56; `1.5 ** 3` is mongod's exact
+        # `3.375000000000000000000000000000000`. A zero base has no `ln`.
+        return _decimal_result(
+            lambda b, e: b**e if b == 0 else _correctly_rounded(lambda: (e * b.ln()).exp()),
+            base,
+            exponent,
+        )
     result = base**exponent
     # A negative base with a fractional exponent yields a Python complex, which
     # is unencodable (crashes BSON) — mongod returns NaN instead.
@@ -1971,7 +1989,24 @@ def _op_log(arg: Any, ctx: _Ctx) -> Any:
             code_name="Location28759",
         )
     if _has_decimal(n, base):
-        return _decimal_result(lambda x, b: x.ln() / b.ln(), n, base)
+        dn, db = _to_decimal(n), _to_decimal(base)
+        # A NaN answers a DOUBLE nan, as `$ln` does; the domain checks apply
+        # to a decimal by VALUE (measured 8.2.11, 2026-10-06).
+        if dn.is_nan() or db.is_nan():
+            return float("nan")
+        if dn <= 0:
+            raise ExpressionError(
+                f"$log's argument must be a positive number, but is {fmt_double_value(float(dn))}",
+                code=28758,
+                code_name="Location28758",
+            )
+        if db <= 0 or db == 1:
+            raise ExpressionError(
+                f"$log's base must be a positive number not equal to 1, but is {base}",
+                code=28759,
+                code_name="Location28759",
+            )
+        return _decimal_result(lambda x, b: _correctly_rounded(lambda: x.ln() / b.ln()), n, base)
     return math.log(n, base)
 
 
@@ -3901,12 +3936,12 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
             f"{_bson_type_name(start)}",
             code=34443,
         )
-    if isinstance(end, bool) or not isinstance(end, (int, float)):
+    if isinstance(end, bool) or not isinstance(end, (int, float, Decimal128)):
         raise ExpressionError(
             f"$range requires a numeric ending value, found value of type: {_bson_type_name(end)}",
             code=34445,
         )
-    if isinstance(step, bool) or not isinstance(step, (int, float)):
+    if isinstance(step, bool) or not isinstance(step, (int, float, Decimal128)):
         raise ExpressionError(
             f"$range requires a numeric step value, found value of type:{_bson_type_name(step)}",
             code=34447,
@@ -3922,19 +3957,19 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
             code=34444,
         ) from None
     try:
-        end = _int_index(end)
+        end = _range_int32(end) if isinstance(end, Decimal128) else _int_index(end)
     except _FractionalIndex:
         raise ExpressionError(
             "$range requires an ending value that can be represented as a "
-            f"32-bit integer, found value: {_fmt_double(end)}",
+            f"32-bit integer, found value: {_range_repr(end)}",
             code=34446,
         ) from None
     try:
-        step = _int_index(step)
+        step = _range_int32(step) if isinstance(step, Decimal128) else _int_index(step)
     except _FractionalIndex:
         raise ExpressionError(
             "$range requires a step value that can be represented as a 32-bit "
-            f"integer, found value: {_fmt_double(step)}",
+            f"integer, found value: {_range_repr(step)}",
             code=34448,
         ) from None
     if not all(isinstance(v, int) for v in (start, end, step)):
@@ -4643,7 +4678,19 @@ def _op_slice(arg: Any, ctx: _Ctx) -> Any:
         ) from None
     if not isinstance(position, int) or not isinstance(n, int):
         return None
-    return arr[position : position + n]
+    if n <= 0:
+        # mongod refuses a count of zero or less (measured 8.2.11, 2026-10-07);
+        # an empty slice was returned.
+        raise ExpressionError(
+            f"Third argument to $slice must be positive: {n}",
+            code=28729,
+            code_name="Location28729",
+        )
+    # A negative position counts back from the end and is clamped at the
+    # start (mongod: `[[1, 2, 3, 4, 5], -9, 2]` is `[1, 2]`). Python's own
+    # negative slice was used, so `-9` gave `[]` and `[-1, 5]` gave `[]`.
+    start = max(len(arr) + position, 0) if position < 0 else position
+    return arr[start : start + n]
 
 
 def _op_concat_arrays(arg: Any, ctx: _Ctx) -> Any:

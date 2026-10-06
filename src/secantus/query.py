@@ -260,6 +260,8 @@ def _check_json_schema_keywords(schema: Any) -> None:
                     code=9,
                     code_name="FailedToParse",
                 )
+        if kw in ("type", "bsonType"):
+            _check_json_schema_type_names(kw, arg)
         # Recurse into sub-schemas.
         if kw in ("properties", "patternProperties") and isinstance(arg, Mapping):
             for sub in arg.values():
@@ -279,6 +281,37 @@ def _check_json_schema_keywords(schema: Any) -> None:
             for dep in arg.values():
                 if isinstance(dep, Mapping):
                     _check_json_schema_keywords(dep)
+
+
+_JSON_SCHEMA_JSON_TYPES = frozenset({"object", "array", "number", "boolean", "string", "null"})
+
+
+def _check_json_schema_type_names(kw: str, arg: Any) -> None:
+    """A ``type`` / ``bsonType`` name mongod refuses while PARSING the schema,
+    before any document is looked at (measured 8.2.11, 2026-09-30):
+
+    - ``integer`` in either keyword is 9 "not currently supported" -- it was
+      accepted, and matched ints, where mongod runs no query at all;
+    - ``type`` takes only the six JSON names (``int`` is an unknown alias there,
+      although ``bsonType`` takes it), and an unknown name is 2 BadValue.
+
+    ``integer`` wins over an unknown name anywhere in the list."""
+    if isinstance(arg, str):
+        names = [arg]
+    elif isinstance(arg, list):
+        names = [n for n in arg if isinstance(n, str)]
+    else:
+        return
+    if "integer" in names:
+        raise QueryError(
+            "$jsonSchema type 'integer' is not currently supported.",
+            code=9,
+            code_name="FailedToParse",
+        )
+    for n in names:
+        known = n in _JSON_SCHEMA_JSON_TYPES if kw == "type" else n in _VALID_TYPE_ALIASES
+        if not known:
+            raise QueryError(f"Unknown type name alias: {n}")
 
 
 def _validate_json_schema(value: Any, schema: Any) -> bool:

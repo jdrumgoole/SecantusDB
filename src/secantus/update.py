@@ -768,7 +768,20 @@ def find_positional_matches(doc: Mapping[str, Any], filter_: Mapping[str, Any]) 
     out: dict[str, int] = {}
     array_paths: dict[str, dict[str, Any]] = {}
     for key, value in filter_.items():
-        if key.startswith("$") or "." not in key:
+        if key.startswith("$"):
+            continue
+        if "." not in key:
+            # A predicate on the array field ITSELF -- `{a: 2}`, `{a: {$gt: 1}}`,
+            # `{a: {$elemMatch: ...}}` -- matches through an element, and `$`
+            # names that element. Only dotted paths were considered, so every
+            # positional update over an array of scalars failed (measured
+            # 8.2.11, 2026-10-07: `update_one({a: 2}, {$set: {"a.$": 9}})`).
+            arr = doc.get(key)
+            if isinstance(arr, list) and key not in out:
+                for i, elem in enumerate(arr):
+                    if _element_matches(elem, value, _matches):
+                        out[key] = i
+                        break
             continue
         top, _, rest = key.partition(".")
         if isinstance(doc.get(top), list):
@@ -783,6 +796,24 @@ def find_positional_matches(doc: Mapping[str, Any], filter_: Mapping[str, Any]) 
                 out[path] = i
                 break
     return out
+
+
+def _element_matches(elem: Any, predicate: Any, matches_fn: Any) -> bool:
+    """Whether one array element satisfies a field predicate the way the
+    array's match went through it."""
+    if isinstance(predicate, Mapping) and "$elemMatch" in predicate:
+        inner = predicate["$elemMatch"]
+        if (
+            isinstance(inner, Mapping)
+            and inner
+            and all(isinstance(k, str) and k.startswith("$") for k in inner)
+            and not any(k in ("$and", "$or", "$nor", "$expr") for k in inner)
+        ):
+            return bool(matches_fn({"x": elem}, {"x": inner}))
+        return isinstance(elem, Mapping) and bool(matches_fn(elem, inner))
+    if isinstance(elem, list):
+        return False
+    return bool(matches_fn({"x": elem}, {"x": predicate}))
 
 
 def _array_filter_referenced_identifiers(update: Mapping[str, Any]) -> set[str]:

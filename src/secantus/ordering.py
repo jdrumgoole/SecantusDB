@@ -272,6 +272,13 @@ def _bson_lt(a: Any, b: Any) -> bool:
         a_items = list(a.items())
         b_items = list(b.items())
         for (ak, av), (bk, bv) in zip(a_items, b_items, strict=False):
+            # mongod's `woCompare`: each element's value TYPE rank first, then
+            # its field name, then its value -- so `{t, crs: {}}` sorts before
+            # `{t, coordinates: []}` (object before array). The name used to be
+            # compared first (measured 8.2.11, 2026-10-06).
+            ra, rb = _bson_type_rank(av), _bson_type_rank(bv)
+            if ra != rb:
+                return ra < rb
             if ak != bk:
                 return ak < bk
             if _bson_lt(av, bv):

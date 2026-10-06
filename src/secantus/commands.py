@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import bson
+from bson import Decimal128, Int64
 
 from secantus import changestreams
 from secantus import deadline as _deadline
@@ -41,6 +42,7 @@ from secantus.auth import (
     continue_scram,
     derive_credentials,
 )
+from secantus.bsontypes import is_bson_string
 from secantus.connreg import ConnectionRegistry
 from secantus.cursors import MAX_GETMORE_BATCH_BYTES, CursorNotFound, CursorRegistry
 from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
@@ -291,33 +293,33 @@ def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
         }
     if "w" in wc:
         w = wc["w"]
-        if isinstance(w, bool) or not isinstance(w, (int, str)):
+        if _is_wc_number(w):
+            # Any number: mongod reads it as `safeNumberLong` and bounds that
+            # (measured 8.2.11, 2026-10-06: a double `w: 1.5` is accepted).
+            n = _wc_w_number(w)
+            if n < 0 or n > 50:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"w has to be a non-negative number and not greater than 50; found: {n}"
+                    ),
+                    "code": 9,
+                    "codeName": "FailedToParse",
+                }
+        elif isinstance(w, Mapping) and not w:
             return {
                 "ok": 0.0,
-                "errmsg": "writeConcern.w must be a number or string",
-                "code": 14,
-                "codeName": "TypeMismatch",
+                "errmsg": "tagged write concern requires tags",
+                "code": 9,
+                "codeName": "FailedToParse",
             }
-        if isinstance(w, str) and w != "majority":
+        elif not (w is None or is_bson_string(w) or isinstance(w, Mapping)):
+            # Any tag parses, and so does a tag set or a null (the empty tag);
+            # an unknown one is reported AFTER the write, as a
+            # `writeConcernError` (see `_unsatisfiable_wc_error`).
             return {
                 "ok": 0.0,
-                "errmsg": f"No write concern mode named {w!r} found in replica set configuration",
-                "code": 79,
-                "codeName": "UnknownReplWriteConcern",
-            }
-        if isinstance(w, int) and (w < 0 or w > 50):
-            # mongod caps a numeric ``w`` at 50 (the max number of voting
-            # replica-set members) and rejects an out-of-range ``w`` at
-            # writeConcern *parse* time with FailedToParse (9) — NOT a
-            # ``writeConcernError`` attached to a successful reply (that's
-            # the satisfiable-but-too-many-nodes case, ``1 < w <= 50``,
-            # handled by ``_unsatisfiable_wc_error``). mongo-c-driver's
-            # /Collection/{drop,rename,index} + /Database/drop assert exactly
-            # this for ``w: 99`` (``assert_wc_oob_error``, the server-version
-            # >= 4.3.3 branch).
-            return {
-                "ok": 0.0,
-                "errmsg": "w has to be a non-negative number and not greater than 50",
+                "errmsg": f"w has to be a number, string, or object; found: {_bson_type_of(w)}",
                 "code": 9,
                 "codeName": "FailedToParse",
             }
@@ -437,21 +439,56 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     write concern and its ``provenance``; we send none.
     """
     wc = doc.get("writeConcern")
-    if not isinstance(wc, Mapping):
+    if not isinstance(wc, Mapping) or "w" not in wc:
         return None
-    w = wc.get("w")
-    # ``bool`` is an ``int`` subclass in Python — exclude it explicitly so
-    # ``w: true`` doesn't trip the comparison below. The ``True``/``False``
-    # case is unspecified at the protocol level; let the wire shape pass.
-    if isinstance(w, bool):
+    w = wc["w"]
+    # A null `w` is the empty tag; a tag set echoes its counts as longs; a
+    # number as mongod stores it, truncated, as an int.
+    if w is None:
+        w = ""
+    elif isinstance(w, Mapping):
+        w = {k: Int64(_wc_w_number(v)) for k, v in w.items()}
+    elif _is_wc_number(w):
+        w = _wc_w_number(w)
+    if _is_wc_number(w) and not isinstance(w, bool) and w > 1:
+        code, name, msg = 100, "UnsatisfiableWriteConcern", "Not enough data-bearing nodes"
+    elif is_bson_string(w) and w != "majority":
+        code, name = 79, "UnknownReplWriteConcern"
+        msg = f"No write concern mode named '{w}' found in replica set configuration"
+    elif isinstance(w, Mapping) and w:
+        code, name, msg = 4, "NoSuchKey", f"No replica set tag key {next(iter(w))} in config"
+    else:
         return None
-    if isinstance(w, int) and w > 1:
-        return {
-            "code": 100,
-            "codeName": "UnsatisfiableWriteConcern",
-            "errmsg": "Not enough data-bearing nodes",
-        }
-    return None
+    echoed: dict[str, Any] = {"w": w}
+    if "j" in wc:
+        j = wc["j"]
+        echoed["j"] = j if isinstance(j, bool) else bool(_wc_w_number(j))
+    wtimeout = wc.get("wtimeout")
+    echoed["wtimeout"] = (
+        _wc_w_number(wtimeout) if _is_wc_number(wtimeout) and wtimeout is not None else 0
+    )
+    echoed["provenance"] = "clientSupplied"
+    return {"code": code, "codeName": name, "errmsg": msg, "errInfo": {"writeConcern": echoed}}
+
+
+def _is_wc_number(v: Any) -> bool:
+    return isinstance(v, (int, float, Int64, Decimal128)) and not isinstance(v, bool)
+
+
+def _wc_w_number(v: Any) -> int:
+    """A numeric ``w`` as mongod reads it: ``safeNumberLong`` -- truncated
+    toward zero, NaN as 0, saturating."""
+    try:
+        f = float(v.to_decimal()) if isinstance(v, Decimal128) else float(v)
+    except (TypeError, ValueError, ArithmeticError):
+        return 0
+    if f != f:
+        return 0
+    if f >= 2**63:
+        return 2**63 - 1
+    if f < -(2**63):
+        return -(2**63)
+    return int(v) if isinstance(v, int) else int(f)
 
 
 def _resolve_let_vars(let: Any) -> dict[str, Any]:
@@ -495,59 +532,26 @@ _VALIDATION_REASON: dict[str, str] = {
 def _validation_failure_details(
     validator: Mapping[str, Any], doc: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """mongod-shaped ``errInfo.details`` for a doc that failed a
-    query-expression collection validator.
+    """mongod-shaped ``errInfo.details`` for a doc that failed the collection
+    validator -- every rule it broke, per ``$jsonSchema`` keyword or per query
+    clause (``secantus.validation_errors``)."""
+    from secantus.validation_errors import explain
 
-    Walks the validator's field clauses, finds the first the document
-    violates, and reports the failing operator with the value the server
-    considered — matching the structure the mongo-csharp-driver CRUD-spec
-    prose test ``WriteError_details`` asserts (``operatorName`` /
-    ``specifiedAs`` / ``reason`` / ``consideredValue`` / ``consideredType``).
-    """
-    from secantus.paths import get_path, has_path
-    from secantus.query import bson_type_name
+    return explain(validator, doc)
 
-    # $jsonSchema validators report a different (schema-rules) structure
-    # we don't synthesise; name the operator and stop.
-    if "$jsonSchema" in validator:
-        return {"operatorName": "$jsonSchema"}
 
-    for field, spec in validator.items():
-        if isinstance(field, str) and field.startswith("$"):
-            # Document-level logical operator ($and/$or/$nor) — skip for
-            # per-field detail (best-effort).
-            continue
-        if matches(doc, {field: spec}):
-            continue
-        present = has_path(doc, field)
-        value = get_path(doc, field) if present else None
-        if (
-            isinstance(spec, Mapping)
-            and spec
-            and all(isinstance(k, str) and k.startswith("$") for k in spec)
-        ):
-            # Operator form — isolate the specific operator that failed.
-            op = next(iter(spec))
-            for candidate in spec:
-                if not matches(doc, {field: {candidate: spec[candidate]}}):
-                    op = candidate
-                    break
-            detail: dict[str, Any] = {
-                "operatorName": op,
-                "specifiedAs": {field: dict(spec)},
-                "reason": _VALIDATION_REASON.get(op, "comparison failed"),
-            }
-        else:
-            detail = {
-                "operatorName": "$eq",
-                "specifiedAs": {field: spec},
-                "reason": "comparison failed",
-            }
-        if present:
-            detail["consideredValue"] = value
-            detail["consideredType"] = bson_type_name(value)
-        return detail
-    return {"operatorName": "validator"}
+#: findAndModify's validation failure comes from the update executor.
+_FAM_VALIDATION_ERRMSG = (
+    "Plan executor error during findAndModify :: caused by :: Document failed validation"
+)
+
+
+def _storage_validation_err_info(validator: Any, exc: Any) -> dict[str, Any]:
+    """``errInfo`` for a validation failure the storage layer raised: the full
+    explanation when it carried the failing document, else just its ``_id``."""
+    if isinstance(validator, Mapping) and exc.doc is not None:
+        return _validation_error_info(validator, exc.doc)
+    return {"failingDocumentId": exc.doc_id, "details": {"operatorName": "validator"}}
 
 
 def _validation_error_info(validator: Mapping[str, Any], doc: Mapping[str, Any]) -> dict[str, Any]:
@@ -747,6 +751,130 @@ def _failpoint_app_name(name: str, doc: Mapping[str, Any], ctx: CommandContext) 
     return name if isinstance(name, str) else None
 
 
+def max_await_time_ms(doc: Mapping[str, Any]) -> int | None:
+    """``maxAwaitTimeMS`` as mongod reads it: any number, truncated toward
+    zero. ``None`` when absent, null or not a number."""
+    v = doc.get("maxAwaitTimeMS")
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, bson.Int64)):
+        return int(v)
+    if isinstance(v, float):
+        return 0 if v != v else int(v)
+    if isinstance(v, Decimal128):
+        try:
+            f = float(v.to_decimal())
+        except (ValueError, ArithmeticError):
+            return None
+        return 0 if f != f else int(f)
+    return None
+
+
+def awaitable_topology_is_current(doc: Mapping[str, Any], counter: int) -> bool:
+    """True when an awaitable ``hello`` names the topology this server is in
+    NOW -- same ``processId``, same counter -- the only case mongod HOLDS the
+    reply for ``maxAwaitTimeMS``. A different process or an older counter
+    means the client is out of date, and mongod answers at once (measured
+    8.2.11, 2026-09-30, streamed and not)."""
+    tv = doc.get("topologyVersion")
+    if not isinstance(tv, Mapping):
+        return False
+    return tv.get("processId") == _HELLO_PROCESS_ID and tv.get("counter") == counter
+
+
+def _awaitable_hello_problem(doc: Mapping[str, Any], counter: int) -> dict[str, Any] | None:
+    """mongod's parse of the awaitable-hello arguments, in its order (measured
+    8.2.11, 2026-09-30); every shape below used to be accepted and waited on.
+
+    1. IDL parse, field by field in document order: ``topologyVersion`` must be
+       an object whose ``processId`` is an ObjectId and whose ``counter`` is a
+       LONG, with no other field, ``counter`` reported missing before
+       ``processId``; ``maxAwaitTimeMS`` must be a number and, truncated, not
+       negative. ``null`` is absent for both. The path says ``hello.`` for
+       ``isMaster`` too.
+    2. The pair: either one without the other is 31368.
+    3. The counter: negative is 31372; for THIS process, newer than ours is
+       31382 (a counter from another process is merely stale).
+    """
+
+    def err(code: int, name: str, msg: str) -> dict[str, Any]:
+        return {"ok": 0.0, "errmsg": msg, "code": code, "codeName": name}
+
+    def mismatch(path: str, v: Any, expected: str) -> dict[str, Any]:
+        return err(
+            14,
+            "TypeMismatch",
+            f"BSON field '{path}' is the wrong type '{_bson_type_of(v)}', expected {expected}",
+        )
+
+    topology: Mapping[str, Any] | None = None
+    max_await = False
+    for key, value in doc.items():
+        if key not in ("topologyVersion", "maxAwaitTimeMS") or value is None:
+            continue
+        if key == "topologyVersion":
+            if not isinstance(value, Mapping):
+                return mismatch("hello.topologyVersion", value, "type 'object'")
+            for field, v in value.items():
+                path = f"hello.topologyVersion.{field}"
+                if field == "processId":
+                    if not isinstance(v, bson.ObjectId):
+                        return mismatch(path, v, "type 'objectId'")
+                elif field == "counter":
+                    if not isinstance(v, bson.Int64):
+                        return mismatch(path, v, "type 'long'")
+                else:
+                    return err(
+                        40415, "IDLUnknownField", f"BSON field '{path}' is an unknown field."
+                    )
+            for required in ("counter", "processId"):
+                if required not in value:
+                    return err(
+                        40414,
+                        "IDLFailedToParse",
+                        f"BSON field 'hello.topologyVersion.{required}' is missing but a "
+                        "required field",
+                    )
+            topology = value
+        else:
+            ms = max_await_time_ms(doc)
+            if ms is None:
+                return mismatch(
+                    "hello.maxAwaitTimeMS", value, "types '[int, decimal, long, double]'"
+                )
+            if ms < 0:
+                return err(
+                    2,
+                    "BadValue",
+                    f"BSON field 'maxAwaitTimeMS' value must be >= 0, actual value '{ms}'",
+                )
+            max_await = True
+    if topology is None and max_await:
+        return err(
+            31368,
+            "Location31368",
+            "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'",
+        )
+    if topology is not None and not max_await:
+        return err(
+            31368,
+            "Location31368",
+            "A request with a 'topologyVersion' must include 'maxAwaitTimeMS'",
+        )
+    if topology is not None:
+        theirs = int(topology["counter"])
+        if theirs < 0:
+            return err(31372, "Location31372", "topologyVersion must have a non-negative counter")
+        if topology["processId"] == _HELLO_PROCESS_ID and theirs > counter:
+            return err(
+                31382,
+                "Location31382",
+                f"Received a topology version with counter: {theirs} which is greater "
+                f"than the server topology version counter: {counter}",
+            )
+    return None
+
+
 def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # Per the MongoDB Handshake spec, drivers send their
     # self-identification (name, version, OS, platform) in the
@@ -766,13 +894,11 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # wait on -- there is nothing to compare against, so the wait is undefined.
     # Measured 8.2.11 (2026-09-29): 31368 / Location31368. Both servers used to
     # ACCEPT it and answer immediately.
-    if "maxAwaitTimeMS" in doc and "topologyVersion" not in doc:
-        return {
-            "ok": 0.0,
-            "errmsg": "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'",
-            "code": 31368,
-            "codeName": "Location31368",
-        }
+    _err = _awaitable_hello_problem(
+        doc, ctx.step_down_state.topology_counter() if ctx.step_down_state else 0
+    )
+    if _err is not None:
+        return _err
 
     # Inside a ``replSetStepDown`` window this node is a SECONDARY. SDAM reads
     # these flags to place the server in the topology, so they must flip
@@ -3242,15 +3368,15 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 journal=_wants_journal(doc),
             )
         except DocumentValidationError as exc:
+            # Raised by the update executor, so mongod reports it under the
+            # executor prefix (measured 8.2.11, 2026-10-06).
             write_errors.append(
                 {
                     "index": index,
                     "code": 121,
-                    "errmsg": "Document failed validation",
-                    "errInfo": {
-                        "failingDocumentId": exc.doc_id,
-                        "details": {"operatorName": "validator"},
-                    },
+                    "errmsg": "Plan executor error during update :: caused by :: "
+                    "Document failed validation",
+                    "errInfo": _storage_validation_err_info(validator_spec, exc),
                 }
             )
             if ordered:
@@ -5330,13 +5456,10 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
                 except DocumentValidationError as exc:
                     return {
                         "ok": 0.0,
-                        "errmsg": "Document failed validation",
+                        "errmsg": _FAM_VALIDATION_ERRMSG,
                         "code": 121,
                         "codeName": "DocumentValidationFailure",
-                        "errInfo": {
-                            "failingDocumentId": exc.doc_id,
-                            "details": {"operatorName": "validator"},
-                        },
+                        "errInfo": _storage_validation_err_info(validator_up, exc),
                     }
                 except IndexConflict as exc:
                     reply: dict[str, Any] = {
@@ -5448,9 +5571,12 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
             if simulated is not None:
                 verr = _validate_doc_against_collection(ctx.storage, ctx.db_name, coll, simulated)
                 if verr is not None:
+                    verr["errmsg"] = _FAM_VALIDATION_ERRMSG
                     return verr
 
         try:
+            # The validator goes to the write as well: a PIPELINE update cannot
+            # be simulated above, and without this it was never validated.
             update_result = ctx.storage.update_matching(
                 ctx.db_name,
                 coll,
@@ -5460,9 +5586,19 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
                 array_filters=array_filters,
                 let=let,
                 collation=collation,
+                validator=validator_spec,
+                validator_moderate=_validation_is_moderate(coll_opts),
                 journal=_wants_journal(doc),
                 return_post_images=True,
             )
+        except DocumentValidationError as exc:
+            return {
+                "ok": 0.0,
+                "errmsg": _FAM_VALIDATION_ERRMSG,
+                "code": 121,
+                "codeName": "DocumentValidationFailure",
+                "errInfo": _storage_validation_err_info(validator_spec, exc),
+            }
         except IndexConflict as exc:
             reply2: dict[str, Any] = {
                 "ok": 0.0,
@@ -5778,8 +5914,51 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # bare ``{create, idIndex}``. Building ``stored`` before the create call
     # also means an invalid ``clusteredIndex`` rejects without leaving a
     # half-created collection behind.
+    # An existing collection answers first: ok when the requested options are
+    # the ones it has (a bare `create` of an existing collection included),
+    # 48 quoting them otherwise (measured 8.2.11, 2026-10-01). The validator is
+    # parsed only for a collection about to be created.
+    if ctx.storage.collection_exists(ctx.db_name, coll):
+        existing = dict(ctx.storage.get_collection_options(ctx.db_name, coll))
+        existing.pop("uuid", None)
+        if existing == stored:
+            return {"ok": 1.0}
+        from secantus.bsontypes import bson_value_repr
+
+        shown = f'uuid: UUID("{ctx.storage.collection_uuid(ctx.db_name, coll)}")'
+        for k, v in existing.items():
+            shown += f", {k}: {bson_value_repr(v)}"
+        return {
+            "ok": 0.0,
+            "errmsg": f"namespace {ctx.db_name}.{coll} already exists, "
+            f"but with different options: {{ {shown} }}",
+            "code": 48,
+            "codeName": "NamespaceExists",
+        }
+    problem = _validator_problem(doc.get("validator"))
+    if problem is not None:
+        return problem
     ctx.storage.create_collection(ctx.db_name, coll, options=stored or None)
     return {"ok": 1.0}
+
+
+def _validator_problem(validator: Any, prefix: str = "") -> dict[str, Any] | None:
+    """mongod's refusal of a collection validator it cannot parse -- an
+    invalid ``$jsonSchema`` or an unknown operator, the same parse ``find``
+    runs -- or ``None``. Both used to be stored, and then failed every write
+    (measured 8.2.11, 2026-10-06)."""
+    if not isinstance(validator, Mapping):
+        return None
+    try:
+        matches({}, validator)
+    except QueryError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": prefix + str(exc),
+            "code": exc.code,
+            "codeName": exc.code_name,
+        }
+    return None
 
 
 def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -5835,6 +6014,11 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # violates it surfaces as a ``DocumentValidationFailure``
     # (code 121) with ``errInfo.failingDocumentId`` + ``details``.
     validator = doc.get("validator")
+    problem = _validator_problem(
+        validator, "Parsing of collection validator failed :: caused by :: "
+    )
+    if problem is not None:
+        return problem
     if isinstance(validator, Mapping):
         ctx.storage.set_collection_options(ctx.db_name, coll, validator=dict(validator))
         description["validator"] = dict(validator)
@@ -10452,7 +10636,11 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # on the wce. Failpoint-attached wces win when both apply.
         wc_wce = _unsatisfiable_wc_error(doc)
         if wc_wce is not None:
+            # Before `ok`, where mongod puts it.
+            ok = result.pop("ok", None)
             result["writeConcernError"] = wc_wce
+            if ok is not None:
+                result["ok"] = ok
     # Cluster-time gossip: real mongod attaches ``$clusterTime`` and
     # ``operationTime`` to EVERY reply — successes and errors — when the
     # node is a replica-set member (standalones don't gossip; neither do
