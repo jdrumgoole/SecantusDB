@@ -728,7 +728,17 @@ CURATED = [
     ({"$dateFromString": {"dateString": "2024-01-15T00:30:00+05:00"}}, {}),  # crosses to prev day
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.123456"}}, {}),  # frac -> defer
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00.5Z"}}, {}),  # frac+Z -> defer
-    ({"$dateFromString": {"dateString": "2024-13-01"}}, {}),  # bad month -> defer
+    # REMOVED 2026-10-06, a scope decision, not a skip: the Rust engine now
+    # parses free-form date strings with a port of timelib, the parser mongod
+    # uses, and on these two mongod 8.2.11 and the Python engine disagree --
+    #   "2024-13-01"                  mongod 241 "...; 6: Unexpected character '3'",
+    #                                 Python 14 "month must be in 1..12";
+    #   "...Z" with timezone "+05:00" mongod 241 (a zone in the string together
+    #                                 with a timezone argument), Python a value.
+    # Parity would pin the Rust server to the Python answer, away from mongod.
+    # What is lost: a drift check on these two shapes. mongod-vs-Rust coverage
+    # is tools/probes/date_string_parsing.py (318 cases, 0 divergent); the
+    # Python divergence is backlog section 7.04.
     (
         {"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}},
         {},
@@ -741,7 +751,7 @@ CURATED = [
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "+0530"}}, {}),
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "UTC"}}, {}),
     # A string that already carries an offset ignores the timezone field.
-    ({"$dateFromString": {"dateString": "2024-01-15T10:30:00Z", "timezone": "+05:00"}}, {}),
+    # (the "...Z" + timezone case: see the REMOVED note above)
     # $dateFromString `format` (strptime) — numeric-directive subset, built from
     # CPython _strptime's exact per-directive regexes so field matching agrees.
     ({"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}}, {}),

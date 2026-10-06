@@ -7698,6 +7698,15 @@ divergent on `main` before this batch, 0 after.**
   RELATIVE (`Tue, 01 Jan 2024` is 2 January) -- all parse as mongod does.
 - [x] Second 60 (`23:59:60`) is refused in every form; it used to roll over
   into the next day.
+- [ ] **PYTHON server: free-form date strings still diverge from mongod**
+  (the Rust server no longer does). Two shapes surfaced by the parity suite,
+  which now excludes them with a written reason: `$dateFromString` of
+  `"2024-13-01"` is 14 "month must be in 1..12" (mongod: 241 "...; 6:
+  Unexpected character '3'"), and a string carrying its own zone together
+  with a `timezone` argument returns a value (mongod: 241). The 12-hour /
+  zone-abbreviation wrong values fixed on the Rust server almost certainly
+  exist there too; run `tools/probes/date_string_parsing.py` with
+  `PROBE_SERVER` at a Python server to size it.
 - [x] **Error TEXT matched by PORTING timelib (2026-10-06).** The Rust server's
   free-form date parsing is now a literal port of timelib 2022.13's scanner
   (`parse_date.re`), `timelib_update_ts`, and mongod's `fromString` wrapper --
