@@ -275,6 +275,18 @@ impl UserTransactionHandle {
                 .any(|(d, c)| d == db && c == coll)
     }
 
+    /// Has the transaction written any collection `pred` accepts?
+    pub fn wrote_any(&self, pred: impl Fn(&str, &str) -> bool) -> bool {
+        self.written_ns.iter().any(|(d, c, _)| pred(d, c))
+            || self
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .collections
+                .iter()
+                .any(|(d, c)| pred(d, c))
+    }
+
     /// How many oplog entries the transaction's writes have produced so far:
     /// a position in its write set, for [`Storage::rebase_user_transaction_keeping`].
     pub fn write_set_len(&self) -> usize {

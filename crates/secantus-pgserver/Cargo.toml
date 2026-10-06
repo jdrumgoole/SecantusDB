@@ -14,6 +14,8 @@ license = "Apache-2.0"
 [workspace]
 
 [dependencies]
+# Anonymous files for an external sort's runs (`external_sort`).
+tempfile = "3"
 bson = "2"
 async-trait = "0.1"
 futures = "0.3"
