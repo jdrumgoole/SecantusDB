@@ -689,7 +689,13 @@ remain open:
       environment skips); SQLAlchemy 978 / 0 (435 skipped); pgjdbc
       7354 completed, 1 failed (`BlobTransactionTest`, below), 28 skipped. The fixes of batches 37-48 are in the git log and the
       corpora `b39_*` .. `b48_*`; this entry keeps only what is open or
-      decided:
+      decided. **Re-measured 2026-10-06, batch 56** (debug build of the
+      pushed commit, tree stamp checked): psycopg 5544 passed / 0 failed
+      (149 skipped, 34 xfailed, 4 xpassed); pgx 377 / 0 / 22 skipped, 399
+      started and 399 reported; SQLAlchemy 978 / 0 (435 skipped); pgjdbc
+      7354 completed, 1 failed (`BlobTransactionTest`), 28 skipped. The
+      full corpus sweep: 235 corpora, 8,544 checks, 0 divergences against
+      PostgreSQL 15.19:
       - **Not a server bug (batch 53):** psycopg's two `test_ctrl_c` failed
         in background-launched gauge runs since batch 51 and passed in
         foreground ones. A shell starts a background job with SIGINT
@@ -1480,6 +1486,23 @@ These work end-to-end but cut corners.
       group's open / commit (~1), the `_id` probe (~1.5), the two socket
       syscalls (~5) and the tokio hand-offs.
 
+      **Batch 56 (2026-10-06)**, release, `bench43.py`, two interleaved
+      runs, load ~7, base `742b9134` -> batch 56 (PG 15.19): simple `select
+      1` 29.6 / 29.2 -> 28.6 / 28.4, extended `select 1` 41.5 / 41.5 ->
+      42.2 / 41.4, PK read 51.0 / 50.1 -> **49.3 / 50.0**, autocommit
+      UPDATE 76.1 / 70.1 -> 71.9 / 70.6 us (PG 15: 23.5, 26.9, 33.4, 85.1)
+      -- within noise. A `sample` of 300k PK reads: four measured costs
+      removed -- the DateStyle and TimeZone GUCs parsed every statement
+      (`install_user_types`; now only when the settings generation moves,
+      `INSTALLED_ZONE_STYLE`), nine catalog-collection checks (a mutex and
+      a SipHash each) every statement (`catalogs_ensured`), the shared
+      type-catalog cache's lock and key hash on each of several reads a
+      statement (`CATALOG_FRONT`, a per-thread copy of current entries),
+      and `sql_relations`' parse-tree walk (memoised by text; the names
+      are still resolved through the search path on every call, which is
+      now most of what is left of `wait_for_table_locks`, ~3% of the
+      connection thread). What remains has no single cost above ~1 us
+      beyond the socket syscalls and the storage read.
       **Batch 54 (2026-10-05):** `is_timeseries` caches its answer per
       collection once a timeseries collection exists (`TIMESERIES_CACHE`),
       transaction-aware: valid while `COLL_TABLE_GEN` -- moved on by every
