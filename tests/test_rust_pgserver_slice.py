@@ -17957,3 +17957,154 @@ def test_batch63_insert_values_subquery(home: Path) -> None:
             " (3, (select count(*) from b63_v))"
         )
         assert a.execute("select * from b63_v order by id").fetchall() == [(1, 5), (2, 1), (3, 1)]
+
+
+def test_batch64_streams_indexed_where_and_inside_a_block(home: Path) -> None:
+    """Batch 64: a simple-protocol SELECT with an INDEXED WHERE streams the
+    index route a batch at a time (`scan_routed_batches`, in the order the
+    materialised path reads), and a simple-protocol SELECT inside a
+    REPEATABLE READ block streams through the block's own transaction. Answers are unchanged: the
+    block's own uncommitted rows are seen, a statement after a streamed one
+    in the same block works, and an error raised part-way through a
+    streamed block read fails the block (PostgreSQL 15.19's answers)."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b64_s (id int primary key, k int, t text)")
+        a.execute("create index b64_s_k on b64_s (k)")
+        a.execute(
+            "insert into b64_s select g, g % 10, repeat('x', g % 7) from generate_series(1, 3000) g"
+        )
+        pg = a.pgconn
+
+        def simple(sql: str) -> list[tuple]:
+            res = pg.exec_(sql.encode())
+            assert res.status == psycopg.pq.ExecStatus.TUPLES_OK, res.error_message
+            return [
+                tuple(
+                    None if res.get_value(r, c) is None else res.get_value(r, c).decode()
+                    for c in range(res.nfields)
+                )
+                for r in range(res.ntuples)
+            ]
+
+        rows = simple("select id from b64_s where k = 3")
+        assert sorted(int(r[0]) for r in rows) == list(range(3, 3001, 10))
+        assert len(simple("select id, t from b64_s where k >= 5")) == 1500
+        assert simple("select count(*), sum(id) from b64_s where k >= 8") == [("600", "902100")]
+        assert simple("select id from b64_s where id = 17") == [("17",)]
+        assert simple("select id from b64_s where k = 4 order by id desc limit 2") == [
+            ("2994",),
+            ("2984",),
+        ]
+        a.execute("begin isolation level repeatable read")
+        a.execute("insert into b64_s values (9999, 3, 'mine')")
+        assert len(simple("select id from b64_s")) == 3001
+        assert simple("select id, t from b64_s where t = 'mine'") == [("9999", "mine")]
+        a.execute("delete from b64_s where id < 100")
+        assert len(simple("select id from b64_s")) == 2902
+        res = pg.exec_(b"select id / (id - 2500) from b64_s")
+        assert res.status == psycopg.pq.ExecStatus.FATAL_ERROR
+        assert res.error_field(psycopg.pq.DiagnosticField.SQLSTATE) == b"22012"
+        res = pg.exec_(b"select 1")
+        assert res.error_field(psycopg.pq.DiagnosticField.SQLSTATE) == b"25P02"
+        a.execute("rollback")
+        assert len(simple("select id from b64_s")) == 3000
+
+
+def test_batch64_distinct_order_by_must_name_the_select_list(home: Path) -> None:
+    """A plain SELECT DISTINCT whose ORDER BY names something not in its
+    select list (`order by v + 1`, `order by w`, `order by 1::text`) is
+    PostgreSQL's 42P10; it answered, de-duplicated on one list and sorted on
+    another. An output name, a position, a listed expression and a column
+    under `*` are still accepted (PostgreSQL 15.19's answers)."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b64_do (v int, w int)")
+        a.execute("insert into b64_do values (1, 10), (2, 20), (2, 30)")
+        for q in (
+            "select distinct v from b64_do order by v + 1",
+            "select distinct v from b64_do order by w",
+            "select distinct v from b64_do order by 1::text",
+            "select distinct v + 1 from b64_do order by v",
+        ):
+            with pytest.raises(psycopg.errors.InvalidColumnReference) as err:
+                a.execute(q)
+            assert str(err.value).startswith(
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+            )
+        assert a.execute("select distinct v + 1 as x from b64_do order by v + 1").fetchall() == [
+            (2,),
+            (3,),
+        ]
+        assert a.execute("select distinct v from b64_do order by 1 desc").fetchall() == [(2,), (1,)]
+        assert a.execute("select distinct * from b64_do order by w desc").fetchall() == [
+            (2, 30),
+            (2, 20),
+            (1, 10),
+        ]
+
+
+def test_batch64_exists_ignores_its_select_list_and_float_errors(home: Path) -> None:
+    """`exists(select 1/0)` is true in PostgreSQL, whose planner drops an
+    EXISTS subquery's select list (`simplify_EXISTS_query`); it raised.
+    And float `sqrt` / `ln` / `log` / `exp` / `power` raise float.c's
+    errors: 2201F / 2201E (they were 22P02), `power` of a negative to a
+    fraction or of zero to a negative is an error (it answered NaN /
+    Infinity), an overflow is 22003 (it answered Infinity)."""
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b64_e (a int, b int)")
+        a.execute("insert into b64_e values (1, 0)")
+        assert a.execute("select exists(select 1/0)").fetchone() == (True,)
+        assert a.execute("select exists(select a/b from b64_e limit 1)").fetchone() == (True,)
+        assert a.execute("select exists(select max(a) from b64_e where false)").fetchone() == (
+            True,
+        )
+        assert a.execute("select exists(select generate_series(1, 0))").fetchone() == (False,)
+        for q, state, msg in (
+            ("select sqrt(-1)", "2201F", "cannot take square root of a negative number"),
+            ("select ln(0)", "2201E", "cannot take logarithm of zero"),
+            ("select log(-1)", "2201E", "cannot take logarithm of a negative number"),
+            ("select exp(1000::float8)", "22003", "value out of range: overflow"),
+            (
+                "select power(-8::float8, 0.5::float8)",
+                "2201F",
+                "a negative number raised to a non-integer power yields a complex result",
+            ),
+            (
+                "select power(0::float8, -1::float8)",
+                "2201F",
+                "zero raised to a negative power is undefined",
+            ),
+        ):
+            with pytest.raises(psycopg.Error) as err:
+                a.execute(q)
+            assert (err.value.sqlstate, str(err.value).split("\n")[0]) == (state, msg), q
+
+
+def test_batch64_plpgsql_expression_context_frame(home: Path) -> None:
+    """A PL/pgSQL expression's error has PostgreSQL's `SQL expression "..."`
+    frame exactly when the error is raised while the expression is PLANNED
+    (an immutable subexpression over constants fails as it is folded, even
+    beside a variable: `1/0 + x`, `case when x > 0 then 1/0 end`), never
+    for one raised while it runs (`x/0`), and never for an unreadable
+    literal (`'x'::int`, which has a position instead). 58 of 60 probed
+    shapes match PostgreSQL 15.19 (tools/probes/plpgsql_expr_context.py)."""
+    with _Server(home) as server, server.connect() as a:
+        cases = (
+            ("x int := 1;", "return 1/0 + x;", 'SQL expression "1/0 + x"'),
+            ("x int := 1;", "return case when x > 0 then 1/0 end;", "SQL expression"),
+            ("x int := 1;", "return x/0;", None),
+            ("", "return 'x'::int;", None),
+            ("", "return 1/0;", 'SQL expression "1/0"'),
+        )
+        for i, (decl, body, frame) in enumerate(cases):
+            a.execute(
+                f"create function b64_c{i}() returns int language plpgsql as"
+                f" $$ declare {decl} begin {body} end $$"
+            )
+            with pytest.raises(psycopg.Error) as err:
+                a.execute(f"select b64_c{i}()")
+            ctx = err.value.diag.context or ""
+            assert ctx.endswith(f"PL/pgSQL function b64_c{i}() line 1 at RETURN"), ctx
+            if frame is None:
+                assert "SQL expression" not in ctx, ctx
+            else:
+                assert ctx.startswith(frame), ctx

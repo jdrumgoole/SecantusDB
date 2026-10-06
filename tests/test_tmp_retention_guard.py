@@ -9,6 +9,7 @@ native crash.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -35,7 +36,19 @@ def _nested_pytest(tmp_path: pathlib.Path, *extra: str) -> subprocess.CompletedP
     worker silently instead of failing with something a reader can act on.
     (Same diagnosis and same fix as the nested runs in
     ``tests/test_crash_stall_watchdog.py``.)
+
+    ``SECANTUS_NO_TMP_REAP=1`` is the same lesson one hook later. The nested
+    run is a pytest CONTROLLER, so ``tests/conftest.py``'s sessionstart
+    sweep (``_reap_abandoned_pytest_tmp``) ran in it too, ``rmtree``-ing
+    every abandoned run's WiredTiger stores (~100 GiB a run) before
+    collecting one file -- inside this test's 300 s budget, under the full
+    suite's I/O. That is the 2026-09-30 timeout (no output for 300 s, 0.5 s
+    alone); batch 64 reproduced it in miniature (a 100k-file stale tree:
+    0.5 s -> 5.6 s, reaped by the nested run). The outer run's controller
+    already sweeps.
     """
+    env = dict(os.environ)
+    env["SECANTUS_NO_TMP_REAP"] = "1"
     return subprocess.run(
         [
             sys.executable,
@@ -54,6 +67,7 @@ def _nested_pytest(tmp_path: pathlib.Path, *extra: str) -> subprocess.CompletedP
         capture_output=True,
         text=True,
         timeout=300,
+        env=env,
     )
 
 
