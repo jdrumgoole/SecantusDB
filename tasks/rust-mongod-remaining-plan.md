@@ -13,75 +13,59 @@ the reference (CLAUDE.md, "Design constraints").
 | Aggregation expressions (full sweep) | 7 of 6,628, all the authorised last-digit decimal transcendentals |
 | pymongo gauge | 1,205 / 5, only declared non-goals left |
 
-## Phase 0 -- re-measure before building (half a day)
+## Phase 0 -- re-measure before building: DONE (2026-10-06)
 
-The backlog lags reality, and several entries below were measured against the
-WRONG server or have probably been fixed since:
+Run against `secantusd-rs 0.5.3-beta.170` (tree `4d2948c6`) and mongod 8.2.11,
+a replica set where write concern or change streams are involved.
 
-- The awaitable-`hello` entry (25 of 33) was measured with `PROBE_SERVER` at a
-  **Python** server.
-- The `maxTimeMS` entry (8 of 11) does not say which server it measured.
-- These §7.00 entries should already have shown up in today's 6,628-case
-  expression sweep, and did not:
-  - `$slice` with a negative position;
-  - `$bucketAuto` with a decimal;
-  - decimal `$pow`;
-  - "Decimal128 refused by some operators";
-  - "50 codes + 212 messages" on the error surface.
+**The headline: most of the list this plan was written from does not apply to
+the Rust server.** The §7.00 entries it was built from sit under the backlog's
+heading "Found and NOT fixed -- Python-server divergences". They were read as
+Rust items when this plan was drafted. Re-measured on the Rust binary:
 
-Steps:
+| Item | Rust vs mongod |
+| --- | --- |
+| awaitable `hello` (`awaitable_hello.py`) | 2 of 33 -- one error code |
+| `maxTimeMS` expiry (`max_time_expiry.py`) | 3 of 11 -- message prefix |
+| regex `\Z` / `\z` (`regex_value_semantics.py`) | 0 (Python: 2) |
+| change streams (`change_streams.py`, `change_stream_fuzz.py`) | 0 of 41, 0 of 60 |
+| `remaining_shapes.py` (new: `$jsonSchema`, write concern, `$project`, positional update, §7.00 expressions) | 6 of 38, one authorised |
 
-1. Build `secantusd-rs` from `origin/main` (provenance-checked), and start
-   `mongod` 8.2.11 on a spare port.
-2. Run each probe with `PROBE_SERVER` at the Rust binary:
-   - `max_time_expiry.py`
-   - `awaitable_hello.py`
-   - `regex_value_semantics.py`
-   - `change_streams.py` / `change_stream_fuzz.py`
-3. Write two small new probes for the shapes that have none: `$jsonSchema`
-   (type keywords, failure `errInfo`) and write concern (`errInfo`, unknown
-   `w` tag).
-4. Rewrite each backlog entry with the Rust count, or close it.
+Clean on the Rust server: regex anchors, `$project: {_id: 1}`, negative
+`$slice`, `$bucketAuto` over decimals, decimal `$pow`, the positional update,
+write-concern `errInfo` and an unknown `w` tag. The detail is in backlog §7.00
+("Rust server, re-measured 2026-10-06").
 
-**Exit:** every item below carries a fresh Rust-vs-mongod count, and the plan
-is re-ordered by it. Anything at 0 is closed, not built.
+## Phase 1 -- the Rust divergences phase 0 found (about a day)
 
-## Phase 1 -- what drivers see on every connection
+All on the wire, all small:
 
-**1a. Awaitable `hello`** (only if Phase 0 shows Rust diverging). The backlog
-entry lists the shapes:
-- a malformed `topologyVersion` / `maxAwaitTimeMS` accepted;
-- a stale or foreign topology held rather than answered at once;
-- the first streamed reply not waited.
+1. **`$jsonSchema` `type: "integer"`** -- refuse with 9 `$jsonSchema type
+   'integer' is not currently supported.`, at the top level and in
+   `properties`, on `create` / `collMod` / `find`.
+2. **A schema failure on update** -- send mongod's
+   `Plan executor error during update :: caused by :: Document failed
+   validation` with the `errInfo` tree. Insert already builds that tree; this
+   is wiring the same builder into the update path. Check `findAndModify` and
+   a replacement update too.
+3. **`maxTimeMS` on writes** -- prefix `Plan executor error during
+   findAndModify / update / delete :: caused by ::`.
+4. **Awaitable `hello`** -- a newer `topologyVersion` counter is 51764, not
+   31382.
+5. **`writeConcern.w` of the wrong type** -- 9 `w has to be a number, string,
+   or object; found: <type>`. Probe the other bad types (bool, double, null)
+   while there.
+6. **Decimal `$log` with a base** -- answer it. Use the same correctly rounded
+   decimal path as `$ln`, if it exists, or decline with a reason.
 
-Probe: `awaitable_hello.py`. Gauge to rerun: Go (`heartbeats_processed_more_frequently`).
+**Exit:** `remaining_shapes.py` at 1 of 38 (the authorised `$sin` digit),
+`max_time_expiry.py` 0 of 11, `awaitable_hello.py` 0 of 33.
 
-**1b. `maxTimeMS` expiry replies.** The entry says "no executor prefix on
-find / aggregate / distinct / count", which is likely message text only.
-Match code, message and prefix per command. Probe: `max_time_expiry.py`.
+## Phase 2 -- folded into Phase 1
 
-**1c. Write-concern errors.**
-- `writeConcernError.errInfo` should be present.
-- An unknown `w` tag should fail the way mongod does, not as a pre-flight
-  refusal.
-
-New probe from Phase 0. Gauges to rerun: Java, Node (write-concern spec tests).
-
-## Phase 2 -- query and validation correctness
-
-**2a. `$jsonSchema`.**
-- `type: "integer"` should be refused (mongod: 9).
-- A failed validation should carry mongod's `errInfo.details` (`schemaRulesNotSatisfied` tree), not just `{operatorName}`. This is the larger half: the tree has a fixed shape per keyword, so measure it keyword by keyword.
-
-**2b. Regex anchors.** `\Z` should match before a final newline; `\z` should
-be accepted. mongod uses PCRE2; check whether the regex crate's translation
-layer or a rewrite of the two anchors is the fix. Probe: `regex_value_semantics.py`.
-
-**2c. Aggregate `$project: {_id: 1}`.** Returns whole documents. Probably a
-one-line inclusion-detection bug; reproduce first.
-
-**2d. Positional `a.$` in change events.** The update description for
-`$set: {"a.$": 9}` (backlog 7.02). Probe: `change_streams.py`.
+`$jsonSchema` `errInfo` turned out to be an update-path wiring gap, not the
+missing tree builder this plan assumed. The regex, `$project` and positional
+items were Python-server entries.
 
 ## Phase 3 -- gauge residue
 
@@ -128,15 +112,13 @@ documents in an embedded server. Test through the crate's public API.
 - A Rust release (`secantusdb-v*`) is cut after each phase that changes the
   wire.
 
-**Rough size:**
+**Rough size (after phase 0):**
 
 | Phase | Estimate |
 | --- | --- |
-| 0 | half a day |
-| 1 | 1-2 days |
-| 2 | 2-3 days (`$jsonSchema` `errInfo` dominates) |
-| 3 | 1-2 days, depending on what the re-triage finds |
+| 1 | about a day |
+| 3 | 1-2 days, depending on what the gauge re-triage finds |
 | 4 | half a day |
 
-Phase 0 will move these numbers; sizes from reading have been wrong in both
-directions here before.
+Phase 0 cut the estimate from 5-8 days to 2-4: the list had been read off the
+wrong server's section.
