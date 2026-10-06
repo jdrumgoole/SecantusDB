@@ -8686,6 +8686,11 @@ impl Storage {
     pub fn find_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let key = id_key(id)?;
+        if let Some(ov) = overlay_for(db, coll) {
+            if let Some(row) = ov.rows.get(&key) {
+                return Ok(row.as_ref().map(|(_, b)| b.clone()));
+            }
+        }
         let session = self.op_session()?;
         // Resolve `_id` -> RecordId via the `_id` index, then fetch the doc row.
         let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
@@ -11086,6 +11091,34 @@ impl Storage {
     /// keyed by the monotonic RecordId, so a plain doc-table walk (`scan_docs`) IS
     /// insertion order — no separate `NAT_TABLE` indirection. Mirrors
     /// `storage._scan_docs_natural`.
+    /// The collection in natural (RecordId) order with `ov` laid over it: the
+    /// snapshot's row for every `_id` key the overlay names is dropped and the
+    /// overlay's present rows are merged in by RecordId (see
+    /// [`Storage::block_overlay`]). Never index-routed: the snapshot's index
+    /// entries describe the committed versions of the overlaid rows.
+    fn overlaid_natural(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        ov: &TableOverlay,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut own: Vec<(i64, Vec<u8>)> = ov.rows.values().flatten().cloned().collect();
+        own.sort_unstable_by_key(|(r, _)| *r);
+        let mut own = own.into_iter().peekable();
+        let mut out = Vec::new();
+        for (recordid, idk, blob) in self.scan_docs(session, db, coll)? {
+            while own.peek().is_some_and(|(r, _)| *r < recordid) {
+                out.push(own.next().expect("peeked").1);
+            }
+            if !ov.rows.contains_key(&idk) {
+                out.push(blob);
+            }
+        }
+        out.extend(own.map(|(_, b)| b));
+        Ok(out)
+    }
+
     fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         // The read path only needs the document blobs, so walk the doc table
         // directly and clone just the blob — `scan_docs` additionally clones each
@@ -12227,6 +12260,9 @@ impl Storage {
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let session = self.op_session()?;
+        if let Some(ov) = overlay_for(db, coll) {
+            return self.scan_batch_after_overlaid(&session, db, coll, filter, after, batch, &ov);
+        }
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok((Vec::new(), None)),
@@ -12264,6 +12300,92 @@ impl Storage {
                 }
             }
             more = cur.next()?;
+        }
+        Ok((out, None))
+    }
+
+    /// [`Self::scan_batch_after`] with a block's rows laid over the snapshot.
+    /// The resume point is the RecordId of the last row handed out, whether
+    /// it came from the snapshot or from the overlay.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_batch_after_overlaid(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        after: Option<i64>,
+        batch: usize,
+        ov: &TableOverlay,
+    ) -> Result<(Vec<Vec<u8>>, Option<i64>)> {
+        let vars = Document::new();
+        let keep = |blob: &[u8]| -> Result<bool> {
+            if filter.is_empty() {
+                return Ok(true);
+            }
+            let raw =
+                bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
+            secantus_core::query::matches_raw(raw, filter, &vars, None).map_err(query_fault)
+        };
+        let batch = batch.max(1);
+        let floor = after.unwrap_or(i64::MIN);
+        let mut own: Vec<(i64, Vec<u8>)> = ov
+            .rows
+            .values()
+            .flatten()
+            .filter(|(r, _)| after.is_none() || *r > floor)
+            .cloned()
+            .collect();
+        own.sort_unstable_by_key(|(r, _)| *r);
+        let mut own = own.into_iter().peekable();
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(batch);
+        if after == Some(i64::MAX) {
+            return Ok((out, None));
+        }
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => Some(c),
+            Err(e) if e.is_missing_table() => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(cur) = cur {
+            cur.set_key_ssq(db, coll, after.map_or(i64::MIN, |a| a.saturating_add(1)));
+            let mut more = match cur.search_near() {
+                Ok(cmp) => cmp >= 0 || cur.next()?,
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            while more {
+                let (d, c, recordid) = cur.get_key_ssq()?;
+                if d != db || c != coll {
+                    break;
+                }
+                while own.peek().is_some_and(|(r, _)| *r < recordid) {
+                    let (r, b) = own.next().expect("peeked");
+                    if keep(&b)? {
+                        out.push(b);
+                        if out.len() >= batch {
+                            return Ok((out, Some(r)));
+                        }
+                    }
+                }
+                let value = cur.get_value_u()?;
+                let (idk, blob) = unframe_doc_value(&value)?;
+                if !ov.rows.contains_key(idk) && keep(blob)? {
+                    out.push(blob.to_vec());
+                    if out.len() >= batch {
+                        return Ok((out, Some(recordid)));
+                    }
+                }
+                more = cur.next()?;
+            }
+        }
+        for (r, b) in own {
+            if keep(&b)? {
+                out.push(b);
+                if out.len() >= batch {
+                    return Ok((out, Some(r)));
+                }
+            }
         }
         Ok((out, None))
     }
@@ -12328,7 +12450,23 @@ impl Storage {
         // optimisation.)
         let force_collscan = coll_opt.is_some();
 
-        let blobs: Vec<Vec<u8>> = if force_collscan {
+        // A block's own rows laid over this snapshot (`with_read_overlay`):
+        // no index can be trusted for them, so the overlaid table is scanned
+        // in natural order and filtered / sorted below like any scan.
+        let overlay = overlay_for(db, coll);
+        let blobs: Vec<Vec<u8>> = if let Some(ov) = &overlay {
+            let mut blobs = self.overlaid_natural(&session, db, coll, ov)?;
+            let backward = matches!(hint, Some(Hint::KeySpec(k)) if k.get("$natural").is_some_and(|v| match v {
+                Bson::Int32(n) => *n < 0,
+                Bson::Int64(n) => *n < 0,
+                Bson::Double(n) => *n < 0.0,
+                _ => false,
+            }));
+            if backward {
+                blobs.reverse();
+            }
+            blobs
+        } else if force_collscan {
             self.scan_blobs_natural(&session, db, coll)?
         } else if let Some(h) = hint {
             let resolved = self.resolve_hint(&session, db, coll, h)?;
@@ -12524,6 +12662,11 @@ impl Storage {
         if self.is_oplog_rs(db, coll) {
             return Ok(self
                 .find_oplog_rs(filter, None, coll_opt, &Document::new())?
+                .len());
+        }
+        if overlay_for(db, coll).is_some() {
+            return Ok(self
+                .find_matching_with(db, coll, filter, None, None, coll_opt, &Document::new())?
                 .len());
         }
         self.with_ddl_generation_check(|| {

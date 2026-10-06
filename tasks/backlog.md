@@ -784,11 +784,16 @@ remain open:
         -> 59 MB; the same through the extended protocol 1755 -> 58 MB.
         Corpus `b60_agg_stream` (also run with
         `SECANTUS_PG_GROUP_MEMORY_BYTES=1000`), slice test
-        `test_batch60_ungrouped_aggregates_in_bounded_memory`. Left (OPEN),
-        each still materialised: an ungrouped `avg`, a float `sum`, any
-        other aggregate, or one with DISTINCT / FILTER / ORDER BY inside
-        (avg needs a (sum, count) partial; a float sum's rounding depends on
-        the order of additions, so chunking would change its last bits); a JOIN
+        `test_batch60_ungrouped_aggregates_in_bounded_memory`. **Batch 61:** `avg` (every
+        numeric and float type) and a float `sum` stream too: an exact avg
+        keeps its (sum, count) and divides once; a float sum / avg CARRIES
+        its running total into the next chunk as the first value added, so
+        the additions are the one-pass ones in the same order and the answer
+        is bit-identical (corpus `b61_agg_stream`, 0 against PostgreSQL 15.19
+        with and without `SECANTUS_PG_GROUP_MEMORY_BYTES=1000`). 300,000 rows
+        of 2 KB after a restart, debug: `avg(d), sum(d)` 1755 -> 63 MB, `avg(i),
+        avg(n)` 1761 -> 64 MB. Left (OPEN), each still materialised: any
+        other aggregate, or one with DISTINCT / FILTER / ORDER BY inside; a JOIN
         (streaming its outer side needs the join planner's leaves to read
         in batches -- `join_docs` reads every side whole); an aggregate
         with grouping sets, or over a join / subquery / indexed filter;
@@ -1079,7 +1084,16 @@ remain open:
         slice test `test_batch60_jsonb_compares_by_value`. What it costs:
         an equality on a jsonb column no longer uses a btree index on it
         (the stored text cannot find `1.0` for `1`), and a jsonb UNIQUE
-        constraint reads the table per write statement.
+        constraint reads the table per write statement. **CLOSED (scope
+        decision, batch 61):** restoring either needs an index keyed on the
+        VALUE (`jsonb_value_key`), and the stored index entries are of the
+        stored text -- a format the Python server writes and reads too. A
+        lookup over the stored text cannot be made sound: one value has
+        unboundedly many spellings (`1`, `1.0`, `1.00`, `1e0` ...), so no
+        finite set of probes finds every equal row, and a miss is a silent
+        wrong answer (a lost UNIQUE violation). A value-keyed index is an
+        on-disk format change for both servers, not a planner fix; the costs
+        stay as they are, correct.
       - `SELECT DISTINCT count(*) ... GROUP BY k ORDER BY 1` (or by the
         aggregate's alias) was 0A000: a plain DISTINCT over bare aggregates
         now goes through the DISTINCT-over-groups subquery when the ORDER
@@ -1288,27 +1302,38 @@ remain open:
         and only then the `_id` point read, the index pickers and the
         counts, each behind the same opt-in. Until every path a statement
         can reach honours it, `rc_select_read_set` must keep refusing the
-        overlay for that statement shape. **Batch 61 (2026-10-06): step one
-        landed, the consumer half did not.** `Storage::block_overlay(handle,
-        db, coll) -> Option<TableOverlay>` exists and is unit-tested
-        (`crates/secantus-storage/tests/read_overlay.rs`, sync and async
-        lanes); it is keyed by `_id` KEY, not RecordId, because a row the
-        block deleted is gone from its own `_id` index, so its RecordId is
-        unreachable from the block -- the fresh snapshot's row carries the
-        `_id` key in its frame. It answers `None` for a write set holding a
-        command on the table and for the async oplog (no readable rows).
-        `with_read_overlay` installs overlays per thread and
-        `scan_matching_batches` honours one (unit-tested). NOT wired into
-        the PG server, for a reason found while wiring it: `read_apart` runs
-        the statement inside a fresh user transaction, so the streaming
-        aggregate path there calls `scan_batch_after` (the in-transaction
-        resumable scan), never `scan_matching_batches`; and a plain SELECT
-        goes through `find_matching_with`. So the next steps are
-        `scan_batch_after` (resume after a RecordId: own rows above it,
-        merged), then `find_by_id`, the pickers and the counts, and only then
-        an opt-in in `read_apart` with `rc_select_read_set` admitting a
-        written table. The replay case was therefore not re-measured (no
-        statement shape changes path). Every move --
+        overlay for that statement shape. **FIXED in batch 61
+        (2026-10-06):** `Storage::block_overlay(handle, db, coll) ->
+        Option<TableOverlay>` (keyed by `_id` KEY: a row the block deleted
+        is gone from its own `_id` index, so its RecordId is unreachable;
+        the fresh snapshot's row carries the key in its frame; `None` for a
+        command on the table in the write set, or the async oplog) and
+        `with_read_overlay` (per thread). Every read a PostgreSQL SELECT
+        reaches honours it -- `find_matching_with` (no index route for an
+        overlaid table: the snapshot's entries describe committed versions;
+        it scans in natural order with the block's rows merged by RecordId,
+        then filters and sorts as any scan), `scan_batch_after`,
+        `scan_matching_batches`, `count_matching` and `find_by_id`; the
+        pgserver reads stored rows through no other storage call. The
+        MongoDB server never installs one. `rc_overlays` admits exactly
+        `rc_select_read_set`'s shapes (no subquery, CTE, row lock, function
+        but pure built-ins, view, rule, inheritance, partitioning, temp
+        table, RLS, user operator or cast) when the block wrote no catalog;
+        `read_apart` then runs the statement in a fresh transaction under
+        the overlays and the block keeps its snapshot. Sound because a row
+        the block wrote is held by it: no other session can commit a newer
+        version, and an insert under a key it wrote or deleted is a write
+        conflict. 200 / 400 / 800 insert-then-aggregate pairs on the block's
+        own table beside a session committing to THAT table, debug: 1.69 /
+        6.36 / 24.7 s (base `5e2273d2`) -> 1.64 / 2.75 / 8.63 s (PG 15.19:
+        0.05 / 0.08 / 0.16; what is left grows with the table's scan and
+        the write-set read per statement). Tests:
+        `crates/secantus-storage/tests/read_overlay.rs` (both oplog lanes)
+        and slice test `test_batch61_read_committed_reads_its_own_table_
+        beside_commits_to_it`, whose scenario also ran against PostgreSQL
+        15.19 unchanged. Left: a read with a subquery / user function still
+        replays (the gate's shapes). Every move --
+Every move --
         this one, ROLLBACK TO's and the conflict
         re-run's -- now keeps its rows held through the gap between rolling
         back and replaying (`MoveGuard`: a FOR SHARE entry under the mover's

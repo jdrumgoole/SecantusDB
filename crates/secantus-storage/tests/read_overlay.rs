@@ -129,3 +129,106 @@ fn a_command_on_the_table_refuses_the_overlay() {
         st.rollback_user_transaction(&mut block).unwrap();
     });
 }
+
+fn decode_all(v: Vec<Vec<u8>>) -> Vec<Document> {
+    v.iter().map(|b| bson::from_slice(b).unwrap()).collect()
+}
+
+/// Every read path a PostgreSQL READ COMMITTED statement can reach inside
+/// `read_apart` -- a fresh user transaction with the block's overlay
+/// installed: `find_matching_with` (an indexed filter, a sort), the count,
+/// the `_id` point read and the resumable `scan_batch_after`.
+#[test]
+fn every_read_path_honours_the_overlay_inside_a_fresh_transaction() {
+    with_db(|st| {
+        st.create_index("app", "t", "v_1", &doc! {"v": 1}, &doc! {})
+            .unwrap();
+        for i in 1..=3 {
+            st.insert_one("app", "t", &enc(&doc! {"_id": i, "v": i * 10}))
+                .unwrap();
+        }
+        let mut block = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut block, || -> secantus_storage::Result<()> {
+            st.replace_by_id("app", "t", &Bson::Int32(2), &enc(&doc! {"_id": 2, "v": 21}))?;
+            st.delete_by_id("app", "t", &Bson::Int32(3))?;
+            st.insert_one("app", "t", &enc(&doc! {"_id": 4, "v": 5}))?;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        st.insert_one("app", "t", &enc(&doc! {"_id": 5, "v": 50}))
+            .unwrap();
+        let Some(ov) = st.block_overlay(&mut block, "app", "t").unwrap() else {
+            assert!(st.oplog_async());
+            st.rollback_user_transaction(&mut block).unwrap();
+            return;
+        };
+        let mut m = HashMap::new();
+        m.insert(("app".to_string(), "t".to_string()), ov);
+        let m = Arc::new(m);
+        let mut tmp = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut tmp, || {
+            with_read_overlay(Arc::clone(&m), || {
+                // The index still holds v=20 for row 2 and v=30 for row 3.
+                let f = |q: Document| {
+                    decode_all(
+                        st.find_matching_with("app", "t", &q, None, None, None, &doc! {})
+                            .unwrap(),
+                    )
+                };
+                assert!(f(doc! {"v": 20}).is_empty());
+                assert!(f(doc! {"v": {"$gte": 30, "$lt": 40}}).is_empty());
+                assert_eq!(f(doc! {"v": 21}), vec![doc! {"_id": 2, "v": 21}]);
+                assert_eq!(f(doc! {"_id": 3}), Vec::<Document>::new());
+                let sorted = decode_all(
+                    st.find_matching_with(
+                        "app",
+                        "t",
+                        &doc! {},
+                        Some(&doc! {"v": -1}),
+                        None,
+                        None,
+                        &doc! {},
+                    )
+                    .unwrap(),
+                );
+                let ids: Vec<i32> = sorted.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+                assert_eq!(ids, vec![5, 2, 1, 4]);
+                assert_eq!(st.count_matching("app", "t", &doc! {}, None).unwrap(), 4);
+                assert_eq!(
+                    st.count_matching("app", "t", &doc! {"v": {"$lt": 25}}, None)
+                        .unwrap(),
+                    3
+                );
+                assert_eq!(st.find_by_id("app", "t", &Bson::Int32(3)).unwrap(), None);
+                assert_eq!(
+                    bson::from_slice::<Document>(
+                        &st.find_by_id("app", "t", &Bson::Int32(2)).unwrap().unwrap()
+                    )
+                    .unwrap(),
+                    doc! {"_id": 2, "v": 21}
+                );
+                // Paged one row at a time, the resume point crossing between
+                // the snapshot's rows and the block's.
+                let mut after = None;
+                let mut paged = Vec::new();
+                loop {
+                    let (rows, next) = st.scan_batch_after("app", "t", &doc! {}, after, 1).unwrap();
+                    paged.extend(decode_all(rows));
+                    if next.is_none() {
+                        break;
+                    }
+                    after = next;
+                }
+                let ids: Vec<i32> = paged.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+                assert_eq!(ids, vec![1, 2, 4, 5]);
+            })
+        })
+        .unwrap();
+        st.rollback_user_transaction(&mut tmp).unwrap();
+        // Without the overlay the fresh snapshot is the committed state.
+        let plain = decode_all(st.find_matching("app", "t", &doc! {"v": 20}).unwrap());
+        assert_eq!(plain, vec![doc! {"_id": 2, "v": 20}]);
+        st.rollback_user_transaction(&mut block).unwrap();
+    });
+}
