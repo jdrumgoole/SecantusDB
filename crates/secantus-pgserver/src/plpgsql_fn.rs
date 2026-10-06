@@ -376,6 +376,82 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
     Ok(f)
 }
 
+/// Every SQL text a PL/pgSQL body can run, each as a statement (an
+/// expression or an assignment's value as `SELECT <expr>`), when the body
+/// runs nothing else: no dynamic SQL, CALL, cursor, transaction control or
+/// EXCEPTION block (a subtransaction). `None` for any other body -- the
+/// caller (whether a read may run apart from its block) then refuses it.
+pub fn static_queries(create_sql: &str) -> Option<Vec<String>> {
+    const ALLOWED: &[&str] = &[
+        "PLpgSQL_stmt_block",
+        "PLpgSQL_stmt_assign",
+        "PLpgSQL_stmt_if",
+        "PLpgSQL_stmt_case",
+        "PLpgSQL_stmt_loop",
+        "PLpgSQL_stmt_while",
+        "PLpgSQL_stmt_fori",
+        "PLpgSQL_stmt_fors",
+        "PLpgSQL_stmt_foreach_a",
+        "PLpgSQL_stmt_exit",
+        "PLpgSQL_stmt_return",
+        "PLpgSQL_stmt_return_next",
+        "PLpgSQL_stmt_return_query",
+        "PLpgSQL_stmt_raise",
+        "PLpgSQL_stmt_assert",
+        "PLpgSQL_stmt_perform",
+        "PLpgSQL_stmt_execsql",
+        "PLpgSQL_stmt_getdiag",
+    ];
+    fn walk(v: &Value, out: &mut Vec<String>) -> Option<()> {
+        match v {
+            Value::Array(items) => {
+                for i in items {
+                    walk(i, out)?;
+                }
+            }
+            Value::Object(map) => {
+                for (k, inner) in map {
+                    if k.starts_with("PLpgSQL_stmt_") {
+                        if !ALLOWED.contains(&k.as_str()) {
+                            return None;
+                        }
+                        if inner.get("exceptions").is_some_and(|e| !e.is_null())
+                            || inner.get("dynquery").is_some()
+                        {
+                            return None;
+                        }
+                    }
+                    if k == "cursor_explicit_expr" {
+                        return None;
+                    }
+                    if k == "PLpgSQL_expr" {
+                        let q = inner.get("query").and_then(Value::as_str)?;
+                        let mode = inner.get("parseMode").and_then(Value::as_u64).unwrap_or(0);
+                        out.push(match mode {
+                            0 => q.to_string(),
+                            // An assignment, `target := value`.
+                            3..=5 => {
+                                let (_, value) =
+                                    q.split_once(":=").or_else(|| q.split_once('='))?;
+                                format!("SELECT {value}")
+                            }
+                            _ => format!("SELECT {q}"),
+                        });
+                        continue;
+                    }
+                    walk(inner, out)?;
+                }
+            }
+            _ => {}
+        }
+        Some(())
+    }
+    let f = parsed(create_sql).ok()?;
+    let mut out = Vec::new();
+    walk(&f, &mut out)?;
+    Some(out)
+}
+
 /// `RETURN NEXT ident;` → `RETURN NEXT (ident);`, case-insensitively.
 fn parenthesise_return_next(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();

@@ -60,6 +60,32 @@ const PURE: &[&str] = &[
 /// (`isolate_for_planning`). Catalog relations
 /// refuse it. `None` otherwise.
 pub fn relations(sql: &str) -> Option<Vec<String>> {
+    relations_with(sql, &|_: &str| None)
+}
+
+/// What a statement's function calls read: for a name as written
+/// (`schema.name` or `name`), `None` when no user function has it, else
+/// `Some(None)` when one may not run apart (a VOLATILE one, one that may
+/// write, one whose body this server cannot see through) and
+/// `Some(Some(relations))` for the relations it reads. A user function's
+/// name refuses or answers even where [`PURE`] lists it.
+pub trait UserReads: Fn(&str) -> Option<Option<Vec<String>>> {}
+impl<F: Fn(&str) -> Option<Option<Vec<String>>>> UserReads for F {}
+
+/// [`relations`], where a function call outside [`PURE`] is judged by
+/// `user` ([`UserReads`]).
+pub fn relations_with(sql: &str, user: &dyn UserReads) -> Option<Vec<String>> {
+    let out = reads_with(sql, user)?;
+    (!out.is_empty()).then_some(out)
+}
+
+/// [`relations_with`] for a function BODY's statement: a SELECT with no
+/// FROM (`select $1 + 1`) reads nothing and is still a read.
+pub fn body_relations_with(sql: &str, user: &dyn UserReads) -> Option<Vec<String>> {
+    reads_with(sql, user)
+}
+
+fn reads_with(sql: &str, user: &dyn UserReads) -> Option<Vec<String>> {
     let parsed = parse_tree(sql).ok()?;
     let [raw] = parsed.stmts.as_slice() else {
         return None;
@@ -119,11 +145,22 @@ pub fn relations(sql: &str) -> Option<Vec<String>> {
                         _ => None,
                     })
                     .collect();
+                if f.over.is_some() {
+                    return None;
+                }
+                if let Some(reads) = user(&parts.join(".")) {
+                    for name in reads? {
+                        if !out.contains(&name) {
+                            out.push(name);
+                        }
+                    }
+                    continue;
+                }
                 let ok = match parts.as_slice() {
                     [name] | ["pg_catalog", name] => PURE.contains(name),
                     _ => false,
                 };
-                if !ok || f.over.is_some() {
+                if !ok {
                     return None;
                 }
             }
@@ -149,7 +186,7 @@ pub fn relations(sql: &str) -> Option<Vec<String>> {
             _ => {}
         }
     }
-    (!out.is_empty()).then_some(out)
+    Some(out)
 }
 
 /// Does `sql` hold a subquery or a WITH item anywhere -- something the
