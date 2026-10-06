@@ -7328,9 +7328,24 @@ impl Storage {
         let wrote_registry = handle.wrote_registry;
         let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         if let Some(session) = handle.session.take() {
-            // Whatever the outcome, the transaction holds no row after this.
+            // Whatever the outcome, the transaction holds no row after this
+            // -- but only AFTER WiredTiger's commit has made its writes
+            // visible (`HeldEnd` drops last). Emptied before the commit
+            // call, a FOR SHARE waiter woke in between, read the row as it
+            // was before this transaction's update (still invisible), found
+            // no holder and returned the stale value (batch 67: a
+            // `test_batch51_for_share_is_a_shared_lock` failure in CI).
+            struct HeldEnd(HeldRows);
+            impl Drop for HeldEnd {
+                fn drop(&mut self) {
+                    let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                    held.clear();
+                    held.release_shared();
+                }
+            }
+            let _held_end = HeldEnd(handle.held.clone());
             let (wrote, written) = {
-                let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
+                let held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
                 let wrote = !held.rows.is_empty();
                 // Every collection it wrote a document row of -- unless it
                 // also wrote something no row records (the registry, an
@@ -7340,8 +7355,6 @@ impl Storage {
                     && self.enable_oplog
                     && self.async_oplog.is_none())
                 .then(|| merge_written(&handle.written_ns, &held.collections));
-                held.clear();
-                held.release_shared();
                 (
                     wrote || handle.has_written() || !handle.pending_async.is_empty(),
                     written,

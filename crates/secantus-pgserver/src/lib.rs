@@ -1570,6 +1570,58 @@ fn jsonb_field(def: &TableDef, field: &str) -> bool {
 }
 
 /// `group_key_ident`, or `jsonb_ident` when `is_jsonb`.
+/// Group slim rows (keys and inputs in flat fields) in memory, in
+/// first-seen order, as the materialised path groups.
+#[allow(clippy::type_complexity)]
+fn group_slim_rows(
+    one: &secantus_pgplan::Aggregate,
+    rows: &[Document],
+) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
+    // Row positions per group; each group's rows are copied out only while
+    // its aggregates run, so the rows are not held twice.
+    let mut buckets: Vec<Vec<usize>> = Vec::new();
+    for (pos, d) in rows.iter().enumerate() {
+        let key: Vec<Option<Bson>> = one
+            .group_by
+            .iter()
+            .map(|k| match d.get(&k.field) {
+                None | Some(Bson::Null) => None,
+                Some(v) => Some(v.clone()),
+            })
+            .collect();
+        let ident: Vec<Option<Bson>> = key
+            .iter()
+            .zip(&one.group_by)
+            .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+            .collect();
+        let id = format!("{ident:?}");
+        let at = match index.get(&id) {
+            Some(&i) => i,
+            None => {
+                index.insert(id, keys.len());
+                keys.push(key);
+                buckets.push(Vec::new());
+                keys.len() - 1
+            }
+        };
+        buckets[at].push(pos);
+    }
+    keys.into_iter()
+        .zip(buckets)
+        .map(|(k, b)| {
+            let b: Vec<Document> = b.into_iter().map(|i| rows[i].clone()).collect();
+            let vals = one
+                .items
+                .iter()
+                .map(|item| compute_aggregate(item, &b))
+                .collect::<PgWireResult<Vec<_>>>()?;
+            Ok((k, vals))
+        })
+        .collect()
+}
+
 fn typed_ident(v: &Option<Bson>, is_jsonb: bool) -> Option<Bson> {
     if is_jsonb {
         jsonb_ident(v)
@@ -1632,6 +1684,15 @@ enum Bounded {
     /// It did not: grouped from sorted runs, one group at a time.
     #[allow(clippy::type_complexity)]
     Grouped(Vec<(Vec<Option<Bson>>, Vec<Bson>)>),
+}
+
+/// What `grouping_sets_in_bounded_memory` made of an input.
+enum SetsInput {
+    /// Past the bound: every set's groups, from one read.
+    #[allow(clippy::type_complexity)]
+    Groups(Vec<(Vec<Option<Bson>>, Vec<Bson>)>),
+    /// It fitted: the rows, read once, for the materialised path.
+    Small(Vec<Document>),
 }
 
 /// The input bytes a GROUP BY groups in memory; past them it sorts.
@@ -4689,18 +4750,30 @@ impl PgHandler {
                 // A join under the aggregate is read in bounded memory
                 // where it can be (`stream_join`), into the same bounded
                 // aggregates a stored table's rows go to.
+                let mut read_once: Option<Vec<Document>> = None;
                 if agg.grouping_sets.is_some() {
-                    if let Some(groups) = self.grouping_sets_in_bounded_memory(agg, true)? {
-                        return self.finish_groups(agg, groups, max_rows);
+                    match self.grouping_sets_in_bounded_memory(agg, true)? {
+                        Some(SetsInput::Groups(groups)) => {
+                            return self.finish_groups(agg, groups, max_rows);
+                        }
+                        Some(SetsInput::Small(docs)) => read_once = Some(docs),
+                        None => {}
                     }
                 }
-                let streamed = match self.join_aggregate_source(agg)? {
-                    Some(mut feed) if agg.group_by.is_empty() && agg.grouping_sets.is_none() => {
-                        self.ungrouped_in_bounded_memory_from(agg, Some(&mut feed))?
-                            .map(|vals| Bounded::Grouped(vec![(Vec::new(), vals)]))
-                    }
-                    Some(mut feed) => self.grouped_in_bounded_memory_from(agg, Some(&mut feed))?,
-                    None => None,
+                let streamed = match read_once {
+                    Some(docs) => Some(Bounded::Small(docs)),
+                    None => match self.join_aggregate_source(agg)? {
+                        Some(mut feed)
+                            if agg.group_by.is_empty() && agg.grouping_sets.is_none() =>
+                        {
+                            self.ungrouped_in_bounded_memory_from(agg, Some(&mut feed))?
+                                .map(|vals| Bounded::Grouped(vec![(Vec::new(), vals)]))
+                        }
+                        Some(mut feed) => {
+                            self.grouped_in_bounded_memory_from(agg, Some(&mut feed))?
+                        }
+                        None => None,
+                    },
                 };
                 match streamed {
                     Some(Bounded::Small(docs)) => docs,
@@ -4731,7 +4804,10 @@ impl PgHandler {
             }
             None if agg.grouping_sets.is_some() => {
                 match self.grouping_sets_in_bounded_memory(agg, false)? {
-                    Some(groups) => return self.finish_groups(agg, groups, max_rows),
+                    Some(SetsInput::Groups(groups)) => {
+                        return self.finish_groups(agg, groups, max_rows)
+                    }
+                    Some(SetsInput::Small(docs)) => docs,
                     None => {
                         let raw = self.scan_table(&agg.table, &agg.filter, true)?;
                         raw.iter()
@@ -37817,7 +37893,276 @@ impl PgHandler {
         Ok(Some(vals))
     }
 
-    /// GROUPING SETS / ROLLUP / CUBE in bounded memory: each set grouped by
+    /// GROUPING SETS / ROLLUP / CUBE from ONE read of the input (batch 67;
+    /// batch 66 read it once per set -- the join under a ROLLUP ran three
+    /// times). Rows are kept whole while they fit the bound and handed back
+    /// (`SetsInput::Small`) for the materialised path, so a small input is
+    /// read once, as before batch 66. Past the bound each row is reduced to
+    /// what the sets need -- every key and every aggregate input, evaluated
+    /// -- held in memory while those fit, else spooled to disk; each set is
+    /// then grouped from those slim rows (`grouped_in_bounded_memory_from`
+    /// over the spool when they did not fit). An aggregate with its own
+    /// ORDER BY, a filter document or a user-defined aggregate keeps the
+    /// per-set reads (`grouping_sets_per_set`).
+    fn grouping_sets_in_bounded_memory(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        join: bool,
+    ) -> PgWireResult<Option<SetsInput>> {
+        let Some(sets) = agg.grouping_sets.as_ref() else {
+            return Ok(None);
+        };
+        if secantus_pgplan::with_scan_cache(|_| ()).is_some() {
+            return Ok(None);
+        }
+        let slimmable = agg
+            .items
+            .iter()
+            .all(|it| it.order.is_empty() && it.filter.is_none() && it.user.is_none());
+        if !slimmable {
+            return Ok(self
+                .grouping_sets_per_set(agg, join)?
+                .map(SetsInput::Groups));
+        }
+        // The slim aggregate: keys and inputs read from flat fields.
+        let mut slim = agg.clone();
+        slim.filter = Document::new();
+        slim.grouping_sets = None;
+        slim.groupings = Vec::new();
+        slim.order = Vec::new();
+        for (i, k) in slim.group_by.iter_mut().enumerate() {
+            k.field = format!("\u{1f}gk{i}");
+            k.expr = None;
+        }
+        for (j, it) in slim.items.iter_mut().enumerate() {
+            if it.field.is_some() || it.expr.is_some() {
+                it.field = Some(format!("\u{1f}f{j}a"));
+            }
+            if it.field2.is_some() || it.expr2.is_some() {
+                it.field2 = Some(format!("\u{1f}f{j}b"));
+            }
+            if it.filter_field.is_some() || it.filter_expr.is_some() {
+                it.filter_field = Some(format!("\u{1f}f{j}c"));
+            }
+            it.expr = None;
+            it.expr2 = None;
+            it.filter_expr = None;
+        }
+        let slim_row = |d: &Document| -> Result<Document, PlanError> {
+            let mut out = Document::new();
+            for (i, k) in agg.group_by.iter().enumerate() {
+                let v = match &k.expr {
+                    Some(e) => secantus_pgplan::apply_row_expr(e, d)?,
+                    None => secantus_pgplan::field_value(d, &k.field),
+                };
+                out.insert(format!("\u{1f}gk{i}"), v);
+            }
+            for (j, it) in agg.items.iter().enumerate() {
+                for (expr, field, tag) in [
+                    (it.expr.as_ref(), it.field.as_deref(), 'a'),
+                    (it.expr2.as_ref(), it.field2.as_deref(), 'b'),
+                    (it.filter_expr.as_ref(), it.filter_field.as_deref(), 'c'),
+                ] {
+                    let v = match (expr, field) {
+                        (Some(e), _) => secantus_pgplan::apply_row_expr(e, d)?,
+                        (None, Some(f)) => secantus_pgplan::field_value(d, f),
+                        (None, None) => continue,
+                    };
+                    out.insert(format!("\u{1f}f{j}{tag}"), v);
+                }
+            }
+            Ok(out)
+        };
+        let bound = group_in_memory_bytes();
+        let mut whole: Vec<Document> = Vec::new();
+        let mut whole_bytes = 0usize;
+        let mut over = false;
+        // Slim rows nearly as wide as the rows (`max(pad)` over a wide
+        // column) would only be spooled and read back once per set, which
+        // measured SLOWER than reading the input once per set: then the
+        // read stops at the bound and the per-set reads run instead.
+        let mut wide = false;
+        let mut slim_rows: Vec<Document> = Vec::new();
+        let mut slim_bytes = 0usize;
+        let mut spool: Option<crate::grace_join::Spool> = None;
+        let mut stopped: Option<PgWireError> = None;
+        let add_slim = |d: Document,
+                        slim_rows: &mut Vec<Document>,
+                        slim_bytes: &mut usize,
+                        spool: &mut Option<crate::grace_join::Spool>|
+         -> PgWireResult<()> {
+            if let Some(sp) = spool.as_mut() {
+                return sp.push(&d);
+            }
+            *slim_bytes += stream_join::doc_bytes(&d);
+            slim_rows.push(d);
+            if *slim_bytes > bound {
+                let mut sp = crate::grace_join::Spool::default();
+                for r in slim_rows.drain(..) {
+                    sp.push(&r)?;
+                }
+                *spool = Some(sp);
+            }
+            Ok(())
+        };
+        let mut sink = |rows: stream_join::RowBatch| -> bool {
+            if wide {
+                return false;
+            }
+            let step = || -> PgWireResult<()> {
+                self.check_cancel()?;
+                for (d, n) in rows.into_sized_docs()? {
+                    if !over {
+                        whole_bytes += n;
+                        whole.push(d);
+                        if whole_bytes > bound {
+                            over = true;
+                            let slim_sample: usize = whole
+                                .iter()
+                                .map(|w| slim_row(w).map(|r| stream_join::doc_bytes(&r)))
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|e| Self::err(&e))?
+                                .into_iter()
+                                .sum();
+                            if slim_sample * 2 > whole_bytes {
+                                wide = true;
+                                whole.clear();
+                                return Ok(());
+                            }
+                            for w in std::mem::take(&mut whole) {
+                                let r = slim_row(&w).map_err(|e| Self::err(&e))?;
+                                add_slim(r, &mut slim_rows, &mut slim_bytes, &mut spool)?;
+                            }
+                        }
+                    } else {
+                        let r = slim_row(&d).map_err(|e| Self::err(&e))?;
+                        add_slim(r, &mut slim_rows, &mut slim_bytes, &mut spool)?;
+                    }
+                }
+                Ok(())
+            };
+            let r = step();
+            match r {
+                Ok(()) => !wide,
+                Err(e) => {
+                    stopped = Some(e);
+                    false
+                }
+            }
+        };
+        let scanned = if join {
+            let Some(mut feed) = self.join_aggregate_source(agg)? else {
+                return Ok(None);
+            };
+            self.run_join_feed(&mut feed, &mut sink)?;
+            Ok(())
+        } else if self.storage.in_user_txn() {
+            let mut after = None;
+            loop {
+                let (blobs, next) = self
+                    .storage
+                    .scan_batch_after(self.db(), &agg.table, &agg.filter, after, 256)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                if !sink(stream_join::RowBatch::Blobs(blobs)) || next.is_none() {
+                    break Ok(());
+                }
+                after = next;
+            }
+        } else {
+            self.storage
+                .scan_routed_batches(self.db(), &agg.table, &agg.filter, 256, |b| {
+                    sink(stream_join::RowBatch::Blobs(b))
+                })
+        };
+        drop(sink);
+        if let Some(e) = stopped {
+            return Err(e);
+        }
+        scanned.map_err(|e| Self::storage_err("could not read", e))?;
+        if wide {
+            return Ok(self
+                .grouping_sets_per_set(agg, join)?
+                .map(SetsInput::Groups));
+        }
+        if !over {
+            return Ok(Some(SetsInput::Small(whole)));
+        }
+        let width = agg.group_by.len();
+        let mut out = Vec::new();
+        for set in sets {
+            let mut one = slim.clone();
+            one.group_by = if set.is_empty() {
+                vec![secantus_pgplan::GroupKey {
+                    name: String::new(),
+                    field: "\u{1f}no_key".into(),
+                    expr: None,
+                    pg_type: "int4".into(),
+                    typmod: -1,
+                }]
+            } else {
+                set.iter().map(|&i| slim.group_by[i].clone()).collect()
+            };
+            let mut groups = match spool.as_mut() {
+                None => group_slim_rows(&one, &slim_rows)?,
+                Some(sp) => {
+                    let mut feed = stream_join::JoinFeed::spooled(sp.reread()?);
+                    let mut whole_one = one.clone();
+                    whole_one.group_by = Vec::new();
+                    let ungrouped = if set.is_empty() {
+                        self.ungrouped_in_bounded_memory_from(&whole_one, Some(&mut feed))?
+                    } else {
+                        None
+                    };
+                    match ungrouped {
+                        Some(vals) => vec![(Vec::new(), vals)],
+                        None => {
+                            let mut feed = stream_join::JoinFeed::spooled(sp.reread()?);
+                            match self.grouped_in_bounded_memory_from(&one, Some(&mut feed))? {
+                                Some(Bounded::Grouped(g)) => g,
+                                Some(Bounded::Small(docs)) => group_slim_rows(&one, &docs)?,
+                                None => {
+                                    return Err(Self::user_error(
+                                        "XX000",
+                                        "a grouping set could not be grouped".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            if set.is_empty() && groups.is_empty() {
+                let vals = agg
+                    .items
+                    .iter()
+                    .map(|item| compute_aggregate(item, &[]))
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                groups.push((Vec::new(), vals));
+            }
+            for (key, mut vals) in groups {
+                let mut full: Vec<Option<Bson>> = vec![None; width];
+                if !set.is_empty() {
+                    for (j, &i) in set.iter().enumerate() {
+                        full[i] = key.get(j).cloned().flatten();
+                    }
+                }
+                for args in &agg.groupings {
+                    let n = args.len();
+                    let bits = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| !set.contains(a))
+                        .fold(0_i32, |acc, (i, _)| acc | (1 << (n - 1 - i)));
+                    vals.push(Bson::Int32(bits));
+                }
+                out.push((full, vals));
+            }
+        }
+        Ok(Some(SetsInput::Groups(out)))
+    }
+
+    /// GROUPING SETS / ROLLUP / CUBE in bounded memory, one read per set:
+    /// each set grouped by
     /// `grouped_in_bounded_memory` over its own read of the input (a stored
     /// table, or -- `join` -- the join under the aggregate, prepared again),
     /// its keys widened to the full GROUP BY with NULL where the set leaves
@@ -37826,7 +38171,7 @@ impl PgHandler {
     /// the materialised path applies: an input small enough to group in
     /// memory, or one `grouped_in_bounded_memory` declines.
     #[allow(clippy::type_complexity)]
-    fn grouping_sets_in_bounded_memory(
+    fn grouping_sets_per_set(
         &self,
         agg: &secantus_pgplan::Aggregate,
         join: bool,
