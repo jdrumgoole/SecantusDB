@@ -7698,14 +7698,28 @@ divergent on `main` before this batch, 0 after.**
   RELATIVE (`Tue, 01 Jan 2024` is 2 January) -- all parse as mongod does.
 - [x] Second 60 (`23:59:60`) is refused in every form; it used to roll over
   into the next day.
-- [ ] **Error TEXT: 26 of 123 strings.** The code (241) is right everywhere;
-  the message is not. mongod's is timelib's scanner diagnostic --
-  `Error parsing date string '<s>'; <pos>: <reason> '<char>'`, several joined
-  by `; `, positions not always ascending (`abc def ghi` reports 0, 8, 4) --
-  where ours is the generic "incomplete date/time". Matching it means porting
-  timelib's `parse_date.re` scanner, not adding rules: the reasons depend on
-  which scanner state rejected which byte. Joe asked for these to be matched
-  (2026-10-06); scoped here before starting.
+- [x] **Error TEXT matched by PORTING timelib (2026-10-06).** The Rust server's
+  free-form date parsing is now a literal port of timelib 2022.13's scanner
+  (`parse_date.re`), `timelib_update_ts`, and mongod's `fromString` wrapper --
+  `crates/secantus-core/src/timelib`, with the 1,127-entry zone table
+  generated from mongod's own `timezonemap.h` by
+  `tools/timelib/gen_zone_tables.py`. The re2c semantics (longest match over
+  all rules, first rule on a tie, NUL-terminated input) are reproduced with a
+  `regex-automata` DFA reporting every pattern at each length. Errors and
+  warnings carry timelib's own positions and characters, so the full message
+  matches. `date_string_parsing.py` widened to 318 cases (both operators,
+  relative forms, timestamps, year 0 / overflow, `timezone` incl. DST gaps and
+  overlaps, `onError`): **0 divergent, values AND error text.** Found on the
+  way and fixed by the port:
+  - `$dateFromString` without a `format` accepted ISO only and refused every
+    other string mongod parses;
+  - its `onError` was never applied;
+  - a DST overlap resolved to the EARLIER instant and a DST gap was an error,
+    where mongod (timelib's `do_adjust_timezone`) answers the later instant
+    and a shifted one -- a London `01:30` on the fall-back day is 01:30Z;
+  - `$toDate` refused any date outside years 1-9999 (the Python engine's
+    range); mongod takes any 64-bit millisecond value and overflows only
+    when the seconds widen to microseconds (159).
 
 ### 7.03 Rust packages (crates.io) -- open items, 2026-10-01
 

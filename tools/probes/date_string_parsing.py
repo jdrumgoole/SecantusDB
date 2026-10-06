@@ -7,13 +7,13 @@ server ports the parts of that grammar clients use. Measured on 8.2.11,
 (`UTC` twelve hours out, `GMT` / `EST` / `PST` likewise) -- because a trailing
 military-zone rule read `PM` and the last letter of `UTC` as zone letters.
 
-Compares VALUES and whether a string parses at all; error TEXT is reported but
-not counted, because the messages are timelib's scanner diagnostics, which the
-Rust server does not reproduce (backlog section 7.04).
+Since the timelib port (`crates/secantus-core/src/timelib`) the comparison is
+EXACT: values and the full error text, through `$toDate` and `$dateFromString`,
+plus `$dateFromString`'s `timezone` and `onError` cases (`TZ_CASES`).
 
     PROBE_MONGOD="mongodb://127.0.0.1:27095/?directConnection=true" \\
     PROBE_SERVER="mongodb://127.0.0.1:27096/?directConnection=true" \\
-        python tools/probes/date_string_parsing.py [--show]
+        python tools/probes/date_string_parsing.py
 """
 
 from __future__ import annotations
@@ -152,6 +152,61 @@ STRINGS = [
     "2024-01-01T23:59:60Z",
     "Wed 2024-01-01",
     "sat, 06 jan 2024",
+    "-0001-01-01",
+    "@-99999999999999",
+    "@99999999999999",
+    "9999-12-31",
+    "+10000-01-01",
+    "-100000-01-01",
+    "@-62167219200",
+    "@253402300800",
+    "@1700000000.5",
+    "tomorrow 2024-01-01",
+    "2024-01-01 +1 day",
+    "first monday of january 2024",
+    "last day of 2024-02",
+    "2024-01-31 +1 month",
+    "yesterday noon 2024-03-01",
+    "2024-01-01 next friday",
+    "2024-01-01 3 weekdays",
+    "10/Oct/2000:13:55:36 -0700",
+    "2024.032",
+    "2024-01-01T10:00:00.123456789Z",
+    "back of 7pm 2024-01-01",
+    "2024-01-01 12:00 (EST)",
+    "2024-01-01 12:00 GMT+2",
+]
+
+
+#: `$dateFromString` with a `timezone` argument (and `onError`), measured the
+#: same way: (dateString, timezone, onError or None).
+TZ_CASES = [
+    ("2024-01-01 10:00", "UTC", None),
+    ("2024-01-01 10:00", "GMT", None),
+    ("2024-01-01 10:00", "+00:00", None),
+    ("2024-01-01 10:00", "+02:00", None),
+    ("2024-01-01 10:00", "-0530", None),
+    ("2024-01-01 10:00", "Europe/Dublin", None),
+    ("2024-07-01 10:00", "Europe/Dublin", None),
+    ("2024-01-01 10:00 EST", "UTC", None),
+    ("2024-01-01 10:00 EST", "GMT", None),
+    ("2024-01-01 10:00 EST", "+00:00", None),
+    ("2024-01-01 10:00 EST", "+02:00", None),
+    ("2024-01-01 10:00 EST", "America/New_York", None),
+    ("2024-01-01 10:00 +05:00", "UTC", None),
+    ("2024-01-01 10:00 +05:00", "+02:00", None),
+    ("2024-01-01T10:00:00Z", "+02:00", None),
+    ("@1700000000", "+02:00", None),
+    ("abc", "+02:00", None),
+    ("abc", "Not/AZone", None),
+    ("2024-03-31 01:30", "Europe/Dublin", None),
+    ("2024-03-31 02:30", "Europe/London", None),
+    ("2024-10-27 01:30", "Europe/London", None),
+    ("2024-03-10 02:30", "America/New_York", None),
+    ("2024-11-03 01:30", "America/New_York", None),
+    ("abc", "UTC", "fallback"),
+    ("2024-01-01 10:00 EST", "+02:00", "fallback"),
+    ("x", None, "fallback"),
 ]
 
 
@@ -162,14 +217,34 @@ def measure(uri: str) -> list[tuple]:
     db.c.insert_one({"_id": 1})
     out = []
     for s in STRINGS:
-        cmd = {"aggregate": "c", "pipeline": [{"$project": {"r": {"$toDate": s}}}], "cursor": {}}
-        try:
-            r = db.command(cmd, codec_options=CO)["cursor"]["firstBatch"][0]["r"]
-            out.append(("OK", str(r)))
-        except pymongo.errors.OperationFailure as e:
-            out.append((e.code, e.details["errmsg"].split(":: caused by :: ")[-1]))
+        for expr in ({"$toDate": s}, {"$dateFromString": {"dateString": s}}):
+            out.append(run(db, expr))
+    for s, tz, on_error in TZ_CASES:
+        spec = {"dateString": s}
+        if tz is not None:
+            spec["timezone"] = tz
+        if on_error is not None:
+            spec["onError"] = on_error
+        out.append(run(db, {"$dateFromString": spec}))
     client.drop_database("date_parse_probe")
     client.close()
+    return out
+
+
+def run(db, expr) -> tuple:
+    cmd = {"aggregate": "c", "pipeline": [{"$project": {"r": expr}}], "cursor": {}}
+    try:
+        r = db.command(cmd, codec_options=CO)["cursor"]["firstBatch"][0]["r"]
+        return ("OK", str(r))
+    except pymongo.errors.OperationFailure as e:
+        return (e.code, e.details["errmsg"].split(":: caused by :: ")[-1])
+
+
+def labels() -> list[str]:
+    out = []
+    for s in STRINGS:
+        out += [f"$toDate {s!r}", f"$dateFromString {s!r}"]
+    out += [f"$dateFromString {s!r} tz={tz!r} onError={oe!r}" for s, tz, oe in TZ_CASES]
     return out
 
 
@@ -179,25 +254,16 @@ def main() -> int:
         return 2
     want, got = measure(MONGOD), measure(SERVER)
     # Self-check: the reference must read a 12-hour time as one.
-    pm = STRINGS.index("2024-01-01 10:00 PM")
+    pm = 2 * STRINGS.index("2024-01-01 10:00 PM")
     if want[pm] != ("OK", "2024-01-01 22:00:00"):
         print(f"SELF-CHECK FAILED: mongod read '10:00 PM' as {want[pm]}")
         return 2
-    bad = text = 0
-    for s, w, g in zip(STRINGS, want, got, strict=True):
-        if w == g:
-            continue
-        if w[0] != "OK" and g[0] != "OK" and w[0] == g[0]:
-            text += 1
-            if "--show" in sys.argv:
-                print(f"text  {s!r}\n   mongod {w[1]}\n   ours   {g[1]}")
-            continue
-        bad += 1
-        print(f"DIFF  {s!r}\n   mongod {w}\n   ours   {g}")
-    print(
-        f"=== date strings: {bad} of {len(STRINGS)} divergent "
-        f"({text} differ in error text only) ==="
-    )
+    bad = 0
+    for label, w, g in zip(labels(), want, got, strict=True):
+        if w != g:
+            bad += 1
+            print(f"DIFF  {label}\n   mongod {w}\n   ours   {g}")
+    print(f"=== date strings: {bad} of {len(want)} divergent (values AND error text) ===")
     return 1 if bad else 0
 
 
