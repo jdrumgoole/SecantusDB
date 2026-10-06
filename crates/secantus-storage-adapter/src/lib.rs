@@ -896,12 +896,9 @@ fn map_err(e: WtError) -> StorageError {
             ),
             exec: false,
         },
-        // Post-apply validator failure → mongod's DocumentValidationFailure (121).
-        WtError::DocumentValidationFailure => StorageError::WriteError {
-            code: 121,
-            errmsg: "Document failed validation".to_string(),
-            exec: false,
-        },
+        // Post-apply validator failure → mongod's DocumentValidationFailure
+        // (121), carrying the failing document for the `errInfo`.
+        WtError::DocumentValidationFailure(doc) => StorageError::ValidationFailure(doc),
         // An update that would change `_id` → mongod's ImmutableField (66).
         WtError::ImmutableField => StorageError::WriteError {
             code: 66,

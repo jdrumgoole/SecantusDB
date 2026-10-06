@@ -36,30 +36,20 @@ Clean on the Rust server: regex anchors, `$project: {_id: 1}`, negative
 write-concern `errInfo` and an unknown `w` tag. The detail is in backlog §7.00
 ("Rust server, re-measured 2026-10-06").
 
-## Phase 1 -- the Rust divergences phase 0 found (about a day)
+## Phase 1 -- the Rust divergences phase 0 found: DONE (2026-10-06)
 
-All on the wire, all small:
+`remaining_shapes.py` went from 25 of 58 to 3 of 72 (all known: two authorised
+last digits and a hash-ordered `w` tag set). Shipped:
+- the validation-failure prefix and `errInfo` on every update path;
+- validator parsing on `create` / `collMod`;
+- `writeConcern.w` parsing and its echo;
+- decimal `$log`.
 
-1. **`$jsonSchema` `type: "integer"`** -- refuse with 9 `$jsonSchema type
-   'integer' is not currently supported.`, at the top level and in
-   `properties`, on `create` / `collMod` / `find`.
-2. **A schema failure on update** -- send mongod's
-   `Plan executor error during update :: caused by :: Document failed
-   validation` with the `errInfo` tree. Insert already builds that tree; this
-   is wiring the same builder into the update path. Check `findAndModify` and
-   a replacement update too.
-3. **`maxTimeMS` on writes** -- prefix `Plan executor error during
-   findAndModify / update / delete :: caused by ::`.
-4. **Awaitable `hello`** -- a newer `topologyVersion` counter is 51764, not
-   31382.
-5. **`writeConcern.w` of the wrong type** -- 9 `w has to be a number, string,
-   or object; found: <type>`. Probe the other bad types (bool, double, null)
-   while there.
-6. **Decimal `$log` with a base** -- answer it. Use the same correctly rounded
-   decimal path as `$ln`, if it exists, or decline with a reason.
-
-**Exit:** `remaining_shapes.py` at 1 of 38 (the authorised `$sin` digit),
-`max_time_expiry.py` 0 of 11, `awaitable_hello.py` 0 of 33.
+**Two items came off the list unbuilt:** awaitable `hello` and `maxTimeMS`.
+Phase 0 measured them against a STANDALONE mongod; against a replica set,
+which is what the Rust server presents, both are 0. The probe that found the
+extra write-path and `w` shapes was widened in the same slice; see backlog
+§7.00.
 
 ## Phase 2 -- folded into Phase 1
 
@@ -67,16 +57,24 @@ All on the wire, all small:
 missing tree builder this plan assumed. The regex, `$project` and positional
 items were Python-server entries.
 
-## Phase 3 -- gauge residue
+## Phase 3 -- gauge residue: DONE (2026-10-06)
 
-- The "three server-side defects" from the 2026-09-28 Rust gauge sweep: re-run
-  the Java and Node gauges with `--server rust` and re-triage. One of the three
-  was already re-diagnosed as not a `$geoIntersects` bug.
-- The Go gauge's 7 remaining failures (backlog triage, 2026-09-30).
-- `failCommand` labels and code names: measure against mongod with the
-  failpoint enabled (`--setParameter enableTestCommands=1`).
-
-Gauges run in a sub-agent and report counts only (CLAUDE.md, "Tooling").
+Re-reading the gauge entries before running anything:
+- **Go:** the one undiagnosed failure, `heartbeats_processed_more_frequently`,
+  was fixed on the Rust server on 2026-09-30. The other six need `$where`, a
+  `mongocryptd` binary, or a second replica-set member, all out of scope here.
+- **C:** the two `ipv6` failures hard-code `[::1]:27017` (inherent).
+- **The "sort by the 2dsphere-indexed field" divergence** from the Java
+  gauge's investigation was real and is FIXED. It was a document comparator
+  that compared field names before value types, not anything geo. 14 of 28 on
+  the Java fixture before, and only the unordered `$geoIntersects` result (no
+  order guaranteed) after. `nested_value_sort.py` 4 of 24 -> 0.
+- **The Java gauge's three stable failures are gone.** A full run against the
+  Rust binary built from this branch (tree `f945d296`), with the `--auth`
+  two-phase spawn and one shared daemon, gave 496 / 0 / 404 of 900, with every
+  test reporting a result. Both geo classes passed inside it. The committed
+  2026-09-30 report already shows 0, so they were fixed between 2026-09-28
+  and 2026-09-30.
 
 ## Phase 4 -- the embedded server (`secantus_mdb::Server`)
 

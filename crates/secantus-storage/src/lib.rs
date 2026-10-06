@@ -1759,8 +1759,9 @@ pub enum StorageError {
     /// offending size; surfaces as mongod's `BSONObjectTooLarge` (10334).
     DocumentTooLarge(usize),
     /// The post-apply document failed the collection `validator`. Surfaces as
-    /// mongod's `DocumentValidationFailure` (121).
-    DocumentValidationFailure,
+    /// mongod's `DocumentValidationFailure` (121). Carries the document that
+    /// failed, from which the command layer builds mongod's `errInfo`.
+    DocumentValidationFailure(Box<Document>),
     /// An update would modify the immutable `_id` field. Surfaces as mongod's
     /// `ImmutableField` (66).
     ImmutableField,
@@ -1836,7 +1837,7 @@ impl std::fmt::Display for StorageError {
                 f,
                 "object to insert too large. size in bytes: {size}, max size: {MAX_BSON_OBJECT_SIZE}"
             ),
-            StorageError::DocumentValidationFailure => write!(f, "Document failed validation"),
+            StorageError::DocumentValidationFailure(_) => write!(f, "Document failed validation"),
         }
     }
 }
@@ -13385,7 +13386,7 @@ impl Storage {
                 let was_already_invalid = validator_moderate
                     && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
                 if !new_ok && !was_already_invalid {
-                    stopped = Some(StorageError::DocumentValidationFailure);
+                    stopped = Some(StorageError::DocumentValidationFailure(Box::new(new)));
                     break;
                 }
             }
@@ -13542,7 +13543,7 @@ impl Storage {
                             let was_already_invalid = validator_moderate
                                 && !query_matches(&doc, v, &Document::new(), None).unwrap_or(true);
                             if !new_ok && !was_already_invalid {
-                                return Err(StorageError::DocumentValidationFailure);
+                                return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                             }
                         }
                         if let Some(c) =
@@ -13672,7 +13673,7 @@ impl Storage {
                     // Validator on an upsert-inserted document, too.
                     if let Some(v) = validator {
                         if !query_matches(&new, v, &Document::new(), None).unwrap_or(true) {
-                            return Err(StorageError::DocumentValidationFailure);
+                            return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                         }
                     }
                     let id = new.get("_id").cloned().unwrap();
