@@ -1,6 +1,6 @@
 [package]
 name = "secantus-mdb"
-version = "0.5.3-beta.170"
+version = "0.5.3-beta.171"
 edition = "2021"
 description = "A surrogate MongoDB server for tests: the real wire protocol over WiredTiger, single-node. Embed it (secantus_mdb::Server) or run the secantusd-rs binary."
 license = "GPL-2.0-only"
@@ -47,10 +47,10 @@ required-features = ["bin"]
 [dependencies]
 bson = "2"
 ctrlc = { version = "3", features = ["termination"], optional = true }
-secantus-storage = { version = "=0.5.3-beta.170", path = "../secantus-storage" }
-secantus-storage-adapter = { version = "=0.5.3-beta.170", path = "../secantus-storage-adapter" }
-secantus-commands = { version = "=0.5.3-beta.170", path = "../secantus-commands" }
-secantus-server = { version = "=0.5.3-beta.170", path = "../secantus-server" }
+secantus-storage = { version = "=0.5.3-beta.171", path = "../secantus-storage" }
+secantus-storage-adapter = { version = "=0.5.3-beta.171", path = "../secantus-storage-adapter" }
+secantus-commands = { version = "=0.5.3-beta.171", path = "../secantus-commands" }
+secantus-server = { version = "=0.5.3-beta.171", path = "../secantus-server" }
 # --log-level: init a logger to the resolved level before storage opens.
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
