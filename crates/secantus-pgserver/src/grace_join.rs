@@ -64,6 +64,23 @@ impl Spool {
         Ok(())
     }
 
+    /// Read the rows back from the start, keeping the spool to read again
+    /// (nothing is written after the first read).
+    pub(crate) fn reread(&mut self) -> PgWireResult<SpoolReader> {
+        let Some(w) = self.w.as_mut() else {
+            return Ok(SpoolReader { r: None });
+        };
+        w.flush().map_err(|e| spill_err(e.to_string()))?;
+        let mut f = w
+            .get_ref()
+            .try_clone()
+            .map_err(|e| spill_err(e.to_string()))?;
+        f.rewind().map_err(|e| spill_err(e.to_string()))?;
+        Ok(SpoolReader {
+            r: Some(BufReader::with_capacity(64 << 10, f)),
+        })
+    }
+
     /// Read the rows back, in the order written.
     pub(crate) fn reader(self) -> PgWireResult<SpoolReader> {
         let r = match self.w {
@@ -109,6 +126,112 @@ impl SpoolReader {
                 Some(d) => out.push(d),
                 None => break,
             }
+        }
+        Ok(out)
+    }
+}
+
+/// `(left number, right number, offset, length)`; a NULL number sorts last.
+type IndexEntry = (i64, i64, u64, u32);
+
+fn seq_key(d: &Document, f: &str) -> i64 {
+    match d.get(f) {
+        Some(Bson::Int64(n)) => *n,
+        _ => i64::MAX,
+    }
+}
+
+fn ops_budget(right: &GraceRight) -> usize {
+    right.budget
+}
+
+/// Joined rows spooled in arrival order, read back in `(LSEQ, RSEQ)` order.
+#[derive(Default)]
+struct OrderSpool {
+    w: Option<BufWriter<std::fs::File>>,
+    at: u64,
+    index: Vec<IndexEntry>,
+}
+
+impl OrderSpool {
+    fn push(&mut self, d: &Document) -> PgWireResult<()> {
+        let bytes = bson::to_vec(d).map_err(|e| spill_err(e.to_string()))?;
+        let len = u32::try_from(bytes.len()).map_err(|_| spill_err("a row is too large"))?;
+        if self.w.is_none() {
+            let f = tempfile::tempfile().map_err(|e| spill_err(e.to_string()))?;
+            self.w = Some(BufWriter::with_capacity(64 << 10, f));
+        }
+        let w = self.w.as_mut().expect("created above");
+        w.write_all(&bytes).map_err(|e| spill_err(e.to_string()))?;
+        self.index
+            .push((seq_key(d, LSEQ), seq_key(d, RSEQ), self.at, len));
+        self.at += u64::from(len);
+        Ok(())
+    }
+
+    /// Every row so far, in arrival order (for the external sort).
+    fn drain(&mut self) -> PgWireResult<Vec<Document>> {
+        let index = std::mem::take(&mut self.index);
+        let Some(w) = self.w.take() else {
+            return Ok(Vec::new());
+        };
+        let mut r = OrderedRows::open(w, index)?;
+        let out = r.next_batch(usize::MAX)?;
+        self.at = 0;
+        Ok(out)
+    }
+
+    fn into_sorted(mut self) -> PgWireResult<OrderedRows> {
+        self.index.sort_by_key(|e| (e.0, e.1));
+        match self.w.take() {
+            Some(w) => OrderedRows::open(w, self.index),
+            None => Ok(OrderedRows {
+                f: None,
+                index: Vec::new(),
+                next: 0,
+                pos: 0,
+            }),
+        }
+    }
+}
+
+struct OrderedRows {
+    f: Option<BufReader<std::fs::File>>,
+    index: Vec<IndexEntry>,
+    next: usize,
+    /// Where the reader stands, to skip a seek for a row that follows.
+    pos: u64,
+}
+
+impl OrderedRows {
+    fn open(w: BufWriter<std::fs::File>, index: Vec<IndexEntry>) -> PgWireResult<Self> {
+        let mut f = w.into_inner().map_err(|e| spill_err(e.to_string()))?;
+        f.rewind().map_err(|e| spill_err(e.to_string()))?;
+        Ok(OrderedRows {
+            f: Some(BufReader::with_capacity(64 << 10, f)),
+            index,
+            next: 0,
+            pos: 0,
+        })
+    }
+
+    fn next_batch(&mut self, n: usize) -> PgWireResult<Vec<Document>> {
+        let mut out = Vec::new();
+        let Some(f) = self.f.as_mut() else {
+            return Ok(out);
+        };
+        while out.len() < n && self.next < self.index.len() {
+            let (_, _, at, len) = self.index[self.next];
+            self.next += 1;
+            if at != self.pos {
+                f.seek(std::io::SeekFrom::Start(at))
+                    .map_err(|e| spill_err(e.to_string()))?;
+            }
+            let mut buf = vec![0u8; len as usize];
+            f.read_exact(&mut buf)
+                .map_err(|e| spill_err(e.to_string()))?;
+            self.pos = at + u64::from(len);
+            out.push(decode_doc(&buf).map_err(|e| spill_err(e.to_string()))?);
         }
         Ok(out)
     }
@@ -235,12 +358,32 @@ impl PgHandler {
             nulls: Nulls::Last,
             expr: None,
         });
+        // The joined rows go to a spool, each indexed by its two numbers
+        // and its place in the file; the index alone is sorted, and the rows
+        // read back in its order (batch 67: an external sort wrote and
+        // merged the whole rows again). Past `budget` of index the rows
+        // move to the external sort after all.
         let mut out = crate::external_sort::RunBuilder::new(&order, None, BATCH);
+        let mut ordered = OrderSpool::default();
+        let index_cap = (ops_budget(&right) / std::mem::size_of::<IndexEntry>()).max(1 << 16);
+        let mut sorting = false;
         let mut push_out = |docs: Vec<Document>| -> PgWireResult<bool> {
+            if !sorting && ordered.index.len() + docs.len() > index_cap {
+                sorting = true;
+                for d in ordered.drain()? {
+                    let n = stream_join::doc_bytes(&d);
+                    out.push(d, n)
+                        .map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;
+                }
+            }
             for d in docs {
-                let n = stream_join::doc_bytes(&d);
-                out.push(d, n)
-                    .map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;
+                if sorting {
+                    let n = stream_join::doc_bytes(&d);
+                    out.push(d, n)
+                        .map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;
+                } else {
+                    ordered.push(&d)?;
+                }
             }
             Ok(true)
         };
@@ -336,6 +479,23 @@ impl PgHandler {
             }
         }
         drop(push_out);
+        if !sorting {
+            let mut rows = ordered.into_sorted()?;
+            loop {
+                self.check_cancel()?;
+                let mut docs = rows.next_batch(BATCH)?;
+                if docs.is_empty() {
+                    return Ok(());
+                }
+                for d in docs.iter_mut() {
+                    d.remove(LSEQ);
+                    d.remove(RSEQ);
+                }
+                if !sink(docs)? {
+                    return Ok(());
+                }
+            }
+        }
         let mut sorted = out
             .finish(0, None, None)
             .map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;
@@ -382,21 +542,20 @@ impl PgHandler {
             return Ok(());
         }
         if right.bytes > budget && right.rows > 1 && depth < MAX_DEPTH {
-            let split = |spool: Spool,
-                         key: &dyn Fn(&Document) -> KeyClass|
-             -> PgWireResult<Vec<Spool>> {
-                let mut parts: Vec<Spool> = (0..PARTITIONS).map(|_| Spool::default()).collect();
-                let mut r = spool.reader()?;
-                while let Some(d) = r.next_row()? {
-                    // Every row here has a key (see `GraceRight::add`).
-                    let k = match key(&d) {
-                        KeyClass::Key(k) => k,
-                        _ => Vec::new(),
-                    };
-                    parts[partition_of(&k, depth + 1)].push(&d)?;
-                }
-                Ok(parts)
-            };
+            let split =
+                |spool: Spool, key: &dyn Fn(&Document) -> KeyClass| -> PgWireResult<Vec<Spool>> {
+                    let mut parts: Vec<Spool> = (0..PARTITIONS).map(|_| Spool::default()).collect();
+                    let mut r = spool.reader()?;
+                    while let Some(d) = r.next_row()? {
+                        // Every row here has a key (see `GraceRight::add`).
+                        let k = match key(&d) {
+                            KeyClass::Key(k) => k,
+                            _ => Vec::new(),
+                        };
+                        parts[partition_of(&k, depth + 1)].push(&d)?;
+                    }
+                    Ok(parts)
+                };
             let rows = right.rows;
             let rparts = split(right, ops.right_key)?;
             let lparts = split(left, ops.left_key)?;
@@ -440,25 +599,30 @@ impl PgHandler {
             }
             Ok(())
         };
-        (ops.join)(rrows, &mut feed, &mut |docs| {
-            let mut kept = Vec::with_capacity(docs.len());
-            for d in docs {
-                let l = match d.get(LSEQ) {
-                    Some(Bson::Int64(n)) if every_seqs.contains(n) => Some(*n),
-                    _ => None,
-                };
-                match (l, d.get(RSEQ)) {
-                    // An `every` row NULL-extended here may match in another
-                    // partition: decided after all of them.
-                    (Some(_), None | Some(Bson::Null)) => continue,
-                    (Some(n), _) => {
-                        every_matched.insert(n);
+        (ops.join)(
+            rrows,
+            &mut feed,
+            &mut |docs| {
+                let mut kept = Vec::with_capacity(docs.len());
+                for d in docs {
+                    let l = match d.get(LSEQ) {
+                        Some(Bson::Int64(n)) if every_seqs.contains(n) => Some(*n),
+                        _ => None,
+                    };
+                    match (l, d.get(RSEQ)) {
+                        // An `every` row NULL-extended here may match in another
+                        // partition: decided after all of them.
+                        (Some(_), None | Some(Bson::Null)) => continue,
+                        (Some(n), _) => {
+                            every_matched.insert(n);
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    kept.push(d);
                 }
-                kept.push(d);
-            }
-            out(kept)
-        }, false)
+                out(kept)
+            },
+            false,
+        )
     }
 }

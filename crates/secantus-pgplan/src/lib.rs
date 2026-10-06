@@ -15151,7 +15151,7 @@ fn rewrite_dml_from(
     // A grouped SELECT with subqueries over its groups is split so they run
     // over the grouped rows (see `agg_hoist`).
     if let Some(N::SelectStmt(sel)) = node.node.as_mut() {
-        if let Some(split) = agg_hoist::split(sel)? {
+        if let Some(split) = agg_hoist::split(sel, lookup)? {
             **sel = split;
         }
     }
@@ -15436,6 +15436,12 @@ fn resolve_sublinks_in_select(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
+    // An aggregate a subquery holds for THIS level (PostgreSQL's
+    // agglevelsup) is hoisted before the subqueries are resolved: resolving
+    // one first would make it a per-row call over the outer value.
+    if let Some(split) = agg_hoist::split_for_outer_aggregates(s, lookup)? {
+        *s = split;
+    }
     // The scoped body pushes this statement's CTEs once their own bodies are
     // resolved; whatever it pushed is popped here, on every exit.
     let depth = VISIBLE_CTES.with(|v| v.borrow().len());
@@ -15451,7 +15457,9 @@ fn resolve_sublinks_in_select(
         o.extend(visible);
         d
     });
+    let from_depth = correlated::push_outer_from(&s.from_clause);
     let out = resolve_sublinks_in_select_scoped(s, lookup, params, run);
+    correlated::pop_outer_from(from_depth);
     OUTER_RELATIONS.with(|o| o.borrow_mut().truncate(outer_depth));
     VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
     out
@@ -17803,6 +17811,28 @@ fn plan_select(
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
+    // A subquery's aggregate over only this level's columns is this level's
+    // (PostgreSQL's agglevelsup), at every level, not just the statement's.
+    if let Some(rewritten) = agg_hoist::split_for_outer_aggregates(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // A window over no FROM (`select max(1) over ()`, or a subquery's
+    // `max(s.x) over ()` over an outer value) is a window over one row.
+    if s.from_clause.is_empty() && (has_window(s) || !s.window_clause.is_empty()) {
+        let mut one = s.clone();
+        let parsed = pg_query::parse("select from (select 1 as \"\u{1f}one\") \"\u{1f}one\"")
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        if let Some(N::SelectStmt(f)) = parsed
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|st| st.stmt.as_ref())
+            .and_then(|st| st.node.as_ref())
+        {
+            one.from_clause = f.from_clause.clone();
+            return plan_select(&one, lookup, params);
+        }
+    }
     enum_order::check_collate_operands(s, lookup)?;
     check_distinct_order(s)?;
     check_distinct_on_order(s)?;
@@ -17925,7 +17955,7 @@ fn plan_select(
             if (!s.group_clause.is_empty() || has_aggregate(s))
                 && !IN_GROUP_SPLIT.with(std::cell::Cell::get) =>
         {
-            match agg_hoist::split_expressions(s)? {
+            match agg_hoist::split_expressions(s, lookup)? {
                 Some(rewritten) => {
                     IN_GROUP_SPLIT.with(|f| f.set(true));
                     let out = plan_select(&rewritten, lookup, params);

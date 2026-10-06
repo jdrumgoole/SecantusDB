@@ -260,3 +260,48 @@ fn user_txn_statement_conflict_surfaces_write_conflict() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A transaction's rows stop counting as held only once its commit is
+/// VISIBLE (batch 67). A FOR SHARE waiter retries when the holder's row set
+/// empties and reads the row afresh: emptied before WiredTiger's commit
+/// call, that read saw the row as it was before the update -- a stale read
+/// after a lock wait. An observer spins on the row set and, the moment it
+/// is empty, reads the row: it must see the committed increment.
+#[test]
+fn held_rows_empty_only_after_commit_is_visible() {
+    let home = temp_home();
+    let st = Arc::new(Storage::open(home.to_str().unwrap()).unwrap());
+    st.insert_one("app", "c", &enc(&doc! {"_id": 1, "n": 0}))
+        .unwrap();
+    for round in 1..=5000 {
+        let mut handle = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut handle, || inc_by_one(&st, "app", "c", 1))
+            .unwrap();
+        let held = handle.held_rows();
+        assert!(!held.lock().unwrap().rows.is_empty());
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = {
+            let st = Arc::clone(&st);
+            let ready = Arc::clone(&ready);
+            thread::spawn(move || {
+                ready.store(true, Ordering::SeqCst);
+                while !held.lock().unwrap().rows.is_empty() {
+                    std::hint::spin_loop();
+                }
+                let blob = st.find_by_id("app", "c", &Bson::Int32(1)).unwrap().unwrap();
+                decode(&blob).get_i32("n").unwrap()
+            })
+        };
+        while !ready.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        st.commit_user_transaction(&mut handle).unwrap();
+        let seen = observer.join().unwrap();
+        assert_eq!(
+            seen, round,
+            "round {round}: the row set emptied before the commit was visible"
+        );
+    }
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

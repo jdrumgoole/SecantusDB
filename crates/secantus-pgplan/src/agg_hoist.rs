@@ -22,7 +22,14 @@
 
 use super::*;
 
-struct Slots {
+struct Slots<'a> {
+    /// The level being split.
+    ours: Level,
+    /// The FROM subquery's alias, unique against every name the statement
+    /// already uses: a split nested inside another's subquery must not
+    /// shadow the outer one's slots.
+    alias: String,
+    lookup: &'a dyn Fn(&str) -> Option<TableDef>,
     /// `(print of the grouped expression, its bare column name if any, slot)`.
     groups: Vec<(String, Option<String>, String)>,
     /// `(print of the aggregate call, slot)`.
@@ -36,10 +43,10 @@ struct Slots {
 /// A slot as the outer query (or any subquery, at any depth) reads it:
 /// qualified by the FROM subquery's alias, so a nested subquery finds it as
 /// an outer reference the same way it finds `d.id`.
-fn slot_ref(slot: &str) -> pg_query::protobuf::Node {
+fn slot_ref(alias: &str, slot: &str) -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-            fields: vec![string_node("__grp"), string_node(slot)],
+            fields: vec![string_node(alias), string_node(slot)],
             location: -1,
         })),
     }
@@ -53,6 +60,23 @@ fn target(name: &str, val: pg_query::protobuf::Node) -> pg_query::protobuf::Node
             location: -1,
             ..Default::default()
         }))),
+    }
+}
+
+/// `__grp`, or `__grp2`, `__grp3`, ... when the statement already has it.
+fn fresh_alias(s: &pg_query::protobuf::SelectStmt) -> String {
+    let printed = format!("{s:?}");
+    let mut k = 1;
+    loop {
+        let name = if k == 1 {
+            "__grp".to_string()
+        } else {
+            format!("__grp{k}")
+        };
+        if !printed.contains(&format!("\"{name}\"")) {
+            return name;
+        }
+        k += 1;
     }
 }
 
@@ -88,34 +112,189 @@ fn from_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     out
 }
 
-/// Does `f`'s argument list read only columns qualified by something the
-/// enclosing subquery does not define (so the aggregate is the OUTER one)?
-fn reads_only_outer(f: &pg_query::protobuf::FuncCall, inner_names: &[String]) -> bool {
-    let mut any = false;
-    let mut all_outer = true;
-    for a in &f.args {
-        let mut a = a.clone();
-        let _ = walk_expr(&mut a, &mut |x| {
-            if let Some(N::ColumnRef(c)) = x.node.as_ref() {
-                any = true;
-                let parts: Vec<String> = c
-                    .fields
-                    .iter()
-                    .filter_map(|p| match p.node.as_ref() {
-                        Some(N::String(s)) => Some(s.sval.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                let outer = parts.len() >= 2 && !inner_names.contains(&parts[parts.len() - 2]);
-                all_outer &= outer;
-            }
-            Ok(())
-        });
-    }
-    any && all_outer
+/// What one query level's FROM exposes: its relation names and aliases,
+/// and every column name when every FROM item's columns are known.
+#[derive(Clone)]
+pub(crate) struct Level {
+    names: Vec<String>,
+    cols: Option<Vec<String>>,
 }
 
-impl Slots {
+impl Level {
+    pub(crate) fn of(
+        s: &pg_query::protobuf::SelectStmt,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> Level {
+        let mut cols = Some(Vec::new());
+        for item in &s.from_clause {
+            from_item_cols(item, lookup, &mut cols);
+        }
+        Level {
+            names: from_names(s),
+            cols,
+        }
+    }
+
+    /// `None` when the level's columns are not all known.
+    fn has_col(&self, c: &str) -> Option<bool> {
+        self.cols.as_ref().map(|v| v.iter().any(|x| x == c))
+    }
+}
+
+fn from_item_cols(
+    item: &pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    cols: &mut Option<Vec<String>>,
+) {
+    if cols.is_none() {
+        return;
+    }
+    let mut unknown = false;
+    let mut found: Vec<String> = Vec::new();
+    match item.node.as_ref() {
+        Some(N::RangeVar(r)) => match lookup(&relation_name(r)) {
+            Some(def) => found.extend(def.columns.iter().map(|c| c.name.clone())),
+            None => unknown = true,
+        },
+        Some(N::RangeSubselect(rs)) => {
+            let renamed: Vec<String> = rs
+                .alias
+                .as_ref()
+                .map(|a| {
+                    a.colnames
+                        .iter()
+                        .filter_map(|c| match c.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            match rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                Some(N::SelectStmt(b))
+                    if b.op == pg_query::protobuf::SetOperation::SetopNone as i32
+                        && !b.target_list.is_empty() =>
+                {
+                    for (i, t) in b.target_list.iter().enumerate() {
+                        if let Some(n) = renamed.get(i) {
+                            found.push(n.clone());
+                            continue;
+                        }
+                        match t.node.as_ref() {
+                            Some(N::ResTarget(rt)) if !rt.name.is_empty() => {
+                                found.push(rt.name.clone())
+                            }
+                            Some(N::ResTarget(rt)) => match rt.val.as_deref() {
+                                Some(v) => {
+                                    let star = matches!(v.node.as_ref(),
+                                        Some(N::ColumnRef(c)) if c.fields.iter().any(|f|
+                                            matches!(f.node.as_ref(), Some(N::AStar(_)))));
+                                    if star {
+                                        unknown = true;
+                                    } else {
+                                        found.push(expression_column_name(v));
+                                    }
+                                }
+                                None => unknown = true,
+                            },
+                            _ => unknown = true,
+                        }
+                    }
+                }
+                _ => unknown = true,
+            }
+        }
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                from_item_cols(side, lookup, cols);
+            }
+            return;
+        }
+        _ => unknown = true,
+    }
+    if unknown {
+        *cols = None;
+    } else if let Some(c) = cols.as_mut() {
+        c.extend(found);
+    }
+}
+
+/// Where a column reference made inside a subquery resolves, relative to
+/// the query level `ours` whose aggregates are being decided.
+#[derive(PartialEq)]
+enum At {
+    /// A subquery between (or at) the reference and `ours`.
+    Inner,
+    Ours,
+    /// A level above `ours`: a constant to it.
+    Higher,
+}
+
+fn ref_parts(c: &pg_query::protobuf::ColumnRef) -> Vec<String> {
+    c.fields
+        .iter()
+        .filter_map(|p| match p.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ref_level(c: &pg_query::protobuf::ColumnRef, stack: &[Level], ours: &Level) -> At {
+    if stack.is_empty() {
+        return At::Ours;
+    }
+    let parts = ref_parts(c);
+    if parts.len() >= 2 {
+        let q = &parts[parts.len() - 2];
+        if stack.iter().any(|l| l.names.contains(q)) {
+            At::Inner
+        } else if ours.names.contains(q) {
+            At::Ours
+        } else {
+            At::Higher
+        }
+    } else {
+        let Some(col) = parts.last() else {
+            return At::Inner;
+        };
+        if c.fields.len() != 1 || stack.iter().any(|l| l.has_col(col) != Some(false)) {
+            At::Inner
+        } else if ours.has_col(col) != Some(false) {
+            At::Ours
+        } else {
+            At::Higher
+        }
+    }
+}
+
+/// PostgreSQL's rule: an aggregate belongs to the LOWEST query level whose
+/// variables it reads (`agglevelsup`). So inside a subquery, `max(s.x)`
+/// over only the outer `s` is the outer query's aggregate; `count(*)`, and
+/// anything reading the subquery's own columns, stays the subquery's.
+fn agg_is_ours(n: &pg_query::protobuf::Node, stack: &[Level], ours: &Level) -> bool {
+    if stack.is_empty() {
+        return true;
+    }
+    let mut inner = false;
+    let mut mine = false;
+    let mut n = n.clone();
+    let _ = walk_expr(&mut n, &mut |x| {
+        match x.node.as_ref() {
+            Some(N::SubLink(_)) => inner = true,
+            Some(N::ColumnRef(c)) => match ref_level(c, stack, ours) {
+                At::Inner => inner = true,
+                At::Ours => mine = true,
+                At::Higher => {}
+            },
+            _ => {}
+        }
+        Ok(())
+    });
+    mine && !inner
+}
+
+impl Slots<'_> {
     fn agg_slot(&mut self, call: &pg_query::protobuf::Node) -> String {
         let print = node_print(call);
         if let Some((_, s)) = self.aggs.iter().find(|(p, _)| *p == print) {
@@ -144,44 +323,38 @@ impl Slots {
     }
 
     /// Rewrite an outer expression: aggregates and grouped columns to slots.
-    /// `inner` is `Some(names)` inside a subquery (whose own aggregates and
-    /// columns stay put unless they read only the outer query).
-    fn rewrite(&mut self, n: &mut pg_query::protobuf::Node, inner: Option<&[String]>) {
+    /// `stack` holds the subquery levels between `n` and the level being
+    /// split, innermost last (empty at that level itself), whose own
+    /// aggregates and columns stay put.
+    fn rewrite(&mut self, n: &mut pg_query::protobuf::Node, stack: &[Level]) {
         // A grouped EXPRESSION (`GROUP BY n % 2`) written again in the
         // outer query is its slot, wherever it sits (`(n % 2)::text`).
-        if inner.is_none()
+        if stack.is_empty()
             && !matches!(
                 n.node.as_ref(),
                 Some(N::ColumnRef(_)) | Some(N::AConst(_)) | None
             )
         {
             if let Some(slot) = self.group_slot(n) {
-                *n = slot_ref(&slot);
+                *n = slot_ref(&self.alias, &slot);
                 return;
             }
         }
         match n.node.as_mut() {
             Some(N::FuncCall(f)) if is_aggregate_call(f) && f.over.is_none() => {
-                let hoist = match inner {
-                    None => true,
-                    Some(names) => reads_only_outer(f, names),
-                };
-                if hoist {
+                if agg_is_ours(n, stack, &self.ours) {
                     let slot = self.agg_slot(n);
-                    *n = slot_ref(&slot);
+                    *n = slot_ref(&self.alias, &slot);
                     return;
                 }
             }
             Some(N::ColumnRef(c)) => {
                 let c = c.clone();
-                let qualified_outer = inner.is_some_and(|names| {
-                    c.fields.len() >= 2
-                        && matches!(c.fields[c.fields.len() - 2].node.as_ref(),
-                            Some(N::String(q)) if !names.contains(&q.sval))
-                });
-                if inner.is_none() || qualified_outer {
+                let qualified_outer =
+                    !stack.is_empty() && ref_level(&c, stack, &self.ours) == At::Ours;
+                if stack.is_empty() || qualified_outer {
                     match self.group_slot(n) {
-                        Some(slot) => *n = slot_ref(&slot),
+                        Some(slot) => *n = slot_ref(&self.alias, &slot),
                         None if qualified_outer && self.ungrouped.is_none() => {
                             let parts: Vec<String> = c
                                 .fields
@@ -202,11 +375,12 @@ impl Slots {
                 if let Some(N::SelectStmt(body)) =
                     sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
                 {
-                    let names = from_names(body);
-                    self.rewrite_select(body, &names);
+                    let mut deeper = stack.to_vec();
+                    deeper.push(Level::of(body, self.lookup));
+                    self.rewrite_select(body, &deeper);
                 }
                 if let Some(t) = sl.testexpr.as_deref_mut() {
-                    self.rewrite(t, inner);
+                    self.rewrite(t, stack);
                 }
                 return;
             }
@@ -254,19 +428,22 @@ impl Slots {
             _ => {}
         }
         for c in children {
-            self.rewrite(c, inner);
+            self.rewrite(c, stack);
         }
     }
 
-    fn rewrite_select(&mut self, s: &mut pg_query::protobuf::SelectStmt, names: &[String]) {
+    fn rewrite_select(&mut self, s: &mut pg_query::protobuf::SelectStmt, stack: &[Level]) {
         for t in &mut s.target_list {
-            self.rewrite(t, Some(names));
+            self.rewrite(t, stack);
         }
         if let Some(w) = s.where_clause.as_deref_mut() {
-            self.rewrite(w, Some(names));
+            self.rewrite(w, stack);
         }
         if let Some(h) = s.having_clause.as_deref_mut() {
-            self.rewrite(h, Some(names));
+            self.rewrite(h, stack);
+        }
+        for o in &mut s.sort_clause {
+            self.rewrite(o, stack);
         }
     }
 }
@@ -276,16 +453,179 @@ impl Slots {
 /// split: DISTINCT, windows, grouping sets, set operations).
 pub(crate) fn split(
     s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
-    let Some(out) = split_inner(s) else {
+    check_misplaced_outer_aggregates(s, lookup)?;
+    let Some(out) = split_inner_with(s, false, lookup) else {
         return Ok(None);
     };
     match out {
         (_, Some(col)) => Err(Error::Grouping(format!(
             "subquery uses ungrouped column \"{col}\" from outer query"
         ))),
-        (stmt, None) => Ok(Some(stmt)),
+        (stmt, None) => {
+            if !s.group_clause.is_empty() || has_aggregate(s) {
+                Ok(Some(stmt))
+            } else {
+                // Grouped only by an aggregate a subquery holds for it: an
+                // outer column read outside one is 42803 as for any other
+                // aggregate query.
+                check_stray(s, &stmt, Some(&Level::of(s, lookup)))?;
+                Ok(Some(stmt))
+            }
+        }
     }
+}
+
+/// `split` where a subquery holds an aggregate for `s` (or misplaces one):
+/// for a query below the statement, which is otherwise planned as it is --
+/// re-splitting a split's own inner query (an aggregate over a subquery,
+/// `sum((select ...))`) would never end.
+pub(crate) fn split_for_outer_aggregates(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    check_misplaced_outer_aggregates(s, lookup)?;
+    let holds = s
+        .target_list
+        .iter()
+        .chain(s.having_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .any(|n| outer_level_aggregates(s, lookup, n).is_some());
+    if !holds {
+        return Ok(None);
+    }
+    split(s, lookup)
+}
+
+/// The aggregates a subquery in `n` holds for the level `s` -- PostgreSQL's
+/// outer-level aggregates (see `agg_is_ours`).
+fn outer_level_aggregates(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    n: &pg_query::protobuf::Node,
+) -> Option<i32> {
+    if !contains_sublink(n) {
+        return None;
+    }
+    let mut slots = Slots {
+        ours: Level::of(s, lookup),
+        alias: fresh_alias(s),
+        lookup,
+        groups: Vec::new(),
+        aggs: Vec::new(),
+        inner_targets: Vec::new(),
+        ungrouped: None,
+    };
+    // Only the subqueries: an aggregate written directly at this level is
+    // the level's own business (and checked where the level is planned).
+    let mut n = n.clone();
+    let mut bodies: Vec<pg_query::protobuf::Node> = Vec::new();
+    let _ = walk_expr(&mut n, &mut |x| {
+        if matches!(x.node.as_ref(), Some(N::SubLink(_))) {
+            bodies.push(x.clone());
+        }
+        Ok(())
+    });
+    for mut b in bodies {
+        slots.rewrite(&mut b, &[]);
+    }
+    slots.inner_targets.first().map(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::FuncCall(f)) => f.location,
+            _ => -1,
+        },
+        _ => -1,
+    })
+}
+
+/// An outer-level aggregate inside a subquery in WHERE, a JOIN condition or
+/// GROUP BY is misplaced exactly as one written there directly (42803).
+fn check_misplaced_outer_aggregates(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    let fail = |at: i32, what: &str| -> Result<()> {
+        if at >= 0 {
+            set_error_location(at);
+        }
+        Err(Error::Grouping(format!(
+            "aggregate functions are not allowed in {what}"
+        )))
+    };
+    if let Some(w) = s.where_clause.as_deref() {
+        if let Some(at) = outer_level_aggregates(s, lookup, w) {
+            return fail(at, "WHERE");
+        }
+    }
+    fn quals(n: &pg_query::protobuf::Node, out: &mut Vec<pg_query::protobuf::Node>) {
+        if let Some(N::JoinExpr(j)) = n.node.as_ref() {
+            out.extend(j.quals.as_deref().cloned());
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                quals(side, out);
+            }
+        }
+    }
+    let mut on = Vec::new();
+    for f in &s.from_clause {
+        quals(f, &mut on);
+    }
+    for q in &on {
+        if let Some(at) = outer_level_aggregates(s, lookup, q) {
+            return fail(at, "JOIN conditions");
+        }
+    }
+    for g in &s.group_clause {
+        if let Some(at) = outer_level_aggregates(s, lookup, g) {
+            return fail(at, "GROUP BY");
+        }
+    }
+    // A LATERAL subquery's aggregate over only its left siblings belongs
+    // to this level, whose FROM it sits in.
+    fn laterals(n: &pg_query::protobuf::Node, out: &mut Vec<pg_query::protobuf::SelectStmt>) {
+        match n.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    laterals(side, out);
+                }
+            }
+            Some(N::RangeSubselect(rs)) if rs.lateral => {
+                if let Some(N::SelectStmt(b)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    out.push((**b).clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut bodies = Vec::new();
+    for f in &s.from_clause {
+        laterals(f, &mut bodies);
+    }
+    for mut b in bodies {
+        let mut slots = Slots {
+            ours: Level::of(s, lookup),
+            alias: String::new(),
+            lookup,
+            groups: Vec::new(),
+            aggs: Vec::new(),
+            inner_targets: Vec::new(),
+            ungrouped: None,
+        };
+        let level = Level::of(&b, lookup);
+        slots.rewrite_select(&mut b, &[level]);
+        if let Some(t) = slots.inner_targets.first() {
+            let at = match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                    Some(N::FuncCall(f)) => f.location,
+                    _ => -1,
+                },
+                _ => -1,
+            };
+            return fail(at, "FROM clause of their own query level");
+        }
+    }
+    Ok(())
 }
 
 /// Split a grouped SELECT whose select list, HAVING or ORDER BY computes
@@ -295,8 +635,9 @@ pub(crate) fn split(
 /// column that is neither grouped nor aggregated is PostgreSQL's 42803.
 pub(crate) fn split_expressions(
     s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
-    let Some((stmt, ungrouped)) = split_inner_with(s, true) else {
+    let Some((stmt, ungrouped)) = split_inner_with(s, true, lookup) else {
         return Ok(None);
     };
     if let Some(col) = ungrouped {
@@ -304,6 +645,26 @@ pub(crate) fn split_expressions(
             "subquery uses ungrouped column \"{col}\" from outer query"
         )));
     }
+    check_stray(s, &stmt, None)?;
+    Ok(Some(stmt))
+}
+
+/// A column the split's outer query still reads that is not a slot: 42803.
+/// With `only`, just the columns that level provably owns (a reference to
+/// a level above it is a constant there, not a stray).
+fn check_stray(
+    s: &pg_query::protobuf::SelectStmt,
+    stmt: &pg_query::protobuf::SelectStmt,
+    only: Option<&Level>,
+) -> Result<()> {
+    let alias = match stmt.from_clause.first().and_then(|f| f.node.as_ref()) {
+        Some(N::RangeSubselect(rs)) => rs
+            .alias
+            .as_ref()
+            .map(|a| a.aliasname.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
     let mut stray: Option<Vec<String>> = None;
     let mut check = |n: &pg_query::protobuf::Node| {
         let mut n = n.clone();
@@ -321,7 +682,15 @@ pub(crate) fn split_expressions(
                             _ => None,
                         })
                         .collect();
-                    if parts.first().map(String::as_str) != Some("__grp") && stray.is_none() {
+                    let owned = match only {
+                        None => true,
+                        Some(l) => match parts.as_slice() {
+                            [.., q, _] => l.names.contains(q),
+                            [c] => l.has_col(c) == Some(true),
+                            _ => false,
+                        },
+                    };
+                    if owned && parts.first() != Some(&alias) && stray.is_none() {
                         stray = Some(parts);
                     }
                 }
@@ -367,22 +736,28 @@ pub(crate) fn split_expressions(
             parts.join(".")
         )));
     }
-    Ok(Some(stmt))
-}
-
-fn split_inner(
-    s: &pg_query::protobuf::SelectStmt,
-) -> Option<(pg_query::protobuf::SelectStmt, Option<String>)> {
-    split_inner_with(s, false)
+    Ok(())
 }
 
 fn split_inner_with(
     s: &pg_query::protobuf::SelectStmt,
     force: bool,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<(pg_query::protobuf::SelectStmt, Option<String>)> {
-    let grouped = !s.group_clause.is_empty() || has_aggregate(s);
+    // An aggregate a subquery in the select list, HAVING or ORDER BY holds
+    // for this level makes this an aggregate query, as one written here
+    // directly does: `select (select max(s.x) from t) from s` is ONE row.
+    let grouped = !s.group_clause.is_empty()
+        || has_aggregate(s)
+        || s.target_list
+            .iter()
+            .chain(s.having_clause.as_deref())
+            .chain(s.sort_clause.iter())
+            .any(|n| outer_level_aggregates(s, lookup, n).is_some());
+    // A plain DISTINCT applies to the grouped rows: the outer query's.
+    let plain_distinct = matches!(s.distinct_clause.as_slice(), [d] if d.node.is_none());
     if !grouped
-        || !s.distinct_clause.is_empty()
+        || (!s.distinct_clause.is_empty() && !plain_distinct)
         || !s.window_clause.is_empty()
         || has_window(s)
         || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
@@ -399,6 +774,9 @@ fn split_inner_with(
         return None;
     }
     let mut slots = Slots {
+        ours: Level::of(s, lookup),
+        alias: fresh_alias(s),
+        lookup,
         groups: Vec::new(),
         aggs: Vec::new(),
         inner_targets: Vec::new(),
@@ -456,12 +834,12 @@ fn split_inner_with(
         } else {
             rt.name.clone()
         };
-        slots.rewrite(&mut val, None);
+        slots.rewrite(&mut val, &[]);
         outer_targets.push(target(&name, val));
     }
     let mut having = s.having_clause.as_deref().cloned();
     if let Some(h) = having.as_mut() {
-        slots.rewrite(h, None);
+        slots.rewrite(h, &[]);
     }
     // A bare name in ORDER BY that is an OUTPUT column's name is that output
     // column, before it is any input column (`SELECT n::text ... ORDER BY n`
@@ -478,13 +856,14 @@ fn split_inner_with(
         if bare_output_name(item, &out_names) {
             continue;
         }
-        slots.rewrite(item, None);
+        slots.rewrite(item, &[]);
     }
     // An output alias in ORDER BY names the output column, which the outer
     // query still has under the same name.
     let mut inner = s.clone();
     inner.target_list = slots.inner_targets.clone();
     inner.having_clause = None;
+    inner.distinct_clause = Vec::new();
     inner.sort_clause = Vec::new();
     inner.limit_count = None;
     inner.limit_offset = None;
@@ -515,13 +894,14 @@ fn split_inner_with(
                             node: Some(N::SelectStmt(Box::new(inner))),
                         })),
                         alias: Some(pg_query::protobuf::Alias {
-                            aliasname: "__grp".into(),
+                            aliasname: slots.alias.clone(),
                             colnames: Vec::new(),
                         }),
                     },
                 ))),
             }],
             where_clause: having.map(Box::new),
+            distinct_clause: s.distinct_clause.clone(),
             sort_clause: sort,
             limit_count: s.limit_count.clone(),
             limit_offset: s.limit_offset.clone(),
