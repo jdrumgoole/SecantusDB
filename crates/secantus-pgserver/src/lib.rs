@@ -2787,6 +2787,11 @@ pub struct PgHandler {
     /// read-only transaction ([`PgHandler::rc_reads_apart`]) instead of the
     /// block being moved onto a new snapshot.
     rc_apart: AtomicBool,
+    /// Set with `rc_apart` when the read-apart statement reads tables the
+    /// block HAS written: the block's own rows of each, laid over the fresh
+    /// snapshot (`secantus_storage::with_read_overlay`) instead of the block
+    /// replaying its write set onto a new one.
+    rc_overlay: Mutex<Option<secantus_storage::ReadOverlays>>,
     /// Names the savepoints a PL/pgSQL block with EXCEPTION handlers opens.
     subtxn_seq: std::sync::atomic::AtomicU64,
 }
@@ -3079,6 +3084,7 @@ impl PgHandler {
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
+            rc_overlay: Mutex::new(None),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -21633,6 +21639,7 @@ impl PgHandler {
         };
         self.rc_apart
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.rc_overlay.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let read_committed = matches!(
             self.settings
                 .lock()
@@ -21686,6 +21693,18 @@ impl PgHandler {
                 // Nothing it reads was written by the block: it reads in a
                 // fresh transaction of its own, which IS the per-statement
                 // snapshot, and the block keeps its own (no replay).
+                self.rc_apart
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else if let Some(overlays) = stale
+                .then_some(stmt.zip(sql))
+                .flatten()
+                .and_then(|(s, q)| self.rc_overlays(handle, s, q))
+            {
+                // It reads tables the block wrote, through read paths that
+                // all honour an overlay: it reads in a fresh transaction with
+                // the block's own rows laid over it, and the block keeps its
+                // snapshot (no replay).
+                *self.rc_overlay.lock().unwrap_or_else(|e| e.into_inner()) = Some(overlays);
                 self.rc_apart
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             } else if stale {
@@ -21812,6 +21831,38 @@ impl PgHandler {
     /// its snapshot touched one of them (or a catalog): a commit to another
     /// table cannot change its answer, and its own writes are in its own
     /// transaction either way.
+    fn rc_overlays(
+        &self,
+        handle: &mut UserTransactionHandle,
+        stmt: &Statement,
+        sql: &str,
+    ) -> Option<secantus_storage::ReadOverlays> {
+        // Gated exactly as `rc_select_read_set` gates a narrowed move: no
+        // subquery, CTE, row lock, function but pure built-ins, view, rule,
+        // inheritance, partitioning, temp table, RLS policy, user operator or
+        // cast. Such a statement reads its tables only through
+        // `find_matching_with`, `scan_batch_after` and `scan_matching_batches`
+        // (and the catalogs), every one of which honours an overlay.
+        let reads = self.rc_select_read_set(stmt, sql)?;
+        let db = self.db();
+        // A catalog the block wrote (a table it created or altered) is not
+        // a row change an overlay carries.
+        if handle.wrote_any(|d, c| d == db && c.starts_with("__")) {
+            return None;
+        }
+        let prefix = format!("{db}.");
+        let mut map = std::collections::HashMap::new();
+        for ns in &reads.all {
+            let table = ns.strip_prefix(&prefix)?;
+            if handle.wrote_collection(db, table) {
+                let ov = self.storage.block_overlay(handle, db, table).ok()??;
+                map.insert((db.to_string(), table.to_string()), ov);
+            }
+        }
+        // Nothing the block wrote is read: `rc_reads_apart` decides that one.
+        (!map.is_empty()).then(|| std::sync::Arc::new(map))
+    }
+
     fn rc_select_read_set(&self, stmt: &Statement, sql: &str) -> Option<RcReadSet> {
         if !matches!(stmt, Statement::Select(_) | Statement::Aggregate(_)) {
             return None;
@@ -21964,13 +22015,23 @@ impl PgHandler {
     /// fresh read-only transaction: it holds no rows and is not registered
     /// for row waits, and is rolled back once the rows are read.
     fn read_apart(&self, stmt: &Statement) -> PgWireResult<Vec<Response>> {
+        let overlays = self
+            .rc_overlay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         let mut tmp = self
             .storage
             .begin_user_transaction()
             .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
         let out = self
             .storage
-            .with_user_transaction(&mut tmp, || self.execute(stmt.clone(), 0))
+            .with_user_transaction(&mut tmp, || match overlays {
+                Some(ov) => {
+                    secantus_storage::with_read_overlay(ov, || self.execute(stmt.clone(), 0))
+                }
+                None => self.execute(stmt.clone(), 0),
+            })
             .map_err(|e| Self::storage_err("transaction failed", e))
             .and_then(|r| r);
         self.storage
@@ -32406,6 +32467,15 @@ thread_local! {
 /// when an addition of two finite values overflows: PostgreSQL's `float8pl`
 /// / `float8_accum` raise 22003 there ("value out of range: overflow"),
 /// even when a later value would have brought the total back.
+/// The aggregate's argument is a stored `real` / `double precision` column.
+fn float_source(it: &AggItem) -> bool {
+    it.expr.is_none()
+        && matches!(
+            it.source_type.as_deref(),
+            Some("float4" | "float8" | "real" | "double precision")
+        )
+}
+
 fn float_sum(values: impl Iterator<Item = f64>) -> Option<f64> {
     let mut total = 0.0_f64;
     for v in values {
@@ -36836,16 +36906,39 @@ impl PgHandler {
                     | AggFunc::Max
                     | AggFunc::BoolAnd
                     | AggFunc::BoolOr => true,
-                    AggFunc::Sum => {
+                    AggFunc::Sum | AggFunc::Avg => {
                         it.expr.is_none()
                             && matches!(
                                 it.source_type.as_deref(),
                                 Some("int2" | "int4" | "int8" | "numeric")
                             )
+                            || float_source(it)
                     }
                     _ => false,
                 }
         });
+        // How each item's chunks combine. A float `sum` / `avg` adds in
+        // order, so its chunks cannot be summed apart and added after (the
+        // rounding would differ): the running total is CARRIED into the next
+        // chunk as its first value, which is the one-pass addition exactly.
+        // An exact `avg` keeps its (sum, count) and divides once at the end.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Plain,
+            Carry,
+            ExactAvg,
+        }
+        let modes: Vec<Mode> = agg
+            .items
+            .iter()
+            .map(|it| match it.func {
+                AggFunc::Sum | AggFunc::Avg if float_source(it) => Mode::Carry,
+                AggFunc::Avg => Mode::ExactAvg,
+                _ => Mode::Plain,
+            })
+            .collect();
+        let mut carries: Vec<Option<Bson>> = vec![None; agg.items.len()];
+        let mut counts: Vec<i64> = vec![0; agg.items.len()];
         if !combinable {
             return Ok(None);
         }
@@ -36882,7 +36975,43 @@ impl PgHandler {
                 }
             }
             for (i, item) in agg.items.iter().enumerate() {
-                partials[i].push(compute_aggregate(item, &docs)?);
+                let field = item.field.as_deref().unwrap_or("");
+                match modes[i] {
+                    Mode::Plain => partials[i].push(compute_aggregate(item, &docs)?),
+                    Mode::ExactAvg => {
+                        let mut sum = item.clone();
+                        sum.func = AggFunc::Sum;
+                        partials[i].push(compute_aggregate(&sum, &docs)?);
+                        counts[i] += docs
+                            .iter()
+                            .filter(|d| !matches!(d.get(field), None | Some(Bson::Null)))
+                            .count() as i64;
+                    }
+                    Mode::Carry => {
+                        let mut sum = item.clone();
+                        sum.func = AggFunc::Sum;
+                        // `avg(real)` adds in double precision, `sum(real)`
+                        // in single: the carried total is the one being kept.
+                        if item.func == AggFunc::Avg {
+                            sum.source_type = Some("float8".into());
+                        }
+                        let added = docs
+                            .iter()
+                            .filter(|d| !matches!(d.get(field), None | Some(Bson::Null)))
+                            .count() as i64;
+                        counts[i] += added;
+                        if added > 0 {
+                            let mut first = Document::new();
+                            if let Some(c) = carries[i].take() {
+                                first.insert(field, c);
+                            }
+                            docs.insert(0, first);
+                            let total = compute_aggregate(&sum, &docs);
+                            docs.remove(0);
+                            carries[i] = Some(total?);
+                        }
+                    }
+                }
             }
             Ok(())
         };
@@ -36931,8 +37060,45 @@ impl PgHandler {
         }
         drop(fold);
         let mut vals = Vec::with_capacity(agg.items.len() + agg.groupings.len());
-        for (item, parts) in agg.items.iter().zip(partials) {
+        for (i, (item, parts)) in agg.items.iter().zip(partials).enumerate() {
             vals.push(match item.func {
+                _ if modes[i] == Mode::Carry => match carries[i].take() {
+                    None => Bson::Null,
+                    Some(Bson::Double(total)) if item.func == AggFunc::Avg => {
+                        Bson::Double(total / counts[i] as f64)
+                    }
+                    Some(total) => total,
+                },
+                _ if modes[i] == Mode::ExactAvg => {
+                    if counts[i] == 0 {
+                        Bson::Null
+                    } else {
+                        let field = item.field.clone().unwrap_or_else(|| "__p".into());
+                        let docs: Vec<Document> = parts
+                            .into_iter()
+                            .map(|v| {
+                                let mut d = Document::new();
+                                d.insert(field.clone(), v);
+                                d
+                            })
+                            .collect();
+                        let mut combine = item.clone();
+                        combine.func = AggFunc::Sum;
+                        combine.source_type = Some("numeric".into());
+                        combine.field = Some(field);
+                        let total = compute_aggregate(&combine, &docs)?;
+                        secantus_pgplan::numeric::numeric_operand_text(&total)
+                            .and_then(|t| {
+                                secantus_pgplan::numeric::decimal_arith(
+                                    "/",
+                                    &t,
+                                    &counts[i].to_string(),
+                                )
+                            })
+                            .and_then(Result::ok)
+                            .unwrap_or(Bson::Null)
+                    }
+                }
                 AggFunc::CountStar | AggFunc::Count => {
                     Bson::Int64(parts.iter().filter_map(bson_i64).sum())
                 }
