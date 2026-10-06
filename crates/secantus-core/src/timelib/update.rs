@@ -138,7 +138,7 @@ fn magic_date_calc(t: &mut Time) {
 }
 
 /// `timelib_do_normalize`.
-fn do_normalize(t: &mut Time) {
+pub(super) fn do_normalize(t: &mut Time) {
     if t.us != UNSET {
         do_range_limit(0, 1_000_000, 1_000_000, &mut t.us, &mut t.s);
     }
@@ -312,4 +312,34 @@ pub(crate) fn update_ts(t: &mut Time) {
     t.relative.have_weekday_relative = false;
     t.relative.have_special_relative = false;
     t.relative.first_last_day_of = 0;
+}
+
+/// `timelib_date_from_isodate` (`dow.c`): the calendar date of an ISO year,
+/// week and day of week.
+pub(super) fn date_from_isodate(iy: i64, iw: i64, id: i64) -> (i64, i64, i64) {
+    let mut daynr = daynr_from_weeknr(iy, iw, id) + 1;
+    let mut y = iy;
+    let mut leap = is_leap(y);
+    while daynr <= 0 {
+        y -= 1;
+        leap = is_leap(y);
+        daynr += if leap { 366 } else { 365 };
+    }
+    while daynr > if leap { 366 } else { 365 } {
+        daynr -= if leap { 366 } else { 365 };
+        y += 1;
+        leap = is_leap(y);
+    }
+    // ml_table_{leap,common}: index 0 unused.
+    let table = if leap {
+        &DAYS_IN_MONTH_LEAP
+    } else {
+        &DAYS_IN_MONTH
+    };
+    let mut m = 1;
+    while daynr > table[m as usize] {
+        daynr -= table[m as usize];
+        m += 1;
+    }
+    (y, m, daynr)
 }

@@ -752,16 +752,21 @@ CURATED = [
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:00", "timezone": "UTC"}}, {}),
     # A string that already carries an offset ignores the timezone field.
     # (the "...Z" + timezone case: see the REMOVED note above)
-    # $dateFromString `format` (strptime) — numeric-directive subset, built from
-    # CPython _strptime's exact per-directive regexes so field matching agrees.
+    # $dateFromString `format`: the Rust server runs mongod's parser (timelib's
+    # parse-from-format under mongod's specifier map), the Python server runs
+    # strptime. They agree on the plain shapes below. REMOVED, because the
+    # Rust answer is mongod's and the Python answer is not (each measured on
+    # 8.2.11, 2026-10-06): `%y` (not a mongod specifier: 18536), `%j` (zero-
+    # based in mongod: "2024-100" is 10 April), `%j` alone (incomplete), a
+    # leap second and 29 February 2023 (invalid, 241), a trailing `%z` with no
+    # zone left ("Not enough data"), and a literal mismatch (241, not a defer).
+    # What is lost: a drift check on those shapes. mongod-vs-Rust coverage is
+    # tools/probes/date_string_parsing.py (`FORMAT_CASES`, 0 divergent); the
+    # Python divergence is backlog section 7.04.
     ({"$dateFromString": {"dateString": "15/01/2024", "format": "%d/%m/%Y"}}, {}),
     ({"$dateFromString": {"dateString": "2024-01-15T10:30:45", "format": "%Y-%m-%dT%H:%M:%S"}}, {}),
     ({"$dateFromString": {"dateString": "20240115", "format": "%Y%m%d"}}, {}),  # adjacent
     ({"$dateFromString": {"dateString": "2024-1-5", "format": "%Y-%m-%d"}}, {}),  # single-digit
-    ({"$dateFromString": {"dateString": "68-06-15", "format": "%y-%m-%d"}}, {}),  # 2000s pivot
-    ({"$dateFromString": {"dateString": "69-06-15", "format": "%y-%m-%d"}}, {}),  # 1900s pivot
-    ({"$dateFromString": {"dateString": "2024-100", "format": "%Y-%j"}}, {}),  # day-of-year
-    ({"$dateFromString": {"dateString": "100", "format": "%j"}}, {}),  # default year 1900
     ({"$dateFromString": {"dateString": "date: 2024-01-15", "format": "date: %Y-%m-%d"}}, {}),
     (
         {
@@ -774,16 +779,6 @@ CURATED = [
         {},
     ),
     # defers: bad field / leap second / unsupported directive / literal mismatch.
-    ({"$dateFromString": {"dateString": "2023-02-29", "format": "%Y-%m-%d"}}, {}),  # -> defer
-    (
-        {"$dateFromString": {"dateString": "10:30:60", "format": "%H:%M:%S"}},
-        {},
-    ),  # leap sec -> defer
-    ({"$dateFromString": {"dateString": "2024-01-15", "format": "%Y-%m-%d%z"}}, {}),  # %z -> defer
-    (
-        {"$dateFromString": {"dateString": "2024/01/15", "format": "%Y-%m-%d"}},
-        {},
-    ),  # mismatch -> defer
     # $dateToString — default format + unambiguous directives. `_DT` is a modern
     # date; a separate date carries non-zero milliseconds for %L.
     ({"$dateToString": {"date": "$d"}}, {"d": _DT}),  # default %Y-%m-%dT%H:%M:%S.%LZ
@@ -1238,48 +1233,6 @@ def test_date_extractor_fuzz():
             assert _same(rust, py), f"{op}: rust={rust} pure={py} ms={ms} dt={doc['d']}"
 
 
-def test_date_from_string_strptime_fuzz():
-    """$dateFromString `format` (strptime): the Rust regex-built parser must match
-    Python's datetime.strptime exactly wherever Rust computes (else it defers).
-    Mixes valid strftime-rendered inputs with random junk so both the compute and
-    the defer/raise paths are exercised."""
-    rng = random.Random(0x57717D)
-    fmts = [
-        "%Y-%m-%d",
-        "%d/%m/%Y",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y%m%d",
-        "%m-%d-%Y",
-        "%Y-%j",
-        "%y-%m-%d",
-        "at %Y-%m-%d %H:%M",
-        "%H:%M:%S",
-    ]
-    for _ in range(6000):
-        fmt = rng.choice(fmts)
-        if rng.random() < 0.8:
-            try:
-                dt = datetime.datetime(
-                    rng.randint(1, 9999),
-                    rng.randint(1, 12),
-                    rng.randint(1, 28),
-                    rng.randint(0, 23),
-                    rng.randint(0, 59),
-                    rng.randint(0, 59),
-                )
-                inp = dt.strftime(fmt)
-            except ValueError:
-                continue
-        else:
-            inp = "".join(rng.choice("0123456789-/T: ") for _ in range(rng.randint(3, 12)))
-        expr = {"$dateFromString": {"dateString": inp, "format": fmt}}
-        rust = _rust_eval(expr, {})
-        if rust is None:
-            continue  # Rust deferred -> Python (compute or raise) handles it
-        py = _bson_norm(_pure.evaluate(expr, {}))
-        assert _same(rust, py), f"rust={rust!r} pure={py!r} inp={inp!r} fmt={fmt!r}"
-
-
 def test_date_arithmetic_fuzz():
     """$dateAdd/$dateSubtract/$dateDiff/$dateTrunc over random instants, units,
     amounts and binSizes, against Python (calendar + delta arithmetic)."""
@@ -1714,7 +1667,9 @@ def test_string_typeguard_defers_and_raises(expr, code):
     [
         ({"$dateToString": {"date": "x"}}, 16006),
         ({"$dateToParts": {"date": "x"}}, 16006),
-        ({"$dateFromString": {"dateString": 5}}, 241),
+        # REMOVED `$dateFromString` of a non-string dateString: mongod (and the
+        # Rust server) end the 241 message "found: int with value 5"; the Python
+        # server stops at "found: int" (backlog section 7.04).
         ({"$let": {"vars": {}, "in": "$$x"}}, 17276),
         ({"$switch": {"branches": []}}, 40068),
         ({"$ifNull": [1]}, 1257300),
