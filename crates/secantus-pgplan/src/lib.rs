@@ -14553,6 +14553,20 @@ fn resolve_sublinks(
             {
                 if sel.values_lists.is_empty() {
                     resolve_sublinks_in_select(sel, lookup, params, run)?;
+                } else {
+                    // `INSERT ... VALUES (1, (SELECT ...))`: a VALUES item
+                    // cannot see the target's columns, and every row's
+                    // subquery reads the snapshot from before the statement
+                    // (PostgreSQL's command counter does not advance within
+                    // it), so it resolves here as RETURNING's does. It was
+                    // `SubLink is not supported yet` (batch 63).
+                    for vl in &mut sel.values_lists {
+                        if let Some(N::List(l)) = vl.node.as_mut() {
+                            for item in &mut l.items {
+                                resolve_sublinks_in_expr(item, lookup, params, run, &[])?;
+                            }
+                        }
+                    }
                 }
             }
             for n in &mut i.returning_list {

@@ -27,7 +27,8 @@
 //!   BY of stored columns is sorted in bounded memory (`external_sort`): by
 //!   the reader outside a block, and inside one (a portal or a `DECLARE
 //!   CURSOR`) at the first fetch, through the block's transaction;
-//! - with a WHERE, only when the client fetches in pieces (`max_rows > 0`):
+//! - with a WHERE, when the client fetches in pieces (`max_rows > 0`), or
+//!   when the storage would answer the WHERE by a collection scan anyway:
 //!   the streamed read is a collection scan, which an indexed lookup should
 //!   not be traded for when the whole result is wanted at once.
 //!
@@ -146,9 +147,10 @@ impl PgHandler {
     /// at READ COMMITTED, the SELECT it plans may stream on a reader thread
     /// of its own snapshot -- the statement's snapshot, as PostgreSQL's --
     /// and pgwire sends its rows as they arrive instead of the whole result
-    /// being built first. Only without a WHERE (`STREAM_UNFILTERED`): the
-    /// whole result is wanted at once, so an indexed lookup is not traded
-    /// for the reader's collection scan.
+    /// being built first. Without a WHERE, or with one the storage would
+    /// answer by a collection scan (`STREAM_UNFILTERED`): the whole result
+    /// is wanted at once, so an indexed lookup is not traded for the
+    /// reader's collection scan.
     pub(crate) fn allow_simple_stream(&self) {
         let idle = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let mode = if idle
@@ -180,7 +182,19 @@ impl PgHandler {
         let mode = self
             .stream_portal
             .swap(STREAM_NEVER, std::sync::atomic::Ordering::Relaxed);
-        if mode == STREAM_NEVER || (mode == STREAM_UNFILTERED && !sel.filter.is_empty()) {
+        // A WHERE the storage would answer by an index keeps that route when
+        // the whole result is wanted at once; one it would answer by a
+        // collection scan anyway streams (batch 63) -- the reader's scan is
+        // the same read, in bounded memory.
+        if mode == STREAM_NEVER
+            || (mode == STREAM_UNFILTERED
+                && !sel.filter.is_empty()
+                && !matches!(
+                    self.storage
+                        .explain_plan(self.db(), &sel.table, &sel.filter),
+                    Ok(secantus_storage::ExplainPlan::CollScan)
+                ))
+        {
             return Ok(None);
         }
         // An ORDER BY of stored columns is sorted in bounded memory
