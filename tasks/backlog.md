@@ -4591,6 +4591,16 @@ These are explicit non-goals. Don't add them without a reason.
       storage scan, the aggregation pipeline and the index build, and those polls
       sit in the flagship server's hottest loops. Benchmark before and after
       (`invoke release-benchmark`); do not assume the cost.
+- [ ] **OPEN — the Go cross-driver smoke tests download modules at test time.**
+      `tests/test_cross_driver_features.py`'s `go run ./cluster_roles`,
+      `./sessions` and `./batchsize-zero` fetch their modules from
+      proxy.golang.org inside the test, and no CI job caches or pre-downloads
+      them. On 2026-10-06 one `test-durable` lane failed all three with
+      `stream error: stream ID 23; INTERNAL_ERROR` from the proxy before any
+      program reached the server. The rerun passed, but the failure measured
+      the network, not the server. Fix: `go mod download` in a setup step,
+      with `actions/setup-go`'s module cache, so the test itself never goes to
+      the network.
 - [ ] **OPEN — two job-tooling tests are load-sensitive under `-n auto`
       (measured 2026-09-28).** `tests/test_detached_run.py::
       test_stop_ends_a_running_command` and `tests/test_opsboard.py::
