@@ -127,6 +127,50 @@ pub struct StorageOptions {
     pub write_tickets: Option<usize>,
 }
 
+/// A block's own rows of one table: see [`Storage::block_overlay`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableOverlay {
+    /// `_id` key -> the block's current `(RecordId, document)`, or `None` for
+    /// a row it deleted.
+    pub rows: BTreeMap<Vec<u8>, Option<(i64, Vec<u8>)>>,
+}
+
+/// Per-table overlays, by `(db, collection)`.
+pub type ReadOverlays = Arc<HashMap<(String, String), TableOverlay>>;
+
+thread_local! {
+    /// The overlays a read on this thread lays over its snapshot, by
+    /// `(db, collection)`: installed by [`with_read_overlay`] (only the
+    /// PostgreSQL server's READ COMMITTED read-apart path does), so a reader
+    /// that never installs one -- the MongoDB server -- reads exactly as
+    /// before.
+    static READ_OVERLAY: RefCell<Option<ReadOverlays>> =
+        const { RefCell::new(None) };
+}
+
+/// Run `f` with `overlays` laid over every read that honours one (today
+/// [`Storage::scan_matching_batches`]; the `_id` point read, the index
+/// pickers and the counts do NOT yet, so a caller must not install one for a
+/// statement that can reach them). Restored on return, panic included.
+pub fn with_read_overlay<T>(overlays: ReadOverlays, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ReadOverlays>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_OVERLAY.with(|o| *o.borrow_mut() = self.0.take());
+        }
+    }
+    let _r = Restore(READ_OVERLAY.with(|o| o.replace(Some(overlays))));
+    f()
+}
+
+fn overlay_for(db: &str, coll: &str) -> Option<TableOverlay> {
+    READ_OVERLAY.with(|o| {
+        o.borrow()
+            .as_ref()
+            .and_then(|m| m.get(&(db.to_string(), coll.to_string())).cloned())
+    })
+}
+
 /// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
 /// session (NOT the calling thread's per-call session) so the transaction's
 /// statements and its retryable commit can run on different connection threads
@@ -7869,6 +7913,119 @@ impl Storage {
         Ok(out)
     }
 
+    /// Whether this store runs the asynchronous (drainer) oplog, where a
+    /// transaction's write set lives on its handle rather than in readable
+    /// oplog rows.
+    pub fn oplog_async(&self) -> bool {
+        self.async_oplog.is_some()
+    }
+
+    /// A user transaction's own versions of the rows it wrote in `(db, coll)`,
+    /// keyed by `_id` key: `Some((RecordId, blob))` for a row it inserted or
+    /// updated (its current version, read through its own session), `None`
+    /// for a row it deleted. Built from the transaction's oplog write set, so
+    /// `None` (the whole answer) when the set holds anything a per-row map
+    /// cannot describe for that table -- a command on it (a drop, a rename, a
+    /// truncate), or async oplog mode with no handle-side rows. The map a
+    /// READ COMMITTED block's statement lays over a fresh snapshot
+    /// ([`with_read_overlay`]) so it sees later commits AND its own writes
+    /// without replaying its write set.
+    ///
+    /// Keyed by `_id` key rather than RecordId: a row the block DELETED is no
+    /// longer in its own `_id` index, so its RecordId is unreachable from the
+    /// block; the fresh snapshot's row carries its `_id` key in its frame,
+    /// which is what a consumer matches on. Not for time-series collections
+    /// (whose stored `_id` key is suffixed); the PostgreSQL server has none.
+    pub fn block_overlay(
+        &self,
+        handle: &mut UserTransactionHandle,
+        db: &str,
+        coll: &str,
+    ) -> Result<Option<TableOverlay>> {
+        if handle.session.is_none() {
+            return Err(StorageError::Internal("transaction already closed".into()));
+        }
+        if self.async_oplog.is_some() || !self.enable_oplog {
+            return Ok(None);
+        }
+        // Rows locked by an unchanged rewrite carry no oplog entry, but they
+        // are unchanged, so the fresh snapshot already has them right.
+        if handle.snapshot_fixed && handle.minted_ranges.is_empty() && !handle.lock_only {
+            return Ok(None);
+        }
+        let ns = format!("{db}.{coll}");
+        let db_cmd = format!("{db}.$cmd");
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for blob in self.transaction_write_set(handle)? {
+            let raw = bson::RawDocument::from_bytes(&blob)
+                .map_err(|e| StorageError::Bson(e.to_string()))?;
+            let op = raw.get_str("op").unwrap_or("");
+            let entry_ns = raw.get_str("ns").unwrap_or("");
+            match op {
+                "i" | "u" | "d" if entry_ns == ns => {
+                    let key_doc = if op == "u" { "o2" } else { "o" };
+                    let id = raw
+                        .get_document(key_doc)
+                        .ok()
+                        .and_then(|d| d.get("_id").ok().flatten())
+                        .ok_or_else(|| {
+                            StorageError::Internal(format!("oplog {op} entry without _id"))
+                        })?;
+                    let id: Bson = id
+                        .to_raw_bson()
+                        .try_into()
+                        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+                    let k = id_key(&id)?;
+                    if seen.insert(k.clone()) {
+                        ids.push(k);
+                    }
+                }
+                "i" | "u" | "d" => {}
+                // A command naming this table (or the whole database) is not
+                // a row change a map can carry.
+                "c" if entry_ns == db_cmd || entry_ns == ns => {
+                    let names_it = raw.get_document("o").is_ok_and(|o| {
+                        o.iter().flatten().any(|(_, v)| match v {
+                            bson::RawBsonRef::String(s) => s == coll || s == ns,
+                            _ => false,
+                        }) || o.get("dropDatabase").ok().flatten().is_some()
+                    });
+                    if names_it {
+                        return Ok(None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let session = handle.session.as_ref().expect("checked above");
+        let mut rows = BTreeMap::new();
+        if ids.is_empty() {
+            return Ok(Some(TableOverlay { rows }));
+        }
+        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        for k in ids {
+            let found = match self.doc_recordid(session, db, coll, &k)? {
+                None => None,
+                Some(recordid) => {
+                    cur.reset()?;
+                    cur.set_key_ssq(db, coll, recordid);
+                    match cur.search() {
+                        Ok(()) => {
+                            let value = cur.get_value_u()?;
+                            let (_idk, blob) = unframe_doc_value(&value)?;
+                            Some((recordid, blob.to_vec()))
+                        }
+                        Err(e) if e.is_not_found() => None,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            };
+            rows.insert(k, found);
+        }
+        Ok(Some(TableOverlay { rows }))
+    }
+
     fn read_prepared_row(&self, gid: &str) -> Result<Option<Document>> {
         let session = self.conn.open_session()?;
         let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
@@ -8529,6 +8686,11 @@ impl Storage {
     pub fn find_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<Vec<u8>>> {
         // Lock-free read (see the `lock` field's invariants).
         let key = id_key(id)?;
+        if let Some(ov) = overlay_for(db, coll) {
+            if let Some(row) = ov.rows.get(&key) {
+                return Ok(row.as_ref().map(|(_, b)| b.clone()));
+            }
+        }
         let session = self.op_session()?;
         // Resolve `_id` -> RecordId via the `_id` index, then fetch the doc row.
         let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
@@ -10929,6 +11091,34 @@ impl Storage {
     /// keyed by the monotonic RecordId, so a plain doc-table walk (`scan_docs`) IS
     /// insertion order — no separate `NAT_TABLE` indirection. Mirrors
     /// `storage._scan_docs_natural`.
+    /// The collection in natural (RecordId) order with `ov` laid over it: the
+    /// snapshot's row for every `_id` key the overlay names is dropped and the
+    /// overlay's present rows are merged in by RecordId (see
+    /// [`Storage::block_overlay`]). Never index-routed: the snapshot's index
+    /// entries describe the committed versions of the overlaid rows.
+    fn overlaid_natural(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        ov: &TableOverlay,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut own: Vec<(i64, Vec<u8>)> = ov.rows.values().flatten().cloned().collect();
+        own.sort_unstable_by_key(|(r, _)| *r);
+        let mut own = own.into_iter().peekable();
+        let mut out = Vec::new();
+        for (recordid, idk, blob) in self.scan_docs(session, db, coll)? {
+            while own.peek().is_some_and(|(r, _)| *r < recordid) {
+                out.push(own.next().expect("peeked").1);
+            }
+            if !ov.rows.contains_key(&idk) {
+                out.push(blob);
+            }
+        }
+        out.extend(own.map(|(_, b)| b));
+        Ok(out)
+    }
+
     fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         // The read path only needs the document blobs, so walk the doc table
         // directly and clone just the blob — `scan_docs` additionally clones each
@@ -11964,43 +12154,81 @@ impl Storage {
     ) -> Result<()> {
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        let vars = Document::new();
+        let keep = |blob: &[u8]| -> Result<bool> {
+            if filter.is_empty() {
+                return Ok(true);
+            }
+            let raw =
+                bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
+            secantus_core::query::matches_raw(raw, filter, &vars, None).map_err(query_fault)
+        };
+        // A block's own rows laid over this snapshot (`with_read_overlay`):
+        // the snapshot's version of every row the block wrote is dropped, and
+        // the block's current versions (filtered here, as an index could not
+        // be trusted for them) are merged in RecordId order.
+        let overlay = overlay_for(db, coll);
+        let mut own: Vec<(i64, Vec<u8>)> = Vec::new();
+        if let Some(ov) = &overlay {
+            for (recordid, blob) in ov.rows.values().flatten() {
+                if keep(blob)? {
+                    own.push((*recordid, blob.clone()));
+                }
+            }
+            own.sort_unstable_by_key(|(r, _)| *r);
+        }
+        let mut own = own.into_iter().peekable();
         let session = self.conn.open_session()?;
         session.begin_transaction(None)?;
         let out = (|| -> Result<()> {
-            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let vars = Document::new();
             let batch = batch.max(1);
             let mut buf: Vec<Vec<u8>> = Vec::with_capacity(batch);
-            cur.set_key_ssq(db, coll, i64::MIN);
-            let mut more = match cur.search_near() {
-                Ok(cmp) => cmp >= 0 || cur.next()?,
-                Err(e) if e.is_not_found() => false,
+            // Push one row; `false` once the sink has had enough.
+            let mut push = |buf: &mut Vec<Vec<u8>>, blob: Vec<u8>| -> bool {
+                buf.push(blob);
+                !(buf.len() >= batch && !sink(std::mem::take(buf)))
+            };
+            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+                Ok(c) => Some(c),
+                Err(e) if e.is_missing_table() => None,
                 Err(e) => return Err(e.into()),
             };
-            while more {
-                let (d, c, _recordid) = cur.get_key_ssq()?;
-                if d != db || c != coll {
-                    break;
-                }
-                let value = cur.get_value_u()?;
-                let (_idk, blob) = unframe_doc_value(&value)?;
-                let keep = filter.is_empty() || {
-                    let raw = bson::RawDocument::from_bytes(blob)
-                        .map_err(|_| StorageError::QueryUnsupported)?;
-                    secantus_core::query::matches_raw(raw, filter, &vars, None)
-                        .map_err(query_fault)?
+            if let Some(cur) = cur {
+                cur.set_key_ssq(db, coll, i64::MIN);
+                let mut more = match cur.search_near() {
+                    Ok(cmp) => cmp >= 0 || cur.next()?,
+                    Err(e) if e.is_not_found() => false,
+                    Err(e) => return Err(e.into()),
                 };
-                if keep {
-                    buf.push(blob.to_vec());
-                    if buf.len() >= batch && !sink(std::mem::take(&mut buf)) {
+                while more {
+                    let (d, c, recordid) = cur.get_key_ssq()?;
+                    if d != db || c != coll {
+                        break;
+                    }
+                    let value = cur.get_value_u()?;
+                    let (idk, blob) = unframe_doc_value(&value)?;
+                    if let Some(ov) = &overlay {
+                        while own.peek().is_some_and(|(r, _)| *r < recordid) {
+                            let (_, b) = own.next().expect("peeked");
+                            if !push(&mut buf, b) {
+                                return Ok(());
+                            }
+                        }
+                        if ov.rows.contains_key(idk) {
+                            more = cur.next()?;
+                            continue;
+                        }
+                    }
+                    if keep(blob)? && !push(&mut buf, blob.to_vec()) {
                         return Ok(());
                     }
+                    more = cur.next()?;
                 }
-                more = cur.next()?;
+            }
+            for (_, b) in own.by_ref() {
+                if !push(&mut buf, b) {
+                    return Ok(());
+                }
             }
             if !buf.is_empty() {
                 sink(buf);
@@ -12032,6 +12260,9 @@ impl Storage {
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let session = self.op_session()?;
+        if let Some(ov) = overlay_for(db, coll) {
+            return self.scan_batch_after_overlaid(&session, db, coll, filter, after, batch, &ov);
+        }
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok((Vec::new(), None)),
@@ -12069,6 +12300,92 @@ impl Storage {
                 }
             }
             more = cur.next()?;
+        }
+        Ok((out, None))
+    }
+
+    /// [`Self::scan_batch_after`] with a block's rows laid over the snapshot.
+    /// The resume point is the RecordId of the last row handed out, whether
+    /// it came from the snapshot or from the overlay.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_batch_after_overlaid(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        after: Option<i64>,
+        batch: usize,
+        ov: &TableOverlay,
+    ) -> Result<(Vec<Vec<u8>>, Option<i64>)> {
+        let vars = Document::new();
+        let keep = |blob: &[u8]| -> Result<bool> {
+            if filter.is_empty() {
+                return Ok(true);
+            }
+            let raw =
+                bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
+            secantus_core::query::matches_raw(raw, filter, &vars, None).map_err(query_fault)
+        };
+        let batch = batch.max(1);
+        let floor = after.unwrap_or(i64::MIN);
+        let mut own: Vec<(i64, Vec<u8>)> = ov
+            .rows
+            .values()
+            .flatten()
+            .filter(|(r, _)| after.is_none() || *r > floor)
+            .cloned()
+            .collect();
+        own.sort_unstable_by_key(|(r, _)| *r);
+        let mut own = own.into_iter().peekable();
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(batch);
+        if after == Some(i64::MAX) {
+            return Ok((out, None));
+        }
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => Some(c),
+            Err(e) if e.is_missing_table() => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(cur) = cur {
+            cur.set_key_ssq(db, coll, after.map_or(i64::MIN, |a| a.saturating_add(1)));
+            let mut more = match cur.search_near() {
+                Ok(cmp) => cmp >= 0 || cur.next()?,
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            while more {
+                let (d, c, recordid) = cur.get_key_ssq()?;
+                if d != db || c != coll {
+                    break;
+                }
+                while own.peek().is_some_and(|(r, _)| *r < recordid) {
+                    let (r, b) = own.next().expect("peeked");
+                    if keep(&b)? {
+                        out.push(b);
+                        if out.len() >= batch {
+                            return Ok((out, Some(r)));
+                        }
+                    }
+                }
+                let value = cur.get_value_u()?;
+                let (idk, blob) = unframe_doc_value(&value)?;
+                if !ov.rows.contains_key(idk) && keep(blob)? {
+                    out.push(blob.to_vec());
+                    if out.len() >= batch {
+                        return Ok((out, Some(recordid)));
+                    }
+                }
+                more = cur.next()?;
+            }
+        }
+        for (r, b) in own {
+            if keep(&b)? {
+                out.push(b);
+                if out.len() >= batch {
+                    return Ok((out, Some(r)));
+                }
+            }
         }
         Ok((out, None))
     }
@@ -12133,7 +12450,23 @@ impl Storage {
         // optimisation.)
         let force_collscan = coll_opt.is_some();
 
-        let blobs: Vec<Vec<u8>> = if force_collscan {
+        // A block's own rows laid over this snapshot (`with_read_overlay`):
+        // no index can be trusted for them, so the overlaid table is scanned
+        // in natural order and filtered / sorted below like any scan.
+        let overlay = overlay_for(db, coll);
+        let blobs: Vec<Vec<u8>> = if let Some(ov) = &overlay {
+            let mut blobs = self.overlaid_natural(&session, db, coll, ov)?;
+            let backward = matches!(hint, Some(Hint::KeySpec(k)) if k.get("$natural").is_some_and(|v| match v {
+                Bson::Int32(n) => *n < 0,
+                Bson::Int64(n) => *n < 0,
+                Bson::Double(n) => *n < 0.0,
+                _ => false,
+            }));
+            if backward {
+                blobs.reverse();
+            }
+            blobs
+        } else if force_collscan {
             self.scan_blobs_natural(&session, db, coll)?
         } else if let Some(h) = hint {
             let resolved = self.resolve_hint(&session, db, coll, h)?;
@@ -12329,6 +12662,11 @@ impl Storage {
         if self.is_oplog_rs(db, coll) {
             return Ok(self
                 .find_oplog_rs(filter, None, coll_opt, &Document::new())?
+                .len());
+        }
+        if overlay_for(db, coll).is_some() {
+            return Ok(self
+                .find_matching_with(db, coll, filter, None, None, coll_opt, &Document::new())?
                 .len());
         }
         self.with_ddl_generation_check(|| {

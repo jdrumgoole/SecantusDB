@@ -17710,3 +17710,70 @@ def test_batch60_ungrouped_aggregates_in_bounded_memory(home: Path, monkeypatch)
             3001,
         )
         a.execute("rollback")
+
+
+def _batch61_overlay_scenario(a: psycopg.Connection, b: psycopg.Connection) -> None:
+    """The statements and PostgreSQL 15.19's answers, shared with the probe
+    that ran them against PostgreSQL itself."""
+    a.execute("create table b61_t (id int primary key, v int, tag text)")
+    a.execute("create index b61_t_v on b61_t (v)")
+    a.execute("create table b61_u (id int primary key, w int)")
+    a.execute("insert into b61_t select g, g * 10, 'x' from generate_series(1, 6) g")
+    a.execute("insert into b61_u values (1, 100), (2, 200), (7, 700)")
+    a.execute("begin")
+    a.execute("insert into b61_t values (7, 70, 'mine')")
+    a.execute("update b61_t set v = 21 where id = 2")
+    a.execute("delete from b61_t where id = 3")
+    # Other sessions commit to the SAME tables after the block's snapshot.
+    b.execute("insert into b61_t values (8, 80, 'theirs')")
+    b.execute("update b61_t set v = 41 where id = 4")
+    b.execute("delete from b61_t where id = 5")
+    b.execute("update b61_u set w = 701 where id = 7")
+    assert a.execute("select count(*), sum(v) from b61_t").fetchone() == (
+        6,
+        10 + 21 + 41 + 60 + 70 + 80,
+    )
+    assert a.execute("select id from b61_t where v = 20").fetchall() == []
+    assert a.execute("select id from b61_t where v = 21").fetchall() == [(2,)]
+    assert a.execute("select id from b61_t where v between 30 and 45 order by id").fetchall() == [
+        (4,)
+    ]
+    assert a.execute("select id from b61_t where id = 3").fetchall() == []
+    assert a.execute("select v from b61_t where id = 7").fetchall() == [(70,)]
+    assert a.execute("select id, v from b61_t order by v desc").fetchall() == [
+        (8, 80),
+        (7, 70),
+        (6, 60),
+        (4, 41),
+        (2, 21),
+        (1, 10),
+    ]
+    assert a.execute(
+        "select t.id, u.w from b61_t t join b61_u u on u.id = t.id order by t.id"
+    ).fetchall() == [(1, 100), (2, 200), (7, 701)]
+    assert a.execute("select tag, count(*) from b61_t group by tag order by tag").fetchall() == [
+        ("mine", 1),
+        ("theirs", 1),
+        ("x", 4),
+    ]
+    # The block writes again after reading: still its own rows, still theirs.
+    a.execute("update b61_t set v = 61 where id = 6")
+    b.execute("insert into b61_t values (9, 90, 'theirs')")
+    assert a.execute("select count(*), max(v) from b61_t where v > 60").fetchone() == (4, 90)
+    a.execute("commit")
+    assert b.execute("select count(*), sum(v) from b61_t").fetchone() == (
+        7,
+        10 + 21 + 41 + 61 + 70 + 80 + 90,
+    )
+
+
+def test_batch61_read_committed_reads_its_own_table_beside_commits_to_it(home: Path) -> None:
+    """A READ COMMITTED block reading a table it wrote, while other sessions
+    commit to THAT table, replayed its whole write set onto a new snapshot
+    for every such statement. It now reads in a fresh transaction with its
+    own rows laid over it (`Storage::block_overlay`): an indexed filter, a
+    point read, ORDER BY, a join and GROUP BY all see its own writes and every
+    commit since. The assertions are PostgreSQL 15.19's answers (the same
+    function ran against it)."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        _batch61_overlay_scenario(a, b)
