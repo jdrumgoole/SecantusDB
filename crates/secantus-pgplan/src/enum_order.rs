@@ -1787,3 +1787,111 @@ pub(crate) fn rewrite_dml(
     r.expr(where_clause)?;
     Ok(r.changed)
 }
+
+/// `ORDER BY v COLLATE "C"` (or a select-list target of that shape) over a
+/// column of a type that takes no collation: PostgreSQL's 42804 is a
+/// parse-analysis error, raised whether or not a row is read -- it was
+/// raised here only when a row was sorted, so the same statement over an
+/// empty table answered. Only a stored table's column is typed here (a
+/// derived relation's columns are not known yet), and only a type known to
+/// take no collation is refused.
+pub(crate) fn check_collate_operands(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    let ctes: Vec<String> = s
+        .with_clause
+        .iter()
+        .flat_map(|w| &w.ctes)
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(cte)) => Some(cte.ctename.clone()),
+            _ => None,
+        })
+        .collect();
+    let tables_only = |name: &str| {
+        if ctes.iter().any(|c| c == name) {
+            None
+        } else {
+            lookup(name)
+        }
+    };
+    let mut defs = Vec::new();
+    for item in &s.from_clause {
+        if matches!(item.node.as_ref(), Some(N::RangeVar(_) | N::JoinExpr(_))) {
+            scope(std::slice::from_ref(item), &tables_only, &mut defs);
+        }
+    }
+    if defs.is_empty() {
+        return Ok(());
+    }
+    let r = Rewriter {
+        scope: &defs,
+        changed: false,
+        collate_locations: std::cell::RefCell::new(Vec::new()),
+        derived: std::cell::RefCell::new(Vec::new()),
+    };
+    let exprs = s
+        .sort_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::SortBy(sb)) => sb.node.as_deref(),
+            _ => None,
+        })
+        .chain(s.target_list.iter().filter_map(|n| match n.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        }));
+    for e in exprs {
+        let Some(N::CollateClause(cc)) = e.node.as_ref() else {
+            continue;
+        };
+        let Some(Some(N::ColumnRef(c))) = cc.arg.as_deref().map(|a| a.node.as_ref()) else {
+            continue;
+        };
+        let Some(col) = r.column_of(c) else {
+            continue;
+        };
+        if takes_no_collation(&col.pg_type) {
+            set_error_location(cc.location);
+            return Err(Error::DatatypeMismatch(format!(
+                "collations are not supported by type {}",
+                crate::display_type(&col.pg_type)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A built-in type known to take no collation (anything else -- a string
+/// type, a domain, an unfamiliar spelling -- is left to the executor).
+fn takes_no_collation(ty: &str) -> bool {
+    let base = ty.trim_end_matches("[]");
+    matches!(
+        base,
+        "int2"
+            | "int4"
+            | "int8"
+            | "smallint"
+            | "integer"
+            | "bigint"
+            | "numeric"
+            | "float4"
+            | "float8"
+            | "real"
+            | "double precision"
+            | "bool"
+            | "boolean"
+            | "date"
+            | "timestamp"
+            | "timestamptz"
+            | "time"
+            | "timetz"
+            | "interval"
+            | "bytea"
+            | "uuid"
+            | "json"
+            | "jsonb"
+            | "oid"
+            | "money"
+    )
+}

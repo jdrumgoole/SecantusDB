@@ -161,11 +161,16 @@ impl PgHandler {
         // own transaction, a batch each time pgwire polls the response
         // (`BlockScan`, as an extended portal in a block) -- the response is
         // sent in full before the next message is read, and any statement
-        // first drains a scan still open (`drain_block_scans`). Only under
-        // REPEATABLE READ / SERIALIZABLE: a READ COMMITTED statement takes a
-        // fresh snapshot around its own run, which a scan polled after the
-        // statement returns would not read through.
-        if in_block && !idle && !failed && !self.read_committed_now() {
+        // first drains a scan still open (`drain_block_scans`). Batch 65:
+        // under READ COMMITTED too. The statement's snapshot is then the
+        // block's own -- refreshed for it, or the block moved onto a fresh
+        // one (`with_isolation_judged`) -- which the scan reads through;
+        // a statement that instead runs APART from the block, in a fresh
+        // transaction that ends when it returns (`read_apart`), keeps the
+        // materialised path (`running_apart`, checked in
+        // `try_stream_select`): a scan polled later would read the block's
+        // older snapshot, which is what the first version of batch 64 did.
+        if in_block && !idle && !failed {
             self.stream_in_block
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.stream_request
@@ -223,6 +228,26 @@ impl PgHandler {
                     .explain_plan(self.db(), &sel.table, &sel.filter),
                 Ok(secantus_storage::ExplainPlan::CollScan)
             );
+        // A READ COMMITTED statement running apart from its block reads in
+        // a transaction that ends when it returns: materialised.
+        if self
+            .stream_in_block
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .running_apart
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.stream_in_block
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        }
+        // A join (batch 65): read now, on this thread, in bounded memory
+        // (`stream_join`).
+        if mode != STREAM_NEVER && (sel.sub.is_some() || sel.join.is_some()) {
+            self.stream_in_block
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return self.try_stream_join_select(sel, env);
+        }
         if mode == STREAM_NEVER
             || block_indexed
             || (mode == STREAM_UNFILTERED && self.primary_key_point(sel))
@@ -491,8 +516,17 @@ impl PgHandler {
         }
         let sorted =
             sorted.map_err(|e| PgHandler::user_error("XX000", format!("could not sort: {e}")))?;
+        Ok(self.sorted_stream(sorted))
+    }
+
+    /// Rows already sorted (or gathered) on this thread, handed out of the
+    /// merge a batch per poll.
+    pub(crate) fn sorted_stream(
+        &self,
+        sorted: crate::external_sort::Sorted,
+    ) -> futures::stream::BoxStream<'static, PgWireResult<Vec<Document>>> {
         let backend = self.backend.clone();
-        Ok(futures::stream::unfold(Some(sorted), move |state| {
+        futures::stream::unfold(Some(sorted), move |state| {
             let backend = backend.clone();
             async move {
                 let mut sorted = state?;
@@ -514,7 +548,7 @@ impl PgHandler {
                 }
             }
         })
-        .boxed())
+        .boxed()
     }
 
     /// Start the thread that reads `sel`'s rows and hands them over.

@@ -45,6 +45,7 @@ mod rules;
 mod scan_partitions;
 mod schema_rows;
 mod server;
+mod stream_join;
 mod table_locks;
 mod triggers;
 mod txn_gucs;
@@ -2752,6 +2753,11 @@ pub struct PgHandler {
     streamed: AtomicBool,
     /// The portal being allowed to stream is in a transaction block.
     stream_in_block: AtomicBool,
+    /// A READ COMMITTED block's statement is running apart from the block,
+    /// in a fresh transaction of its own (`read_apart`), which ends when the
+    /// statement returns: a scan polled after that could only read the
+    /// block's own (older) snapshot, so such a statement does not stream.
+    running_apart: AtomicBool,
     /// A password login in progress: the role, its stored credentials, and --
     /// once the client's first SASL message arrived -- the SCRAM exchange.
     auth: Mutex<
@@ -3209,6 +3215,7 @@ impl PgHandler {
             stream_portal: std::sync::atomic::AtomicU8::new(0),
             streamed: AtomicBool::new(false),
             stream_in_block: AtomicBool::new(false),
+            running_apart: AtomicBool::new(false),
             auth: Mutex::new(None),
             md5_auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
@@ -4658,7 +4665,26 @@ impl PgHandler {
             // A FROM-subquery or inlined CTE under the aggregate: materialise
             // it, then group its rows exactly as a table's.
             _ if agg.sub.is_some() => {
-                self.sub_source_docs(agg.sub.as_ref().expect("checked"), &agg.filter)?
+                // A join under the aggregate is read in bounded memory
+                // where it can be (`stream_join`), into the same bounded
+                // aggregates a stored table's rows go to.
+                let streamed = match self.join_aggregate_source(agg)? {
+                    Some(mut feed) if agg.group_by.is_empty() && agg.grouping_sets.is_none() => {
+                        self.ungrouped_in_bounded_memory_from(agg, Some(&mut feed))?
+                            .map(|vals| Bounded::Grouped(vec![(Vec::new(), vals)]))
+                    }
+                    Some(mut feed) => self.grouped_in_bounded_memory_from(agg, Some(&mut feed))?,
+                    None => None,
+                };
+                match streamed {
+                    Some(Bounded::Small(docs)) => docs,
+                    Some(Bounded::Grouped(groups)) => {
+                        return self.finish_groups(agg, groups, max_rows);
+                    }
+                    None => {
+                        self.sub_source_docs(agg.sub.as_ref().expect("checked"), &agg.filter)?
+                    }
+                }
             }
             None if Self::virtual_table(&agg.table).is_some() => {
                 self.virtual_rows(&agg.table, &agg.filter).expect("checked")
@@ -5222,7 +5248,7 @@ impl PgHandler {
     /// the candidates, so a value it cannot normalise (a numeric, a date)
     /// falls back to comparing every pair rather than to a wrong answer.
     fn join_rows(&self, node: &secantus_pgplan::joins::JoinNode) -> PgWireResult<Vec<Document>> {
-        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::joins::JoinNode;
         match node {
             // A LATERAL item only ever sits on a join's right; alone, with
             // nothing to its left, it was planned as an ordinary leaf.
@@ -5306,132 +5332,189 @@ impl PgHandler {
                     );
                 }
                 let rrows = self.join_rows(right)?;
-                let carry_ids = LOCK_ROW_IDS.with(|c| c.get());
-                let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
-                    let mut d = Document::new();
-                    for (key, lk, rk) in merged {
-                        let lv = l
-                            .and_then(|l| l.get(lk))
-                            .filter(|v| !matches!(v, Bson::Null));
-                        let rv = r
-                            .and_then(|r| r.get(rk))
-                            .filter(|v| !matches!(v, Bson::Null));
-                        let v = match kind {
-                            JoinKind::Right => rv,
-                            JoinKind::Full => lv.or(rv),
-                            _ => lv,
-                        };
-                        d.insert(key.clone(), v.cloned().unwrap_or(Bson::Null));
-                    }
-                    for k in left_keys {
-                        d.insert(
-                            k.clone(),
-                            l.and_then(|l| l.get(k)).cloned().unwrap_or(Bson::Null),
-                        );
-                    }
-                    for k in right_keys {
-                        d.insert(
-                            k.clone(),
-                            r.and_then(|r| r.get(k)).cloned().unwrap_or(Bson::Null),
-                        );
-                    }
-                    if carry_ids {
-                        // The base row ids a locking select's leaves carry.
-                        for side in [l, r].into_iter().flatten() {
-                            for (k, v) in side {
-                                if k.ends_with(secantus_pgplan::LOCK_ROW_ID) {
-                                    d.insert(k.clone(), v.clone());
-                                }
-                            }
-                        }
-                    }
-                    d
-                };
-                let passes = |d: &Document| -> PgWireResult<bool> {
-                    match on {
-                        None => Ok(true),
-                        Some(expr) => Ok(matches!(
-                            secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?,
-                            Bson::Boolean(true)
-                        )),
-                    }
-                };
-                // Candidates per left row: every right row, or those sharing
-                // the equality keys' hash.
-                let hash_key = |d: &Document, keys: &[&String]| -> Option<Vec<String>> {
-                    keys.iter()
-                        .map(|k| match d.get(k.as_str()) {
-                            Some(Bson::Int32(v)) => Some(format!("n{v}")),
-                            Some(Bson::Int64(v)) => Some(format!("n{v}")),
-                            Some(Bson::String(v)) => Some(join_text_hash(v)),
-                            Some(Bson::Boolean(v)) => Some(format!("b{v}")),
-                            _ => None,
-                        })
-                        .collect()
-                };
-                let lk: Vec<&String> = equi.iter().map(|(l, _)| l).collect();
-                let rk: Vec<&String> = equi.iter().map(|(_, r)| r).collect();
-                let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
-                let mut unhashable: Vec<usize> = Vec::new();
-                let hashed = !equi.is_empty();
-                if hashed {
-                    for (i, r) in rrows.iter().enumerate() {
-                        match hash_key(r, &rk) {
-                            Some(k) => index.entry(k).or_default().push(i),
-                            // A NULL key never equals anything, but a type the
-                            // hash does not model might: compare it the slow way.
-                            None if rk
-                                .iter()
-                                .any(|k| matches!(r.get(k.as_str()), Some(Bson::Null) | None)) => {}
-                            None => unhashable.push(i),
-                        }
-                    }
-                }
-                let all: Vec<usize> = (0..rrows.len()).collect();
-                let mut right_matched = vec![false; rrows.len()];
+                let mut lrows = Some(lrows);
                 let mut out = Vec::new();
-                for l in &lrows {
-                    let candidates: Vec<usize> = if !hashed {
-                        all.clone()
-                    } else {
-                        match hash_key(l, &lk) {
-                            Some(k) => {
-                                let mut c = index.get(&k).cloned().unwrap_or_default();
-                                c.extend(unhashable.iter().copied());
-                                c
-                            }
-                            None if lk
-                                .iter()
-                                .any(|k| matches!(l.get(k.as_str()), Some(Bson::Null) | None)) =>
-                            {
-                                Vec::new()
-                            }
-                            None => all.clone(),
+                self.join_rows_core(
+                    *kind,
+                    on.as_ref(),
+                    equi,
+                    merged,
+                    left_keys,
+                    right_keys,
+                    &mut |sink| {
+                        if let Some(rows) = lrows.take() {
+                            sink(rows)?;
                         }
-                    };
-                    let mut matched = false;
-                    for i in candidates {
-                        let d = combine(Some(l), Some(&rrows[i]));
-                        if passes(&d)? {
-                            matched = true;
-                            right_matched[i] = true;
-                            out.push(d);
-                        }
-                    }
-                    if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
-                        out.push(combine(Some(l), None));
-                    }
-                }
-                if matches!(kind, JoinKind::Right | JoinKind::Full) {
-                    for (i, r) in rrows.iter().enumerate() {
-                        if !right_matched[i] {
-                            out.push(combine(None, Some(r)));
-                        }
-                    }
-                }
+                        Ok(())
+                    },
+                    rrows,
+                    &mut |docs| {
+                        out.extend(docs);
+                        Ok(true)
+                    },
+                )?;
                 Ok(out)
             }
         }
+    }
+
+    /// A general join's rows (`join_rows`), the left side fed a batch at a
+    /// time by `left` and each batch's joined rows handed to `emit` (`false`
+    /// stops), in the materialised path's order: each left row in turn with
+    /// its matching right rows in their order, then (RIGHT / FULL) the right
+    /// rows nothing matched.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn join_rows_core(
+        &self,
+        kind: secantus_pgplan::joins::JoinKind,
+        on: Option<&secantus_pgplan::ColumnExpr>,
+        equi: &[(String, String)],
+        merged: &[(String, String, String)],
+        left_keys: &[String],
+        right_keys: &[String],
+        left: &mut dyn FnMut(
+            &mut dyn FnMut(Vec<Document>) -> PgWireResult<bool>,
+        ) -> PgWireResult<()>,
+        rrows: Vec<Document>,
+        emit: &mut dyn FnMut(Vec<Document>) -> PgWireResult<bool>,
+    ) -> PgWireResult<()> {
+        use secantus_pgplan::joins::JoinKind;
+        let carry_ids = LOCK_ROW_IDS.with(|c| c.get());
+        let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
+            let mut d = Document::new();
+            for (key, lk, rk) in merged {
+                let lv = l
+                    .and_then(|l| l.get(lk))
+                    .filter(|v| !matches!(v, Bson::Null));
+                let rv = r
+                    .and_then(|r| r.get(rk))
+                    .filter(|v| !matches!(v, Bson::Null));
+                let v = match kind {
+                    JoinKind::Right => rv,
+                    JoinKind::Full => lv.or(rv),
+                    _ => lv,
+                };
+                d.insert(key.clone(), v.cloned().unwrap_or(Bson::Null));
+            }
+            for k in left_keys {
+                d.insert(
+                    k.clone(),
+                    l.and_then(|l| l.get(k)).cloned().unwrap_or(Bson::Null),
+                );
+            }
+            for k in right_keys {
+                d.insert(
+                    k.clone(),
+                    r.and_then(|r| r.get(k)).cloned().unwrap_or(Bson::Null),
+                );
+            }
+            if carry_ids {
+                // The base row ids a locking select's leaves carry.
+                for side in [l, r].into_iter().flatten() {
+                    for (k, v) in side {
+                        if k.ends_with(secantus_pgplan::LOCK_ROW_ID) {
+                            d.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            d
+        };
+        let passes = |d: &Document| -> PgWireResult<bool> {
+            match on {
+                None => Ok(true),
+                Some(expr) => Ok(matches!(
+                    secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?,
+                    Bson::Boolean(true)
+                )),
+            }
+        };
+        // Candidates per left row: every right row, or those sharing
+        // the equality keys' hash.
+        let hash_key = |d: &Document, keys: &[&String]| -> Option<Vec<String>> {
+            keys.iter()
+                .map(|k| match d.get(k.as_str()) {
+                    Some(Bson::Int32(v)) => Some(format!("n{v}")),
+                    Some(Bson::Int64(v)) => Some(format!("n{v}")),
+                    Some(Bson::String(v)) => Some(join_text_hash(v)),
+                    Some(Bson::Boolean(v)) => Some(format!("b{v}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        let lk: Vec<&String> = equi.iter().map(|(l, _)| l).collect();
+        let rk: Vec<&String> = equi.iter().map(|(_, r)| r).collect();
+        let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+        let mut unhashable: Vec<usize> = Vec::new();
+        let hashed = !equi.is_empty();
+        if hashed {
+            for (i, r) in rrows.iter().enumerate() {
+                match hash_key(r, &rk) {
+                    Some(k) => index.entry(k).or_default().push(i),
+                    // A NULL key never equals anything, but a type the
+                    // hash does not model might: compare it the slow way.
+                    None if rk
+                        .iter()
+                        .any(|k| matches!(r.get(k.as_str()), Some(Bson::Null) | None)) => {}
+                    None => unhashable.push(i),
+                }
+            }
+        }
+        let all: Vec<usize> = (0..rrows.len()).collect();
+        let mut right_matched = vec![false; rrows.len()];
+        let mut stopped = false;
+        left(&mut |lrows: Vec<Document>| {
+            if stopped {
+                return Ok(false);
+            }
+            let mut out = Vec::new();
+            for l in &lrows {
+                let candidates: Vec<usize> = if !hashed {
+                    all.clone()
+                } else {
+                    match hash_key(l, &lk) {
+                        Some(k) => {
+                            let mut c = index.get(&k).cloned().unwrap_or_default();
+                            c.extend(unhashable.iter().copied());
+                            c
+                        }
+                        None if lk
+                            .iter()
+                            .any(|k| matches!(l.get(k.as_str()), Some(Bson::Null) | None)) =>
+                        {
+                            Vec::new()
+                        }
+                        None => all.clone(),
+                    }
+                };
+                let mut matched = false;
+                for i in candidates {
+                    let d = combine(Some(l), Some(&rrows[i]));
+                    if passes(&d)? {
+                        matched = true;
+                        right_matched[i] = true;
+                        out.push(d);
+                    }
+                }
+                if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+                    out.push(combine(Some(l), None));
+                }
+            }
+            if !emit(out)? {
+                stopped = true;
+            }
+            Ok(!stopped)
+        })?;
+        if !stopped && matches!(kind, JoinKind::Right | JoinKind::Full) {
+            let mut out = Vec::new();
+            for (i, r) in rrows.iter().enumerate() {
+                if !right_matched[i] {
+                    out.push(combine(None, Some(r)));
+                }
+            }
+            emit(out)?;
+        }
+        Ok(())
     }
 
     /// A write's filter, narrowed by a RESIDUAL predicate the planner could
@@ -5603,27 +5686,25 @@ impl PgHandler {
     /// SUBQUERY (`... JOIN (SELECT ...) a`) rather than a table -- those rows
     /// are keyed by the sub-plan's OUTPUT names, so the side's "field" is the
     /// column name itself. A table side (rows `None`) reads from `table_docs`.
-    fn join_docs_with(
+    /// The narrow join's rows (`join_docs_with`), the left side fed a batch
+    /// at a time by `left` and each batch's joined rows handed to `emit`
+    /// (`false` stops), in the order the materialised path builds them:
+    /// each left row in turn, with its matching right rows in their order.
+    /// The right rows are matched through a hash on the ON equality
+    /// (`stream_join::NarrowIndex`), which finds exactly the rows `eq`
+    /// accepts -- it was a nested loop over every pair. Without the join's
+    /// ORDER BY (applied by the caller).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn join_docs_core(
         &self,
         join: &secantus_pgplan::JoinSelect,
-        left_rows: Option<Vec<Document>>,
-        right_rows: Option<Vec<Document>>,
-    ) -> PgWireResult<Vec<Document>> {
-        let eq = |a: &Bson, b: &Bson| -> bool {
-            let num = |v: &Bson| -> Option<i64> {
-                secantus_pgplan::regtype_oid(v)
-                    .or_else(|| secantus_pgplan::regclass_oid(v))
-                    .or(match v {
-                        Bson::Int32(x) => Some(i64::from(*x)),
-                        Bson::Int64(x) => Some(*x),
-                        _ => None,
-                    })
-            };
-            match (num(a), num(b)) {
-                (Some(x), Some(y)) => x == y,
-                _ => a == b,
-            }
-        };
+        left: &mut dyn FnMut(
+            &mut dyn FnMut(Vec<Document>) -> PgWireResult<bool>,
+        ) -> PgWireResult<()>,
+        mut right_rows: Vec<Document>,
+        emit: &mut dyn FnMut(Vec<Document>) -> PgWireResult<bool>,
+    ) -> PgWireResult<()> {
+        let eq = crate::stream_join::narrow_eq;
         let field_of = |table: &str, col: &str| -> PgWireResult<String> {
             self.lookup(table)
                 .and_then(|def| def.field_of(col))
@@ -5661,14 +5742,7 @@ impl PgHandler {
                 field_of(&join.right.0, col)
             }
         };
-        let mut left_rows = match left_rows {
-            Some(r) => r,
-            None => self.table_docs(&join.left.0)?,
-        };
-        let mut right_rows = match right_rows {
-            Some(r) => r,
-            None => self.table_docs(&join.right.0)?,
-        };
+        let mut left_preds: Vec<Box<dyn Fn(&Document) -> bool>> = Vec::new();
 
         // WHERE predicates bind to whichever side each alias names; applying
         // them before the join is correct and keeps the nested loop trivial. A
@@ -5709,7 +5783,7 @@ impl PgHandler {
                 }
             };
             if on_left {
-                left_rows.retain(keep);
+                left_preds.push(Box::new(keep));
             } else {
                 right_rows.retain(keep);
             }
@@ -5726,97 +5800,148 @@ impl PgHandler {
 
         let tz = self.session_timezone();
         let keys = secantus_pgplan::join_output_keys(join);
-        let mut out = Vec::new();
-        for l in &left_rows {
-            let matches: Vec<&Document> = right_rows
-                .iter()
-                .filter(|r| match &on {
-                    Some((l_on, r_on)) => match (l.get(l_on), r.get(r_on)) {
-                        (Some(a), Some(b)) => eq(a, b),
-                        _ => false,
-                    },
-                    None => true,
-                })
-                .collect();
-            let rights: Vec<Option<&Document>> = if matches.is_empty() {
-                if join.left_join {
-                    vec![None]
-                } else {
-                    Vec::new()
+        let index = on
+            .as_ref()
+            .map(|(_, r_on)| crate::stream_join::NarrowIndex::new(&right_rows, r_on));
+        let join_batch = |lefts: Vec<Document>| -> PgWireResult<Vec<Document>> {
+            let mut out = Vec::new();
+            for l in &lefts {
+                if !left_preds.iter().all(|keep| keep(l)) {
+                    continue;
                 }
-            } else {
-                matches.into_iter().map(Some).collect()
-            };
-            for r in rights {
-                let mut doc = Document::new();
-                for (i, (_, alias, col)) in join.columns.iter().enumerate() {
-                    let out_name = &keys[i];
-                    let expr = join.exprs.get(i).and_then(|e| e.as_ref());
-                    // A constant target (`'t1'::regclass::oid` in a join's
-                    // list) reads no side at all.
-                    if let Some(expr @ secantus_pgplan::ColumnExpr::Const { .. }) = expr {
-                        let value = secantus_pgplan::apply_column_expr(expr, Bson::Null, &tz)
-                            .map_err(|e| PgHandler::err(&e))?;
-                        doc.insert(out_name.clone(), value);
-                        continue;
+                let matches: Vec<&Document> = match (&on, &index) {
+                    (Some((l_on, r_on)), Some(index)) => index
+                        .matches(&right_rows, r_on, l.get(l_on))
+                        .into_iter()
+                        .map(|i| &right_rows[i])
+                        .collect(),
+                    _ => right_rows.iter().collect(),
+                };
+                let rights: Vec<Option<&Document>> = if matches.is_empty() {
+                    if join.left_join {
+                        vec![None]
+                    } else {
+                        Vec::new()
                     }
-                    let on_left = if *alias == join.left.1 {
-                        true
-                    } else if *alias == join.right.1 {
-                        false
-                    } else {
-                        // Unqualified: it belongs to whichever side HAS it.
-                        left_has(col)
-                    };
-                    let value = if on_left {
-                        let f = lfield(col)?;
-                        l.get(&f).cloned().unwrap_or(Bson::Null)
-                    } else {
-                        match r {
-                            Some(r) => {
-                                let f = rfield(col)?;
-                                r.get(&f).cloned().unwrap_or(Bson::Null)
+                } else {
+                    matches.into_iter().map(Some).collect()
+                };
+                for r in rights {
+                    let mut doc = Document::new();
+                    for (i, (_, alias, col)) in join.columns.iter().enumerate() {
+                        let out_name = &keys[i];
+                        let expr = join.exprs.get(i).and_then(|e| e.as_ref());
+                        // A constant target (`'t1'::regclass::oid` in a join's
+                        // list) reads no side at all.
+                        if let Some(expr @ secantus_pgplan::ColumnExpr::Const { .. }) = expr {
+                            let value = secantus_pgplan::apply_column_expr(expr, Bson::Null, &tz)
+                                .map_err(|e| PgHandler::err(&e))?;
+                            doc.insert(out_name.clone(), value);
+                            continue;
+                        }
+                        let on_left = if *alias == join.left.1 {
+                            true
+                        } else if *alias == join.right.1 {
+                            false
+                        } else {
+                            // Unqualified: it belongs to whichever side HAS it.
+                            left_has(col)
+                        };
+                        let value = if on_left {
+                            let f = lfield(col)?;
+                            l.get(&f).cloned().unwrap_or(Bson::Null)
+                        } else {
+                            match r {
+                                Some(r) => {
+                                    let f = rfield(col)?;
+                                    r.get(&f).cloned().unwrap_or(Bson::Null)
+                                }
+                                None => Bson::Null,
                             }
-                            None => Bson::Null,
-                        }
-                    };
-                    // Most column exprs (cast chains, scalar calls) no-op on a
-                    // NULL and are skipped; COALESCE is the exception -- a
-                    // LEFT-JOIN miss is exactly the NULL it must replace.
-                    let value = match expr {
-                        Some(expr)
-                            if value != Bson::Null
-                                || matches!(expr, secantus_pgplan::ColumnExpr::Coalesce { .. }) =>
-                        {
-                            secantus_pgplan::apply_column_expr(expr, value, &tz)
-                                .map_err(|e| PgHandler::err(&e))?
-                        }
-                        _ => value,
-                    };
-                    doc.insert(out_name.clone(), value);
-                }
-                // The ORDER BY column rides along under a reserved name even
-                // when not projected -- `ORDER BY e.enumsortorder` sorts a
-                // projection that does not include it.
-                if let Some((alias, col, _)) = &join.order {
-                    let value = if *alias == join.left.1 {
-                        let f = lfield(col)?;
-                        l.get(&f).cloned().unwrap_or(Bson::Null)
-                    } else {
-                        match r {
-                            Some(r) => {
-                                let f = rfield(col)?;
-                                r.get(&f).cloned().unwrap_or(Bson::Null)
+                        };
+                        // Most column exprs (cast chains, scalar calls) no-op on a
+                        // NULL and are skipped; COALESCE is the exception -- a
+                        // LEFT-JOIN miss is exactly the NULL it must replace.
+                        let value = match expr {
+                            Some(expr)
+                                if value != Bson::Null
+                                    || matches!(
+                                        expr,
+                                        secantus_pgplan::ColumnExpr::Coalesce { .. }
+                                    ) =>
+                            {
+                                secantus_pgplan::apply_column_expr(expr, value, &tz)
+                                    .map_err(|e| PgHandler::err(&e))?
                             }
-                            None => Bson::Null,
-                        }
-                    };
-                    doc.insert("__join_order", value);
+                            _ => value,
+                        };
+                        doc.insert(out_name.clone(), value);
+                    }
+                    // The ORDER BY column rides along under a reserved name even
+                    // when not projected -- `ORDER BY e.enumsortorder` sorts a
+                    // projection that does not include it.
+                    if let Some((alias, col, _)) = &join.order {
+                        let value = if *alias == join.left.1 {
+                            let f = lfield(col)?;
+                            l.get(&f).cloned().unwrap_or(Bson::Null)
+                        } else {
+                            match r {
+                                Some(r) => {
+                                    let f = rfield(col)?;
+                                    r.get(&f).cloned().unwrap_or(Bson::Null)
+                                }
+                                None => Bson::Null,
+                            }
+                        };
+                        doc.insert("__join_order", value);
+                    }
+                    out.push(doc);
                 }
-                out.push(doc);
             }
-        }
+            Ok(out)
+        };
+        let mut stopped = false;
+        left(&mut |lefts| {
+            if stopped {
+                return Ok(false);
+            }
+            let docs = join_batch(lefts)?;
+            if !emit(docs)? {
+                stopped = true;
+            }
+            Ok(!stopped)
+        })
+    }
 
+    fn join_docs_with(
+        &self,
+        join: &secantus_pgplan::JoinSelect,
+        left_rows: Option<Vec<Document>>,
+        right_rows: Option<Vec<Document>>,
+    ) -> PgWireResult<Vec<Document>> {
+        let mut left_rows = Some(match left_rows {
+            Some(r) => r,
+            None => self.table_docs(&join.left.0)?,
+        });
+        let right_rows = match right_rows {
+            Some(r) => r,
+            None => self.table_docs(&join.right.0)?,
+        };
+        let mut out = Vec::new();
+        self.join_docs_core(
+            join,
+            &mut |sink| {
+                if let Some(rows) = left_rows.take() {
+                    sink(rows)?;
+                }
+                Ok(())
+            },
+            right_rows,
+            &mut |docs| {
+                out.extend(docs);
+                Ok(true)
+            },
+        )?;
         if let Some((_, _, ascending)) = &join.order {
             // PostgreSQL sorts NULLS LAST ascending / FIRST descending, which
             // the LEFT-JOIN misses rely on.
@@ -22457,6 +22582,8 @@ impl PgHandler {
                 .begin_user_transaction()
                 .map_err(|e| Self::storage_err("could not begin a transaction", e))?,
         };
+        self.running_apart
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let out = self
             .storage
             .with_user_transaction(&mut tmp, || match overlays {
@@ -22464,7 +22591,10 @@ impl PgHandler {
                     secantus_storage::with_read_overlay(ov, || self.execute(stmt.clone(), 0))
                 }
                 None => self.execute(stmt.clone(), 0),
-            })
+            });
+        self.running_apart
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let out = out
             .map_err(|e| Self::storage_err("transaction failed", e))
             .and_then(|r| r);
         self.storage
@@ -24298,6 +24428,21 @@ impl PgHandler {
         // OFFSET is applied before LIMIT, as PostgreSQL does.
         if sel.offset > 0 {
             let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
+            // PostgreSQL's Limit node sits ABOVE the projection, so a row
+            // OFFSET skips still has its select list computed: an error
+            // there is raised (`select a/b ... offset 5` is 22012), and a
+            // volatile call runs.
+            if sel.casts.iter().any(Option::is_some) {
+                let schema = self.row_schema(&def, &sel.columns, &sel.casts);
+                let tz = self.session_timezone();
+                for d in docs.iter().take(skip) {
+                    for (i, (_, field)) in sel.columns.iter().enumerate() {
+                        if let Some(c) = sel.casts.get(i).and_then(|c| c.as_ref()) {
+                            resolve_cell(d, field, Some(c), schema[i].datatype(), &tz)?;
+                        }
+                    }
+                }
+            }
             docs = docs.into_iter().skip(skip).collect();
         }
         if let Some(limit) = sel.limit {
@@ -37384,6 +37529,16 @@ impl PgHandler {
         &self,
         agg: &secantus_pgplan::Aggregate,
     ) -> PgWireResult<Option<Vec<Bson>>> {
+        self.ungrouped_in_bounded_memory_from(agg, None)
+    }
+
+    /// `ungrouped_in_bounded_memory` over `join`'s rows when given (an
+    /// aggregate over a join, `stream_join`), else over the stored table.
+    fn ungrouped_in_bounded_memory_from(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        join: Option<&mut stream_join::JoinFeed<'_>>,
+    ) -> PgWireResult<Option<Vec<Bson>>> {
         use secantus_pgplan::AggFunc;
         if secantus_pgplan::with_scan_cache(|_| ()).is_some() || agg.items.is_empty() {
             return Ok(None);
@@ -37520,7 +37675,10 @@ impl PgHandler {
             }
             true
         };
-        let scanned = if self.storage.in_user_txn() {
+        let scanned = if let Some(feed) = join {
+            self.run_join_feed(feed, &mut sink)?;
+            Ok(())
+        } else if self.storage.in_user_txn() {
             let mut after = None;
             loop {
                 let (blobs, next) = self
@@ -37619,6 +37777,16 @@ impl PgHandler {
         &self,
         agg: &secantus_pgplan::Aggregate,
     ) -> PgWireResult<Option<Bounded>> {
+        self.grouped_in_bounded_memory_from(agg, None)
+    }
+
+    /// `grouped_in_bounded_memory` over `join`'s rows when given (an
+    /// aggregate over a join, `stream_join`), else over the stored table.
+    fn grouped_in_bounded_memory_from(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        join: Option<&mut stream_join::JoinFeed<'_>>,
+    ) -> PgWireResult<Option<Bounded>> {
         if agg.grouping_sets.is_some()
             || agg.group_by.is_empty()
             || secantus_pgplan::with_scan_cache(|_| ()).is_some()
@@ -37711,7 +37879,10 @@ impl PgHandler {
                 }
             }
         };
-        let scanned = if self.storage.in_user_txn() {
+        let scanned = if let Some(feed) = join {
+            self.run_join_feed(feed, &mut sink)?;
+            Ok(())
+        } else if self.storage.in_user_txn() {
             // Through the block's transaction, a batch at a time.
             let mut after = None;
             loop {
