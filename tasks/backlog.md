@@ -1214,6 +1214,23 @@ remain open:
         list runs for the skipped rows (`select_docs`).
       Corpus `b65_residuals` (46 lines, 0 against 15.19), slice test
       `test_batch65_collate_distinct_on_and_offset_errors`.
+- [x] **FIXED (batch 67, 2026-10-06) — RUST pgserver: a FOR SHARE that
+      waited for a writer could return the row from BEFORE the write (CI,
+      `test_batch51_for_share_is_a_shared_lock`: 11 where PostgreSQL reads
+      16).** `commit_user_transaction` emptied the transaction's held-row set
+      (what a waiter polls) BEFORE WiredTiger's commit call. A FOR SHARE
+      waiter -- which writes nothing, so WiredTiger raises no conflict for
+      it -- that re-read in that window saw the pre-update row and no
+      holder. Pre-existing (the same ordering in base `c7544eed`); rare
+      end-to-end (0 of 50 runs locally under CPU load, both builds), but
+      certain at the storage level: the new
+      `held_rows_empty_only_after_commit_is_visible` (secantus-storage
+      `tests/concurrent_writes.rs`, an observer reading the row the moment
+      the set empties, 5,000 rounds) failed at round 1,863 with the old
+      ordering and passes with the new one. The set is now emptied by a
+      guard dropped after the commit, on every exit. A rollback still
+      empties it first, which is right: the row a waiter then reads is the
+      final one.
 - [x] **FIXED (batch 67, 2026-10-06) — RUST pgserver: an aggregate over
       ONLY an outer query's columns, inside a scalar subquery, is not the
       outer query's (found batch 66 while writing `b66_unused_outputs`,

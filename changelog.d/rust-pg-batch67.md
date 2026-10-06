@@ -27,6 +27,12 @@ their order.
   column's type.
 - A window function in a SELECT with no FROM (`select max(1) over ()`, or a
   subquery's `max(s.x) over ()`) was refused with 0A000.
+- A `SELECT ... FOR SHARE` that waited for another transaction's update
+  could return the row as it was BEFORE that update. The other
+  transaction's rows stopped counting as locked just before its commit
+  became visible, and a waiter re-reading in that instant saw the old row
+  and no lock. A transaction now holds its rows until its commit is
+  visible.
 - An unread LATERAL subquery output is not computed, so
   `(select a/b x ...) s, lateral (select s.x) l` answers where it raised
   22012.
