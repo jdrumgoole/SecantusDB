@@ -23,6 +23,7 @@ mod encoding;
 mod event_triggers;
 mod explain;
 mod expr_index;
+mod external_sort;
 mod fdw;
 mod largeobjects;
 mod live_notices;
@@ -341,6 +342,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// The settings generation this thread's planner holds a copy of.
     static INSTALLED_SETTINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The settings generation whose DateStyle and TimeZone this thread
+    /// last installed (`install_user_types`).
+    static INSTALLED_ZONE_STYLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `committed_type_catalog_docs`' per-thread copy of the shared catalog
+    /// cache: `(storage, db, collection, catalog version, rows)`, only ever
+    /// filled with what the shared cache holds as current.
+    #[allow(clippy::type_complexity)]
+    static CATALOG_FRONT: std::cell::RefCell<Vec<(usize, String, &'static str, u64, Arc<Vec<Document>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn catalog_cache() -> &'static CatalogCache {
@@ -2495,6 +2505,9 @@ pub struct PgHandler {
     /// sufficient key, and a catalog collection is only removed by dropping
     /// the whole database -- which this connection could not survive anyway.
     ensured_catalog: Mutex<HashSet<String>>,
+    /// Every one of `CATALOG_COLLECTIONS` is in `ensured_catalog`: the
+    /// per-statement check is then one load.
+    catalogs_ensured: AtomicBool,
     /// The open savepoints, oldest first.
     ///
     /// WiredTiger has no savepoint of its own, so one is a set of PRE-IMAGES:
@@ -2613,6 +2626,11 @@ pub struct PgHandler {
     /// query outside a block -- PostgreSQL's non-atomic context. A
     /// multi-statement query string is an implicit block.
     sole_implicit: AtomicBool,
+    /// Set by `with_isolation_for`: the READ COMMITTED statement about to run
+    /// reads only tables the block has not written, so it runs in a fresh
+    /// read-only transaction ([`PgHandler::rc_reads_apart`]) instead of the
+    /// block being moved onto a new snapshot.
+    rc_apart: AtomicBool,
     /// Names the savepoints a PL/pgSQL block with EXCEPTION handlers opens.
     subtxn_seq: std::sync::atomic::AtomicU64,
 }
@@ -2869,6 +2887,7 @@ impl PgHandler {
             mixed_formats: Mutex::new(None),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
             ensured_catalog: Mutex::new(HashSet::new()),
+            catalogs_ensured: AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             session_serial: {
@@ -2903,6 +2922,7 @@ impl PgHandler {
             wire_portals: Mutex::new(HashMap::new()),
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
+            rc_apart: AtomicBool::new(false),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -3257,9 +3277,29 @@ impl PgHandler {
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
-        let datestyle = self.session_datestyle();
-        let order = datestyle.order;
-        secantus_pgplan::set_session_datestyle(datestyle);
+        // The DateStyle and the zone are parsed only when the session's
+        // settings changed since this thread last installed them (the
+        // generation is unique across sessions).
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        if INSTALLED_ZONE_STYLE.with(|g| g.get()) != generation {
+            let datestyle = self.session_datestyle();
+            let order = datestyle.order;
+            secantus_pgplan::set_session_datestyle(datestyle);
+            // The zone too: a row expression runs AFTER planning, and a
+            // stored timestamptz cast to `timestamp` is the session zone's
+            // wall clock.
+            secantus_pgplan::set_session_timezone(self.session_timezone());
+            secantus_pgplan::dtparse::set_date_order(match order {
+                secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
+                secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
+                secantus_pgplan::DateStyleOrder::Mdy => secantus_pgplan::dtparse::DateOrder::Mdy,
+            });
+            INSTALLED_ZONE_STYLE.with(|g| g.set(generation));
+        }
         // The clocks: `now()` is the transaction's start (the open handle's,
         // or this statement's outside one) and `statement_timestamp()` the
         // statement's. `try_lock`: planning NESTED in a running statement (a
@@ -3270,14 +3310,6 @@ impl PgHandler {
             let start = guard.as_ref().map_or(now, |h| h.opened_at_micros());
             secantus_pgplan::scalar::set_clocks(start, now);
         }
-        // The zone too: a row expression runs AFTER planning, and a stored
-        // timestamptz cast to `timestamp` is the session zone's wall clock.
-        secantus_pgplan::set_session_timezone(self.session_timezone());
-        secantus_pgplan::dtparse::set_date_order(match order {
-            secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
-            secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
-            secantus_pgplan::DateStyleOrder::Mdy => secantus_pgplan::dtparse::DateOrder::Mdy,
-        });
         secantus_pgplan::set_session_user(Some(
             self.session_user
                 .lock()
@@ -5432,8 +5464,15 @@ impl PgHandler {
     /// begins lazily on the first statement, so the rows are committed and
     /// visible before its snapshot is taken.
     fn open_transaction_handle(&self) -> PgWireResult<UserTransactionHandle> {
-        for coll in Self::CATALOG_COLLECTIONS {
-            self.ensure_collection(coll)?;
+        if !self
+            .catalogs_ensured
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for coll in Self::CATALOG_COLLECTIONS {
+                self.ensure_collection(coll)?;
+            }
+            self.catalogs_ensured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let handle = self
             .storage
@@ -5602,20 +5641,48 @@ impl PgHandler {
     ) -> PgWireResult<Arc<Vec<Document>>> {
         let cache = catalog_cache();
         let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
-        let key = (
-            Arc::as_ptr(&self.storage) as usize,
-            self.db().to_string(),
-            collection,
-        );
-        if let Some((v, docs)) = cache
+        let storage_id = Arc::as_ptr(&self.storage) as usize;
+        // This thread's copy of what the shared cache held: no lock and no
+        // hashing of the key for the several lookups of every statement.
+        let front = |docs: &Arc<Vec<Document>>| {
+            CATALOG_FRONT.with(|f| {
+                let mut f = f.borrow_mut();
+                f.retain(|(s, d, c, v, _)| {
+                    !(*s == storage_id && d == self.db() && *c == collection) && *v == version
+                });
+                if f.len() >= 64 {
+                    f.clear();
+                }
+                f.push((
+                    storage_id,
+                    self.db().to_string(),
+                    collection,
+                    version,
+                    Arc::clone(docs),
+                ));
+            });
+        };
+        if let Some(docs) = CATALOG_FRONT.with(|f| {
+            f.borrow()
+                .iter()
+                .find(|(s, d, c, v, _)| {
+                    *s == storage_id && *c == collection && *v == version && d == self.db()
+                })
+                .map(|e| Arc::clone(&e.4))
+        }) {
+            return Ok(docs);
+        }
+        let key = (storage_id, self.db().to_string(), collection);
+        let hit = cache
             .entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-        {
-            if *v == version {
-                return Ok(Arc::clone(docs));
-            }
+            .filter(|(v, _)| *v == version)
+            .map(|(_, docs)| Arc::clone(docs));
+        if let Some(docs) = hit {
+            front(&docs);
+            return Ok(docs);
         }
         let raw = self
             .storage
@@ -5639,6 +5706,7 @@ impl PgHandler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, (version, Arc::clone(&docs)));
+            front(&docs);
         }
         Ok(docs)
     }
@@ -7337,6 +7405,13 @@ impl PgHandler {
             }
             secantus_pgplan::correlated::CallArgs::Runtime => false,
         };
+        // An IMMUTABLE function over constants is not inlined: the planner
+        // runs it as itself first (`evaluate_function`, tried before
+        // `inline_function`), so its error has the `statement N` frame.
+        let inlined = inlined
+            && !(folded
+                && !u.returns_set
+                && doc.get_str("volatility").unwrap_or("volatile") == "immutable");
         let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
             let sql = bind_parameter_names(stmt, &names, &u.arg_types);
@@ -20478,11 +20553,29 @@ impl PgHandler {
                         } else {
                             self.with_isolation_for(handle, Some(&stmt))?
                         };
-                        let out = self
-                            .storage
-                            .with_user_transaction(handle, || self.execute(stmt.clone(), max_rows))
-                            .map_err(|e| Self::storage_err("transaction failed", e))
-                            .and_then(|r| r);
+                        let apart = self
+                            .rc_apart
+                            .swap(false, std::sync::atomic::Ordering::Relaxed);
+                        let out = if apart && max_rows == 0 {
+                            self.read_apart(&stmt)
+                        } else {
+                            if apart {
+                                // A portal streamed through the block reads
+                                // there: move it after all.
+                                self.storage.rebase_user_transaction(handle).map_err(|e| {
+                                    eprintln!(
+                                        "secantusd-pg: could not move a transaction to a new snapshot: {e}"
+                                    );
+                                    Self::serialization_failure()
+                                })?;
+                            }
+                            self.storage
+                                .with_user_transaction(handle, || {
+                                    self.execute(stmt.clone(), max_rows)
+                                })
+                                .map_err(|e| Self::storage_err("transaction failed", e))
+                                .and_then(|r| r)
+                        };
                         match (&out, poll.as_mut()) {
                             (Err(e), Some(poll)) if Self::is_write_conflict(e) => {
                                 // PostgreSQL waits for the transaction holding
@@ -21302,6 +21395,8 @@ impl PgHandler {
         handle: &'h mut UserTransactionHandle,
         stmt: Option<&Statement>,
     ) -> PgWireResult<&'h mut UserTransactionHandle> {
+        self.rc_apart
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let read_committed = matches!(
             self.settings
                 .lock()
@@ -21348,7 +21443,13 @@ impl PgHandler {
                         },
                     )
                 };
-            if stale {
+            if stale && stmt.is_some_and(|s| self.rc_reads_apart(handle, s)) {
+                // Nothing it reads was written by the block: it reads in a
+                // fresh transaction of its own, which IS the per-statement
+                // snapshot, and the block keeps its own (no replay).
+                self.rc_apart
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else if stale {
                 match self.storage.rebase_user_transaction(handle) {
                     Ok(_) => {}
                     Err(e) => {
@@ -21372,6 +21473,41 @@ impl PgHandler {
     /// security, inheritance or partitioning -- is `None`: everything. (A
     /// user function elsewhere in the database cannot run: a function is
     /// reached only through the table's own expressions or its triggers.)
+    fn rc_reads_apart(&self, handle: &UserTransactionHandle, stmt: &Statement) -> bool {
+        let Statement::Select(sel) = stmt else {
+            return false;
+        };
+        // A plain read of one stored table: nothing that can run user code
+        // (an expression in the select list, a residual WHERE, a window), no
+        // other source, and no row lock (which must be taken in the block).
+        if sel.sub.is_some()
+            || sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || sel.residual.is_some()
+            || sel.casts.iter().any(Option::is_some)
+            || sel.lock.is_some()
+            || !sel.lock_clauses.is_empty()
+        {
+            return false;
+        }
+        let Some(def) = self.lookup(&sel.table) else {
+            return false;
+        };
+        if partition::parent_of(&def).is_some()
+            || partition::is_partitioned(&def)
+            || self.inheritance().0.iter().any(|(_, p)| *p == sel.table)
+            || self.has_rules(&sel.table)
+            || !self.rls_enabled_docs().is_empty()
+        {
+            return false;
+        }
+        // The block's own writes must be invisible to it: neither the table
+        // nor any catalog written (a table created, altered ... in it).
+        let db = self.db();
+        !handle.wrote_any(|d, c| d == db && (c == sel.table || c.starts_with("__")))
+    }
+
     fn rc_read_set(&self, stmt: &Statement) -> Option<RcReadSet> {
         let Statement::Insert(ins) = stmt else {
             return None;
@@ -21451,6 +21587,25 @@ impl PgHandler {
             all.push(format!("{db}.{}", fk.ref_table));
         }
         Some(RcReadSet { all, changes })
+    }
+
+    /// Run a READ COMMITTED block's read ([`Self::rc_reads_apart`]) in a
+    /// fresh read-only transaction: it holds no rows and is not registered
+    /// for row waits, and is rolled back once the rows are read.
+    fn read_apart(&self, stmt: &Statement) -> PgWireResult<Vec<Response>> {
+        let mut tmp = self
+            .storage
+            .begin_user_transaction()
+            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        let out = self
+            .storage
+            .with_user_transaction(&mut tmp, || self.execute(stmt.clone(), 0))
+            .map_err(|e| Self::storage_err("transaction failed", e))
+            .and_then(|r| r);
+        self.storage
+            .rollback_user_transaction(&mut tmp)
+            .map_err(|e| Self::storage_err("could not roll back", e))?;
+        out
     }
 
     fn in_open_transaction<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
