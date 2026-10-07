@@ -33,8 +33,8 @@ live only in the Rust server.
 
 | | Rust server | Python server |
 | --- | --- | --- |
-| Package | `pip install SecantusDB` (bundled in the wheel) | `pip install SecantusDB` |
-| Run it as | `_secantus_server.RustServer` / `secantusd-rs` | `SecantusDBServer` / `secantusd-py` |
+| Package | `cargo install secantus-mdb` (crates.io), or a release archive | `pip install SecantusDB` |
+| Run it as | `secantusd-rs` / `secantus_mdb::Server` | `SecantusDBServer` / `secantusd-py` |
 | Conformance | **99.5%** of pymongo's own suite | see the [validation report](validation-report.md) |
 | Speed | within 1.0×–2.8× of `mongod` per operation | 2×–27× |
 | Request path | pure Rust (off the GIL) | pure Python |
@@ -46,7 +46,7 @@ need one of the few features only it has (listed below and in the
 [Benchmark](benchmark.md).
 
 The same split exists on the PostgreSQL side: the Rust PostgreSQL server
-(`_secantus_server.PgServer` / `secantusd-pg`) and the Python one
+(`secantusd-pg`) and the Python one
 (`SecantusPGServer` / `secantusd-py-pg`). See the
 [SQL / PostgreSQL interface](sql.md).
 
@@ -87,22 +87,19 @@ See [Quickstart](quickstart.md) and [Installation](installation.md).
 
 ### Rust server
 
-`pip install SecantusDB` ships the Rust server in the wheel on every
-supported platform, both as an embedded handle and as a `secantusd-rs`
-daemon on `PATH`:
-
-```python
-from pymongo import MongoClient
-from _secantus_server import RustServer
-
-with RustServer("./secantus-data") as server:     # port 0 = OS-assigned
-    client = MongoClient(server.uri)
-    client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
-```
+The Rust server ships as the `secantus-mdb` crate on crates.io, not in the
+Python wheel. `cargo install` builds it (WiredTiger included) and puts the
+`secantusd-rs` daemon on `PATH`:
 
 ```bash
+cargo install secantus-mdb
 secantusd-rs --host 127.0.0.1 --port 27017
 ```
+
+From a Rust test, the same crate starts the server in-process as
+`secantus_mdb::Server`. From a Python test, run `secantusd-rs` as a
+subprocess and point `pymongo` at it, or use the Python server, which has
+the same `pymongo` surface.
 
 Standalone `secantusd-rs` archives (no Python needed) are attached to the
 `secantusdb-v*` tags on
@@ -112,8 +109,8 @@ Mongo daemons read the same `secantusd.toml` config (see
 
 ### SQL / PostgreSQL servers
 
-The Rust PostgreSQL server is in the wheel as `_secantus_server.PgServer`,
-and as a standalone `secantusd-pg` archive on the `secantusd-pg-v*` tags on
+The Rust PostgreSQL server ships as a standalone `secantusd-pg` archive on
+the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
 
 ```bash

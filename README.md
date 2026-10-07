@@ -34,17 +34,20 @@ the difference, as long as it only needs single-node behaviour. No
 `mongod` or `postgres` to install, no port conflicts, parallel-test
 friendly, embedded in-process or as a standalone daemon.
 
-The servers you run are written in **Rust**:
+Two ways to get it, depending on which server you want.
+
+**The Python servers** come from PyPI and start in-process in two lines
+(the PostgreSQL one needs the `sql` extra):
 
 ```bash
-pip install SecantusDB
+pip install SecantusDB            # or "SecantusDB[sql]" for the PostgreSQL server
 ```
 
 ```python
 from pymongo import MongoClient
-from _secantus_server import RustServer
+from secantus import SecantusDBServer
 
-with RustServer("./secantus-data") as server:     # port 0 = OS-assigned
+with SecantusDBServer(storage_path="./secantus-data") as server:  # port 0 = OS-assigned
     client = MongoClient(server.uri)
     db = client["mydb"]
     db["users"].insert_one({"_id": 1, "name": "Joe"})
@@ -53,17 +56,28 @@ with RustServer("./secantus-data") as server:     # port 0 = OS-assigned
 
 ```python
 import psycopg
-from _secantus_server import PgServer
+from secantus.sql import SecantusPGServer
 
-with PgServer("./secantus-pg-data") as server:
-    with psycopg.connect(server.dsn, autocommit=True) as conn:
+with SecantusPGServer(storage_path="./secantus-pg-data") as server:
+    with psycopg.connect(server.uri, autocommit=True) as conn:
         conn.execute("CREATE TABLE users (id int PRIMARY KEY, name text)")
         conn.execute("INSERT INTO users VALUES (1, 'Joe')")
         assert conn.execute("SELECT name FROM users WHERE id = 1").fetchone() == ("Joe",)
 ```
 
-Python is only the launcher here: the accept loop runs on a Rust thread
-with the GIL released, and your driver connects over real TCP.
+**The Rust servers** are the fast ones, and they ship as Rust, not inside
+the Python wheel. The Rust MongoDB server is the `secantus-mdb` crate on
+crates.io:
+
+```bash
+cargo install secantus-mdb          # installs the `secantusd-rs` daemon
+secantusd-rs --port 27017 --storage-path ./secantus-data
+```
+
+The same crate is also a library: `secantus_mdb::Server` starts the server
+inside a Rust test. The Rust PostgreSQL server (`secantusd-pg`) is not on
+crates.io yet; prebuilt archives of both Rust servers are attached to their
+tags on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases).
 
 Single-node only by design: replica sets, sharding, streaming
 replication, and anything else that depends on real cluster topology are
@@ -78,8 +92,8 @@ Two wire protocols, two implementations of each, one storage format.
 
 | Server | Wire | Run it as | Role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | MongoDB | `RustServer` / `secantusd-rs` | **The flagship.** In the wheel; prebuilt binaries per platform |
-| **Rust PostgreSQL server** | PostgreSQL | `PgServer` / `secantusd-pg` | **The newest.** In the wheel; prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases) |
+| **Rust MongoDB server** | MongoDB | `secantusd-rs` / `secantus_mdb::Server` | **The flagship.** `cargo install secantus-mdb`; prebuilt binaries per platform |
+| **Rust PostgreSQL server** | PostgreSQL | `secantusd-pg` | **The newest.** Prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases); crates.io to follow |
 | Python MongoDB server | MongoDB | `SecantusDBServer` / `secantusd-py` | The readable reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | PostgreSQL | `SecantusPGServer` / `secantusd-py-pg` | The reference for the SQL surface, and still the most complete one |
 
@@ -200,11 +214,14 @@ Pre-built wheels are published for CPython **3.10**, **3.11**, **3.12**, and **3
 - Linux x86_64 and aarch64 (manylinux_2_28 / glibc, and musllinux_1_2 / Alpine)
 - Windows AMD64
 
-Each wheel carries both Rust servers (`RustServer` and `PgServer` in the
-`_secantus_server` module, plus the `secantusd-rs` binary), both Python
-servers, and WiredTiger itself — no separate package, no compile step,
-no system build tools required. macOS Intel (x86_64) is not in the
+Each wheel carries both Python servers and WiredTiger itself — no separate
+package, no compile step, no system build tools required. It does **not**
+carry the Rust servers (see below). macOS Intel (x86_64) is not in the
 wheel matrix.
+
+The Rust MongoDB server installs from crates.io with `cargo install
+secantus-mdb`, which needs a Rust toolchain and builds WiredTiger as part of
+the crate.
 
 Standalone archives of `secantusd-rs` (Linux x86_64, macOS arm64,
 Windows x86_64) and `secantusd-pg` (Linux x86_64, macOS arm64) are
@@ -233,8 +250,8 @@ See [Installation](https://secantusdb.com/docs/installation.html) for dev-instal
 
 ## Standalone daemons (drop-in `mongod` / `postgres` replacements)
 
-`pip install SecantusDB` puts `secantusd-rs` on your `PATH`. Run it like
-you'd run `mongod`:
+`cargo install secantus-mdb` puts `secantusd-rs` on your `PATH` (or unpack a
+release archive). Run it like you'd run `mongod`:
 
 ```bash
 secantusd-rs --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
@@ -269,11 +286,11 @@ the docs](https://secantusdb.com/docs/examples.html).
 import tempfile
 
 from pymongo import MongoClient
-from _secantus_server import RustServer
+from secantus import SecantusDBServer
 
 # A throwaway directory so the snippet is self-contained; pass a real
 # path to keep the data across restarts.
-with RustServer(tempfile.mkdtemp()) as server:
+with SecantusDBServer(storage_path=tempfile.mkdtemp()) as server:
     client = MongoClient(server.uri)
     cellar = client["wine_cellar"]
     bottles = cellar["bottles"]

@@ -123,14 +123,15 @@ jobs:
           # push to main -- this file only runs at tag time).
           CIBW_BEFORE_TEST_LINUX: sh {project}/.github/actions/non-utc-host/set-zone.sh
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
-          # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
-          # secantusd-rs into the published wheel (kept in sync with
-          # wheels.yml + pyproject's [tool.cibuildwheel] toolchain installs).
+          # The PyPI wheel is the PYTHON servers only (2026-10-07): the Rust
+          # servers ship as crates (crates.io) and tagged GitHub binaries, so
+          # SECANTUS_BUILD_STORAGE_ENGINE stays OFF here and the wheel carries
+          # no Rust extension, which is what keeps the project inside PyPI's
+          # 10 GB storage quota.
           CIBW_ENVIRONMENT_LINUX: >-
             CCACHE_DIR=/host_ccache
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             LIBCLANG_PATH=/opt/libclang
             RUSTFLAGS="-Ctarget-feature=-crt-static"
@@ -144,7 +145,6 @@ jobs:
             SECANTUS_WT_EXTRA_LIBDIR=$HOME/.secantus-lz4/lib
             CMAKE_C_COMPILER_LAUNCHER=ccache
             CMAKE_CXX_COMPILER_LAUNCHER=ccache
-            SKBUILD_CMAKE_DEFINE="SECANTUS_BUILD_STORAGE_ENGINE=ON"
             PATH=$HOME/.cargo/bin:$PATH
             SECANTUS_CARGO_TARGET=$HOME/.cache/ccache/cargo-target
           # Windows: ccache + MSVC is historically fragile, so the

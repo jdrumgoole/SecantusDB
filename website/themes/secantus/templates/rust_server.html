@@ -89,9 +89,9 @@
     <p class="section-lead">Two ways to run the Rust server &mdash; bundled in the Python package, or as a prebuilt standalone binary.</p>
     <div class="install-cols">
       <div class="install-col">
-        <h3>Bundled in the wheel</h3>
-        <p>The <code>secantus</code> wheel ships the Rust server as the <code>secantusd-rs</code> command, alongside the pure-Python <code>secantusd-py</code>.</p>
-        <pre class="install-code"><code>pip install SecantusDB
+        <h3>From crates.io</h3>
+        <p>The Rust server is the <code>secantus-mdb</code> crate. <code>cargo install</code> builds it, WiredTiger included, and puts <code>secantusd-rs</code> on your <code>PATH</code>. The same crate starts the server in-process from a Rust test as <code>secantus_mdb::Server</code>.</p>
+        <pre class="install-code"><code>cargo install secantus-mdb
 secantusd-rs --port 27017 --storage-path ./data</code></pre>
       </div>
       <div class="install-col">
@@ -118,7 +118,7 @@ secantusd-rs --port 27017 --storage-path ./data</code></pre>
         <tbody>
           <tr><th>Request path</th><td>Pure Python</td><td>Pure Rust</td></tr>
           <tr><th>Reach for it when</th><td>You want to read, patch or extend the engine</td><td>You want to run it &mdash; anywhere, fast, with nothing installed</td></tr>
-          <tr><th>How you run it</th><td><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></td><td><code>secantusd-rs</code> binary (bundled in the wheel or from Releases)</td></tr>
+          <tr><th>How you run it</th><td><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></td><td><code>cargo install secantus-mdb</code>, or a binary from Releases</td></tr>
           <tr><th>Python required at runtime</th><td>Yes</td><td>No</td></tr>
           <tr><th>Storage engine</th><td>WiredTiger</td><td>WiredTiger</td></tr>
           <tr><th>Wire protocol &amp; drivers</th><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td></tr>

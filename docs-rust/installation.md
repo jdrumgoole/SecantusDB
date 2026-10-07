@@ -1,8 +1,29 @@
 # Installation
 
-Three ways to get the Rust server, from lightest to heaviest.
+Three ways to get the Rust server. It is not in the `SecantusDB` Python wheel,
+which carries only the Python servers.
 
-## Prebuilt binary (recommended)
+## From crates.io (recommended)
+
+The server is the `secantus-mdb` crate. `cargo install` builds it, WiredTiger
+included, and puts `secantusd-rs` on `PATH`. It needs a Rust toolchain, CMake
+and a C compiler:
+
+```bash
+cargo install secantus-mdb
+secantusd-rs --version
+secantusd-rs --port 27017 --storage-path ./secantus-data
+```
+
+To run the server inside a Rust test instead, add the crate as a
+dev-dependency and start it in-process (see [Embedded](embedded.md)):
+
+```toml
+[dev-dependencies]
+secantus-mdb = "0.5.3-beta.172"
+```
+
+## Prebuilt binary (no Rust toolchain)
 
 Prebuilt archives with WiredTiger statically linked are published on GitHub
 Releases under `secantusdb-v<version>` tags — no Python, no shared
@@ -48,20 +69,6 @@ The Windows build links the C runtime statically, so it needs no Visual C++
 redistributable — the `.exe` runs on a clean machine. It is currently built
 without PGO, so it is a few percent slower on write-heavy paths than the Linux
 and macOS archives; it is otherwise identical.
-
-## Bundled in the Python wheel
-
-Every published `SecantusDB` wheel installs `secantusd-rs` on `PATH` next to
-the pure-Python `secantusd-py`, plus the embedded
-[`RustServer` handle](embedded.md):
-
-```bash
-pip install SecantusDB
-secantusd-rs --port 27017 --storage-path ./secantus-data
-```
-
-From a source checkout, the wheel build needs the storage-engine flag
-(`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev`).
 
 ## Build from source
 
