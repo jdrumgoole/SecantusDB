@@ -18389,3 +18389,59 @@ def test_batch67_aggregate_belongs_to_the_level_of_its_variables(home: Path) -> 
                 a.execute(q)
             assert e.value.sqlstate == code, q
             a.rollback()
+
+
+def test_batch68_left_built_joins_and_hashed_grouping_sets(home: Path) -> None:
+    """Batch 68: a join whose right side is past the bound while its LEFT
+    side fits is joined against the left side held in memory (the right
+    table read again a chunk at a time, never partitioned to disk), and
+    grouping sets over wide aggregate inputs are grouped from one read with
+    each set's partial results hashed. The rows AND THEIR ORDER are the
+    materialised path's; grouped rows are the same groups."""
+    queries = [
+        # narrow two-table joins (no WHERE) and general ones
+        "select s.id, w.id from b68_s s join b68_w w on w.k = s.id",
+        "select s.id, w.id from b68_s s left join b68_w w on w.k = s.id",
+        "select s.name, w.id from b68_s s join b68_w w on w.k = s.id where w.id < 400",
+        "select s.name, w.id from b68_s s left join b68_w w on w.k = s.id and w.id < 50 "
+        "where s.id is not null or s.name = 'nul'",
+        "select s.name, w.id from b68_s s right join b68_w w on w.k = s.id where w.id < 90",
+        "select s.name, w.id from b68_s s full join b68_w w on w.k = s.id and w.id < 30 "
+        "where w.id < 60 or w.id is null",
+        "select count(*), sum(w.id), max(s.name) from b68_s s join b68_w w on w.k = s.id",
+        "select g, k % 3, count(*), max(pad), min(pad), sum(id) from b68_w "
+        "group by grouping sets ((g), (k % 3), ())",
+        "select g, k, bool_and(b), count(pad), max(pad) from b68_w group by cube (g, k)",
+    ]
+
+    def run(env: dict[str, str] | None) -> list[list[tuple]]:
+        with _Server(home, env=env) as server, server.connect() as a:
+            return [a.execute(q).fetchall() for q in queries]
+
+    with _Server(home) as server, server.connect() as a:
+        a.execute("create table b68_w (id int primary key, k int, g int, b bool, pad text)")
+        a.execute(
+            "insert into b68_w select i, (i * 7) % 9, i % 4, i % 5 = 0, repeat(md5(i::text), 4) "
+            "from generate_series(1, 1500) i"
+        )
+        a.execute("insert into b68_w values (1501, null, null, null, null)")
+        a.execute("create table b68_s (id int, name text)")
+        a.execute("insert into b68_s select i, 'n' || i from generate_series(0, 6) i")
+        a.execute("insert into b68_s values (null, 'nul'), (3, 'three-again')")
+    streamed = run(None)
+    left_built = run(
+        {"SECANTUS_PG_JOIN_INNER_BYTES": "20000", "SECANTUS_PG_GROUP_MEMORY_BYTES": "20000"}
+    )
+    partitioned = run({"SECANTUS_PG_JOIN_INNER_BYTES": "1", "SECANTUS_PG_GROUP_MEMORY_BYTES": "1"})
+    materialised = run({"SECANTUS_PG_JOIN_STREAM": "0"})
+    for q, s, lb, p, m in zip(
+        queries, streamed, left_built, partitioned, materialised, strict=True
+    ):
+        if "group by" in q:
+            for got in (s, lb, p):
+                assert sorted(map(repr, got)) == sorted(map(repr, m)), q
+        else:
+            assert s == m, q
+            assert lb == m, q
+            assert p == m, q
+    assert len(streamed[0]) > 1000

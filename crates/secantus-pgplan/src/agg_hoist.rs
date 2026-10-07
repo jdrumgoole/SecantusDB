@@ -673,6 +673,9 @@ fn check_stray(
                 // A subquery's own columns are its business; blank it so
                 // the walk does not descend.
                 Some(N::SubLink(_)) => *x = pg_query::protobuf::Node { node: None },
+                // `GROUPING()`'s arguments are checked against the GROUP BY
+                // by the aggregate planner, with PostgreSQL's own message.
+                Some(N::GroupingFunc(_)) => *x = pg_query::protobuf::Node { node: None },
                 Some(N::ColumnRef(c)) => {
                     let parts: Vec<String> = c
                         .fields

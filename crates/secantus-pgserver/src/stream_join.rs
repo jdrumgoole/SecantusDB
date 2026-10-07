@@ -182,12 +182,17 @@ enum Prepared<'a> {
         left: Box<Prepared<'a>>,
         right: Vec<Document>,
     },
-    /// A right side past the bound (`grace_join`).
+    /// A right side past the bound: partitioned (`grace_join`), or read
+    /// again a chunk at a time against a left side held whole
+    /// (`left_built_join`).
     Grace {
         node: &'a secantus_pgplan::joins::JoinNode,
         left: Box<Prepared<'a>>,
-        right: crate::grace_join::GraceRight,
+        right: GraceSide<'a>,
     },
+    /// A left side read ahead to a spool (or nothing, where it is held in
+    /// `GraceSide::LeftBuilt`).
+    Spooled(Option<crate::grace_join::Spool>),
     /// A LATERAL right side, run for each left batch's rows.
     Lateral {
         node: &'a secantus_pgplan::joins::JoinNode,
@@ -195,10 +200,70 @@ enum Prepared<'a> {
     },
 }
 
+/// A right side past the bound.
+enum GraceSide<'a> {
+    /// Partitioned to disk (`grace_join`).
+    Parted(crate::grace_join::GraceRight),
+    /// The left side fitted: held here, and the right table read again a
+    /// chunk at a time when the join is fed (`left_built_join`).
+    LeftBuilt {
+        left: Vec<Document>,
+        sel: &'a secantus_pgplan::Select,
+        def: &'a TableDef,
+        columns: &'a [(String, String)],
+    },
+}
+
 /// A narrow join's prepared right side.
 enum NarrowRight {
     Held(Vec<Document>),
-    Grace(crate::grace_join::GraceRight),
+    /// Partitioned, the left side spooled ahead of it.
+    Grace(crate::grace_join::GraceRight, crate::grace_join::Spool),
+    /// Past the bound with the left side held: the right table is read
+    /// again a chunk at a time (`left_built_join`).
+    LeftBuilt(Vec<Document>),
+}
+
+/// A left side read ahead of a right side past the bound.
+enum LeftRead {
+    Held(Vec<Document>),
+    Spooled(crate::grace_join::Spool),
+}
+
+/// Read a left side whole, held while it fits `budget` (which it then
+/// takes from), else written to a spool.
+fn hold_or_spool(
+    budget: &mut usize,
+    feed: &mut dyn FnMut(Sink<'_>) -> PgWireResult<()>,
+) -> PgWireResult<LeftRead> {
+    let mut held: Vec<Document> = Vec::new();
+    let mut bytes = 0usize;
+    let mut spool: Option<crate::grace_join::Spool> = None;
+    feed(&mut |docs| {
+        for d in docs {
+            if let Some(sp) = spool.as_mut() {
+                sp.push(&d)?;
+                continue;
+            }
+            bytes += doc_bytes(&d);
+            held.push(d);
+            if bytes > *budget {
+                let mut sp = crate::grace_join::Spool::default();
+                for r in held.drain(..) {
+                    sp.push(&r)?;
+                }
+                spool = Some(sp);
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(match spool {
+        Some(sp) => LeftRead::Spooled(sp),
+        None => {
+            *budget -= bytes;
+            LeftRead::Held(held)
+        }
+    })
 }
 
 /// A narrow join row's key class (`NarrowIndex` buckets): a value with a
@@ -402,37 +467,63 @@ impl PgHandler {
                             let rk: Vec<&String> = equi.iter().map(|(_, r)| r).collect();
                             let mut held: Vec<Document> = Vec::new();
                             let mut held_bytes = 0usize;
-                            let mut grace: Option<crate::grace_join::GraceRight> = None;
-                            let mut declined = false;
+                            let mut over = false;
                             self.table_batches(&rsel.table, &rsel.filter, &mut |batch| {
                                 let bytes: usize = batch.iter().map(Vec::len).sum();
+                                if bytes > *budget {
+                                    over = true;
+                                    return Ok(false);
+                                }
+                                *budget -= bytes;
+                                held_bytes += bytes;
+                                held.extend(self.leaf_docs(rsel, def, columns, &batch)?);
+                                Ok(true)
+                            })?;
+                            if !over {
+                                return Ok(Some(Prepared::Join {
+                                    node,
+                                    left,
+                                    right: held,
+                                }));
+                            }
+                            if equi.is_empty() {
+                                return Ok(None);
+                            }
+                            // Past the bound: the left side is read first
+                            // (batch 68). Held whole, the right side is read
+                            // again a chunk at a time and joined with it
+                            // (`left_built_join`), never written to disk.
+                            *budget += held_bytes;
+                            drop(held);
+                            let mut once = Some(*left);
+                            let left_read = hold_or_spool(budget, &mut |s| match once.take() {
+                                Some(l) => self.feed_join(l, s),
+                                None => Ok(()),
+                            })?;
+                            let left = match left_read {
+                                LeftRead::Held(rows) => {
+                                    return Ok(Some(Prepared::Grace {
+                                        node,
+                                        left: Box::new(Prepared::Spooled(None)),
+                                        right: GraceSide::LeftBuilt {
+                                            left: rows,
+                                            sel: rsel,
+                                            def,
+                                            columns,
+                                        },
+                                    }));
+                                }
+                                LeftRead::Spooled(spool) => {
+                                    Box::new(Prepared::Spooled(Some(spool)))
+                                }
+                            };
+                            // Neither fits: the right side partitioned to disk
+                            // (`grace_join`), the left read back from its spool.
+                            let mut grace = crate::grace_join::GraceRight::new(*budget);
+                            let mut declined = false;
+                            self.table_batches(&rsel.table, &rsel.filter, &mut |batch| {
                                 let docs = self.leaf_docs(rsel, def, columns, &batch)?;
-                                if grace.is_none() && bytes <= *budget {
-                                    *budget -= bytes;
-                                    held_bytes += bytes;
-                                    held.extend(docs);
-                                    return Ok(true);
-                                }
-                                if equi.is_empty() {
-                                    declined = true;
-                                    return Ok(false);
-                                }
-                                if grace.is_none() {
-                                    // The rows held so far go to disk too.
-                                    *budget += std::mem::take(&mut held_bytes);
-                                }
-                                let g = grace.get_or_insert_with(|| {
-                                    crate::grace_join::GraceRight::new(*budget)
-                                });
-                                if !held.is_empty()
-                                    && !g.add(std::mem::take(&mut held), &|d| {
-                                        crate::grace_join::general_key(d, &rk)
-                                    })?
-                                {
-                                    declined = true;
-                                    return Ok(false);
-                                }
-                                if !g.add(docs, &|d| crate::grace_join::general_key(d, &rk))? {
+                                if !grace.add(docs, &|d| crate::grace_join::general_key(d, &rk))? {
                                     declined = true;
                                     return Ok(false);
                                 }
@@ -441,13 +532,10 @@ impl PgHandler {
                             if declined {
                                 return Ok(None);
                             }
-                            return Ok(Some(match grace {
-                                Some(right) => Prepared::Grace { node, left, right },
-                                None => Prepared::Join {
-                                    node,
-                                    left,
-                                    right: held,
-                                },
+                            return Ok(Some(Prepared::Grace {
+                                node,
+                                left,
+                                right: GraceSide::Parted(grace),
                             }));
                         }
                     }
@@ -479,6 +567,18 @@ impl PgHandler {
                     let docs = self.leaf_docs(sel, def, columns, &blobs)?;
                     sink(docs)
                 })
+            }
+            Prepared::Spooled(spool) => {
+                let Some(spool) = spool else {
+                    return Ok(());
+                };
+                let mut r = spool.reader()?;
+                loop {
+                    let rows = r.next_batch(JOIN_BATCH)?;
+                    if rows.is_empty() || !sink(rows)? {
+                        return Ok(());
+                    }
+                }
             }
             Prepared::Rows(node) => {
                 let rows = self.join_rows(node)?;
@@ -600,16 +700,36 @@ impl PgHandler {
                     outer_left: matches!(kind, JoinKind::Left | JoinKind::Full),
                     outer_right: matches!(kind, JoinKind::Right | JoinKind::Full),
                 };
-                let mut left = Some(*left);
-                self.grace_join(
-                    &ops,
-                    right,
-                    &mut |inner_sink| match left.take() {
-                        Some(l) => self.feed_join(l, inner_sink),
-                        None => Ok(()),
-                    },
-                    sink,
-                )
+                match right {
+                    GraceSide::Parted(right) => {
+                        let mut left = Some(*left);
+                        self.grace_join(
+                            &ops,
+                            right,
+                            &mut |inner_sink| match left.take() {
+                                Some(l) => self.feed_join(l, inner_sink),
+                                None => Ok(()),
+                            },
+                            sink,
+                        )
+                    }
+                    GraceSide::LeftBuilt {
+                        left,
+                        sel,
+                        def,
+                        columns,
+                    } => self.left_built_join(
+                        &ops,
+                        left,
+                        join_inner_bytes(),
+                        &mut |inner_sink| {
+                            self.table_batches(&sel.table, &sel.filter, &mut |blobs| {
+                                inner_sink(self.leaf_docs(sel, def, columns, &blobs)?)
+                            })
+                        },
+                        sink,
+                    ),
+                }
             }
             Prepared::Join { node, left, right } => {
                 let JoinNode::Join {
@@ -682,32 +802,43 @@ impl PgHandler {
         }
         let right_key = self.narrow_on_fields(join).map(|(_, r)| r);
         let mut held: Vec<Document> = Vec::new();
-        let mut grace: Option<crate::grace_join::GraceRight> = None;
-        let mut declined = false;
-        let key = |d: &Document| narrow_class(d, right_key.as_deref().unwrap_or(""));
-        self.table_batches(&join.right.0, &Document::new(), &mut |batch| {
-            let bytes: usize = batch.iter().map(Vec::len).sum();
-            let docs = batch
+        let mut over = false;
+        let decode = |batch: &[Vec<u8>]| -> PgWireResult<Vec<Document>> {
+            batch
                 .iter()
                 .map(|b| decode_doc(b))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| Self::storage_err("could not decode a row", e))?;
-            if grace.is_none() && bytes <= budget {
-                budget -= bytes;
-                held.extend(docs);
-                return Ok(true);
-            }
-            if right_key.is_none() {
-                declined = true;
+                .map_err(|e| Self::storage_err("could not decode a row", e))
+        };
+        self.table_batches(&join.right.0, &Document::new(), &mut |batch| {
+            let bytes: usize = batch.iter().map(Vec::len).sum();
+            if bytes > budget {
+                over = true;
                 return Ok(false);
             }
-            let g =
-                grace.get_or_insert_with(|| crate::grace_join::GraceRight::new(join_inner_bytes()));
-            if !held.is_empty() && !g.add(std::mem::take(&mut held), &key)? {
-                declined = true;
-                return Ok(false);
-            }
-            if !g.add(docs, &key)? {
+            budget -= bytes;
+            held.extend(decode(&batch)?);
+            Ok(true)
+        })?;
+        if !over {
+            return Ok(Some(NarrowRight::Held(held)));
+        }
+        let Some(right_key) = right_key else {
+            return Ok(None);
+        };
+        drop(held);
+        // Past the bound: the left side is read first (batch 68); held
+        // whole, the right table is read again a chunk at a time against it.
+        let mut budget = join_inner_bytes();
+        let spool = match hold_or_spool(&mut budget, &mut |s| self.narrow_left(join, s))? {
+            LeftRead::Held(rows) => return Ok(Some(NarrowRight::LeftBuilt(rows))),
+            LeftRead::Spooled(spool) => spool,
+        };
+        let key = |d: &Document| narrow_class(d, &right_key);
+        let mut grace = crate::grace_join::GraceRight::new(join_inner_bytes());
+        let mut declined = false;
+        self.table_batches(&join.right.0, &Document::new(), &mut |batch| {
+            if !grace.add(decode(&batch)?, &key)? {
                 declined = true;
                 return Ok(false);
             }
@@ -716,10 +847,32 @@ impl PgHandler {
         if declined {
             return Ok(None);
         }
-        Ok(Some(match grace {
-            Some(g) => NarrowRight::Grace(g),
-            None => NarrowRight::Held(held),
-        }))
+        Ok(Some(NarrowRight::Grace(grace, spool)))
+    }
+
+    /// A narrow join's left rows, a batch at a time.
+    fn narrow_left(
+        &self,
+        join: &secantus_pgplan::JoinSelect,
+        inner_sink: Sink<'_>,
+    ) -> PgWireResult<()> {
+        if let Some(stmt) = join.left_sub.as_ref() {
+            let rows = self.sub_plan_rows(stmt)?;
+            for chunk in rows.chunks(JOIN_BATCH) {
+                if !inner_sink(chunk.to_vec())? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        self.table_batches(&join.left.0, &Document::new(), &mut |blobs| {
+            let docs = blobs
+                .iter()
+                .map(|b| decode_doc(b))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            inner_sink(docs)
+        })
     }
 
     /// The stored fields a narrow join's ON compares, (left, right), as
@@ -750,28 +903,10 @@ impl PgHandler {
         right: NarrowRight,
         sink: Sink<'_>,
     ) -> PgWireResult<()> {
-        let mut feed_left = |inner_sink: Sink<'_>| -> PgWireResult<()> {
-            if let Some(stmt) = join.left_sub.as_ref() {
-                let rows = self.sub_plan_rows(stmt)?;
-                for chunk in rows.chunks(JOIN_BATCH) {
-                    if !inner_sink(chunk.to_vec())? {
-                        break;
-                    }
-                }
-                return Ok(());
-            }
-            self.table_batches(&join.left.0, &Document::new(), &mut |blobs| {
-                let docs = blobs
-                    .iter()
-                    .map(|b| decode_doc(b))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                inner_sink(docs)
-            })
-        };
+        let mut feed_left = |inner_sink: Sink<'_>| self.narrow_left(join, inner_sink);
         match right {
             NarrowRight::Held(rows) => self.join_docs_core(join, &mut feed_left, rows, sink),
-            NarrowRight::Grace(g) => {
+            NarrowRight::Grace(..) | NarrowRight::LeftBuilt(_) => {
                 let (lf, rf) = self
                     .narrow_on_fields(join)
                     .ok_or_else(|| Self::err(&PlanError::Internal("a narrow ON".into())))?;
@@ -791,7 +926,45 @@ impl PgHandler {
                     outer_left: join.left_join,
                     outer_right: false,
                 };
-                self.grace_join(&ops, g, &mut feed_left, sink)
+                match right {
+                    NarrowRight::Grace(g, spool) => {
+                        let mut spool = Some(spool);
+                        self.grace_join(
+                            &ops,
+                            g,
+                            &mut |s| {
+                                let Some(spool) = spool.take() else {
+                                    return Ok(());
+                                };
+                                let mut r = spool.reader()?;
+                                loop {
+                                    let rows = r.next_batch(JOIN_BATCH)?;
+                                    if rows.is_empty() || !s(rows)? {
+                                        return Ok(());
+                                    }
+                                }
+                            },
+                            sink,
+                        )
+                    }
+                    NarrowRight::LeftBuilt(left) => self.left_built_join(
+                        &ops,
+                        left,
+                        join_inner_bytes(),
+                        &mut |s| {
+                            self.table_batches(&join.right.0, &Document::new(), &mut |blobs| {
+                                let docs = blobs
+                                    .iter()
+                                    .map(|b| decode_doc(b))
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                                s(docs)
+                            })
+                        },
+                        sink,
+                    ),
+                    NarrowRight::Held(_) => unreachable!("matched above"),
+                }
             }
         }
     }

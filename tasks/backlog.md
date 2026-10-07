@@ -691,8 +691,19 @@ remain open:
       (`secantus-server-py`'s Mongo and PG servers) install no signal
       handler -- the host Python process owns its signals -- so they have no
       such window.
-- [ ] **OPEN — RUST pgserver: the client gauges, and what the pgjdbc entry
-      left (re-measured 2026-10-03, batch 50).** Every gauge on a debug build
+- [x] **CLOSED (batch 68, 2026-10-07) — RUST pgserver: the client gauges,
+      and what the pgjdbc entry left.** Nothing open remains: the two
+      batch-67 residuals are fixed (below), and what is left is two scope
+      decisions and one client-side flicker. Final gauges on a debug build
+      of batch 68, tests started vs reported checked: psycopg 5544 passed /
+      0 failed (149 skipped, 34 xfailed, 4 xpassed; 5,731 reported of 5,731
+      selected); pgx 377 / 0 / 22 skipped (399 started, 399 reported);
+      SQLAlchemy 978 / 0 (435 skipped; 1,413 of 1,413); pgjdbc 7354
+      completed, 2 failed -- `BlobTransactionTest` (LANGUAGE C, scope, below)
+      and `ConnectionTest::pGStreamSettings` (the client socket's buffer,
+      below), 28 skipped. Full corpus sweep: 256 corpora, 9,211 checks, 0
+      divergences against PostgreSQL 15.19. The history follows.
+      (Originally re-measured 2026-10-03, batch 50.) Every gauge on a debug build
       of batch 50, tests started vs reported checked: psycopg 5544 passed /
       0 failed (149 skipped, 34 xfailed, 4 xpassed); pgx 377 / 0 / 22 (399
       started, 399 reported; the 22 are unset `PGX_TEST_*_CONN_STRING`
@@ -991,7 +1002,34 @@ remain open:
         all-spilled and materialised rows equal in order). Found on the way
         and fixed: the narrow join compared a `float8` / `numeric` key with
         an int one structurally, so `a.f = b.k` matched NOTHING (a wrong
-        answer, in base too).
+        answer, in base too). **Batch 68 (2026-10-07): both residuals
+        fixed.** (1) A right side past the bound now makes the join read its
+        LEFT side first: held whole when it fits, the right table is read
+        again a chunk at a time and joined against it (`left_built_join`;
+        every left row is decided like an `every` row, so LEFT / FULL NULL
+        extension waits for the last chunk), and nothing is written to
+        partitions; only when neither side fits is the right side
+        partitioned, the left read back from its own spool. Both the narrow
+        and the general join paths. (2) Grouping sets whose slim rows are as
+        wide as the rows (`max(pad)`) are grouped from ONE read when every
+        aggregate's partials combine exactly (`count`, `min` / `max`,
+        `bool_and` / `bool_or`, an integer or numeric `sum`): a chunk at a
+        time, each set's groups hashed with their partials combined
+        (`combine_partials`), so memory is the groups', not the rows' --
+        more groups than the bound falls back to per-set reads. Release,
+        `bench67.py` queries, 64 MB cache, base `23281780` -> batch 68,
+        output md5-identical: right side 300k 4.7-5.0 -> 4.1 s, its
+        aggregate 3.4-3.5 -> 3.0-3.2 s, 100k 1.68 -> 1.49 / 1.24 -> 1.14 s;
+        `gsets` (`max(pad)`) 300k 3.9-4.0 -> 1.9 s (RSS 154-218 -> 214-278
+        MB), 100k 1.44 -> 0.77 s; the other queries unchanged within noise.
+        The probe also found three divergences, fixed: `GROUPING()` over any
+        join was 42803 (the join rewrite never reached its arguments),
+        `GROUPING()` in HAVING was 0A000, and an output alias inside an
+        ORDER BY expression over a join was taken for the output (`-g`,
+        `name || 'x'`) where PostgreSQL resolves the input column. Corpus
+        `b68_wide_sets` (36 lines, 0 against 15.19 with the bounds at
+        default, 20,000, 3,000 and 1 byte and with streaming off), slice
+        test `test_batch68_left_built_joins_and_hashed_grouping_sets`.
       - **CLOSED (scope decision, batch 47):** `BlobTransactionTest` needs
         `CREATE FUNCTION lo_manage() ... LANGUAGE C` (the `lo` extension's
         trigger): `LANGUAGE C` loads a shared library into the server
@@ -1003,8 +1041,9 @@ remain open:
         are 0A000: the catalogs here are computed from the store, so there is
         no row to change (an UPDATE leaving rows as they are reports them, as
         pgjdbc's updatable-result-set write-back needs).
-      - Not the server: ConnectionTest `pGStreamSettings` asserts the CLIENT
-        socket's receive buffer and flickers on its own.
+      - **CLOSED (not the server):** ConnectionTest `pGStreamSettings` asserts
+        the CLIENT socket's receive buffer and flickers on its own (it failed
+        in batch 68's run, passed in batch 56's; the server never sees it).
 - [x] **CLOSED (scope decision, 2026-10-02, batch 45) — RUST pgserver: the
       sqllogictest gauge (batch 32).** `slt_validation` drives the Rust server
       (`SECANTUS_GAUGE_SERVER=rust`, report `slt-raw-rust-server.json`). The
@@ -2041,13 +2080,35 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
-- [ ] **OPEN — RUST pgserver: reading ONE ROW BY PRIMARY KEY costs ~10.7us
-      where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
-      general per-statement target; the protocol work above has taken the
-      extended path as far as it goes cheaply. **Batch 64: this is now the
-      ONE record of the per-statement gap** -- the separate "autocommit
-      per-statement gap is in the WIRE layer" entry below was the same gap
-      measured from `select 1`, and is closed into this one.
+- [x] **CLOSED (scope record, batch 68, 2026-10-07) — RUST pgserver:
+      reading ONE ROW BY PRIMARY KEY, the per-statement gap to PostgreSQL.**
+      Re-measured on a release build, two interleaved runs against
+      PostgreSQL 15.19 on this box (libpq `PQexecPrepared`, so Bind /
+      Describe / Execute / Sync and no Parse; 30,000 statements each; load
+      ~6): PK read 37.2 / 42.9 us (base `23281780`) and 41.2 / 42.1 us
+      (batch 68) against PostgreSQL's 25.4 / 25.4; extended `select 1` 32.0-33.1
+      against 21.4-22.1; simple `select 1` 27.9-28.8 against 22.7-23.0.
+      A `sample` of 392,000 PK reads (10 s) put the connection's tokio
+      worker on CPU ~26 us a statement. Nearly all of the gap is that CPU
+      time, and no single piece of it is above ~1.4 us:
+      `recvfrom` 3.2 + `sendto` 2.3 (the two socket syscalls, one of each a
+      statement); the storage read 3.0 (`_id` index probe 1.4 -- of which
+      the WiredTiger cursor open and close are 0.4 -- and the row fetch
+      1.2); Describe 1.7 (field description 0.3, `install_user_types` 0.4,
+      the RowDescription encoding 0.4); the extended group's open 0.5 and
+      commit 0.7; `install_user_types` 1.3 in all, in pieces under 0.2;
+      `templated_plan` 0.4, `check_sql_privileges` 0.35,
+      `wait_for_table_locks` 0.2, the row projection and stream 1.1;
+      malloc / free ~2.5 spread across all of them. The one piece found
+      near 1 us was `infer_param_types` (0.9 us: libpq declares no
+      parameter types, so the statement was parsed again at every Execute).
+      Its answer depends only on the text and the declarations, so it is
+      now remembered per thread (0.26 us left: the key's hash and copy).
+      What remains is many sub-microsecond costs of a general planner and a
+      tokio server, not one lever. PostgreSQL's process-per-connection
+      backend runs a cached plan with no task hand-offs, and closing the
+      gap would mean restructuring the statement path rather than fixing a
+      hot spot. Kept below as the record.
 
       **Batch 64 (2026-10-06), the measured breakdown.** One lever above
       1 us was left, and it was not in the wire layer: every extended
