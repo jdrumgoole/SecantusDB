@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import statistics
 import subprocess
@@ -154,6 +155,8 @@ def main() -> int:
             d.wait(timeout=10)
         except subprocess.TimeoutExpired:
             d.kill()
+            d.wait()
+        shutil.rmtree(store, ignore_errors=True)
 
     stages = [
         "ping",

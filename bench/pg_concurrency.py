@@ -29,6 +29,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import shutil
 import signal
 import socket
 import statistics
@@ -225,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     counts = [int(c) for c in args.clients.split(",")]
 
     daemon = None
+    store: str | None = None
     collected: dict[str, list[Trials]] = {}
     try:
         if args.server in ("postgres", "both"):
@@ -266,6 +268,10 @@ def main(argv: list[str] | None = None) -> int:
                 daemon.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 daemon.kill()
+                daemon.wait()
+        # Each run's store is tens of MB; twenty runs left 1.3 GB behind.
+        if store is not None:
+            shutil.rmtree(store, ignore_errors=True)
     if args.json:
         args.json.write_text(
             json.dumps(

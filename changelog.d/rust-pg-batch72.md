@@ -37,3 +37,5 @@ unpatched code.
 - `bench/pg_concurrency.py`'s `update` and `select` workloads addressed a row
   that was never seeded, so they measured statements that matched nothing.
   Both benchmarks also measured the main checkout's binary from any worktree.
+- Both PG benchmarks remove their temporary store on exit; twenty runs had left
+  1.3 GB of WiredTiger stores in the temp directory.
