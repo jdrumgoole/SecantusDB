@@ -776,7 +776,16 @@ def _fmt_double(v: float) -> str:
     diverge as soon as a value needs more digits: 1099511627776.0 prints as
     `1.09951e+12` and 0.0 as `0`. Probed 8.2.11 via `$acos`'s Location50989.
     `$toString` uses the round-trip form instead -- see `convert_to_string`.
+
+    A decimal or an integer is rendered through its double value, as mongod
+    does in the "32-bit integer" complaints (`Decimal128("3E+9")` is `3e+09`);
+    formatting a ``Decimal128`` with ``:g`` raised, which reached the client as
+    ``1 internal server error`` (measured 8.2.11, 2026-10-07).
     """
+    if isinstance(v, Decimal128):
+        v = float(v.to_decimal())
+    elif isinstance(v, int) and not isinstance(v, bool):
+        v = float(v)
     return f"{v:g}"
 
 
@@ -843,6 +852,11 @@ def _int_index(v: Any) -> Any:
         if not v.is_integer() or not _fits_int32(v):
             raise _FractionalIndex
         return int(v)
+    if isinstance(v, int) and not isinstance(v, bool) and not _fits_int32(v):
+        # A LONG beyond int32 is refused like any other non-int32 value: it
+        # was passed through and used, so `{$slice: [[1, 2, 3], 3000000000]}`
+        # answered the whole array (measured 8.2.11, 2026-10-07).
+        raise _FractionalIndex
     return v
 
 
@@ -3700,7 +3714,7 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
     except _FractionalIndex:
         raise ExpressionError(
             "$substrCP: starting index cannot be represented as a 32-bit "
-            f"integral value: {_fmt_double(start)}",
+            f"integral value: {_num_msg(start)}",
             code=34451,
         ) from None
     try:
@@ -3708,7 +3722,7 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
     except _FractionalIndex:
         raise ExpressionError(
             "$substrCP: length cannot be represented as a 32-bit integral "
-            f"value: {_fmt_double(length)}",
+            f"value: {_num_msg(length)}",
             code=34453,
         ) from None
     # The first operand is COERCED, not required to be a string: mongod answers
@@ -3761,28 +3775,38 @@ _INDEX_OF_CODES = {"$indexOfArray": (9711600, 9711601)}
 _INDEX_OF_DEFAULT_CODES = (40096, 40097)
 
 
+def _num_msg(v: Any) -> str:
+    """A number as mongod renders it in an argument complaint: a double through
+    ``%g`` (``2.14748e+09``), a long or a decimal as written (``3000000000``,
+    ``3E+9``); anything else by its value rendering."""
+    if isinstance(v, float):
+        return _fmt_double(v)
+    if isinstance(v, (Decimal128, int)) and not isinstance(v, bool):
+        return str(v)
+    return _mongo_val_repr(v)
+
+
 def _index_of_pos(op: str, which: str, v: Any) -> int:
-    """Validate a ``$indexOf*`` start / end index. mongod accepts an int or whole
-    double; a fractional double / bool / non-numeric is the operator's "integral"
-    code (note the message's verbatim missing space after the operator name),
-    and a negative index is its "nonnegative" code."""
+    """Validate a ``$indexOf*`` start / end index. mongod accepts any number
+    that is a whole value representable as a 32-bit integer -- a decimal
+    included; anything else (fractional, beyond int32, bool, non-numeric) is
+    the operator's "integral" code (note the message's verbatim missing space
+    after the operator name), and a negative index is its "nonnegative" code.
+    Measured 8.2.11, 2026-10-07 (`int32_arguments.py`): a decimal was refused
+    and a long beyond int32 was used as given."""
     integral_code, nonneg_code = _INDEX_OF_CODES.get(op, _INDEX_OF_DEFAULT_CODES)
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
+    try:
+        coerced = None if isinstance(v, bool) else _int_index(v)
+    except _FractionalIndex:
+        coerced = None
+    if not isinstance(coerced, int) or isinstance(coerced, bool):
         raise ExpressionError(
             f"{op}requires an integral {which} index, found a value of type: "
-            f"{_bson_type_name(v)}, with value: {_mongo_val_repr(v)}",
+            f"{_bson_type_name(v)}, with value: {_num_msg(v)}",
             code=integral_code,
             code_name=f"Location{integral_code}",
         )
-    if isinstance(v, float):
-        if not v.is_integer():
-            raise ExpressionError(
-                f"{op}requires an integral {which} index, found a value of type: "
-                f"{_bson_type_name(v)}, with value: {_mongo_val_repr(v)}",
-                code=integral_code,
-                code_name=f"Location{integral_code}",
-            )
-        v = int(v)
+    v = coerced
     if v < 0:
         raise ExpressionError(
             f"{op} requires a nonnegative {which} index, found: {v}",
@@ -3973,7 +3997,7 @@ def _op_let(arg: Any, ctx: _Ctx, ret: _Eval = None) -> Any:
 # document like `{$project: {r: {$range: [0, 1_000_000_000]}}}` is an
 # OOM bomb (allocates ~8 GB in CPython). MongoDB caps at 64 MB BSON
 # but doesn't materialise into Python — we have to cap explicitly.
-_MAX_RANGE_SIZE = 100_000
+_RANGE_MEMORY_LIMIT = 100 * 1024 * 1024
 
 
 def _op_range(arg: Any, ctx: _Ctx) -> Any:
@@ -4041,12 +4065,20 @@ def _op_range(arg: Any, ctx: _Ctx) -> Any:
         )
     # Compute the size symbolically so we never call list(range(...)) on
     # a billion-element range.
+    # mongod's limit is on MEMORY, estimated before building anything: 16 bytes
+    # per element plus 40, with the element count taken as the TRUNCATED
+    # quotient. Over 100 MiB is 146 (measured 8.2.11, 2026-09-30, and ported
+    # from the Rust server). A fixed 100,000-element cap stood here, which
+    # refused ranges mongod answers.
     delta = end - start
-    if (delta > 0) == (step > 0):
-        size = (abs(delta) + abs(step) - 1) // abs(step)
-        if size > _MAX_RANGE_SIZE:
+    if delta != 0 and (delta > 0) == (step > 0):
+        estimate = 16 * abs(int(delta / step)) + 40
+        if estimate > _RANGE_MEMORY_LIMIT:
             raise ExpressionError(
-                f"$range result of {size} elements exceeds the {_MAX_RANGE_SIZE}-element cap"
+                f"$range would use too much memory ({estimate} bytes) and cannot spill "
+                f"to disk. Memory limit: {_RANGE_MEMORY_LIMIT} bytes",
+                code=146,
+                code_name="ExceededMemoryLimit",
             )
     return list(range(start, end, step))
 

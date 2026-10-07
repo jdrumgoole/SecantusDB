@@ -5828,3 +5828,22 @@ def test_where_is_refused_on_an_empty_collection(client) -> None:
         with pytest.raises(OperationFailure) as caught:
             db.command({"find": coll, "filter": _WHERE})
         assert caught.value.details["code"] == _NO_SCRIPT[0], coll
+
+
+def test_failed_multi_update_keeps_the_documents_it_already_rewrote(coll) -> None:
+    """mongod's multi-update is not atomic: a failure on a later document
+    leaves the earlier ones rewritten and the later ones untouched, and the
+    reply still says n: 0 (measured 8.2.11, 2026-10-07). This server rolled
+    the whole chunk back, so a change stream and a find disagreed with
+    mongod."""
+    coll.insert_many([{"_id": 1, "b": []}, {"_id": 2, "b": 1}, {"_id": 3, "b": []}])
+    reply = coll.database.command(
+        "update", coll.name, updates=[{"q": {}, "u": {"$push": {"b": 5}}, "multi": True}]
+    )
+    assert reply["n"] == 0 and reply["nModified"] == 0
+    assert reply["writeErrors"][0]["code"] == 2
+    assert list(coll.find().sort("_id", 1)) == [
+        {"_id": 1, "b": [5]},
+        {"_id": 2, "b": 1},
+        {"_id": 3, "b": []},
+    ]

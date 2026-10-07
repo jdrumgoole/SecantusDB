@@ -37,7 +37,7 @@ from bson.int64 import Int64
 from bson.timestamp import Timestamp
 
 from secantus import deadline as _deadline
-from secantus.diff import compute_update_description
+from secantus.diff import compute_update_description, pipeline_update_description
 from secantus.geo import GeoError, parse_doc_geometry, parse_query_geometry, validate_coordinates
 from secantus.geo_index import (
     encode_cell,
@@ -174,6 +174,25 @@ def _doc_table_for(db: str, coll: str) -> str:
 # Every documents shard table + the legacy single table (for migration / purge /
 # rename table-set operations).
 _DOC_ALL_TABLES = [_doc_shard_name(s) for s in range(_DOC_SHARDS)] + [_DOC_TABLE]
+
+
+def _update_oplog_o(
+    pre: dict[str, Any], post: dict[str, Any], update: Any, is_replacement: bool
+) -> dict[str, Any]:
+    """The oplog ``o`` for an update of ``pre`` into ``post``: the whole new
+    document for a replacement, else a ``$v: 2`` diff. A PIPELINE update is
+    logged as a full replacement whenever mongod's own delta would not be
+    clearly smaller than the document -- see
+    :func:`secantus.diff.pipeline_update_description` -- and its change event
+    is then ``replace``."""
+    if is_replacement:
+        return dict(post)
+    if isinstance(update, list):
+        delta = pipeline_update_description(pre, post)
+        if delta is None:
+            return dict(post)
+        return {"$v": 2, "diff": delta}
+    return {"$v": 2, "diff": compute_update_description(pre, post, update)}
 
 
 class IncompatibleStorageFormatError(RuntimeError):
@@ -6119,6 +6138,7 @@ class Storage:
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
         oplog_on = self.enable_oplog
+        failure: Exception | None = None
         with self._batch_transaction(sync=journal):
             ns = self._ns(db, coll)
             ui = self._collection_uuid(db, coll) if oplog_on else None
@@ -6147,49 +6167,37 @@ class Storage:
                 if not matches(doc, filter, vars=let, collation=collation_obj):
                     continue
                 matched += 1
-                pos = find_positional_matches(doc, filter)
-                new = apply_update(
-                    doc,
-                    update,
-                    array_filters=array_filters,
-                    positional_matches=pos,
-                    let=let,
-                )
-                if _doc_changed(new, doc) or arith_wrote_nan(new, update):
-                    # ``validationLevel: "moderate"`` exempts a document that
-                    # ALREADY failed the validator before this update — the level
-                    # exists so a validator can be added to a collection with
-                    # legacy rows without freezing them. A doc that currently
-                    # SATISFIES the validator is still held to it, so an update
-                    # cannot break a valid doc.
-                    was_already_invalid = validator_moderate and not matches(doc, validator)
-                    if (
-                        validator is not None
-                        and not matches(new, validator)
-                        and not was_already_invalid
-                    ):
-                        raise DocumentValidationError(new.get("_id"), new)
-                    conflict = self._unique_conflict(
-                        db, coll, new, indexes, exclude_recordid=recordid, partials=partials
+                try:
+                    checked = self._chunk_doc_update_checked(
+                        db,
+                        coll,
+                        doc,
+                        recordid,
+                        filter,
+                        update,
+                        array_filters=array_filters,
+                        let=let,
+                        validator=validator,
+                        validator_moderate=validator_moderate,
+                        indexes=indexes,
+                        partials=partials,
                     )
-                    if conflict is not None:
-                        cname, kpat, kval = conflict
-                        raise IndexConflict(
-                            cname,
-                            new["_id"],
-                            key_pattern=kpat,
-                            key_value=kval,
-                            namespace=f"{db}.{coll}",
-                        )
-                    self._validate_geo_indexes(db, coll, new, indexes, partials)
+                except wt.WiredTigerError:
+                    raise  # a write conflict retries the whole chunk
+                except Exception as exc:
+                    # mongod's multi-update is not atomic: the documents it
+                    # already rewrote STAY rewritten when a later one fails
+                    # (measured 8.2.11, 2026-10-07 -- {b: []}, {b: 1}, {b: []}
+                    # under $push leaves the first doc pushed and the reply
+                    # n: 0). This doc wrote nothing yet, so stop here, let the
+                    # chunk's transaction commit what came before, and raise
+                    # after the commit.
+                    failure = exc
+                    matched -= 1
+                    break
+                new, changed = checked
+                if changed:
                     new_blob = bson.encode(new)
-                    if len(new_blob) > MAX_BSON_OBJECT_SIZE:
-                        raise DocumentTooLargeError(
-                            10334,
-                            "Plan executor error during update :: caused by :: "
-                            f"Resulting document after update is larger than "
-                            f"{MAX_BSON_OBJECT_SIZE}",
-                        )
                     modified += 1
                     chunk_bytes += len(new_blob)
                     self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)
@@ -6205,13 +6213,7 @@ class Storage:
                         db, coll, new, indexes, multikey_names
                     )
                     if oplog_on:
-                        if is_replacement:
-                            o_field: dict[str, Any] = dict(new)
-                        else:
-                            o_field = {
-                                "$v": 2,
-                                "diff": compute_update_description(doc, new, update),
-                            }
+                        o_field = _update_oplog_o(doc, new, update, is_replacement)
                         oplog_entries.append(
                             {
                                 "op": "u",
@@ -6237,7 +6239,68 @@ class Storage:
                 pre_images.extend(cap_pre)
             if oplog_entries:
                 self._emit_oplog(oplog_entries, pre_images)
+        if failure is not None:
+            raise failure
         return consumed, matched, modified, posts
+
+    def _chunk_doc_update_checked(
+        self,
+        db: str,
+        coll: str,
+        doc: dict[str, Any],
+        recordid: int,
+        filter: dict[str, Any],
+        update: Any,
+        *,
+        array_filters: list[dict[str, Any]] | None,
+        let: dict[str, Any] | None,
+        validator: dict[str, Any] | None,
+        validator_moderate: bool,
+        indexes: Any,
+        partials: Any,
+    ) -> tuple[dict[str, Any], bool]:
+        """Compute one document's update and run every check that can refuse
+        it, WITHOUT writing anything: ``(new, changed)``. Kept apart from the
+        write so a refusal leaves the chunk's earlier writes committable."""
+        pos = find_positional_matches(doc, filter)
+        new = apply_update(
+            doc,
+            update,
+            array_filters=array_filters,
+            positional_matches=pos,
+            let=let,
+        )
+        if not (_doc_changed(new, doc) or arith_wrote_nan(new, update)):
+            return new, False
+        # ``validationLevel: "moderate"`` exempts a document that ALREADY
+        # failed the validator before this update — the level exists so a
+        # validator can be added to a collection with legacy rows without
+        # freezing them. A doc that currently SATISFIES the validator is still
+        # held to it, so an update cannot break a valid doc.
+        was_already_invalid = validator_moderate and not matches(doc, validator)
+        if validator is not None and not matches(new, validator) and not was_already_invalid:
+            raise DocumentValidationError(new.get("_id"), new)
+        conflict = self._unique_conflict(
+            db, coll, new, indexes, exclude_recordid=recordid, partials=partials
+        )
+        if conflict is not None:
+            cname, kpat, kval = conflict
+            raise IndexConflict(
+                cname,
+                new["_id"],
+                key_pattern=kpat,
+                key_value=kval,
+                namespace=f"{db}.{coll}",
+            )
+        self._validate_geo_indexes(db, coll, new, indexes, partials)
+        if len(bson.encode(new)) > MAX_BSON_OBJECT_SIZE:
+            raise DocumentTooLargeError(
+                10334,
+                "Plan executor error during update :: caused by :: "
+                f"Resulting document after update is larger than "
+                f"{MAX_BSON_OBJECT_SIZE}",
+            )
+        return new, True
 
     @_retry_write_conflicts
     def _update_matching_single_txn(
@@ -6388,13 +6451,7 @@ class Storage:
                         isinstance(k, str) and k.startswith("$") for k in update
                     )
                     if oplog_on:
-                        if is_replacement:
-                            o_field: dict[str, Any] = dict(new)
-                        else:
-                            o_field = {
-                                "$v": 2,
-                                "diff": compute_update_description(doc, new, update),
-                            }
+                        o_field = _update_oplog_o(doc, new, update, is_replacement)
                         oplog_entries.append(
                             {
                                 "op": "u",

@@ -42,8 +42,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+import bson
+
 from secantus.ordering import bson_same_stored_value
-from secantus.paths import get_path, set_path, unset_path
+from secantus.paths import get_path, has_path, set_path, unset_path
 
 #: Operators whose effect on an array mongod reports element-wise, provided
 #: they are a plain append (``$slice`` / ``$sort`` / ``$position`` reorder or
@@ -94,6 +96,14 @@ def _elementwise_array_paths(
             for field in spec:
                 parts = str(field).split(".")
                 for i, part in enumerate(parts):
+                    # A positional token (``$``, ``$[]``, ``$[<id>]``) writes
+                    # elements of the array before it, like a numeric index:
+                    # mongod reports ``a.1``, not the whole array (measured
+                    # 8.2.11, 2026-10-01). Which elements is only known after
+                    # the query, so any index is allowed.
+                    if i and part.startswith("$"):
+                        paths[".".join(parts[:i])] = None
+                        continue
                     if not (part.isdigit() and i):
                         continue
                     prefix = ".".join(parts[:i])
@@ -103,6 +113,12 @@ def _elementwise_array_paths(
                     assert named is not None
                     named.add(int(part))
     return paths
+
+
+def _push_targets(update: Mapping[str, Any]) -> set[str]:
+    """The fields a ``$push`` appends to."""
+    spec = update.get("$push")
+    return {str(k) for k in spec} if isinstance(spec, Mapping) else set()
 
 
 def _record_ambiguous(path: str, segments: list[Any], disambiguated: dict[str, list[Any]]) -> None:
@@ -124,6 +140,7 @@ def _walk(
     disambiguated: dict[str, list[Any]],
     segments: list[Any],
     elementwise: dict[str, set[int] | None] | None,
+    push_targets: frozenset[str] | set[str] = frozenset(),
 ) -> None:
     """Recursive walk; mutates the output collections in place."""
     if isinstance(pre, Mapping) and isinstance(post, Mapping):
@@ -149,6 +166,7 @@ def _walk(
                     disambiguated,
                     child_segments,
                     elementwise,
+                    push_targets,
                 )
         return
     if isinstance(pre, list) and isinstance(post, list):
@@ -185,12 +203,17 @@ def _walk(
                     disambiguated,
                     [*segments, i],
                     elementwise,
+                    push_targets,
                 )
             if len(post) < len(pre):
                 truncated.append({"field": path, "newSize": len(post)})
                 _record_ambiguous(path, segments, disambiguated)
             return
-        if path not in elementwise or len(post) < len(pre):
+        # Not element-wise, it shrank, or a ``$push`` onto an EMPTY array:
+        # mongod resends the array. ``$push`` onto ``[]`` is ``updatedFields:
+        # {a: [x]}``, while ``$addToSet`` onto ``[]``, or a ``$set`` of an
+        # index past its end, is ``{a.0: x}`` (measured 8.2.11, 2026-10-01).
+        if path not in elementwise or len(post) < len(pre) or (not pre and path in push_targets):
             updated[path] = post
             _record_ambiguous(path, segments, disambiguated)
             return
@@ -215,6 +238,7 @@ def _walk(
                 disambiguated,
                 [*segments, i],
                 elementwise,
+                push_targets,
             )
         return
     # BSON equality, not Python's: `True == 1` is true in Python, so a field
@@ -262,7 +286,10 @@ def compute_update_description(
         disambiguated,
         [],
         _elementwise_array_paths(update) if isinstance(update, Mapping) else None,
+        _push_targets(update) if isinstance(update, Mapping) else set(),
     )
+    if isinstance(update, Mapping):
+        _report_whole_values(update, post, updated, removed, truncated, disambiguated)
     out: dict[str, Any] = {
         "updatedFields": updated,
         "removedFields": removed,
@@ -271,6 +298,254 @@ def compute_update_description(
     if disambiguated:
         # Only stamped when an ambiguous path exists (the unified specs
         # use $$unsetOrMatches — absence is valid when unambiguous).
+        out["disambiguatedPaths"] = disambiguated
+    return out
+
+
+def _report_whole_values(
+    update: Mapping[str, Any],
+    post: Mapping[str, Any],
+    updated: dict[str, Any],
+    removed: list[str],
+    truncated: list[dict[str, Any]],
+    disambiguated: dict[str, list[Any]],
+) -> None:
+    """mongod describes a modifier update by what each operator TOUCHED, not by
+    diffing the documents: a ``$set`` of a field reports the field's whole new
+    value, and so does a ``$rename`` target. So ``$set: {a: {x: 1, z: 3}}`` over
+    ``a: {x: 1, y: 2}`` is ``updatedFields: {a: {x: 1, z: 3}}`` on mongod, where
+    a value diff says ``{a.z: 3}`` plus ``removedFields: [a.y]``. A ``$rename``
+    target is reported even when the value it receives equals the one it
+    replaces; a ``$set`` that leaves its field unchanged is still no change.
+    Measured against mongod 8.2.11, 2026-10-01
+    (``tools/probes/update_description.py``).
+
+    Applied after the value diff: every entry at or below such a path collapses
+    into one entry for the path itself (appended last, as mongod orders it).
+    Positional (``$``, ``$[]``, ``$[<id>]``) paths are left to the diff, which
+    already reports the resolved element. Mutates the collections in place.
+    """
+    targets: list[tuple[str, bool]] = []
+    for op, payload in update.items():
+        if not isinstance(payload, Mapping):
+            continue
+        if op == "$set":
+            for path in payload:
+                if not any(p.startswith("$") for p in str(path).split(".")):
+                    targets.append((str(path), False))
+        elif op == "$rename":
+            for to in payload.values():
+                if isinstance(to, str):
+                    targets.append((to, True))
+    for path, always in targets:
+        if not has_path(post, path):
+            continue
+        value = get_path(post, path)
+        prefix = path + "."
+
+        def below(p: str, path: str = path, prefix: str = prefix) -> bool:
+            return p == path or p.startswith(prefix)
+
+        touched = any(below(k) for k in updated)
+        kept_removed = [r for r in removed if not below(r)]
+        touched |= len(kept_removed) != len(removed)
+        kept_truncated = [t for t in truncated if not below(str(t.get("field", "")))]
+        touched |= len(kept_truncated) != len(truncated)
+        if touched or always:
+            removed[:] = kept_removed
+            truncated[:] = kept_truncated
+            keep = {k: v for k, v in updated.items() if not below(k)}
+            updated.clear()
+            updated.update(keep)
+            updated[path] = value
+            for k in [k for k in disambiguated if below(k)]:
+                del disambiguated[k]
+            _record_ambiguous(path, _typed_segments(post, path), disambiguated)
+
+
+def _typed_segments(doc: Any, path: str) -> list[Any]:
+    """``path``'s segments typed against ``doc``: an int where the parent is an
+    array, the field name otherwise (``disambiguatedPaths``' shape)."""
+    segments: list[Any] = []
+    node = doc
+    for part in path.split("."):
+        if isinstance(node, list) and part.isdigit():
+            segments.append(int(part))
+            idx = int(part)
+            node = node[idx] if idx < len(node) else None
+        else:
+            segments.append(part)
+            node = node.get(part) if isinstance(node, Mapping) else None
+    return segments
+
+
+# --- pipeline updates: mongod's own diff ------------------------------------
+#
+# A PIPELINE update is not described by what operators touched (there are
+# none): mongod diffs the two documents into its ``$v: 2`` oplog diff, and logs
+# a full REPLACEMENT instead whenever that diff is not clearly smaller than the
+# new document. Both halves are observable -- the event is ``replace`` rather
+# than ``update``, and an ``update``'s ``updatedFields`` follows the diff's own
+# choices. Measured against mongod 8.2.11, 2026-10-01
+# (``tools/probes/update_description.py``, ``change_stream_fuzz.py``):
+#
+# * a diff is logged iff ``bsonsize(diff) + 15 < bsonsize(post)`` -- the 15 is
+#   the oplog entry's own overhead;
+# * fields are compared in lockstep while their names line up; once the order
+#   diverges, the rest of ``post`` is INSERTED and the rest of ``pre`` that
+#   ``post`` lacks is DELETED;
+# * a document or array that changed gets a sub-diff only when the sub-diff is
+#   smaller than the new value; otherwise the whole value is an update.
+#
+# A diff node is a dict: a document node ``{"kind": "doc", "d": [names],
+# "u": [(name, v)], "i": [(name, v)], "s": [(name, node)]}``, an array node
+# ``{"kind": "arr", "l": new_len | None, "e": [(index, ("u", v) | ("s", node))]}``.
+
+#: mongod's per-entry overhead of a delta oplog entry (see above).
+_DELTA_OPLOG_OVERHEAD = 15
+
+
+def _bson_size(value: Any) -> int:
+    # document header (4) + type byte (1) + empty name's NUL (1) + trailer (1)
+    return len(bson.encode({"": value})) - 7
+
+
+def _binary_equal(a: Any, b: Any) -> bool:
+    return bson.encode({"": a}) == bson.encode({"": b})
+
+
+def _serialize(node: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if node["kind"] == "doc":
+        if node["d"]:
+            out["d"] = {f: False for f in node["d"]}
+        if node["u"]:
+            out["u"] = dict(node["u"])
+        if node["i"]:
+            out["i"] = dict(node["i"])
+        for f, sub in node["s"]:
+            out[f"s{f}"] = _serialize(sub)
+        return out
+    out["a"] = True
+    if node["l"] is not None:
+        out["l"] = node["l"]
+    for i, (tag, v) in node["e"]:
+        out[f"{tag}{i}"] = _serialize(v) if tag == "s" else v
+    return out
+
+
+def _node_size(node: dict[str, Any]) -> int:
+    return _bson_size(_serialize(node))
+
+
+def _changed_value(pre: Any, post: Any) -> tuple[str, Any]:
+    """``("s", node)`` when a sub-diff is smaller than the new value, else
+    ``("u", post)``."""
+    sub = None
+    if isinstance(pre, Mapping) and isinstance(post, Mapping):
+        sub = _diff_doc(pre, post)
+    elif isinstance(pre, list) and isinstance(post, list):
+        sub = _diff_arr(pre, post)
+    if sub is not None and _node_size(sub) < _bson_size(post):
+        return ("s", sub)
+    return ("u", post)
+
+
+def _diff_doc(pre: Mapping[str, Any], post: Mapping[str, Any]) -> dict[str, Any] | None:
+    node: dict[str, Any] = {"kind": "doc", "d": [], "u": [], "i": [], "s": []}
+    pre_items = list(pre.items())
+    post_items = list(post.items())
+    i = 0
+    while i < len(pre_items) and i < len(post_items) and pre_items[i][0] == post_items[i][0]:
+        name, a = pre_items[i]
+        b = post_items[i][1]
+        if not _binary_equal(a, b):
+            tag, v = _changed_value(a, b)
+            node[tag].append((name, v))
+        i += 1
+    # Past the first name mismatch the order changed (or fields came and
+    # went): everything left in `post` is inserted, and what `post` no longer
+    # has is deleted.
+    for name, _ in pre_items[i:]:
+        if name not in post:
+            node["d"].append(name)
+    node["i"].extend(post_items[i:])
+    if node["d"] or node["u"] or node["i"] or node["s"]:
+        return node
+    return None
+
+
+def _diff_arr(pre: list[Any], post: list[Any]) -> dict[str, Any] | None:
+    node: dict[str, Any] = {"kind": "arr", "l": None, "e": []}
+    for i, b in enumerate(post):
+        if i < len(pre):
+            if _binary_equal(pre[i], b):
+                continue
+            node["e"].append((i, _changed_value(pre[i], b)))
+        else:
+            node["e"].append((i, ("u", b)))
+    if len(post) < len(pre):
+        node["l"] = len(post)
+    if node["l"] is not None or node["e"]:
+        return node
+    return None
+
+
+def _describe(
+    node: dict[str, Any],
+    prefix: str,
+    segs: list[Any],
+    updated: dict[str, Any],
+    removed: list[str],
+    truncated: list[dict[str, Any]],
+    disambiguated: dict[str, list[Any]],
+) -> None:
+    def path(name: str) -> str:
+        return f"{prefix}.{name}" if prefix else name
+
+    if node["kind"] == "doc":
+        for f in node["d"]:
+            _record_ambiguous(path(f), [*segs, f], disambiguated)
+            removed.append(path(f))
+        for f, v in [*node["u"], *node["i"]]:
+            _record_ambiguous(path(f), [*segs, f], disambiguated)
+            updated[path(f)] = v
+        for f, sub in node["s"]:
+            _describe(sub, path(f), [*segs, f], updated, removed, truncated, disambiguated)
+        return
+    if node["l"] is not None:
+        truncated.append({"field": prefix, "newSize": node["l"]})
+    for i, (tag, v) in node["e"]:
+        p = path(str(i))
+        if tag == "u":
+            _record_ambiguous(p, [*segs, i], disambiguated)
+            updated[p] = v
+        else:
+            _describe(v, p, [*segs, i], updated, removed, truncated, disambiguated)
+
+
+def pipeline_update_description(
+    pre: Mapping[str, Any], post: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """What mongod logs for a PIPELINE update of ``pre`` into ``post``: ``None``
+    when it logs a full replacement (the event is then ``replace``), else the
+    ``updateDescription`` its delta yields. An unchanged document is an empty
+    description, as for any no-op update."""
+    updated: dict[str, Any] = {}
+    removed: list[str] = []
+    truncated: list[dict[str, Any]] = []
+    disambiguated: dict[str, list[Any]] = {}
+    node = _diff_doc(pre, post)
+    if node is not None:
+        if _node_size(node) + _DELTA_OPLOG_OVERHEAD >= _bson_size(dict(post)):
+            return None
+        _describe(node, "", [], updated, removed, truncated, disambiguated)
+    out: dict[str, Any] = {
+        "updatedFields": updated,
+        "removedFields": removed,
+        "truncatedArrays": truncated,
+    }
+    if disambiguated:
         out["disambiguatedPaths"] = disambiguated
     return out
 
