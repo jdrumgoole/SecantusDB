@@ -31,3 +31,7 @@ and every test it starts reports a result.
 - The Windows runner image exports `PGPASSWORD`. That made `test_used_password`
   expect a password challenge that a trusted role never gets. The variable is
   now unset for the gauge step.
+- psycopg's `refcount` marker is now excluded on Windows, as psycopg's own
+  scheduled Windows CI does. These are client-side checks that count live
+  Python objects to find leaks. On the runner they passed in one run and
+  failed 75 `test_leak` cases in the next, some with negative counts.

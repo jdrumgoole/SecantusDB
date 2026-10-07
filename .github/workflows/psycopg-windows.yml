@@ -18,8 +18,6 @@ on:
   schedule:
     - cron: "17 4 * * 0"  # Sundays, off the hour
   workflow_dispatch:
-  push:  # TEMPORARY: lets the branch run this before it is on main
-    branches: [rust-pg-batch73]
   pull_request:
     branches: [main]
     paths:
