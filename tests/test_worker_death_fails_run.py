@@ -16,8 +16,27 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 import conftest
 from conftest import _lost_test_report
+
+
+@pytest.fixture(autouse=True)
+def _no_tmp_reap(monkeypatch) -> None:
+    """Keep the real temp-tree sweep out of these tests.
+
+    ``pytest_sessionfinish`` reclaims earlier runs' temp trees, and the hook
+    tests below call it with a controller-shaped fake config -- from inside an
+    xdist WORKER. So the worker ran the sweep itself, mid-suite. On 2026-10-07
+    that sank a release gate: three of these tests went down as ``node down:
+    Not properly terminated`` and the stall watchdog then failed the run. The
+    workers' stderr was lost, so the cause is inferred -- the three most likely
+    spent their 600 s timeout deleting a previous full run's tree, which
+    pytest-timeout answers by killing the worker. The end-to-end test's
+    subprocess sweeps at its own session start, and inherits this too.
+    """
+    monkeypatch.setenv("SECANTUS_NO_TMP_REAP", "1")
 
 
 def test_clean_run_reports_nothing() -> None:
@@ -110,6 +129,20 @@ def test_hook_preserves_an_existing_failure_status(monkeypatch) -> None:
     conftest.pytest_sessionfinish(session, exitstatus=2)
 
     assert session.exitstatus == 2
+
+
+def test_hook_tests_do_not_run_the_real_sweep(monkeypatch) -> None:
+    """The fixture above is what keeps a hook test from deleting gigabytes."""
+    import python_tasks
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        python_tasks, "_sweep_stale_pytest_tmp", lambda *a, **k: calls.append("swept") or (0, 0)
+    )
+
+    conftest.pytest_sessionfinish(_FakeSession(_FakeConfig(), collected=0), exitstatus=0)
+
+    assert calls == []
 
 
 def test_hook_is_a_no_op_inside_a_worker(monkeypatch) -> None:
