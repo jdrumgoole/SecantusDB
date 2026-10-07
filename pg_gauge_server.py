@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 RUST_BINARY = (
     REPO_ROOT
     / "crates"
-    / "secantus-pgserver"
+    / "secantus-pg"
     / "target"
     / "debug"
     / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")

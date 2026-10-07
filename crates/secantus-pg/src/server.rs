@@ -99,11 +99,23 @@ pub fn commit_sync_method(config: &str) -> String {
 /// Measured 2026-10-02: without it a `CREATE TABLE` + `INSERT` acknowledged
 /// just before a SIGKILL were gone after restart.
 pub fn open_storage(home: &str) -> secantus_storage::Result<Storage> {
+    open_storage_with_cache(home, "4G")
+}
+
+/// [`open_storage`] with a WiredTiger cache cap other than the daemon's 4G, in
+/// WiredTiger's syntax (`"256M"`). The embedded [`crate::PgServer`] uses a
+/// smaller one, because a test suite starts many servers.
+pub fn open_storage_with_cache(home: &str, cache_size: &str) -> secantus_storage::Result<Storage> {
     let force = std::env::var("SECANTUS_FORCE_DURABLE").as_deref() == Ok("1");
     let fast = std::env::var("SECANTUS_TEST_FAST_STORAGE").as_deref() == Ok("1");
     // The same engine knobs as `Storage::open`'s default config, with only
     // `transaction_sync` chosen here.
-    let config = commit_sync_method(&wt_config("4G", 1000, sync_on_commit(force, fast), "128MB"));
+    let config = commit_sync_method(&wt_config(
+        cache_size,
+        1000,
+        sync_on_commit(force, fast),
+        "128MB",
+    ));
     Storage::open_with_options(
         home,
         &StorageOptions {
@@ -162,6 +174,9 @@ pub struct RunningPgServer {
     active: Arc<AtomicUsize>,
     /// The last `Arc` to the store. `stop` drops it — that is the checkpoint.
     storage: Option<Arc<Storage>>,
+    /// Set by `stop` once the store is known to be closed (its last reference
+    /// dropped, so the close-checkpoint ran).
+    store_closed: bool,
 }
 
 impl RunningPgServer {
@@ -184,6 +199,15 @@ impl RunningPgServer {
         )
     }
 
+    /// Whether [`stop`](Self::stop) has run and closed the store. False before
+    /// `stop`, and after a `stop` whose drain gave up with the store still
+    /// referenced (reported on stderr). A caller that owns the store's
+    /// directory removes it only when this is true: deleting files from under
+    /// an open WiredTiger is how a `WT_PANIC` happens.
+    pub fn store_closed(&self) -> bool {
+        self.store_closed
+    }
+
     /// Stop accepting, drain connections, and close the store (checkpointing
     /// WiredTiger). Idempotent — a second call is a no-op — and called by
     /// `Drop`.
@@ -197,6 +221,9 @@ impl RunningPgServer {
     /// once the store is closed -- the checkpoint is not left to race the
     /// caller.
     pub fn stop(&mut self) {
+        if self.storage.is_none() {
+            return;
+        }
         self.stop_flag.store(true, Ordering::SeqCst);
         // Tell the accept loop and every live connection to finish. Ignore a
         // send error: it only means every receiver is already gone.
@@ -211,7 +238,7 @@ impl RunningPgServer {
             storage: self.storage.take(),
         };
         if tokio::runtime::Handle::try_current().is_err() {
-            teardown.run();
+            self.store_closed = teardown.run();
             return;
         }
         // Inside a runtime: hand the blocking part to a thread that is not.
@@ -219,19 +246,18 @@ impl RunningPgServer {
         // `stop` promises; the server's connections run on its own runtime,
         // so nothing the drain waits for needs the caller's.
         match std::thread::Builder::new()
-            .name("secantus-pgserver-stop".into())
+            .name("secantus-pg-stop".into())
             .spawn(move || teardown.run())
         {
-            Ok(thread) => {
-                if let Err(panic) = thread.join() {
-                    std::panic::resume_unwind(panic);
-                }
-            }
+            Ok(thread) => match thread.join() {
+                Ok(closed) => self.store_closed = closed,
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
             // No thread to be had: report it rather than return as if stopped
             // (the teardown was moved into the failed spawn and dropped, which
             // is exactly the runtime drop this path exists to avoid).
             Err(e) => eprintln!(
-                "secantus-pgserver: WARNING: could not start the shutdown thread for {}: {e}; \
+                "secantus-pg: WARNING: could not start the shutdown thread for {}: {e}; \
                  the store's close-checkpoint may not have run",
                 self.address
             ),
@@ -250,7 +276,9 @@ struct Teardown {
 }
 
 impl Teardown {
-    fn run(mut self) {
+    /// Returns whether the store was closed (false only when a reference
+    /// outlived the drain, which is reported on stderr).
+    fn run(mut self) -> bool {
         // Wait for the connections, bounded. Each holds an `Arc<Storage>`
         // clone and the checkpoint below cannot run while one is outstanding.
         let deadline = Instant::now() + DRAIN_TIMEOUT;
@@ -267,13 +295,16 @@ impl Teardown {
         if let Some(storage) = self.storage.take() {
             match Arc::try_unwrap(storage) {
                 // The close-checkpoint runs here, in `Storage::drop`.
-                Ok(storage) => drop(storage),
+                Ok(storage) => {
+                    drop(storage);
+                    true
+                }
                 Err(still_shared) => {
                     // Never silent: this is a database, and reaching here means
                     // the acknowledged writes since the last checkpoint are at
                     // risk. Report it rather than returning as if stopped.
                     eprintln!(
-                        "secantus-pgserver: WARNING: the store behind {} is still \
+                        "secantus-pg: WARNING: the store behind {} is still \
                          referenced after the shutdown drain ({} live \
                          connection(s)); its close-checkpoint has NOT run and \
                          writes since the last checkpoint may be lost",
@@ -281,8 +312,11 @@ impl Teardown {
                         self.active.load(Ordering::SeqCst),
                     );
                     drop(still_shared);
+                    false
                 }
             }
+        } else {
+            true
         }
     }
 }
@@ -385,6 +419,7 @@ pub fn bind(
         shutdown,
         active,
         storage: Some(storage),
+        store_closed: false,
     })
 }
 

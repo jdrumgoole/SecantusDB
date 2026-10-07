@@ -1,13 +1,34 @@
-//! The SecantusDB PostgreSQL server -- P1 vertical slice.
+//! A surrogate PostgreSQL server you can start from a test.
 //!
-//! psql -> `pgwire` -> `secantus-pgplan` (libpg_query) -> MQL ->
+//! SecantusDB speaks the real PostgreSQL wire protocol on a real TCP socket,
+//! parses SQL with PostgreSQL's own grammar (libpg_query), and stores rows in
+//! WiredTiger, scoped to a single node. [`PgServer`] runs one in-process: an
+//! application's tests connect to it with `tokio-postgres`, `sqlx` or any other
+//! PostgreSQL client instead of standing up a `postgres`.
+//!
+//! ```
+//! let server = secantus_pg::PgServer::start()?;
+//! // Connect any client to `server.dsn()` (or `server.url()`), e.g.
+//! // tokio_postgres::connect(&server.dsn(), tokio_postgres::NoTls)
+//! assert!(server.url().starts_with("postgresql://postgres@127.0.0.1:"));
+//! # Ok::<(), secantus_pg::Error>(())
+//! ```
+//!
+//! [`PgServer::start`] gives each server its own temporary store, removed when
+//! the server is dropped, and an OS-assigned port, so any number can run in
+//! parallel. [`PgServer::builder`] sets a persistent store, a port, extra
+//! databases and the WiredTiger cache.
+//!
+//! The lower-level [`bind`] / [`RunningPgServer`] pair is what both
+//! [`PgServer`] and the `secantusd-pg` binary are built on.
+//!
+//! Building this crate compiles WiredTiger and libpg_query from source, which
+//! needs CMake, a C compiler and libclang.
+//!
+//! Internally: psql -> `pgwire` -> `secantus-pgplan` (libpg_query) -> MQL ->
 //! `secantus-storage` (WiredTiger). No Python anywhere in that path, and no
 //! fallback into it: a construct the planner cannot lower becomes a real
 //! PostgreSQL SQLSTATE, never a wrong row.
-//!
-//! Scope is deliberately thin -- CREATE TABLE, INSERT, single-table SELECT --
-//! because the point of P1 is to prove the SEAM end to end on real storage,
-//! including the shared on-disk catalog format. Breadth is P5's problem.
 
 mod advisory;
 mod aggregates;
@@ -20,6 +41,7 @@ mod collations;
 mod db_settings;
 mod distinct_set;
 mod do_block;
+mod embedded;
 mod encoding;
 mod event_triggers;
 mod explain;
@@ -53,7 +75,8 @@ mod txn_gucs;
 mod wire_portals;
 mod xids;
 
-pub use server::{bind, open_storage, sync_on_commit, RunningPgServer};
+pub use embedded::{Error, PgBuilder, PgServer, DEFAULT_CACHE_SIZE, DEFAULT_DATABASE};
+pub use server::{bind, open_storage, open_storage_with_cache, sync_on_commit, RunningPgServer};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};

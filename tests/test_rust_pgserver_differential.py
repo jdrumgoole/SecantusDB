@@ -7,7 +7,7 @@ match — which is how the NULL-ordering and three-valued-logic rules in
 `secantus-pgplan` were derived rather than guessed.
 
 Needs BOTH:
-  * `secantusd-pg` built  — cd crates/secantus-pgserver && cargo build
+  * `secantusd-pg` built  — cd crates/secantus-pg && cargo build
   * a live PostgreSQL     — SECANTUS_PG_ORACLE_DSN, default the local 14
 """
 
@@ -101,7 +101,7 @@ def _oracle_available() -> bool:
 pytestmark = [
     pytest.mark.skipif(
         not BINARY.exists(),
-        reason="secantusd-pg not built (cargo build in crates/secantus-pgserver)",
+        reason="secantusd-pg not built (cargo build in crates/secantus-pg)",
     ),
     pytest.mark.skipif(
         not _oracle_available(),

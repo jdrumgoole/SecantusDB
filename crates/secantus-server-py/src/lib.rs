@@ -14,7 +14,7 @@
 //! is available (the wheel's CMake / local maturin), never the WT-less `rust` CI.
 //!
 //! `PgServer` is the same handle for the Rust **PostgreSQL**-wire server
-//! (`secantus_pgserver::bind`) -- same contract, same shape: Python starts and
+//! (`secantus_pg::bind`) -- same contract, same shape: Python starts and
 //! stops it, psycopg talks to it over real TCP, and no statement ever enters
 //! Python. It is behind the default-on `pgserver` cargo feature so a build that
 //! does not want the libpg_query / pgwire tree can drop it.
@@ -35,7 +35,7 @@ use secantus_storage::{wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 #[cfg(feature = "pgserver")]
-use secantus_pgserver::{bind as pg_bind, DatabaseRegistry, RunningPgServer};
+use secantus_pg::{bind as pg_bind, DatabaseRegistry, RunningPgServer};
 
 /// An in-process handle to a running Rust SecantusDB server. Constructing it
 /// binds a socket and starts the accept loop; `stop()` (or `__exit__` / drop)
@@ -233,7 +233,7 @@ impl RustServer {
 /// (`secantusd-pg`'s engine). Constructing it opens the store and binds a
 /// socket; `stop()` (or `__exit__` / drop) shuts it down.
 ///
-/// The handle OWNS the `Storage` it opens -- `secantus_pgserver::bind` takes it
+/// The handle OWNS the `Storage` it opens -- `secantus_pg::bind` takes it
 /// by value for exactly this reason. WiredTiger's close-checkpoint runs when
 /// that last reference is dropped, which `stop()` does after draining the
 /// connections; a design where the caller could hold a second reference would
@@ -280,7 +280,7 @@ impl PgServer {
         })?;
         // The PG server's own open: a per-commit log sync in durable mode, so
         // an acknowledged COMMIT survives a process kill (as `secantusd-pg`).
-        let storage = secantus_pgserver::open_storage(storage_path)
+        let storage = secantus_pg::open_storage(storage_path)
             .map_err(|e| PyRuntimeError::new_err(format!("failed to open storage: {e:?}")))?;
         let registry = Arc::new(DatabaseRegistry::new(
             "postgres",

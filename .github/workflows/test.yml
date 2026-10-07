@@ -2216,8 +2216,8 @@ jobs:
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           export LIBCLANG_PATH="$(dirname "$lc")"
           echo "LIBCLANG_PATH=$LIBCLANG_PATH"
-          (cd crates/secantus-pgserver && cargo build --bin secantusd-pg)
-          test -x crates/secantus-pgserver/target/debug/secantusd-pg
+          (cd crates/secantus-pg && cargo build --bin secantusd-pg)
+          test -x crates/secantus-pg/target/debug/secantusd-pg
 
       # The cross-protocol tests in test_rust_pgserver_slice.py need the
       # MongoDB binary as well: they have the PG server write a table, stop it,
@@ -2242,6 +2242,7 @@ jobs:
       # `cargo test` locally. `cargo build --bin` above does not build tests.
       # `signals` starts the binary with SIGTERM blocked / ignored, as a
       # supervisor may leave it, and requires it to stop on SIGTERM.
+      # `pg_server` covers `secantus_pg::PgServer`, the crates.io embedding API.
       - name: Run the embedded pgserver tests
         shell: bash
         run: |
@@ -2250,7 +2251,7 @@ jobs:
           lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
           test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
           export LIBCLANG_PATH="$(dirname "$lc")"
-          (cd crates/secantus-pgserver && cargo test --test embedded --test signals)
+          (cd crates/secantus-pg && cargo test --test embedded --test signals --test pg_server)
 
       - name: Verify the reference server is reachable
         # Fail CLOSED. The whole point of this job is that these suites stop

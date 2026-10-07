@@ -48,7 +48,7 @@ def test_bump_rewrites_versions_pins_and_locks(tmp_path: Path) -> None:
     # A pin, a lockfile of a crate OUTSIDE the lockstep that depends on it,
     # and the canonical manifest all move together.
     assert "secantus-wt/Cargo.toml" in names  # pins secantus-wiredtiger-sys
-    assert "secantus-pgserver/Cargo.lock" in names  # records secantus-storage
+    assert "secantus-pg/Cargo.lock" in names  # records secantus-storage
     assert "secantusdb/Cargo.toml" in names
     pins = (crates / "secantus-commands" / "Cargo.toml").read_text()
     assert f'version = "={new}"' in pins and f"={old}" not in pins
@@ -57,11 +57,38 @@ def test_bump_rewrites_versions_pins_and_locks(tmp_path: Path) -> None:
 def test_bump_leaves_the_pg_version_line_alone(tmp_path: Path) -> None:
     mod = _load()
     crates = _copy_manifests(tmp_path)
-    pg = crates / "secantus-pgserver" / "Cargo.toml"
-    before = pg.read_text()
+    pg_old = mod.current_version(crates, line="pg")
     old = mod.current_version(crates)
     mod.bump(old, old + ".9", crates)
-    assert pg.read_text() == before
+    # The PG crates' own version and their pins on each other stay; only
+    # their pins on MongoDB-side crates (secantus-core, -storage, -auth) move.
+    assert mod.current_version(crates, line="pg") == pg_old
+    pg = (crates / "secantus-pg" / "Cargo.toml").read_text()
+    assert f'"={pg_old}"' in pg and f'"={old}.9"' in pg
+
+
+def test_pg_line_bumps_the_four_pg_crates_and_nothing_else(tmp_path: Path) -> None:
+    mod = _load()
+    crates = _copy_manifests(tmp_path)
+    mdb_before = (crates / "secantusdb" / "Cargo.toml").read_text()
+    mdb = mod.current_version(crates)
+    old = mod.current_version(crates, line="pg")
+    assert old != mdb
+    new = "9.8.7-beta.1"
+
+    changed = mod.bump(old, new, crates)
+
+    assert mod.current_version(crates, line="pg") == new
+    assert mod.current_version(crates) == mdb
+    assert mod.leftovers(old, crates) == []
+    names = {p.relative_to(crates).as_posix() for p in changed}
+    for manifest in ("secantus-pgcatalog", "secantus-pgplan", "secantus-pgwire", "secantus-pg"):
+        assert f"{manifest}/Cargo.toml" in names
+    assert "secantus-pg/Cargo.lock" in names
+    assert (crates / "secantusdb" / "Cargo.toml").read_text() == mdb_before
+    pg = (crates / "secantus-pg" / "Cargo.toml").read_text()
+    # Its pins on the PG line moved; its pins on the MongoDB line did not.
+    assert f'version = "={new}"' in pg and f'"={mdb}"' in pg
 
 
 def test_bump_matches_whole_versions_only(tmp_path: Path) -> None:

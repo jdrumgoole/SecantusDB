@@ -7,7 +7,7 @@ twin of ``tests/test_rust_binary_smoke.py``, and what the release workflow runs
 against the exact artifact it is about to publish.
 
 Skipped unless the binary exists: build it with
-``cargo build --manifest-path crates/secantus-pgserver/Cargo.toml`` (WiredTiger
+``cargo build --manifest-path crates/secantus-pg/Cargo.toml`` (WiredTiger
 required — set SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB), or point
 ``SECANTUSD_PG_BIN`` at a prebuilt one.
 """
@@ -50,11 +50,11 @@ def _binary_path() -> pathlib.Path | None:
                 f"SECANTUSD_PG_BIN={env!r} does not exist"
                 + (f" (nor {p})" if str(p) != env else "")
                 + ". Point it at a built secantusd-pg binary, or unset it to let "
-                "the suite discover one under crates/secantus-pgserver/target/."
+                "the suite discover one under crates/secantus-pg/target/."
             )
         return p
     for profile in ("release", "debug"):
-        p = _REPO_ROOT / "crates" / "secantus-pgserver" / "target" / profile / "secantusd-pg"
+        p = _REPO_ROOT / "crates" / "secantus-pg" / "target" / profile / "secantusd-pg"
         if sys.platform == "win32":
             p = p.with_suffix(".exe")
         if p.exists():
@@ -66,7 +66,7 @@ _BIN = _binary_path()
 pytestmark = pytest.mark.skipif(
     _BIN is None,
     reason="secantusd-pg not built (cargo build --manifest-path "
-    "crates/secantus-pgserver/Cargo.toml, or set SECANTUSD_PG_BIN)",
+    "crates/secantus-pg/Cargo.toml, or set SECANTUSD_PG_BIN)",
 )
 
 _WINDOWS = sys.platform == "win32"
@@ -252,7 +252,7 @@ def test_binary_was_built_from_this_tree() -> None:
     message = (
         f"{_BIN.name} was built from crates tree {stamped[:12]}, but HEAD has "
         f"{head[:12]} — the binary is stale. Rebuild it:\n"
-        f"    cargo build --manifest-path crates/secantus-pgserver/Cargo.toml\n"
+        f"    cargo build --manifest-path crates/secantus-pg/Cargo.toml\n"
         f"Smoking a stale binary proves only that OLD code works."
     )
     if os.environ.get("SECANTUSD_PG_BIN"):

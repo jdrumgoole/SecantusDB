@@ -1,4 +1,4 @@
-"""Bump the Rust MongoDB server's lockstep version, pins and lockfiles included.
+"""Bump one Rust version line (MongoDB or PostgreSQL), pins and lockfiles included.
 
 Phase E step 2 of ``tasks/rust-packages-plan.md``. The MongoDB-side crates all
 carry one version (``0.MAJOR.PATCH-beta.N``) and pin each other EXACTLY
@@ -14,13 +14,18 @@ rewrite, the old version must appear nowhere it was replaced, and every
 lockfile must still resolve ``--locked`` -- the release workflows build
 ``--locked``, so a lockfile the bump left inconsistent fails on release day.
 
-The PostgreSQL crates carry their own version line and are left alone: their
-``[package] version`` never equals the MongoDB one.
+The PostgreSQL crates (``secantus-pgcatalog``, ``secantus-pgplan``,
+``secantus-pgwire``, ``secantus-pg``) carry their own lockstep line, bumped
+with ``--line pg``; each line's bump leaves the other alone, because the two
+version strings never coincide. A PG crate's ``=`` pins on MongoDB-side crates
+(``secantus-core``, ``-storage``, ``-auth``) belong to the MongoDB line and move
+with it.
 
 Usage::
 
-    python scripts/rust_version_bump.py 0.5.3-beta.166        # bump + check
-    python scripts/rust_version_bump.py --check               # check only
+    python scripts/rust_version_bump.py 0.5.3-beta.166             # MongoDB line
+    python scripts/rust_version_bump.py --line pg 0.1.0-beta.3     # PostgreSQL line
+    python scripts/rust_version_bump.py --check                    # check only
 """
 
 from __future__ import annotations
@@ -33,17 +38,20 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CRATES = REPO / "crates"
-CANONICAL = CRATES / "secantusdb" / "Cargo.toml"
+# The manifest whose version IS each line's version.
+LINES = {"mdb": "secantusdb", "pg": "secantus-pg"}
+CANONICAL = CRATES / LINES["mdb"] / "Cargo.toml"
 
 # A SemVer pre-release of the shape the lockstep line uses.
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
 
 
-def current_version(crates: Path = CRATES) -> str:
-    text = (crates / "secantusdb" / "Cargo.toml").read_text()
+def current_version(crates: Path = CRATES, line: str = "mdb") -> str:
+    directory = LINES[line]
+    text = (crates / directory / "Cargo.toml").read_text()
     m = re.search(r'(?m)^version = "([^"]+)"', text)
     if not m:
-        raise SystemExit("no version in crates/secantusdb/Cargo.toml")
+        raise SystemExit(f"no version in crates/{directory}/Cargo.toml")
     return m.group(1)
 
 
@@ -117,11 +125,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("new", nargs="?", help="the new lockstep version, e.g. 0.5.3-beta.166")
     ap.add_argument(
+        "--line",
+        choices=sorted(LINES),
+        default="mdb",
+        help="which version line to bump: mdb (default) or pg",
+    )
+    ap.add_argument(
         "--check", action="store_true", help="only check the lockfiles resolve --locked"
     )
     args = ap.parse_args()
 
-    old = current_version()
+    old = current_version(line=args.line)
+    if args.line == "pg" and old == current_version(line="mdb"):
+        ap.error("the two version lines share a version; a bump would move both")
     if args.check:
         bad = lock_failures()
     else:

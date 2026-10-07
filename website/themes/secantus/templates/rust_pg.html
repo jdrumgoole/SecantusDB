@@ -124,7 +124,7 @@
         <h3>Build from source</h3>
         <p>The crate links the vendored WiredTiger, so clone with submodules; it sits outside the clean Cargo workspace and builds from its own directory. The binary takes a storage directory and an address.</p>
         <pre class="install-code"><code>git clone --recurse-submodules {{ SECANTUS_GITHUB_URL }}.git
-cd SecantusDB/crates/secantus-pgserver
+cd SecantusDB/crates/secantus-pg
 cargo build --release
 
 ./target/release/secantusd-pg ./data 127.0.0.1:5432</code></pre>

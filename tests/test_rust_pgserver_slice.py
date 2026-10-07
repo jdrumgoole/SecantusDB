@@ -8,7 +8,7 @@ silent data loss, so both directions are exercised here.
 Skipped unless `secantusd-pg` has been built (it links WiredTiger and is
 excluded from the clean workspace):
 
-    cd crates/secantus-pgserver && cargo build
+    cd crates/secantus-pg && cargo build
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parents[1]
 BINARY = (
     REPO
     / "crates"
-    / "secantus-pgserver"
+    / "secantus-pg"
     / "target"
     / "debug"
     / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")
@@ -51,7 +51,7 @@ BINARY = (
 
 pytestmark = pytest.mark.skipif(
     not BINARY.exists(),
-    reason=f"{BINARY.relative_to(REPO)} not built (cargo build in crates/secantus-pgserver)",
+    reason=f"{BINARY.relative_to(REPO)} not built (cargo build in crates/secantus-pg)",
 )
 
 _WINDOWS = sys.platform == "win32"
