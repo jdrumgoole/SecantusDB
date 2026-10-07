@@ -11,8 +11,8 @@ product; the Python pair is the reference implementation they are held to.
 
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Prebuilt binaries per platform, and bundled in the wheel |
-| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Embedded in the wheel as `_secantus_server.PgServer`; standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); builds from its own directory |
+| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform; NOT in the PyPI wheel since 2026-10-07 |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); not yet on crates.io; NOT in the PyPI wheel since 2026-10-07; builds from its own directory |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
 
@@ -50,6 +50,17 @@ claims and it is easy to cite one as evidence for the other:
     page as though both can serve at once.
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
+
+**Distribution (decided 2026-10-07): the PyPI wheel carries ONLY the Python
+servers; the Rust servers ship as crates.** `publish.yml` / `wheels.yml` build
+with `SECANTUS_BUILD_STORAGE_ENGINE` OFF, so no `_secantus_server` /
+`_secantus_storage` / `secantusd-rs` in the published wheel. The Rust MongoDB
+server is the `secantus-mdb` crate (`cargo install secantus-mdb` gives
+`secantusd-rs`; `secantus_mdb::Server` embeds it in a Rust test), plus the
+tagged GitHub binaries. The embedded Python `RustServer` / `PgServer` handles
+remain a SOURCE-BUILD tool for this repo's own tests and gauges -- do not
+document them to users as something `pip install` provides. Why: the bundled
+Rust pushed the project past PyPI's 10 GB quota (10.72 GB at the time).
 
 The name was chosen to dodge brand-clash risk: an early prototype was called "fongo", a follow-on was called "fongodb", and the current name avoids both the existing "Fongo" brand and any confusion with MongoDB itself. Internal references to `fongo` or `fongodb` are stale — flag and rename to `secantus` (or `SecantusDB` for the brand form).
 

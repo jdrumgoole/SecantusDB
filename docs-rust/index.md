@@ -9,23 +9,22 @@ unmodified driver-conformance suites (99.5% of pymongo's own tests — level
 with the Python server), and ships as a single static-WiredTiger binary:
 `secantusd-rs`.
 
+It ships as the `secantus-mdb` crate on crates.io:
+
 ```bash
-# From a prebuilt archive (Linux x86_64 / macOS arm64):
-./secantusd-rs --port 27017 --storage-path ./secantus-data
+cargo install secantus-mdb          # builds WiredTiger, installs `secantusd-rs`
+secantusd-rs --port 27017 --storage-path ./secantus-data
 ```
 
-```python
-# Or bundled in the Python wheel:
-#   pip install SecantusDB
-import _secantus_server
-from pymongo import MongoClient
-
-srv = _secantus_server.RustServer("./secantus-data", 0)  # port 0 = OS-assigned
-host, port = srv.address
-client = MongoClient(host, port, directConnection=True)
-client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
-srv.stop()
+```rust
+// Or in-process, from a Rust test (add `secantus-mdb` as a dev-dependency):
+let server = secantus_mdb::Server::start()?;   // temporary store, OS-assigned port
+let client = mongodb::sync::Client::with_uri_str(server.uri())?;
 ```
+
+Prebuilt archives (Linux x86_64, macOS arm64, Windows x86_64) are on GitHub
+Releases for machines without a Rust toolchain. The Rust server is **not** in
+the `SecantusDB` Python wheel, which carries only the Python servers.
 
 Every MongoDB driver that talks to the Python server talks to the Rust
 server unchanged — same `OP_MSG` handshake, same commands, same error

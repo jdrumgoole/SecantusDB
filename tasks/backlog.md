@@ -8261,6 +8261,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.06 Release tooling gaps found cutting 0.6.0b18 -- 2026-10-07
+
+- [ ] **The binary smoke test and the stale-artifact check look at DIFFERENT
+  binaries.** `tests/test_rust_binary_smoke.py` prefers
+  `crates/secantusdb/target/release/secantusd-rs` and falls back to debug,
+  while `./inv rust-binary-build` builds debug and the provenance check passed
+  on it. A `beta.165` release binary from 29 September, older than the SIGTERM
+  fix (#1738), was smoked instead and failed
+  `test_stops_on_sigterm_sent_at_the_banner...[_block_stop_signals]`
+  deterministically. That looked like a regression in the release suite.
+  Fix: make the provenance check cover every binary the smoke test can pick,
+  or make the smoke test use exactly the one the check verified.
+- [ ] **The `secantusdb-release` skill's finalize loop uses `timeout`, which
+  macOS does not have** (`command not found`, exit 127 on all four attempts,
+  which reads as four finalize failures). Use a background run, or `gtimeout`
+  from coreutils.
+- [ ] **The PyPI project is at its 10 GB quota.** It held 10.72 GB when
+  `0.6.0b18` was refused. The wheel is now Python-only, and Joe is deleting
+  the `0.5.x` releases (2.12 GB). Watch the total each release; the JSON API
+  gives the per-file sizes.
+
 ### 7.05 MongoDB-server backlog close-out -- 2026-10-07
 
 Every open item for the two MongoDB servers was reproduced against mongod 8.2.11
