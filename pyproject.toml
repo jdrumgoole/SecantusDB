@@ -366,8 +366,9 @@ archs = ["AMD64"]
 # (`invalid: []`) because the space in the path doesn't survive cibuildwheel's
 # env serialization on Windows; a no-space LIBCLANG_PATH sidesteps that.
 before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:\libclang) && copy /Y "C:\Program Files\LLVM\bin\libclang.dll" C:\libclang'
-# Flag + libclang + shared cargo target for the storage-engine bundle
-# (_secantus_storage / _secantus_server extensions + secantusd-rs.exe). Set here,
+# libclang + shared cargo target. The PyPI wheel no longer bundles the Rust
+# servers (they ship as crates), so SECANTUS_BUILD_STORAGE_ENGINE is not set
+# here; these two stay for a local storage-engine build. Set here,
 # not in a workflow CIBW_ENVIRONMENT_WINDOWS (none exists, so this isn't
 # overridden). Raw values — cibuildwheel quotes table values itself, so our own
 # quotes once produced a doubled-quote "Malformed environment option".
@@ -376,7 +377,7 @@ before-build = 'choco install -y swig llvm && (if not exist C:\libclang mkdir C:
 # Forward slashes: a backslash in C:\... gets eaten when the path flows through
 # CMake (`\c` escape), turning it into the invalid drive-relative `C:cargo-target`.
 # CMake, cargo and clang-sys all accept forward slashes on Windows.
-environment = { SKBUILD_CMAKE_DEFINE = "SECANTUS_BUILD_STORAGE_ENGINE=ON", LIBCLANG_PATH = 'C:/libclang', SECANTUS_CARGO_TARGET = 'C:/cargo-target' }
+environment = { LIBCLANG_PATH = 'C:/libclang', SECANTUS_CARGO_TARGET = 'C:/cargo-target' }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
