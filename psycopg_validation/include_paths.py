@@ -128,5 +128,35 @@ if sys.platform == "darwin":
 # hang truncated the run. What is lost: the proxy-driven connection-failure
 # tests, the wall-clock `timing` budgets and psycopg's own mypy checks, none
 # of which reach a server behaviour the rest of the suite does not.
+#
+# `refcount` (the tests that take psycopg's `gc` fixture and count live Python
+# objects) is psycopg's own fourth Windows exclusion: its scheduled Windows CI
+# adds it because "Refcount tests are flakey on windows ... objects leaked: 0,
+# -2". Measured here on windows-latest (2026-10-07): one run passed all of
+# them, the next failed 75 `test_leak` cases with counts like `-87, 87` --
+# NEGATIVE leaks, which is the client's garbage collector, not the server.
+# Lost: the client-side object-leak checks, which Linux and macOS still run.
 elif sys.platform == "win32":
-    MARKER_EXPR = "not proxy and not timing and not mypy"
+    MARKER_EXPR = "not proxy and not timing and not mypy and not refcount"
+    # Measured on the windows-latest CI runner (2026-10-07, the
+    # psycopg-windows workflow), each against the runner's own PostgreSQL too:
+    DESELECT_TESTS += [
+        # Inserts 3 x 50,000 rows to have something to cancel. It takes 30 s
+        # against PostgreSQL itself on that runner (66 s against the debug
+        # secantusd-pg the gauge builds), over the gauge's `timeout=20` -- and
+        # Windows' THREAD timeout method ends the whole pytest process, so this
+        # one test truncated every run at ~65%. It passes on Linux and macOS,
+        # where it fits the budget. Lost: one asyncio check that a task's
+        # exception is not shadowed by the CancelledError of its siblings.
+        "tests/test_concurrency_async.py::test_type_error_shadow",
+        # The test pins PostgreSQL-on-Windows's own socket artefact: there the
+        # server's FATAL is destroyed by an abortive close, so it expects a
+        # bare OperationalError on win32 and IdleInTransactionSessionTimeout
+        # everywhere else. secantusd-pg closes gracefully (the lingering close
+        # in the vendored pgwire), so the client gets the real 25P03 FATAL --
+        # the other-platform answer, which the test's own comment calls
+        # acceptable while its assert rejects it. Lost: nothing about the
+        # server; the timeout itself is still covered on Linux and macOS.
+        "tests/test_connection.py::test_right_exception_on_session_timeout",
+        "tests/test_connection_async.py::test_right_exception_on_session_timeout",
+    ]
