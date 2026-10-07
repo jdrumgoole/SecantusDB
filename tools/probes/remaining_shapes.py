@@ -489,6 +489,46 @@ def cases():
                 "startOfWeek": "mon",
             }
         },
+        "dateTrunc week mon no tz": {
+            "$dateTrunc": {"date": DT, "unit": "week", "startOfWeek": "mon"}
+        },
+        "dateTrunc week MONDAY no tz": {
+            "$dateTrunc": {"date": DT, "unit": "week", "startOfWeek": "MONDAY"}
+        },
+        "dateTrunc week default tz": {
+            "$dateTrunc": {"date": DT, "unit": "week", "timezone": "America/New_York"}
+        },
+        "dateTrunc week bad start": {
+            "$dateTrunc": {"date": DT, "unit": "week", "startOfWeek": "mo"}
+        },
+        "dateTrunc month tz": {
+            "$dateTrunc": {"date": DT, "unit": "month", "timezone": "Asia/Tokyo"}
+        },
+        "dateTrunc quarter tz": {
+            "$dateTrunc": {"date": DT, "unit": "quarter", "timezone": "+05:30"}
+        },
+        "dateTrunc year tz bin": {
+            "$dateTrunc": {"date": DT, "unit": "year", "binSize": 2, "timezone": "Europe/Paris"}
+        },
+        "dateTrunc hour bin tz": {
+            "$dateTrunc": {"date": DT, "unit": "hour", "binSize": 5, "timezone": "America/New_York"}
+        },
+        "dateDiff month tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-01-31T23:30:00Z"},
+                "endDate": DT,
+                "unit": "month",
+                "timezone": "Asia/Tokyo",
+            }
+        },
+        "dateDiff week startOfWeek": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-01T12:00:00Z"},
+                "endDate": DT,
+                "unit": "week",
+                "startOfWeek": "fri",
+            }
+        },
         "dateDiff day tz": {
             "$dateDiff": {
                 "startDate": {"$toDate": "2024-03-09T12:00:00Z"},

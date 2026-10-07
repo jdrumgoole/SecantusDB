@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
-from bson import Binary, Decimal128, Int64, ObjectId, Timestamp
+from bson import Binary, Code, Decimal128, Int64, ObjectId, Timestamp
 
 from secantus import timelib
 from secantus.bsontypes import bson_value_repr_stage, fmt_double_value, is_bson_string
@@ -2912,7 +2912,42 @@ def _op_date_trunc(arg: Any, ctx: _Ctx) -> Any:
     tz = (
         _resolve_timezone(arg.get("timezone"), operator="$dateTrunc") if "timezone" in arg else None
     )
-    return _truncate_date(date, unit, bin_size, tz, _eval(arg.get("startOfWeek"), ctx))
+    start_of_week = _start_of_week("$dateTrunc", arg, ctx)
+    if start_of_week is _NULL_START_OF_WEEK:
+        return None
+    return _truncate_date(date, unit, bin_size, tz, start_of_week)
+
+
+#: `startOfWeek: null` makes the whole result null.
+_NULL_START_OF_WEEK = object()
+
+
+def _start_of_week(op: str, arg: Mapping[str, Any], ctx: _Ctx) -> Any:
+    """``startOfWeek`` as mongod parses it, whatever the unit (measured 8.2.11,
+    2026-10-07): a day name or its three-letter abbreviation, case-insensitive
+    (``mon``, ``MON``, ``MonDay``; not ``tues`` / ``thur``). A non-string is
+    5439015, an unrecognised string 5439016, null makes the result null.
+    Returns the full lower-case day name, or ``None`` when absent."""
+    if "startOfWeek" not in arg:
+        return None
+    v = _eval(arg.get("startOfWeek"), ctx)
+    if v is None:
+        return _NULL_START_OF_WEEK
+    if not isinstance(v, str) or isinstance(v, Code):
+        raise ExpressionError(
+            f"{op} requires 'startOfWeek' to be a string, but got {_bson_type_name(v)}",
+            code=5439015,
+            code_name="Location5439015",
+        )
+    low = v.lower()
+    for day in _WEEKDAYS:
+        if low == day or (len(low) == 3 and day.startswith(low)):
+            return day
+    raise ExpressionError(
+        f"{op} parameter 'startOfWeek' value cannot be recognized as a day of a week: {v}",
+        code=5439016,
+        code_name="Location5439016",
+    )
 
 
 _TRUNC_REFERENCE = _dt.datetime(2000, 1, 1)
@@ -3472,9 +3507,13 @@ def _op_date_diff(arg: Any, ctx: _Ctx) -> Any:
     zone = tz or _dt.timezone.utc
     start_aware = start if start.tzinfo is not None else start.replace(tzinfo=_dt.timezone.utc)
     end_aware = end if end.tzinfo is not None else end.replace(tzinfo=_dt.timezone.utc)
-    start_of_week = _eval(arg.get("startOfWeek"), ctx) if "startOfWeek" in arg else None
-    return _date_bin_index(end_aware, unit, 1, zone, start_of_week) - _date_bin_index(
-        start_aware, unit, 1, zone, start_of_week
+    start_of_week = _start_of_week("$dateDiff", arg, ctx)
+    if start_of_week is _NULL_START_OF_WEEK:
+        return None
+    # A 64-bit integer on mongod whatever the magnitude; an int32 was returned.
+    return Int64(
+        _date_bin_index(end_aware, unit, 1, zone, start_of_week)
+        - _date_bin_index(start_aware, unit, 1, zone, start_of_week)
     )
 
 
@@ -3692,12 +3731,22 @@ def _op_substr_cp(arg: Any, ctx: _Ctx) -> Any:
     return s[start : start + length]
 
 
+def _type_or_missing(value: Any, arg: Any, ctx: _Ctx) -> str:
+    """The type name mongod prints for an operand: ``missing`` when the operand
+    is a field path that does not exist, which is not the same as ``null``
+    (measured 8.2.11, 2026-10-07: ``$strLenCP`` of ``"$nosuch"`` says
+    ``found: missing``)."""
+    if value is None and _eval_field_value(arg, ctx) is MISSING:
+        return "missing"
+    return _bson_type_name(value)
+
+
 def _op_str_len_cp(arg: Any, ctx: _Ctx) -> Any:
     s = _eval(arg, ctx)
     # See `$strLenBytes`: a `bson.Code` is not a BSON string.
     if not is_bson_string(s):
         raise ExpressionError(
-            f"$strLenCP requires a string argument, found: {_bson_type_name(s)}",
+            f"$strLenCP requires a string argument, found: {_type_or_missing(s, arg, ctx)}",
             code=34471,
             code_name="Location34471",
         )
@@ -3809,7 +3858,7 @@ def _op_str_len_bytes(arg: Any, ctx: _Ctx) -> Any:
     # below already named the type correctly -- it was simply never reached.
     if not is_bson_string(s):
         raise ExpressionError(
-            f"$strLenBytes requires a string argument, found: {_bson_type_name(s)}",
+            f"$strLenBytes requires a string argument, found: {_type_or_missing(s, arg, ctx)}",
             code=34473,
             code_name="Location34473",
         )
@@ -5430,6 +5479,12 @@ def _convert_value(value: Any, target: Any) -> Any:
     """
     from bson import ObjectId as _ObjectId
 
+    # `bson.decode` hands back binary SUBTYPE 0 as plain `bytes`, not `Binary`,
+    # so every `isinstance(value, Binary)` arm below missed the commonest
+    # binData of all: `$toInt` of `BinData(0, "7A")` answered "Unsupported
+    # conversion" where mongod answers 122 (measured 8.2.11, 2026-10-07).
+    if type(value) is bytes:
+        value = Binary(value, 0)
     code = _CONVERT_TARGETS.get(target)
     if code is None:
         raise ExpressionError(f"Unknown type name: {target}", code=2)
@@ -5924,7 +5979,8 @@ def _op_all_elements_true(arg: Any, ctx: _Ctx) -> bool:
     arr = _eval(arg, ctx)
     if not isinstance(arr, list):
         raise ExpressionError(
-            f"$allElementsTrue's argument must be an array, but is {_bson_type_name(arr)}",
+            "$allElementsTrue's argument must be an array, but is "
+            f"{_type_or_missing(arr, arg, ctx)}",
             code=17040,
             code_name="Location17040",
         )
@@ -5938,7 +5994,8 @@ def _op_any_element_true(arg: Any, ctx: _Ctx) -> bool:
     arr = _eval(arg, ctx)
     if not isinstance(arr, list):
         raise ExpressionError(
-            f"$anyElementTrue's argument must be an array, but is {_bson_type_name(arr)}",
+            "$anyElementTrue's argument must be an array, but is "
+            f"{_type_or_missing(arr, arg, ctx)}",
             code=17041,
             code_name="Location17041",
         )
