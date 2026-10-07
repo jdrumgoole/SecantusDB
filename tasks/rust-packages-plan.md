@@ -1,7 +1,9 @@
 # Rust packages for the two Rust servers
 
-**Status:** plan, 2026-09-30; decisions made 2026-10-01 (§2). Nothing here is
-built yet. Every fact below was read from `origin/main` at `aa0161de` or
+**Status:** plan, 2026-09-30; decisions made 2026-10-01 (§2). Both halves of
+Phases B, C, D.2 and E are built as of 2026-10-07 (the PG half that day, see
+§5.2 / §5.3); what remains is the first real crates.io publish of each line,
+which runs from a release tag in Joe's account. Every fact below was read from `origin/main` at `aa0161de` or
 measured on this box that day; re-check before relying on one.
 
 ## 1. Goal
@@ -196,10 +198,36 @@ step 1 is what protects that, and it is non-negotiable.
 
 ### 5.2 Phase B — make every crate publishable
 
-**Status (2026-10-01): the MongoDB side is done; the PG side is not started.**
-That session was asked to keep clear of the PG server, so steps 2 (pgwire) and
-the PG crates' metadata in step 4 are still open, and `secantus-pg` is still
-the `secantus-pgserver` package. What landed, for the ten crates in
+**Status (2026-10-07): both sides are done.** The PG half, 2026-10-07:
+
+- `crates/secantus-pgserver` is now `crates/secantus-pg`, package
+  `secantus-pg`, library `secantus_pg`; the binary is still `secantusd-pg`
+  and behaves identically. GPL-2.0-only; `secantus-pgcatalog` /
+  `secantus-pgplan` stay Apache-2.0. All four PG crates carry crates.io
+  metadata, `rust-version = "1.98"`, a README (internal ones with the no-semver
+  note) and `=` pins (PG line `=0.1.0-beta.2`, MongoDB line for
+  `secantus-core` / `-storage` / `-auth`). The binary's dependencies (`ctrlc`,
+  `libc`) sit behind a default-on `bin` feature; the Python handle builds
+  with `default-features = false`.
+- **pgwire: the fork, not upstreaming.** The vendored copy has diverged well
+  past the one `parameter_oids` change step 2 assumed -- 17 files differ from
+  upstream 0.40.7 plus a new `messages/fastpath.rs` -- so there is no minimal
+  upstream PR to wait on. It moved from `crates/vendor/pgwire` to
+  `crates/secantus-pgwire`, is published as `secantus-pgwire` (MIT OR
+  Apache-2.0, as upstream; library name still `pgwire`), and the dependents
+  say `pgwire = { package = "secantus-pgwire", ... }`. Both `[patch.crates-io]`
+  stanzas are gone. Upstreaming the changes is still worth doing; the fork is
+  what lets the server publish meanwhile.
+- `scripts/crates_package_check.py` has `--line {mdb,pg,all}` (`PG_ORDER`,
+  plus `PG_NEEDS`, the MongoDB-side crates a PG release resolves but never
+  publishes); `crates-package.yml` checks `all`. `--version` says
+  `source: crates.io` for a packaged `secantusd-pg` too.
+- docs.rs: the WiredTiger crates skip their native build under `DOCS_RS` as
+  before; libpg_query is compiled by `pg_query`'s own build script, which this
+  repo cannot skip, so the PG crates' docs.rs build depends on that working
+  in docs.rs's sandbox.
+
+What landed for the MongoDB side, 2026-10-01, for the ten crates in
 `scripts/crates_package_check.py`'s `PUBLISH_ORDER`:
 
 - `publish = false` gone, `=0.5.3-beta.165` pins on every internal dependency
@@ -239,9 +267,16 @@ the `secantus-pgserver` package. What landed, for the ten crates in
 
 ### 5.3 Phase C — the embedding API
 
-**Status (2026-10-01): the MongoDB half is done (steps 1, 4 and 5); the PG half
-(step 2, `secantus_pg::PgServer`) is not started**, for the same reason as
-Phase B. `secantus_mdb::Server` lives in `crates/secantusdb/src/lib.rs`; the
+**Status (2026-10-07): both halves are done.** `secantus_pg::PgServer` (step 2)
+landed 2026-10-07 in `crates/secantus-pg/src/embedded.rs`: `start()`,
+`builder()` with `.storage_path` / `.host` / `.port` / `.databases` /
+`.cache_size` (256M default, as the Mongo side), `.dsn()`, `.url()` (the
+`postgresql://` form the plan called `connection_string`), `.address()`,
+`.port()`, `.stop()`, and `Drop`, which removes a temporary store only once
+`RunningPgServer::store_closed()` says WiredTiger closed it. Tests:
+`crates/secantus-pg/tests/pg_server.rs` (tokio-postgres, both runtime
+flavours, a persistent store across a restart, 50 servers in parallel), a
+doc-test, and `examples/quickstart.rs`. The MongoDB half landed 2026-10-01. `secantus_mdb::Server` lives in `crates/secantusdb/src/lib.rs`; the
 tests are `crates/secantusdb/tests/embedded.rs` (official driver, tokio both
 flavours, 50 in parallel). Not carried over from the daemon: its noop
 heartbeat and TTL sweeper threads -- the Python embedded handle runs neither
@@ -312,8 +347,18 @@ checks `--locked` still resolves; publishing is per crate and resumable
 (`scripts/crates_publish.py` skips versions already on crates.io); and the
 `secantusdb-release` skill documents the publish step, the yank procedure and
 that a fix is always a new version. Phase D.2 landed with them: binstall
-metadata on `secantus-mdb` points at the release archives. Open: the PG crates
-(their Phase B).
+metadata on `secantus-mdb` points at the release archives.
+
+The PG line joined on 2026-10-07: `publish-crates.yml` also fires on
+`secantusd-pg-v*` tags, checks the tag against `crates/secantus-pg`'s version,
+and publishes the four PG crates (`crates_publish.py --line pg`, which refuses
+to start if a MongoDB-side crate they pin is not on crates.io yet);
+`./inv rust-version-bump --line pg --to <ver>` bumps the PG line; binstall
+metadata on `secantus-pg` points at the `secantusd-pg-<ver>-<target>.tar.gz`
+archives. **The one step left is the first real publish of each line**, from a
+release tag, which needs the trusted-publishing configs on crates.io for
+`secantus-pg` and `secantus-pgwire` (Joe's account) -- check every PG crate
+has one before tagging.
 
 1. A `publish-crates.yml` workflow on the existing `secantusdb-v*` /
    `secantusd-pg-v*` tags: verify the tag against the crate version (as the

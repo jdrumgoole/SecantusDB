@@ -50,9 +50,7 @@ import time
 from pathlib import Path
 
 REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
-RUST = Path(
-    os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pgserver/target/release/secantusd-pg")
-)
+RUST = Path(os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pg/target/release/secantusd-pg"))
 
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))

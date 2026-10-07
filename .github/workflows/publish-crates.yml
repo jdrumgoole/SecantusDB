@@ -1,21 +1,29 @@
 name: publish crates
 
-# Publishes the Rust MongoDB server's crates to crates.io on a Rust release tag
-# (tasks/rust-packages-plan.md, Phase E). Trusted publishing: crates.io trusts
+# Publishes a Rust server's crates to crates.io on its release tag
+# (tasks/rust-packages-plan.md, Phase E): the MongoDB server's line on a
+# `secantusdb-v*` tag, the PostgreSQL server's line on a `secantusd-pg-v*` tag. Trusted publishing: crates.io trusts
 # THIS workflow file, in the `crates-io` environment, for each secantus-*
 # crate, and mints a short-lived token per run -- no long-lived token is stored
 # anywhere. Nobody runs `cargo publish` by hand.
 #
 # The `crates-io` environment only accepts the `secantusdb-v*` and
-# `secantusd-pg-v*` tags. The PostgreSQL crates are not publishable yet (their
-# half of Phase B is open), so a `secantusd-pg-v*` tag does not trigger this.
+# `secantusd-pg-v*` tags. A PG release publishes only the four PG crates; the
+# MongoDB-side crates they pin must already be on crates.io (a `secantusdb-v*`
+# release first), and scripts/crates_publish.py refuses to start otherwise.
 
 on:
   push:
     tags:
       - "secantusdb-v*"
+      - "secantusd-pg-v*"
   workflow_dispatch:
     inputs:
+      line:
+        description: "Which release line: mdb (secantus-mdb and its crates) or pg (secantus-pg and its crates)"
+        type: choice
+        options: [mdb, pg]
+        default: mdb
       dry_run:
         description: "Package and verify only; publish nothing"
         type: boolean
@@ -47,23 +55,52 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Pick the release line
+        # From the tag on a push; from the input on a dispatch.
+        env:
+          INPUT_LINE: ${{ inputs.line }}
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/secantusd-pg-v*) line=pg ;;
+            refs/tags/secantusdb-v*) line=mdb ;;
+            *) line="${INPUT_LINE:-mdb}" ;;
+          esac
+          case "$line" in
+            pg) echo "LINE=pg" >> "$GITHUB_ENV"
+                echo "CANONICAL=crates/secantus-pg/Cargo.toml" >> "$GITHUB_ENV"
+                echo "TAG_PREFIX=secantusd-pg-v" >> "$GITHUB_ENV" ;;
+            mdb) echo "LINE=mdb" >> "$GITHUB_ENV"
+                echo "CANONICAL=crates/secantusdb/Cargo.toml" >> "$GITHUB_ENV"
+                echo "TAG_PREFIX=secantusdb-v" >> "$GITHUB_ENV" ;;
+            *) echo "unknown line $line" >&2; exit 1 ;;
+          esac
+
       - name: Verify the tag matches the crate version
         # The same guard publish.yml applies to PyPI: a tag that disagrees
         # with the crates it would publish is refused before anything ships.
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          tag="${GITHUB_REF#refs/tags/secantusdb-v}"
-          crate=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('crates/secantusdb/Cargo.toml').read_text())['package']['version'])")
+          tag="${GITHUB_REF#refs/tags/$TAG_PREFIX}"
+          crate=$(python -c "import tomllib, pathlib, os; print(tomllib.loads(pathlib.Path(os.environ['CANONICAL']).read_text())['package']['version'])")
           if [ "$tag" != "$crate" ]; then
-            echo "Tag $tag does not match the secantus-mdb version $crate" >&2
+            echo "Tag $tag does not match the $CANONICAL version $crate" >&2
             exit 1
           fi
+
+      - name: Find libclang
+        # pg_query runs bindgen in its build script, so the PG line's crates
+        # need libclang to build from their tarballs.
+        if: env.LINE == 'pg'
+        run: |
+          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          echo "LIBCLANG_PATH=$(dirname "$lc")" >> "$GITHUB_ENV"
 
       - name: Stage and verify every crate from its tarball
         # Packages the crates together and builds each from its tarball (the
         # crates-package.yml gate), keeping the staged workspace to publish
         # from: `cargo package` cannot run inside this checkout.
-        run: python scripts/crates_package_check.py --keep "$RUNNER_TEMP/stage"
+        run: python scripts/crates_package_check.py --line "$LINE" --keep "$RUNNER_TEMP/stage"
 
       - name: Authenticate to crates.io
         if: github.event_name == 'push' || !inputs.dry_run
@@ -78,4 +115,4 @@ jobs:
         # One crate at a time, skipping any version already on crates.io, so a
         # run that failed part way is fixed by re-running it on the same tag.
         # The previous step already verified each tarball.
-        run: python scripts/crates_publish.py "$RUNNER_TEMP/stage"
+        run: python scripts/crates_publish.py "$RUNNER_TEMP/stage" --line "$LINE"

@@ -8411,11 +8411,17 @@ Phases A and B are merged for the MongoDB side and Phase C's MongoDB half is
 on `mdb-embedding-api` (`tasks/rust-packages-plan.md` has the status per step).
 What is left, recorded so the PG session and the release work find it:
 
-- [ ] **The PG half of Phases B and C** -- `pgwire` upstreaming or the
-      `secantus-pgwire` fork, crates.io metadata on the three PG crates, the
-      `secantus-pg` rename, `secantus_pg::PgServer`. Deliberately not done by
-      the session that did the Mongo half (asked to keep clear of the PG
-      server). Its `Cargo.lock` already carries the bundled-WiredTiger deps.
+- [x] **The PG half of Phases B and C (code done 2026-10-07).** The crate is
+      `secantus-pg` (`crates/secantus-pg`, library `secantus_pg`, binary
+      `secantusd-pg` unchanged) with `secantus_pg::PgServer`; pgwire is the
+      published fork `secantus-pgwire` (`crates/secantus-pgwire`; it differs
+      from upstream 0.40.7 in 18 files, too far for a minimal upstream PR);
+      all four PG crates carry crates.io metadata and pins, are in the
+      `crates-package.yml` gate, and publish from `secantusd-pg-v*` tags via
+      `publish-crates.yml`. **Only remaining step:** the first real publish,
+      from a release tag, after confirming crates.io trusted-publishing configs
+      exist for `secantus-pg` and `secantus-pgwire` (Joe's account). Details in
+      `tasks/rust-packages-plan.md` 5.2 / 5.3 / 5.5.
 - [x] **`secantus_mdb::Server` runs the daemon's sweepers (2026-10-06).** It
       expires TTL-indexed documents every 60 seconds, the daemon's and mongod's
       default (`Builder::ttl_sweep`, `None` to disable). The noop heartbeat,

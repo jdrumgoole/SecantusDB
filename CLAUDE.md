@@ -12,7 +12,7 @@ product; the Python pair is the reference implementation they are held to.
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
 | **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform; NOT in the PyPI wheel since 2026-10-07 |
-| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); not yet on crates.io; NOT in the PyPI wheel since 2026-10-07; builds from its own directory |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pg`) | PostgreSQL | **the newest.** Ships as the `secantus-pg` crate (publish-ready; first crates.io publish at its next release) and standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); NOT in the PyPI wheel since 2026-10-07; builds from its own directory |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
 
@@ -300,7 +300,7 @@ one request path:
   handle** (`start`/`stop`/`address`) — the accept loop runs on a GIL-released Rust
   thread in-process and `pymongo` connects over real TCP; Python is only the
   launcher, never an operator. **This is the server the project leads with.**
-- **The Rust PostgreSQL server** (`secantusd-pg`, `crates/secantus-pgserver`) —
+- **The Rust PostgreSQL server** (`secantusd-pg`, `crates/secantus-pg`) —
   the PostgreSQL wire protocol over the same `secantus-storage`. SQL is parsed by
   **`libpg_query`** (the real PostgreSQL grammar via `pg_query`), lowered by
   `secantus-pgplan` to the MQL filters `secantus-core` already evaluates, against
@@ -477,7 +477,7 @@ one request path:
     2026-09-29.** `CREATE FUNCTION ... LANGUAGE sql | plpgsql` is callable
     everywhere an expression or a FROM item goes; PL/pgSQL runs on an
     interpreter over `pg_query::parse_plpgsql`'s JSON
-    (`secantus-pgserver/src/plpgsql_fn.rs`), which also runs the `DO` blocks
+    (`secantus-pg/src/plpgsql_fn.rs`), which also runs the `DO` blocks
     the older `plpgsql_do.rs` subset refuses. `CREATE TRIGGER` fires BEFORE /
     AFTER, ROW / STATEMENT (`triggers.rs`). Also landed: window functions over
     aggregates, expression column defaults, composite `PRIMARY KEY` and
@@ -663,7 +663,7 @@ one request path:
     PostgreSQL has it. `DISTINCT`, `DISTINCT ON`, `count(DISTINCT ...)` and
     `UNION` / `INTERSECT` / `EXCEPT` were genuinely missing until 2026-09-20
     and are now implemented.
-  - Builds from **its own directory** (`cd crates/secantus-pgserver && cargo build
+  - Builds from **its own directory** (`cd crates/secantus-pg && cargo build
     --release`), because it links WiredTiger and is excluded from the clean
     workspace. `./inv rust-pgserver-build` (the task lives in `rust_tasks.py`, not
     `tasks.py`) does the debug build the gauge expects.
@@ -694,7 +694,7 @@ one server bumps only that server's version:
 - **Rust server version** — the `version` field in the **thirteen** MongoDB-side
   `crates/*/Cargo.toml`, kept in **lockstep** across them (`0.MAJOR.PATCH-beta.N`,
   SemVer pre-release). **NOT every crate under `crates/`:** the three PostgreSQL
-  crates (`secantus-pgcatalog` / `secantus-pgplan` / `secantus-pgserver`) carry
+  crates (`secantus-pgcatalog` / `secantus-pgplan` / `secantus-pg`) carry
   their own line, at `0.1.0-beta.0` as of 2026-09-18, and are a **third
   deliverable that is not bumped with the Rust MongoDB server**. The sweep recipe
   below is safe only because it substitutes one exact version string — a blanket

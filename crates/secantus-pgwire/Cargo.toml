@@ -12,8 +12,8 @@
 [package]
 edition = "2024"
 rust-version = "1.89"
-name = "pgwire"
-version = "0.40.7"
+name = "secantus-pgwire"
+version = "0.1.0-beta.2"
 authors = ["Ning Sun <sunng@pm.me>"]
 build = false
 autolib = false
@@ -21,17 +21,19 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Postgresql wire protocol implemented as a library"
+description = "SecantusDB's fork of pgwire 0.40.7 (the PostgreSQL wire protocol as a library), carrying the changes the secantus-pg server needs. Internal; depend on upstream pgwire instead."
 homepage = "https://github.com/sunng87/pgwire"
-documentation = "https://docs.rs/crate/pgwire/"
+documentation = "https://docs.rs/secantus-pgwire/"
 readme = "README.md"
+# Repo tooling and upstream CI, not part of the library.
+exclude = [".github", ".gitignore", "flake.lock", "flake.nix", "pgbench", "prek.toml", "release.toml", "tests-integration"]
 keywords = [
     "database",
     "postgresql",
 ]
 categories = ["database"]
-license = "MIT/Apache-2.0"
-repository = "https://github.com/sunng87/pgwire"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jdrumgoole/SecantusDB"
 
 [features]
 _aws-lc-rs = [
@@ -119,6 +121,12 @@ simple-oidc-validator = [
     "dep:serde",
 ]
 
+# Excluded from the clean `crates` workspace (see crates/Cargo.toml) and
+# depended on by secantus-pg and secantus-server-py by path + exact version.
+[workspace]
+
+# The library keeps upstream's name, so `use pgwire::...` is unchanged in the
+# dependents (which also rename the dependency to `pgwire`).
 [lib]
 name = "pgwire"
 path = "src/lib.rs"

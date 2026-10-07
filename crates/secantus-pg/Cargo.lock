@@ -1620,28 +1620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgwire"
-version = "0.40.7"
-dependencies = [
- "async-trait",
- "bytes",
- "derive-new",
- "futures",
- "hex",
- "lazy-regex",
- "md5",
- "pg_interval",
- "postgres-types",
- "rand 0.10.2",
- "ryu",
- "serde_json",
- "smol_str",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2119,6 +2097,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "secantus-pg"
+version = "0.1.0-beta.2"
+dependencies = [
+ "async-trait",
+ "bson",
+ "bytes",
+ "ctrlc",
+ "futures",
+ "libc",
+ "pg_query",
+ "postgres-types",
+ "rand 0.9.5",
+ "secantus-auth",
+ "secantus-core",
+ "secantus-pgcatalog",
+ "secantus-pgplan",
+ "secantus-pgwire",
+ "secantus-storage",
+ "serde_json",
+ "stacker",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "secantus-pgcatalog"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -2159,29 +2163,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "secantus-pgserver"
+name = "secantus-pgwire"
 version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
- "bson",
  "bytes",
- "ctrlc",
+ "derive-new",
  "futures",
- "libc",
- "pg_query",
- "pgwire",
+ "hex",
+ "lazy-regex",
+ "md5",
+ "pg_interval",
  "postgres-types",
- "rand 0.9.5",
- "secantus-auth",
- "secantus-core",
- "secantus-pgcatalog",
- "secantus-pgplan",
- "secantus-storage",
+ "rand 0.10.2",
+ "ryu",
  "serde_json",
- "stacker",
- "tempfile",
+ "smol_str",
+ "thiserror 2.0.20",
  "tokio",
- "tokio-postgres",
+ "tokio-util",
 ]
 
 [[package]]

@@ -1,3 +1,27 @@
+# secantus-pgwire
+
+**A fork of [pgwire](https://github.com/sunng87/pgwire) 0.40.7, internal to
+[SecantusDB](https://github.com/jdrumgoole/SecantusDB).** It is published only
+so the `secantus-pg` server can be built from crates.io, which ignores
+`[patch]` sections. It carries **no semver promise**; use upstream `pgwire`
+in your own code. The library keeps upstream's name (`pgwire`).
+
+What the fork changes, against upstream 0.40.7 (regenerate the full diff with
+`diff -ru <pgwire-0.40.7 from the cargo registry> crates/secantus-pgwire`):
+
+- `StoredStatement::parameter_oids` -- the raw Parse-message type oids, which
+  upstream flattens through `Type::from_oid` (a user composite or enum oid
+  becomes `None`).
+- Extended-query, COPY, portal, transaction-status, error/notice and
+  function-call (fastpath) handling the server's PostgreSQL fidelity work
+  needed; see the SecantusDB history of `crates/secantus-pgwire` (formerly
+  `crates/vendor/pgwire`).
+
+The fork is deleted once upstream carries these changes. Licence: MIT OR
+Apache-2.0, as upstream.
+
+---
+
 # pgwire
 
 [![CI](https://github.com/sunng87/pgwire/actions/workflows/ci.yml/badge.svg)](https://github.com/sunng87/pgwire/actions/workflows/ci.yml)

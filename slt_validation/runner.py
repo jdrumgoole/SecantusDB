@@ -41,7 +41,7 @@ RAW_OUT = REPO_ROOT / ".validation" / "slt-raw.json"
 RUST_BINARY = (
     REPO_ROOT
     / "crates"
-    / "secantus-pgserver"
+    / "secantus-pg"
     / "target"
     / "debug"
     / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")

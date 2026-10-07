@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use secantus_pgserver::{bind, DatabaseRegistry, RunningPgServer};
+use secantus_pg::{bind, DatabaseRegistry, RunningPgServer};
 use secantus_storage::Storage;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;

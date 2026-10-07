@@ -2,14 +2,14 @@
 //!
 //! A CLI wrapper, nothing more: argument parsing, the readiness line, and the
 //! signal wait. The accept loop, the shutdown drain, and the storage ownership
-//! that makes the close-checkpoint run all live in `secantus_pgserver::bind`,
+//! that makes the close-checkpoint run all live in `secantus_pg::bind`,
 //! which the embedded Python handle (`_secantus_server`'s `PgServer`) calls
 //! too -- so there is one serve path, not two.
 
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pgserver::{bind, DatabaseRegistry};
+use secantus_pg::{bind, DatabaseRegistry};
 
 /// Unblock SIGINT / SIGTERM in the calling thread and give them their
 /// default disposition, undoing whatever the parent left. POSIX only:
@@ -34,12 +34,15 @@ fn reset_stop_signals() {
 #[cfg(not(unix))]
 fn reset_stop_signals() {}
 
-/// `--version` output: the version, and the source tree it was built from.
+/// `--version` output: the version, and the source tree it was built from --
+/// or, for a build from a packaged crate (no git tree), `source: crates.io`.
 fn version_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    match option_env!("SECANTUS_SOURCE_TREE").unwrap_or("") {
-        "" => format!("secantusd-pg {version}\n"),
-        tree => format!("secantusd-pg {version}\ntree: {tree}\n"),
+    let origin = option_env!("SECANTUS_SOURCE_ORIGIN").unwrap_or("");
+    match (option_env!("SECANTUS_SOURCE_TREE").unwrap_or(""), origin) {
+        ("", "") => format!("secantusd-pg {version}\n"),
+        ("", origin) => format!("secantusd-pg {version}\nsource: {origin}\n"),
+        (tree, _) => format!("secantusd-pg {version}\ntree: {tree}\n"),
     }
 }
 
@@ -139,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tx.send(());
     })?;
 
-    let storage = secantus_pgserver::open_storage(&home)?;
+    let storage = secantus_pg::open_storage(&home)?;
     let mut server = bind(&addr, storage, databases)?;
 
     // One line, flushed, so a harness can wait for readiness. It reports the

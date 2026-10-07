@@ -7,7 +7,7 @@ with no external processes to manage. This is that surface for the PG server:
 
 The headline assertion is the durability one. ``stop()`` is where WiredTiger's
 close-checkpoint runs, and it runs only because the handle OWNS the store
-(``secantus_pgserver::bind`` takes ``Storage`` by value). Get that ownership
+(``secantus_pg::bind`` takes ``Storage`` by value). Get that ownership
 wrong and the checkpoint quietly does not happen: measured 2026-08-31, a
 ``CREATE TABLE`` + ``INSERT`` the client had been told succeeded was gone
 afterwards. So the test writes over the real wire, stops, reopens the same home

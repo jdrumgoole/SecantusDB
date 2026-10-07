@@ -61,7 +61,7 @@ REBUILD_PGSERVER_CMD = "./inv rust-pgserver-build"
 REBUILD_RS_CMD = "./inv rust-binary-build"
 
 #: Where each binary lands, relative to the repo root.
-PGSERVER_REL = "crates/secantus-pgserver/target/debug/secantusd-pg"
+PGSERVER_REL = "crates/secantus-pg/target/debug/secantusd-pg"
 RS_REL = "crates/secantusdb/target/debug/secantusd-rs"
 
 #: What a stale one has actually cost, per artifact. Carried in the failure text
