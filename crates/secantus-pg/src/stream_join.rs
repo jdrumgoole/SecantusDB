@@ -1057,7 +1057,6 @@ impl PgHandler {
             Source::General(p) => self.feed_join(p, &mut sink)?,
             Source::Narrow(join, right) => self.feed_narrow(join, right, &mut sink)?,
         }
-        drop(sink);
         let sorted = runs
             .finish(skip, limit, None)
             .map_err(|e| Self::user_error("XX000", format!("could not sort: {e}")))?;

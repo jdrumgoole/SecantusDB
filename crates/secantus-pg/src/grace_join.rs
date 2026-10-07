@@ -613,7 +613,6 @@ impl PgHandler {
             Ok(true)
         };
         body(&mut push_out)?;
-        drop(push_out);
         if !sorting {
             let mut rows = ordered.into_sorted()?;
             loop {
