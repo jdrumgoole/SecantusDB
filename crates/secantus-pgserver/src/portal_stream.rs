@@ -530,7 +530,7 @@ impl PgHandler {
             let backend = backend.clone();
             async move {
                 let mut sorted = state?;
-                let out = tokio::task::block_in_place(|| -> PgWireResult<Vec<Document>> {
+                let out = crate::blocking_wait(|| -> PgWireResult<Vec<Document>> {
                     if backend.terminate.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(PgHandler::admin_shutdown());
                     }
@@ -1181,7 +1181,7 @@ impl PgHandler {
             let backend = backend.clone();
             async move {
                 let scan = state?;
-                let out = tokio::task::block_in_place(|| -> PgWireResult<Vec<Document>> {
+                let out = crate::blocking_wait(|| -> PgWireResult<Vec<Document>> {
                     let mut st = scan.lock().unwrap_or_else(|e| e.into_inner());
                     if !st.pending.is_empty() {
                         let n = st.pending.len().min(BATCH);

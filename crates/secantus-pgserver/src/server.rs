@@ -293,7 +293,7 @@ impl Drop for RunningPgServer {
     }
 }
 
-/// Each runtime worker's stack: see `bind`.
+/// Each connection thread's (and runtime worker's) stack: see `bind`.
 pub const WORKER_STACK_BYTES: usize = 256 << 20;
 
 /// Open a listener on `addr` and start serving the PostgreSQL wire protocol
@@ -319,8 +319,8 @@ pub fn bind(
     storage: Storage,
     databases: Arc<DatabaseRegistry>,
 ) -> io::Result<RunningPgServer> {
-    // Statements are planned and run on the worker threads (`block_in_place`),
-    // and planning recurses once per expression level: tokio's 2 MiB default
+    // Statements are planned and run on each connection's own thread (see
+    // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
     // overflowed on a 24-term `||` chain, which ABORTS the process -- every
     // connection with it. The stack is reserved, not committed, so a large
     // one costs address space only. `planning_depth_guard` refuses what even
@@ -408,19 +408,75 @@ async fn accept_loop(
         let handler = Arc::new(PgHandler::new(storage.clone(), databases.clone()));
         let active = active.clone();
         let mut conn_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let _guard = ConnGuard::new(active);
-            tokio::select! {
-                _ = pgwire::tokio::process_socket(
-                    sock,
-                    None,
-                    Arc::new(HandlerFactory(handler)),
-                ) => {}
-                // The server is stopping: drop this connection rather than wait
-                // for a client that may never hang up.
-                _ = conn_shutdown.changed() => {}
+        // One OS thread per connection, running the connection on a runtime
+        // of its own -- PostgreSQL's backend-per-connection model. A
+        // statement then runs synchronously on the thread that owns its
+        // client, with no hand-off: under the shared multi-thread runtime
+        // every statement paid `block_in_place`, whose blocking-pool mutex
+        // was the largest contention at 8 inserting clients (`sample`,
+        // batch 71), and a statement that ran on a worker instead held up
+        // the other connections queued there. A connection that blocks
+        // (a lock wait, `pg_sleep`) now blocks only itself.
+        let guard = ConnGuard::new(active);
+        let std_sock = match sock.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("secantusd-pg: could not take over a connection: {e}");
+                continue;
             }
-        });
+        };
+        let spawned = std::thread::Builder::new()
+            .name("secantus-pg-conn".into())
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(move || {
+                let _guard = guard;
+                // A ONE-worker multi-thread runtime, not a current-thread one:
+                // a statement that sends a notice while it runs
+                // (`live_notices`) hands the worker to another thread with
+                // `block_in_place` so the socket's I/O keeps being driven. On
+                // a current-thread runtime nothing drove it, and the send
+                // waited forever (pgjdbc's
+                // `StatementTest.concurrentWarningReadAndClear`, batch 71).
+                let runtime = match Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("secantus-pg-conn-worker")
+                    .thread_stack_size(WORKER_STACK_BYTES)
+                    .on_thread_start(|| crate::mark_connection_thread(true))
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("secantusd-pg: could not start a connection's runtime: {e}");
+                        return;
+                    }
+                };
+                let conn = runtime.spawn(async move {
+                    let sock = match tokio::net::TcpStream::from_std(std_sock) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("secantusd-pg: could not register a connection: {e}");
+                            return;
+                        }
+                    };
+                    tokio::select! {
+                        _ = pgwire::tokio::process_socket(
+                            sock,
+                            None,
+                            Arc::new(HandlerFactory(handler)),
+                        ) => {}
+                        // The server is stopping: drop this connection rather
+                        // than wait for a client that may never hang up.
+                        _ = conn_shutdown.changed() => {}
+                    }
+                });
+                let _ = runtime.block_on(conn);
+            });
+        if let Err(e) = spawned {
+            // The connection is dropped (its socket closes) and the client
+            // sees the refusal; never a silent hang.
+            eprintln!("secantusd-pg: could not start a connection thread: {e}");
+        }
     }
 }
 

@@ -48,6 +48,10 @@ impl<'a> LiveNotices<'a> {
                     }
                 }
             };
+            // Hands the worker to another thread, which keeps driving the
+            // socket's I/O while this one waits on the send. Never a
+            // current-thread runtime: nothing would drive it (see
+            // `server::accept_loop`).
             tokio::task::block_in_place(|| handle.block_on(deliver));
         };
         let boxed: Box<dyn FnMut(Vec<ErrorInfo>) + Send + '_> = Box::new(send);
