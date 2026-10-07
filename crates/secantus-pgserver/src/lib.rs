@@ -297,7 +297,12 @@ thread_local! {
 /// never mistakes one session's map for another's.
 #[derive(Clone, Debug)]
 pub(crate) struct GucMap {
-    map: HashMap<String, String>,
+    /// Shared with the planner's per-thread copy (`set_session_context`),
+    /// so installing it is a reference count rather than a deep copy: a
+    /// worker thread alternating between connections copied every GUC on
+    /// every statement, two fifths of a point read's server time (measured
+    /// 2026-10-07). A write copies it only while a planner still holds it.
+    map: Arc<HashMap<String, String>>,
     generation: u64,
 }
 
@@ -316,7 +321,7 @@ impl GucMap {
 impl From<HashMap<String, String>> for GucMap {
     fn from(map: HashMap<String, String>) -> Self {
         Self {
-            map,
+            map: Arc::new(map),
             generation: Self::next_generation(),
         }
     }
@@ -332,13 +337,15 @@ impl std::ops::Deref for GucMap {
 impl std::ops::DerefMut for GucMap {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.generation = Self::next_generation();
-        &mut self.map
+        Arc::make_mut(&mut self.map)
     }
 }
 
 /// Whose per-session planner tables (`install_user_types`) a thread holds:
-/// (storage, session, catalog version, role, database).
-type SessionTablesKey = (usize, u64, u64, String, String);
+/// (storage, session, catalog version, role, database, session user). The
+/// session is 0 -- shared by every connection -- unless something this
+/// session sees is its own (see `session_tables_owner`).
+type SessionTablesKey = (usize, u64, u64, String, String, String);
 
 thread_local! {
     static INSTALLED_SESSION_TABLES: std::cell::RefCell<Option<SessionTablesKey>> =
@@ -1166,7 +1173,7 @@ impl RoutineSettings {
         Some(out)
     }
 
-    fn install(&self, settings: HashMap<String, String>) {
+    fn install(&self, settings: Arc<HashMap<String, String>>) {
         let role = settings
             .get("role")
             .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none"))
@@ -3723,6 +3730,31 @@ impl PgHandler {
     /// must be re-published every statement and never recorded as held).
     /// Before the skip, every statement rebuilt every table's row type
     /// from BSON, and a used store made `select 1` twice as slow.
+    /// Whose planner tables `install_user_types` may reuse on this thread.
+    /// The tables are read from the committed catalog for a role, a
+    /// database and a session user, all in the key, so two connections that
+    /// share those share the tables -- 0 here. Keying them by connection
+    /// re-read the whole catalog whenever a worker thread alternated between
+    /// two connections, which made two point-read clients slower together
+    /// than one alone (measured 2026-10-07: 21.2k -> 14.4k statements/s).
+    /// A session with its own temporary tables or functions, or a database
+    /// with row-level security (whose tables are resolved by name), keeps a
+    /// private record.
+    fn session_tables_owner(&self) -> u64 {
+        let private = !self
+            .temp_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || !self.rls_enabled_docs().is_empty()
+            || self.any_temp_function();
+        if private {
+            self.session_serial
+        } else {
+            0
+        }
+    }
+
     fn install_user_types(&self) {
         // Whose transaction a `txid_current()` planned on this thread asks
         // about.
@@ -3792,25 +3824,33 @@ impl PgHandler {
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
         secantus_pgplan::schemas::set_temp_schema_serial(self.session_serial);
+        let owner = self.session_tables_owner();
+        let session_user = self
+            .session_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // Compared in place: building the key allocated the role and the
         // database name on every statement.
         let fresh = !shareable
             || !INSTALLED_SESSION_TABLES.with(|c| {
                 c.borrow().as_ref().is_some_and(|k| {
                     k.0 == storage_ptr
-                        && k.1 == self.session_serial
+                        && k.1 == owner
                         && k.2 == catalog_version
                         && k.3 == role
                         && k.4 == self.db()
+                        && k.5 == session_user
                 })
             });
         if fresh {
             let session_key = (
                 storage_ptr,
-                self.session_serial,
+                owner,
                 catalog_version,
                 role.clone(),
                 self.db().to_string(),
+                session_user,
             );
             // Per statement, not per catalog version: SET ROLE changes which
             // schemas the search path may use without changing the catalog.
@@ -19519,6 +19559,20 @@ impl PgHandler {
         })
     }
 
+    /// A relation named in TEXT as PostgreSQL's error messages show it: an
+    /// unquoted part folded to lower case, a quoted one kept as written.
+    fn relation_text_shown(text: &str) -> String {
+        text.split('.')
+            .map(
+                |p| match p.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
+                    Some(quoted) => quoted.to_string(),
+                    None => p.to_lowercase(),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
     /// The catalog key a relation named in TEXT resolves to (`'s.t'`,
     /// `'t'`, `'public.t'`): a user schema keeps its `schema.` prefix, a
     /// builtin one drops it, and a bare name walks the search_path.
@@ -21972,23 +22026,39 @@ impl PgHandler {
                 Ok(Bson::Int64(set))
             }
             ConstCol::SerialSequence { table, column } => {
+                // The name as written, for the 42P01 below.
+                let shown = match self.resolve_const_col(table)? {
+                    Bson::String(s) => Self::relation_text_shown(&s),
+                    other => other.to_string(),
+                };
                 let (Some(table), Some(column)) = (
                     self.sequence_name_arg(table)?,
                     self.sequence_name_arg(column)?,
                 ) else {
                     return Ok(Bson::Null);
                 };
-                // NULL rather than an error when the column is not serial,
-                // and when the table is not there -- PostgreSQL answers NULL
-                // for a column with no owned sequence.
+                // NULL for a column with no owned sequence; a table or a
+                // column that is not there is PostgreSQL's 42P01 / 42703
+                // (measured on 15.19).
                 let table = if table.contains('.') {
                     table
                 } else {
                     secantus_pgplan::schemas::resolve_unqualified(&table)
                 };
-                let owned = self
-                    .lookup(&table)
-                    .and_then(|def| def.column(&column).and_then(|c| c.sequence.clone()));
+                let Some(def) = self.lookup(&table) else {
+                    return Err(Self::user_error(
+                        "42P01",
+                        format!("relation \"{shown}\" does not exist"),
+                    ));
+                };
+                let Some(col) = def.column(&column) else {
+                    let (_, relname) = secantus_pgplan::schemas::split_key(&def.name);
+                    return Err(Self::user_error(
+                        "42703",
+                        format!("column \"{column}\" of relation \"{relname}\" does not exist"),
+                    ));
+                };
+                let owned = col.sequence.clone();
                 Ok(match owned {
                     // PostgreSQL schema-qualifies the answer; a sequence
                     // outside `public` is already stored as `schema.name`.
@@ -23296,6 +23366,7 @@ impl PgHandler {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .map
+                            .as_ref()
                             .clone(),
                         txn_gucs: self
                             .txn_gucs

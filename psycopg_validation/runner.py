@@ -184,6 +184,17 @@ def main() -> int:
             # (a bare `mypy` on this box is intercepted by pyenv and fails).
             "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")]),
         }
+        # psycopg's conftest refuses to run ANY test after a run that died
+        # without reaching sessionfinish ("Previous run resulted in
+        # segfault!"), and a timeout kill or a Ctrl-C leaves that flag behind
+        # exactly as a segfault does. This run is a fresh measurement, so a
+        # flag from an earlier one would make it report nothing; say so and
+        # clear it. A crash in THIS run still ends it early, and that is
+        # this run's own failure.
+        stale_flag = VENDOR / ".pytest_cache" / "v" / "segfault"
+        if stale_flag.exists():
+            print(f"clearing a stale crash flag from an earlier run: {stale_flag}", file=sys.stderr)
+            stale_flag.unlink()
         deselect = [f"--deselect={t}" for t in DESELECT_TESTS]
         marker = ["-m", MARKER_EXPR] if MARKER_EXPR else []
         # Run from VENDOR so psycopg's own conftest/config apply (this is
