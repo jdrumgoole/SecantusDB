@@ -32,8 +32,14 @@ def _cycle(idx: int) -> None:
         srv = _server.RustServer(str(data), 0)
         try:
             host, port = srv.address
+            # 30s, not 5s: `RustServer(...)` returns once the listener is
+            # BOUND, so a connection made before the accept thread runs waits
+            # in the kernel backlog rather than failing. What cost 5s once on
+            # a loaded Windows runner (2026-09-01) was four servers opening
+            # WiredTiger at once ahead of the first `hello` -- scheduling, not
+            # a lost connection -- so the budget is sized for a slow box.
             client = pymongo.MongoClient(
-                host, port, directConnection=True, serverSelectionTimeoutMS=5000
+                host, port, directConnection=True, serverSelectionTimeoutMS=30000
             )
             coll = client["app"]["c"]
             coll.insert_many([{"_id": i, "v": i} for i in range(50)])
