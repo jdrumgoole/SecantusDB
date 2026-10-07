@@ -1540,6 +1540,8 @@ def sort_spec_problem(spec: Mapping[str, Any]) -> tuple[int, str] | None:
     """mongod's verdict on each key and value of a sort spec, shared by
     ``find`` and the ``$sort`` stage (the Rust server's ``sort_spec_problem``)."""
     for field, v in spec.items():
+        if field == "$natural":
+            continue  # a find-only scan-order directive, not a path
         if field == "":
             return 40352, "FieldPath cannot be constructed with empty string"
         if field.endswith("."):

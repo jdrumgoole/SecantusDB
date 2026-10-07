@@ -97,7 +97,7 @@ def test_sort_stage_validation() -> None:
         ({"x": True}, 15974),
         ({"x": 0}, 15975),
         ({"x": 2}, 15975),
-        ({"x": 1.5}, 15975),
+        ({"x": 0.5}, 15975),  # a double truncates: 1.5 is ascending on mongod
         ({}, 15976),
     ]:
         with pytest.raises(AggregateError) as exc:

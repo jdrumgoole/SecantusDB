@@ -2299,15 +2299,17 @@ def test_create_index_same_name_different_key_conflicts(coll) -> None:
 
 
 def test_create_index_same_name_different_options_conflicts(coll) -> None:
-    """Same name + same key but different options → IndexOptionsConflict (85)."""
+    """Same name + same key but different options → 86, quoting both specs
+    (measured 8.2.11, 2026-10-07; this asserted 85, which is mongod's answer for
+    the same key under ANOTHER name)."""
     from pymongo.errors import OperationFailure
 
     coll.insert_one({"b": 1})
     coll.create_index([("b", 1)], name="b_idx")
     with pytest.raises(OperationFailure) as exc:
         coll.create_index([("b", 1)], name="b_idx", unique=True)
-    assert exc.value.code == 85
-    assert exc.value.details.get("codeName") == "IndexOptionsConflict"
+    assert exc.value.code == 86
+    assert exc.value.details.get("codeName") == "IndexKeySpecsConflict"
 
 
 def test_create_index_identical_recreate_is_noop(coll) -> None:
