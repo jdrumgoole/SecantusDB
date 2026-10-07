@@ -13146,7 +13146,22 @@ shared storage engine or building large new protocol subsystems:
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
-- [ ] **The Rust PG psycopg gauge does not finish on Windows** (2026-09-20).
+- [x] **RESOLVED (2026-10-07, batch 73): the Rust PG psycopg gauge now
+      COMPLETES on Windows, in CI** -- `.github/workflows/psycopg-windows.yml`
+      (weekly, on demand, and on PRs touching `crates/secantus-pg*` /
+      `psycopg_validation/`). windows-latest, debug `secantusd-pg`: **4,846
+      passed, 0 failed**, 176 skipped, 34 xfailed, 4 xpassed; 5,060 started =
+      5,060 reported (run 37658711387, ~10 min of gauge). No server change was
+      needed. What truncated it was one test, `test_type_error_shadow`, which
+      takes 30 s against the runner's OWN PostgreSQL (66 s against us) and so
+      overran `timeout=20`, and pytest-timeout's thread method ends the whole
+      run -- reading (2) below was right. Also deselected on win32: the two
+      `test_right_exception_on_session_timeout` (they pin PG-on-Windows's
+      lost FATAL; the runner's PostgreSQL passes, we deliver 25P03) and psycopg's `refcount` marker (flaky
+      client GC counts, as psycopg's own Windows CI says). The runner image
+      exports `PGPASSWORD`, which fails `test_used_password` against a
+      trusted role; the workflow unsets it. Original entry:
+  The Rust PG psycopg gauge did not finish on Windows (2026-09-20).
   It hangs in psycopg's own TCP-proxy fixture (`tests/fix_proxy.py`
   `_wait_listen`), and excluding those tests still times out. Two traps for
   the next attempt: a killed run leaves a "previous run segfaulted" flag in

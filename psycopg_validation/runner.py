@@ -65,8 +65,9 @@ RUST_BINARY = (
 
 #: Wall-clock cap on the pytest invocation. The full sync half is ~28s against
 #: a healthy server; a broken change leaves hung awaits, and per-test
-#: ``timeout=20`` plus this backstop keeps a bad run bounded.
-PYTEST_TIMEOUT_SECONDS = 1800.0
+#: ``timeout=20`` plus this backstop keeps a bad run bounded. A slower host
+#: (the Windows CI runner) can raise it with ``SECANTUS_PSYCOPG_GAUGE_TIMEOUT``.
+PYTEST_TIMEOUT_SECONDS = float(os.environ.get("SECANTUS_PSYCOPG_GAUGE_TIMEOUT", "1800"))
 
 
 def _pick_ephemeral_port() -> int:
