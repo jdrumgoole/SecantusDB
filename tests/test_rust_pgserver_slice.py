@@ -16130,6 +16130,70 @@ def test_an_acknowledged_commit_survives_a_kill_in_durable_mode(
             assert c.execute("select id, v from t").fetchall() == [(1, "acked")]
 
 
+@pytest.mark.skipif(_WINDOWS, reason="SIGKILL is a POSIX signal")
+def test_concurrent_acknowledged_commits_survive_a_kill_in_durable_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eight clients insert in autocommit while the server is SIGKILLed
+    mid-stream; every row a client saw acknowledged must be there after
+    restart. A ninth session READS while they write, and every row it saw
+    must survive too: as in PostgreSQL, a commit becomes visible to other
+    sessions only once it is durable (batch 70 measured a group-commit design
+    that broke this and dropped it)."""
+    monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
+    for round_ in range(2):
+        home = tmp_path / f"gkill{round_}"
+        home.mkdir()
+        acked: list[list[int]] = [[] for _ in range(8)]
+        seen: set[int] = set()
+        stop = threading.Event()
+        with _Server(home) as server:
+            with server.connect(autocommit=True) as c:
+                c.execute("create table t (id int primary key, w int)")
+
+            def write(w: int, acked: list[list[int]] = acked) -> None:
+                try:
+                    with server.connect(autocommit=True) as c:
+                        for n in range(100_000):
+                            i = w * 1_000_000 + n
+                            c.execute("insert into t values (%s, %s)", (i, w))
+                            acked[w].append(i)
+                except psycopg.Error:
+                    pass  # the kill: whatever was acknowledged is recorded
+
+            def read(seen: set[int] = seen, stop: threading.Event = stop) -> None:
+                try:
+                    with server.connect(autocommit=True) as c:
+                        while not stop.is_set():
+                            rows = c.execute(
+                                "select id from t where w = 0 order by id desc limit 20"
+                            ).fetchall()
+                            seen.update(r[0] for r in rows)
+                except psycopg.Error:
+                    pass  # the kill
+
+            threads = [threading.Thread(target=write, args=(w,)) for w in range(8)]
+            threads.append(threading.Thread(target=read))
+            for t in threads:
+                t.start()
+            time.sleep(1.0)
+            assert server.proc is not None
+            server.proc.kill()
+            server.proc.wait(timeout=10)
+            stop.set()
+            for t in threads:
+                t.join(timeout=30)
+        want = sorted(i for ids in acked for i in ids)
+        assert len(want) > 100, "the writers never got going; the test proved nothing"
+        assert seen, "the reader never saw a row; the test proved nothing"
+        with _Server(home) as server, server.connect() as c:
+            got = {r[0] for r in c.execute("select id from t").fetchall()}
+        missing = [i for i in want if i not in got]
+        assert not missing, f"{len(missing)} acknowledged rows lost, e.g. {missing[:5]}"
+        phantom = sorted(seen - got)
+        assert not phantom, f"{len(phantom)} rows another session saw were lost: {phantom[:5]}"
+
+
 def test_batch46_function_body_error_context(home: Path) -> None:
     """An error inside a PL/pgSQL body carries PostgreSQL's CONTEXT stack:
     the statement's `SQL expression` / `SQL statement` / `PL/pgSQL
