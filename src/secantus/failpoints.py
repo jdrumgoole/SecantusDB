@@ -71,7 +71,10 @@ class _FailCommand:
     write_concern_error: dict[str, Any] | None = None
     """If set, run the command then attach this block to the reply."""
 
-    error_labels: tuple[str, ...] = ()
+    error_labels: tuple[str, ...] | None = None
+    """The failpoint's ``errorLabels``: ``None`` when the key was absent, the
+    list (an explicit ``[]`` included) when supplied -- mongod treats a supplied
+    list as authoritative and computes labels only when it is absent."""
 
     close_connection: bool = False
     """If True, drop the TCP connection abruptly when matched."""
@@ -108,7 +111,7 @@ class FailPointMatch:
     """The decision the registry returns for a single command."""
 
     error_code: int | None = None
-    error_labels: tuple[str, ...] = ()
+    error_labels: tuple[str, ...] | None = None
     write_concern_error: dict[str, Any] | None = None
     close_connection: bool = False
     block_connection: bool = False
@@ -196,7 +199,11 @@ class FailPointRegistry:
                     if isinstance(data.get("writeConcernError"), dict)
                     else None
                 ),
-                error_labels=tuple(data.get("errorLabels") or ()),
+                error_labels=(
+                    tuple(data["errorLabels"])
+                    if isinstance(data.get("errorLabels"), list)
+                    else None
+                ),
                 close_connection=bool(data.get("closeConnection", False)),
                 block_connection=bool(data.get("blockConnection", False)),
                 block_time_ms=int(data.get("blockTimeMS", 0) or 0),
@@ -297,6 +304,37 @@ RESUMABLE_CHANGE_STREAM_CODES: frozenset[int] = frozenset(
         13436,  # NotPrimaryOrSecondary
     }
 )
+
+
+#: The codes mongod labels ``RetryableWriteError`` -- on a retryable write (a
+#: write carrying ``txnNumber`` outside a transaction) and on a failed
+#: ``commitTransaction`` / ``abortTransaction``. Measured by sweeping
+#: ``failCommand`` over every code in 1..520 on a single-node replica-set mongod
+#: 8.2.11 (2026-09-30, ``tools/probes/error_labels.py``).
+RETRYABLE_WRITE_CODES = frozenset(
+    {6, 7, 89, 91, 134, 189, 262, 317, 358, 384, 402, 406, 407, 412, 453, 462}
+    | {9001, 10107, 11600, 11602, 13435, 13436, 50915}
+)
+
+#: The codes mongod labels ``TransientTransactionError`` on a STATEMENT inside a
+#: transaction, from the same sweep. 50, 100, 11601 and 11000 get no label.
+TRANSIENT_TXN_CODES = frozenset(
+    {6, 7, 24, 89, 91, 112, 134, 150, 189, 239, 246, 250, 251, 262, 267, 272, 317}
+    | {384, 402, 406, 407, 412, 453, 462, 9001, 10107, 11600, 11602, 13435, 13436, 50915}
+)
+
+#: ``ResumableChangeStreamError`` when ``failCommand`` fails the AGGREGATE that
+#: opens a change stream (not its getMore).
+CHANGE_STREAM_OPEN_RESUMABLE_CODES = frozenset(
+    {6, 7, 89, 91, 133, 134, 150, 175, 189, 234, 262, 317, 358, 384, 401, 402, 406}
+    | {407, 412, 453, 462, 9001, 10107, 11600, 11602, 13435, 13436, 50915}
+)
+
+#: ``NonResumableChangeStreamError`` on EVERY command.
+NON_RESUMABLE_CHANGE_STREAM_CODES = frozenset({280, 286})
+
+#: ``SystemOverloadedError`` on every command, after any other label.
+SYSTEM_OVERLOADED_CODES = frozenset({433, 449, 450, 462})
 
 
 def is_resumable_change_stream_code(code: int | None) -> bool:

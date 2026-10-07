@@ -145,7 +145,7 @@ def test_awaitable_exhaust_hello_streams_more_to_come(wt_home) -> None:
                 {
                     "hello": 1,
                     "maxAwaitTimeMS": 150,
-                    "topologyVersion": {"processId": bson.ObjectId(), "counter": 0},
+                    "topologyVersion": {"processId": bson.ObjectId(), "counter": bson.Int64(0)},
                     "$db": "admin",
                 }
             )
@@ -208,7 +208,9 @@ def test_awaitable_exhaust_hello_streams_when_fd_above_1024(wt_home) -> None:
                 {
                     "hello": 1,
                     "maxAwaitTimeMS": 100,
-                    "topologyVersion": {"counter": 0},
+                    # Well-formed by mongod's rules (a processId and an Int64
+                    # counter) and out of date, so the first frame is immediate.
+                    "topologyVersion": {"processId": bson.ObjectId(), "counter": bson.Int64(0)},
                     "$db": "admin",
                 }
             )

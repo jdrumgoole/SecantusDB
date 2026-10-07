@@ -375,7 +375,7 @@ def test_aborted_ddl_rolls_back(client):
 
 def test_transaction_too_large_for_cache(tmp_path):
     # An oversized multi-document transaction is rejected with mongod's
-    # TransactionTooLargeForCache (313) BEFORE its unevictable dirty
+    # TransactionTooLargeForCache (388) BEFORE its unevictable dirty
     # content can stall the storage engine. Not transient — retrying the
     # same transaction would hit the same wall — and the failed statement
     # aborts the transaction server-side (mongod parity).
@@ -388,7 +388,7 @@ def test_transaction_too_large_for_cache(tmp_path):
                 sess.start_transaction()
                 with pytest.raises(OperationFailure) as exc_info:
                     coll.insert_many(docs, session=sess)
-                assert exc_info.value.code == 313
+                assert exc_info.value.code == 388
                 assert "TransientTransactionError" not in (
                     exc_info.value.details.get("errorLabels") or []
                 )

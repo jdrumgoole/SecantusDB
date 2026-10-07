@@ -461,6 +461,67 @@ def cases():
         "range decimal step": {"$range": [0, 6, D("2")]},
         "range decimal fractional start": {"$range": [D("1.5"), 4]},
         "pow decimal exact square": {"$pow": [D("2.5"), 2]},
+        # $dateToString directives beyond the numeric subset.
+        "dateToString %z": {"$dateToString": {"date": DT, "format": "%z", "timezone": "-0530"}},
+        "dateToString %Z": {"$dateToString": {"date": DT, "format": "%Z", "timezone": "+0230"}},
+        "dateToString iso week": {"$dateToString": {"date": DT, "format": "%G-W%V-%u"}},
+        "dateToString %U %w %j": {"$dateToString": {"date": DT, "format": "%U %w %j"}},
+        "dateToString %b %B %a": {"$dateToString": {"date": DT, "format": "%b %B %a"}},
+        "dateToString named zone %z": {
+            "$dateToString": {
+                "date": DT,
+                "format": "%Y-%m-%d %H:%M %z",
+                "timezone": "America/New_York",
+            }
+        },
+        # The timezone form of $dateTrunc / $dateDiff, across a DST change.
+        "dateTrunc day tz": {
+            "$dateTrunc": {"date": DT, "unit": "day", "timezone": "America/New_York"}
+        },
+        "dateTrunc hour tz": {
+            "$dateTrunc": {"date": DT, "unit": "hour", "timezone": "America/New_York"}
+        },
+        "dateTrunc week tz": {
+            "$dateTrunc": {
+                "date": DT,
+                "unit": "week",
+                "timezone": "Europe/London",
+                "startOfWeek": "mon",
+            }
+        },
+        "dateDiff day tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-09T12:00:00Z"},
+                "endDate": DT,
+                "unit": "day",
+                "timezone": "America/New_York",
+            }
+        },
+        "dateDiff day no tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-09T23:00:00Z"},
+                "endDate": DT,
+                "unit": "day",
+            }
+        },
+        "dateDiff week tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-01T12:00:00Z"},
+                "endDate": DT,
+                "unit": "week",
+                "timezone": "America/New_York",
+            }
+        },
+        # Decimal transcendentals and conversions.
+        "ln decimal": {"$ln": D("10")},
+        "log10 decimal": {"$log10": D("1000")},
+        "cos decimal": {"$cos": D("1")},
+        "tan decimal": {"$tan": D("0.5")},
+        "asin decimal": {"$asin": D("0.5")},
+        "atanh decimal": {"$atanh": D("0.5")},
+        "sinh decimal": {"$sinh": D("1")},
+        "toDate decimal": {"$toDate": D("1700000000000")},
+        "toDate decimal fraction": {"$toDate": D("1700000000000.7")},
         "log decimal base int": {"$log": [D("8"), 2]},
         "log int base decimal": {"$log": [8, D("2")]},
         "log decimal double": {"$log": [D("10"), 2.5]},
@@ -521,6 +582,7 @@ def cases():
     )
 
 
+DT = {"$toDate": "2024-03-10T06:30:45.123Z"}
 STRIP = {
     "$clusterTime",
     "operationTime",

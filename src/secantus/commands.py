@@ -253,7 +253,11 @@ _ERROR_CODE_NAMES: dict[int, str] = {
 
 
 def _code_name_for(code: int) -> str:
-    return _ERROR_CODE_NAMES.get(code, f"Location{code}")
+    """mongod's ``codeName``: the measured table first (``mongod_codes``, every
+    code mongod names), this module's short list only for a code it lacks."""
+    from secantus.mongod_codes import CODE_NAMES
+
+    return CODE_NAMES.get(code) or _ERROR_CODE_NAMES.get(code, f"Location{code}")
 
 
 def _validate_write_concern(doc: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -9953,9 +9957,67 @@ def _retry_identity(doc: Mapping[str, Any]) -> bytes:
 #: ``MaxTimeMSExpired``, 100 ``UnsatisfiableWriteConcern``, 11601 ``Interrupted``
 #: and 11000 duplicate key (which aborts the transaction, but retrying it would
 #: not help).
-_TRANSIENT_TXN_CODES = frozenset(
-    {6, 7, 24, 89, 91, 112, 134, 189, 246, 251, 262, 267, 9001, 10107, 11600, 11602, 13435, 13436}
-)
+# The measured set (see `failpoints.TRANSIENT_TXN_CODES`); this list had 18 of
+# its 31 codes.
+from secantus.failpoints import TRANSIENT_TXN_CODES as _TRANSIENT_TXN_CODES  # noqa: E402
+
+
+def _failpoint_error_labels(name: str, doc: Mapping[str, Any], code: int, match: Any) -> list[str]:
+    """The ``errorLabels`` mongod attaches to a ``failCommand``-injected error.
+
+    A supplied ``errorLabels`` -- an explicit ``[]`` included -- is
+    authoritative (measured 2026-09-28). Otherwise mongod computes them; the
+    rules are a sweep of every code in 1..520 on 8.2.11 (2026-09-30,
+    ``tools/probes/error_labels.py``), ported from the Rust server:
+
+    * 280 / 286 -> ``NonResumableChangeStreamError``, on ANY command;
+    * a server-injected getMore error -> ``ResumableChangeStreamError`` for the
+      resumable set; the aggregate that OPENS a change stream -> the same label
+      for its own set;
+    * a statement in a transaction (``autocommit: false``) ->
+      ``TransientTransactionError``; ``commitTransaction`` /
+      ``abortTransaction`` -> ``RetryableWriteError`` for the retryable-write
+      codes, else ``TransientTransactionError`` for the transient ones;
+    * a retryable write (``txnNumber``, not in a transaction) ->
+      ``RetryableWriteError``;
+    * then ``SystemOverloadedError``, after any of the above.
+    """
+    from secantus import failpoints as fp
+
+    if match.error_labels is not None:
+        return list(match.error_labels)
+    labels: list[str] = []
+    pipeline = doc.get("pipeline")
+    opens_change_stream = (
+        name == "aggregate"
+        and isinstance(pipeline, list)
+        and bool(pipeline)
+        and isinstance(pipeline[0], Mapping)
+        and "$changeStream" in pipeline[0]
+    )
+    if code in fp.NON_RESUMABLE_CHANGE_STREAM_CODES:
+        labels.append("NonResumableChangeStreamError")
+    elif match.server_injected:
+        if is_resumable_change_stream_code(code):
+            labels.append("ResumableChangeStreamError")
+    elif opens_change_stream:
+        if code in fp.CHANGE_STREAM_OPEN_RESUMABLE_CODES:
+            labels.append("ResumableChangeStreamError")
+    elif doc.get("autocommit") is False:
+        ending = name in ("commitTransaction", "abortTransaction")
+        if ending and code in fp.RETRYABLE_WRITE_CODES:
+            labels.append("RetryableWriteError")
+        elif code in fp.TRANSIENT_TXN_CODES:
+            labels.append(TRANSIENT_LABEL)
+    elif (
+        "txnNumber" in doc
+        and name in ("insert", "update", "delete", "findAndModify", "findandmodify", "bulkWrite")
+        and code in fp.RETRYABLE_WRITE_CODES
+    ):
+        labels.append("RetryableWriteError")
+    if code in fp.SYSTEM_OVERLOADED_CODES:
+        labels.append("SystemOverloadedError")
+    return labels
 
 
 def _txn_unsupported_reason(name: str, doc: dict[str, Any], ctx: CommandContext) -> str | None:
@@ -10431,47 +10493,31 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 # client-side and we never have to send a reply.
                 _time.sleep(match.block_time_ms / 1000.0)
             if match.error_code is not None:
+                from secantus import mongod_codes as _mc
+
+                # A code whose error carries structured extra info cannot be
+                # injected bare: mongod refuses with 40671. On a few others it
+                # drops the connection instead of replying (measured 8.2.11,
+                # 2026-09-30, `tools/probes/error_labels.py`).
+                if match.error_code in _mc.NEEDS_EXTRA_INFO:
+                    return {
+                        "ok": 0.0,
+                        "errmsg": "Missing required extra info for error code "
+                        + _code_name_for(match.error_code),
+                        "code": 40671,
+                        "codeName": "Location40671",
+                    }
+                if match.error_code in _mc.CLOSES_CONNECTION:
+                    from secantus.failpoints import CloseConnectionRequested
+
+                    raise CloseConnectionRequested()
                 result: dict[str, Any] = {
                     "ok": 0.0,
                     "errmsg": "Failing command via 'failCommand' failpoint",
                     "code": match.error_code,
                     "codeName": _code_name_for(match.error_code),
                 }
-                labels = list(match.error_labels)
-                # ``failGetMoreAfterCursorCheckout`` is injected *inside*
-                # mongod's change-stream getMore path, so a resumable code
-                # comes back stamped ``ResumableChangeStreamError`` and the
-                # driver resumes the stream. Plain ``failCommand``
-                # short-circuits earlier and carries only the labels the
-                # failpoint itself named — the change-streams spec pins that
-                # difference, so the label must NOT be added for it.
-                if (
-                    match.server_injected
-                    and is_resumable_change_stream_code(match.error_code)
-                    and "ResumableChangeStreamError" not in labels
-                ):
-                    labels.append("ResumableChangeStreamError")
-                # A failpoint-injected error inside a transaction gets the same
-                # ``TransientTransactionError`` treatment a real one does. The
-                # labelling already existed in ``_finish_txn_statement`` -- this
-                # short-circuit simply never reached it, because it returns
-                # before the handler runs and before ``txn`` is even resolved.
-                # That is why the driver specs' error-label tests saw
-                # ``errorLabels: []``: every one of them injects its error with
-                # ``failCommand``, so every one of them took this path.
-                #
-                # ``autocommit: false`` is the signal mongod itself uses -- the
-                # driver sends it on every statement of a transaction, commit and
-                # abort included -- so it works here without moving the failpoint
-                # check below the transaction resolution, which would reorder
-                # failpoint-vs-transaction error precedence with no probe to say
-                # which mongod prefers.
-                if (
-                    doc.get("autocommit") is False
-                    and match.error_code in _TRANSIENT_TXN_CODES
-                    and TRANSIENT_LABEL not in labels
-                ):
-                    labels.append(TRANSIENT_LABEL)
+                labels = _failpoint_error_labels(name, doc, match.error_code, match)
                 if labels:
                     result["errorLabels"] = labels
                 return result
@@ -10488,7 +10534,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 # got: 3". The synthesised `codeName` was wrong anyway -- it
                 # rendered 91 as "Location91" where 91 is ShutdownInProgress.
                 failpoint_wce = dict(match.write_concern_error)
-                failpoint_labels = match.error_labels
+                failpoint_labels = match.error_labels or ()
 
     # A node inside its ``replSetStepDown`` window is a SECONDARY, and mongod
     # refuses writes there with 10107 while still serving reads. Gated on the
@@ -10585,7 +10631,9 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         result = {
             "ok": 0.0,
             "errmsg": str(exc),
-            "code": 313,
+            # 388 is mongod's `TransactionTooLargeForCache`; 313 was a wrong
+            # code (the Rust server's mongod_codes table has it as 388).
+            "code": 388,
             "codeName": "TransactionTooLargeForCache",
         }
     except changestreams.ChangeStreamFatalError as exc:

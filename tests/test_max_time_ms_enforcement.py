@@ -81,7 +81,20 @@ def test_an_exhausted_budget_answers_50(loaded, command):
     with pytest.raises((OperationFailure, ExecutionTimeout)) as exc:
         db.command({**command, "maxTimeMS": 1})
     assert _expired(exc.value)
-    assert exc.value.details["errmsg"] == "operation exceeded time limit"
+    message = exc.value.details["errmsg"]
+    name = next(iter(command))
+    if name in ("find", "count", "distinct", "aggregate"):
+        # mongod's READ commands name themselves and the namespace when the
+        # budget runs out mid-execution (`Executor error during find command:
+        # <ns> :: caused by :: ...`), and send the bare message when it runs
+        # out before execution -- which at 1ms mongod itself does some of the
+        # time (measured 8.2.11, `tools/probes/max_time_expiry.py`).
+        assert message == "operation exceeded time limit" or (
+            message.startswith(f"Executor error during {name} command")
+            and message.endswith(":: caused by :: operation exceeded time limit")
+        ), message
+    else:
+        assert message == "operation exceeded time limit"
 
 
 def test_create_indexes_wraps_the_timeout_in_an_index_build_failure(loaded):
