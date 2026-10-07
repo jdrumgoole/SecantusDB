@@ -14,11 +14,11 @@ of table as the other gauges.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 import secantus
@@ -116,7 +116,7 @@ def render(xml_path: Path, out_path: Path) -> None:
     md.append("# mongo-php-driver Validation Report")
     md.append("")
     md.append(
-        f"Generated {dt.date.today().isoformat()} — SecantusDB "
+        f"{gauge_common.measured_on()} — SecantusDB "
         f"{secantus.__version__} vs mongo-php-driver "
         f"{_read_driver_version()[:12]} (`vendor/mongo-php-driver/`)."
     )

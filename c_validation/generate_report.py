@@ -18,11 +18,11 @@ Usage::
 
 from __future__ import annotations
 
-import datetime as _dt
 import subprocess
 import sys
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 from c_validation import load_results
@@ -85,7 +85,7 @@ def _render(raw: dict) -> str:
     lines.append("# mongo-c-driver Validation Report")
     lines.append("")
     lines.append(
-        f"Generated {_dt.date.today().isoformat()} — "
+        f"{gauge_common.measured_on()} — "
         f"SecantusDB {_secantus_version()} vs mongo-c-driver "
         f"{_vendor_ref()} (`vendor/mongo-c-driver/`)."
     )

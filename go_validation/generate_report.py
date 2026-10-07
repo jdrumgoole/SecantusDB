@@ -11,12 +11,12 @@ so the two reports look at home next to each other.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 import secantus
@@ -122,7 +122,7 @@ def render(ndjson_path: Path, out_path: Path) -> bool:
     md.append("# mongo-go-driver Validation Report")
     md.append("")
     md.append(
-        f"Generated {dt.date.today().isoformat()} — SecantusDB "
+        f"{gauge_common.measured_on()} — SecantusDB "
         f"{secantus.__version__} vs mongo-go-driver "
         f"{_read_driver_version()[:12]} (`vendor/mongo-go-driver/`)."
     )

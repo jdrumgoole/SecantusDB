@@ -222,8 +222,10 @@ def test_job_log_tail_captures_child_output(client: TestClient) -> None:
     client.post("/jobs/start", data={"task_key": "py-test"}, follow_redirects=False)
     # Find the job id from history.
     journal = client.app.state.journal
-    # Let the fast child finish and be reaped.
-    deadline = time.monotonic() + 5
+    # Let the fast child finish and be reaped. A polled wait with room to
+    # spare: 5s lost under a loaded `-n auto` run (2026-09-28) while the child
+    # was simply slow to be scheduled, and the poll costs nothing when it is not.
+    deadline = time.monotonic() + 60
     jobs = journal.list(limit=1)[0]
     while time.monotonic() < deadline and (not jobs or jobs[0].running):
         time.sleep(0.05)

@@ -310,6 +310,21 @@ def _supervise(argv: list[str]) -> int:
         )
         code = proc.wait()
     exit_file.write_text(str(code))
+    # Record the exit in the STATE file too. It used to be written only when
+    # `status` / `wait` reaped the run, so anything reading `<name>.json`
+    # directly saw `exit_code: null` for a run that had finished hours before
+    # (2026-09-28) -- and a waiter polling that field would have waited forever.
+    state_file = exit_file.with_suffix(".json")
+    try:
+        state = json.loads(state_file.read_text())
+        if state.get("exit_code") is None:
+            state["exit_code"] = code
+            state["finished_at"] = datetime.now(timezone.utc).isoformat()
+            tmp = state_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state, indent=2))
+            os.replace(tmp, state_file)
+    except (OSError, ValueError):
+        pass  # `status` / `wait` still reap from the exit file
     return code
 
 

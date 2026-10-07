@@ -13,11 +13,11 @@ failures for triage.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 from collections import defaultdict
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 import secantus
@@ -130,7 +130,7 @@ def render(raw: dict, out_path: Path, *, server: str = "python") -> None:
     )
     md.append("")
     md.append(
-        f"Generated {dt.date.today().isoformat()} — SecantusDB "
+        f"{gauge_common.measured_on()} — SecantusDB "
         f"{secantus.__version__} vs pymongo {_read_pymongo_version()[:12]}"
         f" (`vendor/pymongo-tests/`)."
     )

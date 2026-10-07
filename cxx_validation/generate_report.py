@@ -16,12 +16,12 @@ Usage::
 
 from __future__ import annotations
 
-import datetime as _dt
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -81,7 +81,7 @@ def render(xml_path: Path, out_path: Path) -> None:
     md.append("# mongo-cxx-driver Validation Report")
     md.append("")
     md.append(
-        f"Generated {_dt.date.today().isoformat()} — "
+        f"{gauge_common.measured_on()} — "
         f"SecantusDB {_secantus_version()} vs mongo-cxx-driver "
         f"{_vendor_ref()} (`vendor/mongo-cxx-driver/`)."
     )
