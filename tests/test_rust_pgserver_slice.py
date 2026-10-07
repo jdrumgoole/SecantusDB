@@ -16147,7 +16147,7 @@ def test_concurrent_acknowledged_commits_survive_a_kill_in_durable_mode(
             with server.connect(autocommit=True) as c:
                 c.execute("create table t (id int primary key, w int)")
 
-            def write(w: int) -> None:
+            def write(w: int, acked: list[list[int]] = acked) -> None:
                 try:
                     with server.connect(autocommit=True) as c:
                         for n in range(100_000):
