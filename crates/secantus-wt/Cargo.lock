@@ -236,7 +236,7 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.172"
+version = "0.5.3-beta.173"
 dependencies = [
  "cc",
  "cmake",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.172"
+version = "0.5.3-beta.173"
 dependencies = [
  "bindgen",
  "secantus-wiredtiger-sys",
