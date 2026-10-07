@@ -5847,3 +5847,21 @@ def test_failed_multi_update_keeps_the_documents_it_already_rewrote(coll) -> Non
         {"_id": 2, "b": 1},
         {"_id": 3, "b": []},
     ]
+
+
+def test_sort_puts_every_number_before_every_bool(coll) -> None:
+    """mongod 8.2.11 (2026-10-07): numbers (NaN first) sort below bools, and
+    `True` is not tied with `1`. Python's `True == 1` used to tie them inside
+    the sort key, giving `[-1, True, 1, False]`."""
+    coll.insert_many(
+        [
+            {"_id": 1, "v": float("nan")},
+            {"_id": 2, "v": True},
+            {"_id": 3, "v": 1},
+            {"_id": 4, "v": False},
+            {"_id": 5, "v": -1.0},
+        ]
+    )
+    asc = [d["_id"] for d in coll.aggregate([{"$sort": {"v": 1}}])]
+    assert asc == [1, 5, 3, 4, 2]
+    assert [d["_id"] for d in coll.find().sort("v", -1)] == [2, 4, 3, 5, 1]

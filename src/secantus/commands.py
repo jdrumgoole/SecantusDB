@@ -5291,7 +5291,24 @@ def _max_time_expired_reply(
             "code": 50,
             "codeName": "MaxTimeMSExpired",
         }
-    if command == "createIndexes":
+    # On a STANDALONE the write commands name themselves too; a replica-set
+    # member sends them bare (measured 8.2.11, 2026-10-07, both topologies).
+    if (
+        ctx.replica_set_name is None
+        and getattr(exc, "during_execution", False)
+        and command in ("update", "delete", "findAndModify")
+    ):
+        return {
+            "ok": 0.0,
+            "errmsg": f"Plan executor error during {command} :: caused by :: {message}",
+            "code": 50,
+            "codeName": "MaxTimeMSExpired",
+        }
+    # The index-build envelope is a STANDALONE answer: a replica-set member
+    # sends the bare message, because the build runs apart from the command
+    # that waits on it (measured 8.2.11, 2026-10-07, both topologies,
+    # `tools/probes/max_time_expiry.py`).
+    if command == "createIndexes" and ctx.replica_set_name is None:
         coll = doc.get(command)
         ns = _ns(ctx.db_name, coll) if isinstance(coll, str) else ctx.db_name
         uuid = ""

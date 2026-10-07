@@ -164,8 +164,12 @@ item is not overhead — it is where the findings come from.
       delegates to the OS locale; ICU or a `C`-collation-only restriction are
       the two honest options. Numeric and boolean ORDER BY are unaffected.
 
-- [ ] **`test_concurrent_server_lifecycle_no_panic` is load-sensitive on the
-      Windows CI runner — observed 2026-09-01.** Failed once on
+- [x] **FIXED 2026-10-07 (test budget) -- `test_concurrent_server_lifecycle_no_panic` is load-sensitive on the
+      Windows CI runner — observed 2026-09-01.** Diagnosed as the test, not
+      the server: `RustServer(...)` returns once the listener is BOUND, so an
+      early connection waits in the kernel backlog rather than failing -- the
+      5s went on four servers opening WiredTiger at once. Server selection is
+      now 30s. Failed once on
       `windows-latest` with
       `ServerSelectionTimeoutError(... Timeout: 5.0s ...)`, then PASSED on a
       plain re-run of the same commit, with `main` green throughout. The test
@@ -3612,7 +3616,7 @@ These work end-to-end but cut corners.
         exists to withhold**, all on BOTH servers (see the entry in §5):
         a stored string could impersonate a `$$KEEP` decision, the descent
         skipped nested arrays, and the decision names leaked outside the stage.
-  - [ ] **An unknown-index `hint` reports our message, not mongod's plan dump**
+  - [ ] **DEFERRED, both servers (re-confirmed 2026-10-07: the only arg-type message differences left) -- An unknown-index `hint` reports our message, not mongod's plan dump**
         (6 cases, on `find` / `count` / `aggregate` / `update` / `delete` /
         `findAndModify`). The CODE matches (2) on all six; mongod's text is a
         rendering of the whole canonical query
@@ -3622,8 +3626,10 @@ These work end-to-end but cut corners.
         which is a subsystem, for message text on an already-correct code —
         deliberately deferred, same call as the aggregation wrapper prefix in
         `tasks/remaining-work-plan.md` §1b.
-  - [ ] **The PYTHON server has the same class open on ~61 of these slots, with
-        18 CRASHES.** Measured on the same 685 shapes, same day: 409 code + 123
+  - [x] **FIXED 2026-10-07 -- the PYTHON server had the same class open on ~61 of these slots, with
+        18 CRASHES.** Re-measured: `arg_types_messages.py` 0 code differences
+        (6 messages, the deferred hint plan dump above), `arg_types_extended.py`
+        0, `arg_types_documents.py` 0. Measured on the same 685 shapes, same day: 409 code + 123
         message divergences, and 18 cases answering `internal server error`
         (code 1) — every one an `int()` over a wrong-typed value
         (`count.limit` / `count.skip` / `listCollections.cursor.batchSize` /
@@ -4434,8 +4440,9 @@ These are explicit non-goals. Don't add them without a reason.
       kind of thing later mis-attributed to the server. Start by timing the
       daemon shutdown path — the gauge's own test phase was 86s.
 
-- [ ] **OPEN — `.detached-runs/<name>.json` can report `exit_code: null` for a
-      process that finished long ago (2026-09-28).** The pymongo gauge finished
+- [x] **FIXED 2026-10-07 — `.detached-runs/<name>.json` could report `exit_code: null` for a
+      process that finished long ago (2026-09-28).** The supervisor now writes
+      the exit into the state file itself (`test_the_state_file_records_the_exit_without_a_status_call`). The pymongo gauge finished
       in 2m39s and wrote both artifacts; its state file still read
       `exit_code: null` two hours later with the recorded pid dead.
 
@@ -4444,8 +4451,12 @@ These are explicit non-goals. Don't add them without a reason.
       `ps -p`, and treat a low load average as corroborating evidence. Cost here
       was only a delay, but a `wait --name` loop would have hung indefinitely.
 
-- [ ] **OPEN — seven `-rust-server` reports carry a date weeks newer than the
-      measurement behind them (2026-09-28).** The `Generated <date>` line
+- [x] **MECHANISM FIXED 2026-10-07 -- seven `-rust-server` reports carry a date weeks newer than the
+      measurement behind them (2026-09-28).** All 13 `generate_report.py`
+      stamp `gauge_common.measured_on()` -- the RAW artifact's date -- so a
+      regenerated report can no longer claim a newer date than its data. The
+      seven reports named below still hold August data until those gauges
+      are re-run; that is a re-measurement, not a code change. The `Generated <date>` line
       records when the report GENERATOR ran, not when the tests ran, and for
       these gauges the two are far apart:
 
@@ -4479,8 +4490,12 @@ These are explicit non-goals. Don't add them without a reason.
       artifacts, so the published panels are unaffected by these seven — but
       anyone quoting a Rust number from `docs/` is quoting August.
 
-- [ ] **OPEN — the Go gauge reports 100.0% over a population capped by a
-      30-minute timeout, and nothing in the report says so (2026-09-28).**
+- [x] **FIXED -- the Go gauge reported 100.0% over a population capped by a
+      30-minute timeout, and nothing in the report said so (2026-09-28).** Both
+      fixes landed: `go_validation/generate_report.py` refuses a rate for a
+      truncated run, and the DNS-dependent tests are excluded in
+      `include_packages.py`. The gauge now completes 659 of 659 (see the
+      Go-gauge triage entry).
       Every recorded run of this gauge has been truncated at the same point, on
       BOTH servers, including the committed 2026-09-21 report. The published
       "Go: 100%" has never described the whole include set.
@@ -4535,8 +4550,17 @@ These are explicit non-goals. Don't add them without a reason.
       the honest signal — 30m 09s for a gauge whose own timeout is 30m is a
       truncation, not a slow run.
 
-- [ ] **CLOSED-BY-MEASUREMENT — `createIndexes` under a timeout needs no Rust
-      change; the PYTHON server is the divergent one (2026-09-28).**
+- [x] **FIXED 2026-10-07 — `createIndexes` under a timeout: the envelope is a
+      STANDALONE answer.** Measured both topologies on 8.2.11: a replica-set
+      member sends the bare message, a standalone wraps it in `Index build
+      failed: <uuid>: Collection <ns> ( <uuid> )` -- and a standalone also
+      prefixes `update` / `delete` / `findAndModify` with `Plan executor error
+      during <cmd>`. The Python server now answers by its own topology; the
+      Rust server (always a replica set) was already bare.
+      `max_time_expiry.py` gained the case and follows mongod's topology: 0 of
+      12 for Python against both, 0 of 12 for Rust. Original entry:
+      CLOSED-BY-MEASUREMENT — `createIndexes` under a timeout needs no Rust
+      change; the PYTHON server is the divergent one (2026-09-28).
       `tasks/driver-conformance-followups-plan.md` §4 asked which shape mongod
       gives when `createIndexes` exceeds `maxTimeMS`, and said to "align both".
       Measured on mongod 8.2.11 — it gives the BARE message, so the Rust server
@@ -4601,8 +4625,10 @@ These are explicit non-goals. Don't add them without a reason.
       the network, not the server. Fix: `go mod download` in a setup step,
       with `actions/setup-go`'s module cache, so the test itself never goes to
       the network.
-- [ ] **OPEN — two job-tooling tests are load-sensitive under `-n auto`
-      (measured 2026-09-28).** `tests/test_detached_run.py::
+- [x] **FIXED 2026-10-07 — two job-tooling tests were load-sensitive under `-n auto`
+      (measured 2026-09-28).** Both waits are polled with room to spare (90s /
+      60s); the `taskkill` race noted below is already absorbed by `stop`'s
+      retry, which reports the first failure and still succeeds. `tests/test_detached_run.py::
       test_stop_ends_a_running_command` and `tests/test_opsboard.py::
       test_job_log_tail_captures_child_output` failed together in one full
       `-n auto` run on Windows (14,857 passed, these 2 failed) and **both pass
@@ -4736,8 +4762,9 @@ These are explicit non-goals. Don't add them without a reason.
       EXPOSED rather than newly broken. Not attributed to either — it was
       observed from a branch that did not touch this file, and `main` was green
       on `pg-oracle` across the four runs before it.
-- [ ] **OPEN — the PYTHON server cannot tell `errorLabels: []` from an absent
-      `errorLabels`, so it adds a label where mongod adds none (2026-09-28).**
+- [x] **FIXED 2026-10-07 — the PYTHON server could not tell `errorLabels: []` from an absent
+      `errorLabels`, so it added a label where mongod adds none (2026-09-28).**
+      `FailPoint.error_labels` is `tuple | None`; `error_labels.py` 0 of 540.
       `failpoints.py:199` parses the key as
       `tuple(data.get("errorLabels") or ())`, which collapses "supplied and
       empty" into "not supplied". mongod treats a supplied list as
@@ -4754,8 +4781,8 @@ These are explicit non-goals. Don't add them without a reason.
       `commitTransaction` itself and converts the NotPrimary family into a
       client-side exception, so a pymongo-driven probe measures the driver.
 
-- [ ] **OPEN on the Python server; fixed on the Rust server
-      (2026-09-30).** Rust now sends `errInfo.writeConcern` with the client's `w`,
+- [x] **FIXED on both servers (Python 2026-10-07; Rust
+      2026-09-30).** Rust now sends `errInfo.writeConcern` with the client's `w`,
       its `j` if given, `wtimeout` (0 when absent) and `provenance:
       "clientSupplied"`, places `writeConcernError` before `ok`, and runs a
       write whose `w` names an unknown tag (79 afterwards, not a pre-flight
@@ -4885,8 +4912,11 @@ These are explicit non-goals. Don't add them without a reason.
       shape ("monotonic, no cliff"), and a noisy neighbour is exactly what could
       fake a cliff or hide one.
 
-- [ ] **OPEN — a Java typed-collection round-trip with a custom codec registry
-      fails, and it is NOT mapReduce (2026-09-27).**
+- [x] **CLOSED BY MEASUREMENT — a Java typed-collection round-trip with a custom codec registry
+      failed, and it is NOT mapReduce (2026-09-27).** It passes in the later
+      Java gauge runs against the Rust server (496 / 0 / 404 on 2026-09-30 and
+      again in phase 3 of the remaining-features plan, 2026-10-06), so it was
+      reached-then-fixed by the intervening work rather than diagnosed here.
       `com.mongodb.client.MongoCollectionTest#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists`
       fails in the Java gauge. It arrived in the same `validate-all` as the
       `mapReduce` failure and in the same test class, which is why the first
@@ -6023,7 +6053,7 @@ to the Rust server should close them there.
   differential cases.
 
   **What is left of the sweep, all measured 2026-08-31:**
-  - [ ] **~1336 Rust code differences left: the per-operator OPERAND-TYPE
+  - [x] **CLOSED -- ~1336 Rust code differences left: the per-operator OPERAND-TYPE
         errors.** `{$abs: "x"}` is `28765 $abs only supports numeric types, not
         string`. **The largest family -- the 24 unary numeric guards, 220
         shapes -- was closed 2026-08-31** by re-evaluating just the ARGUMENT
@@ -6032,6 +6062,7 @@ to the Rust server should close them there.
         conversions (16006), 130 `$OP accepts exactly one argument if given an
         <T>` (40536), 97 more ranged arities (28667), 60 `requires a single
         argument` (50723), and roughly 190 smaller families.
+        **Re-measured 2026-10-07 (`agg_expressions.py`, 6,628 cases, mongod 8.2.11): BOTH servers 0 code and 0 message differences, 7 values** -- the Decimal128 last digit of `$sin` / `$tan` / `$ln` / `$log10` / `$acosh` / `$cosh` / `$sinh` at 2.5, where ours is the correctly rounded value (the authorised divergence, see the transcendentals entry).
 
   - [x] **RESOLVED 2026-08-31 — the constant-folding WRAPPER, and it was cheap
         once measured.** mongod picks between `Failed to optimize pipeline ::
@@ -6054,10 +6085,10 @@ to the Rust server should close them there.
         its decision variables itself, so folding reported `$$KEEP` as
         undefined.
 
-  - [ ] **~143 Python message-only differences left: NUMBER RENDERING inside the
+  - [x] **CLOSED -- ~143 Python message-only differences left: NUMBER RENDERING inside the
         message.** mongod prints `1.09951e+12` where we print `1099511627776`,
         and `0` where we print `0.0`. Same family as the `$limit` / `$skip`
-        value-rendering entry above. Measured 2026-08-31.
+        value-rendering entry above. Measured 2026-08-31. **Re-measured 2026-10-07 (`agg_expressions.py`, 6,628 cases, mongod 8.2.11): BOTH servers 0 code and 0 message differences, 7 values** -- the Decimal128 last digit of `$sin` / `$tan` / `$ln` / `$log10` / `$acosh` / `$cosh` / `$sinh` at 2.5, where ours is the correctly rounded value (the authorised divergence, see the transcendentals entry).
 
 - [x] **RESOLVED except the LOCALE (2026-09-01): collated ordering is now a
       three-level key, and 17 of 19 sweep cases match mongod exactly.**
@@ -6243,7 +6274,7 @@ to the Rust server should close them there.
 
         Pinned by 27 differential cases.
 
-  - [ ] **Decimal128 transcendentals: the last digit of 34.** `$sin`, `$tan`,
+  - [x] **AUTHORISED DIVERGENCE (Joe, kept as correctly rounded) -- Decimal128 transcendentals: the last digit of 34.** `$sin`, `$tan`,
         `$ln`, `$log10` and `$acosh` disagree with mongod in the final digit
         for a Decimal128 operand. Measured 2026-08-31 at 80 digits: **our value
         is the correctly-rounded one** and mongod's is 1-2 ulp low (true
@@ -6256,10 +6287,10 @@ to the Rust server should close them there.
 
         Related and still open: `cmp(string, Decimal128)` is inverted in the
         cross-type order (4 of 121 pairs).
-  - [ ] **135 message-only differences** remain on the Python server across
+  - [x] **CLOSED -- 135 message-only differences** remained on the Python server across
         the expression family (Rust: 4), down from 689. The largest remaining
         group is wording rather than rendering — the number rendering itself is
-        fixed (`expressions._fmt_double` is mongod's `%g`).
+        fixed (`expressions._fmt_double` is mongod's `%g`). **Re-measured 2026-10-07 (`agg_expressions.py`, 6,628 cases, mongod 8.2.11): BOTH servers 0 code and 0 message differences, 7 values** -- the Decimal128 last digit of `$sin` / `$tan` / `$ln` / `$log10` / `$acosh` / `$cosh` / `$sinh` at 2.5, where ours is the correctly rounded value (the authorised divergence, see the transcendentals entry).
 
 
 - [x] **RESOLVED (verified 2026-09-01), and with the BETTER fix this entry
@@ -8047,6 +8078,49 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.05 MongoDB-server backlog close-out -- 2026-10-07
+
+Every open item for the two MongoDB servers was reproduced against mongod 8.2.11
+and either fixed, closed by re-measurement, or given the disposition below.
+Standing numbers after the batch (Python / Rust): `remaining_shapes` 4 / 4 of
+118 (all known, below), `agg_expressions` 7 / 7 of 6,628 values and 0 codes /
+messages (the authorised Decimal128 last digit), `int32_arguments` 0 / 0 of
+189, `write_error_replies` 0 / 0 of 58, `change_stream_fuzz` 0 / 0 of 60,
+`update_description` 0 / 0 of 61, `max_time_expiry` 0 / 0 of 12, `error_labels`
+0 / 0 of 540, `date_string_parsing` 0 / 0 of 433, `nested_value_sort` 0 / 0 of
+24, `awaitable_hello` 0 / 0 of 33.
+
+**Left open on purpose, each with its reason** (the entry itself has the detail):
+
+- **Unknown-index `hint` plan dump** (both servers, 6 message-only cases): needs
+  mongod's planner `debugString` renderer for text on an already-correct code.
+- **`$where` / server-side JavaScript**: a scope decision; it also accounts for
+  three of the Go gauge's remaining failures.
+- **Go gauge `TestSDAMProse/heartbeats_processed_more_frequently`**: the Python
+  cause was the awaitable `hello` (fixed); not re-run on the Rust server this
+  batch, so the Go-gauge triage entry stays open until the next Go run.
+- **A `w` tag set with more than one key**: accepted divergence (mongod's
+  hash-map order).
+- **The multikey `$sort` plan artifact**: accepted -- mongod contradicting its
+  own `_id` tie-break.
+- **Decimal128 transcendental last digit**: authorised (correctly rounded).
+- **Make Rust the recommended default**: a product decision for Joe.
+- **PyPI trusted publisher for `secantus-core` / lockstep publishing**: needs
+  Joe's PyPI account.
+- **CI Python matrix (3.10 only on push)** and **vendored WiredTiger rebuilt per
+  CI job**: cost decisions.
+- **.NET gauge on this box**: a stale `gpg` lock -- environment, not code.
+- **Performance items** (droplet comparison, write amplification,
+  `--oplog-async` default, cache defaulting, `log_file_max`, the writer-scaling
+  chart, `concurrency-refresh` on a quiet box): need droplet runs and
+  durability decisions, not code.
+- **`test_tmp_retention_guard` timeout**: not reproduced; a watch item.
+- **Go smoke tests fetch modules at test time**: needs a vendoring decision.
+- **Stale `-rust-server` validation reports**: the stamping is fixed; the
+  numbers wait on re-running those gauges.
+- **Out of scope**: macOS x86_64 wheels, and the in-process engine-selection
+  notes in the porting history.
+
 ### 7.04 Rust MongoDB server: `$toDate` / `$dateFromString` strings -- 2026-10-06
 
 `tools/probes/date_string_parsing.py` (123 strings, mongod 8.2.11): **61
@@ -8147,8 +8221,9 @@ What is left, recorded so the PG session and the release work find it:
       driver, a disabled sweeper, and a heartbeat reaching the oplog. The
       Python embedded handle still runs neither.
 
-- [ ] **`test_replset_step_down_refusals_match_mongod[unforced, catch-up
-      overridden]` depends on mongod's timing (seen 2026-10-02, Windows CI).**
+- [x] **FIXED 2026-10-07 -- `test_replset_step_down_refusals_match_mongod[unforced, catch-up
+      overridden]` depended on mongod's timing (seen 2026-10-02, Windows CI).**
+      The test now accepts either of mongod's two 262 messages.
       With `{replSetStepDown: 5, secondaryCatchUpPeriodSecs: 1}`, mongod
       normally answers 262 "No electable secondaries caught up". On a slow
       runner it answered 262 "By the time we were ready to step down, we were
@@ -8230,12 +8305,28 @@ mongod 8.2.11 as a replica set: 28 of 35 shapes differed when first measured,
   orders `n`, `upserted` / `writeErrors`, `nModified`, `ok` as mongod does
   (`ok` used to come before `writeErrors`).
 
-**Found and NOT fixed -- Python-server divergences** (out of scope):
+**Python-server divergences -- FIXED 2026-10-07** (mongod 8.2.11, replica set):
 
-- [ ] the same positional gap: `update_one({a: 2}, {$set: {"a.$": 9}})`
-  fails with code 9 on the Python server;
-- [ ] its change events, update descriptions and these error replies were not
-  measured; run the three new probes with `PROBE_SERVER` at a Python server.
+- [x] the same positional gap: `update_one({a: 2}, {$set: {"a.$": 9}})`
+  fails with code 9 on the Python server. **Fixed** (`find_positional_matches`
+  takes a predicate on the array field itself).
+- [x] its change events, update descriptions and these error replies were not
+  measured. **Measured and fixed:** `change_stream_fuzz.py` 13 of 60 -> 0,
+  `update_description.py` 1 -> 0 of 61, `write_error_replies.py` 22 -> 0 of
+  58, `change_streams.py` 0 of 41. Found on the way, three of them SILENT
+  WRITES: a failed `updateMany` rolled back the documents it had already
+  rewritten (mongod keeps them; the chunk now commits up to the failure and
+  then raises); `$set: {"b.2.c": 1}` over `b: []` wrote nothing (an
+  intermediate index past the end is now created, null-padded); `multi: true`
+  with a replacement APPLIED it; `delete` with a numeric `limit` other than 0
+  / 1 deleted; `createIndexes` built a duplicate index under a new name and an
+  empty-key index; `a$b` / `""` / `system.foo` became collections. Also:
+  dup-key replies under the executor wrapper, 85 / 86 index conflicts in
+  mongod's words, a unique build over duplicates naming the KEY (it said
+  `dup key: { _id: 2 }`), `renameCollection` outside `admin` (13), `collMod`
+  unknown fields (40415), `find` sort values through the `$sort` stage's rule
+  (a double truncates, a decimal rounds half to even), PCRE2's messages for an
+  invalid regex (51091), and no `fullDocumentBeforeChange` on inserts.
 
 ### 7.01 Rust MongoDB server driver-gauge sweep — 2026-09-30
 
@@ -8298,15 +8389,16 @@ newly pass (Rust driver `find_one_and_delete_hint_server_version`, Java
   true", 1 failure of 2 assertions). It selects a SECONDARY, gets the one node
   (a direct connection accepts any server type), and asserts the resumed
   cursor's server `isSecondary()`; one member cannot be both.
-- [ ] **The .NET gauge could not run on this box:** its build step `gpg
+- [ ] **ENVIRONMENT, not code -- left for Joe. The .NET gauge could not run on this box:** its build step `gpg
   --batch --import` blocks on a stale `~/.gnupg/public-keys.d/pubring.db.lock`
   left by a dead process under an old hostname. An environment problem, not a
   repo one; clear the lock and re-run `invoke validate-dotnet --server rust`.
   (The Ruby gauge hit a similar local problem -- Homebrew's read-only
   `rdoc_plugin.rb` -- and passed with `BUNDLE_PATH` pointed elsewhere.)
 
-- [ ] **`test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
-  timed out ONCE (2026-09-30).** Its nested collect-only pytest hit the 300s
+- [ ] **NOT REPRODUCED -- left open as a watch item. `test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
+  timed out ONCE (2026-09-30).** It passed in every full-suite run of the
+  2026-10-07 batch (14,500+ tests under `-n auto`). Its nested collect-only pytest hit the 300s
   `subprocess.run` timeout in an `-n auto` run of eight files alongside the
   PG-binary tests; it takes ~3s, and passed 3 of 3 alone straight after. A
   300s wall on a 3s job is a hang, not slowness -- the docstring already
@@ -8314,12 +8406,16 @@ newly pass (Rust driver `find_one_and_delete_hint_server_version`, Java
   `--basetemp` was meant to remove. Not reproduced yet; run the file under
   `-n auto` next to a heavy suite and sample the nested process if it sticks.
 
-**Found and NOT fixed -- Python-server divergences** (out of scope here):
+**Python-server divergences -- FIXED 2026-10-07:**
 
-- [ ] the Python server has the same oversized-transaction code, 313 instead
-  of 388 (`commands.py`, and `tests/test_transactions.py` asserts 313).
-- [ ] its `failCommand` labels and code names were not measured this batch;
-  run `tools/probes/error_labels.py` with `PROBE_SERVER` at a Python server.
+- [x] the Python server has the same oversized-transaction code, 313 instead
+  of 388. **Fixed 2026-10-07** (388; the test now asserts it).
+- [x] its `failCommand` labels and code names were not measured this batch.
+  **Measured and fixed 2026-10-07: 0 of 540** -- an explicit `errorLabels: []`
+  is authoritative, the label sets and code names come from
+  `src/secantus/mongod_codes.py` (generated from `mongod_codes.rs`), the 24
+  extra-info codes are refused with 40671, and the connection-closing codes
+  close it.
 
 ### 7.00 Rust MongoDB server batch — 2026-09-30, measured against mongod 8.2.11
 
@@ -8390,33 +8486,44 @@ are the probes' own numbers.
   non-streamed hold whose topology moves rebuilds its reply instead of sending
   the pre-wait one. `tools/probes/awaitable_hello.py` 0 of 35.
 
-**Found and NOT fixed -- Python-server divergences** (out of this batch's scope,
-which was the Rust server; each measured against 8.2.11 on 2026-09-30):
+**Python-server divergences found by this batch -- ALL FIXED 2026-10-07**
+(each measured against 8.2.11 on 2026-09-30, re-measured after the fix with
+`PROBE_SERVER` at a Python server, replica-set mongod where the shape needs one):
 
-- [ ] `maxTimeMS`: 8 of 11 commands differ (`tools/probes/max_time_expiry.py`
+- [x] `maxTimeMS`: 8 of 11 commands differ (`tools/probes/max_time_expiry.py`
   without `PROBE_SERVER`) -- no executor prefix on find / aggregate /
-  distinct / count.
-- [ ] regex `\Z` misses a final newline and `\z` is refused (the anchor block
-  of `regex_value_semantics.py`).
-- [ ] `$jsonSchema` accepts `type: "integer"` (mongod: 9).
-- [ ] aggregate `$project: {_id: 1}` returns whole documents
-  (`aggregation_stage_results.py`, python 2).
-- [ ] the awaitable `hello`: 25 of 33 shapes differ
+  distinct / count. **Fixed: 0 of 11** (`_READ_EXECUTOR_COMMANDS`).
+- [x] regex `\Z` misses a final newline and `\z` is refused (the anchor block
+  of `regex_value_semantics.py`). **Fixed: 0 of 114** (`query.pcre_to_python`).
+- [x] `$jsonSchema` accepts `type: "integer"` (mongod: 9). **Fixed**, and an
+  invalid validator is refused at `create` / `collMod` as on the Rust server.
+- [x] aggregate `$project: {_id: 1}` returns whole documents
+  (`aggregation_stage_results.py`, python 2). **Fixed** (`remaining_shapes.py`).
+- [x] the awaitable `hello`: 25 of 33 shapes differ
   (`tools/probes/awaitable_hello.py` with `PROBE_SERVER` at a Python server) --
   every malformed `topologyVersion` / `maxAwaitTimeMS` accepted, a stale or
   another process's topology held instead of answered, and the first streamed
   reply sent at once (so the Python Go gauge's
-  `heartbeats_processed_more_frequently` failure is this too).
-- [ ] `$slice: [a, <negative>, n]` counts from the raw start (`[[4, 3, 1, 3, 1],
+  `heartbeats_processed_more_frequently` failure is this too). **Fixed: 0 of 33**
+  (`_awaitable_hello_problem`, the hold in `server.py`).
+- [x] `$slice: [a, <negative>, n]` counts from the raw start (`[[4, 3, 1, 3, 1],
   -3, 4]` is `[]`, mongod `[1, 3, 1]`) and a count of 0 or less is accepted.
   `test_index_math_fuzz` draws around both, with the reason written in.
-- [ ] `$bucketAuto` refuses a decimal groupBy with a granularity, and answers
-  doubles for `POWERSOF2`.
-- [ ] write-concern errors carry no `errInfo`, and an unknown `w` tag is a
-  pre-flight refusal.
-- [ ] `$jsonSchema` validation failures report only `{operatorName: "$jsonSchema"}`.
-- [ ] decimal `$pow` is `exp(e * ln b)` at 34 digits; correctly rounded matches
-  mongod on 130 of 183 finite pairs, that method on 56.
+  **Fixed** (negative position clamped, 28729 for a count of 0 or less).
+- [x] `$bucketAuto` refuses a decimal groupBy with a granularity, and answers
+  doubles for `POWERSOF2`. **Fixed** (decimal series and bounds in decimal).
+- [x] write-concern errors carry no `errInfo`, and an unknown `w` tag is a
+  pre-flight refusal. **Fixed** with the Rust server's `w` rules (number
+  truncation, null as the empty tag, tag sets as `NoSuchKey`, 9 for an empty
+  set / bool / array), `writeConcernError` ahead of `ok`.
+- [x] `$jsonSchema` validation failures report only `{operatorName: "$jsonSchema"}`.
+  **Fixed**: `src/secantus/validation_errors.py` is a port of the Rust
+  explainer, and update / `findAndModify` failures carry the executor prefix.
+- [x] decimal `$pow` is `exp(e * ln b)` at 34 digits; correctly rounded matches
+  mongod on 130 of 183 finite pairs, that method on 56. **Fixed** -- now
+  correctly rounded, the same authorised last-digit divergence as the Rust
+  server (`$pow` 2.5^2 and the transcendentals are the 7 of 6,628 left in the
+  expression sweep, all of that class).
 
 **Still open on the Rust server after this batch:**
 
@@ -8463,16 +8570,17 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   in the 2026-09-28 gauge entry, and it has nothing to do with the index.
   `nested_value_sort.py` gained the shape: 4 of 24 divergent before, 0 after.
   The on-disk index encoding was already type-first (entry format 4).
-- [ ] **OPEN — the PYTHON engine sorts documents by field name before value type**
-  (`ordering._bson_lt`), the bug fixed on the Rust server above.
+- [x] **FIXED 2026-10-07 — the PYTHON engine sorted documents by field name before value type**
+  (`ordering._bson_lt`), the bug fixed on the Rust server above. Type rank is
+  now compared first; `nested_value_sort.py` 0 of 24 against a Python server.
   `nested_value_sort.py` with `PROBE_SERVER` at a Python server sizes it.
   Parity did not catch it: the curated corpus has no such pair.
-- [ ] **OPEN — a `w` tag set with more than one key (known divergence).** mongod
+- [x] **ACCEPTED DIVERGENCE (both servers) — a `w` tag set with more than one key.** mongod
   echoes it, and names the key in its `NoSuchKey` message, in hash-map order
   (`{a, b, c, d}` comes back `{d, b, a, c}` and names `c`), which is not
   reproducible without its hash function. One key matches exactly.
 
-- [ ] **A mongod plan artifact, recorded not matched:** with a multikey index,
+- [x] **ACCEPTED -- a mongod plan artifact, recorded not matched:** with a multikey index,
   `$sort: {x: -1, _id: 1}` over `[[3], [1, 2, 3]]` returns `[1, 0]` on mongod,
   contradicting its own `_id` tiebreak (without the index it returns `[0, 1]`).
   `nested_value_sort.py` lists it as KNOWN.
@@ -9030,8 +9138,8 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   scanner text, section 7.04) and 7 last-digit decimal transcendentals (the
   authorised divergence above). The entry below, and the 925-of-3,968 one
   after it, are history.
-- [ ] **Aggregation expression error surface: 50 codes + 212 messages left
-  (2026-09-02).** `tools/probes/agg_expressions.py` had never been reported on;
+- [x] **CLOSED 2026-10-07 -- Aggregation expression error surface: 50 codes + 212 messages left
+  (2026-09-02).** **Re-measured 2026-10-07 (`agg_expressions.py`, 6,628 cases, mongod 8.2.11): BOTH servers 0 code and 0 message differences, 7 values** -- the Decimal128 last digit of `$sin` / `$tan` / `$ln` / `$log10` / `$acosh` / `$cosh` / `$sinh` at 2.5, where ours is the correctly rounded value (the authorised divergence, see the transcendentals entry). `tools/probes/agg_expressions.py` had never been reported on;
   running it found **551 wrong codes** across 58 operators on 3,968 cases, now
   **50**. The systematic half is done — arity and spec-shape are PARSE errors
   carrying the stage wrapper, not fold errors (`_expression_shape_problem`).
@@ -9102,7 +9210,7 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   a `TZ=UTC` server before implementing. Note `$toString` of a `Timestamp` is a
   241 on mongod, so those two accept a type `$toString` refuses.
 
-- [ ] **SUPERSEDED by the entry above — the same probe against the RUST server:
+- [x] **SUPERSEDED and CLOSED (0 codes, 0 messages, 7 authorised values on 2026-10-07) — the same probe against the RUST server:
   925 of 3,968 (2026-09-02).**
   Was 981; `$stdDevPop` / `$stdDevSamp` in EXPRESSION position are now
   implemented (the `$group` accumulator forms had shipped long ago and the
@@ -9246,7 +9354,7 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   `tests/test_rust_hint_error_message.py`, registered in the storage-engine CI
   lane.
 
-- [ ] **NOT A DEFECT, recorded so it is not re-investigated: the six
+- [x] **NOT A DEFECT, recorded so it is not re-investigated: the six
   message-only bad-hint divergences in `tools/probes/arg_types_messages.py` are
   DELIBERATE, and BOTH servers have them.** Measured 2026-09-07: python 6,
   rust 6, and they are the same six. mongod answers a bad hint with a
@@ -9390,7 +9498,7 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   `unicode-normalization` and `unicode-properties` dependencies to
   `secantus-core`; both were already in the lock tree transitively.
 
-- [ ] **OPEN: the PYTHON server orders LIGATURES wrongly under a collation
+- [x] **FIXED 2026-10-07: the PYTHON server ordered LIGATURES wrongly under a collation
   (found 2026-09-07 while porting `sort_levels` to Rust).** 5 of 64 shapes in
   the three-way sweep; mongod and the Rust server agree, the Python server does
   not:
@@ -9399,6 +9507,15 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
           mongod  ['fi', 'ﬁ', 'fj']
           rust    ['fi', 'ﬁ', 'fj']
           python  ['ﬁ', 'fi', 'fj']
+
+  **Fixed:** `sort_levels` is now a byte key in the Rust server's layout, with
+  a compatibility character expanded at the primary and secondary levels and
+  ranked at the tertiary -- on BOTH servers, since the Rust port tied `fi` / `ﬁ`
+  at strength 3 too. `collation_order.py` 0 unexpected on both (the two
+  locale cases remain, needing CLDR data). Found on the way, both servers:
+  `ß` tied `ss` at strength 2 where mongod puts `Strasse` first -- now `ss`
+  plus a secondary weight, which also closes the PostgreSQL eszett gap
+  `test_sql_collation_order.py` pinned.
 
   `sort_levels` decomposes with **NFD**, which does not split a COMPATIBILITY
   ligature, so `ﬁ` stays one base character while the primary level case-folds
@@ -10075,7 +10192,7 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   computes at 34 digits THROUGHOUT to track mongod's own error; `$asinh` is now
   the one exception, and any decision here should say which rule wins.
 
-- [ ] **Decimal128 operands are refused by some Rust operators.** `$pow` and
+- [x] **CLOSED 2026-10-07 (`agg_expressions.py`: 0 codes, 0 messages; 7 authorised last-digit values) -- Decimal128 operands were refused by some Rust operators.** `$pow` and
   `$atan2` answer a decimal since 2026-09-30 -- correctly rounded under the
   #1436 rule, which was MEASURED for `$pow` rather than assumed: over 183
   finite pairs against 8.2.11, correct rounding matched mongod on 130 where
@@ -11609,7 +11726,12 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `from_f64` and `group::gkey`/`GKey` are now exposed. Validated across curated
   cases + a dedicated 4000-case densify fuzz in-repo **and** 8 extra local seeds
   (5000 densify pipelines each, all handled, zero mismatches).
-- [ ] **Pipeline stages — the list below was STALE; re-measured 2026-09-01.**
+- [x] **CLOSED BY MEASUREMENT 2026-10-07 -- Pipeline stages — the list below was STALE; re-measured 2026-09-01.**
+  Re-probed against mongod 8.2.11: `$out`, `$merge` (`whenMatched: "merge"`)
+  and `$sort` over NaN / bool / number keys all match on the Rust server. The
+  PYTHON server's `$sort` did not -- `_SortKey.__eq__` used Python's `==`, so
+  `True` tied with `1` inside the tuple key -- and is fixed
+  (`test_sort_puts_every_number_before_every_bool`).
   `$lookup`, `$graphLookup`, `$densify` and `$sample` all work on the Rust
   server today (probed against mongod 8.2.11 through the standalone server, not
   read off this file). What this entry described as waiting for Phase 3+ had
@@ -11797,10 +11919,13 @@ defer), and `$dateToString` (strftime-style formatting: `%Y`/`%m`/`%d`/`%H`/`%M`
 complete on both servers** (only date *formatting/parsing* edges below remain).
 **Remaining:**
 
-- [ ] **Expression operators (Rust server):** the remaining date-op defers to the
+- [x] **CLOSED BY MEASUREMENT 2026-10-07 -- Expression operators (Rust server):** the remaining date-op defers to the
   Python oracle (the Rust server errors on them): *named IANA* `timezone` zones on
   `$dateFromString` (naive-local→instant is DST-ambiguous across a gap/overlap, so
-  it stays deferred — unlike `$dateToString`'s unambiguous instant→wall-clock);
+  it stays deferred [**no longer**: the timelib port answers every one of these,
+  `date_string_parsing.py` 0 of 433 on both servers, and `$dateTrunc` /
+  `$dateDiff` with an IANA or offset `timezone`, `$dateToString` `%z` / `%Z` /
+  ISO-week directives all match mongod 8.2.11 on both servers, 2026-10-07] — unlike `$dateToString`'s unambiguous instant→wall-clock);
   `$dateFromString` `format` directives *outside* the numeric subset
   (`%z`/`%Z`/`%a`/`%b`/`%p`/… — need locale/text/offset handling), a `%j` combined
   with `%m`/`%d`, and any input Python would reject; `$dateToString` `%z`/`%Z`/
@@ -16537,7 +16662,7 @@ point on the CPU/IO curve for this engine on small-core machines.
   writes added an lz4 table alongside the 11 zlib ones. A unit test
   (`zlib_must_remain_available_for_legacy_tables`) records why the extension
   cannot be dropped as a cleanup.
-- [ ] **Consider exposing `--block-compressor`** so a disk-constrained
+- [x] **DONE 2026-10-07 (Rust daemon: `--block-compressor lz4|zlib|none`, `[storage] block_compressor`; the per-table default is not done) -- Consider exposing `--block-compressor`** so a disk-constrained
   deployment can opt back to zlib (1.9x less disk on incompressible content),
   and consider a per-table default — documents and oplog have different
   read/write mixes and the sweep measured them together.

@@ -149,7 +149,16 @@ class _SortKey:
         return _bson_lt(a, b)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, _SortKey) and self.val == other.val
+        # Equal means "neither sorts before the other". A tuple of keys is
+        # compared by finding the first pair that is NOT equal, so Python's
+        # `==` here let `True == 1` (and `0 == False`) tie and never reach
+        # `__lt__`: `$sort` gave `[-1, True, 1, False]` where mongod puts every
+        # number before every bool (measured 8.2.11, 2026-10-07).
+        if not isinstance(other, _SortKey):
+            return False
+        return not self.__lt__(other) and not other.__lt__(self)
+
+    __hash__ = None  # type: ignore[assignment]
 
 
 def bson_equal(a: Any, b: Any) -> bool:
