@@ -6770,6 +6770,9 @@ impl Storage {
 /// half-pruned range (`read_oplog`, resume) tolerate missing rows. A free
 /// function over the shared context so the async drainer pool can run the
 /// sweep without a `Storage` borrow.
+/// Oplog rows removed per prune transaction (see the phase-2 comment).
+const PRUNE_DELETE_BATCH: usize = 1024;
+
 fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let _p = ctx.prune_lock.lock().unwrap_or_else(|e| e.into_inner());
     let existing = ctx.shards_created.load(Ordering::Relaxed);
@@ -6866,34 +6869,63 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // concurrent writers only ever append higher seqs. Each doomed row is
     // removed from its exact source table (the phase-1 tag). Pre-images stay
     // in one table.
+    //
+    // The deletes are grouped into transactions of `PRUNE_DELETE_BATCH`
+    // rows. Run one autocommit remove at a time they were one LOGGED commit
+    // each -- and with `transaction_sync` on (every durable store) one
+    // journal write + sync each, two per oplog entry written. Under a
+    // sustained writer at the entry cap the pruner then spent its whole life
+    // in `__wt_log_write` -> `pwrite`, holding the journal against the
+    // commits clients were waiting on: the INSERT scaling ceiling measured
+    // 2026-10-07 (batch 70). Durability is unchanged -- a crash mid-sweep
+    // leaves whole batches undone, and those rows are doomed again by the
+    // next sweep; the archive above is written before any batch commits.
     let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
     let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
-    for (seq, tbl) in &doomed {
-        if del_curs[*tbl].is_none() {
-            del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+    let mut pruned = 0usize;
+    for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
+        session.begin_transaction(None)?;
+        let removed = (|| -> Result<()> {
+            for (seq, tbl) in batch {
+                if del_curs[*tbl].is_none() {
+                    del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+                }
+                let op_del = del_curs[*tbl].as_ref().unwrap();
+                op_del.reset()?;
+                op_del.set_key_q(*seq);
+                match op_del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                pre_del.reset()?;
+                pre_del.set_key_q(*seq);
+                match pre_del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = removed {
+            // Surface the remove's error, not the rollback's; a failed
+            // rollback is reported alongside rather than swallowed.
+            if let Err(rb) = session.rollback_transaction(None) {
+                eprintln!("secantus-storage: oplog prune rollback failed: {rb:?}");
+            }
+            return Err(e);
         }
-        let op_del = del_curs[*tbl].as_ref().unwrap();
-        op_del.reset()?;
-        op_del.set_key_q(*seq);
-        match op_del.remove() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
-        pre_del.reset()?;
-        pre_del.set_key_q(*seq);
-        match pre_del.remove() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
+        session.commit_transaction(None)?;
+        pruned += batch.len();
+        // Keep the live-count honest for the next sweep's sizing -- per
+        // committed batch, so a later batch's failure leaves it exact.
+        ctx.oplog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live_count -= batch.len() as i64;
     }
-    // Keep the live-count honest for the next sweep's sizing.
-    ctx.oplog
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .live_count -= doomed.len() as i64;
-    Ok(doomed.len())
+    Ok(pruned)
 }
 
 impl Storage {
