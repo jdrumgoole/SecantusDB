@@ -163,7 +163,7 @@ pub fn acquire<E>(
         // Waiting blocks this thread, which may be a runtime worker: hand its
         // queued tasks to the others first, or the connection holding the
         // lock -- scheduled behind this one -- never runs to release it.
-        let mut wait = || -> Result<std::sync::MutexGuard<'static, Vec<Hold>>, E> {
+        let wait = || -> Result<std::sync::MutexGuard<'static, Vec<Hold>>, E> {
             let unwait = || {
                 t.waiting
                     .lock()
@@ -204,11 +204,7 @@ pub fn acquire<E>(
             unwait();
             Ok(holds)
         };
-        holds = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(wait)?
-        } else {
-            wait()?
-        };
+        holds = crate::blocking_wait(wait)?;
     }
     // A hold this session already has at this mode needs no second entry.
     if take

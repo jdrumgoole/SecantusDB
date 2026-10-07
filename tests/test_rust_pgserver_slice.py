@@ -6239,6 +6239,46 @@ def _notices(conn: psycopg.Connection) -> list[tuple[str, str | None, str, str |
     return seen
 
 
+def test_notices_raised_mid_statement_are_sent_without_hanging(home: Path) -> None:
+    """A function that raises notices while it runs, called over the extended
+    protocol (pgjdbc's `StatementTest.concurrentWarningReadAndClear`): each
+    notice goes to the client the moment it is raised. With a connection on a
+    current-thread runtime that send waited forever (batch 71), so the call is
+    made on a thread and bounded rather than left to hang the suite."""
+    import threading
+
+    with _Server(home) as server:
+        conn = server.connect()
+        conn.autocommit = True
+        conn.execute(
+            "create function b71_notify_loop() returns void as $b$ begin"
+            " for i in 1..200 loop raise notice 'Warning %', i; end loop; end"
+            " $b$ language plpgsql"
+        )
+        seen = _notices(conn)
+        out: list[object] = []
+
+        def call() -> None:
+            try:
+                out.append(conn.execute("select b71_notify_loop()", prepare=True).fetchall())
+            except Exception as exc:  # reported below, never swallowed
+                out.append(exc)
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        t.join(30)
+        if t.is_alive():
+            # Closing the connection would wait on the hung call; end the
+            # server first so the failure is reported, not a stuck suite.
+            assert server.proc is not None
+            server.proc.kill()
+            server.proc.wait()
+            pytest.fail("the statement never finished: a live notice send hung")
+        conn.close()
+        assert out == [[("",)]], out
+        assert [n[2] for n in seen] == [f"Warning {i}" for i in range(1, 201)]
+
+
 def test_do_block_raise_levels_and_notices(home: Path) -> None:
     """`RAISE NOTICE / WARNING / INFO` reach the client as notices with the
     block's context; `DEBUG` and `LOG` do not (below `client_min_messages`).
