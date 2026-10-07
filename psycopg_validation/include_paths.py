@@ -128,8 +128,16 @@ if sys.platform == "darwin":
 # hang truncated the run. What is lost: the proxy-driven connection-failure
 # tests, the wall-clock `timing` budgets and psycopg's own mypy checks, none
 # of which reach a server behaviour the rest of the suite does not.
+#
+# `refcount` (the tests that take psycopg's `gc` fixture and count live Python
+# objects) is psycopg's own fourth Windows exclusion: its scheduled Windows CI
+# adds it because "Refcount tests are flakey on windows ... objects leaked: 0,
+# -2". Measured here on windows-latest (2026-10-07): one run passed all of
+# them, the next failed 75 `test_leak` cases with counts like `-87, 87` --
+# NEGATIVE leaks, which is the client's garbage collector, not the server.
+# Lost: the client-side object-leak checks, which Linux and macOS still run.
 elif sys.platform == "win32":
-    MARKER_EXPR = "not proxy and not timing and not mypy"
+    MARKER_EXPR = "not proxy and not timing and not mypy and not refcount"
     # Measured on the windows-latest CI runner (2026-10-07, the
     # psycopg-windows workflow), each against the runner's own PostgreSQL too:
     DESELECT_TESTS += [

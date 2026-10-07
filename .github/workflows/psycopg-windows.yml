@@ -167,19 +167,6 @@ jobs:
             "pytest-randomly>=3.5" "pproxy>=2.7" "pytest-timeout>=2.4" \
             "pytest-json-report>=1.5"
 
-      - name: Start the runner's PostgreSQL (reference server)
-        run: |
-          $PgSvc = Get-Service "postgresql*"
-          Set-Service $PgSvc.Name -StartupType manual
-          $PgSvc.Start()
-        shell: powershell
-
-      - name: TEMP diagnose suspect tests against PostgreSQL and secantusd-pg
-        shell: bash
-        env:
-          PGDIAG_TESTS: tests/test_connection.py::test_right_exception_on_session_timeout,tests/pq/test_pgconn.py::test_used_password
-        run: .gauge-venv/Scripts/python tools/probes/psycopg_windows_diag.py || true
-
       - name: Run the psycopg gauge against secantusd-pg
         shell: bash
         env:
