@@ -29,6 +29,21 @@ def walk_to_parent(doc: dict[str, Any], path: str, *, create: bool) -> tuple[Any
             idx = int(part)
             if 0 <= idx < len(cur):
                 cur = cur[idx]
+            elif create:
+                # An intermediate index past the end is CREATED, padding with
+                # nulls: `$set: {"b.2.c": 1}` over `b: []` stores
+                # `[null, null, {c: 1}]` on mongod (measured 8.2.11). This
+                # returned no parent, and the update was acknowledged having
+                # written nothing.
+                if idx > _MAX_LIST_GROW_INDEX:
+                    raise PathError(
+                        f"set_path index {idx} exceeds the {_MAX_LIST_GROW_INDEX}-element "
+                        f"list-growth cap (path={path!r})"
+                    )
+                while len(cur) < idx:
+                    cur.append(None)
+                cur.append({})
+                cur = cur[idx]
             else:
                 return None, None
         else:

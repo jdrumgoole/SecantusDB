@@ -13,12 +13,12 @@ Usage::
 
 from __future__ import annotations
 
-import datetime as _dt
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -75,7 +75,7 @@ def _render(raw: dict) -> str:
     lines.append("# mongo-rust-driver Validation Report")
     lines.append("")
     lines.append(
-        f"Generated {_dt.date.today().isoformat()} — "
+        f"{gauge_common.measured_on()} — "
         f"SecantusDB {_secantus_version()} vs mongo-rust-driver "
         f"{_vendor_ref()} (`vendor/mongo-rust-driver/`)."
     )

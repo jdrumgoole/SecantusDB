@@ -156,6 +156,25 @@ fn init_logger(level: &str) {
 }
 
 fn run(cli: CliArgs) -> Result<(), String> {
+    // `--block-compressor`: the compressor for newly created data tables, set
+    // through the storage layer's `SECANTUS_DATA_TABLE_EXTRA` create-time hook
+    // (WiredTiger takes the last duplicate key, so this overrides the lz4
+    // default). Done FIRST, while this is the only thread: the signal handler
+    // below starts one, and the environment is not to be written once another
+    // thread may read it. An explicit SECANTUS_DATA_TABLE_EXTRA is kept and
+    // the compressor appended after it.
+    if let Some(compressor) = &cli.block_compressor {
+        let clause = if compressor == "none" {
+            "block_compressor=".to_string()
+        } else {
+            format!("block_compressor={compressor}")
+        };
+        let merged = match std::env::var("SECANTUS_DATA_TABLE_EXTRA") {
+            Ok(prior) if !prior.is_empty() => format!("{prior},{clause}"),
+            _ => clause,
+        };
+        std::env::set_var("SECANTUS_DATA_TABLE_EXTRA", merged);
+    }
     // Take back SIGINT / SIGTERM, then install the stop handler, BEFORE
     // opening storage or announcing readiness. A parent may leave SIGTERM
     // blocked or ignored (both survive exec), and with the handler installed

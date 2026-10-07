@@ -203,11 +203,14 @@ def contexts(client: pymongo.MongoClient, code: int) -> dict[str, tuple[str, Cal
 
 
 def measure(uri: str) -> list[tuple[str, tuple[Any, ...]]]:
-    client = pymongo.MongoClient(uri, retryReads=False, retryWrites=False)
+    # A socket timeout so a server that never answers is a visible
+    # `client-error NetworkTimeout` row rather than a probe that hangs forever.
+    client = pymongo.MongoClient(uri, retryReads=False, retryWrites=False, socketTimeoutMS=15000)
     client.drop_database(DB)
     client[DB][COLL].insert_many([{"_id": i} for i in range(3)])
     rows = []
     for code in CODES:
+        print(f"... {uri.split('@')[-1][:30]} code {code}", file=sys.stderr, flush=True)
         for label, (command, fn) in contexts(client, code).items():
             if command:
                 arm(client, command, code)

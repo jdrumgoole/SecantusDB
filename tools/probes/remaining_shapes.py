@@ -352,6 +352,58 @@ def cases():
             ],
         )
     yield (
+        "bucketAuto decimal powers of two",
+        [
+            (
+                "insert",
+                {
+                    "insert": "ba2",
+                    "documents": [{"_id": i, "v": D(str(i * 1.5))} for i in range(1, 9)],
+                },
+            ),
+            (
+                "aggregate",
+                {
+                    "aggregate": "ba2",
+                    "pipeline": [
+                        {"$bucketAuto": {"groupBy": "$v", "buckets": 3, "granularity": "POWERSOF2"}}
+                    ],
+                    "cursor": {},
+                },
+            ),
+        ],
+    )
+    for name, arr, q in [
+        ("scalar eq", [1, 2, 3], {"a": 2}),
+        ("scalar gt", [1, 2, 3], {"a": {"$gt": 1}}),
+        ("elemMatch scalar", [1, 2, 3], {"a": {"$elemMatch": {"$gte": 3}}}),
+        ("elemMatch doc", [{"k": 1}, {"k": 2}], {"a": {"$elemMatch": {"k": 2}}}),
+        ("dotted", [{"k": 1}, {"k": 2}], {"a.k": 2}),
+    ]:
+        c = "pos_" + name.replace(" ", "_")
+        yield (
+            f"positional update {name}",
+            [
+                ("insert", {"insert": c, "documents": [{"_id": 1, "a": arr}]}),
+                ("update", {"update": c, "updates": [{"q": q, "u": {"$set": {"a.$": 9}}}]}),
+                ("find", {"find": c}),
+            ],
+        )
+    yield (
+        "create existing with different options",
+        [
+            ("create", {"create": "cx1", "capped": True, "size": 4096}),
+            ("create", {"create": "cx1", "validator": {"a": {"$gt": 1}}}),
+        ],
+    )
+    yield (
+        "create existing same options",
+        [
+            ("create", {"create": "cx2", "validator": {"a": {"$gt": 1}}}),
+            ("create", {"create": "cx2", "validator": {"a": {"$gt": 1}}}),
+        ],
+    )
+    yield (
         "project _id only",
         [
             ("insert", {"insert": "pj", "documents": [{"_id": 1, "a": 1, "b": 2}]}),
@@ -402,6 +454,114 @@ def cases():
         "arrayElemAt decimal": {"$arrayElemAt": [[1, 2, 3], D("1")]},
         "substrCP decimal": {"$substrCP": ["hello", D("1"), D("2")]},
         "ln decimal neg": {"$ln": D("-1")},
+        "slice count zero": {"$slice": [[1, 2, 3], 1, 0]},
+        "slice count negative": {"$slice": [[1, 2, 3], 1, -1]},
+        "slice neg position past end": {"$slice": [[1, 2, 3, 4, 5], -1, 5]},
+        "range decimal start": {"$range": [D("1"), 4]},
+        "range decimal step": {"$range": [0, 6, D("2")]},
+        "range decimal fractional start": {"$range": [D("1.5"), 4]},
+        "pow decimal exact square": {"$pow": [D("2.5"), 2]},
+        # $dateToString directives beyond the numeric subset.
+        "dateToString %z": {"$dateToString": {"date": DT, "format": "%z", "timezone": "-0530"}},
+        "dateToString %Z": {"$dateToString": {"date": DT, "format": "%Z", "timezone": "+0230"}},
+        "dateToString iso week": {"$dateToString": {"date": DT, "format": "%G-W%V-%u"}},
+        "dateToString %U %w %j": {"$dateToString": {"date": DT, "format": "%U %w %j"}},
+        "dateToString %b %B %a": {"$dateToString": {"date": DT, "format": "%b %B %a"}},
+        "dateToString named zone %z": {
+            "$dateToString": {
+                "date": DT,
+                "format": "%Y-%m-%d %H:%M %z",
+                "timezone": "America/New_York",
+            }
+        },
+        # The timezone form of $dateTrunc / $dateDiff, across a DST change.
+        "dateTrunc day tz": {
+            "$dateTrunc": {"date": DT, "unit": "day", "timezone": "America/New_York"}
+        },
+        "dateTrunc hour tz": {
+            "$dateTrunc": {"date": DT, "unit": "hour", "timezone": "America/New_York"}
+        },
+        "dateTrunc week tz": {
+            "$dateTrunc": {
+                "date": DT,
+                "unit": "week",
+                "timezone": "Europe/London",
+                "startOfWeek": "mon",
+            }
+        },
+        "dateTrunc week mon no tz": {
+            "$dateTrunc": {"date": DT, "unit": "week", "startOfWeek": "mon"}
+        },
+        "dateTrunc week MONDAY no tz": {
+            "$dateTrunc": {"date": DT, "unit": "week", "startOfWeek": "MONDAY"}
+        },
+        "dateTrunc week default tz": {
+            "$dateTrunc": {"date": DT, "unit": "week", "timezone": "America/New_York"}
+        },
+        "dateTrunc week bad start": {
+            "$dateTrunc": {"date": DT, "unit": "week", "startOfWeek": "mo"}
+        },
+        "dateTrunc month tz": {
+            "$dateTrunc": {"date": DT, "unit": "month", "timezone": "Asia/Tokyo"}
+        },
+        "dateTrunc quarter tz": {
+            "$dateTrunc": {"date": DT, "unit": "quarter", "timezone": "+05:30"}
+        },
+        "dateTrunc year tz bin": {
+            "$dateTrunc": {"date": DT, "unit": "year", "binSize": 2, "timezone": "Europe/Paris"}
+        },
+        "dateTrunc hour bin tz": {
+            "$dateTrunc": {"date": DT, "unit": "hour", "binSize": 5, "timezone": "America/New_York"}
+        },
+        "dateDiff month tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-01-31T23:30:00Z"},
+                "endDate": DT,
+                "unit": "month",
+                "timezone": "Asia/Tokyo",
+            }
+        },
+        "dateDiff week startOfWeek": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-01T12:00:00Z"},
+                "endDate": DT,
+                "unit": "week",
+                "startOfWeek": "fri",
+            }
+        },
+        "dateDiff day tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-09T12:00:00Z"},
+                "endDate": DT,
+                "unit": "day",
+                "timezone": "America/New_York",
+            }
+        },
+        "dateDiff day no tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-09T23:00:00Z"},
+                "endDate": DT,
+                "unit": "day",
+            }
+        },
+        "dateDiff week tz": {
+            "$dateDiff": {
+                "startDate": {"$toDate": "2024-03-01T12:00:00Z"},
+                "endDate": DT,
+                "unit": "week",
+                "timezone": "America/New_York",
+            }
+        },
+        # Decimal transcendentals and conversions.
+        "ln decimal": {"$ln": D("10")},
+        "log10 decimal": {"$log10": D("1000")},
+        "cos decimal": {"$cos": D("1")},
+        "tan decimal": {"$tan": D("0.5")},
+        "asin decimal": {"$asin": D("0.5")},
+        "atanh decimal": {"$atanh": D("0.5")},
+        "sinh decimal": {"$sinh": D("1")},
+        "toDate decimal": {"$toDate": D("1700000000000")},
+        "toDate decimal fraction": {"$toDate": D("1700000000000.7")},
         "log decimal base int": {"$log": [D("8"), 2]},
         "log int base decimal": {"$log": [8, D("2")]},
         "log decimal double": {"$log": [D("10"), 2.5]},
@@ -462,6 +622,7 @@ def cases():
     )
 
 
+DT = {"$toDate": "2024-03-10T06:30:45.123Z"}
 STRIP = {
     "$clusterTime",
     "operationTime",

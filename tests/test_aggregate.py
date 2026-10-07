@@ -97,7 +97,7 @@ def test_sort_stage_validation() -> None:
         ({"x": True}, 15974),
         ({"x": 0}, 15975),
         ({"x": 2}, 15975),
-        ({"x": 1.5}, 15975),
+        ({"x": 0.5}, 15975),  # a double truncates: 1.5 is ascending on mongod
         ({}, 15976),
     ]:
         with pytest.raises(AggregateError) as exc:
@@ -598,13 +598,17 @@ def test_bucket_auto_granularity_boundaries() -> None:
     ]
     assert bounds([1, 10, 100, 1000], 2, "1-2-5") == [(0.5, 20.0, 2), (20.0, 2000.0, 2)]
     assert bounds([3, 7, 15, 44, 90], 2, "E6") == [(2.2, 22.0, 3), (22.0, 100.0, 2)]
-    # Decimal128 boundaries are deferred (the standing precision deferral).
-    with pytest.raises(AggregateError) as exc:
-        apply_pipeline(
-            [{"v": Decimal128("1.5")}, {"v": Decimal128("2.5")}],
-            [{"$bucketAuto": {"groupBy": "$v", "buckets": 2, "granularity": "R5"}}],
-        )
-    assert exc.value.code == 2
+    # Decimal128 boundaries are rounded in decimal and stay decimal -- mongod
+    # 8.2.11's answer for 1.5 .. 12 in steps of 1.5 (measured 2026-10-07,
+    # `tools/probes/remaining_shapes.py`). They used to be refused.
+    out = apply_pipeline(
+        [{"_id": i, "v": Decimal128(str(i * 1.5))} for i in range(1, 9)],
+        [{"$bucketAuto": {"groupBy": "$v", "buckets": 3, "granularity": "R5"}}],
+    )
+    assert [b["_id"] for b in out] == [
+        {"min": Decimal128("1.00000000000000"), "max": Decimal128("6.30000000000000")},
+        {"min": Decimal128("6.30000000000000"), "max": Decimal128("16.0000000000000")},
+    ]
 
 
 def test_lookup_requires_storage_context() -> None:

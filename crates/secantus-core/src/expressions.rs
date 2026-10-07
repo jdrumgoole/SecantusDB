@@ -5004,7 +5004,11 @@ fn op_date_diff(arg: &Bson, ctx: &Ctx) -> R {
     // answered 0 days where New York answers 1.
     let tz = d.get("timezone");
     validate_timezone(tz, Some("$dateDiff"))?;
-    let start_of_week = start_of_week_arg(d, ctx)?;
+    let start_of_week = match start_of_week_arg("$dateDiff", d, ctx)? {
+        StartOfWeek::Null => return Ok(Bson::Null),
+        StartOfWeek::Absent => None,
+        StartOfWeek::Day(day) => Some(day),
+    };
     let (sm, em) = (s.timestamp_millis(), e.timestamp_millis());
     let value = date_bin_index(em, &unit, 1, tz, start_of_week.as_deref())?
         - date_bin_index(sm, &unit, 1, tz, start_of_week.as_deref())?;
@@ -5133,13 +5137,55 @@ fn trunc_reference_instant_ms(tz: Option<&Bson>) -> Result<i64, Fallback> {
     tz_instant_from_local_ms(tz, days_from_civil(TRUNC_REF_YEAR, 1, 1) * 86_400_000)
 }
 
-fn start_of_week_arg(d: &bson::Document, ctx: &Ctx) -> Result<Option<String>, Fallback> {
-    match d.get("startOfWeek") {
-        None => Ok(None),
-        Some(e) => match eval(e, ctx)? {
-            Bson::String(s) => Ok(Some(s)),
-            _ => Err(Fallback::Defer),
-        },
+/// `startOfWeek` as mongod parses it for `$dateTrunc` / `$dateDiff`, whatever
+/// the unit (measured 8.2.11, 2026-10-07): a day name or its three-letter
+/// abbreviation, case-insensitive (`mon`, `MON`, `MonDay`; not `tues` /
+/// `thur`); a non-string is 5439015, an unrecognised string 5439016. `Ok(None)`
+/// when absent; `Err` with a `null` marker is handled by the caller via
+/// [`StartOfWeek::Null`]. The abbreviations used to be refused outright.
+enum StartOfWeek {
+    Absent,
+    Null,
+    Day(String),
+}
+
+fn start_of_week_arg(op: &str, d: &bson::Document, ctx: &Ctx) -> Result<StartOfWeek, Fallback> {
+    const DAYS: [&str; 7] = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    let Some(e) = d.get("startOfWeek") else {
+        return Ok(StartOfWeek::Absent);
+    };
+    match eval(e, ctx)? {
+        Bson::Null | Bson::Undefined => Ok(StartOfWeek::Null),
+        Bson::String(s) => {
+            let lower = s.to_ascii_lowercase();
+            DAYS.iter()
+                .find(|day| **day == lower || (lower.len() == 3 && day.starts_with(&lower)))
+                .map(|day| StartOfWeek::Day((*day).to_string()))
+                .ok_or_else(|| {
+                    Fallback::mongo(
+                        5439016,
+                        format!(
+                            "{op} parameter 'startOfWeek' value cannot be recognized as a day \
+                             of a week: {s}"
+                        ),
+                    )
+                })
+        }
+        other => Err(Fallback::mongo(
+            5439015,
+            format!(
+                "{op} requires 'startOfWeek' to be a string, but got {}",
+                type_name(&other)
+            ),
+        )),
     }
 }
 
@@ -5167,7 +5213,11 @@ fn op_date_trunc(arg: &Bson, ctx: &Ctx) -> R {
     };
     let tz = d.get("timezone");
     validate_timezone(tz, Some("$dateTrunc"))?;
-    let start_of_week = start_of_week_arg(d, ctx)?;
+    let start_of_week = match start_of_week_arg("$dateTrunc", d, ctx)? {
+        StartOfWeek::Null => return Ok(Bson::Null),
+        StartOfWeek::Absent => None,
+        StartOfWeek::Day(day) => Some(day),
+    };
     let millis = dt.timestamp_millis();
     let index = date_bin_index(millis, &unit, bin, tz, start_of_week.as_deref())?;
 

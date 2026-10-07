@@ -149,7 +149,16 @@ class _SortKey:
         return _bson_lt(a, b)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, _SortKey) and self.val == other.val
+        # Equal means "neither sorts before the other". A tuple of keys is
+        # compared by finding the first pair that is NOT equal, so Python's
+        # `==` here let `True == 1` (and `0 == False`) tie and never reach
+        # `__lt__`: `$sort` gave `[-1, True, 1, False]` where mongod puts every
+        # number before every bool (measured 8.2.11, 2026-10-07).
+        if not isinstance(other, _SortKey):
+            return False
+        return not self.__lt__(other) and not other.__lt__(self)
+
+    __hash__ = None  # type: ignore[assignment]
 
 
 def bson_equal(a: Any, b: Any) -> bool:
@@ -272,6 +281,13 @@ def _bson_lt(a: Any, b: Any) -> bool:
         a_items = list(a.items())
         b_items = list(b.items())
         for (ak, av), (bk, bv) in zip(a_items, b_items, strict=False):
+            # mongod's `woCompare`: each element's value TYPE rank first, then
+            # its field name, then its value -- so `{t, crs: {}}` sorts before
+            # `{t, coordinates: []}` (object before array). The name used to be
+            # compared first (measured 8.2.11, 2026-10-06).
+            ra, rb = _bson_type_rank(av), _bson_type_rank(bv)
+            if ra != rb:
+                return ra < rb
             if ak != bk:
                 return ak < bk
             if _bson_lt(av, bv):

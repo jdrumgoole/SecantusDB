@@ -435,8 +435,46 @@ fn report_whole_values(update: &Document, post: &Document, acc: &mut Acc) {
             for k in stale {
                 acc.disambiguated.remove(&k);
             }
+            // The collapsed path keeps ITS OWN entry: `$set: {"a.0.1": 2}`
+            // over `{a: [{"1": 1}]}` is `{"a.0.1": ["a", 0, "1"]}` on mongod
+            // 8.2.11 (2026-10-07); dropping the stale ones dropped it too.
+            let segments = typed_segments(post, &path);
+            record_ambiguous(&path, &segments, acc);
         }
     }
+}
+
+/// `path`'s segments typed against `doc`: an Int32 where the parent is an
+/// array, the field name otherwise (`disambiguatedPaths`' shape).
+fn typed_segments(doc: &Document, path: &str) -> Vec<Bson> {
+    let mut segments = Vec::new();
+    let mut node: Option<&Bson> = None;
+    let mut root = Some(doc);
+    for part in path.split('.') {
+        let is_index = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        let next = if let Some(d) = root.take() {
+            segments.push(Bson::String(part.to_string()));
+            d.get(part)
+        } else {
+            match node {
+                Some(Bson::Array(items)) if is_index => {
+                    let idx: usize = part.parse().unwrap_or(usize::MAX);
+                    segments.push(Bson::Int32(idx as i32));
+                    items.get(idx)
+                }
+                Some(Bson::Document(d)) => {
+                    segments.push(Bson::String(part.to_string()));
+                    d.get(part)
+                }
+                _ => {
+                    segments.push(Bson::String(part.to_string()));
+                    None
+                }
+            }
+        };
+        node = next;
+    }
+    segments
 }
 
 // --- pipeline updates: mongod's own diff --------------------------------------
@@ -766,6 +804,19 @@ pub fn apply_update_description(mut doc: Document, diff: &Document) -> R<Documen
 mod tests {
     use super::*;
     use bson::doc;
+
+    #[test]
+    fn collapsed_path_keeps_its_own_disambiguated_entry() {
+        // mongod 8.2.11, 2026-10-07.
+        let pre = doc! {"_id": 1, "a": [{"1": 1}]};
+        let post = doc! {"_id": 1, "a": [{"1": 2}]};
+        let out = compute_update_description_for(&pre, &post, Some(&doc! {"$set": {"a.0.1": 2}}))
+            .unwrap();
+        assert_eq!(
+            out.get_document("disambiguatedPaths").unwrap(),
+            &doc! {"a.0.1": ["a", 0, "1"]}
+        );
+    }
 
     fn d(pre: Document, post: Document) -> Document {
         compute_update_description(&pre, &post).expect("should not fall back")

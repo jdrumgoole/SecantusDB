@@ -541,11 +541,14 @@ class SecantusDBServer:
         or ``maxAwaitTimeMS`` expires. ``_stop_event`` is polled so shutdown
         stays prompt.
         """
-        try:
-            budget_s = max(0.0, min(float(body.get("maxAwaitTimeMS", 0)) / 1000.0, 60.0))
-        except (TypeError, ValueError):
-            return
+        from secantus.commands import awaitable_topology_is_current, max_await_time_ms
+
         counter_at_entry = self.step_down_state.topology_counter() if self.step_down_state else 0
+        # Only a client naming the CURRENT topology is held; a stale one is
+        # answered at once so it can catch up (mongod 8.2.11, 2026-09-30).
+        if not awaitable_topology_is_current(body, counter_at_entry):
+            return
+        budget_s = max(0.0, min((max_await_time_ms(body) or 0) / 1000.0, 60.0))
         deadline = time.monotonic() + budget_s
         while time.monotonic() < deadline:
             if self._stop_event.is_set():
@@ -613,8 +616,16 @@ class SecantusDBServer:
                 return False
             return True
 
-        # Establish the stream with the reply the handler already produced.
-        if not send(first_doc, more=True):
+        # Establish the stream with the reply the handler already produced --
+        # but only for a client that is OUT OF DATE. One naming the current
+        # topology gets nothing until the wait ends, the first frame included:
+        # sending it at once was one extra reply per stream, which the Go
+        # driver's `heartbeats_processed_more_frequently` counts (mongod held
+        # it for the full budget; measured 8.2.11, 2026-09-30).
+        from secantus.commands import awaitable_topology_is_current
+
+        counter_now = self.step_down_state.topology_counter() if self.step_down_state else 0
+        if not awaitable_topology_is_current(body, counter_now) and not send(first_doc, more=True):
             return False
         # Readiness check used to wake early when the socket becomes readable —
         # the client closed it or ``killOp`` shut it down, both of which surface

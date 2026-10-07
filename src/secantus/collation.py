@@ -184,8 +184,14 @@ def _mark_weight(codepoint: int) -> tuple[int, int]:
     return (rank, 0)
 
 
+_SHARP_S = frozenset({"\u00df", "\u1e9e"})
+# Any secondary weight puts `ß` after plain `ss`, which is what was measured.
+# Where it falls among `ss` forms carrying a real accent was NOT measured.
+_SHARP_S_SECONDARY = (0, 0xDF)
+
+
 @functools.lru_cache(maxsize=8192)
-def sort_levels(s: str, collation: Collation) -> tuple[Any, ...]:
+def sort_levels(s: str, collation: Collation) -> bytes:
     """A multi-level ORDERING key for ``s``, in the shape ICU uses.
 
     Ordering is not the same problem as matching, and this module only ever
@@ -231,35 +237,89 @@ def sort_levels(s: str, collation: Collation) -> tuple[Any, ...]:
     """
     nfd = unicodedata.normalize("NFD", s)
     bases: list[str] = []
-    marks: list[tuple[tuple[int, int], ...]] = []
+    marks: list[list[tuple[int, int]]] = []
     cases: list[int] = []
+    compat: list[int] = []
     for ch in nfd:
         if unicodedata.combining(ch):
             if marks:
-                marks[-1] = marks[-1] + (_mark_weight(ord(ch)),)
+                marks[-1].append(_mark_weight(ord(ch)))
             continue
-        bases.append(ch)
-        marks.append(())
-        cases.append(1 if ch.isupper() else 0)
+        # A COMPATIBILITY character (`ﬁ`) is its expansion (`f`, `i`) at the
+        # primary and secondary levels, and differs only at the tertiary: ICU's
+        # rule, and mongod's answer -- `fi` and `ﬁ` tie at strength 2 (input
+        # order kept) and `fi < ﬁ` at strength 3 (measured 8.2.11, 2026-10-07).
+        if ch in _SHARP_S:
+            # `ß` is `ss` at the primary level and differs at the SECONDARY:
+            # mongod ties `Straße` / `Strasse` at strength 1 and puts
+            # `Strasse` first at 2 and 3 (measured 8.2.11, 2026-10-07).
+            for _ in range(2):
+                bases.append("s")
+                marks.append([])
+                cases.append(1 if ch.isupper() else 0)
+                compat.append(0)
+            marks[-1].append(_SHARP_S_SECONDARY)
+            continue
+        expansion = unicodedata.normalize("NFKD", ch)
+        is_compat = expansion != ch
+        for part in expansion if is_compat else ch:
+            if unicodedata.combining(part):
+                if marks:
+                    marks[-1].append(_mark_weight(ord(part)))
+                continue
+            bases.append(part)
+            marks.append([])
+            cases.append(1 if ch.isupper() else 0)
+            compat.append(1 if is_compat else 0)
     primary_str = "".join(bases).casefold()
-    primary: Any = primary_str
+
+    # A BYTE key, in the layout of the Rust server's `sort_level_bytes`: each
+    # level terminated by `00 00`, which no level body contains, so a shorter
+    # level sorts before a longer one that extends it. The tuple key this
+    # replaced compared a ligature's ONE secondary group against its expansion's
+    # TWO and put `ﬁ` before `fi`, where mongod (and the Rust server) answer
+    # `fi, ﬁ, fj` (measured 8.2.11, 2026-09-07).
+    out = bytearray()
     if collation.numeric_ordering:
-        parts = _NUMERIC_SPLIT.split(primary_str)
-        primary = tuple((int(p) if p.isdigit() else p) for p in parts if p != "")
-
-    secondary: tuple[Any, ...] = tuple(marks)
-    if collation.backwards:
-        secondary = tuple(reversed(secondary))
-
-    case_ranks = tuple(cases)
-    if collation.case_first == "upper":
-        case_ranks = tuple(1 - c for c in case_ranks)
-
+        for part in _NUMERIC_SPLIT.split(primary_str):
+            if part == "":
+                continue
+            if part.isdigit():
+                out.append(0x01)
+                out += min(int(part), 2**128 - 1).to_bytes(16, "big")
+            else:
+                out.append(0x02)
+                out += _escape_level(part.encode())
+    else:
+        out += _escape_level(primary_str.encode())
+    upper_first = collation.case_first == "upper"
+    case_bytes = bytes(((1 - c) if upper_first else c) + 1 for c in cases)
+    # The full tertiary: case, then the compatibility variant above it.
+    tertiary_bytes = bytes(
+        ((1 - c) if upper_first else c) + 1 + 2 * k for c, k in zip(cases, compat, strict=True)
+    )
     if collation.strength <= 1:
-        return (primary, case_ranks) if collation.case_level else (primary,)
+        if collation.case_level:
+            out += b"\x00\x00" + case_bytes
+        return bytes(out)
+    out += b"\x00\x00"
+    groups = list(reversed(marks)) if collation.backwards else marks
+    for group in groups:
+        for rank, cp in group:
+            out.append(0x01)
+            out += rank.to_bytes(4, "big") + cp.to_bytes(4, "big")
+        out.append(0x00)  # end of this base character's marks
     if collation.strength == 2:
-        return (primary, secondary, case_ranks) if collation.case_level else (primary, secondary)
-    return (primary, secondary, case_ranks)
+        if collation.case_level:
+            out += b"\x00\x00" + case_bytes
+        return bytes(out)
+    out += b"\x00\x00" + tertiary_bytes
+    return bytes(out)
+
+
+def _escape_level(raw: bytes) -> bytes:
+    """Null-escape so a level body can never contain the ``00 00`` separator."""
+    return raw.replace(b"\x00", b"\x00\xff")
 
 
 def normalize_for_index_bytes(s: str, collation: Collation) -> bytes:

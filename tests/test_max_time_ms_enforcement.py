@@ -81,23 +81,56 @@ def test_an_exhausted_budget_answers_50(loaded, command):
     with pytest.raises((OperationFailure, ExecutionTimeout)) as exc:
         db.command({**command, "maxTimeMS": 1})
     assert _expired(exc.value)
-    assert exc.value.details["errmsg"] == "operation exceeded time limit"
+    message = exc.value.details["errmsg"]
+    name = next(iter(command))
+    if name in ("find", "count", "distinct", "aggregate"):
+        # mongod's READ commands name themselves and the namespace when the
+        # budget runs out mid-execution (`Executor error during find command:
+        # <ns> :: caused by :: ...`), and send the bare message when it runs
+        # out before execution -- which at 1ms mongod itself does some of the
+        # time (measured 8.2.11, `tools/probes/max_time_expiry.py`).
+        assert message == "operation exceeded time limit" or (
+            message.startswith(f"Executor error during {name} command")
+            and message.endswith(":: caused by :: operation exceeded time limit")
+        ), message
+    else:
+        assert message == "operation exceeded time limit"
 
 
-def test_create_indexes_wraps_the_timeout_in_an_index_build_failure(loaded):
-    """mongod's own envelope: the build uuid, the namespace, the collection
-    uuid, then the cause."""
-    db = loaded.database
+def _expire_create_indexes(coll):
     with pytest.raises((OperationFailure, ExecutionTimeout)) as exc:
-        db.command(
+        coll.database.command(
             {
-                "createIndexes": "big",
+                "createIndexes": coll.name,
                 "indexes": [{"key": {"s": 1}, "name": "s_1"}],
                 "maxTimeMS": 1,
             }
         )
     assert _expired(exc.value)
-    message = exc.value.details["errmsg"]
+    return exc.value.details["errmsg"]
+
+
+def test_create_indexes_timeout_is_bare_on_a_replica_set(loaded):
+    """A replica-set member (the default topology) sends the bare message;
+    the build runs apart from the command waiting on it (measured 8.2.11,
+    2026-10-07)."""
+    assert _expire_create_indexes(loaded) == "operation exceeded time limit"
+
+
+def test_create_indexes_wraps_the_timeout_when_standalone(tmp_path):
+    """A STANDALONE wraps it in mongod's envelope: the build uuid, the
+    namespace, the collection uuid, then the cause."""
+    with SecantusDBServer(port=0, storage_path=str(tmp_path), replica_set_name=None) as srv:
+        c = MongoClient(srv.uri, serverSelectionTimeoutMS=5000)
+        try:
+            coll = c["mtms_db"]["big"]
+            for start in range(0, _ROWS, 10000):
+                coll.insert_many(
+                    [{"_id": i, "a": i % 97, "s": "x" * 200} for i in range(start, start + 10000)]
+                )
+            message = _expire_create_indexes(coll)
+        finally:
+            c.close()
     assert message.startswith("Index build failed: ")
     assert "Collection mtms_db.big (" in message
     assert message.endswith(":: caused by :: operation exceeded time limit")
