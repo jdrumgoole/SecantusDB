@@ -2,8 +2,11 @@
 
 PyPI has no API for deleting a release; it is web-only, behind the owner's
 login and 2FA. This drives a real, visible browser so the owner logs in
-themselves. The profile is kept in ``~/.cache/secantus-pypi-browser``, so
-later runs reuse the session. For each release it opens the management page,
+themselves. The browser is started once and LEFT OPEN: every later run
+attaches to that same window, so one login covers them all. (Relaunching from
+the saved profile in ``~/.cache/secantus-pypi-browser`` was not enough -- each
+run still landed on PyPI's login page.) Quit the window when finished.
+For each release it opens the management page,
 types the version into PyPI's confirmation box, submits, and then checks that
 PyPI answers 404 for it.
 
@@ -29,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import subprocess
 import sys
 import time
 import urllib.error
@@ -39,6 +43,9 @@ PROJECT = "SecantusDB"
 MANAGE = "https://pypi.org/manage/project/secantusdb/release/{version}/"
 PROFILE = Path.home() / ".cache" / "secantus-pypi-browser"
 UA = "secantusdb-release-tooling (joe@joedrumgoole.com)"
+# The script's own browser listens here (loopback only) so a later run can
+# attach to it instead of starting a fresh, logged-out one.
+CDP = "http://127.0.0.1:9333"
 
 
 def _get_json(url: str) -> dict:
@@ -75,6 +82,39 @@ def is_gone(version: str) -> bool:
     except urllib.error.HTTPError as exc:
         return exc.code == 404
     return False
+
+
+def attach_browser(p):
+    """The script's browser: the one a previous run left open if there is one,
+    otherwise a new one started detached so it outlives this run."""
+    try:
+        return p.chromium.connect_over_cdp(CDP)
+    except Exception:
+        pass  # nothing listening yet -- start one
+    PROFILE.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(
+        [
+            p.chromium.executable_path,
+            f"--remote-debugging-port={CDP.rsplit(':', 1)[1]}",
+            f"--user-data-dir={PROFILE}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(40):
+        time.sleep(0.5)
+        try:
+            return p.chromium.connect_over_cdp(CDP)
+        except Exception:
+            continue
+    raise SystemExit(
+        f"Started a browser but could not attach to it on {CDP}. If a window "
+        f"using {PROFILE} is already open from an older run, quit it and retry."
+    )
 
 
 def delete_in_browser(page, version: str, shots: Path) -> None:
@@ -142,9 +182,10 @@ def main() -> int:
 
     from playwright.sync_api import sync_playwright
 
-    PROFILE.mkdir(parents=True, exist_ok=True)
+    # Leaving the ``with`` block only detaches; the browser (and its login)
+    # stays up for the next run.
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(str(PROFILE), headless=False)
+        ctx = attach_browser(p).contexts[0]
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         for version, _, size in plan:
             print(f"deleting {version} ...", flush=True)
@@ -154,10 +195,8 @@ def main() -> int:
                     break
                 time.sleep(3)
             else:
-                ctx.close()
                 raise SystemExit(f"{version} still answers on PyPI after the delete; stopping.")
             print(f"  gone ({size / 1e6:.0f} MB freed)")
-        ctx.close()
     return 0
 
 
