@@ -1,0 +1,204 @@
+# The Rust PostgreSQL server (`secantusd-pg`) scored by psycopg 3's own,
+# unmodified test suite -- ON WINDOWS.
+#
+# Why its own workflow: nothing else builds `secantusd-pg` on Windows (the
+# pg-oracle lane is Linux; `storage-engine (windows-latest)` builds the wheel,
+# not this binary), and the gauge once hung there in a way no Linux/macOS run
+# could show (tasks/backlog.md, "The Rust PG psycopg gauge does not finish on
+# Windows"). A Windows WiredTiger + bindgen + libpg_query build is ~15 minutes,
+# so this does NOT run on every PR: weekly, on demand, and on PRs that touch
+# the PG crates, the gauge runner or this file.
+#
+# What it gates: that the run COMPLETES and every test it started reported a
+# result. A truncated run is a failure, never a pass (CLAUDE.md, "A test that
+# does not COMPLETE is a failure").
+name: psycopg gauge (Windows, Rust PG server)
+
+on:
+  schedule:
+    - cron: "17 4 * * 0"  # Sundays, off the hour
+  workflow_dispatch:
+  push:  # TEMPORARY: lets the branch run this before it is on main
+    branches: [rust-pg-batch73]
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/secantus-pg*/**"
+      - "psycopg_validation/**"
+      - ".github/workflows/psycopg-windows.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  psycopg-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Checkout the WiredTiger and psycopg submodules
+        # Only these two feed this job; the other vendored submodules are
+        # driver-gauge repos with gigabytes of history.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger vendor/psycopg ||
+          git submodule update --init vendor/wiredtiger vendor/psycopg
+
+      # The toolchain steps below mirror test.yml's `storage-engine` job, which
+      # builds this same static WiredTiger on windows-latest. Keep them in sync.
+      - name: Disable Defender real-time scanning
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Warning "could not disable Defender real-time scanning: $_" }
+
+      - name: Put temp files on the big drive
+        # C: is small on this image; RUNNER_TEMP is on D:. See test.yml.
+        shell: bash
+        run: |
+          printf 'TMP=%s\nTEMP=%s\nTMPDIR=%s\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Install toolchain
+        run: choco install -y swig ninja llvm
+
+      - name: Point bindgen at libclang
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+          prune-cache: false
+          cache-suffix: py3.12
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12 (tool cache)
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Point uv at the tool-cached interpreter
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "UV_PYTHON=${{ steps.setup-python.outputs.python-path }}"
+
+      - name: Compute WT submodule SHA
+        id: wt-sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+
+      - name: Point cargo at a cacheable target dir
+        # Forward slashes: CMake eats a backslash path as an escape (test.yml).
+        shell: bash
+        run: echo "SECANTUS_CARGO_TARGET=C:/cargo-target" >> "$GITHUB_ENV"
+
+      - name: Restore cargo targets + registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            C:/cargo-target
+            crates/secantus-pgserver/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: psycopg-win-cargo-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
+          restore-keys: |
+            psycopg-win-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            psycopg-win-cargo-
+
+      - name: Build vendored WiredTiger (static) via the storage-engine wheel build
+        # Same route as release-binaries.yml / release-pg-binaries.yml: the
+        # side effect we want is the static WT lib + headers under
+        # build/*/wt-build.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv build --wheel --out-dir dist-storage
+
+      - name: Build secantusd-pg (debug, where the gauge runner looks)
+        shell: bash
+        env:
+          # WiredTiger's static lib is built against the STATIC CRT; mixing
+          # CRTs is two heaps in one process (release-binaries.yml).
+          RUSTFLAGS: -Ctarget-feature=+crt-static
+        run: |
+          set -euo pipefail
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
+            echo "::error::vendored WiredTiger not found under build/*/wt-build"
+            exit 1
+          fi
+          export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+          cd crates/secantus-pgserver
+          cargo build --locked
+          ./target/debug/secantusd-pg.exe --version
+
+      - name: Install the gauge's Python dependencies
+        # Not `uv sync`: that builds the whole secantus package again. The
+        # runner needs only psycopg (pinned to the vendored suite's tag) and
+        # the suite's test plugins.
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv .gauge-venv
+          uv pip install --python .gauge-venv \
+            "psycopg[binary]==3.3.4" "anyio>=4.0" "pytest>=8" "pytest-cov>=3.0" \
+            "pytest-randomly>=3.5" "pproxy>=2.7" "pytest-timeout>=2.4" \
+            "pytest-json-report>=1.5"
+
+      - name: Run the psycopg gauge against secantusd-pg
+        shell: bash
+        env:
+          SECANTUS_GAUGE_SERVER: rust
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -uo pipefail
+          .gauge-venv/Scripts/python -m psycopg_validation.runner
+          echo "runner exit: $?"
+
+      - name: Check every started test reported a result
+        # pytest exits non-zero on any failing test; the gate here is that the
+        # run COMPLETED. The JSON report is written at sessionfinish, so a
+        # truncated run (a pytest-timeout thread kill ends the whole process on
+        # Windows) leaves no report, or one whose collected count exceeds its
+        # outcomes.
+        shell: bash
+        run: |
+          .gauge-venv/Scripts/python - <<'EOF'
+          import json, pathlib, sys
+          p = pathlib.Path(".validation/psycopg-raw-rust.json")
+          if not p.exists():
+              print("::error::no JSON report -- the run did not reach sessionfinish")
+              sys.exit(1)
+          r = json.loads(p.read_text())
+          s = r.get("summary", {})
+          print("summary:", json.dumps(s, sort_keys=True))
+          tests = r.get("tests", [])
+          outcomes = {}
+          for t in tests:
+              outcomes[t["outcome"]] = outcomes.get(t["outcome"], 0) + 1
+          print("outcomes:", outcomes)
+          for t in tests:
+              if t["outcome"] in ("failed", "error"):
+                  print("FAILED", t["nodeid"])
+          started = s.get("collected", 0) - s.get("deselected", 0)
+          reported = len(tests)
+          print(f"started={started} reported={reported}")
+          if reported != started:
+              print("::error::truncated run: started != reported")
+              sys.exit(1)
+          EOF
+
+      - name: Upload the raw report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: psycopg-raw-rust-windows
+          path: .validation/psycopg-raw-rust.json
+          if-no-files-found: warn
