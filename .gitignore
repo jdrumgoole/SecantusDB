@@ -123,6 +123,11 @@ xunit-results/
 crates/secantus-storage-adapter/target/
 crates/secantus-storage/target/
 crates/secantus-server-py/target/
+# Any other cargo target dir under crates/ (`CARGO_TARGET_DIR=target-dev` and
+# friends). `crates/secantus-storage/target-dev/` was committed once: 6,875
+# files, 1.77 GB, which took the sdist from 14 MB to 573 MB and past PyPI's
+# 100 MB file limit. tests/test_no_tracked_build_output.py holds the line.
+crates/**/target*/
 
 # Playwright MCP browser-session artefacts — Claude sessions write them to repo
 # root when capturing screenshots / DOM dumps. Always untracked, never shipped.
