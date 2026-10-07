@@ -253,6 +253,7 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
     let mut bases: Vec<char> = Vec::new();
     let mut marks: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut cases: Vec<u8> = Vec::new();
+    let mut compat: Vec<u8> = Vec::new();
     for ch in s.nfd() {
         if is_ccc_mark(ch) {
             if let Some(last) = marks.last_mut() {
@@ -260,9 +261,24 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
             }
             continue;
         }
-        bases.push(ch);
-        marks.push(Vec::new());
-        cases.push(u8::from(ch.is_uppercase()));
+        // A COMPATIBILITY character (`ﬁ`) is its expansion (`f`, `i`) at the
+        // primary and secondary levels and differs only at the tertiary --
+        // ICU's rule and mongod's answer: `fi` and `ﬁ` tie at strength 2 and
+        // `fi < ﬁ` at strength 3 (measured 8.2.11, 2026-10-07).
+        let expansion: Vec<char> = std::iter::once(ch).nfkd().collect();
+        let is_compat = expansion.len() != 1 || expansion[0] != ch;
+        for part in expansion {
+            if is_ccc_mark(part) {
+                if let Some(last) = marks.last_mut() {
+                    last.push(mark_weight(part as u32));
+                }
+                continue;
+            }
+            bases.push(part);
+            marks.push(Vec::new());
+            cases.push(u8::from(ch.is_uppercase()));
+            compat.push(u8::from(is_compat));
+        }
     }
     let primary_text = case_fold(&bases.iter().collect::<String>());
 
@@ -313,11 +329,18 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
         }
         out.push(0x00); // end of this base character's marks
     }
-    if c.strength == 2 && !c.case_level {
+    if c.strength == 2 {
+        if c.case_level {
+            out.extend_from_slice(&[0x00, 0x00]);
+            push_case_ranks(&mut out, &cases, c.case_first_upper);
+        }
         return out;
     }
     out.extend_from_slice(&[0x00, 0x00]);
-    push_case_ranks(&mut out, &cases, c.case_first_upper);
+    // The full tertiary: case, then the compatibility variant above it.
+    for (rank, k) in cases.iter().zip(&compat) {
+        out.push(if c.case_first_upper { 1 - *rank } else { *rank } + 1 + 2 * k);
+    }
     out
 }
 

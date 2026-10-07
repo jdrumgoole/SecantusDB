@@ -27,6 +27,13 @@ MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 SERVER = os.environ.get("PROBE_SERVER")
 
 CASES = [
+    # Compatibility ligatures and their expansions (found 2026-09-07 while
+    # porting `sort_levels` to Rust: the Python server put the ligature first).
+    ("ligature_fi", ["\ufb01", "fi", "fj"], {"locale": "en"}),
+    ("ligature_fi_s1", ["\ufb01", "fi", "fj"], {"locale": "en", "strength": 1}),
+    ("ligature_fi_s2", ["fi", "\ufb01", "fh"], {"locale": "en", "strength": 2}),
+    ("ligature_ff_ffi", ["\ufb00", "ff", "\ufb03", "ffi", "fg"], {"locale": "en"}),
+    ("sharp_s", ["\u00df", "ss", "st", "sr"], {"locale": "en"}),
     ("accents_en", ["a", "á", "ä", "az", "b"], {"locale": "en"}),
     ("accents_mixed", ["resume", "résumé", "resumes", "Resume"], {"locale": "en"}),
     ("case_s3", ["a", "A", "b", "B"], {"locale": "en", "strength": 3}),
