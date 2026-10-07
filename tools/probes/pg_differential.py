@@ -266,7 +266,7 @@ class _RustServer:
     def __init__(self) -> None:
         binary = resolve_binary(REPO_ROOT / PGSERVER_REL)
         if not binary.exists():
-            raise SystemExit(f"{binary} is not built -- cd crates/secantus-pgserver && cargo build")
+            raise SystemExit(f"{binary} is not built -- cd crates/secantus-pg && cargo build")
         # And built from THIS tree. A probe against a stale binary reports
         # divergences that are the binary's age, not the server's behaviour --
         # which is what happened on 2026-09-28, caught only by a hand-read of

@@ -40,7 +40,7 @@ _RUST_BINDINGS_DIR = "crates/secantus-core-py"
 _RUST_WT_DIR = "crates/secantus-wt"
 _RUST_STORAGE_DIR = "crates/secantus-storage"
 _RUST_ADAPTER_DIR = "crates/secantus-storage-adapter"
-_RUST_PGSERVER_DIR = "crates/secantus-pgserver"
+_RUST_PGSERVER_DIR = "crates/secantus-pg"
 _RUST_STORAGE_PY_DIR = "crates/secantus-storage-py"
 _RUST_BINARY_DIR = "crates/secantusdb"
 
@@ -532,19 +532,20 @@ def wt_bindings_refresh(c: Context) -> None:
 
 
 @task(name="rust-version-bump")
-def rust_version_bump(c: Context, to: str = "", check: bool = False) -> None:
-    """Bump the Rust MongoDB server's lockstep version (``--to 0.5.3-beta.166``).
+def rust_version_bump(c: Context, to: str = "", check: bool = False, line: str = "mdb") -> None:
+    """Bump a Rust version line (``--to 0.5.3-beta.166``; ``--line pg`` for PG).
 
-    Rewrites every MongoDB-side ``[package] version``, every ``=`` pin between
-    those crates, and every ``Cargo.lock`` that records one (the PG server's and
-    the Python bindings' included), then fails if the old version survives or
-    a lockfile no longer resolves ``--locked``. The PG crates' own version line
-    is not touched. ``--check`` only verifies the lockfiles.
+    Rewrites every ``[package] version`` on that line, every ``=`` pin on it,
+    and every ``Cargo.lock`` that records one (the PG server's and the Python
+    bindings' included), then fails if the old version survives or a lockfile
+    no longer resolves ``--locked``. The other line is not touched: ``mdb``
+    (default) is the MongoDB crates, ``pg`` is secantus-pgcatalog / -pgplan /
+    -pgwire / -pg. ``--check`` only verifies the lockfiles.
     """
     args = "--check" if check else to
     if not args:
         raise SystemExit("give --to <version> or --check")
-    c.run(f"{sys.executable} scripts/rust_version_bump.py {args}", pty=PTY)
+    c.run(f"{sys.executable} scripts/rust_version_bump.py --line {line} {args}", pty=PTY)
 
 
 @task(name="rust-storage-test")
@@ -576,12 +577,12 @@ def rust_adapter_test(c: Context) -> None:
 
 @task(name="rust-pgserver-test")
 def rust_pgserver_test(c: Context) -> None:
-    """fmt/clippy/test the secantus-pgserver crate (the PostgreSQL server).
+    """fmt/clippy/test the secantus-pg crate (the PostgreSQL server).
 
     Excluded from the clean workspace (links WiredTiger through
     secantus-storage), so the clean-workspace ``rust-test`` NEVER covers it and
     Cargo does not warn about that. Run this after any change under
-    ``crates/secantus-pgserver``. Same WiredTiger / libclang prerequisites as
+    ``crates/secantus-pg``. Same WiredTiger / libclang prerequisites as
     ``rust-wt-test``.
 
     The pure-Rust halves (``secantus-pgcatalog`` / ``secantus-pgplan``) ARE in

@@ -322,7 +322,7 @@ def pg_concurrency(
 
     The PG-side counterpart of ``invoke concurrency``. Needs a local
     PostgreSQL for the comparison rows and, for any number worth
-    quoting, a RELEASE ``secantusd-pg`` (``cd crates/secantus-pgserver
+    quoting, a RELEASE ``secantusd-pg`` (``cd crates/secantus-pg
     && cargo build --release``) -- a debug binary is ~2.3x slower, which
     is enough to invert a conclusion about per-operation cost.
     """

@@ -421,7 +421,7 @@ src = ["src", "tests"]
 # was the environment, not the config.
 extend-exclude = [
     "vendor",
-    "crates/vendor",
+    "crates/secantus-pgwire",
 ]
 
 [tool.ruff.lint]

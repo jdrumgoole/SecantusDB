@@ -17,7 +17,7 @@ one table, which is where a global write lock would show itself.
 roughly 2.3x slower here, which is large enough to invert a conclusion about
 absolute cost (scaling RATIOS survive it, absolute throughput does not):
 
-    cd crates/secantus-pgserver && cargo build --release
+    cd crates/secantus-pg && cargo build --release
 
 Report `--repeat 3` or more. A single 5s window moved by up to 8% run to run on
 this box, so a one-shot difference under that is not a difference.
@@ -43,7 +43,7 @@ REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
 # `SECANTUSD_PG` measures a binary other than the main checkout's (a worktree's
 # build) -- the same override `bench/pg_statement_cost.py` has.
 RUST_BINARY = Path(
-    os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pgserver/target/release/secantusd-pg")
+    os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pg/target/release/secantusd-pg")
 )
 
 if str(REPO) not in sys.path:

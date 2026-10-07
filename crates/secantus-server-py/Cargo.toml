@@ -21,7 +21,7 @@ crate-type = ["cdylib"]
 [features]
 default = ["pgserver"]
 # Builds `PgServer` (the embedded PostgreSQL-wire server) into the extension.
-pgserver = ["dep:secantus-pgserver"]
+pgserver = ["dep:secantus-pg"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
@@ -34,7 +34,9 @@ secantus-server = { path = "../secantus-server" }
 # (`--no-default-features`) without touching this file. It is default-ON because
 # the wheel's `PgServer` is the point of the crate's PG half: a test that has to
 # spawn a subprocess is exactly the ergonomic this replaces.
-secantus-pgserver = { path = "../secantus-pgserver", optional = true }
+# `default-features = false`: the library only, not the `secantusd-pg` binary's
+# signal-handling dependencies.
+secantus-pg = { path = "../secantus-pg", optional = true, default-features = false }
 # Fast allocator: profiling (tasks/rust-perf-findings.md, Finding 1) put
 # malloc/realloc/free churn from BSON materialization among the top CPU costs on
 # every read/aggregate path. mimalloc replaces the system allocator process-wide
@@ -65,12 +67,3 @@ mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# Vendored, locally-patched pgwire (crates/vendor/pgwire) -- the same patch
-# `crates/secantus-pgserver/Cargo.toml` applies. `[patch.crates-io]` is honoured
-# only from a WORKSPACE ROOT manifest, and this crate is its own workspace, so
-# secantus-pgserver's patch does NOT reach it: without this stanza the
-# extension would silently link the unpatched upstream pgwire and lose
-# `StoredStatement::parameter_oids`.
-[patch.crates-io]
-pgwire = { path = "../vendor/pgwire" }

@@ -1,7 +1,8 @@
 name: crates package
 
 # The Phase B gate of tasks/rust-packages-plan.md: package every crates.io-bound
-# MongoDB-side crate together and build each FROM ITS TARBALL, as `cargo
+# crate -- both release lines, the MongoDB server's and the PostgreSQL
+# server's -- together and build each FROM ITS TARBALL, as `cargo
 # publish` would (scripts/crates_package_check.py). Runs on every PR that
 # touches crates/, so a new path dependency without a version, or a file a
 # crate reaches for outside its own directory, fails the day it is introduced
@@ -52,5 +53,13 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
+      - name: Find libclang
+        # pg_query (the PostgreSQL crates' parser) runs bindgen in its build
+        # script, whatever we do, so building secantus-pgplan / secantus-pg from
+        # their tarballs needs libclang. Found wherever the runner's LLVM put it.
+        run: |
+          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          echo "LIBCLANG_PATH=$(dirname "$lc")" >> "$GITHUB_ENV"
       - name: Package and verify every crate
-        run: python scripts/crates_package_check.py
+        run: python scripts/crates_package_check.py --line all

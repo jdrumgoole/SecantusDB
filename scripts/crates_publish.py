@@ -1,8 +1,9 @@
-"""Publish the staged MongoDB-side crates to crates.io, resumably.
+"""Publish one release line's staged crates to crates.io, resumably.
 
 Run by ``.github/workflows/publish-crates.yml`` after
 ``scripts/crates_package_check.py --keep <stage>`` has staged and verified the
-crates. Publishes them ONE AT A TIME in ``PUBLISH_ORDER`` (dependency order),
+crates. Publishes the line's crates (``--line mdb``: the MongoDB server's,
+``--line pg``: the PostgreSQL server's) ONE AT A TIME in dependency order,
 skipping any whose version is already on crates.io, so a run that failed part
 way can simply be re-run on the same tag: crates.io versions are immutable, and
 a plain ``cargo publish --workspace`` would stop at the first crate a previous
@@ -12,7 +13,11 @@ the index before returning, so its dependents resolve.
 The token comes from the environment (``CARGO_REGISTRY_TOKEN``, minted per run
 by trusted publishing). Never run this by hand.
 
-Usage: ``python scripts/crates_publish.py <stage-dir> [--dry-run]``
+A PG release never publishes a MongoDB-side crate: the ones it depends on must
+already be on crates.io at the pinned version (released by a ``secantusdb-v*``
+tag first), and the run stops before publishing anything if one is missing.
+
+Usage: ``python scripts/crates_publish.py <stage-dir> [--line {mdb,pg}] [--dry-run]``
 """
 
 from __future__ import annotations
@@ -31,13 +36,28 @@ REPO = Path(__file__).resolve().parent.parent
 UA = "secantusdb-publish (https://github.com/jdrumgoole/SecantusDB)"
 
 
-def _publish_order() -> tuple[str, ...]:
+def _check_module():
     spec = importlib.util.spec_from_file_location(
         "ccheck", REPO / "scripts" / "crates_package_check.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.PUBLISH_ORDER
+    return mod
+
+
+def _publish_order(line: str = "mdb") -> tuple[str, ...]:
+    return _check_module().PUBLISHED[line]
+
+
+def _required(line: str) -> tuple[str, ...]:
+    """Staged crates this line depends on but never publishes itself."""
+    mod = _check_module()
+    return tuple(c for c in mod.STAGED[line] if c not in mod.PUBLISHED[line])
+
+
+def _manifest(stage: Path, directory: str) -> tuple[str, str]:
+    package = tomllib.loads((stage / directory / "Cargo.toml").read_text())["package"]
+    return package["name"], package["version"]
 
 
 def published(name: str, version: str) -> bool:
@@ -56,6 +76,7 @@ def published(name: str, version: str) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("stage", type=Path)
+    ap.add_argument("--line", choices=("mdb", "pg"), default="mdb")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -67,9 +88,22 @@ def main() -> int:
         subprocess.run(cmd, cwd=args.stage, check=True)
         return 0
 
-    for directory in _publish_order():
-        manifest = tomllib.loads((args.stage / directory / "Cargo.toml").read_text())["package"]
-        name, version = manifest["name"], manifest["version"]
+    missing = [
+        f"{name} {version}"
+        for name, version in (_manifest(args.stage, d) for d in _required(args.line))
+        if not published(name, version)
+    ]
+    if missing:
+        print(
+            f"the {args.line} line depends on crates not on crates.io yet:",
+            *missing,
+            "release them first (their own tag); nothing was published",
+            sep="\n  ",
+        )
+        return 1
+
+    for directory in _publish_order(args.line):
+        name, version = _manifest(args.stage, directory)
         if published(name, version):
             print(f"already on crates.io: {name} {version}")
             continue

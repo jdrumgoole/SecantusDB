@@ -1,4 +1,4 @@
-"""Package every crates.io-bound MongoDB-side crate, as `cargo publish` would.
+"""Package every crates.io-bound Rust crate, as `cargo publish` would.
 
 Phase B of ``tasks/rust-packages-plan.md``. ``cargo publish --dry-run`` on one
 crate resolves its dependencies from crates.io, so it cannot check a crate
@@ -14,10 +14,16 @@ The crates live in several cargo workspaces today (the WiredTiger-linked ones
 are excluded from ``crates/Cargo.toml``), so this stages copies of them into
 one throwaway workspace first.
 
-``PUBLISH_ORDER`` is the dependency order a release publishes in; keep new
-crates.io-bound crates in it.
+There are two release lines (``tasks/rust-packages-plan.md`` section 2.5):
+``MDB_ORDER`` is the MongoDB server's crates, released on ``secantusdb-v*``
+tags, and ``PG_ORDER`` the PostgreSQL server's, released on ``secantusd-pg-v*``
+tags. Each is in dependency order, every crate after everything it depends on;
+keep new crates.io-bound crates in the right one. ``--line pg`` stages the PG
+crates together with the MongoDB-side crates they depend on (``PG_NEEDS``),
+which a PG release does not publish but must resolve; the default ``all``
+stages both lines, which is what the CI gate checks.
 
-Usage: ``python scripts/crates_package_check.py [--no-verify] [--keep DIR]``
+Usage: ``python scripts/crates_package_check.py [--line {all,mdb,pg}] [--no-verify] [--keep DIR]``
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ REPO = Path(__file__).resolve().parent.parent
 CRATES = REPO / "crates"
 
 # Dependency order: every crate comes after everything it depends on.
-PUBLISH_ORDER = (
+MDB_ORDER = (
     "secantus-wiredtiger-sys",
     "secantus-wt",
     "secantus-core",
@@ -48,11 +54,35 @@ PUBLISH_ORDER = (
     "secantusdb",  # package name secantus-mdb
 )
 
+PG_ORDER = (
+    "secantus-pgcatalog",
+    "secantus-pgplan",
+    "secantus-pgwire",  # SecantusDB's fork of pgwire; the library is `pgwire`
+    "secantus-pg",
+)
+
+# The MongoDB-side crates the PG crates depend on, in MDB_ORDER's order. A PG
+# release resolves them from crates.io; it never publishes them.
+PG_NEEDS = (
+    "secantus-wiredtiger-sys",
+    "secantus-wt",
+    "secantus-core",
+    "secantus-auth",
+    "secantus-storage",
+)
+
+# What each line stages, and what each line PUBLISHES (a subset).
+STAGED = {"mdb": MDB_ORDER, "pg": PG_NEEDS + PG_ORDER, "all": MDB_ORDER + PG_ORDER}
+PUBLISHED = {"mdb": MDB_ORDER, "pg": PG_ORDER, "all": MDB_ORDER + PG_ORDER}
+
+# Kept for callers that predate the PG line: the MongoDB release order.
+PUBLISH_ORDER = MDB_ORDER
+
 SKIP_DIRS = {"target", "target-dev"}
 
 
-def _stage(dest: Path) -> None:
-    for name in PUBLISH_ORDER:
+def _stage(dest: Path, order: tuple[str, ...]) -> None:
+    for name in order:
         src = CRATES / name
         shutil.copytree(
             src,
@@ -67,7 +97,7 @@ def _stage(dest: Path) -> None:
             r"(?m)^\[workspace\]\n(?:[^\[\n][^\n]*\n|\n)*?(?=\[|\Z)", "", manifest.read_text()
         )
         manifest.write_text(text)
-    members = ",\n".join(f'    "{n}"' for n in PUBLISH_ORDER)
+    members = ",\n".join(f'    "{n}"' for n in order)
     # Carry the tables the clean-workspace crates inherit (`dep.workspace =
     # true`) from crates/Cargo.toml; `cargo package` writes the resolved values
     # into each packaged manifest.
@@ -78,7 +108,7 @@ def _stage(dest: Path) -> None:
     )
 
 
-def _forget_previous_runs() -> None:
+def _forget_previous_runs(order: tuple[str, ...]) -> None:
     """Remove earlier runs' extracted tarballs of OUR crates from cargo's cache.
 
     `cargo package --workspace` unpacks each tarball into a local registry under
@@ -92,7 +122,7 @@ def _forget_previous_runs() -> None:
     home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     names = {
         (CRATES / n / "Cargo.toml").read_text().split('name = "', 1)[1].split('"', 1)[0]
-        for n in PUBLISH_ORDER
+        for n in order
     }
     for kind in ("src", "cache"):
         for registry in (home / "registry" / kind).glob("-*"):
@@ -110,7 +140,14 @@ def main() -> int:
         "--no-verify", action="store_true", help="package only; skip building each tarball"
     )
     ap.add_argument("--keep", type=Path, help="stage here and keep it, instead of a temp dir")
+    ap.add_argument(
+        "--line",
+        choices=sorted(STAGED),
+        default="all",
+        help="which release line to stage: mdb, pg, or all (default)",
+    )
     args = ap.parse_args()
+    order = STAGED[args.line]
 
     if not (CRATES / "secantus-wiredtiger-sys" / "wiredtiger" / "CMakeLists.txt").exists():
         subprocess.run([sys.executable, str(REPO / "scripts" / "wt_sys_refresh.py")], check=True)
@@ -120,8 +157,8 @@ def main() -> int:
         shutil.rmtree(stage)
     stage.mkdir(parents=True, exist_ok=True)
     try:
-        _forget_previous_runs()
-        _stage(stage)
+        _forget_previous_runs(order)
+        _stage(stage, order)
         cmd = ["cargo", "package", "--workspace", "--allow-dirty"]
         if args.no_verify:
             cmd.append("--no-verify")

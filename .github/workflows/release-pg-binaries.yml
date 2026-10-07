@@ -17,7 +17,7 @@
 # `0.1.0-beta.0` while `crates/secantusdb` is at `0.5.3-beta.163`. Folding it
 # into that lockstep to simplify tagging would tie a 0.1 server's version to an
 # unrelated one, so it keeps its own line and its own tag prefix. The version
-# assertion below reads `crates/secantus-pgserver/Cargo.toml` and nothing else.
+# assertion below reads `crates/secantus-pg/Cargo.toml` and nothing else.
 #
 #     git tag secantusd-pg-v0.1.0-beta.0 && git push origin secantusd-pg-v0.1.0-beta.0
 #
@@ -84,9 +84,9 @@ jobs:
             tag="${GITHUB_REF_NAME}"
           fi
           ver="${tag#secantusd-pg-v}"
-          crate=$(grep -m1 '^version' crates/secantus-pgserver/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          crate=$(grep -m1 '^version' crates/secantus-pg/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
           if [ "$ver" != "$crate" ]; then
-            echo "::error::tag version ($ver) != crates/secantus-pgserver Cargo.toml version ($crate)"
+            echo "::error::tag version ($ver) != crates/secantus-pg Cargo.toml version ($crate)"
             exit 1
           fi
           {
@@ -200,8 +200,8 @@ jobs:
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
           target=${{ matrix.target }}
           cargo build --release --locked --target "$target" \
-            --manifest-path crates/secantus-pgserver/Cargo.toml
-          bin="crates/secantus-pgserver/target/$target/release/secantusd-pg"
+            --manifest-path crates/secantus-pg/Cargo.toml
+          bin="crates/secantus-pg/target/$target/release/secantusd-pg"
           strip "$bin" || true
           echo "BIN=$bin" >> "$GITHUB_ENV"
           # Also the first check that the artifact runs at all. `--version` used
