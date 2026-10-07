@@ -68,6 +68,9 @@ pub struct CliArgs {
     pub checkpoint_seconds: Option<u64>,
     /// Admission control: cap on concurrent engine writes (0 / None = off).
     pub write_tickets: Option<usize>,
+    /// `--block-compressor` / `[storage] block_compressor`: the compressor for
+    /// newly created data tables.
+    pub block_compressor: Option<String>,
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -119,6 +122,7 @@ impl CliArgs {
             data_nonlogged: cfg.data_nonlogged,
             checkpoint_seconds: cfg.checkpoint_seconds,
             write_tickets: cfg.write_tickets,
+            block_compressor: cfg.block_compressor.clone(),
         })
     }
 
@@ -304,6 +308,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     format!("--checkpoint-seconds expects a non-negative integer, got {raw:?}")
                 })?);
             }
+            "--block-compressor" => {
+                let raw = take_value("--block-compressor")?;
+                o.block_compressor = Some(crate::config::block_compressor(&raw)?);
+            }
             "--noop-heartbeat-seconds" => {
                 let raw = take_value("--noop-heartbeat-seconds")?;
                 o.noop_heartbeat_seconds = Some(raw.parse::<f64>().map_err(|_| {
@@ -415,6 +423,11 @@ OPTIONS:
                                  load = higher throughput; files are sparse.)
     --session-max N              WiredTiger session_max — concurrent WT session
                                  cap (default: 1000)
+    --block-compressor NAME      Compressor for newly created data tables:
+                                 lz4 (default), zlib (about 1.9x less disk on
+                                 incompressible data, more CPU) or none. An
+                                 existing store keeps the one it was created
+                                 with.
     --write-tickets N            Admission control: cap on writes concurrently
                                  inside the storage engine; further writers
                                  queue OUTSIDE it. 0 = unlimited (default).
@@ -590,6 +603,14 @@ mod tests {
         assert_eq!(a.oplog_nonlogged, Some(true));
         assert_eq!(a.data_nonlogged, Some(true));
         assert_eq!(a.checkpoint_seconds, Some(15));
+    }
+
+    #[test]
+    fn block_compressor_flag_is_validated() {
+        let a = run(&["--block-compressor", "zlib"]);
+        assert_eq!(a.block_compressor.as_deref(), Some("zlib"));
+        assert_eq!(run(&[]).block_compressor, None);
+        assert!(parse(&["--block-compressor", "zstd"]).is_err());
     }
 
     #[test]

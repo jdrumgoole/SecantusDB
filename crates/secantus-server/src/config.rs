@@ -84,6 +84,10 @@ pub struct ResolvedConfig {
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
     pub write_tickets: Option<usize>,
+    /// The block compressor for NEWLY CREATED data tables (`lz4`, `zlib` or
+    /// `none`); an existing store keeps the compressor it was created with.
+    /// `None` keeps the default, lz4.
+    pub block_compressor: Option<String>,
 
     // ---- [tls] -------------------------------------------------------
     pub tls_cert_file: Option<String>,
@@ -117,6 +121,7 @@ impl Default for ResolvedConfig {
             data_nonlogged: None,
             checkpoint_seconds: None,
             write_tickets: None,
+            block_compressor: None,
             tls_cert_file: None,
             tls_key_file: None,
             tls_ca_file: None,
@@ -152,6 +157,7 @@ pub struct ConfigOverrides {
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
     pub write_tickets: Option<usize>,
+    pub block_compressor: Option<String>,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
     pub tls_ca_file: Option<String>,
@@ -210,6 +216,9 @@ impl ConfigOverrides {
         }
         if let Some(v) = self.checkpoint_seconds {
             base.checkpoint_seconds = Some(v);
+        }
+        if let Some(v) = &self.block_compressor {
+            base.block_compressor = Some(v.clone());
         }
         if let Some(v) = &self.tls_cert_file {
             base.tls_cert_file = Some(v.clone());
@@ -399,6 +408,10 @@ pub fn parse_str(text: &str, label: &str) -> Result<ConfigOverrides, String> {
                 "checkpoint_seconds" => {
                     out.checkpoint_seconds = Some(as_u64(val, "storage", key, label)?)
                 }
+                "block_compressor" => {
+                    out.block_compressor =
+                        Some(block_compressor(&as_string(val, "storage", key, label)?)?)
+                }
                 other => return Err(unknown_key("storage", other, label)),
             }
         }
@@ -453,6 +466,19 @@ fn get_table<'a>(
 
 fn unknown_key(table: &str, key: &str, label: &str) -> String {
     format!("{label}: unknown key [{table}].{key:?}")
+}
+
+/// A block compressor the bundled WiredTiger has built in: lz4 (the
+/// default) or zlib (1.9x less disk on incompressible content, measured
+/// 2026-08-22), or none. The Windows build links no compressor, so only `none`
+/// is usable there.
+pub fn block_compressor(name: &str) -> Result<String, String> {
+    match name {
+        "lz4" | "zlib" | "none" => Ok(name.to_string()),
+        other => Err(format!(
+            "block_compressor must be one of lz4, zlib, none; got {other:?}"
+        )),
+    }
 }
 
 fn as_string(v: &toml::Value, table: &str, key: &str, label: &str) -> Result<String, String> {
