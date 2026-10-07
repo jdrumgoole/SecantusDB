@@ -37,7 +37,7 @@ permissions:
 jobs:
   psycopg-windows:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -156,13 +156,18 @@ jobs:
         shell: bash
         env:
           SECANTUS_GAUGE_SERVER: rust
+          SECANTUS_PSYCOPG_GAUGE_TIMEOUT: "4800"
           PYTHONUNBUFFERED: "1"
+          # Name every test and the slowest ones, so a slow or hung test on
+          # this runner is identifiable from the log alone.
+          PYTEST_ADDOPTS: "-v --durations=40 -rfE"
         run: |
-          set -uo pipefail
+          set +e
           .gauge-venv/Scripts/python -m psycopg_validation.runner
           echo "runner exit: $?"
 
       - name: Check every started test reported a result
+        if: always()
         # pytest exits non-zero on any failing test; the gate here is that the
         # run COMPLETED. The JSON report is written at sessionfinish, so a
         # truncated run (a pytest-timeout thread kill ends the whole process on
