@@ -2776,11 +2776,17 @@ These work end-to-end but cut corners.
       that names the failure and distinguishes the remaining possibilities.
       Probe: `scratchpad/sockwatch.py` in the session that measured this.
 
-- [ ] **OPEN, no known lever left — Rust PostgreSQL server: a READ
-      statement costs ~1.45-1.6x PostgreSQL's, and durable writes reach ~3x
-      scaling at 8 clients against PostgreSQL's ~4x (re-measured 2026-10-07,
-      batch 72; the batch 72 section at the end of this entry is the current
-      state, what precedes it is the history).** Release `secantusd-pg` against PostgreSQL 15.19
+- [x] **ACCEPTED AS A LIMIT 2026-10-07 (Joe), and may be revisited — Rust
+      PostgreSQL server: a READ statement costs ~1.45-1.6x PostgreSQL's, and
+      durable writes reach ~3x scaling at 8 clients against PostgreSQL's ~4x
+      (measured 2026-10-07, batch 72; the batch 72 section at the end of this
+      entry is the current state, what precedes it is the history).** Not
+      being worked: no lever above ~1us is known for reads, and the write gap
+      is the hand-off between one group's log write and the next. Joe kept the
+      option to reopen it. A session that does should start from the batch 72
+      numbers, re-measure them first, and measure LINUX, which nobody has (the
+      server uses `method=fsync` there and runs unpatched WiredTiger code).
+      Release `secantusd-pg` against PostgreSQL 15.19
       (port 5415; the harness still LABELS it "PostgreSQL 16"), same box, 5s x3
       medians. `bench/pg_statement_cost.py --iters 1200`: `select 1` 40.6us vs
       26.1, row by PK 44.8 vs 27.9 (was 76.3 / 89.2 against PG 16 on
@@ -2936,16 +2942,6 @@ These work end-to-end but cut corners.
       So the cost gap is in READ statements only (+12-16us), a write
       statement is at parity. Re-profiled (`sample`, prepared row-by-PK loop):
       nothing above ~1us beyond the send/recv syscalls, as batch 71 found.
-
-- [ ] **`cargo clippy -D warnings` fails in `crates/secantus-pg`, and no CI
-      lane runs it (found 2026-10-07, batch 72).** Six `clippy::drop_non_drop`
-      errors under rustc/clippy 1.98.1: `drop(sink)` on a closure at
-      `src/grace_join.rs:616`, `src/stream_join.rs:1060` and
-      `src/lib.rs:38078`, `:38088`, `:38461`, `:38786`. `test.yml` builds the
-      binary and runs three integration tests for this crate but never clippy
-      or `cargo fmt --check`, so nothing would have reported it. Fix the six
-      sites (scope the closure in a block instead of dropping it) and add the
-      crate to a lint lane.
 
 - [x] **RESOLVED 2026-10-07 (batch 69): the read-path ceiling was two
       per-thread caches keyed by CONNECTION.** Re-measured before fixing:

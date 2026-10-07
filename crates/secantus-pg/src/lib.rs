@@ -38075,7 +38075,6 @@ impl PgHandler {
                     sink(stream_join::RowBatch::Blobs(b))
                 })
         };
-        drop(sink);
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
@@ -38085,7 +38084,6 @@ impl PgHandler {
         if !chunk.is_empty() || folds.get() == 0 {
             fold(&mut chunk)?;
         }
-        drop(fold);
         let mut vals = Vec::with_capacity(agg.items.len() + agg.groupings.len());
         for (i, (item, parts)) in agg.items.iter().zip(partials).enumerate() {
             vals.push(match item.func {
@@ -38458,7 +38456,6 @@ impl PgHandler {
                     sink(stream_join::RowBatch::Blobs(b))
                 })
         };
-        drop(sink);
         if let Some(e) = stopped {
             return Err(e);
         }
@@ -38783,7 +38780,6 @@ impl PgHandler {
                     sink(stream_join::RowBatch::Blobs(b))
                 })
         };
-        drop(sink);
         if let Some(e) = stopped.or(failed) {
             return Err(e);
         }
