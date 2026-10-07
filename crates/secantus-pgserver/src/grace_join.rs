@@ -18,6 +18,12 @@
 //! then the right rows nothing matched (their left number is NULL, which
 //! sorts last).
 //!
+//! Batch 68: the LEFT side is read first once the right side passes the
+//! bound. A left side that fits is held whole and the right table read
+//! again a chunk at a time against it (`left_built_join`), so the right side
+//! is never written to disk; only when neither side fits is the right side
+//! partitioned, the left read back from a spool of its own.
+//!
 //! Only a join with column equalities in its ON (`equi`) partitions. A right
 //! row whose key the hash does not model (`join_hash_key` is `None` for a
 //! non-NULL value) would have to meet every left row, so the join declines
@@ -352,20 +358,239 @@ impl PgHandler {
         sink: Sink<'_>,
     ) -> PgWireResult<()> {
         let outer_left = ops.outer_left;
+        let budget = ops_budget(&right);
+        let mut right = Some(right);
+        self.ordered_join(
+            budget,
+            &mut |push_out: Sink<'_>| {
+                let Some(right) = right.take() else {
+                    return Ok(());
+                };
+                // The left side, numbered and partitioned. A NULL key matches
+                // nothing: a LEFT / FULL join NULL-extends it at once.
+                let mut lparts: Vec<Spool> = (0..PARTITIONS).map(|_| Spool::default()).collect();
+                let mut every = Spool::default();
+                let mut every_seqs: HashSet<i64> = HashSet::new();
+                let mut lseq = 0i64;
+                feed_left(&mut |docs| {
+                    self.check_cancel()?;
+                    let mut nulls = Vec::new();
+                    for mut d in docs {
+                        d.insert(LSEQ, Bson::Int64(lseq));
+                        match (ops.left_key)(&d) {
+                            KeyClass::Key(k) => lparts[partition_of(&k, 0)].push(&d)?,
+                            KeyClass::Null => {
+                                if outer_left {
+                                    nulls.push(d);
+                                }
+                            }
+                            KeyClass::Other => {
+                                every_seqs.insert(lseq);
+                                every.push(&d)?;
+                            }
+                        }
+                        lseq += 1;
+                    }
+                    if !nulls.is_empty() {
+                        (ops.join)(
+                            Vec::new(),
+                            &mut |s| s(std::mem::take(&mut nulls)).map(|_| ()),
+                            &mut *push_out,
+                            false,
+                        )?;
+                    }
+                    Ok(true)
+                })?;
+                // `every` is read once per partition, so it stays in memory:
+                // these are the rare left rows of a type the hash does not
+                // model.
+                let every_rows = every.reader()?.next_batch(usize::MAX)?;
+                let mut every_matched: HashSet<i64> = HashSet::new();
+                let GraceRight {
+                    parts,
+                    null_keys,
+                    budget,
+                    ..
+                } = right;
+                for (rpart, lpart) in parts.into_iter().zip(lparts) {
+                    self.join_spilled(
+                        ops,
+                        rpart,
+                        lpart,
+                        &every_rows,
+                        &every_seqs,
+                        &mut every_matched,
+                        budget,
+                        0,
+                        &mut *push_out,
+                    )?;
+                }
+                // A left row of `every` nothing matched, NULL-extended.
+                if outer_left {
+                    self.null_extend_unmatched(ops, &every_rows, &every_matched, &mut *push_out)?;
+                }
+                // The right rows with a NULL key, for a RIGHT / FULL join.
+                if ops.outer_right {
+                    let mut r = null_keys.reader()?;
+                    loop {
+                        let rows = r.next_batch(BATCH)?;
+                        if rows.is_empty() {
+                            break;
+                        }
+                        (ops.join)(rows, &mut |_| Ok(()), &mut *push_out, false)?;
+                    }
+                }
+                Ok(())
+            },
+            sink,
+        )
+    }
+
+    /// The left rows of `rows` no right row matched, NULL-extended (a LEFT /
+    /// FULL join).
+    fn null_extend_unmatched(
+        &self,
+        ops: &GraceOps<'_>,
+        rows: &[Document],
+        matched: &HashSet<i64>,
+        out: Sink<'_>,
+    ) -> PgWireResult<()> {
+        let unmatched: Vec<Document> = rows
+            .iter()
+            .filter(|d| !matches!(d.get(LSEQ), Some(Bson::Int64(n)) if matched.contains(n)))
+            .cloned()
+            .collect();
+        if unmatched.is_empty() {
+            return Ok(());
+        }
+        let mut unmatched = Some(unmatched);
+        (ops.join)(
+            Vec::new(),
+            &mut |s| match unmatched.take() {
+                Some(rows) => s(rows).map(|_| ()),
+                None => Ok(()),
+            },
+            out,
+            true,
+        )
+    }
+
+    /// A join whose LEFT side fitted in memory while its right side did not
+    /// (batch 68): the right rows are read a chunk of at most `budget` bytes
+    /// at a time and each chunk joined with every left row in memory, so the
+    /// right side is never written to partitions. Every left row takes the
+    /// part an `every` row takes in `grace_join`: its NULL extension is
+    /// decided once all chunks have been joined. The rows come out in the
+    /// materialised path's order (`ordered_join`).
+    pub(crate) fn left_built_join(
+        &self,
+        ops: &GraceOps<'_>,
+        left: Vec<Document>,
+        budget: usize,
+        feed_right: &mut dyn FnMut(Sink<'_>) -> PgWireResult<()>,
+        sink: Sink<'_>,
+    ) -> PgWireResult<()> {
+        let mut left = Some(left);
+        self.ordered_join(
+            budget,
+            &mut |push_out: Sink<'_>| {
+                let Some(mut left) = left.take() else {
+                    return Ok(());
+                };
+                for (i, d) in left.iter_mut().enumerate() {
+                    d.insert(LSEQ, Bson::Int64(i as i64));
+                }
+                let mut matched: HashSet<i64> = HashSet::new();
+                let mut chunk: Vec<Document> = Vec::new();
+                let mut chunk_bytes = 0usize;
+                let mut rseq = 0i64;
+                let flush = |chunk: Vec<Document>,
+                             matched: &mut HashSet<i64>,
+                             push_out: Sink<'_>|
+                 -> PgWireResult<()> {
+                    let left = &left;
+                    let mut feed = |s: Sink<'_>| -> PgWireResult<()> {
+                        for rows in left.chunks(BATCH) {
+                            if !s(rows.to_vec())? {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    };
+                    (ops.join)(
+                        chunk,
+                        &mut feed,
+                        &mut |docs| {
+                            let mut kept = Vec::with_capacity(docs.len());
+                            for d in docs {
+                                let l = match d.get(LSEQ) {
+                                    Some(Bson::Int64(n)) => Some(*n),
+                                    _ => None,
+                                };
+                                match (l, d.get(RSEQ)) {
+                                    // NULL-extended here, it may match in a
+                                    // later chunk: decided after all of them.
+                                    (Some(_), None | Some(Bson::Null)) => continue,
+                                    (Some(n), _) => {
+                                        matched.insert(n);
+                                    }
+                                    _ => {}
+                                }
+                                kept.push(d);
+                            }
+                            push_out(kept)
+                        },
+                        false,
+                    )
+                };
+                feed_right(&mut |docs| {
+                    self.check_cancel()?;
+                    for mut d in docs {
+                        d.insert(RSEQ, Bson::Int64(rseq));
+                        rseq += 1;
+                        chunk_bytes += stream_join::doc_bytes(&d);
+                        chunk.push(d);
+                    }
+                    if chunk_bytes > budget {
+                        chunk_bytes = 0;
+                        flush(std::mem::take(&mut chunk), &mut matched, &mut *push_out)?;
+                    }
+                    Ok(true)
+                })?;
+                if !chunk.is_empty() {
+                    flush(std::mem::take(&mut chunk), &mut matched, &mut *push_out)?;
+                }
+                if ops.outer_left {
+                    self.null_extend_unmatched(ops, &left, &matched, &mut *push_out)?;
+                }
+                Ok(())
+            },
+            sink,
+        )
+    }
+
+    /// Run `body`, which hands joined rows carrying `LSEQ` / `RSEQ` to its
+    /// sink in any order, and hand them on to `sink` in `(LSEQ, RSEQ)` order
+    /// with the two numbers removed. The rows go to a spool, each indexed by
+    /// its two numbers and its place in the file; the index alone is
+    /// sorted, and the rows read back in its order (batch 67: an external
+    /// sort wrote and merged the whole rows again). Past `budget` of index
+    /// the rows move to the external sort after all.
+    fn ordered_join(
+        &self,
+        budget: usize,
+        body: &mut dyn FnMut(Sink<'_>) -> PgWireResult<()>,
+        sink: Sink<'_>,
+    ) -> PgWireResult<()> {
         let order = [LSEQ, RSEQ].map(|f| OrderKey {
             field: f.to_string(),
             ascending: true,
             nulls: Nulls::Last,
             expr: None,
         });
-        // The joined rows go to a spool, each indexed by its two numbers
-        // and its place in the file; the index alone is sorted, and the rows
-        // read back in its order (batch 67: an external sort wrote and
-        // merged the whole rows again). Past `budget` of index the rows
-        // move to the external sort after all.
         let mut out = crate::external_sort::RunBuilder::new(&order, None, BATCH);
         let mut ordered = OrderSpool::default();
-        let index_cap = (ops_budget(&right) / std::mem::size_of::<IndexEntry>()).max(1 << 16);
+        let index_cap = (budget / std::mem::size_of::<IndexEntry>()).max(1 << 16);
         let mut sorting = false;
         let mut push_out = |docs: Vec<Document>| -> PgWireResult<bool> {
             if !sorting && ordered.index.len() + docs.len() > index_cap {
@@ -387,97 +612,7 @@ impl PgHandler {
             }
             Ok(true)
         };
-        // The left side, numbered and partitioned. A NULL key matches
-        // nothing: a LEFT / FULL join NULL-extends it at once.
-        let mut lparts: Vec<Spool> = (0..PARTITIONS).map(|_| Spool::default()).collect();
-        let mut every = Spool::default();
-        let mut every_seqs: HashSet<i64> = HashSet::new();
-        let mut lseq = 0i64;
-        feed_left(&mut |docs| {
-            self.check_cancel()?;
-            let mut nulls = Vec::new();
-            for mut d in docs {
-                d.insert(LSEQ, Bson::Int64(lseq));
-                match (ops.left_key)(&d) {
-                    KeyClass::Key(k) => lparts[partition_of(&k, 0)].push(&d)?,
-                    KeyClass::Null => {
-                        if outer_left {
-                            nulls.push(d);
-                        }
-                    }
-                    KeyClass::Other => {
-                        every_seqs.insert(lseq);
-                        every.push(&d)?;
-                    }
-                }
-                lseq += 1;
-            }
-            if !nulls.is_empty() {
-                (ops.join)(
-                    Vec::new(),
-                    &mut |s| s(std::mem::take(&mut nulls)).map(|_| ()),
-                    &mut push_out,
-                    false,
-                )?;
-            }
-            Ok(true)
-        })?;
-        // `every` is read once per partition, so it stays in memory: these
-        // are the rare left rows of a type the hash does not model.
-        let every_rows = every.reader()?.next_batch(usize::MAX)?;
-        let mut every_matched: HashSet<i64> = HashSet::new();
-        let GraceRight {
-            parts,
-            null_keys,
-            budget,
-            ..
-        } = right;
-        for (rpart, lpart) in parts.into_iter().zip(lparts) {
-            self.join_spilled(
-                ops,
-                rpart,
-                lpart,
-                &every_rows,
-                &every_seqs,
-                &mut every_matched,
-                budget,
-                0,
-                &mut push_out,
-            )?;
-        }
-        // A left row of `every` nothing matched, NULL-extended.
-        if outer_left {
-            let unmatched: Vec<Document> = every_rows
-                .iter()
-                .filter(
-                    |d| !matches!(d.get(LSEQ), Some(Bson::Int64(n)) if every_matched.contains(n)),
-                )
-                .cloned()
-                .collect();
-            if !unmatched.is_empty() {
-                let mut unmatched = Some(unmatched);
-                (ops.join)(
-                    Vec::new(),
-                    &mut |s| match unmatched.take() {
-                        Some(rows) => s(rows).map(|_| ()),
-                        None => Ok(()),
-                    },
-                    &mut push_out,
-                    true,
-                )?;
-            }
-        }
-        // The right rows with a NULL key, for a RIGHT / FULL join.
-        if ops.outer_right {
-            let mut r = null_keys.reader()?;
-            loop {
-                let rows = r.next_batch(BATCH)?;
-                if rows.is_empty() {
-                    break;
-                }
-                (ops.join)(rows, &mut |_| Ok(()), &mut push_out, false)?;
-            }
-        }
+        body(&mut push_out)?;
         drop(push_out);
         if !sorting {
             let mut rows = ordered.into_sorted()?;

@@ -1695,6 +1695,40 @@ enum SetsInput {
     Small(Vec<Document>),
 }
 
+/// One grouping set's groups, hashed by key identity while its rows are
+/// read a chunk at a time (`grouping_sets_in_bounded_memory`).
+#[derive(Default)]
+struct SetGroups {
+    index: std::collections::HashMap<String, usize>,
+    #[allow(clippy::type_complexity)]
+    groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)>,
+}
+
+/// Two partial results of one aggregate combined into the result over both
+/// inputs: counts add, and every other aggregate this is used for (`min` /
+/// `max`, `bool_and` / `bool_or`, an exact `sum`) is itself applied to its
+/// two partials.
+fn combine_partials(item: &secantus_pgplan::AggItem, a: Bson, b: Bson) -> PgWireResult<Bson> {
+    use secantus_pgplan::AggFunc;
+    Ok(match item.func {
+        AggFunc::CountStar | AggFunc::Count => {
+            Bson::Int64(bson_i64(&a).unwrap_or(0) + bson_i64(&b).unwrap_or(0))
+        }
+        _ => {
+            let field = item.field.clone().unwrap_or_else(|| "__p".into());
+            let docs = [a, b].map(|v| {
+                let mut d = Document::new();
+                d.insert(field.clone(), v);
+                d
+            });
+            let mut combine = item.clone();
+            combine.expr = None;
+            combine.field = Some(field);
+            compute_aggregate(&combine, &docs)?
+        }
+    })
+}
+
 /// The input bytes a GROUP BY groups in memory; past them it sorts.
 /// `SECANTUS_PG_GROUP_MEMORY_BYTES` lowers it, so a test can reach the
 /// sorted path with a small table.
@@ -5034,7 +5068,7 @@ impl PgHandler {
         // them -- and after the aggregates are computed, which is the whole
         // point of the clause.
         if let Some(having) = agg.having.as_ref() {
-            groups.retain(|(key, vals)| having_holds(having, key, vals));
+            groups.retain(|(key, vals)| having_holds(having, key, vals, agg.items.len()));
         }
         // `SELECT DISTINCT` over an aggregate dedups the OUTPUT rows -- the
         // select list, so two groups with the same count collapse into one --
@@ -33086,7 +33120,12 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
 /// never projects. Comparison goes through `group_key_ident` so a numeric is
 /// matched by VALUE, the same rule the grouping itself uses, and a NULL on
 /// either side makes the comparison UNKNOWN (never true), as SQL has it.
-fn having_holds(having: &secantus_pgplan::Having, key: &[Option<Bson>], vals: &[Bson]) -> bool {
+fn having_holds(
+    having: &secantus_pgplan::Having,
+    key: &[Option<Bson>],
+    vals: &[Bson],
+    items: usize,
+) -> bool {
     use secantus_pgplan::{Having, OutputCol};
     let value_of = |subject: &OutputCol| -> Option<Bson> {
         match subject {
@@ -33095,14 +33134,16 @@ fn having_holds(having: &secantus_pgplan::Having, key: &[Option<Bson>], vals: &[
                 None | Some(Bson::Null) => None,
                 Some(v) => Some(v.clone()),
             },
-            // `plan_having` only ever names an aggregate or a grouping key.
-            OutputCol::Expr(_) | OutputCol::Grouping(_) => None,
+            // A `GROUPING()` follows the items' values.
+            OutputCol::Grouping(g) => vals.get(items + *g).cloned(),
+            // `plan_having` never names an expression.
+            OutputCol::Expr(_) => None,
         }
     };
     match having {
-        Having::And(parts) => parts.iter().all(|p| having_holds(p, key, vals)),
-        Having::Or(parts) => parts.iter().any(|p| having_holds(p, key, vals)),
-        Having::Not(inner) => !having_holds(inner, key, vals),
+        Having::And(parts) => parts.iter().all(|p| having_holds(p, key, vals, items)),
+        Having::Or(parts) => parts.iter().any(|p| having_holds(p, key, vals, items)),
+        Having::Not(inner) => !having_holds(inner, key, vals, items),
         Having::IsNull { subject, negated } => value_of(subject).is_none() != *negated,
         Having::Compare { subject, op, value } => {
             let Some(have) = value_of(subject) else {
@@ -37974,6 +38015,102 @@ impl PgHandler {
             Ok(out)
         };
         let bound = group_in_memory_bytes();
+        // Each set's aggregate over the slim rows.
+        let set_aggs: Vec<secantus_pgplan::Aggregate> = sets
+            .iter()
+            .map(|set| {
+                let mut one = slim.clone();
+                one.group_by = if set.is_empty() {
+                    vec![secantus_pgplan::GroupKey {
+                        name: String::new(),
+                        field: "\u{1f}no_key".into(),
+                        expr: None,
+                        pg_type: "int4".into(),
+                        typmod: -1,
+                    }]
+                } else {
+                    set.iter().map(|&i| slim.group_by[i].clone()).collect()
+                };
+                one
+            })
+            .collect();
+        // Batch 68: slim rows as wide as the rows (`max(pad)`) are grouped
+        // from ONE read anyway when every aggregate's partial results
+        // combine exactly (`count`, `min` / `max`, `bool_and` / `bool_or`,
+        // an integer or numeric `sum`): the rows are taken a chunk at a
+        // time, each set grouped over the chunk, and each group's partials
+        // combined into a hash of that set's groups -- so memory is the
+        // groups', not the rows'. More groups than the bound holds falls
+        // back to the per-set reads.
+        let hashable = agg.items.iter().all(|it| {
+            use secantus_pgplan::AggFunc;
+            !it.distinct
+                && it.filter.is_none()
+                && it.filter_expr.is_none()
+                && it.order.is_empty()
+                && it.field2.is_none()
+                && it.user.is_none()
+                && match it.func {
+                    AggFunc::CountStar
+                    | AggFunc::Count
+                    | AggFunc::Min
+                    | AggFunc::Max
+                    | AggFunc::BoolAnd
+                    | AggFunc::BoolOr => true,
+                    AggFunc::Sum => {
+                        it.expr.is_none()
+                            && matches!(
+                                it.source_type.as_deref(),
+                                Some("int2" | "int4" | "int8" | "numeric")
+                            )
+                    }
+                    _ => false,
+                }
+        });
+        let mut hashing = false;
+        let mut hash_over = false;
+        let mut hashed: Vec<SetGroups> = sets.iter().map(|_| SetGroups::default()).collect();
+        let mut hash_bytes = 0usize;
+        let mut hchunk: Vec<Document> = Vec::new();
+        let mut hchunk_bytes = 0usize;
+        let hchunk_cap = bound.min(16 << 20);
+        let fold_hash = |rows: Vec<Document>,
+                         hashed: &mut Vec<SetGroups>,
+                         hash_bytes: &mut usize|
+         -> PgWireResult<()> {
+            for (one, state) in set_aggs.iter().zip(hashed.iter_mut()) {
+                for (key, vals) in group_slim_rows(one, &rows)? {
+                    let ident: Vec<Option<Bson>> = key
+                        .iter()
+                        .zip(&one.group_by)
+                        .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                        .collect();
+                    let id = format!("{ident:?}");
+                    match state.index.get(&id) {
+                        Some(&at) => {
+                            let old = std::mem::take(&mut state.groups[at].1);
+                            let mut merged = Vec::with_capacity(old.len());
+                            for ((item, a), b) in one.items.iter().zip(old).zip(vals) {
+                                merged.push(combine_partials(item, a, b)?);
+                            }
+                            state.groups[at].1 = merged;
+                        }
+                        None => {
+                            *hash_bytes += id.len()
+                                + key
+                                    .iter()
+                                    .flatten()
+                                    .chain(&vals)
+                                    .map(|v| stream_join::doc_bytes(&bson::doc! { "v": v.clone() }))
+                                    .sum::<usize>();
+                            state.index.insert(id, state.groups.len());
+                            state.groups.push((key, vals));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
         let mut whole: Vec<Document> = Vec::new();
         let mut whole_bytes = 0usize;
         let mut over = false;
@@ -38006,7 +38143,7 @@ impl PgHandler {
             Ok(())
         };
         let mut sink = |rows: stream_join::RowBatch| -> bool {
-            if wide {
+            if wide || hash_over {
                 return false;
             }
             let step = || -> PgWireResult<()> {
@@ -38025,13 +38162,40 @@ impl PgHandler {
                                 .into_iter()
                                 .sum();
                             if slim_sample * 2 > whole_bytes {
-                                wide = true;
-                                whole.clear();
-                                return Ok(());
+                                if !hashable {
+                                    wide = true;
+                                    whole.clear();
+                                    return Ok(());
+                                }
+                                hashing = true;
+                                let rows = std::mem::take(&mut whole)
+                                    .iter()
+                                    .map(&slim_row)
+                                    .collect::<Result<Vec<_>, _>>()
+                                    .map_err(|e| Self::err(&e))?;
+                                fold_hash(rows, &mut hashed, &mut hash_bytes)?;
+                                if hash_bytes > bound {
+                                    hash_over = true;
+                                    return Ok(());
+                                }
+                                // The rest of this batch is hashed too.
+                                continue;
                             }
                             for w in std::mem::take(&mut whole) {
                                 let r = slim_row(&w).map_err(|e| Self::err(&e))?;
                                 add_slim(r, &mut slim_rows, &mut slim_bytes, &mut spool)?;
+                            }
+                        }
+                    } else if hashing {
+                        let r = slim_row(&d).map_err(|e| Self::err(&e))?;
+                        hchunk_bytes += stream_join::doc_bytes(&r);
+                        hchunk.push(r);
+                        if hchunk_bytes > hchunk_cap {
+                            hchunk_bytes = 0;
+                            fold_hash(std::mem::take(&mut hchunk), &mut hashed, &mut hash_bytes)?;
+                            if hash_bytes > bound {
+                                hash_over = true;
+                                return Ok(());
                             }
                         }
                     } else {
@@ -38043,7 +38207,7 @@ impl PgHandler {
             };
             let r = step();
             match r {
-                Ok(()) => !wide,
+                Ok(()) => !wide && !hash_over,
                 Err(e) => {
                     stopped = Some(e);
                     false
@@ -38079,7 +38243,10 @@ impl PgHandler {
             return Err(e);
         }
         scanned.map_err(|e| Self::storage_err("could not read", e))?;
-        if wide {
+        if hashing && !hash_over && !hchunk.is_empty() {
+            fold_hash(std::mem::take(&mut hchunk), &mut hashed, &mut hash_bytes)?;
+        }
+        if wide || hash_over {
             return Ok(self
                 .grouping_sets_per_set(agg, join)?
                 .map(SetsInput::Groups));
@@ -38089,20 +38256,10 @@ impl PgHandler {
         }
         let width = agg.group_by.len();
         let mut out = Vec::new();
-        for set in sets {
-            let mut one = slim.clone();
-            one.group_by = if set.is_empty() {
-                vec![secantus_pgplan::GroupKey {
-                    name: String::new(),
-                    field: "\u{1f}no_key".into(),
-                    expr: None,
-                    pg_type: "int4".into(),
-                    typmod: -1,
-                }]
-            } else {
-                set.iter().map(|&i| slim.group_by[i].clone()).collect()
-            };
+        for ((set, one), state) in sets.iter().zip(&set_aggs).zip(hashed) {
+            let one = one.clone();
             let mut groups = match spool.as_mut() {
+                _ if hashing => state.groups,
                 None => group_slim_rows(&one, &slim_rows)?,
                 Some(sp) => {
                     let mut feed = stream_join::JoinFeed::spooled(sp.reread()?);

@@ -1230,8 +1230,37 @@ fn rewrite_query(s: &mut pg_query::protobuf::SelectStmt, scope: &Scope) -> Resul
     for d in &mut s.distinct_clause {
         rewrite_expr(d, scope, &outputs)?;
     }
+    // Only a key that IS a bare name may name an output: inside an
+    // expression (`grouping(name)`, `name || 'x'`) a name is an input
+    // column, as in PostgreSQL (batch 68).
     for o in &mut s.sort_clause {
-        rewrite_expr(o, scope, &outputs)?;
+        let bare = matches!(o.node.as_ref(), Some(N::SortBy(sb))
+            if matches!(sb.node.as_deref().and_then(|n| n.node.as_ref()),
+                Some(N::ColumnRef(c)) if names_of(c).is_some_and(|p| p.len() == 1)));
+        if !bare {
+            // An output name inside an expression that no FROM item has is
+            // PostgreSQL's 42703 (it reached the aggregate planner as a
+            // hidden column and came back as a grouping error).
+            walk_expr(o, &mut |n| {
+                if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                    if let Some([name]) = names_of(c).as_deref() {
+                        if outputs.contains(name)
+                            && scope.resolve(std::slice::from_ref(name))?.is_none()
+                        {
+                            if c.location >= 0 {
+                                set_error_location(c.location);
+                            }
+                            return Err(Error::Sqlstate(
+                                "42703",
+                                format!("column \"{name}\" does not exist"),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        rewrite_expr(o, scope, if bare { &outputs } else { &[] })?;
     }
     for w in &mut s.window_clause {
         rewrite_expr(w, scope, &[])?;
