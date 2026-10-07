@@ -1,6 +1,6 @@
 [package]
 name = "secantus-wt"
-version = "0.5.3-beta.172"
+version = "0.5.3-beta.173"
 edition = "2021"
 description = "Safe Rust bindings over the vendored WiredTiger C library — the storage foundation for SecantusDB's Rust engine (Phase 4)."
 license = "GPL-2.0-only"
@@ -41,7 +41,7 @@ bundled = ["dep:secantus-wiredtiger-sys"]
 bindgen = ["dep:bindgen"]
 
 [dependencies]
-secantus-wiredtiger-sys = { version = "=0.5.3-beta.172", path = "../secantus-wiredtiger-sys", optional = true }
+secantus-wiredtiger-sys = { version = "=0.5.3-beta.173", path = "../secantus-wiredtiger-sys", optional = true }
 
 [build-dependencies]
 bindgen = { version = "0.70", optional = true }
