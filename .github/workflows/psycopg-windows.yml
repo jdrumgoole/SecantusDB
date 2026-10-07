@@ -176,6 +176,8 @@ jobs:
 
       - name: TEMP diagnose suspect tests against PostgreSQL and secantusd-pg
         shell: bash
+        env:
+          PGDIAG_TESTS: tests/test_connection.py::test_right_exception_on_session_timeout,tests/pq/test_pgconn.py::test_used_password
         run: .gauge-venv/Scripts/python tools/probes/psycopg_windows_diag.py || true
 
       - name: Run the psycopg gauge against secantusd-pg
@@ -186,9 +188,14 @@ jobs:
           PYTHONUNBUFFERED: "1"
           # Name every test and the slowest ones, so a slow or hung test on
           # this runner is identifiable from the log alone.
-          PYTEST_ADDOPTS: "-vv --durations=40 -rfE --deselect=tests/test_concurrency_async.py::test_type_error_shadow"
+          PYTEST_ADDOPTS: "-vv --durations=40 -rfE"
         run: |
           set +e
+          # The runner image exports PGPASSWORD (for its own PostgreSQL), and
+          # tests/pq/test_pgconn.py::test_used_password then asserts the server
+          # ASKED for a password. secantusd-pg trusts a role with no password,
+          # as the Linux and macOS gauges (which have no PGPASSWORD) measure it.
+          unset PGPASSWORD
           .gauge-venv/Scripts/python -m psycopg_validation.runner
           echo "runner exit: $?"
 
