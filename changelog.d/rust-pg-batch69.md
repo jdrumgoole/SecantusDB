@@ -1,4 +1,4 @@
-### The Rust PostgreSQL server scales with readers, and gauge reports carry the date they were measured
+### The Rust PostgreSQL server scales with readers
 
 Two point-read clients against the Rust PostgreSQL server used to get LESS
 done together than one did alone: 21,000 statements a second for one client
@@ -8,10 +8,6 @@ connection to another, because both per-thread caches were keyed by the
 connection. They are now keyed by what they actually depend on, and the same
 benchmark scales like PostgreSQL 15 does: 1.81x at two clients (PostgreSQL
 1.86x) and 3.6x at eight (PostgreSQL 3.6x).
-
-Every MongoDB driver gauge report now dates its `Generated` line from the raw
-test artifact rather than from the day the report was rendered, so
-re-rendering an old run no longer makes it look current.
 
 #### Fixed
 
@@ -24,8 +20,6 @@ re-rendering an old run no longer makes it look current.
 - `secantus-pgserver`: `pg_get_serial_sequence` on a table that does not exist
   raises `42P01`, and on a column that does not exist `42703`, as PostgreSQL
   does; both used to answer NULL.
-- Driver gauge reports (`*_validation/generate_report.py`): the `Generated`
-  date is the raw artifact's modification date (`validation_summary/measured.py`).
 - psycopg gauge: on Windows it deselects the `proxy`, `timing` and `mypy`
   markers, as psycopg's own Windows CI does, and clears a crash flag left by
   an earlier interrupted run that otherwise stopped every later run.
