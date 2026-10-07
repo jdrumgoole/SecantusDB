@@ -19,6 +19,157 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.7.0b0] — 2026-10-07
+
+### The PyPI package is the Python servers; the Rust servers ship as crates
+
+`pip install SecantusDB` now installs the two Python reference servers (MongoDB
+and PostgreSQL) and WiredTiger, and nothing else. The Rust servers no longer
+ride inside the wheel. The Rust MongoDB server is the `secantus-mdb` crate on
+crates.io: `cargo install secantus-mdb` builds it, WiredTiger included, and
+puts `secantusd-rs` on your `PATH`. From a Rust test, `secantus_mdb::Server`
+starts it in-process. Prebuilt binaries of both Rust servers stay on GitHub
+Releases for machines without a Rust toolchain.
+
+Two things drove the split. Bundling the Rust servers multiplied the size of
+every wheel. That growth pushed the project past PyPI's 10 GB storage quota,
+and `0.6.0b18`'s upload was refused. It also meant a Python user downloaded
+two Rust servers they might never run.
+
+Because this changes what `pip install SecantusDB` gives you, the release
+starts the 0.7 line: it is `0.7.0b0`, not `0.6.0b19`.
+
+#### Changed
+
+- `publish.yml` and `wheels.yml` build the wheel with
+  `SECANTUS_BUILD_STORAGE_ENGINE` off, so it carries no `_secantus_server`,
+  `_secantus_storage` or `secantusd-rs`.
+- **If you used the embedded handle** (`from _secantus_server import
+  RustServer`) from a PyPI install, you have two options. You can run
+  `secantusd-rs` as a subprocess and point `pymongo` at it, or you can use
+  `SecantusDBServer`, which has the same `pymongo` surface. The handle remains
+  available in a source build.
+- The README, the server comparison, the installation pages and the website
+  now give `cargo install secantus-mdb` as the way to get the Rust MongoDB
+  server.
+
+### The Rust PostgreSQL server gives each connection its own thread
+
+The Rust PostgreSQL server now runs every client connection on a thread of
+its own, the way PostgreSQL gives every connection a backend process. A
+statement runs directly on the thread that owns its client, instead of being
+handed off from a shared runtime worker to a blocking thread first, and a
+connection that waits (on a lock, in `pg_sleep`) holds up only itself.
+
+Profiling eight inserting clients showed the server's time going to locks,
+not work: the per-statement hand-off contended on the async runtime's
+blocking-pool mutex, and every table lookup took one process-wide catalog
+cache lock. With both gone, INSERT throughput at 8 clients (one table each,
+no journal sync) rose from about 45k to about 61k statements a second, and
+scaling from 2.8x to 3.6x of one client.
+
+#### Changed
+
+- `secantus-pgserver`: each accepted connection runs on its own OS thread with
+  a one-worker runtime of its own (`server::accept_loop`). Synchronous statement
+  work goes through `blocking_wait`, which runs it in place on a connection's
+  runtime and uses `block_in_place` elsewhere. A notice sent mid-statement
+  still hands the worker off so the socket keeps being driven.
+- `secantus-pgserver`: the table-definition cache (`lookup_inner`) and the
+  committed-catalog cache (`committed_cached`) keep a per-thread copy of what
+  the shared cache holds as current, so a hit takes no shared lock.
+
+### The psycopg gauge now runs the Rust PostgreSQL server on Windows, in CI
+
+psycopg 3's own test suite had never finished against `secantusd-pg` on
+Windows. A new workflow builds the server on `windows-latest` and runs the
+gauge there, so that result now comes from a real run. The run completes,
+and every test it starts reports a result.
+
+#### Added
+
+- `.github/workflows/psycopg-windows.yml`: builds WiredTiger and a debug
+  `secantusd-pg` on `windows-latest`, then runs
+  `SECANTUS_GAUGE_SERVER=rust python -m psycopg_validation.runner`. The job
+  fails when the run is truncated, meaning the tests that started outnumber
+  the ones that reported a result. It runs weekly, on demand, and on PRs that
+  touch `crates/secantus-pg*`, `psycopg_validation/` or the workflow itself.
+- `SECANTUS_PSYCOPG_GAUGE_TIMEOUT` raises the runner's wall-clock cap on
+  slower hosts.
+
+#### Fixed
+
+- The Windows gauge stopped at about 65% of the run. One test,
+  `test_type_error_shadow`, takes 30 s against PostgreSQL itself on that
+  runner, which is more than the gauge's 20 s limit per test. On Windows,
+  pytest-timeout can only use its thread method, so a test that runs over the
+  limit ends the whole pytest process. The test is now deselected on Windows,
+  with that reason written down.
+- Two `test_right_exception_on_session_timeout` tests are deselected on
+  Windows. They expect PostgreSQL's Windows-only behaviour, where an abortive
+  close destroys the server's FATAL. `secantusd-pg` closes the connection
+  gracefully and delivers the real `25P03`.
+- The Windows runner image exports `PGPASSWORD`. That made `test_used_password`
+  expect a password challenge that a trusted role never gets. The variable is
+  now unset for the gauge step.
+- psycopg's `refcount` marker is now excluded on Windows, as psycopg's own
+  scheduled Windows CI does. These are client-side checks that count live
+  Python objects to find leaks. On the runner they passed in one run and
+  failed 75 `test_leak` cases in the next, some with negative counts.
+
+### The Rust PostgreSQL server is ready for crates.io as `secantus-pg`
+
+The Rust PostgreSQL server's crate is now `secantus-pg`, the name it will have
+on crates.io, and it can be embedded in a Rust test in one line:
+`secantus_pg::PgServer::start()` opens a temporary store, binds a free port and
+hands back `dsn()` / `url()` for `tokio-postgres` or any other client; dropping
+it stops the server, checkpoints the store and removes it. It is the
+PostgreSQL counterpart of `secantus_mdb::Server`, and like it is safe to start
+and drop inside `#[tokio::test]`. The `secantusd-pg` binary is unchanged.
+
+All four PostgreSQL-side crates are now publishable, and the release pipeline
+publishes them from a `secantusd-pg-v*` tag. Nothing has been published yet;
+the first publish happens at the next PostgreSQL server release.
+
+#### Added
+
+- `secantus_pg::PgServer` and `PgBuilder` (`.storage_path`, `.host`, `.port`,
+  `.databases`, `.cache_size`, 256M by default), with `address()`, `port()`,
+  `dsn()`, `url()`, `stop()` and `Drop`. A temporary store is removed only
+  once `RunningPgServer::store_closed()` confirms WiredTiger closed it. Tests
+  in `crates/secantus-pg/tests/pg_server.rs` (both tokio runtime flavours, a
+  persistent store across a restart, 50 servers in parallel), a doc-test, and
+  `examples/quickstart.rs`.
+- `secantus_pg::open_storage_with_cache`, the PG server's storage open with a
+  cache size other than the daemon's 4G.
+- `secantus-pgwire`: the vendored pgwire 0.40.7 fork, moved from
+  `crates/vendor/pgwire` to `crates/secantus-pgwire` and made a publishable
+  crate. crates.io ignores `[patch]`, and the fork has diverged too far from
+  upstream for one small upstream PR to replace it. The library keeps the name
+  `pgwire`.
+- crates.io metadata, exact `=` version pins, READMEs and `rust-version` on
+  `secantus-pg`, `secantus-pgplan`, `secantus-pgcatalog` and
+  `secantus-pgwire`; `cargo binstall secantus-pg` metadata pointing at the
+  `secantusd-pg-v*` release archives.
+- `scripts/crates_package_check.py --line {mdb,pg,all}`, and the
+  `crates-package.yml` gate now packages and builds both lines from their
+  tarballs. `publish-crates.yml` fires on `secantusd-pg-v*` tags as well and
+  publishes the PG line (`crates_publish.py --line pg`), refusing to start
+  if a MongoDB-side crate it pins is not on crates.io yet.
+- `./inv rust-version-bump --line pg --to <ver>` bumps the PG version line.
+
+#### Changed
+
+- `crates/secantus-pgserver` is now `crates/secantus-pg` (package
+  `secantus-pg`, library `secantus_pg`), licensed GPL-2.0-only as the plan
+  decided; `secantus-pgplan` / `secantus-pgcatalog` stay Apache-2.0. Every
+  path in the workflows, invoke tasks, gauges, probes, benches and tests moved
+  with it.
+- The binary's signal-handling dependencies sit behind a default-on `bin`
+  feature; the Python extension builds the library without them.
+- `secantusd-pg --version` prints `source: crates.io` for a build from a
+  packaged crate, as `secantusd-rs` does.
+
 ### The oplog pruner stops monopolising the Rust PostgreSQL server's journal
 
 In durable mode, concurrent INSERT throughput on the Rust PostgreSQL server
