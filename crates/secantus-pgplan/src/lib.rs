@@ -12199,6 +12199,9 @@ pub(crate) fn walk_expr(
         N::CollateClause(c) => c.arg.as_deref_mut().map_or(Ok(()), |a| walk_expr(a, visit)),
         N::NamedArgExpr(a) => a.arg.as_deref_mut().map_or(Ok(()), |a| walk_expr(a, visit)),
         N::GroupingSet(g) => g.content.iter_mut().try_for_each(|a| walk_expr(a, visit)),
+        // `GROUPING(a, b)`'s arguments are expressions of this row (a join's
+        // rewrite must reach them, batch 68).
+        N::GroupingFunc(g) => g.args.iter_mut().try_for_each(|a| walk_expr(a, visit)),
         N::List(l) => l.items.iter_mut().try_for_each(|a| walk_expr(a, visit)),
         // The TESTED expression of `x IN (select ...)` belongs to this row;
         // the subquery's body does not (see above).
@@ -12746,6 +12749,53 @@ fn plan_set_operation(
 /// rather than the table, which this slice does not do -- so it is refused as
 /// unsupported. Resolving it against the table instead reported the key as an
 /// undefined column, which is a different and misleading answer.
+/// The `GROUPING()` calls an aggregate computes, while HAVING may add one.
+struct GroupingsCtx<'a> {
+    groupings: &'a mut Vec<Vec<usize>>,
+    prints: &'a [String],
+}
+
+/// The GROUP BY keys a `GROUPING(a, b, ...)` names, by index.
+fn grouping_indices(
+    g: &pg_query::protobuf::GroupingFunc,
+    group_by: &[GroupKey],
+    group_prints: &[String],
+) -> Result<Vec<usize>> {
+    let mut idxs = Vec::new();
+    for a in &g.args {
+        let print = node_print(a);
+        let by_name = match a.node.as_ref() {
+            Some(N::ColumnRef(c)) => column_ref_name(c).and_then(|n| {
+                group_by
+                    .iter()
+                    .position(|k| k.expr.is_none() && k.name == n)
+            }),
+            _ => None,
+        };
+        let idx = group_prints
+            .iter()
+            .position(|p| *p == print)
+            .or(by_name)
+            .ok_or_else(|| {
+                if let Some(at) = expr_location(a).filter(|l| *l >= 0) {
+                    set_error_location(at);
+                }
+                Error::Grouping(
+                    "arguments to GROUPING must be grouping expressions of the associated query level"
+                        .into(),
+                )
+            })?;
+        idxs.push(idx);
+    }
+    if idxs.len() > 31 {
+        return Err(Error::Sqlstate(
+            "54011",
+            "GROUPING must have fewer than 32 arguments".into(),
+        ));
+    }
+    Ok(idxs)
+}
+
 /// Plan a `HAVING` predicate against a query's groups and aggregates.
 ///
 /// An aggregate written in HAVING need not be in the SELECT list, so one that
@@ -12762,13 +12812,14 @@ fn plan_having(
     group_by: &[GroupKey],
     items: &mut Vec<AggItem>,
     params: &[Bson],
+    groupings: &mut GroupingsCtx<'_>,
 ) -> Result<Having> {
     match node.node.as_ref() {
         Some(N::BoolExpr(b)) => {
             let parts: Result<Vec<Having>> = b
                 .args
                 .iter()
-                .map(|a| plan_having(a, def, group_by, items, params))
+                .map(|a| plan_having(a, def, group_by, items, params, groupings))
                 .collect();
             let parts = parts?;
             match BoolExprType::try_from(b.boolop) {
@@ -12785,7 +12836,8 @@ fn plan_having(
             }
         }
         Some(N::NullTest(t)) => {
-            let subject = having_subject(t.arg.as_deref(), def, group_by, items, params)?;
+            let subject =
+                having_subject(t.arg.as_deref(), def, group_by, items, params, groupings)?;
             let negated = matches!(
                 NullTestType::try_from(t.nulltesttype),
                 Ok(NullTestType::IsNotNull)
@@ -12800,8 +12852,27 @@ fn plan_having(
             // The constant may be written on either side; a comparison with a
             // constant on the LEFT flips, so `100 < count(*)` keeps meaning
             // what it says.
-            let subject_on_left =
-                having_subject(e.lexpr.as_deref(), def, group_by, items, params).is_ok();
+            // Probed on a copy: a failed probe must not leave a GROUPING
+            // behind.
+            let probe_side = |side: Option<&pg_query::protobuf::Node>| {
+                let mut probe_items = items.clone();
+                let mut probe_groupings = groupings.groupings.clone();
+                let mut probe = GroupingsCtx {
+                    groupings: &mut probe_groupings,
+                    prints: groupings.prints,
+                };
+                having_subject(side, def, group_by, &mut probe_items, params, &mut probe)
+            };
+            let left_try = probe_side(e.lexpr.as_deref());
+            let subject_on_left = left_try.is_ok();
+            // Neither side a grouped value: the LEFT side's error (a
+            // misplaced `GROUPING(k)` is PostgreSQL's 42803 about it).
+            if let Err(left_err) = left_try {
+                if matches!(left_err, Error::Grouping(_)) && probe_side(e.rexpr.as_deref()).is_err()
+                {
+                    return Err(left_err);
+                }
+            }
             let (subject_node, value_node) = if subject_on_left {
                 (e.lexpr.as_deref(), e.rexpr.as_deref())
             } else {
@@ -12818,7 +12889,7 @@ fn plan_having(
                     other => other.to_string(),
                 }
             };
-            let subject = having_subject(subject_node, def, group_by, items, params)?;
+            let subject = having_subject(subject_node, def, group_by, items, params, groupings)?;
             let value = const_value(
                 value_node.ok_or_else(|| Error::Parse("HAVING without an operand".into()))?,
                 params,
@@ -12842,9 +12913,23 @@ fn having_subject(
     group_by: &[GroupKey],
     items: &mut Vec<AggItem>,
     _params: &[Bson],
+    groupings: &mut GroupingsCtx<'_>,
 ) -> Result<OutputCol> {
     let node = node.ok_or_else(|| Error::Parse("a HAVING term without an operand".into()))?;
     match node.node.as_ref() {
+        // `GROUPING(a, ...)` tested in HAVING (batch 68): computed for the
+        // test like a hidden aggregate.
+        Some(N::GroupingFunc(g)) => {
+            let idxs = grouping_indices(g, group_by, groupings.prints)?;
+            let at = match groupings.groupings.iter().position(|e| *e == idxs) {
+                Some(at) => at,
+                None => {
+                    groupings.groupings.push(idxs);
+                    groupings.groupings.len() - 1
+                }
+            };
+            Ok(OutputCol::Grouping(at))
+        }
         Some(N::FuncCall(f)) if is_aggregate_call(f) => {
             let item = plan_aggregate_item(
                 f,
@@ -19981,31 +20066,7 @@ fn finish_aggregate(
         // below answers `this target is not supported yet`, which tells a
         // reader nothing about which part of their query to change.
         if let Some(N::GroupingFunc(g)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-            let mut idxs = Vec::new();
-            for a in &g.args {
-                let print = node_print(a);
-                let by_name = match a.node.as_ref() {
-                    Some(N::ColumnRef(c)) => column_ref_name(c).and_then(|n| {
-                        group_by
-                            .iter()
-                            .position(|k| k.expr.is_none() && k.name == n)
-                    }),
-                    _ => None,
-                };
-                let idx = group_prints.iter().position(|p| *p == print).or(by_name).ok_or_else(|| {
-                    Error::Grouping(
-                        "arguments to GROUPING must be grouping expressions of the associated query level"
-                            .into(),
-                    )
-                })?;
-                idxs.push(idx);
-            }
-            if idxs.len() > 31 {
-                return Err(Error::Sqlstate(
-                    "54011",
-                    "GROUPING must have fewer than 32 arguments".into(),
-                ));
-            }
+            let idxs = grouping_indices(g, &group_by, &group_prints)?;
             let out = if rt.name.is_empty() {
                 "grouping".to_string()
             } else {
@@ -20198,7 +20259,17 @@ fn finish_aggregate(
     // the test and never projected.
     let having = match s.having_clause.as_deref() {
         None => None,
-        Some(node) => Some(plan_having(node, &def, &group_by, &mut items, params)?),
+        Some(node) => Some(plan_having(
+            node,
+            &def,
+            &group_by,
+            &mut items,
+            params,
+            &mut GroupingsCtx {
+                groupings: &mut groupings,
+                prints: &group_prints,
+            },
+        )?),
     };
 
     let (limit, offset) = limit_offset(s, params)?;
@@ -28191,12 +28262,37 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// parameter). Anything else stays `None`, so `pg_typeof($1)` still reports
 /// what PostgreSQL does for a parameter with no context: an error.
 pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
-    let mut inferred = declared.to_vec();
     // Only an undeclared parameter is inferred: with none, there is nothing
     // to walk the statement for (most clients declare every one).
-    if inferred.iter().all(Option::is_some) {
-        return inferred;
+    if declared.iter().all(Option::is_some) {
+        return declared.to_vec();
     }
+    // The answer depends on the text and the declarations alone, and a
+    // prepared statement asks again at every Execute: remembered per thread
+    // (batch 68; the parse was ~0.9 us of a primary-key read through libpq,
+    // which declares no parameter types).
+    thread_local! {
+        #[allow(clippy::type_complexity)]
+        static INFERRED: std::cell::RefCell<std::collections::HashMap<(String, Vec<Option<String>>), Vec<Option<String>>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (sql.to_string(), declared.to_vec());
+    if let Some(hit) = INFERRED.with(|m| m.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let inferred = infer_param_types_uncached(sql, declared);
+    INFERRED.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 256 {
+            m.clear();
+        }
+        m.insert(key, inferred.clone());
+    });
+    inferred
+}
+
+fn infer_param_types_uncached(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
+    let mut inferred = declared.to_vec();
     let Ok(parsed) = parse_tree(sql) else {
         return inferred;
     };
