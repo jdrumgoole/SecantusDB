@@ -19,6 +19,4858 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b18] — 2026-10-07
+
+### Every MongoDB backlog item closed, and a Rust PostgreSQL server that runs real SQL
+
+This release bundles 131 slices. Three themes stand out.
+
+The first is the Rust PostgreSQL server, which went from a protocol and type
+system with a thin query language to most of what an application writes. It
+gained general JOINs, subqueries and CTEs, window functions, `GROUPING SETS`,
+`ON CONFLICT`, sequences, `ALTER TABLE`, views and indexes, user functions and
+triggers, `MERGE`, row-level security, full-text search, and PostgreSQL's own
+catalogs. Much of it now streams in bounded memory. Every piece was measured
+against a real PostgreSQL rather than written from the documentation. Several
+fixes were silent wrong answers. A `DELETE ... USING` deleted every row, an
+`UPDATE ... FROM` wrote to every row, and an autocommit write could lose a
+concurrent update.
+
+The second is the MongoDB servers. Every open backlog item for the Rust and
+Python MongoDB servers was reproduced against mongod 8.2.11 and either fixed,
+closed by re-measurement, or given a written disposition. The Python reference
+server caught up with the Rust one. On every differential probe, both now give
+mongod's answers, apart from documented, deliberate differences. Seven of the
+fixes were silent writes, for example a failed `updateMany` that rolled back
+work mongod keeps, and a `$set` past the end of an array that stored nothing.
+Both servers now also read date strings with mongod's own parser, a port of
+timelib.
+
+The third is honesty in the published numbers. A Go gauge had reported 100%
+over a run that stopped three-quarters of the way through, and a crashed
+pymongo gauge had published a fabricated report. The driver panels could only
+ever show the Python server. All of these now refuse to publish a number they
+did not measure. A stale build is caught for every artifact, and reports are
+stamped with the date of the data behind them.
+
+### The admin screenshots regenerate correctly on Windows
+
+The 22 admin-UI screenshots had not been regenerated since `0.6.0b11`
+(2026-08-15), so the published images still showed a `0.6.0b10` version
+badge six releases later. `tests/test_docs_screenshots.py` cannot catch
+this — it checks that every documented page *has* an image, and nothing
+checks what is in one.
+
+Regenerating on Windows then surfaced two faults in the capture script
+itself, both of which would have shipped a worse image than the stale one
+they replaced.
+
+#### Fixed
+
+- `scripts/admin_screenshots.py` scrubbed machine-specific paths by
+  rewriting only their PREFIX, so on Windows every segment after the
+  placeholder kept its backslash and the docs would have shown
+  `/var/lib/secantus\backups` and `/home/user\.secantus\embedded-data`.
+  The scrubber now re-slashes the run of path characters it has just
+  written, and leaves backslashes anywhere else on the page alone.
+
+#### Changed
+
+- Regenerated all 22 admin screenshots at `0.6.0b17`.
+
+### `apiStrict: true` now rejects a command outside the Stable API
+
+A client that declares `serverApi: {version: "1", strict: true}` is asking the
+server to refuse anything outside MongoDB's Stable API Version 1. SecantusDB
+accepted those commands and ran them, which is the one thing a strict client has
+explicitly asked you not to do — a driver using strict mode to catch
+non-portable calls in CI got a clean run and a false sense of portability.
+
+Both servers now answer mongod's `APIStrictError` (323), with mongod's own
+message, for a command outside Version 1. The rule has three branches rather
+than the two the specification's wording suggests, and the third is the one that
+matters: a command the server *has* but that sits outside Version 1 is rejected,
+a command inside Version 1 runs, and a command that **does not exist at all**
+still answers `CommandNotFound` (59) even under `apiStrict`. A check that simply
+refused everything it did not recognise would get that last case wrong.
+
+The membership list was measured, not transcribed, by sending every command
+SecantusDB implements to a real mongod 8.2.11 under `apiStrict: true` and
+recording which it refused. That is how `distinct`, `buildInfo`, `isMaster` and
+`serverStatus` turned out to be *outside* the Stable API while `count` and
+`hello` are inside it — a set assembled by reading the manual would have had
+several of those the wrong way round.
+
+#### Fixed
+- `commands.py` / `crates/secantus-commands`: `apiStrict: true` answers
+  `APIStrictError` (323) for a command outside Stable API Version 1, with
+  mongod's verbatim message including the dochub link.
+- The aggregation-stage message was wrong on both servers. mongod says
+  `$listLocalSessions is not allowed with 'apiStrict: true' in API Version 1`;
+  we said `Provided aggregation pipeline stage ... is not in API Version 1`.
+- Closes the `apiStrict` failure in **two** driver gauges — pymongo's
+  `TestVersionedApiTestCommandsStrictMode` and the Java driver's
+  `VersionedApiTest` strict-mode case. Two unrelated drivers failing the same
+  behaviour is what marked it as a real gap rather than a harness artifact.
+
+#### Changed
+- Replaced the narrow `_API_V1_REJECTED_BY_NAME` gate (just `distinct`, with a
+  non-mongod message) and the Rust `name == "distinct"` canary with one measured
+  allowlist per server. The old gate's comment said a full allowlist "would
+  reject `count`"; probing mongod showed `count` is in Version 1, so that
+  objection was a guess rather than a measurement.
+
+#### Testing
+- `tests/test_mongod_differential.py`: eleven cases asserting an exact match —
+  code, codeName and errmsg — against a live mongod, covering all three
+  branches. `testVersion2` is deliberately excluded: it is gated behind
+  `enableTestCommands`, so including it would assert the fixture's configuration
+  rather than our conformance. The driver gauges cover that one.
+
+### A stale build was only caught for one of four artifacts
+
+#1489 added a collection-time check that refuses to run when the installed
+`_secantus_core` was built from different sources than the checkout. It covered
+that one extension. `_secantus_server`, `secantusd-pg` and `secantusd-rs` had no
+such protection, and on 2026-09-27 that cost **nine false-regression diagnoses in
+a single session**:
+
+- a stale `_secantus_server` — six days behind, predating #1569 — failed a
+  colleague's entire new failpoint test file with 3 failures and a **hang** that
+  killed three xdist workers at 99%, surfacing as a bare `rc=70` with no summary
+  line. It was diagnosed as "main is broken" and reported as such. 13 of 13
+  passed after a rebuild, with no code change.
+- a stale `secantusd-pg` produced failures on **six** separate occasions, each
+  time in the test file whose fix the binary predated, each time reading as
+  somebody else's regression.
+
+The binaries already **carried** a source stamp from #1492 and nothing read it —
+the worst arrangement, with the evidence sitting in `--version` output that no
+automated thing looked at.
+
+#### Added
+
+- `secantus-server-py`: `build.rs` stamps the crates tree hash, exposed as
+  `_secantus_server.__source_tree__`, mirroring `secantus-core-py`.
+- `tests/conftest.py`: the collection-time check now covers all four artifacts,
+  reading the binaries' stamps via `--version`.
+- `tests/test_build_provenance.py`: cases for the generic check, weighted toward
+  the configurations where it must stay **silent** — an unstamped artifact, a
+  checkout git cannot read, a binary that is not built — because a false
+  positive is how a check gets disabled.
+
+#### Notes on the design
+
+The identifier is a git **tree** hash, not the commit SHA (which moves on every
+commit and would cry stale constantly) and not the package version (constant for
+these path dependencies — #1489 measured `beta.163` reported by a build stale
+enough to need rebuilding twice in a day). This is why no Python packaging tool
+solves it: pip and uv compare versions, and `uv sync` reuses a cached build for a
+path dependency whose version has not moved.
+
+`_secantus_core` keeps its narrower two-crate stamp so an unrelated crate's
+change does not read as stale there; the server extension links most of the
+workspace and takes the whole `crates` tree, which is also what both binaries
+stamp. Conflating them would either over-report on core or under-report on the
+server.
+
+The rebuild commands are asserted against `rust_tasks.py` rather than trusted:
+the first draft pointed `secantusd-rs` at `rust-server-build`, which rebuilds the
+embedded extension instead of the binary. A check that prints the wrong remedy
+sends the reader on a detour and teaches them to distrust it.
+
+### The C driver gauge covers change streams again
+
+Running libmongoc's suite against a `--standalone` server fixed four tests
+that assert standalone semantics, but libmongoc then skipped every test that
+needs a replica set -- most of its change-stream suite. The gauge now runs the
+suite against the default single-node replica set and re-runs just the six
+standalone-only tests against a standalone server, then merges the two. On the
+Rust server that is 790 passed, 2 failed (the known IPv6 tests), up from 768.
+
+#### Changed
+
+- `c_validation` runs two passes and merges them; the standalone tests are
+  listed in `c_validation/include_paths.py` as `STANDALONE_ONLY`.
+
+### `cbrt` is judged against the platform's libm, not a hardcoded 3.0
+
+Three `cbrt` tests asserted that `cbrt(27.0)` is exactly `3.0`. That is what
+Windows and macOS answer — and it is not what Linux answers. PostgreSQL's
+`dcbrt` is a bare libm `cbrt()` call, libm is not correctly rounded, and glibc
+2.39 returns `3.0000000000000004` for that input: exactly one ULP high, while
+8, 64, 125 and 1e6 come out exact. So PostgreSQL on Linux returns
+`3.0000000000000004` too, and the assertion was pinning the wrong platform's
+answer.
+
+The tests now assert to within one ULP, plus a separate check that we hand
+libm's value through byte-for-byte — which is the property that matters, since
+being *more* exact than libm would move us away from PostgreSQL. `_real_cbrt`
+itself is unchanged; its docstring already named this trade-off correctly.
+
+Worth recording how it hid for so long: a push or PR run tests only Python 3.10
+on Linux, and 3.10 has no `math.cbrt`, so it takes a Newton-refined fallback
+that rounds the ULP away and passes. Only the full 3.10–3.13 matrix — a
+`workflow_dispatch` or the weekly cron — runs the Python versions that fail. It
+had been red in the cron before anyone looked.
+
+#### Fixed
+
+- `tests/test_sql_missing_builtins.py`: `cbrt` expectations are no longer
+  hardcoded floats. Verified by emulating glibc's `cbrt(27.0)` on a non-Linux
+  box: the old assertions fail with exactly the three names CI reported, the new
+  ones pass.
+
+#### Added
+
+- A test that a 1-ULP libm value survives the SQL layer unrounded, so nothing
+  between the function and the result row quietly "corrects" it.
+- Two backlog entries: the ≤1 ULP divergence the 3.10 fallback causes against
+  PostgreSQL on Linux (a record, not a task — it disappears when 3.10 support
+  does), and the CI matrix gap that let a 3.11+ Linux failure stay invisible to
+  every pull request.
+
+### The MongoDB-side Rust crates are publishable
+
+The ten crates behind the Rust MongoDB server now package for crates.io, and a
+CI gate keeps them that way.
+
+#### Changed
+
+- The `secantusdb` crate is now named `secantus-mdb`. Its directory, the
+  `secantusd-rs` binary and the `secantusdb-v*` release tags are unchanged.
+- `secantus-wt` now builds through the bundled WiredTiger by default. The
+  `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB` override still links a prebuilt
+  WiredTiger, which is how the wheel and the release binaries build. zlib and
+  lz4 are now linked statically from bundled sources everywhere: zlib from
+  `libz-sys`, and lz4 from `lz4.c` alone, vendored in `secantus-wiredtiger-sys`.
+  It is not `lz4-sys`, because that crate's bundled xxhash collides with
+  libpg_query's when both link into the PostgreSQL server.
+- Regenerating the bindings with bindgen is now opt-in (`--features bindgen`).
+  `./inv rust-wt-test` turns it on, so the drift check still runs in CI.
+- `secantus-wiredtiger-sys` joins the MongoDB server's version line.
+
+#### Added
+
+- Every one of the ten crates has crates.io metadata, a README, and exact
+  `=version` pins on its sibling crates. The internal crates say they carry no
+  semver promise.
+- `secantusd-rs --version` prints `source: crates.io` for a build from a
+  packaged crate, which has no git tree to stamp.
+- docs.rs can document the crates without compiling WiredTiger.
+- `scripts/crates_package_check.py` packages all ten crates together and builds
+  each one from its own tarball. The new `crates-package.yml` workflow runs it
+  on every PR that touches `crates/`.
+
+### Rust release tooling for crates.io
+
+A Rust release now bumps, checks and publishes the crates in one consistent
+path.
+
+#### Added
+
+- `./inv rust-version-bump --to <version>` bumps the Rust MongoDB server's
+  lockstep version. It rewrites every version, every exact `=` pin between the
+  crates, and every `Cargo.lock` that records one. It then fails if the old
+  version survives anywhere or a lockfile no longer resolves `--locked`, which
+  the release builds require.
+- `cargo binstall secantus-mdb` installs the prebuilt, PGO-optimised
+  `secantusd-rs` from the GitHub release instead of compiling WiredTiger.
+
+#### Changed
+
+- The crates.io publish step publishes one crate at a time and skips any
+  version that is already published. A run that failed part way is fixed by
+  re-running it on the same tag.
+
+### `featureCompatibilityVersion` said 7.0 while the server said 8.2.11
+
+`getParameter` reported `featureCompatibilityVersion: {version: "7.0"}` on both
+servers. The handshake right next to it reported `buildInfo.version` `8.2.11`,
+`versionArray` `[8, 2, 11, 0]` and `maxWireVersion` 27 — so the value
+contradicted the same server's own answers, not merely mongod's. A client
+gating a feature on FCV was told this is a 7.0 deployment.
+
+Measured against a mongod 8.2.11, which answers `{"version": "8.2"}` — the
+major.minor of the running binary.
+
+#### Fixed
+
+- Both servers now derive the string from `SERVER_VERSION_ARRAY` instead of
+  carrying a second copy of the version. As a literal it survived the retarget
+  from 6.0 to 8.x untouched while every other version surface moved; deriving it
+  is what stops that recurring.
+
+#### Added
+
+- A differential test asserting FCV equals mongod's, and a value assertion in
+  the Rust `get_parameter_named_and_all` unit test.
+
+  The two tests that already looked at this parameter asserted only that the KEY
+  was present — which is exactly the assertion a stale literal survives, and why
+  nothing caught a wrong value for the whole life of the 8.x retarget.
+
+### The Go gauge was hiding 16 failures behind a 100% score
+
+It had been reporting **100.0%** over a run that never finished. `go test`
+killing itself on `-timeout` panics the binary without emitting a terminal event
+for the tests still in flight, so 476 of 481 reported and the summariser scored
+the survivors as perfect. **A truncated run looks better the more tests go
+missing**, which is why it survived review — in every committed report back
+through 2026-09-21.
+
+With the run completing: **594 passed / 16 failed / 49 skipped over 659 tests —
+97.3%**, on both servers. The 16 failures are not new; they simply never ran.
+
+#### Fixed
+
+- `TestInitialDNSSeedlistDiscoverySpec/replica_set` excluded — the narrow branch,
+  not the whole spec, whose `sharded`, `load_balanced` and non-RS cases all run.
+
+  It blocks forever: `getServerByAddress` calls
+  `topo.SelectServer(context.Background(), ...)` — no deadline — waiting for the
+  SRV-resolved `localhost:27017` to join the topology. Our daemon binds an
+  ephemeral port, so it never joins. The subtest is gated on the replica-set
+  persona this gauge deliberately keeps for change streams, so `--standalone`
+  cannot dodge it the way it does for the C gauge.
+
+  What is lost: the Go driver's own SRV/TXT resolver. No SecantusDB code path.
+  Measured: 803 started / 798 finished / 5 hung before, **659 / 659 / 0 in ~6
+  minutes** after — the timeout had also been costing 30 minutes per run.
+
+#### Found
+
+Eight distinct leaf failures, triaged in `tasks/backlog.md`. Two are worth
+naming here: **`setParameter` is not implemented on either server** (mongod has
+it), and **`replSetStepDown` answers 59 where a standalone mongod answers 76
+`NoReplicationEnabled`** — a divergence rather than an unimplemented feature. Two
+more, the SDAM pool-clearing pair, assert the pool is *not* cleared on a timeout
+or cancelled context, and look most likely to be real.
+
+### The Go gauge reported 100.0% over a run that stopped three-quarters of the way through
+
+`go test` killing itself on `-timeout` panics the binary **without** emitting a
+terminal event for the tests still in flight. The summariser therefore counted
+only the tests that finished, found no failures among them, and printed 100.0%
+— while the package-level event in the same file said `fail`. The two
+disagreed, and nothing compared them.
+
+Every recorded run of this gauge had been truncated at the same point: 476 of
+481 tests, on **both** servers, including the committed 2026-09-21 report. The
+five that never complete are `TestInitialDNSSeedlistDiscoverySpec` and two
+others, which resolve SRV/TXT records against `mongodb.test.build.10gen.cc` —
+DNS tests that never open a connection to SecantusDB, and which cost 30 minutes
+of wall clock per run before the binary gives up.
+
+So the published "Go: 100%" has never described the whole include set. What it
+did describe is real: 439 of 439 tests that ran passed.
+
+#### Fixed
+
+- The report generator now detects a truncated run — a test that emitted `run`
+  with no terminal event, or a package reporting `fail` with no failing test
+  beneath it — and refuses to present the rate as a result: the report opens
+  with a banner naming the tests that never finished, and the process exits
+  non-zero.
+
+  The banner goes **above** the table on purpose. A reader who meets the numbers
+  first has already formed a view of the pass rate by the time a footnote
+  reaches them.
+
+- An ordinary red run (a package `fail` **with** a failing test under it) is
+  deliberately not flagged. A guard that cried truncation at every failing gauge
+  would be ignored exactly when it mattered.
+
+#### Added
+
+- `tests/test_go_gauge_truncation.py`, the Go counterpart of the pgjdbc guard in
+  `tests/test_pgjdbc_gauge_truncation.py` — which already existed, and which the
+  Go gauge simply never had.
+
+#### How it was found
+
+A fresh Rust-server run and a stale report from a different server, a different
+version and a week earlier carried **identical** numbers. Agreement between a
+fresh artifact and a stale one reads as confirmation; here it meant both were
+cut off at the same DNS hang. The honest signal was the wall clock: 30m 09s for
+a gauge whose own timeout is 30m is a truncation, not a slow run.
+
+---
+
+### A crashed pymongo gauge published a fabricated report
+
+Separate bug, same class, found in the same run. The two pymongo tasks run
+pytest with `warn=True` — correctly, since a partially-red suite still owes us a
+report — and then generated the report **unconditionally**. Unlike `_run_gauge`,
+they never cleared the raw artifact first.
+
+So `invoke validate --server rust` died in **one second** on a missing
+`_secantus_server`, collected zero tests, and rewrote
+`docs/validation-report-rust-server.md` as *"Generated 2026-09-28 — SecantusDB
+0.6.0b17"*, **99.4%** — over a raw artifact from **30 August**.
+
+The figures had even drifted against the previous report (99.5% → 99.4%, with a
+new failing test) because the generator changed under the same data. A reader
+diffing the file would have concluded a fresh run had caught a regression.
+
+#### Fixed
+
+- Both pymongo tasks now clear the raw before the run and refuse to generate a
+  report when the run produced none, leaving the previous report untouched and
+  naming the usual cause (`invoke rust-server-build`).
+
+#### Also found, not fixed here
+
+Seven `-rust-server` reports claim *"Generated 2026-09-21 — 0.6.0b16"* over raw
+artifacts dated 10–30 August: pymongo, pymongo-async, c, cxx, dotnet, php-ext
+and php-lib. The date records when the generator ran, not when the tests did.
+Filed in `tasks/backlog.md`.
+
+### Drivers now speak modern `hello` instead of falling back to legacy `isMaster`
+
+A driver puts `helloOk: true` in its opening handshake to ask whether the server
+understands the modern `hello` command; a server that does echoes `helloOk: true`
+back, and the driver uses `hello` from then on. Neither SecantusDB server echoed
+it, so every modern driver concluded the server predated `hello` and fell back to
+the legacy `isMaster` — on every connection it opened, for the life of that
+connection.
+
+That was visible on the wire rather than inferred: captured through a logging
+proxy, mongo-go-driver's SDAM monitor sent `isMaster exhaustAllowed` to
+SecantusDB and `hello exhaustAllowed` to a real mongod, and did no RTT
+monitoring against us at all. Both servers now echo the flag, and only when the
+client asks for it — mongod omits it otherwise, so echoing unconditionally would
+be its own divergence.
+
+#### Fixed
+- `hello` / `isMaster` echo `helloOk: true` when the client's request carries it, over both the initial OP_QUERY handshake and OP_MSG, matching mongod 8.2.11.
+
+### Indexes order embedded documents and arrays by value
+
+An index keyed a document or an array by its raw BSON, which begins with the
+value's length, so byte order was size order: `{a: 2, b: [3]}` sorted above
+`{a: 5}` because it is longer. The Rust server refused to use an index for a
+range or sort over such values; the Python server used it anyway and scanned
+the wrong part of the index. Both servers now key documents and arrays the way
+mongod compares them, element by element, and use the index.
+
+#### Changed
+
+- **Index entry format 4.** A store whose indexes were written by an earlier
+  build is refused at open with `IncompatibleStorageFormatError`; drop and
+  recreate the indexes (the documents themselves are untouched -- `_id` keys
+  keep their encoding).
+- Range queries, partial-index use and sorts over document-valued fields use
+  the index on the Rust server again; on the Python server they now return the
+  right documents.
+- Strings inside documents and arrays follow the index's collation, as they do
+  in mongod.
+
+#### Added
+
+- `tools/probes/value_order_encoding.py`: the index encoder against mongod's
+  `$cmp` over 16,110 random pairs.
+
+### A LIKE pattern ending in an escape character matched instead of nothing
+
+A trailing escape has no character to escape. Falling through to the default
+branch treated it as a literal backslash, so a pattern of `a` + backslash
+matched a value of `a` + backslash — where PostgreSQL returns no rows.
+
+Measured on PostgreSQL 14 (2026-09-25) with a matching row present and the
+pattern bound as a parameter: no rows, and no error.
+
+#### Fixed
+
+- `_like_to_regex` returns a never-matching regex when the escape character is
+  the last character of the pattern.
+
+The check happens **during** the pattern scan, not with `endswith`. A pattern of
+`a` + two backslashes also *ends* with the escape character, but there the first
+consumes the second and it matches one literal backslash perfectly well — a
+first version of this guard used `endswith` and broke exactly that case. Both
+sides are pinned by the tests, along with the same pair under a custom `ESCAPE`
+character and the `ESCAPE ''` case where escaping is disabled and a trailing
+backslash really is literal.
+
+Found from pgjdbc's `DatabaseMetaDataTest::escaping`.
+
+### `./inv rust-gate` lints the same scope as CI again
+
+When CI's lint step was widened from `src tests` to `.`, `rust_tasks.py`'s gate
+was left at the old scope — so the gate would have passed while CI failed, which
+is exactly the failure its own comment says it exists to prevent. Found by the
+documentation pass at session close rather than by anything automated.
+
+#### Fixed
+
+- `rust-gate` now runs `ruff check .` and `ruff format --check .`, matching CI.
+
+#### Added
+
+- `test_the_local_gate_lints_the_same_scope_as_ci` pins the two together, so
+  widening one without the other fails a test instead of a push.
+
+### The macOS release binary builds again
+
+The macOS `secantusd-rs` for 0.5.3-beta.166 was not published, because its
+profile-guided-optimisation (PGO) build failed. 0.5.3-beta.167 restores it.
+
+#### Fixed
+
+- The `cc` crate copied rustc's PGO flag onto clang, so Apple clang instrumented
+  the bundled `lz4.c`. Its profile format no longer matches the one rustc 1.99
+  writes, and the instrumented binary failed with "Runtime and instrumentation
+  version mismatch". The lz4 build no longer takes rustc's flags.
+- zlib links the system library again where there is one (always on macOS)
+  instead of being compiled with the same inherited flags. The Linux release
+  lanes still link it statically.
+
+### The macOS release binary builds again, for real this time
+
+0.5.3-beta.166 and 0.5.3-beta.167 published no macOS `secantusd-rs`.
+0.5.3-beta.168 restores it.
+
+#### Fixed
+
+- The macOS profile-guided build instrumented C as well as Rust. The `cc`
+  crate copies rustc's profiling flags onto clang, so `ring` (used by rustls)
+  was instrumented by Apple clang. Apple clang's profile format no longer
+  matches the one rustc 1.99 reads. The macOS release build now compiles C
+  through a wrapper that drops those flags, so only Rust is profiled. The
+  0.5.3-beta.167 fix covered only the bundled lz4, which was not enough.
+
+### Start the Rust MongoDB server from a Rust test
+
+`secantus-mdb` is now a library as well as the `secantusd-rs` binary. A Rust
+test suite can start a server in one line and connect the official `mongodb`
+driver to it.
+
+```rust
+let server = secantus_mdb::Server::start()?;
+let client = mongodb::sync::Client::with_uri_str(server.uri())?;
+```
+
+#### Added
+
+- `Server::start()` gives each server a temporary store, which is removed on
+  drop, and an OS-assigned port. It advertises the `secantus` single-node
+  replica set and enables test commands, as the Python embedded handle does.
+- `Server::builder()` sets a persistent store, the host, the port, the
+  replica-set name (or none), auth, TLS, the WiredTiger cache (256M by default)
+  and test commands. A server provides `uri()`, `address()`, `port()` and
+  `stop()`, and dropping it stops it.
+- A temporary store is removed only after the storage is confirmed closed. If a
+  connection outlives the shutdown drain, the directory is left in place with a
+  warning, rather than removed while WiredTiger still has it open.
+- A runnable `quickstart` example, a doc-test, and tests through the official
+  driver, including use inside `#[tokio::test]` and 50 servers in parallel.
+
+#### Changed
+
+- The binary's own dependencies (`ctrlc`, `env_logger`, `mimalloc`) are behind
+  a default-on `bin` feature, so a test that uses only the library can turn it
+  off. Release builds with `--no-default-features` now pass `--features bin`.
+
+### Both MongoDB servers close out their backlog against mongod 8.2.11
+
+Every open backlog item for the Rust and Python MongoDB servers was reproduced
+against mongod 8.2.11 and fixed, closed by re-measurement, or given a written
+disposition (`tasks/backlog.md` §7.05). Most of the work landed on the Python
+reference server, which had fallen behind the Rust server on error replies,
+write concern, failpoints, `maxTimeMS`, change streams and collation. On every
+differential probe in `tools/probes/` the two servers now give the same answers
+as mongod, except for differences that are documented and deliberate.
+
+Several of the Python fixes were silent writes, where a client got an
+acknowledgement for a result mongod would not produce:
+- a failed `updateMany` rolled back the documents it had already rewritten;
+- `$set: {"b.2.c": 1}` over `b: []` stored nothing;
+- `multi: true` with a replacement applied it;
+- `delete` with `limit: 5` deleted;
+- `createIndexes` built a duplicate index under a new name, and built an index
+  over an empty key;
+- `a$b`, `""` and `system.foo` became collections;
+- `$sort` tied `true` with `1`.
+
+#### Fixed
+
+- **Python server, writes:**
+  - A multi-update that fails part-way keeps the documents written before the
+    failure. The reply is still `n: 0`, as mongod reports it.
+  - An intermediate array index past the end is created and padded with nulls.
+  - A `multi` replacement is a per-statement 9.
+  - A numeric delete `limit` other than 0 or 1 is 9.
+  - Duplicate keys on `update` / upsert / `findAndModify` carry the executor
+    prefix.
+  - An `_id` changed by a replacement, `$rename` onto `_id`, and an unmatched
+    positional `$` use mongod's words.
+- **Python server, indexes:**
+  - 85 / 86 index conflicts, in mongod's text.
+  - An empty key, an unknown plugin and a missing name are refused with mongod's
+    codes.
+  - A unique build over duplicates fails the build with mongod's wrapper, and
+    names the colliding key.
+- **Python server, namespaces and commands:**
+  - Namespace validation on `create` and on every write command.
+  - `renameCollection` outside `admin` is 13.
+  - `collMod` refuses unknown fields (40415).
+  - `find` sort values follow the `$sort` stage's rule: a double truncates and a
+    decimal rounds half to even.
+  - An invalid regex answers 51091 with PCRE2's message.
+  - `$sort` orders every number before every bool.
+- **Python server, rules ported from the Rust server:**
+  - Validation `errInfo`, and the validator checked at `create` / `collMod`.
+  - The `writeConcern.w` rules.
+  - The awaitable `hello`.
+  - `failCommand` labels and code names (`mongod_codes.py`).
+  - 388 for an oversized transaction.
+  - `maxTimeMS` executor prefixes. The index-build envelope and the write
+    prefixes are given only when running standalone, as mongod does.
+  - PCRE `\Z` / `\z`.
+  - Type-first document comparison.
+  - `startOfWeek`.
+  - Decimal `$range` / `$log` / `$pow` / `$bucketAuto`.
+  - Negative `$slice`.
+  - `$project: {_id: 1}`.
+  - The 32-bit index-argument rules, including the `$range` memory limit (146).
+- **Both servers:**
+  - Collated ordering expands a compatibility character (`ﬁ`) at the primary
+    and secondary levels.
+  - `ß` sorts as `ss` plus a secondary weight. This also makes the PostgreSQL
+    server's `ORDER BY ... COLLATE` agree with PostgreSQL on `Straße`.
+- **Rust server:**
+  - `renameCollection` checks argument types before the `admin` check.
+  - `--block-compressor lz4|zlib|none` is exposed on the daemon.
+- **Tooling:**
+  - `detached_run.py` records the exit in its state file.
+  - Gauge reports are stamped with the date of the raw artifact.
+  - `max_time_expiry.py` covers `createIndexes` and follows mongod's topology.
+  - Two load-sensitive tooling tests now poll.
+
+### Two test harnesses stopped hiding what the servers were telling them
+
+Both changes are to harnesses rather than to a server, and both had the same
+shape: a real signal from a database was being discarded before anyone could
+read it.
+
+#### Fixed
+
+- **A crashed oracle is now an error, not silence.** The differential gate
+  spawns a real `mongod` and compares against it, but sent that server's output
+  to `DEVNULL` and discarded its exit status — so a `mongod` that died
+  mid-module was indistinguishable from one the harness stopped on purpose,
+  while every comparison made after it died was against nothing at all and the
+  gate went on reporting agreement. This is not hypothetical: a `mongod` on the
+  Windows dev box really did abort on 2026-09-22, and the only surviving
+  evidence was a minidump with no log beside it (its exception stream reads
+  `0xE0000001`, `EXCEPTION_NONCONTINUABLE` — `mongod`'s own fatal-assertion
+  path, not a memory fault — but the assertion message was gone for good). The
+  gate now captures the oracle's output to `<dbpath>/mongod.log`, and an
+  unexpected exit preserves that log outside the doomed dbpath and raises with
+  its tail attached.
+
+- **The Rust PG server was being killed, not stopped, on Windows.** The slice
+  tests' `_Server.__exit__` called `proc.terminate()` — SIGTERM on POSIX, but
+  `TerminateProcess` on Windows, an immediate kill that runs no handler, so
+  WiredTiger never closed and anything not yet checkpointed was gone. Seven
+  tests failed as a result, including the cross-language hand-off cases where
+  the Python server opened the store and found it empty. The binary already
+  installed a Windows console control handler (the `ctrlc` crate with
+  `termination`); it was simply never sent a signal it could catch. It is now
+  spawned with `CREATE_NEW_PROCESS_GROUP` and stopped with `CTRL_BREAK_EVENT`,
+  the pattern the Rust binary smoke tests already used. On the Windows dev box
+  that moves the file from 10 failures to 3; the remaining three are a
+  different root cause (a FATAL racing the socket close) and are recorded in
+  `tasks/backlog.md`.
+
+#### Added
+
+- Twelve `$geoWithin` / `$centerSphere` cases in the differential gate, run both
+  over a `2d` index and without one. `$centerSphere`'s radius is in radians, so
+  anything at or past pi covers the whole sphere and must match every document —
+  which is what the mongo-java-driver's own fixture asserts with r=4. That test
+  failed once in the 2026-09-21 gauge and passed again on 2026-09-27; it was a
+  flake, but nothing pinned the behaviour, so a real regression would have
+  looked identical to one. Probed against 8.2.11: 0 of 12 divergent.
+
+#### Changed
+
+- The gate's `mongod` is spawned with `CREATE_NO_WINDOW` on Windows. A console
+  executable with no creation flags allocates its own console, so under
+  `-n auto` every xdist worker popped a terminal window on the desktop.
+
+### Two more ways the driver panels could publish a number they had not measured
+
+Both found while rendering the first Rust-server grid, and both the same shape as
+the Go and pymongo bugs fixed earlier the same day: an artifact that looks
+current and isn't.
+
+#### Fixed
+
+- **An EMPTY artifact passed the freshness check.** It tests mtime, and an empty
+  directory keeps a fresh one — so `java-results-rust-server/`, cleared by a
+  re-run and never refilled, had the *newest* timestamp of the whole set and
+  rendered a blank panel beside twelve real ones. The report on disk still
+  described the data that had gone. The guard now refuses an artifact that
+  exists but holds no results, naming it.
+
+- **The panel showed a rate for a truncated run.** #1613 stopped the Go *report*
+  claiming one; the panel had no such check and published **100.0%** — over a run
+  cut short at 476 of 481 tests by a 30-minute DNS hang. `passed / ran` over the
+  part that finished looks *better* the more tests went missing, which is what
+  made the number so convincing. `GaugeStats.truncated` now carries the signal
+  and the panel renders an em-dash instead.
+
+The Go collector detects truncation by the same two signatures the report
+generator uses: a test that emitted `run` with no terminal event, or a package
+reporting `fail` with no failing test beneath it. Verified against both real Go
+artifacts — python and rust — which are both flagged.
+
+### The published driver panels could only ever show the Python server
+
+Every gauge has written a `-rust-server` artifact for months, and nothing read
+them: all thirteen collectors hardcoded the Python filenames. The page's own
+prose carried a note saying the Rust numbers were not shown — a documented
+limitation rather than a fixed one.
+
+#### Added
+
+- `--server python|rust` on `validation_summary.driver_panels`. The Rust grid
+  now renders from the Rust artifacts.
+- **A mixed-age guard.** The grid is published as ONE snapshot with one implied
+  date, so a panel built from a months-old artifact reads as current to everyone
+  who sees it. There was no check at all: the first Rust render would have put a
+  **10 August** pymongo-async rate beside twelve numbers measured that morning.
+
+  It tests SPREAD rather than absolute age — a deliberately old but consistent
+  sweep is honest, and it is the mixing that misleads. `--allow-stale` overrides
+  it for the rare case where a mixed grid is genuinely wanted.
+
+- `GAUGE_ARTIFACTS`, one map from panel name to artifact filename, so the
+  freshness check reaches the same files the collectors do. A test pins it
+  against the collector registry: a gauge added to one and not the other would
+  be silently exempt from the check, which is the exact failure the guard exists
+  to prevent.
+
+### The Python PostgreSQL server on a store the Rust server shares: honest refusals, faithful indexes
+
+The two PostgreSQL servers share one on-disk format. The Python server
+silently mishandled three things the Rust server stores in it, each a
+wrong answer rather than an error. Batch 16 makes the Python server either
+handle them as PostgreSQL does or refuse them with PostgreSQL's `0A000`.
+
+#### Fixed
+
+- **Triggers it cannot run were skipped.** The Python server runs only
+  BEFORE INSERT FOR EACH ROW triggers, and it silently ignored every other
+  kind the Rust server stores, so a write bypassed an audit trigger or an
+  enforced invariant.
+  - A write that would fire such a trigger is now refused. This covers
+    INSERT, UPDATE, DELETE, TRUNCATE, MERGE, ON CONFLICT, UPDATE FROM and
+    DELETE USING.
+  - A multi-event trigger is now read from all of its events, not only the
+    first.
+- **Partitions read as empty.** The Rust server keeps a partitioned table's
+  rows in the root's collection, so the Python server read a partition as
+  having no rows and accepted root writes no partition covers.
+  - Reading the root is allowed, since every row is there.
+  - Anything else touching a partition or writing the root is refused.
+- **ALTER TABLE erased what the Rust server recorded.** A Python catalog
+  rewrite dropped every key it does not model: `partition_by`, `owner`, a
+  column's `collation`. Those keys now round-trip verbatim.
+- **CREATE INDEX** matches PostgreSQL on all 48 lines of `indexes.sql`, up
+  from 35:
+  - a unique index over colliding rows, and an UPDATE into one, are `23505`,
+    not `XX000`;
+  - default names follow PostgreSQL's `<table>_<cols>_idx`;
+  - an index name collides with table and view names in both directions;
+  - dropping a constraint's index is `2BP01`;
+  - `DROP INDEX a, b` works;
+  - `USING hash` and `INCLUDE` render in `pg_indexes`.
+
+### A terminated connection now hears why
+
+`pg_terminate_backend`, an idle-session timeout and an idle-in-transaction
+timeout all end a connection with a FATAL error, and the client is supposed to
+see that error on its next round trip. It often saw nothing of the kind: on
+Linux the `57P01` surfaced only afterwards, buried in psycopg's rollback
+warning, and on Windows it vanished entirely behind a bare
+`Software caused connection abort (10053)` with no SQLSTATE at all.
+
+The error was being sent correctly and then destroyed in transit. After the
+FATAL the connection loop breaks, `process_socket` returns, and the socket is
+dropped — closed outright. The client's next statement is a *write* to a closed
+socket, which draws a TCP RST, and an RST discards whatever the client has not
+yet read. The FATAL was sitting in exactly that buffer.
+
+#### Fixed
+
+- The server now ends a connection with a lingering close
+  (`crates/vendor/pgwire/src/tokio/server.rs`): it shuts the write half down
+  first, sending a FIN so the client reads the error and then a clean EOF, and
+  drains reads afterwards so the socket stays half-open long enough for the
+  client's in-flight bytes to be consumed rather than reset. Applied to both
+  `process_socket` and `process_socket_unix`.
+
+  The drain budget is a ceiling rather than a delay — it ends at the client's
+  EOF, so an ordinary `Terminate`-and-hang-up costs nothing measurable. On the
+  Rust PG server's slice tests the change is a straight improvement in both
+  directions: **229.8s with three failures becomes 95.1s with none**, because
+  the connection aborts had been burning time in retries.
+
+- The same tests were also killing the server rather than stopping it on
+  Windows. `proc.terminate()` is SIGTERM on POSIX but `TerminateProcess`
+  there — an immediate kill that runs no handler, so WiredTiger never closed
+  and anything not yet checkpointed was lost, which is why the cross-language
+  hand-off tests opened an empty store. The binary already installed a console
+  control handler; it was never sent a signal it could catch.
+
+### Four built-in types were missing from `pg_type`
+
+`char`, `json`, `pg_lsn` and `txid_snapshot` had no `pg_type` row, so a client
+enumerating types never saw them. pgjdbc's `getTypeInfo()` is checked against a
+fixed list of 38 built-in names, and those four were the gap.
+
+`char` is worth calling out: it is PostgreSQL's internal **one-byte** character
+type (oid 18), a different type from `bpchar` / `character(n)` (1042). The names
+invite conflating them, so the test pins both rows.
+
+Oids, `typarray` and `typlen` all measured against PostgreSQL 14 on 2026-09-27.
+
+#### Added
+
+- `pg_type` rows for `char` (18), `json` (114), `pg_lsn` (3220) and
+  `txid_snapshot` (2970).
+
+#### Noted, not fixed
+
+Probing this surfaced a separate divergence: a `json` column reports `atttypid`
+3802 (`jsonb`) rather than 114. The two are distinct types in PostgreSQL — `json`
+keeps its text verbatim, `jsonb` normalises — and this server folds `json` onto
+the `jsonb` tag. The `pg_type` row added here is correct on its own terms, since
+PostgreSQL has both; only the column identity is wrong. Filed in
+`tasks/backlog.md` rather than fixed, because reporting 114 over jsonb storage
+would trade one wrong answer for another — the value semantics are the harder
+half.
+
+Found from pgjdbc's `DatabaseMetaDataTest::types`.
+
+### The Rust PostgreSQL server can be started and stopped inside an async test
+
+`secantus_pgserver::bind` and the handle it returns could only be used from a
+plain thread. Called inside a tokio runtime -- a `#[tokio::test]`, which is how
+a Rust program writes a database test -- `bind` panicked before returning
+("Cannot start a runtime from within a runtime"), and so did stopping or
+dropping the handle ("Cannot drop a runtime in a context where blocking is not
+allowed"). The Python embedding never hit either, because it calls from a plain
+thread.
+
+#### Fixed
+
+- `bind` no longer blocks on the server's runtime: the listener is bound with
+  the standard library and then handed to the runtime, which works from any
+  context.
+- `stop()` and `Drop` run their blocking half -- the connection drain, the
+  runtime shutdown and the store's close-checkpoint -- on a thread of their own
+  when called inside a runtime, and wait for it, so they still return only once
+  the store is closed.
+- New tests start, write, drop, reopen and read back inside both a
+  current-thread and a multi-thread `#[tokio::test]`.
+
+### The stale-artifact check now covers probes, gauges and benchmarks — not just pytest
+
+PR #1586 added a collection-time check that refuses to run when a built artifact
+was made from a different `crates/` tree than the checkout. It works, and it only
+ever ran under pytest.
+
+That left the gap where it matters most. This repo's primary bug-finding method is
+not the test suite — CLAUDE.md says to run behaviour against the reference server
+rather than reason about the source — and an ad-hoc probe, a driver gauge and a
+benchmark all launch these artifacts directly, with nothing checking them. On
+2026-09-28 a probe of `secantusd-pg` duly ran against a binary built from a
+different tree, and the only thing that caught it was a hand-read of `--version`:
+exactly the state #1586's own docstring complains about, where "the evidence was
+sitting in `--version` output that no automated thing read".
+
+#### Changed
+
+- The comparison, the rebuild commands and the per-artifact cost strings moved
+  from `tests/conftest.py` into `tools/provenance.py`, importable by anything that
+  runs with the repo root on `sys.path`. `conftest.py` is now one caller rather
+  than the owner; its behaviour is unchanged.
+- Both probe launch paths check before starting a server: `tools/probes/_servers.py`
+  (the embedded `_secantus_server`) and `tools/probes/pg_differential.py`
+  (`secantusd-pg`). A stale artifact aborts the probe instead of producing
+  divergences that are the artifact's age rather than the server's behaviour.
+- The Windows `.exe` fallback moved into the shared `resolve_binary`, so the
+  fourth caller cannot forget it. Getting it wrong once already made the guard
+  watch a filename that cannot exist on Windows, and made 1,194 pgserver tests
+  skip.
+
+#### Added
+
+- Eight tests in `tests/test_build_provenance.py`, including two that pin the gap
+  this closes: each probe launcher must call the check, and `tools.provenance` must
+  import with nothing but the repo root on the path — no pytest, no conftest.
+
+#### Note
+
+`conftest.py` discovers `tools/provenance.py` by walking up from its own
+location and **abstains when it is not there**, rather than importing it
+unconditionally. A verbatim copy of `conftest.py` is loaded from a temp
+directory by `tests/test_crash_stall_watchdog.py` (deliberately, so the nested
+session exercises the real watchdog), where no checkout sits above it — a hard
+module-scope import failed to LOAD the conftest there, which is not one test
+failing but every test in the lane. Pinned by
+`test_a_copied_conftest_still_loads`.
+
+### The stale-artifact check reaches the gauges and benchmarks, and the lint gate reaches the whole repo
+
+Two gaps left open by the previous change, both of the same shape: a guard that
+existed but only covered part of what it was meant to.
+
+#### Changed
+
+- **Every launcher checks provenance, not just pytest and the probes.** Six more
+  sites: `gauge_common.rust_binary()` (all thirteen MongoDB gauges),
+  `psycopg_validation/runner.py`, and the `bench/` harnesses behind the published
+  concurrency chart, the latency-vs-mongod table and the two PostgreSQL cost
+  benchmarks. These are the paths that PUBLISH a number — on 2026-09-18 the
+  psycopg gauge was measured against a checkout 116 crate-commits behind, reported
+  73.8% where the truth was ~99.98%, and that figure reached the live website.
+- **`SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides the check, loudly.** Measuring an
+  old build on purpose — a bisect, a before/after against a previous release — is
+  legitimate, and without a supported way to say so the person who needs it
+  comments the check out, which removes it for everybody. The override still
+  prints the mismatch, so a stale run cannot look like a clean one in a log.
+- **CI lints `.` instead of `src tests`.** That scope left `tools/`, `bench/`, all
+  nineteen gauge runners, the invoke tasks and `website/` unchecked. A named path
+  list was the first fix and was wrong the same way — an enumeration grows a hole
+  the moment a directory is added, and the test written against it immediately
+  found 27 locations missing. ruff already skips gitignored trees and the vendored
+  submodules, so `.` reaches our Python and nothing else.
+
+#### Fixed
+
+- **A dict key written twice in `pgtest_validation/include_paths.py`**, silently
+  discarding one session's findings — Python keeps only the last. Two sessions had
+  each documented the `procedure` stanza; only one was visible. Both are now
+  merged into a single entry, including the detail they disagree on (the offending
+  line is cited as `procedure:66` by one and `procedure:68` by the other), rather
+  than one being picked. This was invisible until ruff was pointed at that
+  directory.
+- 44 further lint findings across the newly-covered directories: unused imports,
+  import ordering, long lines, a `zip()` without `strict=`, a `try`/`except`/`pass`.
+
+#### Added
+
+- Twelve tests: one per launcher asserting it calls the check, two for the
+  override's behaviour, and two pinning the lint gate's scope.
+
+#### Note
+
+`[tool.ruff] extend-exclude` now names `vendor` and `crates/vendor`. Linting `.`
+reaches every checked-out submodule, so without it the gate reports upstream's
+style as our failure — CI failed on a WiredTiger analytics notebook. It passed
+locally because a fresh worktree has no submodules checked out, so `.` reached
+nothing vendored and the exclusion looked unnecessary; the difference was the
+environment, not the config. Pinned by `test_ruff_excludes_every_vendored_tree`,
+which fails if a newly-added submodule is not covered.
+
+### The Rust MongoDB server publishes to crates.io on release
+
+A `secantusdb-v*` release tag now also publishes the Rust MongoDB server's
+crates to crates.io, with no stored token.
+
+#### Added
+
+- `.github/workflows/publish-crates.yml`:
+  - It refuses a tag that disagrees with the crate version.
+  - It packages the ten crates and builds each one from its tarball.
+  - It publishes them in dependency order with `cargo publish --workspace`.
+  - It authenticates by crates.io trusted publishing, in a `crates-io`
+    environment that accepts only release tags.
+  - A manual run defaults to a dry run.
+
+### Four wrong answers the Python PostgreSQL server gave about arrays
+
+The Rust PostgreSQL server's array work last release left a corpus that could be
+pointed at the Python server too. It was not flattering: 18 divergences out of
+32 against PostgreSQL 14.13, where the Rust server had none. Four of them were
+*wrong answers* rather than refusals, and one of those was wrong in two
+independent places.
+
+`ARRAY[1,NULL] @> ARRAY[NULL]` answered true. So did `&&`, and
+`ARRAY[1,NULL] <@ ARRAY[1,NULL]`. PostgreSQL says false to all three: the
+containment operators use the element type's `=`, under which a NULL matches
+nothing — not even another NULL. Python's `None == None` is True, and that
+stood in for the SQL semantic. In a `WHERE` clause it returned rows PostgreSQL
+excludes.
+
+The same predicate had a second copy of the bug in the index path, which had to
+be fixed separately: `field @> ARRAY[...]` lowers to a Mongo bare-equality
+filter so it can use a multikey index, and a bare equality against null matches
+a *missing* field as well. Fixing the evaluator alone would have left the
+indexed form of the same query still wrong.
+
+Separately, `array_position(arr, elem, start)` ignored its third argument
+entirely, so `array_position(ARRAY[1,2,3,2], 2, 3)` answered 2 where PostgreSQL
+answers 4 — a wrong number, which is why nothing had caught it. sqlglot files
+that argument under a slot named `zero_based`, which it reuses; the obvious
+place to look for it holds nothing at all.
+
+And a multidimensional subscript — `m[1]`, `m[1:2][2]` — leaked a bare Python
+`ValueError` to the wire with no SQLSTATE at all, reachable from a plain
+`SELECT`.
+
+#### Fixed
+
+- `@>` / `<@` / `&&` no longer match a NULL to a NULL, in both the per-row
+  evaluator and the index pushdown.
+- `@>` / `<@` / `&&` now flatten both operands, so
+  `ARRAY[[1,2],[3,4]] @> ARRAY[3]` is true as PostgreSQL has it; previously
+  containment was wrong for every multidimensional array.
+- A NULL array operand to any of the three is now NULL rather than
+  `42883 function array_contains_all() does not exist` — an internal fallthrough
+  re-labelled as a missing function the user never called.
+- `array_position(arr, elem, start)` honours `start`, and a NULL `start` is
+  PostgreSQL's `22004 initial position must not be null`.
+- `array_cat(NULL, NULL)` is NULL, not the empty array.
+- `array_length(arr, NULL)` is NULL rather than a `42883` naming
+  `array_size(...)`.
+- `string_to_array(s, '')` keeps the whole string as one element rather than
+  raising, and `string_to_array('', sep)` is the empty array rather than `{''}`.
+- `array_positions` is declared `integer[]`, which is what PostgreSQL reports,
+  not `bigint[]`.
+- A subscript chain shorter than the array's dimensionality is NULL —
+  `(ARRAY[[1,2],[3,4]])[1]`, which used to return the inner row and then fail
+  to coerce it, leaking a Python `ValueError` with no SQLSTATE.
+- Once any subscript in a chain is a slice, a bare index means "1 to n" as
+  PostgreSQL defines it, so `m[1:2][2]` is the whole second dimension. The
+  result type is now taken over the whole chain, so a nested slice reports the
+  array type rather than the element type.
+
+#### Added
+
+- `UPDATE t SET a[i] = v` and `SET a[lo:hi] = v`, matching the Rust server:
+  a subscript past the end extends the array with NULLs, assigning into a NULL
+  column builds it from nothing, and two assignments to one column in one
+  statement compose rather than racing.
+- A subscript below 1 is refused by name. PostgreSQL answers it by *moving* the
+  array's lower bound, which neither server models; writing it at 1 instead
+  would silently shift every other subscript into the array.
+
+#### Security
+
+- `SET a[1000000000] = 1` is one statement and would have allocated every slot
+  it named. PostgreSQL caps an array at 134217727 elements and says so; the cap
+  is now checked before allocation.
+
+### Python PostgreSQL server: constraint triggers and INSTEAD OF triggers
+
+`CREATE CONSTRAINT TRIGGER` now runs on the Python PG server. Each behaviour below was checked against PostgreSQL 15.
+
+#### Added
+
+- A `DEFERRABLE INITIALLY DEFERRED` constraint trigger queues its row events for COMMIT. If the trigger raises there, the whole block rolls back.
+- `SET CONSTRAINTS name | ALL IMMEDIATE` runs the queued events and switches the trigger to fire at once. Setting a non-deferrable constraint trigger answers `42809`.
+- Outside a transaction block, a deferred constraint trigger runs at the end of the statement, after the immediate triggers.
+- `CREATE CONSTRAINT TRIGGER` rejects a BEFORE trigger, a statement-level trigger, and `NOT DEFERRABLE INITIALLY DEFERRED` with PostgreSQL's `42601`.
+- `INSTEAD OF` row triggers on views. Each row an `INSERT`, `UPDATE` or `DELETE` names goes to the trigger instead of the base table. A NULL return skips the row, the command tag counts the rest, and `RETURNING` projects what the trigger returned.
+- `CREATE TRIGGER` rejects the shapes PostgreSQL rejects for views and tables, with the same SQLSTATE, message and detail. Dropping a view drops its triggers.
+
+### Python PostgreSQL server: date/time input follows PostgreSQL's DecodeDateTime
+
+Date, timestamp and timestamptz text input on the Python PG server now goes through a port of PostgreSQL's `ParseDateTime` / `DecodeDateTime` (`src/secantus/sql/dtparse.py`). Corpus `dt_input` went from 117 divergences of 212 to 0 against PostgreSQL. `wide_timestamptz`, `time_input` and `tz_abbrevs` each improved, and no corpus got worse.
+
+#### Fixed
+
+- Date and time input now accepts everything PostgreSQL accepts:
+  - month and weekday names, in any order (`Jan 5 2020 10:30 PM`, `Sat Jan 05 10:30:00 2020 CET`);
+  - two-digit years (`1/5/69` is 2069, `1/5/70` is 1970);
+  - Julian days (`J2458854`), `year.doy` (`2020.005`) and `y2020m01d05`;
+  - `AD` / `BC`, `24:00:00` rollover;
+  - time-zone abbreviations, IANA zone names and numeric offsets.
+- Errors split as PostgreSQL's do: `22007` for bad syntax, `22008` for an out-of-range field, `22009` for an invalid zone. A timestamptz error names the type `timestamp with time zone`.
+- A time in a daylight-saving gap or overlap resolves to the same offset PostgreSQL picks.
+- `AT TIME ZONE` accepts interval zones, abbreviations and POSIX offsets (`+05`, `utc+3`, `-03:30`). `timezone(zone, ts)` is added.
+- A timestamptz outside Python's year range renders in the session zone with PostgreSQL's offset spelling (`+00`, `-12`).
+
+### Python PostgreSQL server: full-text search follows PostgreSQL
+
+The Python PG server's text search was a simplified stand-in. It is now a port of PostgreSQL's own (tsvector / tsquery I/O, the document parser, ranking, headlines, phrase search). Corpora `fts`, `fts2` and `fts_langs` went from 106 divergences to 0 against PostgreSQL, and no corpus got worse.
+
+#### Added
+
+- A new `fts` extra: `pip install "SecantusDB[fts]"` installs `snowballstemmer==2.2.0`, the Snowball release PostgreSQL 15 ships. With it, the 26 non-English text search configurations stem and drop stop words exactly as PostgreSQL does. Without it they refuse with `0A000` rather than answering differently.
+- `setweight` (two and three arguments), `ts_delete`, `ts_filter`, `tsquery_phrase` and `get_current_ts_config` are implemented.
+
+#### Fixed
+
+- tsvector and tsquery input and output follow PostgreSQL's rules: ordering, positions, weights, quoting, and the exact error codes and messages. `'x'::tsquery` is no longer stemmed.
+- The document parser recognises emails, hosts, URLs, numbers, versions and hyphenated words. The English stop-word list is complete.
+- `ts_rank` / `ts_rank_cd` match PostgreSQL's arithmetic and return `real`.
+- Operators: `!!tsquery`, `tsquery <-> tsquery`, `tsvector @@ 'literal'` and `text @@ text` now work as PostgreSQL defines them.
+- An unknown text search configuration answers `42704`.
+
+### Python PostgreSQL server: the range and multirange operators
+
+The `range_ops` corpus went from 260 divergences of 771 to 0 against PostgreSQL 15.
+
+#### Fixed
+
+- Range ordering (`<`, `<=`, `>`, `>=`) follows PostgreSQL's range order: empty first, then lower bound, then upper bound. It raised `42883` for an unbounded or empty range.
+- `<<`, `>>`, `&<` and `&>` work on ranges and multiranges. `&<` / `&>` answered `0A000`, and `<<` / `>>` fell through to the bit-shift path.
+- Multirange `+`, `*` and `-` are implemented, and `pg_typeof` reports the multirange type.
+- A non-contiguous range union or difference answers `22000`, where it raised an internal error.
+- A multirange against a plain range answers PostgreSQL's `42883 operator does not exist: int4multirange + int4range`.
+- `daterange @> date` no longer raises an internal error.
+
+### Python PostgreSQL server: fixes from a full PostgreSQL corpus sweep
+
+Running every corpus in `tools/probes/pg_corpora/` against the Python PG server turned up these divergences from PostgreSQL 15. They are fixed, and the sweep total drops from 2,985 to 2,955 with no corpus getting worse.
+
+#### Fixed
+
+- A join whose alias equals a column of the FROM table (`FROM a o JOIN a n`) returned the whole joined row for `o.n`, silently. It now returns the value.
+- `IS [NOT] DISTINCT FROM` works in `WHERE`, `JOIN ... ON`, `UPDATE` and `DELETE`. It answered `0A000` there before.
+- `string_agg(<expression>, ...)` over a join now works. It answered `0A000 expected a column`.
+- `CREATE OR REPLACE VIEW` refuses to drop, rename or retype a view column with `42P16`, as PostgreSQL does. It used to replace the view silently.
+- Dates with a month name (`'Jan 5, 2020'`, `'5 Jan 2020'`, `'2020-Jan-05'`) are accepted.
+- A date with a day past its month's end (`'2020-02-30'`, `'Feb 29 2021'`) answers `22008`, where it answered `22007`.
+- `SELECT t FROM t` describes its column with the table's row type rather than generic `record`, so a client reads it as it does from PostgreSQL.
+- `pg_trigger` lists triggers (it was always empty), including the deferrability of constraint triggers.
+- `SET CONSTRAINTS` naming no constraint answers `42704`.
+- Transition tables with one name for OLD and NEW answer `42P17`.
+
+### Python PostgreSQL server: trigger transition tables, and three `string_agg` fixes
+
+AFTER triggers can now declare `REFERENCING OLD TABLE AS ... NEW TABLE AS ...` and query the statement's affected rows as a relation. Each change was checked against PostgreSQL 15.
+
+#### Added
+
+- Transition tables on every write path: INSERT, UPDATE, DELETE, ON CONFLICT, UPDATE FROM, DELETE USING and MERGE. They are available to both statement-level and row-level AFTER triggers.
+- `CREATE TRIGGER` rejects the shapes PostgreSQL rejects, with the same SQLSTATE and message: a BEFORE trigger, more than one event, a column list, the wrong OLD/NEW side for the event, and TRUNCATE.
+
+#### Fixed
+
+- A `string_agg` nested in an expression no longer drops its in-call `ORDER BY`. For example, `coalesce(string_agg(v, ',' ORDER BY id DESC), '')` came back in insertion order with no error.
+- A `string_agg` nested in an expression over a JOIN no longer fails with `0A000 unsupported aggregate`.
+- `||` with a non-text operand inside an aggregate (`string_agg(id || '=' || v, ',')`) now casts the operand to text. It used to fail with `$concat only supports strings`.
+
+### Python PostgreSQL server: trigger arguments, UPDATE OF and TRUNCATE triggers
+
+The Python PG server now runs three trigger shapes it used to refuse, each checked against PostgreSQL 15's output.
+
+#### Added
+
+- Trigger arguments: `EXECUTE FUNCTION f('x', 7)` is stored as text and exposed to PL/pgSQL as `TG_ARGV` (subscripted from 0) and `TG_NARGS`.
+- `UPDATE OF col, ...` triggers. One fires when any listed column is a target of the `SET` list, whether or not its value changes.
+- `BEFORE` / `AFTER TRUNCATE` statement triggers. A truncate that fires one runs as a single transaction, so a trigger that raises leaves the rows in place.
+
+### The Python PostgreSQL server runs AFTER, statement-level, UPDATE and DELETE triggers
+
+Until now the Python PostgreSQL server ran only `BEFORE INSERT FOR EACH ROW`
+triggers. It now runs the trigger kinds most applications use, as PostgreSQL
+does, and refuses with `0A000` the ones it still cannot run.
+
+#### Added
+
+- `CREATE TRIGGER`:
+  - `BEFORE` and `AFTER`, `FOR EACH ROW` and `FOR EACH STATEMENT` (the
+    default), on `INSERT`, `UPDATE` and `DELETE`, several events joined with
+    `OR`;
+  - `WHEN (...)` conditions over `NEW` / `OLD`.
+- Inside a trigger function:
+  - `TG_OP`, `TG_WHEN`, `TG_LEVEL`, `TG_NAME` and `TG_TABLE_NAME`;
+  - `OLD` / `NEW` are NULL where the event has none, and a field of a NULL
+    record is NULL;
+  - SQL statements in the body can read `new.x` / `old.x`, so an audit
+    trigger can insert them into another table.
+- Firing:
+  - a BEFORE ROW trigger can change `NEW`, or skip the row with `NULL`;
+  - statement-level triggers fire even when no row matches.
+- Triggers the Rust server stores in the shared catalog fire here too.
+
+#### Fixed
+
+- **A write whose trigger wrote, then failed, left the trigger's writes
+  committed.** A single INSERT / UPDATE / DELETE / MERGE now runs as one
+  transaction whenever the database has a trigger, as on PostgreSQL.
+
+Still refused, with `0A000`:
+
+- `UPDATE OF` column lists, trigger arguments, transition tables
+  (`REFERENCING`), constraint triggers, `INSTEAD OF` and `TRUNCATE`;
+- a trigger on a path that fires none: `ON CONFLICT`, `MERGE`,
+  `UPDATE ... FROM` and `DELETE ... USING`.
+
+The firing order and logged values are checked against PostgreSQL 15's output
+for the same statements.
+
+### Python PostgreSQL server: triggers fire on ON CONFLICT, UPDATE FROM, DELETE USING and MERGE
+
+These write paths used to refuse any table with a trigger. They now fire triggers in PostgreSQL's order, checked against PostgreSQL 15.
+
+#### Added
+
+- `INSERT ... ON CONFLICT` fires BEFORE INSERT ROW for every proposed row. `EXCLUDED` sees the row as that trigger returned it. A conflicting `DO UPDATE` then fires BEFORE UPDATE ROW.
+- `UPDATE ... FROM` and `DELETE ... USING` fire their statement and row triggers, including `UPDATE OF`.
+- `MERGE` fires BEFORE STATEMENT for each action its WHEN clauses name, row triggers per action, and the AFTER STATEMENT triggers in reverse.
+- On every path, AFTER ROW events queue to the end of the statement. A BEFORE ROW trigger can change the row or skip it.
+
+### Python PostgreSQL server: statement-level triggers on views
+
+`BEFORE` / `AFTER ... FOR EACH STATEMENT` triggers on a view are now accepted, and they fire in PostgreSQL's order: around the view's `INSTEAD OF` rows, and not for a write through an automatically-updatable view, which fires the base table's triggers instead. Checked against PostgreSQL 15. This closes the last trigger shape the Python server refused.
+
+### The Python server reads date strings with mongod's own parser
+
+The Python MongoDB server now parses date strings the way mongod 8.2.11 does,
+because it runs the same parser: a pure-Python port of timelib 2022.13 -- the
+library mongod vendors -- together with mongod's own wrapper around it. That
+covers `$dateFromString` with and without a `format`, `$toDate`, and
+`$convert` to a date. Before this, the Python server used Python's ISO parser
+and `strptime`, and on mongod's differential probe of 433 date strings it
+answered 323 differently: wrong values (every 12-hour time, every zone
+abbreviation), strings mongod accepts refused, and error text that matched
+nothing mongod says. It now matches on all 433, values and full error text.
+
+#### Fixed
+
+- `secantus/timelib/` (new): a literal port of timelib's free-form scanner
+  (`parse_date.re`, re2c longest-match semantics), its parse-from-format under
+  mongod's `kDateFromStringFormatMap`, `timelib_update_ts`, and the 1,127-entry
+  zone abbreviation table (generated from mongod's `timezonemap.h` by
+  `tools/timelib/gen_zone_tables.py --python`). Pure Python, no Rust in the
+  request path.
+- `$dateFromString`: evaluated in mongod's order -- `format` type (40684) and
+  validity (18535 / 18536) first, then `timezone` (40517 / 40485), then
+  `onNull`, then `onError` around the `dateString` type check and the parse
+  (241, now "found: int with value 5"). `%j` is zero-based as in mongod; `%y`
+  is refused (not a mongod specifier); a lone `%Y` / `%j` is
+  incomplete; a zone in the string together with a `timezone` argument is
+  refused; a DST gap or overlap resolves the way mongod's does; a present but
+  null `format` gives null; and a literal bad `format` is reported before a
+  bad literal `timezone`.
+- `$toDate` / `$convert` of a string: every shape timelib accepts (relative
+  forms, `@` timestamps, ISO weeks, month names, zone abbreviations, 12-hour
+  times) with mongod's value, and mongod's exact error text otherwise. Dates
+  outside years 1-9999 are returned as raw BSON dates rather than refused; one
+  beyond about +-292,000 years is mongod's 159 `DurationOverflow`.
+
+### `replSetStepDown`, and a hello that waits when it is asked to
+
+SecantusDB advertises itself as a single-node replica-set primary and already
+answered `replSetGetStatus` with a full status, but `replSetStepDown` was
+`CommandNotFound` — so a driver could read the topology and not act on it. It is
+implemented now on both servers, reproducing what a real single-node replica set
+does: the command returns immediately, the node reports itself a secondary for
+the requested period with `primary` and `electionId` dropped from `hello`,
+writes are refused `10107 "not primary"` while reads keep working, and then it
+is primary again.
+
+Two halves of that were not guessable from the command's description. The
+refusal has to carry `topologyVersion`, or the driver marks the server Unknown
+and the very next *read* fails server selection. And the monitoring `hello`
+stream has to push the change the moment it happens rather than waiting out
+`maxAwaitTimeMS`, or the driver does not learn about it until its next heartbeat
+and the refusal then looks newer than its whole view of the server.
+
+Alongside it, a plain awaitable `hello` — `topologyVersion` plus
+`maxAwaitTimeMS`, without `exhaustAllowed` — now holds its reply for the
+requested budget instead of answering in a fraction of a millisecond. The
+streaming `exhaustAllowed` form was already implemented; this is the other half
+of the same protocol, and a driver that polls it was spinning.
+
+Election *timing* is deliberately not reproduced: mongod's return to primary is
+driven by its election machinery rather than the step-down period alone, and
+modelling that means modelling election timeouts — the multi-node machinery this
+project puts out of scope. The window here is exactly the period requested.
+
+#### Added
+- `replSetStepDown` on both servers, with mongod's refusals: `2 BadValue` for a period under `secondaryCatchUpPeriodSecs` or a negative one, `262` when a non-forced step-down has no electable secondary to hand over to, `10107` when already a secondary, and `76 NoReplicationEnabled` on a server not advertising a set.
+- `hello` reports `secondary`, which mongod always includes in a replica-set reply and SecantusDB never emitted.
+
+#### Fixed
+- A plain awaitable `hello` holds its reply for `maxAwaitTimeMS` rather than returning at once.
+- `maxAwaitTimeMS` without a `topologyVersion` is refused `31368`, as mongod refuses it; both servers used to accept it.
+- `topologyVersion.counter` advances when the topology changes. It was pinned at 0 on the grounds that the topology never changes, which stopped being true here — and a frozen counter makes a step-down look stale to a driver.
+
+### Change events and error replies on the Rust MongoDB server match mongod
+
+Three new probes compare the Rust MongoDB server with mongod 8.2.11: random
+write sequences watched through a change stream, every update operator's
+`updateDescription`, and the full reply to 58 real failures. Everything they
+found is fixed, including several writes that stored nothing or the wrong
+thing.
+
+#### Fixed
+
+- `$set` through an array index past the end (`b.0.c` on `[]`) creates the
+  element instead of silently writing nothing.
+- A positional update whose query names the array itself (`{a: 2}` with
+  `$set: {"a.$": 9}`) works; it was refused.
+- `updateMany` keeps the documents it updated before a failure, as mongod does.
+- `multi` with a replacement document, a delete `limit` other than 0 or 1, a
+  duplicate index under a new name, an index with an empty key or no name, and
+  collection names mongod refuses are now refused instead of carried out.
+- Change events: no `fullDocumentBeforeChange` on inserts; `updateDescription`
+  reports what each update operator touched, as mongod does; pipeline updates
+  use mongod's own diff and become `replace` events when mongod's would.
+- Error replies: duplicate-key messages in mongod's form with `keyPattern` and
+  `keyValue`, and mongod's code and message for unknown operators, invalid
+  regexes, unmatched positional updates, unused array filters, index and
+  collection DDL conflicts, bad sort specifications, negative `skip` / `limit`,
+  `aggregate` without `cursor`, and `renameCollection` outside `admin`.
+
+#### Added
+
+- `tools/probes/change_stream_fuzz.py`, `tools/probes/update_description.py`
+  and `tools/probes/write_error_replies.py`.
+
+### `$dateFromString` with a `format` now parses the way mongod does, on the Rust server
+
+`$dateFromString` with a `format` on the Rust MongoDB server is now a literal
+port of the parser mongod uses: timelib's parse-from-format, run under mongod's
+own table of format specifiers and its `%` prefix. Before, it used a
+hand-written strptime. That refused most of what mongod accepts (`%L`
+milliseconds, ISO weeks, `%z` zones, and every malformed string) and got some
+answers wrong. `%j` came out a day early, because mongod counts the day of the
+year from zero, and a lone `%Y` returned a date where mongod reports the string
+as incomplete.
+
+Against mongod 8.2.11, 433 date-string cases (now including 115 with a
+`format`) give 0 divergences, in both the values and the full error text.
+
+#### Fixed
+
+- `$dateFromString` with a `format` on the Rust server: `%L`, `%G` / `%V` /
+  `%u`, `%z`, `%Z` (an offset in minutes), `%b` / `%B` and `%%` all parse.
+  `%j` is zero-based. Invalid dates and times, trailing data, missing data and
+  literal mismatches return mongod's 241 message, with timelib's positions and
+  characters.
+- A format with an unknown specifier or a trailing `%` now returns mongod's
+  18536 / 18535. A non-string `format` returns 40684, and a non-string
+  `timezone` returns 40517. These checks run in mongod's order, so a bad
+  format is reported even when `dateString` is null.
+- `format` and `timezone` are evaluated as expressions, so `"$field"`
+  references work.
+- A non-string `dateString` is a 241 that `onError` catches, as on mongod. The
+  Rust server used to refuse it.
+
+### Rust MongoDB server: 12-hour times and zone names in date strings
+
+`$toDate` and `$dateFromString` returned wrong times on the Rust MongoDB
+server for every 12-hour time and every zone abbreviation, with no error. They
+now match mongod 8.2.11 on all 123 probed strings; 61 differed before.
+
+#### Fixed
+
+- A 12-hour time came back hours out, often on another day. `"2024-01-01 10:00 PM"`
+  was 01:00, and `"12:00 AM"` was 23:00 the previous day. Times are now read
+  as mongod reads them: hours 1–12, with `am`/`pm` or `a.m.`/`p.m.`.
+- A zone abbreviation came back hours out: `"… 22:30 UTC"` was twelve hours
+  off, and `GMT`, `EST` and `PST` were wrong too. There are 51 abbreviations,
+  each with the offset mongod gives it; some are timelib's historical values,
+  such as `IST` +2. Abbreviations mongod does not know are refused.
+- Second 60 (`"23:59:60"`) is refused, as mongod refuses it. It used to roll
+  over into the next day.
+
+#### Added
+
+- These date-string forms now parse as on mongod:
+  - an offset after a space (`"22:30 +02:00"`);
+  - a time before the date;
+  - a month-name date followed by a time;
+  - ctime order (`"Jan 1 10:00:00 2024"`);
+  - month and year (`"Jan 2024"`, `"Sept 2024"`);
+  - a leading weekday, which moves the date forward to that weekday, as
+    mongod does.
+- `tools/probes/date_string_parsing.py`, a 123-string probe that compares
+  against mongod.
+
+### A `hint` on a collection that does not exist was rejected
+
+mongod validates a hint during query **planning**, and there is nothing to plan
+against when the namespace does not exist — so it accepts any hint there and
+returns an empty result. This server refused it, on every command that takes a
+hint.
+
+Measured against mongod 8.2.11 (2026-09-28), across three collection states:
+
+| collection | mongod | before |
+|---|---|---|
+| does not exist | `ok` | **BadValue (2)** |
+| exists, empty | BadValue (2) | BadValue (2) |
+| has documents | BadValue (2) | BadValue (2) |
+
+#### Fixed
+
+- Two sites, because reads and writes validate in different places: the storage
+  layer's `resolve_hint` covers `find` / `count` / `aggregate` / `distinct`, and
+  `validate_write_hint` covers `findAndModify` / `update` / `delete`. Fixing
+  only the first left the three write commands still diverging, which is the
+  sort of half-fix a single-command test would have missed.
+
+#### Found by
+
+mongo-c-driver's `/find_and_modify/hint`, which runs against a collection it
+never creates. One failing driver test; **seven** diverging commands once the
+siblings were probed.
+
+#### Also
+
+- The C gauge now spawns its daemon with `--standalone`, as the Java gauge
+  already did. libmongoc's `MONGOC_TEST_URI` carries no `replicaSet=`, so its
+  tests assert standalone semantics — four `/Client/select_server*` tests select
+  with a SECONDARY read preference and assert
+  `standalone_or_rs_secondary_or_mongos`, which our single-node replica-set
+  persona answered with `RSPrimary`. With the flag they pass; without it they
+  fail.
+
+### The Rust server ignored `maxTimeMS`
+
+It was parsed and validated exactly as mongod validates it — every type error,
+every bound — and then never checked. The operation ran to completion and
+answered `ok`. Measured against mongod 8.2.11: a `createIndexes` over 100,000
+documents with `maxTimeMS: 1` returned `ok: 1.0` here and `code 50
+MaxTimeMSExpired` there.
+
+That is invisible on a fast operation, which is why validating the argument so
+carefully never exposed it.
+
+#### Added
+
+- `secantus_core::deadline` — a thread-local budget armed by `run_handler`
+  around the whole handler, because that is the span mongod bounds: the
+  operation, not any one loop inside it. Mirrors `src/secantus/deadline.py`
+  deliberately, so the two servers overrun in the same places for the same
+  reasons.
+
+- Polling in the loops whose length is driven by the data: the document scan,
+  the two predicate passes behind `find` and `count`, and the three index-build
+  loops. Every 64 documents, which bounds the overrun to 64 rows rather than the
+  whole table.
+
+  `getMore` is excluded, as on the Python server — there `maxTimeMS` is the
+  awaitData *wait*, not a limit, and arming a deadline would make every tailable
+  poll report a timeout.
+
+#### Measured
+
+- Against mongod 8.2.11: **0 divergent of 4** — `createIndexes`, `find` + sort
+  and `count` all answer code 50 where they previously answered `ok`, and an
+  operation with no budget is untouched.
+- **Cost on the unarmed fast path: none detectable.** A 100,000-document
+  COLLSCAN with no `maxTimeMS`: 34.9 ms before, 34.7 ms after (−0.7% on the min
+  of seven). The plan warned these polls sit in the flagship's hottest loops and
+  said not to assume the cost, so it was measured rather than asserted.
+
+### The embedded Rust server expires TTL documents
+
+`secantus_mdb::Server`, the MongoDB server you start from a Rust test, now runs
+the same background sweepers as the `secantusd-rs` daemon. A TTL index expires
+documents every 60 seconds, as on mongod. Before this, documents in an embedded
+server never expired. The noop oplog heartbeat, which keeps a quiet change
+stream's resume token advancing, is available and off by default, as on the
+daemon.
+
+#### Added
+
+- `Builder::ttl_sweep(Option<Duration>)` sets the TTL sweep interval (default
+  60 seconds, `None` to disable). Set a shorter one in a test that waits for
+  an expiry.
+- `Builder::noop_heartbeat(Option<Duration>)` sets the noop oplog heartbeat,
+  which also prunes the oplog (default off).
+
+### The Rust MongoDB server labels injected errors the way mongod does
+
+A driver decides whether to retry a write, resume a change stream or replay a
+transaction from the `errorLabels` on an error, not from the code alone. Errors
+injected with `failCommand` -- which is how every driver's retry and resume
+tests work -- carried a label in only one of the places mongod puts one. Every
+code from 1 to 520 was swept against mongod 8.2.11 and the Rust server now
+answers each one the same way.
+
+#### Fixed
+
+- `ChangeStreamFatalError` (280) and `ChangeStreamHistoryLost` (286) carry
+  `NonResumableChangeStreamError` on every command, a plain cursor's `getMore`
+  included (the PHP driver's `bug1419-001.phpt`).
+- The aggregate that opens a change stream carries
+  `ResumableChangeStreamError` for mongod's 28 resumable codes; a retryable
+  write carries `RetryableWriteError` for its 23 codes, which it never did;
+  the transaction and commit label sets gain the codes they were missing; and
+  four overload codes add `SystemOverloadedError`.
+- `failCommand` refuses a code whose error needs extra information (duplicate
+  key, stale config and 22 more) with mongod's 40671, and drops the connection
+  on the four codes where mongod does.
+- An injected error reports mongod's real `codeName` for 452 codes that used
+  to come back as `Location<code>`.
+- An oversized multi-document transaction now fails with
+  `TransactionTooLargeForCache`'s real code, 388. It said 313, which on mongod
+  is a different error.
+- The C++ driver gauge started its server without test commands, so every
+  failpoint test in it failed on the harness.
+
+#### Added
+
+- `tools/probes/error_labels.py`: code, code name and labels for injected
+  errors across nine command contexts, compared against mongod.
+
+### The Rust MongoDB server stops losing rows through its indexes, and matches mongod on twenty more shapes
+
+A sweep of every differential probe against mongod 8.2.11 found three ways an
+index made the Rust server return fewer documents than it should. A sort over
+a partial compound index, a sort or hint over a multikey index holding an empty
+array, and an index range scan bounded by an array or a document each dropped
+rows silently. All three are fixed, and the probe that should have caught them
+now does.
+
+The same sweep turned up a run of wrong answers and missing pieces: sorting
+embedded documents by their encoded length instead of their value,
+`$project: {_id: 1}` returning whole documents, `$slice` / `$indexOf*` /
+`$range` argument handling, `maxTimeMS` not interrupting aggregations, and an
+aggregate result over 16 MB sent as a message too large for any driver to
+accept. Each was measured against mongod, fixed, and pinned by a probe that now
+reports zero divergences.
+
+#### Fixed
+
+- **Silent data loss through indexes (Rust server).** `find({}).sort({a: 1, b: 1})`
+  over a compound index partial on `a` returned only the rows the index holds;
+  a sort or a hint over a multikey index dropped every document whose field is
+  an empty array (`count({}, hint: ...)` too); and `{x: {$gt: [1, 2, 3]}}` with
+  an index on `x` dropped `{x: [9]}`.
+- **Sort order of embedded documents and nested arrays.** `find().sort()`
+  compared raw-BSON sort keys, which lead with the value's length, so
+  `{a: 2, b: [3]}` sorted above `{a: 5}`. Documents and arrays now compare by
+  value, as the aggregation `$sort` always did.
+- `$project: {_id: 1}` alone is an inclusion projection.
+- `$slice` accepts a whole Decimal128, refuses a count outside int32 (28726 /
+  28728) or not positive (28729), and counts a negative start from the right
+  place; `$substrCP` and `$indexOfCP` / `$indexOfBytes` / `$indexOfArray`
+  enforce int32 and accept whole decimals; `$range` is bounded by mongod's
+  100 MiB memory estimate (146) instead of refusing past 100,000 elements.
+- `maxTimeMS` interrupts aggregation stages, `distinct`, sorted `find` and index
+  walks; read commands report an execution-time expiry under mongod's executor
+  prefix, and `update` / `delete` fail the command rather than reporting a
+  per-statement write error.
+- An aggregate result over 16 MB answers `10334 BSONObjectTooLarge` instead of
+  an 84 MB reply the driver rejects; decoded first batches respect the 16 MB
+  budget.
+- Regex `$` and `\Z` match before a final newline, as PCRE does; `\Z` was
+  refused.
+- `$jsonSchema` refuses `type: "integer"` (9) and unknown type names (2).
+- `$bucketAuto` `POWERSOF2` answers an int for a whole power of two.
+- A `writeConcernError` carries mongod's `errInfo.writeConcern` (`w`, `j`,
+  `wtimeout`, `provenance`) and sits before `ok`; a write whose `w` names an
+  unknown tag runs and then reports 79, instead of being refused.
+- `drop` reports the collection's real index count as `nIndexesWas`.
+- SASL errors match mongod (`Authentication failed.`, 334 for an unknown
+  mechanism, 17 with no conversation), and `usersInfo {forAllDBs: true}` lists
+  every user instead of none.
+- **The streaming `hello` a driver's server monitor sends is held as mongod
+  holds it.** A monitor that already had the current topology got its first
+  streamed reply at once, one extra heartbeat per stream: the Go driver's
+  `heartbeats_processed_more_frequently` test counted 12 messages against a
+  limit of 10. A monitor with an out-of-date topology is now answered at once
+  instead of held, returning to primary after `replSetStepDown` moves
+  `topologyVersion` so the monitor hears about it immediately, and a
+  malformed `topologyVersion` or `maxAwaitTimeMS` gets mongod's error instead
+  of being accepted.
+- A document that fails its validator gets mongod's full explanation in
+  `errInfo.details`: every broken `$jsonSchema` rule in mongod's order, and
+  every failing query clause, where it used to get `{operatorName: "$jsonSchema"}`.
+
+#### Added
+
+- **SCRAM-SHA-1 on the Rust server**, created for every user by default next to
+  SCRAM-SHA-256 as mongod 8.2 does; `hello`'s `saslSupportedMechs` names the
+  user's own mechanisms.
+- **The localhost exception**: a fresh `--auth` Rust server lets a loopback
+  connection create the first user, as mongod does. It refused every
+  `createUser`, so it could never be given one.
+- Decimal128 operands for `$pow`, `$atan2` and `$bucketAuto` `granularity`,
+  correctly rounded and with mongod's special values and quanta.
+- A multi-field filter rides a single-field index on one of its fields, and a
+  sort under an unindexed filter walks the sort index -- the plans mongod picks.
+- Probes: `max_time_expiry.py`, `int32_arguments.py`, `nested_value_sort.py`,
+  `bucket_auto_granularity.py`, `validation_error_details.py`, `scram_auth.py`,
+  `awaitable_hello.py`;
+  `index_result_sets.py` now covers empty filters, compound sorts, hints,
+  partial compound indexes and array / document bounds.
+
+#### Changed
+
+- Differential probes stop their embedded server before deleting its store; three
+  of them ended in a `WT_PANIC` at exit.
+- The driver gauges pass `--noop-heartbeat-seconds` and the other tuning flags
+  through to the Rust server, which accepts them all.
+
+### ALTER TABLE on the Rust PostgreSQL server
+
+`ALTER TABLE` did not exist in any form — `AlterTableStmt is not supported
+yet` — which put every migration tool out of reach. `ALTER TABLE ... RENAME`
+was a separate refusal (`RenameStmt`), because PostgreSQL's parser puts it in
+a different node.
+
+Both work now. Against a live PostgreSQL 14.13 the DDL corpus went from 28
+divergences out of 41 to 7, and every one of the seven left is `CREATE INDEX`
+or `CREATE VIEW` — a different slice. A second corpus of 85 lines written for
+this change, covering the shapes the first one never reached, is clean.
+
+What works: `ADD COLUMN` (with `DEFAULT`, `NOT NULL`, `IF NOT EXISTS`),
+`DROP COLUMN`, `ALTER COLUMN SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`,
+`ALTER COLUMN TYPE`, `ADD CONSTRAINT ... CHECK`, `DROP CONSTRAINT`,
+`RENAME COLUMN` and `RENAME TO` — several actions in one statement, applied in
+order, so `add column m int, alter column m set default 5` works.
+
+Three decisions worth stating, because each is a place where a plausible
+implementation is silently wrong:
+
+**The rows are rewritten, not left short a field.** `ADD COLUMN` fills every
+existing row and `DROP COLUMN` removes the field. Leaving the field behind
+would be invisible while the catalog no longer named it — and then adding a
+column of the same name later would resurrect the old values, a wrong answer
+no error would flag. It makes an ALTER O(table) where PostgreSQL can often
+avoid the rewrite; that is the right trade here, where tables are fixtures.
+
+**`ALTER COLUMN TYPE` follows PostgreSQL's cast rule, which is about the TYPES
+and not the values.** `text -> int` is refused with `42804` even when every
+value would convert cleanly; it needs a `USING` clause. Casting per row
+instead made the same statement succeed or fail depending on the data, which
+is not what PostgreSQL does either way. The rule was measured across 31 type
+pairs on 14.24.
+
+**An ALTER is validated before a row is touched.** Every action is checked
+against the catalog first, so a second action failing cannot leave the table
+in a shape neither the old nor the new catalog describes. `SET NOT NULL` over
+a column that has NULLs, and `ADD CONSTRAINT CHECK` that existing rows fail,
+are both refused with PostgreSQL's own SQLSTATE.
+
+#### Added
+
+- `secantus-pgplan` / `secantus-pgserver`: `ALTER TABLE` and
+  `ALTER TABLE ... RENAME`, in the forms above. An action outside them is
+  refused by its own name (`ALTER TABLE OWNER TO`, `... VALIDATE CONSTRAINT`)
+  rather than under one catch-all.
+- Savepoint capture for the new statements, so a `ROLLBACK TO` puts back the
+  rewritten ROWS as well as the catalog.
+
+#### Fixed
+
+- `secantus-pgplan`: `CREATE TABLE t (id int, id int)` was accepted silently,
+  producing a table whose second column was unreachable because every lookup
+  resolves a name to the first match. It is PostgreSQL's `42701` now.
+
+### The Rust PostgreSQL server learns arrays
+
+Arrays were the largest hole left in the Rust PostgreSQL server's query
+language. Storing and returning one already worked — `int[]` columns,
+`ARRAY[...]` literals, multidimensional values, `||` — but almost nothing could
+be *done* with one: fifteen array functions, the three containment operators,
+and subscripting itself all answered `0A000 … is not supported yet`, and
+`UPDATE t SET a[2] = 99` answered `cannot cast int4 to int4[]`, an error about a
+cast the statement never asked for.
+
+All of that now works. The array corpus this release was measured against went
+from 24 divergences out of 29 to 6, and a second corpus of 32 further shapes
+runs clean; every one of the six remaining is an honest, named refusal rather
+than a wrong answer, and five of them are one missing feature (set-returning
+functions — `unnest`, `generate_subscripts`, a function in `FROM`).
+
+Two things are deliberately refused rather than approximated. This server does
+not model array *lower bounds* — every array starts at subscript 1, which is
+what every array a client can build actually does — so `array_fill(v, dims,
+lbounds)` with a bound other than 1, and `SET a[i] = v` below subscript 1, both
+answer `0A000` by name. PostgreSQL answers the second by *moving* the array's
+lower bound, leaving an `[0:5]={…}`; a server that silently re-based it to 1
+would hand back the right value under subscripts that then lie about it, which
+is the kind of quiet divergence this project treats as data loss.
+
+#### Added
+
+- The array functions: `array_length`, `array_ndims`, `array_dims`,
+  `array_lower`, `array_upper`, `cardinality`, `array_cat`, `array_append`,
+  `array_prepend`, `array_to_string`, `string_to_array`, `array_position`,
+  `array_positions`, `array_remove`, `array_replace` and `array_fill`, each
+  measured against PostgreSQL 14.13 including its NULL rules — which are not
+  one rule: `array_cat(NULL, ARRAY[3])` is `{3}` while `array_remove(NULL, 1)`
+  is NULL, and `array_position(ARRAY[1,NULL], NULL)` finds the NULL where
+  `ARRAY[1,NULL] @> ARRAY[NULL]` is false.
+- The containment operators `@>`, `<@` and `&&`, which flatten both sides, so
+  `ARRAY[[1,2],[3,4]] @> ARRAY[3]` is true.
+- Array subscripting: `a[1]`, `a[2:3]`, `a[2:]`, `a[:2]`, `m[1][2]`,
+  `m[1:2][1:1]`, and a bound that reads the row (`a[n]`). An out-of-range
+  element is NULL where an out-of-range *slice* is the empty array, and a
+  subscript list shorter than the array's dimensionality selects nothing —
+  `(ARRAY[[1,2],[3,4]])[1]` is NULL, not the inner row.
+- Subscript assignment: `SET a[i] = v` and `SET a[lo:hi] = v`, extending the
+  array with NULLs past its end, building it from a NULL column, and letting a
+  second assignment in one statement see the first.
+
+#### Fixed
+
+- A multidimensional array reported its type as `text[]` instead of the
+  element array (`int4[]`, oid 1007). A binary-format client refused the
+  integer rows it was handed as `_text`.
+- An array whose *first* element was NULL took its element type from that NULL
+  and reported `text[]`, so a client decoded the values beside it as NULL.
+- An array column was sampled as NULL at plan time, so every expression over
+  one was described from a NULL: `length(ta[1])` was typed `text` and the
+  integer it computed went out as the string `'1'`.
+- `UPDATE` with only a subscripted assignment took the bulk write path, wrote
+  an empty `$set` and still reported `UPDATE 1` — a statement that claimed
+  success and changed nothing.
+
+#### Security
+
+- `array_fill(1, ARRAY[1000000000])` and `SET a[1000000000] = 1` each size an
+  array from a number the client supplies. PostgreSQL caps an array at
+  134217727 elements and says so; the cap is now checked before any
+  allocation, so a single statement can no longer exhaust the server's
+  memory.
+
+### Rust PostgreSQL server: system types, all PG 15 settings, session-private pg_temp functions
+
+pgjdbc against the Rust PostgreSQL server went from 22 failures to 3 (7,354 tests). The remaining three are an UPDATE of `pg_class`, a `LANGUAGE C` function, and a client-socket check. pgx stays at 377 passed / 0 failed, including two runs over one store. Every fix is checked against PostgreSQL 15 and pinned in the `b40_fixes` and `b40_types` corpora.
+
+#### Added
+
+- The `macaddr`, `macaddr8`, `pg_lsn`, `txid_snapshot`, `pg_snapshot`, `xid`, `xid8` and `cid` types.
+- All 345 PostgreSQL 15 settings are SHOW-able with PG's defaults. `pg_settings` carries their metadata.
+- Standalone composite types appear in `pg_class`.
+
+#### Fixed
+
+- `pg_temp` functions are private to their session and dropped at disconnect.
+- `ADD PRIMARY KEY USING INDEX` keeps the index's name and its INCLUDE columns.
+- A LIKE pattern ending in its escape character raises 22025 only when matching reaches it.
+- `_custom` array type names follow PostgreSQL's rule. Columns of composite or enum array types appear in `pg_attribute`.
+- Two-dimensional enum and composite arrays render correctly.
+- A `BC` date keeps a UTC offset written after it.
+- Describe of a statement reports text formats. The time-zone name is case-canonical.
+- System relations carry initdb's `relacl`.
+- Startup ParameterStatus no longer sends `search_path`.
+- The pgjdbc runner gives its `test` role a password, as pgjdbc's CI does.
+
+### Rust PostgreSQL server: a privilege bypass, has_table_privilege, and backlog leftovers
+
+#### Security
+
+- A table named with its schema (`s.t`) skipped the privilege check entirely: any role could SELECT and INSERT on it. The check now resolves the qualified relation.
+- `has_table_privilege` answered true for every role. It now answers from grants, owners, role membership and PUBLIC.
+
+#### Fixed
+
+- Two cases accepted duplicate rows silently on a dotted column: `ALTER TABLE ADD UNIQUE` over existing rows, and `UNIQUE NULLS NOT DISTINCT`. Both now reject them.
+- Binary input of `xid`, `cid`, `xid8`, `txid_snapshot`, `pg_snapshot` and their arrays was stored as raw bytes. It is now decoded.
+- A `pg_temp` function called without its `pg_temp.` prefix is refused (42883). Leftovers from a killed server are dropped at open.
+- `min` / `max` over types with no such aggregate in PostgreSQL 15 are refused.
+- SET of server-start or reload-only settings is refused with 55P02.
+- Index comments are kept per schema.
+- `pg_get_viewdef` qualifies other schemas' tables.
+- `'t'::regclass` and `to_regclass` walk `search_path`.
+- An aggregate `FILTER` containing a subquery works for `array_agg`, `json_agg`, `jsonb_agg`, `json_object_agg` and window aggregates.
+- The SQLAlchemy gauge runner deletes its temp directory.
+
+### Rust PostgreSQL server: durable commits, schema and object privileges, snapshot functions
+
+#### Changed
+
+- In durable mode (the default), every acknowledged COMMIT on `secantusd-pg` is now synced to disk. Before, a commit acknowledged just before a process kill was lost: 20 of 20 times in a kill test, against 0 of 20 now. This matches PostgreSQL's default. Durable autocommit writes cost about 10x more. Test fast-storage mode (`SECANTUS_TEST_FAST_STORAGE=1`) is unchanged. The Rust MongoDB server is unaffected.
+
+#### Fixed
+
+- Schema USAGE is enforced: reading `s.t` without it is `42501`.
+- GRANT / REVOKE on schemas, sequences and functions is recorded.
+- `has_schema_privilege`, `has_sequence_privilege`, `has_function_privilege` and `has_column_privilege` answer from grants and owners, not true for everyone.
+- `set_config(x, v, true)` outside a block lasts only for its statement.
+- Large-object descriptors opened in autocommit close at statement end.
+- Other sessions' temp tables are listed in `pg_class`.
+- A notice raised before `pg_sleep` is sent during the sleep, and the sleep can be cancelled.
+
+#### Added
+
+- `information_schema.role_table_grants` and `table_privileges`.
+- The snapshot functions: `pg_snapshot_xmin` / `xmax` / `xip`, `pg_visible_in_snapshot`, `pg_current_snapshot`, and their `txid_` forms.
+
+### Rust PostgreSQL server: privilege enforcement, and the per-statement cost halved
+
+#### Fixed
+
+- Privileges that were recorded but never enforced now are:
+  - A schema without USAGE is left out of the search path.
+  - Schema CREATE is checked when an object is created.
+  - `nextval` / `currval` / `setval` and `SELECT` from a sequence check its privileges.
+  - Function EXECUTE is checked at the call.
+- Function grants are per signature. `GRANT ... ON ALL SEQUENCES / FUNCTIONS IN SCHEMA` takes effect.
+- A dropped sequence's or function's grants no longer carry over to a recreated object of the same name.
+- A PL/pgSQL or DO-block `RAISE NOTICE` is sent as it is raised.
+
+#### Performance
+
+Per-statement overhead had tripled since the full PostgreSQL 15 setting list was added. Release build, psycopg, median of 5 × 1,000:
+
+| µs per statement | before | after |
+| --- | --- | --- |
+| simple `select 1` | 78 | 37 |
+| extended `select 1` | 152 | 60 |
+| extended primary-key read | 205 | 103 |
+
+The setting map is reinstalled only when it changes. Roles, row-level-security flags, inheritance and expression-index lists are cached against the catalog version.
+
+### Rust PostgreSQL server: READ COMMITTED waits for a row instead of failing
+
+#### Fixed
+
+- A READ COMMITTED block that met another session's uncommitted row used to fail at once with 40001. It now waits for that session, then re-runs its statement against the committed row, as PostgreSQL does. The final result matches PostgreSQL in every scenario tested. The wait still ends on:
+  - cancel;
+  - `statement_timeout`;
+  - `lock_timeout` (55P03);
+  - a deadlock (40P01).
+- REPEATABLE READ and SERIALIZABLE still raise 40001.
+- An UPDATE that leaves a row unchanged (`n = n*2` over 0) now takes the row lock. Before, it ignored another session's uncommitted update: it left 7 where PostgreSQL gives 14.
+- A failed block rolls back its storage transaction immediately, so a deadlock's survivor need not wait for the loser's ROLLBACK.
+- Privilege checks:
+  - a SERIAL column's default `nextval` is checked for the inserting role;
+  - `lastval()` is checked against its sequence;
+  - EXECUTE on the trigger function is checked at `CREATE TRIGGER`;
+  - grants on built-in functions are per signature.
+
+#### Performance
+
+A statement's Describe result is cached per session while the catalog, settings and role are unchanged. Release build, before and after:
+
+| statement | before | after |
+| --- | --- | --- |
+| primary-key read | 104 µs | 77 µs |
+| autocommit update | 101 µs | 84 µs |
+
+### Rust PostgreSQL server: operator type checks, built-in EXECUTE, view definitions
+
+#### Fixed
+
+- Four comparisons across types used to give a silent wrong answer. Each now raises PostgreSQL's error (42883 / 22007):
+  - `arr = 1` returned the row;
+  - `a = ANY(ARRAY['x'])` returned no rows;
+  - `text BETWEEN 1 AND 2` returned no rows;
+  - `current_date = 'x'` returned no rows.
+- Other type and placement errors:
+  - `sum(text)` returned 0;
+  - an aggregate or window function in WHERE was accepted;
+  - json `->` / `->>` operand types were not checked;
+  - `int + float8` typing now matches PostgreSQL.
+- After `REVOKE EXECUTE` on a built-in function, a direct call is refused. The check uses the overload chosen for the argument types.
+- `pg_get_viewdef` prints cross-type date/time comparisons, `[NOT] MATERIALIZED` CTEs and RANGE offsets. Invalid RANGE offsets are refused at planning.
+- Error positions and hints for the ungrouped-column and invalid-reference errors.
+
+#### Changed
+
+- A test now proves the catalog-cache gate is needed: without it, one connection's uncommitted event trigger fired on another connection's DDL.
+
+### Rust PostgreSQL server: PostgreSQL-equivalent commit sync on macOS, PL/pgSQL error context
+
+#### Changed
+
+- On macOS, durable commits sync the log with `O_DSYNC`, which is what PostgreSQL's macOS default `open_datasync` does. They no longer use a full drive-cache flush (`F_FULLFSYNC`). An acknowledged commit still survives a process kill (0 losses in 20 kill runs), but not a power loss, the same as PostgreSQL. Durable autocommit UPDATE dropped from 7.9 ms to 149 µs, against PostgreSQL 15's 82 µs. Linux and the Rust MongoDB server are unchanged.
+
+#### Fixed
+
+- `a LIKE 'x'` over an integer in the select list returned NULL. It is now 42883 with a position.
+- A FROM-list subquery that references a sibling (`FROM t x, (SELECT x.a) s`) is 42P01 with PostgreSQL's hint.
+- PL/pgSQL errors carry PostgreSQL's CONTEXT stack, through nested calls, EXECUTE, triggers and DO blocks.
+- `pg_get_viewdef`:
+  - prints implicit casts for the resolved overload;
+  - prints `EXTRACT` in its own syntax;
+  - wraps by column width.
+
+### Rust PostgreSQL server: system indexes, SQL-function error context, SECURITY DEFINER
+
+#### Fixed
+
+- Writes to system catalogs were silently wrong: UPDATE and DELETE reported 0 rows, and INSERT created a hidden table. Now:
+  - an UPDATE that leaves every matched row unchanged reports its rows, as PostgreSQL does;
+  - a real change, a DELETE that matches rows, or an INSERT is refused with 0A000.
+- `pg_index`, `pg_indexes` and `pg_get_indexdef` list PostgreSQL's own 162 system indexes. Catalog result columns carry their table oid and column number.
+- Errors in `LANGUAGE sql` functions carry PostgreSQL's CONTEXT: `statement N`, `during inlining`, or no frame, following PostgreSQL's inlining rules.
+- `CREATE FUNCTION ... SECURITY DEFINER` and `SET` clauses were dropped. They are now stored and applied: a definer function runs as its owner, and a SET clause holds for the call only.
+
+#### Performance
+
+- Extended-protocol replies are buffered until Sync or Flush rather than flushed once per message. Extended `select 1` went from 61 to 53 µs.
+
+### Rust PostgreSQL server: precise row waits, plan reuse, streaming portals, PG 15 catalog columns
+
+#### Fixed
+
+- A transaction waiting on a row now waits only on that row's holder. The holder is tracked through each block's written rows, including rows written by triggers and FK cascades. A chain of waits no longer reports a false deadlock (40P01); real cycles still do.
+- `SELECT *` over 51 system catalogs returns exactly PostgreSQL 15's columns, in PostgreSQL 15's order. 21 differed before.
+- An int8 value too large for an int4 column answers 22003, not 22P02.
+
+#### Performance
+
+- A prepared SELECT / UPDATE / DELETE that is safe to template reuses its plan across Executes, substituting the bound values into its WHERE filter.
+- An extended-protocol SELECT outside a transaction block streams from one snapshot in 256-row batches on a pooled reader thread. Server memory for a 400 MB result grew 436 MB instead of 1,620 MB.
+
+| µs per statement (release) | before | after | PostgreSQL 15 |
+| --- | --- | --- | --- |
+| extended primary-key read | 74 | 55 | 34 |
+| simple `select 1` | 37 | 32 | 23 |
+| extended scan, 1,000 rows | 891 | 755 | 188 |
+
+### Rust PostgreSQL server: psycopg back to zero failures, COMMIT no longer rebuilds the catalog
+
+The psycopg suite against the Rust PostgreSQL server had regressed from 1 failure (2026-09-18) to 61. It is now 5,544 passed / 0 failed. Every fix is checked against PostgreSQL 15 and pinned in the `b49_psycopg` corpus.
+
+#### Fixed
+
+- An untyped literal or parameter compared with a range or multirange takes the range's type (`'empty' = $1::int4range`).
+- An explicit cast to `bpchar` with no length keeps trailing blanks (`chr(32)::bpchar` is `' '`).
+- An untyped argument no longer forces a text overload (`array[set_byte('x', 0, $2)]`).
+- Temporary tables:
+  - a temp table can `REFERENCES` itself;
+  - constraint errors on a temp table report its bare name, with `pg_temp_N` as the schema.
+- `SET client_encoding` inside a block keeps working after COMMIT.
+
+#### Performance
+
+- COMMIT and ROLLBACK rebuilt every connection's catalog view, even when the transaction changed no catalog. 60 `select; commit` over 100 tables took 31.9 s; they now take 0.4 s. The full psycopg run dropped from 1,539 s to 1,010 s.
+
+### Rust PostgreSQL server: SELECT FOR UPDATE, row-lock residuals, type checks, faster correlated subqueries
+
+#### Fixed
+
+- `SELECT ... FOR UPDATE` / `FOR NO KEY UPDATE` was accepted and ignored. Two sessions could both read and then update a row: a lost update. Row locks are now taken, including `NOWAIT` (55P03) and `SKIP LOCKED`.
+- Row waits and deadlocks:
+  - Autocommit statements, a running statement and primary-key INSERT conflicts now hold their rows while waiting, so cycles through them are 40P01.
+  - `ROLLBACK TO SAVEPOINT` releases the rows written after the savepoint.
+  - REPEATABLE READ waits for the holder before deciding on 40001.
+  - A block re-run after a conflict no longer writes its failed attempt twice.
+- Type mismatches that returned a value now raise PostgreSQL's error:
+  - `CASE` / `COALESCE` / `GREATEST` / `LEAST` / `NULLIF` over mismatched types;
+  - `x IN (SELECT ...)` across types.
+- `greatest(date, timestamptz)` returns a timestamptz.
+- `pg_get_viewdef` matches PostgreSQL on 60 more view shapes.
+- `txid_current()` and `pg_current_xact_id()` work. `pg_current_snapshot()` reports running transactions.
+- DDL notices ("skipping", the CASCADE list) are sent as they are raised.
+
+#### Performance
+
+- Correlated subqueries with a text key, a JOIN or an aggregate under a filter are hash-indexed: 2,000 × 2,000 rows went from about 1.2 s to 0.01-0.1 s.
+- UPDATE / DELETE no longer decode the whole catalog to find foreign keys. Planner setup is cached per session.
+
+| µs per statement (release) | before | after | PostgreSQL 15 |
+| --- | --- | --- | --- |
+| extended `select 1` | 49 | 42 | 27 |
+| extended autocommit UPDATE | 86 | 74 | 56 |
+
+### Rust PostgreSQL server: shared row locks, FOR UPDATE through joins and views, streaming cursors in a block
+
+#### Fixed
+
+- `FOR SHARE` / `FOR KEY SHARE` took no lock. They are now shared row locks following PostgreSQL's conflict table: sharers coexist, writers and `FOR UPDATE` wait for them, and two sharers that both upgrade get 40P01.
+- `FOR UPDATE` / `FOR SHARE` over a join, FROM-subquery or view locked nothing. It now locks the base rows behind the returned rows and honours `OF`.
+- PostgreSQL's refusals of row locking are added: with DISTINCT, GROUP BY, aggregates, windows, UNION, or on the nullable side of an outer join.
+- `ROLLBACK TO SAVEPOINT` releases later rows under REPEATABLE READ, after DDL, and for lock-only rows. When it does rewrite, a commit by another session no longer makes it fail.
+
+#### Performance
+
+- Inside a transaction block, an extended-protocol portal or a `DECLARE CURSOR` (with or without HOLD) over a plain one-table SELECT now streams in batches. Server memory for a 200 MB result grew 16-24 MB instead of 670-900 MB.
+
+### Rust PostgreSQL server: faster correlated subqueries, `sum(bigint)` overflow, `pg_collation_for`
+
+#### Fixed
+
+- `sum(bigint)` past the int64 range silently wrapped (`-9223372036854775806` where PostgreSQL answers `9223372036854775810`). It now sums exactly and answers numeric.
+- `pg_collation_for`:
+  - raises 42804 over a non-collatable type;
+  - answers NULL for an untyped literal;
+  - keeps its column name.
+- A COPY or Describe that arrived before any statement had run on its worker thread could miss user-defined types.
+
+#### Performance
+
+Correlated subqueries, 2,000 × 2,000 rows, release build:
+
+| shape | before | after | PostgreSQL 15 |
+| --- | --- | --- | --- |
+| nested correlated EXISTS | 36.7 s | 1.21 s | 0.13 s |
+| `sum` / `avg` under a filter | 1.2 s | 0.03-0.04 s | 0.15 s |
+| inner `ORDER BY ... LIMIT 1` | 0.30 s | 0.008 s | 0.13 s |
+
+- A WHERE with one non-lowerable conjunct now lowers the rest instead of evaluating the whole clause per row.
+- BindComplete and CloseComplete wait for Sync or Flush. A primary-key read went from 54 to 50 µs.
+
+### Rust PostgreSQL server: FOR UPDATE on tables without a primary key, faster nested subqueries
+
+#### Fixed
+
+- `FOR UPDATE` through a subquery on a table with no primary key locks only the rows behind the result.
+- `sum` / `avg` of double precision returned Infinity on overflow. They now raise 22003, as PostgreSQL does, for plain aggregates and window functions.
+- A user error inside a subquery reached the client as XX000 "could not read a subquery". It now keeps its own SQLSTATE.
+- The psycopg gauge runner restores default SIGINT handling. A run launched in the background inherited SIGINT ignored, so psycopg's `test_ctrl_c` could never send its cancel.
+
+#### Performance
+
+2,000 × 2,000 rows, release build:
+
+| shape | before | after | PostgreSQL 15 |
+| --- | --- | --- | --- |
+| nested correlated EXISTS | 1.23 s | 0.147 s | 0.128 s |
+| grouping in a FROM subquery | 0.32 s | 0.045 s | 0.128 s |
+| `sum` / `avg` of bigint, numeric or float under a filter | ~1.24 s | 0.03-0.07 s | ~0.146 s |
+
+### Rust PostgreSQL server: savepoint-safe UNIQUE indexes, READ COMMITTED reads after a write, EXCEPTION blocks
+
+#### Fixed
+
+- A UNIQUE index created in a transaction became a plain index if the transaction was later moved: by `ROLLBACK TO SAVEPOINT`, a conflict re-run, or a snapshot refresh. Duplicates were then accepted after COMMIT, silently. The index's options are now kept.
+- A READ COMMITTED block that has written now sees other sessions' later commits in its following statements, as PostgreSQL does. This applies while its write set is at most 256 entries.
+- A PL/pgSQL `EXCEPTION` block releases the rows it undoes immediately.
+- Every transaction move keeps the block's rows held across the move, closing a window where another writer could take them.
+- `FOR UPDATE` through a JOIN on a table without a primary key locks only the rows returned.
+- `sum(real)` adds in single precision. It raises 22003 on overflow instead of returning Infinity.
+- `round` / `trunc(numeric, n)` honour a negative `n` and handle NaN and Infinity.
+- A correlated subquery no longer raises a data error from a select-list expression on a row no outer row reaches.
+
+#### Performance
+
+- More correlated-subquery shapes run once per statement rather than once per outer row:
+  - numeric ordering filters;
+  - `sum` / `avg` of real;
+  - immutable built-ins in the select list;
+  - `generate_series` / `unnest` of constants.
+
+### Rust PostgreSQL server: SIGTERM, long READ COMMITTED blocks, sequences read live
+
+#### Fixed
+
+- `secantusd-pg` started with SIGTERM blocked, for example as a background job, could not be stopped by SIGTERM. It now unblocks and resets SIGINT and SIGTERM at startup. This is POSIX only.
+- A block's `SELECT last_value` on a sequence missed another session's `nextval`. Sequences are now read live unless the block wrote them.
+- READ COMMITTED blocks with more than 256 writes no longer keep their first snapshot. A block of 400 serial INSERTs alternating with SELECTs went from 2.54 s to 0.44 s. The block now moves to a fresh snapshot only for commits that can change its answer.
+
+#### Performance
+
+- Correlated subqueries with collated-text ordering filters, or with numeric `min` / `max` under a filter, are hashed instead of run per row. At 2,000 × 2,000 rows they take 0.03-0.04 s, against 0.12-0.68 s before.
+
+#### Tooling
+
+- The PostgreSQL differential probe compares against a `C`-collation reference database when the reference cluster's default collation is not `C`.
+
+### Rust PostgreSQL server: linear long READ COMMITTED blocks and sorted portals in bounded memory
+
+A READ COMMITTED transaction block that had written and then read another
+table while other sessions kept committing there was moved onto a fresh
+snapshot before every such read, replaying its whole write set each time --
+quadratic in the block's length (800 insert/read pairs took 54 s). A plain read
+of a table the block has not written now runs in a fresh read-only
+transaction of its own, which is exactly the per-statement snapshot
+PostgreSQL takes, and the same 800 pairs take 1.3 s.
+
+An extended-protocol `SELECT ... ORDER BY` outside a block is now streamed:
+the reader sorts the rows in runs of at most 16 MB, spills them to anonymous
+temporary files and merges them (a LIMIT keeps only the rows it can return),
+so a 300,000-row, 600 MB ordered result costs the server what an unordered one
+does instead of ~800 MB more.
+
+#### Fixed
+
+- `secantus-pgserver`: a READ COMMITTED block's plain one-table read of a
+  table it has not written (nor any catalog) reads in its own transaction
+  instead of replaying the block's write set (`rc_reads_apart`,
+  `read_apart`).
+- `secantus-pgserver`: an IMMUTABLE `LANGUAGE sql` function called over
+  constants is run as itself, as PostgreSQL's `evaluate_function` does before
+  inlining, so its error carries `SQL function "f" statement 1` (it said
+  `during inlining`).
+
+#### Changed
+
+- `secantus-pgserver`: streamed portals accept an ORDER BY of stored columns
+  (`external_sort`); per-statement work trimmed -- the DateStyle and TimeZone
+  are parsed only when the session's settings change, the catalog collections
+  are checked once per connection, the type catalog is read through a
+  per-thread copy of the shared cache, and `sql_relations` remembers its
+  parse-tree walk per statement text (names are still resolved per call).
+
+### Rust PostgreSQL server: READ COMMITTED joins and aggregates without a replay, and pulled-up constants
+
+A READ COMMITTED transaction block that has written, then reads other tables by
+a join or an aggregate while other sessions commit, no longer replays its whole
+write set before each read. Errors from inlined SQL functions over a one-row
+constant FROM item now carry PostgreSQL's `during inlining` context.
+
+#### Fixed
+
+- `secantusd-pg`: a READ COMMITTED block's read by a JOIN, an aggregate, GROUP BY
+  or an ORDER BY over an expression now runs in a fresh read-only transaction
+  when every table it names is an ordinary table the block has not written. Before,
+  the block was moved to a new snapshot with its writes replayed for every such
+  statement. The read also has to call no function except pure built-ins, and
+  have no subquery, no CTE and no row lock. 800 insert-then-join pairs beside a
+  committing writer (debug build): 66.5 s -> 11.8 s.
+- `secantusd-pg`: a one-row `VALUES` or constant `SELECT` in FROM is pulled up
+  into a user function call's arguments, as PostgreSQL's planner does. An error
+  raised by an inlined `LANGUAGE sql` function over that column now says
+  `SQL function "f" during inlining`. Before, the error had no CONTEXT.
+
+### The Rust servers: ordered cursors in bounded memory, cheaper primary-key reads, fewer READ COMMITTED replays, and a SIGTERM fix for `secantusd-rs`
+
+Inside a transaction block, a cursor or portal over one table with an
+`ORDER BY` of stored columns no longer holds its whole result in memory. A
+primary-key read is about 3 µs faster. A READ COMMITTED block that reads a
+table it has written no longer replays its writes when only other tables
+changed.
+
+#### Changed
+
+- Rust PostgreSQL server: a `DECLARE CURSOR`, or an extended-protocol portal
+  inside a block, over one table with an `ORDER BY` of stored columns is
+  sorted at its first fetch in bounded memory. It spills sorted runs to
+  temporary files and merges them. Fetching 300,000 rows of 2 KB in a block
+  grew the server by 47 MB, down from 2.7 GB.
+- Rust PostgreSQL server: a read by primary-key equality runs on its tokio
+  worker directly, without `block_in_place`'s hand-off. In a release build
+  a primary-key read went from about 49 µs to 45 µs.
+- Rust PostgreSQL server: in a READ COMMITTED block that has written, a
+  plain read of tables the block wrote takes a fresh snapshot only when
+  another session committed to one of those tables (or to a catalog). It
+  used to move whenever anything had committed. Then it replayed the
+  block's whole write set, which made a long block quadratic: 800
+  insert-then-read pairs beside another table's writer took 52.7 s, and
+  now take 3.2 s.
+
+#### Fixed
+
+- `secantusd-rs` (the Rust MongoDB server binary) ignored SIGTERM when its
+  parent had left SIGTERM blocked. It also lost a SIGTERM sent the moment
+  it printed its "listening on" line, because the stop handler was
+  installed after that line. It now resets the signal mask and installs
+  the handler before opening storage, as `secantusd-pg` does.
+
+### The Rust PostgreSQL server: hashed DISTINCT, bounded-memory DISTINCT, expression sorts and large GROUP BYs, and cheaper primary-key reads
+
+`DISTINCT`, `GROUP BY`, `INTERSECT` and `EXCEPT` no longer compare each row
+against every distinct row kept so far. That comparison was quadratic, and a
+`SELECT DISTINCT` over 300,000 distinct rows did not finish. Rows now go
+through a hash on the same value identity. `DISTINCT`, `DISTINCT ON` and an
+`ORDER BY` over an expression now stream in bounded memory, as an `ORDER BY`
+of stored columns already did. So does a `GROUP BY` whose input is larger
+than 64 MB. A primary-key read is about 3 µs faster.
+
+#### Changed
+
+- Rust PostgreSQL server: `SELECT DISTINCT`, `DISTINCT ON`, `GROUP BY`
+  (grouping sets included), `INTERSECT [ALL]`, `EXCEPT [ALL]` and
+  `agg(DISTINCT ...)` use a hash on the value identity. Equality is still
+  decided by `==` inside a bucket, so the answers are unchanged
+  (`distinct_set.rs`).
+- Rust PostgreSQL server: a `DECLARE CURSOR`, a block's portal and an
+  extended-protocol portal outside a block now stream with `DISTINCT`,
+  `DISTINCT ON` or an `ORDER BY` over an expression. Each one sorts in
+  bounded memory and keeps the first of each run of equal rows. Fetching
+  300,000 rows of 2 KB 1,000 at a time after a restart (release build), the
+  server's RSS growth went down as follows:
+  - expression `ORDER BY`, outside a block: 1,719 → 40 MB;
+  - expression `ORDER BY`, named cursor: 2,384 → 44 MB;
+  - `DISTINCT`: 1,371 → 33 MB;
+  - `DISTINCT ON`: 1,372 → 37 MB.
+- Rust PostgreSQL server: a plain `GROUP BY` over one stored table whose
+  input passes 64 MB sorts on the group key and aggregates one group at a
+  time. This also works inside a transaction block. RSS growth for the
+  300,000-row table went from 1,430 MB to 106–110 MB. Smaller inputs are
+  grouped as before. `SECANTUS_PG_GROUP_MEMORY_BYTES` lowers the threshold
+  for tests.
+- Rust PostgreSQL server: a primary-key read no longer copies the role list,
+  the session user, the role and the temp-schema name on every statement. It
+  also no longer resolves its relations through the search path on every
+  statement. Release build, `bench43.py`, two interleaved runs: 47.4 / 49.0 →
+  45.4 / 45.3 µs. PostgreSQL 15.19 takes 33.1 µs.
+
+#### Fixed
+
+- Rust PostgreSQL server: `DISTINCT` / `GROUP BY` over an array compares its
+  elements by value. `{1.0}` and `{1.00}` are now one numeric array, and
+  `{NaN}` equals itself in a float array. A set operation now matches an
+  integer literal against a numeric column by value, so `select n ... union
+  select 1` no longer returns `1` twice. These are PostgreSQL 15.19's
+  answers (corpus `b59_distinct`).
+
+### Rust PostgreSQL server: jsonb compares by value, ungrouped aggregates in bounded memory
+
+`jsonb` values were compared by their stored text, which keeps each
+number's scale, so `{"x": 1}` and `{"x": 1.0}` came out as two different
+values. PostgreSQL compares jsonb numbers as numerics. The wrong answers
+were not limited to DISTINCT and GROUP BY: `WHERE j = '{"x":1.0}'`
+returned no rows at all, even for a row stored with exactly that text. An
+aggregate with no GROUP BY now runs in bounded memory.
+
+#### Fixed
+
+- jsonb equality is by value everywhere it is decided: WHERE `=` / `<>` /
+  `IN` / `= ANY` / `IS [NOT] DISTINCT FROM`, joins, IN and EXISTS
+  semi-joins, SELECT DISTINCT, DISTINCT ON, GROUP BY (including its
+  sorted spill), `count(DISTINCT j)`, UNION / INTERSECT / EXCEPT, a
+  window's PARTITION BY, and UNIQUE / PRIMARY KEY constraints on INSERT
+  and UPDATE. Checked against PostgreSQL 15.19 with corpus `b60_jsonb_eq`.
+- An UPDATE now enforces a UNIQUE constraint over a column with a
+  nondeterministic collation. Before, only INSERT checked it.
+- `SELECT DISTINCT count(*) ... GROUP BY k ORDER BY 1` (or `ORDER BY` the
+  aggregate's alias) returned an error. It now returns the distinct
+  aggregate values in order.
+
+#### Changed
+
+- An aggregate with no GROUP BY over one stored table (with no filter or a
+  collection-scan filter) reads its input one chunk at a time and combines
+  the partial results. This covers `count`, `min`, `max`, `bool_and`,
+  `bool_or`, and an exact integer or numeric `sum`. On 300,000 rows of 2 KB
+  the server's memory growth fell from 1755 MB to 58 MB.
+- An equality on a `jsonb` column is now checked row by row, so it no
+  longer uses a btree index on that column. A jsonb UNIQUE constraint reads
+  the whole table once per write statement.
+
+### READ COMMITTED reads its own rows without replaying, and avg streams
+
+A READ COMMITTED transaction block on the Rust PostgreSQL server that reads
+a table it has written, while other sessions keep committing to that same
+table, no longer replays its whole write set onto a new snapshot for every
+statement. The read runs in a fresh snapshot with the block's own rows laid
+over it, so it sees every commit since and its own uncommitted writes, as
+PostgreSQL does: 800 insert-then-aggregate pairs beside a committing writer
+went from 24.7 s to 8.6 s on a debug build.
+
+`avg` over any numeric or floating-point column, and `sum` over a float
+column, with no GROUP BY, are now computed a chunk at a time in bounded
+memory, with answers bit-identical to the one-pass result: 300,000 rows of
+2 KB went from about 1.75 GB of server memory growth to about 64 MB.
+
+#### Added
+
+- `secantus-storage`: `Storage::block_overlay`, `TableOverlay`,
+  `with_read_overlay` and `Storage::oplog_async`. `find_matching_with`,
+  `scan_batch_after`, `scan_matching_batches`, `count_matching` and
+  `find_by_id` honour an installed overlay; nothing installs one on the
+  MongoDB server.
+
+#### Changed
+
+- `secantus-pgserver`: a READ COMMITTED SELECT of the narrowed shapes over
+  tables the block wrote reads apart under the block's overlay
+  (`rc_overlays`) instead of moving the block. Ungrouped `avg` and float
+  `sum` stream (`ungrouped_in_bounded_memory`): a float total is carried
+  from chunk to chunk, an exact average keeps its sum and count.
+
+### Rust PostgreSQL server: subqueries see READ COMMITTED commits; sub-millisecond timestamps sort and group; simple-protocol SELECTs stream
+
+A batch of fixes and memory work on `secantusd-pg`. Every answer was checked
+against PostgreSQL 15.19.
+
+#### Fixed
+
+- **A READ COMMITTED block's uncorrelated subquery missed rows committed
+  since the block's snapshot.** A subquery like this runs while the
+  statement is planned. Planning came before the block moved onto a fresh
+  snapshot. So the first read after another session's commit answered the
+  subquery from the old snapshot: `select (select max(x) from t)` gave `2`
+  where PostgreSQL gives `300`. A statement with a subquery or a WITH item
+  now gets its snapshot before planning.
+- **Timestamps that share a millisecond were not told apart in five places.**
+  A `timestamp` / `timestamptz` is stored as a millisecond date plus a hidden
+  microsecond remainder. Five places compared the date alone:
+  - `ORDER BY ts` put `.002006` before `.002000`.
+  - `GROUP BY ts` merged every value in one millisecond into one group.
+  - `DISTINCT ON (ts)` kept one row per millisecond.
+  - `min(ts)` / `max(ts)` lost the microseconds.
+  - `count(DISTINCT ts)` undercounted.
+
+  All of these now use the full value, and window peers and ranks use the
+  same comparison. Corpus `b62_distinct_ts` gives 0 divergences in 35
+  checks, with and without `SECANTUS_PG_GROUP_MEMORY_BYTES=1000`.
+
+#### Changed
+
+- **A READ COMMITTED read with uncorrelated subqueries or plain-SELECT CTEs
+  no longer replays the block's write set.** Such a read used to move the
+  block onto a new snapshot whenever another session had committed. Now it
+  reads in a fresh transaction, with the block's own rows laid over it,
+  exactly as a read without a subquery already did. The planning-time
+  subquery and the statement share that one transaction. Measured on a debug
+  build with 200 / 400 / 800 insert-then-subquery-read pairs, beside a
+  session committing to the same table: the replay path takes 4.0 / 15.5 /
+  59.8 s and the new path 1.1 / 3.3 / 12.2 s.
+- **A lone SELECT sent through the simple query protocol now streams.** This
+  covers a SELECT with no WHERE, outside any transaction. Its rows come from
+  a reader thread as pgwire sends them, as an extended portal's already did.
+  Measured on 300,000 rows of 2 KB after a restart, with the WiredTiger cache
+  capped at 64 MB so the result is not hidden behind the cache: peak RSS
+  went from 1884 MB to 175 MB.
+- **`DISTINCT` over a `timestamp` / `timestamptz` column streams in bounded
+  memory.** It used to be materialised. The hidden microsecond remainder is
+  now part of the row's identity.
+
+### Rust PostgreSQL server: read-only STABLE functions, and two silent wrong answers fixed
+
+The Rust PostgreSQL server now runs a STABLE or IMMUTABLE function the way
+PostgreSQL does: read-only. An INSERT, UPDATE, DELETE, DDL, SET, SHOW, NOTIFY
+or row-locking SELECT inside one is refused with PostgreSQL's 0A000 "... is not
+allowed in a non-volatile function" -- for a SQL function before any of its
+statements runs, for PL/pgSQL at the offending statement. Before, the write
+simply happened.
+
+That guarantee is what lets a READ COMMITTED block call such a function
+without replaying its writes: a read that calls only STABLE / IMMUTABLE
+functions whose bodies read plain tables now reads in a fresh snapshot with
+the block's own rows laid over it. Doing that exposed a silent wrong answer
+that was already there -- a function over constants is run while the
+statement is planned, which was before the block took its fresh snapshot, so
+`select f()` missed a row another session had just committed. Such a read now
+gets its snapshot before planning.
+
+A subquery inside `INSERT ... VALUES` works (it was "SubLink is not supported
+yet"), and a simple-protocol SELECT whose WHERE would be answered by a
+collection scan anyway now streams its rows instead of building the whole
+result first.
+
+#### Fixed
+
+- `secantus-pgserver`: a write (or any statement but a plain SELECT) inside a
+  STABLE / IMMUTABLE function is 0A000, with PostgreSQL's CONTEXT
+  (`SQL function "f" during startup`, or the PL/pgSQL statement frame). A
+  VOLATILE function such a function calls may still write, as in PostgreSQL.
+- `secantus-pgserver`: in a READ COMMITTED block that had written, a user
+  function folded while planning read the block's old snapshot and missed
+  rows other sessions had committed since (`select f()` answered 2 where
+  PostgreSQL 15 answers 3).
+- `secantus-pgplan`: a subquery in an `INSERT ... VALUES` row.
+
+#### Changed
+
+- `secantus-pgserver`: a READ COMMITTED read calling STABLE / IMMUTABLE user
+  functions (SQL, or PL/pgSQL without dynamic SQL, cursors, CALL or EXCEPTION
+  blocks, transitively, with no VOLATILE function anywhere) reads apart from
+  the block under its overlay instead of replaying the block's write set.
+- `secantus-pgserver`: a simple-protocol SELECT whose WHERE the storage would
+  answer by a collection scan streams from a reader thread (300,000 rows of
+  2 KB: server RSS growth ~700-1000 MB -> ~20 MB).
+
+### Rust PostgreSQL server: indexed and in-block reads stream, and four wrong answers fixed
+
+The Rust PostgreSQL server streams more reads in bounded memory. A SELECT with
+an indexed WHERE now walks its index a batch at a time instead of building the
+whole result first, and so does an aggregate over an indexed filter. A
+simple-protocol SELECT inside a REPEATABLE READ or SERIALIZABLE block streams
+through the block's own transaction. A DISTINCT over a `tsvector` or `tsquery` column streams too.
+Over 300,000 rows of 2 KB, server memory growth fell from 1.3 GB to 27 MB for
+an indexed range, and from 2.6 GB to 47 MB for a whole-table read inside a
+REPEATABLE READ block. The answers are byte-identical.
+
+Reading one row by primary key no longer asks the storage for a query plan
+first. That makes a PK read about 3 microseconds faster.
+
+Probing these paths against PostgreSQL 15.19 found four wrong answers, all now
+fixed. `exists(select 1/0)` raised an error, but PostgreSQL never evaluates an
+EXISTS subquery's select list and answers true. A `SELECT DISTINCT` whose
+ORDER BY was not in the select list returned rows where PostgreSQL raises
+42P10. Float `power` returned NaN or Infinity where PostgreSQL raises an
+error. Float `sqrt`, `ln` and `log` raised errors with the wrong SQLSTATE.
+
+#### Added
+
+- `secantus-storage`: `Storage::scan_routed_batches`, a batched scan routed
+  through the same index `find_matching` would use.
+- `tools/probes/plpgsql_expr_context.py`: compares the CONTEXT of PL/pgSQL
+  expression errors against PostgreSQL over 60 expression shapes.
+
+#### Changed
+
+- `secantus-pgserver`: a simple-protocol or whole-result extended SELECT with
+  an indexed WHERE streams; a primary-key point lookup keeps the direct path.
+- `secantus-pgserver`: an aggregate over an indexed filter is computed in
+  bounded memory, like one over a collection scan.
+- `secantus-pgserver`: a simple-protocol SELECT inside a REPEATABLE READ /
+  SERIALIZABLE block streams through the block's transaction.
+- `secantus-pgserver`: a DISTINCT over a tsvector / tsquery column streams,
+  de-duplicating on the value's text.
+
+#### Fixed
+
+- `secantus-pgplan`: an EXISTS subquery's select list, DISTINCT and ORDER BY
+  are dropped before it runs, so `exists(select 1/0)` is true
+  (PostgreSQL's `simplify_EXISTS_query`).
+- `secantus-pgplan`: `SELECT DISTINCT ... ORDER BY <something not in the
+  select list>` is 42P10 `for SELECT DISTINCT, ORDER BY expressions must
+  appear in select list`.
+- `secantus-pgplan`: the float math functions follow PostgreSQL's `float.c`:
+  - `sqrt` of a negative raises 2201F.
+  - `ln` / `log` of zero or a negative raises 2201E, with PostgreSQL's two
+    messages.
+  - `exp` overflow and underflow raise 22003.
+  - `power` raises 2201F for a negative to a fraction or zero to a negative,
+    and 22003 on overflow or underflow. Its NaN and infinity cases match.
+- `secantus-pgserver`: a PL/pgSQL expression error carries the
+  `SQL expression "..."` CONTEXT frame exactly when PostgreSQL's planner would
+  raise it. That happens when a constant subexpression fails as it is folded:
+  `1/0 + x` gets the frame and `x/0` does not. An unreadable literal never gets
+  the frame. 58 of 60 probed shapes now match, up from 50.
+- tests: the nested pytest runs no longer sweep the stale temp backlog at
+  session start. That sweep was the cause of a 300 s timeout in
+  `test_tmp_retention_guard.py`.
+
+### Rust PostgreSQL server: joins and READ COMMITTED reads stream in bounded memory
+
+A join of stored tables no longer builds every joined row before the first one
+goes out. The Rust PostgreSQL server reads and hashes each right side first,
+within a 64 MB bound, then reads the leftmost table a batch at a time on the
+statement's own thread, joining, filtering and handing rows on as it goes; an
+aggregate over the join folds them in bounded memory. A 300,000-row join that
+held 3.5 GB now holds 25 MB, with byte-identical output. The narrow two-table
+path's nested loop over every pair is a hash on the ON equality, so a join it
+falls back on is fast too.
+
+A plain SELECT inside a READ COMMITTED transaction block streams through the
+block's transaction as well, except when the statement reads apart from the
+block in a fresh snapshot of its own. Three missing errors are raised now: a
+COLLATE on a type that takes none is caught at planning, a DISTINCT or
+DISTINCT ON whose ORDER BY does not match it is 42P10, and rows skipped by
+OFFSET still have their select list computed.
+
+#### Changed
+
+- `secantus-pgserver` (`stream_join`): joins of stored tables, and aggregates
+  over them, stream outside a transaction block; a right side over
+  `SECANTUS_PG_JOIN_INNER_BYTES` (default 64 MB) falls back to the
+  materialised path before any row is sent.
+- `secantus-pgserver`: the narrow join path matches through a hash on its ON
+  equality instead of a nested loop.
+- `secantus-pgserver`: a simple-protocol SELECT inside a READ COMMITTED block
+  streams unless it runs apart from the block.
+
+#### Fixed
+
+- `secantus-pgplan`: `ORDER BY v COLLATE "C"` over an integer column is 42804
+  at planning, over an empty table too.
+- `secantus-pgplan`: `SELECT DISTINCT t ... ORDER BY t COLLATE "C"` and a
+  DISTINCT ON whose leading ORDER BY items are not its expressions are 42P10.
+- `secantus-pgserver`: rows skipped by OFFSET have their select list computed,
+  so `exists(select a/b ... offset 5)` raises 22012 as PostgreSQL does.
+
+### The Rust PostgreSQL server skips subquery outputs nothing reads, and streams the joins it used to hold whole
+
+PostgreSQL never computes a FROM-subquery output that nothing reads, so
+`select count(*) from (select a/b from t) s` answers even when `b` is zero.
+The Rust PostgreSQL server computed every output and raised a division by
+zero; it now removes an unread output first, under PostgreSQL's own rules.
+
+Joins that batch 65 still built whole now read in bounded memory: a join with
+a subquery, function or LATERAL side, a join inside a transaction block,
+GROUPING SETS / ROLLUP / CUBE, and a join whose right side is too big to hold
+(that side is now split into partitions on disk). On 300,000 rows of 2 KB with
+a 64 MB WiredTiger cache, peak server memory for these queries dropped from
+2.9-5.9 GB to 52-290 MB, with byte-identical output.
+
+#### Fixed
+
+- `secantus-pgplan` (`prune_outputs`): a FROM-subquery output (or an output of
+  an inlined CTE, or of a UNION ALL arm) that the enclosing query cannot read is
+  replaced by NULL before planning, so its errors are not raised. As in
+  PostgreSQL, volatile and set-returning outputs are kept, and so are outputs
+  under a plain DISTINCT or named by the subquery's own ORDER BY / GROUP BY. A
+  subquery that does not plan on its own keeps every output, so parse-analysis
+  errors still surface.
+- `secantus-pgserver`: a two-table join of a `float8` or `numeric` column to an
+  int column (`ON a.f = b.k`) returned no rows on the narrow join path. It now
+  compares the values numerically.
+
+#### Changed
+
+- `secantus-pgserver` (`stream_join`, `grace_join`): streamed joins now cover
+  subquery, function and LATERAL sides, transaction blocks (read through the
+  block's session), and right sides past `SECANTUS_PG_JOIN_INNER_BYTES` (a
+  grace hash join that keeps the materialised order). GROUPING SETS are
+  aggregated one set at a time in bounded memory. Aggregates over a join no
+  longer encode the joined rows only to decode them again.
+  `SECANTUS_PG_JOIN_STREAM=0` turns streamed joins off.
+
+### The Rust PostgreSQL server places an aggregate at the query level its columns belong to, and groups ROLLUP / CUBE from one read
+
+In PostgreSQL an aggregate belongs to the lowest query level whose columns it
+reads. So in `select (select max(s.x) from t) from s`, `max(s.x)` is the OUTER
+query's aggregate: the outer query returns one row, and the subquery fails
+with "more than one row returned" when `t` has several rows. The Rust
+PostgreSQL server computed the aggregate once per outer row instead, and
+returned a confident wrong answer. It now follows PostgreSQL's rule in select
+lists, HAVING, ORDER BY, EXISTS / IN / ARRAY subqueries and nested subqueries.
+Such an aggregate placed in WHERE, a JOIN condition, GROUP BY or a LATERAL
+FROM item is now rejected with 42803, as in PostgreSQL.
+
+GROUPING SETS / ROLLUP / CUBE over an input too big for memory read that input
+once per grouping set (batch 66), so a ROLLUP over a join ran the join three
+times. The input is now read once, and only the keys and aggregate inputs are
+kept. A small input is read once too; batch 66 read it twice. Joins whose
+right side spills to disk no longer re-sort the whole joined rows to restore
+their order.
+
+#### Fixed
+
+- An aggregate inside a subquery that reads only outer columns is the outer
+  query's aggregate (PostgreSQL's `agglevelsup`), at any depth. One misplaced
+  in WHERE / JOIN ON / GROUP BY / a LATERAL subquery raises 42803.
+- A correlated scalar subquery that returns an outer column
+  (`(select s.x) from s`) reported its column as `text` instead of the
+  column's type.
+- A window function in a SELECT with no FROM (`select max(1) over ()`, or a
+  subquery's `max(s.x) over ()`) was refused with 0A000.
+- A `SELECT ... FOR SHARE` that waited for another transaction's update
+  could return the row as it was BEFORE that update. The other
+  transaction's rows stopped counting as locked just before its commit
+  became visible, and a waiter re-reading in that instant saw the old row
+  and no lock. A transaction now holds its rows until its commit is
+  visible.
+- An unread LATERAL subquery output is not computed, so
+  `(select a/b x ...) s, lateral (select s.x) l` answers where it raised
+  22012.
+
+#### Changed
+
+- GROUPING SETS / ROLLUP / CUBE past the memory bound read their input once
+  (unless the aggregate inputs are about as wide as the rows).
+  On 300,000 rows of 2 KB (release build, 64 MB WiredTiger cache), a ROLLUP
+  over a join went from 7.6 s to 2.2 s, and CUBE from 5.8 s to 1.7 s.
+  Below the bound, the input is read once again.
+- A grace hash join restores row order by sorting an index of the joined
+  rows, not the rows themselves.
+
+### Rust PostgreSQL server: joins past the memory bound skip the spill when the other side fits, and GROUPING() works over joins and in HAVING
+
+A join whose right side is too big to hold in memory used to write that whole
+side to partition files before it had looked at the left side. The server now
+reads the left side first. If the left side fits, it keeps it in memory and
+reads the right table again in chunks, so nothing goes to disk. Only when
+neither side fits does it partition, as before. Grouping sets over wide
+aggregate inputs (a `max()` over a long text column, say) used to read the
+input once per set. Now they read it once: each set's groups are hashed and
+their partial results combined, so the memory used grows with the number of
+groups, not with the rows.
+
+Running queries against PostgreSQL 15.19 turned up three divergences in
+`GROUPING()` and ORDER BY, all now fixed. `GROUPING()` was refused with a
+grouping error over any join. It was also refused in a HAVING clause. And an
+output alias inside an ORDER BY expression was taken for the output column
+where PostgreSQL resolves it to an input column.
+
+#### Changed
+
+- `secantus-pgserver` `grace_join.rs` / `stream_join.rs`: a right side past
+  `SECANTUS_PG_JOIN_INNER_BYTES` triggers a read of the left side; a left
+  side within the bound is held and joined against the right table a chunk at
+  a time (`left_built_join`), in the materialised path's row order. Otherwise
+  the left side is spooled and the right side partitioned (`grace_join`).
+  Both the narrow two-table path and the general join planner use it.
+- `secantus-pgserver`: grouping sets whose slim rows are as wide as the rows
+  are grouped from one read when every aggregate's partials combine exactly
+  (`count`, `min` / `max`, `bool_and` / `bool_or`, integer / numeric `sum`).
+  When more groups than the bound holds turn up, it falls back to one read
+  per set.
+- `secantus-pgplan`: `infer_param_types` remembers its answer per statement
+  text and declared types (per thread). libpq declares no parameter types,
+  so a prepared statement was parsed again at every Execute (~0.9 us of a
+  primary-key read).
+
+#### Fixed
+
+- `secantus-pgplan`: `GROUPING(...)` over a join (in the select list, ORDER BY
+  or HAVING) was 42803 "arguments to GROUPING must be grouping expressions";
+  the expression walker now reaches its arguments.
+- `secantus-pgplan`: `GROUPING(...)` in HAVING was 0A000; it is computed for
+  the test like a hidden aggregate. A misplaced `GROUPING(k)` in HAVING is
+  PostgreSQL's 42803 with its position.
+- `secantus-pgplan`: over a join, an ORDER BY expression (`-g`,
+  `name || 'x'`, `grouping(name)`) now resolves names to input columns. Only
+  a bare ORDER BY key may name an output column, as in PostgreSQL. An output
+  alias used inside an expression is 42703 (it was a confusing 42803 naming a
+  hidden column).
+- Corpus `b68_wide_sets` (36 lines, 0 against PostgreSQL 15.19, also with the
+  join and group bounds at 20,000 bytes and at 1 byte, and with streaming
+  off); slice test `test_batch68_left_built_joins_and_hashed_grouping_sets`.
+
+### The Rust PostgreSQL server scales with readers
+
+Two point-read clients against the Rust PostgreSQL server used to get LESS
+done together than one did alone: 21,000 statements a second for one client
+fell to 14,400 for two. Each statement re-read the whole user catalog and
+copied every session setting whenever a worker thread switched from one
+connection to another, because both per-thread caches were keyed by the
+connection. They are now keyed by what they actually depend on, and the same
+benchmark scales like PostgreSQL 15 does: 1.81x at two clients (PostgreSQL
+1.86x) and 3.6x at eight (PostgreSQL 3.6x).
+
+#### Fixed
+
+- `secantus-pgserver`: the planner's per-session catalog tables are shared
+  between connections with the same role, database and session user; a
+  session with its own temporary tables or functions, or a database with
+  row-level security, keeps a private copy.
+- `secantus-pgserver` / `secantus-pgplan`: session settings reach the planner
+  as a shared reference instead of a full copy per statement.
+- `secantus-pgserver`: `pg_get_serial_sequence` on a table that does not exist
+  raises `42P01`, and on a column that does not exist `42703`, as PostgreSQL
+  does; both used to answer NULL.
+- psycopg gauge: on Windows it deselects the `proxy`, `timing` and `mypy`
+  markers, as psycopg's own Windows CI does, and clears a crash flag left by
+  an earlier interrupted run that otherwise stopped every later run.
+- `bench/pg_concurrency.py` honours `SECANTUSD_PG`, so a worktree's build can be
+  measured.
+
+### Rust PostgreSQL server: citext, and the PostgreSQL gauges can drive it
+
+#### Added
+
+- `CREATE EXTENSION citext` on the Rust PG server, matching PostgreSQL 15. citext columns and casts compare, order, group, dedup and enforce `UNIQUE` / `PRIMARY KEY` case-insensitively.
+  - `LIKE` / `~` on citext are case-insensitive, and citext's own string functions (`strpos`, `replace`, `split_part`, the regexp family) match case-insensitively.
+  - citext against a typed `text` value compares as text, as PostgreSQL resolves it.
+  - Corpus `citext`: 79 lines, 0 divergences.
+- The SQLAlchemy, pgjdbc, pgx and pgtest gauges can run against the Rust server through a shared `pg_gauge_server.py` switch.
+  - Set `SECANTUS_GAUGE_SERVER=rust`. Results go to a `-rust-server` report beside the Python server's, and a binary built from a different source tree is refused.
+  - The SQLAlchemy dialect suite, run against the Rust server for the first time, found the schema gap now in the backlog.
+
+#### Fixed
+
+- A JOIN `ON` condition over a nondeterministic collation now matches case-insensitively. It used to match only rows with the same case.
+- A grouped nondeterministic-collation column used inside an expression no longer raises 42803.
+
+### The Rust PostgreSQL server answers `pg_constraint`, and a regclass list no longer silently matches nothing
+
+`pg_constraint` was the last catalog table a client could not read on the Rust
+PostgreSQL server: every query against it answered `42P01 relation
+"pg_constraint" does not exist`, even though the server already enforced all
+four constraint kinds and recorded each one's name. It is now a virtual table
+with PostgreSQL 14's full 25-column shape, projected from the catalog the
+server already keeps.
+
+Measuring it turned up a second, quieter bug one level down. A `regclass` value
+is carried as a document holding its oid, and only the scalar comparison path
+unwrapped it — so `WHERE conrelid IN ('t'::regclass, 'u'::regclass)` compared
+documents against numbers, matched **nothing**, and returned zero rows with no
+error, while the same predicate spelled with `OR` returned the right ones. That
+is the shape catalog reflection actually emits (SQLAlchemy and pgjdbc both use
+`IN` / `= ANY`), so it read as "this server has no constraints" rather than as a
+defect.
+
+#### Added
+
+- `pg_constraint` on the Rust PostgreSQL server, with PostgreSQL 14.24's column
+  set, attnum order and wire-type oids — including the two types the server had
+  no vocabulary for: the internal single-byte `"char"` (18) that `contype` and
+  the three `conf*type` columns use, and `pg_node_tree` (194) for `conbin`.
+  Rows cover PRIMARY KEY (`p`, named `<table>_pkey` as PostgreSQL names an
+  implicit one), UNIQUE (`u`), `EXCLUDE` (`x`), CHECK (`c`) and FOREIGN KEY
+  (`f`) with its one-letter `ON UPDATE` / `ON DELETE` action codes and
+  `confkey` resolved against the parent table.
+- `pg_constraint` is listed in `pg_tables` under `schemaname = 'pg_catalog'`,
+  like the other catalog relations the server answers for.
+
+#### Fixed
+
+- A `regclass` or `regtype` operand inside `IN (...)` or `= ANY(ARRAY[...])` is
+  now compared by its oid, as the scalar `=` path already did. Previously such
+  a predicate matched no rows at all and reported no error.
+
+#### Notes
+
+- **NOT NULL deliberately produces no row.** PostgreSQL records a not-null as
+  `pg_attribute.attnotnull` rather than as a `pg_constraint` entry, so a table
+  with a NOT NULL column, a CHECK, an FK, a UNIQUE and a PK has exactly five
+  rows here — measured, and pinned by a test.
+- Two columns are honestly empty rather than fabricated: `conbin` is NULL
+  because the server keeps a CHECK predicate as SQL text, not as PostgreSQL's
+  serialised parse tree, and `conindid` is 0 because there are no `pg_index`
+  rows for it to point at. Constraint `oid`s are synthetic — distinct and
+  stable per table, but not PostgreSQL's numbers.
+
+### Rust PostgreSQL server: correlated subqueries over equalities run once
+
+A correlated subquery used to be planned and run again for every distinct outer value. When every outer reference is an equality (`WHERE t.x = o.a AND t.y = o.b`), the inner query now runs once per statement and each outer row is answered by a hash lookup, the semi-join PostgreSQL itself plans.
+
+#### Changed
+
+- Timings at 2,000 × 2,000 rows (debug build):
+  - `EXISTS` over two equalities: 7.3 s → 36 ms.
+  - `NOT EXISTS` over two equalities: 7.4 s → 47 ms.
+  - A correlated `count(*)`: 1.1 s → 227 ms.
+  - A correlated `LIMIT 1` subquery: 7.6 s → 36 ms.
+- Answers are unchanged. A shape the lookup cannot reproduce exactly falls back to the per-row path. That includes a non-equality correlation, a numeric key, a nondeterministic collation, and an inner `ORDER BY`, `DISTINCT` or function.
+- New corpus `correlated_hash` (23 edge cases) matches PostgreSQL. Every corpus still matches.
+
+### Rust PostgreSQL server: correlated subqueries with comparisons, and subquery column names
+
+#### Changed
+
+- The once-per-statement path for correlated subqueries now also takes comparisons (`<`, `<=`, `>`, `>=`, `<>`) against the outer row, for numbers and timestamps. `EXISTS (... t.x = o.a AND t.y > o.b)` at 2,000 × 2,000 rows went from 7.6 s to 40 ms (debug build), with the same answers as PostgreSQL.
+
+#### Fixed
+
+- A scalar subquery's column is named after its inner column, as in PostgreSQL. `EXISTS` and `ARRAY(...)` are named `exists` and `array`. Before, all three were `?column?`.
+- With the names fixed, `ORDER BY id` over two output columns named `id` answers PostgreSQL's `42702 ORDER BY "id" is ambiguous`. It used to sort by one of them silently.
+
+### Rust PostgreSQL server: column names with a dot or a leading `$`
+
+A column named like `"dot.s"` or `"$x"` was read as a nested MongoDB-style path. `WHERE` matched nothing, `UPDATE` / `DELETE` reported rows but changed nothing, and `UNIQUE` was never enforced. These columns now behave as in PostgreSQL 15, pinned by the new `dotted_columns` corpus. The SQLAlchemy dialect suite against the Rust server is now 978 passed / 0 failed.
+
+#### Fixed
+
+- `WHERE` over such a column is evaluated against the literal key.
+- `UPDATE` and `ON CONFLICT DO UPDATE` write the literal key.
+- `UNIQUE` constraints and unique indexes over such columns are enforced. An automatic index name containing a dot no longer breaks its hidden index field.
+
+### `ORDER BY` over an expression, and a `WHERE` that cannot lower to a filter
+
+Two more of the refusals the 2026-09-28 survey found. The predicate corpus
+against PostgreSQL 14.13 goes 14/17 → **17/17**.
+
+#### Added
+
+- `ORDER BY <expression>` — `order by n * -1`, `order by upper(a)`, and several
+  expression keys in one clause. The expression is materialised per row into a
+  synthetic field just before sorting, so the comparison stays one routine.
+- A `WHERE` that does not lower to an MQL filter (`where (case ... end)`) is
+  evaluated per row as a residual instead of being refused. Only TRUE keeps a
+  row, so SQL's three-valued logic is preserved.
+
+#### Fixed
+
+- **The build-provenance stamp went stale in a git worktree.** `build.rs`
+  declared `rerun-if-changed=../../.git/HEAD`, but in a worktree `.git` is a
+  FILE, so that path does not exist, cargo never re-ran the build script, and
+  the stamp reported the tree of whichever checkout last built it — a staleness
+  checker that is itself stale, which is the failure the block exists to
+  prevent. All four stamping build scripts now resolve the path with
+  `git rev-parse --git-path`.
+
+### Rust PostgreSQL server: aggregate FILTER with a subquery
+
+`count(*) FILTER (WHERE EXISTS (SELECT ...))`, and any other `FILTER` condition holding a subquery, used to answer `0A000 SubLink is not supported yet`.
+
+#### Fixed
+
+- An aggregate that skips NULL inputs now accepts a subquery in its `FILTER`, correlated or not. This covers `count`, `sum`, `avg`, `min`, `max`, `string_agg`, the `bool_*` and `bit_*` aggregates, and the variance family. The filter is rewritten to the `CASE` argument it is equivalent to.
+- It works in the select list, `HAVING` and `ORDER BY`, and with `GROUP BY` and `DISTINCT`. Corpus `filter_sublink` matches PostgreSQL 14 on all 13 lines.
+- NULL-keeping aggregates such as `array_agg` still refuse with `0A000`.
+
+### `GROUPING SETS`, `ROLLUP` and `CUBE` on the Rust PostgreSQL server
+
+The clause used to be parsed and then discarded: the `GroupingSet` node fell
+through to the expression arm, failed to resolve as a column, and the statement
+died with `42803 column "a" must appear in the GROUP BY clause` — an error
+blaming the user's own query for a clause the server had dropped. That is the
+second of the two such cases the 2026-09-28 survey found, and the last one.
+
+#### Added
+
+- `GROUP BY GROUPING SETS (...)`, `ROLLUP (...)` and `CUBE (...)`, including
+  several constructs in one `GROUP BY` (their sets are crossed). Each set groups
+  on its own keys and NULL-pads the others; sets concatenate in declared order
+  and duplicate sets emit duplicate rows, as PostgreSQL 14.13 does.
+- The empty set `()` groups the whole input into one row, and still returns that
+  row when the input is empty.
+
+#### Known limitation
+
+- The `GROUPING(col)` function is refused `0A000`, and the refusal names it
+  rather than answering the generic "this target is not supported yet". It
+  reports which set produced a row, which needs the producing set carried
+  through the group.
+
+### information_schema and the catalog views on the Rust PostgreSQL server
+
+`information_schema.columns` — the single most-read relation in any
+PostgreSQL deployment, because every ORM, migration tool and `\d` starts
+there — did not exist. Nor did `.tables`, `.table_constraints`,
+`.key_column_usage`, `.sequences`, `pg_class`, `pg_namespace`, `pg_index`,
+`pg_indexes` or `pg_attrdef`; `pg_attribute` existed but listed only composite
+types, so `attrelid = 't'::regclass` found nothing for a table.
+
+Against a live PostgreSQL 14.13 the catalog corpus went from 19 divergences
+of 22 to 4, and the sequences corpus finished at 0. A second corpus of 34
+lines written for this change is clean.
+
+Two findings worth stating:
+
+**Seven catalog functions already worked — but only as a bare select-list
+target, and the two halves have to be kept apart.** Three of them
+(`current_database`, `current_catalog`, `current_setting`) must still DEFER to
+the connection when they stand alone: the server's value is the live one, and
+`current_setting` has to see a `set_config` from earlier in the session.
+Making the expression form work by adding them to the scalar evaluator's name
+list silently broke that — the bare-target gate matched them first and folded
+them, which a planner unit test with no session installed saw as
+"unrecognized configuration parameter" for a GUC that exists. CI's `rust` job
+caught it; a test now pins both halves together.
+
+**The seven:** `version()`, `current_schema()`, `current_database()`,
+`current_setting()`, `format_type()`, `obj_description()` and `pg_get_expr()`
+become a value the server resolves when they stand alone. Reached inside an
+EXPRESSION — `version() LIKE 'PostgreSQL%'`, `current_setting('x') ~ '...'`,
+`obj_description(oid) IS NULL` — the constant evaluator handled them instead
+and had nowhere to ask, so every one answered `0A000`. Which is precisely how
+a client writes them.
+
+**`information_schema`'s views are called `tables`, `columns` and
+`sequences`** — names a user table may perfectly well have, and a virtual
+relation wins over the catalog. Registering them bare would have made a
+user's own `columns` table unreachable, so they keep their schema in the name
+and both resolve.
+
+#### Added
+
+- `information_schema.columns` / `.tables` / `.table_constraints` /
+  `.key_column_usage` / `.sequences`, and `pg_class` / `pg_namespace` /
+  `pg_index` / `pg_indexes` / `pg_attrdef`.
+- The catalog functions reachable inside an expression, with
+  `current_database()` and `current_setting()` reading a per-statement session
+  snapshot the way the session user and the timezone already do.
+- `server_version_num`, the numeric form every client that gates on a server
+  version actually reads.
+
+#### Fixed
+
+- `pg_attribute` listed only composite types, so a table's columns were
+  missing entirely — and a table's ROW TYPE is a composite under the same name
+  and the same relation oid, so once tables were added every column appeared
+  TWICE, once with `attnotnull` true and once false.
+- `pg_attribute` gained `attnotnull`, `atttypmod` and `atthasdef`, without
+  which a client cannot tell a nullable column from a NOT NULL one.
+- `format_type(oid, NULL)` answered NULL. It is not null-propagating in its
+  second argument: a NULL typmod means "no modifier", and PostgreSQL answers
+  `integer`.
+- `information_schema.table_constraints` under-counted every table by one:
+  PostgreSQL records a NOT NULL check for the PRIMARY KEY column too.
+
+### Rust PostgreSQL server: pgx is clean, pgjdbc runs to completion
+
+The pgx gauge against the Rust PostgreSQL server went from 357 passed / 20 failed to 377 / 0. Before this change the pgjdbc gauge hung forever. It now completes: 5,475 of 5,637 tests pass and 134 fail. Each fix was checked against PostgreSQL 15 and pinned in the new `jdbc_pgx` corpus.
+
+#### Fixed
+
+- Several silent wrong answers:
+  - A row error raised while rows streamed (`select 0/0 from t`) left the batch's earlier writes committed and the block not aborted.
+  - `DEFERRABLE UNIQUE` was never enforced.
+  - A data-modifying CTE ran again at Parse and Describe.
+  - `5/count(*)` over no rows answered NULL instead of `22012`.
+- Two hangs:
+  - `nextval` deadlocked on its own transaction after a table was dropped and re-created in one block.
+  - An extended-protocol group kept its table and advisory locks after `Sync`.
+- Temporary tables are per session (`pg_temp_N`): they shadow permanent tables and are dropped at disconnect and at `DISCARD TEMP`.
+- Prepared statements and portals:
+  - `DEALLOCATE` and `DISCARD ALL` also drop wire-level statements.
+  - A failed Bind aborts the block.
+  - A changed result shape reports `cached plan must not change result type`.
+  - A suspended portal resumes.
+  - `ROLLBACK TO SAVEPOINT` reports the right transaction status.
+- Startup:
+  - Startup parameters and `options -c` are applied.
+  - `server_version` is reported as 15.0.
+  - `application_name` is reported.
+  - Protocol 3.2 requests are negotiated down to 3.0.
+
+#### Added
+
+- `DISCARD`.
+- `current_schemas(bool)`.
+- `regproc` over the built-in functions.
+- Empty-query responses.
+- `22021` for a NUL byte in a text parameter.
+- Binary `COPY` ending without its trailer.
+- The pgjdbc runner creates its `test` database.
+
+### `normalize()` on the Rust PostgreSQL server
+
+The one string function left after the last release needed something the others
+did not: a dependency. Unicode normalisation is table-driven — the composition
+and decomposition mappings are data rather than an algorithm — so there is no
+honest way to approximate it in a few lines. An ASCII-passthrough version would
+have answered most inputs correctly and a minority silently wrongly, which is
+exactly the kind of divergence this project treats as unacceptable, so it stayed
+refused by name until the dependency was agreed.
+
+It is implemented now, on `unicode-normalization`, and all four forms match
+PostgreSQL 14.13: `NFC` (the default), `NFD`, `NFKC` and `NFKD`. A precomposed
+`á` decomposes to two codepoints under NFD and recomposes to one under NFC; the
+compatibility forms fold the `ﬁ` ligature to `fi` where the canonical ones leave
+it alone.
+
+#### Added
+
+- `normalize(text [, form])`. The form arrives as an ordinary string constant —
+  `NFD` and its siblings are grammar keywords, so an unknown one is a syntax
+  error before the evaluator ever sees it.
+
+#### Known limitations
+
+- `IS NORMALIZED` and `IS NORMALIZED NFD` are a separate construct and remain
+  unimplemented.
+
+### `INSERT ... ON CONFLICT` works on the Rust PostgreSQL server
+
+The clause used to be parsed and then silently discarded, so
+`insert ... on conflict do nothing` raised `23505` where PostgreSQL inserts
+nothing and succeeds, and `do update` never upserted. A dropped clause is worse
+than an unimplemented one — the client gets a confident wrong answer instead of
+an honest `0A000` — and it was one of two such cases the 2026-09-28 survey found.
+
+#### Added
+
+- `ON CONFLICT DO NOTHING` and `ON CONFLICT ... DO UPDATE SET ... [WHERE ...]`,
+  with `excluded.*` reading the proposed row, assignments that mix the existing
+  row and the proposed one (`set v = t.v * 100 + excluded.v`), a column-list /
+  `ON CONSTRAINT` / bare arbiter, `RETURNING` over exactly the rows affected,
+  and PostgreSQL's row counts (a skipped row counts 0).
+- An arbiter that matches no unique constraint is a PLAN-time error, as in
+  PostgreSQL: `42P10` for a column list, `42704` for an unknown constraint name.
+  The two codes differ, measured against PostgreSQL 14.13 rather than assumed.
+
+#### Known limitation
+
+- A partial-index arbiter (`ON CONFLICT (a) WHERE ...`) is refused `0A000`.
+  Inferring it needs partial indexes, which this server does not have; widening
+  it to the unconditional index would absorb a conflict the predicate excludes,
+  which is the silent divergence this change exists to remove.
+
+### `LIKE`, `ILIKE`, the regex operators and `CASE` on the Rust PostgreSQL server
+
+Four of the seventeen refusals the 2026-09-28 survey found, closed together.
+0/17 → 14/17 on a differential corpus against PostgreSQL 14.13.
+
+#### Added
+
+- `LIKE` / `ILIKE` / `NOT LIKE` / `NOT ILIKE`, anchored as SQL requires, with
+  `%` and `_` wildcards, every other character literal, and an explicit
+  `ESCAPE` (which the parser folds into a `like_escape(p, e)` call rather than
+  a third operand).
+- The regex operators `~`, `~*`, `!~`, `!~*`.
+- Both work as predicates and as values (`select a like 'a%'`).
+- `CASE` in the searched and simple forms, with lazy branch evaluation, `NULL`
+  falling through as not-true, and a missing `ELSE` yielding `NULL` — including
+  in a FROM-less `SELECT`, which routed targets through a separate allow-list.
+
+#### Fixed
+
+- `n LIKE 'x'` over a non-text column is now `42883 operator does not exist:
+  integer ~~ unknown`, as PostgreSQL has it. Lowering it to a regex anyway
+  returned no rows, silently.
+
+#### Known limitations
+
+- `CASE` used directly as a bare `WHERE` predicate is still `0A000`: a CASE does
+  not lower to an MQL filter, and `lower_where` has no arm for it.
+- `ORDER BY` over an expression is unchanged, still `0A000`.
+
+### Rust PostgreSQL server: timestamptz, temp-table race, pgjdbc metadata
+
+pgjdbc against the Rust PostgreSQL server went from 84 failures to 22 (7,354 tests); pgx stays at 377 passed / 0 failed. Every fix is checked against PostgreSQL 15 and pinned in the `b39_fixes`, `b39_datetime` and `b39_catalog` corpora.
+
+#### Fixed
+
+- A timestamptz copied from a column, a bound parameter or an array parameter was re-read as a wall clock. Under summer time that moved the value by an hour, silently.
+- A newly created temp table was intermittently not found (42P01) under parallel sessions. The catalog version was bumped before the creating transaction committed.
+- `ROLLBACK TO SAVEPOINT` undoes `SET` / `SET LOCAL`.
+- `pg_typeof(nextval(...))` no longer advances the sequence twice.
+- Unary `-` / `+` on money is refused.
+- Binary money parameters are decoded.
+- Notices are sent while a statement waits on a table lock. `LOCK TABLE` works inside a function.
+- A comma-join with no join keys in `FROM` now hashes the WHERE equalities. pgjdbc's foreign-key metadata query no longer runs for minutes.
+- Date/time:
+  - fractional seconds round half-to-even;
+  - `+hhmm` offsets are accepted;
+  - `timetz ± interval` works;
+  - BC binary dates decode.
+- Binary `varchar[]` / `bpchar[]` / `name[]` results.
+- `LIKE` with a parameter is described as boolean.
+
+#### Added
+
+- PostgreSQL's read-only internal settings, such as `max_index_keys`.
+- `pg_get_keywords()`.
+- Expression and partial indexes in `pg_index` / `pg_get_indexdef`.
+- `ADD PRIMARY KEY USING INDEX`.
+- `COMMENT ON DOMAIN`.
+- Pseudo-types in `pg_type`.
+- `lseg ?# box`.
+- `COPY ... HEADER`.
+- PL/pgSQL `$n` argument references.
+- The pgjdbc runner creates a `test` role, as pgjdbc's own CI does.
+
+### Rust PostgreSQL server: money, large objects, refcursors and database settings
+
+The Rust PostgreSQL server gained the PostgreSQL 15 features pgjdbc's suite was missing. pgjdbc now runs 7,354 tests, up from 5,637, because three classes no longer fail in setup. 84 fail, down from 133. pgx stays at 377 passed / 0 failed. Each feature is pinned by a new corpus checked against PostgreSQL 15.
+
+#### Added
+
+- The `money` type, transcribed from `cash.c`. It is stored as Decimal128, as on the Python server.
+- Large objects:
+  - every `lo_*` function, from SQL and over the Fastpath function-call protocol;
+  - stored in the Python server's collections;
+  - `pg_largeobject_metadata`.
+- PL/pgSQL `OPEN` for refcursors: `FOR query`, `FOR EXECUTE` and bound cursors. `refcursor` is now a type.
+- `ALTER DATABASE ... SET` / `RESET`, applied at connect, and a `pg_settings` view.
+- `SET LOCAL` and `set_config(..., true)` are undone at transaction end. A `SET` inside a rolled-back block is undone. ParameterStatus is re-sent when a value changes back.
+- `information_schema._pg_expandarray`, and `unnest` over `int2vector` / `oidvector`.
+- Named protocol portals appear in `pg_cursors`.
+- Smaller additions:
+  - `getdatabaseencoding` and `pg_encoding_to_char` / `pg_char_to_encoding`;
+  - negative numeric scale;
+  - every DateStyle keyword;
+  - `interval + datetime`;
+  - timestamp-to-time assignment casts;
+  - `inet` / `cidr` / `bit` / `varbit` in `pg_type`;
+  - `INSERT ... SELECT` with an uncorrelated subquery.
+
+### Rust PostgreSQL server: schema-qualified tables
+
+The Rust PG server dropped the schema from every relation name, so `CREATE TABLE test_schema.users` was silently created in `public` and collided with `public.users`. Relations are now schema-qualified as in PostgreSQL 15, using the same catalog keys as the Python server (a non-public relation is `schema.name`), so each server reads the other's tables.
+
+#### Fixed
+
+- `schema.table` works in CREATE / DROP / ALTER / RENAME / TRUNCATE, DML with RETURNING and ON CONFLICT, joins and subqueries, serial and identity sequences, UNIQUE / CHECK / FOREIGN KEY, indexes and views.
+- Unqualified names resolve through `search_path`, and an unqualified CREATE lands in the path's first existing schema. A missing schema answers `3F000`.
+- `DROP SCHEMA` RESTRICT refuses a non-empty schema with `2BP01`, and CASCADE drops its contents.
+- The catalogs report the real schema: `pg_class` / `pg_namespace`, `pg_tables`, `pg_indexes`, `pg_views`, `pg_constraint`, `information_schema`, regclass and `to_regclass`.
+- `nextval('s.seq')` used the public sequence of the same name. It now resolves the schema.
+- `information_schema.sequences` no longer lists identity-column sequences, matching PostgreSQL 15.
+- Corpus `schemas`: 75 lines, 0 divergences. Two cross-server tests prove each server reads the other's schema tables. The SQLAlchemy dialect suite against the Rust server went from 421 passed / 782 errors to 811 passed / 0 errors.
+
+### Sequences and identity columns on the Rust PostgreSQL server
+
+`CREATE SEQUENCE`, `nextval`, `currval`, `setval`, `ALTER SEQUENCE`,
+`DROP SEQUENCE` and `GENERATED ... AS IDENTITY` were all missing. The machinery
+was already there — `serial` columns have drawn from a stored sequence
+document since the beginning — but none of it was reachable from SQL.
+
+Against a live PostgreSQL 14.13 the sequences corpus went from 24 divergences
+of 26 to 1, and the one left is `information_schema.sequences`, part of the
+catalog-introspection gap. A second corpus of 70 lines written for this change
+is clean.
+
+A sequence is also a RELATION, so `SELECT last_value, is_called FROM s` reads
+it like a one-row table, and `pg_get_serial_sequence('t', 'id')` names the
+sequence a serial column owns.
+
+Three behaviours were measured rather than assumed, and each is a place a
+plausible implementation goes wrong:
+
+**The bound a sequence runs into depends on its DIRECTION.** A descending
+sequence starts at its MAXIMUM and exhausts at its MINIMUM. Checking only
+`max_value` let `CREATE SEQUENCE s INCREMENT -3 MINVALUE -10` run past its
+floor for ever, and named the wrong bound when it did stop. `CYCLE` wraps to
+the far bound instead of failing.
+
+**`currval` is keyed to the SESSION**, not to the sequence. It is `55000`
+before any `nextval` in that session even when another session has advanced
+the sequence — reading the stored value instead would hand one session
+another's number.
+
+**The identity overriding matrix has four live cases**, measured on 14.24:
+`GENERATED ALWAYS` refuses a hand-written value with `428C9`;
+`OVERRIDING SYSTEM VALUE` lets it through; `OVERRIDING USER VALUE` discards it
+and draws from the sequence for EITHER kind; and an explicit NULL is a
+not-null violation for both kinds, even under `OVERRIDING SYSTEM VALUE` —
+the override decides whose value wins, not whether the column may be null.
+
+#### Added
+
+- `CREATE` / `ALTER` / `DROP SEQUENCE` with `START`, `INCREMENT`, `MINVALUE`,
+  `MAXVALUE`, `CYCLE`, `RESTART [WITH]`, `OWNED BY`, `IF NOT EXISTS` and
+  `IF EXISTS`; `nextval` / `currval` / `setval` (both arities);
+  `pg_get_serial_sequence`; and a sequence read as a relation.
+- `GENERATED ALWAYS` / `BY DEFAULT AS IDENTITY` columns, with
+  `OVERRIDING SYSTEM VALUE` and `OVERRIDING USER VALUE`.
+
+#### Fixed
+
+- `secantus-pgcatalog`: a column's catalog keys that this server does not
+  model — `identity`, `enum_type`, `domain_type`, `generated`, `comment`,
+  `default_expr`, `composite_type`, `json_plain` — were written back as
+  unconditional NULLs, so any rewrite of a catalog row here ERASED what the
+  Python server had recorded. That was unreachable while nothing rewrote an
+  existing row; `ALTER TABLE` made it reachable last week. They are kept
+  verbatim now, and `identity` is modelled outright because this server
+  enforces it.
+- `tools/probes/pg_corpora/sequences.setup.sql`: the identity tables were
+  never dropped, so the REFERENCE server accumulated them across runs —
+  `CREATE TABLE idt11` answered `42P07` and `count(*)` grew by three every
+  time. Four scenarios were comparing against that debris rather than against
+  PostgreSQL's behaviour.
+
+### Rust PostgreSQL server: the sqllogictest gauge, and what it found
+
+The sqllogictest gauge can now run against the Rust PG server (`SECANTUS_GAUGE_SERVER=rust`). Its report goes to a separate `.validation/slt-raw-rust-server.json`, and it refuses a binary built from a different source tree. The first run passed 28 of 60 lane-files. These fixes came from it, each checked against PostgreSQL 15.
+
+#### Fixed
+
+- `BETWEEN` in every shape: `NULL BETWEEN …`, `NOT x BETWEEN …`, expression bounds and `BETWEEN SYMMETRIC`. These answered `0A000 this operator form is not supported yet`. `x NOT BETWEEN NULL AND hi` now keeps the rows above `hi` (it matched nothing).
+- `SELECT DISTINCT` over an aggregate or a grouped expression (it was `0A000`). `SELECT *` / `t.*` with `GROUP BY` is fixed too (it was a 42803 naming an empty column).
+- A correlated subquery whose inner FROM aliases the outer table's own name (`FROM t1 AS x WHERE x.b < t1.b`) failed with `42P01`. It now reads the outer row, as in PostgreSQL.
+- An aggregate inside `CASE`, `COALESCE`, `NULLIF` or an `IN (...)` list is now computed. It was left out, and the expression answered NULL.
+- Arithmetic over a numeric aggregate (`- avg(x)`, `avg(x) / count(*)`) failed with `42883 operator does not exist: integer - text`. It now works.
+- A scalar subquery column takes its inner column's name.
+- The "must appear in the GROUP BY clause" error names the column qualified, as PostgreSQL does (`tab2.col1`).
+
+### Rust PostgreSQL server: SQLAlchemy reflection works
+
+The SQLAlchemy dialect suite against the Rust PostgreSQL server went from 811 passed / 167 failed to 977 / 1. Every fix was checked against PostgreSQL 15 and pinned in the new `sqlalchemy_catalog` corpus.
+
+#### Fixed
+
+- `pg_table_is_visible` always returned true, so table and view listings included `information_schema` relations. It now follows `search_path`.
+- Index names are per schema, not global. `DROP INDEX s.ix` and `COMMENT ON INDEX s.ix` resolve within that schema.
+- `pg_get_constraintdef` quotes identifiers the way PostgreSQL does.
+- Constraint comments now appear in `pg_description` / `obj_description`.
+- `PRIMARY KEY` column order and `INCLUDE` columns are reported correctly in the catalogs.
+- A `DECLARE` cursor now sees rows written earlier in the same transaction.
+- Index listing reads inside the open transaction.
+- A sequence created in the transaction is visible to `regclass`.
+- Casts over joined columns and scalar subqueries in the select list now get PostgreSQL's column names and types.
+- `LIMIT $1` inside a scalar subquery no longer fails at Describe.
+
+### `FROM unnest(...)` on the Rust PostgreSQL server
+
+`SELECT * FROM unnest(ARRAY[1,2,3])` is how a client turns an array into rows,
+and the Rust PostgreSQL server answered `0A000 … is not supported yet`. So did
+`regexp_split_to_table` and `generate_subscripts`, and so did every clause a
+client puts around one of them — the `ORDER BY`, the `WHERE`, the
+`count(*)`.
+
+All of that works now. A set-returning function in `FROM` supports table and
+column aliases, `*` expansion, filtering, ordering, limiting and aggregates; an
+empty or NULL array yields no rows rather than an error; and a multidimensional
+array unnests to its *leaves* in row-major order, so `unnest(ARRAY[[1,2],[3,4]])`
+is four rows rather than two. The same functions work as a bare target with no
+`FROM` at all.
+
+The interesting part is how little code it took. The executor already had the
+right shape for this — its own comment explains that a generated source "is a
+SOURCE rather than its own statement" precisely because everything downstream
+works on documents and does not care where they came from. So a set-returning
+function is now planned as the same thing `FROM (SELECT …) s` produces, and the
+FROM-subquery path supplies all the clause handling for free. Nothing in the
+executor changed, and the two spellings of `unnest(ARRAY[1,2])` — as a target
+and as a `FROM` item — share one implementation, so they cannot drift apart.
+
+`generate_series` keeps the lazy path it already had. It is a *range* rather
+than a bounded list, and materialising `generate_series(1, 10000000)` into a
+vector to gain uniformity would have been a clear regression.
+
+#### Added
+
+- `unnest`, `generate_subscripts` and `regexp_split_to_table` as a `FROM` item,
+  with `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`count(*)`, `array_agg`), `AS
+  t(col)` and `AS t` aliasing, and `*` expansion.
+- The same three as a bare select-list target with no `FROM`.
+- `unnest` over a multidimensional array, yielding the leaves in row-major
+  order.
+
+#### Known limitations
+
+- A set-returning function in the select list **over a column** —
+  `SELECT unnest(ia) FROM t` — is still refused by name. That form changes the
+  row count mid-pipeline rather than supplying the source, which is a different
+  mechanism from the one added here.
+- `unnest(a, b)` with several arrays zips and NULL-pads them; it is refused by
+  name rather than answered as a single column.
+- `LATERAL` forms are unaffected: a function in `FROM` that references the row
+  to its left needs correlation machinery, not a materialised source.
+
+### Ten string functions, and three that were quietly wrong
+
+Padding a string, converting one to hex, translating characters, overlaying a
+run, quoting a literal — the Rust PostgreSQL server could do none of them. Each
+answered `0A000 … is not supported yet`, which is at least honest. Three others
+were worse than missing: they answered, and the answer was wrong.
+
+`split_part('a,b,c', ',', -1)` was refused outright. PostgreSQL has counted from
+the end since version 14, so this rejected a form that works — and the error for
+a *zero* field named the wrong rule besides ("must be greater than zero", where
+PostgreSQL says "must not be zero").
+
+`regexp_replace('abc', 'b', '\&\&')` returned `a\&\&c`. In PostgreSQL's
+replacement text `\&` means the whole match, so the answer is `abbc`. The escape
+was passing through as literal characters.
+
+And `substring('abc' from '(b)')` — the regex form every client actually writes
+— answered `42601 function substring does not exist with that argument list`.
+That was not a missing function but a missing *overload*: the second argument's
+type is what decides whether it is an offset or a POSIX pattern, and it was
+always read as an offset. An error naming the user's call as malformed is worse
+than one naming a gap.
+
+Measured against PostgreSQL 14.13: the `strings` corpus went 18 divergences out
+of 35 to 8, a new `strings2` corpus of 27 shapes runs clean, and `char_padding`
+and `jsonpath_number` improved on the way past. Of the eight that remain, one is
+a locale artifact rather than a defect (this reference server runs `lc_ctype =
+C`, which does no non-ASCII case mapping), two are functions PostgreSQL 14 does
+not itself have, and two need set-returning functions.
+
+#### Added
+
+- `lpad` and `rpad`, which count characters rather than bytes, truncate when the
+  target is shorter than the input, and cannot pad at all with an empty fill.
+- `to_hex`, whose width follows the argument's *type*: an `int4` `-1` is
+  `ffffffff` and an `int8` `-1` is `ffffffffffffffff`.
+- `translate`, which deletes the characters its target string does not cover.
+- `overlay(s placing r from p [for n])`, with `n` defaulting to the length of
+  `r`. A `p` below 1 answers PostgreSQL's own `22011 substring_error` — its own
+  class, not the generic `22P02` a malformed value gets.
+- `quote_literal` and `quote_nullable`. The pair differ only on NULL:
+  `quote_literal(NULL)` is NULL, `quote_nullable(NULL)` is the four-character
+  string `NULL`.
+- `regexp_split_to_array`, `unistr` (all four escape spellings, with
+  PostgreSQL's `42601` for a bad one) and `convert_from`.
+- `substring(s FROM pattern)` and `substring(s FROM pattern FOR escape)` — the
+  POSIX and SQL-standard regex forms.
+
+#### Fixed
+
+- `split_part` accepts a negative field, counting from the end, and its
+  zero-field error is PostgreSQL's wording.
+- `regexp_replace` expands `\&` to the whole match. An unknown escape such as
+  `\q` still passes through as written, which PostgreSQL also does.
+- `substring` with a negative length now reports `22011` rather than `22P02`,
+  matching the class PostgreSQL gives.
+
+### Subqueries and CTEs on the Rust PostgreSQL server
+
+The Rust PostgreSQL server refused every form of subquery. `(SELECT ...)` as a
+value, `EXISTS`, `IN (SELECT ...)`, a subquery in `FROM`, and `WITH` all
+answered `0A000 ... is not supported yet`, which gated most real application
+SQL — a table of gaps in `tasks/backlog.md` named them the biggest single
+lever left on this server. Measured against a live PostgreSQL 14.13 with a
+33-line corpus, 32 of 33 diverged.
+
+They work now, in every uncorrelated form: scalar subqueries, `EXISTS` /
+`NOT EXISTS`, `IN` / `NOT IN`, `ANY` / `ALL`, `ARRAY(SELECT ...)`, a subquery
+in `FROM` with an alias and an optional column list, and non-recursive `WITH`
+including several CTEs where one reads another. A widened 50-line corpus is at
+five divergences, and all five are **correlated** subqueries — refused by name
+(`a correlated subquery ...`), because a subquery whose value depends on the
+outer row has no single set of values to substitute, and substituting one
+would be a wrong answer rather than a missing feature.
+
+Three bugs were found while building it, two of them wrong answers rather than
+errors, and all three reachable before this change or made reachable by it.
+The one that matters most is the correlation check itself: the lowering
+resolves a column by the last part of its name and ignores the qualifier, so
+`EXISTS (SELECT 1 FROM emp e WHERE e.dept_id = d.id)` bound the outer `d.id`
+to `emp`'s own `id`, planned cleanly, and answered **true for every row**.
+
+#### Added
+
+- `secantus-pgplan` / `secantus-pgserver`: uncorrelated subqueries in every
+  form. An uncorrelated subquery is evaluated once during planning and
+  replaced by the values it returned — which is what PostgreSQL does with one
+  too — so `IN (SELECT ...)` lowers through the same `ANY`/`ALL` path that
+  already had SQL's three-valued rules right: an empty `ANY` matches nothing,
+  an empty `ALL` matches everything, and a NULL in a `NOT IN` subquery makes
+  the whole predicate NULL, so it returns no rows.
+- `secantus-pgplan`: `FROM (SELECT ...) s` as a source in its own right, for
+  plain and aggregate selects alike, with `s(a, b)` column aliases.
+- `secantus-pgplan`: non-recursive `WITH`, rewritten into the FROM-subqueries
+  it is shorthand for. `WITH RECURSIVE` and a data-modifying `WITH` are
+  refused rather than inlined: the first has no subquery to expand into, and
+  the second must run exactly once however many times it is referenced.
+- `secantus-pgplan`: `21000` (cardinality_violation) for a scalar subquery
+  that returns more than one row, as PostgreSQL reports it.
+
+#### Fixed
+
+- `secantus-pgplan`: a qualified aggregate argument read the FIRST part of the
+  column's name, so `max(t.n)` answered `42703 column "t" does not exist` —
+  over a plain table as much as over a subquery, and for as long as aggregates
+  have existed.
+- `secantus-pgserver`: an UNQUALIFIED column reference across a join whose
+  left side is a subquery was assumed to belong to the right side, because a
+  subquery side's columns could not be probed by name. They can now, from the
+  side's own plan; before, `select x, y from (select 1 as x) a, (select 2 as
+  y) b` answered `(NULL, 2)`.
+- `secantus-pgserver`: a subquery runs during planning, which is outside the
+  transaction scope the statement's execution runs in, so WiredTiger served it
+  its own snapshot — `insert; select count(*) from t where id in (select id
+  from t)` counted the rows from before the insert while the same query
+  without a subquery counted correctly. The read now enters the open
+  transaction.
+- `secantus-pgplan`: `walk_column_refs` and the new subquery walk are one
+  traversal rather than two over the same dozen node kinds — the drift the
+  former's own comment was already warning about.
+
+### Window functions on the Rust PostgreSQL server
+
+`sum(v) OVER (PARTITION BY g ORDER BY id)`, `row_number()`, `rank()`, `lag`,
+`lead` — none of them worked, and most did not even fail honestly. Ten were
+refused by name, but the seventeen most common shapes answered
+`42803 column "id" must appear in the GROUP BY clause`: the planner matched
+`sum` on its NAME, never looked at the `OVER` beside it, and routed the query
+into the aggregate planner, which demanded a `GROUP BY` the query neither has
+nor needs. The client got an error blaming its own SQL for a feature the
+server did not have.
+
+Measured against a live PostgreSQL 14.13, the existing window corpus diverged
+on **27 of 27** lines. Across four corpora totalling 89 lines it is now 86,
+and the three that differ are all refusals that name what is missing: a
+window over an aggregate, over a JOIN, and over a generated source.
+
+Three of those corpora were written for this change, and the third one earned
+its place: the first two agreed with PostgreSQL on all 75 lines while a
+`RANGE` frame whose bounds sat on ONE side of the current row — `RANGE
+BETWEEN 1 FOLLOWING AND 20 FOLLOWING` — returned the whole partition on every
+row. Neither corpus contained such a frame. A corpus that agrees completely
+is evidence about the shapes it holds and nothing else.
+
+The whole family works: `row_number` / `rank` / `dense_rank` /
+`percent_rank` / `cume_dist` / `ntile`, `lag` / `lead` / `first_value` /
+`last_value` / `nth_value`, and the aggregates as windows; `PARTITION BY` and
+`ORDER BY` over columns or expressions; `ROWS`, `RANGE` and `GROUPS` frames
+including value offsets; all three `EXCLUDE` forms; named `WINDOW` clauses;
+and `FILTER`.
+
+One behaviour is worth stating because it is the one an implementation
+usually gets wrong: the DEFAULT frame is `RANGE BETWEEN UNBOUNDED PRECEDING
+AND CURRENT ROW`, and under `RANGE` a bound at `CURRENT ROW` means the
+current row *and its peers*. So two rows that tie on the `ORDER BY` get the
+SAME running total, and a window with no `ORDER BY` at all sees the whole
+partition — the second falls out of the first, because with nothing to order
+by every row is a peer.
+
+#### Added
+
+- `secantus-pgplan` / `secantus-pgserver`: window functions, computed over
+  the materialised rows after the `WHERE` and before `DISTINCT` / `ORDER BY` /
+  `LIMIT`, which is PostgreSQL's evaluation order. Each lands in a synthetic
+  `__winN` field the select list projects, the same way a computed `ORDER BY`
+  key already used `__orderN`.
+- The aggregate windows go through the ORDINARY aggregate accumulator rather
+  than a second implementation, so `sum(int4)` widens to int8, `sum(numeric)`
+  stays exact and `avg` divides as numeric exactly as a `GROUP BY` does.
+- `22014` for `ntile(0)`, which PostgreSQL gives its own class rather than the
+  generic `22023`.
+
+#### Fixed
+
+- `secantus-pgplan`: `ORDER BY` now sees the select list's output names, so
+  `select id * 2 as d from t order by d` works. Independent of windows — it
+  answered `42703 column "d" does not exist` for any aliased column — but it
+  is what makes a window usable, since `ORDER BY rn` is the only way to sort
+  by one.
+- `secantus-pgplan`: a window's synthetic column reaches the def a subquery or
+  CTE publishes, so `select rn from (select row_number() over (...) as rn from
+  t) s` can name what the window computed.
+- `secantus-pgserver`: the window columns are added to the def `select_docs`
+  RETURNS rather than only in `select_def`. Every reader of a select's schema
+  takes the former, and without it a window value went over the wire as TEXT
+  while its value was right — which a row comparison alone does not catch.
+- `secantus-pgplan`: a window function beside a `GROUP BY`, over a `JOIN`, or
+  over a generated source is refused by that name, instead of the false
+  `function sum() is not supported yet` / `function row_number() is not
+  supported yet` those paths used to produce.
+- `secantus-pgplan`: a window function in a `WHERE` answers PostgreSQL's own
+  `42P20 window functions are not allowed in WHERE`, and a `RANGE` offset over
+  more than one `ORDER BY` column answers `42P20` with PostgreSQL's wording.
+
+### The Rust PostgreSQL server: user aggregates and operators, table inheritance, hash partitioning, pg_trgm, and operators resolved by type
+
+Several queries answered an empty result where PostgreSQL refuses them or
+returns rows. Each was silent: no error, just a wrong answer.
+
+- **Comparisons across type categories.** A text column compared with an
+  integer (`WHERE s = 1`) answered an empty result, as did a date compared
+  with a number or a boolean compared with an integer. PostgreSQL refuses
+  each at plan time with `42883 operator does not exist: text = integer`.
+  The Rust server now resolves operators by type as PostgreSQL does.
+- **A date column against a timestamp.** `WHERE d < now()` matched nothing.
+  The date is now promoted to midnight, in the session zone for a
+  `timestamptz`.
+- **A binary FETCH from some cursors.** Over `VALUES`, an aggregate or a
+  constant select, the FETCH sent text bytes that a binary client decoded as
+  garbage integers.
+- **A partition's own constraints were not enforced.** A PRIMARY KEY, UNIQUE
+  or CHECK declared on a partition was accepted and never checked, so
+  duplicate keys went in silently. They now hold for the rows the partition
+  takes, whether written through the parent or the partition itself.
+- **`text || numeric` printed the value's internal form**
+  (`aDecimal128(96000...)`) instead of `a1.50`.
+- **`col::numeric(5,1)` and `col::timestamp(0)` over a column** ignored the
+  modifier and kept every digit.
+
+Errors now carry PostgreSQL's position, so a client prints the caret under the
+token at fault.
+
+**psql's describe commands work.** With psql 15, the output of `\d`, `\d+`,
+`\dt`, `\di`, `\dv`, `\dm`, `\ds`, `\df`, `\df+`, `\sf`, `\dT`, `\dD`, `\dp`,
+`\dn` and `\dx` is byte-for-byte what PostgreSQL 15 prints, including the
+index, check, foreign-key, referenced-by, trigger and policy footers.
+`\dt+`'s Size column is the one exception: PostgreSQL counts its TOAST index
+pages, which this server does not have.
+
+**SQLAlchemy 2.1's reflection matches.** Its inspector answers the same as
+against PostgreSQL 15 for columns, keys, foreign keys, indexes (DESC ordering
+included), unique and check constraints, and comments. That covers
+`pg_opclass`, and `pg_index.indclass` / `indoption` / `indcollation`.
+
+#### Added
+
+- `CREATE AGGREGATE`, `CREATE OPERATOR`, `CREATE STATISTICS`,
+  `CREATE PUBLICATION`, `CREATE TABLESPACE` and `SECURITY LABEL`, each with
+  its catalog (`pg_aggregate`, `pg_operator`, `pg_statistic_ext`,
+  `pg_publication*`, `pg_tablespace`).
+- Table inheritance (`INHERITS`):
+  - a read of a parent reads its descendants;
+  - `UPDATE` / `DELETE` / the recursing `ALTER`s reach them too;
+  - `tableoid` works on every table.
+- `PARTITION BY HASH`, routed by PostgreSQL's own lookup3 hash, so a row lands
+  in the partition PostgreSQL would choose. Partition keys may be
+  expressions, and a multi-column key compares in declared order.
+- `pg_trgm`: `similarity`, `word_similarity`, the `%` family of operators and
+  their thresholds, and trigram opclasses.
+- `ALTER VIEW` (owner, rename, rename column, defaults, options,
+  `security_invoker`). Views follow the renames of what they read. A view's
+  `*` is frozen at creation. `pg_views` and `information_schema.views` are
+  populated.
+- Other additions:
+  - table locks held by a block's statements, deadlock detection (`40P01`),
+    and `pg_locks`;
+  - `DROP TABLE ... CASCADE`;
+  - `ADD COLUMN ... serial`;
+  - ON CONFLICT arbiters on unique and partial indexes, and key-changing
+    upserts;
+  - `DISTINCT` on the extended aggregates;
+  - `STRICT` functions;
+  - function-style casts.
+- RANGE window frames with interval offsets over dates and times, and with
+  fractional offsets over numbers. ROWS and GROUPS offsets are read as bigint.
+- A `Bind` asking for MIXED per-column result formats is honoured column by
+  column. A format count that does not match the columns is `08P01`.
+- DDL waits for readers: `ALTER TABLE`, `DROP TABLE`, a rename and `CLUSTER`
+  take ACCESS EXCLUSIVE, and `CREATE INDEX` takes SHARE, so each waits for
+  (or, under `lock_timeout`, fails against) a session still using the table.
+- A partition's own column options in `PARTITION OF (...)`: NOT NULL,
+  DEFAULT, and column CHECK / UNIQUE / PRIMARY KEY.
+- `pg_get_viewdef(view [, pretty])`, by oid, regclass or name.
+- For psql and ORMs:
+  - the relations `pg_collation`, `pg_am`, `pg_policy`, `pg_depend`,
+    `pg_sequence`, `pg_description` and `pg_publication_namespace`;
+  - the missing columns of `pg_class`, `pg_index`, `pg_attribute`, `pg_type`
+    and `pg_extension`, with `pg_attribute` rows for view and index columns;
+  - the functions `pg_get_indexdef`, `pg_get_triggerdef`, `pg_get_partkeydef`,
+    `pg_get_functiondef`, `pg_get_function_arguments` / `_identity_arguments`
+    / `_result`, `pg_get_function_sqlbody`, `pg_get_userbyid`,
+    `pg_partition_ancestors`, `pg_relation_is_publishable` and the
+    `pg_*_is_visible` family;
+  - `OPERATOR(pg_catalog.op)` syntax;
+  - PostgreSQL's catalog relation oids;
+  - a sequence resolves as a `regclass`, and `nextval('s'::regclass)` works.
+
+#### Fixed
+
+- Silent wrong answers, each measured against PostgreSQL 15:
+  - `ON UPDATE CASCADE` now checks the child row's other foreign keys, so a
+    cascade onto a key another parent lacks is `23503` instead of committing.
+  - Two unnamed foreign keys over one column are named `t_a_fkey` and
+    `t_a_fkey1`, not both `t_a_fkey`. A named `ADD CONSTRAINT` that clashes
+    is `42710`.
+  - int8 values above 2^53 compare exactly in ORDER BY, DISTINCT and window
+    peers, and in RANGE frames.
+  - A `timestamp(p)` / `timestamptz(p)` column stores its value rounded to
+    `p` digits.
+  - A stored `timestamptz` cast to `timestamp` or `date` is the session
+    zone's wall clock inside a WHERE, a nested cast and an aggregate, not
+    only a plain projection.
+  - An UPDATE onto an equal wide numeric primary key is `23505`, and the
+    error names `t_pkey`.
+- `null::no_such_type` is `42704`.
+- Error codes and messages now match PostgreSQL:
+  - `abs(text)` and the other numeric built-ins given a string are `42883`,
+    as are `upper(1)` and the other text built-ins given a number;
+  - an unknown function is `42883` at plan time, even over an empty table;
+  - negative frame offsets are `22013`;
+  - in a FROM-less select, a WHERE naming an output alias is `42703`, and a
+    WHERE naming no column is evaluated once;
+  - a recursive CTE whose anchor is narrower than its UNION's type is
+    `42804`;
+  - `CREATE AGGREGATE` over a built-in operator function that does not take
+    the declared types is `42883`;
+  - `ORDER BY` a name that two different output columns carry is `42702`;
+  - operators are also resolved by type inside a subquery.
+- `||` renders each side as its `::text`: a float4 in its own digits, a
+  timestamptz in the session zone. An unknown literal beside a timestamp or
+  interval is text there, not that type.
+- A function parameter's `DEFAULT` was accepted and ignored: a call that left
+  the argument out was `42883`. It now fills the call, and a later parameter
+  without a default is refused (`42P13`).
+- A domain's CHECK constraints are listed in `pg_constraint`.
+- An aggregate whose WHERE compares two columns over a join, such as `SELECT
+  count(*) FROM a, b WHERE a.id = b.id`, was refused. So was a subquery
+  correlated through a FROM function's argument, such as `ARRAY(SELECT ...
+  FROM unnest(t.opts) x)`.
+- `pg_get_constraintdef(oid, true)` drops a CHECK's outer parentheses, and a
+  CHECK shows PostgreSQL's implicit casts (`v > 0::numeric`, `'-3'::integer`).
+- `pg_class.relhastriggers` is true for both sides of a foreign key.
+- A failed autocommit INSERT consumes the serial values it drew, as
+  PostgreSQL's non-transactional sequences do, so the next id matches. The
+  statement's own transaction used to roll the sequence back with it.
+- A folded DEFAULT takes the column's modifier as stored: `numeric(4,1)
+  DEFAULT 1.25` stores `1.3`, on INSERT and on `ADD COLUMN`'s backfill.
+- `timestamp(p)` / `timestamptz(p)` casts round to `p` digits, as
+  PostgreSQL's `AdjustTimestampForTypmod` does.
+- The Python PG server has `pg_catalog.pg_tablespace` and the
+  `default_table_access_method` setting, which SQLAlchemy 2.1's table
+  reflection reads.
+- An untyped literal compared with a date column is read as a date.
+- A parameterised recursive CTE (`SELECT $1::int UNION ALL SELECT n + 1 ...`)
+  typed its column as text and failed with `42883`. A VALUES column holding
+  NULL under a cast now takes the cast's type.
+- Date and time handling:
+  - time-only input forms and PostgreSQL 15's full default zone-abbreviation
+    set;
+  - `DateStyle` in text casts and arrays;
+  - `to_date` / `to_timestamp` stop at the end of the input, read ISO weeks,
+    and number negative years as PostgreSQL does;
+  - wide-year and BC `timestamptz` render in the session zone;
+  - numeric and POSIX `TimeZone` settings are accepted;
+  - daylight saving is applied past 2037.
+- Float NaN compares above every number. Stored ranges render in the session
+  zone, and a range casts to a multirange.
+- `information_schema.columns.column_default` prints expressions as
+  PostgreSQL's ruleutils does: negative constants typed by the literal,
+  implicit numeric casts shown, `NOT` / `AND` / `OR` kept rather than folded,
+  and arrays as typed literals.
+- MERGE fires each action's statement triggers once, and acts on identical
+  keyless rows as separate rows. Row-level security on a table read through a
+  view applies the view owner's policies.
+
+### The Rust PostgreSQL server verifies passwords, and gains LATERAL and EXPLAIN
+
+A role created with a password now has to prove it. The Rust PostgreSQL server
+stored the SCRAM-SHA-256 verifier `CREATE ROLE ... PASSWORD` gives it, and then
+trusted every connection anyway -- a wrong password, or none, logged in as the
+role. It now runs the SCRAM-SHA-256 exchange against the stored verifier, and
+refuses a NOLOGIN role. A role with no password, and a user the server has
+never heard of, are still trusted, which is what test fixtures connecting as a
+password-less `postgres` rely on.
+
+`LATERAL` works, for subqueries and for functions (which are implicitly
+lateral, as in PostgreSQL), in comma, CROSS and LEFT joins. A set-returning
+function over a column in the select list -- `SELECT unnest(tags) FROM t` --
+works, planned as the lateral join it means. `EXPLAIN` answers with the plan's
+shape in PostgreSQL's layout; it prints zero costs rather than invented ones.
+
+#### Added
+
+- SCRAM-SHA-256 password verification (`secantus-auth` gains the PostgreSQL
+  form of the exchange: an empty client user name and the `y,,` header).
+- `LATERAL` subqueries and functions; select-list set-returning functions;
+  `jsonb_array_elements[_text]`, `jsonb_each[_text]`, `jsonb_object_keys` and
+  their `json_` twins; `regexp_matches`; multi-array `unnest(a, b)`.
+- `EXPLAIN [ANALYZE]`, `(COSTS OFF)`, `(FORMAT JSON)`.
+- `COLLATE "C"` (and `POSIX` / `default` / `ucs_basic`).
+
+#### Fixed
+
+- `regexp_count` / `_instr` / `_substr` / `_like` and `to_ascii` answer as
+  PostgreSQL 14 does (42883, 0A000) rather than "not supported yet".
+- `unnest(a) AS x` names its column `x`, as PostgreSQL's rule for a function
+  returning one column has it.
+
+#### Added (foreign keys)
+
+- Multi-column FOREIGN KEYs, to a composite PRIMARY KEY or to a UNIQUE
+  constraint; `ON DELETE` / `ON UPDATE` with `CASCADE`, `SET NULL` and the new
+  `SET DEFAULT`. MATCH SIMPLE: a key with a NULL column references nothing.
+
+### The Rust PostgreSQL server: two silent data-loss fixes, rules, event triggers, foreign data, CREATE CAST and COLLATION, pgcrypto's PGP, and view definitions as PostgreSQL prints them
+
+Batch 11 started from a re-measured backlog: every open Rust-server entry was
+probed against PostgreSQL 15. Two of them were losing committed data without an
+error; both are fixed. The batch then closes the refusals and wrong answers that
+probe found, and adds `CREATE CAST` and pgcrypto's encryption functions. Every
+change is measured against PostgreSQL 15 (and 14 where a corpus needs it).
+
+#### Fixed
+
+- **A block's earlier write could vanish.** An explicit transaction that
+  wrote, then collided with another session on a later statement, retried that
+  statement on a fresh transaction and silently discarded its earlier writes,
+  while every statement and the `COMMIT` reported success. The "has this
+  transaction written?" check read a flag before the snapshot refresh that
+  sets it. The block now fails whole with `40001`.
+- **A prepared transaction lost its locks across a restart.** Recovered from
+  its record, it held nothing: another session could update one of its rows
+  and commit, and `COMMIT PREPARED` then overwrote that commit. A prepared
+  transaction is now revived as a live transaction when the store opens, so a
+  conflicting write waits (`55P03` under `lock_timeout`), as in PostgreSQL.
+- **`inet` / `cidr` ordered and compared as text.** `10.0.0.1` sorted before
+  `9.0.0.1`, `a < '9.255.0.0'::inet` compared strings, `min` / `max` were
+  wrong, and `a = '10.0.0.1'` missed the stored `10.0.0.1/32`. They now follow
+  PostgreSQL's `network_cmp`.
+- **Deep and long expressions.** A 10-term `a || b || ...` never finished
+  (typing re-walked each operand per arm, about 5^depth). A 24-term chain
+  overflowed a worker's stack and aborted the whole server, and past 50 levels
+  the parse tree failed to decode. Typing is now linear. Workers have a large
+  reserved stack, and a statement nested past PostgreSQL's own limit is its
+  `54001`, never a crash.
+- **`now()`** is the transaction's start, as in PostgreSQL, where it was the
+  statement's. `statement_timestamp()` and `clock_timestamp()` keep their own
+  meanings.
+- **Window `RANGE` frames** over numeric values past 15 significant digits
+  compare exactly.
+- **`greatest` / `least`** keep an array's lower bounds.
+- **An aggregate over a derived source** (`VALUES`, a subquery, a function)
+  with a WHERE that is not a plain filter works; it was `0A000`.
+- **`DISTINCT ON` over a grouped query** works; it was `0A000`.
+- **Set operations** type their columns as PostgreSQL does:
+  - `varchar UNION name` is `name`;
+  - `null::text UNION 1` is `42804`, with its position.
+- **Error codes and messages now match PostgreSQL:**
+  - `max(boolean)`, `md5(1)`, `substr(1, 1)`, `array_length(1, 1)` and
+    `to_hex(text)` are `42883`;
+  - a cross-type comparison on a subquery or CTE column is `42883`, as it
+    already was for a table's;
+  - `1::inet` is `42846`.
+- **`to_tsvector`** follows the `C.UTF-8` locale the server reports: every
+  letter lowercases, and only letters make words.
+- **SQL functions returning composites.** A function returning a composite
+  returns the whole row. A composite-returning function in `FROM`, and
+  `(f()).*`, expand to its fields.
+- **Composite operands.** A composite beside another type in an operator is
+  `42883`, as in PostgreSQL.
+- **Dropping a type** that a function's signature names now refuses (`2BP01`)
+  or cascades, as PostgreSQL does.
+- **`DROP FUNCTION f(), g()`** with several functions works. It runs as
+  one transaction: when one is missing, none is dropped (it was `0A000`).
+- **A PL/pgSQL record's array field** keeps its array type. `r.a` of a
+  `text[]` column was typed `text`, so storing it failed with `42804`.
+- **A computed column's type modifier.** `x::numeric(5,2)` in a select list
+  or a view now reports `numeric(5,2)`, in the row description and in
+  `pg_attribute`, where it was bare `numeric`.
+- **`pg_table_size`** counts a table's TOAST index (8192 bytes) when a
+  column can be TOASTed, as PostgreSQL does.
+- **Time zone abbreviations tied to a zone** (`MSK`, `VOLT`, `YAKT`, ...)
+  mean that zone's offset at the time given: `2012-01-01 12:00 MSK` is
+  UTC+4, as it was then. A zone abbreviation on a `timetz` (`'12:00
+  EST'::timetz`) is read; it was dropped.
+- **`pg_class.relacl`** shows the grants on a table (`grantee=arwd/owner`,
+  `*` for WITH GRANT OPTION, per privilege); it was always NULL.
+  `relhasrules` is true for a table with a rule.
+
+#### Added
+
+- **Collations:**
+  - ICU ones: any `<tag>-x-icu` name, and `CREATE COLLATION ... provider =
+    icu` with the locale's `ks` / `kn` / `kf` / `co` / `ka` keywords
+    (`de-u-co-phonebk`, `und-u-kn-true`).
+  - Applied in `ORDER BY`, comparisons, `IN`, `min` / `max`, `greatest` /
+    `least`, `DISTINCT`, `GROUP BY` and `UNIQUE` indexes.
+  - Nondeterministic (case-insensitive) collations compare equal where their
+    strength says so; `LIKE` under one is refused, as in PostgreSQL.
+  - A column's `COLLATE`, which was silently dropped, is recorded and
+    honoured.
+  - `COLLATE` in an index key, `DROP COLLATION` with its column dependencies,
+    and the `42P21` / `42P22` conflicts.
+  - Catalog: `pg_collation`, `pg_attribute.attcollation`,
+    `information_schema.columns.collation_name`, `regcollation` and
+    `pg_collation_for` / `COLLATION FOR`.
+  - Built on ICU4X, over the same CLDR data as the ICU PostgreSQL links.
+- **`DISTINCT ON` over an expression** (`DISTINCT ON (lower(x))`).
+- **`CREATE CAST` / `DROP CAST`:**
+  - function, `WITH INOUT` and binary casts;
+  - explicit, `AS ASSIGNMENT` and `AS IMPLICIT` contexts, through `INSERT` and
+    `UPDATE` too;
+  - `pg_cast`, with PostgreSQL's built-in rows;
+  - PostgreSQL's validation and dependency errors.
+- **pgcrypto's PGP functions:**
+  - `pgp_sym_encrypt` / `pgp_sym_decrypt` (and `_bytea`) with all of
+    pgcrypto's options;
+  - `pgp_pub_encrypt` / `pgp_pub_decrypt` over RSA and Elgamal keys,
+    password-protected keys included;
+  - `armor`, `dearmor` and `pgp_key_id`.
+  - Messages decrypt on PostgreSQL and the other way round. Blowfish and CAST5
+    are checked against GnuPG, since the reference servers' OpenSSL 3 builds
+    lack them.
+- **pgcrypto's raw ciphers:** `encrypt` / `decrypt` / `encrypt_iv` /
+  `decrypt_iv`, byte for byte with PostgreSQL.
+- **The network functions:** `host`, `masklen`, `network`, `broadcast`,
+  `netmask`, `hostmask`, `family`, `abbrev`, `text`, `set_masklen`,
+  `inet_same_family`, `inet_merge`, and the containment operators `<<`,
+  `<<=`, `>>`, `>>=` and `&&`.
+- **`CREATE RULE` / `DROP RULE`** on INSERT, UPDATE and DELETE: `DO ALSO`,
+  `DO INSTEAD`, `DO INSTEAD NOTHING` and a `WHERE`, with `pg_rewrite` and
+  `pg_rules`. `ALTER TABLE ... ENABLE` / `DISABLE RULE` and `TRIGGER`
+  (including `ALL` and `USER`) work too.
+- **Event triggers:** `CREATE` / `ALTER` / `DROP EVENT TRIGGER` on
+  `ddl_command_start`, `ddl_command_end` and `sql_drop`, with `TG_EVENT`,
+  `TG_TAG`, a `WHEN TAG IN` filter, `pg_event_trigger_dropped_objects()`,
+  `pg_event_trigger_ddl_commands()` and `pg_event_trigger`.
+- **Foreign data:** `CREATE` / `ALTER` / `DROP FOREIGN DATA WRAPPER`,
+  `SERVER`, `USER MAPPING` and `FOREIGN TABLE`, with their options,
+  dependencies and `CASCADE`, and the `pg_foreign_*` catalogs and
+  `information_schema` views. There is no FDW handler here, so reading or
+  writing a foreign table, and `IMPORT FOREIGN SCHEMA`, answer PostgreSQL's
+  own `55000` for a wrapper without one.
+- **View definitions as PostgreSQL prints them.** `pg_get_viewdef` and
+  `pg_views.definition` now follow ruleutils' layout: qualified columns,
+  typed literals, implicit casts written out, and parenthesised operators.
+  The pretty form `pg_get_viewdef(v, true)` (which psql's `\d+` uses) works
+  too. `pg_rules.definition`, and `pg_get_expr` over generated columns,
+  CHECK constraints and policies, use the same printer.
+- **`LANGUAGE internal` wrappers** are callable when the C function they
+  name has a SQL form here (`int4pl`, `textlen`, `upper`, ...).
+- **New corpora:** `user_casts`, `pgcrypto_ciphers`, `expr_depth`, `clocks`,
+  `triage_fixes`, `collations`, `rules`, `event_triggers`, `fdw`,
+  `catalog_b11`, `views_ruleutils`, `expr_ruleutils` and
+  `internal_functions`.
+
+### The Rust PostgreSQL server: rules as a real rewriter, a DELETE USING that deleted every row, overload choice by type, and HAVING without GROUP BY
+
+Batch 12 started from the re-measured backlog, as batch 11 did: every open
+Rust-server entry was probed against PostgreSQL 15. Two findings were silent
+wrong answers, and both are fixed. Most of the rest of the batch replaces
+approximations with PostgreSQL's own rules, transcribed from its source or its
+catalogs: the rewriter for rules, `func_select_candidate` for choosing a
+function overload, and `pg_proc` / `pg_type` for types. Each change is
+measured against PostgreSQL 15.
+
+#### Fixed
+
+- **`DELETE ... USING (subquery)` deleted every row.** A derived table inside
+  the correlated subquery that `USING` is rewritten to was not recognised as
+  local, so the correlation never bound and the predicate matched every row.
+- **`HAVING` without `GROUP BY` was ignored.** `select 1 from t having
+  count(*) > 5` returned every row of `t`. The whole input is now one group,
+  so the query yields one row or none.
+- **Rules ran as per-row triggers.** A `DO ALSO` action ran once per row, and
+  an `UPDATE` rule's action ran after the update and saw the new rows. Rules
+  now rewrite the statement as PostgreSQL's `rewriteHandler` does: once per
+  statement, actions before the original for `UPDATE` / `DELETE`, conditional
+  `INSTEAD` rules negated into the original, and recursive rules refused
+  (`42P17`).
+- **Function results had the wrong type.** `round` / `ceil` / `floor` /
+  `trunc` of an integer are `double precision`, as PostgreSQL picks the
+  `float8` overload (its category's preferred type). `abs(real)` is `real`.
+  Over a table column these came back as `numeric`.
+- `generate_series(smallint, smallint [, smallint])` is `42725 ... is not
+  unique`, as on PostgreSQL. A bigint series is `bigint`, and `select from
+  generate_series(...)` is rows of no columns.
+- A 2-D `varchar[]` / `bpchar[]` / `name[]` rendered as a 1-D array of the
+  sub-arrays' text.
+- `inet[]` / `cidr[]` to text prints each element as `inet_out` does, dropping
+  a full host mask.
+- `aclitem` resolves roles made with `CREATE ROLE`. `aclitem::oid` is
+  `42846`, and `oid` has no arithmetic operators (`42883`).
+- Under `LATIN1` / `LATIN9`, a binary text array is transcoded element by
+  element. A column name the encoding cannot hold is `22P05`.
+- Date and time input errors carry their position, and a month or day
+  overflow carries PostgreSQL's `datestyle` hint. `to_date` has
+  PostgreSQL's DETAIL lines and refuses an invalid day name. jsonpath
+  `keyvalue()` ids follow the position of the value.
+
+#### Added
+
+- **Functions resolve by argument type** against PostgreSQL 15's `pg_proc`
+  signatures and implicit casts: a call no overload takes is `42883`, and a
+  call's result types the expressions around it.
+- **Expression typing** covers CASE, COALESCE, NULLIF, GREATEST / LEAST, `||`,
+  date and numeric arithmetic and scalar subqueries. Compared literals are
+  coerced when the statement is analysed.
+- **Aggregates with no FROM** (`select sum(1)`, `select count(*) having
+  false`).
+- **EXPLAIN** prints `Index Cond`, `Filter`, `Hash Cond`, `Join Filter` and
+  scan aliases.
+- **`CREATE TYPE`** takes `internallength`, `passedbyvalue`, `alignment`,
+  `storage`, `category`, `receive` / `send` and the rest, with PostgreSQL's
+  validation. `pg_type` carries the physical and I/O columns and array rows
+  for the built-ins.
+- **`information_schema`** lists the `pg_catalog` and `information_schema`
+  relations and columns.
+- Corpora `builtin_overloads`, `assign_types`, `explain_quals`,
+  `create_type_options`, `infoschema_system`, `func_types` and `b12_residuals`,
+  all at 0 divergences against PostgreSQL 15.
+- The vendored `pgwire` fork's two TLS unit tests generate their certificate
+  per run. They used to fail on a key file that the repository's `*.key`
+  ignore rule keeps out.
+
+### The Rust PostgreSQL server: procedures, ALTER FUNCTION, column privileges, every RENAME, and PostgreSQL's own catalogs
+
+Batch 13 continued from the re-measured backlog. Two of its findings were
+security bugs, and both are fixed: column privileges acted as table privileges,
+and dropped tables' grants survived. It also fills in a family of missing
+statements: procedures, `ALTER FUNCTION` and the `RENAME` forms. Every change
+is measured against PostgreSQL 15.
+
+#### Fixed
+
+- **A column-level GRANT acted as a table-level one.** After `GRANT SELECT (v)
+  ON t TO r`, the grantee could read every column of `t`. Column privileges
+  are now recorded in the shared `__sql_column_grants__` catalog (the Python
+  server's shape) and checked against the columns a statement uses.
+- **Grants outlived their table.** A table created under a dropped table's
+  name inherited its grants. `DROP TABLE` / `DROP VIEW` now drop them, a
+  rename moves them, and a dropped column's grants go with it.
+- **A procedure could be called with SELECT**, which ran it as a function.
+  That is now `42809 ... is a procedure`, as on PostgreSQL.
+- **A PRIMARY KEY or UNIQUE constraint over a nondeterministic collation**
+  accepted `apple` beside `Apple`. Keys are now compared by the collation's
+  sort key, and `count(DISTINCT ...)` counts them the same way.
+- A named `CONSTRAINT ... PRIMARY KEY` was reported as `<table>_pkey`.
+- `relacl` lost the owner's entry once every grant was revoked. `relacl` and
+  `attacl` are now `aclitem[]`, and `attacl` shows column grants.
+- A function with OUT parameters returned NULL (plpgsql) or a single record
+  column from `select * from f()`.
+- A `void` function's value is now `''`, not NULL.
+
+#### Added
+
+- **`CREATE / CALL / DROP PROCEDURE`**, with OUT and INOUT parameters.
+- **`ALTER FUNCTION / PROCEDURE / ROUTINE`**: RENAME, SET SCHEMA, OWNER TO,
+  volatility, STRICT, SECURITY, LEAKPROOF, COST, ROWS, PARALLEL, and SET /
+  RESET.
+- **`CREATE FUNCTION` without RETURNS** (the result comes from the OUT
+  parameters), and function schemas. Functions are stored in the shared
+  shape, every parameter with its mode.
+- **`ALTER ... RENAME`** for indexes, constraints, sequences, types (with enum
+  values and composite attributes), domains (and their constraints), schemas,
+  triggers and rules. Each rewrites every stored reference to the object.
+- **Rules**: a rule action with several VALUES rows, `DEFAULT` in VALUES, and
+  `CREATE RULE "_RETURN" ... ON SELECT` turning an empty table into a view. A
+  set-operation action is refused at CREATE RULE (`42P10`).
+- **Event triggers**:
+  - `table_rewrite` fires, with `pg_event_trigger_table_rewrite_oid()` and
+    `_reason()`.
+  - `pg_event_trigger_ddl_commands()` covers schemas, comments, renames,
+    grants, routines, domains, sequences, types, triggers, rules, policies,
+    statistics and publications, and has a `command` column.
+  - The event functions raise `39P03` outside their event.
+- **Catalogs**:
+  - `pg_class` and `pg_attribute` list PostgreSQL 15's own relations and their
+    columns, and those relations resolve through `::regclass`.
+  - `pg_type` has a row type for each view and an array type for every user
+    type, and `pg_rewrite` lists each view's `_RETURN` rule.
+  - `pg_proc` has argument modes, namespaces and owners.
+  - `pg_indexes` prints `COLLATE` and ruleutils' parenthesised expressions.
+- Corpora `column_privileges`, `rule_shapes`, `nondeterministic_keys`,
+  `procedures`, `alter_routines`, `event_trigger_coverage`, `renames` and
+  `catalog_system`, all at 0 divergences against PostgreSQL 15.
+
+### The Rust PostgreSQL server: transaction control in procedures, semi-joins, join pushdown, recursive views
+
+Batch 14 adds transaction control to procedures and `DO` blocks, and plans
+`EXISTS` and selective joins far faster. It also fixes three silent-data bugs.
+Each change was probed against PostgreSQL 15, and the corpora run against PostgreSQL 14.
+
+#### Fixed
+
+- **A failing `DO` block left its earlier writes committed.** A block run on
+  the function interpreter wrote each statement on its own. Its statements
+  now join the session's transaction.
+- **A caught exception did not undo its block's writes.** A `BEGIN ...
+  EXCEPTION` block now runs as a subtransaction, as PostgreSQL's does.
+- **`COMMIT` in a SQL-language procedure crashed the connection.** It is now
+  `0A000`, as on PostgreSQL.
+- `VALUES` columns take the rows' common type. A string beside a numeric was
+  summed as 0.
+- NaN and -0 group as PostgreSQL groups them in `GROUP BY`, `DISTINCT`,
+  `count(DISTINCT)` and window partitions.
+- A `COLLATE` inside a `VALUES` list, subquery or CTE carries out to the
+  derived column. `GROUP BY` under a nondeterministic collation answers the
+  group's first value.
+- An aggregate under a subscript, `(array_agg(x))[1]`, is an aggregate.
+- A view over `SELECT * FROM (VALUES ...) v` had no columns.
+- A table column-alias list, `FROM t r(a, b)`, answered 42703.
+
+#### Added
+
+- `COMMIT` / `ROLLBACK` [`AND CHAIN`] in procedures and `DO` blocks. They are
+  allowed only outside a transaction block, as on PostgreSQL; anywhere else
+  they are 2D000.
+- `CALL` inside PL/pgSQL, writing `OUT` / `INOUT` values back to variables.
+- `CREATE VIEW ... WITH RECURSIVE`, and recursive CTEs inside FROM subqueries.
+- `pg_get_viewdef` prints PostgreSQL's form for more view shapes:
+  - `VALUES`;
+  - `ROWS` / `GROUPS` frames with `EXCLUDE`;
+  - `LATERAL` and column-alias lists;
+  - a set operation's `ORDER BY` / `LIMIT` / `OFFSET`;
+  - `WITH RECURSIVE` and CTE column lists;
+  - renamed relations (`t t_1`).
+
+#### Performance
+
+- A join applies each single-table WHERE condition to that table's own
+  scan, so the scan can use an index. Only tables on the preserved side of
+  an outer join are filtered early. A selective join over 20,000 rows went
+  from 731 ms to 1.7 ms.
+- A WHERE-level `EXISTS` / `NOT EXISTS` over one equality runs as the
+  uncorrelated `IN` / null-safe `NOT IN` it equals. Over 2,000 x 2,000 rows,
+  `EXISTS` went from 7.2 s to 46 ms.
+- Window partitions are hashed rather than scanned.
+
+New corpora: `values_common_type`, `derived_collation`,
+`procedure_transactions`, `join_pushdown`, `semi_join`, `viewdef_shapes` and `srf_fields`.
+All are at 0 divergences, and so is every other corpus.
+
+### The Rust PostgreSQL server: expression indexes that work, numeric and NOT IN at index speed, error positions
+
+Batch 15 makes several common shapes fast instead of quadratic or
+full-scanning. It also corrects error positions and static type checks.
+Each change was probed against PostgreSQL 15, and the corpora run against
+PostgreSQL 14.
+
+#### Fixed
+
+- **A UNIQUE expression index (`lower(email)`) cost a full table evaluation
+  per write.** An INSERT took 1.6 s at 20,000 rows; it now takes 0.9 ms at
+  any size.
+  - Each row keeps the expression's value in a hidden field, and the storage
+    index on that field enforces UNIQUE.
+  - Rows another writer left (the Python server knows no expression indexes)
+    are recomputed when the server opens the store.
+- An error raised while rows stream, or for a record without the named
+  field, now carries PostgreSQL's position.
+- `integer + boolean`, string arithmetic and `jsonb` arithmetic on a
+  composite field are rejected at plan time (`42883`), as on PostgreSQL,
+  even over an empty table.
+
+#### Added
+
+- `ON CONFLICT (expression)` arbitrates on a unique expression index.
+
+#### Performance (debug builds)
+
+- A WHERE over an indexed expression uses the index: `lower(t) = 'x'` at
+  20,000 rows went from 2.4 s to 3.7 ms.
+- A `numeric` predicate uses the column's index: `n = 5` went from 820 ms to
+  1.2 ms, and `BETWEEN` from 1.9 s to 17 ms.
+  - Storage answers an `$or` whose every branch has an index as the union of
+    the branches' lookups (mongod's OR plan).
+  - Each indexable `$or` in an AND is intersected with the others.
+- `NOT IN (subquery)` and `NOT EXISTS` went from 7.3 s to 34 ms over
+  2,000 x 2,000 rows.
+  - `NOT (x = ANY (...))` now lowers to an index-aware filter.
+  - A scan hashes a large `$in` / `$nin` list once instead of comparing every
+    row against every element.
+
+#### The MongoDB server
+
+The storage and matcher changes above apply to the Rust MongoDB server too:
+
+- an indexed `$or` uses its indexes;
+- a long `$in` / `$nin` list is hashed;
+- `explain` reports the OR plan as mongod 8.2.11 does: `SUBPLAN`, `FETCH`,
+  `OR`, and an `IXSCAN` per branch.
+
+New corpora: `not_in_large`, `numeric_index`, `error_positions`,
+`expr_unique`, `expr_where`. All are at 0 divergences.
+
+### The Rust PostgreSQL server compares quoted literals correctly, and gains expression defaults
+
+A quoted literal compared with a column is PostgreSQL's unknown-typed constant,
+and it takes the column's type. The Rust PostgreSQL server left it a string, so
+`WHERE n > '5'`, `WHERE ok = 't'` or `WHERE created > '2026-03-01'` compared a
+string against a number, boolean or timestamp and matched **nothing** -- a
+silent empty answer, on every quoted number, boolean, timestamp and interval
+in a WHERE, an IN list or a BETWEEN. The literal is now coerced to the
+column's type, and a timestamp comparison accounts for the sub-millisecond
+remainder the storage keeps beside the millisecond value.
+
+Column DEFAULTs may now be expressions -- `now()`, `CURRENT_DATE`,
+`gen_random_uuid()`, `nextval('s')` -- evaluated for each inserted row (and
+each existing row, for `ALTER TABLE ADD COLUMN`) rather than refused.
+`INSERT ... DEFAULT VALUES`, `VALUES (DEFAULT, ...)` and `UPDATE ... SET c =
+DEFAULT` work. Sequence functions work anywhere in an expression, not only as
+a bare select-list target. Window functions work over an aggregate, over
+`generate_series`, and inside an expression.
+
+#### Added
+
+- `secantus-pgplan` / `secantus-pgserver`: expression column defaults, stored in
+  the Python server's `default_expr` catalog key; `DEFAULT VALUES`, the
+  `DEFAULT` keyword in VALUES and SET.
+- `nextval` / `currval` / `setval` / `lastval` inside any expression, through a
+  sequence hook the executor installs; `lastval()`.
+- `gen_random_uuid()` / `uuid_generate_v4()`, `random()`, and `CURRENT_DATE` /
+  `CURRENT_TIME` / `LOCALTIME` / `LOCALTIMESTAMP` anywhere in an expression.
+- A window function over an aggregate (`sum(sum(v)) OVER (...)`), over
+  `generate_series`, and nested in an expression (`v - avg(v) OVER ()`).
+
+#### Fixed
+
+- A quoted literal compared with a non-text column matched nothing.
+- A timestamp comparison ignored the stored microsecond remainder, so
+  `t = '...123456'` and `t > '...123'` answered wrongly.
+- A volatile SET value (`SET n = nextval('s')`) was evaluated once for every
+  row instead of once per row.
+- `now()::date` and the other timestamptz casts to a zone-less type failed in a
+  constant expression.
+
+#### Added (composite keys)
+
+- A composite `PRIMARY KEY`, stored as the Python server's subdocument `_id`
+  (its columns in table order), so either server reads and enforces the
+  other's. A duplicate names the key's columns in its DETAIL.
+
+#### Fixed (grouping)
+
+- A QUALIFIED grouped column in the select list (`select c.a, count(*) from t
+  c group by c.a`) was a 42803 naming the alias `c`: the target read the first
+  name part rather than the column.
+
+### The Rust PostgreSQL server: UPDATE ... FROM, updatable views, exact numeric math, and PostgreSQL's full date/time input
+
+`UPDATE ... FROM` and `DELETE ... USING` used to ignore their extra FROM and
+write every row the statement's own WHERE allowed. They now touch only the
+joined rows. `RETURNING` may read the joined item, and an ambiguous unqualified
+column is `42702`, as in PostgreSQL.
+
+A view over a single table is now automatically updatable. `INSERT` /
+`UPDATE` / `DELETE` through it are rewritten onto the base table, a computed
+view column is read-only, and `WITH [LOCAL | CASCADED] CHECK OPTION` refuses a
+row the view would not show (`44000`). A `READ ONLY` transaction, or
+`default_transaction_read_only`, now refuses every write, `nextval()`
+included (`25006`); before, it wrote.
+
+Integer arithmetic overflows as PostgreSQL does (`22003 integer out of range`).
+Before, an `int4` result silently widened to `int8`. The numeric
+transcendentals (`sqrt`, `exp`, `ln`, `log`, `power`, `^`) are exact, at
+PostgreSQL's result scale, instead of float approximations.
+
+Date/time input now goes through a transcription of PostgreSQL's
+`DecodeDateTime`. `Jan 5, 2020`, `5 January 2020 10:30 PM`, `1/5/2020` (in the
+session's DateStyle order), `20200105T103000`, `J2458854`, `y2020m01d05`, zone
+names and abbreviations, and `today` / `tomorrow` all read as they do on
+PostgreSQL. `AT TIME ZONE` is implemented.
+
+#### Added
+
+- `bit(n)` / `bit varying(n)`: literals, casts to and from integers and text,
+  `& | # ~ << >> ||`, `get_bit` / `set_bit` / `bit_count` / `length` /
+  `position` / `substring` / `overlay`, binary wire format; the integer bitwise
+  operators.
+- `AT TIME ZONE` / `timezone()`, with named zones, abbreviations, POSIX
+  offsets and intervals.
+- `scale()`, `min_scale()`, `trim_scale()`, `numeric_send()`, and
+  `numeric(p,s)` rounding and overflow (`22003`) on casts and assignment.
+- Expression indexes, `CREATE [UNIQUE] INDEX ... (lower(email))`: a unique
+  one is enforced on INSERT and UPDATE. Index keys may declare `NULLS FIRST` /
+  `LAST`.
+- `ORDER BY` over an aggregate result (`ORDER BY count(*) DESC`, by alias or
+  position); `GROUPING()`; an aggregate over a WHERE that does not lower to a
+  filter (`WHERE lower(email) = ...`).
+- `generate_series` over `numeric`, and over `date` / `timestamp` /
+  `timestamptz` with an interval step.
+- `EXPLAIN (FORMAT YAML | XML)`, and `Parent Relationship` / `Alias` /
+  `Parallel Aware` in the structured formats.
+- `SET (a, b) = (1, 2)`, subqueries in `INSERT ... RETURNING`,
+  `has_*_privilege()`, `to_regclass()`, `IS [NOT] TRUE / FALSE / UNKNOWN`, and
+  the `"char"` type.
+
+#### Fixed
+
+- `UPDATE ... RETURNING` / `DELETE ... RETURNING` with bound parameters sent
+  rows without a RowDescription, which a client rejects.
+- A `float4` is rounded to single precision and prints as `float4out` does
+  (`0.33333334`).
+- `CASE` / `COALESCE` / `greatest` / `least` answer the branches' common type;
+  `real + int` is `double precision`; a negative `LIMIT` / `OFFSET` is
+  `2201W` / `2201X`.
+- `upper` / `lower` / `initcap` use the simple case mapping (`upper('ß')` is
+  `ß`); `lc_collate` / `lc_ctype` report `C.UTF-8`.
+- A DST-ambiguous or skipped local time resolves to the offset PostgreSQL picks.
+- The information_schema views report `varchar` / `name` / `"char"` column
+  types, and `column_default` shows a folded default as written (`(1 + 2)`).
+- A wide-year or BC `timestamptz` prints with its zone offset.
+
+### The Rust PostgreSQL server runs user-defined functions and triggers
+
+`CREATE FUNCTION ... LANGUAGE sql` and `LANGUAGE plpgsql` now define functions
+the Rust PostgreSQL server can call — in the select list, in `WHERE`, in
+`FROM` as a set-returning function, and from each other (recursion included).
+PL/pgSQL runs on a new interpreter over the real PostgreSQL grammar
+(`libpg_query`'s PL/pgSQL parser), so a body the reference server rejects is
+rejected here at `CREATE` time too. Functions are stored in the Python
+server's `__sql_functions__` shape, so either server can call the other's.
+
+`CREATE TRIGGER` works: `BEFORE` and `AFTER`, `FOR EACH ROW` and
+`FOR EACH STATEMENT`, over `INSERT`, `UPDATE`, `DELETE` and (statement-level)
+`TRUNCATE`, with `UPDATE OF`, `WHEN (...)`, `TG_ARGV` and every `TG_`
+variable. A BEFORE row trigger can rewrite the row (`NEW.x := ...`) or skip it
+(`RETURN NULL`); an AFTER trigger can write elsewhere; an error raised in any
+trigger aborts the whole statement. `pg_trigger` lists them.
+
+`DO` blocks outside the small subset they already supported — `DECLARE`,
+`IF`, loops, `EXCEPTION` handlers, `SELECT ... INTO` — now run on the same
+interpreter instead of being refused.
+
+#### Added
+
+- `CREATE [OR REPLACE] FUNCTION` in `LANGUAGE sql` / `plpgsql`: scalar,
+  `SETOF`, `RETURNS TABLE` and OUT parameters.
+- A PL/pgSQL interpreter: blocks and `EXCEPTION` handlers (condition names and
+  SQLSTATEs), assignment, `IF` / `CASE`, `LOOP` / `WHILE` / integer `FOR` /
+  query `FOR` / `FOREACH`, `EXIT` / `CONTINUE`, `RETURN` / `RETURN NEXT` /
+  `RETURN QUERY`, `RAISE` with `USING`, `PERFORM`, `SELECT ... INTO`,
+  `EXECUTE`, `GET DIAGNOSTICS`, `FOUND`, `ASSERT`.
+- `CREATE [OR REPLACE] TRIGGER`, `DROP TRIGGER [IF EXISTS]`, `pg_trigger`.
+
+#### Fixed
+
+- `DROP FUNCTION` refuses (2BP01) while a trigger calls the function, and
+  `CASCADE` drops the trigger; `DROP TABLE` drops the table's triggers.
+- A statement that runs user code is atomic outside a block too: a `DO` block
+  or trigger that raises after writing takes those writes with it (a `DO`
+  that ran `EXECUTE 'insert ...'` and then raised used to leave the row).
+- `ROLLBACK TO SAVEPOINT` undoes what a trigger or function wrote to tables
+  other than the statement's own target.
+- A call at an arity no user function has answers PostgreSQL's
+  `42883 function f(integer) does not exist`.
+
+### The Rust PostgreSQL server gains general JOINs, correlated subqueries, views and indexes
+
+The Rust PostgreSQL server (`secantusd-pg`) used to support a JOIN only in the
+narrow two-table shape psycopg's catalog queries take. It now plans any JOIN as
+a source: inner, LEFT, RIGHT, FULL and CROSS joins, `USING` and `NATURAL`,
+joins of three or more relations, subqueries and set-returning functions as
+join sides, and every clause over them (WHERE, GROUP BY / HAVING, window
+functions, DISTINCT, `SELECT *` and `t.*`). A bare column name that both sides
+have is PostgreSQL's `42702` rather than the left side's value taken silently.
+
+Correlated subqueries (`EXISTS`, `NOT EXISTS`, `IN`, `ANY` / `ALL`, `ARRAY(...)`
+and scalar subqueries that read the outer row) now answer per row instead of
+being refused, including in an UPDATE's SET and in an UPDATE or DELETE WHERE.
+`CREATE [UNIQUE] INDEX` / `DROP INDEX` and `CREATE [OR REPLACE] VIEW` /
+`DROP VIEW` are implemented, in the same on-disk shape the Python SQL server
+uses, so either server reads the other's views and indexes.
+
+#### Added
+
+- `secantus-pgplan` / `secantus-pgserver`: general JOIN planning (`joins.rs`),
+  hash-joined on the ON clause's column equalities and always decided by the
+  full ON predicate.
+- `secantus-pgplan` / `secantus-pgserver`: correlated subqueries, evaluated per
+  outer row and memoised by the outer values (`correlated.rs`).
+- `CREATE [UNIQUE] INDEX` (btree / hash, DESC, `INCLUDE`, a partial `WHERE`,
+  `IF NOT EXISTS`, PostgreSQL's default `<table>_<cols>_idx` naming) and
+  `DROP INDEX`, reported by `pg_indexes`. A unique index admits many NULLs, and
+  a violation names the index.
+- `CREATE [OR REPLACE] VIEW` (with a column list and `WITH CHECK OPTION`) and
+  `DROP VIEW [CASCADE]`, with PostgreSQL's OR REPLACE column rules (`42P16`)
+  and dependency errors (`2BP01`) for a view's table or view.
+- `IS [NOT] DISTINCT FROM`, as a filter and as a value.
+
+#### Fixed
+
+- A WHERE on the nullable side of a LEFT JOIN ran before the join and kept
+  the NULL-extended rows PostgreSQL drops.
+- The narrow join path took a bare column name both sides have from the left
+  side, and accepted a qualifier naming neither side.
+- A subquery calling `nextval()` (or another volatile function) ran once per
+  PLAN -- a Describe and an Execute advanced the sequence twice. It now runs
+  only in the plan that executes.
+- `NULL > ALL (empty set)` answered NULL; PostgreSQL answers TRUE.
+- A missing qualified column is reported as `column e.nosuch does not exist`,
+  as PostgreSQL words it.
+
+### The Rust PostgreSQL server: MERGE, row-level security, table locks and timeouts, and autocommit writes that no longer lose updates
+
+An autocommit `UPDATE ... SET n = n + 1` now runs in a transaction of its
+own. Before, a row changed by another session between this statement's read
+and its write was silently overwritten: the committed value was lost, where
+PostgreSQL waits for the other writer and builds on its result. A write that
+collides with another transaction's now waits, and re-evaluates against the
+row that transaction left, as READ COMMITTED does. The wait honours a cancel,
+`statement_timeout` and `lock_timeout`.
+
+A primary key column accepted NULL, and did so repeatedly. It is now NOT
+NULL, as in PostgreSQL. A table rewrite (`ALTER COLUMN TYPE`, `CLUSTER`) and
+an autocommit `COPY FROM` are now atomic. A duplicate key midway through
+either used to leave the table half-written.
+
+The server reports PostgreSQL 15.0, and now has what 15 added: `MERGE`,
+`regexp_count` / `regexp_instr` / `regexp_substr` / `regexp_like`, and
+`UNIQUE NULLS NOT DISTINCT`. SQL/JSON syntax from 16 and 17 is answered as
+15 answers it. The differential probe can run a corpus against a PostgreSQL
+15 reference (`# reference-version: 15`).
+
+#### Added
+
+- `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED [AND ...] THEN UPDATE |
+  DELETE | INSERT | DO NOTHING`, with PostgreSQL 15's `21000` for a target
+  row matched twice.
+- Row-level security enforced: permissive and restrictive policies per
+  command, `WITH CHECK` on new rows, `FORCE`, `BYPASSRLS`, and the SELECT
+  policies on an UPDATE or DELETE that reads its rows.
+- Table privileges read off the SQL as written. A view is checked as the
+  view, and its base tables as the view's owner. A subquery anywhere in the
+  statement, correlated or not, is checked with it.
+- Arrays whose lower bound is not 1 (`'[0:1]={a,b}'`, `array_fill(v, dims,
+  lbounds)`, an assignment below or past the bounds). They keep their bounds
+  through text and binary I/O, subscripts, `array_lower` / `array_dims`,
+  equality, and the functions that carry them.
+- Timeouts and table locks:
+  - `statement_timeout` (57014) and `lock_timeout` (55P03).
+  - `LOCK TABLE ... IN <mode> MODE [NOWAIT]`, with PostgreSQL's conflict
+    table.
+- Maintenance statements:
+  - `CLUSTER`, which rewrites a table in an index's order.
+  - `VACUUM`, `ANALYZE`, `CHECKPOINT` and `REINDEX`, with PostgreSQL's
+    validation.
+- `ALTER TABLE` forms:
+  - `ADD UNIQUE`, `ADD PRIMARY KEY` (the rows are re-keyed) and `ADD FOREIGN
+    KEY`, each checked against the existing rows.
+  - `ADD COLUMN` with inline constraints.
+  - `ALTER COLUMN TYPE ... USING`.
+  - `ADD CHECK ... NOT VALID` / `VALIDATE CONSTRAINT`.
+  - `CLUSTER ON` / `SET WITHOUT CLUSTER`.
+- SQL `PREPARE` / `EXECUTE` / `DEALLOCATE`, listed in
+  `pg_prepared_statements` with `from_sql`.
+- `WITH ORDINALITY`, and `ROWS FROM (f(...), g(...))`.
+- Several set-returning functions in one select list, run in lockstep.
+- A bare `VALUES` with `ORDER BY` / `LIMIT` / `OFFSET`.
+- `(a, b) IN (SELECT ...)` and `NOT IN`.
+- New functions and aggregates:
+  - `range_agg` and `range_intersect_agg`.
+  - `trim_array`.
+  - `IS [form] NORMALIZED`.
+- Triggers:
+  - `INSTEAD OF` triggers on views.
+  - Constraint triggers and `SET CONSTRAINTS`.
+  - Transition tables (`REFERENCING OLD/NEW TABLE`).
+- User-defined functions:
+  - Overloads.
+  - `VARIADIC`.
+  - SQL-standard bodies.
+- Types:
+  - The geometric types.
+  - `regnamespace`, `regrole`, `regproc` and `regprocedure`.
+- `pgcrypto` and jsonpath `.datetime()`.
+- Roles:
+  - Role membership: `IN ROLE`, `GRANT role`, `pg_has_role`,
+    `pg_auth_members`.
+  - md5 passwords and `VALID UNTIL`.
+
+#### Fixed
+
+- A parameter compared with a column (`WHERE id = $1`, `SET n = $1`) is
+  described with the column's type.
+- `WITH ORDINALITY` and `ROWS FROM` silently dropped a column, and a bare
+  `VALUES` ignored its `ORDER BY`. A FROM subquery with one output name twice
+  answered the second column for both.
+- An `array_cat` with an untyped literal beside an array now resolves. A
+  bare boolean column works in a FILTER, and `NOT` of one too.
+- POSIX character classes (`[[:alpha:]]`) follow the UTF-8 ctype, and
+  `pg_database` reports the `C.UTF-8` the server behaves as. A strict jsonpath
+  datetime template reports trailing or missing input.
+- A storage insert's rejected rows were dropped by several callers. Every one
+  now reports the first.
+
+### The Rust PostgreSQL server gains full-text search, formatting, datetime functions, SQL/JSON paths and the statistical aggregates
+
+Full-text search now works on the Rust PostgreSQL server: `to_tsvector`,
+`to_tsquery` and its `plainto_` / `phraseto_` / `websearch_` forms, `@@`,
+phrase operators, weights, `ts_rank` / `ts_rank_cd`, `ts_headline` and the
+tsvector editing functions. It follows PostgreSQL 14's `english` configuration
+(Snowball stemmer, stop list, parser token types) and its `simple` one. A
+tsvector column written by either server can be read and searched by the
+other.
+
+`to_char` / `to_number` for numbers and `to_char` / `to_date` /
+`to_timestamp` for dates and times are transcribed from PostgreSQL's
+`formatting.c`, and so is the rest of the datetime family: `extract` /
+`date_part`, `date_trunc`, `age`, `justify_*`, `make_*`, `date_bin`,
+`isfinite`, BC dates, and `time` / `timestamp` arithmetic.
+
+SQL/JSON path is implemented: the `jsonpath` type, `jsonb_path_query` (as a
+set-returning function), `jsonb_path_query_array` / `_first` / `_exists` /
+`_match`, `@?` and `@@`, in lax and strict modes, with `vars` and `silent`.
+
+#### Added
+
+- Statistical aggregates: `var_*` / `stddev_*` / `variance` / `stddev`
+  (exact over `numeric`), `corr`, `covar_*`, every `regr_*`, and `bit_and` /
+  `bit_or`.
+- Ordered-set and hypothetical-set aggregates: `percentile_cont` /
+  `percentile_disc` (scalar and array), `mode()`, and `rank` / `dense_rank` /
+  `percent_rank` / `cume_dist` `WITHIN GROUP`.
+- `json_agg` / `jsonb_agg` / `json[b]_object_agg`, `to_json[b]`,
+  `json[b]_build_object` / `_build_array`, `json_object`, `array_to_json`,
+  `row_to_json`, `json[b]_strip_nulls`, with PostgreSQL's per-function
+  spacing.
+- A whole-row reference (`SELECT t FROM t`, `row_to_json(t)`) and named
+  record fields.
+- `char(n)` semantics: values pad on output (including GROUP BY keys and
+  record fields) and compare blank-insensitively. An assignment that is too
+  long is `22001`, unless the excess is blanks, which are dropped.
+- `IN` / `NOT IN` and `SIMILAR TO` over constants; a constant `WHERE`
+  (`true` / `false` / `NULL` / a parameter).
+
+#### Fixed
+
+- The Python PostgreSQL server reads a tsvector written by the Rust server,
+  and treats a string opposite a tsquery in `@@` as a tsvector.
+
+### The Rust PostgreSQL server: partitioning, row-level security, WITH RECURSIVE, domains, materialized views, READ COMMITTED, the xml type, and every text-search language
+
+Inside a transaction block, each statement now sees what other connections
+committed before it, as PostgreSQL's default READ COMMITTED does. That covers
+rows, and tables created since the block began. An `UPDATE` of a row another
+connection changed since the block began no longer fails with an internal
+`WriteConflict`. One limit comes from WiredTiger: once a block has written,
+it keeps its snapshot, as REPEATABLE READ would. A write that still conflicts
+now reports PostgreSQL's retryable `40001`, not `XX000`.
+
+#### Added
+
+- Declarative partitioning, `PARTITION BY RANGE | LIST`:
+  - `CREATE TABLE ... PARTITION OF ... FOR VALUES FROM / TO / IN / DEFAULT`,
+    including multi-column ranges, `MINVALUE` / `MAXVALUE`, `NULL` list
+    members and sub-partitions.
+  - A row written to the parent goes to its partition. A row that fits
+    none is `23514 no partition of relation ... found for row`. A row
+    written to a partition must satisfy the partition's bound.
+  - An `UPDATE` that changes the key moves the row between partitions.
+  - `ATTACH` / `DETACH PARTITION` move the rows. `DROP` and `TRUNCATE` of a
+    partition remove its rows. `COPY` works in and out of partitions.
+  - `ALTER TABLE ADD COLUMN` on the parent reaches every partition.
+  - Overlapping, empty and mismatched bounds are refused with PostgreSQL's
+    errors.
+  - Reflected in the catalog: `relkind 'p'`, `relispartition`,
+    `pg_get_expr(relpartbound)`, `pg_inherits`, `pg_partitioned_table`, and
+    per-partition indexes.
+  - The `tableoid` system column names the partition a row is in.
+  - A duplicate key names the partition's own constraint.
+- `CREATE INDEX ... USING gin | gist | brin | spgist`, with PostgreSQL's
+  operator-class rules. A type with no default class is `42704`, and an
+  explicit class such as `jsonb_path_ops` or `text_pattern_ops` shows in
+  `pg_indexes`. The `btree_gin` and `btree_gist` extensions add the scalar
+  classes. Dropping one refuses (`2BP01`) or cascades to the indexes that
+  use it.
+- `UPDATE` of a `PRIMARY KEY` column, single or composite. Uniqueness is
+  checked row by row as PostgreSQL checks it, so `SET id = id + 1` over
+  `(1, 2)` collides, and nothing is written when it does.
+- Row-level security:
+  - `ALTER TABLE ... ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY`,
+    reflected in `pg_class.relrowsecurity` / `relforcerowsecurity`.
+  - `CREATE` / `ALTER` / `DROP POLICY`, listed in `pg_policies` with
+    PostgreSQL's rendering of `USING` and `WITH CHECK`.
+  - Policies are recorded, not yet enforced; see the backlog.
+- `ALTER TYPE ... ADD VALUE [BEFORE | AFTER]` and `RENAME VALUE`. Enum
+  values order by declared position in `ORDER BY`, comparisons, `BETWEEN`,
+  `min` / `max` and `GREATEST` / `LEAST`.
+- Generated columns (`GENERATED ALWAYS AS (...) STORED`), recomputed on
+  INSERT, UPDATE and COPY. Assigning one directly is `428C9`. Reflected in
+  `information_schema.columns` and `pg_attrdef`.
+- `CREATE TABLE ... (LIKE t INCLUDING ...)`.
+- The jsonb functions: `jsonb_set`, `jsonb_set_lax`, `jsonb_insert`,
+  `jsonb_pretty`, `jsonb_typeof`, `jsonb_array_length`,
+  `jsonb_extract_path[_text]`, `json[b]_to_record[set]` and
+  `json[b]_populate_record`, and the `-`, `#-` and `||` operators.
+- Trigonometric, hyperbolic and degree functions, `cbrt`, `gcd`, `lcm`,
+  `factorial`, `width_bucket`, `setseed`, and the `@`, `|/` and `||/`
+  operators.
+- `sha224` / `sha256` / `sha384` / `sha512`, `string_to_table`, and
+  `format()` widths (`%-10s`, `%*s`).
+- Advisory locks: `pg_advisory_lock` and its whole family, session-level and
+  transaction-level, shared and exclusive, blocking and `try_`.
+
+- `WITH RECURSIVE`, iterated to a fixed point: `UNION` stops a cycle,
+  `UNION ALL` keeps every row, and a self-reference without a non-recursive
+  term is `42P19`.
+- `CREATE DOMAIN` / `ALTER DOMAIN` / `DROP DOMAIN`. A domain's NOT NULL,
+  CHECK constraints and DEFAULT apply on INSERT, UPDATE and casts. The wire
+  carries the base type, as PostgreSQL's does, and domains are reflected in
+  `pg_type` (`typtype 'd'`), `information_schema.domains`, and
+  `information_schema.columns.domain_name`.
+- Materialized views: `CREATE MATERIALIZED VIEW [WITH NO DATA]`,
+  `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `pg_matviews`, and
+  `relkind 'm'`. A write to one is refused (`42809`).
+- `COMMENT ON` a table, column, index, constraint, function and more, read
+  back through `obj_description` / `col_description`.
+- `GRANT` / `REVOKE` on tables (recorded, as the Python server records them)
+  and on other objects, `GRANT role TO role`, and
+  `ALTER DEFAULT PRIVILEGES`. Missing roles (`42704`), missing relations
+  (`42P01`) and bad privileges (`0LP01`) are refused.
+- `TABLESAMPLE SYSTEM | BERNOULLI`, `pg_size_pretty`, `pg_size_bytes`,
+  `pg_column_size`, and the relation-size functions.
+- `pg_type` gains `typtype`, `typbasetype`, `typnotnull`, `typnamespace`,
+  `typtypmod` and `typdefault`. `pg_namespace` uses PostgreSQL's fixed oids.
+- The `xml` type: input checked for well-formedness (`2200N` / `2200M`),
+  `xmlelement` / `xmlattributes`, `xmlforest`, `xmlconcat`, `xmlagg`,
+  `xmlcomment`, `xmlpi`, `xmlroot`, `xmlparse`, `xmlserialize`,
+  `IS DOCUMENT`, the `xml_is_well_formed*` functions, and XPath 1.0 through
+  `xpath`, `xpath_exists` and `XMLEXISTS`, namespaces included.
+- Every PostgreSQL text-search configuration (french, german, russian,
+  spanish and 23 more), each with its Snowball stemmer and stop-word list.
+  `russian` sends ASCII words to the English stemmer, as PostgreSQL does.
+- `EXCLUDE` constraints over any operator (`23P01`), `MATCH FULL` foreign
+  keys, and `pg_get_constraintdef` for every constraint kind.
+- `pg_index` lists every index: `CREATE INDEX`, `UNIQUE` constraints and
+  expression indexes, not just the primary key. Each row has a real
+  `indexrelid` that `pg_class` and `::regclass` agree on, and `indkey` is an
+  `int2vector` (`2 3`, subscripted from 0).
+- Subqueries in a grouped query's select list, `HAVING` or `ORDER BY`,
+  including an outer aggregate inside the subquery.
+- A grouped query that computes over its groups (`n::text ... GROUP BY n`,
+  `-n, count(*)`), which used to be refused.
+- `DROP EXTENSION ... CASCADE` drops the columns of the extension's types,
+  and `DROP SCHEMA ... CASCADE` drops the schema's types.
+- Range and multirange operators, `box` operators, and binary results for
+  `box`, `bit`, `varbit`, `regtype` and `regclass`.
+
+#### Fixed
+
+- `CREATE TABLE ... PARTITION OF` used to create a table with no columns,
+  and every row stayed in the parent. `INHERITS` was ignored. It is now
+  refused by name.
+- `array_agg(DISTINCT x)` over no rows answered `{}` instead of NULL. A
+  DISTINCT `array_agg` / `string_agg` ignored its `ORDER BY ... DESC` and
+  `NULLS` placement. An ORDER BY that is not the argument is now PostgreSQL's
+  `42P10`.
+- `jsonb || jsonb` concatenated the two as text.
+- `FILTER (WHERE ...)` over `generate_series` ignored the filter.
+- An unknown function is `42883` with PostgreSQL's message, argument types
+  included (`function foo(integer, unknown) does not exist`), rather than
+  `0A000`.
+
+- `FROM t, LATERAL (SELECT ... WHERE x = t.id) s` gave every row the same
+  answer: the subquery was planned on its own, and `t.id` resolved to its
+  own `id` column. A qualified column naming nothing in the FROM clause
+  (`sv_c.id` inside `FROM (SELECT ... FROM sv_o)`) was silently read as the
+  inner table's column. Both are now `42P01`, as in PostgreSQL.
+- A select-list `t.*` returned the row as one composite column instead of
+  the table's columns.
+- `WHERE c.col IN (...)` with a qualified column failed with
+  `column "c" does not exist`.
+- `INSERT ... SELECT`, `CREATE TABLE AS` and `COPY (query) TO` over an
+  aggregate or a join were refused.
+- `CREATE TABLE` with an unknown column type succeeded, silently storing
+  text. It is now `42704`, as in PostgreSQL.
+- The catalog kept only part of a table's metadata when rewriting it.
+  Table-level and constraint comments, and a named primary key, recorded by
+  the Python server were erased.
+- `ORDER BY 1` and `ORDER BY <alias>` over a computed column sorted by the
+  column it was computed from. `SELECT n::text ... ORDER BY 1` came back in
+  numeric order where PostgreSQL gives text order.
+- A recursive PL/pgSQL function overflowed the worker's stack within a few
+  levels and aborted the whole server. The stack now grows on demand, and
+  runaway recursion is `54001`.
+- A function's result is coerced to its declared return type, so a
+  recursive `RETURNS numeric` function no longer overflows as an integer.
+- `nextval` / `setval` are no longer rolled back with the transaction.
+- A cast to an unknown type is `42704`, and `isempty('...')` with an untyped
+  argument is `42725`, as in PostgreSQL.
+- Text search treats every non-ASCII character as a letter, as PostgreSQL
+  does under the C locale, so `a—b` and Devanagari words tokenise as they
+  do there.
+
+### Rust MongoDB server: timelib's date parser, ported
+
+`$toDate` and `$dateFromString` on the Rust MongoDB server now parse date
+strings with a port of timelib, the same parser mongod uses, so they match
+mongod 8.2.11 exactly, error messages included.
+
+#### Changed
+
+- Free-form date strings go through a literal port of timelib 2022.13's
+  scanner and post-processing, and of mongod's wrapper that turns its errors
+  into messages. On 318 probed cases, values and full error text match
+  mongod: every error and warning, with the position and character mongod
+  reports. Before this, 26 strings got only a generic "incomplete date/time"
+  message.
+- The zone abbreviation table is generated from mongod's own copy of timelib's
+  `timezonemap.h`, which has 1,127 entries.
+
+#### Fixed
+
+- `$dateFromString` without a `format` refused every string mongod parses
+  except strict ISO-8601.
+- `$dateFromString`'s `onError` was never applied to a string that failed to
+  parse.
+- With a named `timezone`, a local time in a daylight-saving overlap resolved
+  to the earlier instant, and one in a daylight-saving gap was an error.
+  Both now resolve as on mongod.
+- `$toDate` and `$dateFromString` refused dates outside the years 1–9999.
+  mongod accepts any 64-bit millisecond value, such as year 0 or year
+  −100000, and reports an overflow only at its own limit (code 159).
+
+### The Rust server's transaction errors carried the wrong label, and sometimes the wrong name
+
+A driver decides what to do after a transaction fails by reading the error's
+`codeName` and `errorLabels`. The Rust server got both wrong in ways that left
+a driver's retry machinery either idle or running when it should not, and the
+drivers' own specification suite said so in ten tests.
+
+Everything below was measured against a single-node **replica set** mongod
+8.2.11 over a raw OP_MSG socket. Both qualifiers earned their place: transactions
+need a replica set, so the standalone used for most probing here cannot answer
+these at all; and a driver in the path is not safe to measure through, because
+pymongo retries `commitTransaction` itself and converts the NotPrimary family
+into a client-side exception whose reply is never read. Two earlier passes did
+exactly that and produced two confidently wrong columns.
+
+#### Fixed
+
+- **A `failCommand`-injected transaction error carried no label at all.** The
+  failpoint short-circuit returns before the handler runs and before the
+  transaction is resolved, so it never reached the labelling code that has been
+  there all along. Every test in the drivers' transaction error-label suite
+  injects its error that way, so every one of them saw `errorLabels: []`.
+- **The label depends on WHICH COMMAND failed, which no server here modelled.**
+  A statement inside a transaction gets `TransientTransactionError`; a
+  `commitTransaction` or `abortTransaction` splits the same set in two, giving
+  `RetryableWriteError` to the thirteen codes that are about reaching the node
+  and keeping `TransientTransactionError` for the five that are about the
+  transaction. Telling a driver the wrong one of those asks it to replay an
+  entire transaction where mongod asks it to retry just the commit.
+- **Six codes had no name and fell through to `Location<code>`** — 24, 112, 246,
+  251, 267 and 11601. This is what made the spec's `commitTransaction fails
+  after Interrupted` assert `Interrupted` and receive `Location11601`: the
+  behaviour was right and the name was not.
+- **An explicit `errorLabels: []` was indistinguishable from the key being
+  absent**, because both parsed to an empty list. mongod treats a supplied list
+  as authoritative and adds nothing to it, so an explicit `[]` means "no labels"
+  rather than "you decide". Found by this change breaking two previously-passing
+  spec tests, which is the argument for running the suite rather than the
+  targeted tests.
+- **Code 100 was `CannotSatisfyWriteConcern` on both servers**, a name mongod
+  uses in neither context. A `w: 5` write against a single-node replica set and
+  a `failCommand` injecting 100 both answer `UnsatisfiableWriteConcern`. The
+  Python server's message for it also named the requested `w`, where mongod's is
+  the bare `Not enough data-bearing nodes`. `tests/test_crud.py` asserted the old
+  name, so the test was pinning our bug rather than mongod's behaviour.
+- **Both servers were missing 134 and 262 from the transient set, together.**
+  The Rust comment cited `commands.py::_TRANSIENT_TXN_CODES` as its authority,
+  which is precisely how two engines stay in perfect agreement while both differ
+  from the server they imitate. Neither the parity suite nor an engine-vs-engine
+  sweep can see that; only the reference server can.
+
+#### Added
+
+- `failpoints::COMMIT_RETRYABLE_WRITE_CODES`, the measured commit/abort split,
+  with unit tests that encode the mongod table as data — so a future divergence
+  fails a fast Rust test instead of surfacing as an unlocalised red driver gauge.
+
+#### Measured
+
+- Rust server versus mongod 8.2.11: **0 divergent of 63** across `codeName` and
+  `errorLabels` for 21 codes on `insert` / `commitTransaction` /
+  `abortTransaction`, plus the explicit-`errorLabels` rule.
+- `test_transactions_unified` against the standalone `secantusd-rs`: **10
+  failures to 3**, and the three survivors are the secondary-read cases already
+  recorded as an explicit non-goal — there is no secondary on a single node.
+
+### Validation failures, validators and write concern now answer as mongod does, on the Rust server
+
+A write that leaves a document failing the collection validator now gets
+mongod's full reply on every update path: `update` (operator, replacement,
+pipeline, multi, upsert) and `findAndModify`. That means the `Plan executor
+error during <command>` prefix and the `errInfo` explaining which schema rule
+failed. Before this, updates carried no `errInfo` at all.
+
+`create` and `collMod` now parse the validator. An invalid `$jsonSchema` or
+an unknown operator is refused when it is set, as on mongod, instead of being
+stored and then failing every write. `writeConcern.w` follows mongod's
+parsing. Decimal `$log` is answered rather than refused.
+
+#### Fixed
+
+- Rust server: validation failures on `update` and `findAndModify` carry
+  mongod's message prefix and `errInfo` (`failingDocumentId` and the
+  `schemaRulesNotSatisfied` tree).
+- Rust server: `create` / `collMod` refuse a validator mongod cannot parse.
+  This covers `$jsonSchema` `type: "integer"`, an unknown keyword and an
+  unknown operator; `collMod` uses mongod's `Parsing of collection validator
+  failed` prefix.
+- Rust server: `writeConcern.w` accepts a double or decimal (truncated), null
+  (the empty tag) and a tag set, and refuses bool / array / an empty tag set
+  with mongod's 9.
+- Rust server: `$log` with a decimal operand returns a decimal result.
+- Rust server: documents sort as mongod sorts them, comparing each element's
+  value type before its field name. GeoJSON with a `crs` member used to sort
+  after a point without one.
+
+### Rust MongoDB server: decimal sort directions, write namespaces and arrayFilters
+
+A decimal sort direction sorted the wrong way on the Rust MongoDB server.
+Writes could also create collections mongod refuses. Both now match mongod
+8.2.11, along with the rest of sort-spec, arrayFilters and write-reply
+validation.
+
+#### Fixed
+
+- `find` with a `Decimal128` sort direction returned the wrong order:
+  `sort: {a: Decimal128("-1")}` sorted ascending. Sort directions now follow
+  mongod's rule in `find` and in the aggregation `$sort` stage. A double is
+  truncated and a decimal is rounded half to even.
+- An insert, update, delete, findAndModify or createIndexes into a name mongod
+  refuses now fails with code 73 and mongod's message. That covers `a$b`,
+  `system.foo`, `system.views`, `system.profile`, and a namespace over 255
+  characters. An insert used to create such a collection.
+- A bad `$sort` key, value or `$meta` spec now gets mongod's own error code,
+  at the top level and inside `$facet`, `$lookup` and `$unionWith`. These used
+  to report "stage not supported", and `{a: 1.5}` was refused although mongod
+  accepts it.
+- Invalid `arrayFilters` get mongod's code and message on `update` and
+  `findAndModify`. A non-document filter fails the whole command, as on mongod.
+- On a replica set, insert, update and delete replies now carry `electionId`
+  and `opTime`. All write replies order their fields as mongod does.
+
+#### Added
+
+- `tools/probes/write_and_sort_validation.py` covers 84 shapes against mongod.
+
+### `setParameter` works, and refuses the way mongod refuses
+
+Both servers reported their parameters through `getParameter` and had no way to
+change one: `setParameter` answered `59 CommandNotFound`. It is implemented now,
+matching mongod 8.2.11 on every outcome for the parameters SecantusDB registers
+— the previous value in `was`, and four distinct refusals that are easy to
+conflate. A parameter that *exists* but is startup-only is `20
+IllegalOperation`, not the `72 InvalidOptions` an unknown name gets; answering
+72 there would claim the parameter does not exist while `getParameter` was
+still reporting it.
+
+The coercion rules are more permissive than their types suggest, and every one
+below was measured rather than inferred. `logLevel` accepts any number or bool,
+truncates toward zero (`1.9` → `1`), clamps at 5 (`99` → `5`), and refuses only
+a negative that does not truncate to zero. A boolean parameter accepts *every*
+BSON type and stores its truthiness — `null`, `0` and `0.0` are false, while an
+empty string, an array and a document are all true.
+
+A parameter SecantusDB does not implement is refused rather than accepted and
+ignored. mongod's `ingressConnectionEstablishment*` family tunes a connection
+rate limiter this server has no equivalent of; accepting those names would let a
+client ask for rate limiting and silently get none.
+
+#### Added
+- `setParameter` on both servers, with `getParameter` reporting whatever was last set. The store is server-wide, so a value set on one connection is visible on every other.
+- A `setParameter` privilege action, granted to `clusterAdmin` as mongod grants it to `hostManager`.
+
+#### Fixed
+- `getParameter` and `setParameter` can no longer disagree: the getter overlays the changed values onto its defaults instead of keeping a second copy.
+
+### Eleven driver gauges re-measured against the Rust server
+
+Step 5 of the driver-conformance plan, run against `secantusd-rs` built from
+`d971ef9e` — the first sweep since the transaction fixes landed.
+
+| gauge | passed | failed | skipped | rate |
+| --- | ---: | ---: | ---: | ---: |
+| C++, Kotlin, .NET | 892 / 340 / 228 | 0 | 9 / 198 / 0 | **100.0%** |
+| php-lib | 3,101 | 1 | 27 | 99.9% |
+| php-ext | 679 | 1 | 35 | 99.8% |
+| Node | 357 | 1 | 6 | 99.7% |
+| Ruby | 293 | 1 | 24 | 99.6% |
+| pymongo | 1,205 | 5 | 290 | 99.5% |
+| Java | 493 | 3 | 404 | 99.3% |
+| mongo-rust-driver | 100 | 1 | 0 | 99.0% |
+| Go | 439 | 0 | 37 | withheld — truncated run |
+
+**pymongo hit the predicted 1,205 / 5 exactly**, and its five remaining failures
+are precisely the declared non-goals: hashed indexes, text indexes, `$where`
+twice, and `test_to_list_csot_applied`. The Rust server went 15 failures to 5 on
+that gauge and is now level with the Python server.
+
+#### Changed
+
+- Every `-rust-server` report regenerated from a run of its own. Seven of them
+  previously carried a September date over raw artifacts from 10–30 August.
+- The two Go reports now carry the truncation banner added in #1613, rather
+  than a bare 100.0% over a run that stopped at 476 of 481 tests.
+
+#### Found
+
+Three server-side defects, all filed in `tasks/backlog.md` — and none of them in
+pymongo, which is the argument for running the other-language gauges at all:
+`$geoIntersects` returning nothing, change-stream resume losing the original
+read preference, and eight C-driver failures clustered in the connection-string
+and server-selection surface.
+
+### `configureFailPoint` is now gated behind `enableTestCommands`
+
+W6 in `docs/security-reports/2026-08-10.md`: an unauthenticated client that can
+reach the port could arm a server-wide `failCommand` with
+`closeConnection: true`, dropping the socket of every subsequent operation on
+*every* connection — a cross-tenant DoS with no privilege required. mongod ships
+the same command behind a startup parameter, off by default. SecantusDB had no
+equivalent gate; the feature was always live.
+
+Measured against mongod 8.2.11 (2026-09-28): started without the parameter it
+answers `59 CommandNotFound :: no such command: 'configureFailPoint'` — not
+`Unauthorized`, not a no-op — and `getParameter` reports
+`enableTestCommands: false`. Both servers now answer identically.
+
+#### Changed
+
+- **The standalone daemons default it OFF**, as mongod does:
+  `--enable-test-commands` on `secantusd-rs` and `secantusd-py`, or
+  `[server] enable_test_commands` in `secantusd.toml`.
+- **The embedded `SecantusDBServer` defaults it ON.** Constructing one in a test
+  is the entire use case for that class, and every driver failpoint suite needs
+  it. The daemon is the thing an operator exposes on a port; the embedded handle
+  is not.
+- `getParameter` reports the **real** value instead of a hardcoded `true`.
+  Drivers gate their failpoint suites on this flag — while it merely *said*
+  false, pymongo skipped ~1,080 unified-spec tests — so a server that refuses
+  the command must not claim to accept it.
+
+#### The gate is the registry's absence
+
+A server that did not enable test commands wires no `FailPointRegistry`, and
+the missing registry is what makes the command report `CommandNotFound`. That
+keeps the decision at server startup, where the operator made it, instead of
+threading a flag down to the dispatch table.
+
+#### One choke point for the gauges, not thirteen
+
+`tasks/driver-conformance-followups-plan.md` sized the cost as *"every gauge
+task must pass the flag. Miss one and that gauge silently loses its failpoint
+coverage."* `gauge_common.spawn_daemon` already rewrites the port and log level,
+so it forces the flag too — all thirteen daemon gauges get it from one place,
+and the failure mode the plan predicted cannot happen.
+
+### Transaction failures reported `Location11601` where mongod says `Interrupted`
+
+A `failCommand` failpoint renders its injected error code through the server's
+code-name table, and that table had none of the transaction or replication
+failure codes in it. So every injected transaction error came back named
+`Location<code>` — `Location11601` for `Interrupted`, `Location251` for
+`NoSuchTransaction`, `Location112` for `WriteConflict`. Drivers assert on
+`codeName`, so the specs' `commitTransaction fails after Interrupted` failed not
+because the behaviour was wrong but because the name was.
+
+Seventeen names now come from a probe rather than the error-codes list, read off
+a single-node **replica-set** mongod 8.2.11 — transactions need one, so the
+standalone used for most probing in this file could not answer it.
+
+The same probe settled a question that looked like one item and was two. The
+driver gauges failed on `Interrupted` (11601) and
+`PreparedTransactionInProgress` (267) together, and the obvious move was to add
+both to the transient-label set. mongod labels 267
+`TransientTransactionError` and gives 11601 **no labels at all** — so adding
+both would have turned one test green and the other red. 267 is in; 11601 stays
+out, which is where it already was.
+
+#### Fixed
+- `commands.py`: 17 transaction / replication codes now render mongod's real
+  `codeName` instead of `Location<code>` — `Interrupted`, `NoSuchTransaction`,
+  `WriteConflict`, `PreparedTransactionInProgress`, `SnapshotUnavailable`,
+  `LockTimeout`, `NotWritablePrimary`, `InterruptedAtShutdown`,
+  `InterruptedDueToReplStateChange`, `ShutdownInProgress`, `PrimarySteppedDown`,
+  `SocketException`, `NetworkTimeout`, `HostUnreachable`, `HostNotFound`,
+  `NotPrimaryNoSecondaryOk`, `NotPrimaryOrSecondary`.
+- `267 PreparedTransactionInProgress` added to `_TRANSIENT_TXN_CODES`, measured
+  rather than assumed.
+- `test_transactions_unified.py`: 5 failures -> 3, and the remaining three are
+  the secondary-read cases already recorded as an explicit non-goal (single node,
+  no secondary to read from). Both retry-semantics failures are closed.
+
+### A transaction error injected by a failpoint carried no `errorLabels`
+
+A driver decides whether to retry a whole transaction by reading the
+`TransientTransactionError` label off the error. SecantusDB attached that label
+to errors it raised itself, but not to errors produced by a `failCommand`
+failpoint — and since every test in the drivers' transaction error-label suite
+injects its error that way, the entire suite saw `errorLabels: []`. A driver's
+retry loop, exercised exactly as the specification intends, silently did not
+engage.
+
+The labelling logic already existed and was already correct. `failCommand`'s
+short-circuit simply returned before reaching it: it answers before the handler
+runs, and before the transaction is even resolved. So this is six lines routing
+one path through machinery the other path had been using all along, not new
+semantics — the third time in this file that a gap turned out to be an existing
+mechanism one caller never reached.
+
+#### Fixed
+- `commands.py`: a failpoint-injected error whose code is in
+  `_TRANSIENT_TXN_CODES` now carries `TransientTransactionError` when the
+  statement is part of a transaction, matching what a naturally-occurring error
+  of the same code already did. Detected via `autocommit: false` — the signal
+  mongod itself uses, present on every statement of a transaction including
+  commit and abort — so the failpoint check does not have to move below the
+  transaction resolution and reorder failpoint-versus-transaction error
+  precedence, which no probe currently justifies.
+- Takes `test_transactions_unified.py` from 9 failures to 5, including all three
+  of `TestUnifiedErrorLabels` (`NoSuchTransaction`, `NoSuchTransaction` on
+  commit, `WriteConflict`).
+
+#### Changed
+- Reading from a secondary is now an explicit non-goal rather than a gap.
+  SecantusDB is single-node, so there is no secondary to read from and anything
+  whose behaviour is defined by one is out of scope. Three driver-gauge tests
+  fail permanently on this and are accepted with the reason written down in
+  `tasks/backlog.md` §4, rather than deselected to tidy the number.
+
+#### Deferred
+- Two failures remain, and the two error codes want OPPOSITE treatment:
+  `Interrupted` (11601) where the test expects the commit to fail, and
+  `PreparedTransactionInProgress` (267) where it expects the transaction to be
+  retried. Adding both to the transient set would make one green and the other
+  red, so `tasks/backlog.md` §5 says to probe a single-node replica-set mongod —
+  transactions need one, so a standalone cannot answer it — before moving a label
+  set on a guess.
+
+### `$where` is refused the way a mongod without a script engine refuses it
+
+`$where` runs user-supplied JavaScript, and SecantusDB embeds no script engine.
+Both servers already declined it, but each invented its own answer: the Rust
+server said `BadValue: query uses a construct the Rust server does not support`
+— our implementation leaking onto the wire — and the Python server said
+`unknown top level operator: $where`, which is wrong twice over, because mongod
+knows `$where` perfectly well.
+
+`mongod --noscripting` is a supported configuration with exactly the property we
+have, and it answers `6108304 / Location6108304 / "no globalScriptEngine in
+$where parsing"`. Both servers now answer that, on every command that takes a
+filter, with the per-statement `writeErrors` shape on the two batch writes that
+mongod uses. Inside an aggregation `$match` the answer is different and
+deliberately so — `2 / BadValue / "$where is not allowed in this context"`,
+which mongod gives whether or not it has a script engine, so it is a pipeline
+rule rather than a scripting one.
+
+This does not make `$where` work: a query that needs the JavaScript to run still
+fails, exactly as it does against a real `--noscripting` mongod. What it fixes is
+that a client reading the error now learns something true.
+
+#### Fixed
+- `$where` in a query context answers mongod's `6108304 Location6108304 "no globalScriptEngine in $where parsing"` on both servers, for `find`, `count`, `distinct`, `findAndModify`, and per-statement in `writeErrors` for `delete` / `update`, at parse time so an empty or nonexistent collection refuses too.
+- `$where` inside an aggregation `$match` answers `2 BadValue "$where is not allowed in this context"`, and is checked before the leading-`$match` lift — previously the first stage picked up the query-context refusal while every other position answered correctly.
+- `command_error_during` / `read_exec_error` sent the bare sentinel `codeName: "Location"` for any error code with no symbolic name, where mongod sends `Location<n>`. Affected every such code reaching a non-batch command through the storage error path, not just `$where`.
+
+#### Added
+- `mongod_noscripting_uri` fixture in the differential gate, so a refusal that only a script-engine-less mongod can demonstrate is compared against a live one rather than against hardcoded values.
+
+### Committed WiredTiger bindings
+
+`secantus-wt` can now build without libclang.
+
+#### Added
+
+- `secantus-wt` ships its WiredTiger bindings as `src/bindings.rs`. A build without the `bindgen` feature uses that file and needs no libclang.
+- The `bindgen` feature, on by default, regenerates the bindings and fails the build if they differ from the committed file. `./inv wt-bindings-refresh` updates the file.
+
+### WiredTiger builds from a crate
+
+The Rust servers can now build WiredTiger from bundled source, the first step
+towards publishing them on crates.io.
+
+#### Added
+
+- `crates/secantus-wiredtiger-sys`: builds the same WiredTiger as the wheel
+  (mongodb-7.0.33 with SecantusDB's patches) as a static library with CMake and
+  a C compiler, with zlib and lz4 linked statically. No Python is needed.
+- `secantus-wt` has a `bundled` feature that uses it. It is off by default, so
+  existing builds still link the prebuilt WiredTiger.
+- `./inv wt-sys-refresh` regenerates the bundled source. A test fails if the
+  source drifts from `vendor/wiredtiger` and the patch scripts.
+
 ## [0.6.0b17] — 2026-09-26
 
 ### The errors are the feature
