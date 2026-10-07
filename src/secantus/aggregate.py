@@ -1232,10 +1232,21 @@ _TIMEZONE_OPERATORS = frozenset(
 
 def _literal_timezone_problem(spec: Any) -> tuple[int, str] | None:
     """The first date operator in `spec` carrying an unusable literal timezone."""
+    from secantus import timelib
     from secantus.expressions import ExpressionError, resolve_timezone_argument
 
     if isinstance(spec, Mapping):
         for key, value in spec.items():
+            if (
+                key == "$dateFromString"
+                and isinstance(value, Mapping)
+                and isinstance(value.get("format"), str)
+            ):
+                # mongod checks a literal `format` before the zone: `%Q` with
+                # `Bad/Zone` is 18536, not 40485 (measured 8.2.11).
+                bad_format = timelib.validate_format(value["format"])
+                if bad_format is not None:
+                    return bad_format
             if (
                 key in _TIMEZONE_OPERATORS
                 and isinstance(value, Mapping)
@@ -1492,10 +1503,81 @@ def _sort_val_repr(v: Any) -> str:
     return bson_value_repr(v)
 
 
+_SORT_DOLLAR = (
+    "Consider using $getField or $setField for a field path with '.' or '$'. :: caused by :: "
+)
+
+
+def sort_direction(v: Any) -> int | None:
+    """The direction a numeric sort value means, by mongod's rule: a double is
+    TRUNCATED (``1.9`` ascending, ``0.5`` refused) and a decimal rounded half
+    to even (``0.9`` ascending, ``1.5`` refused) -- measured 8.2.11 and ported
+    from the Rust server. ``1`` / ``-1``, or None when it is neither."""
+    import math
+
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        n = float(v)
+    elif isinstance(v, float):
+        if not math.isfinite(v):
+            return None
+        n = float(math.trunc(v))
+    elif isinstance(v, Decimal128):
+        try:
+            d = v.to_decimal()
+        except (ValueError, ArithmeticError):
+            return None
+        if not d.is_finite():
+            return None
+        n = float(d.to_integral_value(rounding=_decimal.ROUND_HALF_EVEN))
+    else:
+        return None
+    return int(n) if n in (1.0, -1.0) else None
+
+
+def sort_spec_problem(spec: Mapping[str, Any]) -> tuple[int, str] | None:
+    """mongod's verdict on each key and value of a sort spec, shared by
+    ``find`` and the ``$sort`` stage (the Rust server's ``sort_spec_problem``)."""
+    for field, v in spec.items():
+        if field == "$natural":
+            continue  # a find-only scan-order directive, not a path
+        if field == "":
+            return 40352, "FieldPath cannot be constructed with empty string"
+        if field.endswith("."):
+            return 40353, "FieldPath must not end with a '.'."
+        for part in field.split("."):
+            if part == "":
+                return 15998, f"{_SORT_DOLLAR}FieldPath field names may not be empty strings."
+            if part.startswith("$"):
+                return (
+                    16410,
+                    f"{_SORT_DOLLAR}FieldPath field names may not start with '$', given '{part}'.",
+                )
+        if isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool):
+            if sort_direction(v) is None:
+                return 15975, "$sort key ordering must be 1 (for ascending) or -1 (for descending)"
+        elif isinstance(v, Mapping):
+            if "$meta" not in v:
+                return 17312, "$meta is the only expression supported by $sort right now"
+            if len(v) > 1:
+                return 9, "Cannot have additional keys in a $meta sort specification"
+            meta = v["$meta"]
+            if not (isinstance(meta, str) and meta in ("textScore", "randVal", "searchScore")):
+                return 31138, f"Illegal $meta sort: $meta: {_sort_val_repr(meta)}"
+        else:
+            return 15974, f"Illegal key in $sort specification: {field}: {_sort_val_repr(v)}"
+    return None
+
+
+def normalise_sort(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """A validated sort spec with every numeric direction as ``1`` / ``-1``."""
+    return {k: (sort_direction(v) if not isinstance(v, Mapping) else v) for k, v in spec.items()}
+
+
 def _validate_sort_spec(spec: Any) -> None:
-    """mongod's `$sort` stage validation: at least one key (15976); each direction
-    is 1 / -1 as an int or whole double, else a non-numeric value is "Illegal key"
-    (15974) and a numeric non-±1 is "must be 1 … or -1" (15975)."""
+    """mongod's `$sort` stage validation: an object (15973) with at least one
+    key (15976), then ``sort_spec_problem``."""
     if not isinstance(spec, Mapping):
         # A wrong-TYPED spec and an EMPTY one are different errors on mongod
         # (15973 vs 15976); we answered 15976 for both.
@@ -1510,24 +1592,14 @@ def _validate_sort_spec(spec: Any) -> None:
             code=15976,
             code_name="Location15976",
         )
-    for key, direction in spec.items():
-        if isinstance(direction, Mapping):
-            continue  # {$meta: …} — text-score / indexKey sort, out of scope here
-        if isinstance(direction, bool) or not isinstance(direction, (int, float)):
-            raise AggregateError(
-                f"Illegal key in $sort specification: {key}: {_sort_val_repr(direction)}",
-                code=15974,
-                code_name="Location15974",
-            )
-        if (isinstance(direction, float) and not direction.is_integer()) or int(direction) not in (
-            1,
-            -1,
-        ):
-            raise AggregateError(
-                "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
-                code=15975,
-                code_name="Location15975",
-            )
+    problem = sort_spec_problem(spec)
+    if problem is not None:
+        code, msg = problem
+        raise AggregateError(msg, code=code, code_name=_code_name_for_sort(code))
+
+
+def _code_name_for_sort(code: int) -> str:
+    return "BadValue" if code == 2 else ("FailedToParse" if code == 9 else f"Location{code}")
 
 
 def _stage_sort(
@@ -1540,7 +1612,7 @@ def _stage_sort(
     # The context's collation reaches string ORDERING here, not just the
     # bucket-key equality ``$group`` uses. Without it a collated aggregation
     # sorted by codepoint while the same collated ``find().sort()`` did not.
-    return sort_docs(list(docs), spec, collation=_parse_collation(_ctx.collation))
+    return sort_docs(list(docs), normalise_sort(spec), collation=_parse_collation(_ctx.collation))
 
 
 def _stage_project(
@@ -1591,8 +1663,11 @@ def _project_one(
         else:
             computed[key] = value
 
-    has_inclusion = bool(inclusions) or bool(computed)
     has_exclusion = bool(exclusions)
+    # `{_id: 1}` alone is an INCLUSION projection of just `_id` (measured
+    # 8.2.11): without this rule it fell through and returned the whole
+    # document. Beside an exclusion it stays an exclusion projection.
+    has_inclusion = bool(inclusions) or bool(computed) or (id_handling == 1 and not has_exclusion)
     if has_inclusion and has_exclusion:
         raise AggregateError(
             "$project cannot mix inclusion and exclusion (other than excluding _id)"
@@ -4958,6 +5033,68 @@ def _round_down_series(number: float, series: list[float]) -> float:
     return series[idx - 1] * multiplier
 
 
+def _bound(v: Any) -> Any:
+    """A rounded boundary as the BSON value it is: a decimal one stays decimal."""
+    return Decimal128(v) if isinstance(v, _decimal.Decimal) else v
+
+
+def _dec_series(series: list[float]) -> list[_decimal.Decimal]:
+    """The series as mongod's Decimal128 of a double: 15 significant digits
+    (`1.00000000000000`)."""
+    return [_decimal.Decimal(f"{f:.14e}") for f in series]
+
+
+def _dec_product(s: _decimal.Decimal, k: int) -> _decimal.Decimal:
+    """``s * 10**k`` as mongod forms it: a positive ``k`` appends coefficient
+    zeros, a negative one shifts the exponent."""
+    sign, digits, exp = s.as_tuple()
+    if k >= 1:
+        return _decimal.Decimal((sign, digits + (0,) * k, exp))
+    return _decimal.Decimal((sign, digits, int(exp) + k))
+
+
+_GRANULARITY_MAX_STEPS = 6_200
+
+
+def _round_dec(number: _decimal.Decimal, granularity: str, *, up: bool) -> _decimal.Decimal:
+    """mongod's granularity rounders on a Decimal128 (``roundUp`` / ``roundDown``),
+    computed in decimal. Ported from ``secantus_core::decimal``."""
+    if number == 0 or number.is_infinite():
+        return number
+    if granularity == "POWERSOF2":
+        lg = math.log2(float(number))
+        n = math.floor(lg) + 1 if up else math.ceil(lg) - 1
+        with _decimal.localcontext(_decimal.Context(prec=34, traps=[])):
+            r = _decimal.Decimal(2) ** n
+            # The exact power of two, padded to 34 digits.
+            return r.quantize(_decimal.Decimal(1).scaleb(r.adjusted() - 33))
+    ser = _dec_series(_BUCKET_AUTO_SERIES[granularity])
+    front, back = ser[0], ser[-1]
+    k = 0
+    if up:
+        while not number < _dec_product(back, k):
+            k += 1
+            if k > _GRANULARITY_MAX_STEPS:
+                return number
+        while number < _dec_product(front, k):
+            previous_min = _dec_product(front, k)
+            k -= 1
+            if not number < _dec_product(back, k):
+                return previous_min
+        return next(_dec_product(s, k) for s in ser if number < _dec_product(s, k))
+    while not number > _dec_product(front, k):
+        k -= 1
+        if k < -_GRANULARITY_MAX_STEPS:
+            return number
+    while number > _dec_product(back, k):
+        previous_max = _dec_product(back, k)
+        k += 1
+        if not number > _dec_product(front, k):
+            return previous_max
+    idx = next(i for i, s in enumerate(ser) if not number > _dec_product(s, k))
+    return _dec_product(ser[idx - 1], k)
+
+
 def _round_up_pow2(v: float) -> float:
     """mongod `GranularityRounderPowersOfTwo::roundUp` (double path)."""
     if v == 0.0 or v == math.inf:
@@ -4996,15 +5133,25 @@ def _bisect_left(a: list[float], x: float) -> int:
 
 def _granularity_coerce(v: Any) -> float:
     """Coerce a groupBy value to the double mongod's rounder operates on, or
-    raise mongod's granularity error. Decimal128 is deferred (the standing
-    Decimal128 precision deferral) rather than approximated in f64."""
+    raise mongod's granularity error. A Decimal128 stays a decimal, and is
+    rounded in decimal (`_round_dec`) -- it used to be refused."""
     if isinstance(v, Decimal128):
-        raise AggregateError(
-            "$bucketAuto 'granularity' over Decimal128 boundaries is not yet "
-            "supported by SecantusDB (the double-valued series ships hex-exact; "
-            "Decimal128 rounding is the standing precision deferral)",
-            code=2,
-        )
+        d = v.to_decimal()
+        if d.is_nan():
+            raise AggregateError(
+                "$bucketAuto can specify a 'granularity' with numeric boundaries only, "
+                "but found a NaN",
+                code=40259,
+                code_name="Location40259",
+            )
+        if d < 0:
+            raise AggregateError(
+                "$bucketAuto can specify a 'granularity' with non-negative numbers "
+                "only, but found a negative number",
+                code=40260,
+                code_name="Location40260",
+            )
+        return d  # type: ignore[return-value]
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise AggregateError(
             "$bucketAuto can specify a 'granularity' with numeric boundaries "
@@ -5073,11 +5220,21 @@ def _bucket_auto_granular(
     values = [_granularity_coerce(v) for v, _ in pairs]
     docs = [d for _, d in pairs]
     if granularity == "POWERSOF2":
-        rup, rdn = _round_up_pow2, _round_down_pow2
+        rup_f, rdn_f = _round_up_pow2, _round_down_pow2
     else:
         series = _BUCKET_AUTO_SERIES[granularity]
-        rup = lambda x: _round_up_series(x, series)  # noqa: E731
-        rdn = lambda x: _round_down_series(x, series)  # noqa: E731
+        rup_f = lambda x: _round_up_series(x, series)  # noqa: E731
+        rdn_f = lambda x: _round_down_series(x, series)  # noqa: E731
+
+    def rup(x: Any) -> Any:
+        if isinstance(x, _decimal.Decimal):
+            return _round_dec(x, granularity, up=True)
+        return rup_f(x)
+
+    def rdn(x: Any) -> Any:
+        if isinstance(x, _decimal.Decimal):
+            return _round_dec(x, granularity, up=False)
+        return rdn_f(x)
 
     n = len(pairs)
     approx = math.floor(n / n_buckets + 0.5)  # std::round (positive) — fixed for all buckets
@@ -5126,7 +5283,7 @@ def _bucket_auto_granular(
             bucket_max: float = rdn(values[next_i])
         else:
             bucket_max = boundary
-        bucket: dict[str, Any] = {"_id": {"min": cur_min, "max": bucket_max}}
+        bucket: dict[str, Any] = {"_id": {"min": _bound(cur_min), "max": _bound(bucket_max)}}
         for field_name, accumulator in output_spec.items():
             for ci in chunk:
                 _accumulate(bucket, field_name, accumulator, docs[ci], ctx.vars)

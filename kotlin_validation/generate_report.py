@@ -13,11 +13,11 @@ table as the other gauges — the Kotlin analogue of
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+import gauge_common
 from validation_summary.rates import pass_rate
 
 import secantus
@@ -108,7 +108,7 @@ def render(xml_dir: Path, out_path: Path) -> None:
     md.append("# mongo-kotlin-driver Validation Report")
     md.append("")
     md.append(
-        f"Generated {dt.date.today().isoformat()} — SecantusDB "
+        f"{gauge_common.measured_on()} — SecantusDB "
         f"{secantus.__version__} vs mongo-kotlin-driver "
         f"{_read_driver_version()[:12]} (`vendor/mongo-java-driver/driver-kotlin-sync/`)."
     )

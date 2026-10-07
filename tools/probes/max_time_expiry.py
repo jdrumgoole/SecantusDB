@@ -31,6 +31,8 @@ nothing below measured an expiry.
 from __future__ import annotations
 
 import collections
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,7 @@ from typing import Any
 from pymongo.errors import OperationFailure
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _servers import probe_targets, report  # noqa: E402
+from _servers import DEFAULT_MONGOD, probe_targets, report  # noqa: E402
 
 DB = "maxtime_probe"
 COLL = "c"
@@ -65,6 +67,10 @@ CASES: list[tuple[str, dict[str, Any]]] = [
         {"update": COLL, "updates": [{"q": NO_MATCH, "u": {"$set": {"z": 1}}, "multi": True}]},
     ),
     ("delete", {"delete": COLL, "deletes": [{"q": NO_MATCH, "limit": 0}]}),
+    (
+        "createIndexes",
+        {"createIndexes": COLL, "indexes": [{"key": {"b": 1, "_id": -1}, "name": "mt_b"}]},
+    ),
 ]
 
 #: The case mongod must expire, or the run measured nothing.
@@ -78,6 +84,10 @@ def outcome(db: Any, cmd: dict[str, Any]) -> str:
         msg = (e.details or {}).get("errmsg", "")
         head, sep, _ = msg.partition(" :: caused by :: ")
         form = head.replace(f"{DB}.{COLL}", "<ns>") if sep else "bare"
+        # An index build's own UUIDs are fresh per attempt.
+        form = re.sub(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>", form
+        )
         return f"ok:0 code {e.code} {form}"
     errs = reply.get("writeErrors") or []
     if errs:
@@ -99,7 +109,17 @@ def seed(client: Any) -> Any:
 
 def main() -> int:
     divergent: dict[str, int] = {}
-    with probe_targets() as (mongod, targets):
+    # The embedded Python server takes mongod's topology: a standalone and a
+    # replica-set member answer some of these differently.
+    import pymongo
+
+    ref = pymongo.MongoClient(
+        os.environ.get("PROBE_MONGOD", DEFAULT_MONGOD),
+        directConnection=True,
+    )
+    set_name = ref.admin.command("hello").get("setName")
+    ref.close()
+    with probe_targets(replica_set=set_name) as (mongod, targets):
         ref_db = seed(mongod)
         expected = {name: modal(ref_db, cmd) for name, cmd in CASES}
         if not expected[SELF_CHECK].startswith("ok:0"):

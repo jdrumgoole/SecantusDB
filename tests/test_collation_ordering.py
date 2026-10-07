@@ -104,9 +104,11 @@ def test_sort_levels_truncates_by_strength():
     en3 = parse({"locale": "en", "strength": 3})
     en2 = parse({"locale": "en", "strength": 2})
     en1 = parse({"locale": "en", "strength": 1})
-    assert len(sort_levels("a", en1)) == 1
-    assert len(sort_levels("a", en2)) == 2
-    assert len(sort_levels("a", en3)) == 3
+    # The key is bytes now, levels joined by `00 00`; a weaker strength's key
+    # is a strict prefix of a stronger one's.
+    assert sort_levels("a", en3).startswith(sort_levels("a", en2))
+    assert sort_levels("a", en2).startswith(sort_levels("a", en1))
+    assert len(sort_levels("a", en1)) < len(sort_levels("a", en2)) < len(sort_levels("a", en3))
     # Equal at strength 1, distinguished at 2 and 3.
     assert sort_levels("a", en1) == sort_levels("A", en1) == sort_levels("á", en1)
     assert sort_levels("a", en2) == sort_levels("A", en2)
@@ -133,3 +135,16 @@ def test_an_index_does_not_change_the_collated_order(tmp_path):
     finally:
         without.close()
         withidx.close()
+
+
+def test_sharp_s_is_ss_with_a_secondary_difference():
+    """mongod 8.2.11 (2026-10-07): `Straße` ties `Strasse` at strength 1 and
+    sorts after it at strengths 2 and 3."""
+    words = ["Straße", "Strasse", "Strase"]
+    for strength, want in (
+        (1, ["Strase", "Straße", "Strasse"]),
+        (2, ["Strase", "Strasse", "Straße"]),
+        (3, ["Strase", "Strasse", "Straße"]),
+    ):
+        col = parse({"locale": "en", "strength": strength})
+        assert sorted(words, key=lambda w: sort_levels(w, col)) == want, strength

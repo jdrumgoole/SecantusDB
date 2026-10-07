@@ -2299,15 +2299,17 @@ def test_create_index_same_name_different_key_conflicts(coll) -> None:
 
 
 def test_create_index_same_name_different_options_conflicts(coll) -> None:
-    """Same name + same key but different options → IndexOptionsConflict (85)."""
+    """Same name + same key but different options → 86, quoting both specs
+    (measured 8.2.11, 2026-10-07; this asserted 85, which is mongod's answer for
+    the same key under ANOTHER name)."""
     from pymongo.errors import OperationFailure
 
     coll.insert_one({"b": 1})
     coll.create_index([("b", 1)], name="b_idx")
     with pytest.raises(OperationFailure) as exc:
         coll.create_index([("b", 1)], name="b_idx", unique=True)
-    assert exc.value.code == 85
-    assert exc.value.details.get("codeName") == "IndexOptionsConflict"
+    assert exc.value.code == 86
+    assert exc.value.details.get("codeName") == "IndexKeySpecsConflict"
 
 
 def test_create_index_identical_recreate_is_noop(coll) -> None:
@@ -5828,3 +5830,40 @@ def test_where_is_refused_on_an_empty_collection(client) -> None:
         with pytest.raises(OperationFailure) as caught:
             db.command({"find": coll, "filter": _WHERE})
         assert caught.value.details["code"] == _NO_SCRIPT[0], coll
+
+
+def test_failed_multi_update_keeps_the_documents_it_already_rewrote(coll) -> None:
+    """mongod's multi-update is not atomic: a failure on a later document
+    leaves the earlier ones rewritten and the later ones untouched, and the
+    reply still says n: 0 (measured 8.2.11, 2026-10-07). This server rolled
+    the whole chunk back, so a change stream and a find disagreed with
+    mongod."""
+    coll.insert_many([{"_id": 1, "b": []}, {"_id": 2, "b": 1}, {"_id": 3, "b": []}])
+    reply = coll.database.command(
+        "update", coll.name, updates=[{"q": {}, "u": {"$push": {"b": 5}}, "multi": True}]
+    )
+    assert reply["n"] == 0 and reply["nModified"] == 0
+    assert reply["writeErrors"][0]["code"] == 2
+    assert list(coll.find().sort("_id", 1)) == [
+        {"_id": 1, "b": [5]},
+        {"_id": 2, "b": 1},
+        {"_id": 3, "b": []},
+    ]
+
+
+def test_sort_puts_every_number_before_every_bool(coll) -> None:
+    """mongod 8.2.11 (2026-10-07): numbers (NaN first) sort below bools, and
+    `True` is not tied with `1`. Python's `True == 1` used to tie them inside
+    the sort key, giving `[-1, True, 1, False]`."""
+    coll.insert_many(
+        [
+            {"_id": 1, "v": float("nan")},
+            {"_id": 2, "v": True},
+            {"_id": 3, "v": 1},
+            {"_id": 4, "v": False},
+            {"_id": 5, "v": -1.0},
+        ]
+    )
+    asc = [d["_id"] for d in coll.aggregate([{"$sort": {"v": 1}}])]
+    assert asc == [1, 5, 3, 4, 2]
+    assert [d["_id"] for d in coll.find().sort("v", -1)] == [2, 4, 3, 5, 1]

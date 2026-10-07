@@ -221,6 +221,9 @@ fn mark_weight(cp: u32) -> (u32, u32) {
     }
 }
 
+/// The secondary weight `ß` carries over its `ss` expansion.
+const SHARP_S_SECONDARY: (u32, u32) = (0, 0xDF);
+
 /// A BYTE-COMPARABLE multi-level ordering key for `s`, in the shape ICU uses
 /// and `collation.py`'s `sort_levels` produces.
 ///
@@ -253,6 +256,7 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
     let mut bases: Vec<char> = Vec::new();
     let mut marks: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut cases: Vec<u8> = Vec::new();
+    let mut compat: Vec<u8> = Vec::new();
     for ch in s.nfd() {
         if is_ccc_mark(ch) {
             if let Some(last) = marks.last_mut() {
@@ -260,9 +264,41 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
             }
             continue;
         }
-        bases.push(ch);
-        marks.push(Vec::new());
-        cases.push(u8::from(ch.is_uppercase()));
+        // `ß` is `ss` at the primary level and differs at the SECONDARY:
+        // mongod ties `Straße` / `Strasse` at strength 1 and puts `Strasse`
+        // first at 2 and 3 (measured 8.2.11, 2026-10-07). Any secondary weight
+        // puts it after plain `ss`; where it falls among accented `ss` forms
+        // was not measured.
+        if ch == '\u{df}' || ch == '\u{1e9e}' {
+            for _ in 0..2 {
+                bases.push('s');
+                marks.push(Vec::new());
+                cases.push(u8::from(ch.is_uppercase()));
+                compat.push(0);
+            }
+            if let Some(last) = marks.last_mut() {
+                last.push(SHARP_S_SECONDARY);
+            }
+            continue;
+        }
+        // A COMPATIBILITY character (`ﬁ`) is its expansion (`f`, `i`) at the
+        // primary and secondary levels and differs only at the tertiary --
+        // ICU's rule and mongod's answer: `fi` and `ﬁ` tie at strength 2 and
+        // `fi < ﬁ` at strength 3 (measured 8.2.11, 2026-10-07).
+        let expansion: Vec<char> = std::iter::once(ch).nfkd().collect();
+        let is_compat = expansion.len() != 1 || expansion[0] != ch;
+        for part in expansion {
+            if is_ccc_mark(part) {
+                if let Some(last) = marks.last_mut() {
+                    last.push(mark_weight(part as u32));
+                }
+                continue;
+            }
+            bases.push(part);
+            marks.push(Vec::new());
+            cases.push(u8::from(ch.is_uppercase()));
+            compat.push(u8::from(is_compat));
+        }
     }
     let primary_text = case_fold(&bases.iter().collect::<String>());
 
@@ -313,11 +349,18 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
         }
         out.push(0x00); // end of this base character's marks
     }
-    if c.strength == 2 && !c.case_level {
+    if c.strength == 2 {
+        if c.case_level {
+            out.extend_from_slice(&[0x00, 0x00]);
+            push_case_ranks(&mut out, &cases, c.case_first_upper);
+        }
         return out;
     }
     out.extend_from_slice(&[0x00, 0x00]);
-    push_case_ranks(&mut out, &cases, c.case_first_upper);
+    // The full tertiary: case, then the compatibility variant above it.
+    for (rank, k) in cases.iter().zip(&compat) {
+        out.push(if c.case_first_upper { 1 - *rank } else { *rank } + 1 + 2 * k);
+    }
     out
 }
 
@@ -398,5 +441,20 @@ mod tests {
         // strength 1 + caseLevel: accent-insensitive but case-sensitive.
         let c = coll(1, true);
         assert_eq!(equal("PING", "ping", &c), Some(false));
+    }
+
+    #[test]
+    fn sharp_s_is_ss_with_a_secondary_difference() {
+        // mongod 8.2.11 (2026-10-07): ties at strength 1, after `ss` at 2 / 3.
+        for (strength, want) in [
+            (1, ["Strase", "Straße", "Strasse"]),
+            (2, ["Strase", "Strasse", "Straße"]),
+            (3, ["Strase", "Strasse", "Straße"]),
+        ] {
+            let c = coll(strength, false);
+            let mut words = ["Straße", "Strasse", "Strase"];
+            words.sort_by_key(|w| sort_level_bytes(w, &c));
+            assert_eq!(words, want, "strength {strength}");
+        }
     }
 }

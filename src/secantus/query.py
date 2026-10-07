@@ -260,6 +260,8 @@ def _check_json_schema_keywords(schema: Any) -> None:
                     code=9,
                     code_name="FailedToParse",
                 )
+        if kw in ("type", "bsonType"):
+            _check_json_schema_type_names(kw, arg)
         # Recurse into sub-schemas.
         if kw in ("properties", "patternProperties") and isinstance(arg, Mapping):
             for sub in arg.values():
@@ -279,6 +281,37 @@ def _check_json_schema_keywords(schema: Any) -> None:
             for dep in arg.values():
                 if isinstance(dep, Mapping):
                     _check_json_schema_keywords(dep)
+
+
+_JSON_SCHEMA_JSON_TYPES = frozenset({"object", "array", "number", "boolean", "string", "null"})
+
+
+def _check_json_schema_type_names(kw: str, arg: Any) -> None:
+    """A ``type`` / ``bsonType`` name mongod refuses while PARSING the schema,
+    before any document is looked at (measured 8.2.11, 2026-09-30):
+
+    - ``integer`` in either keyword is 9 "not currently supported" -- it was
+      accepted, and matched ints, where mongod runs no query at all;
+    - ``type`` takes only the six JSON names (``int`` is an unknown alias there,
+      although ``bsonType`` takes it), and an unknown name is 2 BadValue.
+
+    ``integer`` wins over an unknown name anywhere in the list."""
+    if isinstance(arg, str):
+        names = [arg]
+    elif isinstance(arg, list):
+        names = [n for n in arg if isinstance(n, str)]
+    else:
+        return
+    if "integer" in names:
+        raise QueryError(
+            "$jsonSchema type 'integer' is not currently supported.",
+            code=9,
+            code_name="FailedToParse",
+        )
+    for n in names:
+        known = n in _JSON_SCHEMA_JSON_TYPES if kw == "type" else n in _VALID_TYPE_ALIASES
+        if not known:
+            raise QueryError(f"Unknown type name alias: {n}")
 
 
 def _validate_json_schema(value: Any, schema: Any) -> bool:
@@ -1424,12 +1457,48 @@ def _re_flags(flags_input: Any) -> int:
 _MAX_REGEX_PATTERN_LEN = 1000
 
 
+def pcre_to_python(pattern: str) -> str:
+    """mongod's PCRE end anchors in Python's dialect.
+
+    PCRE's ``\\Z`` matches at the end OR before a final newline; Python's
+    ``\\Z`` is the absolute end, so ``/foo\\Z/`` missed ``"foo\\n"``. PCRE's
+    ``\\z`` (the absolute end) does not exist in Python and was refused as a
+    bad escape (measured 8.2.11, 2026-10-07; ``regex_value_semantics.py``).
+    Escapes and character classes are walked so only a real anchor is
+    rewritten."""
+    if "\\" not in pattern:
+        return pattern
+    out: list[str] = []
+    i, n, in_class = 0, len(pattern), False
+    while i < n:
+        c = pattern[i]
+        if c == "\\" and i + 1 < n:
+            nxt = pattern[i + 1]
+            if not in_class and nxt == "Z":
+                out.append("(?=\\n?\\Z)")
+            elif not in_class and nxt == "z":
+                out.append("\\Z")
+            else:
+                out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if c == "[" and not in_class:
+            in_class = True
+        elif c == "]" and in_class:
+            in_class = False
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 @lru_cache(maxsize=1024)
 def _compile_regex(pattern: str | bytes, flags: int) -> re.Pattern:
     if hasattr(pattern, "__len__") and len(pattern) > _MAX_REGEX_PATTERN_LEN:
         raise QueryError(
             f"regex pattern of {len(pattern)} chars exceeds the {_MAX_REGEX_PATTERN_LEN}-char cap"
         )
+    if isinstance(pattern, str):
+        pattern = pcre_to_python(pattern)
     return re.compile(pattern, flags)
 
 
@@ -1459,6 +1528,151 @@ def _validate_regex_pattern(pattern: Any) -> None:
         raise QueryError("$regex has to be a string")
 
 
+def pcre_compile_error(pat: str) -> str | None:
+    """PCRE2's message for a pattern it would refuse, for the malformations
+    measured against mongod 8.2.11 (2026-10-01), which reports them as
+    ``51091 Regular expression is invalid: <message>``. Scans left to right as
+    PCRE does, so the first fault wins; ``None`` when none applies. A port of
+    the Rust server's ``regexutil::pcre_compile_error``."""
+    chars = pat
+    n = len(chars)
+    depth = 0
+    names: list[str] = []
+    repeatable = False  # whether the previous token can take a quantifier
+    quantifier = "quantifier does not follow a repeatable item"
+    i = 0
+    while i < n:
+        c = chars[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return "\\ at end of pattern"
+            if chars[i + 1] == "k" and i + 2 < n and chars[i + 2] == "<":
+                end = chars.find(">", i + 3)
+                if end < 0:
+                    return None
+                if chars[i + 3 : end] not in names:
+                    return "reference to non-existent subpattern"
+                i = end + 1
+            else:
+                i += 2
+            repeatable = True
+            continue
+        if c == "[":
+            j = i + 1
+            if j < n and chars[j] == "^":
+                j += 1
+            if j < n and chars[j] == "]":
+                j += 1
+            prev: str | None = None
+            while True:
+                if j >= n:
+                    return "missing terminating ] for character class"
+                ch = chars[j]
+                if ch == "]":
+                    break
+                if ch == "\\":
+                    prev = chars[j + 1] if j + 1 < n else None
+                    j += 2
+                    continue
+                if ch == "-" and prev is not None and j + 1 < n:
+                    hi = chars[j + 1]
+                    if hi not in ("]", "\\") and hi < prev:
+                        return "range out of order in character class"
+                prev = ch
+                j += 1
+            i = j + 1
+            repeatable = True
+            continue
+        if c == "(":
+            depth += 1
+            if i + 1 < n and chars[i + 1] == "?":
+                rest = chars[i + 2 :]
+                named: str | None = None
+                if rest.startswith("P<"):
+                    named = rest[2:]
+                elif rest.startswith("<") and not rest.startswith(("<=", "<!")):
+                    named = rest[1:]
+                if named is not None:
+                    name = ""
+                    for ch in named:
+                        if not (ch.isalnum() or ch == "_"):
+                            break
+                        name += ch
+                    if not name:
+                        return "subpattern name expected"
+                    if name in names:
+                        return "two named subpatterns have the same name (PCRE2_DUPNAMES not set)"
+                    names.append(name)
+                # Skip the group header so its `?` is not read as a quantifier.
+                j = i + 2
+                if named is not None:
+                    consumed = len(rest) - len(named)
+                    name_len = len(named.split(">", 1)[0])
+                    j += consumed + name_len + 1
+                else:
+                    while j < n:
+                        ch = chars[j]
+                        j += 1
+                        if ch in ":=!)":
+                            if ch == ")":
+                                j -= 1
+                            break
+                i = j
+                repeatable = False
+                continue
+            repeatable = False
+        elif c == ")":
+            if depth == 0:
+                return "unmatched closing parenthesis"
+            depth -= 1
+            repeatable = True
+        elif c == "|":
+            repeatable = False
+        elif c in "*+?":
+            if not repeatable:
+                return quantifier
+            # A lazy `?` or possessive `+` straight after a quantifier is part
+            # of it, not a second quantifier.
+            if i + 1 < n and chars[i + 1] in "?+":
+                i += 1
+            repeatable = False
+        elif c == "{":
+            close = chars.find("}", i)
+            bounds = None
+            if close >= 0:
+                body = chars[i + 1 : close]
+                lo, _, hi = body.partition(",") if "," in body else (body, "", body)
+                if lo.isascii() and lo.isdigit():
+                    bounds = (int(lo), hi)
+            if bounds is not None:
+                if not repeatable:
+                    return quantifier
+                lo_n, hi_s = bounds
+                if hi_s.isascii() and hi_s.isdigit() and int(hi_s) < lo_n:
+                    return "numbers out of order in {} quantifier"
+                i = close + 1
+                repeatable = False
+                continue
+            repeatable = True
+        else:
+            repeatable = True
+        i += 1
+    return "missing closing parenthesis" if depth > 0 else None
+
+
+def _invalid_regex(pattern: str, exc: Exception) -> QueryError:
+    """mongod's 51091 for a pattern PCRE refuses, in PCRE2's words when the
+    checker recognises the fault (measured 8.2.11)."""
+    msg = pcre_compile_error(pattern) if isinstance(pattern, str) else None
+    if msg is not None:
+        return QueryError(
+            f"Regular expression is invalid: {msg}", code=51091, code_name="Location51091"
+        )
+    return QueryError(
+        f"Regular expression is invalid: {exc}", code=51091, code_name="Location51091"
+    )
+
+
 def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = True) -> bool:
     flags = _re_flags(options)
     if isinstance(pattern, Regex):
@@ -1476,12 +1690,15 @@ def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = 
     try:
         compiled = _compile_regex(regex_pattern, flags)
     except re.error as exc:
-        raise QueryError(f"invalid regex: {exc}") from exc
+        raise _invalid_regex(regex_pattern, exc) from exc
     except TypeError as exc:
         # Unhashable pattern (e.g. a non-str/bytes input) — fall back to
         # an uncached compile so the caller still gets a real re.error.
         try:
-            compiled = re.compile(regex_pattern, flags)
+            compiled = re.compile(
+                pcre_to_python(regex_pattern) if isinstance(regex_pattern, str) else regex_pattern,
+                flags,
+            )
         except re.error as e:
             raise QueryError(f"invalid regex: {e}") from e
         except Exception as e:

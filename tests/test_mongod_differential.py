@@ -4402,6 +4402,13 @@ def test_replset_step_down_refusals_match_mongod(
             # The 262's message embeds a wall clock; compare its stable half.
             if d.get("code") == 262:
                 message = message.split(" as of ")[0]
+                # mongod's OWN answer varies with timing here: when the catch-up
+                # wait outruns the step-down window it says so instead of "No
+                # electable secondaries caught up" (seen on a slow Windows
+                # runner, 2026-10-02). Both are mongod's 262 for the same
+                # request, so they compare as one.
+                if message.startswith("By the time we were ready to step down"):
+                    message = "No electable secondaries caught up"
             return (d.get("code"), message)
         finally:
             client.close()

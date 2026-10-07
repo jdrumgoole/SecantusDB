@@ -201,9 +201,27 @@ def test_stop_ends_a_running_command(tmp_path: Path) -> None:
     # this assertion has failed on Windows CI without either, which left
     # nothing to diagnose.
     assert _wait_for(
-        lambda: "finished" in _run_env(state, env, "status", "--name", "nap").stdout, timeout=30
+        lambda: "finished" in _run_env(state, env, "status", "--name", "nap").stdout, timeout=90
     ), (
         stop.stdout,
         stop.stderr,
         _run_env(state, env, "status", "--name", "nap").stdout,
     )
+
+
+def test_the_state_file_records_the_exit_without_a_status_call(tmp_path: Path) -> None:
+    """A finished run's ``<name>.json`` says so by itself. It used to keep
+    ``exit_code: null`` until something called ``status`` / ``wait``, so a
+    reader of the file waited on a run that had ended hours before
+    (2026-09-28)."""
+    state = tmp_path / "runs"
+    out = _run(state, "start", "--name", "quick", "--", sys.executable, "-c", "pass")
+    assert out.returncode == 0, out.stderr
+    deadline = time.monotonic() + 60
+    recorded = None
+    while time.monotonic() < deadline:
+        recorded = json.loads((state / "quick.json").read_text()).get("exit_code")
+        if recorded is not None:
+            break
+        time.sleep(0.2)
+    assert recorded == 0

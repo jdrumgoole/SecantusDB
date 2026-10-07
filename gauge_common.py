@@ -264,3 +264,34 @@ def spawn_daemon(
         raise RuntimeError(f"{label}: daemon did not report a listening port within {timeout}s")
 
     return proc, host, port
+
+
+def measured_on() -> str:
+    """The date line of a validation report: when the RAW ARTIFACT was
+    written, and when the report was generated.
+
+    Reports used to print only the generation date, so a report regenerated
+    from a weeks-old artifact claimed a measurement that never happened -- seven
+    `-rust-server` reports said 2026-09-21 over artifacts from August
+    (found 2026-09-28). The artifact is whichever existing file or directory
+    named on the generator's command line is newest (the output `.md` aside);
+    a directory counts by its newest file, as JUnit results are written."""
+    import datetime as _dt
+    import sys as _sys
+
+    newest: float | None = None
+    for arg in _sys.argv[1:]:
+        path = pathlib.Path(arg)
+        if not path.exists() or path.suffix == ".md":
+            continue
+        if path.is_dir():
+            stamps = [f.stat().st_mtime for f in path.rglob("*") if f.is_file()]
+        else:
+            stamps = [path.stat().st_mtime]
+        for stamp in stamps:
+            newest = stamp if newest is None else max(newest, stamp)
+    today = _dt.date.today().isoformat()
+    if newest is None:
+        return f"Generated {today} (no raw artifact found on the command line)"
+    measured = _dt.datetime.fromtimestamp(newest).date().isoformat()
+    return f"Measured {measured} (raw artifact), generated {today}"

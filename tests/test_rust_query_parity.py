@@ -543,8 +543,11 @@ CURATED = [
     ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"bsonType": ["int", "long"]}}}}),
     ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"bsonType": 16}}}}),  # numeric code
     ({"n": 5.0}, {"$jsonSchema": {"properties": {"n": {"type": "number"}}}}),
-    ({"n": 5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),
-    ({"n": 5.5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}}),  # double !integer
+    # REMOVED `type: "integer"`: mongod refuses the schema at parse time (9
+    # "$jsonSchema type 'integer' is not currently supported.") and matches
+    # nothing. The Python matcher refuses it too; the Rust server refuses it at
+    # its command layer, so its core matcher is never asked.
+    # `test_json_schema_integer_type_is_refused` pins the Python refusal.
     # Draft-4 exclusive bounds (booleans sharpening minimum/maximum, per mongod).
     ({"n": 6}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}),
     ({"n": 7}, {"$jsonSchema": {"properties": {"n": {"minimum": 6, "exclusiveMinimum": True}}}}),
@@ -1026,3 +1029,12 @@ def test_regex_fuzz_parity():
         py = _pure.matches(doc, query)
         assert same(rust, py), f"regex divergence: rust={rust} pure={py} query={query} doc={doc}"
     assert handled > 1000, f"expected many handled regex cases, only {handled}"
+
+
+def test_json_schema_integer_type_is_refused():
+    """mongod refuses `type: "integer"` while parsing the schema (measured
+    8.2.11, 2026-09-30); the Python matcher used to match ints with it."""
+    with pytest.raises(_pure.QueryError) as exc:
+        _pure.matches({"n": 5}, {"$jsonSchema": {"properties": {"n": {"type": "integer"}}}})
+    assert exc.value.code == 9
+    assert str(exc.value) == "$jsonSchema type 'integer' is not currently supported."

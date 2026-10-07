@@ -520,7 +520,9 @@ def test_compound_index_skipping_leading_field_falls_back(storage: Storage, monk
 
 
 def test_compound_index_filter_with_extra_fields_falls_back(storage: Storage, monkeypatch) -> None:
-    """Filter has fields beyond what the index covers — needs post-filter, defer."""
+    """Filter has fields beyond what the index covers: one clause rides the
+    index and the rest is re-checked, as mongod plans it (an IXSCAN on the
+    index, then the residual filter)."""
     storage.create_index("db", "c", "ab_1", {"a": 1, "b": 1}, {})
     storage.insert(
         "db",
@@ -533,8 +535,8 @@ def test_compound_index_filter_with_extra_fields_falls_back(storage: Storage, mo
     calls = _spy_scans(storage, monkeypatch)
     docs = storage.find_matching("db", "c", {"a": 1, "b": 10, "z": "x"})
     assert [d["_id"] for d in docs] == [1]
-    # Index covers only {a, b}; the z filter forced a full scan in this MVP.
-    assert calls != []
+    # The index serves `a` (its leading field); `z` is the residual filter.
+    assert calls == []
 
 
 def test_single_field_filter_uses_compound_index_when_no_single_index(
@@ -706,13 +708,14 @@ def test_compound_range_does_not_leak_across_eq_prefix(storage: Storage, monkeyp
 def test_compound_index_range_skipping_middle_field_falls_back(
     storage: Storage, monkeypatch
 ) -> None:
-    """Index {a,b,c}; filter {a:1, c:{$gt:5}} skips b — planner can't use the index."""
+    """Index {a,b,c}; filter {a:1, c:{$gt:5}} skips b: the index still serves
+    the leading `a`, and `c` is re-checked -- mongod's plan too."""
     storage.create_index("db", "c", "abc_1", {"a": 1, "b": 1, "c": 1}, {})
     storage.insert("db", "c", [{"_id": i, "a": 1, "b": i, "c": i * 2} for i in range(10)])
     calls = _spy_scans(storage, monkeypatch)
     docs = storage.find_matching("db", "c", {"a": 1, "c": {"$gt": 10}})
     assert sorted(d["_id"] for d in docs) == [6, 7, 8, 9]
-    assert calls != []
+    assert calls == []
 
 
 def test_compound_index_range_in_with_empty_list(storage: Storage) -> None:

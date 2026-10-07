@@ -464,9 +464,14 @@ def _project(
         _attach_full_document(
             event, op, oplog_entry, storage=storage, full_document_mode=full_document_mode
         )
-        _attach_full_document_before_change(
-            event, seq, storage=storage, mode=full_document_before_change_mode
-        )
+        # An insert has no "before" -- mongod omits `fullDocumentBeforeChange`
+        # from insert events in every mode, `required` included (measured
+        # 8.2.11, 2026-10-01; fixed on the Rust server then). Under
+        # `whenAvailable` every insert carried `fullDocumentBeforeChange: null`.
+        if op != "i":
+            _attach_full_document_before_change(
+                event, seq, storage=storage, mode=full_document_before_change_mode
+            )
         return event, False
     if op == "c":
         cmd = oplog_entry.get("o", {}) if isinstance(oplog_entry.get("o"), Mapping) else {}

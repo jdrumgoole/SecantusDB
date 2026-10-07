@@ -1795,8 +1795,12 @@ pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
 pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    // mongod runs this only against `admin` (measured 8.2.11, 2026-10-01);
-    // drivers send it there, and any other database is refused.
+    // The fields are PARSED first -- a wrong-typed `to` / `dropTarget` is
+    // mongod's 14 / 40414 on any database (measured 8.2.11, 2026-10-07,
+    // `arg_types_messages.py`) -- and only then is a non-`admin` database
+    // refused (measured 2026-10-01).
+    argtypes::require_required_string(doc, "to", "renameCollection.to")?;
+    argtypes::require_bool_or_bindata(doc, "dropTarget", "renameCollection.dropTarget")?;
     if ctx.db_name != "admin" {
         return Err(CommandError::new(
             13,
@@ -1804,8 +1808,6 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
             "renameCollection may only be run against the admin database.",
         ));
     }
-    argtypes::require_required_string(doc, "to", "renameCollection.to")?;
-    argtypes::require_bool_or_bindata(doc, "dropTarget", "renameCollection.dropTarget")?;
     let src = match doc.get("renameCollection") {
         Some(Bson::String(s)) => s.clone(),
         _ => {

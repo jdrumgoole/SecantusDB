@@ -812,10 +812,11 @@ def test_date_from_string_with_timezone_interprets_naive_input() -> None:
         },
         {},
     )
-    # 12:00 in +02:00 represents the instant 10:00 UTC.
-    assert out == dt.datetime(2026, 5, 2, 10, 0, 0, tzinfo=dt.timezone.utc)
-    # Returned datetime is tz-aware in the requested zone.
-    assert out.utcoffset() == dt.timedelta(hours=2)
+    # 12:00 in +02:00 represents the instant 10:00 UTC. A BSON date carries
+    # no zone, so the result is that instant as a naive UTC datetime -- what a
+    # client decodes from mongod's answer (an earlier version returned an
+    # aware datetime in +02:00, which no mongod reply can encode).
+    assert out == dt.datetime(2026, 5, 2, 10, 0, 0)
 
 
 def test_date_from_string_unknown_timezone_raises() -> None:
