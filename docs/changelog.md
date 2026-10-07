@@ -19,6 +19,40 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.7.0b1] — 2026-10-08
+
+### The source distribution is back under PyPI's file-size limit
+
+`0.7.0b0` reached PyPI as wheels only. Its source distribution came out at
+573 MB, against 14 MB for `0.6.0b17`, and PyPI refuses any file over 100 MB. A
+cargo build directory, `crates/secantus-storage/target-dev/`, had been
+committed to the repository: 6,875 files and 1.77 GB, all of which the sdist
+picked up.
+
+#### Fixed
+
+- The build directory is no longer tracked, and every cargo target directory
+  under `crates/` is now ignored by git and excluded from the sdist.
+- A test fails if a cargo target directory, or any file over 8 MB, is tracked.
+
+### The Rust PostgreSQL server's crate is linted in CI
+
+`crates/secantus-pg` was built and tested in CI but never run through
+`cargo fmt --check` or `cargo clippy`, and six `clippy::drop_non_drop` errors
+had accumulated in it. They are fixed and the crate joins the lint step the
+other WiredTiger-linked crates already have.
+
+#### Fixed
+
+- Six redundant `drop()` calls on closures, in `grace_join.rs`,
+  `stream_join.rs` and `lib.rs`. No behaviour change: a closure with no `Drop`
+  releases its borrows at its last use.
+
+#### Changed
+
+- `test.yml`'s `rust-storage` job runs `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings` in `crates/secantus-pg`.
+
 ### Concurrent durable commits share log writes on the Rust PostgreSQL server (macOS)
 
 On macOS the Rust PostgreSQL server syncs each commit with WiredTiger's
