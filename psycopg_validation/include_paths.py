@@ -116,3 +116,17 @@ if sys.platform == "darwin":
         "tests/test_generators.py::test_cancel",
     ]
     MARKER_EXPR = "not proxy and not timing"
+# Windows: psycopg's own Windows CI job deselects exactly these markers
+# (`NOT_MARKERS: "timing proxy mypy"` in vendor/psycopg/.github/workflows/
+# tests.yml, "On windows pproxy doesn't seem very happy"). The `proxy`
+# fixture's `_wait_listen` is the hang this gauge hit there (tasks/backlog.md,
+# 2026-09-20): it reuses one socket across failed connect_ex() calls, which
+# Winsock refuses (WSAEINVAL) just as BSD does, and a refused loopback connect
+# on Windows takes ~2s rather than failing at once. Under pytest-timeout's
+# THREAD method -- the only one Windows has -- a test that overruns
+# `timeout=20` ends the WHOLE pytest process, not just the test, so one such
+# hang truncated the run. What is lost: the proxy-driven connection-failure
+# tests, the wall-clock `timing` budgets and psycopg's own mypy checks, none
+# of which reach a server behaviour the rest of the suite does not.
+elif sys.platform == "win32":
+    MARKER_EXPR = "not proxy and not timing and not mypy"

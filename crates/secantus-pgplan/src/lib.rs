@@ -25093,8 +25093,8 @@ thread_local! {
     /// same thread-local the session user and the timezone already use.
     static PLAN_SESSION_DB: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
-    static PLAN_SETTINGS: std::cell::RefCell<std::collections::HashMap<String, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static PLAN_SETTINGS: std::cell::RefCell<std::sync::Arc<std::collections::HashMap<String, String>>> =
+        std::cell::RefCell::new(std::sync::Arc::default());
 }
 
 /// Install the database and settings for the statements that follow.
@@ -25108,9 +25108,13 @@ pub fn set_session_database(database: &str) {
     });
 }
 
-pub fn set_session_context(database: &str, settings: std::collections::HashMap<String, String>) {
+pub fn set_session_context(
+    database: &str,
+    settings: impl Into<std::sync::Arc<std::collections::HashMap<String, String>>>,
+) {
     PLAN_SESSION_DB.with(|d| *d.borrow_mut() = database.to_string());
     schemas::bump_resolve_epoch();
+    let settings = settings.into();
     PLAN_SETTINGS.with(|s| *s.borrow_mut() = settings);
 }
 

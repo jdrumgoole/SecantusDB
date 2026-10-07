@@ -40,7 +40,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
-RUST_BINARY = REPO / "crates/secantus-pgserver/target/release/secantusd-pg"
+# `SECANTUSD_PG` measures a binary other than the main checkout's (a worktree's
+# build) -- the same override `bench/pg_statement_cost.py` has.
+RUST_BINARY = Path(
+    os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pgserver/target/release/secantusd-pg")
+)
 
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))

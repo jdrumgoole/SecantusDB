@@ -2776,7 +2776,41 @@ These work end-to-end but cut corners.
       that names the failure and distinguishes the remaining possibilities.
       Probe: `scratchpad/sockwatch.py` in the session that measured this.
 
-- [ ] **OPEN — Rust PostgreSQL server: per-statement COST, and a read-path
+- [ ] **OPEN — Rust PostgreSQL server: per-statement cost is ~1.4-1.6x
+      PostgreSQL's, and INSERT throughput stops scaling at ~2x (re-measured
+      2026-10-07, batch 69).** Release `secantusd-pg` against PostgreSQL 15.19
+      (port 5415; the harness still LABELS it "PostgreSQL 16"), same box, 5s x3
+      medians. `bench/pg_statement_cost.py --iters 1200`: `select 1` 40.6us vs
+      26.1, row by PK 44.8 vs 27.9 (was 76.3 / 89.2 against PG 16 on
+      2026-09-18; the seven `ensure_collection` probes named below are gone --
+      `ensured_catalog` caches them per connection). What is left of the
+      parse+plan step is +19.3us against PG's +7.6. INSERT, one table per
+      client: 11.3k / 16.1k / 18.6k / 22.9k at N=1/2/4/8 (1.00x -> 2.03x)
+      where PG goes 8.7k -> 45.1k (5.17x). A `sample` at N=4 has the commit
+      path in `__wt_log_write` -> `pwrite` (~2,400 of the busy samples): the
+      WiredTiger journal write, a storage-engine property, not a lock in
+      this server. Measure it against the journal settings before touching it.
+
+- [x] **RESOLVED 2026-10-07 (batch 69): the read-path ceiling was two
+      per-thread caches keyed by CONNECTION.** Re-measured before fixing:
+      SELECT gave 21.2k / 14.4k / 26.3k / 34.0k at N=1/2/4/8 -- two clients
+      did LESS than one (0.68x), reproducible across runs and with
+      `TOKIO_WORKER_THREADS=1/2/4`, which ruled out the runtime and the
+      P-core confound below. `sample` at N=2: `install_user_types` was 60%
+      of the server's busy time. Two causes: `INSTALLED_SESSION_TABLES` was
+      keyed by `session_serial`, so a worker alternating between two
+      connections re-read and decoded the whole catalog (`all_table_defs`)
+      on every statement; and `set_session_context` deep-copied every GUC
+      whenever the settings generation (unique per session) changed. Fixed by
+      keying the tables by role / database / session user, private only for
+      a session with its own temp tables or functions or under RLS
+      (`session_tables_owner`), and by sharing the GUC map as an `Arc`. After,
+      PG 15.19 alongside: SELECT 21.0k / 23.8k -> (GUC fix) 38.4k / 50.3k /
+      76.9k at N=1/2/4/8, i.e. 1.81x / 2.38x / 3.63x scaling against PG's
+      1.86x / 2.55x / 3.61x. The ceiling is gone; per-statement cost is the
+      entry above. History of the investigation follows.
+
+      **Superseded entry — per-statement COST, and a read-path
       ceiling at N≈4 (measured 2026-09-18; supersedes the "lift the global
       write lock" framing this entry used to carry).**
 
@@ -5557,7 +5591,9 @@ IDENTITY all match. What is open:
 - [ ] **`INSERT ... OVERRIDING SYSTEM VALUE` does not parse** (`42601`), so a
       `GENERATED ALWAYS AS IDENTITY` column cannot be written explicitly.
 - [ ] **`pg_get_serial_sequence` on an unknown relation answers NULL**;
-      Postgres raises `42P01`.
+      Postgres raises `42P01`. (PYTHON server. The RUST server had the same
+      divergence and an unknown column answering NULL where PG raises
+      `42703`; both fixed there 2026-10-07, `pg_corpora/sequences2.sql`.)
 
 ### 2026-09-03 SQL sweep ten: DDL and catalog — what is still open
 
@@ -13007,6 +13043,30 @@ shared storage engine or building large new protocol subsystems:
   directly works -- 327 tests pass across `test_cursor` / `test_sql` /
   `test_typing` -- so it is the fixture, not the server. The number CLAUDE.md
   quotes comes from a Linux run.
+  **Worked 2026-10-07 (batch 69), from the code -- no Windows box here, so
+  still unconfirmed by a run.** Ruled in, and fixed in the runner:
+  (1) psycopg's OWN Windows CI deselects `timing proxy mypy`
+  (`vendor/psycopg/.github/workflows/tests.yml`, "On windows pproxy doesn't
+  seem very happy"); the gauge deselected nothing on Windows. `_wait_listen`
+  reuses one socket across failed `connect_ex()` calls, which Winsock rejects
+  (WSAEINVAL) as BSD does, and a refused loopback connect costs ~2s there.
+  `include_paths.py` now sets that marker expression on `win32`. (2) On
+  Windows pytest-timeout has only the THREAD method, which ends the whole
+  pytest process when any test overruns `timeout=20` -- so one slow test is a
+  truncated run, not one failure; that is the most likely reading of "times
+  out even with those excluded", and it means the NEXT Windows hang will look
+  the same. (3) The stale `.pytest_cache/v/segfault` flag is now cleared by
+  the runner, with a message. Ruled out, from the code: the server's listener
+  (std `TcpListener::bind` on 127.0.0.1, no `SO_REUSEADDR` games), the DSN
+  (`host=127.0.0.1`, so no `localhost` -> `::1` fallback delay), and shutdown
+  (`lingering_close` is already in). **No CI lane:** no Windows job builds
+  `secantusd-pg` (the pg-oracle lane is Linux; `storage-engine`'s Windows
+  cell builds the wheel, not this binary), and adding one means a Windows
+  WT + bindgen build of the PG crate per PR -- not cheap, and it could not be
+  verified from a branch push (test.yml runs on PRs and main only). Next
+  step: run `SECANTUS_GAUGE_SERVER=rust python -m psycopg_validation.runner`
+  on the Windows box and, if it is still truncated, read the pytest-timeout
+  stack dump at the end of its output -- it names the test that hung.
 - [x] **RESOLVED (2026-09-28): the Rust PG server slice tests pass on Windows
       -- 387 passed, 0 failed** (was 9 failing when they first RAN there on
       2026-09-20; `BINARY` lacked the `.exe` suffix, so all 1,194 had been
