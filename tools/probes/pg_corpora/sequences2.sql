@@ -58,6 +58,10 @@ SELECT id, big FROM srw1 ORDER BY id
 SELECT currval('srw1_id_seq'), currval('srw1_big_seq')
 SELECT pg_get_serial_sequence('srw1', 'id')
 SELECT pg_get_serial_sequence('srw1', 'n')
+# a relation or a column that is not there is an error, not NULL
+SELECT pg_get_serial_sequence('nosuch_srw', 'id')
+SELECT pg_get_serial_sequence('public.NoSuch_srw', 'id')
+SELECT pg_get_serial_sequence('srw1', 'nope')
 # --- identity: ALWAYS refuses a hand-written value, BY DEFAULT takes it
 CREATE TABLE idw1 (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int)
 INSERT INTO idw1 (v) VALUES (1), (2)
