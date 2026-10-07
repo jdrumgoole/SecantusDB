@@ -115,9 +115,9 @@ format are all WiredTiger's.
 
 The layers above storage — command dispatch, query planning, the
 operator engines — are where the servers differ. On a like-for-like
-benchmark the **Rust MongoDB server runs within 1.0×–3.5× of `mongod`**
+benchmark the **Rust MongoDB server runs within 1.0×–2.8× of `mongod`**
 per operation (reads at the low end, multi-stage aggregation at the
-high end); the Python server runs 2×–25×. See
+high end); the Python server runs 2×–27×. See
 [`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html) for
 the numbers and methodology. The right use is tests, dev, CI,
 containers, and single-node prototypes where conformance and
