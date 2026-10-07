@@ -2853,7 +2853,7 @@ These work end-to-end but cut corners.
       on tokio's blocking-pool mutex -- the `block_in_place` hand-off every
       statement paid. Fixed: a per-thread front for the table cache and for
       `committed_cached`, and one OS thread per connection with its own
-      single-threaded runtime (`server::accept_loop`), so a statement runs on
+      one-worker runtime (`server::accept_loop`), so a statement runs on
       the thread that owns its client with no hand-off. Inlining INSERT on
       the shared runtime was tried first and dropped: it gained at N=8 but
       cost 18% at N=2 (two connections stalled behind one worker).

@@ -430,14 +430,28 @@ async fn accept_loop(
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
                 let _guard = guard;
-                let runtime = match Builder::new_current_thread().enable_all().build() {
+                // A ONE-worker multi-thread runtime, not a current-thread one:
+                // a statement that sends a notice while it runs
+                // (`live_notices`) hands the worker to another thread with
+                // `block_in_place` so the socket's I/O keeps being driven. On
+                // a current-thread runtime nothing drove it, and the send
+                // waited forever (pgjdbc's
+                // `StatementTest.concurrentWarningReadAndClear`, batch 71).
+                let runtime = match Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("secantus-pg-conn-worker")
+                    .thread_stack_size(WORKER_STACK_BYTES)
+                    .on_thread_start(|| crate::mark_connection_thread(true))
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         eprintln!("secantusd-pg: could not start a connection's runtime: {e}");
                         return;
                     }
                 };
-                runtime.block_on(async move {
+                let conn = runtime.spawn(async move {
                     let sock = match tokio::net::TcpStream::from_std(std_sock) {
                         Ok(s) => s,
                         Err(e) => {
@@ -456,6 +470,7 @@ async fn accept_loop(
                         _ = conn_shutdown.changed() => {}
                     }
                 });
+                let _ = runtime.block_on(conn);
             });
         if let Err(e) = spawned {
             // The connection is dropped (its socket closes) and the client

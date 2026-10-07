@@ -378,14 +378,26 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Set on a connection's own runtime worker (`server::accept_loop`).
+    static CONNECTION_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn mark_connection_thread(on: bool) {
+    CONNECTION_THREAD.with(|c| c.set(on));
+}
+
 /// Run something that may block for a while (a statement, a lock wait, a
-/// sleep between polls). On a multi-thread runtime worker it goes through
-/// `block_in_place`, so the other tasks on that worker are not stalled
-/// behind it. Each connection now runs on a single-threaded runtime of its
-/// own thread (`server::bind`), where blocking holds up only that
+/// sleep between polls). Each connection runs on a one-worker runtime of its
+/// own (`server::accept_loop`), where blocking holds up only that
 /// connection -- as a PostgreSQL backend blocks only itself -- so there it
-/// simply runs, with no hand-off to pay.
+/// simply runs, with no hand-off to pay. On any other multi-thread runtime
+/// worker it goes through `block_in_place`, so the other tasks there are not
+/// stalled behind it.
 pub(crate) fn blocking_wait<R>(f: impl FnOnce() -> R) -> R {
+    if CONNECTION_THREAD.with(|c| c.get()) {
+        return f();
+    }
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)
