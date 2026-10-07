@@ -16148,6 +16148,16 @@ def test_binary_xid_and_snapshot_parameters_decode(home: Path) -> None:
         assert r.error_field(psycopg.pq.DiagnosticField.SQLSTATE) == b"22P03"
 
 
+def test_the_server_links_the_patched_wiredtiger() -> None:
+    """`cmake/patch_wt_dsync_group.py` changes how a `method=dsync` commit
+    reaches disk, and three separate builds apply it (the wheel's CMake, the
+    crate's bundled copy, `./inv rust-wt-build`). A server linked against a
+    WiredTiger built before the patch still passes every other test, so check
+    for the one string only the patched library carries. Failing here means the
+    WiredTiger build this binary linked is stale: rebuild it."""
+    assert b"log slot group close fatal error" in BINARY.read_bytes()
+
+
 @pytest.mark.skipif(_WINDOWS, reason="SIGKILL is a POSIX signal")
 def test_an_acknowledged_commit_survives_a_kill_in_durable_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -16179,7 +16189,12 @@ def test_concurrent_acknowledged_commits_survive_a_kill_in_durable_mode(
     restart. A ninth session READS while they write, and every row it saw
     must survive too: as in PostgreSQL, a commit becomes visible to other
     sessions only once it is durable (batch 70 measured a group-commit design
-    that broke this and dropped it)."""
+    that broke this and dropped it).
+
+    On macOS this is also the test of `cmake/patch_wt_dsync_group.py`, which
+    makes concurrent commits share one log write. A build of that patch altered
+    to acknowledge before the write lost rows here on 3 runs of 3
+    (2026-10-07), and in the single-client test above."""
     monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
     for round_ in range(2):
         home = tmp_path / f"gkill{round_}"

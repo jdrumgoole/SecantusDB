@@ -9,7 +9,9 @@ the two WiredTiger builds cannot drift apart by patching differently.
 Only the patches a Python-free static build needs are applied:
 
 - ``patch_wt_strict.py`` -- drop ``-Werror`` (newer compilers add warnings);
-- ``patch_wt_musl.py`` -- ``off64_t`` -> ``off_t`` for musl.
+- ``patch_wt_musl.py`` -- ``off64_t`` -> ``off_t`` for musl;
+- ``patch_wt_dsync_group.py`` -- group commit for ``method=dsync`` (the one
+  patch that changes behaviour rather than the build).
 
 The three Python-binding patches have nothing to act on: ``lang/`` is not
 copied. On top of those, the top-level ``CMakeLists.txt`` stops adding the
@@ -67,6 +69,8 @@ PYTHON_PROBE = "source_python3_package(python_libs python_version python_executa
 PATCHES = (
     ("patch_wt_strict.py", "cmake/strict/strict_flags_helpers.cmake"),
     ("patch_wt_musl.py", "src/os_posix/os_fs.c"),
+    ("patch_wt_dsync_group.py", "src/log/log.c"),
+    ("patch_wt_dsync_group.py", "src/log/log_slot.c"),
 )
 
 

@@ -60,6 +60,22 @@ if(WT_SRC_TOP_RC EQUAL 0)
     endif()
 endif()
 
+# The patch set, embedded in the download command the same way. The patch
+# command's own text never changes, so without this an existing build dir keeps
+# the WiredTiger it built before a patch script was added or edited: the stamp
+# says "patched" and nothing recompiles. Re-staging from the pristine source is
+# what makes an EDITED patch apply too, since each script skips a file that
+# already carries its marker.
+file(GLOB _wt_patch_files ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_wt_*.py)
+list(SORT _wt_patch_files)
+list(APPEND _wt_patch_files ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_wt_patches.cmake)
+set(_wt_patch_hashes "")
+foreach(_wt_patch_file IN LISTS _wt_patch_files)
+    file(SHA256 ${_wt_patch_file} _wt_patch_hash)
+    string(APPEND _wt_patch_hashes "${_wt_patch_hash}")
+endforeach()
+string(SHA256 WT_PATCH_SHA "${_wt_patch_hashes}")
+
 # mongodb-7.0.33's CMake adds -Werror at the WT-target level (cmake/strict/
 # strict_flags_helpers.cmake). Modern Clang (>= 21) added several warnings
 # that flip those targets red — -Wreserved-identifier on WT's __wt_* typedef
@@ -214,6 +230,7 @@ ExternalProject_Add(wiredtiger_ext
         -DSRC=${WT_SOURCE_DIR}
         -DDST=${WT_WORK_DIR}
         -DWT_SHA=${WT_SRC_SHA}
+        -DWT_PATCHES=${WT_PATCH_SHA}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_wt_source.cmake
     BINARY_DIR        ${WT_BINARY_DIR}
     INSTALL_DIR       ${WT_INSTALL_DIR}
