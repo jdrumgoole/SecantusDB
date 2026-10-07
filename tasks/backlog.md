@@ -2791,48 +2791,58 @@ These work end-to-end but cut corners.
       WiredTiger journal write, a storage-engine property, not a lock in
       this server. Measure it against the journal settings before touching it.
 
-      **Batch 70 (2026-10-07): the journal was serialised by US, twice --
-      fixed; what is left is not the journal.** Release build, PG 15.19 on
-      5415 alongside, `bench/pg_concurrency.py` 5s x3 medians, INSERT one
-      table per client, box load ~5-6 from parallel sessions:
+      **Batch 70 (2026-10-07): one journal hog fixed; group commit tried
+      and DROPPED (Joe: match PostgreSQL visibility).** Release build, PG
+      15.19 on 5415 alongside, `bench/pg_concurrency.py` 5s x3 medians,
+      INSERT one table per client, durable:
 
-      | N | PG 15 | before (durable) | after (durable) | fast mode before / after |
-      | --- | --- | --- | --- | --- |
-      | 1 | 10.4k | 11.5k | 11.3k | 16.8k / 16.3k |
-      | 2 | 20.1k | 17.8k (1.55x) | 22.5k (1.99x) | 32.8k / 32.7k |
-      | 4 | 31.1k | 20.6k (1.80x) | 26.6k (2.34x) | 37.0k / 36.8k |
-      | 8 | 41.6k (4.00x) | 24.4k (2.13x) | 33.2k (2.93x) | 45.4k / 45.6k |
+      | N | PG 15 | before | after (shipped) | group commit (dropped) | fast mode |
+      | --- | --- | --- | --- | --- | --- |
+      | 1 | 7.9-10.4k | 11.5k | 11.2k | 11.3k | 16.3k |
+      | 2 | 19.4-20.1k | 17.8k (1.55x) | 21.9k (1.95x) | 22.5k | 32.7k |
+      | 4 | 30.2-31.1k | 20.6k (1.80x) | 26.1k (2.32x) | 26.6k | 36.8k |
+      | 8 | 41.5k | 24.4k (2.13x) | 27.5k (2.45x) | 33.2k | 45.6k |
 
-      Cause 1: `sample` at N=4 put ~3,500 of 3,688 samples of the
-      `secantus-oplog-pruner` thread in `__wt_log_write` -> `pwrite`: the
-      prune sweep removed each doomed oplog row as its own autocommit, so a
-      writer at the 100k entry cap paid two synced journal writes per insert
-      and the pruner held the journal the whole time. Now 1,024 rows per
-      transaction. Cause 2: WiredTiger closes the log slot on every synced
-      commit (`__wt_log_write` forces `__wt_log_slot_switch` under
-      `WT_LOG_FLUSH`/`FSYNC`), so concurrent commits never share a write and
-      the LSN-ordered writes run one at a time. The PG server now commits
-      `sync=off` and waits on ONE in-flight `log_flush` (leader/follower,
-      `Storage::set_group_commit`); naive per-committer `log_flush` was
-      worse (WiredTiger's flush polls in 1 ms `__wt_sleep`). Durability:
-      an ack still follows a write through the `O_DSYNC` log (macOS) /
-      fdatasync (elsewhere); the kill test passes and a new 8-writer SIGKILL
-      test (`test_concurrent_acknowledged_commits_survive_a_kill_in_durable_mode`)
-      loses 148-480 acked rows with the wait removed and 0 with it.
-      **Disclosed difference:** a concurrent READER can see a group-committed
-      row during its flush, before it is durable (PostgreSQL flushes before
-      the commit is visible; mongod `j:true` behaves like us). A writer that
-      depends on it logs later, so its own ack covers it.
+      **Fixed:** `sample` at N=4 put ~3,500 of 3,688 samples of the
+      `secantus-oplog-pruner` thread in `__wt_log_write` -> `pwrite`. The
+      prune sweep removed each doomed oplog row as its own synced
+      autocommit, so a writer at the 100k entry cap paid two journal writes
+      per insert. It now deletes 1,024 rows per transaction.
 
-      **What remains open:** fast mode (no sync at all) caps at 2.8x too, so
-      the N=8 gap to PG (33.2k vs 41.6k) is no longer the journal -- profile
-      the fast-mode N=8 path next. Per-statement (`bench/pg_statement_cost.py
-      --iters 1200`, after): `select 1` 39.2us vs 27.1, row by PK 45.1 vs
-      28.6. A FROM-less literal SELECT now skips the `block_in_place`
-      hand-off (41.2 -> 39.2us). Profile of prepared `select 1` (release,
-      `sample`, ~12.6us server CPU a statement): send/recv syscalls ~4.5us,
-      `install_user_types` ~1.3us, the rest spread thin under
-      `on_execute`/`on_sync`; no other single lever above ~1us found.
+      **What remains is WiredTiger's, not a lock of ours.** The sample has
+      the commits running concurrently into `__wt_log_write`; nothing in this
+      server serialises them first. WiredTiger itself closes the log slot on
+      every synced commit (`force = LF_ISSET(WT_LOG_FLUSH | WT_LOG_FSYNC)`
+      -> `__wt_log_slot_switch` in `log.c`), so concurrent synced commits
+      never share a write, and the LSN-ordered writes run one at a time.
+      Two ways round it were measured or checked:
+      - **Group commit** (commit `sync=off`, then one leader `log_flush`
+        for everyone) reached 33.2k at N=8. It made a row VISIBLE to other
+        sessions before its flush, which PostgreSQL never does, so it was
+        dropped. Naive per-committer `log_flush` was worse, because
+        WiredTiger's flush polls in 1 ms `__wt_sleep`.
+      - **Prepared transactions** (prepare, flush, then commit) are refused
+        on logged tables (`txn.c`: "a prepared transaction cannot include a
+        logged table"), and every table here is logged.
+
+      What would close it: a WiredTiger change so a synced commit joins the
+      active slot and waits on `log_write_cond` instead of forcing a switch
+      (a `cmake/patch_wt_*.py` patch, which needs a MongoDB-side review
+      because the vendored WT is shared). Fast mode (no sync) also stops at
+      2.8x, so beyond the journal there is a CPU ceiling to profile at N=8.
+
+      `test_concurrent_acknowledged_commits_survive_a_kill_in_durable_mode`
+      SIGKILLs 8 writers + 1 reader. Every acknowledged row, and every row
+      the reader saw, must survive. With the group-commit ack wait removed it
+      lost 148-480 acked rows per run.
+
+      Per-statement (`bench/pg_statement_cost.py --iters 1200`): `select 1`
+      39.2us vs 27.1, row by PK 45.1 vs 28.6. A FROM-less literal SELECT now
+      skips the `block_in_place` hand-off (41.2 -> 39.2us). Profile of
+      prepared `select 1` (release, `sample`, ~12.6us server CPU a
+      statement): send/recv syscalls ~4.5us, `install_user_types` ~1.3us,
+      the rest spread thin under `on_execute`/`on_sync`. No other single
+      lever above ~1us found.
 
 - [x] **RESOLVED 2026-10-07 (batch 69): the read-path ceiling was two
       per-thread caches keyed by CONNECTION.** Re-measured before fixing:
