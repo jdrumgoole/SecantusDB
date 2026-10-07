@@ -103,19 +103,21 @@ class TestLocaleCollation:
 
 
 class TestKnownNonIcuLimits:
-    """The two corpora where the non-ICU key differs from PostgreSQL.
+    """The corpora where the non-ICU key differed from PostgreSQL; eszett now agrees.
 
     Pinned so the gap is visible and a future ICU-backed implementation has a
     target, rather than left to be rediscovered.
     """
 
-    def test_eszett_is_not_expanded_to_ss(self, db):
-        """PostgreSQL expands `ß` to `ss`, so `Straße` sorts AFTER `Strasse`."""
+    def test_eszett_is_expanded_to_ss(self, db):
+        """PostgreSQL expands `ß` to `ss`, so `Straße` sorts AFTER `Strasse`.
+        This was a known gap until the shared ordering key gave `ß` its `ss`
+        expansion plus a secondary weight (2026-10-07, for mongod); it now
+        matches PostgreSQL 14.13's ["Strase", "Strasse", "Straße"]."""
         db("DELETE FROM collt")
         for w in ["Straße", "Strasse", "Strase"]:
             db(f"INSERT INTO collt VALUES ({w!r})")
-        assert _order(db, ' COLLATE "en_US.UTF-8"') == ["Strase", "Straße", "Strasse"]
-        # PostgreSQL 14.13 answers ["Strase", "Strasse", "Straße"].
+        assert _order(db, ' COLLATE "en_US.UTF-8"') == ["Strase", "Strasse", "Straße"]
 
     def test_punctuation_weights_differ(self, db):
         """`-` versus `_` take different relative weights under CLDR."""

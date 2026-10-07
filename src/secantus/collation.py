@@ -184,6 +184,12 @@ def _mark_weight(codepoint: int) -> tuple[int, int]:
     return (rank, 0)
 
 
+_SHARP_S = frozenset({"\u00df", "\u1e9e"})
+# Any secondary weight puts `ß` after plain `ss`, which is what was measured.
+# Where it falls among `ss` forms carrying a real accent was NOT measured.
+_SHARP_S_SECONDARY = (0, 0xDF)
+
+
 @functools.lru_cache(maxsize=8192)
 def sort_levels(s: str, collation: Collation) -> bytes:
     """A multi-level ORDERING key for ``s``, in the shape ICU uses.
@@ -243,6 +249,17 @@ def sort_levels(s: str, collation: Collation) -> bytes:
         # primary and secondary levels, and differs only at the tertiary: ICU's
         # rule, and mongod's answer -- `fi` and `ﬁ` tie at strength 2 (input
         # order kept) and `fi < ﬁ` at strength 3 (measured 8.2.11, 2026-10-07).
+        if ch in _SHARP_S:
+            # `ß` is `ss` at the primary level and differs at the SECONDARY:
+            # mongod ties `Straße` / `Strasse` at strength 1 and puts
+            # `Strasse` first at 2 and 3 (measured 8.2.11, 2026-10-07).
+            for _ in range(2):
+                bases.append("s")
+                marks.append([])
+                cases.append(1 if ch.isupper() else 0)
+                compat.append(0)
+            marks[-1].append(_SHARP_S_SECONDARY)
+            continue
         expansion = unicodedata.normalize("NFKD", ch)
         is_compat = expansion != ch
         for part in expansion if is_compat else ch:

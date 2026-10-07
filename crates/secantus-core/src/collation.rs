@@ -221,6 +221,9 @@ fn mark_weight(cp: u32) -> (u32, u32) {
     }
 }
 
+/// The secondary weight `ß` carries over its `ss` expansion.
+const SHARP_S_SECONDARY: (u32, u32) = (0, 0xDF);
+
 /// A BYTE-COMPARABLE multi-level ordering key for `s`, in the shape ICU uses
 /// and `collation.py`'s `sort_levels` produces.
 ///
@@ -258,6 +261,23 @@ pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
         if is_ccc_mark(ch) {
             if let Some(last) = marks.last_mut() {
                 last.push(mark_weight(ch as u32));
+            }
+            continue;
+        }
+        // `ß` is `ss` at the primary level and differs at the SECONDARY:
+        // mongod ties `Straße` / `Strasse` at strength 1 and puts `Strasse`
+        // first at 2 and 3 (measured 8.2.11, 2026-10-07). Any secondary weight
+        // puts it after plain `ss`; where it falls among accented `ss` forms
+        // was not measured.
+        if ch == '\u{df}' || ch == '\u{1e9e}' {
+            for _ in 0..2 {
+                bases.push('s');
+                marks.push(Vec::new());
+                cases.push(u8::from(ch.is_uppercase()));
+                compat.push(0);
+            }
+            if let Some(last) = marks.last_mut() {
+                last.push(SHARP_S_SECONDARY);
             }
             continue;
         }
@@ -421,5 +441,20 @@ mod tests {
         // strength 1 + caseLevel: accent-insensitive but case-sensitive.
         let c = coll(1, true);
         assert_eq!(equal("PING", "ping", &c), Some(false));
+    }
+
+    #[test]
+    fn sharp_s_is_ss_with_a_secondary_difference() {
+        // mongod 8.2.11 (2026-10-07): ties at strength 1, after `ss` at 2 / 3.
+        for (strength, want) in [
+            (1, ["Strase", "Straße", "Strasse"]),
+            (2, ["Strase", "Strasse", "Straße"]),
+            (3, ["Strase", "Strasse", "Straße"]),
+        ] {
+            let c = coll(strength, false);
+            let mut words = ["Straße", "Strasse", "Strase"];
+            words.sort_by_key(|w| sort_level_bytes(w, &c));
+            assert_eq!(words, want, "strength {strength}");
+        }
     }
 }

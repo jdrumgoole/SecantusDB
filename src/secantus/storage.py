@@ -7407,7 +7407,19 @@ class Storage:
                     ):
                         if seen is not None:
                             if kb in seen:
-                                raise IndexConflict(name, d.get("_id"), namespace=f"{db}.{coll}")
+                                # The key that collided, not the doc's ``_id``
+                                # -- this said ``dup key: { _id: 2 }`` over a
+                                # unique ``{a: 1}`` (measured 8.2.11,
+                                # 2026-10-07), and carried no keyPattern.
+                                raise IndexConflict(
+                                    name,
+                                    d.get("_id"),
+                                    key_pattern=key_spec_dict,
+                                    key_value=_conflict_key_value(
+                                        d, key_spec_dict, kb, collation=coll_opt
+                                    ),
+                                    namespace=f"{db}.{coll}",
+                                )
                             seen[kb] = d.get("_id")
                         entries.append((kb, recordid))
                 if multikey:

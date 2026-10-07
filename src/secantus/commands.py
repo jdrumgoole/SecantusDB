@@ -370,6 +370,61 @@ def _wants_journal(doc: Mapping[str, Any]) -> bool:
     return bool(wc.get("j"))
 
 
+def _ns_error(msg: str) -> dict[str, Any]:
+    return {"ok": 0.0, "errmsg": msg, "code": 73, "codeName": "InvalidNamespace"}
+
+
+def _invalid_collection_name(db: str, coll: str) -> dict[str, Any] | None:
+    """mongod's refusal of a collection name it will not create (measured
+    8.2.11, 2026-10-07; the Rust server's rule). These used to be created."""
+    if coll == "":
+        return _ns_error(f"Invalid namespace specified: {db}")
+    if "\0" in coll:
+        return _ns_error("namespaces cannot have embedded null characters")
+    if coll.startswith("."):
+        return _ns_error(f"Collection names cannot start with '.': {coll}")
+    if "$" in coll:
+        return _ns_error(f"Invalid collection name: {coll}")
+    if coll.startswith("system."):
+        rest = coll[len("system.") :]
+        if rest not in ("views", "profile", "js", "users", "roles", "version") and not (
+            rest.startswith("buckets.")
+        ):
+            return _ns_error(f"Invalid system namespace: {db}.{coll}")
+    return None
+
+
+def _invalid_write_namespace(db: str, coll: str) -> dict[str, Any] | None:
+    """mongod's refusal of a namespace a WRITE command may not touch (measured
+    8.2.11; the Rust server's rule). Stricter than ``create``: the 255-character
+    namespace limit, and the system collections a client may not write."""
+    if not coll.startswith("system."):
+        err = _invalid_collection_name(db, coll)
+        if err is not None:
+            return err
+    else:
+        rest = coll[len("system.") :]
+        if (
+            rest in ("js", "users")
+            or rest.startswith("buckets.")
+            or (rest in ("roles", "version") and db == "admin")
+        ):
+            pass
+        elif rest in ("views", "profile"):
+            return _ns_error(f"cannot write to {db}.{coll}")
+        else:
+            return _ns_error(f"Invalid system namespace: {db}.{coll}")
+    ns = f"{db}.{coll}"
+    if len(ns) > 255:
+        return _ns_error(f"Fully qualified namespace is too long. Namespace: {ns} Max: 255")
+    return None
+
+
+_NAMESPACE_CHECKED_WRITES = frozenset(
+    {"insert", "update", "delete", "findAndModify", "createIndexes"}
+)
+
+
 def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict[str, Any] | None:
     """Refuse any write to a synthetic read-only view.
 
@@ -392,6 +447,14 @@ def _reject_oplog_rs_write(ctx: CommandContext, coll: str, op_name: str) -> dict
             "code": 13,
             "codeName": "Unauthorized",
         }
+    if (
+        op_name in _NAMESPACE_CHECKED_WRITES
+        and isinstance(coll, str)
+        and not (ctx.db_name == "admin" and coll == "system.users")
+    ):
+        ns_err = _invalid_write_namespace(ctx.db_name, coll)
+        if ns_err is not None:
+            return ns_err
     if ctx.db_name == "admin" and coll == "system.users":
         return {
             "ok": 0.0,
@@ -2765,6 +2828,21 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     skip = int(doc.get("skip", 0) or 0)
     limit = int(doc.get("limit", 0) or 0)
     sort = doc.get("sort") or None
+    if isinstance(sort, Mapping):
+        # Every sort key and value is checked by the `$sort` stage's rule, and
+        # reaches storage as 1 / -1: `{a: 2}` was ACCEPTED, and `{a: 1.9}` is
+        # ascending on mongod (measured 8.2.11, 2026-10-07).
+        from secantus.aggregate import normalise_sort, sort_spec_problem
+
+        _problem = sort_spec_problem(sort)
+        if _problem is not None:
+            return {
+                "ok": 0.0,
+                "errmsg": _problem[1],
+                "code": _problem[0],
+                "codeName": _code_name_for(_problem[0]),
+            }
+        sort = normalise_sort(sort)
     projection = doc.get("projection") or None
     hint = doc.get("hint")
     # Cursor ``min`` / ``max`` index bounds (the find command fields, not
@@ -3335,6 +3413,23 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                         "code": 168,
                         "codeName": "InvalidPipelineOperator",
                     }
+        if (
+            bool(spec.get("multi", False))
+            and isinstance(u, Mapping)
+            and not any(isinstance(k, str) and k.startswith("$") for k in u)
+        ):
+            # A replacement cannot apply to many documents: mongod refuses the
+            # statement (measured 8.2.11, 2026-10-07). This APPLIED it.
+            write_errors.append(
+                {
+                    "index": index,
+                    "code": 9,
+                    "errmsg": "multi update is not supported for replacement-style update",
+                }
+            )
+            if ordered:
+                break
+            continue
         try:
             # Parse-time validation: mongod rejects an unknown update
             # modifier before matching any document, so an invalid update
@@ -3387,7 +3482,13 @@ def _update(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 break
             continue
         except IndexConflict as exc:
-            err: dict[str, Any] = {"index": index, "code": 11000, "errmsg": str(exc)}
+            # Under the executor wrapper on update and upsert alike (measured
+            # 8.2.11, 2026-10-07); an insert's duplicate stays bare.
+            err: dict[str, Any] = {
+                "index": index,
+                "code": 11000,
+                "errmsg": f"Plan executor error during update :: caused by :: {exc}",
+            }
             if exc.key_pattern is not None:
                 err["keyPattern"] = exc.key_pattern
             if exc.key_value is not None:
@@ -3910,6 +4011,19 @@ def _delete(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         _err = _require_object_bson_field(_stmt.get("collation"), "delete.deletes.collation")
         if _err is not None:
             return _err
+        _lim = _delete_limit_number(_stmt.get("limit"))
+        if _lim is not None and _lim not in (0, 1):
+            # A NUMERIC limit other than 0 / 1 refuses the whole command;
+            # `limit: 5` used to delete up to everything. Measured 8.2.11,
+            # 2026-10-07: 5 / 1.5 / 0.5 / 2.0 / -1 / Int64 / Decimal128("2") all
+            # 9, rendered "Got 2" for 2.0; a non-number still deletes every match.
+            _shown = int(_lim) if _lim.is_integer() else _lim
+            return {
+                "ok": 0.0,
+                "errmsg": f"The limit field in delete objects must be 0 or 1. Got {_shown}",
+                "code": 9,
+                "codeName": "FailedToParse",
+            }
     coll = doc["delete"]
     oplog_err = _reject_oplog_rs_write(ctx, coll, "delete")
     if oplog_err is not None:
@@ -4213,11 +4327,22 @@ def _delete_stmt_limit(value: Any) -> int:
     "validate every numeric argument" rule would break this one. We used to call
     ``int()`` on it and crash with "internal server error".
     """
+    return 1 if _delete_limit_number(value) == 1 else 0
+
+
+def _delete_limit_number(value: Any) -> float | None:
+    """A delete statement's ``limit`` as a number, or None when it is not one
+    (a bool is not a number here, matching mongod)."""
     if isinstance(value, bool):
-        return 0
-    if isinstance(value, (int, float)) and value == 1:
-        return 1
-    return 0
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, Decimal128):
+        try:
+            return float(value.to_decimal())
+        except (ValueError, ArithmeticError):
+            return None
+    return None
 
 
 def _require_number_bson_field(value: Any, field_path: str) -> dict[str, Any] | None:
@@ -5495,7 +5620,7 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
                 except IndexConflict as exc:
                     reply: dict[str, Any] = {
                         "ok": 0.0,
-                        "errmsg": str(exc),
+                        "errmsg": f"Plan executor error during findAndModify :: caused by :: {exc}",
                         "code": 11000,
                         "codeName": "DuplicateKey",
                     }
@@ -5633,7 +5758,7 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
         except IndexConflict as exc:
             reply2: dict[str, Any] = {
                 "ok": 0.0,
-                "errmsg": str(exc),
+                "errmsg": f"Plan executor error during findAndModify :: caused by :: {exc}",
                 "code": 11000,
                 "codeName": "DuplicateKey",
             }
@@ -5743,6 +5868,16 @@ def _rename_collection(doc: dict[str, Any], ctx: CommandContext) -> dict[str, An
     )
     if _err is not None:
         return _err
+    # The fields are parsed first, then a non-`admin` database is refused
+    # (measured 8.2.11, 2026-10-07; the Rust server's order). This renamed
+    # from any database.
+    if ctx.db_name != "admin":
+        return {
+            "ok": 0.0,
+            "errmsg": "renameCollection may only be run against the admin database.",
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
     if not isinstance(src_ns, str) or not isinstance(dst_ns, str):
         return {
             "ok": 0.0,
@@ -5808,6 +5943,10 @@ def _create(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     oplog_err = _reject_oplog_rs_write(ctx, coll, "create")
     if oplog_err is not None:
         return oplog_err
+    if isinstance(coll, str):
+        ns_err = _invalid_collection_name(ctx.db_name, coll)
+        if ns_err is not None:
+            return ns_err
     # Types before semantics: mongod parses the command, THEN validates the
     # capped-collection rules, so a `size: "x"` is a TypeMismatch and never
     # reaches the "required when capped is true" arm. All four rules below were
@@ -5992,6 +6131,26 @@ def _validator_problem(validator: Any, prefix: str = "") -> dict[str, Any] | Non
     return None
 
 
+_COLLMOD_FIELDS = frozenset(
+    {
+        "validator",
+        "validationLevel",
+        "validationAction",
+        "index",
+        "viewOn",
+        "pipeline",
+        "expireAfterSeconds",
+        "changeStreamPreAndPostImages",
+        "timeseries",
+        "cappedSize",
+        "cappedMax",
+        "dryRun",
+        "recordIdsReplicated",
+        "timeseriesBucketsMayHaveMixedSchemaData",
+    }
+)
+
+
 def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     wc_err = _validate_write_concern(doc)
     if wc_err is not None:
@@ -6014,6 +6173,21 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     )
     if _err is not None:
         return _err
+    # An unknown field is refused before the namespace is looked up (measured
+    # 8.2.11, 2026-10-07; the Rust server's list). It used to be ignored.
+    from secantus.serverparams import is_generic_arg as _is_generic_arg
+
+    _unknown = next(
+        (k for k in list(doc)[1:] if k not in _COLLMOD_FIELDS and not _is_generic_arg(k)),
+        None,
+    )
+    if _unknown is not None:
+        return {
+            "ok": 0.0,
+            "errmsg": f"BSON field 'collMod.{_unknown}' is an unknown field.",
+            "code": 40415,
+            "codeName": "IDLUnknownField",
+        }
     coll = doc["collMod"]
     if not ctx.storage.collection_exists(ctx.db_name, coll):
         return {
@@ -6377,6 +6551,82 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     }
 
 
+_KNOWN_INDEX_PLUGINS = frozenset({"2d", "2dsphere", "text", "hashed", "2dsphere_bucket"})
+
+# Catalog bookkeeping that is not part of an index's options.
+_INDEX_NOT_OPTIONS = frozenset({"v", "key", "name", "ns", "entryFormat", "multikey"})
+
+
+def _index_options_of(spec: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    return [(k, v) for k, v in spec.items() if k not in _INDEX_NOT_OPTIONS]
+
+
+def _same_by_value(a: Any, b: Any) -> bool:
+    """mongod's comparison of two index specs: field ORDER matters, numbers
+    are equal by value (a ``{filename: 1.0}`` index is ``{filename: 1}``)."""
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        return len(a) == len(b) and all(
+            ka == kb and _same_by_value(va, vb)
+            for (ka, va), (kb, vb) in zip(a.items(), b.items(), strict=True)
+        )
+    return bool(a == b)
+
+
+def _conflict_spec_text(spec: Mapping[str, Any]) -> str:
+    from secantus.bsontypes import render_bson
+
+    out: dict[str, Any] = {"v": 2}
+    out.update(_index_options_of(spec))
+    if "key" in spec:
+        out["key"] = spec["key"]
+    if "name" in spec:
+        out["name"] = spec["name"]
+    return render_bson(out)
+
+
+def _index_conflict(
+    existing: list[Mapping[str, Any]],
+    idx_spec: Mapping[str, Any],
+    name: str,
+    key_spec: Mapping[str, Any],
+    options: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """mongod's answer when a requested index collides with an existing one
+    (measured 8.2.11, 2026-10-07; ported from the Rust server):
+
+    * same NAME, different key or options -> 86, quoting both specs;
+    * same KEY and options under another name -> 85. This one used to BUILD a
+      second, duplicate index.
+    """
+    wanted = dict(_index_options_of(options))
+    requested = {k: v for k, v in idx_spec.items() if k in ("key", "name") or k in wanted}
+    for idx in existing:
+        same_name = idx.get("name") == name
+        same_key = isinstance(idx.get("key"), Mapping) and _same_by_value(idx["key"], key_spec)
+        same_opts = _same_by_value(dict(_index_options_of(idx)), wanted)
+        if same_name and not (same_key and same_opts):
+            return {
+                "ok": 0.0,
+                "errmsg": (
+                    "An existing index has the same name as the requested index. When index "
+                    "names are not specified, they are auto generated and can cause conflicts. "
+                    "Please refer to our documentation. Requested index: "
+                    f"{_conflict_spec_text(requested)}, existing index: "
+                    f"{_conflict_spec_text(idx)}"
+                ),
+                "code": 86,
+                "codeName": "IndexKeySpecsConflict",
+            }
+        if not same_name and same_key and same_opts:
+            return {
+                "ok": 0.0,
+                "errmsg": f"Index already exists with a different name: {idx.get('name')}",
+                "code": 85,
+                "codeName": "IndexOptionsConflict",
+            }
+    return None
+
+
 def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     _err = _require_typed_bson_field(
         doc.get("indexes"),
@@ -6454,6 +6704,52 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         key_spec = idx_spec.get("key")
         name = idx_spec.get("name")
+        # mongod refuses these before anything else about the spec, quoting
+        # the spec as given (measured 8.2.11, 2026-10-07; the Rust server's
+        # order). An empty key used to BUILD an index over nothing, and a
+        # missing name answered a 14 of our own wording.
+        if isinstance(key_spec, Mapping):
+            from secantus.bsontypes import render_bson as _render_spec
+
+            _spec_text = _render_spec(idx_spec)
+            if not key_spec:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Error in specification {_spec_text} :: caused by :: "
+                        "Index keys cannot be empty."
+                    ),
+                    "code": 67,
+                    "codeName": "CannotCreateIndex",
+                }
+            _plugin = next(
+                (
+                    v
+                    for v in key_spec.values()
+                    if isinstance(v, str) and v not in _KNOWN_INDEX_PLUGINS
+                ),
+                None,
+            )
+            if _plugin is not None:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Error in specification {_spec_text} :: caused by :: "
+                        f"Unknown index plugin '{_plugin}'"
+                    ),
+                    "code": 67,
+                    "codeName": "CannotCreateIndex",
+                }
+            if "name" not in idx_spec:
+                return {
+                    "ok": 0.0,
+                    "errmsg": (
+                        f"Error in specification {_spec_text} :: caused by :: "
+                        "The 'name' field is a required property of an index specification"
+                    ),
+                    "code": 9,
+                    "codeName": "FailedToParse",
+                }
         if not isinstance(key_spec, dict) or not isinstance(name, str):
             return {
                 "ok": 0.0,
@@ -6574,6 +6870,11 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     "code": 2,
                     "codeName": "BadValue",
                 }
+        _conflict = _index_conflict(
+            ctx.storage.list_indexes(ctx.db_name, coll), idx_spec, name, key_spec, options
+        )
+        if _conflict is not None:
+            return _conflict
         try:
             new = ctx.storage.create_index(ctx.db_name, coll, name, key_spec, options)
         except CreateIndexUnsupported as exc:
@@ -6598,12 +6899,26 @@ def _create_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "codeName": "IndexKeySpecsConflict",
             }
         except IndexConflict as exc:
-            return {
+            # A unique index over data that already holds duplicates: mongod
+            # fails the BUILD under its own wrapper and still carries
+            # keyPattern / keyValue (measured 8.2.11, 2026-10-07).
+            import uuid as _uuid
+
+            _coll_uuid = ctx.storage.collection_uuid(ctx.db_name, coll)
+            _reply: dict[str, Any] = {
                 "ok": 0.0,
-                "errmsg": str(exc),
+                "errmsg": (
+                    f"Index build failed: {_uuid.uuid4()}: Collection "
+                    f"{ctx.db_name}.{coll} ( {_coll_uuid} ) :: caused by :: {exc}"
+                ),
                 "code": 11000,
                 "codeName": "DuplicateKey",
             }
+            if exc.key_pattern is not None:
+                _reply["keyPattern"] = exc.key_pattern
+            if exc.key_value is not None:
+                _reply["keyValue"] = exc.key_value
+            return _reply
         except GeoExtractError as exc:
             # `createIndex` on existing docs hit a doc the geo extractor
             # can't make sense of — fail the whole index creation, like

@@ -1528,6 +1528,151 @@ def _validate_regex_pattern(pattern: Any) -> None:
         raise QueryError("$regex has to be a string")
 
 
+def pcre_compile_error(pat: str) -> str | None:
+    """PCRE2's message for a pattern it would refuse, for the malformations
+    measured against mongod 8.2.11 (2026-10-01), which reports them as
+    ``51091 Regular expression is invalid: <message>``. Scans left to right as
+    PCRE does, so the first fault wins; ``None`` when none applies. A port of
+    the Rust server's ``regexutil::pcre_compile_error``."""
+    chars = pat
+    n = len(chars)
+    depth = 0
+    names: list[str] = []
+    repeatable = False  # whether the previous token can take a quantifier
+    quantifier = "quantifier does not follow a repeatable item"
+    i = 0
+    while i < n:
+        c = chars[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return "\\ at end of pattern"
+            if chars[i + 1] == "k" and i + 2 < n and chars[i + 2] == "<":
+                end = chars.find(">", i + 3)
+                if end < 0:
+                    return None
+                if chars[i + 3 : end] not in names:
+                    return "reference to non-existent subpattern"
+                i = end + 1
+            else:
+                i += 2
+            repeatable = True
+            continue
+        if c == "[":
+            j = i + 1
+            if j < n and chars[j] == "^":
+                j += 1
+            if j < n and chars[j] == "]":
+                j += 1
+            prev: str | None = None
+            while True:
+                if j >= n:
+                    return "missing terminating ] for character class"
+                ch = chars[j]
+                if ch == "]":
+                    break
+                if ch == "\\":
+                    prev = chars[j + 1] if j + 1 < n else None
+                    j += 2
+                    continue
+                if ch == "-" and prev is not None and j + 1 < n:
+                    hi = chars[j + 1]
+                    if hi not in ("]", "\\") and hi < prev:
+                        return "range out of order in character class"
+                prev = ch
+                j += 1
+            i = j + 1
+            repeatable = True
+            continue
+        if c == "(":
+            depth += 1
+            if i + 1 < n and chars[i + 1] == "?":
+                rest = chars[i + 2 :]
+                named: str | None = None
+                if rest.startswith("P<"):
+                    named = rest[2:]
+                elif rest.startswith("<") and not rest.startswith(("<=", "<!")):
+                    named = rest[1:]
+                if named is not None:
+                    name = ""
+                    for ch in named:
+                        if not (ch.isalnum() or ch == "_"):
+                            break
+                        name += ch
+                    if not name:
+                        return "subpattern name expected"
+                    if name in names:
+                        return "two named subpatterns have the same name (PCRE2_DUPNAMES not set)"
+                    names.append(name)
+                # Skip the group header so its `?` is not read as a quantifier.
+                j = i + 2
+                if named is not None:
+                    consumed = len(rest) - len(named)
+                    name_len = len(named.split(">", 1)[0])
+                    j += consumed + name_len + 1
+                else:
+                    while j < n:
+                        ch = chars[j]
+                        j += 1
+                        if ch in ":=!)":
+                            if ch == ")":
+                                j -= 1
+                            break
+                i = j
+                repeatable = False
+                continue
+            repeatable = False
+        elif c == ")":
+            if depth == 0:
+                return "unmatched closing parenthesis"
+            depth -= 1
+            repeatable = True
+        elif c == "|":
+            repeatable = False
+        elif c in "*+?":
+            if not repeatable:
+                return quantifier
+            # A lazy `?` or possessive `+` straight after a quantifier is part
+            # of it, not a second quantifier.
+            if i + 1 < n and chars[i + 1] in "?+":
+                i += 1
+            repeatable = False
+        elif c == "{":
+            close = chars.find("}", i)
+            bounds = None
+            if close >= 0:
+                body = chars[i + 1 : close]
+                lo, _, hi = body.partition(",") if "," in body else (body, "", body)
+                if lo.isascii() and lo.isdigit():
+                    bounds = (int(lo), hi)
+            if bounds is not None:
+                if not repeatable:
+                    return quantifier
+                lo_n, hi_s = bounds
+                if hi_s.isascii() and hi_s.isdigit() and int(hi_s) < lo_n:
+                    return "numbers out of order in {} quantifier"
+                i = close + 1
+                repeatable = False
+                continue
+            repeatable = True
+        else:
+            repeatable = True
+        i += 1
+    return "missing closing parenthesis" if depth > 0 else None
+
+
+def _invalid_regex(pattern: str, exc: Exception) -> QueryError:
+    """mongod's 51091 for a pattern PCRE refuses, in PCRE2's words when the
+    checker recognises the fault (measured 8.2.11)."""
+    msg = pcre_compile_error(pattern) if isinstance(pattern, str) else None
+    if msg is not None:
+        return QueryError(
+            f"Regular expression is invalid: {msg}", code=51091, code_name="Location51091"
+        )
+    return QueryError(
+        f"Regular expression is invalid: {exc}", code=51091, code_name="Location51091"
+    )
+
+
 def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = True) -> bool:
     flags = _re_flags(options)
     if isinstance(pattern, Regex):
@@ -1545,7 +1690,7 @@ def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = 
     try:
         compiled = _compile_regex(regex_pattern, flags)
     except re.error as exc:
-        raise QueryError(f"invalid regex: {exc}") from exc
+        raise _invalid_regex(regex_pattern, exc) from exc
     except TypeError as exc:
         # Unhashable pattern (e.g. a non-str/bytes input) — fall back to
         # an uncached compile so the caller still gets a real re.error.

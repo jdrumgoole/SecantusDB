@@ -744,8 +744,14 @@ def apply_update(
     new = copy.deepcopy(dict(update))
     if "_id" in doc:
         if "_id" in new and new["_id"] != doc["_id"]:
+            # A REPLACEMENT is checked after it is applied, and mongod says so,
+            # naming the new value (measured 8.2.11, 2026-10-07); an operator
+            # update keeps the path wording.
+            from secantus.bsontypes import render_bson
+
             raise _exec_error(
-                "Performing an update on the path '_id' would modify the immutable field '_id'",
+                "After applying the update, the (immutable) field '_id' was found to "
+                f"have been altered to _id: {render_bson(new['_id'])}",
                 code=66,
             )
         # ``_id`` leads the stored document, as it does in mongod. Assigning
@@ -987,8 +993,9 @@ def _walk_positional(
         path_so_far = ".".join(prefix)
         idx = positional_matches.get(path_so_far)
         if idx is None or not (0 <= idx < len(cur)):
-            raise UpdateError(
-                f"$ positional update for {path_so_far!r} could not resolve a matched index"
+            raise _exec_error(
+                "The positional operator did not find the match needed from the query.",
+                code=2,
             )
         _walk_positional(
             cur[idx], rest, prefix + [str(idx)], out, array_filters, positional_matches
@@ -1489,9 +1496,10 @@ def _apply_op(
                 # ImmutableField). $rename targeting (or sourcing from)
                 # _id would silently overwrite it without this guard.
                 if np_path == "_id" or op_path == "_id":
-                    raise UpdateError(
+                    raise _exec_error(
                         "Performing an update on the path '_id' would modify "
-                        "the immutable field '_id' (mongod code 66 ImmutableField)"
+                        "the immutable field '_id'",
+                        code=66,
                     )
                 if has_path(doc, op_path):
                     value = get_path(doc, op_path)

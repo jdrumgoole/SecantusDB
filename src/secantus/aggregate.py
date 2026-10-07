@@ -1503,10 +1503,79 @@ def _sort_val_repr(v: Any) -> str:
     return bson_value_repr(v)
 
 
+_SORT_DOLLAR = (
+    "Consider using $getField or $setField for a field path with '.' or '$'. :: caused by :: "
+)
+
+
+def sort_direction(v: Any) -> int | None:
+    """The direction a numeric sort value means, by mongod's rule: a double is
+    TRUNCATED (``1.9`` ascending, ``0.5`` refused) and a decimal rounded half
+    to even (``0.9`` ascending, ``1.5`` refused) -- measured 8.2.11 and ported
+    from the Rust server. ``1`` / ``-1``, or None when it is neither."""
+    import math
+
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        n = float(v)
+    elif isinstance(v, float):
+        if not math.isfinite(v):
+            return None
+        n = float(math.trunc(v))
+    elif isinstance(v, Decimal128):
+        try:
+            d = v.to_decimal()
+        except (ValueError, ArithmeticError):
+            return None
+        if not d.is_finite():
+            return None
+        n = float(d.to_integral_value(rounding=_decimal.ROUND_HALF_EVEN))
+    else:
+        return None
+    return int(n) if n in (1.0, -1.0) else None
+
+
+def sort_spec_problem(spec: Mapping[str, Any]) -> tuple[int, str] | None:
+    """mongod's verdict on each key and value of a sort spec, shared by
+    ``find`` and the ``$sort`` stage (the Rust server's ``sort_spec_problem``)."""
+    for field, v in spec.items():
+        if field == "":
+            return 40352, "FieldPath cannot be constructed with empty string"
+        if field.endswith("."):
+            return 40353, "FieldPath must not end with a '.'."
+        for part in field.split("."):
+            if part == "":
+                return 15998, f"{_SORT_DOLLAR}FieldPath field names may not be empty strings."
+            if part.startswith("$"):
+                return (
+                    16410,
+                    f"{_SORT_DOLLAR}FieldPath field names may not start with '$', given '{part}'.",
+                )
+        if isinstance(v, (int, float, Decimal128)) and not isinstance(v, bool):
+            if sort_direction(v) is None:
+                return 15975, "$sort key ordering must be 1 (for ascending) or -1 (for descending)"
+        elif isinstance(v, Mapping):
+            if "$meta" not in v:
+                return 17312, "$meta is the only expression supported by $sort right now"
+            if len(v) > 1:
+                return 9, "Cannot have additional keys in a $meta sort specification"
+            meta = v["$meta"]
+            if not (isinstance(meta, str) and meta in ("textScore", "randVal", "searchScore")):
+                return 31138, f"Illegal $meta sort: $meta: {_sort_val_repr(meta)}"
+        else:
+            return 15974, f"Illegal key in $sort specification: {field}: {_sort_val_repr(v)}"
+    return None
+
+
+def normalise_sort(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """A validated sort spec with every numeric direction as ``1`` / ``-1``."""
+    return {k: (sort_direction(v) if not isinstance(v, Mapping) else v) for k, v in spec.items()}
+
+
 def _validate_sort_spec(spec: Any) -> None:
-    """mongod's `$sort` stage validation: at least one key (15976); each direction
-    is 1 / -1 as an int or whole double, else a non-numeric value is "Illegal key"
-    (15974) and a numeric non-±1 is "must be 1 … or -1" (15975)."""
+    """mongod's `$sort` stage validation: an object (15973) with at least one
+    key (15976), then ``sort_spec_problem``."""
     if not isinstance(spec, Mapping):
         # A wrong-TYPED spec and an EMPTY one are different errors on mongod
         # (15973 vs 15976); we answered 15976 for both.
@@ -1521,24 +1590,14 @@ def _validate_sort_spec(spec: Any) -> None:
             code=15976,
             code_name="Location15976",
         )
-    for key, direction in spec.items():
-        if isinstance(direction, Mapping):
-            continue  # {$meta: …} — text-score / indexKey sort, out of scope here
-        if isinstance(direction, bool) or not isinstance(direction, (int, float)):
-            raise AggregateError(
-                f"Illegal key in $sort specification: {key}: {_sort_val_repr(direction)}",
-                code=15974,
-                code_name="Location15974",
-            )
-        if (isinstance(direction, float) and not direction.is_integer()) or int(direction) not in (
-            1,
-            -1,
-        ):
-            raise AggregateError(
-                "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
-                code=15975,
-                code_name="Location15975",
-            )
+    problem = sort_spec_problem(spec)
+    if problem is not None:
+        code, msg = problem
+        raise AggregateError(msg, code=code, code_name=_code_name_for_sort(code))
+
+
+def _code_name_for_sort(code: int) -> str:
+    return "BadValue" if code == 2 else ("FailedToParse" if code == 9 else f"Location{code}")
 
 
 def _stage_sort(
@@ -1551,7 +1610,7 @@ def _stage_sort(
     # The context's collation reaches string ORDERING here, not just the
     # bucket-key equality ``$group`` uses. Without it a collated aggregation
     # sorted by codepoint while the same collated ``find().sort()`` did not.
-    return sort_docs(list(docs), spec, collation=_parse_collation(_ctx.collation))
+    return sort_docs(list(docs), normalise_sort(spec), collation=_parse_collation(_ctx.collation))
 
 
 def _stage_project(
