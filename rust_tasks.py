@@ -18,6 +18,8 @@ tasks below. Plan / status: tasks/rust-server-plan.md, tasks/rust-rewrite-plan.m
 from __future__ import annotations
 
 import glob
+import hashlib
+import importlib.util
 import os
 import pathlib
 import re
@@ -323,6 +325,20 @@ def _storage_engine_build_env() -> dict[str, str]:
     return env
 
 
+def _wt_source_patches() -> list[tuple[str, str]]:
+    """The ``cmake/patch_wt_*.py`` source patches a Python-free WiredTiger build
+    needs, as ``(script, file relative to the WiredTiger root)``. The SAME list
+    ``scripts/wt_sys_refresh.py`` applies to the crate's bundled copy, read from
+    there so the two cannot drift apart."""
+    spec = importlib.util.spec_from_file_location(
+        "wt_sys_refresh", _REPO / "scripts" / "wt_sys_refresh.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return list(module.PATCHES)
+
+
 def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     """Build the vendored WiredTiger static lib the Rust crates link (cross-platform).
 
@@ -338,17 +354,36 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     Prompt or admin is required beyond having the C++ tools + Windows SDK.
     """
     build_dir = _RUST_WT_BUILD_DIR
-    src = _REPO / "vendor" / "wiredtiger"
+    vendor = _REPO / "vendor" / "wiredtiger"
     static_lib = build_dir / ("wiredtiger.lib" if os.name == "nt" else "libwiredtiger.a")
     header = build_dir / "include" / "wiredtiger.h"
-    if static_lib.exists() and header.exists() and not force:
+    # The source patches this build applies, and a stamp of them beside the
+    # library: a library built before a patch was added or edited is rebuilt
+    # rather than reused, so this build cannot drift from the wheel's.
+    patches = _wt_source_patches()
+    patch_digest = hashlib.sha256(
+        b"".join((_REPO / "cmake" / script).read_bytes() for script, _ in patches)
+    ).hexdigest()
+    stamp = build_dir / "secantus-wt-patches.sha256"
+    stamped = stamp.read_text().strip() if stamp.exists() else ""
+    if static_lib.exists() and header.exists() and stamped == patch_digest and not force:
         print(f"WiredTiger already built: {static_lib}")
         return build_dir
 
-    if not (src / "CMakeLists.txt").exists():
+    if not (vendor / "CMakeLists.txt").exists():
         raise SystemExit(
             "vendor/wiredtiger is not checked out. Run:\n"
             "  git submodule update --init --depth 1 vendor/wiredtiger"
+        )
+    # Patch a COPY: the scripts rewrite files in place, and the submodule must
+    # stay clean. Re-staged from pristine each time so an edited patch applies.
+    src = build_dir.parent / "wt-src"
+    if src.exists():
+        shutil.rmtree(src)
+    shutil.copytree(vendor, src, ignore=shutil.ignore_patterns(".git"))
+    for script, target in patches:
+        subprocess.run(
+            [sys.executable, str(_REPO / "cmake" / script), str(src / target)], check=True
         )
     cmake = _find_cmake()
     if not cmake:
@@ -414,6 +449,7 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
             f"WiredTiger build completed but expected outputs are missing:\n"
             f"  {static_lib}\n  {header}"
         )
+    stamp.write_text(patch_digest + "\n")
     print(f"WiredTiger built: {static_lib}")
     return build_dir
 

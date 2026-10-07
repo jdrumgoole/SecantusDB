@@ -52,6 +52,10 @@ set(_patches
     "patch_wt_helpers.py|${WT_SOURCE_DIR}/cmake/helpers.cmake"
     "patch_wt_musl.py|${WT_SOURCE_DIR}/src/os_posix/os_fs.c"
     "patch_wt_pyapi.py|${WT_SOURCE_DIR}/lang/python/wiredtiger.i"
+    # The one BEHAVIOURAL patch (the rest are build fixes): group commit for
+    # method=dsync. One script, two files.
+    "patch_wt_dsync_group.py|${WT_SOURCE_DIR}/src/log/log.c"
+    "patch_wt_dsync_group.py|${WT_SOURCE_DIR}/src/log/log_slot.c"
 )
 
 foreach(_entry IN LISTS _patches)

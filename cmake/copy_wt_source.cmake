@@ -19,13 +19,15 @@
 # state lives in the same directory as the stamps that describe it.
 #
 # Invoked as:
-#   cmake -DSRC=... -DDST=... -DWT_SHA=... -P copy_wt_source.cmake
+#   cmake -DSRC=... -DDST=... -DWT_SHA=... -DWT_PATCHES=... -P copy_wt_source.cmake
 #
 # ``WT_SHA`` is not read here. It is present so the vendored commit is part of
 # ExternalProject's RECORDED download command: bumping the submodule changes
 # the command text, which re-runs this copy and, because the later steps depend
 # on it, re-runs the patch and configure steps too. Without it a stale copy
-# would survive a WiredTiger bump.
+# would survive a WiredTiger bump. ``WT_PATCHES`` (a digest of the patch
+# scripts) is there for the same reason: a new or edited patch re-stages the
+# pristine source, so it is applied and compiled rather than skipped.
 
 foreach(var SRC DST)
     if(NOT DEFINED ${var})

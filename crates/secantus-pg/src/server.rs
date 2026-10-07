@@ -82,6 +82,12 @@ pub fn sync_on_commit(force_durable: bool, fast_storage: bool) -> bool {
 /// fsync 7.9 ms, dsync 149 us, PG15 82 us; a SIGKILL after 20 acked runs
 /// lost nothing. The Rust MongoDB
 /// server does not call this and is unchanged.
+///
+/// Under `method=dsync` concurrent commits share log writes: stock WiredTiger
+/// gives every synced commit a log slot and a synchronous write of its own,
+/// and `cmake/patch_wt_dsync_group.py` lets commits that arrive during a write
+/// join the next one. A commit still returns, and becomes visible, only after
+/// its record is written. `method=fsync` runs unpatched code.
 pub fn commit_sync_method(config: &str) -> String {
     if cfg!(target_os = "macos") {
         config.replace("method=fsync", "method=dsync")
