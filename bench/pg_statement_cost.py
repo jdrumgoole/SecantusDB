@@ -49,7 +49,7 @@ import tempfile
 import time
 from pathlib import Path
 
-REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
+REPO = Path(__file__).resolve().parent.parent
 RUST = Path(os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pg/target/release/secantusd-pg"))
 
 if str(REPO) not in sys.path:
@@ -114,6 +114,12 @@ def measure(dsn: str, iters: int, in_transaction: bool = False) -> dict[str, flo
             out["select_row_p"] = _time_loop(
                 lambda: cur.execute("select v from attr_t where k = %s", (1,), prepare=True), iters
             )
+            # A write by primary key: in autocommit this is one transaction
+            # (and one journal sync) per statement.
+            out["update_row_p"] = _time_loop(
+                lambda: cur.execute("update attr_t set v = v + 1 where k = %s", (1,), prepare=True),
+                iters,
+            )
     return out
 
 
@@ -149,7 +155,14 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             d.kill()
 
-    stages = ["ping", "select_const", "select_const_p", "select_row", "select_row_p"]
+    stages = [
+        "ping",
+        "select_const",
+        "select_const_p",
+        "select_row",
+        "select_row_p",
+        "update_row_p",
+    ]
     print(f"{'stage':>16} {'ours us':>9} {'PG us':>8} {'delta':>8}")
     for s in stages:
         print(f"{s:>16} {ours[s]:>9.1f} {pg[s]:>8.1f} {ours[s] - pg[s]:>+8.1f}")
@@ -160,6 +173,7 @@ def main() -> int:
         ("...saved by preparing", "select_const", "select_const_p"),
         ("catalog+storage row read", "select_row", "select_const"),
         ("...saved by preparing", "select_row", "select_row_p"),
+        ("UPDATE by PK over PK read", "update_row_p", "select_row_p"),
     ]
     for label, a, b in steps:
         print(f"{label:>28}: {ours[a] - ours[b]:>+7.1f}us / {pg[a] - pg[b]:>+6.1f}us")

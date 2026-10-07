@@ -2776,9 +2776,11 @@ These work end-to-end but cut corners.
       that names the failure and distinguishes the remaining possibilities.
       Probe: `scratchpad/sockwatch.py` in the session that measured this.
 
-- [ ] **OPEN — Rust PostgreSQL server: per-statement cost is ~1.4-1.6x
-      PostgreSQL's, and INSERT throughput stops scaling at ~2x (re-measured
-      2026-10-07, batch 69).** Release `secantusd-pg` against PostgreSQL 15.19
+- [ ] **OPEN, no known lever left — Rust PostgreSQL server: a READ
+      statement costs ~1.45-1.6x PostgreSQL's, and durable writes reach ~3x
+      scaling at 8 clients against PostgreSQL's ~4x (re-measured 2026-10-07,
+      batch 72; the batch 72 section at the end of this entry is the current
+      state, what precedes it is the history).** Release `secantusd-pg` against PostgreSQL 15.19
       (port 5415; the harness still LABELS it "PostgreSQL 16"), same box, 5s x3
       medians. `bench/pg_statement_cost.py --iters 1200`: `select 1` 40.6us vs
       26.1, row by PK 44.8 vs 27.9 (was 76.3 / 89.2 against PG 16 on
@@ -2876,6 +2878,74 @@ These work end-to-end but cut corners.
       statement): send/recv syscalls ~4.5us, `install_user_types` ~1.3us,
       the rest spread thin under `on_execute`/`on_sync`. No other single
       lever above ~1us found.
+
+      **Batch 72 (2026-10-07): WiredTiger patched for dsync group commit;
+      the batch 70 diagnosis was wrong about the cause.** Joe approved a
+      patch to the shared WiredTiger. Batch 70 wrote that "the LSN-ordered
+      writes run one at a time" and proposed making a synced commit "join the
+      active slot and wait on `log_write_cond` instead of forcing a switch".
+      Built exactly as described, that was SLOWER: 25.0k at N=8 against 30.6k
+      stock (waiters sleep on a condition variable, and on macOS the wake-up
+      costs more than the ~20us write). With yields in place of the sleep it
+      matched stock (31.8k): the writes did coalesce (`sample`: time in
+      `pwrite` fell from ~6,500 samples to ~2,300) but the group then waited
+      for every member to wake and copy its record in. What works is
+      PostgreSQL's arrangement: each committer copies its record in and
+      releases at once, leaving the slot open, and the first waiter to find
+      every earlier slot written closes it and writes the whole group
+      (`cmake/patch_wt_dsync_group.py`). Release build, PG 15.19 alongside,
+      `bench/pg_concurrency.py` 5s x3 medians, durable, one table per client:
+
+      | N | PG 15 INSERT | stock WT | patched | PG 15 UPDATE | stock WT | patched |
+      | --- | --- | --- | --- | --- | --- | --- |
+      | 1 | 10.2k | 12.1k | 12.7k | 9.9k | 10.3k | 10.3k |
+      | 2 | 17.9k | 22.9k | 23.4k | 18.1k | 18.1k | 18.7k |
+      | 4 | 29.9k | 28.6k | 29.7k | 29.8k | 24.3k | 25.2k |
+      | 8 | 41.5k (4.08x) | 31.5k (2.60x) | 37.9k (2.99x) | 42.4k (4.27x) | 29.6k (2.88x) | 33.5k (3.25x) |
+
+      Three things measured on the way that the next session should not
+      re-derive:
+      - **The disk is not the limit.** One `O_DSYNC` `pwrite` is ~20us here,
+        and the patched server keeps the log device busy only ~55% of the
+        time at N=8. What is left is the hand-off between one group's write
+        finishing and the next one starting.
+      - **Stock dsync commits stalled 10 ms on a lock they did not need.**
+        `__wt_log_release` try-locks `log_sync_lock` to check whether the log
+        directory needs syncing, and a loser sleeps on `log_sync_cond`, which
+        nothing signals under dsync. ~12% of worker time at N=8. The patch
+        skips the lock when the directory sync is already done. Fixing that
+        alone moved throughput by nothing (30.9k against 31.0k): the time
+        went to waiting on earlier slots instead.
+      - **The UPDATE and SELECT workloads of `bench/pg_concurrency.py`
+        matched no row until this batch** (`k = pid * 10_000_000`, never
+        seeded), so every UPDATE figure above this section, here and in
+        batches 69-71, is for a statement that wrote nothing. Fixed; the
+        worker now fails if a statement touches no row.
+
+      Scope of the patch: `WT_LOG_DSYNC` commits only, which is the
+      PostgreSQL server on macOS. `method=fsync` (both MongoDB servers, and
+      this server on Linux, where WiredTiger already consolidates fsyncs under
+      `log_sync_lock` -- read from `__wt_log_release`, not measured) runs the
+      stock code. NOT measured: Linux. Both SIGKILL tests pass (10 of 10
+      runs), and a build altered to acknowledge before the write fails both
+      (3 of 3 runs).
+
+      Per-statement, same day (`bench/pg_statement_cost.py --iters 1200`, two
+      runs): `select 1` 38.3-39.0us vs 25.7-26.1, row by PK 44.3-44.6 vs
+      27.8-28.1, and a durable UPDATE by PK 90-92us vs PostgreSQL's 95-100.
+      So the cost gap is in READ statements only (+12-16us), a write
+      statement is at parity. Re-profiled (`sample`, prepared row-by-PK loop):
+      nothing above ~1us beyond the send/recv syscalls, as batch 71 found.
+
+- [ ] **`cargo clippy -D warnings` fails in `crates/secantus-pg`, and no CI
+      lane runs it (found 2026-10-07, batch 72).** Six `clippy::drop_non_drop`
+      errors under rustc/clippy 1.98.1: `drop(sink)` on a closure at
+      `src/grace_join.rs:616`, `src/stream_join.rs:1060` and
+      `src/lib.rs:38078`, `:38088`, `:38461`, `:38786`. `test.yml` builds the
+      binary and runs three integration tests for this crate but never clippy
+      or `cargo fmt --check`, so nothing would have reported it. Fix the six
+      sites (scope the closure in a block instead of dropping it) and add the
+      crate to a lint lane.
 
 - [x] **RESOLVED 2026-10-07 (batch 69): the read-path ceiling was two
       per-thread caches keyed by CONNECTION.** Re-measured before fixing:

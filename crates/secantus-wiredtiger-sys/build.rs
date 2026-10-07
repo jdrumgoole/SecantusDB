@@ -30,6 +30,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_LIB");
     if let (Ok(inc), Ok(lib)) = (env::var("SECANTUS_WT_INCLUDE"), env::var("SECANTUS_WT_LIB")) {
         emit(Path::new(&inc), Path::new(&lib));
+        watch_prebuilt(Path::new(&lib));
         return;
     }
 
@@ -40,6 +41,7 @@ fn main() {
         // always carries `wiredtiger/`, so this never runs from crates.io.
         if let Some(dir) = repo_wt_build(&manifest) {
             emit(&dir.join("include"), &dir);
+            watch_prebuilt(&dir);
             return;
         }
         panic!(
@@ -106,6 +108,18 @@ fn main() {
     };
     for l in sys_libs {
         println!("cargo:rustc-link-lib=dylib={l}");
+    }
+}
+
+/// Rebuild when a PREBUILT WiredTiger changes on disk. The static library is
+/// bundled into this crate's rlib, so one rebuilt in place (a new patch, the
+/// same directory) would otherwise never be relinked: cargo sees no change.
+fn watch_prebuilt(lib: &Path) {
+    for name in ["libwiredtiger.a", "wiredtiger.lib"] {
+        let file = lib.join(name);
+        if file.exists() {
+            println!("cargo:rerun-if-changed={}", file.display());
+        }
     }
 }
 

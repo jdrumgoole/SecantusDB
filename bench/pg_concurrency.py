@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
+REPO = Path(__file__).resolve().parent.parent
 # `SECANTUSD_PG` measures a binary other than the main checkout's (a worktree's
 # build) -- the same override `bench/pg_statement_cost.py` has.
 RUST_BINARY = Path(
@@ -89,6 +89,10 @@ class Trials:
         return 100.0 * (max(self.rates) - min(self.rates)) / self.median
 
 
+#: Rows `_prepare` seeds per table; client `i` works on row `i % _SEEDED_ROWS`.
+_SEEDED_ROWS = 64
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -106,8 +110,14 @@ def _wait_for_listener(host: str, port: int, timeout: float = 30.0) -> None:
     raise RuntimeError(f"no listener on {host}:{port} after {timeout}s")
 
 
-def _worker(dsn: str, table: str, workload: str, seconds: float, out: mp.Queue) -> None:
-    """Commit as many statements as possible for `seconds`, then report."""
+def _worker(dsn: str, table: str, workload: str, seconds: float, out: mp.Queue, slot: int) -> None:
+    """Commit as many statements as possible for `seconds`, then report.
+
+    `slot` is this client's own seeded row for `update` / `select`. Until
+    2026-10-07 those two addressed `k = pid * 10_000_000`, a key `_prepare`
+    never seeds, so every statement matched NO row: the "update" workload
+    wrote nothing and synced nothing, and scaled accordingly. The worker now
+    checks the statement touched a row, so that cannot recur silently."""
     import psycopg  # imported in the child so the parent needn't hold a connection
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent owns Ctrl-C
@@ -120,9 +130,13 @@ def _worker(dsn: str, table: str, workload: str, seconds: float, out: mp.Queue) 
                 if workload == "insert":
                     cur.execute(f"insert into {table} (k, v) values (%s, %s)", (key + n, n))
                 elif workload == "update":
-                    cur.execute(f"update {table} set v = v + 1 where k = %s", (key,))
+                    cur.execute(f"update {table} set v = v + 1 where k = %s", (slot,))
+                    if cur.rowcount != 1:
+                        raise RuntimeError(f"update touched {cur.rowcount} rows, not 1")
                 else:
-                    cur.execute(f"select v from {table} where k = %s", (key,))
+                    cur.execute(f"select v from {table} where k = %s", (slot,))
+                    if cur.fetchone() is None:
+                        raise RuntimeError("select found no row")
                 n += 1
     except Exception as exc:  # a failure must not read as zero throughput
         out.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -140,7 +154,7 @@ def _prepare(dsn: str, tables: list[str], workload: str) -> None:
         if workload in ("update", "select"):
             # Seed one row per client so the statement has a target.
             for t in tables:
-                for pid_slot in range(64):
+                for pid_slot in range(_SEEDED_ROWS):
                     cur.execute(f"insert into {t} (k, v) values (%s, 0)", (pid_slot,))
 
 
@@ -149,7 +163,10 @@ def _run_one(dsn: str, clients: int, mode: str, workload: str, seconds: float) -
     _prepare(dsn, tables, workload)
     q: mp.Queue = mp.Queue()
     procs = [
-        mp.Process(target=_worker, args=(dsn, tables[i % len(tables)], workload, seconds, q))
+        mp.Process(
+            target=_worker,
+            args=(dsn, tables[i % len(tables)], workload, seconds, q, i % _SEEDED_ROWS),
+        )
         for i in range(clients)
     ]
     start = time.monotonic()
