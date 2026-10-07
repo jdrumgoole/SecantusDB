@@ -104,7 +104,7 @@ jobs:
         with:
           path: |
             C:/cargo-target
-            crates/secantus-pgserver/target
+            crates/secantus-pg/target
             ~/.cargo/registry
             ~/.cargo/git
           key: psycopg-win-cargo-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
@@ -134,7 +134,7 @@ jobs:
             exit 1
           fi
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
-          cd crates/secantus-pgserver
+          cd crates/secantus-pg
           cargo build --locked
           ./target/debug/secantusd-pg.exe --version
 
@@ -147,7 +147,7 @@ jobs:
         with:
           path: |
             C:/cargo-target
-            crates/secantus-pgserver/target
+            crates/secantus-pg/target
             ~/.cargo/registry
             ~/.cargo/git
           key: psycopg-win-cargo-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
