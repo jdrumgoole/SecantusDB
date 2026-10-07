@@ -265,7 +265,7 @@ struct CatalogCache {
     entries: VersionedMap<&'static str, Arc<Vec<Document>>>,
     /// `(storage, db, table)` -> its decoded catalog entry; `None` records
     /// that the table does not exist.
-    tables: VersionedMap<String, Option<TableDef>>,
+    tables: VersionedMap<String, Arc<Option<TableDef>>>,
 }
 
 thread_local! {
@@ -361,6 +361,37 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static CATALOG_FRONT: std::cell::RefCell<Vec<(usize, String, &'static str, u64, Arc<Vec<Document>>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `committed_cached`'s per-thread copy of its shared map:
+    /// `(storage, db, slot, catalog version, value)`.
+    #[allow(clippy::type_complexity)]
+    static COMMITTED_FRONT: std::cell::RefCell<
+        Vec<(usize, String, &'static str, u64, Arc<dyn std::any::Any + Send + Sync>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+    /// `lookup_inner`'s per-thread copy of the shared table cache:
+    /// `(storage, db, table, catalog version, entry)`. Every statement looks
+    /// its table up several times (planning, foreign-table check, expression
+    /// fields, execution), and through the shared map alone each lookup took
+    /// one process-wide lock: at 8 inserting clients `sample` put ~1,850
+    /// worker samples in 10s waiting on it (batch 71).
+    #[allow(clippy::type_complexity)]
+    static TABLE_FRONT: std::cell::RefCell<Vec<(usize, String, String, u64, Arc<Option<TableDef>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run something that may block for a while (a statement, a lock wait, a
+/// sleep between polls). On a multi-thread runtime worker it goes through
+/// `block_in_place`, so the other tasks on that worker are not stalled
+/// behind it. Each connection now runs on a single-threaded runtime of its
+/// own thread (`server::bind`), where blocking holds up only that
+/// connection -- as a PostgreSQL backend blocks only itself -- so there it
+/// simply runs, with no hand-off to pay.
+pub(crate) fn blocking_wait<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 fn catalog_cache() -> &'static CatalogCache {
@@ -2685,18 +2716,51 @@ impl PgHandler {
             self.db().to_string(),
             slot,
         );
-        if let Some((v, value)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            if *v == version {
-                if let Some(value) = value.downcast_ref::<T>() {
-                    return value.clone();
+        // This thread's copy first: several slots are read on every
+        // statement, and the shared map's one lock was contended at 8
+        // clients (batch 71). Only what the shared map holds as current
+        // reaches the front.
+        let front = COMMITTED_FRONT.with(|f| {
+            f.borrow()
+                .iter()
+                .find(|(s, d, sl, v, _)| *s == key.0 && *sl == slot && *v == version && *d == key.1)
+                .map(|e| Arc::clone(&e.4))
+        });
+        if let Some(value) = front.as_ref().and_then(|v| v.downcast_ref::<T>()) {
+            return value.clone();
+        }
+        let to_front = |value: &Arc<dyn std::any::Any + Send + Sync>| {
+            COMMITTED_FRONT.with(|f| {
+                let mut f = f.borrow_mut();
+                f.retain(|(s, d, sl, v, _)| {
+                    *v == version && !(*s == key.0 && *sl == slot && *d == key.1)
+                });
+                if f.len() >= 64 {
+                    f.clear();
                 }
+                f.push((key.0, key.1.clone(), slot, version, Arc::clone(value)));
+            });
+        };
+        let shared = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|(v, _)| *v == version)
+            .map(|(_, value)| Arc::clone(value));
+        if let Some(entry) = shared {
+            if let Some(value) = entry.downcast_ref::<T>() {
+                let value = value.clone();
+                to_front(&entry);
+                return value;
             }
         }
         let value = read();
+        let entry: Arc<dyn std::any::Any + Send + Sync> = Arc::new(value.clone());
         cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (version, Arc::new(value.clone())));
+            .insert(key.clone(), (version, Arc::clone(&entry)));
+        to_front(&entry);
         value
     }
 
@@ -15696,15 +15760,45 @@ impl PgHandler {
             self.db().to_string(),
             name.to_string(),
         );
-        if let Some((v, def)) = cache
+        let front_hit = TABLE_FRONT.with(|f| {
+            f.borrow()
+                .iter()
+                .find(|(s, d, n, v, _)| *s == key.0 && *v == version && n == name && *d == key.1)
+                .map(|e| Arc::clone(&e.4))
+        });
+        if let Some(def) = front_hit {
+            return (*def).clone();
+        }
+        // Only an entry the shared cache holds as CURRENT reaches the front,
+        // so the front can never serve what the shared cache would not.
+        let to_front = |def: &Arc<Option<TableDef>>| {
+            TABLE_FRONT.with(|f| {
+                let mut f = f.borrow_mut();
+                f.retain(|(s, d, n, v, _)| {
+                    *v == version && !(*s == key.0 && n == name && *d == key.1)
+                });
+                if f.len() >= 64 {
+                    f.clear();
+                }
+                f.push((
+                    key.0,
+                    key.1.clone(),
+                    key.2.clone(),
+                    version,
+                    Arc::clone(def),
+                ));
+            });
+        };
+        let shared = cache
             .tables
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-        {
-            if *v == version {
-                return def.clone();
-            }
+            .filter(|(v, _)| *v == version)
+            .map(|(_, def)| Arc::clone(def));
+        if let Some(def) = shared {
+            to_front(&def);
+            return (*def).clone();
         }
         let filter = bson::doc! { "_id": name };
         // A storage error is a transient `None`, not a recorded absence.
@@ -15727,11 +15821,13 @@ impl PgHandler {
             }
         }
         if self.may_fill_catalog_cache(version) {
+            let entry = Arc::new(def.clone());
             cache
                 .tables
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(key, (version, def.clone()));
+                .insert(key.clone(), (version, Arc::clone(&entry)));
+            to_front(&entry);
         }
         def
     }
@@ -20900,7 +20996,7 @@ impl PgHandler {
             if left.is_zero() {
                 return Ok(());
             }
-            std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+            blocking_wait(|| std::thread::sleep(left.min(std::time::Duration::from_millis(5))));
         }
     }
 
@@ -21289,11 +21385,11 @@ impl PgHandler {
         // Everything else runs INSIDE the open transaction when there is one,
         // so a later ROLLBACK really discards it.
         //
-        // The statement runs synchronously, so it runs under
-        // `block_in_place`: a worker that blocks in a long statement
-        // (`pg_sleep`, a big scan) would otherwise take the runtime's I/O
-        // driver down with it — no other connection is served, and the
-        // `CancelRequest` meant to interrupt the statement never arrives.
+        // The statement runs synchronously, through `blocking_wait`: on a
+        // shared multi-thread runtime a worker that blocked in a long
+        // statement (`pg_sleep`, a big scan) would take the runtime's I/O
+        // driver down with it. Each connection has its own thread and
+        // runtime now (`server::bind`), where it blocks only itself.
         // A CALL of a PL/pgSQL procedure outside a block may COMMIT: it runs
         // WITHOUT the transaction guard, each of its statements joining the
         // session's transaction on its own, so a COMMIT between them can end
@@ -21303,7 +21399,7 @@ impl PgHandler {
                 let prev = self
                     .txn_control
                     .swap(true, std::sync::atomic::Ordering::Relaxed);
-                let out = tokio::task::block_in_place(|| self.execute(stmt, max_rows));
+                let out = crate::blocking_wait(|| self.execute(stmt, max_rows));
                 self.txn_control
                     .store(prev, std::sync::atomic::Ordering::Relaxed);
                 self.collect_planner_warnings();
@@ -21404,7 +21500,7 @@ impl PgHandler {
                                 *handle = self.open_transaction_handle()?;
                                 if !waited {
                                     poll()?;
-                                    std::thread::sleep(delay);
+                                    blocking_wait(|| std::thread::sleep(delay));
                                     delay = (delay * 2).min(std::time::Duration::from_millis(20));
                                 }
                             }
@@ -21429,7 +21525,7 @@ impl PgHandler {
             if inline {
                 work()
             } else {
-                tokio::task::block_in_place(work)
+                crate::blocking_wait(work)
             }
         };
         self.collect_planner_warnings();
@@ -21542,7 +21638,7 @@ impl PgHandler {
                 let mut delay = std::time::Duration::from_millis(2);
                 loop {
                     poll()?;
-                    std::thread::sleep(delay);
+                    blocking_wait(|| std::thread::sleep(delay));
                     delay = (delay * 2).min(std::time::Duration::from_millis(20));
                     let writers = row_waits::writers_other_than(pid);
                     if writers.is_empty()
@@ -21640,7 +21736,7 @@ impl PgHandler {
                 }
             }
             poll()?;
-            std::thread::sleep(delay);
+            blocking_wait(|| std::thread::sleep(delay));
             delay = (delay * 2).min(std::time::Duration::from_millis(10));
         }
     }
@@ -21749,7 +21845,7 @@ impl PgHandler {
                 if let Err(poll_err) = poll() {
                     break Err(poll_err);
                 }
-                std::thread::sleep(delay);
+                blocking_wait(|| std::thread::sleep(delay));
                 delay = (delay * 2).min(std::time::Duration::from_millis(20));
             }
             handle = match self.open_transaction_handle() {

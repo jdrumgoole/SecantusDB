@@ -48,7 +48,17 @@ impl<'a> LiveNotices<'a> {
                     }
                 }
             };
-            tokio::task::block_in_place(|| handle.block_on(deliver));
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| handle.block_on(deliver));
+            } else {
+                // A connection's own single-threaded runtime (`server::bind`
+                // runs each on its own thread): it cannot be re-entered from
+                // inside the statement, so the send is polled here. A write
+                // the socket takes at once completes; only a client that has
+                // stopped reading with its receive buffer full of notices
+                // would make this wait, as it would wait in PostgreSQL.
+                futures::executor::block_on(deliver);
+            }
         };
         let boxed: Box<dyn FnMut(Vec<ErrorInfo>) + Send + '_> = Box::new(send);
         // SAFETY: as above -- the closure never outlives this guard, which

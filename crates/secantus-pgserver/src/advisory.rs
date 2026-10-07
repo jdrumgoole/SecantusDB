@@ -66,19 +66,16 @@ pub fn lock<E>(
     xact: bool,
     cancelled: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    // Waiting blocks this thread, which may be a runtime worker: hand its
-    // queued tasks to the others first, or a connection scheduled behind
-    // this one -- the very one holding the lock -- never runs.
+    // Waiting blocks this thread. On a shared runtime worker its queued
+    // tasks go to the others first (`blocking_wait`), or a connection
+    // scheduled behind this one -- the very one holding the lock -- never
+    // runs; on a connection's own thread it blocks only that connection.
     let t = table();
     {
         let holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());
         if conflicts(&holds, key, pid, shared) {
             drop(holds);
-            if tokio::runtime::Handle::try_current().is_ok() {
-                return tokio::task::block_in_place(|| {
-                    wait_and_take(key, pid, shared, xact, cancelled)
-                });
-            }
+            return crate::blocking_wait(|| wait_and_take(key, pid, shared, xact, cancelled));
         }
     }
     wait_and_take(key, pid, shared, xact, cancelled)

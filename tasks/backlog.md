@@ -2836,6 +2836,39 @@ These work end-to-end but cut corners.
       the reader saw, must survive. With the group-commit ack wait removed it
       lost 148-480 acked rows per run.
 
+      **Batch 71 (2026-10-07): the fast-mode ceiling was two LOCKS, not
+      work.** Release build, PG 15.19 alongside, 5s x3 medians, INSERT one
+      table per client:
+
+      | N | PG 15 | fast before | fast after | durable before | durable after |
+      | --- | --- | --- | --- | --- | --- |
+      | 1 | 8.7-8.8k | 16.2k | 17.0k | 11.6k | 12.0k |
+      | 2 | 19.1-19.2k (2.2x) | 32.3k (2.00x) | 35.4k (2.08x) | 22.4k | 22.3k |
+      | 4 | 30.4-30.6k (3.5x) | 36.9k (2.28x) | 44.6k (2.62x) | 26.5k | 27.8k |
+      | 8 | 41.4-41.8k (4.7x) | 45.2k (2.79x) | 60.7k (3.56x) | 28.1k | 30.4k |
+
+      `sample` of fast mode at N=8: ~1,850 worker samples in 10s waiting on
+      the process-wide `catalog_cache().tables` mutex (`lookup_inner`, taken
+      ~6 times a statement and cloning the `TableDef` under it), and ~1,400
+      on tokio's blocking-pool mutex -- the `block_in_place` hand-off every
+      statement paid. Fixed: a per-thread front for the table cache and for
+      `committed_cached`, and one OS thread per connection with its own
+      single-threaded runtime (`server::accept_loop`), so a statement runs on
+      the thread that owns its client with no hand-off. Inlining INSERT on
+      the shared runtime was tried first and dropped: it gained at N=8 but
+      cost 18% at N=2 (two connections stalled behind one worker).
+
+      **What remains is the box, not a lock.** After the fix no mutex has more
+      than ~65 waiting samples in 10s. Server CPU per INSERT is 41us at N=1
+      and 77us at N=8 (`ps` time over 10s): at N=8 eight server threads plus
+      eight Python client processes contend for 8 performance + 4 efficiency
+      cores, alongside other sessions' load (load average 5-7 throughout).
+      Absolute throughput at N=8 is now 1.45x PostgreSQL's; the RATIO is
+      lower mostly because one client already does 2x PostgreSQL's single
+      client. Durable mode is still the WiredTiger journal (batch 70 above).
+      SELECT / UPDATE fast mode after: 21.6k/39.8k/52.8k/79.3k and
+      14.8k/27.9k/40.4k/63.3k at N=1/2/4/8 (SELECT matches batch 69's).
+
       Per-statement (`bench/pg_statement_cost.py --iters 1200`): `select 1`
       39.2us vs 27.1, row by PK 45.1 vs 28.6. A FROM-less literal SELECT now
       skips the `block_in_place` hand-off (41.2 -> 39.2us). Profile of
