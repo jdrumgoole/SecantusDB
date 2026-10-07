@@ -2791,6 +2791,49 @@ These work end-to-end but cut corners.
       WiredTiger journal write, a storage-engine property, not a lock in
       this server. Measure it against the journal settings before touching it.
 
+      **Batch 70 (2026-10-07): the journal was serialised by US, twice --
+      fixed; what is left is not the journal.** Release build, PG 15.19 on
+      5415 alongside, `bench/pg_concurrency.py` 5s x3 medians, INSERT one
+      table per client, box load ~5-6 from parallel sessions:
+
+      | N | PG 15 | before (durable) | after (durable) | fast mode before / after |
+      | --- | --- | --- | --- | --- |
+      | 1 | 10.4k | 11.5k | 11.3k | 16.8k / 16.3k |
+      | 2 | 20.1k | 17.8k (1.55x) | 22.5k (1.99x) | 32.8k / 32.7k |
+      | 4 | 31.1k | 20.6k (1.80x) | 26.6k (2.34x) | 37.0k / 36.8k |
+      | 8 | 41.6k (4.00x) | 24.4k (2.13x) | 33.2k (2.93x) | 45.4k / 45.6k |
+
+      Cause 1: `sample` at N=4 put ~3,500 of 3,688 samples of the
+      `secantus-oplog-pruner` thread in `__wt_log_write` -> `pwrite`: the
+      prune sweep removed each doomed oplog row as its own autocommit, so a
+      writer at the 100k entry cap paid two synced journal writes per insert
+      and the pruner held the journal the whole time. Now 1,024 rows per
+      transaction. Cause 2: WiredTiger closes the log slot on every synced
+      commit (`__wt_log_write` forces `__wt_log_slot_switch` under
+      `WT_LOG_FLUSH`/`FSYNC`), so concurrent commits never share a write and
+      the LSN-ordered writes run one at a time. The PG server now commits
+      `sync=off` and waits on ONE in-flight `log_flush` (leader/follower,
+      `Storage::set_group_commit`); naive per-committer `log_flush` was
+      worse (WiredTiger's flush polls in 1 ms `__wt_sleep`). Durability:
+      an ack still follows a write through the `O_DSYNC` log (macOS) /
+      fdatasync (elsewhere); the kill test passes and a new 8-writer SIGKILL
+      test (`test_concurrent_acknowledged_commits_survive_a_kill_in_durable_mode`)
+      loses 148-480 acked rows with the wait removed and 0 with it.
+      **Disclosed difference:** a concurrent READER can see a group-committed
+      row during its flush, before it is durable (PostgreSQL flushes before
+      the commit is visible; mongod `j:true` behaves like us). A writer that
+      depends on it logs later, so its own ack covers it.
+
+      **What remains open:** fast mode (no sync at all) caps at 2.8x too, so
+      the N=8 gap to PG (33.2k vs 41.6k) is no longer the journal -- profile
+      the fast-mode N=8 path next. Per-statement (`bench/pg_statement_cost.py
+      --iters 1200`, after): `select 1` 39.2us vs 27.1, row by PK 45.1 vs
+      28.6. A FROM-less literal SELECT now skips the `block_in_place`
+      hand-off (41.2 -> 39.2us). Profile of prepared `select 1` (release,
+      `sample`, ~12.6us server CPU a statement): send/recv syscalls ~4.5us,
+      `install_user_types` ~1.3us, the rest spread thin under
+      `on_execute`/`on_sync`; no other single lever above ~1us found.
+
 - [x] **RESOLVED 2026-10-07 (batch 69): the read-path ceiling was two
       per-thread caches keyed by CONNECTION.** Re-measured before fixing:
       SELECT gave 21.2k / 14.4k / 26.3k / 34.0k at N=1/2/4/8 -- two clients

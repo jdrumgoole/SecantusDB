@@ -3204,6 +3204,12 @@ pub struct Storage {
     /// A session whose commit FAILED is never returned -- its `Drop` is what
     /// rolls the dead transaction back.
     txn_session_pool: Mutex<Vec<crate::Session>>,
+    /// Group commit for user transactions (see [`Storage::set_group_commit`]):
+    /// the `log_flush` config a committing transaction waits on, or unset for
+    /// WiredTiger's own per-commit `transaction_sync` (every MongoDB store).
+    group_commit_flush: std::sync::OnceLock<String>,
+    /// The group-commit leader election and flush watermark.
+    group_commit: GroupCommit,
     /// Per-collection write locks: CRUD on `(db, coll)` serialises here so
     /// writes to different collections run in parallel. Entries are created
     /// on first reference and never removed — the lock identity for a
@@ -5113,6 +5119,8 @@ impl Storage {
             home: home.to_string(),
             lock: Mutex::new(()),
             txn_session_pool: Mutex::new(Vec::new()),
+            group_commit_flush: std::sync::OnceLock::new(),
+            group_commit: GroupCommit::default(),
             coll_locks: Mutex::new(HashMap::new()),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
@@ -6770,6 +6778,71 @@ impl Storage {
 /// half-pruned range (`read_oplog`, resume) tolerate missing rows. A free
 /// function over the shared context so the async drainer pool can run the
 /// sweep without a `Storage` borrow.
+/// Leader/follower group commit over `WT_SESSION::log_flush`.
+///
+/// Exactly one flush is in flight at a time. A committer takes a TICKET after
+/// its `sync=off` commit returns, so its log record is already in a slot; any
+/// flush that STARTS after that covers it. If no flush is running it becomes
+/// the leader and flushes everything ticketed so far; otherwise it waits, and
+/// the next leader's single write carries it together with everyone else who
+/// arrived meanwhile. Concurrent `log_flush` callers would instead contend on
+/// the slot-switch lock and poll WiredTiger's 1 ms flush wait (measured: 6,508
+/// of 18,122 busy samples in `__wt_sleep` at 8 clients).
+#[derive(Default)]
+struct GroupCommit {
+    state: Mutex<GroupCommitState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct GroupCommitState {
+    /// Tickets handed out (the last one issued).
+    issued: u64,
+    /// Every ticket at or below this is durable.
+    durable: u64,
+    flushing: bool,
+    /// The last failed flush: the tickets it was to cover and its error.
+    failed: Option<(u64, WtError)>,
+}
+
+impl GroupCommit {
+    fn wait_durable(&self, session: &Session, flush: &str) -> std::result::Result<(), WtError> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.issued += 1;
+        let ticket = st.issued;
+        loop {
+            if st.durable >= ticket {
+                return Ok(());
+            }
+            if let Some((upto, e)) = &st.failed {
+                // A failed flush that was to cover this ticket: nothing says
+                // the record reached the log, so it is not acknowledged.
+                if *upto >= ticket {
+                    return Err(e.clone());
+                }
+            }
+            if !st.flushing {
+                st.flushing = true;
+                let target = st.issued;
+                drop(st);
+                let flushed = session.log_flush(Some(flush));
+                st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.flushing = false;
+                match flushed {
+                    Ok(()) => st.durable = st.durable.max(target),
+                    Err(e) => st.failed = Some((target, e)),
+                }
+                self.cv.notify_all();
+                continue;
+            }
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Oplog rows removed per prune transaction (see the phase-2 comment).
+const PRUNE_DELETE_BATCH: usize = 1024;
+
 fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let _p = ctx.prune_lock.lock().unwrap_or_else(|e| e.into_inner());
     let existing = ctx.shards_created.load(Ordering::Relaxed);
@@ -6866,34 +6939,63 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // concurrent writers only ever append higher seqs. Each doomed row is
     // removed from its exact source table (the phase-1 tag). Pre-images stay
     // in one table.
+    //
+    // The deletes are grouped into transactions of `PRUNE_DELETE_BATCH`
+    // rows. Run one autocommit remove at a time they were one LOGGED commit
+    // each -- and with `transaction_sync` on (every durable store) one
+    // journal write + sync each, two per oplog entry written. Under a
+    // sustained writer at the entry cap the pruner then spent its whole life
+    // in `__wt_log_write` -> `pwrite`, holding the journal against the
+    // commits clients were waiting on: the INSERT scaling ceiling measured
+    // 2026-10-07 (batch 70). Durability is unchanged -- a crash mid-sweep
+    // leaves whole batches undone, and those rows are doomed again by the
+    // next sweep; the archive above is written before any batch commits.
     let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
     let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
-    for (seq, tbl) in &doomed {
-        if del_curs[*tbl].is_none() {
-            del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+    let mut pruned = 0usize;
+    for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
+        session.begin_transaction(None)?;
+        let removed = (|| -> Result<()> {
+            for (seq, tbl) in batch {
+                if del_curs[*tbl].is_none() {
+                    del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
+                }
+                let op_del = del_curs[*tbl].as_ref().unwrap();
+                op_del.reset()?;
+                op_del.set_key_q(*seq);
+                match op_del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                pre_del.reset()?;
+                pre_del.set_key_q(*seq);
+                match pre_del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = removed {
+            // Surface the remove's error, not the rollback's; a failed
+            // rollback is reported alongside rather than swallowed.
+            if let Err(rb) = session.rollback_transaction(None) {
+                eprintln!("secantus-storage: oplog prune rollback failed: {rb:?}");
+            }
+            return Err(e);
         }
-        let op_del = del_curs[*tbl].as_ref().unwrap();
-        op_del.reset()?;
-        op_del.set_key_q(*seq);
-        match op_del.remove() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
-        pre_del.reset()?;
-        pre_del.set_key_q(*seq);
-        match pre_del.remove() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
+        session.commit_transaction(None)?;
+        pruned += batch.len();
+        // Keep the live-count honest for the next sweep's sizing -- per
+        // committed batch, so a later batch's failure leaves it exact.
+        ctx.oplog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live_count -= batch.len() as i64;
     }
-    // Keep the live-count honest for the next sweep's sizing.
-    ctx.oplog
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .live_count -= doomed.len() as i64;
-    Ok(doomed.len())
+    Ok(pruned)
 }
 
 impl Storage {
@@ -7368,7 +7470,7 @@ impl Storage {
                 // waiter that outlived it may carry on its own snapshot
                 // (`no_commit_since`).
                 let committed = if wrote {
-                    counted_commit(written.as_deref(), || session.commit_transaction(None))
+                    counted_commit(written.as_deref(), || self.commit_durably(&session))
                 } else {
                     session.commit_transaction(None)
                 };
@@ -7422,6 +7524,47 @@ impl Storage {
             self.park_txn_session(session);
         }
         Ok(())
+    }
+
+    /// Turn on GROUP COMMIT for user transactions that wrote: commit without
+    /// the per-commit log sync, then wait in `log_flush(flush_config)` until
+    /// the log is written (and, with `sync=on`, synced) past the commit.
+    ///
+    /// Why: with `transaction_sync` on, WiredTiger closes a log slot on every
+    /// synced commit, so concurrent commits never share a log write -- each
+    /// pays its own synced `pwrite`, one after another (log writes are
+    /// LSN-ordered). Measured 2026-10-07 (batch 70) that serial journal was
+    /// the PG server's INSERT ceiling. A commit made `sync=off` joins the
+    /// active slot; the flush that follows writes every record that joined
+    /// since the last one in ONE write, which is PostgreSQL's group commit.
+    ///
+    /// The guarantee an ACKNOWLEDGED commit carries is unchanged: the caller
+    /// returns only after the flush covers its record, through the same
+    /// file (an `O_DSYNC` log under `method=dsync`) or the same sync
+    /// (`sync=on`). What differs is the order of VISIBILITY: a concurrent
+    /// reader can see the committed rows during the flush, before they are
+    /// durable (mongod's `j:true` behaves the same way). A writer that builds
+    /// on them logs after them, so its own acknowledged flush covers them.
+    ///
+    /// Set once, before serving; a second call is ignored. The Rust MongoDB
+    /// server never calls it and keeps per-commit `transaction_sync`.
+    pub fn set_group_commit(&self, flush_config: &str) {
+        let _ = self.group_commit_flush.set(flush_config.to_string());
+    }
+
+    /// Commit a user transaction that wrote: per-commit sync, or group
+    /// commit when [`Storage::set_group_commit`] configured it.
+    fn commit_durably(&self, session: &crate::Session) -> std::result::Result<(), WtError> {
+        match self.group_commit_flush.get() {
+            None => session.commit_transaction(None),
+            Some(flush) => {
+                session.commit_transaction(Some("sync=off"))?;
+                // The transaction is committed here; a failed flush means it
+                // may not be durable, so the error goes to the client rather
+                // than an acknowledgement.
+                self.group_commit.wait_durable(session, flush)
+            }
+        }
     }
 
     /// Return a finished transaction's session to the pool, or close it if the

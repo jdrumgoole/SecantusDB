@@ -103,14 +103,33 @@ pub fn open_storage(home: &str) -> secantus_storage::Result<Storage> {
     let fast = std::env::var("SECANTUS_TEST_FAST_STORAGE").as_deref() == Ok("1");
     // The same engine knobs as `Storage::open`'s default config, with only
     // `transaction_sync` chosen here.
-    let config = commit_sync_method(&wt_config("4G", 1000, sync_on_commit(force, fast), "128MB"));
-    Storage::open_with_options(
+    let sync = sync_on_commit(force, fast);
+    let config = commit_sync_method(&wt_config("4G", 1000, sync, "128MB"));
+    let storage = Storage::open_with_options(
         home,
         &StorageOptions {
             wt_config: Some(config),
             ..StorageOptions::default()
         },
-    )
+    )?;
+    if sync {
+        storage.set_group_commit(group_commit_flush());
+    }
+    Ok(storage)
+}
+
+/// The `log_flush` config a group commit waits on (see
+/// `Storage::set_group_commit`), matched to [`commit_sync_method`]: on macOS
+/// the log is opened `O_DSYNC`, so a WRITE is the same synced write a
+/// per-commit `method=dsync` commit makes, and `sync=on` would add WiredTiger's
+/// `F_FULLFSYNC` (the 5-8 ms drive flush PostgreSQL does not do there either).
+/// Elsewhere `sync=on` is the fdatasync `method=fsync` commits make.
+pub fn group_commit_flush() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "sync=off"
+    } else {
+        "sync=on"
+    }
 }
 
 /// How long `stop` waits for live connection tasks to finish before giving up

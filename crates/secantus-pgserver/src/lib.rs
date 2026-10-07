@@ -21315,7 +21315,8 @@ impl PgHandler {
         }
         let out = {
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-            let inline = Self::point_read(&stmt) && self.rls_enabled_docs().is_empty();
+            let inline = Self::literal_select(&stmt)
+                || (Self::point_read(&stmt) && self.rls_enabled_docs().is_empty());
             let work = || match guard.as_mut() {
                 Some(handle) => {
                     // A row write in a transaction that has not written yet --
@@ -22676,6 +22677,23 @@ impl PgHandler {
             all.push(format!("{db}.{}", fk.ref_table));
         }
         Some(RcReadSet { all, changes })
+    }
+
+    /// A FROM-less SELECT of literal values only (`select 1`, `select 'a',
+    /// null`): no function, no source, nothing that reads or waits. It runs on
+    /// the worker like [`Self::point_read`] -- the hand-off would cost more
+    /// than the statement.
+    fn literal_select(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::SelectConstant(sc) => {
+                sc.source.is_none()
+                    && sc
+                        .columns
+                        .iter()
+                        .all(|(_, col, _, _)| matches!(col, secantus_pgplan::ConstCol::Value(_)))
+            }
+            _ => false,
+        }
     }
 
     /// A read of one stored table by primary-key equality: a single
