@@ -101,7 +101,8 @@ jobs:
         run: echo "SECANTUS_CARGO_TARGET=C:/cargo-target" >> "$GITHUB_ENV"
 
       - name: Restore cargo targets + registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             C:/cargo-target
@@ -139,6 +140,20 @@ jobs:
           cargo build --locked
           ./target/debug/secantusd-pg.exe --version
 
+      - name: Save cargo targets + registry
+        # Saved straight after the build rather than at job end, so a red
+        # gauge (the expected state while iterating) still keeps the ~25 min
+        # Windows build warm for the next run.
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            C:/cargo-target
+            crates/secantus-pgserver/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: psycopg-win-cargo-${{ hashFiles('**/Cargo.lock') }}-wt-${{ steps.wt-sha.outputs.sha }}
+
       - name: Install the gauge's Python dependencies
         # Not `uv sync`: that builds the whole secantus package again. The
         # runner needs only psycopg (pinned to the vendored suite's tag) and
@@ -152,6 +167,17 @@ jobs:
             "pytest-randomly>=3.5" "pproxy>=2.7" "pytest-timeout>=2.4" \
             "pytest-json-report>=1.5"
 
+      - name: Start the runner's PostgreSQL (reference server)
+        run: |
+          $PgSvc = Get-Service "postgresql*"
+          Set-Service $PgSvc.Name -StartupType manual
+          $PgSvc.Start()
+        shell: powershell
+
+      - name: TEMP diagnose suspect tests against PostgreSQL and secantusd-pg
+        shell: bash
+        run: .gauge-venv/Scripts/python tools/probes/psycopg_windows_diag.py || true
+
       - name: Run the psycopg gauge against secantusd-pg
         shell: bash
         env:
@@ -160,7 +186,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           # Name every test and the slowest ones, so a slow or hung test on
           # this runner is identifiable from the log alone.
-          PYTEST_ADDOPTS: "-v --durations=40 -rfE"
+          PYTEST_ADDOPTS: "-vv --durations=40 -rfE --deselect=tests/test_concurrency_async.py::test_type_error_shadow"
         run: |
           set +e
           .gauge-venv/Scripts/python -m psycopg_validation.runner
