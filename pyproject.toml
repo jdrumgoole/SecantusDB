@@ -226,6 +226,8 @@ sdist.exclude = [
     # Differential probes are a development tool (they need a live mongod
     # alongside SecantusDB), same rationale as the gauge dirs below.
     "tools/**",
+    # Cargo build output never belongs in the sdist, tracked or not.
+    "crates/**/target*/**",
     "vendor/wiredtiger/test/**",
     "vendor/wiredtiger/bench/**",
     "vendor/wiredtiger/examples/**",
