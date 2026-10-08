@@ -2809,9 +2809,32 @@ These work end-to-end but cut corners.
       ~120 us, which is what PostgreSQL pays too. The gap is ~245 us between
       `recvfrom` of the Bind/Execute and the log `pwrite`, on one thread, with
       no syscall in it: CPU time in the server. The same statement costs ~90 us
-      in total on the macOS box, where a row read costs 44 us against 86 here,
-      so slower cores explain about 2x and the UPDATE is ~4-5x. That
-      difference is NOT explained.
+      in total on the macOS box.
+
+      **Nothing about it is Linux-specific: an UPDATE simply executes four
+      times the instructions of a SELECT, and the droplet's cores run them
+      slowly** (follow-up, same day, same droplet plan, `perf stat -p` on the
+      server over 20,000 prepared statements, per statement):
+
+      | statement | instructions | cycles | server CPU | context switches |
+      | --- | --- | --- | --- | --- |
+      | `select 1` | 97k | 151k | 60 us | 1.0 |
+      | row by PK | 148k | 255k | 90 us | 1.0 |
+      | UPDATE by PK, durable | 590k | 1,146k | 380 us | 3.2 |
+      | UPDATE by PK, `SECANTUS_TEST_FAST_STORAGE=1` | 547k | 932k | 290 us | 1.0 |
+
+      Pinning the server to one CPU changes nothing (591k / 1,132k), and no
+      statement migrates or page-faults, so it is not wake-ups, migration or
+      the allocator returning memory. Turning the sync off removes only 43k
+      instructions. The server runs ~0.5 instructions per cycle here.
+
+      macOS, a symbolized build of the same tag (`ps` CPU time over 20,000
+      statements): `select 1` 21 us, row by PK 27 us, UPDATE by PK 68 us of
+      server CPU, 95 us wall. In a `sample` the UPDATE splits about evenly
+      three ways: planning 23%, `execute_statement` 29% (`update_matching`
+      15%), and the commit's log `pwrite` 29%. The planning and execution
+      shares match the Linux profile, so no one phase grows on Linux: the
+      whole path costs 380 us of CPU where the Mac spends 68.
 
       Leads from a `perf` profile of a symbolized build of the same tag
       (inclusive, share of on-CPU samples; the profile is flat, no function
@@ -2824,8 +2847,15 @@ These work end-to-end but cut corners.
       - glibc `malloc` + `free` are 17% inclusive. The release binary links
         the system allocator on Linux.
 
-      Start by timing the same phases on macOS to see which one grows 4-5x
-      rather than 2x; nothing here says which. The droplets are destroyed.
+      So the work is to cut instructions on the write path, and it will show
+      on both platforms. In order of what the profile offers: do not plan a
+      prepared statement again on every Execute (23% of an UPDATE, ~135k
+      instructions, nearly a whole row read's budget); then
+      `execute_statement` outside `update_matching` (~20%); then the
+      allocator (17% in glibc `malloc`/`free`; the MongoDB server links
+      mimalloc, this one does not). PostgreSQL's own instruction count was
+      not isolated: the system-wide counters taken include the client. The
+      droplets are destroyed.
       To repeat: `do-cluster up --prefix <own> --server-size c-16`, install
       `postgresql`, add a `trust` line for 127.0.0.1, clone the tag, download
       the release tarball, and run the two harnesses with `SECANTUSD_PG` set
