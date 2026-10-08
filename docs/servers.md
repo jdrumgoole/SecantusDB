@@ -33,7 +33,7 @@ live only in the Rust server.
 
 | | Rust server | Python server |
 | --- | --- | --- |
-| Package | `cargo install secantus-mdb` (crates.io), or a release archive | `pip install SecantusDB` |
+| Package | the `secantus-mdb` crate (crates.io), or a release archive | `pip install SecantusDB` |
 | Run it as | `secantusd-rs` / `secantus_mdb::Server` | `SecantusDBServer` / `secantusd-py` |
 | Conformance | **99.5%** of pymongo's own suite | see the [validation report](validation-report.md) |
 | Speed | within 1.0×–2.8× of `mongod` per operation | 2×–27× |
@@ -92,7 +92,7 @@ Python wheel. `cargo install` builds it (WiredTiger included) and puts the
 `secantusd-rs` daemon on `PATH`:
 
 ```bash
-cargo install secantus-mdb
+cargo install secantus-mdb --version 0.5.3-beta.173
 secantusd-rs --host 127.0.0.1 --port 27017
 ```
 
@@ -109,7 +109,9 @@ Mongo daemons read the same `secantusd.toml` config (see
 
 ### SQL / PostgreSQL servers
 
-The Rust PostgreSQL server ships as a standalone `secantusd-pg` archive on
+The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
+install secantus-pg --version 0.1.0-beta.3`), and also ships as a standalone
+`secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
 

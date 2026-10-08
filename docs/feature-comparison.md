@@ -20,7 +20,7 @@ The MongoDB column describes `mongod` 7.0 itself and is the reference.
 | | MongoDB | Python server | Rust server |
 | --- | --- | --- | --- |
 | What it is | the real thing | pure-Python in-process server | self-contained Rust server, GIL-free request path |
-| Install | external `mongod` process | `pip install SecantusDB` | `cargo install secantus-mdb` (crates.io), or a release archive |
+| Install | external `mongod` process | `pip install SecantusDB` | the `secantus-mdb` crate (crates.io), or a release archive |
 | Run | daemon | 1-line embedded (`SecantusDBServer`) or `secantusd-py` daemon | `secantusd-rs` daemon, or in-process from Rust (`secantus_mdb::Server`) |
 | pymongo's own suite | 100% by definition | **99.5%** (1020 pass / 5 fail) | **99.5%** (1020 pass / 5 fail) |
 | Version line | 7.0.x | `0.5.4bN` (the PyPI package) | `0.5.3-beta.N` (crates, `buildInfo.secantusVersion`) |
