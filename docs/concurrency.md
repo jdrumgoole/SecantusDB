@@ -5,10 +5,10 @@ about what that means for **concurrent writers** — many client
 connections issuing inserts/updates/deletes at the same time.
 
 The short version: the Rust server's fully-durable write path now
-scales **monotonically** — ~1.8× at two writers, ~3.2× at four, ~3.7×
-at eight — with no cliff (the earlier peak-then-collapse shape was
+scales **monotonically** — 1.7×–2.0× at two writers, 2.7×–3.2× at four,
+3.3×–3.7× at eight, across three runs of the same build — with no cliff (the earlier peak-then-collapse shape was
 oplog-prune churn on the write path plus over-sharded oplog btrees;
-both fixed). The remaining gap to mongod's ~5.2× is a **WiredTiger**
+both fixed). The remaining gap to mongod's 5.1×–5.6× is a **WiredTiger**
 ceiling — cache eviction and checkpoint pressure inside one embedded WT
 connection — not a SecantusDB lock. The opt-in async + non-logged
 oplog stack (mitigations 5–6 below) starts from a ~1.3× higher
@@ -57,7 +57,7 @@ confirms eight writers on eight vCPUs is not core-starved.
 
 Aggregate write throughput *without bound*. Both SecantusDB servers hit
 a WiredTiger ceiling as writers pile up — the Rust server's scaling
-flattens between four and eight writers (~3.2× → ~3.7×, still
+flattens between four and eight writers (2.7×–3.2× → 3.3×–3.7×, still
 monotonic); a shared-table / large-row workload (the pure-C `wt_poc`
 case below) tops out much earlier, around N≈2, and actively regresses
 past its peak.
@@ -125,17 +125,17 @@ body[data-theme="dark"] .dviz-wrap {
 .dv-legend .chip { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:-1px; }
 </style>
 <!-- concurrency-viz:begin -->
-<div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-mongo)"></span>mongod</span><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span><span><span class="chip" style="background:var(--dv-py)"></span>Python server</span><span><span class="chip" style="background:transparent;border:2px dashed var(--dv-rust);box-sizing:border-box"></span>Rust server — async stack</span></div><svg viewBox="0 0 790 320" role="img" aria-label="Throughput scaling relative to each server single-writer rate" class="dviz"><line x1="56" y1="214" x2="668" y2="214" class="dv-ref"/><text x="48" y="218" text-anchor="end" class="dv-tick">1<tspan class="dv-x">x</tspan></text><line x1="56" y1="172" x2="668" y2="172" class="dv-grid"/><text x="48" y="176" text-anchor="end" class="dv-tick">2<tspan class="dv-x">x</tspan></text><line x1="56" y1="130" x2="668" y2="130" class="dv-grid"/><text x="48" y="134" text-anchor="end" class="dv-tick">3<tspan class="dv-x">x</tspan></text><line x1="56" y1="88" x2="668" y2="88" class="dv-grid"/><text x="48" y="92" text-anchor="end" class="dv-tick">4<tspan class="dv-x">x</tspan></text><line x1="56" y1="46" x2="668" y2="46" class="dv-grid"/><text x="48" y="50" text-anchor="end" class="dv-tick">5<tspan class="dv-x">x</tspan></text><text x="56" y="290" text-anchor="middle" class="dv-tick">1</text><text x="143" y="290" text-anchor="middle" class="dv-tick">2</text><text x="318" y="290" text-anchor="middle" class="dv-tick">4</text><text x="668" y="290" text-anchor="middle" class="dv-tick">8</text><text x="362" y="310" text-anchor="middle" class="dv-lab">concurrent writers</text><path d="M56.0,214.0 L143.4,157.1 L318.3,85.5 L668.0,21.0" fill="none" stroke="var(--dv-mongo)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="157.1" r="4.5" fill="var(--dv-mongo)"><title>mongod — 2 writers: 2.36x its single-writer rate</title></circle><circle cx="318.3" cy="85.5" r="4.5" fill="var(--dv-mongo)"><title>mongod — 4 writers: 4.07x its single-writer rate</title></circle><circle cx="668.0" cy="21.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 8 writers: 5.61x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,170.3 L318.3,121.4 L668.0,102.3" fill="none" stroke="var(--dv-rust)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-rust)"><title>Rust server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="170.3" r="4.5" fill="var(--dv-rust)"><title>Rust server — 2 writers: 2.04x its single-writer rate</title></circle><circle cx="318.3" cy="121.4" r="4.5" fill="var(--dv-rust)"><title>Rust server — 4 writers: 3.21x its single-writer rate</title></circle><circle cx="668.0" cy="102.3" r="4.5" fill="var(--dv-rust)"><title>Rust server — 8 writers: 3.67x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,215.9 L318.3,219.3 L668.0,229.2" fill="none" stroke="var(--dv-py)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-py)"><title>Python server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="215.9" r="4.5" fill="var(--dv-py)"><title>Python server — 2 writers: 0.96x its single-writer rate</title></circle><circle cx="318.3" cy="219.3" r="4.5" fill="var(--dv-py)"><title>Python server — 4 writers: 0.87x its single-writer rate</title></circle><circle cx="668.0" cy="229.2" r="4.5" fill="var(--dv-py)"><title>Python server — 8 writers: 0.64x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,184.5 L318.3,138.9 L668.0,128.4" fill="none" stroke="var(--dv-rust)" stroke-width="2" stroke-dasharray="6 4"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="184.5" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 2 writers: 1.70x its single-writer rate</title></circle><circle cx="318.3" cy="138.9" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 4 writers: 2.79x its single-writer rate</title></circle><circle cx="668.0" cy="128.4" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 8 writers: 3.04x its single-writer rate</title></circle><text x="674" y="25" class="dv-val" fill="var(--dv-mongo)">mongod 5.6<tspan class="dv-x">x</tspan></text><text x="674" y="106" class="dv-val" fill="var(--dv-rust)">Rust 3.7<tspan class="dv-x">x</tspan></text><text x="674" y="233" class="dv-val" fill="var(--dv-py)">Python 0.6<tspan class="dv-x">x</tspan></text><text x="674" y="132" class="dv-val" fill="var(--dv-rust)">async 3.0<tspan class="dv-x">x</tspan></text></svg></div>
+<div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-mongo)"></span>mongod</span><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span><span><span class="chip" style="background:var(--dv-py)"></span>Python server</span><span><span class="chip" style="background:transparent;border:2px dashed var(--dv-rust);box-sizing:border-box"></span>Rust server — async stack</span></div><svg viewBox="0 0 790 320" role="img" aria-label="Throughput scaling relative to each server single-writer rate" class="dviz"><line x1="56" y1="214" x2="668" y2="214" class="dv-ref"/><text x="48" y="218" text-anchor="end" class="dv-tick">1<tspan class="dv-x">x</tspan></text><line x1="56" y1="166" x2="668" y2="166" class="dv-grid"/><text x="48" y="170" text-anchor="end" class="dv-tick">2<tspan class="dv-x">x</tspan></text><line x1="56" y1="119" x2="668" y2="119" class="dv-grid"/><text x="48" y="123" text-anchor="end" class="dv-tick">3<tspan class="dv-x">x</tspan></text><line x1="56" y1="71" x2="668" y2="71" class="dv-grid"/><text x="48" y="75" text-anchor="end" class="dv-tick">4<tspan class="dv-x">x</tspan></text><text x="56" y="290" text-anchor="middle" class="dv-tick">1</text><text x="143" y="290" text-anchor="middle" class="dv-tick">2</text><text x="318" y="290" text-anchor="middle" class="dv-tick">4</text><text x="668" y="290" text-anchor="middle" class="dv-tick">8</text><text x="362" y="310" text-anchor="middle" class="dv-lab">concurrent writers</text><path d="M56.0,214.0 L143.4,169.4 L318.3,88.0 L668.0,21.0" fill="none" stroke="var(--dv-mongo)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="169.4" r="4.5" fill="var(--dv-mongo)"><title>mongod — 2 writers: 1.94x its single-writer rate</title></circle><circle cx="318.3" cy="88.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 4 writers: 3.65x its single-writer rate</title></circle><circle cx="668.0" cy="21.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 8 writers: 5.06x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,180.9 L318.3,130.9 L668.0,105.8" fill="none" stroke="var(--dv-rust)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-rust)"><title>Rust server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="180.9" r="4.5" fill="var(--dv-rust)"><title>Rust server — 2 writers: 1.70x its single-writer rate</title></circle><circle cx="318.3" cy="130.9" r="4.5" fill="var(--dv-rust)"><title>Rust server — 4 writers: 2.75x its single-writer rate</title></circle><circle cx="668.0" cy="105.8" r="4.5" fill="var(--dv-rust)"><title>Rust server — 8 writers: 3.28x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,214.6 L318.3,222.7 L668.0,235.6" fill="none" stroke="var(--dv-py)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-py)"><title>Python server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="214.6" r="4.5" fill="var(--dv-py)"><title>Python server — 2 writers: 0.99x its single-writer rate</title></circle><circle cx="318.3" cy="222.7" r="4.5" fill="var(--dv-py)"><title>Python server — 4 writers: 0.82x its single-writer rate</title></circle><circle cx="668.0" cy="235.6" r="4.5" fill="var(--dv-py)"><title>Python server — 8 writers: 0.55x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,184.7 L318.3,137.0 L668.0,120.1" fill="none" stroke="var(--dv-rust)" stroke-width="2" stroke-dasharray="6 4"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="184.7" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 2 writers: 1.62x its single-writer rate</title></circle><circle cx="318.3" cy="137.0" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 4 writers: 2.62x its single-writer rate</title></circle><circle cx="668.0" cy="120.1" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 8 writers: 2.97x its single-writer rate</title></circle><text x="674" y="25" class="dv-val" fill="var(--dv-mongo)">mongod 5.1<tspan class="dv-x">x</tspan></text><text x="674" y="110" class="dv-val" fill="var(--dv-rust)">Rust 3.3<tspan class="dv-x">x</tspan></text><text x="674" y="240" class="dv-val" fill="var(--dv-py)">Python 0.5<tspan class="dv-x">x</tspan></text><text x="674" y="124" class="dv-val" fill="var(--dv-rust)">async 3.0<tspan class="dv-x">x</tspan></text></svg></div>
 <!-- concurrency-viz:end -->
 ```
 
 <!-- concurrency-table:begin -->
 | N writers | Python server (docs/s) | Rust server (docs/s) | Rust — async stack (docs/s) | mongod (docs/s) |
 |---|---:|---:|---:|---:|
-| 1 | 3,600 | 9,700 | 13,800 | 19,300 |
-| 2 | 3,500 | 19,800 | 23,500 | 45,600 |
-| 4 | 3,200 | 31,200 | 38,500 | 78,600 |
-| 8 | 2,300 | 35,600 | 41,900 | 108,400 |
+| 1 | 3,800 | 10,100 | 13,200 | 19,600 |
+| 2 | 3,700 | 17,100 | 21,300 | 38,000 |
+| 4 | 3,100 | 27,700 | 34,500 | 71,600 |
+| 8 | 2,100 | 33,000 | 39,200 | 99,100 |
 <!-- concurrency-table:end -->
 
 (The async-stack column is the opt-in async-oplog + non-logged-oplog
@@ -147,10 +147,13 @@ to each series' own single-writer rate.)
 
 Three different shapes:
 
-- **mongod scales** — 5.2× its own single-writer aggregate at N=8. That's
+- **mongod scales** — 5.1×–5.6× its own single-writer aggregate at N=8
+  across the three runs (2026-10-07 and two on 2026-10-08; the chart shows
+  the newest). That's
   the C++ scheduler above WT doing its job.
-- **The Rust server now scales monotonically** — 1.8× at two writers,
-  3.2× at four, **3.7× at eight**, with no cliff. The earlier
+- **The Rust server now scales monotonically** — 1.7×–2.0× at two writers,
+  2.7×–3.2× at four, **3.3×–3.7× at eight**, with no cliff in any of the
+  three runs. The earlier
   peak-then-collapse shape (2.6× at four easing back to 1.6× at eight)
   was diagnosed by profiling and eliminated in two steps: the
   opportunistic **oplog prune** was consuming ~36% of the sustained
@@ -160,7 +163,8 @@ Three different shapes:
   across two append-tuned btrees). Together with the per-collection
   write-lock split and the **RecordId keying** work (write
   amplification cut from four WT writes per document to three), the
-  fully-durable default now holds ~70% of mongod's scaling ratio (3.7× against 5.2×). The
+  fully-durable default now holds about two-thirds of mongod's scaling ratio
+  (65%–70% across the three runs). The
   remaining flattening between four and eight writers is **WiredTiger
   itself** — cache eviction and checkpoint pressure inside a single
   embedded WT connection — not a SecantusDB lock.
@@ -168,13 +172,14 @@ Three different shapes:
   line) — the opt-in async-oplog + non-logged-oplog configuration
   (mitigations 5–6 below)
   moves the oplog write off the writers' critical path and out of the
-  WAL: 3.5× scaling from a ~1.3× higher single-writer base (13.0k vs
-  10.2k docs/s), reaching ~45.9k docs/s at eight writers — ~1.2× the
-  default's 37.2k (droplet run, 2026-10-07). The trade is that a hard crash loses the oplog tail
+  WAL: 3.0×–3.5× scaling from a ~1.3×–1.4× higher single-writer base
+  (13.0k–13.8k vs 9.7k–10.2k docs/s), reaching 39.2k–45.9k docs/s at eight
+  writers — ~1.2× the default's 33.0k–37.2k in every run (three droplet
+  runs, 2026-10-07 and 2026-10-08). The trade is that a hard crash loses the oplog tail
   since the last checkpoint (data stays fully durable; change streams
   remain exactly-once).
 - **The Python server degrades** under contention — the GIL plus the
-  WT-binding ceiling measured above hold it to ~0.8× of its single-writer
+  WT-binding ceiling measured above hold it to 0.5×–0.8× of its single-writer
   rate at eight writers. It degrades *gracefully*, though: the write conflicts WiredTiger
   reports under saturation are retried with backoff, without a deadline,
   exactly like mongod's `writeConflictRetry` — a client never sees an

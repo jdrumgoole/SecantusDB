@@ -8,73 +8,73 @@
       "key": "insert",
       "label": "insert (10k docs)",
       "md_label": "insert (10k docs)",
-      "mongod_ms": 89.77,
-      "rust_ms": 196.01,
-      "py_ms": 882.21
+      "mongod_ms": 85.19,
+      "rust_ms": 177.08,
+      "py_ms": 893.84
     },
     {
       "key": "find_indexed_range",
       "label": "find indexed range",
       "md_label": "find indexed range",
-      "mongod_ms": 11.35,
-      "rust_ms": 10.88,
-      "py_ms": 86.54
+      "mongod_ms": 9.06,
+      "rust_ms": 12.42,
+      "py_ms": 89.04
     },
     {
       "key": "find_all",
       "label": "find full scan",
       "md_label": "find full scan",
-      "mongod_ms": 18.21,
-      "rust_ms": 24.47,
-      "py_ms": 171.11
+      "mongod_ms": 20.27,
+      "rust_ms": 26.84,
+      "py_ms": 150.55
     },
     {
       "key": "find_filtered_scan",
       "label": "find filtered scan",
       "md_label": "find filtered scan",
-      "mongod_ms": 17.46,
-      "rust_ms": 20.39,
-      "py_ms": 203.19
+      "mongod_ms": 17.71,
+      "rust_ms": 21.83,
+      "py_ms": 188.26
     },
     {
       "key": "update_many_half",
       "label": "update_many (half)",
       "md_label": "update_many (half)",
-      "mongod_ms": 114.67,
-      "rust_ms": 155.76,
-      "py_ms": 2304.92
+      "mongod_ms": 103.8,
+      "rust_ms": 150.5,
+      "py_ms": 2216.24
     },
     {
       "key": "aggregate_group",
       "label": "aggregate $group",
       "md_label": "aggregate $group",
-      "mongod_ms": 12.4,
-      "rust_ms": 25.98,
-      "py_ms": 364.78
+      "mongod_ms": 13.07,
+      "rust_ms": 35.6,
+      "py_ms": 340.1
     },
     {
       "key": "aggregate_multistage",
       "label": "aggregate multi-stage",
       "md_label": "aggregate multi-stage",
-      "mongod_ms": 14.79,
-      "rust_ms": 52.9,
-      "py_ms": 367.38
+      "mongod_ms": 14.48,
+      "rust_ms": 58.88,
+      "py_ms": 401.91
     },
     {
       "key": "delete_many_half",
       "label": "delete_many (half)",
       "md_label": "delete_many (half)",
-      "mongod_ms": 46.85,
-      "rust_ms": 101.23,
-      "py_ms": 930.76
+      "mongod_ms": 41.53,
+      "rust_ms": 124.4,
+      "py_ms": 898.72
     },
     {
       "key": "change_stream_drain",
       "label": "change-stream drain",
       "md_label": "change-stream drain",
-      "mongod_ms": 118.04,
-      "rust_ms": 146.2,
-      "py_ms": 302.38
+      "mongod_ms": 129.27,
+      "rust_ms": 157.69,
+      "py_ms": 274.57
     }
   ]
 }
