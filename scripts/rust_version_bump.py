@@ -21,6 +21,13 @@ version strings never coincide. A PG crate's ``=`` pins on MongoDB-side crates
 (``secantus-core``, ``-storage``, ``-auth``) belong to the MongoDB line and move
 with it.
 
+The bump also rewrites the version a READER is told to install. Every release
+so far is a pre-release, so the README, the docs and the crate READMEs print
+``cargo install secantus-mdb --version <ver>`` and ``secantus-mdb = "<ver>"``
+with the version spelled out, and nothing else moves those when the crates do.
+Only a version attached to the line's own installable crate is rewritten; a
+version mentioned in passing is history and stays.
+
 Usage::
 
     python scripts/rust_version_bump.py 0.5.3-beta.166             # MongoDB line
@@ -41,6 +48,14 @@ CRATES = REPO / "crates"
 # The manifest whose version IS each line's version.
 LINES = {"mdb": "secantusdb", "pg": "secantus-pg"}
 CANONICAL = CRATES / LINES["mdb"] / "Cargo.toml"
+
+# The crate a user installs for each line, as the docs name it.
+INSTALL_CRATE = {"mdb": "secantus-mdb", "pg": "secantus-pg"}
+# The pages that print an install command. The changelog and the blog are
+# history; the site reads its version from the binary tag in pelicanconf.py,
+# which moves only once the binaries are published.
+DOC_GLOBS = ("README.md", "docs/*.md", "docs-rust/*.md", "crates/*/README.md")
+DOC_HISTORY = {"docs/changelog.md"}
 
 # A SemVer pre-release of the shape the lockstep line uses.
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
@@ -96,6 +111,53 @@ def leftovers(old: str, crates: Path = CRATES) -> list[str]:
     return found
 
 
+def doc_files(repo: Path = REPO) -> list[Path]:
+    """Every published page that may print an install command."""
+    files = {p for pattern in DOC_GLOBS for p in repo.glob(pattern)}
+    return sorted(p for p in files if p.relative_to(repo).as_posix() not in DOC_HISTORY)
+
+
+def _install_pin(crate: str, version: str | None = None) -> re.Pattern[str]:
+    """`<crate> --version <ver>` or `<crate> = "<ver>"`; the version is group 2.
+
+    The gap may be a line break (prose wraps) and, at the start of the next
+    line, the `>` of a Markdown quote. A longer crate name that merely starts
+    the same (`secantus-pgwire`) and a longer version do not match.
+    """
+    ver = re.escape(version) if version else r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]*[0-9A-Za-z])?"
+    return re.compile(
+        r"((?<![\w-])" + re.escape(crate) + r'(?:\s+(?:>\s*)?--version\s+|\s*=\s*"))'
+        r"(" + ver + r")(?![0-9A-Za-z-]|\.[0-9A-Za-z])"
+    )
+
+
+def bump_docs(old: str, new: str, line: str = "mdb", repo: Path = REPO) -> list[Path]:
+    """Rewrite the install version the docs print for `line`; return files changed."""
+    pattern = _install_pin(INSTALL_CRATE[line], old)
+    changed = []
+    for path in doc_files(repo):
+        text = path.read_text(encoding="utf-8")
+        updated = pattern.sub(lambda m: m.group(1) + new, text)
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+            changed.append(path)
+    return changed
+
+
+def doc_mismatches(line: str = "mdb", repo: Path = REPO, crates: Path | None = None) -> list[str]:
+    """Install commands in the docs naming a version other than the line's own."""
+    want = current_version(crates or repo / "crates", line)
+    pattern = _install_pin(INSTALL_CRATE[line])
+    found = []
+    for path in doc_files(repo):
+        text = path.read_text(encoding="utf-8")
+        for m in pattern.finditer(text):
+            if m.group(2) != want:
+                n = text.count("\n", 0, m.start(2)) + 1
+                found.append(f"{path.relative_to(repo)}:{n}: names {m.group(2)}, crate is {want}")
+    return found
+
+
 def lock_failures(crates: Path = CRATES) -> list[str]:
     """Crate dirs whose Cargo.lock no longer resolves `--locked`."""
     bad = []
@@ -146,10 +208,13 @@ def main() -> int:
         if args.new == old:
             ap.error(f"already at {old}")
         changed = bump(old, args.new)
-        print(f"{old} -> {args.new}: {len(changed)} files")
-        stale = leftovers(old)
+        docs = bump_docs(old, args.new, line=args.line)
+        print(f"{old} -> {args.new}: {len(changed)} files, {len(docs)} doc pages")
+        stale = leftovers(old) + doc_mismatches(line=args.line)
         if stale:
-            print("the old version survived in:", *stale, sep="\n  ", file=sys.stderr)
+            print(
+                "a version other than the new one survived in:", *stale, sep="\n  ", file=sys.stderr
+            )
             return 1
         bad = lock_failures()
     if bad:
