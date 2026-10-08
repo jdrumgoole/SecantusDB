@@ -93,7 +93,7 @@ Two wire protocols, two implementations of each, one storage format.
 | Server | Wire | Run it as | Role |
 | --- | --- | --- | --- |
 | **Rust MongoDB server** | MongoDB | `secantusd-rs` / `secantus_mdb::Server` | **The flagship.** `cargo install secantus-mdb`; prebuilt binaries per platform |
-| **Rust PostgreSQL server** | PostgreSQL | `secantusd-pg` | **The newest.** Prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases); crates.io to follow |
+| **Rust PostgreSQL server** | PostgreSQL | `secantusd-pg` | **The newest.** Prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases), and the [`secantus-pg`](https://crates.io/crates/secantus-pg) crate |
 | Python MongoDB server | MongoDB | `SecantusDBServer` / `secantusd-py` | The readable reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | PostgreSQL | `SecantusPGServer` / `secantusd-py-pg` | The reference for the SQL surface, and still the most complete one |
 
