@@ -2776,6 +2776,62 @@ These work end-to-end but cut corners.
       that names the failure and distinguishes the remaining possibilities.
       Probe: `scratchpad/sockwatch.py` in the session that measured this.
 
+- [ ] **OPEN — Rust PostgreSQL server on LINUX: durable writes are 2.1-2.4x
+      slower than PostgreSQL at EVERY client count, one client included
+      (measured 2026-10-08).** The first Linux measurement. It is a different
+      problem from the macOS one below: there the gap opens only under
+      concurrency, here it is the cost of one statement.
+
+      Setup: a DigitalOcean `c-16` droplet (16 dedicated vCPU, 32 GB, ext4,
+      Ubuntu 24.04, kernel 6.8), the RELEASED `secantusd-pg 0.1.0-beta.3`
+      x86_64 binary (stamped tree `f162a408`, equal to the tag's
+      `HEAD:crates`) against the distro's PostgreSQL 16.15 with default
+      settings (`fsync=on`, `synchronous_commit=on`, `wal_sync_method=fdatasync`),
+      same box, loopback. `bench/pg_concurrency.py --seconds 10 --repeat 3`,
+      one table per client, medians in ops/s. `pg_test_fsync` on that disk:
+      one 8 kB `fdatasync` is 84 us.
+
+      | N | INSERT PG 16 | INSERT ours | UPDATE PG 16 | UPDATE ours | SELECT PG 16 | SELECT ours |
+      | --- | --- | --- | --- | --- | --- | --- |
+      | 1 | 5,174 | 2,413 (2.14x slower) | 5,063 | 1,989 (2.55x) | 13,749 | 8,251 (1.67x) |
+      | 2 | 8,348 | 4,129 (2.02x) | 8,298 | 3,604 (2.30x) | 24,644 | 18,959 (1.30x) |
+      | 4 | 13,161 | 6,255 (2.10x) | 13,467 | 5,636 (2.39x) | 45,772 | 32,393 (1.41x) |
+      | 8 | 19,136 | 8,095 (2.36x) | 18,668 | 7,760 (2.41x) | 61,958 | 42,393 (1.46x) |
+
+      INSERT into one SHARED table is the same within noise (2.07x / 1.99x /
+      2.09x / 2.41x). Both servers SCALE alike (INSERT 3.35x ours, 3.70x PG at
+      8 clients), so this is not a concurrency problem.
+      `bench/pg_statement_cost.py`: `select 1` 54.5 us vs 49.9, row by PK
+      prepared 85.6 vs 57.1, durable UPDATE by PK prepared **464.8 vs 177.8**.
+
+      **It is not the sync.** `strace` on the server shows exactly one 384-byte
+      `pwrite` and one `fdatasync` on the log per UPDATE, the `fdatasync` at
+      ~120 us, which is what PostgreSQL pays too. The gap is ~245 us between
+      `recvfrom` of the Bind/Execute and the log `pwrite`, on one thread, with
+      no syscall in it: CPU time in the server. The same statement costs ~90 us
+      in total on the macOS box, where a row read costs 44 us against 86 here,
+      so slower cores explain about 2x and the UPDATE is ~4-5x. That
+      difference is NOT explained.
+
+      Leads from a `perf` profile of a symbolized build of the same tag
+      (inclusive, share of on-CPU samples; the profile is flat, no function
+      owns more than ~4% self time):
+      - `secantus_pgplan::plan_with_session_types_and_subqueries` is 23%, and
+        it runs inside `run_typed_inner` on every Execute of a PREPARED
+        statement. The statement is planned again each time.
+      - `execute_statement` is 35%, of which `Storage::update_matching` is 15%.
+      - `commit_user_transaction` is 12% (`__wt_txn_commit` 11%).
+      - glibc `malloc` + `free` are 17% inclusive. The release binary links
+        the system allocator on Linux.
+
+      Start by timing the same phases on macOS to see which one grows 4-5x
+      rather than 2x; nothing here says which. The droplets are destroyed.
+      To repeat: `do-cluster up --prefix <own> --server-size c-16`, install
+      `postgresql`, add a `trust` line for 127.0.0.1, clone the tag, download
+      the release tarball, and run the two harnesses with `SECANTUSD_PG` set
+      and `--pg-dsn "host=127.0.0.1 port=5432 dbname=postgres user=postgres"`.
+      About $0.60 and an hour.
+
 - [x] **ACCEPTED AS A LIMIT 2026-10-07 (Joe), and may be revisited — Rust
       PostgreSQL server: a READ statement costs ~1.45-1.6x PostgreSQL's, and
       durable writes reach ~3x scaling at 8 clients against PostgreSQL's ~4x
@@ -2784,8 +2840,8 @@ These work end-to-end but cut corners.
       being worked: no lever above ~1us is known for reads, and the write gap
       is the hand-off between one group's log write and the next. Joe kept the
       option to reopen it. A session that does should start from the batch 72
-      numbers, re-measure them first, and measure LINUX, which nobody has (the
-      server uses `method=fsync` there and runs unpatched WiredTiger code).
+      numbers and re-measure them first. LINUX was measured 2026-10-08 and is
+      the entry directly above: the picture there is different and worse.
       Release `secantusd-pg` against PostgreSQL 15.19
       (port 5415; the harness still LABELS it "PostgreSQL 16"), same box, 5s x3
       medians. `bench/pg_statement_cost.py --iters 1200`: `select 1` 40.6us vs
