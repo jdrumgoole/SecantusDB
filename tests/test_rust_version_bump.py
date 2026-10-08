@@ -103,3 +103,74 @@ def test_bump_matches_whole_versions_only(tmp_path: Path) -> None:
     text = (crates / "secantusdb" / "Cargo.toml").read_text()
     assert 'version = "1.0.0-beta.17"' in text
     assert "=1.0.0-beta.165" in text  # a longer version that merely starts the same is untouched
+
+
+def _copy_docs(mod, dest: Path) -> Path:
+    for path in mod.doc_files(REPO):
+        target = dest / path.relative_to(REPO)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    return dest
+
+
+def test_docs_name_the_version_the_crates_carry() -> None:
+    """A hand bump that skipped the docs, or a doc edit naming a stale version."""
+    mod = _load()
+    assert mod.doc_mismatches("mdb") == []
+    assert mod.doc_mismatches("pg") == []
+
+
+def test_bump_rewrites_the_install_commands_in_the_real_docs(tmp_path: Path) -> None:
+    mod = _load()
+    repo = _copy_docs(mod, tmp_path)
+    crates = _copy_manifests(tmp_path)
+    old = mod.current_version(crates)
+    pg = mod.current_version(crates, line="pg")
+    new = "9.9.9-beta.1"
+
+    mod.bump(old, new, crates)
+    changed = mod.bump_docs(old, new, repo=repo)
+
+    names = {p.relative_to(repo).as_posix() for p in changed}
+    # The PyPI README, both docs trees and the crates.io README.
+    assert {
+        "README.md",
+        "docs/servers.md",
+        "docs-rust/installation.md",
+        "crates/secantusdb/README.md",
+    } <= names
+    assert mod.doc_mismatches("mdb", repo=repo) == []
+    readme = (repo / "README.md").read_text()
+    assert f"cargo install secantus-mdb --version {new}" in readme
+    # The other line's command, on the next line of the same file, stays.
+    assert f"cargo install secantus-pg --version {pg}" in readme
+    assert f'secantus-mdb = "{new}"' in (repo / "docs-rust" / "installation.md").read_text()
+
+
+def test_doc_bump_touches_only_the_install_pin(tmp_path: Path) -> None:
+    mod = _load()
+    (tmp_path / "README.md").write_text(
+        "cargo install secantus-mdb --version 1.0.0-beta.16\n"
+        "wrapped: `cargo install secantus-mdb\n> --version 1.0.0-beta.16`.\n"
+        'secantus-mdb = "1.0.0-beta.16"\n'
+        "cargo install secantus-mdb --version 1.0.0-beta.165\n"
+        "cargo install secantus-pg --version 1.0.0-beta.16\n"
+        "Fixed in 1.0.0-beta.16.\n"
+    )
+    mod.bump_docs("1.0.0-beta.16", "1.0.0-beta.17", repo=tmp_path)
+    assert (tmp_path / "README.md").read_text() == (
+        "cargo install secantus-mdb --version 1.0.0-beta.17\n"
+        "wrapped: `cargo install secantus-mdb\n> --version 1.0.0-beta.17`.\n"
+        'secantus-mdb = "1.0.0-beta.17"\n'
+        "cargo install secantus-mdb --version 1.0.0-beta.165\n"  # a longer version
+        "cargo install secantus-pg --version 1.0.0-beta.16\n"  # the other line's crate
+        "Fixed in 1.0.0-beta.16.\n"  # history, not an install command
+    )
+
+
+def test_a_stale_install_command_is_reported(tmp_path: Path) -> None:
+    mod = _load()
+    crates = _copy_manifests(tmp_path)
+    (tmp_path / "README.md").write_text("cargo install secantus-pg --version 0.0.1\n")
+    found = mod.doc_mismatches("pg", repo=tmp_path, crates=crates)
+    assert len(found) == 1 and found[0].startswith("README.md:1: names 0.0.1")
