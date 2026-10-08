@@ -355,10 +355,16 @@ and publishes the four PG crates (`crates_publish.py --line pg`, which refuses
 to start if a MongoDB-side crate they pin is not on crates.io yet);
 `./inv rust-version-bump --line pg --to <ver>` bumps the PG line; binstall
 metadata on `secantus-pg` points at the `secantusd-pg-<ver>-<target>.tar.gz`
-archives. **The one step left is the first real publish of each line**, from a
-release tag, which needs the trusted-publishing configs on crates.io for
-`secantus-pg` and `secantus-pgwire` (Joe's account) -- check every PG crate
-has one before tagging.
+archives.
+
+**Both lines are published (2026-10-07).** `secantusdb-v0.5.3-beta.173` and
+then `secantusd-pg-v0.1.0-beta.3`, the PG line's first: all four PG crates
+went up through trusted publishing on the first run, so every `secantus-*`
+name has a working config. The order matters and will again: the PG crates
+pin the MongoDB-side crates exactly, so when `secantus-storage`,
+`secantus-wiredtiger-sys` or another MongoDB-side crate has changed since its
+last publish, bump and tag that line FIRST, or a crates.io build of
+`secantus-pg` is built from older storage than the released binary.
 
 1. A `publish-crates.yml` workflow on the existing `secantusdb-v*` /
    `secantusd-pg-v*` tags: verify the tag against the crate version (as the
