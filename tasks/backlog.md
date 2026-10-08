@@ -2859,9 +2859,33 @@ These work end-to-end but cut corners.
       `text` with no width, domain, enum or generation). Server CPU per
       statement, macOS release build, before -> after: INSERT 48.7 -> 42.0 us,
       `SET v = $1` 58.7 -> 47.3, `SET v = v + 1` 68.7 -> 57.3, an UPDATE
-      matching no row 45.3 -> 29.3. NOT re-measured on Linux.
+      matching no row 45.3 -> 29.3.
+
+      Linux, same day, a fresh `c-16` droplet, the released beta.3 binary
+      against a release build of `24f68221` on the same box, two interleaved
+      passes of 20,000 prepared statements each over `int` columns (`perf
+      stat -p`; the second pass agrees with the first within 3%):
+
+      | statement | instructions | server CPU | wall |
+      | --- | --- | --- | --- |
+      | row by PK (unchanged, the control) | 148k -> 147k | 85 -> 86 us | 116 -> 117 us |
+      | `UPDATE SET v = v + 1` | 592k -> 430k | 361 -> 295 us | 527 -> 467 us |
+      | `UPDATE SET v = $1` | 457k -> 353k | 316 -> 263 us | 483 -> 443 us |
+      | `INSERT` | 366k -> 294k | 270 -> 237 us | 424 -> 399 us |
+
+      `bench/pg_concurrency.py` (`bigint` columns, 10s x3), ops/s at
+      1 / 2 / 4 / 8 clients: UPDATE 2,076 / 3,741 / 6,289 / 8,891 ->
+      2,396 / 4,218 / 6,810 / 9,525, against PostgreSQL 16's 5,010 / 8,434 /
+      15,202 / 22,976 in the same run (2.0-2.4x slower, was 2.3-2.6x).
+      INSERT did not move (2,594 / 4,663 / 7,401 / 9,604 -> 2,504 / 4,588 /
+      7,037 / 9,437): the harness binds a small Python int, which psycopg
+      sends as `int2`, into a `bigint` column, and a value the planner
+      widens is not templated.
 
       What is left, in order of what the profile offers:
+      - an int32 bound for a `bigint` column (every small Python int through
+        psycopg) is not templated; widening is lossless and checks nothing,
+        so it is the cheapest next case and the one the INSERT bench needs;
       - a stored value into any other column type (`varchar(n)`, `smallint`,
         `numeric`, `timestamptz`, `bool`...) is still planned per Execute,
         because the planner checks or converts it. Templating those means
