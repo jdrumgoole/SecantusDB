@@ -81,7 +81,126 @@ pub(crate) fn eligible_sql(sql: &str) -> Option<Vec<String>> {
                     | pg_query::NodeRef::OnConflictClause(_)
             )
         });
-    plain.then(|| parsed.tables())
+    let stmt = stmts[0].stmt.as_ref()?.node.as_ref()?;
+    (plain && params_stand_alone(sql, stmt)).then(|| parsed.tables())
+}
+
+type Node = pg_query::protobuf::Node;
+
+fn is_param(n: Option<&Node>) -> bool {
+    matches!(
+        n.and_then(|n| n.node.as_ref()),
+        Some(pg_query::NodeEnum::ParamRef(_))
+    )
+}
+
+fn is_column(n: Option<&Node>) -> bool {
+    matches!(
+        n.and_then(|n| n.node.as_ref()),
+        Some(pg_query::NodeEnum::ColumnRef(_))
+    )
+}
+
+/// `column <op> $n` or `$n <op> column`, for an operator in `ops`.
+fn column_op_param(a: &pg_query::protobuf::AExpr, ops: &[&str]) -> bool {
+    let op = a.name.last().and_then(|n| match n.node.as_ref() {
+        Some(pg_query::NodeEnum::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+        && op.is_some_and(|op| ops.contains(&op))
+        && ((is_column(a.lexpr.as_deref()) && is_param(a.rexpr.as_deref()))
+            || (is_param(a.lexpr.as_deref()) && is_column(a.rexpr.as_deref())))
+}
+
+/// The parameters of a WHERE that are compared with a column as they are:
+/// `column = $n` (any comparison) and the items of `column IN ($n, ...)`,
+/// under any AND / OR / NOT.
+fn where_params(n: Option<&Node>) -> usize {
+    match n.and_then(|n| n.node.as_ref()) {
+        Some(pg_query::NodeEnum::BoolExpr(b)) => b.args.iter().map(|a| where_params(Some(a))).sum(),
+        Some(pg_query::NodeEnum::AExpr(a))
+            if column_op_param(a, &["=", "<>", "!=", "<", "<=", ">", ">="]) =>
+        {
+            1
+        }
+        Some(pg_query::NodeEnum::AExpr(a))
+            if a.kind == pg_query::protobuf::AExprKind::AexprIn as i32
+                && is_column(a.lexpr.as_deref()) =>
+        {
+            match a.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
+                Some(pg_query::NodeEnum::List(l)) => {
+                    l.items.iter().filter(|i| is_param(Some(i))).count()
+                }
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Does every `$n` of the statement STAND ALONE where substitution puts a
+/// value: compared with a column in the WHERE, an item of an INSERT's VALUES,
+/// the whole of an UPDATE's `SET column = $n`, or one operand of
+/// `SET column = other_column <op> $n`?
+///
+/// A parameter anywhere else may be folded into a value while planning
+/// (`k = $1 % 100000`, `values ($1 % 1000)`), and the two stand-ins --
+/// both small -- pass through such a fold unchanged, so the plan looked like
+/// a template and a later value was substituted UNFOLDED. That returned the
+/// wrong row and stored the wrong value.
+fn params_stand_alone(sql: &str, stmt: &pg_query::NodeEnum) -> bool {
+    let Ok(scanned) = pg_query::scan(sql) else {
+        return false;
+    };
+    let total = scanned
+        .tokens
+        .iter()
+        .filter(|t| t.token == pg_query::protobuf::Token::Param as i32)
+        .count();
+    let alone = match stmt {
+        pg_query::NodeEnum::SelectStmt(s) => where_params(s.where_clause.as_deref()),
+        pg_query::NodeEnum::DeleteStmt(d) => where_params(d.where_clause.as_deref()),
+        pg_query::NodeEnum::InsertStmt(i) => {
+            match i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                Some(pg_query::NodeEnum::SelectStmt(s)) => s
+                    .values_lists
+                    .iter()
+                    .filter_map(|row| match row.node.as_ref() {
+                        Some(pg_query::NodeEnum::List(l)) => Some(l),
+                        _ => None,
+                    })
+                    .flat_map(|l| l.items.iter())
+                    .filter(|item| is_param(Some(item)))
+                    .count(),
+                _ => 0,
+            }
+        }
+        pg_query::NodeEnum::UpdateStmt(u) => {
+            let set: usize = u
+                .target_list
+                .iter()
+                .filter_map(|t| match t.node.as_ref() {
+                    Some(pg_query::NodeEnum::ResTarget(rt)) => rt.val.as_deref(),
+                    _ => None,
+                })
+                .map(|val| match val.node.as_ref() {
+                    Some(pg_query::NodeEnum::ParamRef(_)) => 1,
+                    // Evaluated per row by the executor, which reads `$n`
+                    // from the statement's own values.
+                    Some(pg_query::NodeEnum::AExpr(a))
+                        if column_op_param(a, &["+", "-", "*", "/", "%", "||"]) =>
+                    {
+                        1
+                    }
+                    _ => 0,
+                })
+                .sum();
+            set + where_params(u.where_clause.as_deref())
+        }
+        _ => 0,
+    };
+    alone == total
 }
 
 /// The two stand-in sets for `params`, or `None` when one of them cannot be
@@ -316,6 +435,45 @@ mod tests {
         assert!(eligible_sql("select 1; select 2").is_none());
         assert!(eligible_sql("select current_user").is_none());
         assert!(eligible_sql("create table x (a int)").is_none());
+    }
+
+    #[test]
+    fn a_parameter_must_stand_alone() {
+        for sql in [
+            "select v from t where k = $1",
+            "select v from t where $1 = k and (v > $2 or not v <= $3)",
+            "select v from t where k in ($1, $2)",
+            "delete from t where k <> $1",
+            "insert into t values ($1, $2), ($3, 4)",
+            "insert into t (k, v) values ($1, $2) returning k",
+            "update t set v = $1, w = 5 where k = $2",
+            "update t set v = v + $1 where k = $2",
+            "update t set v = v + 1 where k = $1",
+        ] {
+            assert!(eligible_sql(sql).is_some(), "{sql}");
+        }
+        for sql in [
+            // Folded while planning: the stand-ins pass through unchanged.
+            "select v from t where k = $1 % 100000",
+            "select v from t where k = $1 + 0",
+            "select v from t where k = -$1",
+            "select v from t where k = $1::int2",
+            "select v from t where k = case when $1 > 5 then 1 else 2 end",
+            "select v from t where k + $1 = 5",
+            "select v from t where k between $1 and $2",
+            "select v from t where v like $1",
+            "select v from t where k in ($1 % 10, 2)",
+            "select v from t where k = $1 limit $2",
+            "select $1 from t",
+            "insert into t values ($1 % 1000, $2)",
+            "insert into t values ($1::int2, 1)",
+            "update t set v = $1 % 1000 where k = $2",
+            "update t set v = $1 + 1 where k = $2",
+            "update t set v = v + $1 % 7 where k = $2",
+            "update t set v = v + $1 where k = $2 % 9",
+        ] {
+            assert!(eligible_sql(sql).is_none(), "{sql}");
+        }
     }
 
     #[test]
