@@ -9,6 +9,7 @@ asserts the child is still there.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import signal
@@ -197,16 +198,65 @@ def test_stop_ends_a_running_command(tmp_path: Path) -> None:
     assert "running" in running.stdout, (running.stdout, running.stderr)
     stop = _run_env(state, env, "stop", "--name", "nap")
     assert stop.returncode == 0, (stop.stdout, stop.stderr)
-    # On a failure, say what `stop` reported and what `status` still sees --
-    # this assertion has failed on Windows CI without either, which left
-    # nothing to diagnose.
-    assert _wait_for(
-        lambda: "finished" in _run_env(state, env, "status", "--name", "nap").stdout, timeout=90
-    ), (
-        stop.stdout,
-        stop.stderr,
-        _run_env(state, env, "status", "--name", "nap").stdout,
+    # `stop` records the end itself, so one `status` is enough: no waiting.
+    # (This used to poll for 90s and still fail on Windows CI. The run WAS
+    # stopped; `status` was crashing on an exit file the killed supervisor left
+    # empty, which the stdout-only failure message could not show.)
+    status = _run_env(state, env, "status", "--name", "nap")
+    assert "finished" in status.stdout, (stop.stdout, stop.stderr, status.stdout, status.stderr)
+    assert json.loads((state / "nap.json").read_text())["exit_code"] is not None
+
+
+@pytest.mark.parametrize("left_behind", ["", "12", "not a number", None])
+def test_status_survives_whatever_a_killed_supervisor_left(
+    tmp_path: Path, left_behind: str | None
+) -> None:
+    """A supervisor killed while recording its child's exit leaves the exit
+    file empty, partial or absent. `status` must still say the run finished:
+    an empty file made it raise `ValueError` on every call, so a stopped run
+    read as never finishing (Windows CI, 2026-10-07)."""
+    state = tmp_path / "runs"
+    state.mkdir()
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    (state / "nap.json").write_text(
+        json.dumps(
+            {"name": "nap", "pid": dead.pid, "log": str(state / "nap.log"), "exit_code": None}
+        )
     )
+    if left_behind is not None:
+        (state / "nap.exit").write_text(left_behind)
+    status = _run(state, "status", "--name", "nap")
+    want = "rc=12" if left_behind == "12" else "rc=-1"
+    assert f"finished {want}" in status.stdout, (status.stdout, status.stderr)
+    # ...and the answer is recorded, so the next reader does not redo this.
+    assert json.loads((state / "nap.json").read_text())["exit_code"] is not None
+
+
+def test_a_kill_cannot_leave_a_half_written_file(tmp_path: Path) -> None:
+    """Files are written beside their name and renamed into place, so the name
+    holds the old content or the new one and never an empty file."""
+    spec = importlib.util.spec_from_file_location("detached_run", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    target = tmp_path / "nap.exit"
+    target.write_text("old")
+    real_replace = os.replace
+    seen: list[str] = []
+
+    def replace(src: object, dst: object) -> None:
+        seen.append(target.read_text())  # what a reader sees mid-write
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    module.os.replace = replace
+    try:
+        module._write_atomic(target, "new")
+    finally:
+        module.os.replace = real_replace
+    assert seen == ["old"]
+    assert target.read_text() == "new"
+    assert list(tmp_path.iterdir()) == [target]
 
 
 def test_the_state_file_records_the_exit_without_a_status_call(tmp_path: Path) -> None:
