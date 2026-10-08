@@ -24,7 +24,7 @@ it is a test's server.
 
 The published `SecantusDB` wheel no longer contains the Rust server: it
 carries only the Python servers. From a Python test, either run
-`secantusd-rs` (from `cargo install secantus-mdb` or a release archive) as a
+`secantusd-rs` (from the `secantus-mdb` crate or a release archive) as a
 subprocess and point `pymongo` at it, or use the Python server's
 `SecantusDBServer`, which has the same `pymongo` surface.
 
