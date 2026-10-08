@@ -9534,6 +9534,83 @@ def test_a_reused_write_plan_stores_each_value_and_keeps_every_check(home: Path)
         assert q("select k, n from pw_a order by k") == [(5, 5)]
 
 
+def test_a_parameter_inside_an_expression_is_computed_every_execution(home: Path) -> None:
+    """A parameter the planner folds into a value (`k = $1 % 100000`,
+    `values ($1 % 1000000)`) is folded with EACH execution's value. A reused
+    plan substituted the raw parameter instead: the SELECT returned the wrong
+    row, and the INSERT and UPDATE stored the wrong value. (`Int4` pins the
+    declared type, so every execution is the same prepared statement.)"""
+    from psycopg.types.numeric import Int4
+
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table pf_t (k int primary key, v int)")
+        for i in (56, 7, 23456, 123456):
+            c.execute("insert into pf_t values (%s, %s)", (i, i))
+
+        def q(sql: str, *args: int) -> list[tuple]:
+            return c.execute(sql, tuple(Int4(a) for a in args), prepare=True).fetchall()
+
+        def each(sql: str, values: tuple[int, ...]) -> list[list[tuple]]:
+            return [q(sql, v) for v in values]
+
+        assert each("select k from pf_t where k = %s %% 100000", (23456, 123456, 200056, 7)) == [
+            [(23456,)],
+            [(23456,)],
+            [(56,)],
+            [(7,)],
+        ]
+        assert each("select k from pf_t where k = %s + 0", (56, 7, 123456)) == [
+            [(56,)],
+            [(7,)],
+            [(123456,)],
+        ]
+        assert each("select k from pf_t where k = -%s", (-7, -56, -123456)) == [
+            [(7,)],
+            [(56,)],
+            [(123456,)],
+        ]
+        assert each("select k from pf_t where k = %s * 8", (7, 2932, 15432)) == [
+            [(56,)],
+            [(23456,)],
+            [(123456,)],
+        ]
+        assert each(
+            "select k from pf_t where k = case when %s > 1000 then 7 else 56 end",
+            (5000, 5000, 5, 5),
+        ) == [[(7,)], [(7,)], [(56,)], [(56,)]]
+        assert each("select k from pf_t where k in (%s %% 100, 7) order by k", (156, 256, 9)) == [
+            [(7,), (56,)],
+            [(7,), (56,)],
+            [(7,)],
+        ]
+        for n, x in enumerate((300001, 300002, 300003, 1300004)):
+            c.execute(
+                "insert into pf_t values (%s %% 1000000, %s)", (Int4(x), Int4(n)), prepare=True
+            )
+        assert q("select k from pf_t where k >= %s order by k", 300000) == [
+            (300001,),
+            (300002,),
+            (300003,),
+            (300004,),
+        ]
+        for x in (2000001, 2000002, 2000003, 3000004):
+            c.execute(
+                "update pf_t set v = %s %% 1000000 where k = %s", (Int4(x), Int4(7)), prepare=True
+            )
+        assert q("select v from pf_t where k = %s", 7) == [(4,)]
+        for x in (1, 2, 3, 1000):
+            c.execute(
+                "update pf_t set v = v + %s %% 10 where k = %s", (Int4(x), Int4(56)), prepare=True
+            )
+        assert q("select v from pf_t where k = %s", 56) == [(62,)]
+        for x in (100007, 200007, 300056):
+            c.execute("update pf_t set v = 0 where k = %s %% 100000", (Int4(x),), prepare=True)
+        assert q("select k, v from pf_t where k < %s order by k", 100) == [(7, 0), (56, 0)]
+        for x in (1300001, 2300002, 5300003):
+            c.execute("delete from pf_t where k = %s %% 1000000", (Int4(x),), prepare=True)
+        assert q("select k from pf_t where k >= %s order by k", 300000) == [(300004,)]
+
+
 def test_a_portal_outside_a_block_streams_from_one_snapshot(home: Path) -> None:
     """A SELECT fetched in pieces (Execute with a row cap) outside a block is
     streamed from a reader thread over one snapshot: a row another session
