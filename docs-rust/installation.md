@@ -10,17 +10,21 @@ included, and puts `secantusd-rs` on `PATH`. It needs a Rust toolchain, CMake
 and a C compiler:
 
 ```bash
-cargo install secantus-mdb
+cargo install secantus-mdb --version 0.5.3-beta.173
 secantusd-rs --version
 secantusd-rs --port 27017 --storage-path ./secantus-data
 ```
+
+The crate is a pre-release, so `cargo install` needs the `--version`; without
+it cargo stops at "nothing to install". The current version is on
+[crates.io](https://crates.io/crates/secantus-mdb).
 
 To run the server inside a Rust test instead, add the crate as a
 dev-dependency and start it in-process (see [Embedded](embedded.md)):
 
 ```toml
 [dev-dependencies]
-secantus-mdb = "0.5.3-beta.172"
+secantus-mdb = "0.5.3-beta.173"
 ```
 
 ## Prebuilt binary (no Rust toolchain)

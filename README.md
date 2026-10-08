@@ -65,19 +65,22 @@ with SecantusPGServer(storage_path="./secantus-pg-data") as server:
         assert conn.execute("SELECT name FROM users WHERE id = 1").fetchone() == ("Joe",)
 ```
 
-**The Rust servers** are the fast ones, and they ship as Rust, not inside
-the Python wheel. The Rust MongoDB server is the `secantus-mdb` crate on
-crates.io:
+**The Rust servers** are the fast ones, and they ship as Rust crates on
+crates.io, not inside the Python wheel:
 
 ```bash
-cargo install secantus-mdb          # installs the `secantusd-rs` daemon
+cargo install secantus-mdb --version 0.5.3-beta.173   # MongoDB: the `secantusd-rs` daemon
+cargo install secantus-pg --version 0.1.0-beta.3      # PostgreSQL: the `secantusd-pg` daemon
 secantusd-rs --port 27017 --storage-path ./secantus-data
 ```
 
-The same crate is also a library: `secantus_mdb::Server` starts the server
-inside a Rust test. The Rust PostgreSQL server (`secantusd-pg`) is not on
-crates.io yet; prebuilt archives of both Rust servers are attached to their
-tags on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases).
+Both crates are pre-releases, so `cargo install` needs the `--version`:
+without it cargo stops at "nothing to install". The current versions are on
+the [`secantus-mdb`](https://crates.io/crates/secantus-mdb) and
+[`secantus-pg`](https://crates.io/crates/secantus-pg) pages. Each crate is
+also a library: `secantus_mdb::Server` and `secantus_pg::PgServer` start a
+server inside a Rust test. Prebuilt archives of both Rust servers are attached
+to their tags on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases).
 
 Single-node only by design: replica sets, sharding, streaming
 replication, and anything else that depends on real cluster topology are
@@ -92,7 +95,7 @@ Two wire protocols, two implementations of each, one storage format.
 
 | Server | Wire | Run it as | Role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | MongoDB | `secantusd-rs` / `secantus_mdb::Server` | **The flagship.** `cargo install secantus-mdb`; prebuilt binaries per platform |
+| **Rust MongoDB server** | MongoDB | `secantusd-rs` / `secantus_mdb::Server` | **The flagship.** The [`secantus-mdb`](https://crates.io/crates/secantus-mdb) crate; prebuilt binaries per platform |
 | **Rust PostgreSQL server** | PostgreSQL | `secantusd-pg` | **The newest.** Prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases), and the [`secantus-pg`](https://crates.io/crates/secantus-pg) crate |
 | Python MongoDB server | MongoDB | `SecantusDBServer` / `secantusd-py` | The readable reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | PostgreSQL | `SecantusPGServer` / `secantusd-py-pg` | The reference for the SQL surface, and still the most complete one |
@@ -219,9 +222,9 @@ package, no compile step, no system build tools required. It does **not**
 carry the Rust servers (see below). macOS Intel (x86_64) is not in the
 wheel matrix.
 
-The Rust MongoDB server installs from crates.io with `cargo install
-secantus-mdb`, which needs a Rust toolchain and builds WiredTiger as part of
-the crate.
+Both Rust servers install from crates.io: `cargo install secantus-mdb
+--version 0.5.3-beta.173` and `cargo install secantus-pg --version 0.1.0-beta.3`.
+Each needs a Rust toolchain and builds WiredTiger as part of the crate.
 
 Standalone archives of `secantusd-rs` (Linux x86_64, macOS arm64,
 Windows x86_64) and `secantusd-pg` (Linux x86_64, macOS arm64) are
@@ -250,15 +253,15 @@ See [Installation](https://secantusdb.com/docs/installation.html) for dev-instal
 
 ## Standalone daemons (drop-in `mongod` / `postgres` replacements)
 
-`cargo install secantus-mdb` puts `secantusd-rs` on your `PATH` (or unpack a
-release archive). Run it like you'd run `mongod`:
+Installing the `secantus-mdb` crate puts `secantusd-rs` on your `PATH` (or
+unpack a release archive). Run it like you'd run `mongod`:
 
 ```bash
 secantusd-rs --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
-The Rust PostgreSQL server comes as a release archive and takes
-positional arguments:
+The Rust PostgreSQL server comes from the `secantus-pg` crate or a release
+archive, and takes positional arguments:
 
 ```bash
 secantusd-pg ./secantus-pg-data 127.0.0.1:5432
