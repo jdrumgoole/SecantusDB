@@ -2253,7 +2253,9 @@ def release_prepare(c: Context, version: str) -> None:
       1. Full default test suite (`pytest` parallel, perf-excluded).
       2. Perf regression gates (serial).
       3. Bump pyproject.toml + src/secantus/__init__.py + uv.lock.
-      4. Commit, annotate-tag, push commit + tag (combined push).
+      4. Commit and annotate-tag, then push `main` FIRST and the tag only
+         once `main` carries the release commit. If `main` moved while
+         the tests ran, merge it in and retry (see `_push_release`).
       5. Create a GitHub Release for `vX.Y.Z` with auto-generated
          notes (marked pre-release for `aN`/`bN`/`rcN` versions).
     """
@@ -2298,10 +2300,7 @@ def release_prepare(c: Context, version: str) -> None:
     else:
         c.run(f'git commit -m "Release v{version}"', pty=PTY)
     c.run(f'git tag -a v{version} -m "Release v{version}"', pty=PTY)
-    # Combine the branch and tag pushes into one network round-trip.
-    # The publish workflow still fires on the tag ref; nothing else
-    # depends on the order of branch-then-tag.
-    c.run(f"git push origin main v{version}", pty=PTY)
+    _push_release(version)
 
     print(f"==> [6/6] Creating GitHub Release v{version}")
     # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
@@ -2310,7 +2309,9 @@ def release_prepare(c: Context, version: str) -> None:
         f"gh release create v{version} "
         f"--title 'v{version}' "
         f"--generate-notes "
-        f"--target $(git rev-parse HEAD)"
+        # The tag, not HEAD: after a merge in `_push_release`, HEAD is the
+        # merge commit and the release commit is the tag's.
+        f"--verify-tag"
     )
     if is_prerelease:
         cmd += " --prerelease"
@@ -2443,6 +2444,61 @@ def _ensure_in_sync_with_origin() -> None:
         raise SystemExit(
             f"local main ({head[:7]}) is not in sync with origin/main "
             f"({origin[:7]}) — push or pull first."
+        )
+
+
+def _push_release(version: str, *, cwd: str | None = None, attempts: int = 5) -> None:
+    """Push the release commit to ``main``, then the tag -- in that order.
+
+    The two used to go in one ``git push origin main vX.Y.Z``, which is not
+    atomic: when another PR merged during the ~30 minute test run, the tag was
+    accepted and ``main`` was rejected. That left a published, protected tag on
+    a commit ``main`` did not have, and the version bump had to be landed by
+    hand. It happened on two releases running (0.7.0b1 and 0.7.0b2).
+
+    So ``main`` goes first. If it is rejected because ``main`` moved, merge
+    ``origin/main`` into the release commit and try again; the tag stays on the
+    release commit, which is the tree the tests ran against, and that commit is
+    then in ``main``'s history. The tag -- the thing that triggers the publish
+    workflow -- is pushed only once ``main`` has it.
+
+    Anything this cannot resolve (a conflicting merge, a push refused for some
+    other reason) stops BEFORE the tag is pushed, so nothing is published.
+    """
+    tag = f"v{version}"
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+    def give_up(why: str) -> None:
+        git("tag", "-d", tag)  # never pushed; a re-run recreates it
+        raise SystemExit(
+            f"{why}\nNothing was published: {tag} was not pushed. Local main "
+            f"still holds the unpushed release commit; discard it with "
+            f"`git reset --hard origin/main` before re-running."
+        )
+
+    for attempt in range(1, attempts + 1):
+        push = git("push", "origin", "main")
+        if push.returncode == 0:
+            break
+        git("fetch", "origin")
+        if git("merge-base", "--is-ancestor", "origin/main", "HEAD").returncode == 0:
+            # Not behind, so this is not the race: surface git's own reason.
+            give_up(f"`git push origin main` failed:\n{push.stderr.strip()}")
+        print(f"    main moved during the release run; merging it in (attempt {attempt})")
+        merge = git("merge", "--no-edit", "origin/main")
+        if merge.returncode != 0:
+            git("merge", "--abort")
+            give_up(f"origin/main conflicts with the release commit:\n{merge.stdout.strip()}")
+    else:
+        give_up(f"main was still moving after {attempts} attempts to push the release commit.")
+
+    tag_push = git("push", "origin", tag)
+    if tag_push.returncode != 0:
+        raise SystemExit(
+            f"main carries the release commit but pushing {tag} failed:\n"
+            f"{tag_push.stderr.strip()}\nPush it with `git push origin {tag}`."
         )
 
 
