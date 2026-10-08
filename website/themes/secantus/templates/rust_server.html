@@ -60,7 +60,7 @@
 <section class="section">
   <div class="wrap">
     <h2>Measured, not promised</h2>
-    <p class="section-lead">Nine workloads, median of five runs, end to end through <code>pymongo</code> on on-disk WiredTiger, with a real <code>mongod</code> 8.0.32 as the reference &mdash; all three on a dedicated 8-vCPU cloud instance, because a laptop cannot be trusted for this. The Rust server runs at <strong>1.0&times;&ndash;2.8&times; of mongod</strong> per operation, and <strong>~1.8&times;&ndash;14.2&times; faster than the Python reference</strong> workload for workload.</p>
+    <p class="section-lead">Nine workloads, median of five runs, end to end through <code>pymongo</code> on on-disk WiredTiger, with a real <code>mongod</code> 8.0.32 as the reference &mdash; all three on a dedicated 8-vCPU cloud instance, because a laptop cannot be trusted for this. Across three runs of the same build the Rust server runs at <strong>1.0&times;&ndash;4.1&times; of mongod</strong> per operation, and <strong>~1.7&times;&ndash;14.8&times; faster than the Python reference</strong> workload for workload.</p>
     <div class="compare-wrap">
       <table class="compare-table">
         <thead>

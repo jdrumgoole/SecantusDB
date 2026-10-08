@@ -36,7 +36,7 @@ live only in the Rust server.
 | Package | the `secantus-mdb` crate (crates.io), or a release archive | `pip install SecantusDB` |
 | Run it as | `secantusd-rs` / `secantus_mdb::Server` | `SecantusDBServer` / `secantusd-py` |
 | Conformance | **99.5%** of pymongo's own suite | see the [validation report](validation-report.md) |
-| Speed | within 1.0×–2.8× of `mongod` per operation | 2×–27× |
+| Speed | within 1.0×–4.1× of `mongod` per operation | 2×–29× |
 | Request path | pure Rust (off the GIL) | pure Python |
 
 Use the **Rust server** to run SecantusDB — in tests, in CI, in a container.
