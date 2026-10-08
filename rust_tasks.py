@@ -573,8 +573,9 @@ def rust_version_bump(c: Context, to: str = "", check: bool = False, line: str =
 
     Rewrites every ``[package] version`` on that line, every ``=`` pin on it,
     and every ``Cargo.lock`` that records one (the PG server's and the Python
-    bindings' included), then fails if the old version survives or a lockfile
-    no longer resolves ``--locked``. The other line is not touched: ``mdb``
+    bindings' included), plus the version in every documented ``cargo install
+    secantus-mdb --version ...`` (README, docs, crate READMEs), then fails if
+    another version survives or a lockfile no longer resolves ``--locked``. The other line is not touched: ``mdb``
     (default) is the MongoDB crates, ``pg`` is secantus-pgcatalog / -pgplan /
     -pgwire / -pg. ``--check`` only verifies the lockfiles.
     """
