@@ -24,20 +24,28 @@
 //!   trailing blanks and mixed case (so a trim, pad or case fold shows);
 //! - an execution whose values have the stand-ins' BSON types and no NULL
 //!   (NULL changes a plan's meaning: `= NULL` is never true);
-//! - only where the substituted values can land: the WHERE filter of a
-//!   SELECT, UPDATE or DELETE. A value anywhere else (a LIMIT, a computed
-//!   column, an UPDATE's SET, an INSERT's row) makes the two plans differ
-//!   after substitution, and the statement is not templated. A value bound
-//!   for storage is excluded on purpose: the planner checks it against its
-//!   column (a varchar length, an integer range, a domain), and a stand-in
-//!   passing that check says nothing about the next value.
+//! - only where the substituted values can land:
+//!   - the WHERE filter of a SELECT, UPDATE or DELETE;
+//!   - an expression the executor evaluates per row (an UPDATE's
+//!     `SET v = v + $1`, a residual WHERE), which carries the statement's
+//!     values and is checked against its column when it runs;
+//!   - a value bound for STORAGE (an INSERT's row, an UPDATE's `SET v = $1`),
+//!     but only into a column no value of that kind can fail to fit
+//!     (`stores_verbatim`). The planner checks a stored value against its
+//!     column -- a varchar length, an integer range, a domain -- and a
+//!     stand-in passing that check says nothing about the next value, so a
+//!     column with any such check is never templated.
+//!
+//!   A value anywhere else (a LIMIT, a computed column) makes the two plans
+//!   differ after substitution, and the statement is not templated.
 //!
 //! A template is valid while the catalog version, the session's settings
 //! generation and its role are those it was planned under, and never while
 //! the session has uncommitted DDL (its lookups see that DDL).
 
 use bson::{Bson, Document};
-use secantus_pgplan::Statement;
+use secantus_pgcatalog::Column;
+use secantus_pgplan::{ColumnExpr, Statement};
 
 /// May `sql` be templated at all, and over which relations? (A
 /// statement-shape check, made once per statement text; the caller then
@@ -149,6 +157,63 @@ fn sub_doc(d: &mut Document, from: &[Bson], to: &[Bson], hits: &mut [bool]) {
     }
 }
 
+/// Can every value of `v`'s BSON type be stored in `column` exactly as it
+/// is, with nothing to check? True for the four pairings where the column's
+/// type holds the whole range of the value's and declares no width, domain,
+/// enum or generation: `int4` <- int32, `int8` <- int64, `float8` <- double,
+/// `text` <- string.
+pub(crate) fn stores_verbatim(v: &Bson, column: &Column) -> bool {
+    column.typmod == -1
+        && column.extra.is_empty()
+        && column.field_override.is_none()
+        && matches!(
+            (v, column.pg_type.as_str()),
+            (Bson::Int32(_), "int4")
+                | (Bson::Int64(_), "int8")
+                | (Bson::Double(_), "float8")
+                | (Bson::String(_), "text")
+        )
+}
+
+/// The top-level values of `d` only: a stored row's own fields. A stand-in
+/// deeper in (an array element, a composite key's part) is left alone, so
+/// such a statement never passes the template check.
+fn sub_fields(d: &mut Document, from: &[Bson], to: &[Bson], hits: &mut [bool]) {
+    for (_, v) in d.iter_mut() {
+        if let Some(i) = from.iter().position(|f| same(f, v)) {
+            *v = to[i].clone();
+            hits[i] = true;
+        }
+    }
+}
+
+/// A per-row expression carries the statement's values whole (`params`),
+/// read by `$n` when it is evaluated. Where they are exactly `from` they
+/// become `to`, and each `$n` the expression reads counts as found.
+fn sub_expr(e: &mut ColumnExpr, from: &[Bson], to: &[Bson], hits: &mut [bool]) {
+    let ColumnExpr::Row { expr, params, .. } = e else {
+        return;
+    };
+    if params.len() != from.len() || !params.iter().zip(from).all(|(p, f)| same(p, f)) {
+        return;
+    }
+    params.clone_from_slice(to);
+    let Some(root) = expr.node.as_ref() else {
+        return;
+    };
+    for (node, ..) in root.nodes() {
+        if let pg_query::NodeRef::ParamRef(p) = node {
+            if let Some(hit) = usize::try_from(p.number)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| hits.get_mut(i))
+            {
+                *hit = true;
+            }
+        }
+    }
+}
+
 /// `stmt` with every stand-in in `from` replaced by its value in `to`, in the
 /// places a parameter may land; `None` for a statement kind not templated.
 pub(crate) fn substitute(stmt: &Statement, from: &[Bson], to: &[Bson]) -> Option<Statement> {
@@ -171,16 +236,52 @@ fn substitute_counting(
             }
             sub_doc(&mut sel.filter, from, to, h);
         }
-        // The filter only: a value bound for STORAGE (an UPDATE's SET, an
-        // INSERT's row) is checked against its column while planning -- a
-        // length, a range, a domain -- and a stand-in that passes says
-        // nothing about the value that comes later. A comparison checks
-        // nothing of the kind.
-        Statement::Update(u) => sub_doc(&mut u.filter, from, to, h),
-        Statement::Delete(d) => sub_doc(&mut d.filter, from, to, h),
+        Statement::Insert(i) => {
+            if i.source.is_some() {
+                return None;
+            }
+            for row in &mut i.rows {
+                sub_fields(row, from, to, h);
+            }
+        }
+        Statement::Update(u) => {
+            sub_fields(&mut u.set, from, to, h);
+            for (_, _, _, e) in &mut u.set_exprs {
+                sub_expr(e, from, to, h);
+            }
+            sub_doc(&mut u.filter, from, to, h);
+            if let Some(e) = &mut u.residual {
+                sub_expr(e, from, to, h);
+            }
+        }
+        Statement::Delete(d) => {
+            sub_doc(&mut d.filter, from, to, h);
+            if let Some(e) = &mut d.residual {
+                sub_expr(e, from, to, h);
+            }
+        }
         _ => return None,
     }
     Some((s, hits))
+}
+
+/// Where `plan` STORES one of the stand-ins `a`: `(table, field, value)` for
+/// each field of an INSERT's rows or an UPDATE's SET holding one. The caller
+/// checks each against its column (`stores_verbatim`).
+pub(crate) fn stored_stand_ins<'p>(
+    plan: &'p Statement,
+    a: &[Bson],
+) -> Vec<(&'p str, &'p str, &'p Bson)> {
+    let (table, docs): (&str, Vec<&Document>) = match plan {
+        Statement::Insert(i) => (&i.table, i.rows.iter().collect()),
+        Statement::Update(u) => (&u.table, vec![&u.set]),
+        _ => return Vec::new(),
+    };
+    docs.into_iter()
+        .flat_map(|d| d.iter())
+        .filter(|(_, v)| a.iter().any(|s| same(s, v)))
+        .map(|(k, v)| (table, k.as_str(), v))
+        .collect()
 }
 
 /// Is `plan_a` (planned with stand-ins `a`) a template: does substituting
@@ -225,5 +326,46 @@ mod tests {
         assert_ne!(a, b);
         assert!(fits(&[Bson::Int32(9), Bson::String("y".into())], &a));
         assert!(!fits(&[Bson::Int64(9), Bson::String("y".into())], &a));
+    }
+
+    #[test]
+    fn stores_verbatim_only_where_no_value_can_fail() {
+        let col = |t: &str| Column::new("c", t, false);
+        let text = || Bson::String("x".into());
+        assert!(stores_verbatim(&Bson::Int32(1), &col("int4")));
+        assert!(stores_verbatim(&Bson::Int64(1), &col("int8")));
+        assert!(stores_verbatim(&Bson::Double(1.0), &col("float8")));
+        assert!(stores_verbatim(&text(), &col("text")));
+        // A narrower range, a conversion, a parse.
+        assert!(!stores_verbatim(&Bson::Int32(1), &col("int2")));
+        assert!(!stores_verbatim(&Bson::Int32(1), &col("int8")));
+        assert!(!stores_verbatim(&Bson::Int64(1), &col("int4")));
+        assert!(!stores_verbatim(&Bson::Double(1.0), &col("float4")));
+        assert!(!stores_verbatim(&text(), &col("varchar")));
+        assert!(!stores_verbatim(&text(), &col("date")));
+        assert!(!stores_verbatim(&Bson::Boolean(true), &col("bool")));
+        // A declared width, and a domain / enum / generated column.
+        let mut wide = col("text");
+        wide.typmod = 12;
+        assert!(!stores_verbatim(&text(), &wide));
+        let mut domain = col("text");
+        domain.extra.insert("domain_type", "d");
+        assert!(!stores_verbatim(&text(), &domain));
+    }
+
+    #[test]
+    fn stored_stand_ins_are_top_level_fields_only() {
+        let a = [Bson::Int32(23_011)];
+        let mut row = Document::new();
+        row.insert("_id", Bson::Int32(23_011));
+        row.insert("arr", Bson::Array(vec![Bson::Int32(23_011)]));
+        let mut hits = [false];
+        sub_fields(&mut row, &a, &[Bson::Int32(5)], &mut hits);
+        assert_eq!(row.get("_id"), Some(&Bson::Int32(5)));
+        assert_eq!(
+            row.get("arr"),
+            Some(&Bson::Array(vec![Bson::Int32(23_011)]))
+        );
+        assert!(hits[0]);
     }
 }
