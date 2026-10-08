@@ -4872,9 +4872,22 @@ These are explicit non-goals. Don't add them without a reason.
       the network, not the server. Fix: `go mod download` in a setup step,
       with `actions/setup-go`'s module cache, so the test itself never goes to
       the network.
-- [ ] **REOPENED 2026-10-07, the fix did not hold — two job-tooling tests were
-      load-sensitive under `-n auto` (measured 2026-09-28; marked FIXED
-      2026-10-07 and failed again the same day, see the end of this entry).** Both waits are polled with room to spare (90s /
+- [x] **FIXED 2026-10-08, by cause this time — `test_stop_ends_a_running_command`
+      on Windows. It was never load: `status` was CRASHING.** A supervisor
+      killed by `stop` could be killed while writing its child's exit code
+      (`taskkill /T` can end the child first), and `write_text` truncates
+      before it writes, so the exit file was left empty and every later
+      `status` raised `ValueError` parsing it. The test printed only stdout,
+      which was empty, so it read as a slow child. Reproduced on macOS by
+      writing that empty file by hand. Fixed in `scripts/detached_run.py`:
+      files are written beside their name and renamed into place, a damaged
+      exit file reads as rc=-1, and `stop` records the end itself. NOT yet
+      observed passing under the original Windows race, which is rare; if it
+      fails again the message now carries `status`'s stderr. The
+      `test_opsboard.py` half of this entry has not recurred and was not
+      touched. History follows. (Two job-tooling tests were
+      load-sensitive under `-n auto`, measured 2026-09-28; marked FIXED
+      2026-10-07 and failed again the same day.) Both waits are polled with room to spare (90s /
       60s); the `taskkill` race noted below is already absorbed by `stop`'s
       retry, which reports the first failure and still succeeds. `tests/test_detached_run.py::
       test_stop_ends_a_running_command` and `tests/test_opsboard.py::

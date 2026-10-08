@@ -44,15 +44,66 @@ def _log_path(state_dir: Path, name: str) -> Path:
     return state_dir / f"{name}.log"
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` so a reader, or a kill, never sees the file half done.
+
+    The supervisor is killed by `stop`, and it can be killed WHILE recording
+    its child's exit: on Windows `taskkill /T` can end the child a moment
+    before the supervisor, which then starts writing. A plain `write_text`
+    truncates first, so that left an EMPTY exit file, and every later `status`
+    died parsing it (2026-10-07, PR #1801's Windows lane). Write a sibling and
+    rename it into place: the name holds the old content or the new, never
+    neither. Windows refuses the rename while another process has the target
+    open, so retry briefly.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    for attempt in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05)
+
+
 def _read_state(state_dir: Path, name: str) -> dict[str, object]:
     path = _state_path(state_dir, name)
     if not path.exists():
         raise SystemExit(f"no run named {name!r} under {state_dir}")
-    return json.loads(path.read_text())
+    # A writer may be renaming the file into place; on Windows that can make
+    # one read fail. A file that stays unreadable is a real error and raises.
+    for attempt in range(20):
+        try:
+            return json.loads(path.read_text())
+        except (PermissionError, ValueError):
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+    raise AssertionError("unreachable")
 
 
 def _write_state(state_dir: Path, name: str, state: dict[str, object]) -> None:
-    _state_path(state_dir, name).write_text(json.dumps(state, indent=2) + "\n")
+    _write_atomic(_state_path(state_dir, name), json.dumps(state, indent=2) + "\n")
+
+
+#: Exit code recorded for a run whose real one is unknown: its supervisor was
+#: killed before it could write one.
+UNKNOWN_EXIT = -1
+
+
+def _read_exit_file(path: Path) -> int:
+    """The exit code the supervisor recorded, or `UNKNOWN_EXIT`.
+
+    Missing, empty and garbled all mean the same thing here -- the supervisor
+    did not finish recording -- and none of them may stop `status` answering.
+    """
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return UNKNOWN_EXIT
 
 
 _WINDOWS = os.name == "nt"
@@ -131,8 +182,7 @@ def _reap(state_dir: Path, name: str, state: dict[str, object]) -> dict[str, obj
         return state
     # The child is not ours to waitpid() -- it was reparented when its
     # launcher exited -- so the exit code comes from the wrapper's own file.
-    code_file = state_dir / f"{name}.exit"
-    state["exit_code"] = int(code_file.read_text().strip()) if code_file.exists() else -1
+    state["exit_code"] = _read_exit_file(state_dir / f"{name}.exit")
     state["finished_at"] = datetime.now(timezone.utc).isoformat()
     _write_state(state_dir, name, state)
     return state
@@ -286,10 +336,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
             note = f" ({trouble})" if trouble else ""
             print(f"{args.name} (pid {pid}) did not stop{note}")
             return 1
+    # Record the end now, while this command knows it happened. Leaving it to
+    # the next `status` meant a stopped run's state file still said running.
+    _reap(args.state_dir, args.name, _read_state(args.state_dir, args.name))
     if trouble:
-        # It died, but the first kill reported something -- say so rather than
-        # leave a failed command silently behind a success.
-        print(f"stopped {args.name} (pid {pid}) after a retry ({trouble})")
+        # It died, but the kill reported something -- say so rather than leave
+        # a failed command silently behind a success. On Windows the usual
+        # report is a child that exited while `taskkill /T` walked the tree.
+        print(f"stopped {args.name} (pid {pid}); the kill reported: {trouble}")
         return 0
     print(f"stopped {args.name} (pid {pid})")
     return 0
@@ -309,7 +363,7 @@ def _supervise(argv: list[str]) -> int:
             argv[1:], stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
         )
         code = proc.wait()
-    exit_file.write_text(str(code))
+    _write_atomic(exit_file, str(code))
     # Record the exit in the STATE file too. It used to be written only when
     # `status` / `wait` reaped the run, so anything reading `<name>.json`
     # directly saw `exit_code: null` for a run that had finished hours before
@@ -320,9 +374,7 @@ def _supervise(argv: list[str]) -> int:
         if state.get("exit_code") is None:
             state["exit_code"] = code
             state["finished_at"] = datetime.now(timezone.utc).isoformat()
-            tmp = state_file.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(state, indent=2))
-            os.replace(tmp, state_file)
+            _write_atomic(state_file, json.dumps(state, indent=2))
     except (OSError, ValueError):
         pass  # `status` / `wait` still reap from the exit file
     return code
