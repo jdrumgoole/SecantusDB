@@ -27338,6 +27338,19 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     })
 }
 
+/// An integer cast's result held to smallint's range when the target is
+/// one: PostgreSQL's 22003 `smallint out of range`.
+fn fit_int2(v: Bson, target: &str) -> Result<Bson> {
+    match v {
+        Bson::Int32(n) if matches!(target, "int2" | "smallint") && i16::try_from(n).is_err() => {
+            Err(Error::NumericOutOfRange(
+                "smallint out of range".to_string(),
+            ))
+        }
+        v => Ok(v),
+    }
+}
+
 fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes -- but the
     // type must exist: `null::no_such_type` is 42704, as any value's cast.
@@ -27673,8 +27686,11 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     };
 
     match target {
+        // The narrowing below reaches int4; `fit_int2` then holds a smallint
+        // to its own range, which nothing did (`40000::smallint` answered
+        // 40000, and a smallint column stored it).
         "int4" | "int2" | "integer" | "int" | "smallint" => match &value {
-            Bson::Int32(_) => Ok(value),
+            Bson::Int32(_) => Ok(value.clone()),
             // `boolean -> integer` is 1 / 0; there is no cast to smallint.
             Bson::Boolean(b) if matches!(target, "int4" | "integer" | "int") => {
                 Ok(Bson::Int32(i32::from(*b)))
@@ -27698,20 +27714,52 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // `3.5` -> 4), which is NOT the half-away-from-zero rule it uses
             // for numeric->integer. Rust's `round()` is the latter, so using
             // it here answered 3 for `2.5::float8::int`. Measured on PG 14.
-            Bson::Double(d) => Ok(Bson::Int32(d.round_ties_even() as i32)),
+            // Out of range (or NaN) is 22003, where `as` would saturate.
+            Bson::Double(d) => {
+                let r = d.round_ties_even();
+                if (-2_147_483_648.0..=2_147_483_647.0).contains(&r) {
+                    Ok(Bson::Int32(r as i32))
+                } else {
+                    Err(Error::NumericOutOfRange(
+                        if matches!(target, "int2" | "smallint") {
+                            "smallint out of range"
+                        } else {
+                            "integer out of range"
+                        }
+                        .to_string(),
+                    ))
+                }
+            }
             v if is_numeric(v) => decimal_to_integer(v)
                 .and_then(|n| i32::try_from(n).ok())
                 .map(Bson::Int32)
                 .ok_or_else(|| {
                     Error::NumericOutOfRange(format!("integer out of range: \"{}\"", as_text(v)))
                 }),
-            Bson::String(s) => s
-                .trim()
-                .parse::<i32>()
-                .map(Bson::Int32)
-                .map_err(|_| bad("integer", &value)),
+            Bson::String(s) => {
+                let small = matches!(target, "int2" | "smallint");
+                let name = if small { "smallint" } else { "integer" };
+                let t = s.trim();
+                match t.parse::<i32>() {
+                    Ok(n) if !small || i16::try_from(n).is_ok() => Ok(Bson::Int32(n)),
+                    // Digits that do not fit are out of range, not bad syntax.
+                    parsed => {
+                        let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+                        if parsed.is_ok()
+                            || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                        {
+                            Err(Error::NumericOutOfRange(format!(
+                                "value \"{s}\" is out of range for type {name}"
+                            )))
+                        } else {
+                            Err(bad(name, &value))
+                        }
+                    }
+                }
+            }
             _ => Err(bad("integer", &value)),
-        },
+        }
+        .and_then(|v| fit_int2(v, target)),
         "int8" | "bigint" => match &value {
             Bson::Int32(i) => Ok(Bson::Int64(i64::from(*i))),
             Bson::Int64(_) => Ok(value),

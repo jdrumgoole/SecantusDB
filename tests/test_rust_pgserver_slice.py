@@ -9333,6 +9333,207 @@ def test_a_reused_plan_takes_each_executions_values(home: Path) -> None:
         assert q("select k, vc, n from pc_v order by k") == [(1, "cd", 6), (2, "a", 0), (3, "b", 0)]
 
 
+def test_a_reused_write_plan_stores_each_value_and_keeps_every_check(home: Path) -> None:
+    """An INSERT's row and an UPDATE's SET are reused plans too (`plan_cache`),
+    where the column takes any value of the parameter's kind: each execution
+    stores ITS values, edge values included, and everything checked when the
+    statement runs -- a CHECK, NOT NULL, a key, a foreign key, an overflow --
+    still answers PostgreSQL's SQLSTATE on a later execution. A column with a
+    width or a narrower range is checked per value as before."""
+    import math
+
+    with _Server(home) as server, server.connect() as c:
+
+        def q(sql: str, *args: object) -> list[tuple]:
+            return c.execute(sql, args, prepare=True).fetchall()
+
+        def state(sql: str, *args: object) -> str | None:
+            try:
+                c.execute(sql, args, prepare=True)
+            except psycopg.Error as e:
+                return e.sqlstate
+            return None
+
+        c.execute("create table pw_t (k int primary key, n int, b bigint, f float8, t text)")
+        big = 2**40
+        rows = [
+            (1, 7, big, 1.5, "a"),
+            (2, 2**31 - 1, 2**63 - 1, math.inf, ""),
+            (3, -(2**31), -(2**63), -math.inf, " padded "),
+            (4, 100000, big + 1, -0.0, "MiXeD \u00e9\u4e2d"),
+            (5, 70000, big + 2, 1e308, "x" * 5000),
+            (6, 99999, big + 3, 5e-324, "' or 1=1 --"),
+        ]
+        for r in rows:
+            c.execute("insert into pw_t values (%s, %s, %s, %s, %s)", r, prepare=True)
+        got = q("select k, n, b, f, t from pw_t order by k")
+        assert got == rows
+        assert math.copysign(1.0, got[3][3]) == -1.0
+        c.execute("insert into pw_t values (%s, %s, %s, %s, %s)", (7, 70001, big, math.nan, "n"))
+        assert math.isnan(q("select f from pw_t where k = %s", 7)[0][0])
+
+        # SET from a value, from the row, and from both.
+        for k, t in ((1, "u1"), (2, "u2"), (3, "u3")):
+            c.execute("update pw_t set t = %s where k = %s", (t, k), prepare=True)
+        for k in (1, 1, 4, 5, 5, 5):
+            c.execute("update pw_t set n = n + 1 where k = %s", (k,), prepare=True)
+        for k, d in ((1, 100000), (4, 200000), (6, 300000)):
+            c.execute("update pw_t set n = n + %s where k = %s", (d, k), prepare=True)
+        for k, n in ((6, 400000), (7, 500000), (8, 600000)):
+            c.execute("update pw_t set n = %s where k = %s", (n, k), prepare=True)
+        assert q("select k, n, t from pw_t where k in (1, 3, 4, 5, 6, 7) order by k") == [
+            (1, 100009, "u1"),
+            (3, -(2**31), "u3"),
+            (4, 300001, "MiXeD \u00e9\u4e2d"),
+            (5, 70003, "x" * 5000),
+            (6, 400000, "' or 1=1 --"),
+            (7, 500000, "n"),
+        ]
+        # An overflow computed from the row is the statement's, each time.
+        assert [state("update pw_t set n = n + %s where k = %s", d, 2) for d in (70000, 70000)] == [
+            "22003",
+            "22003",
+        ]
+        # NULL after a run of values, and a value after NULL.
+        assert [state("update pw_t set t = %s where k = %s", v, 1) for v in ("p", None, "q")] == [
+            None,
+            None,
+            None,
+        ]
+        assert q("select t from pw_t where k = %s", 1) == [("q",)]
+
+        # A column whose type can refuse a value is checked per execution,
+        # after however many values that fitted. (`Int4` pins the declared
+        # type, so every execution is the same prepared statement.)
+        from psycopg.types.numeric import Int4
+
+        c.execute("create table pw_w (k int primary key, vc varchar(8), s smallint)")
+        c.execute("insert into pw_w values (1, 'a', 0)")
+        assert [
+            state("update pw_w set vc = %s where k = %s", v, 1)
+            for v in ("ab", "cd", "ef", "x" * 9, "gh")
+        ] == [None, None, None, "22001", None]
+        assert [
+            state("update pw_w set s = %s where k = %s", Int4(v), Int4(1))
+            for v in (1, 2, 3, 40000, 4)
+        ] == [None, None, None, "22003", None]
+        assert [
+            state("insert into pw_w values (%s, %s, %s)", Int4(k), v, Int4(n))
+            for k, v, n in ((2, "a", 1), (3, "b", 2), (4, "c", 3), (5, "y" * 9, 4), (6, "d", 40000))
+        ] == [None, None, None, "22001", "22003"]
+        assert q("select k, vc, s from pw_w order by k") == [
+            (1, "gh", 4),
+            (2, "a", 1),
+            (3, "b", 2),
+            (4, "c", 3),
+        ]
+
+        # Checked when the statement runs: all still checked on a reused plan.
+        c.execute("create table pw_p (id int primary key)")
+        c.execute("insert into pw_p values (1), (2), (3)")
+        c.execute(
+            "create table pw_c (k int primary key, n int not null check (n < 500000),"
+            " u int unique, p int references pw_p (id))"
+        )
+        ins = "insert into pw_c values (%s, %s, %s, %s)"
+        assert [
+            state(ins, *r)
+            for r in (
+                (100001, 100000, 100001, 1),
+                (100002, 100000, 100002, 2),
+                (100003, 100000, 100003, 3),
+                (100004, 900000, 100004, 1),
+                (100005, None, 100005, 1),
+                (100001, 100000, 100006, 1),
+                (100007, 100000, 100002, 1),
+                (100008, 100000, 100008, 99),
+                (100009, 100000, 100009, 2),
+            )
+        ] == [None, None, None, "23514", "23502", "23505", "23505", "23503", None]
+        upd = "update pw_c set n = %s where k = %s"
+        assert [state(upd, n, 100001) for n in (100001, 100002, 700000, 100003)] == [
+            None,
+            None,
+            "23514",
+            None,
+        ]
+        assert [state("update pw_c set p = %s where k = %s", p, 100001) for p in (2, 3, 77, 1)] == [
+            None,
+            None,
+            "23503",
+            None,
+        ]
+        assert q("select k, n, u, p from pw_c order by k") == [
+            (100001, 100003, 100001, 1),
+            (100002, 100000, 100002, 2),
+            (100003, 100000, 100003, 3),
+            (100009, 100000, 100009, 2),
+        ]
+
+        # What the executor fills in is filled in per execution: a serial, a
+        # volatile default, a generated column.
+        c.execute(
+            "create table pw_d (id serial primary key, n int,"
+            " at timestamptz default clock_timestamp(),"
+            " g int generated always as (n * 2) stored)"
+        )
+        for n in (100000, 200000, 300000, 400000):
+            c.execute("insert into pw_d (n) values (%s)", (n,), prepare=True)
+            time.sleep(0.005)
+        got = q("select id, n, g, at from pw_d order by id")
+        assert [r[:3] for r in got] == [
+            (1, 100000, 200000),
+            (2, 200000, 400000),
+            (3, 300000, 600000),
+            (4, 400000, 800000),
+        ]
+        assert len({r[3] for r in got}) == 4
+        for i in (1, 2, 3):
+            c.execute("update pw_d set n = %s where id = %s", (i * 111111, i), prepare=True)
+        assert q("select n, g from pw_d order by id") == [
+            (111111, 222222),
+            (222222, 444444),
+            (333333, 666666),
+            (400000, 800000),
+        ]
+
+        # A trigger sees each execution's row.
+        c.execute("create table pw_log (n int)")
+        c.execute(
+            "create function pw_f() returns trigger language plpgsql as"
+            " $$ begin insert into pw_log values (new.n); return new; end $$"
+        )
+        c.execute("create trigger pw_tr after insert on pw_d for each row execute function pw_f()")
+        for n in (500000, 600000):
+            c.execute("insert into pw_d (n) values (%s)", (n,), prepare=True)
+        assert q("select n from pw_log order by n") == [(500000,), (600000,)]
+
+        # A constraint added between two executions is enforced on the next.
+        assert state("update pw_t set n = %s where k = %s", 800000, 6) is None
+        c.execute("alter table pw_t add constraint pw_t_n check (n <> 950000)")
+        assert [state("update pw_t set n = %s where k = %s", n, 6) for n in (950000, 850000)] == [
+            "23514",
+            None,
+        ]
+        # A column made narrower between two executions checks its range.
+        c.execute("create table pw_a (k int primary key, n int)")
+        for k in (1, 2, 3):
+            c.execute("insert into pw_a values (%s, %s)", (k, 40000 + k), prepare=True)
+        c.execute("delete from pw_a")
+        c.execute("alter table pw_a alter column n type smallint")
+        assert [
+            state("insert into pw_a values (%s, %s)", k, n) for k, n in ((4, 40000), (5, 5))
+        ] == [
+            "22003",
+            None,
+        ]
+        # In a transaction that rolls back, nothing a reused plan wrote stays.
+        with pytest.raises(psycopg.errors.UniqueViolation), c.transaction():
+            c.execute("insert into pw_a values (%s, %s)", (6, 6), prepare=True)
+            c.execute("insert into pw_a values (%s, %s)", (5, 7), prepare=True)
+        assert q("select k, n from pw_a order by k") == [(5, 5)]
+
+
 def test_a_portal_outside_a_block_streams_from_one_snapshot(home: Path) -> None:
     """A SELECT fetched in pieces (Execute with a row cap) outside a block is
     streamed from a reader thread over one snapshot: a row another session
