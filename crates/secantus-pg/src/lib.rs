@@ -36648,6 +36648,21 @@ impl PgHandler {
             if ran_subquery.get() || touched_temp.get() {
                 return None;
             }
+            // A stand-in the plan STORES must be bound for a column that
+            // takes any value of its kind as it is.
+            let storable = plan_cache::stored_stand_ins(&plan_a, &a).into_iter().all(
+                |(table, field, value)| {
+                    self.lookup_inner(table).is_some_and(|def| {
+                        def.columns
+                            .iter()
+                            .find(|c| c.field() == field)
+                            .is_some_and(|c| plan_cache::stores_verbatim(value, c))
+                    })
+                },
+            );
+            if !storable {
+                return None;
+            }
             plan_cache::is_template(&plan_a, &plan_b, &a, &b).then_some((a, plan_a))
         })();
         let mut cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());

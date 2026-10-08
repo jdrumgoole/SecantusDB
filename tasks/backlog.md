@@ -2847,15 +2847,34 @@ These work end-to-end but cut corners.
       - glibc `malloc` + `free` are 17% inclusive. The release binary links
         the system allocator on Linux.
 
-      So the work is to cut instructions on the write path, and it will show
-      on both platforms. In order of what the profile offers: do not plan a
-      prepared statement again on every Execute (23% of an UPDATE, ~135k
-      instructions, nearly a whole row read's budget); then
-      `execute_statement` outside `update_matching` (~20%); then the
-      allocator (17% in glibc `malloc`/`free`; the MongoDB server links
-      mimalloc, this one does not). PostgreSQL's own instruction count was
-      not isolated: the system-wide counters taken include the client. The
-      droplets are destroyed.
+      So the work is to cut instructions on the write path, and it shows on
+      both platforms.
+
+      **Done 2026-10-08: write plans are reused.** The plan cache existed
+      but took a parameter only in a WHERE filter, so an INSERT's row, an
+      UPDATE's `SET v = $1` and `SET v = v + 1` (whose per-row expression
+      carries a copy of the parameters) were planned on every Execute. They
+      are templated now where the column takes any value of the parameter's
+      kind (`plan_cache::stores_verbatim`: `int4` / `int8` / `float8` /
+      `text` with no width, domain, enum or generation). Server CPU per
+      statement, macOS release build, before -> after: INSERT 48.7 -> 42.0 us,
+      `SET v = $1` 58.7 -> 47.3, `SET v = v + 1` 68.7 -> 57.3, an UPDATE
+      matching no row 45.3 -> 29.3. NOT re-measured on Linux.
+
+      What is left, in order of what the profile offers:
+      - a stored value into any other column type (`varchar(n)`, `smallint`,
+        `numeric`, `timestamptz`, `bool`...) is still planned per Execute,
+        because the planner checks or converts it. Templating those means
+        running the column's check at substitution time;
+      - a parameter of a kind with no stand-in (bool, date, numeric, bytes,
+        NULL) is never templated at all;
+      - once any table in the database has row-level security, nothing is
+        templated;
+      - `execute_statement` outside `update_matching` (~20% of an UPDATE);
+      - the allocator (17% in glibc `malloc`/`free`; the MongoDB server links
+        mimalloc, this one does not).
+      PostgreSQL's own instruction count was not isolated: the system-wide
+      counters taken include the client. The droplets are destroyed.
       To repeat: `do-cluster up --prefix <own> --server-size c-16`, install
       `postgresql`, add a `trust` line for 127.0.0.1, clone the tag, download
       the release tarball, and run the two harnesses with `SECANTUSD_PG` set
