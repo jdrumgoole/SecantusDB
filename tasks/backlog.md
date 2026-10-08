@@ -4872,8 +4872,9 @@ These are explicit non-goals. Don't add them without a reason.
       the network, not the server. Fix: `go mod download` in a setup step,
       with `actions/setup-go`'s module cache, so the test itself never goes to
       the network.
-- [x] **FIXED 2026-10-07 — two job-tooling tests were load-sensitive under `-n auto`
-      (measured 2026-09-28).** Both waits are polled with room to spare (90s /
+- [ ] **REOPENED 2026-10-07, the fix did not hold — two job-tooling tests were
+      load-sensitive under `-n auto` (measured 2026-09-28; marked FIXED
+      2026-10-07 and failed again the same day, see the end of this entry).** Both waits are polled with room to spare (90s /
       60s); the `taskkill` race noted below is already absorbed by `stop`'s
       retry, which reports the first failure and still succeeds. `tests/test_detached_run.py::
       test_stop_ends_a_running_command` and `tests/test_opsboard.py::
@@ -4900,6 +4901,18 @@ These are explicit non-goals. Don't add them without a reason.
       walked it, so the retry path took the race as a failure. That points at
       the tree-kill's handling of a child that exits mid-walk, not only at the
       wait being too short.
+
+      **Seen again 2026-10-07 22:50 UTC, AFTER the fix**, on PR #1801
+      (`test-windows (3.10, 4)`, a change to `Cargo.toml` / `Cargo.lock` files
+      only; run 37697580245). `test_stop_ends_a_running_command` failed its 90s
+      polled wait with the same message: `stopped nap (pid 4440) after a retry
+      (taskkill exited 255: ... The process with PID 7928 (child process of PID
+      8168) could not be terminated. Reason: There is no ...`. `stop` reported
+      success, and `status` never reached `finished` in 90s. So a longer wait
+      is not the fix: after the retry path, the run's recorded state is not
+      being moved to finished. The rerun of the same job passed. Look at what
+      `stop` writes to the state file when the first `taskkill` fails and the
+      retry succeeds, not at the timeout.
 
 - [ ] **OPEN — a push/PR CI run tests only Python 3.10 on Linux, so a 3.11+
       Linux bug can ONLY surface in the weekly cron (found 2026-09-28).** This

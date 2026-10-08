@@ -121,13 +121,12 @@
         <p class="install-cta"><a href="{{ SECANTUS_PG_BINARY_URL }}" rel="noopener">Current binary release ({{ SECANTUS_PG_BINARY_TAG | replace("secantusd-pg-v", "") }}) &rarr;</a></p>
       </div>
       <div class="install-col">
-        <h3>Build from source</h3>
-        <p>The crate links the vendored WiredTiger, so clone with submodules; it sits outside the clean Cargo workspace and builds from its own directory. The binary takes a storage directory and an address.</p>
-        <pre class="install-code"><code>git clone --recurse-submodules {{ SECANTUS_GITHUB_URL }}.git
-cd SecantusDB/crates/secantus-pg
-cargo build --release
+        <h3>From crates.io</h3>
+        <p>The <a href="https://crates.io/crates/secantus-pg" rel="noopener"><code>secantus-pg</code></a> crate builds the server and the WiredTiger it links. It needs a Rust toolchain, CMake, a C compiler and libclang. The binary takes a storage directory and an address.</p>
+        <pre class="install-code"><code>cargo install secantus-pg --version {{ SECANTUS_PG_BINARY_TAG | replace("secantusd-pg-v", "") }}
 
-./target/release/secantusd-pg ./data 127.0.0.1:5432</code></pre>
+secantusd-pg ./data 127.0.0.1:5432</code></pre>
+        <p>Or from a checkout: <code>git clone --recurse-submodules</code>, then <code>cargo build --release</code> in <code>crates/secantus-pg</code>.</p>
       </div>
       <div class="install-col">
         <h3>Connect</h3>
