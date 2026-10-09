@@ -1427,6 +1427,54 @@ fn txn_blocked_agg_stage(stage: &str) -> bool {
 }
 
 /// The mongod-shaped reason a statement can't run in a transaction, or `None`.
+/// The reply to a write on a capped collection inside a multi-document
+/// transaction, which mongod refuses and which aborts the transaction; `None`
+/// for anything else. Shapes measured on 8.2.11: `insert` / `update` /
+/// `delete` answer `ok: 1` with ONE write error at index 0 whatever the batch
+/// holds (263, or 20 for a delete), and `findAndModify` fails outright.
+fn capped_write_in_txn(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
+    if !matches!(
+        name,
+        "insert" | "update" | "delete" | "findAndModify" | "findandmodify"
+    ) {
+        return None;
+    }
+    let coll = doc.get_str(name).ok()?;
+    let capped = ctx
+        .storage
+        .as_ref()?
+        .collection_is_capped(&ctx.db_name, coll)
+        .unwrap_or(false);
+    if !capped {
+        return None;
+    }
+    let ns = format!("{}.{coll}", ctx.db_name);
+    let refused = format!(
+        "Collection '{ns}' is a capped collection. Writes in transactions are not allowed on \
+         capped collections."
+    );
+    let write_error = |code: i32, errmsg: String| {
+        let mut reply = doc! { "n": 0_i32 };
+        if name == "update" {
+            reply.insert("nModified", 0_i32);
+        }
+        reply.insert(
+            "writeErrors",
+            vec![doc! { "index": 0_i32, "code": code, "errmsg": errmsg }],
+        );
+        reply.insert("ok", 1.0);
+        reply
+    };
+    Some(match name {
+        "insert" | "update" => write_error(263, refused),
+        "delete" => write_error(
+            20,
+            format!("Cannot remove from a capped collection in a multi-document transaction: {ns}"),
+        ),
+        _ => CommandError::new(263, "OperationNotSupportedInTransaction", refused).into_reply(),
+    })
+}
+
 fn txn_unsupported_reason(name: &str, doc: &Document) -> Option<String> {
     if !txn_allowed_command(name) {
         return Some(format!(
@@ -1610,6 +1658,10 @@ fn run_with_txn_envelope(
     if let Some(reason) = txn_unsupported_reason(name, doc) {
         registry.abort_in_progress(&txn);
         return CommandError::new(263, "OperationNotSupportedInTransaction", reason).into_reply();
+    }
+    if let Some(reply) = capped_write_in_txn(name, doc, ctx) {
+        registry.abort_in_progress(&txn);
+        return reply;
     }
     let Some(storage) = ctx.storage.clone() else {
         return run_handler(handler, doc, ctx);

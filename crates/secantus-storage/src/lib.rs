@@ -11242,8 +11242,12 @@ impl Storage {
                 _ => None,
             }
         };
-        let size_limit = num("size");
-        let max_limit = num("max");
+        // A bound of zero or less is no bound. mongod stores "no document
+        // limit" as 2147483647 and refuses a `size` under 1, but a store
+        // written before 2026-10-09 can hold `max: 0` as given -- which,
+        // read as a limit, evicted everything except the newest document.
+        let size_limit = num("size").filter(|s| *s > 0);
+        let max_limit = num("max").filter(|m| *m > 0);
         if size_limit.is_none() && max_limit.is_none() {
             return Ok(());
         }
@@ -13766,6 +13770,21 @@ impl Storage {
                         pre_images.push(None);
                     }
                     upserted_id = Some(id);
+                    // An upsert's insert is an insert: a capped collection
+                    // is brought back within its bounds, as after `insert`.
+                    // It used to be skipped, so upserts grew one without
+                    // limit.
+                    self.enforce_capped_bounds(
+                        &session,
+                        db,
+                        coll,
+                        &descs,
+                        oplog_on,
+                        &ns,
+                        ui.as_deref(),
+                        &mut oplog_entries,
+                        &mut pre_images,
+                    )?;
                 }
 
                 if oplog_on && !oplog_entries.is_empty() {

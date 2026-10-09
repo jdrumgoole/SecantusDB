@@ -2043,11 +2043,11 @@ fn apply_coll_stats(
             // silently vanished from the reply.
             let opts = storage.get_collection_options(db, coll).unwrap_or_default();
             if let Some(size) = opts.get("size").and_then(as_i64) {
-                storage_stats.insert("maxSize", size);
+                storage_stats.insert("maxSize", crate::admin::int_bson(size));
             }
-            if let Some(max) = opts.get("max").and_then(as_i64) {
-                storage_stats.insert("max", max);
-            }
+            // 0 when the collection has no document limit, as mongod has it.
+            let max = opts.get("max").and_then(as_i64).unwrap_or(0);
+            storage_stats.insert("max", crate::admin::int_bson(max));
         }
         out.insert("storageStats", storage_stats);
     }
