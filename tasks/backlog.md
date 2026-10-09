@@ -8611,6 +8611,22 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.065 Capped collections -- 2026-10-09
+
+- [ ] **PYTHON MongoDB server: a capped collection is not held to its bounds
+      within one insert batch.** `mongod` 8.2.11 leaves a `max: 3` collection
+      with the last three of a five-document `insert_many`, and seven of forty
+      500-byte documents in a `size: 4096` one; the Python server spares every
+      document of the inserting batch ("oldest non-fresh docs"), so it keeps
+      all five and all forty. The Rust server was fixed 2026-10-09 (0 of 34
+      sweep results differ from `mongod`, was 17); the Python server was not
+      touched. Reproduce by running the sweep against `secantusd-py`.
+- [ ] **RUST MongoDB server: capped eviction rescans the whole collection on
+      every insert chunk.** `enforce_capped_bounds` calls `scan_docs` and sums
+      every document's size to learn the collection's size and count, so an
+      insert into a capped collection costs time proportional to the
+      collection. Not measured. A running size and count would remove it.
+
 ### 7.06 Release tooling gaps found cutting 0.6.0b18 -- 2026-10-07
 
 - [ ] **The binary smoke test and the stale-artifact check look at DIFFERENT
