@@ -8714,6 +8714,32 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.067 Index management -- 2026-10-10
+
+`tools/probes/index_admin.py`, mongod 8.2.11: the Rust server went from 68
+of 87 results different to 9. Seven are `text` / `hashed` indexes (out of
+scope) and the index counts that follow from not building them.
+
+- [ ] **RUST MongoDB server: a hidden index is still used by the planner.**
+      `collMod` now records `hidden` and `listIndexes` reports it, but nothing
+      was done to make `find` ignore a hidden index. Not probed: compare
+      `explain` on both servers after hiding.
+- [ ] **RUST MongoDB server: a `partialFilterExpression` with an operator
+      mongod does not allow is accepted.** `{a: {$ne: 1}}` is 67 on `mongod`
+      8.2.11, `Expression not supported in partial index: $not` followed by a
+      rendering of the expression tree.
+- [ ] **RUST MongoDB server: an index `collation` is neither checked nor
+      expanded.** `{locale: "zz_nope"}` is accepted (`mongod`: 2, `Field
+      'locale' is invalid`), and `listIndexes` echoes the collation as given
+      where `mongod` fills in every default and a `version`.
+- [ ] **RUST MongoDB server: `listIndexes` is in name order after `_id_`.**
+      `mongod` lists in creation order. The storage layer keeps no creation
+      order for indexes.
+- [ ] **PYTHON MongoDB server: 69 of 87 index-management results differ from
+      `mongod`** (same probe). Not changed, and not read through: check
+      whether `dropIndexes` with the key `{_id: 1}` drops the `_id` index
+      there too.
+
 ### 7.066 Views and `$count` -- 2026-10-09
 
 `tools/probes/views.py`, mongod 8.2.11: the Rust server went from 52 of 70

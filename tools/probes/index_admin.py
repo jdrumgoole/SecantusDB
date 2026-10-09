@@ -8,6 +8,7 @@ conflicting, duplicate and malformed index specs.
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -133,8 +134,14 @@ SEQUENCE = [
 ]
 
 
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 def typed(v):
-    if isinstance(v, bool) or v is None or isinstance(v, str):
+    if isinstance(v, str):
+        # An index build's id and the collection's are random per run.
+        return UUID.sub("<uuid>", v)
+    if isinstance(v, bool) or v is None:
         return v
     if isinstance(v, Int64):
         return f"long:{int(v)}"

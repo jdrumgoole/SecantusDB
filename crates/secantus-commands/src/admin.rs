@@ -1473,6 +1473,10 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // `_id_` is always listed first, as on mongod. The rest come back in name
+    // order here (mongod: creation order), which put an index named `$**_1`
+    // or `A_1` ahead of it.
+    indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
     // A collection that exists always has at least the synthesised `_id_` index, so
     // an empty result means the namespace doesn't exist — mongod errors
     // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
@@ -3116,7 +3120,11 @@ mod parity_tests {
         )
         .unwrap();
         let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        // mongod 8.2.11 answers 197 (this asserted 40415 until 2026-10-10).
+        assert_eq!(
+            (code, name.as_str()),
+            (197, "InvalidIndexSpecificationOption")
+        );
         assert!(msg.contains("invalid"), "{msg}");
     }
 
