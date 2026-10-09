@@ -913,3 +913,59 @@ fn narrow_decode_ahead_of_a_group_or_count_changes_no_answer() {
         }
     });
 }
+
+/// `$count` over no documents emits no document (mongod 8.2.11 answers `[]`).
+/// It used to emit `{n: 0}`, which also put a phantom row in every
+/// sub-pipeline that counted no match.
+#[test]
+fn count_over_no_input_emits_nothing() {
+    with_wt(|c| {
+        seed(c, "a", (0..3).map(|i| doc! {"_id": i, "g": i}).collect());
+        seed(c, "b", (0..3).map(|i| doc! {"_id": i, "g": 1}).collect());
+        let run = |c: &mut CommandContext, coll: &str, pipeline: Vec<Document>| {
+            let reply = dispatch(
+                &doc! {"aggregate": coll, "pipeline": pipeline, "cursor": {}},
+                c,
+            );
+            assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+            docs_of(&reply)
+        };
+        assert!(run(
+            c,
+            "a",
+            vec![doc! {"$match": {"_id": -1}}, doc! {"$count": "n"}]
+        )
+        .is_empty());
+        assert!(run(c, "nosuch", vec![doc! {"$count": "n"}]).is_empty());
+        assert_eq!(run(c, "a", vec![doc! {"$count": "n"}]), vec![doc! {"n": 3}]);
+        let joined = run(
+            c,
+            "a",
+            vec![
+                doc! {"$lookup": {"from": "b", "localField": "g", "foreignField": "g",
+                "pipeline": [{"$count": "n"}], "as": "m"}},
+                doc! {"$sort": {"_id": 1}},
+                doc! {"$project": {"_id": 0, "m": 1}},
+            ],
+        );
+        assert_eq!(
+            joined,
+            vec![doc! {"m": []}, doc! {"m": [{"n": 3}]}, doc! {"m": []}]
+        );
+        let unioned = run(
+            c,
+            "a",
+            vec![
+                doc! {"$limit": 1},
+                doc! {"$unionWith": {"coll": "b", "pipeline": [{"$match": {"g": 9}}, {"$count": "n"}]}},
+            ],
+        );
+        assert_eq!(unioned, vec![doc! {"_id": 0, "g": 0}]);
+        let faceted = run(
+            c,
+            "a",
+            vec![doc! {"$facet": {"x": [{"$match": {"_id": -1}}, {"$count": "n"}]}}],
+        );
+        assert_eq!(faceted, vec![doc! {"x": []}]);
+    });
+}

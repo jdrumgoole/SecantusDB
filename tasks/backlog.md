@@ -8611,6 +8611,48 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.066 Views and `$count` -- 2026-10-09
+
+`tools/probes/views.py`, mongod 8.2.11: the Rust server went from 52 of 70
+results different to 2. What is left, there and beside it:
+
+- [ ] **RUST MongoDB server: there is no `system.views` collection.** `mongod`
+      lists it in `listCollections` once a view exists and `find` on it
+      returns `{_id: "db.view", viewOn, pipeline[, collation]}` per view. The
+      Rust server keeps a view's definition in the view's own collection
+      options, so both are empty. These are the 2 of 70.
+- [ ] **RUST MongoDB server: no view depth limit.** `mongod` refuses a chain
+      of views past 20 (`165 ViewDepthLimitExceeded`, `View depth limit
+      exceeded; maximum depth is 20` on create, `View depth too deep or view
+      cycle detected; maximum depth is 20` on read). Its two limits are not
+      the same: `ch19`, twenty views deep, was created and then could not be
+      read. The exact create boundary was not measured.
+- [ ] **RUST MongoDB server: the `bulkWrite` command writes into a view.**
+      `mongod` answers a per-operation error 166 in the cursor. `insert`,
+      `update`, `delete` and `findAndModify` are refused; `bulkWrite` (the
+      8.0 command, not the driver helper) is not.
+- [ ] **RUST MongoDB server: smaller view differences.** A `hint` naming an
+      index on a view is ignored (`mongod`: 2, `hint provided does not
+      correspond to an existing index`); `$indexStats` on a view answers
+      (`mongod`: 40602); `create` of an existing view with another
+      definition words its 48 differently (`already exists, but with
+      pipeline ... rather than ...`, `already exists, but is a view on ...
+      rather than ...`); `distinct` on a view returns values in scan order,
+      `mongod` in hash order.
+- [ ] **`mongod` 8.2.11 itself crashes on `{collMod: <a view>, cappedSize:
+      100}`** (the connection closes and the server is gone). Not ours; the
+      Rust server answers 72 `Collection must be capped.` Do not put that
+      command in a probe that needs mongod to survive it.
+- [ ] **PYTHON MongoDB server: 52 of 70 view results differ from `mongod`**
+      (same probe, same day). Not changed.
+- [ ] **PYTHON MongoDB server: `$count` over no documents emits `{n: 0}`.**
+      `mongod` 8.2.11 emits nothing (`[{$match: {_id: -1}}, {$count: "n"}]`
+      is `[]`, and a `$lookup` / `$unionWith` / `$facet` sub-pipeline that
+      counts no match adds no document). The Rust engine was moved
+      2026-10-09. `tests/test_rust_aggregate_parity.py::test_pipeline_fuzz`
+      now steps over any disagreement in a pipeline that holds a `$count`;
+      remove that exclusion when the Python engine is fixed.
+
 ### 7.065 Capped collections -- 2026-10-09
 
 - [ ] **RUST MongoDB server: `convertToCapped` is not implemented**

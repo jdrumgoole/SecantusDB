@@ -1080,3 +1080,395 @@ fn a_write_to_a_capped_collection_inside_a_transaction_is_refused() {
         );
     });
 }
+
+// --- views: every expectation is what mongod 8.2.11 answered (2026-10-09).
+
+/// `src` (ten documents, `g` = `_id % 3`), `other`, a view `v1` of `g == 1`
+/// and a view `v4` over `v1`.
+fn seed_views(c: &mut CommandContext) {
+    let src: Vec<Bson> = (0..10_i32)
+        .map(|i| Bson::Document(doc! {"_id": i, "g": i % 3, "v": i * 10, "tags": [i, i + 1]}))
+        .collect();
+    dispatch(&doc! {"insert": "src", "documents": src}, c);
+    let other: Vec<Bson> = (0..3_i32)
+        .map(|i| Bson::Document(doc! {"_id": i, "g": i}))
+        .collect();
+    dispatch(&doc! {"insert": "other", "documents": other}, c);
+    for cmd in [
+        doc! {"create": "v1", "viewOn": "src", "pipeline": [{"$match": {"g": 1}}]},
+        doc! {"create": "v4", "viewOn": "v1", "pipeline": [{"$project": {"v": 1, "g": 1}}]},
+    ] {
+        assert_eq!(dispatch(&cmd, c).get_f64("ok").unwrap(), 1.0, "{cmd}");
+    }
+}
+
+fn agg_docs(c: &mut CommandContext, coll: &str, pipeline: Vec<Document>) -> Vec<Document> {
+    let reply = dispatch(
+        &doc! {"aggregate": coll, "pipeline": pipeline, "cursor": {}},
+        c,
+    );
+    assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+    reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .map(|b| b.as_document().unwrap().clone())
+        .collect()
+}
+
+fn view_ids(c: &mut CommandContext, find: Document) -> Vec<i32> {
+    // `dispatch_full`: a plain collection's `find` hands its batch over
+    // out of band, a view's (an aggregation) inline.
+    let reply = common::dispatch_full(&find, c);
+    assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+    reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .map(|b| b.as_document().unwrap().get_i32("_id").unwrap())
+        .collect()
+}
+
+#[test]
+fn a_view_refuses_writes_indexes_and_collection_commands() {
+    with_wt(|c| {
+        seed_views(c);
+        let refused = "Namespace t.v1 is a view, not a collection";
+        // Writes: one error per statement, or the first alone when ordered.
+        for (cmd, reported) in [
+            (
+                doc! {"insert": "v1", "documents": [{"_id": 100}, {"_id": 101}]},
+                1,
+            ),
+            (
+                doc! {"insert": "v1", "documents": [{"_id": 100}, {"_id": 101}], "ordered": false},
+                2,
+            ),
+            (
+                doc! {"update": "v1", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}]},
+                1,
+            ),
+            (
+                doc! {"delete": "v1", "ordered": false,
+                "deletes": [{"q": {}, "limit": 1_i32}, {"q": {}, "limit": 0_i32}]},
+                2,
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{cmd}: {reply}");
+            assert_eq!(reply.get_i32("n").unwrap(), 0, "{cmd}");
+            let errors = reply.get_array("writeErrors").unwrap();
+            assert_eq!(errors.len(), reported, "{cmd}: {reply}");
+            for (i, e) in errors.iter().enumerate() {
+                let e = e.as_document().unwrap();
+                assert_eq!(e.get_i32("index").unwrap(), i as i32);
+                assert_eq!(e.get_i32("code").unwrap(), 166);
+                assert_eq!(e.get_str("errmsg").unwrap(), refused);
+            }
+        }
+        for (cmd, code, msg) in [
+            (
+                doc! {"findAndModify": "v1", "query": {}, "remove": true},
+                166,
+                refused,
+            ),
+            (
+                doc! {"createIndexes": "v1", "indexes": [{"key": {"v": 1}, "name": "v_1"}]},
+                166,
+                refused,
+            ),
+            (doc! {"listIndexes": "v1"}, 166, refused),
+            (doc! {"dropIndexes": "v1", "index": "*"}, 166, refused),
+            (doc! {"collStats": "v1"}, 166, refused),
+            (doc! {"validate": "v1"}, 166, "Cannot validate a view"),
+            (
+                doc! {"aggregate": "v1", "pipeline": [{"$collStats": {"count": {}}}], "cursor": {}},
+                166,
+                "Executor error during aggregate command on namespace: t.v1 :: caused by :: \
+                 Namespace t.v1 is a view, not a collection",
+            ),
+            (
+                doc! {"aggregate": "other", "pipeline": [{"$out": "v1"}], "cursor": {}},
+                166,
+                "Executor error during aggregate command on namespace: t.other :: caused by :: \
+                 Namespace t.v1 is a view, not a collection",
+            ),
+            (
+                doc! {"aggregate": "other", "pipeline": [{"$merge": {"into": "v1"}}], "cursor": {}},
+                166,
+                "Executor error during aggregate command on namespace: t.other :: caused by :: \
+                 Namespace t.v1 is a view, not a collection",
+            ),
+            (
+                doc! {"renameCollection": "t.v1", "to": "t.v1b"},
+                166,
+                "cannot rename view: t.v1",
+            ),
+            (
+                doc! {"renameCollection": "t.other", "to": "t.v1", "dropTarget": true},
+                48,
+                "a view already exists with that name: t.v1",
+            ),
+            (
+                doc! {"find": "v1", "tailable": true},
+                168,
+                "Tailable cursors are not supported in aggregation.",
+            ),
+            (
+                doc! {"find": "v1", "collation": {"locale": "fr"}},
+                167,
+                "Cannot override a view's default collation",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        // Nothing was written anywhere, and the view still reads its source.
+        assert_eq!(view_ids(c, doc! {"find": "v1"}), vec![1, 4, 7]);
+        assert_eq!(view_ids(c, doc! {"find": "other"}), vec![0, 1, 2]);
+        // Dropping a view reports no index count.
+        assert_eq!(
+            dispatch(&doc! {"drop": "v4"}, c),
+            doc! {"ns": "t.v4", "ok": 1.0}
+        );
+    });
+}
+
+#[test]
+fn a_view_is_read_through_by_distinct_joins_and_natural_order() {
+    with_wt(|c| {
+        seed_views(c);
+        let distinct = |c: &mut CommandContext, cmd: Document| {
+            let reply = dispatch(&cmd, c);
+            let mut values: Vec<i32> = reply
+                .get_array("values")
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i32().unwrap())
+                .collect();
+            values.sort();
+            (values, reply.get("ok").cloned())
+        };
+        // mongod answers `ok` as an int32 for a view's distinct.
+        assert_eq!(
+            distinct(c, doc! {"distinct": "v1", "key": "v"}),
+            (vec![10, 40, 70], Some(Bson::Int32(1)))
+        );
+        assert_eq!(
+            distinct(
+                c,
+                doc! {"distinct": "v1", "key": "v", "query": {"v": {"$gt": 10}}}
+            )
+            .0,
+            vec![40, 70]
+        );
+        assert_eq!(distinct(c, doc! {"distinct": "v4", "key": "g"}).0, vec![1]);
+        assert_eq!(
+            distinct(c, doc! {"distinct": "src", "key": "g"}),
+            (vec![0, 1, 2], Some(Bson::Double(1.0)))
+        );
+
+        let sizes = |docs: Vec<Document>| -> Vec<i32> {
+            docs.iter().map(|d| d.get_i32("n").unwrap()).collect()
+        };
+        let lookup = agg_docs(
+            c,
+            "other",
+            vec![
+                doc! {"$lookup": {"from": "v1", "localField": "g", "foreignField": "g", "as": "m"}},
+                doc! {"$project": {"n": {"$size": "$m"}}},
+                doc! {"$sort": {"_id": 1}},
+            ],
+        );
+        assert_eq!(sizes(lookup), vec![0, 3, 0]);
+        let graph = agg_docs(
+            c,
+            "other",
+            vec![
+                doc! {"$graphLookup": {"from": "v1", "startWith": "$g", "connectFromField": "g",
+                "connectToField": "g", "as": "m", "maxDepth": 0_i32}},
+                doc! {"$project": {"n": {"$size": "$m"}}},
+                doc! {"$sort": {"_id": 1}},
+            ],
+        );
+        assert_eq!(sizes(graph), vec![0, 3, 0]);
+        let union = agg_docs(
+            c,
+            "other",
+            vec![doc! {"$unionWith": "v1"}, doc! {"$count": "n"}],
+        );
+        assert_eq!(union, vec![doc! {"n": 6}]);
+
+        // `$natural` is the direction the source is scanned in.
+        assert_eq!(
+            view_ids(c, doc! {"find": "v1", "sort": {"$natural": -1}}),
+            vec![7, 4, 1]
+        );
+        assert_eq!(
+            view_ids(c, doc! {"find": "v1", "sort": {"$natural": 1}}),
+            vec![1, 4, 7]
+        );
+    });
+}
+
+#[test]
+fn coll_mod_redefines_a_view_and_only_a_view() {
+    with_wt(|c| {
+        seed_views(c);
+        // Each of `pipeline` and `viewOn` replaces its own half.
+        dispatch(
+            &doc! {"collMod": "v1", "pipeline": [{"$match": {"g": 2}}]},
+            c,
+        );
+        assert_eq!(view_ids(c, doc! {"find": "v1"}), vec![2, 5, 8]);
+        assert_eq!(
+            collection_options(c, "v1"),
+            doc! {"viewOn": "src", "pipeline": [{"$match": {"g": 2}}]}
+        );
+        dispatch(&doc! {"collMod": "v1", "viewOn": "other"}, c);
+        assert_eq!(view_ids(c, doc! {"find": "v1"}), vec![2]);
+        dispatch(
+            &doc! {"collMod": "v1", "viewOn": "src", "pipeline": [{"$match": {"g": 0}}]},
+            c,
+        );
+        assert_eq!(view_ids(c, doc! {"find": "v1"}), vec![0, 3, 6, 9]);
+
+        for (cmd, code, msg) in [
+            (
+                doc! {"collMod": "src", "viewOn": "other", "pipeline": []},
+                72,
+                "option only supported on a view: pipeline",
+            ),
+            (
+                doc! {"collMod": "src", "viewOn": "other"},
+                72,
+                "option only supported on a view: viewOn",
+            ),
+            (
+                doc! {"collMod": "v1", "validator": {"a": 1}},
+                72,
+                "option not supported on a view: validator",
+            ),
+            (
+                doc! {"collMod": "v1", "validationLevel": "off"},
+                72,
+                "option not supported on a view: validationLevel",
+            ),
+            (
+                doc! {"collMod": "v1", "index": {"name": "x", "hidden": true}},
+                72,
+                "option not supported on a view: index",
+            ),
+            (
+                doc! {"collMod": "v1", "viewOn": "v4", "pipeline": []},
+                5,
+                "View cycle detected: t.v1 => t.v1 => t.v4 => t.v1",
+            ),
+            (
+                doc! {"collMod": "v1", "viewOn": "src", "pipeline": [{"$nope": 1}]},
+                40324,
+                "Unrecognized pipeline stage name: '$nope'",
+            ),
+            (
+                doc! {"collMod": "v1", "viewOn": "src", "pipeline": [{"$out": "x"}]},
+                167,
+                "Invalid pipeline for view t.v1 :: caused by :: The aggregation stage $out in \
+                 location 0 of the pipeline cannot be used in the view definition of t.v1 because \
+                 it writes to disk",
+            ),
+            (
+                doc! {"collMod": "v1", "viewOn": "src", "pipeline": {"a": 1}},
+                14,
+                "BSON field 'collMod.pipeline' is the wrong type 'object', expected type 'array'",
+            ),
+            (
+                doc! {"collMod": "v1", "viewOn": "", "pipeline": []},
+                2,
+                "'viewOn' cannot be empty",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        assert_eq!(view_ids(c, doc! {"find": "v1"}), vec![0, 3, 6, 9]);
+    });
+}
+
+#[test]
+fn create_checks_a_views_definition() {
+    with_wt(|c| {
+        seed_views(c);
+        for (cmd, code, msg) in [
+            (
+                doc! {"create": "bad", "pipeline": []},
+                72,
+                "'pipeline' requires 'viewOn' to also be specified",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": "src", "pipeline": [{"$nope": 1}]},
+                40324,
+                "Unrecognized pipeline stage name: '$nope'",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": "src", "pipeline": [{"$merge": {"into": "x"}}]},
+                167,
+                "Invalid pipeline for view t.bad :: caused by :: The aggregation stage $merge in \
+                 location 0 of the pipeline cannot be used in the view definition of t.bad \
+                 because it writes to disk",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": "src", "pipeline": [{"$changeStream": {}}]},
+                167,
+                "Invalid pipeline for view t.bad :: caused by :: $changeStream cannot be used in \
+                 a view definition",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": "src", "pipeline": {"$match": {}}},
+                14,
+                "BSON field 'create.pipeline' is the wrong type 'object', expected type 'array'",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": 5_i32, "pipeline": []},
+                14,
+                "BSON field 'create.viewOn' is the wrong type 'int', expected type 'string'",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": "", "pipeline": []},
+                2,
+                "'viewOn' cannot be empty",
+            ),
+            (
+                doc! {"create": "bad", "viewOn": "bad", "pipeline": []},
+                5,
+                "View cycle detected: t.bad => t.bad => t.bad",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        let listed = dispatch(&doc! {"listCollections": 1, "filter": {"name": "bad"}}, c);
+        assert!(
+            listed
+                .get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap()
+                .is_empty(),
+            "{listed}"
+        );
+        // A view over a collection that does not exist yet is fine, and empty.
+        let reply = dispatch(
+            &doc! {"create": "later", "viewOn": "nosuch", "pipeline": []},
+            c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+        assert!(view_ids(c, doc! {"find": "later"}).is_empty());
+    });
+}
