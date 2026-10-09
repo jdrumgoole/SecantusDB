@@ -260,9 +260,18 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
     }
-    if let Some(Bson::Document(sort)) = doc.get("sort") {
-        argtypes::require_sort_spec(sort)?;
-    }
+    // `{$natural: ±1}` is storage order, which `find` runs as the `$natural`
+    // hint; any other spec is an ordinary sort.
+    let natural_hint = match doc.get("sort") {
+        Some(Bson::Document(sort)) => {
+            let natural = argtypes::natural_sort(sort, doc.get("hint"))?;
+            if natural.is_none() {
+                argtypes::require_sort_spec(sort)?;
+            }
+            natural
+        }
+        _ => None,
+    };
     // `min` / `max` are the Expected-field family, which REJECTS an explicit
     // null -- not the BSON-field family, which accepts it. Probed.
     argtypes::require_object_expected(doc, "min")?;
@@ -345,6 +354,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let sort_owned = doc
         .get("sort")
         .and_then(Bson::as_document)
+        .filter(|_| natural_hint.is_none())
         .map(argtypes::normalise_sort_spec);
     let sort = sort_owned.as_ref();
     // An empty projection means "no projection" (return full docs). Mutable
@@ -391,7 +401,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Ok(reply.into_reply());
         }
     }
-    let hint = doc.get("hint");
+    let hint = natural_hint.as_ref().or_else(|| doc.get("hint"));
     let collation = collation_of(doc);
     // Command `let` → vars visible to `$expr` in the filter.
     let let_vars = resolve_let_vars(doc.get("let"));
