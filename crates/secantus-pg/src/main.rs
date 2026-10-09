@@ -6,6 +6,14 @@
 //! which the embedded Python handle (`_secantus_server`'s `PgServer`) calls
 //! too -- so there is one serve path, not two.
 
+// The binary's allocator. Planning and running a statement allocate heavily
+// (the parse tree, the plan, each row's BSON), and on Linux glibc's malloc was
+// about a sixth of the server's CPU time for a prepared write. The LIBRARY
+// sets no allocator: a test that embeds `PgServer` keeps its own.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::mpsc;
 use std::sync::Arc;
 
