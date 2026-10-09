@@ -135,9 +135,10 @@ unpatched code.
 `pip install SecantusDB` now installs the two Python reference servers (MongoDB
 and PostgreSQL) and WiredTiger, and nothing else. The Rust servers no longer
 ride inside the wheel. The Rust MongoDB server is the `secantus-mdb` crate on
-crates.io: `cargo install secantus-mdb` builds it, WiredTiger included, and
-puts `secantusd-rs` on your `PATH`. From a Rust test, `secantus_mdb::Server`
-starts it in-process. Prebuilt binaries of both Rust servers stay on GitHub
+crates.io: `cargo install secantus-mdb --version 0.5.3-beta.173` builds it,
+WiredTiger included, and puts `secantusd-rs` on your `PATH`. From a Rust test,
+`secantus_mdb::Server` starts it in-process. Prebuilt binaries of both Rust
+servers stay on GitHub
 Releases for machines without a Rust toolchain.
 
 Two things drove the split. Bundling the Rust servers multiplied the size of
@@ -159,8 +160,8 @@ starts the 0.7 line: it is `0.7.0b0`, not `0.6.0b19`.
   `SecantusDBServer`, which has the same `pymongo` surface. The handle remains
   available in a source build.
 - The README, the server comparison, the installation pages and the website
-  now give `cargo install secantus-mdb` as the way to get the Rust MongoDB
-  server.
+  now give `cargo install secantus-mdb --version 0.5.3-beta.173` as the way
+  to get the Rust MongoDB server.
 
 ### The Rust PostgreSQL server gives each connection its own thread
 

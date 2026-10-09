@@ -339,6 +339,34 @@ def _wt_source_patches() -> list[tuple[str, str]]:
     return list(module.PATCHES)
 
 
+def _cmake_cache_source(build_dir: pathlib.Path) -> pathlib.Path | None:
+    """The source directory a CMake build directory was configured from."""
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    for line in cache.read_text(errors="replace").splitlines():
+        if line.startswith("CMAKE_HOME_DIRECTORY:"):
+            return pathlib.Path(line.split("=", 1)[1].strip())
+    return None
+
+
+def _drop_foreign_cmake_cache(build_dir: pathlib.Path, src: pathlib.Path) -> bool:
+    """Remove a build directory configured from a different source tree.
+
+    CMake refuses to reconfigure one ("the source ... does not match the source
+    ... used to generate cache"), and the build moved its source from
+    ``vendor/wiredtiger`` to a patched copy on 2026-10-07, so every checkout
+    built before that hit the refusal. Nothing in the directory is reusable
+    across source trees. Returns True if it removed one.
+    """
+    recorded = _cmake_cache_source(build_dir)
+    if recorded is None or recorded.resolve() == src.resolve():
+        return False
+    print(f"WiredTiger build dir was configured from {recorded}; rebuilding from {src}")
+    shutil.rmtree(build_dir)
+    return True
+
+
 def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     """Build the vendored WiredTiger static lib the Rust crates link (cross-platform).
 
@@ -436,6 +464,7 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     elif os.name == "nt":
         raise SystemExit("ninja not found. Install Ninja, or the VS 'C++ CMake tools' component.")
 
+    _drop_foreign_cmake_cache(build_dir, src)
     print(f"Configuring WiredTiger -> {build_dir}")
     subprocess.run(configure, env=env, check=True)
     print("Building wiredtiger_static ...")
