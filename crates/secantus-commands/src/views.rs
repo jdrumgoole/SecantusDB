@@ -69,7 +69,14 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
                 "update" => "updates",
                 _ => "deletes",
             };
-            let count = doc.get_array(statements).map(Vec::len).unwrap_or(1).max(1);
+            // An insert's documents usually arrive as a document sequence,
+            // which the server hands over raw instead of merging into `doc`.
+            let count = match (&ctx.raw_insert_documents, doc.get_array(statements)) {
+                (Some(raw), _) if name == "insert" => raw.len(),
+                (_, Ok(inline)) => inline.len(),
+                _ => 1,
+            }
+            .max(1);
             let ordered = !matches!(doc.get("ordered"), Some(Bson::Boolean(false)));
             let reported = if ordered { 1 } else { count };
             let msg = not_a_collection(&format!("{db}.{coll}"));

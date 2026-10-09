@@ -328,6 +328,14 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .unwrap_or(false)
     };
     if is_view {
+        if matches!(doc.get("tailable"), Some(Bson::Boolean(true))) {
+            return Ok(CommandError::new(
+                168,
+                "InvalidPipelineOperator",
+                "Tailable cursors are not supported in aggregation.",
+            )
+            .into_reply());
+        }
         let agg = build_view_find_aggregate(doc, &coll, natural_hint.as_ref());
         return crate::aggregate::aggregate(&agg, ctx);
     }

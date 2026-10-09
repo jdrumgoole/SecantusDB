@@ -269,6 +269,33 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // (recursively for a view-on-a-view). The reply ns keeps the queried
             // (view) name; only the fetch reads the base collection. Mirrors
             // commands._resolve_view.
+            // A view reads in its own default collation and no other: a
+            // request naming a different one is refused, not obeyed.
+            if let Some(requested) = doc.get("collation").and_then(Bson::as_document) {
+                let opts = storage
+                    .get_collection_options(&ctx.db_name, c)
+                    .unwrap_or_default();
+                if opts.contains_key("viewOn") {
+                    let own = opts.get_document("collation").ok();
+                    let locale = |d: Option<&Document>| {
+                        d.and_then(|d| d.get_str("locale").ok())
+                            .unwrap_or("simple")
+                            .to_string()
+                    };
+                    let same = match own {
+                        Some(own) => locale(Some(own)) == locale(Some(requested)),
+                        None => locale(Some(requested)) == "simple",
+                    };
+                    if !same {
+                        return Ok(CommandError::new(
+                            167,
+                            "OptionNotSupportedOnView",
+                            "Cannot override a view's default collation",
+                        )
+                        .into_reply());
+                    }
+                }
+            }
             let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline);
             let c = base_coll.as_str();
             // Stages that generate / read their own input start from no docs.
