@@ -138,6 +138,34 @@ Four rows reproduce to within about ±0.1× (insert, filtered scan,
 swing is the denominator. A single run of this harness cannot tell a
 30% change on those three rows from noise; use the range.
 
+**The harness now interleaves the servers** (from 2026-10-09). The three runs
+above measured all of `mongod`'s reps, then all of the Rust server's, then all
+of the Python server's, five each, so a change in the machine during a run
+landed on one column of a ratio. The harness now runs every server within each
+rep, rotating the order, and the droplet task takes fifteen reps. Two droplet
+runs of the same build that way, on machines whose absolute speed differed by
+about 1.5×:
+
+| Workload | sequential, 5 reps (3 runs) | interleaved, 15 reps (2 runs) |
+|---|---:|---:|
+| insert (10k docs) | 1.95×–2.18× | 2.07×–2.28× |
+| find indexed range | 0.96×–1.37× | 1.14×–1.17× |
+| find full scan | 1.02×–1.34× | 1.16×–1.42× |
+| find filtered scan | 1.17×–1.26× | 1.16×–1.17× |
+| update_many (half) | 1.36×–1.48× | 1.36×–1.71× |
+| aggregate $group | 1.99×–2.72× | 2.04×–2.34× |
+| aggregate multi-stage | 2.83×–4.07× | 2.95×–3.19× |
+| delete_many (half) | 1.97×–3.00× | 2.05×–2.07× |
+| change-stream drain | 1.22×–1.24× | 1.08×–1.25× |
+
+The widest disagreement between runs fell from 1.24× (multi-stage
+aggregation) to 0.35× (`update_many`), and the three rows that would not hold
+still now agree to within 0.3×. Two runs is a small sample, and two rows moved
+the other way; the change-stream row's `mongod` figure comes from a separate
+replica-set run and is not interleaved. The chart and table at the top of this
+page are still the last sequential run, and will be replaced at the next
+refresh.
+
 The trade is unchanged: conformance and WiredTiger durability over raw
 per-op latency. For ephemeral test and dev data the wall-clock difference
 rarely matters; when it does, that's what the Rust server is for. See
@@ -149,7 +177,7 @@ rarely matters; when it does, that's what the Rust server is for. See
 ```bash
 # The embedded Rust server needs the storage-engine build:
 SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
-uv run --no-sync python -m bench.compare_servers --n 10000 --reps 5
+uv run --no-sync python -m bench.compare_servers --n 10000 --reps 15
 ```
 
 Requires `mongod` on `PATH` (Community Server is enough; `--no-mongod` skips
