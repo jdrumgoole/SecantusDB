@@ -739,3 +739,344 @@ fn rename_nonexistent_source_is_namespace_not_found() {
         assert_eq!(r.get_str("codeName").unwrap(), "NamespaceNotFound");
     });
 }
+
+// --- capped collections: every expectation is what mongod 8.2.11 answered
+// --- for the same command (2026-10-09).
+
+fn create_capped(c: &mut CommandContext, name: &str, extra: Document) -> Document {
+    let mut cmd = doc! {"create": name};
+    cmd.extend(extra);
+    dispatch(&cmd, c)
+}
+
+#[test]
+fn capped_size_and_max_are_stored_as_integers() {
+    with_wt(|c| {
+        // pymongo sends `size` as a double; it used to be echoed as one.
+        for (name, extra, want) in [
+            (
+                "a",
+                doc! {"capped": true, "size": 1000.7_f64},
+                doc! {"capped": true, "size": 1000_i32},
+            ),
+            (
+                "b",
+                doc! {"capped": 1_i32, "size": 1000_i64, "max": 3.7_f64},
+                doc! {"capped": true, "size": 1000_i32, "max": 3_i32},
+            ),
+            (
+                "c",
+                doc! {"capped": true, "size": 1_i64 << 50},
+                doc! {"capped": true, "size": 1_i64 << 50},
+            ),
+            // Zero or less means no document limit, stored as 2147483647.
+            (
+                "d",
+                doc! {"capped": true, "size": 1000_i32, "max": 0_i32},
+                doc! {"capped": true, "size": 1000_i32, "max": i32::MAX},
+            ),
+            (
+                "e",
+                doc! {"capped": true, "size": 1000_i32, "max": -5_i64},
+                doc! {"capped": true, "size": 1000_i32, "max": i32::MAX},
+            ),
+            (
+                "f",
+                doc! {"capped": true, "size": 10_i32, "max": Bson::Null},
+                doc! {"capped": true, "size": 10_i32},
+            ),
+        ] {
+            let reply = create_capped(c, name, extra.clone());
+            assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{extra}: {reply}");
+            assert_eq!(collection_options(c, name), want, "{extra}");
+        }
+        // Creating it again with options that normalise to the same thing is
+        // not a conflict; a different size is.
+        let again = create_capped(
+            c,
+            "d",
+            doc! {"capped": true, "size": 1000.9_f64, "max": -7_i32},
+        );
+        assert_eq!(again.get_f64("ok").unwrap(), 1.0, "{again}");
+        let other = create_capped(c, "d", doc! {"capped": true, "size": 2000_i32});
+        assert_eq!(other.get_i32("code").unwrap(), 48, "{other}");
+    });
+}
+
+#[test]
+fn capped_size_and_max_out_of_range_are_refused() {
+    with_wt(|c| {
+        for (extra, msg) in [
+            (
+                doc! {"capped": true, "size": 0_i32},
+                "BSON field 'size' value must be >= 1, actual value '0'",
+            ),
+            (
+                doc! {"capped": true, "size": -1_i32},
+                "BSON field 'size' value must be >= 1, actual value '-1'",
+            ),
+            (
+                doc! {"capped": true, "size": 0.5_f64},
+                "BSON field 'size' value must be >= 1, actual value '0'",
+            ),
+            (
+                doc! {"capped": true, "size": f64::NAN},
+                "BSON field 'size' value must be >= 1, actual value '0'",
+            ),
+            (
+                doc! {"capped": true, "size": 1_i64 << 62},
+                "BSON field 'size' value must be <= 1125899906842624, actual value \
+                 '4611686018427387904'",
+            ),
+            (
+                doc! {"capped": true, "size": f64::INFINITY},
+                "BSON field 'size' value must be <= 1125899906842624, actual value \
+                 '9223372036854775807'",
+            ),
+            (
+                doc! {"capped": true, "size": 1000_i32, "max": 1_i64 << 31},
+                "BSON field 'max' value must be < 2147483648, actual value '2147483648'",
+            ),
+            // The range is checked before the rules about `capped` itself.
+            (
+                doc! {"size": 0_i32},
+                "BSON field 'size' value must be >= 1, actual value '0'",
+            ),
+            (
+                doc! {"capped": true, "max": 1_i64 << 31},
+                "BSON field 'max' value must be < 2147483648, actual value '2147483648'",
+            ),
+        ] {
+            let reply = create_capped(c, "bad", extra.clone());
+            assert_eq!(reply.get_i32("code").unwrap(), 2, "{extra}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{extra}");
+        }
+        assert!(!dispatch(&doc! {"listCollections": 1}, c)
+            .to_string()
+            .contains("\"bad\""));
+    });
+}
+
+#[test]
+fn coll_mod_rebounds_a_capped_collection() {
+    with_wt(|c| {
+        create_capped(
+            c,
+            "s",
+            doc! {"capped": true, "size": 1000_i32, "max": 5_i32},
+        );
+        dispatch(&doc! {"create": "plain"}, c);
+        let reply = dispatch(
+            &doc! {"collMod": "s", "cappedSize": 7000.9_f64, "cappedMax": 2_i64},
+            c,
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+        assert_eq!(
+            collection_options(c, "s"),
+            doc! {"capped": true, "size": 7000_i32, "max": 2_i32}
+        );
+        dispatch(&doc! {"collMod": "s", "cappedMax": 0_i32}, c);
+        assert_eq!(collection_options(c, "s").get_i32("max").unwrap(), i32::MAX);
+        // A null is "not given".
+        dispatch(&doc! {"collMod": "s", "cappedSize": Bson::Null}, c);
+        assert_eq!(collection_options(c, "s").get_i32("size").unwrap(), 7000);
+
+        for (cmd, code, msg) in [
+            (
+                doc! {"collMod": "s", "cappedSize": 0_i32},
+                2,
+                "BSON field 'cappedSize' value must be >= 1, actual value '0'",
+            ),
+            (
+                doc! {"collMod": "s", "cappedSize": 1_i64 << 62},
+                2,
+                "BSON field 'cappedSize' value must be <= 1125899906842624, actual value \
+                 '4611686018427387904'",
+            ),
+            (
+                doc! {"collMod": "s", "cappedMax": 1_i64 << 31},
+                2,
+                "BSON field 'cappedMax' value must be < 2147483648, actual value '2147483648'",
+            ),
+            (
+                doc! {"collMod": "s", "cappedSize": "x"},
+                14,
+                "BSON field 'collMod.cappedSize' is the wrong type 'string', expected types \
+                 '[double, int, long, decimal]'",
+            ),
+            (
+                doc! {"collMod": "plain", "cappedSize": 5000_i32},
+                72,
+                "Collection must be capped.",
+            ),
+            (
+                doc! {"collMod": "plain", "cappedMax": 5_i32},
+                72,
+                "Collection must be capped.",
+            ),
+            // The range check comes before the capped check.
+            (
+                doc! {"collMod": "plain", "cappedSize": 0_i32},
+                2,
+                "BSON field 'cappedSize' value must be >= 1, actual value '0'",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        assert_eq!(collection_options(c, "s").get_i32("size").unwrap(), 7000);
+    });
+}
+
+#[test]
+fn coll_stats_reports_a_capped_collections_bounds() {
+    with_wt(|c| {
+        create_capped(
+            c,
+            "s",
+            doc! {"capped": true, "size": 1000_i32, "max": 5_i32},
+        );
+        create_capped(c, "nomax", doc! {"capped": true, "size": 1000_i32});
+        create_capped(
+            c,
+            "unlimited",
+            doc! {"capped": true, "size": 1000_i32, "max": 0_i32},
+        );
+        dispatch(&doc! {"create": "plain"}, c);
+        for (name, max) in [("s", 5), ("nomax", 0), ("unlimited", i32::MAX)] {
+            let stats = dispatch(&doc! {"collStats": name}, c);
+            assert_eq!(stats.get("max"), Some(&Bson::Int32(max)), "{name}: {stats}");
+            assert_eq!(stats.get("maxSize"), Some(&Bson::Int32(1000)), "{name}");
+            let agg = dispatch(
+                &doc! {"aggregate": name, "pipeline": [{"$collStats": {"storageStats": {}}}],
+                "cursor": {}},
+                c,
+            );
+            let first = agg
+                .get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap()[0]
+                .as_document()
+                .unwrap()
+                .get_document("storageStats")
+                .unwrap()
+                .clone();
+            assert_eq!(first.get("max"), Some(&Bson::Int32(max)), "{name}: {first}");
+            assert_eq!(first.get("maxSize"), Some(&Bson::Int32(1000)), "{name}");
+        }
+        let plain = dispatch(&doc! {"collStats": "plain"}, c);
+        assert!(!plain.get_bool("capped").unwrap());
+        assert!(
+            !plain.contains_key("max") && !plain.contains_key("maxSize"),
+            "{plain}"
+        );
+    });
+}
+
+#[test]
+fn a_write_to_a_capped_collection_inside_a_transaction_is_refused() {
+    with_wt(|c| {
+        // The registry the server builds: commit and rollback go to storage.
+        use secantus_commands::transactions::{Transaction, TransactionRegistry};
+        let commit = c.storage.clone().unwrap();
+        let rollback = c.storage.clone().unwrap();
+        c.transactions = Some(std::sync::Arc::new(TransactionRegistry::new(
+            Box::new(move |txn: &mut Transaction| {
+                if let Some(h) = txn.handle.as_mut() {
+                    let _ = commit.commit_user_transaction(h.as_mut());
+                }
+            }),
+            Box::new(move |txn: &mut Transaction| {
+                if let Some(h) = txn.handle.as_mut() {
+                    let _ = rollback.rollback_user_transaction(h.as_mut());
+                }
+            }),
+            secantus_commands::transactions::DEFAULT_LIFETIME_SECONDS,
+            Box::new(|| 0.0),
+        )));
+        create_capped(c, "tx", doc! {"capped": true, "size": 100000_i32});
+        dispatch(&doc! {"insert": "tx", "documents": [{"_id": 1, "a": 1}]}, c);
+        dispatch(&doc! {"insert": "plain", "documents": [{"_id": 1}]}, c);
+        let lsid = doc! {"id": bson::Binary {
+        subtype: bson::spec::BinarySubtype::Uuid, bytes: vec![7; 16] }};
+        let refused = "Collection 't.tx' is a capped collection. Writes in transactions are not \
+                       allowed on capped collections.";
+        let mut txn_number = 0_i64;
+        let mut in_txn = |c: &mut CommandContext, mut cmd: Document| {
+            txn_number += 1;
+            cmd.insert("lsid", lsid.clone());
+            cmd.insert("txnNumber", txn_number);
+            cmd.insert("autocommit", false);
+            cmd.insert("startTransaction", true);
+            let reply = dispatch(&cmd, c);
+            // The refusal aborts the transaction: committing it finds none.
+            let commit = dispatch(
+                &doc! {"commitTransaction": 1, "lsid": lsid.clone(), "txnNumber": txn_number,
+                "autocommit": false},
+                c,
+            );
+            (reply, commit.get_i32("code").ok())
+        };
+        for (cmd, code, msg) in [
+            (
+                doc! {"insert": "tx", "documents": [{"_id": 2}, {"_id": 3}], "ordered": false},
+                263,
+                refused,
+            ),
+            (
+                doc! {"update": "tx", "updates": [{"q": {"_id": 1}, "u": {"$set": {"a": 2}}}]},
+                263,
+                refused,
+            ),
+            (
+                doc! {"update": "tx", "updates": [{"q": {"_id": 9}, "u": {"$set": {"a": 2}}, "upsert": true}]},
+                263,
+                refused,
+            ),
+            (
+                doc! {"delete": "tx", "deletes": [{"q": {"_id": 1}, "limit": 1_i32}]},
+                20,
+                "Cannot remove from a capped collection in a multi-document transaction: t.tx",
+            ),
+        ] {
+            let (reply, commit) = in_txn(c, cmd.clone());
+            assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{cmd}: {reply}");
+            assert_eq!(reply.get_i32("n").unwrap(), 0, "{cmd}");
+            let errors = reply.get_array("writeErrors").unwrap();
+            assert_eq!(errors.len(), 1, "{cmd}: {reply}");
+            let e = errors[0].as_document().unwrap();
+            assert_eq!(
+                (e.get_i32("index").unwrap(), e.get_i32("code").unwrap()),
+                (0, code),
+                "{cmd}"
+            );
+            assert_eq!(e.get_str("errmsg").unwrap(), msg, "{cmd}");
+            assert_eq!(commit, Some(251), "{cmd}");
+        }
+        let (reply, commit) = in_txn(
+            c,
+            doc! {"findAndModify": "tx", "query": {"_id": 1}, "update": {"$set": {"a": 3}}},
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 263, "{reply}");
+        assert_eq!(reply.get_str("errmsg").unwrap(), refused);
+        assert_eq!(commit, Some(251));
+        // Reading a capped collection in a transaction is fine, and so is
+        // writing any other collection.
+        let (reply, commit) = in_txn(c, doc! {"find": "tx"});
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+        assert_eq!(commit, None);
+        let (reply, commit) = in_txn(c, doc! {"insert": "plain", "documents": [{"_id": 2}]});
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
+        assert_eq!(commit, None);
+        let left = dispatch(&doc! {"find": "tx", "projection": {"_id": 1, "a": 1}}, c);
+        assert_eq!(
+            left.get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap(),
+            &vec![Bson::Document(doc! {"_id": 1, "a": 1})]
+        );
+    });
+}

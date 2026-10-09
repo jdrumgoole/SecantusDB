@@ -66,4 +66,4 @@ pub use numeric::{format_double_g, format_double_spec};
 // can decode just the top-level fields a `$group` reads from wide documents
 // ahead of the stage, instead of materializing every field. The `group` module
 // itself stays private.
-pub use group::referenced_top_level_fields;
+pub use group::{pipeline_prefix_fields, referenced_top_level_fields};
