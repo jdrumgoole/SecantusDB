@@ -1,6 +1,6 @@
 [package]
 name = "secantus-pgplan"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 edition = "2021"
 description = "PostgreSQL parse trees lowered to MQL for the SecantusDB PostgreSQL server"
 license = "Apache-2.0"
@@ -36,7 +36,7 @@ pg_query = "6"
 # decoding result". PostgreSQL takes 1,000 terms; depth is policed by the
 # planner's own 54001 guard (`check_depth`) instead.
 prost = { version = "0.13", features = ["no-recursion-limit"] }
-secantus-pgcatalog = { version = "=0.1.0-beta.3", path = "../secantus-pgcatalog" }
+secantus-pgcatalog = { version = "=0.1.0-beta.4", path = "../secantus-pgcatalog" }
 # `numeric` arithmetic beyond Decimal128's 34 digits: PostgreSQL's numeric is
 # arbitrary precision, and a sum or product of two wide values has to be exact.
 num-bigint = "0.4"
