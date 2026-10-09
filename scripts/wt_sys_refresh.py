@@ -71,6 +71,7 @@ PATCHES = (
     ("patch_wt_musl.py", "src/os_posix/os_fs.c"),
     ("patch_wt_dsync_group.py", "src/log/log.c"),
     ("patch_wt_dsync_group.py", "src/log/log_slot.c"),
+    ("patch_wt_fsync_group.py", "src/log/log.c"),
 )
 
 

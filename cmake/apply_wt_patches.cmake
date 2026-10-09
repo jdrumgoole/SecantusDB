@@ -56,6 +56,9 @@ set(_patches
     # method=dsync. One script, two files.
     "patch_wt_dsync_group.py|${WT_SOURCE_DIR}/src/log/log.c"
     "patch_wt_dsync_group.py|${WT_SOURCE_DIR}/src/log/log_slot.c"
+    # The second behavioural patch: under method=fsync one sync is credited
+    # with every commit already written, not only the syncing thread's own.
+    "patch_wt_fsync_group.py|${WT_SOURCE_DIR}/src/log/log.c"
 )
 
 foreach(_entry IN LISTS _patches)
