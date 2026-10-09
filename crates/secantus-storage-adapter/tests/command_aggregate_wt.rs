@@ -831,3 +831,85 @@ fn accumulators_and_literal_are_not_unknown_expressions() {
         }
     });
 }
+
+/// Decoding only the fields a pipeline's leading stages read must not change
+/// its answer. Each pipeline runs as written, and again behind an identity
+/// `$replaceWith` that the field analysis does not look through, so the second
+/// run decodes whole documents; the two must agree exactly.
+#[test]
+fn narrow_decode_ahead_of_a_group_or_count_changes_no_answer() {
+    with_wt(|c| {
+        let mut docs = Vec::new();
+        for i in 0..60_i32 {
+            let tags = match i % 6 {
+                0 => Bson::Array(vec![]),
+                1 => Bson::Null,
+                2 => Bson::Int32(i % 4),
+                3 => bson::bson!([{"x": [i % 3, 9]}, {"x": 1}, i % 5]),
+                _ => bson::bson!([i % 3, (i + 1) % 3, "s"]),
+            };
+            let mut d = doc! {
+                "_id": i, "wide": "w".repeat(64), "g": i % 4, "v": i * 2,
+                "pos": {"keep": i}, "k": (i * 7) % 11, "e": {"f": i % 3},
+                "active": i % 2 == 0,
+            };
+            if i % 9 != 0 {
+                d.insert("tags", tags);
+            }
+            docs.push(d);
+        }
+        seed(c, "n", docs);
+        let pipelines: Vec<Vec<Document>> = vec![
+            vec![doc! {"$count": "n"}],
+            vec![doc! {"$unwind": "$tags"}, doc! {"$count": "n"}],
+            vec![
+                doc! {"$unwind": "$tags"},
+                doc! {"$group": {"_id": "$tags", "total": {"$sum": "$v"}, "n": {"$sum": 1}}},
+                doc! {"$sort": {"total": -1, "_id": 1}},
+            ],
+            vec![
+                doc! {"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": true,
+                "includeArrayIndex": "pos.i"}},
+                doc! {"$group": {"_id": "$pos.i", "keeps": {"$sum": "$pos.keep"},
+                "first": {"$first": "$tags"}}},
+                doc! {"$sort": {"_id": 1}},
+            ],
+            vec![
+                doc! {"$unwind": "$tags"},
+                doc! {"$unwind": "$tags.x"},
+                doc! {"$sortByCount": "$tags.x"},
+                doc! {"$sort": {"count": -1, "_id": 1}},
+            ],
+            vec![
+                doc! {"$sort": {"k": -1, "_id": 1}},
+                doc! {"$skip": 3},
+                doc! {"$limit": 40},
+                doc! {"$unwind": "$tags"},
+                doc! {"$match": {"$or": [{"e.f": 1}, {"$expr": {"$gt": ["$v", "$k"]}}]}},
+                doc! {"$group": {"_id": "$g", "last": {"$last": "$_id"}, "tags": {"$push": "$tags"}}},
+                doc! {"$sort": {"_id": 1}},
+            ],
+            vec![
+                doc! {"$unwind": "$tags"},
+                doc! {"$match": {"active": true}},
+                doc! {"$count": "n"},
+            ],
+        ];
+        for pipeline in pipelines {
+            let run = |c: &mut CommandContext, stages: Vec<Document>| {
+                let reply = dispatch(
+                    &doc! {"aggregate": "n", "pipeline": stages, "cursor": {"batchSize": 1000}},
+                    c,
+                );
+                assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+                docs_of(&reply)
+            };
+            let narrow = run(c, pipeline.clone());
+            let mut whole_stages = vec![doc! {"$replaceWith": "$$ROOT"}];
+            whole_stages.extend(pipeline.clone());
+            let whole = run(c, whole_stages);
+            assert!(!narrow.is_empty(), "{pipeline:?} returned nothing");
+            assert_eq!(narrow, whole, "{pipeline:?}");
+        }
+    });
+}
