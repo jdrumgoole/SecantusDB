@@ -96,6 +96,43 @@ pub fn commit_sync_method(config: &str) -> String {
     }
 }
 
+/// The log file size for a store whose commits sync, where the log is
+/// zero-filled ([`zero_filled_log`]).
+const ZERO_FILLED_LOG_FILE_MAX: &str = "16MB";
+
+/// Is the log zero-filled on this platform when commits sync? Linux only: it
+/// is where it was measured, and macOS syncs a different way
+/// ([`commit_sync_method`]).
+const ZERO_FILL_SYNCED_LOG: bool = cfg!(target_os = "linux");
+
+/// A log file written with zeros when it is created, for a store whose
+/// commits sync, as PostgreSQL does for a WAL segment.
+///
+/// WiredTiger sizes a new log file with `fallocate`, which reserves the
+/// blocks but leaves them UNWRITTEN. The first write into such a block makes
+/// the filesystem record that it now holds data, so the `fdatasync` after
+/// every commit also commits a filesystem journal transaction. Over blocks
+/// that already hold zeros it has only the data to flush. Measured 2026-10-09
+/// on a DigitalOcean `c-16` (ext4): the average `fdatasync` went from about
+/// 150 to 110 us, and a durable `UPDATE` by primary key from 2.3k to 2.7k
+/// statements a second with one client and from 9.0k to 12.1k with eight.
+/// Preallocation alone (`prealloc=true`) changed nothing.
+///
+/// The file is 16 MB, not 128: zero-filling 128 MB added 150 ms to every
+/// start, 16 MB adds 25 ms, and the throughput is the same. A transaction
+/// larger than one file spans files as before.
+///
+/// It only applies when commits sync. Without a sync per commit there is no
+/// `fdatasync` to make cheaper, and the test suite's fast mode starts
+/// thousands of stores.
+pub fn zero_filled_log(config: &str, synced: bool) -> String {
+    if synced && ZERO_FILL_SYNCED_LOG {
+        config.replace("prealloc=false)", "prealloc=false,zero_fill=true)")
+    } else {
+        config.to_string()
+    }
+}
+
 /// Open the store the PostgreSQL server serves, with a per-commit log sync in
 /// durable mode (see [`sync_on_commit`]).
 ///
@@ -116,12 +153,16 @@ pub fn open_storage_with_cache(home: &str, cache_size: &str) -> secantus_storage
     let fast = std::env::var("SECANTUS_TEST_FAST_STORAGE").as_deref() == Ok("1");
     // The same engine knobs as `Storage::open`'s default config, with only
     // `transaction_sync` chosen here.
-    let config = commit_sync_method(&wt_config(
-        cache_size,
-        1000,
-        sync_on_commit(force, fast),
-        "128MB",
-    ));
+    let synced = sync_on_commit(force, fast);
+    let log_file_max = if synced && ZERO_FILL_SYNCED_LOG {
+        ZERO_FILLED_LOG_FILE_MAX
+    } else {
+        "128MB"
+    };
+    let config = zero_filled_log(
+        &commit_sync_method(&wt_config(cache_size, 1000, synced, log_file_max)),
+        synced,
+    );
     Storage::open_with_options(
         home,
         &StorageOptions {
@@ -523,7 +564,9 @@ async fn accept_loop(
 
 #[cfg(test)]
 mod sync_tests {
-    use super::{commit_sync_method, sync_on_commit, wt_config};
+    use super::{
+        commit_sync_method, sync_on_commit, wt_config, zero_filled_log, ZERO_FILL_SYNCED_LOG,
+    };
 
     /// Durable (the shipped default) syncs per commit; the test suite's fast
     /// mode does not; `SECANTUS_FORCE_DURABLE=1` wins over fast mode.
@@ -546,5 +589,19 @@ mod sync_tests {
         } else {
             assert_eq!(got, cfg);
         }
+    }
+
+    /// The log is zero-filled only where commits sync, and only on Linux.
+    #[test]
+    fn the_log_is_zero_filled_only_when_commits_sync() {
+        let synced = wt_config("4G", 1000, true, "16MB");
+        let got = zero_filled_log(&synced, true);
+        if ZERO_FILL_SYNCED_LOG {
+            assert!(got.contains("log=(enabled=true,file_max=16MB,prealloc=false,zero_fill=true)"));
+        } else {
+            assert_eq!(got, synced);
+        }
+        let unsynced = wt_config("4G", 1000, false, "128MB");
+        assert_eq!(zero_filled_log(&unsynced, false), unsynced);
     }
 }
