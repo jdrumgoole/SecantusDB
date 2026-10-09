@@ -20,7 +20,7 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--port N` | TCP port (`0` = OS-assigned) | `27017` |
 | `--storage-path PATH` | WiredTiger home directory (created if absent) | `./secantus-data` |
 | `--log-level LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
-| `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `1G` |
+| `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `4G` |
 | `--session-max N` | Max concurrent WiredTiger sessions (≈ client connections) | `1000` |
 | `--sync-on-commit` | fsync every commit (closes the `j: true` gap; large throughput cost) | off |
 | `--oplog-async` | Persist oplog entries via a background drainer pool instead of inside each write's commit (higher write throughput; change-stream events surface once drained) | off, or `SECANTUS_OPLOG_ASYNC` |
@@ -41,6 +41,29 @@ Both `--flag value` and `--flag=value` spellings work.
 TLS pairing rules are enforced: setting one of `cert-file` / `key-file`
 without the other is a startup error, and the client-cert flags are only
 meaningful with server TLS configured. See [Security](security.md).
+
+## Slow operations
+
+An operation that runs for 100 ms or longer writes one line to the log, at
+`INFO`, as `mongod` does:
+
+```text
+[2026-10-09T19:10:59Z INFO  secantus_server] Slow query {"type":"command","ns":"bench.stall","command":"insert","ctx":"conn3","ninserted":100,"workingMillis":1717,"durationMillis":1717}
+```
+
+The same lines are in the `getLog` buffer. `workingMillis` leaves out time an
+awaitData `getMore` spent waiting for new data, so an idle change stream logs
+nothing. A failed operation carries `"ok":0` with `errCode` and `errName`.
+
+The threshold is the `profile` command's `slowms`, and `sampleRate` thins the
+lines. Both are server-wide and last until the server stops:
+
+```python
+client.admin.command("profile", 0, slowms=20)   # log anything over 20 ms
+```
+
+The line says which operation was slow and for how long. It does not say where
+in the storage engine the time went, which `mongod`'s line does.
 
 ## Configuration file
 

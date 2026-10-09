@@ -107,7 +107,14 @@ pub fn attributes(
     total: Duration,
 ) -> String {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
-    let ns = match request.get(name) {
+    // `getMore` names its collection in `collection`; its own value is the
+    // cursor id.
+    let target = if name == "getMore" {
+        request.get("collection")
+    } else {
+        request.get(name)
+    };
+    let ns = match target {
         Some(bson::Bson::String(coll)) if !coll.is_empty() => format!("{db}.{coll}"),
         _ => format!("{db}.$cmd"),
     };
@@ -163,6 +170,23 @@ mod tests {
         assert_eq!(
             line,
             r#"{"type":"command","ns":"a.t","command":"insert","ctx":"conn7","ninserted":100,"workingMillis":4140,"durationMillis":4140}"#
+        );
+    }
+
+    #[test]
+    fn a_get_more_is_attributed_to_its_collection() {
+        let line = attributes(
+            &doc! {"getMore": 7_i64, "collection": "t", "$db": "a"},
+            &doc! {"ok": 1.0},
+            "a",
+            2,
+            Duration::from_millis(120),
+            Duration::from_millis(1120),
+        );
+        assert!(line.contains(r#""ns":"a.t","command":"getMore""#), "{line}");
+        assert!(
+            line.contains(r#""workingMillis":120,"durationMillis":1120"#),
+            "{line}"
         );
     }
 
