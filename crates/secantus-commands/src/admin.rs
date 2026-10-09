@@ -624,28 +624,66 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 })
                 .cloned()
         } else {
-            None
-        };
-        let Some(target) = target else {
             return Ok(CommandError::new(
-                27,
-                "IndexNotFound",
-                format!("cannot find index for ns {}.{}", ctx.db_name, coll),
+                72,
+                "InvalidOptions",
+                "Must specify either index name or key pattern.",
             )
             .into_reply());
         };
+        let Some(target) = target else {
+            let wanted = match index_spec.get("name") {
+                Some(Bson::String(n)) => n.clone(),
+                _ => index_spec
+                    .get("keyPattern")
+                    .map(argtypes::render_stage_value)
+                    .unwrap_or_default(),
+            };
+            return Ok(CommandError::new(
+                27,
+                "IndexNotFound",
+                format!("cannot find index {wanted} for ns {}.{}", ctx.db_name, coll),
+            )
+            .into_reply());
+        };
+        if !["expireAfterSeconds", "hidden", "unique", "prepareUnique"]
+            .iter()
+            .any(|f| index_spec.contains_key(*f))
+        {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                "no expireAfterSeconds, hidden, unique, or prepareUnique field",
+            )
+            .into_reply());
+        }
         let target_name = target.get_str("name").unwrap_or("").to_string();
-        // `expireAfterSeconds` retunes a TTL index: echo the old/new expiry and
-        // persist the new one. Mirrors commands.py::_coll_mod.
+        // `hidden` was accepted and ignored: the reply said ok and the index
+        // stayed as it was. The reply names the change only when there is one.
+        if let Some(hide) = index_spec.get("hidden").and_then(Bson::as_bool) {
+            if target_name == "_id_" {
+                return Ok(CommandError::new(2, "BadValue", "can't hide _id index").into_reply());
+            }
+            let hidden = target.get_bool("hidden").unwrap_or(false);
+            if hidden != hide {
+                reply.insert("hidden_old", hidden);
+                reply.insert("hidden_new", hide);
+                storage
+                    .set_index_options(&ctx.db_name, &coll, &target_name, &doc! {"hidden": hide})
+                    .map_err(command_error)?;
+            }
+        }
         if let Some(new_expiry) = index_spec.get("expireAfterSeconds") {
+            // Both as int64, and no `_old` for an index that had no TTL.
+            if let Some(old) = target.get("expireAfterSeconds").and_then(as_i64) {
+                reply.insert("expireAfterSeconds_old", old);
+            }
             reply.insert(
-                "expireAfterSeconds_old",
-                target
-                    .get("expireAfterSeconds")
-                    .cloned()
-                    .unwrap_or(Bson::Null),
+                "expireAfterSeconds_new",
+                as_i64(new_expiry)
+                    .map(Bson::Int64)
+                    .unwrap_or(new_expiry.clone()),
             );
-            reply.insert("expireAfterSeconds_new", new_expiry.clone());
             storage
                 .set_index_options(
                     &ctx.db_name,
@@ -1675,6 +1713,25 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         }
     }
 
+    // A number is a boolean to an index option: `unique: 1` is a unique
+    // index. It used to be read as "not unique".
+    let specs: Vec<Bson> = specs
+        .into_iter()
+        .map(|spec| match spec {
+            Bson::Document(mut s) => {
+                for flag in ["unique", "sparse", "hidden", "background"] {
+                    if let Some(n) = s.get(flag).and_then(|v| match v {
+                        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => as_i64(v),
+                        _ => None,
+                    }) {
+                        s.insert(flag, n != 0);
+                    }
+                }
+                Bson::Document(s)
+            }
+            other => other,
+        })
+        .collect();
     // Every spec is checked before anything is created: an invalid spec used
     // to leave the collection, and the specs before it, created.
     if specs.is_empty() {
@@ -1704,6 +1761,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
     let mut any_created = false;
+    let mut any_existed = false;
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         let key = s
@@ -1719,6 +1777,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // The `_id` index always exists, under its own name: asking for it
         // again, whatever the request calls it, creates nothing.
         if key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
+            any_existed = true;
             continue;
         }
         if key.is_empty() {
@@ -1879,6 +1938,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             Err(e) => return Err(command_error(e)),
         };
         any_created |= created;
+        any_existed |= !created;
     }
 
     let after = storage
@@ -1889,6 +1949,8 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // was created (left out when nothing was built), the commit quorum a
     // replica-set member reports, and the no-op note.
     let all_existed = !any_created && !specs.is_empty();
+    // A collection created here already has its `_id` index when counted.
+    let before = if created_coll { before.max(1) } else { before };
     let mut reply = doc! {
         "numIndexesBefore": before as i32,
         "numIndexesAfter": after as i32,
@@ -1897,7 +1959,14 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         reply.insert("createdCollectionAutomatically", created_coll);
     }
     if ctx.replica_set_name.is_some() {
-        reply.insert("commitQuorum", "votingMembers");
+        let quorum = doc
+            .get("commitQuorum")
+            .cloned()
+            .unwrap_or_else(|| Bson::String("votingMembers".into()));
+        reply.insert("commitQuorum", quorum);
+    }
+    if any_created && any_existed {
+        reply.insert("note", "index already exists");
     }
     // When every requested index already existed, mongod adds
     // `note: "all indexes already exist"` so drivers report a no-op (mongocxx's
