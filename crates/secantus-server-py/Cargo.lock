@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pg"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "async-trait",
  "bson",
@@ -2191,14 +2191,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "aes",
  "blowfish 0.9.1",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgwire"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "async-trait",
  "bytes",
