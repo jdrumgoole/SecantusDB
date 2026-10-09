@@ -2789,8 +2789,8 @@ These work end-to-end but cut corners.
 
 - [ ] **OPEN — Rust PostgreSQL server on LINUX: durable writes WERE
       2.1-2.4x slower than PostgreSQL at EVERY client count, one client
-      included (measured 2026-10-08); 1.3-1.7x through eight clients and ~2x
-      at sixteen as of 2026-10-09 (the "Done" sections below, newest
+      included (measured 2026-10-08); 1.2-1.7x through eight clients and
+      1.7-1.8x at sixteen as of 2026-10-09 (the "Done" sections below, newest
       last).** The first Linux measurement. It is a different
       problem from the macOS one below: there the gap opens only under
       concurrency, here it is the cost of one statement.
@@ -2962,8 +2962,52 @@ These work end-to-end but cut corners.
       (384 bytes), where PostgreSQL writes one 8K block per sync. That is
       WiredTiger's log-slot hand-off under `method=fsync`, the same place
       `patch_wt_dsync_group.py` changed for `method=dsync`.
-      NOT measured: whether zero-fill helps macOS (`method=dsync`), or the
-      MongoDB server under `--sync-on-commit`; neither is changed.
+      macOS (`method=dsync`) was measured the same day and zero-fill does
+      nothing there: 12.3k / 30.7k / 39.3k statements a second at 1 / 4 / 8
+      clients as shipped, 12.1k / 30.9k / 39.2k with 16 MB zero-filled files
+      (first two passes; the machine was loaded). macOS stays as it is. NOT
+      measured: the MongoDB server under `--sync-on-commit`.
+
+      **Done 2026-10-09: one sync is credited with every commit already
+      written (`cmake/patch_wt_fsync_group.py`).** The commits-per-sync gap
+      above had a narrow cause. Under `method=fsync` each committer writes
+      its own slot, then syncs under `log_sync_lock` and records `sync_lsn`
+      as its OWN slot's end, though the `fsync` flushed everything written
+      before it. The next thread, already written, synced again. The patch
+      notes `write_lsn` before the sync and credits that. A fresh `c-16`,
+      main `3312febb` against the patch, durable UPDATE by PK, `bpftrace`
+      over 9s, two passes:
+
+      | clients | commits per `fdatasync` | statements/s |
+      | --- | --- | --- |
+      | 4 | 1.05 -> 1.27 | 8,892 / 9,482 -> 9,172 / 9,641 |
+      | 8 | 1.49 -> 1.87 | 12,873 / 13,596 -> 14,486 / 15,377 |
+      | 16 | 2.65 -> 3.44 | 15,291 / 16,176 -> 17,367 / 18,164 |
+      | 32 | 4.2 -> 5.3 | 14,755 / 15,952 -> 16,307 / 17,282 |
+
+      `bench/pg_concurrency.py` at 1 / 2 / 4 / 8 / 16 clients: UPDATE
+      2,993 / 5,744 / 9,560 / 13,584 / 15,346 -> 3,032 / 5,949 / 9,866 /
+      15,655 / 18,153 (PostgreSQL 16: 5,272 / 9,208 / 16,326 / 23,095 /
+      33,488); INSERT 3,382 / 6,919 / 10,322 / 14,854 / 17,995 -> 3,558 /
+      7,231 / 11,583 / 17,157 / 19,807 (PostgreSQL: 5,272 / 8,878 / 16,840 /
+      23,157 / 34,467). So 1.2-1.7x slower through eight clients and 1.7-1.8x
+      at sixteen.
+
+      **How it was tested, and why a kill is not enough.** SIGKILL under 16
+      writers, ten times: nothing lost, but that only shows no commit is
+      acknowledged before it is WRITTEN, because the page cache survives the
+      process. So the server was hard-rebooted (`echo b >
+      /proc/sysrq-trigger`) under 16 writers on a second droplet that logged
+      each acknowledged key. A build with the `fsync` removed lost 5,538 and
+      5,359 acknowledged rows on two reboots, so the test sees a missing
+      sync; the patched build lost none on six (697,189 rows at the end).
+      This also exercised, on Linux `method=fsync`, the directory-sync
+      shortcut of `patch_wt_dsync_group.py` that the 2026-10-08 security
+      report (#1811) flagged as untested there.
+
+      With the sync stream now 60-75% busy at sixteen clients, the next
+      limit there is not the sync. NOT measured: the MongoDB server under
+      `--sync-on-commit`, which runs the same patched code.
 
       What is left, in order of what the profile offers:
       - a stored value into any other column type (`varchar(n)`, `smallint`,

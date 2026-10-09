@@ -87,7 +87,12 @@ pub fn sync_on_commit(force_durable: bool, fast_storage: bool) -> bool {
 /// gives every synced commit a log slot and a synchronous write of its own,
 /// and `cmake/patch_wt_dsync_group.py` lets commits that arrive during a write
 /// join the next one. A commit still returns, and becomes visible, only after
-/// its record is written. `method=fsync` runs unpatched code.
+/// its record is written.
+///
+/// Under `method=fsync` (Linux) every commit keeps its own slot and write,
+/// and `cmake/patch_wt_fsync_group.py` credits one `fsync` with every commit
+/// written before it began, where stock WiredTiger credited only the syncing
+/// thread's own and the next thread synced again.
 pub fn commit_sync_method(config: &str) -> String {
     if cfg!(target_os = "macos") {
         config.replace("method=fsync", "method=dsync")
