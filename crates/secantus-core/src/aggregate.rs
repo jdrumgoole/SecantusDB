@@ -110,6 +110,13 @@ fn apply_stage(
             if field.is_empty() || field.starts_with('$') || field.contains('.') || field == "_id" {
                 return Err(Fallback::Defer);
             }
+            // No input, no output: `$count` is a `$group` with a null `_id`,
+            // which emits nothing for nothing. mongod 8.2.11 answers `[]`,
+            // and `{n: 0}` here also put a phantom row in every `$lookup` /
+            // `$unionWith` / `$facet` sub-pipeline that counted no match.
+            if docs.is_empty() {
+                return Ok(Vec::new());
+            }
             let mut out = Document::new();
             out.insert(
                 field.clone(),

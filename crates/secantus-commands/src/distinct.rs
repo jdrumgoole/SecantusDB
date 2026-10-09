@@ -76,22 +76,42 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_hint(doc, "hint")?;
     let hint = doc.get("hint");
     let storage = ctx.storage()?;
-    let bytes = storage
-        .find_collated(
+    let on_view = crate::views::is_view(storage, &ctx.db_name, &coll);
+    // A view has no rows of its own: its documents are its pipeline's output
+    // over the collection it is defined on. Reading the view's own (empty)
+    // storage answered `[]` for every `distinct` on a view.
+    let documents: Vec<Document> = if on_view {
+        crate::aggregate::collection_documents(
+            storage,
             &ctx.db_name,
             &coll,
             &filter,
-            None,
-            hint,
             collation.as_ref(),
-            &Document::new(),
-        )
-        .map_err(command_error)?;
+        )?
+    } else {
+        let bytes = storage
+            .find_collated(
+                &ctx.db_name,
+                &coll,
+                &filter,
+                None,
+                hint,
+                collation.as_ref(),
+                &Document::new(),
+            )
+            .map_err(command_error)?;
+        let mut decoded = Vec::with_capacity(bytes.len());
+        for b in bytes {
+            decoded.push(
+                Document::from_reader(&mut b.as_slice())
+                    .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))?,
+            );
+        }
+        decoded
+    };
 
     let mut values: Vec<Bson> = Vec::new();
-    for b in bytes {
-        let d = Document::from_reader(&mut b.as_slice())
-            .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))?;
+    for d in documents {
         match get_path(&d, &key) {
             // An array value contributes each of its elements (one level).
             Some(Bson::Array(arr)) => {
@@ -102,6 +122,11 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Some(v) => push_distinct(&mut values, v, collation.as_ref()),
             None => {}
         }
+    }
+    if on_view {
+        // mongod runs a view's `distinct` as an aggregation and answers
+        // `ok` as an int32 there, where a collection's is a double.
+        return Ok(doc! { "values": values, "ok": 1_i32 });
     }
     Ok(doc! { "values": values, "ok": 1.0 })
 }

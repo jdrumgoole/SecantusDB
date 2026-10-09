@@ -190,6 +190,59 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(e) = invalid_collection_name(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
     }
+    // A view's definition is checked when it is created, not when it is first
+    // read: a pipeline that is not an array, an unknown or write stage, an
+    // empty `viewOn` and a cycle were all accepted and stored.
+    match doc.get("viewOn") {
+        None | Some(Bson::Null | Bson::String(_)) => {}
+        Some(v) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'create.viewOn' is the wrong type '{}', expected type 'string'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            ))
+        }
+    }
+    let view_pipeline = match doc.get("pipeline") {
+        None | Some(Bson::Null) => None,
+        Some(Bson::Array(p)) => Some(p.as_slice()),
+        Some(v) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'create.pipeline' is the wrong type '{}', expected type 'array'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            ))
+        }
+    };
+    match doc.get("viewOn") {
+        Some(Bson::String(view_on)) => {
+            let storage = ctx.storage()?;
+            if let Some(problem) = crate::views::definition_problem(
+                storage,
+                &ctx.db_name,
+                &coll,
+                view_on,
+                view_pipeline,
+            ) {
+                return Ok(problem.into_reply());
+            }
+        }
+        _ if view_pipeline.is_some() => {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                "'pipeline' requires 'viewOn' to also be specified",
+            )
+            .into_reply())
+        }
+        _ => {}
+    }
     if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
         return Ok(CommandError::new(
             40415,
@@ -409,6 +462,71 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Ok(problem.into_reply());
         }
     }
+    // `viewOn` / `pipeline` redefine a view and nothing else; a view takes
+    // none of a collection's options. Until 2026-10-09 a view's `collMod` was
+    // stored under the wrong key and changed nothing.
+    let is_view = crate::views::is_view(storage, &ctx.db_name, &coll);
+    let given = |f: &str| !matches!(doc.get(f), None | Some(Bson::Null));
+    let new_pipeline = match doc.get("pipeline") {
+        None | Some(Bson::Null) => None,
+        Some(Bson::Array(p)) => Some(p.clone()),
+        Some(v) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'collMod.pipeline' is the wrong type '{}', expected type 'array'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            ))
+        }
+    };
+    let new_view_on = doc.get_str("viewOn").ok().map(String::from);
+    if is_view {
+        const NOT_ON_A_VIEW: [&str; 5] = [
+            "validator",
+            "validationLevel",
+            "validationAction",
+            "index",
+            "changeStreamPreAndPostImages",
+        ];
+        if let Some(option) = doc
+            .keys()
+            .find(|k| NOT_ON_A_VIEW.contains(&k.as_str()) && given(k))
+        {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                format!("option not supported on a view: {option}"),
+            )
+            .into_reply());
+        }
+        if new_view_on.is_some() || new_pipeline.is_some() {
+            let current = storage
+                .get_collection_options(&ctx.db_name, &coll)
+                .unwrap_or_default();
+            let view_on = new_view_on
+                .clone()
+                .or_else(|| current.get_str("viewOn").ok().map(String::from))
+                .unwrap_or_default();
+            if let Some(problem) = crate::views::definition_problem(
+                storage,
+                &ctx.db_name,
+                &coll,
+                &view_on,
+                new_pipeline.as_deref(),
+            ) {
+                return Ok(problem.into_reply());
+            }
+        }
+    } else if let Some(option) = ["pipeline", "viewOn"].into_iter().find(|f| given(f)) {
+        return Ok(CommandError::new(
+            72,
+            "InvalidOptions",
+            format!("option only supported on a view: {option}"),
+        )
+        .into_reply());
+    }
     let mut reply = doc! { "ok": 1.0 };
     // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
     if let Some(Bson::Document(index_spec)) = doc.get("index") {
@@ -509,6 +627,16 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     let mut opts = collection_option_subset(doc);
+    // Each of `viewOn` and `pipeline` replaces its own half of the view's
+    // definition and leaves the other as it was.
+    if is_view {
+        if let Some(view_on) = new_view_on {
+            opts.insert("viewOn", view_on);
+        }
+        if let Some(pipeline) = new_pipeline {
+            opts.insert("viewPipeline", pipeline);
+        }
+    }
     // `cappedSize` / `cappedMax` re-bound a capped collection. Nothing is
     // evicted here; the next insert brings the collection within the new
     // bounds, as on mongod. They were accepted and ignored until 2026-10-09.
@@ -912,6 +1040,7 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .list_indexes(&ctx.db_name, &coll)
         .map(|ix| ix.len().max(1))
         .unwrap_or(1);
+    let was_view = crate::views::is_view(storage, &ctx.db_name, &coll);
     let existed = storage
         .drop_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
@@ -923,6 +1052,10 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // already-absent collection with w:50 and asserts a WriteConcernError.
         // Mirrors commands.py::_drop.
         return Ok(doc! { "ok": 1.0 });
+    }
+    // A view had no indexes to count: mongod answers `{ns, ok}`.
+    if was_view {
+        return Ok(doc! { "ns": ns, "ok": 1.0 });
     }
     // mongod's field order: the count first, then the namespace.
     Ok(doc! { "nIndexesWas": n_indexes as i32, "ns": ns, "ok": 1.0 })
