@@ -1,6 +1,6 @@
 # mongo-php-driver Validation Report
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-php-driver 06be1f01bb4c (`vendor/mongo-php-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-php-driver 06be1f01bb4c (`vendor/mongo-php-driver/`).
 
 Run `uv run python -m invoke validate-php-ext` to refresh. This is the low-level PHP extension (the PECL `mongodb` package that wraps libmongoc) — the strictest wire-protocol gauge, alongside mongo-go-driver, for catching bugs pymongo's permissive client misses.
 
@@ -11,7 +11,7 @@ Run `uv run python -m invoke validate-php-ext` to refresh. This is the low-level
 | `tests/bson` | 426 | 0 | 18 | 444 | 100.0% |
 | `tests/bulk` | 45 | 0 | 1 | 46 | 100.0% |
 | `tests/command` | 10 | 0 | 1 | 11 | 100.0% |
-| `tests/cursor` | 58 | 1 | 3 | 62 | 98.3% |
+| `tests/cursor` | 59 | 0 | 3 | 62 | 100.0% |
 | `tests/exception` | 12 | 0 | 0 | 12 | 100.0% |
 | `tests/functional` | 6 | 0 | 0 | 6 | 100.0% |
 | `tests/query` | 24 | 0 | 0 | 24 | 100.0% |
@@ -21,17 +21,9 @@ Run `uv run python -m invoke validate-php-ext` to refresh. This is the low-level
 | `tests/writeConcernError` | 1 | 0 | 4 | 5 | 100.0% |
 | `tests/writeError` | 7 | 0 | 0 | 7 | 100.0% |
 | `tests/writeResult` | 21 | 0 | 2 | 23 | 100.0% |
-| **Overall** | **679** | **1** | **35** | **715** | **99.8%** |
+| **Overall** | **680** | **0** | **35** | **715** | **100.0%** |
 
-Run time: 149.19s.
-
-## Failures (1)
-
-First 30 failed tests for triage:
-
-```
-tests/cursor :: tests/cursor/bug1419-001.phpt (PHPC-1419: error labels from getMore are not exposed)
-```
+Run time: 144.74s.
 
 ## How this is generated
 

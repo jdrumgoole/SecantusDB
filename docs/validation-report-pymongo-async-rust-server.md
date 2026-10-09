@@ -1,6 +1,6 @@
 # pymongo async Validation Report (Rust server)
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async --server rust` to refresh. This is the async-driver analogue of the R8 conformance gate: pymongo's native `AsyncMongoClient` suite pointed at the **Rust server**.
 

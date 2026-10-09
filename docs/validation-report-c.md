@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-09-27 — SecantusDB 0.6.0b17 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -9,7 +9,7 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | Suite | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 93 | 0 | 10 | 103 | 100.0% |
-| `/Client` | 96 | 6 | 17 | 119 | 94.1% |
+| `/Client` | 102 | 2 | 15 | 119 | 98.0% |
 | `/Collection` | 144 | 0 | 12 | 156 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
@@ -28,22 +28,18 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
 | `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **783** | **7** | **48** | **838** | **99.1%** |
+| **Overall** | **789** | **3** | **46** | **838** | **99.6%** |
 
-## Failures (7)
+## Failures (3)
 
 First 30 failed tests for triage:
 
 ```
 /Client/ipv6/single
 /Client/ipv6/single
-/Client/select_server/single
-/Client/select_server/pooled
-/Client/select_server/err/single
-/Client/select_server/err/pooled
 /find_and_modify/hint
 ```
 
 ## How this is generated
 
-`invoke validate-c` builds the vendored driver's `test-libmongoc` binary once (CMake, `ENABLE_TESTS=ON`), spawns a SecantusDB daemon on a fresh ephemeral port, and runs the curated `-l` prefixes with `MONGOC_TEST_URI` pointed at the daemon, writing JSON results via `-F`. The list of in-scope test prefixes (and the skip-list of out-of-scope tests) lives in `c_validation/include_paths.py`.
+`invoke validate-c` builds the vendored driver's `test-libmongoc` binary once (CMake, `ENABLE_TESTS=ON`) and runs it TWICE, each against a fresh SecantusDB daemon on an ephemeral port with `MONGOC_TEST_URI` pointed at it, writing JSON results via `-F`: the curated `-l` prefixes against the default single-node replica set, then the few tests that assert standalone semantics (`STANDALONE_ONLY`) against a `--standalone` daemon. The two are merged into one result set. The in-scope prefixes, the skip-list of out-of-scope tests and the standalone list live in `c_validation/include_paths.py`.
