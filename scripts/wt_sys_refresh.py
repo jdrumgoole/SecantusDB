@@ -10,8 +10,10 @@ Only the patches a Python-free static build needs are applied:
 
 - ``patch_wt_strict.py`` -- drop ``-Werror`` (newer compilers add warnings);
 - ``patch_wt_musl.py`` -- ``off64_t`` -> ``off_t`` for musl;
-- ``patch_wt_dsync_group.py`` -- group commit for ``method=dsync`` (the one
-  patch that changes behaviour rather than the build).
+- ``patch_wt_dsync_group.py`` -- group commit for ``method=dsync``;
+- ``patch_wt_fsync_group.py`` -- under ``method=fsync`` one sync is credited
+  with every commit already written. These two change behaviour rather than
+  the build.
 
 The three Python-binding patches have nothing to act on: ``lang/`` is not
 copied. On top of those, the top-level ``CMakeLists.txt`` stops adding the
