@@ -130,11 +130,76 @@ fn collection_option_subset(doc: &Document) -> Document {
 /// unknown query operator (2 `unknown operator: $x`). Measured 8.2.11,
 /// 2026-10-06 -- both used to be accepted and stored.
 fn validator_problem(v: &Document) -> Option<CommandError> {
+    if let Some(e) = operator_not_allowed_in_validator(v) {
+        return Some(e);
+    }
     if let Some((code, name, msg)) = crate::find::json_schema_error_in_filter(v) {
         return Some(CommandError::new(code, name, msg));
     }
     secantus_core::query::first_unknown_operator(v)
         .map(|op| CommandError::new(2, "BadValue", format!("unknown operator: {op}")))
+}
+
+/// The operators a validator may not hold, anywhere in it: `$where`, `$text`
+/// and the sorting geo operators. They were accepted and stored.
+fn operator_not_allowed_in_validator(v: &Document) -> Option<CommandError> {
+    for (key, value) in v {
+        match key.as_str() {
+            "$where" | "$text" => {
+                return Some(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!("{key} is not allowed in this context"),
+                ))
+            }
+            "$near" | "$nearSphere" | "$geoNear" => {
+                return Some(CommandError::new(
+                    5626500,
+                    "Location5626500",
+                    "$geoNear, $near, and $nearSphere are not allowed in this context, as these \
+                     operators require sorting geospatial data. If you do not need sort, consider \
+                     using $geoWithin instead. Check out \
+                     https://dochub.mongodb.org/core/near-sort-operation and \
+                     https://dochub.mongodb.org/core/nearSphere-sort-operationfor more details.",
+                ))
+            }
+            _ => {}
+        }
+        let nested = match value {
+            Bson::Document(d) => operator_not_allowed_in_validator(d),
+            Bson::Array(a) => a
+                .iter()
+                .filter_map(Bson::as_document)
+                .find_map(operator_not_allowed_in_validator),
+            _ => None,
+        };
+        if nested.is_some() {
+            return nested;
+        }
+    }
+    None
+}
+
+/// `validationLevel` / `validationAction` take a fixed set of words; anything
+/// else was stored as given and then silently read as the default.
+fn validation_enum_problem(doc: &Document, command: &str) -> Option<CommandError> {
+    for (field, allowed) in [
+        ("validationLevel", &["off", "strict", "moderate"][..]),
+        ("validationAction", &["error", "warn", "errorAndLog"][..]),
+    ] {
+        if let Some(Bson::String(v)) = doc.get(field) {
+            if !allowed.contains(&v.as_str()) {
+                return Some(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "Enumeration value '{v}' for field '{command}.{field}' is not a valid value."
+                    ),
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// `create` — create a collection, persisting recognised options.
@@ -188,6 +253,9 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let coll = coll_arg(doc, "create")?;
     if let Some(e) = invalid_collection_name(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
+    if let Some(e) = validation_enum_problem(doc, "create") {
         return Ok(e.into_reply());
     }
     // A view's definition is checked when it is created, not when it is first
@@ -255,6 +323,10 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
     let mut opts = collection_option_subset(doc);
+    // An empty validator is no validator: mongod stores nothing for it.
+    if matches!(opts.get("validator"), Some(Bson::Document(v)) if v.is_empty()) {
+        opts.remove("validator");
+    }
     // A capped collection's options are stored as mongod reports them:
     // `capped: true` whatever number said so, and integer `size` / `max`
     // (pymongo sends `size` as a double, and it used to be echoed as one).
@@ -385,6 +457,9 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "collMod.changeStreamPreAndPostImages",
     )?;
     argtypes::require_string(doc, "viewOn", "collMod.viewOn")?;
+    if let Some(e) = validation_enum_problem(doc, "collMod") {
+        return Err(e);
+    }
     for field in ["cappedSize", "cappedMax"] {
         if let Some(v) = doc.get(field) {
             if !matches!(
@@ -627,6 +702,25 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     let mut opts = collection_option_subset(doc);
+    // A `collMod` that touches validation leaves the collection with BOTH
+    // `validationLevel` and `validationAction` written out (the defaults
+    // where neither was ever given). An empty validator removes the
+    // validator while keeping them; it is stored empty, which validates
+    // nothing, and `listCollections` leaves it out. Measured on 8.2.11.
+    if ["validator", "validationLevel", "validationAction"]
+        .iter()
+        .any(|f| opts.contains_key(*f))
+    {
+        let current = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .unwrap_or_default();
+        for (field, default) in [("validationLevel", "strict"), ("validationAction", "error")] {
+            if !opts.contains_key(field) {
+                let kept = current.get_str(field).unwrap_or(default).to_string();
+                opts.insert(field, kept);
+            }
+        }
+    }
     // Each of `viewOn` and `pipeline` replaces its own half of the view's
     // definition and leaves the other as it was.
     if is_view {
@@ -1192,6 +1286,10 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         let is_view = options.contains_key("viewOn");
         if let Some(p) = options.remove("viewPipeline") {
             options.insert("pipeline", p);
+        }
+        // An empty validator is how a removed one is stored.
+        if matches!(options.get("validator"), Some(Bson::Document(v)) if v.is_empty()) {
+            options.remove("validator");
         }
         // `uuid` is an internal option (the collection identity) — it's surfaced
         // under `info.uuid`, not as a collection option. Strip it from `options`.
