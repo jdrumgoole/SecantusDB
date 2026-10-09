@@ -8613,14 +8613,6 @@ server turned out to be the Java gauge's own parallelism).
 
 ### 7.065 Capped collections -- 2026-10-09
 
-- [ ] **PYTHON MongoDB server: a capped collection is not held to its bounds
-      within one insert batch.** `mongod` 8.2.11 leaves a `max: 3` collection
-      with the last three of a five-document `insert_many`, and seven of forty
-      500-byte documents in a `size: 4096` one; the Python server spares every
-      document of the inserting batch ("oldest non-fresh docs"), so it keeps
-      all five and all forty. The Rust server was fixed 2026-10-09 (0 of 34
-      sweep results differ from `mongod`, was 17); the Python server was not
-      touched. Reproduce by running the sweep against `secantusd-py`.
 - [ ] **RUST MongoDB server: `convertToCapped` is not implemented**
       (`CommandNotFound`). `mongod` 8.2.11 rebuilds the collection capped at
       `size`, keeping the newest documents that fit (20 x 100-byte documents
