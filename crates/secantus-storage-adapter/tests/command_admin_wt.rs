@@ -1557,6 +1557,76 @@ fn validation_options_are_checked_and_stored_as_mongod_stores_them() {
                 doc! {"create": "x", "validator": {"$or": [{"a": 1}, {"$text": {"$search": "a"}}]}},
                 2,
                 "$text is not allowed in this context",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        let near = dispatch(
+            &doc! {"create": "x", "validator": {"loc": {"$near": [0, 0]}}},
+            c,
+        );
+        assert_eq!(near.get_i32("code").unwrap(), 5626500, "{near}");
+
+        // An empty validator is no validator.
+        dispatch(&doc! {"create": "e", "validator": {}}, c);
+        assert_eq!(collection_options(c, "e"), doc! {});
+        // `collMod` writes out both the level and the action.
+        dispatch(&doc! {"create": "q", "validator": {"a": 1}}, c);
+        dispatch(&doc! {"collMod": "q", "validationAction": "warn"}, c);
+        assert_eq!(
+            collection_options(c, "q"),
+            doc! {"validator": {"a": 1}, "validationLevel": "strict", "validationAction": "warn"}
+        );
+        let bad = dispatch(&doc! {"collMod": "q", "validationLevel": "nope"}, c);
+        assert_eq!(
+            bad.get_str("errmsg").unwrap(),
+            "Enumeration value 'nope' for field 'collMod.validationLevel' is not a valid value."
+        );
+        // Removing the validator keeps them.
+        dispatch(&doc! {"collMod": "q", "validator": {}}, c);
+        assert_eq!(
+            collection_options(c, "q"),
+            doc! {"validationLevel": "strict", "validationAction": "warn"}
+        );
+        let reply = dispatch(&doc! {"insert": "q", "documents": [{"_id": 1}]}, c);
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
+    });
+}
+
+#[test]
+fn out_and_merge_report_a_validation_failure_with_its_details() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "w", "documents": [{"_id": 1, "qty": -1}]},
+            c,
+        );
+        dispatch(&doc! {"create": "m", "validator": {"qty": {"$gte": 0}}}, c);
+        for (stage, msg) in [
+            (
+                doc! {"$out": "m"},
+                "Executor error during aggregate command on namespace: t.w :: caused by :: \
+                 Document failed validation",
+            ),
+            (
+                doc! {"$merge": {"into": "m"}},
+                "Executor error during aggregate command on namespace: t.w :: caused by :: Plan \
+                 executor error during update :: caused by :: Document failed validation",
+            ),
+        ] {
+            let reply = dispatch(
+                &doc! {"aggregate": "w", "pipeline": [stage.clone()], "cursor": {}},
+                c,
+            );
+            assert_eq!(reply.get_i32("code").unwrap(), 121, "{stage}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{stage}");
+            let info = reply.get_document("errInfo").unwrap();
+            assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1, "{stage}");
+            assert!(info.get_document("details").is_ok(), "{stage}: {reply}");
+        }
+    });
+}
 
 // --- index management: every expectation is what mongod 8.2.11 answered
 // --- (2026-10-10).
@@ -1612,36 +1682,6 @@ fn drop_indexes_never_drops_the_id_index() {
             assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
             assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
         }
-        let near = dispatch(
-            &doc! {"create": "x", "validator": {"loc": {"$near": [0, 0]}}},
-            c,
-        );
-        assert_eq!(near.get_i32("code").unwrap(), 5626500, "{near}");
-
-        // An empty validator is no validator.
-        dispatch(&doc! {"create": "e", "validator": {}}, c);
-        assert_eq!(collection_options(c, "e"), doc! {});
-        // `collMod` writes out both the level and the action.
-        dispatch(&doc! {"create": "q", "validator": {"a": 1}}, c);
-        dispatch(&doc! {"collMod": "q", "validationAction": "warn"}, c);
-        assert_eq!(
-            collection_options(c, "q"),
-            doc! {"validator": {"a": 1}, "validationLevel": "strict", "validationAction": "warn"}
-        );
-        let bad = dispatch(&doc! {"collMod": "q", "validationLevel": "nope"}, c);
-        assert_eq!(
-            bad.get_str("errmsg").unwrap(),
-            "Enumeration value 'nope' for field 'collMod.validationLevel' is not a valid value."
-        );
-        // Removing the validator keeps them.
-        dispatch(&doc! {"collMod": "q", "validator": {}}, c);
-        assert_eq!(
-            collection_options(c, "q"),
-            doc! {"validationLevel": "strict", "validationAction": "warn"}
-        );
-        let reply = dispatch(&doc! {"insert": "q", "documents": [{"_id": 1}]}, c);
-        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
-
         // Nothing was dropped by the refused lists.
         assert_eq!(index_names(c, "c"), vec!["_id_", "a_1", "b_1", "t_1"]);
         let reply = dispatch(&doc! {"dropIndexes": "c", "index": ["a_1", "b_1"]}, c);
@@ -1657,35 +1697,6 @@ fn drop_indexes_never_drops_the_id_index() {
 }
 
 #[test]
-fn out_and_merge_report_a_validation_failure_with_its_details() {
-    with_wt(|c| {
-        dispatch(
-            &doc! {"insert": "w", "documents": [{"_id": 1, "qty": -1}]},
-            c,
-        );
-        dispatch(&doc! {"create": "m", "validator": {"qty": {"$gte": 0}}}, c);
-        for (stage, msg) in [
-            (
-                doc! {"$out": "m"},
-                "Executor error during aggregate command on namespace: t.w :: caused by :: \
-                 Document failed validation",
-            ),
-            (
-                doc! {"$merge": {"into": "m"}},
-                "Executor error during aggregate command on namespace: t.w :: caused by :: Plan \
-                 executor error during update :: caused by :: Document failed validation",
-            ),
-        ] {
-            let reply = dispatch(
-                &doc! {"aggregate": "w", "pipeline": [stage.clone()], "cursor": {}},
-                c,
-            );
-            assert_eq!(reply.get_i32("code").unwrap(), 121, "{stage}: {reply}");
-            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{stage}");
-            let info = reply.get_document("errInfo").unwrap();
-            assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1, "{stage}");
-            assert!(info.get_document("details").is_ok(), "{stage}: {reply}");
-
 fn create_indexes_refuses_a_bad_spec_before_building_anything() {
     with_wt(|c| {
         dispatch(
