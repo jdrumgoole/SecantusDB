@@ -8643,13 +8643,14 @@ server turned out to be the Java gauge's own parallelism).
       written to the oplog as `size` / `max`.** `mongod` records the command
       as sent. Replay applies it correctly; a `showExpandedEvents` change
       stream shows different field names. Not probed.
-- [ ] **PYTHON MongoDB server: the capped-collection fixes of 2026-10-09 were
-      made on the Rust server only.** Not measured on the Python server:
-      upserts held to the cap, `max <= 0` as no limit, the `size` / `max`
-      ranges and integer storage, `collMod` `cappedSize` / `cappedMax`,
-      `collStats` `max` / `maxSize`, and the refusal of writes inside a
-      transaction. Run the capped probes against `secantusd-py` before
-      assuming any of them.
+- [ ] **PYTHON MongoDB server: 51 of 97 capped-collection results differ from
+      `mongod` 8.2.11** (`tools/probes/capped_collections.py`, 2026-10-09; the
+      Rust server is at 0, from 67). The fixes of that day were made on the
+      Rust server only: a batch and an upsert held to the cap, `max <= 0` as
+      no limit, the `size` / `max` ranges and integer storage, `collMod`
+      `cappedSize` / `cappedMax`, `collStats` `max` / `maxSize`. The Python
+      server does refuse a write inside a transaction, with its own wording
+      and reply shape.
 - [ ] **RUST MongoDB server: capped eviction rescans the whole collection on
       every insert chunk.** `enforce_capped_bounds` calls `scan_docs` and sums
       every document's size to learn the collection's size and count, so an

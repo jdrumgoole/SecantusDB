@@ -1,16 +1,18 @@
 ### Capped collections on the Rust MongoDB server follow mongod in six more places
 
-A probe of capped-collection behaviour against `mongod` 8.2.11 found the Rust
-MongoDB server different on 27 of 50 results. Two of the causes lost or
+A probe of capped-collection behaviour against `mongod` 8.2.11
+(`tools/probes/capped_collections.py`) found the Rust MongoDB server different
+on 67 of 97 results. It now differs on none. Two of the causes lost or
 over-kept data. An upsert was never held to the cap, so a `max: 3` collection
 that received upserts grew without limit. And `max: 0`, which means "no
 document limit" on `mongod`, was read as a limit of zero: every insert
 evicted everything except the newest document.
 
-After this change three of the 50 still differ, all of them
-`convertToCapped`, which the server does not implement and refuses with
-`CommandNotFound`. A second sweep of 70 option, `collMod`, `collStats` and
-transaction results has one message that differs.
+Not covered by that probe, and still different: `convertToCapped` is not
+implemented (the server answers `CommandNotFound`), and after a refused
+statement aborts a transaction the server words the follow-up error
+differently from `mongod`. The Python MongoDB server differs on 51 of the 97
+and was not changed.
 
 #### Fixed
 
