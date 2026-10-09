@@ -1141,3 +1141,33 @@ so a bisect step costs one `cargo build -p secantusdb` (~30 s) instead of a
 full extension rebuild. Old commits need `RUSTFLAGS="-L native=/opt/homebrew/lib
 -l lz4"` because their `build.rs` predates lz4 linking while the shared WT
 build has the compressor built in.
+
+## Multi-stage aggregate: the narrow decode now reaches past `$unwind` (2026-10-09)
+
+Measured on a Mac against `mongod` 8.2.11, 10,000 five-field documents, the
+benchmark's own pipeline (`$match` active, `$unwind` tags, `$group`, `$sort`),
+median of 40 warm runs, old and new binary interleaved twice. The machine was
+busy (a test suite was running), so read the differences, not the absolutes.
+
+| pipeline | mongod | before | after |
+|---|---:|---:|---:|
+| `$match`, `$count` | 1.4 ms | 6.2 ms | 3.0 ms |
+| `$match`, `$unwind`, `$count` | 3.8 ms | 9.7 ms | 6.9 ms |
+| `$match`, `$unwind`, `$group` | 4.6 ms | 13.1 ms | 9.8 ms |
+| full (`... $sort`) | 4.6 ms | 13.1 ms | 10.1 ms |
+| `$group` alone | 1.6 ms | 5.5 ms | 5.5 ms |
+
+A stack sample of `$match`, `$count` before the change was dominated by
+`bson` deserialisation into owned `Document`s (`BsonVisitor::visit_map`,
+`IndexMap::insert_full`, allocation and drop): every survivor was decoded
+whole to be counted. The 6a pushdown only applied when `$group` was the first
+remaining stage. `secantus_core::pipeline_prefix_fields` now walks `$unwind` /
+`$sort` / `$match` / `$skip` / `$limit` to the first `$group`, `$sortByCount`
+or `$count`.
+
+What is left is flat. After the change the full pipeline's sample has no
+function over 6%: allocation and drop of the 15,000 unwound documents (~20%
+together), raw iteration, SipHash on the group key, expression evaluation.
+`$group` alone at 5.5 ms against 1.6 ms is the same picture. The next step
+down is the streaming execution this file calls 6b; a cheaper first try is a
+faster hasher for group keys.
