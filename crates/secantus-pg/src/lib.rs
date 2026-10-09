@@ -3119,6 +3119,10 @@ pub struct PgHandler {
     /// `in_transaction` stays false, so `DECLARE` and `SAVEPOINT` still
     /// answer `25P01`, and a `BEGIN` inside the group turns it into one.
     implicit_extended: AtomicBool,
+    /// Messages of one cycle are being processed: set by the first message
+    /// after a `ReadyForQuery`, cleared when the next one is sent. See
+    /// `begin_message_cycle`.
+    cycle_open: AtomicBool,
     /// A statement in the open group failed: the group rolls back at `Sync`.
     group_failed: AtomicBool,
     /// NOTIFYs of the open transaction, `(channel, payload)` in first-issue
@@ -3462,6 +3466,7 @@ impl PgHandler {
             constraint_modes: Mutex::new((None, HashMap::new())),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
+            cycle_open: AtomicBool::new(false),
             group_failed: AtomicBool::new(false),
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
@@ -17906,6 +17911,12 @@ impl SimpleQueryHandler for PgHandler {
         // The simple protocol takes any number of commands separated by
         // semicolons and answers with one result each. The extended protocol
         // does not, and still refuses -- see `Error::MultipleCommands`.
+        // A Query message is a cycle of its own: whatever cancel was pending
+        // when it arrived targeted nothing.
+        self.end_message_cycle();
+        self.backend
+            .cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // The simple protocol carries no `Bind`, so its results are always text.
         self.binary_results
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -20836,12 +20847,6 @@ impl PgHandler {
         {
             return Err(Self::admin_shutdown());
         }
-        // A cancel that arrived while this backend was idle is dropped, as
-        // PostgreSQL drops one: it targets the statement that is running,
-        // and none was.
-        self.backend
-            .cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
         // `statement_timeout` starts now, for this statement.
         let timeout = self.ms_setting("statement_timeout");
         *self
@@ -20972,8 +20977,33 @@ impl PgHandler {
         )))
     }
 
+    /// The first message after a `ReadyForQuery` starts a cycle, and a cancel
+    /// that arrived before it is dropped: the backend was idle, and
+    /// PostgreSQL drops a cancel it receives while waiting for a command.
+    ///
+    /// One that arrives LATER in the cycle stays pending until a cancellation
+    /// point takes it, whichever message is being processed. Dropping it when
+    /// the statement started executing instead lost every cancel that landed
+    /// during Parse / Bind / Describe: probed against PostgreSQL 15.19 with a
+    /// statement slow to parse, PostgreSQL answered 57014 at every offset and
+    /// this server ran the statement to completion.
+    fn begin_message_cycle(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.cycle_open.swap(true, Relaxed) {
+            self.backend.cancel.store(false, Relaxed);
+        }
+    }
+
+    /// The cycle's `ReadyForQuery` is going out: the backend is idle again.
+    fn end_message_cycle(&self) {
+        self.cycle_open
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// A cancellation point: `57014` if a `CancelRequest` for this backend
-    /// has arrived since the running statement started.
+    /// has arrived since the current message cycle started. Taking the
+    /// request consumes it, so a handler that catches the error is not
+    /// cancelled a second time by the same request.
     fn check_cancel(&self) -> PgWireResult<()> {
         // A `pg_terminate_backend` aimed at a RUNNING statement ends it, and
         // the session, at the statement's next cancellation point -- the
@@ -20985,7 +21015,11 @@ impl PgHandler {
         {
             return Err(Self::admin_shutdown());
         }
-        if self.backend.cancelled() {
+        if self
+            .backend
+            .cancel
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(Self::query_canceled());
         }
         let expired = self
@@ -36975,6 +37009,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.begin_message_cycle();
         self.apply_wire_dealloc(client.portal_store());
         let parser = <Self as ExtendedQueryHandler>::query_parser(self);
         let mut message = message;
@@ -37022,6 +37057,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.begin_message_cycle();
         self.apply_wire_dealloc(client.portal_store());
         if message.target_type == pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT {
             if let Some(name) = message.name.as_deref().filter(|n| !n.is_empty()) {
@@ -37173,6 +37209,7 @@ impl ExtendedQueryHandler for PgHandler {
             self.forget_wire_portals();
         }
         self.flush_notifications(client).await?;
+        self.end_message_cycle();
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 client.transaction_status(),
@@ -37199,6 +37236,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.begin_message_cycle();
         let out = self._on_execute(client, message).await;
         if out.is_err() {
             self.note_failure();
@@ -37219,6 +37257,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.begin_message_cycle();
         self.apply_wire_dealloc(client.portal_store());
         let statement_name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
         // A Bind that fails aborts the block (and the statement group) as
@@ -37253,6 +37292,7 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.begin_message_cycle();
         self.apply_wire_dealloc(client.portal_store());
         if message.target_type == TARGET_TYPE_BYTE_PORTAL {
             let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);

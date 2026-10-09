@@ -582,6 +582,17 @@ remain open:
       identically against PostgreSQL 15. Nothing to do server-side;
       `psycopg_validation/include_paths.py` keeps `test_cancel` deselected
       and the `proxy`-marked pair out of the macOS gauge.
+- RUST pgserver: a cancel that arrives during Parse / Bind / Describe is kept
+  (fixed 2026-10-09), but two differences from PostgreSQL remain. It is
+  honoured at the first cancellation point of EXECUTION, not during the parse
+  itself: against a statement that takes 2.8 s to parse here, PostgreSQL 15
+  answers 57014 in 30 ms and this server answers it after the parse. And the
+  idle window is wider: a cancel that lands while the server is still READING
+  a large message is dropped (0-5 ms after a 1.4 MB statement in a debug
+  build), where PostgreSQL has finished reading by then. Closing the second
+  needs a hook in the vendored `secantus-pgwire` at the point a message's
+  first byte is read. Probe: send `select pg_sleep(3), 1 in (0..200000)` with
+  `send_query_params`, then a blocking `PQcancel` at a chosen offset.
 - RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
   pass that rewrites each plain literal to the `E'...'` it means before
   pg_query (which has the setting hard-wired on) sees it, with the
