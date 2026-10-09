@@ -1,5 +1,6 @@
-"""`cmake/patch_wt_dsync_group.py` -- the one WiredTiger patch that changes
-BEHAVIOUR (group commit for `method=dsync`) rather than the build.
+"""`cmake/patch_wt_dsync_group.py` -- one of the two WiredTiger patches that
+change BEHAVIOUR (group commit for `method=dsync`) rather than the build. The
+other is `tests/test_wt_fsync_group_patch.py`.
 
 It rewrites the commit path of the storage engine, so the script itself is
 held to more than "it ran": it must apply to the vendored source as it is
