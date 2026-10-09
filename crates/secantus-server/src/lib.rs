@@ -174,6 +174,8 @@ struct Shared {
     step_down: Arc<secantus_commands::stepdown::StepDownState>,
     /// Server-wide per-namespace operation accounting, reported by `top`.
     top_stats: Arc<secantus_commands::topstats::TopStats>,
+    /// The server-wide slow-operation threshold, set by `profile`.
+    slow_ops: Arc<secantus_commands::slowop::SlowOpSettings>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -393,6 +395,7 @@ pub fn bind(
         server_params: Arc::new(secantus_commands::params::ServerParams::new()),
         step_down: Arc::new(secantus_commands::stepdown::StepDownState::new()),
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
+        slow_ops: Arc::new(secantus_commands::slowop::SlowOpSettings::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -939,6 +942,28 @@ fn run_dispatch(
             }
         }
     }
+    // The slow-operation log: mongod writes one `Slow query` line for every
+    // operation that ran for `slowms` or longer, at any profiling level. It is
+    // the only record of WHERE a stall was -- a client sees one slow call and
+    // nothing else. Time an awaitData `getMore` spent blocked is not work.
+    let total = started.elapsed();
+    let worked = total.saturating_sub(ctx.awaited.get());
+    if worked.as_millis() >= shared.slow_ops.slow_ms().max(0) as u128
+        && shared.slow_ops.should_log(worked, rand::random::<f64>())
+    {
+        let attr = secantus_commands::slowop::attributes(
+            request,
+            &reply,
+            &ctx.db_name,
+            conn_id,
+            worked,
+            total,
+        );
+        log::info!("Slow query {attr}");
+        shared
+            .logs
+            .append("I", "COMMAND", format!("Slow query {attr}"));
+    }
     // `pending_batch` is set by `find` / `getMore` to hand the reply's document
     // batch to the wire as pre-encoded blobs (spliced by `write_op_msg` /
     // `materialize_batch`) instead of an owned `Bson::Array` in the reply.
@@ -962,6 +987,7 @@ fn make_context(
         .with_conn_killer(shared.conn_killer.clone())
         .with_logs(shared.logs.clone())
         .with_top_stats(shared.top_stats.clone())
+        .with_slow_ops(shared.slow_ops.clone())
         // `next_conn_id` starts at 1 and is bumped per accepted connection, so
         // it is the lifetime total plus one; `conns` holds the live sockets.
         .with_conn_stats(secantus_commands::ConnStats {

@@ -32,6 +32,10 @@ rustls-pemfile = "2"
 x509-parser = "0.16"
 # TOML config-file loader for the standalone `secantusdb` daemon (`--config`).
 toml = "0.8"
+# The slow-operation log line (`Slow query`), at `info`.
+log = "0.4"
+# The slow-operation log's sample draw.
+rand = "0.9"
 
 [dev-dependencies]
 # Self-signed cert generation for the TLS integration tests (ring backend).

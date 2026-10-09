@@ -142,6 +142,66 @@ def test_binary_serves_pymongo_and_exits_cleanly(
     assert daemon.wait(timeout=15) == 0, daemon.stderr.read() if daemon.stderr else ""
 
 
+def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
+    daemon: subprocess.Popen[str],
+) -> None:
+    """An operation at or over ``slowms`` writes one ``Slow query`` line.
+
+    mongod does this at any profiling level, and it is the only record of where
+    a stall was: the client sees one slow call and nothing else. ``slowms`` is
+    server-wide on mongod 8.2.11 -- set through one database, read back through
+    another -- and an awaitData ``getMore`` that only waited is not slow.
+    """
+    host, port = _bound_address(daemon)
+    client: pymongo.MongoClient = pymongo.MongoClient(
+        host=host, port=port, serverSelectionTimeoutMS=10_000
+    )
+
+    def slow_lines() -> list[str]:
+        log = client.admin.command("getLog", "global")["log"]
+        return [line for line in log if "Slow query" in line]
+
+    try:
+        col = client.smoke.things
+        col.insert_one({"_id": 0})
+        with col.watch(max_await_time_ms=300) as stream:
+            assert stream.try_next() is None
+            assert stream.try_next() is None
+        # Only the getMore lines: on a loaded machine the insert above can
+        # honestly take 100 ms and be logged.
+        waited = [line for line in slow_lines() if '"command":"getMore"' in line]
+        assert waited == [], "an idle awaitData getMore was logged as slow"
+
+        was = client.smoke.command("profile", 0, slowms=0)
+        assert (was["slowms"], was["sampleRate"]) == (100, 1.0)
+        assert client.other.command("profile", -1)["slowms"] == 0
+
+        col.insert_many([{"_id": i} for i in range(1, 6)])
+        with pytest.raises(pymongo.errors.OperationFailure):
+            client.smoke.command({"find": "things", "filter": {"$bad": 1}})
+        client.smoke.command("profile", 0, slowms=100)
+        lines = slow_lines()
+        assert any(
+            '"ns":"smoke.things","command":"insert"' in x and '"ninserted":5' in x for x in lines
+        ), lines
+        assert any('"command":"find"' in x and '"errCode":2' in x for x in lines), lines
+
+        # Above the threshold nothing is logged, however slow the machine.
+        client.smoke.command("profile", 0, slowms=3_600_000)
+        before = len(slow_lines())
+        col.insert_one({"_id": 99})
+        assert col.count_documents({}) == 7
+        assert len(slow_lines()) == before
+    finally:
+        client.close()
+
+    _request_shutdown(daemon)
+    assert daemon.wait(timeout=15) == 0
+    assert daemon.stderr is not None
+    stderr = daemon.stderr.read()
+    assert 'Slow query {"type":"command","ns":"smoke.things","command":"insert"' in stderr, stderr
+
+
 def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
     assert _BIN is not None
     proc = subprocess.Popen(

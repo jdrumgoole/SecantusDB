@@ -51,6 +51,7 @@ pub mod mongod_codes;
 pub mod params;
 pub mod rbac;
 pub mod roles;
+pub mod slowop;
 pub mod stepdown;
 pub mod storage;
 pub mod topstats;
@@ -173,6 +174,15 @@ pub struct CommandContext {
     /// Server-wide per-namespace operation accounting, read by `top`. `None`
     /// off-server (unit tests) ⇒ `top` reports zeros, as it always used to.
     pub top_stats: Option<Arc<topstats::TopStats>>,
+    /// The server-wide slow-operation threshold and sample rate, set by
+    /// `profile`. `None` off-server (unit tests) ⇒ `profile` keeps the values
+    /// with the database's profiling level, as it always did.
+    pub slow_ops: Option<Arc<slowop::SlowOpSettings>>,
+    /// Time this request spent WAITING for data rather than working: an
+    /// awaitData `getMore` blocked on the oplog. Left out of the time the
+    /// slow-operation log measures, or every idle change stream would log a
+    /// slow query a second.
+    pub awaited: std::cell::Cell<std::time::Duration>,
     /// Set by a cursor-producing handler (`find` / `getMore`) to hand the
     /// server the reply's document batch as **pre-encoded blobs** instead of an
     /// owned `Bson::Array` inside the reply document. The reply the handler
@@ -229,6 +239,8 @@ impl CommandContext {
             logs: None,
             conn_stats: None,
             top_stats: None,
+            slow_ops: None,
+            awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             raw_insert_documents: None,
         }
@@ -274,6 +286,12 @@ impl CommandContext {
     /// reads it.
     pub fn with_logs(mut self, logs: Arc<logbuf::LogBuffer>) -> Self {
         self.logs = Some(logs);
+        self
+    }
+
+    /// Attach the server-wide slow-operation settings (builder-style).
+    pub fn with_slow_ops(mut self, settings: Arc<slowop::SlowOpSettings>) -> Self {
+        self.slow_ops = Some(settings);
         self
     }
 

@@ -257,6 +257,9 @@ def test_session_finish_reaps_too(monkeypatch, tmp_path: Path) -> None:
     """
     import tests.conftest as ct
 
+    # A run that opted out of the reap (a worktree run does) must not turn
+    # this test red: it is about the hook, not about this run's environment.
+    monkeypatch.delenv("SECANTUS_NO_TMP_REAP", raising=False)
     calls: list[str] = []
     monkeypatch.setattr(
         python_tasks,

@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 import pytest
-from bench.concurrency import _parse_writer_log
+from bench.concurrency import _parse_writer_log, _report_failed_row
 
 # Single-writer floor we expect per-writer when scaling is healthy.
 # A writer that gets shut out completely by lock contention will
@@ -208,3 +208,35 @@ def test_two_writers_scale_above_single_writer(tmp_path) -> None:
             server.wait()
         if storage.exists():
             shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_a_failed_row_keeps_its_evidence_and_shows_the_log_tail(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refused row must leave something to diagnose it from.
+
+    On 2026-10-09 a droplet sweep refused a row because a writer had not
+    stopped within ten seconds, and the harness then removed the server's
+    store and had sent its output to /dev/null. Whether the server stalled
+    could not be established.
+    """
+    log = tmp_path / "server.log"
+    log.write_text("\n".join(f"line {i}" for i in range(40)) + "\n")
+    store = tmp_path / "store"
+    _report_failed_row("rust", 1, log, store)
+    err = capsys.readouterr().err
+    assert str(log) in err
+    assert str(store) in err
+    assert "| line 39" in err
+    assert "| line 20" in err
+    assert "| line 19" not in err
+    assert log.exists()
+
+
+def test_a_failed_row_with_an_empty_log_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log = tmp_path / "server.log"
+    log.write_text("")
+    _report_failed_row("mongod", 8, log, tmp_path / "store")
+    assert "| <empty log>" in capsys.readouterr().err
