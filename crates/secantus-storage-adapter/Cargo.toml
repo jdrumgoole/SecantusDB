@@ -1,6 +1,6 @@
 [package]
 name = "secantus-storage-adapter"
-version = "0.5.3-beta.173"
+version = "0.5.3-beta.174"
 edition = "2021"
 description = "Adapts the WiredTiger-backed secantus-storage Storage to the secantus-commands Storage trait for the Rust server."
 license = "GPL-2.0-only"
@@ -30,8 +30,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 bson = "2"
-secantus-storage = { version = "=0.5.3-beta.173", path = "../secantus-storage" }
-secantus-commands = { version = "=0.5.3-beta.173", path = "../secantus-commands" }
+secantus-storage = { version = "=0.5.3-beta.174", path = "../secantus-storage" }
+secantus-commands = { version = "=0.5.3-beta.174", path = "../secantus-commands" }
 
 # Test-only: the server-roundtrip integration tests (moved here from the
 # WiredTiger-free secantus-server crate) bind the real Rust server over real
@@ -39,4 +39,4 @@ secantus-commands = { version = "=0.5.3-beta.173", path = "../secantus-commands"
 # secantus-server is itself WT-free, so this adds no WiredTiger to the dep graph
 # beyond what secantus-storage already pulls in.
 [dev-dependencies]
-secantus-server = { version = "=0.5.3-beta.173", path = "../secantus-server" }
+secantus-server = { version = "=0.5.3-beta.174", path = "../secantus-server" }
