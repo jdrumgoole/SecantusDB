@@ -28,3 +28,13 @@ def test_the_init_script_does_not_fall_back_to_every_core() -> None:
     script = (REPO / "java_validation" / "init.gradle.kts").read_text()
     assert "availableProcessors" not in script
     assert "toIntOrNull() ?: 1" in script
+
+
+def test_the_kotlin_gauge_shares_the_rule() -> None:
+    """The Kotlin sync tests use the same fixture, so the same default."""
+    script = (REPO / "kotlin_validation" / "init.gradle.kts").read_text()
+    assert "availableProcessors" not in script
+    assert "toIntOrNull() ?: 1" in script
+    runner = (REPO / "kotlin_validation" / "runner.py").read_text()
+    assert "cpu_count" not in runner
+    assert "default_forks(os.environ)" in runner

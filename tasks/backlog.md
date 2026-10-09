@@ -8499,17 +8499,6 @@ One run that did not finish and is not explained, and one follow-up from a
 result that WAS explained (documents "missing" after an insert on the Rust
 server turned out to be the Java gauge's own parallelism).
 
-- [ ] **Kotlin gauge: still runs its test JVMs in parallel.** The Java gauge
-      ran twelve and published a wrong number for it (the driver's fixture
-      drops the shared `JavaDriverTest` database as each JVM exits; found with
-      a wire capture 2026-10-09, fixed by defaulting to one fork).
-      `kotlin_validation/runner.py` still defaults to the CPU count, and the
-      Kotlin sync tests sit on the same Java fixture. It has reported 340 of
-      340 every time, so nothing is known to be wrong; nobody has checked
-      whether that is luck. Check with the same proxy
-      (`dropDatabase` from another connection during a test) before trusting
-      it, or default it to one fork too.
-
 - [ ] **RUST MongoDB server: one writer made no progress for over 10 s in the
       droplet concurrency sweep.** `invoke do-perf`, 2026-10-09, run 3 of 3,
       server `rust`, 1 writer: the writer process did not stop within 10 s of
