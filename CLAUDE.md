@@ -1034,6 +1034,26 @@ After every push (to a feature branch via PR — the default — or to `main`), 
 
 ## Conventions for changes here
 
+- **Never commit build output or any other generated binary.** No cargo
+  `target*/` directory, no `.so` / `.dylib` / `.a` / `.rlib` / `.o`, no
+  executable, no wheel or sdist, no `.profraw`, no core dump, no database
+  store. Source and small hand-made fixtures only. On 2026-09-30 a
+  `git add -A` swept `crates/secantus-storage/target-dev/` into a feature
+  commit: 6,875 files and 1.77 GB. Nobody noticed for a week, until PyPI
+  refused a 573 MB sdist, and git history had to be rewritten to get the
+  repository back from 513 MB to about 70.
+  - **Read `git status --short` before every `git add -A`**, and stage by
+    path when anything in it is not a file you wrote. An unfamiliar
+    directory in that list is the warning.
+  - A new build directory gets a `.gitignore` line in the same change that
+    creates it. `CARGO_TARGET_DIR=<anything>` inside the repository is how
+    this one got past the existing ignore rules.
+  - `tests/test_no_tracked_build_output.py` fails on a tracked cargo target
+    directory or any tracked file over 8 MB. Run it when in doubt; do not
+    raise its limit to get something in.
+  - The one binary that IS committed on purpose is the PGO profile,
+    `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling). Adding
+    another needs Joe's say-so.
 - **Claim a backlog item before working it — the claim is a PUSHED branch.**
   This repo runs several parallel sessions against one `tasks/backlog.md`, and
   the same item repeatedly got picked up twice: `set` and `timetz` in the pgtest
