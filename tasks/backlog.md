@@ -8512,8 +8512,11 @@ writes and the second is a run that did not finish.
         over them did not contain `Pete = 2` (`:171`).
 
       With `SECANTUS_GAUGE_PARALLEL_FORKS=1` the same build passes 496 of 496.
-      The Python server passed 496 of 496 in parallel (one run). The panel
-      published before this (2026-09-30) had the Rust server at 496 of 496.
+      The Python server passed 496 of 496 in parallel (one run). The report
+      committed before this (2026-09-30) had the Rust server at 496 of 496,
+      but the PANEL published beside it already read "495 passed, 1 known
+      divergence" for the same gauge -- so a run with one failure here has
+      been seen before and was not written down.
       Classes running in the same second: `ExplainTest`, `ReadConcernTest`,
       `MongoClientTest`, `ConnectivityTest`, `SessionsTest`
       (`MongoWriteConcernWithResponseExceptionTest` arms a server-wide insert
