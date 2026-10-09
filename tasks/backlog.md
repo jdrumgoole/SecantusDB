@@ -8756,6 +8756,14 @@ results different to 2. What is left, there and beside it:
       now steps over any disagreement in a pipeline that holds a `$count`;
       remove that exclusion when the Python engine is fixed.
 
+### 7.064 Document validation -- 2026-10-09
+
+- [ ] **PYTHON MongoDB server: 16 of 68 document-validation results differ
+      from `mongod` 8.2.11** (`tools/probes/validators.py`; the Rust server
+      is at 0, from 15). Not changed, and not read through one by one: it
+      includes an ordered `insert` dropping the documents before a validation
+      failure, and `$merge` into a validated collection succeeding.
+
 ### 7.065 Capped collections -- 2026-10-09
 
 - [ ] **RUST MongoDB server: `convertToCapped` is not implemented**
