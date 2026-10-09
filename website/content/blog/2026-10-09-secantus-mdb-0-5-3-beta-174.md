@@ -23,7 +23,7 @@ The cause was a sort validator shared between `find` and the aggregation
 `$sort` stage. The stage does read `$natural` as a field path and rejects it;
 `find` does not, and the validator applied the stage's rule to both.
 
-A second fault had been there longer and made no noise. `findAndModify` with
+A second fault made no noise. `findAndModify` with
 `sort: {$natural: -1}` passed the sort down as a field named `$natural`, which
 no document has, so the command acted on the first document in the collection
 where `mongod` acts on the last. A `findOneAndDelete` meant to remove the
