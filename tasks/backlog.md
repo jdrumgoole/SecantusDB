@@ -3009,6 +3009,65 @@ These work end-to-end but cut corners.
       limit there is not the sync. NOT measured: the MongoDB server under
       `--sync-on-commit`, which runs the same patched code.
 
+      **Left open when the 2026-10-09 session closed** (three things Joe
+      asked for in order; the first two were not started, the third has only
+      its measurement):
+
+      1. **Release the sync patch** (`cmake/patch_wt_fsync_group.py`, PR
+         #1846). It changes `secantus-wiredtiger-sys`, so the MongoDB line
+         must be bumped and tagged FIRST and its crates published, then the PG
+         line (`0.1.0-beta.7`), then the website tags and a post. The
+         published `0.1.0-beta.6` does not carry it.
+      2. **`website/themes/secantus/templates/rust_pg.html` is stale in two
+         places.** Its "Not yet" row lists `CREATE INDEX`, `pg_constraint`,
+         multi-column `FOREIGN KEY` and password verification: all four work
+         (run against a build of `bb904163`, with a unique index enforced and
+         a wrong password refused). Its "What it speaks" rows predate joins,
+         CTEs, correlated subqueries, windows, views, `ALTER TABLE`,
+         sequences, PL/pgSQL functions, triggers, full-text search, jsonpath,
+         `MERGE`, `ON CONFLICT` and `EXPLAIN`, each of which answered
+         correctly in the same run. Its performance table and the "1.75x /
+         2.48x" note are an old measurement. Numbers to replace them with,
+         measured for that purpose: DigitalOcean `c-16`, ext4, PostgreSQL
+         16 defaults, a release build of `bb904163` (PR #1846's head),
+         `bench/pg_concurrency.py` 10s x3, ops/s, PostgreSQL then ours:
+
+         | workload | clients | PostgreSQL 16 | secantusd-pg |
+         | --- | --- | --- | --- |
+         | insert, one table each | 1 / 4 / 8 | 5,473 / 14,647 / 21,639 | 3,426 / 10,812 / 15,624 |
+         | insert, shared table | 8 | 21,722 | 14,410 |
+         | update by PK | 1 / 4 / 8 | 4,902 / 13,393 / 21,409 | 2,832 / 9,193 / 14,350 |
+         | select by PK | 1 / 4 / 8 | 12,259 / 42,358 / 58,602 | 9,654 / 32,339 / 41,181 |
+
+         The page is hand-written (the table is not generated), and the
+         durable-write rows there are from a machine and a sync method this
+         table does not match, so replace the table whole and say which
+         machine. Re-measure if the release differs from `bb904163`.
+      3. **Reads.** Same droplet and build, server CPU per statement by
+         `perf stat -p` (PostgreSQL: the connection's backend), 30,000
+         statements over a 1,000-row table, two passes within 2%:
+
+         | statement | ours: instructions / CPU | PostgreSQL 16 |
+         | --- | --- | --- |
+         | empty query | 34k / 28 us | 50k / 34 us |
+         | `select 1` | 92k / 57 us | 66k / 39 us |
+         | row by PK, prepared | 136k / 94 us | 86k / 54 us |
+         | row by PK, NOT prepared, a different literal each time | 900k / 329 us | 140k / 79 us |
+
+         **The unprepared statement with a changing literal is the outlier:
+         6.4x PostgreSQL's instructions, 2.9x its wall time (380 us against
+         128).** `bench/pg_statement_cost.py`'s `select_row` does not show it,
+         because it sends the SAME text every time and the server caches by
+         text. The profile is libpg_query and what surrounds it: the text is
+         parsed twice (`pg_query_split_with_parser`, then
+         `pg_query_parse_protobuf_opts`), the tree is packed to protobuf in C
+         (`protobuf_c_message_pack` / `get_packed_size`, 5.6% self), unpacked
+         in Rust, and cloned (`Node::clone` / `to_vec`). Start there: one
+         parse, and no clone of the tree. The prepared read has no hot spot
+         (largest self time is the allocator at 4.7%; `install_user_types`,
+         `rls_enabled_docs`, `client_encoding`, `session_timezone` and
+         `DateStyle::parse_over` each run per statement at 0.3-0.6%).
+
       What is left, in order of what the profile offers:
       - a stored value into any other column type (`varchar(n)`, `smallint`,
         `numeric`, `timestamptz`, `bool`...) is still planned per Execute,
