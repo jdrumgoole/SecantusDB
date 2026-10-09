@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import gauge_common
@@ -151,6 +152,31 @@ def _verify_secantus_identity(host: str, port: int, gauge: str) -> None:
             "Refusing to run the gauge against a foreign server."
         )
     print(f"{gauge}: target verified — secantus {marker['server']} server", file=sys.stderr)
+
+
+def default_forks(environ: Mapping[str, str]) -> int:
+    """How many test JVMs Gradle may run at once: one, unless overridden.
+
+    The driver's tests are not safe to run in parallel against ONE server, and
+    the reason is in the driver's own fixture, not in the server. Every test
+    JVM that touches ``com.mongodb.client.Fixture`` registers a shutdown hook
+    that DROPS the default database, and that database's name is a constant
+    (``JavaDriverTest``) shared by every class. With several forks, a fork
+    that finishes drops the database under the forks still running.
+
+    Measured 2026-10-09 with a logging proxy in front of ``secantusd-rs``: a
+    ``dropDatabase JavaDriverTest`` from another connection arrived 2 ms
+    before ``MongoCollectionTest`` read back two documents it had just
+    inserted, and the read returned none. Twelve forks produced one such
+    failure per run, in a different test each time, on three runs out of four;
+    one fork passed 496 of 496. The published figure had been wrong by that
+    one test for at least two releases.
+
+    ``SECANTUS_GAUGE_PARALLEL_FORKS`` still raises it, for timing experiments
+    whose pass count is not going to be published.
+    """
+    override = environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
+    return int(override) if override else 1
 
 
 def main() -> int:
@@ -319,8 +345,8 @@ def main() -> int:
         # Phase 3: parallel JVM forks for the test tasks. The driver's
         # ``conventions/testing-base.gradle.kts`` hardcodes
         # ``maxParallelForks = 1``; we override via an init-script
-        # (vendored tree stays unmodified). Worker count is the runner's
-        # CPU count by default; ``SECANTUS_GAUGE_PARALLEL_FORKS`` overrides.
+        # (vendored tree stays unmodified). The default is ONE fork -- see
+        # ``default_forks`` -- and ``SECANTUS_GAUGE_PARALLEL_FORKS`` overrides.
         init_script = REPO_ROOT / "java_validation" / "init.gradle.kts"
         # Base parallel-fork count: the user-supplied override if set, else
         # the runner's CPU count. This is the CEILING — the per-module fork
@@ -337,8 +363,7 @@ def main() -> int:
         # ``:driver-core`` (only 2 geo specs) races into the crash. Capping
         # forks at the class count per module keeps driver-sync fully parallel
         # while driver-core drops to 2 forks with no empty forks.
-        _forks_override = os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS")
-        base_forks = int(_forks_override) if _forks_override else (os.cpu_count() or 1)
+        base_forks = default_forks(os.environ)
 
         # Wipe stale JUnit XML before running so a failed build can't
         # masquerade as a passing run. If Gradle aborts (unsupported JDK,
@@ -410,8 +435,7 @@ def main() -> int:
             # Fork count for this invocation. ``serial`` specs run at 1 fork —
             # they hold the timing-sensitive SDAM / command-monitoring tests,
             # which assert exact event sequences and flake under parallel CPU
-            # contention against the single-GIL Python daemon (the Rust server,
-            # being truly multithreaded, passes them at full parallelism). Other
+            # contention against the single-GIL Python daemon. Other
             # specs cap the fork count at the number of test classes they run so
             # Gradle never spawns an empty test-worker fork (an empty fork leaves
             # ``output.bin.idx`` unwritten → the result aggregator crashes with

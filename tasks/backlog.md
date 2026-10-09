@@ -8495,45 +8495,20 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ### 7.07 Open, unexplained, from the 0.7 gauge and benchmark refresh -- 2026-10-09
 
-Two results that did not complete or did not agree, neither reproduced, neither
-explained. Both are recorded because the first reads like lost or invisible
-writes and the second is a run that did not finish.
+One run that did not finish and is not explained, and one follow-up from a
+result that WAS explained (documents "missing" after an insert on the Rust
+server turned out to be the Java gauge's own parallelism).
 
-- [ ] **RUST MongoDB server: documents missing from a read straight after
-      they were inserted, only when the Java gauge runs its classes in
-      parallel.** `validate-java --server rust` (12 parallel JVM forks against
-      one `secantusd-rs`, `--standalone --auth --enable-test-commands`) failed
-      one test of `com.mongodb.client.MongoCollectionTest` in each of two runs,
-      a DIFFERENT test each time:
-      - `shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists`: two
-        identical `find({i: 1})` calls with nothing between them; the first
-        returned 1 document, the second 0 (`AbstractMongoCollectionTest.java:147`).
-      - `testMapReduceWithGenerics`: three documents inserted, the map-reduce
-        over them did not contain `Pete = 2` (`:171`).
-
-      With `SECANTUS_GAUGE_PARALLEL_FORKS=1` the same build passes 496 of 496.
-      The Python server passed 496 of 496 in parallel (one run). The report
-      committed before this (2026-09-30) had the Rust server at 496 of 496,
-      but the PANEL published beside it already read "495 passed, 1 known
-      divergence" for the same gauge -- so a run with one failure here has
-      been seen before and was not written down.
-      Classes running in the same second: `ExplainTest`, `ReadConcernTest`,
-      `MongoClientTest`, `ConnectivityTest`, `SessionsTest`
-      (`MongoWriteConcernWithResponseExceptionTest` arms a server-wide insert
-      fail point but skips itself on a standalone).
-
-      NOT reproduced with pymongo against the release binary, single server,
-      in any of: 3,000 serial drop / drop / insert / read rounds; 4,800 rounds
-      from 12 processes on separate collections of one database; ~45,000
-      rounds of insert-then-read-six-times while six other threads ran one of
-      explain (all verbosities), every read concern, causal / transactional /
-      snapshot sessions, abandoned cursors, index build + drop, or client
-      churn. Not tried: `--auth`, the unified-test fail points
-      (`UnifiedCrudTest` starts about a second later and its fail points are
-      server-wide), and a wire capture of the failing run, which is the next
-      step (a logging TCP proxy in front of the gauge's daemon).
-
-      The driver panel shows the parallel result, 495 of 496, on purpose.
+- [ ] **Kotlin gauge: still runs its test JVMs in parallel.** The Java gauge
+      ran twelve and published a wrong number for it (the driver's fixture
+      drops the shared `JavaDriverTest` database as each JVM exits; found with
+      a wire capture 2026-10-09, fixed by defaulting to one fork).
+      `kotlin_validation/runner.py` still defaults to the CPU count, and the
+      Kotlin sync tests sit on the same Java fixture. It has reported 340 of
+      340 every time, so nothing is known to be wrong; nobody has checked
+      whether that is luck. Check with the same proxy
+      (`dropDatabase` from another connection during a test) before trusting
+      it, or default it to one fork too.
 
 - [ ] **RUST MongoDB server: one writer made no progress for over 10 s in the
       droplet concurrency sweep.** `invoke do-perf`, 2026-10-09, run 3 of 3,
