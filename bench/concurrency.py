@@ -149,8 +149,10 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
             str(port),
             "--storage-path",
             str(storage_path),
+            # INFO, not WARNING: the server's `Slow query` lines are at info,
+            # and they are the only record of where a stalled row stalled.
             "--log-level",
-            "WARNING",
+            "INFO",
         ]
         if server == "rust-async":
             argv += ["--oplog-async", "--oplog-nonlogged"]
@@ -181,20 +183,40 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
 def _spawn_server(
     port: int, storage_path: Path, server: str = "python", server_log: Path | None = None
 ) -> subprocess.Popen[bytes]:
-    if server_log is not None:
-        out = server_log.open("ab")
+    """Start a benchmark server, its output appended to ``server_log`` when given."""
+    if server_log is None:
+        return subprocess.Popen(
+            _server_argv(server, port, storage_path),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    with server_log.open("ab") as out:
         return subprocess.Popen(
             _server_argv(server, port, storage_path),
             stdin=subprocess.DEVNULL,
             stdout=out,
             stderr=subprocess.STDOUT,
         )
-    return subprocess.Popen(
-        _server_argv(server, port, storage_path),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+
+
+def _report_failed_row(server: str, n: int, row_log: Path, row_storage: Path) -> None:
+    """Say where a failed row's evidence is, and show the end of the server's log.
+
+    A row that is refused used to take its server log and its store with it,
+    which left a stalled writer on a droplet with nothing to diagnose it from.
+    """
+    try:
+        lines = row_log.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        lines = [f"<could not read the log: {exc}>"]
+    print(
+        f"row failed (server {server}, {n} writers): kept the server log at {row_log} "
+        f"and the store at {row_storage}",
+        file=sys.stderr,
     )
+    for line in lines[-20:] or ["<empty log>"]:
+        print(f"    | {line}", file=sys.stderr)
 
 
 def run_writers(
@@ -327,7 +349,13 @@ def run_concurrency_sweep(
         # killing the row. Per-row stores bound peak usage to one row.
         row_storage = Path(tempfile.mkdtemp(prefix=f"bench-concurrency-n{n}-"))
         port = _free_port()
-        server_proc = _spawn_server(port, row_storage, server, server_log)
+        # The server's output always goes to a file. Without ``--server-log``
+        # it is a per-row file, removed once the row has its numbers.
+        row_log = server_log or Path(
+            tempfile.mkstemp(prefix=f"bench-concurrency-n{n}-", suffix=".server.log")[1]
+        )
+        server_proc = _spawn_server(port, row_storage, server, row_log)
+        completed = False
         try:
             if not _wait_listen("127.0.0.1", port, timeout=30):
                 print("ERROR: server didn't come up", file=sys.stderr)
@@ -344,9 +372,15 @@ def run_concurrency_sweep(
                 collection_prefix=f"{DEFAULT_COLLECTION_PREFIX}n{n}_",
                 shared_collection=shared_collection,
             )
+            completed = True
         finally:
             _stop_server(server_proc)
-            shutil.rmtree(row_storage, ignore_errors=True)
+            if completed:
+                shutil.rmtree(row_storage, ignore_errors=True)
+                if server_log is None:
+                    row_log.unlink(missing_ok=True)
+            else:
+                _report_failed_row(server, n, row_log, row_storage)
 
         total = sum(s[1] for s in stats if s)
         unparsed = sum(1 for s in stats if s is None)

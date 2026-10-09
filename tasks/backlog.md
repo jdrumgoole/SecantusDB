@@ -8585,6 +8585,32 @@ server turned out to be the Java gauge's own parallelism).
       keep the server's log and store before the harness cleans up. Two later
       sweeps the same day, on other droplets, completed all rows.
 
+      Followed up 2026-10-09 on a Mac (`mongod` 8.2.11, 256M cache, six
+      processes writing and `F_FULLFSYNC`ing 512 MiB files beside the store,
+      one client inserting 100 x 8 KiB): BOTH servers stall single inserts
+      for seconds. Two 60 s runs each: `mongod` max 1.5 s and 4.1 s, the Rust
+      server 1.3 s and 3.3 s; without the disk load neither exceeds 0.5 s.
+      `mongod`'s `Slow query` line puts its 4.1 s in
+      `storage.timeWaitingMicros.cacheMicros` with 4 MB written by the
+      operation's own thread, i.e. application-thread eviction blocked on the
+      disk. So seconds-long stalls under disk contention are shared with
+      `mongod`; a TEN-second one was not reproduced and stays unexplained.
+      The server now logs `Slow query` lines and the harness keeps a failed
+      row's server log and store, so a recurrence says whether the server
+      held the insert.
+- [ ] **PYTHON MongoDB server: `profile`'s `slowms` and `sampleRate` are kept
+      per database.** `mongod` 8.2.11 keeps them server-wide (set through
+      database `a`, `profile: -1` on `b` reads them back). The Rust server
+      was moved 2026-10-09; the Python server was not touched. It also
+      writes no `Slow query` log line.
+- [ ] **RUST MongoDB server: the `Slow query` line does not say where the time
+      went.** `mongod`'s carries `storage.timeWaitingMicros` (cache, schema
+      lock) and bytes written by the operation; ours has only the duration.
+      WiredTiger keeps these per session (`statistics:session`), but the
+      storage layer opens a session per operation and exposes none of it.
+      Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
+      `nreturned`, `reslen`, and the command document.
+
 ### 7.06 Release tooling gaps found cutting 0.6.0b18 -- 2026-10-07
 
 - [ ] **The binary smoke test and the stale-artifact check look at DIFFERENT

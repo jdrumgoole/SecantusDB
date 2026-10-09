@@ -676,6 +676,7 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // shutdown). A non-await_data cursor or a zero deadline polls exactly once.
         let max_time_ms = doc.get("maxTimeMS").and_then(as_i64).unwrap_or(1000).max(0) as u64;
         let deadline = Instant::now() + Duration::from_millis(max_time_ms);
+        let mut awaited = Duration::ZERO;
 
         let mut batch;
         let mut position;
@@ -709,7 +710,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // `position` or the deadline; then re-poll (the producer reads the
             // newly-appended entries). killCursors wakes this via notify.
             storage.wait_for_oplog(position, (deadline - now).as_millis() as u64);
+            awaited += now.elapsed();
         }
+        ctx.awaited.set(ctx.awaited.get() + awaited);
 
         // A fatal projection error ends the stream with an `ok: 0` reply (the
         // cursor was already dropped in the registry).

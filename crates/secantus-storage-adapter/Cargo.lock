@@ -1115,6 +1115,8 @@ name = "secantus-server"
 version = "0.5.3-beta.174"
 dependencies = [
  "bson",
+ "log",
+ "rand",
  "rustls",
  "rustls-pemfile",
  "secantus-commands",

@@ -2143,8 +2143,17 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let prev = storage.get_profile(&db).map_err(command_error)?;
     let prev_level = prev.get_i32("level").unwrap_or(0);
-    let prev_slowms = prev.get_i32("slowms").unwrap_or(100);
-    let prev_rate = prev.get_f64("sampleRate").unwrap_or(1.0);
+    // `slowms` and `sampleRate` are server-wide on mongod: set through one
+    // database, read back through every other (probed on 8.2.11). Only the
+    // level is per-database.
+    let slow_ops = ctx.slow_ops.clone();
+    let (prev_slowms, prev_rate) = match &slow_ops {
+        Some(s) => (s.slow_ms(), s.sample_rate()),
+        None => (
+            prev.get_i32("slowms").unwrap_or(100),
+            prev.get_f64("sampleRate").unwrap_or(1.0),
+        ),
+    };
     let was = doc! {
         "was": prev_level,
         "slowms": prev_slowms,
@@ -2172,6 +2181,9 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             storage
                 .set_profile(&db, level, slowms, rate)
                 .map_err(command_error)?;
+            if let Some(s) = &slow_ops {
+                s.set(slowms, rate);
+            }
             Ok(was)
         }
         _ => Ok(
