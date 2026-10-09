@@ -148,6 +148,62 @@ fn capped_collection_keeps_its_newest_document_whatever_its_size() {
     }
 }
 
+/// An upsert's insert is held to the cap like any other insert (mongod
+/// 8.2.11). It used to be skipped, so upserts grew a capped collection
+/// without limit.
+#[test]
+fn capped_bounds_hold_for_upserts() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "c", "capped": true, "max": 3i64, "size": 100000i64},
+            c,
+        );
+        dispatch(&doc! {"insert": "c", "documents": capped_batch(0..3, 1)}, c);
+        for id in [10, 11, 12] {
+            let reply = dispatch(
+                &doc! {"update": "c", "updates": [{"q": {"_id": id}, "u": {"$set": {"a": 1}}, "upsert": true}]},
+                c,
+            );
+            assert_eq!(reply.get_array("upserted").unwrap().len(), 1, "{reply}");
+        }
+        assert_eq!(capped_ids(c), vec![10, 11, 12]);
+        dispatch(
+            &doc! {"findAndModify": "c", "query": {"_id": 77}, "update": {"$set": {"a": 1}}, "upsert": true},
+            c,
+        );
+        assert_eq!(capped_ids(c), vec![11, 12, 77]);
+        // A replacement upsert, and four upserts in one command.
+        dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"_id": 88}, "u": {"a": 2}, "upsert": true}]},
+            c,
+        );
+        assert_eq!(capped_ids(c), vec![12, 77, 88]);
+        let many: Vec<Bson> = (90..94)
+            .map(|i| {
+                Bson::Document(doc! {"q": {"_id": i}, "u": {"$set": {"a": 1}}, "upsert": true})
+            })
+            .collect();
+        dispatch(&doc! {"update": "c", "updates": many}, c);
+        assert_eq!(capped_ids(c), vec![91, 92, 93]);
+    });
+}
+
+/// `max` of zero or less is "no document limit" on mongod, which keeps all
+/// five. Read as a limit, it evicted everything except the newest document.
+#[test]
+fn capped_max_of_zero_or_less_is_no_limit() {
+    for max in [0i64, -5] {
+        with_wt(|c| {
+            dispatch(
+                &doc! {"create": "c", "capped": true, "max": max, "size": 100000i64},
+                c,
+            );
+            dispatch(&doc! {"insert": "c", "documents": capped_batch(0..5, 1)}, c);
+            assert_eq!(capped_ids(c), vec![0, 1, 2, 3, 4], "max={max}");
+        });
+    }
+}
+
 #[test]
 fn insert_then_count() {
     with_wt(|c| {
