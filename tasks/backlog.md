@@ -2787,9 +2787,11 @@ These work end-to-end but cut corners.
       that names the failure and distinguishes the remaining possibilities.
       Probe: `scratchpad/sockwatch.py` in the session that measured this.
 
-- [ ] **OPEN — Rust PostgreSQL server on LINUX: durable writes are 2.1-2.4x
-      slower than PostgreSQL at EVERY client count, one client included
-      (measured 2026-10-08).** The first Linux measurement. It is a different
+- [ ] **OPEN — Rust PostgreSQL server on LINUX: durable writes WERE
+      2.1-2.4x slower than PostgreSQL at EVERY client count, one client
+      included (measured 2026-10-08); 1.3-1.7x through eight clients and ~2x
+      at sixteen as of 2026-10-09 (the "Done" sections below, newest
+      last).** The first Linux measurement. It is a different
       problem from the macOS one below: there the gap opens only under
       concurrency, here it is the cost of one statement.
 
@@ -2926,6 +2928,42 @@ These work end-to-end but cut corners.
       with it against 3.4x without). So above two clients the limit is not
       CPU in the statement; look at what the writers wait on before taking
       more instructions out.
+
+      **Done 2026-10-09: the log is zero-filled, which was the multi-client
+      limit.** Syscall counts and time (`bpftrace`, 9s of a durable UPDATE by
+      PK) showed both servers bound by ONE stream of `fdatasync` calls, about
+      80% busy at eight clients, and ours slower per call: 149 us against
+      PostgreSQL's 102 with one client, 177 against 128 with eight.
+      WiredTiger `fallocate`s its log file and never writes it, so the first
+      write into each block converts an unwritten extent and the `fdatasync`
+      commits a filesystem journal transaction too; PostgreSQL zero-fills a
+      WAL segment. With `log=(zero_fill=true)` the call is ~110 us.
+      `prealloc=true` alone changed nothing. The server now sets it, with
+      16 MB files, on Linux when commits sync (`server::zero_filled_log`):
+      128 MB zero-filled added 150 ms to each start, 16 MB adds 25 ms, same
+      throughput. `bench/pg_concurrency.py` on the same `c-16`, the build
+      before this change -> after, ops/s at 1 / 2 / 4 / 8 / 16 clients:
+
+      | | before | after | PostgreSQL 16 |
+      | --- | --- | --- | --- |
+      | UPDATE | 2,474 / 4,343 / 6,647 / 8,530 / 9,905 | 2,963 / 5,297 / 8,769 / 12,543 / 14,504 | 4,623 / 7,532 / 13,669 / 20,780 / 31,335 |
+      | INSERT | 2,783 / 4,904 / 7,341 / 9,381 / 10,308 | 3,355 / 6,193 / 9,726 / 13,767 / 15,440 | 4,795 / 8,211 / 13,345 / 20,862 / 30,696 |
+
+      So through eight clients the server is now 1.3-1.7x slower than
+      PostgreSQL (INSERT 1.3-1.5x, UPDATE 1.4-1.7x), and about 2x at sixteen.
+      Checked on the droplet: a 60 MB transaction commits and survives a
+      SIGKILL with 16 MB files; a store written by the previous build, killed,
+      reopened by this one and back again (five kills, 15,000 acknowledged
+      rows) lost nothing.
+
+      What that leaves for many clients is COMMITS PER SYNC: at eight clients
+      ours averaged 1.8 commits per `fdatasync` and PostgreSQL 2.7, at
+      sixteen 3.1 against 5.7. Each of our commits is also its own `pwrite`
+      (384 bytes), where PostgreSQL writes one 8K block per sync. That is
+      WiredTiger's log-slot hand-off under `method=fsync`, the same place
+      `patch_wt_dsync_group.py` changed for `method=dsync`.
+      NOT measured: whether zero-fill helps macOS (`method=dsync`), or the
+      MongoDB server under `--sync-on-commit`; neither is changed.
 
       What is left, in order of what the profile offers:
       - a stored value into any other column type (`varchar(n)`, `smallint`,
