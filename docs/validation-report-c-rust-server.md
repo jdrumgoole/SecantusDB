@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-c-driver 57dba9c049 (`vendor/mongo-c-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 

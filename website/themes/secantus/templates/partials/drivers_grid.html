@@ -38,7 +38,7 @@
       <span class="rate">99.7%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>495</strong> tests passed &middot; <strong>1</strong> known divergence</p>
+    <p class="counts"><strong>495</strong> tests passed &middot; <strong>1</strong> failed</p>
     <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> &mdash; integration tests that open a real connection to a SecantusDB daemon (the driver's own BSON codec unit tests are run but not counted here; they never touch the server). Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -77,10 +77,10 @@
       <span class="lang">Go</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">97.3%</span>
+      <span class="rate">98.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>594</strong> tests passed &middot; <strong>16</strong> failed</p>
+    <p class="counts"><strong>598</strong> tests passed &middot; <strong>12</strong> failed</p>
     <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -105,10 +105,10 @@
       <span class="lang">Rust</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.0%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>100</strong> tests passed &middot; <strong>1</strong> failed</p>
+    <p class="counts"><strong>101</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The official MongoDB Rust driver &mdash; the basis for Tokio-async MongoDB consumers in Rust. We run a curated set of <code>driver/src/test/</code> in-tree tests via <code>cargo test --lib -p mongodb</code> with <code>MONGODB_URI</code> explicitly overridden in the subprocess env, so the rust driver's fallback chain (<code>$MONGODB_URI</code> &rarr; <code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) can't accidentally route to a real mongod.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-rust.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -133,10 +133,10 @@
       <span class="lang">PHP</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.6%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>253</strong> tests passed &middot; <strong>1</strong> failed</p>
+    <p class="counts"><strong>254</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The low-level PHP extension &mdash; the C-based PECL <code>ext-mongodb</code> that wraps libmongoc and underpins the library above. We run its <code>.phpt</code> wire-protocol suite via PHP's <code>run-tests.php</code> against an embedded SecantusDB daemon (the pure BSON-serialization tests are run but not counted). Alongside Go, the strictest wire-shape check we run &mdash; type divergences pymongo accepts silently fail here.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-php-ext.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -147,10 +147,10 @@
       <span class="lang">C</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">98.9%</span>
+      <span class="rate">99.7%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>782</strong> tests passed &middot; <strong>2</strong> failed &middot; <strong>6</strong> known divergences</p>
+    <p class="counts"><strong>790</strong> tests passed &middot; <strong>2</strong> known divergences</p>
     <p class="note">The official MongoDB <strong>C</strong> driver (<code>libmongoc</code>) &mdash; the lowest-level official client, the one the PHP, Ruby (bson), and PyMongo C-extensions ultimately wrap. We build its <code>test-libmongoc</code> suite from source and run a curated set of wire-protocol prefixes (CRUD / cursor / aggregate / command / GridFS / index management) against an embedded SecantusDB daemon via <code>MONGOC_TEST_URI</code>. A strict C client &mdash; type and wire-shape divergences surface here that permissive clients accept.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-c.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -207,10 +207,10 @@
       <span class="lang">Python / asyncio</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">98.5%</span>
+      <span class="rate">99.4%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>1101</strong> tests passed &middot; <strong>10</strong> failed &middot; <strong>6</strong> known divergences</p>
+    <p class="counts"><strong>1111</strong> tests passed &middot; <strong>6</strong> known divergences</p>
     <p class="note">pymongo's native <code>AsyncMongoClient</code> suite &mdash; the async/await wire path that replaced Motor. Same unmodified upstream tests as the sync gauge, run under <code>pytest-asyncio</code> against the same embedded SecantusDB, so the non-blocking client is held to the same bar rather than assumed to follow from the sync one. Remaining failures are the same out-of-scope surfaces (text / hashed indexes, server-side <code>$where</code>) plus a few timeout-introspection tests.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-pymongo-async.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -221,10 +221,10 @@
       <span class="lang">Java</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.5%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>494</strong> tests passed &middot; <strong>1</strong> failed &middot; <strong>1</strong> known divergence</p>
+    <p class="counts"><strong>496</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The driver enterprise MongoDB consumers most often use, and the foundation for many JVM-language wrappers. We run a curated subset of <code>driver-sync/src/test/functional/</code> &mdash; integration tests that open a real connection to a SecantusDB daemon (the driver's own BSON codec unit tests are run but not counted here; they never touch the server). Type-strict decoders catch wire-shape divergences pymongo's permissive client accepts silently.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-java.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -263,10 +263,10 @@
       <span class="lang">Go</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">97.3%</span>
+      <span class="rate">98.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>594</strong> tests passed &middot; <strong>16</strong> failed</p>
+    <p class="counts"><strong>598</strong> tests passed &middot; <strong>12</strong> failed</p>
     <p class="note">The same driver <code>mongodump</code> and <code>mongorestore</code> are built on. We run <code>./internal/integration/...</code> &mdash; the package that opens real <code>mongo.Client</code> instances and exchanges wire commands. Type-strict (<code>int32</code> vs <code>int64</code>) bugs that pymongo accepts silently fail loudly here.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-go.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -319,10 +319,10 @@
       <span class="lang">PHP</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.6%</span>
+      <span class="rate">100.0%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>253</strong> tests passed &middot; <strong>1</strong> failed</p>
+    <p class="counts"><strong>254</strong> tests passed &middot; <strong>0</strong> failed</p>
     <p class="note">The low-level PHP extension &mdash; the C-based PECL <code>ext-mongodb</code> that wraps libmongoc and underpins the library above. We run its <code>.phpt</code> wire-protocol suite via PHP's <code>run-tests.php</code> against an embedded SecantusDB daemon (the pure BSON-serialization tests are run but not counted). Alongside Go, the strictest wire-shape check we run &mdash; type divergences pymongo accepts silently fail here.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-php-ext.html" rel="noopener">Read the report &rarr;</a>
   </article>
@@ -333,10 +333,10 @@
       <span class="lang">C</span>
     </header>
     <div class="pass-rate">
-      <span class="rate">99.1%</span>
+      <span class="rate">99.6%</span>
       <span class="rate-label">pass rate</span>
     </div>
-    <p class="counts"><strong>783</strong> tests passed &middot; <strong>1</strong> failed &middot; <strong>6</strong> known divergences</p>
+    <p class="counts"><strong>789</strong> tests passed &middot; <strong>1</strong> failed &middot; <strong>2</strong> known divergences</p>
     <p class="note">The official MongoDB <strong>C</strong> driver (<code>libmongoc</code>) &mdash; the lowest-level official client, the one the PHP, Ruby (bson), and PyMongo C-extensions ultimately wrap. We build its <code>test-libmongoc</code> suite from source and run a curated set of wire-protocol prefixes (CRUD / cursor / aggregate / command / GridFS / index management) against an embedded SecantusDB daemon via <code>MONGOC_TEST_URI</code>. A strict C client &mdash; type and wire-shape divergences surface here that permissive clients accept.</p>
     <a class="report" href="https://secantusdb.com/docs/validation-report-c.html" rel="noopener">Read the report &rarr;</a>
   </article>

@@ -1,6 +1,6 @@
 # mongo-ruby-driver Validation Report
 
-Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-ruby-driver f68d676643c1 (`vendor/mongo-ruby-driver/`).
 
 Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver gauges for the official Ruby driver — the same gem Rails + Sinatra applications and the Ruby ecosystem build on.
 
@@ -12,7 +12,7 @@ Run `uv run python -m invoke validate-ruby` to refresh. The pass rate is the ana
 | `spec/support` | 89 | 0 | 8 | 97 | 100.0% |
 | **Overall** | **293** | **1** | **24** | **318** | **99.6%** |
 
-Run time: 22.34s.
+Run time: 22.12s.
 
 ## Failures (1)
 
