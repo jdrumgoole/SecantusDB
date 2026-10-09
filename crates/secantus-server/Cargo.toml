@@ -1,6 +1,6 @@
 [package]
 name = "secantus-server"
-version = "0.5.3-beta.174"
+version = "0.5.3-beta.175"
 edition = "2021"
 description = "The standalone SecantusDB Rust server: TCP accept loop + connection handling over secantus-wire + secantus-commands."
 license = "GPL-2.0-only"
@@ -22,8 +22,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 bson = { workspace = true }
-secantus-wire = { version = "=0.5.3-beta.174", path = "../secantus-wire" }
-secantus-commands = { version = "=0.5.3-beta.174", path = "../secantus-commands" }
+secantus-wire = { version = "=0.5.3-beta.175", path = "../secantus-wire" }
+secantus-commands = { version = "=0.5.3-beta.175", path = "../secantus-commands" }
 # TLS / mTLS in the accept loop (R5c). `ring` crypto backend (no cmake/nasm
 # build, unlike aws-lc-rs). `rustls-pemfile` loads the PEM cert/key/CA;
 # `x509-parser` extracts the verified client cert's subject DN for MONGODB-X509.

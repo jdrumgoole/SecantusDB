@@ -92,7 +92,7 @@ Python wheel. `cargo install` builds it (WiredTiger included) and puts the
 `secantusd-rs` daemon on `PATH`:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.174
+cargo install secantus-mdb --version 0.5.3-beta.175
 secantusd-rs --host 127.0.0.1 --port 27017
 ```
 
@@ -110,7 +110,7 @@ Mongo daemons read the same `secantusd.toml` config (see
 ### SQL / PostgreSQL servers
 
 The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.6`), and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.7`), and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
