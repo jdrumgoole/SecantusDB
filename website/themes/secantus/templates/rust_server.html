@@ -60,26 +60,26 @@
 <section class="section">
   <div class="wrap">
     <h2>Measured, not promised</h2>
-    <p class="section-lead">Nine workloads, median of five runs, end to end through <code>pymongo</code> on on-disk WiredTiger, with a real <code>mongod</code> 8.0.32 as the reference &mdash; all three on a dedicated 8-vCPU cloud instance, because a laptop cannot be trusted for this. Across three runs of the same build the Rust server runs at <strong>1.0&times;&ndash;4.1&times; of mongod</strong> per operation, and <strong>~1.7&times;&ndash;14.8&times; faster than the Python reference</strong> workload for workload.</p>
+    <p class="section-lead">Nine workloads, median of fifteen interleaved runs, end to end through <code>pymongo</code> on on-disk WiredTiger, with a real <code>mongod</code> 8.0.32 as the reference &mdash; all three on a dedicated 8-vCPU cloud instance, because a laptop cannot be trusted for this. Across three such measurements the Rust server runs at <strong>1.0&times;&ndash;3.2&times; of mongod</strong> per operation, and <strong>~1.9&times;&ndash;13.5&times; faster than the Python reference</strong> workload for workload.</p>
     <div class="compare-wrap">
       <table class="compare-table">
         <thead>
           <tr><th>Workload</th><th>mongod</th><th>Rust server</th><th><span class="unit-x">x</span>&hairsp;mongod</th></tr>
         </thead>
         <tbody>
-          <tr><th>insert (10k docs)</th><td>79.6 ms</td><td>152.8 ms</td><td>1.9<span class="unit-x">x</span></td></tr>
-          <tr><th>find indexed range</th><td>9.4 ms</td><td>10.1 ms</td><td>1.1<span class="unit-x">x</span></td></tr>
-          <tr><th>find full scan</th><td>18.2 ms</td><td>18.4 ms</td><td>1.0<span class="unit-x">x</span></td></tr>
-          <tr><th>find filtered scan</th><td>14.5 ms</td><td>16.4 ms</td><td>1.1<span class="unit-x">x</span></td></tr>
-          <tr><th>update_many (half)</th><td>91.8 ms</td><td>134.0 ms</td><td>1.5<span class="unit-x">x</span></td></tr>
-          <tr><th>aggregate <code>$group</code></th><td>12.2 ms</td><td>23.1 ms</td><td>1.9<span class="unit-x">x</span></td></tr>
-          <tr><th>aggregate multi-stage</th><td>14.3 ms</td><td>50.0 ms</td><td>3.5<span class="unit-x">x</span></td></tr>
-          <tr><th>delete_many (half)</th><td>42.7 ms</td><td>88.1 ms</td><td>2.1<span class="unit-x">x</span></td></tr>
-          <tr><th>change-stream drain</th><td>107.5 ms</td><td>120.4 ms</td><td>1.1<span class="unit-x">x</span></td></tr>
+          <tr><th>insert (10k docs)</th><td>93.0 ms</td><td>190.7 ms</td><td>2.1<span class="unit-x">x</span></td></tr>
+          <tr><th>find indexed range</th><td>11.3 ms</td><td>11.2 ms</td><td>1.0<span class="unit-x">x</span></td></tr>
+          <tr><th>find full scan</th><td>20.9 ms</td><td>22.6 ms</td><td>1.1<span class="unit-x">x</span></td></tr>
+          <tr><th>find filtered scan</th><td>16.0 ms</td><td>21.5 ms</td><td>1.3<span class="unit-x">x</span></td></tr>
+          <tr><th>update_many (half)</th><td>109.8 ms</td><td>155.4 ms</td><td>1.4<span class="unit-x">x</span></td></tr>
+          <tr><th>aggregate <code>$group</code></th><td>14.3 ms</td><td>27.1 ms</td><td>1.9<span class="unit-x">x</span></td></tr>
+          <tr><th>aggregate multi-stage</th><td>16.5 ms</td><td>42.3 ms</td><td>2.6<span class="unit-x">x</span></td></tr>
+          <tr><th>delete_many (half)</th><td>56.0 ms</td><td>105.2 ms</td><td>1.9<span class="unit-x">x</span></td></tr>
+          <tr><th>change-stream drain</th><td>115.0 ms</td><td>141.4 ms</td><td>1.2<span class="unit-x">x</span></td></tr>
         </tbody>
       </table>
     </div>
-    <p class="perf-note" style="margin-top: 20px;">Full scan sits at parity with mongod, with indexed range, filtered scan and the change-stream drain a shade behind at 1.1<span class="unit-x">x</span>. The gaps left are dispatch and operator work &mdash; aggregation (1.9&ndash;3.5<span class="unit-x">x</span>), <code>delete_many</code> (2.1<span class="unit-x">x</span>) and insert (1.9<span class="unit-x">x</span>) &mdash; above a storage engine that is literally the same C library mongod links. Every number includes the wire and driver overhead a real client pays. <a href="/performance.html">All three servers, latency and concurrency &rarr;</a></p>
+    <p class="perf-note" style="margin-top: 20px;">The table is the newest of the three runs. The indexed range read sits at parity with mongod, with full scan, the change-stream drain and filtered scan behind it at 1.1&ndash;1.3<span class="unit-x">x</span>. The gaps left are dispatch and operator work &mdash; aggregation (1.9&ndash;2.6<span class="unit-x">x</span>), <code>delete_many</code> (1.9<span class="unit-x">x</span>) and insert (2.1<span class="unit-x">x</span>) &mdash; above a storage engine that is literally the same C library mongod links. Every number includes the wire and driver overhead a real client pays. <a href="/performance.html">All three servers, latency and concurrency &rarr;</a></p>
   </div>
 </section>
 

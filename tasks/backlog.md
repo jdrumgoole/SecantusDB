@@ -8513,7 +8513,8 @@ server turned out to be the Java gauge's own parallelism).
       writeback on an otherwise idle machine. No OOM kill, no server log
       survived (the harness removes its temp stores). The evidence points at
       the machine, and does not exclude a stall in the server. If it recurs,
-      keep the server's log and store before the harness cleans up.
+      keep the server's log and store before the harness cleans up. Two later
+      sweeps the same day, on other droplets, completed all rows.
 
 ### 7.06 Release tooling gaps found cutting 0.6.0b18 -- 2026-10-07
 
