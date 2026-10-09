@@ -63,6 +63,57 @@ const STORED_COLL_OPTIONS: [&str; 11] = [
     "indexOptionDefaults",
 ];
 
+/// The largest capped-collection `size` mongod accepts (1 PB).
+const CAPPED_SIZE_MAX: i64 = 1 << 50;
+/// What mongod stores for a capped `max` that means "no document limit".
+pub(crate) const CAPPED_MAX_UNLIMITED: i64 = i32::MAX as i64;
+
+/// An integer as mongod reports it: int32 when it fits, int64 otherwise.
+pub(crate) fn int_bson(v: i64) -> Bson {
+    match i32::try_from(v) {
+        Ok(n) => Bson::Int32(n),
+        Err(_) => Bson::Int64(v),
+    }
+}
+
+/// A capped collection's byte bound, as `create.size` / `collMod.cappedSize`
+/// take it (`field` names it in the error). mongod reads any number as a
+/// 64-bit integer -- a fraction is dropped, NaN is 0, an out-of-range double
+/// saturates -- and then requires 1 to 1 PB. Measured on 8.2.11.
+fn capped_size(field: &str, v: &Bson) -> Result<i64, CommandError> {
+    let n = as_i64(v).unwrap_or(0);
+    if n < 1 {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field '{field}' value must be >= 1, actual value '{n}'"),
+        ));
+    }
+    if n > CAPPED_SIZE_MAX {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field '{field}' value must be <= {CAPPED_SIZE_MAX}, actual value '{n}'"),
+        ));
+    }
+    Ok(n)
+}
+
+/// A capped collection's document bound (`create.max` / `collMod.cappedMax`).
+/// Zero or less means no limit, which mongod stores as 2147483647; 2^31 or
+/// more is refused. Measured on 8.2.11.
+fn capped_max(field: &str, v: &Bson) -> Result<i64, CommandError> {
+    let n = as_i64(v).unwrap_or(0);
+    if n > CAPPED_MAX_UNLIMITED {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field '{field}' value must be < 2147483648, actual value '{n}'"),
+        ));
+    }
+    Ok(if n <= 0 { CAPPED_MAX_UNLIMITED } else { n })
+}
+
 /// The subset of a command doc that maps to persisted collection options.
 fn collection_option_subset(doc: &Document) -> Document {
     let mut out = Document::new();
@@ -106,8 +157,20 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let capped_true = matches!(doc.get("capped"), Some(Bson::Boolean(true)))
         || matches!(doc.get("capped"), Some(Bson::Int32(n)) if *n != 0)
         || matches!(doc.get("capped"), Some(Bson::Int64(n)) if *n != 0)
-        || matches!(doc.get("capped"), Some(Bson::Double(d)) if *d != 0.0);
+        || matches!(doc.get("capped"), Some(Bson::Double(d)) if *d != 0.0)
+        || matches!(doc.get("capped"), Some(d @ Bson::Decimal128(_)) if as_i64(d) != Some(0));
     let has = |f: &str| !matches!(doc.get(f), None | Some(Bson::Null));
+    // The RANGE of `size` and `max` is part of parsing the command, so it is
+    // checked before the two rules below and whether or not `capped` is set:
+    // `{create: "c", size: 0}` is the range error, not "needs to be true".
+    let size = match doc.get("size") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(capped_size("size", v)?),
+    };
+    let max = match doc.get("max") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(capped_max("max", v)?),
+    };
     if capped_true && !has("size") {
         return Err(CommandError::new(
             72,
@@ -139,6 +202,21 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
     let mut opts = collection_option_subset(doc);
+    // A capped collection's options are stored as mongod reports them:
+    // `capped: true` whatever number said so, and integer `size` / `max`
+    // (pymongo sends `size` as a double, and it used to be echoed as one).
+    opts.remove("capped");
+    opts.remove("size");
+    opts.remove("max");
+    if capped_true {
+        opts.insert("capped", true);
+        if let Some(size) = size {
+            opts.insert("size", int_bson(size));
+        }
+        if let Some(max) = max {
+            opts.insert("max", int_bson(max));
+        }
+    }
     // `viewOn` + `pipeline` makes this a read-only view of another collection
     // (mongod 3.4+). Store the source and the pipeline (under `viewPipeline` so
     // it doesn't collide with an aggregate's `pipeline`); `listCollections`
@@ -254,6 +332,38 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "collMod.changeStreamPreAndPostImages",
     )?;
     argtypes::require_string(doc, "viewOn", "collMod.viewOn")?;
+    for field in ["cappedSize", "cappedMax"] {
+        if let Some(v) = doc.get(field) {
+            if !matches!(
+                v,
+                Bson::Null
+                    | Bson::Int32(_)
+                    | Bson::Int64(_)
+                    | Bson::Double(_)
+                    | Bson::Decimal128(_)
+            ) {
+                // Not `argtypes::require_number`: collMod lists the numeric
+                // types in its own order.
+                return Err(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "BSON field 'collMod.{field}' is the wrong type '{}', expected types \
+                         '[double, int, long, decimal]'",
+                        secantus_core::query::bson_type_name(v)
+                    ),
+                ));
+            }
+        }
+    }
+    let capped_size_arg = match doc.get("cappedSize") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(capped_size("cappedSize", v)?),
+    };
+    let capped_max_arg = match doc.get("cappedMax") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(capped_max("cappedMax", v)?),
+    };
     // An unknown field is refused, not ignored (measured 8.2.11, 2026-10-01).
     if let Some(unknown) = doc
         .keys()
@@ -398,7 +508,26 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 .map_err(command_error)?;
         }
     }
-    let opts = collection_option_subset(doc);
+    let mut opts = collection_option_subset(doc);
+    // `cappedSize` / `cappedMax` re-bound a capped collection. Nothing is
+    // evicted here; the next insert brings the collection within the new
+    // bounds, as on mongod. They were accepted and ignored until 2026-10-09.
+    if capped_size_arg.is_some() || capped_max_arg.is_some() {
+        if !storage
+            .collection_is_capped(&ctx.db_name, &coll)
+            .map_err(command_error)?
+        {
+            return Ok(
+                CommandError::new(72, "InvalidOptions", "Collection must be capped.").into_reply(),
+            );
+        }
+        if let Some(size) = capped_size_arg {
+            opts.insert("size", int_bson(size));
+        }
+        if let Some(max) = capped_max_arg {
+            opts.insert("max", int_bson(max));
+        }
+    }
     // `coll_mod` (not `set_collection_options`) so a `showExpandedEvents` change
     // stream sees the resulting `modify` event.
     storage
@@ -939,7 +1068,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         for k in ["size", "max"] {
             if let Some(Bson::Int64(v)) = options.get(k) {
                 let v = *v;
-                options.insert(k, Bson::Int32(v as i32));
+                options.insert(k, int_bson(v));
             }
         }
         let coll_type = if is_view {
@@ -1897,7 +2026,7 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .map_err(command_error)?;
     let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
     let avg_obj_size = if count > 0 { size / count } else { 0 };
-    Ok(doc! {
+    let mut reply = doc! {
         "ns": format!("{}.{}", ctx.db_name, coll),
         "count": count as i32,
         "size": size,
@@ -1907,8 +2036,23 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "totalIndexSize": total_index_size,
         "indexSizes": index_sizes,
         "capped": capped,
-        "ok": 1.0,
-    })
+    };
+    if capped {
+        // mongod reports a capped collection's bounds here: `max` (0 when no
+        // document limit was given) and the byte bound as `maxSize`.
+        let opts = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .unwrap_or_default();
+        reply.insert(
+            "max",
+            int_bson(opts.get("max").and_then(as_i64).unwrap_or(0)),
+        );
+        if let Some(size) = opts.get("size").and_then(as_i64) {
+            reply.insert("maxSize", int_bson(size));
+        }
+    }
+    reply.insert("ok", 1.0);
+    Ok(reply)
 }
 
 /// `dbStats` — database-wide totals aggregated across collections.

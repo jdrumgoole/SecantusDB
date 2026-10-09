@@ -306,17 +306,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // decoded (tasks/rust-perf-findings.md).
                 let (reduced, remaining) =
                     reduce_raw_prefix(bytes, &rest, &vars, collation.as_ref());
-                // If the first heavier stage is a `$group`, decode only the
-                // top-level fields its `_id` + accumulators read from each
+                // If the pipeline reaches a `$group` / `$count` through stages
+                // that only pass documents along (`$unwind`, `$sort`, ...),
+                // decode only the top-level fields those stages read from each
                 // survivor, not the whole (often wide) document
-                // (tasks/rust-phase6-streaming-agg-scoping.md, 6a). Any group
-                // shape the collector can't bound falls back to a full decode.
-                let group_fields = remaining
-                    .first()
-                    .and_then(Bson::as_document)
-                    .filter(|d| d.len() == 1)
-                    .and_then(|d| d.get("$group"))
-                    .and_then(secantus_core::referenced_top_level_fields);
+                // (tasks/rust-phase6-streaming-agg-scoping.md, 6a). Any shape
+                // the collector can't bound falls back to a full decode.
+                let group_fields = secantus_core::pipeline_prefix_fields(&remaining);
                 let input = match group_fields {
                     Some(fields) => decode_docs_minimal(reduced, &fields)?,
                     None => decode_docs(reduced)?,
@@ -2047,11 +2043,11 @@ fn apply_coll_stats(
             // silently vanished from the reply.
             let opts = storage.get_collection_options(db, coll).unwrap_or_default();
             if let Some(size) = opts.get("size").and_then(as_i64) {
-                storage_stats.insert("maxSize", size);
+                storage_stats.insert("maxSize", crate::admin::int_bson(size));
             }
-            if let Some(max) = opts.get("max").and_then(as_i64) {
-                storage_stats.insert("max", max);
-            }
+            // 0 when the collection has no document limit, as mongod has it.
+            let max = opts.get("max").and_then(as_i64).unwrap_or(0);
+            storage_stats.insert("max", crate::admin::int_bson(max));
         }
         out.insert("storageStats", storage_stats);
     }

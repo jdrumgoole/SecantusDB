@@ -8611,6 +8611,44 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.065 Capped collections -- 2026-10-09
+
+- [ ] **RUST MongoDB server: `convertToCapped` is not implemented**
+      (`CommandNotFound`). `mongod` 8.2.11 rebuilds the collection capped at
+      `size`, keeping the newest documents that fit (20 x 100-byte documents
+      into `size: 1000` leaves the last 8); a missing source is 26 `source
+      collection t.nope does not exist`, and no `size` is 72 `Capped
+      collection size must be greater than zero`. `cloneCollectionAsCapped`
+      was not probed.
+- [ ] **RUST MongoDB server: a transaction the server aborted reports the
+      wrong 251 message.** After a refused statement aborts a transaction,
+      `mongod` 8.2.11 answers the next statement and the commit with
+      `Transaction with { txnNumber: N } has been aborted.`; the Rust server
+      says `Given transaction number N does not match any in-progress
+      transactions.` Code, code name and the `TransientTransactionError`
+      label match. Seen on the capped-collection refusals; the registry's
+      `abort_in_progress` is shared by every server-side abort.
+- [ ] **RUST MongoDB server: `collMod` on a missing collection says `ns does
+      not exist: t.c`.** `mongod` 8.2.11 says `ns does not exist` (same code,
+      26). Measured with `{collMod: "nonesuch", cappedSize: 10}` only.
+- [ ] **RUST MongoDB server: a `collMod` of `cappedSize` / `cappedMax` is
+      written to the oplog as `size` / `max`.** `mongod` records the command
+      as sent. Replay applies it correctly; a `showExpandedEvents` change
+      stream shows different field names. Not probed.
+- [ ] **PYTHON MongoDB server: 51 of 97 capped-collection results differ from
+      `mongod` 8.2.11** (`tools/probes/capped_collections.py`, 2026-10-09; the
+      Rust server is at 0, from 67). The fixes of that day were made on the
+      Rust server only: a batch and an upsert held to the cap, `max <= 0` as
+      no limit, the `size` / `max` ranges and integer storage, `collMod`
+      `cappedSize` / `cappedMax`, `collStats` `max` / `maxSize`. The Python
+      server does refuse a write inside a transaction, with its own wording
+      and reply shape.
+- [ ] **RUST MongoDB server: capped eviction rescans the whole collection on
+      every insert chunk.** `enforce_capped_bounds` calls `scan_docs` and sums
+      every document's size to learn the collection's size and count, so an
+      insert into a capped collection costs time proportional to the
+      collection. Not measured. A running size and count would remove it.
+
 ### 7.06 Release tooling gaps found cutting 0.6.0b18 -- 2026-10-07
 
 - [ ] **The binary smoke test and the stale-artifact check look at DIFFERENT

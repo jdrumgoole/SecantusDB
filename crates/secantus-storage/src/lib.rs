@@ -8521,14 +8521,9 @@ impl Storage {
         const INSERT_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
         let mut inserted = 0usize;
         let mut errors: Vec<Document> = Vec::new();
-        // Committed prior chunks' doc keys, so capped eviction never evicts
-        // documents of the batch being inserted. Extended only after a chunk
-        // commits — the conflict-retry re-runs a rolled-back chunk and must
-        // not see its phantom keys.
-        let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
         if docs.is_empty() {
             // An empty batch still lazily creates the collection.
-            let (_, _, _, _) = self.insert_chunk(db, coll, &[], 0, ordered, &fresh_id_keys)?;
+            let (_, _, _) = self.insert_chunk(db, coll, &[], 0, ordered)?;
             return Ok((0, errors));
         }
         let n = docs.len();
@@ -8543,11 +8538,10 @@ impl Storage {
                 chunk_bytes += docs[end].len();
                 end += 1;
             }
-            let (chunk_inserted, chunk_errors, chunk_keys, stopped) =
-                self.insert_chunk(db, coll, &docs[start..end], start, ordered, &fresh_id_keys)?;
+            let (chunk_inserted, chunk_errors, stopped) =
+                self.insert_chunk(db, coll, &docs[start..end], start, ordered)?;
             inserted += chunk_inserted;
             errors.extend(chunk_errors);
-            fresh_id_keys.extend(chunk_keys);
             if stopped {
                 break;
             }
@@ -8558,11 +8552,8 @@ impl Storage {
 
     /// One bounded statement transaction of [`Self::insert`] (see the chunk
     /// note there). `base_index` offsets per-doc error indexes back into the
-    /// client's batch; `prior_fresh` carries the committed earlier chunks'
-    /// doc keys for capped-FIFO protection. Returns
-    /// `(inserted, errors, chunk_keys, stopped)` — `stopped` when an ordered
-    /// batch hit an error and the remaining chunks must not run.
-    #[allow(clippy::type_complexity)]
+    /// client's batch. Returns `(inserted, errors, stopped)` — `stopped` when
+    /// an ordered batch hit an error and the remaining chunks must not run.
     fn insert_chunk(
         &self,
         db: &str,
@@ -8570,8 +8561,7 @@ impl Storage {
         docs: &[Vec<u8>],
         base_index: usize,
         ordered: bool,
-        prior_fresh: &HashSet<Vec<u8>>,
-    ) -> Result<(usize, Vec<Document>, HashSet<Vec<u8>>, bool)> {
+    ) -> Result<(usize, Vec<Document>, bool)> {
         self.retry_write_conflicts("insert", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -8590,10 +8580,10 @@ impl Storage {
                 let mut inserted = 0usize;
                 let mut errors: Vec<Document> = Vec::new();
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
-                let mut fresh_id_keys: HashSet<Vec<u8>> = HashSet::new();
                 let mut stopped = false;
                 let doc_cur =
                     session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
+                let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
                     let mut doc = decode_doc(doc_bytes)?;
@@ -8650,7 +8640,7 @@ impl Storage {
                     // a duplicate `_id` is caught here now (not by the doc-table
                     // insert, which is keyed by the unique RecordId). WT_DUPLICATE_KEY
                     // does not abort the transaction, so unordered inserts continue.
-                    let recordid = match self.write_nat_entry(&session, db, coll, &key) {
+                    let recordid = match self.write_nat_entry_with(&nat_cur, db, coll, &key) {
                         Ok(r) => r,
                         Err(StorageError::DuplicateId) => {
                             let ns = format!("{db}.{coll}");
@@ -8684,7 +8674,6 @@ impl Storage {
                     doc_cur.insert()?;
                     self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
-                    fresh_id_keys.insert(key.clone());
                     inserted += 1;
                     if oplog_on {
                         // `o` splices the stored doc bytes (`blob`) verbatim — no
@@ -8705,13 +8694,10 @@ impl Storage {
                 // the per-insert pre-image slots are all None; eviction appends its own.
                 let mut pre_images: Vec<Option<Vec<u8>>> = vec![None; oplog_entries.len()];
                 if inserted > 0 {
-                    let all_fresh: HashSet<Vec<u8>> =
-                        prior_fresh.union(&fresh_id_keys).cloned().collect();
                     self.enforce_capped_bounds(
                         &session,
                         db,
                         coll,
-                        &all_fresh,
                         &descs,
                         oplog_on,
                         &ns,
@@ -8723,7 +8709,7 @@ impl Storage {
                 if oplog_on && !oplog_entries.is_empty() {
                     self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
-                Ok((inserted, errors, fresh_id_keys, stopped))
+                Ok((inserted, errors, stopped))
             })
         })
     }
@@ -11000,12 +10986,26 @@ impl Storage {
         coll: &str,
         id_key: &[u8],
     ) -> Result<i64> {
-        let recordid = self.mint_nat_seq();
         // overwrite=false: the `_id` index is where a duplicate `_id` is now caught
         // (the doc table is keyed by the unique RecordId, so it can't reject dups).
+        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        self.write_nat_entry_with(&rev, db, coll, id_key)
+    }
+
+    /// [`Self::write_nat_entry`] through a cursor the caller opened on
+    /// `NAT_SEQ_TABLE` with `overwrite=false` and reuses across a batch, so a
+    /// ten-thousand-document insert opens it once.
+    fn write_nat_entry_with(
+        &self,
+        rev: &Cursor,
+        db: &str,
+        coll: &str,
+        id_key: &[u8],
+    ) -> Result<i64> {
+        let recordid = self.mint_nat_seq();
         // A wasted RecordId on the dup path is harmless — RecordIds only need to be
         // unique + monotonic; gaps are fine.
-        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        rev.reset()?;
         note_id_key(db, coll, id_key)?;
         rev.set_key_ssu(db, coll, id_key);
         rev.set_value_q(recordid);
@@ -11223,7 +11223,6 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-        fresh_id_keys: &HashSet<Vec<u8>>,
         descs: &[IndexDesc],
         oplog_on: bool,
         ns: &str,
@@ -11243,8 +11242,12 @@ impl Storage {
                 _ => None,
             }
         };
-        let size_limit = num("size");
-        let max_limit = num("max");
+        // A bound of zero or less is no bound. mongod stores "no document
+        // limit" as 2147483647 and refuses a `size` under 1, but a store
+        // written before 2026-10-09 can hold `max: 0` as given -- which,
+        // read as a limit, evicted everything except the newest document.
+        let size_limit = num("size").filter(|s| *s > 0);
+        let max_limit = num("max").filter(|m| *m > 0);
         if size_limit.is_none() && max_limit.is_none() {
             return Ok(());
         }
@@ -11261,12 +11264,18 @@ impl Storage {
             if !over_size && !over_max {
                 break;
             }
-            if fresh_id_keys.contains(&id_k) {
-                // Don't evict docs inserted in this batch — with monotonic
-                // _ids they sort to the tail, so reaching one means the rest
-                // are fresh too.
+            // The newest document always stays, even when it alone is larger
+            // than `size`: mongod 8.2.11 keeps `[59]` after sixty 3,000-byte
+            // inserts into a `size: 1000` collection, where evicting to the
+            // bound would leave it empty.
+            if count <= 1 {
                 break;
             }
+            // The documents of the batch that caused the overflow are evicted
+            // like any other: mongod 8.2.11 leaves a `max: 3` collection with
+            // the LAST three of a five-document `insert_many`. Sparing them
+            // (as this did until 2026-10-09) let one batch take a capped
+            // collection past its bounds without limit.
             let doc = decode_doc(&blob)?;
             // Doc row first, entries after — see prune_ttl for the lock-free
             // reader ordering rationale.
@@ -13761,6 +13770,21 @@ impl Storage {
                         pre_images.push(None);
                     }
                     upserted_id = Some(id);
+                    // An upsert's insert is an insert: a capped collection
+                    // is brought back within its bounds, as after `insert`.
+                    // It used to be skipped, so upserts grew one without
+                    // limit.
+                    self.enforce_capped_bounds(
+                        &session,
+                        db,
+                        coll,
+                        &descs,
+                        oplog_on,
+                        &ns,
+                        ui.as_deref(),
+                        &mut oplog_entries,
+                        &mut pre_images,
+                    )?;
                 }
 
                 if oplog_on && !oplog_entries.is_empty() {
@@ -17296,7 +17320,8 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![3, 4, 5]);
 
-        // A single over-cap batch keeps all its docs (they're all "fresh").
+        // A single over-cap batch is held to the cap as well: mongod 8.2.11
+        // keeps the last three. (This asserted six until 2026-10-09.)
         s.create_collection_with_options(
             "app",
             "cap2",
@@ -17312,7 +17337,13 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(s.find_matching("app", "cap2", &doc! {}).unwrap().len(), 6);
+        let kept: Vec<i32> = s
+            .find_matching("app", "cap2", &doc! {})
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
+            .collect();
+        assert_eq!(kept, vec![3, 4, 5]);
     }
 
     #[test]

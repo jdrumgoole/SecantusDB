@@ -62,6 +62,148 @@ fn capped_eviction_is_fifo_with_non_monotonic_ids() {
     });
 }
 
+/// The `_id`s left in capped collection `c`, in natural order.
+fn capped_ids(c: &mut CommandContext) -> Vec<i32> {
+    let reply = dispatch(&doc! {"find": "c", "batchSize": 100_000_i32}, c);
+    fb(&reply, c)
+        .iter()
+        .map(|b| b.as_document().unwrap().get_i32("_id").unwrap())
+        .collect()
+}
+
+fn capped_batch(ids: std::ops::Range<i32>, payload: usize) -> Vec<Bson> {
+    ids.map(|i| Bson::Document(doc! {"_id": i, "p": "x".repeat(payload)}))
+        .collect()
+}
+
+/// Every expectation here is what mongod 8.2.11 returned for the same
+/// commands (2026-10-09). The batch that overflows a capped collection is
+/// evicted from like any other documents; until then it was spared, so one
+/// `insert_many` could take the collection past its bounds without limit.
+#[test]
+fn capped_bounds_hold_within_one_insert_batch() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "c", "capped": true, "max": 3i64, "size": 1048576i64},
+            c,
+        );
+        let reply = dispatch(&doc! {"insert": "c", "documents": capped_batch(0..5, 1)}, c);
+        assert_eq!(reply.get_i32("n").unwrap(), 5);
+        assert_eq!(capped_ids(c), vec![2, 3, 4]);
+        // A duplicate in an unordered batch is reported and the rest land.
+        let reply = dispatch(
+            &doc! {"insert": "c", "ordered": false,
+            "documents": [{"_id": 7}, {"_id": 7}, {"_id": 8}, {"_id": 9}, {"_id": 10}]},
+            c,
+        );
+        assert_eq!(reply.get_array("writeErrors").unwrap().len(), 1);
+        assert_eq!(capped_ids(c), vec![8, 9, 10]);
+    });
+    // Larger than one internal insert chunk (1,000 documents).
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "c", "capped": true, "max": 1500i64, "size": 16777216i64},
+            c,
+        );
+        dispatch(
+            &doc! {"insert": "c", "documents": capped_batch(0..2500, 1)},
+            c,
+        );
+        let ids = capped_ids(c);
+        assert_eq!((ids.len(), ids[0], ids[ids.len() - 1]), (1500, 1000, 2499));
+    });
+    // Bounded by size alone.
+    with_wt(|c| {
+        dispatch(&doc! {"create": "c", "capped": true, "size": 4096i64}, c);
+        dispatch(
+            &doc! {"insert": "c", "documents": capped_batch(0..40, 500)},
+            c,
+        );
+        assert_eq!(capped_ids(c), (33..40).collect::<Vec<_>>());
+    });
+}
+
+/// The newest document stays even when it alone is larger than `size`
+/// (mongod 8.2.11: sixty 3,000-byte inserts into `size: 1000` leave `[59]`).
+#[test]
+fn capped_collection_keeps_its_newest_document_whatever_its_size() {
+    for one_batch in [true, false] {
+        with_wt(|c| {
+            dispatch(&doc! {"create": "c", "capped": true, "size": 1000i64}, c);
+            if one_batch {
+                dispatch(
+                    &doc! {"insert": "c", "documents": capped_batch(0..60, 3000)},
+                    c,
+                );
+            } else {
+                for i in 0..60 {
+                    dispatch(
+                        &doc! {"insert": "c", "documents": capped_batch(i..i + 1, 3000)},
+                        c,
+                    );
+                }
+            }
+            assert_eq!(capped_ids(c), vec![59], "one_batch={one_batch}");
+        });
+    }
+}
+
+/// An upsert's insert is held to the cap like any other insert (mongod
+/// 8.2.11). It used to be skipped, so upserts grew a capped collection
+/// without limit.
+#[test]
+fn capped_bounds_hold_for_upserts() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "c", "capped": true, "max": 3i64, "size": 100000i64},
+            c,
+        );
+        dispatch(&doc! {"insert": "c", "documents": capped_batch(0..3, 1)}, c);
+        for id in [10, 11, 12] {
+            let reply = dispatch(
+                &doc! {"update": "c", "updates": [{"q": {"_id": id}, "u": {"$set": {"a": 1}}, "upsert": true}]},
+                c,
+            );
+            assert_eq!(reply.get_array("upserted").unwrap().len(), 1, "{reply}");
+        }
+        assert_eq!(capped_ids(c), vec![10, 11, 12]);
+        dispatch(
+            &doc! {"findAndModify": "c", "query": {"_id": 77}, "update": {"$set": {"a": 1}}, "upsert": true},
+            c,
+        );
+        assert_eq!(capped_ids(c), vec![11, 12, 77]);
+        // A replacement upsert, and four upserts in one command.
+        dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"_id": 88}, "u": {"a": 2}, "upsert": true}]},
+            c,
+        );
+        assert_eq!(capped_ids(c), vec![12, 77, 88]);
+        let many: Vec<Bson> = (90..94)
+            .map(|i| {
+                Bson::Document(doc! {"q": {"_id": i}, "u": {"$set": {"a": 1}}, "upsert": true})
+            })
+            .collect();
+        dispatch(&doc! {"update": "c", "updates": many}, c);
+        assert_eq!(capped_ids(c), vec![91, 92, 93]);
+    });
+}
+
+/// `max` of zero or less is "no document limit" on mongod, which keeps all
+/// five. Read as a limit, it evicted everything except the newest document.
+#[test]
+fn capped_max_of_zero_or_less_is_no_limit() {
+    for max in [0i64, -5] {
+        with_wt(|c| {
+            dispatch(
+                &doc! {"create": "c", "capped": true, "max": max, "size": 100000i64},
+                c,
+            );
+            dispatch(&doc! {"insert": "c", "documents": capped_batch(0..5, 1)}, c);
+            assert_eq!(capped_ids(c), vec![0, 1, 2, 3, 4], "max={max}");
+        });
+    }
+}
+
 #[test]
 fn insert_then_count() {
     with_wt(|c| {

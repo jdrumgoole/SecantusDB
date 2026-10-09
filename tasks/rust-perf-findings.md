@@ -1141,3 +1141,63 @@ so a bisect step costs one `cargo build -p secantusdb` (~30 s) instead of a
 full extension rebuild. Old commits need `RUSTFLAGS="-L native=/opt/homebrew/lib
 -l lz4"` because their `build.rs` predates lz4 linking while the shared WT
 build has the compressor built in.
+
+## Multi-stage aggregate: the narrow decode now reaches past `$unwind` (2026-10-09)
+
+Measured on a Mac against `mongod` 8.2.11, 10,000 five-field documents, the
+benchmark's own pipeline (`$match` active, `$unwind` tags, `$group`, `$sort`),
+median of 40 warm runs, old and new binary interleaved twice. The machine was
+busy (a test suite was running), so read the differences, not the absolutes.
+
+| pipeline | mongod | before | after |
+|---|---:|---:|---:|
+| `$match`, `$count` | 1.4 ms | 6.2 ms | 3.0 ms |
+| `$match`, `$unwind`, `$count` | 3.8 ms | 9.7 ms | 6.9 ms |
+| `$match`, `$unwind`, `$group` | 4.6 ms | 13.1 ms | 9.8 ms |
+| full (`... $sort`) | 4.6 ms | 13.1 ms | 10.1 ms |
+| `$group` alone | 1.6 ms | 5.5 ms | 5.5 ms |
+
+A stack sample of `$match`, `$count` before the change was dominated by
+`bson` deserialisation into owned `Document`s (`BsonVisitor::visit_map`,
+`IndexMap::insert_full`, allocation and drop): every survivor was decoded
+whole to be counted. The 6a pushdown only applied when `$group` was the first
+remaining stage. `secantus_core::pipeline_prefix_fields` now walks `$unwind` /
+`$sort` / `$match` / `$skip` / `$limit` to the first `$group`, `$sortByCount`
+or `$count`.
+
+What is left is flat. After the change the full pipeline's sample has no
+function over 6%: allocation and drop of the 15,000 unwound documents (~20%
+together), raw iteration, SipHash on the group key, expression evaluation.
+`$group` alone at 5.5 ms against 1.6 ms is the same picture. The next step
+down is the streaming execution this file calls 6b; a cheaper first try is a
+faster hasher for group keys.
+
+## Insert: one `_id` index cursor per batch (2026-10-09)
+
+Same day, quieter machine (load 3 to 7), `insert_many` of 10,000 five-field
+documents into a fresh collection, median of 25, old and new binary
+interleaved three times: 48.0 / 49.8 / 48.0 ms before, 42.8 / 46.6 / 41.5 ms
+after; `mongod` 8.2.11 37.8 ms. Server-side, by each server's own slow-query
+line, the old binary took 42 ms and `mongod` 28 ms, so about 9 ms of every
+figure is the client.
+
+The stack sample under `insert_chunk` showed `write_nat_entry` at 24% with a
+third of that opening and closing a cursor per document, and 5% hashing each
+`_id` key into a set only capped eviction read (and should not have: see the
+capped-collection fix). Both are gone.
+
+What is left under `insert_chunk`, by inclusive share before the change:
+`decode_doc` 14% (the document is decoded whole to find `_id` and to feed
+index maintenance, even with no secondary index), oplog entry construction
+and write 20%, the two B-tree inserts 23%, commit 6%. Skipping the decode
+when a collection has no secondary index is the next candidate; it needs a
+raw-BSON validation that accepts exactly what `Document::from_reader` does,
+because the decode is also what rejects a malformed document.
+
+A first measurement that day put the Rust server at 144 ms against `mongod`
+at 41 ms. A test suite was running; with it finished the same probe gave 51
+and 37. `mongod` did not slow down under that load and the Rust server did,
+so the control did not catch it. Check `uptime` first. The asymmetry is not
+explained: fourteen CPU-bound processes slowed both alike (58 ms and 50 ms),
+and under disk contention the Rust server held up better than `mongod` in
+the stall probe of the same day.

@@ -999,6 +999,127 @@ pub fn referenced_top_level_fields(spec: &Bson) -> Option<std::collections::BTre
     Some(fields)
 }
 
+/// The set of top-level document fields the LEADING stages of a pipeline read,
+/// up to and including the first stage whose output no longer carries the
+/// input documents (`$group`, `$sortByCount`, `$count`) -- or `None` when no
+/// such stage is reached through stages this walk understands.
+///
+/// When `Some(fields)`, decoding only `fields` from each input document and
+/// running the pipeline is byte-identical to running it on the fully decoded
+/// documents: the pass-through stages in front (`$unwind`, `$sort`, `$match`,
+/// `$skip`, `$limit`) read only the fields collected here, they carry every
+/// other field along untouched, and the terminal stage reads nothing else.
+/// So `[{$unwind: "$tags"}, {$group: {_id: "$tags", n: {$sum: "$v"}}}]` needs
+/// `tags` and `v`, and `[{$unwind: "$tags"}, {$count: "n"}]` needs `tags`.
+///
+/// Anything else in the prefix -- a stage that reshapes documents, reads
+/// storage, or is simply not listed -- gives `None`, and the caller decodes
+/// whole documents as before.
+pub fn pipeline_prefix_fields(stages: &[Bson]) -> Option<std::collections::BTreeSet<String>> {
+    let mut fields = std::collections::BTreeSet::new();
+    let top = |path: &str, out: &mut std::collections::BTreeSet<String>| {
+        out.insert(path.split('.').next().unwrap_or(path).to_string());
+    };
+    for stage in stages {
+        let Bson::Document(stage) = stage else {
+            return None;
+        };
+        if stage.len() != 1 {
+            return None;
+        }
+        let (name, spec) = stage.iter().next().unwrap();
+        match name.as_str() {
+            "$group" => {
+                fields.extend(referenced_top_level_fields(spec)?);
+                return Some(fields);
+            }
+            "$sortByCount" => {
+                return collect_fields(spec, &mut fields).then_some(fields);
+            }
+            "$count" => return Some(fields),
+            "$skip" | "$limit" => {}
+            "$unwind" => {
+                let (path, index) = match spec {
+                    Bson::String(p) => (p.as_str(), None),
+                    Bson::Document(d) => (
+                        d.get_str("path").ok()?,
+                        match d.get("includeArrayIndex") {
+                            None => None,
+                            Some(Bson::String(i)) => Some(i.as_str()),
+                            Some(_) => return None,
+                        },
+                    ),
+                    _ => return None,
+                };
+                // A malformed path is the stage's error to raise, on whole
+                // documents.
+                let path = path.strip_prefix('$').filter(|p| !p.is_empty())?;
+                if path.starts_with('$') {
+                    return None;
+                }
+                top(path, &mut fields);
+                // The index is WRITTEN, possibly inside an existing embedded
+                // document, so that document has to be there to write into.
+                if let Some(index) = index {
+                    top(index, &mut fields);
+                }
+            }
+            "$sort" => {
+                let Bson::Document(keys) = spec else {
+                    return None;
+                };
+                for (key, dir) in keys {
+                    // `{$meta: ...}` sorts by something that is not a field.
+                    if matches!(dir, Bson::Document(_)) || key.starts_with('$') {
+                        return None;
+                    }
+                    top(key, &mut fields);
+                }
+            }
+            "$match" => {
+                if !collect_match_fields(spec, &mut fields) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Insert the top-level component of every field a query filter reads.
+/// Returns `false` for a filter that can read a field without naming it
+/// (`$where`, `$jsonSchema`, `$text`, a whole-document `$expr`) or that is not
+/// a document at all.
+fn collect_match_fields(filter: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
+    let Bson::Document(filter) = filter else {
+        return false;
+    };
+    for (key, value) in filter {
+        match key.as_str() {
+            "$and" | "$or" | "$nor" => {
+                let Bson::Array(clauses) = value else {
+                    return false;
+                };
+                if !clauses.iter().all(|c| collect_match_fields(c, out)) {
+                    return false;
+                }
+            }
+            "$expr" => {
+                if !collect_fields(value, out) {
+                    return false;
+                }
+            }
+            "$comment" => {}
+            k if k.starts_with('$') => return false,
+            k => {
+                out.insert(k.split('.').next().unwrap_or(k).to_string());
+            }
+        }
+    }
+    true
+}
+
 /// Walk an aggregation expression, inserting the top-level component of every
 /// `$field.path` string into `out`. Returns `false` to signal the caller must
 /// full-decode: a `$$ROOT`/`$$CURRENT`/`$$REMOVE` whole-document reference, or a
@@ -2226,5 +2347,91 @@ mod bucket_auto_granularity_type_tests {
             ),
             vec![(Bson::Double(0.25), Bson::Int32(2048))]
         );
+    }
+}
+
+#[cfg(test)]
+mod prefix_field_tests {
+    use super::pipeline_prefix_fields;
+    use bson::{bson, Bson};
+
+    fn fields(pipeline: Bson) -> Option<Vec<String>> {
+        let Bson::Array(stages) = pipeline else {
+            panic!("pipeline must be an array")
+        };
+        pipeline_prefix_fields(&stages).map(|f| f.into_iter().collect())
+    }
+
+    fn some(names: &[&str]) -> Option<Vec<String>> {
+        Some(names.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_group_behind_pass_through_stages_needs_their_fields_too() {
+        let group = bson!({"$group": {"_id": "$tags", "total": {"$sum": "$v"}}});
+        assert_eq!(fields(bson!([group.clone()])), some(&["tags", "v"]));
+        assert_eq!(
+            fields(bson!([{"$unwind": "$tags"}, group.clone(), {"$sort": {"total": -1}}])),
+            some(&["tags", "v"])
+        );
+        assert_eq!(
+            fields(bson!([
+                {"$sort": {"when.at": 1, "k": -1}},
+                {"$skip": 1},
+                {"$limit": 5},
+                {"$match": {"a.b": 1, "$or": [{"c": 2}, {"$expr": {"$gt": ["$d", "$e.f"]}}]}},
+                group
+            ])),
+            some(&["a", "c", "d", "e", "k", "tags", "v", "when"])
+        );
+    }
+
+    #[test]
+    fn a_count_needs_only_what_the_stages_before_it_read() {
+        assert_eq!(fields(bson!([{"$count": "n"}])), some(&[]));
+        assert_eq!(
+            fields(bson!([
+                {"$unwind": {"path": "$tags.x", "includeArrayIndex": "pos.i",
+                             "preserveNullAndEmptyArrays": true}},
+                {"$count": "n"}
+            ])),
+            some(&["pos", "tags"])
+        );
+        assert_eq!(
+            fields(bson!([{"$unwind": "$t"}, {"$sortByCount": "$t.kind"}])),
+            some(&["t"])
+        );
+    }
+
+    #[test]
+    fn a_prefix_the_walk_cannot_bound_decodes_whole_documents() {
+        for pipeline in [
+            // Nothing in the pipeline stops carrying the documents.
+            bson!([{"$unwind": "$tags"}, {"$sort": {"a": 1}}]),
+            bson!([]),
+            // A stage that reshapes documents, or one not listed.
+            bson!([{"$project": {"a": 1}}, {"$count": "n"}]),
+            bson!([{"$addFields": {"a": 1}}, {"$group": {"_id": "$a"}}]),
+            bson!([{"$lookup": {"from": "o", "localField": "a", "foreignField": "b", "as": "j"}},
+                   {"$count": "n"}]),
+            // A whole-document reference anywhere in the prefix.
+            bson!([{"$unwind": "$tags"}, {"$group": {"_id": null, "all": {"$push": "$$ROOT"}}}]),
+            bson!([{"$match": {"$expr": {"$eq": ["$$ROOT", 1]}}}, {"$count": "n"}]),
+            bson!([{"$match": {"$where": "this.a"}}, {"$count": "n"}]),
+            bson!([{"$sortByCount": "$$CURRENT"}]),
+            // Specs the stage itself has to reject, on whole documents.
+            bson!([{"$unwind": "tags"}, {"$count": "n"}]),
+            bson!([{"$unwind": "$$tags"}, {"$count": "n"}]),
+            bson!([{"$unwind": {"path": "$tags", "includeArrayIndex": 1}}, {"$count": "n"}]),
+            bson!([{"$unwind": 7}, {"$count": "n"}]),
+            bson!([{"$sort": {"score": {"$meta": "textScore"}}}, {"$count": "n"}]),
+            bson!([{"$sort": 1}, {"$count": "n"}]),
+            bson!([{"$match": 1}, {"$count": "n"}]),
+            bson!([{"$match": {"$or": 1}}, {"$count": "n"}]),
+            bson!([{"$unwind": "$a", "$count": "n"}]),
+            bson!(["$count"]),
+        ] {
+            assert_eq!(fields(pipeline.clone()), None, "{pipeline}");
+        }
     }
 }
