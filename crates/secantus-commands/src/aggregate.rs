@@ -1196,8 +1196,22 @@ fn apply_storage_stage(
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
         "$indexStats" => apply_index_stats(db, coll, storage),
-        "$out" => apply_out(spec, docs, db, storage, bypass_validation),
-        "$merge" => apply_merge(spec, docs, db, storage, bypass_validation),
+        // A document the target's validator refuses is reported under the
+        // SOURCE namespace's executor prefix, as mongod reports it.
+        "$out" | "$merge" => {
+            let written = if name == "$out" {
+                apply_out(spec, docs, db, storage, bypass_validation)
+            } else {
+                apply_merge(spec, docs, db, storage, bypass_validation)
+            };
+            written.map_err(|mut e| {
+                if e.code == 121 {
+                    let ns = format!("{db}.{}", coll.unwrap_or(""));
+                    e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(&ns));
+                }
+                e
+            })
+        }
         "$geoNear" => apply_geo_near(spec, docs, db, coll, vars, storage),
         "$unionWith" => apply_union_with(spec, docs, db, storage, collation),
         _ => Err(bad_value(format!(
@@ -2154,6 +2168,7 @@ fn enforce_target_validator(
     coll: &str,
     docs: &[Document],
     bypass: bool,
+    through_update: bool,
 ) -> Result<(), CommandError> {
     if bypass {
         return Ok(());
@@ -2170,11 +2185,18 @@ fn enforce_target_validator(
     }
     for d in docs {
         if !secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(false) {
-            return Err(CommandError::new(
-                121,
-                "DocumentValidationFailure",
-                "Document failed validation",
-            ));
+            // `$merge` writes through the update executor and says so;
+            // `$out` inserts. Both carry the same `errInfo` an insert does.
+            let errmsg = if through_update {
+                "Plan executor error during update :: caused by :: Document failed validation"
+            } else {
+                "Document failed validation"
+            };
+            let mut e = CommandError::new(121, "DocumentValidationFailure", errmsg);
+            let mut extra = Document::new();
+            extra.insert("errInfo", crate::crud::validation_error_info(&validator, d));
+            e.extra = Some(Box::new(extra));
+            return Err(e);
         }
     }
     Ok(())
@@ -2191,7 +2213,7 @@ fn apply_out(
     bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll) = out_target(spec, db)?;
-    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation)?;
+    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation, false)?;
     storage
         .drop_collection(&out_db, &out_coll)
         .map_err(command_error)?;
@@ -2245,7 +2267,7 @@ fn apply_merge(
     bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll, on, when_matched, when_not_matched) = merge_spec(spec, db)?;
-    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation)?;
+    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation, true)?;
     storage
         .create_collection(&out_db, &out_coll)
         .map_err(command_error)?;

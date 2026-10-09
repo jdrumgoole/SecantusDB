@@ -1472,3 +1472,155 @@ fn create_checks_a_views_definition() {
         assert!(view_ids(c, doc! {"find": "later"}).is_empty());
     });
 }
+
+// --- validators: every expectation is what mongod 8.2.11 answered (2026-10-09).
+
+#[test]
+fn an_ordered_insert_keeps_the_documents_before_a_validation_failure() {
+    with_wt(|c| {
+        dispatch(&doc! {"create": "q", "validator": {"qty": {"$gte": 0}}}, c);
+        let batch = |ids: [i32; 3]| -> Vec<Bson> {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    Bson::Document(doc! {"_id": *id, "qty": if i == 1 { -1 } else { 1 }})
+                })
+                .collect()
+        };
+        // The second document fails: the first is in, the third never runs.
+        let reply = dispatch(&doc! {"insert": "q", "documents": batch([10, 11, 12])}, c);
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
+        let errors = reply.get_array("writeErrors").unwrap();
+        assert_eq!(errors.len(), 1);
+        let e = errors[0].as_document().unwrap();
+        assert_eq!(
+            (e.get_i32("index").unwrap(), e.get_i32("code").unwrap()),
+            (1, 121)
+        );
+        assert_eq!(
+            e.get_document("errInfo")
+                .unwrap()
+                .get_i32("failingDocumentId")
+                .unwrap(),
+            11
+        );
+        // Unordered: both good documents land.
+        let reply = dispatch(
+            &doc! {"insert": "q", "ordered": false, "documents": batch([20, 21, 22])},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 2, "{reply}");
+        // A duplicate key before the validation failure stops an ordered
+        // batch first, and is the only error reported.
+        let reply = dispatch(
+            &doc! {"insert": "q", "documents": [{"_id": 10, "qty": 1}, {"_id": 30, "qty": -1}]},
+            c,
+        );
+        let errors = reply.get_array("writeErrors").unwrap();
+        assert_eq!(errors.len(), 1, "{reply}");
+        assert_eq!(
+            errors[0].as_document().unwrap().get_i32("code").unwrap(),
+            11000
+        );
+        assert_eq!(
+            view_ids(c, doc! {"find": "q", "sort": {"_id": 1}}),
+            vec![10, 20, 22]
+        );
+    });
+}
+
+#[test]
+fn validation_options_are_checked_and_stored_as_mongod_stores_them() {
+    with_wt(|c| {
+        for (cmd, code, msg) in [
+            (
+                doc! {"create": "x", "validator": {"a": 1}, "validationLevel": "sometimes"},
+                2,
+                "Enumeration value 'sometimes' for field 'create.validationLevel' is not a valid \
+                 value.",
+            ),
+            (
+                doc! {"create": "x", "validator": {"a": 1}, "validationAction": "shout"},
+                2,
+                "Enumeration value 'shout' for field 'create.validationAction' is not a valid \
+                 value.",
+            ),
+            (
+                doc! {"create": "x", "validator": {"$where": "true"}},
+                2,
+                "$where is not allowed in this context",
+            ),
+            (
+                doc! {"create": "x", "validator": {"$or": [{"a": 1}, {"$text": {"$search": "a"}}]}},
+                2,
+                "$text is not allowed in this context",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        let near = dispatch(
+            &doc! {"create": "x", "validator": {"loc": {"$near": [0, 0]}}},
+            c,
+        );
+        assert_eq!(near.get_i32("code").unwrap(), 5626500, "{near}");
+
+        // An empty validator is no validator.
+        dispatch(&doc! {"create": "e", "validator": {}}, c);
+        assert_eq!(collection_options(c, "e"), doc! {});
+        // `collMod` writes out both the level and the action.
+        dispatch(&doc! {"create": "q", "validator": {"a": 1}}, c);
+        dispatch(&doc! {"collMod": "q", "validationAction": "warn"}, c);
+        assert_eq!(
+            collection_options(c, "q"),
+            doc! {"validator": {"a": 1}, "validationLevel": "strict", "validationAction": "warn"}
+        );
+        let bad = dispatch(&doc! {"collMod": "q", "validationLevel": "nope"}, c);
+        assert_eq!(
+            bad.get_str("errmsg").unwrap(),
+            "Enumeration value 'nope' for field 'collMod.validationLevel' is not a valid value."
+        );
+        // Removing the validator keeps them.
+        dispatch(&doc! {"collMod": "q", "validator": {}}, c);
+        assert_eq!(
+            collection_options(c, "q"),
+            doc! {"validationLevel": "strict", "validationAction": "warn"}
+        );
+        let reply = dispatch(&doc! {"insert": "q", "documents": [{"_id": 1}]}, c);
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
+    });
+}
+
+#[test]
+fn out_and_merge_report_a_validation_failure_with_its_details() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "w", "documents": [{"_id": 1, "qty": -1}]},
+            c,
+        );
+        dispatch(&doc! {"create": "m", "validator": {"qty": {"$gte": 0}}}, c);
+        for (stage, msg) in [
+            (
+                doc! {"$out": "m"},
+                "Executor error during aggregate command on namespace: t.w :: caused by :: \
+                 Document failed validation",
+            ),
+            (
+                doc! {"$merge": {"into": "m"}},
+                "Executor error during aggregate command on namespace: t.w :: caused by :: Plan \
+                 executor error during update :: caused by :: Document failed validation",
+            ),
+        ] {
+            let reply = dispatch(
+                &doc! {"aggregate": "w", "pipeline": [stage.clone()], "cursor": {}},
+                c,
+            );
+            assert_eq!(reply.get_i32("code").unwrap(), 121, "{stage}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{stage}");
+            let info = reply.get_document("errInfo").unwrap();
+            assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1, "{stage}");
+            assert!(info.get_document("details").is_ok(), "{stage}: {reply}");
+        }
+    });
+}

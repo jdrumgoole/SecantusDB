@@ -54,8 +54,16 @@ fn insert_reply(
     errors: Vec<Document>,
     pre_errors: Vec<Document>,
     survivor_to_orig: &[usize],
+    ordered: bool,
 ) -> HandlerResult {
     let mut reply = doc! { "n": inserted as i32, "ok": 1.0 };
+    // In an ordered batch a storage error (a duplicate key, say) stopped the
+    // batch before the pre-check failure further on was ever reached.
+    let pre_errors = if ordered && !errors.is_empty() {
+        Vec::new()
+    } else {
+        pre_errors
+    };
     if !pre_errors.is_empty() || !errors.is_empty() {
         let mut write_errors: Vec<Bson> = pre_errors.into_iter().map(Bson::Document).collect();
         for mut err in errors {
@@ -68,6 +76,13 @@ fn insert_reply(
             }
             write_errors.push(Bson::Document(err));
         }
+        // By position in the batch, whichever check caught each.
+        write_errors.sort_by_key(|e| {
+            e.as_document()
+                .and_then(|d| d.get("index"))
+                .and_then(as_i64)
+                .unwrap_or(0)
+        });
         reply.insert("writeErrors", write_errors);
     }
     Ok(reply)
@@ -160,16 +175,17 @@ fn insert_raw_path(
         survivor_to_orig.push(index);
     }
 
-    if !pre_errors.is_empty() && ordered {
-        return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
-    }
+    // An ordered batch stops AT the document that failed a pre-check: the
+    // documents before it are inserted (mongod 8.2.11 answers `n: 1` for a
+    // three-document batch whose second fails its validator). They used to
+    // be dropped with it.
     if surviving.is_empty() {
         return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
     }
     let (inserted, errors) = storage
         .insert(db, coll, surviving, ordered)
         .map_err(command_error)?;
-    insert_reply(inserted, errors, pre_errors, &survivor_to_orig)
+    insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
 }
 
 /// `insert` — batch document insert.
@@ -313,11 +329,8 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         survivor_to_orig.push(index);
     }
 
-    // Ordered + a pre-check failure aborts the whole batch (matching the Python
-    // server): nothing is inserted, the first bad doc is reported.
-    if !pre_errors.is_empty() && ordered {
-        return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
-    }
+    // An ordered batch stops AT the pre-check failure; the documents before
+    // it are inserted (see `insert_raw_path`).
     if surviving.is_empty() {
         return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
     }
@@ -325,7 +338,7 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let (inserted, errors) = storage
         .insert(&db, &coll, surviving, ordered)
         .map_err(command_error)?;
-    insert_reply(inserted, errors, pre_errors, &survivor_to_orig)
+    insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
 }
 
 /// `delete` — batch delete, one entry per `{q, limit}` spec.
