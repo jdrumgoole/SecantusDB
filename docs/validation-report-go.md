@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -8,11 +8,11 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 554 | 14 | 49 | 617 | 97.5% |
+| `internal/integration` | 556 | 12 | 49 | 617 | 97.8% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **596** | **14** | **49** | **659** | **97.7%** |
+| **Overall** | **598** | **12** | **49** | **659** | **98.0%** |
 
-## Failures (14)
+## Failures (12)
 
 First 30 failed tests for triage:
 
@@ -25,8 +25,6 @@ internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_
 internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors
 internal/integration :: TestSDAMErrorHandling/after_handshake_completes
 internal/integration :: TestSDAMErrorHandling
-internal/integration :: TestSDAMProse/heartbeats_processed_more_frequently
-internal/integration :: TestSDAMProse
 internal/integration :: TestConnectionPoolBackpressure
 internal/integration :: TestSessionsMongocryptdProse/18._implicit_session_is_ignored_if_connection_does_not_support_sessions
 internal/integration :: TestSessionsMongocryptdProse/19._explicit_session_raises_an_error_if_connection_does_not_support_sessions

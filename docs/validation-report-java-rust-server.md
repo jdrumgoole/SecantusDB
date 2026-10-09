@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report (Rust server)
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java --server rust` to refresh. The same unmodified suite as `docs/validation-report-java.md`, pointed at the standalone **Rust server** (`secantusd-rs`) instead of the Python one — the gap between the two reports is part of the Rust server's remaining to-do list.
 
@@ -13,9 +13,17 @@ Run `uv run python -m invoke validate-java --server rust` to refresh. The same u
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
-| `driver-sync__0` | 406 | 0 | 354 | 760 | 100.0% |
+| `driver-sync__0` | 405 | 1 | 354 | 760 | 99.7% |
 | `driver-sync__1` | 80 | 0 | 50 | 130 | 100.0% |
-| **Overall** | **496** | **0** | **404** | **900** | **100.0%** |
+| **Overall** | **495** | **1** | **404** | **900** | **99.7%** |
+
+## Failures (1)
+
+First 30 failed tests for triage:
+
+```
+driver-sync__0 :: com.mongodb.client.MongoCollectionTest#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists()
+```
 
 ## How this is generated
 

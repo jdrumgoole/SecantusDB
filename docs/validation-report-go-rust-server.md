@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
