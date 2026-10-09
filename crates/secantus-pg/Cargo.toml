@@ -40,7 +40,10 @@ name = "secantus_pg"
 path = "src/lib.rs"
 
 [features]
-default = ["bin"]
+# mimalloc is default-on and optional, as it is for `secantusd-rs`: a build
+# can leave it out (`--no-default-features --features bin`) to compare
+# allocators or to instrument for PGO.
+default = ["bin", "mimalloc"]
 # Builds the `secantusd-pg` binary (signal handling). Off, the crate is the
 # library alone -- what a dev-dependency or the Python handle wants.
 bin = ["dep:ctrlc", "dep:libc"]
@@ -78,6 +81,8 @@ rand = "0.9"
 # test harness stops the daemon with SIGTERM, and an uncaught one skips the
 # WiredTiger close entirely -- which loses acknowledged writes.
 ctrlc = { version = "3", features = ["termination"], optional = true }
+# The binary's allocator (see the `#[global_allocator]` note in main.rs).
+mimalloc = { version = "0.1", optional = true }
 bytes = "1.12.1"
 # The trait pgwire encodes BINARY values through -- same version as its own,
 # or the `ToSql` we implement is a different trait from the one it calls.

@@ -2893,10 +2893,41 @@ These work end-to-end but cut corners.
       sends as `int2`, into a `bigint` column, and a value the planner
       widens is not templated.
 
+      **Done 2026-10-09: an int32 widened into a `bigint` column is
+      templated, and the binary allocates with mimalloc.** A fresh `c-16`
+      droplet; the released beta.4 binary against two release builds of
+      `26e0bfc1` on the same box, one with the default `mimalloc` feature and
+      one without. Instructions per prepared statement in the server (`perf
+      stat -p`, 20,000 statements, two interleaved passes that agree within
+      1%), values bound as psycopg sends a small Python int (`int2`):
+
+      | statement | beta.4 | + widening (glibc) | + mimalloc |
+      | --- | --- | --- | --- |
+      | row by PK, `int` | 148k | 148k | 128k |
+      | `UPDATE SET v = v + 1`, `int` | 431k | 433k | 360k |
+      | `UPDATE SET v = $1`, `int` | 355k | 356k | 302k |
+      | `INSERT`, `int` | 297k | 297k | 259k |
+      | `UPDATE SET v = $1`, `bigint` | 469k | 366k | 314k |
+      | `INSERT`, `bigint` | 381k | 314k | 274k |
+
+      Server CPU for the two `bigint` writes went 356 -> 266 us and
+      309 -> 240 us. `bench/pg_concurrency.py` (10s x3), ops/s at 1 / 2 / 4 /
+      8 clients:
+
+      | | beta.4 | + widening (glibc) | + mimalloc | PostgreSQL 16 |
+      | --- | --- | --- | --- | --- |
+      | INSERT | 2,395 / 4,295 / 6,396 / 8,299 | 2,664 / 4,747 / 7,095 / 9,022 | 2,798 / 4,966 / 6,962 / 8,912 | 4,959 / 8,278 / 12,897 / 19,595 |
+      | UPDATE | 2,213 / 3,972 / 6,333 / 8,381 | 2,178 / 3,822 / 6,270 / 8,542 | 2,428 / 4,257 / 6,433 / 8,512 | 4,825 / 8,353 / 12,517 / 19,533 |
+
+      INSERT is now 1.7-2.2x slower than PostgreSQL (was 1.9-2.4x), UPDATE
+      2.0-2.3x. **mimalloc buys 13-17% of the instructions and 5-11% of the
+      throughput at one and two clients, and NOTHING at four and eight**
+      (inside the run-to-run spread, and INSERT's scaling at eight is 3.2x
+      with it against 3.4x without). So above two clients the limit is not
+      CPU in the statement; look at what the writers wait on before taking
+      more instructions out.
+
       What is left, in order of what the profile offers:
-      - an int32 bound for a `bigint` column (every small Python int through
-        psycopg) is not templated; widening is lossless and checks nothing,
-        so it is the cheapest next case and the one the INSERT bench needs;
       - a stored value into any other column type (`varchar(n)`, `smallint`,
         `numeric`, `timestamptz`, `bool`...) is still planned per Execute,
         because the planner checks or converts it. Templating those means
@@ -2906,8 +2937,8 @@ These work end-to-end but cut corners.
       - once any table in the database has row-level security, nothing is
         templated;
       - `execute_statement` outside `update_matching` (~20% of an UPDATE);
-      - the allocator (17% in glibc `malloc`/`free`; the MongoDB server links
-        mimalloc, this one does not).
+      - an int bound for a `float8` or `numeric` column is still planned
+        per Execute (only int32 -> `bigint` is carried).
       PostgreSQL's own instruction count was not isolated: the system-wide
       counters taken include the client. The droplets are destroyed.
       To repeat: `do-cluster up --prefix <own> --server-size c-16`, install

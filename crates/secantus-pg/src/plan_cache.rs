@@ -34,7 +34,10 @@
 //!     (`stores_verbatim`). The planner checks a stored value against its
 //!     column -- a varchar length, an integer range, a domain -- and a
 //!     stand-in passing that check says nothing about the next value, so a
-//!     column with any such check is never templated.
+//!     column with any such check is never templated. One conversion is
+//!     carried: an int32 bound for an `int8` column is stored as the same
+//!     number in 64 bits (`widened`), which every int32 fits and nothing
+//!     checks. It is what a driver sends for a small integer.
 //!
 //!   A value anywhere else (a LIMIT, a computed column) makes the two plans
 //!   differ after substitution, and the statement is not templated.
@@ -276,11 +279,26 @@ fn sub_doc(d: &mut Document, from: &[Bson], to: &[Bson], hits: &mut [bool]) {
     }
 }
 
+/// An int32 as the planner stores it in an `int8` column: the same number in
+/// 64 bits. `None` for any other value.
+fn widened(v: &Bson) -> Option<Bson> {
+    match v {
+        Bson::Int32(n) => Some(Bson::Int64(i64::from(*n))),
+        _ => None,
+    }
+}
+
+/// Is `v` the stand-in `s` as stored: `s` itself, or `s` widened?
+fn stored_form(s: &Bson, v: &Bson) -> bool {
+    same(s, v) || widened(s).is_some_and(|w| same(&w, v))
+}
+
 /// Can every value of `v`'s BSON type be stored in `column` exactly as it
 /// is, with nothing to check? True for the four pairings where the column's
 /// type holds the whole range of the value's and declares no width, domain,
 /// enum or generation: `int4` <- int32, `int8` <- int64, `float8` <- double,
-/// `text` <- string.
+/// `text` <- string. (`v` is the value in the PLAN, so an int32 the planner
+/// widened for an `int8` column arrives here as an int64.)
 pub(crate) fn stores_verbatim(v: &Bson, column: &Column) -> bool {
     column.typmod == -1
         && column.extra.is_empty()
@@ -302,6 +320,16 @@ fn sub_fields(d: &mut Document, from: &[Bson], to: &[Bson], hits: &mut [bool]) {
         if let Some(i) = from.iter().position(|f| same(f, v)) {
             *v = to[i].clone();
             hits[i] = true;
+        } else if let Some(i) = from
+            .iter()
+            .position(|f| widened(f).is_some_and(|w| same(&w, v)))
+        {
+            // `to[i]` has `from[i]`'s type (`fits`), so it widens too; were it
+            // ever otherwise the stand-in stays and the template check fails.
+            if let Some(w) = widened(&to[i]) {
+                *v = w;
+                hits[i] = true;
+            }
         }
     }
 }
@@ -398,7 +426,7 @@ pub(crate) fn stored_stand_ins<'p>(
     };
     docs.into_iter()
         .flat_map(|d| d.iter())
-        .filter(|(_, v)| a.iter().any(|s| same(s, v)))
+        .filter(|(_, v)| a.iter().any(|s| stored_form(s, v)))
         .map(|(k, v)| (table, k.as_str(), v))
         .collect()
 }
@@ -474,6 +502,35 @@ mod tests {
         ] {
             assert!(eligible_sql(sql).is_none(), "{sql}");
         }
+    }
+
+    #[test]
+    fn an_int32_stored_in_an_int8_column_is_carried_widened() {
+        let from = [Bson::Int32(23_011), Bson::Int32(23_013)];
+        let to = [Bson::Int32(-7), Bson::Int32(i32::MAX)];
+        // A stored row: the first stand-in widened, the second as it is.
+        let mut row = bson::doc! { "a": 23_011_i64, "b": 23_013_i32, "c": 23_013_i64 };
+        let mut hits = [false; 2];
+        sub_fields(&mut row, &from, &to, &mut hits);
+        assert_eq!(
+            row,
+            bson::doc! { "a": -7_i64, "b": i32::MAX, "c": i64::from(i32::MAX) }
+        );
+        assert_eq!(hits, [true, true]);
+        // An int64 stand-in is never matched by a narrower plan value, and a
+        // WHERE filter (`sub_doc`) is matched exactly only.
+        let mut row = bson::doc! { "a": 23_011_i32 };
+        sub_fields(
+            &mut row,
+            &[Bson::Int64(23_011)],
+            &[Bson::Int64(5)],
+            &mut [false],
+        );
+        assert_eq!(row, bson::doc! { "a": 23_011_i32 });
+        let mut filter = bson::doc! { "k": 23_011_i64 };
+        let mut hit = [false];
+        sub_doc(&mut filter, &from[..1], &to[..1], &mut hit);
+        assert_eq!((filter, hit), (bson::doc! { "k": 23_011_i64 }, [false]));
     }
 
     #[test]

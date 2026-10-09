@@ -9611,6 +9611,120 @@ def test_a_parameter_inside_an_expression_is_computed_every_execution(home: Path
         assert q("select k from pf_t where k >= %s order by k", 300000) == [(300004,)]
 
 
+def test_a_small_integer_bound_for_a_bigint_column_reuses_the_plan(home: Path) -> None:
+    """A driver sends a small integer as `int2` or `int4`; bound for a `bigint`
+    column the planner stores it as 64 bits, and the reused plan (`plan_cache`)
+    carries that conversion. Each execution stores ITS value as a bigint, at
+    the edges of each width, and a CHECK or a key on the column still answers
+    on a later execution."""
+    from psycopg.types.numeric import Int2, Int4, Int8
+
+    with _Server(home) as server, server.connect() as c:
+
+        def q(sql: str, *args: object) -> list[tuple]:
+            return c.execute(sql, args, prepare=True).fetchall()
+
+        def state(sql: str, *args: object) -> str | None:
+            try:
+                c.execute(sql, args, prepare=True)
+            except psycopg.Error as e:
+                return e.sqlstate
+            return None
+
+        c.execute(
+            "create table pb_t (k bigint primary key, b bigint check (b <> 950000), "
+            "u bigint unique)"
+        )
+        i4 = [0, 1, -1, 23011, 23012, 23013, 2**31 - 1, -(2**31), 32767, -32768, 70000]
+        for n, v in enumerate(i4):
+            c.execute(
+                "insert into pb_t values (%s, %s, %s)", (Int4(n), Int4(v), Int4(-n)), prepare=True
+            )
+        i2 = [0, 5, -5, 23011, 23012, 32767, -32768]
+        for n, v in enumerate(i2):
+            c.execute(
+                "insert into pb_t values (%s, %s, %s)",
+                (Int2(100 + n), Int2(v), Int2(1 + n)),
+                prepare=True,
+            )
+        # Widths mixed in one statement, and a literal equal to a stand-in.
+        for n, v in enumerate((2**40, -(2**62), 23011)):
+            c.execute(
+                "insert into pb_t values (%s, %s, 23011 + %s)", (Int4(200 + n), Int8(v), Int4(n))
+            )
+        for n in range(8):
+            c.execute(
+                "insert into pb_t values (%s, 23011, %s)",
+                (Int4(300 + n), Int4(1000 + n)),
+                prepare=True,
+            )
+        want = (
+            [(n, v, -n) for n, v in enumerate(i4)]
+            + [(100 + n, v, 1 + n) for n, v in enumerate(i2)]
+            + [(200, 2**40, 23011), (201, -(2**62), 23012), (202, 23011, 23013)]
+            + [(300 + n, 23011, 1000 + n) for n in range(8)]
+        )
+        assert q("select k, b, u from pb_t order by k") == want
+        # Stored as 64 bits: arithmetic past int4 neither wraps nor overflows.
+        assert q("select k, b * 4294967296 from pb_t where k in (6, 7, 105) order by k") == [
+            (6, (2**31 - 1) * 2**32),
+            (7, -(2**31) * 2**32),
+            (105, 32767 * 2**32),
+        ]
+        assert q("select count(*) from pb_t where b = %s", Int8(23011)) == [(11,)]
+
+        # UPDATE SET, from a value and from the row.
+        for k, v in ((0, 5), (1, -(2**31)), (2, 2**31 - 1), (3, 23012), (4, 23011), (5, 0)):
+            c.execute("update pb_t set b = %s where k = %s", (Int4(v), Int4(k)), prepare=True)
+        for k, v in ((100, 7), (101, -32768), (102, 32767)):
+            c.execute("update pb_t set b = %s where k = %s", (Int2(v), Int2(k)), prepare=True)
+        for k, d in ((2, 2**31 - 1), (2, 2**31 - 1), (1, -(2**31)), (0, 23011)):
+            c.execute("update pb_t set b = b + %s where k = %s", (Int4(d), Int4(k)), prepare=True)
+        assert q(
+            "select k, b from pb_t where k in (0, 1, 2, 3, 4, 5, 100, 101, 102) order by k"
+        ) == [
+            (0, 23016),
+            (1, -(2**32)),
+            (2, 3 * (2**31 - 1)),
+            (3, 23012),
+            (4, 23011),
+            (5, 0),
+            (100, 7),
+            (101, -32768),
+            (102, 32767),
+        ]
+        # What the statement checks when it runs, after a run of values that passed.
+        ins = "insert into pb_t values (%s, %s, %s)"
+        assert [
+            state(ins, Int4(400 + n), Int4(v), Int4(5000 + n))
+            for n, v in enumerate((1, 2, 950000, 3))
+        ] == [
+            None,
+            None,
+            "23514",
+            None,
+        ]
+        assert [
+            state(ins, Int4(k), Int4(1), Int4(u))
+            for k, u in ((500, 6000), (500, 6001), (501, 6000))
+        ] == [
+            None,
+            "23505",
+            "23505",
+        ]
+        upd = "update pb_t set b = %s where k = %s"
+        assert [state(upd, Int4(v), Int4(400)) for v in (10, 950000, 11)] == [None, "23514", None]
+        assert q("select b from pb_t where k = %s", Int4(400)) == [(11,)]
+        assert q("select count(*) from pb_t where k in (402, 501)") == [(0,)]
+        # NULL in the run, and a rollback.
+        assert [state(upd, v, Int4(401)) for v in (Int4(1), None, Int4(2))] == [None, None, None]
+        with pytest.raises(RuntimeError), c.transaction():
+            c.execute(upd, (Int4(99), Int4(401)), prepare=True)
+            c.execute(ins, (Int4(600), Int4(1), Int4(7000)), prepare=True)
+            raise RuntimeError
+        assert q("select b from pb_t where k in (401, 600)") == [(2,)]
+
+
 def test_a_portal_outside_a_block_streams_from_one_snapshot(home: Path) -> None:
     """A SELECT fetched in pieces (Execute with a row cap) outside a block is
     streamed from a reader thread over one snapshot: a row another session
