@@ -1,6 +1,6 @@
 [package]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.173"
+version = "0.5.3-beta.174"
 edition = "2021"
 description = "Builds the WiredTiger storage engine (mongodb-7.0.33, SecantusDB's patches) from bundled source as a static library. Internal to SecantusDB: no semver promise."
 license = "GPL-2.0-only"
