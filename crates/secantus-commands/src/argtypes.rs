@@ -1084,6 +1084,78 @@ pub(crate) fn nested_sort_problem(pipeline: &[Bson]) -> Option<(i32, String)> {
     None
 }
 
+/// A `sort` of `{$natural: 1}` or `{$natural: -1}`, as `find` and
+/// `findAndModify` take it: storage order, forwards or backwards. Returns the
+/// `{$natural: <direction>}` hint that runs it, or `None` when the spec does
+/// not mention `$natural` and is an ordinary sort.
+///
+/// `$natural` is NOT a field path here, although the aggregation `$sort`
+/// stage reads it as one and answers 16410. Measured on 8.2.11, 2026-10-09:
+///
+/// - The value must be exactly 1 or -1 (`-1.0` and a decimal `-1.0` are; `1.9`,
+///   a decimal `1.4`, `true`, `null` and NaN are not), and `$natural` must be
+///   the only key. Anything else is 2 `$natural sort cannot be set to a value
+///   other than -1 or 1.`
+/// - A `hint` of `{$natural: <same direction>}` is allowed, the other
+///   direction is 2 `$natural hint must be in the same direction as $natural
+///   sort order`, and any index hint is 2 `index hint not allowed with
+///   $natural sort order`.
+pub(crate) fn natural_sort(
+    sort: &Document,
+    hint: Option<&Bson>,
+) -> Result<Option<Bson>, CommandError> {
+    let Some(value) = sort.get("$natural") else {
+        return Ok(None);
+    };
+    let bad_value = || {
+        CommandError::new(
+            2,
+            "BadValue",
+            "$natural sort cannot be set to a value other than -1 or 1.",
+        )
+    };
+    let exact = |v: &Bson| -> Option<i32> {
+        let n: f64 = match v {
+            Bson::Int32(n) => *n as f64,
+            Bson::Int64(n) => *n as f64,
+            Bson::Double(d) => *d,
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().ok()?,
+            _ => return None,
+        };
+        if n == 1.0 {
+            Some(1)
+        } else if n == -1.0 {
+            Some(-1)
+        } else {
+            None
+        }
+    };
+    let direction = match exact(value) {
+        Some(d) if sort.len() == 1 => d,
+        _ => return Err(bad_value()),
+    };
+    match hint {
+        None | Some(Bson::Null) => {}
+        Some(Bson::Document(h)) if h.len() == 1 && h.contains_key("$natural") => {
+            if h.get("$natural").and_then(exact) != Some(direction) {
+                return Err(CommandError::new(
+                    2,
+                    "BadValue",
+                    "$natural hint must be in the same direction as $natural sort order",
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "index hint not allowed with $natural sort order",
+            ));
+        }
+    }
+    Ok(Some(Bson::Document(bson::doc! {"$natural": direction})))
+}
+
 /// [`sort_spec_problem`] as a command error.
 pub(crate) fn require_sort_spec(sort: &Document) -> Result<(), CommandError> {
     match sort_spec_problem(sort) {
@@ -4188,6 +4260,51 @@ mod write_and_sort_validation_tests {
             sort_spec_problem(&doc! {"a": {"$meta": "x"}}).unwrap().1,
             "Illegal $meta sort: $meta: \"x\""
         );
+    }
+
+    #[test]
+    fn natural_sort_follows_mongods_rules() {
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let ok = |v: Bson| natural_sort(&doc! {"$natural": v}, None).unwrap();
+        let hint = |d: i32| Some(Bson::Document(doc! {"$natural": d}));
+        assert_eq!(natural_sort(&doc! {"a": 1}, None).unwrap(), None);
+        assert_eq!(ok(Bson::Int32(1)), hint(1));
+        assert_eq!(ok(Bson::Int64(-1)), hint(-1));
+        assert_eq!(ok(Bson::Double(-1.0)), hint(-1));
+        assert_eq!(ok(dec("-1.0")), hint(-1));
+        for v in [
+            Bson::Int32(2),
+            Bson::Int32(0),
+            Bson::Double(1.9),
+            Bson::Double(f64::NAN),
+            dec("1.4"),
+            Bson::Boolean(true),
+            Bson::Null,
+            Bson::String("x".into()),
+        ] {
+            let err = natural_sort(&doc! {"$natural": v.clone()}, None).unwrap_err();
+            assert_eq!(err.code, 2, "{v:?}");
+            assert_eq!(
+                err.errmsg,
+                "$natural sort cannot be set to a value other than -1 or 1."
+            );
+        }
+        // `$natural` beside another key, in either order.
+        assert!(natural_sort(&doc! {"$natural": 1, "a": 1}, None).is_err());
+        assert!(natural_sort(&doc! {"a": 1, "$natural": -1}, None).is_err());
+        // Hints.
+        let sort = doc! {"$natural": -1};
+        assert_eq!(natural_sort(&sort, hint(-1).as_ref()).unwrap(), hint(-1));
+        assert_eq!(
+            natural_sort(&sort, hint(1).as_ref()).unwrap_err().errmsg,
+            "$natural hint must be in the same direction as $natural sort order"
+        );
+        for h in [Bson::String("a_1".into()), Bson::Document(doc! {"a": 1})] {
+            assert_eq!(
+                natural_sort(&sort, Some(&h)).unwrap_err().errmsg,
+                "index hint not allowed with $natural sort order"
+            );
+        }
     }
 
     #[test]
