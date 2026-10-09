@@ -1,6 +1,6 @@
 [package]
 name = "secantus-pg"
-version = "0.1.0-beta.4"
+version = "0.1.0-beta.5"
 edition = "2021"
 description = "A surrogate PostgreSQL server for tests: the real PostgreSQL wire protocol and grammar (libpg_query) over WiredTiger, single-node. Embed it (secantus_pg::PgServer) or run the secantusd-pg binary."
 # GPL in effect: it links secantus-core / -storage / -wt / -auth (GPL-2.0-only)
@@ -55,7 +55,7 @@ futures = "0.3"
 # `pgwire` here. A fork rather than `[patch.crates-io]`, because crates.io
 # ignores `[patch]` in a published crate: see that crate's README for what it
 # changes, and tasks/rust-packages-plan.md section 5.2 step 2.
-pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.4", path = "../secantus-pgwire", default-features = false, features = ["server-api"] }
+pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.5", path = "../secantus-pgwire", default-features = false, features = ["server-api"] }
 # "sync" is for the shutdown `watch` channel the accept loop and every
 # connection task select on -- do not rely on another crate's feature
 # unification to supply it.
@@ -63,8 +63,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"]
 # The pure query engine, for filtering VIRTUAL tables' computed rows --
 # storage filters real tables, but a virtual row never reaches storage.
 secantus-core = { version = "=0.5.3-beta.174", path = "../secantus-core" }
-secantus-pgcatalog = { version = "=0.1.0-beta.4", path = "../secantus-pgcatalog" }
-secantus-pgplan = { version = "=0.1.0-beta.4", path = "../secantus-pgplan" }
+secantus-pgcatalog = { version = "=0.1.0-beta.5", path = "../secantus-pgcatalog" }
+secantus-pgplan = { version = "=0.1.0-beta.5", path = "../secantus-pgplan" }
 secantus-storage = { version = "=0.5.3-beta.174", path = "../secantus-storage" }
 # The SCRAM-SHA-256 verifier `CREATE ROLE ... PASSWORD` stores, derived as
 # PostgreSQL derives it, and the exchange a login is checked by.
