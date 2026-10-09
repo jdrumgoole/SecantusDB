@@ -584,7 +584,7 @@ def release_benchmark(
     name="do-perf",
     help={
         "count": "Documents per latency workload (default: 10000).",
-        "reps": "Reps to median over per latency workload (default: 5).",
+        "reps": "Interleaved reps to median over per latency workload (default: 15).",
         "duration": "Seconds per writer count in the scaling sweep (default: 30).",
         "writers": 'Writer counts for the scaling sweep (default: "1,2,4,8").',
         "runs": "Interleaved sweeps to median over (default: 3).",
@@ -604,7 +604,7 @@ def release_benchmark(
 def do_perf(
     c: Context,
     count: int = 10000,
-    reps: int = 5,
+    reps: int = 15,
     duration: float = 30.0,
     writers: str = "1,2,4,8",
     runs: int = 3,

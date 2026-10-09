@@ -21,12 +21,14 @@ given), the comparison runs Rust-vs-Python only and notes mongod was skipped.
 
 Run via ``uv run python -m invoke compare-servers`` (or this module directly):
 
-    uv run --no-sync python -m bench.compare_servers --n 10000 --reps 5
+    uv run --no-sync python -m bench.compare_servers --n 10000 --reps 15
     uv run --no-sync python -m bench.compare_servers --n 100000   # bigger, see how the gap scales
     uv run --no-sync python -m bench.compare_servers --mongo-uri mongodb://127.0.0.1:27017
     uv run --no-sync python -m bench.compare_servers --no-mongod
 
-Ctrl-C aborts cleanly between reps.
+The servers are measured INTERLEAVED: each rep runs every server before the
+next rep starts, so a change in the machine during the run lands on every
+column rather than on one. Ctrl-C aborts cleanly between reps.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import pathlib
 import platform
 import shutil
@@ -354,17 +357,54 @@ def _capture_mongod_version(client: pymongo.MongoClient) -> None:
         _MONGOD_VERSION["version"] = str(client.server_info().get("version", "unknown"))
 
 
-def _median_run(
-    make_client: Any, n: int, reps: int, *, capture_version: bool = False
-) -> dict[str, float]:
-    samples: dict[str, list[float]] = {}
-    for _ in range(reps):
-        with make_client() as client:
-            if capture_version:
-                _capture_mongod_version(client)
-            for k, v in _run_workloads(client, n).items():
-                samples.setdefault(k, []).append(v)
+Samples = dict[str, dict[str, list[float]]]
+
+
+def _interleaved_runs(makers: dict[str, Any], n: int, reps: int) -> Samples:
+    """Every server's per-rep timings, with the servers INTERLEAVED.
+
+    Rep 1 runs every server, then rep 2 runs every server, and so on, and the
+    order rotates each rep. Measuring one server's reps back to back and then
+    the next server's put minutes between the numerator and the denominator of
+    every published ratio, so a change in the machine during the run (a noisy
+    neighbour on a shared-CPU droplet) landed on one column only. Three runs
+    of one build put multi-stage aggregation at 2.8x, 3.6x and 4.1x of mongod
+    that way (2026-10-07 and -08).
+
+    Returns ``{server: {workload: [seconds per rep]}}``; rep ``i`` of every
+    server was measured within the same pass.
+    """
+    names = list(makers)
+    samples: Samples = {name: {} for name in names}
+    for rep in range(reps):
+        shift = rep % len(names)
+        for name in names[shift:] + names[:shift]:
+            with makers[name]() as client:
+                if name == "mongod":
+                    _capture_mongod_version(client)
+                for k, v in _run_workloads(client, n).items():
+                    samples[name].setdefault(k, []).append(v)
+    return samples
+
+
+def _medians(samples: dict[str, list[float]]) -> dict[str, float]:
     return {k: statistics.median(v) for k, v in samples.items()}
+
+
+def paired_ratio_range(numer: list[float], denom: list[float]) -> tuple[float, float] | None:
+    """Lowest and highest per-rep ratio, pairing reps measured in one pass.
+
+    The published figure is the ratio of two medians; this is how far the
+    individual passes sat from it. ``None`` when a pass has no usable pair.
+    """
+    ratios = [
+        a / b
+        for a, b in zip(numer, denom, strict=False)
+        if b and not math.isnan(a) and not math.isnan(b)
+    ]
+    if not ratios:
+        return None
+    return (min(ratios), max(ratios))
 
 
 # Display labels for each workload key, matching what the chart generator and
@@ -382,12 +422,30 @@ JSON_LABELS = {
 }
 
 
+def _spread_fields(samples: Samples | None, key: str) -> dict[str, list[float]]:
+    """Per-pass spread of one workload's ratios, for the results file.
+
+    ``rust_x_range`` / ``py_x_range`` are the lowest and highest ratio to
+    mongod among the passes. The change-stream row has none: its mongod figure
+    comes from a separate replica-set run, not from the interleaved passes.
+    """
+    if samples is None or "mongod" not in samples:
+        return {}
+    out: dict[str, list[float]] = {}
+    for field, server in (("rust_x_range", "rust"), ("py_x_range", "python")):
+        spread = paired_ratio_range(samples[server].get(key, []), samples["mongod"].get(key, []))
+        if spread is not None:
+            out[field] = [round(spread[0], 2), round(spread[1], 2)]
+    return out
+
+
 def _write_json(
     path: Path,
     mongod: dict[str, float],
     rust: dict[str, float],
     py: dict[str, float],
     args: argparse.Namespace,
+    samples: Samples | None = None,
 ) -> None:
     """Write results in the ``bench/results/latency.json`` schema.
 
@@ -403,6 +461,7 @@ def _write_json(
         "host": f"{platform.system()} {platform.machine()}",
         "source": f"bench.compare_servers --n {args.n} --reps {args.reps}",
         "mongod_version": _MONGOD_VERSION["version"],
+        "order": "interleaved",
         "workloads": [
             {
                 "key": k,
@@ -411,6 +470,7 @@ def _write_json(
                 "mongod_ms": round(mongod[k] * 1000, 2),
                 "rust_ms": round(rust[k] * 1000, 2),
                 "py_ms": round(py[k] * 1000, 2),
+                **_spread_fields(samples, k),
             }
             for k in WORKLOADS
         ],
@@ -455,18 +515,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_mongod and not use_mongod:
         print("note: mongod not on PATH and no --mongo-uri — skipping the mongod column.\n")
 
-    print(f"workload n={args.n}, median of {args.reps} reps, on-disk WiredTiger, via pymongo\n")
-    mongod = (
-        _median_run(
-            lambda: _mongod_client(args.mongo_uri or None),
-            args.n,
-            args.reps,
-            capture_version=True,
-        )
-        if use_mongod
-        else None
+    print(
+        f"workload n={args.n}, median of {args.reps} interleaved reps, "
+        "on-disk WiredTiger, via pymongo\n"
     )
-    import math
+    makers: dict[str, Any] = {}
+    if use_mongod:
+        makers["mongod"] = lambda: _mongod_client(args.mongo_uri or None)
+    makers["rust"] = _rust_client
+    makers["python"] = _python_client
+    samples = _interleaved_runs(makers, args.n, args.reps)
+    mongod = _medians(samples["mongod"]) if use_mongod else None
 
     if (
         mongod is not None
@@ -476,13 +535,15 @@ def main(argv: list[str] | None = None) -> int:
     ):
         # Standalone mongod rejects $changeStream — measure that one row
         # against a throwaway single-node replica set.
-        samples = []
+        drains = []
         for _ in range(args.reps):
             with _mongod_replset_client() as rc:
-                samples.append(_change_stream_drain(rc, args.n))
-        mongod["change_stream_drain"] = statistics.median(samples)
-    rust = _median_run(_rust_client, args.n, args.reps)
-    py = _median_run(_python_client, args.n, args.reps)
+                drains.append(_change_stream_drain(rc, args.n))
+        mongod["change_stream_drain"] = statistics.median(drains)
+        # Not measured in the interleaved passes, so it has no paired spread.
+        samples["mongod"].pop("change_stream_drain", None)
+    rust = _medians(samples["rust"])
+    py = _medians(samples["python"])
 
     # Column labels: SecantusDB = the Python server, SecantusDB-rs = the Rust
     # server. The implementation is spelled out in a sub-label row beneath.
@@ -502,6 +563,11 @@ def main(argv: list[str] | None = None) -> int:
             px = p / m if m else float("nan")
             row = f"{k:<22}{m:>12.2f}{r:>19.2f}{rx:>8.1f}x{p:>16.2f}{px:>8.1f}x"
             print(row.replace("nan", "  —"))
+        print("\nRust ×mongod, lowest and highest single pass:")
+        for k in WORKLOADS:
+            spread = paired_ratio_range(samples["rust"].get(k, []), samples["mongod"].get(k, []))
+            if spread is not None:
+                print(f"  {k:<22}{spread[0]:>6.2f}x – {spread[1]:.2f}x")
     else:
         header = f"{'workload':<22}{'SecantusDB-rs(ms)':>19}{'SecantusDB(ms)':>16}{'speedup':>10}"
         sub = f"{'':<22}{'(Rust)':>19}{'(Python)':>16}{'':>10}"
@@ -516,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         if mongod is None:
             print("--json needs the mongod column; nothing written.", file=sys.stderr)
             return 2
-        _write_json(Path(args.json), mongod, rust, py, args)
+        _write_json(Path(args.json), mongod, rust, py, args, samples)
         print(f"\nwrote {args.json}")
     return 0
 
