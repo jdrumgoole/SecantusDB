@@ -6,7 +6,11 @@
 // ``conventions/testing-base.gradle.kts`` hardcodes ``maxParallelForks = 1``);
 // running this init script applies AFTER project evaluation so our override
 // wins. Worker count comes from ``SECANTUS_GAUGE_PARALLEL_FORKS`` (set by the
-// runner) and falls back to the JVM's reported processor count.
+// runner) and falls back to one.
+//
+// More than one fork is NOT safe: these tests use the Java driver's fixture,
+// whose shutdown hook drops the database every class shares. See
+// ``default_forks`` in ``java_validation/runner.py``.
 //
 // Unlike the Java gauge's init script we add no SecantusDB-specific
 // ``excludeTestsMatching`` filter — the Kotlin integration include set
@@ -21,7 +25,7 @@ allprojects {
     afterEvaluate {
         tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {
             val envForks = System.getenv("SECANTUS_GAUGE_PARALLEL_FORKS")
-            val forks = envForks?.toIntOrNull() ?: Runtime.getRuntime().availableProcessors()
+            val forks = envForks?.toIntOrNull() ?: 1
             maxParallelForks = forks
             println("[secantus-init] maxParallelForks=$forks for task ${path}")
         }

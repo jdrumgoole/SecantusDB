@@ -16,3 +16,6 @@ the ones still running. A logging proxy in front of the server showed a
   itself does. `SECANTUS_GAUGE_PARALLEL_FORKS` still raises it for timing
   experiments.
 - The Rust server's Java panel is corrected to 496 of 496.
+- `invoke validate-kotlin` does the same: its tests use the same fixture. It
+  had not shown a failure, and one JVM at a time reports the same 340 of 340
+  on both servers.

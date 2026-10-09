@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 import gauge_common
+from java_validation.runner import default_forks
 
 # The Java gauge's pure helpers (JDK probe, identity tripwire,
 # jstack-on-hang dumper) are imported lazily inside ``main`` from
@@ -202,8 +203,10 @@ def main() -> int:
         jstack_dir.mkdir(parents=True)
 
         init_script = REPO_ROOT / "kotlin_validation" / "init.gradle.kts"
-        if os.environ.get("SECANTUS_GAUGE_PARALLEL_FORKS") is None:
-            env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(os.cpu_count() or 1)
+        # ONE test JVM by default. The Kotlin sync tests sit on the Java
+        # driver's fixture, whose shutdown hook drops the database every
+        # class shares -- see ``java_validation.runner.default_forks``.
+        env["SECANTUS_GAUGE_PARALLEL_FORKS"] = str(default_forks(os.environ))
 
         # Wipe stale JUnit XML before running so a failed build can't
         # masquerade as a passing run (see java_validation.runner for the
