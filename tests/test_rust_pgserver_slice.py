@@ -18842,3 +18842,55 @@ def test_batch68_left_built_joins_and_hashed_grouping_sets(home: Path) -> None:
             assert lb == m, q
             assert p == m, q
     assert len(streamed[0]) > 1000
+
+
+def test_a_cancel_that_lands_before_execution_still_cancels(home: Path) -> None:
+    """A CancelRequest received while the statement is still being PARSED
+    cancels it, and one received while the backend is idle is dropped.
+
+    The server used to clear its pending-cancel flag when a statement began
+    executing, so a cancel that arrived during Parse / Bind / Describe was
+    lost and the statement ran to completion. That is how psycopg's
+    `test_generators.py::test_cancel` ran its `pg_sleep(180)` to the end on the
+    Windows runner. Probed against PostgreSQL 15.19 with the statement below
+    (slow to parse, so the cancel lands before execution): 57014 at every
+    offset from 0 to 640 ms.
+
+    The legacy blocking `PQcancel` is used on purpose: psycopg's non-blocking
+    cancel has a client-side race on macOS (see `psycopg_validation`).
+    """
+    from psycopg import pq
+
+    constants = ",".join(map(str, range(200_000)))
+    slow_to_parse = f"select pg_sleep(30), 1 in ({constants})"
+    with _Server(home) as server:
+        pgconn = pq.PGconn.connect(
+            f"host=127.0.0.1 port={server.port} dbname=postgres user=test".encode()
+        )
+        try:
+            assert pgconn.status == pq.ConnStatus.OK, pgconn.error_message
+
+            # Idle: the cancel targets nothing, and the next statement runs.
+            pgconn.get_cancel().cancel()
+            time.sleep(0.2)
+            res = pgconn.exec_(b"select pg_sleep(0.3), 7")
+            assert res.status == pq.ExecStatus.TUPLES_OK, res.error_message
+            assert res.get_value(0, 1) == b"7"
+
+            started = time.monotonic()
+            pgconn.send_query_params(slow_to_parse.encode(), [])
+            time.sleep(0.3)
+            pgconn.get_cancel().cancel()
+            res = pgconn.get_result()
+            elapsed = time.monotonic() - started
+            assert res is not None
+            assert res.error_field(pq.DiagnosticField.SQLSTATE) == b"57014", res.error_message
+            assert elapsed < 20, f"the statement was not interrupted ({elapsed:.1f}s)"
+            while pgconn.get_result() is not None:
+                pass
+
+            # The request was consumed with the statement it cancelled.
+            res = pgconn.exec_(b"select 8")
+            assert res.status == pq.ExecStatus.TUPLES_OK, res.error_message
+        finally:
+            pgconn.finish()
