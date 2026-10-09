@@ -108,7 +108,17 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         }
     }
     let query = doc_field(doc, "query");
-    let sort = doc.get("sort").and_then(Bson::as_document);
+    // `sort: {$natural: ±1}` picks the first or last document in storage
+    // order. It used to be passed down as a field named `$natural`, which no
+    // document has, so `-1` returned the FIRST document.
+    let natural_hint = match doc.get("sort").and_then(Bson::as_document) {
+        Some(sort) => argtypes::natural_sort(sort, doc.get("hint"))?,
+        None => None,
+    };
+    let sort = doc
+        .get("sort")
+        .and_then(Bson::as_document)
+        .filter(|_| natural_hint.is_none());
     let fields = doc.get("fields").and_then(Bson::as_document);
     let return_new = doc.get("new").and_then(Bson::as_bool).unwrap_or(false);
     let upsert = doc.get("upsert").and_then(Bson::as_bool).unwrap_or(false);
@@ -269,7 +279,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 &coll,
                 &query,
                 sort,
-                None,
+                natural_hint.as_ref(),
                 collation.as_ref(),
                 &let_vars,
             )

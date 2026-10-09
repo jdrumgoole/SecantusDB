@@ -442,6 +442,17 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .unwrap_or_default();
     let sort = inner.get("sort").and_then(Bson::as_document);
     let hint = inner.get("hint");
+    // `find` / `findAndModify` read `sort: {$natural: ±1}` as storage order
+    // (see `argtypes::natural_sort`), so the plan is the hinted collection
+    // scan and not a blocking sort.
+    let natural_hint = match sort {
+        Some(s) if inner.contains_key("find") || inner.contains_key("findAndModify") => {
+            crate::argtypes::natural_sort(s, hint)?
+        }
+        _ => None,
+    };
+    let sort = sort.filter(|_| natural_hint.is_none());
+    let hint = natural_hint.as_ref().or(hint);
     let collation = collation_of(&inner);
     // Aggregate lifts a leading $match into the fetch — explain reports the same.
     if cmd_name == "aggregate" && filter.is_empty() {
