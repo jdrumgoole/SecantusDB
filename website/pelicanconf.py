@@ -39,7 +39,7 @@ SECANTUS_RUST_BINARY_URL: str = f"{SECANTUS_GITHUB_URL}/releases/tag/{SECANTUS_R
 # the MongoDB one above: these are GitHub PRE-releases, so they never become
 # "Latest" and the bare /releases listing leads with the source-only PyPI
 # release instead. Bump it when a new `secantusd-pg-v*` tag publishes assets.
-SECANTUS_PG_BINARY_TAG: str = "secantusd-pg-v0.1.0-beta.3"
+SECANTUS_PG_BINARY_TAG: str = "secantusd-pg-v0.1.0-beta.4"
 SECANTUS_PG_BINARY_URL: str = f"{SECANTUS_GITHUB_URL}/releases/tag/{SECANTUS_PG_BINARY_TAG}"
 SECANTUS_RUST_RELEASES_URL: str = f"{SECANTUS_GITHUB_URL}/releases?q=secantusdb-v&expanded=true"
 SECANTUS_TAGLINE: str = "THE SQLITE OF DOCUMENT DATABASES"
