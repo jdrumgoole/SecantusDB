@@ -1197,4 +1197,7 @@ because the decode is also what rejects a malformed document.
 A first measurement that day put the Rust server at 144 ms against `mongod`
 at 41 ms. A test suite was running; with it finished the same probe gave 51
 and 37. `mongod` did not slow down under that load and the Rust server did,
-so the control did not catch it. Check `uptime` first.
+so the control did not catch it. Check `uptime` first. The asymmetry is not
+explained: fourteen CPU-bound processes slowed both alike (58 ms and 50 ms),
+and under disk contention the Rust server held up better than `mongod` in
+the stall probe of the same day.
