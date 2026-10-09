@@ -188,15 +188,18 @@ fn unknown_expr_operator_in_filter(filter: &Document) -> Option<String> {
 /// Build the aggregate command equivalent to a `find` on a view: the find's
 /// filter / sort / skip / limit / projection become pipeline stages (in that
 /// order), over the view namespace, carrying the collation / let / batchSize.
-fn build_view_find_aggregate(doc: &Document, coll: &str) -> Document {
+fn build_view_find_aggregate(doc: &Document, coll: &str, natural_hint: Option<&Bson>) -> Document {
     let mut pipeline: Vec<Bson> = Vec::new();
     if let Some(Bson::Document(f)) = doc.get("filter") {
         if !f.is_empty() {
             pipeline.push(Bson::Document(doc! { "$match": f.clone() }));
         }
     }
+    // A `$natural` sort is not a `$sort` stage (which would read `$natural`
+    // as a field path and fail): it is the direction the BASE collection is
+    // scanned in, which the aggregate takes as a hint.
     if let Some(Bson::Document(s)) = doc.get("sort") {
-        if !s.is_empty() {
+        if !s.is_empty() && natural_hint.is_none() {
             pipeline.push(Bson::Document(doc! { "$sort": s.clone() }));
         }
     }
@@ -229,6 +232,9 @@ fn build_view_find_aggregate(doc: &Document, coll: &str) -> Document {
     }
     if let Some(l) = doc.get("let") {
         agg.insert("let", l.clone());
+    }
+    if let Some(h) = natural_hint {
+        agg.insert("hint", h.clone());
     }
     agg
 }
@@ -322,7 +328,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .unwrap_or(false)
     };
     if is_view {
-        let agg = build_view_find_aggregate(doc, &coll);
+        let agg = build_view_find_aggregate(doc, &coll, natural_hint.as_ref());
         return crate::aggregate::aggregate(&agg, ctx);
     }
     let storage = ctx.storage()?;

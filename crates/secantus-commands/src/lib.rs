@@ -58,6 +58,7 @@ pub mod topstats;
 pub mod transactions;
 mod util;
 mod validation_errors;
+mod views;
 
 use std::sync::{Arc, Mutex};
 
@@ -1054,6 +1055,9 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             }
             // Time profile-eligible commands so dispatch can record a
             // `system.profile` entry when the per-database level requires it.
+            if let Some(reply) = views::refusal(name, doc, ctx) {
+                return reply;
+            }
             let start = profile_eligible(name, doc).then(std::time::Instant::now);
             let mut reply = run_with_txn_envelope(name, handler, doc, ctx);
             // A failpoint-configured writeConcernError attaches to a successful reply,

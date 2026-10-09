@@ -703,7 +703,7 @@ fn validate_no_where_in_match(pipeline: &[Bson]) -> Result<(), CommandError> {
     Ok(())
 }
 
-fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
+pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
     for stage in pipeline {
         // Both of these used to `continue`, so a malformed element sailed past
         // validation: `pipeline: [42]` reached execution and surfaced as a bare
@@ -1237,11 +1237,8 @@ fn apply_lookup(
     }
 
     // Materialise the foreign collection once (the whole join's candidate pool).
-    let foreign: Vec<Document> = decode_docs(
-        storage
-            .find(db, from, &Document::new(), None, None)
-            .map_err(command_error)?,
-    )?;
+    let foreign: Vec<Document> =
+        collection_documents(storage, db, from, &Document::new(), collation)?;
 
     let mut out = Vec::with_capacity(docs.len());
     for doc in docs {
@@ -1347,11 +1344,7 @@ fn index_join_lookup(
         }
         other => doc! { foreign_field: other.cloned().unwrap_or(Bson::Null) },
     };
-    decode_docs(
-        storage
-            .find(db, coll, &filter, None, None)
-            .map_err(command_error)?,
-    )
+    collection_documents(storage, db, coll, &filter, None)
 }
 
 /// `$graphLookup` — recursive graph traversal of a foreign collection. Mirrors
@@ -1392,11 +1385,7 @@ fn apply_graph_lookup(
         .get("restrictSearchWithMatch")
         .and_then(Bson::as_document);
 
-    let foreign: Vec<Document> = decode_docs(
-        storage
-            .find(db, from, &Document::new(), None, None)
-            .map_err(command_error)?,
-    )?;
+    let foreign: Vec<Document> = collection_documents(storage, db, from, &Document::new(), None)?;
 
     let mut out = Vec::with_capacity(docs.len());
     for doc in docs {
@@ -1555,11 +1544,8 @@ fn apply_union_with(
             ))
         }
     };
-    let mut foreign: Vec<Document> = decode_docs(
-        storage
-            .find(db, from, &Document::new(), None, None)
-            .map_err(command_error)?,
-    )?;
+    let mut foreign: Vec<Document> =
+        collection_documents(storage, db, from, &Document::new(), collation)?;
     if let Some(sub) = sub_pipeline {
         foreign = run_segmented(
             foreign,
@@ -1778,6 +1764,48 @@ pub(crate) fn resolve_view(
         coll = view_on.to_string();
     }
     (coll, combined)
+}
+
+/// The documents of `db.coll` matching `filter` -- a collection's own, or a
+/// view's: its pipeline's output over the collection it is defined on. Every
+/// stage that reads ANOTHER namespace (`$lookup`, `$graphLookup`,
+/// `$unionWith`) and `distinct` go through here; reading a view's own storage
+/// instead found nothing, so a `$lookup` from a view matched no document.
+pub(crate) fn collection_documents(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    collation: Option<&Collation>,
+) -> Result<Vec<Document>, CommandError> {
+    if !crate::views::is_view(storage, db, coll) {
+        return decode_docs(
+            storage
+                .find(db, coll, filter, None, None)
+                .map_err(command_error)?,
+        );
+    }
+    let mut tail: Vec<Bson> = Vec::new();
+    if !filter.is_empty() {
+        tail.push(Bson::Document(doc! { "$match": filter.clone() }));
+    }
+    let (base, pipeline) = resolve_view(storage, db, coll, tail);
+    let input = decode_docs(
+        storage
+            .find(db, &base, &Document::new(), None, None)
+            .map_err(command_error)?,
+    )?;
+    run_segmented(
+        input,
+        &pipeline,
+        db,
+        Some(&base),
+        &Document::new(),
+        storage,
+        collation,
+        &Document::new(),
+        None,
+    )
 }
 
 /// Conservative `$geoWithin` candidate filter for a leading bounded `$geoNear`
