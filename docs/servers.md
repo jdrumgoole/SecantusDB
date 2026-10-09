@@ -110,7 +110,7 @@ Mongo daemons read the same `secantusd.toml` config (see
 ### SQL / PostgreSQL servers
 
 The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.4`), and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.5`), and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):

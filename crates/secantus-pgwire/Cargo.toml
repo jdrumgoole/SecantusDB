@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "secantus-pgwire"
-version = "0.1.0-beta.4"
+version = "0.1.0-beta.5"
 authors = ["Ning Sun <sunng@pm.me>"]
 build = false
 autolib = false
