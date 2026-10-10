@@ -29,6 +29,12 @@ other two are below.
 - `collMod` with `index: {hidden: ...}` hides or shows the index and reports
   `hidden_old` / `hidden_new`. It answered `ok` and did nothing. Hiding the
   `_id` index is refused.
+- A hidden index is passed over by the query planner, by sorts and by hints
+  (on reads and writes), whether hidden by `collMod` or created hidden. It is
+  still maintained, and a hidden unique index still enforces uniqueness.
+- `$geoWithin` with `$box`, `$polygon` or a `$geometry` polygon includes a
+  point that lies on the boundary. It was left out, with and without an
+  index; `mongod` includes it in all 15 combinations probed.
 - `collMod` of a TTL reports both values as int64 and no old value for an
   index that had none, and names the missing index or option in its errors.
 - `listIndexes` lists `_id_` first.

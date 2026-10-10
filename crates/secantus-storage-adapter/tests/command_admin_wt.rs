@@ -1895,3 +1895,127 @@ fn coll_mod_hides_an_index_and_says_what_changed() {
         }
     });
 }
+
+fn winning_stage(c: &mut CommandContext, find: Document) -> String {
+    let reply = dispatch(&doc! {"explain": find, "verbosity": "queryPlanner"}, c);
+    let mut plan = reply
+        .get_document("queryPlanner")
+        .unwrap()
+        .get_document("winningPlan")
+        .unwrap()
+        .clone();
+    // The scan is the innermost stage.
+    while let Ok(inner) = plan.get_document("inputStage").cloned() {
+        plan = inner;
+    }
+    plan.get_str("stage").unwrap().to_string()
+}
+
+/// A hidden index is passed over by the planner, by sorts and by hints, and
+/// still enforces uniqueness (mongod 8.2.11).
+#[test]
+fn a_hidden_index_is_not_used_by_queries_but_still_enforced() {
+    with_wt(|c| {
+        let docs: Vec<Bson> = (0..20_i32)
+            .map(|i| Bson::Document(doc! {"_id": i, "a": i, "u": i}))
+            .collect();
+        dispatch(&doc! {"insert": "c", "documents": docs}, c);
+        create_index(c, doc! {"key": {"a": 1}, "name": "a_1"});
+        create_index(c, doc! {"key": {"u": 1}, "name": "u_1", "unique": true});
+        let by_a = doc! {"find": "c", "filter": {"a": 5}};
+        assert_eq!(winning_stage(c, by_a.clone()), "IXSCAN");
+        for name in ["a_1", "u_1"] {
+            dispatch(
+                &doc! {"collMod": "c", "index": {"name": name, "hidden": true}},
+                c,
+            );
+        }
+        assert_eq!(winning_stage(c, by_a.clone()), "COLLSCAN");
+        assert_eq!(
+            winning_stage(c, doc! {"find": "c", "filter": {"a": {"$gt": 5}}}),
+            "COLLSCAN"
+        );
+        assert_eq!(
+            winning_stage(c, doc! {"find": "c", "sort": {"a": 1}}),
+            "COLLSCAN"
+        );
+        // Same answer, with or without the index.
+        assert_eq!(view_ids(c, by_a.clone()), vec![5]);
+        // A hint naming it is a hint naming no index.
+        for hint in [Bson::String("a_1".into()), Bson::Document(doc! {"a": 1})] {
+            let reply = dispatch(&doc! {"find": "c", "filter": {"a": 5}, "hint": hint}, c);
+            assert_eq!(reply.get_i32("code").unwrap(), 2, "{reply}");
+        }
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"a": 5}, "u": {"$set": {"z": 1}}, "hint": "a_1"}]},
+            c,
+        );
+        assert_eq!(reply.get_array("writeErrors").unwrap().len(), 1, "{reply}");
+        // Uniqueness is still enforced through the hidden index.
+        let reply = dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 100, "u": 3}]},
+            c,
+        );
+        let errors = reply.get_array("writeErrors").unwrap();
+        assert_eq!(
+            errors[0].as_document().unwrap().get_i32("code").unwrap(),
+            11000
+        );
+        // A new document is indexed while hidden, so unhiding finds it.
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 200, "a": 77, "u": 77}]},
+            c,
+        );
+        dispatch(
+            &doc! {"collMod": "c", "index": {"name": "a_1", "hidden": false}},
+            c,
+        );
+        assert_eq!(winning_stage(c, by_a), "IXSCAN");
+        assert_eq!(
+            view_ids(c, doc! {"find": "c", "filter": {"a": 77}}),
+            vec![200]
+        );
+        let listed = dispatch(&doc! {"listIndexes": "c"}, c).to_string();
+        assert!(!listed.contains("\"hidden\": false"), "{listed}");
+    });
+}
+
+/// A point on the boundary of a `$geoWithin` box or polygon is inside it
+/// (mongod 8.2.11, every shape, with and without an index).
+#[test]
+fn geo_within_includes_points_on_the_boundary() {
+    for index in [None, Some("2d"), Some("2dsphere")] {
+        with_wt(|c| {
+            let points = [
+                (0, [1, 1]),
+                (1, [0, 0]),
+                (2, [2, 2]),
+                (3, [1, 0]),
+                (4, [2, 1]),
+                (5, [3, 1]),
+            ];
+            let docs: Vec<Bson> = points
+                .iter()
+                .map(|(id, p)| Bson::Document(doc! {"_id": *id, "loc": [p[0], p[1]]}))
+                .collect();
+            dispatch(&doc! {"insert": "c", "documents": docs}, c);
+            if let Some(kind) = index {
+                create_index(c, doc! {"key": {"loc": kind}, "name": "loc"});
+            }
+            let square = bson::bson!([[0, 0], [2, 0], [2, 2], [0, 2]]);
+            let ring = bson::bson!([[[0, 0], [2, 0], [2, 2], [0, 2], [0, 0]]]);
+            for shape in [
+                doc! {"$box": [[0, 0], [2, 2]]},
+                doc! {"$polygon": square.clone()},
+                doc! {"$geometry": {"type": "Polygon", "coordinates": ring.clone()}},
+            ] {
+                let mut ids = view_ids(
+                    c,
+                    doc! {"find": "c", "filter": {"loc": {"$geoWithin": shape.clone()}}},
+                );
+                ids.sort();
+                assert_eq!(ids, vec![0, 1, 2, 3, 4], "{shape} index={index:?}");
+            }
+        });
+    }
+}

@@ -1477,6 +1477,12 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // order here (mongod: creation order), which put an index named `$**_1`
     // or `A_1` ahead of it.
     indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
+    // `hidden` is listed only on an index that is hidden.
+    for ix in &mut indexes {
+        if ix.get_bool("hidden") == Ok(false) {
+            ix.remove("hidden");
+        }
+    }
     // A collection that exists always has at least the synthesised `_id_` index, so
     // an empty result means the namespace doesn't exist — mongod errors
     // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not

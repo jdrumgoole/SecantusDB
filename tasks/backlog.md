@@ -8720,10 +8720,19 @@ server turned out to be the Java gauge's own parallelism).
 of 87 results different to 9. Seven are `text` / `hashed` indexes (out of
 scope) and the index counts that follow from not building them.
 
-- [ ] **RUST MongoDB server: a hidden index is still used by the planner.**
-      `collMod` now records `hidden` and `listIndexes` reports it, but nothing
-      was done to make `find` ignore a hidden index. Not probed: compare
-      `explain` on both servers after hiding.
+- [ ] **RUST MongoDB server: `$near` runs without a geo index.** `mongod`
+      8.2.11 refuses (291, `unable to find index for $geoNear query`), which
+      is also what it answers when the only geo index is hidden; the Rust
+      server sorts by distance with no index. Lenient, not wrong data.
+- [ ] **RUST MongoDB server: a hint that names no usable index is worded
+      differently.** Same code (2) as `mongod`, whose message is a dump of
+      the query tree ending `hint provided does not correspond to an existing
+      index`; ours is `hint "a_1" does not correspond to an existing index`.
+- [ ] **PYTHON MongoDB server: `$geoWithin` leaves out points on the
+      boundary** of a `$box`, `$polygon` or `$geometry` polygon (Shapely
+      `within`); `mongod` 8.2.11 includes them. The Rust engine was moved
+      2026-10-10. The parity corpus has no boundary point, so the suite did
+      not notice. Hidden indexes on the Python server were not probed.
 - [ ] **RUST MongoDB server: a `partialFilterExpression` with an operator
       mongod does not allow is accepted.** `{a: {$ne: 1}}` is 67 on `mongod`
       8.2.11, `Expression not supported in partial index: $not` followed by a
