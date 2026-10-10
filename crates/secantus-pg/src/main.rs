@@ -17,7 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pg::{bind, DatabaseRegistry};
+use secantus_pg::{bind_tls, DatabaseRegistry, TlsConfig};
 
 /// Unblock SIGINT / SIGTERM in the calling thread and give them their
 /// default disposition, undoing whatever the parent left. POSIX only:
@@ -73,6 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut home: Option<String> = None;
     let mut addr: Option<String> = None;
     let mut databases: Vec<String> = Vec::new();
+    let mut tls_cert_file: Option<String> = None;
+    let mut tls_key_file: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         // `--version` / `--help` BEFORE the positional fallthrough. Without
@@ -95,7 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "secantusd-pg {} -- standalone PostgreSQL-wire server (SecantusDB)\n\
                  \n\
                  USAGE:\n    \
-                 secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n\
+                 secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n                \
+                 [--tls-cert-file PATH --tls-key-file PATH]\n\
                  \n\
                  ARGS:\n    \
                  <storage-path>  WiredTiger home directory (default: ./secantus-pg-data)\n    \
@@ -106,6 +109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  --database NAME  A database a client may connect to without CREATE\n                     \
                  DATABASE first. Repeatable. `postgres` and `template1`\n                     \
                  always exist.\n    \
+                 --tls-cert-file PATH  PEM certificate chain. With --tls-key-file, a\n                     \
+                 client that asks for TLS gets it; one that does not is\n                     \
+                 still served in the clear. Without the pair the server\n                     \
+                 answers a TLS request with \"not supported\".\n    \
+                 --tls-key-file PATH   PEM private key for that certificate, with no\n                     \
+                 passphrase.\n    \
                  -V, --version    Print version and exit\n    \
                  -h, --help       Print this help and exit",
                 env!("CARGO_PKG_VERSION")
@@ -116,6 +125,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             databases.push(name);
         } else if let Some(name) = arg.strip_prefix("--database=") {
             databases.push(name.to_string());
+        } else if arg == "--tls-cert-file" {
+            tls_cert_file = Some(args.next().ok_or("--tls-cert-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--tls-cert-file=") {
+            tls_cert_file = Some(path.to_string());
+        } else if arg == "--tls-key-file" {
+            tls_key_file = Some(args.next().ok_or("--tls-key-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--tls-key-file=") {
+            tls_key_file = Some(path.to_string());
+        } else if arg.starts_with("--") {
+            // Never a storage path: an unknown or misspelt option fell through
+            // to `home` and the server came up over a directory named after
+            // it -- for a TLS option, in the clear.
+            return Err(format!("unknown option: {arg}").into());
         } else if home.is_none() {
             home = Some(arg);
         } else if addr.is_none() {
@@ -124,6 +146,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("unexpected argument: {arg}").into());
         }
     }
+    // Both or neither, checked before anything is opened: half a pair must
+    // not start a server that then serves without TLS.
+    let tls = match (tls_cert_file, tls_key_file) {
+        (Some(cert), Some(key)) => Some(TlsConfig::new(cert, key)),
+        (None, None) => None,
+        (Some(_), None) => return Err("--tls-cert-file needs --tls-key-file".into()),
+        (None, Some(_)) => return Err("--tls-key-file needs --tls-cert-file".into()),
+    };
     let home = home.unwrap_or_else(|| "./secantus-pg-data".into());
     let addr = addr.unwrap_or_else(|| "127.0.0.1:25434".into());
     let databases = Arc::new(DatabaseRegistry::new("postgres", databases));
@@ -151,7 +181,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let storage = secantus_pg::open_storage(&home)?;
-    let mut server = bind(&addr, storage, databases)?;
+    // The error as a sentence: an unusable certificate is the likeliest thing
+    // to go wrong here, and the `Debug` form buries which file it was.
+    let mut server =
+        bind_tls(&addr, storage, databases, tls.as_ref()).map_err(|e| e.to_string())?;
 
     // One line, flushed, so a harness can wait for readiness. It reports the
     // address the listener actually BOUND, not the one requested, so that

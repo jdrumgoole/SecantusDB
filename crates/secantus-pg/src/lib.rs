@@ -70,13 +70,17 @@ mod schema_rows;
 mod server;
 mod stream_join;
 mod table_locks;
+mod tls;
 mod triggers;
 mod txn_gucs;
 mod wire_portals;
 mod xids;
 
 pub use embedded::{Error, PgBuilder, PgServer, DEFAULT_CACHE_SIZE, DEFAULT_DATABASE};
-pub use server::{bind, open_storage, open_storage_with_cache, sync_on_commit, RunningPgServer};
+pub use server::{
+    bind, bind_tls, open_storage, open_storage_with_cache, sync_on_commit, RunningPgServer,
+};
+pub use tls::TlsConfig;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2900,6 +2904,9 @@ impl PgHandler {
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
     storage: Arc<Storage>,
+    /// Whether the server was started with a certificate: what `SHOW ssl`
+    /// answers. A server fact, not a session's, so it survives `RESET ALL`.
+    ssl: bool,
     /// The database the startup packet named, once it has been checked
     /// against the registry; the registry's default until then.
     db: OnceLock<String>,
@@ -3426,6 +3433,7 @@ impl PgHandler {
     pub fn new(storage: Arc<Storage>, databases: Arc<DatabaseRegistry>) -> Self {
         Self {
             storage,
+            ssl: false,
             db: OnceLock::new(),
             databases,
             txn: Arc::new(Mutex::new(None)),
@@ -3498,6 +3506,25 @@ impl PgHandler {
             plan_apart: Mutex::new(None),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A handler for a server that offers TLS (`ssl` reads `on`).
+    pub fn with_ssl(mut self, ssl: bool) -> Self {
+        self.ssl = ssl;
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) =
+            GucMap::from(self.server_defaults());
+        self
+    }
+
+    /// The settings a fresh connection to THIS server starts with:
+    /// [`default_settings`], with the ones that depend on how the server was
+    /// started.
+    pub(crate) fn server_defaults(&self) -> HashMap<String, String> {
+        let mut defaults = default_settings();
+        if self.ssl {
+            defaults.insert("ssl".to_string(), "on".to_string());
+        }
+        defaults
     }
 
     /// The storage namespace this connection reads and writes.
@@ -17634,7 +17661,7 @@ impl PgHandler {
         // `SHOW timezone` answers -- pgwire's own defaults (`Etc/UTC`, `ISO,
         // YMD`) disagreed with the session's `UTC` / `ISO, MDY`.
         let mut provider = DefaultServerParameterProvider::default();
-        let defaults = default_settings();
+        let defaults = self.server_defaults();
         if let Some(tz) = defaults.get("TimeZone") {
             provider.time_zone = tz.clone();
         }
@@ -29455,7 +29482,7 @@ impl PgHandler {
                         .unwrap_or_else(|e| e.into_inner())
                         .clear();
                     *self.settings.lock().unwrap_or_else(|e| e.into_inner()) =
-                        default_settings().into();
+                        self.server_defaults().into();
                     self.deallocate_all();
                     self.pending_listens
                         .lock()
@@ -29941,7 +29968,7 @@ impl PgHandler {
                 let db_defaults = self.db_setting_defaults();
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 if name.is_empty() {
-                    *settings = default_settings().into();
+                    *settings = self.server_defaults().into();
                     settings.extend(db_defaults);
                 } else {
                     let key = canonical_setting(&name);
@@ -29953,7 +29980,7 @@ impl PgHandler {
                         .into_iter()
                         .find(|(k, _)| *k == key)
                         .map(|(_, v)| v);
-                    match db_default.as_ref().or(default_settings().get(&key)) {
+                    match db_default.as_ref().or(self.server_defaults().get(&key)) {
                         Some(d) => {
                             settings.insert(key.clone(), d.clone());
                             let d = d.clone();

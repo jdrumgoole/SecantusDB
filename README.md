@@ -190,7 +190,8 @@ suite that ran against it on 2026-10-10 (macOS, psycopg 3.3.4), it passes
 gauge measures the protocol and the type system. The query language now
 covers joins, correlated subqueries and CTEs, window functions, `GROUP BY`
 with `GROUPING SETS`, views, indexes, `ALTER TABLE`, `ON CONFLICT`,
-`MERGE`, triggers and PL/pgSQL functions. Not yet: TLS, a foreign table's
+`MERGE`, triggers and PL/pgSQL functions. TLS is on `main` and not yet in a
+release (`--tls-cert-file` / `--tls-key-file`). Not yet: a foreign table's
 rows, and a collection written through the MongoDB server read as a table.
 `EXPLAIN` prints a plan with zero costs. What it does not do it refuses
 with SQLSTATE `0A000` rather than answering wrongly.

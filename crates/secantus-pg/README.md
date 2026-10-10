@@ -32,7 +32,8 @@ async fn selects_one() {
 ```
 
 `PgServer::builder()` sets a persistent store (`.storage_path(..)`), a port,
-extra databases (`.databases(["app"])`) and the WiredTiger cache. `.dsn()` is
+extra databases (`.databases(["app"])`), the WiredTiger cache, and a TLS
+certificate and key (`.tls("server.crt", "server.key")`). `.dsn()` is
 the libpq key/value form, `.url()` the `postgresql://` form.
 
 ## The binary
@@ -41,6 +42,11 @@ the libpq key/value form, `.url()` the `postgresql://` form.
 cargo install secantus-pg --version 0.1.0-beta.8   # a pre-release: cargo needs the version
 secantusd-pg ./pg-data 127.0.0.1:5433   # storage path, bind address
 ```
+
+`--tls-cert-file server.crt --tls-key-file server.key` (PEM, no passphrase)
+offers TLS: a client that asks for it gets it, and one that does not is still
+served in the clear. Client certificates and SCRAM channel binding are not
+supported.
 
 Prebuilt binaries are on the
 [GitHub releases](https://github.com/jdrumgoole/SecantusDB/releases)

@@ -103,13 +103,13 @@ impl PgHandler {
             .into_iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v)
-            .or_else(|| default_settings().get(key).cloned())
+            .or_else(|| self.server_defaults().get(key).cloned())
     }
 
     /// `pg_settings`: one row per setting this session knows.
     pub(crate) fn pg_settings_rows(&self, def: &TableDef) -> Vec<Document> {
         let field = |c: &str| def.field_of(c).expect("column");
-        let defaults = default_settings();
+        let defaults = self.server_defaults();
         let db_defaults = self.db_setting_defaults();
         let settings = self
             .settings

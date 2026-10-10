@@ -4303,6 +4303,36 @@ These work end-to-end but cut corners.
 
 ### 3.1 Authentication
 
+- [ ] **RUST PG server: TLS has no channel binding, no client
+  certificates and no `pg_stat_ssl`.** The server side is in since
+  2026-10-10: `secantusd-pg --tls-cert-file C --tls-key-file K`
+  (`PgBuilder::tls`, `bind_tls`), `crates/secantus-pg/src/tls.rs`. Measured against
+  PostgreSQL 15.19 with `ssl = on` and the same certificate
+  (`require` / `verify-ca` / `verify-full` / a TLS 1.2 ceiling / `disable`,
+  `SHOW ssl`, `RESET ALL`, `SET ssl` 55P02, SCRAM over TLS): the same. Open:
+  - **No channel binding.** `SCRAM-SHA-256-PLUS` is not offered, so
+    `channel_binding=require` with a password fails in the client
+    ("channel binding is required, but server did not offer an
+    authentication method that supports channel binding") where PostgreSQL
+    connects. It needs the `tls-server-end-point` hash of the server
+    certificate in `secantus_auth::begin_scram_pg`.
+  - **No client certificates**: no `clientcert=verify-ca` / `verify-full`
+    and no `cert` authentication. The acceptor is built
+    `with_no_client_auth`.
+  - **`pg_stat_ssl` cannot be read** (42P01; it is listed in `pg_class` and
+    was unreadable before TLS too). It needs the negotiated protocol and
+    cipher out of the wire crate's `ClientInfo`, and OpenSSL's names for
+    rustls' suites.
+  - **A plaintext connection is always accepted**; there is no `hostssl`
+    equivalent to refuse one.
+  - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
+    PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
+  - The key must have no passphrase, and the files are read once at
+    startup (no reload on SIGHUP).
+  - The embedded Python handle (`_secantus_server.PgServer`) has no TLS
+    parameter, and the psycopg gauge starts the server without a
+    certificate, so no gauge exercises TLS.
+
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
 - ~~**MONGODB-X509**~~ — shipped on top of the b22 mTLS slice. Users with `mechanisms: ["MONGODB-X509"]` on `$external` (or `admin`) auth via cert-subject-DN-as-username; no password. The legacy `authenticate` command path (what pymongo / Java / Go / Node use for X509) is wired up alongside `saslStart`. See `docs/authentication.md` "MONGODB-X509" section.

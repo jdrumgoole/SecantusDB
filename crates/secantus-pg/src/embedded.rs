@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::server::{bind, open_storage_with_cache, RunningPgServer};
-use crate::DatabaseRegistry;
+use crate::server::{bind_tls, open_storage_with_cache, RunningPgServer};
+use crate::{DatabaseRegistry, TlsConfig};
 
 /// The WiredTiger cache cap for an embedded server. Smaller than the daemon's
 /// 4G because a test suite starts many of these; WiredTiger fills it lazily
@@ -179,6 +179,7 @@ pub struct PgBuilder {
     port: u16,
     databases: Vec<String>,
     cache_size: String,
+    tls: Option<TlsConfig>,
 }
 
 impl Default for PgBuilder {
@@ -189,6 +190,7 @@ impl Default for PgBuilder {
             port: 0,
             databases: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE.to_string(),
+            tls: None,
         }
     }
 }
@@ -231,6 +233,15 @@ impl PgBuilder {
         self
     }
 
+    /// Offer TLS with this PEM certificate chain and private key. A client
+    /// that asks for TLS gets it; one that does not is still served in the
+    /// clear. Without this the server answers a TLS request with "not
+    /// supported", as PostgreSQL does with `ssl = off`.
+    pub fn tls(mut self, cert_file: impl Into<PathBuf>, key_file: impl Into<PathBuf>) -> Self {
+        self.tls = Some(TlsConfig::new(cert_file, key_file));
+        self
+    }
+
     /// Open the store and start serving.
     pub fn start(self) -> Result<PgServer, Error> {
         if self.cache_size.trim().is_empty() || self.cache_size.contains([',', '(', ')', '=']) {
@@ -266,7 +277,12 @@ impl PgBuilder {
             self.databases.clone(),
         ));
         let addr = format!("{}:{}", self.host, self.port);
-        let running = bind(&addr, storage, databases)?;
+        let running =
+            bind_tls(&addr, storage, databases, self.tls.as_ref()).map_err(|e| match e.kind() {
+                // A certificate or key that could not be used, not a socket.
+                std::io::ErrorKind::InvalidData => Error::Config(e.to_string()),
+                _ => Error::Io(e),
+            })?;
         Ok(PgServer {
             address: running.address(),
             running: Some(running),

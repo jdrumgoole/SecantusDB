@@ -656,6 +656,10 @@ one request path:
     aggregates are the corpora with the most divergences -- run
     `tools/probes/pg_differential.py ... --rust` over `pg_corpora/` for the
     current counts rather than trusting a number here).
+  - TLS is server-side only since 2026-10-10 (`--tls-cert-file` /
+    `--tls-key-file`, `PgBuilder::tls`; rustls with the `ring` provider, in
+    `crates/secantus-pg/src/tls.rs`). No client certificates and no SCRAM
+    channel binding; `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
     pass SCRAM-SHA-256; a role with none, and an unknown user, are still
     trusted (test fixtures rely on that).

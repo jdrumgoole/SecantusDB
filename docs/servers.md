@@ -119,6 +119,21 @@ the `secantusd-pg-v*` tags on
 secantusd-pg ./secantus-pg-data 127.0.0.1:5432
 ```
 
+To offer TLS, give it a PEM certificate chain and its private key (no
+passphrase):
+
+```bash
+secantusd-pg ./secantus-pg-data 127.0.0.1:5432 \
+    --tls-cert-file server.crt --tls-key-file server.key
+```
+
+A client that asks for TLS then gets it (`sslmode=require`, `verify-ca`,
+`verify-full`); one that does not ask is still served in the clear. Without
+the pair the server answers a TLS request with "not supported", as PostgreSQL
+does with `ssl = off`. Client certificates and SCRAM channel binding are not
+supported. The TLS options are on `main`; the released binaries up to beta 8
+do not have them.
+
 The Python one needs the `sql` extra (`pip install "SecantusDB[sql]"`) and
 runs as `secantusd-py-pg`:
 

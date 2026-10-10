@@ -50,7 +50,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::{DatabaseRegistry, HandlerFactory, PgHandler};
+use crate::{DatabaseRegistry, HandlerFactory, PgHandler, TlsConfig};
 
 /// Whether a store this server opens syncs the WiredTiger log on every commit.
 ///
@@ -405,6 +405,21 @@ pub fn bind(
     storage: Storage,
     databases: Arc<DatabaseRegistry>,
 ) -> io::Result<RunningPgServer> {
+    bind_tls(addr, storage, databases, None)
+}
+
+/// [`bind`], offering TLS when `tls` names a certificate and key.
+///
+/// The files are read HERE, before the socket is bound: a path that does not
+/// open or a key that does not match is an error from this call, never a
+/// server that came up without the TLS it was asked for.
+pub fn bind_tls(
+    addr: &str,
+    storage: Storage,
+    databases: Arc<DatabaseRegistry>,
+    tls: Option<&TlsConfig>,
+) -> io::Result<RunningPgServer> {
+    let acceptor = tls.map(TlsConfig::acceptor).transpose()?;
     // Statements are planned and run on each connection's own thread (see
     // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
     // overflowed on a 24-term `||` chain, which ABORTS the process -- every
@@ -457,6 +472,7 @@ pub fn bind(
             listener,
             storage,
             databases,
+            acceptor,
             stop_flag,
             active,
             shutdown_rx,
@@ -479,6 +495,7 @@ async fn accept_loop(
     listener: TcpListener,
     storage: Arc<Storage>,
     databases: Arc<DatabaseRegistry>,
+    acceptor: Option<pgwire::tokio::TlsAcceptor>,
     stop_flag: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
@@ -492,7 +509,10 @@ async fn accept_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let handler = Arc::new(PgHandler::new(storage.clone(), databases.clone()));
+        let handler = Arc::new(
+            PgHandler::new(storage.clone(), databases.clone()).with_ssl(acceptor.is_some()),
+        );
+        let acceptor = acceptor.clone();
         let active = active.clone();
         let mut conn_shutdown = shutdown.clone();
         // One OS thread per connection, running the connection on a runtime
@@ -549,7 +569,7 @@ async fn accept_loop(
                     tokio::select! {
                         _ = pgwire::tokio::process_socket(
                             sock,
-                            None,
+                            acceptor,
                             Arc::new(HandlerFactory(handler)),
                         ) => {}
                         // The server is stopping: drop this connection rather
