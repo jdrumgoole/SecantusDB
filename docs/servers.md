@@ -110,7 +110,7 @@ Mongo daemons read the same `secantusd.toml` config (see
 ### SQL / PostgreSQL servers
 
 The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.8`), and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.9`), and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
@@ -131,8 +131,7 @@ A client that asks for TLS then gets it (`sslmode=require`, `verify-ca`,
 `verify-full`); one that does not ask is still served in the clear. Without
 the pair the server answers a TLS request with "not supported", as PostgreSQL
 does with `ssl = off`. Client certificates and SCRAM channel binding are not
-supported. The TLS options are on `main`; the released binaries up to beta 8
-do not have them.
+supported. The TLS options are in 0.1.0-beta.9 and later.
 
 The Python one needs the `sql` extra (`pip install "SecantusDB[sql]"`) and
 runs as `secantusd-py-pg`:
