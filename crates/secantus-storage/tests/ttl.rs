@@ -124,3 +124,159 @@ fn no_ttl_index_prunes_nothing() {
         assert_eq!(live_ids(st), vec![1]);
     });
 }
+
+/// A partial TTL index expires only the documents its filter covers. The
+/// filter used to be ignored, so the index deleted documents it did not hold
+/// (mongod 8.2.11, 2026-10-10).
+#[test]
+fn a_partial_ttl_index_spares_documents_outside_its_filter() {
+    with_db(|st| {
+        st.create_index(
+            "app",
+            "c",
+            "t_1",
+            &doc! {"t": 1},
+            &doc! {"expireAfterSeconds": 100, "partialFilterExpression": {"gone": true}},
+        )
+        .unwrap();
+        for (id, gone) in [(1, Some(true)), (2, Some(false)), (3, None)] {
+            let mut d = doc! {"_id": id, "t": secs_ago(200)};
+            if let Some(g) = gone {
+                d.insert("gone", g);
+            }
+            st.insert_one("app", "c", &enc(&d)).unwrap();
+        }
+        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 1);
+        assert_eq!(live_ids(st), vec![2, 3]);
+    });
+}
+
+/// An array expires by any date in it that has passed, through a dotted path
+/// too; an array nested inside the array is not looked into.
+#[test]
+fn an_array_of_dates_expires_by_its_earliest() {
+    with_db(|st| {
+        st.create_index(
+            "app",
+            "c",
+            "t_1",
+            &doc! {"t": 1},
+            &doc! {"expireAfterSeconds": 100},
+        )
+        .unwrap();
+        let old = secs_ago(200);
+        let fresh = secs_ago(-200);
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "t": [fresh, old]}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "t": [fresh, fresh]}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 3, "t": [old, "x"]}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 4, "t": [[old]]}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 5, "t": ["x", 5]}))
+            .unwrap();
+        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 2);
+        assert_eq!(live_ids(st), vec![2, 4, 5]);
+    });
+}
+
+/// Only a single-field index is a TTL index. A compound index carrying the
+/// option (mongod refuses to create one) used to delete by its first field.
+#[test]
+fn a_compound_index_is_never_a_ttl_index() {
+    with_db(|st| {
+        st.create_index(
+            "app",
+            "c",
+            "t_1_x_1",
+            &doc! {"t": 1, "x": 1},
+            &doc! {"expireAfterSeconds": 100},
+        )
+        .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "t": secs_ago(200)}))
+            .unwrap();
+        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 0);
+        assert_eq!(live_ids(st), vec![1]);
+    });
+}
+
+/// An expiry is a delete like any other: it is in the oplog, which is what a
+/// change stream and crash recovery read. It used to be written nowhere.
+#[test]
+fn an_expiry_writes_a_delete_to_the_oplog() {
+    with_db(|st| {
+        st.create_index(
+            "app",
+            "c",
+            "t_1",
+            &doc! {"t": 1},
+            &doc! {"expireAfterSeconds": 100},
+        )
+        .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 7, "t": secs_ago(200)}))
+            .unwrap();
+        assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 1);
+        let deletes: Vec<Document> = st
+            .read_oplog(0, 1000)
+            .unwrap()
+            .iter()
+            .map(|(_, raw)| {
+                Document::from_reader(&mut std::io::Cursor::new(raw.as_slice())).unwrap()
+            })
+            .filter(|e| e.get_str("op") == Ok("d"))
+            .collect();
+        assert_eq!(deletes.len(), 1, "{deletes:?}");
+        assert_eq!(deletes[0].get_str("ns").unwrap(), "app.c");
+        assert_eq!(
+            deletes[0].get_document("o").unwrap().get("_id"),
+            Some(&Bson::Int32(7))
+        );
+    });
+}
+
+/// The monitor counts its passes and what they deleted, runs only when its
+/// period has elapsed, and stops when it is disabled.
+#[test]
+fn the_monitor_counts_passes_and_obeys_its_settings() {
+    with_db(|st| {
+        st.create_index(
+            "app",
+            "c",
+            "t_1",
+            &doc! {"t": 1},
+            &doc! {"expireAfterSeconds": 1},
+        )
+        .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "t": secs_ago(200)}))
+            .unwrap();
+        let before = st.ttl_monitor();
+        assert!(before.enabled);
+        assert_eq!(
+            (before.sleep_secs, before.passes, before.deleted),
+            (0, 0, 0)
+        );
+
+        let period = std::time::Duration::from_secs(3600);
+        // The first tick only starts the clock; the next is inside the period.
+        assert_eq!(st.ttl_monitor_tick(period).unwrap(), None);
+        assert_eq!(st.ttl_monitor_tick(period).unwrap(), None);
+        // Disabled: nothing runs however short the period.
+        st.set_ttl_monitor(None, Some(false));
+        assert_eq!(
+            st.ttl_monitor_tick(std::time::Duration::ZERO).unwrap(),
+            None
+        );
+        st.set_ttl_monitor(None, Some(true));
+        assert_eq!(
+            st.ttl_monitor_tick(std::time::Duration::ZERO).unwrap(),
+            Some(1)
+        );
+        let after = st.ttl_monitor();
+        assert_eq!((after.passes, after.deleted), (1, 1));
+        assert_eq!(live_ids(st), Vec::<i32>::new());
+
+        st.set_ttl_monitor(Some(5), None);
+        assert_eq!(st.ttl_monitor().sleep_secs, 5);
+    });
+}

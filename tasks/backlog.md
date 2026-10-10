@@ -5358,6 +5358,12 @@ These are explicit non-goals. Don't add them without a reason.
       anything a particular change provoked, because this change could not have
       provoked it.
 
+      **A different assertion of the same test failed 2026-10-10**, in the
+      `pg-oracle` lane on a PR that changed only the MongoDB server (#1850 or
+      #1851; which was not written down): the cancel half, `assert time.monotonic() - t0 < 1.0`, measured
+      1.06 s. It passed on the re-run. Same shape as the reap: a fixed bound
+      on a shared runner standing in for "the cancel arrived".
+
       Practical note for whoever works it: `gh run rerun --failed` is NOT
       available on this workflow (it answers "run ... cannot be rerun; its
       workflow file may be broken"), so a single-lane re-run is not a diagnostic
@@ -8756,11 +8762,69 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.068 The `bulkWrite` command and TTL indexes -- 2026-10-10
+
+`tools/probes/bulk_write_command.py` and `tools/probes/ttl_indexes.py`, mongod
+8.2.11. The Rust server went from 55 of 141 `bulkWrite` results different to
+2 (both the hint wording filed under 7.067), and from 26 of 50 TTL results
+to 3. What is left, and what the same probes say about the Python server:
+
+- [ ] **PYTHON MongoDB server: a partial TTL index deletes documents outside
+      its filter.** Three expired documents, one matching
+      `partialFilterExpression: {gone: true}`: `mongod` 8.2.11 deletes that
+      one, the Python server all three. Silent data loss. The Rust server did
+      the same until 2026-10-10. The Python server also expires by a
+      COMPOUND index that `collMod` gave an `expireAfterSeconds` (`mongod`
+      refuses the `collMod`, 72), and does not expire a document whose field
+      is an ARRAY holding an expired date, directly or through a dotted path
+      (`mongod` does). Whether its expiries reach the oplog was not measured:
+      the probe's Python server runs without a replica set name, so the
+      change stream there is refused.
+- [ ] **PYTHON MongoDB server: 47 of 50 TTL results and 63 of 141 `bulkWrite`
+      results differ from `mongod`** (same probes). Not changed and not read
+      through beyond the entry above. Whether it stores an array or regex
+      `_id` (the Rust server did, on `insert` and on upsert) was not probed.
+- [ ] **RUST MongoDB server: a 2dsphere index builds over a value that is not
+      a geometry.** `mongod` 8.2.11 fails the build (16755, `Can't extract
+      geo keys: ... geo element must be an array or object`); the Rust server
+      builds the index and leaves the document out of it.
+- [ ] **RUST MongoDB server: a clustered collection reports an `_id` index.**
+      `createIndexes` on one answers `numIndexesBefore: 1`; `mongod` answers
+      0, because the clustered key is not a separate index. Clustering is
+      accepted as an option and changes nothing else here.
+- [ ] **RUST MongoDB server: a pipeline upsert that yields an array `_id`
+      answers 53.** `mongod` answers 54 (`... the (immutable) field '_id' was
+      found to be an array or array descendant`), as it does for a
+      replacement, which the Rust server matches. The storage path cannot
+      tell a pipeline from an operator update. Also not refused there: a
+      `$`-prefixed field inside an upserted `_id` document (`mongod`: 52).
+- [ ] **RUST MongoDB server: `upsertSupplied` is two steps.** The update runs
+      without the upsert, and when nothing matched `c.new` is inserted: not
+      one atomic statement, and the inserted document skips the collection's
+      validator.
+- [ ] **RUST MongoDB server: `getParameter ttlMonitorSleepSecs` reads 60 until
+      a client sets it**, whatever cadence the server was started with, and a
+      server started with the sweep off (`ttl_sweep_seconds = 0`) has no
+      monitor for `ttlMonitorEnabled` to turn on. The embedded Python
+      `RustServer` handle runs no monitor at all.
+- [ ] **RUST MongoDB server: the TTL cutoff is exclusive.** A date exactly
+      `expireAfterSeconds` old is kept until the next pass. Which side
+      `mongod` puts that one millisecond on was not measured.
+- [ ] **RUST MongoDB server: `bulkWrite` checks not probed.** `ops` and
+      `nsInfo` that are not arrays of documents (pymongo cannot send them),
+      `collectionUUID` mismatches, `maxTimeMS`, and the command inside a
+      transaction.
+
 ### 7.067 Index management -- 2026-10-10
 
 `tools/probes/index_admin.py`, mongod 8.2.11: the Rust server went from 68
-of 87 results different to 9. Seven are `text` / `hashed` indexes (out of
-scope) and the index counts that follow from not building them.
+of 87 results different to 9, and to 8 of 90 on 2026-10-10 (the partial-filter
+operator check landed, and the probe now drops the `text`, `hashed` and
+bad-locale indexes straight after building them, so one index built on one
+side only is no longer a shifted count in every later reply). The eight:
+`text` and `hashed` are not built (out of scope) and so cannot be dropped
+(four); the bad-locale collation is built, and so can be dropped (two); and
+`listIndexes` twice, for the collation it does not expand and for its order.
 
 - [ ] **RUST MongoDB server: `$near` runs without a geo index.** `mongod`
       8.2.11 refuses (291, `unable to find index for $geoNear query`), which
@@ -8775,10 +8839,6 @@ scope) and the index counts that follow from not building them.
       `within`); `mongod` 8.2.11 includes them. The Rust engine was moved
       2026-10-10. The parity corpus has no boundary point, so the suite did
       not notice. Hidden indexes on the Python server were not probed.
-- [ ] **RUST MongoDB server: a `partialFilterExpression` with an operator
-      mongod does not allow is accepted.** `{a: {$ne: 1}}` is 67 on `mongod`
-      8.2.11, `Expression not supported in partial index: $not` followed by a
-      rendering of the expression tree.
 - [ ] **RUST MongoDB server: an index `collation` is neither checked nor
       expanded.** `{locale: "zz_nope"}` is accepted (`mongod`: 2, `Field
       'locale' is invalid`), and `listIndexes` echoes the collation as given
@@ -8807,10 +8867,6 @@ results different to 2. What is left, there and beside it:
       cycle detected; maximum depth is 20` on read). Its two limits are not
       the same: `ch19`, twenty views deep, was created and then could not be
       read. The exact create boundary was not measured.
-- [ ] **RUST MongoDB server: the `bulkWrite` command writes into a view.**
-      `mongod` answers a per-operation error 166 in the cursor. `insert`,
-      `update`, `delete` and `findAndModify` are refused; `bulkWrite` (the
-      8.0 command, not the driver helper) is not.
 - [ ] **RUST MongoDB server: smaller view differences.** A `hint` naming an
       index on a view is ignored (`mongod`: 2, `hint provided does not
       correspond to an existing index`); `$indexStats` on a view answers

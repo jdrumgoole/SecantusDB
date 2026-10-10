@@ -643,6 +643,15 @@ impl CmdStorage for StorageAdapter {
         self.inner.prune_oplog(None).map_err(map_err)
     }
 
+    fn ttl_monitor(&self) -> Option<(i64, bool, u64, u64)> {
+        let m = self.inner.ttl_monitor();
+        Some((m.sleep_secs, m.enabled, m.passes, m.deleted))
+    }
+
+    fn set_ttl_monitor(&self, sleep_secs: Option<i64>, enabled: Option<bool>) {
+        self.inner.set_ttl_monitor(sleep_secs, enabled);
+    }
+
     fn prune_ttl_all(&self) -> Result<usize, StorageError> {
         self.inner
             .prune_ttl_all_collections(bson::DateTime::now())

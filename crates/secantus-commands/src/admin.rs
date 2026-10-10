@@ -355,6 +355,16 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .unwrap_or_default();
         opts.insert("viewPipeline", Bson::Array(pipeline));
     }
+    // A collection-level TTL belongs to a clustered or time-series collection.
+    if has("expireAfterSeconds") && !has("clusteredIndex") && !has("timeseries") {
+        return Ok(CommandError::new(
+            72,
+            "InvalidOptions",
+            "'expireAfterSeconds' is only supported on time-series collections or when the \
+             'clusteredIndex' option is specified",
+        )
+        .into_reply());
+    }
     // `clusteredIndex` clusters the collection on `_id` — which is already
     // SecantusDB's doc-table layout (keyed by `_id`), so this is metadata-only.
     // mongod allows it only on `{_id: 1}` with `unique: true`; normalise the
@@ -674,22 +684,54 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
         if let Some(new_expiry) = index_spec.get("expireAfterSeconds") {
+            // Checked as mongod checks it (measured 8.2.11, 2026-10-10). Every
+            // one of these used to be stored: a string, a negative number, and
+            // a TTL on a compound index, which then deleted documents.
+            let invalid = |why: &str| CommandError::new(72, "InvalidOptions", why).into_reply();
+            let seconds = match new_expiry {
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                    as_i64(new_expiry).unwrap_or(0)
+                }
+                other => {
+                    return Ok(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        format!(
+                            "BSON field 'collMod.index.expireAfterSeconds' is the wrong type \
+                             '{}', expected types '[long, int, decimal, double]'",
+                            secantus_core::query::bson_type_name(other)
+                        ),
+                    )
+                    .into_reply())
+                }
+            };
+            if seconds < 0 {
+                return Ok(invalid(
+                    "TTL index 'expireAfterSeconds' option cannot be less than 0",
+                ));
+            }
+            let target_key = target.get_document("key").cloned().unwrap_or_default();
+            if target_name == "_id_" {
+                return Ok(invalid("the _id field does not support TTL indexes"));
+            }
+            if target_key.len() > 1 {
+                return Ok(invalid(
+                    "TTL indexes are single-field indexes, compound indexes do not support TTL",
+                ));
+            }
+            // A value past int32 is stored, and reported, as int32's largest.
+            let seconds = seconds.min(i64::from(i32::MAX));
             // Both as int64, and no `_old` for an index that had no TTL.
             if let Some(old) = target.get("expireAfterSeconds").and_then(as_i64) {
                 reply.insert("expireAfterSeconds_old", old);
             }
-            reply.insert(
-                "expireAfterSeconds_new",
-                as_i64(new_expiry)
-                    .map(Bson::Int64)
-                    .unwrap_or(new_expiry.clone()),
-            );
+            reply.insert("expireAfterSeconds_new", seconds);
             storage
                 .set_index_options(
                     &ctx.db_name,
                     &coll,
                     &target_name,
-                    &doc! {"expireAfterSeconds": new_expiry.clone()},
+                    &doc! {"expireAfterSeconds": seconds as i32},
                 )
                 .map_err(command_error)?;
         }
@@ -1737,6 +1779,17 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                         s.insert(flag, n != 0);
                     }
                 }
+                // mongod stores a TTL as an int32 whatever number type it was
+                // given, truncating a fraction. NaN is left for the check
+                // below to refuse.
+                let seconds = s.get("expireAfterSeconds").and_then(|v| match v {
+                    Bson::Double(d) if d.is_nan() => None,
+                    Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => as_i64(v),
+                    _ => None,
+                });
+                if let Some(n) = seconds.filter(|n| (0..=i64::from(i32::MAX)).contains(n)) {
+                    s.insert("expireAfterSeconds", n as i32);
+                }
                 Bson::Document(s)
             }
             other => other,
@@ -1988,6 +2041,135 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     Ok(reply)
 }
 
+/// What mongod refuses in a `partialFilterExpression`.
+enum PartialProblem {
+    /// An operator barred from the context altogether: `(code, name, op)`.
+    NotAllowed(i32, &'static str, &'static str),
+    /// An expression a partial index cannot hold, as mongod prints the
+    /// offending node of its parsed tree.
+    Unsupported(String),
+}
+
+/// The first expression in `filter` a partial index does not support
+/// (measured 8.2.11, 2026-10-10). Allowed: equality, `$gt` / `$gte` / `$lt` /
+/// `$lte`, `$in`, `$exists: true`, `$type`, `$all`, the geo operators, and
+/// `$and` / `$or` over those. The text after the operator name is mongod's
+/// debug print of the node; it is reproduced for the single-value forms and
+/// approximated beyond them.
+fn partial_filter_problem(filter: &Document) -> Option<PartialProblem> {
+    let show = |v: &Bson| argtypes::render_stage_value(v);
+    for (key, value) in filter {
+        match key.as_str() {
+            "$expr" => return Some(PartialProblem::NotAllowed(224, "Location224", "$expr")),
+            "$jsonSchema" => {
+                return Some(PartialProblem::NotAllowed(
+                    224,
+                    "Location224",
+                    "$jsonSchema",
+                ))
+            }
+            "$where" => return Some(PartialProblem::NotAllowed(2, "BadValue", "$where")),
+            "$text" => return Some(PartialProblem::NotAllowed(2, "BadValue", "$text")),
+            "$and" | "$or" | "$nor" => {
+                let clauses: Vec<&Document> = match value {
+                    Bson::Array(a) => a.iter().filter_map(Bson::as_document).collect(),
+                    _ => Vec::new(),
+                };
+                for clause in &clauses {
+                    if let Some(p) = partial_filter_problem(clause) {
+                        return Some(p);
+                    }
+                }
+                if key == "$nor" {
+                    let mut tree = String::from("$nor\n");
+                    for clause in clauses {
+                        for (f, v) in clause {
+                            tree.push_str(&format!("    {f} $eq {}\n", show(v)));
+                        }
+                    }
+                    return Some(PartialProblem::Unsupported(tree));
+                }
+            }
+            _ if key.starts_with('$') => {}
+            field => {
+                let ops = match value {
+                    Bson::RegularExpression(re) => {
+                        return Some(PartialProblem::Unsupported(format!(
+                            "{field} regex /{}/{}\n",
+                            re.pattern, re.options
+                        )))
+                    }
+                    Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => d,
+                    _ => continue,
+                };
+                for (op, arg) in ops {
+                    let tree = match op.as_str() {
+                        "$ne" => format!("$not\n    {field} $eq {}\n", show(arg)),
+                        "$nin" => {
+                            let items: Vec<String> = match arg {
+                                Bson::Array(a) => a.iter().map(&show).collect(),
+                                other => vec![show(other)],
+                            };
+                            format!("$not\n    {field} $in [ {}]\n", items.join(" "))
+                        }
+                        "$not" => {
+                            let mut tree = String::from("$not\n    $and\n");
+                            if let Bson::Document(inner) = arg {
+                                for (iop, iarg) in inner {
+                                    tree.push_str(&format!(
+                                        "        {field} {iop} {}\n",
+                                        show(iarg)
+                                    ));
+                                }
+                            }
+                            tree
+                        }
+                        "$exists" if is_falsy(arg) => format!("$not\n    {field} exists\n"),
+                        "$regex" => format!(
+                            "{field} regex /{}/{}\n",
+                            arg.as_str().unwrap_or_default(),
+                            ops.get_str("$options").unwrap_or_default()
+                        ),
+                        "$mod" => match arg {
+                            Bson::Array(a) if a.len() == 2 => {
+                                format!("{field} mod {} % x == {}\n", show(&a[0]), show(&a[1]))
+                            }
+                            other => format!("{field} mod {}\n", show(other)),
+                        },
+                        "$size" => format!("{field} $size : {}\n", show(arg)),
+                        "$elemMatch" => {
+                            let mut tree = format!("{field} $elemMatch (value)\n");
+                            if let Bson::Document(inner) = arg {
+                                for (iop, iarg) in inner {
+                                    tree.push_str(&format!("     {iop} {}\n", show(iarg)));
+                                }
+                            }
+                            tree
+                        }
+                        "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear" => {
+                            // mongod prints the bit POSITIONS a numeric mask sets.
+                            let positions: Vec<String> = match arg {
+                                Bson::Array(a) => a.iter().map(&show).collect(),
+                                other => {
+                                    let mask = as_i64(other).unwrap_or(0);
+                                    (0..63)
+                                        .filter(|bit| mask >> bit & 1 == 1)
+                                        .map(|bit| bit.to_string())
+                                        .collect()
+                                }
+                            };
+                            format!("{field} {op}: [{}]\n", positions.join(", "))
+                        }
+                        _ => continue,
+                    };
+                    return Some(PartialProblem::Unsupported(tree));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Why mongod refuses an index spec before building anything, or `None`.
 /// Each message is what 8.2.11 answered (2026-10-10); all of these specs
 /// used to be accepted and an index built from them.
@@ -2120,6 +2302,29 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
             "cannot mix \"partialFilterExpression\" and \"sparse\" options",
         ));
     }
+    // A partial filter takes a narrow set of operators. The others were
+    // accepted and an index built that the planner could never reason about.
+    if let Some(Bson::Document(filter)) = spec.get("partialFilterExpression") {
+        match partial_filter_problem(filter) {
+            Some(PartialProblem::NotAllowed(code, name, op)) => {
+                return Some(in_spec(
+                    code,
+                    name,
+                    &text,
+                    &format!("{op} is not allowed in this context"),
+                ))
+            }
+            Some(PartialProblem::Unsupported(tree)) => {
+                return Some(in_spec(
+                    67,
+                    "CannotCreateIndex",
+                    &versioned_text,
+                    &format!("Expression not supported in partial index: {tree}"),
+                ))
+            }
+            None => {}
+        }
+    }
     // TTL: one field, and a non-negative 32-bit number of seconds.
     if let Some(seconds) = spec.get("expireAfterSeconds") {
         let ttl = |why: &str| {
@@ -2129,8 +2334,14 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
                 format!(". Index spec: {text} :: caused by :: {why}"),
             )
         };
+        if matches!(seconds, Bson::Double(d) if d.is_nan()) {
+            return Some(ttl("TTL index 'expireAfterSeconds' option must not be NaN"));
+        }
         if let Some(n) = as_i64(seconds) {
-            if matches!(seconds, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
+            if matches!(
+                seconds,
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+            ) {
                 if n < 0 {
                     return Some(ttl(
                         "TTL index 'expireAfterSeconds' option cannot be less than 0",
@@ -2267,6 +2478,29 @@ fn conflict_spec_text(spec: &Document) -> String {
     argtypes::render_stage_value(&Bson::Document(out))
 }
 
+/// A spec as mongod quotes it for an EQUIVALENT index: the options that do
+/// not change which index it is come last, after the name.
+fn equivalent_spec_text(spec: &Document) -> String {
+    let mut out = Document::new();
+    out.insert("v", 2i32);
+    let trailing = |k: &str| matches!(k, "expireAfterSeconds" | "hidden");
+    let listed =
+        |k: &str| !matches!(k, "v" | "key" | "name" | "ns") && !INDEX_CATALOG_ONLY.contains(&k);
+    for (k, v) in spec.iter().filter(|(k, _)| listed(k) && !trailing(k)) {
+        out.insert(k.clone(), v.clone());
+    }
+    if let Some(k) = spec.get("key") {
+        out.insert("key", k.clone());
+    }
+    if let Some(n) = spec.get("name") {
+        out.insert("name", n.clone());
+    }
+    for (k, v) in spec.iter().filter(|(k, _)| trailing(k)) {
+        out.insert(k.clone(), v.clone());
+    }
+    argtypes::render_stage_value(&Bson::Document(out))
+}
+
 /// The options that make two index specs different indexes.
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
@@ -2328,6 +2562,30 @@ fn index_conflict(
             .get_document("key")
             .is_ok_and(|k| docs_equal_by_value(k, key));
         let same_opts = docs_equal_by_value(&index_options(idx), &wanted);
+        // Options that do not change WHICH index it is: the same name and key
+        // with only these different is an equivalent index, 85.
+        let identity = |d: &Document| -> Document {
+            d.iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "expireAfterSeconds" | "hidden"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        if same_name
+            && same_key
+            && !same_opts
+            && docs_equal_by_value(&identity(&index_options(idx)), &identity(&wanted))
+        {
+            return Some(CommandError::new(
+                85,
+                "IndexOptionsConflict",
+                format!(
+                    "An equivalent index already exists with the same name but different \
+                     options. Requested index: {}, existing index: {}",
+                    equivalent_spec_text(spec),
+                    equivalent_spec_text(idx),
+                ),
+            ));
+        }
         if same_name && !(same_key && same_opts) {
             return Some(CommandError::new(
                 86,
@@ -2655,6 +2913,24 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // Defaults to persistent when there is no storage (unit-test contexts),
     // matching the Python server's fallback rather than erroring the command.
     let persistent = ctx.storage().map(|s| !s.in_memory()).unwrap_or(true);
+    let mut metrics = doc! {
+        "cursor": {
+            "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
+        },
+    };
+    // The TTL monitor's counters. Drivers' and users' tests wait on `passes`
+    // to know a sweep has happened instead of sleeping for one.
+    if let Some((_, _, passes, deleted)) = ctx.storage().ok().and_then(|s| s.ttl_monitor()) {
+        metrics.insert(
+            "ttl",
+            doc! {
+                "deletedDocuments": deleted as i64,
+                "invalidTTLIndexSkips": 0i64,
+                "passes": passes as i64,
+                "subPasses": passes as i64,
+            },
+        );
+    }
     Ok(doc! {
         "host": "secantus",
         "version": crate::SERVER_VERSION,
@@ -2663,11 +2939,7 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         "uptime": 0.0,
         "uptimeMillis": Bson::Int64(0),
         "localTime": bson::DateTime::now(),
-        "metrics": {
-            "cursor": {
-                "open": { "total": open_cursors, "pinned": 0i64, "noTimeout": 0i64 },
-            },
-        },
+        "metrics": metrics,
         // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
         // `connections.totalCreated` off serverStatus to check the connection
         // pool wasn't cleared. Omitting the section made those fail with

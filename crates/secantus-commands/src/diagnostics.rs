@@ -218,6 +218,8 @@ pub(crate) fn known_params(test_commands: bool) -> Document {
         "enableTestCommands": test_commands,
         "logLevel": 0_i32,
         "quiet": false,
+        "ttlMonitorEnabled": true,
+        "ttlMonitorSleepSecs": 60_i32,
         // We implement SCRAM-SHA-256 + MONGODB-X509 (R5); advertise just those
         // so driver test runners gating on other mechanisms self-skip.
         "authenticationMechanisms": [

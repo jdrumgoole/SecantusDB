@@ -2019,3 +2019,228 @@ fn geo_within_includes_points_on_the_boundary() {
         });
     }
 }
+
+/// A TTL is stored as an int32 whatever number it was given, and `collMod`
+/// checks a new one as `createIndexes` does. Every refusal here used to be
+/// accepted (mongod 8.2.11, 2026-10-10).
+#[test]
+fn ttl_seconds_are_normalised_and_checked() {
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
+        let seconds = |c: &mut CommandContext, name: &str| -> Option<Bson> {
+            dispatch(&doc! {"listIndexes": "c"}, c)
+                .get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap()
+                .iter()
+                .filter_map(Bson::as_document)
+                .find(|ix| ix.get_str("name") == Ok(name))
+                .and_then(|ix| ix.get("expireAfterSeconds").cloned())
+        };
+        for (name, given) in [
+            ("a", Bson::Int64(60)),
+            ("b", Bson::Double(60.9)),
+            ("d", Bson::Decimal128("60".parse().unwrap())),
+        ] {
+            let reply = create_index(
+                c,
+                doc! {"key": {name: 1}, "name": name, "expireAfterSeconds": given},
+            );
+            assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply}");
+            assert_eq!(seconds(c, name), Some(Bson::Int32(60)), "{name}");
+        }
+        let reply = create_index(
+            c,
+            doc! {"key": {"n": 1}, "name": "n", "expireAfterSeconds": f64::NAN},
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 67, "{reply}");
+        assert!(reply
+            .get_str("errmsg")
+            .unwrap()
+            .ends_with("TTL index 'expireAfterSeconds' option must not be NaN"));
+
+        create_index(c, doc! {"key": {"p": 1, "q": 1}, "name": "pq"});
+        let collmod = |c: &mut CommandContext, name: &str, value: Bson| {
+            dispatch(
+                &doc! {"collMod": "c", "index": {"name": name, "expireAfterSeconds": value}},
+                c,
+            )
+        };
+        for (name, value, code, errmsg) in [
+            (
+                "a",
+                Bson::Int32(-1),
+                72,
+                "TTL index 'expireAfterSeconds' option cannot be less than 0",
+            ),
+            (
+                "a",
+                Bson::String("60".into()),
+                14,
+                "BSON field 'collMod.index.expireAfterSeconds' is the wrong type 'string', \
+                 expected types '[long, int, decimal, double]'",
+            ),
+            (
+                "pq",
+                Bson::Int32(60),
+                72,
+                "TTL indexes are single-field indexes, compound indexes do not support TTL",
+            ),
+            (
+                "_id_",
+                Bson::Int32(60),
+                72,
+                "the _id field does not support TTL indexes",
+            ),
+        ] {
+            let reply = collmod(c, name, value.clone());
+            assert_eq!(
+                reply.get_i32("code").ok(),
+                Some(code),
+                "{name} {value} -> {reply}"
+            );
+            assert_eq!(reply.get_str("errmsg").unwrap(), errmsg);
+        }
+        assert_eq!(seconds(c, "a"), Some(Bson::Int32(60)));
+        assert_eq!(seconds(c, "pq"), None);
+        // Past int32 is stored as int32's largest; a fraction is dropped.
+        let reply = collmod(c, "a", Bson::Int64(2_147_483_648));
+        assert_eq!(
+            reply.get_i64("expireAfterSeconds_new").unwrap(),
+            2_147_483_647
+        );
+        assert_eq!(seconds(c, "a"), Some(Bson::Int32(i32::MAX)));
+        collmod(c, "a", Bson::Double(30.5));
+        assert_eq!(seconds(c, "a"), Some(Bson::Int32(30)));
+    });
+}
+
+/// The same name and key with only the TTL different is an EQUIVALENT index:
+/// 85, quoting both specs with the TTL after the name.
+#[test]
+fn the_same_index_with_another_ttl_is_an_options_conflict() {
+    with_wt(|c| {
+        create_index(
+            c,
+            doc! {"key": {"t": 1}, "name": "t_1", "expireAfterSeconds": 86400},
+        );
+        let reply = create_index(
+            c,
+            doc! {"key": {"t": 1}, "name": "t_1", "expireAfterSeconds": 60},
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 85, "{reply}");
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "An equivalent index already exists with the same name but different options. \
+             Requested index: { v: 2, key: { t: 1 }, name: \"t_1\", expireAfterSeconds: 60 }, \
+             existing index: { v: 2, key: { t: 1 }, name: \"t_1\", expireAfterSeconds: 86400 }"
+        );
+    });
+}
+
+/// A partial filter takes a narrow set of operators; the rest are refused
+/// with mongod's print of the offending node.
+#[test]
+fn a_partial_filter_refuses_operators_it_cannot_hold() {
+    with_wt(|c| {
+        let build = |c: &mut CommandContext, filter: Document| {
+            create_index(
+                c,
+                doc! {"key": {"k": 1}, "name": "k", "partialFilterExpression": filter},
+            )
+        };
+        for (filter, tree) in [
+            (doc! {"a": {"$ne": 1}}, "$not\n    a $eq 1\n"),
+            (doc! {"a": {"$nin": [1]}}, "$not\n    a $in [ 1]\n"),
+            (
+                doc! {"a": {"$not": {"$gt": 1}}},
+                "$not\n    $and\n        a $gt 1\n",
+            ),
+            (doc! {"$nor": [{"a": 1}]}, "$nor\n    a $eq 1\n"),
+            (doc! {"a": {"$exists": false}}, "$not\n    a exists\n"),
+            (doc! {"a": {"$regex": "x"}}, "a regex /x/\n"),
+            (doc! {"a": {"$mod": [2, 0]}}, "a mod 2 % x == 0\n"),
+            (doc! {"a": {"$size": 2}}, "a $size : 2\n"),
+            (
+                doc! {"a": {"$elemMatch": {"$gt": 1}}},
+                "a $elemMatch (value)\n     $gt 1\n",
+            ),
+            (doc! {"a": {"$bitsAllSet": 1}}, "a $bitsAllSet: [0]\n"),
+            (doc! {"$or": [{"a": {"$ne": 1}}]}, "$not\n    a $eq 1\n"),
+        ] {
+            let reply = build(c, filter.clone());
+            assert_eq!(reply.get_i32("code").ok(), Some(67), "{filter} -> {reply}");
+            let errmsg = reply.get_str("errmsg").unwrap();
+            assert!(
+                errmsg.ends_with(&format!(
+                    ", v: 2 }} :: caused by :: Expression not supported in partial index: {tree}"
+                )),
+                "{filter} -> {errmsg:?}"
+            );
+        }
+        for (filter, code, op) in [
+            (doc! {"$expr": {"$eq": ["$a", 1]}}, 224, "$expr"),
+            (doc! {"$where": "1"}, 2, "$where"),
+        ] {
+            let reply = build(c, filter.clone());
+            assert_eq!(
+                reply.get_i32("code").ok(),
+                Some(code),
+                "{filter} -> {reply}"
+            );
+            assert!(reply
+                .get_str("errmsg")
+                .unwrap()
+                .ends_with(&format!("caused by :: {op} is not allowed in this context")));
+        }
+        // And the ones it does take still build.
+        for (i, filter) in [
+            doc! {"a": {"$exists": true}},
+            doc! {"a": {"$in": [1, 2]}},
+            doc! {"a": {"$type": "string"}},
+            doc! {"$or": [{"a": 1}, {"b": {"$gt": 2}}]},
+            doc! {"a": {"$gte": 1, "$lt": 5}},
+            doc! {"a": null},
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("ok{i}");
+            let reply = create_index(
+                c,
+                doc! {"key": {&name: 1}, "name": &name, "partialFilterExpression": filter.clone()},
+            );
+            assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{filter} -> {reply}");
+        }
+    });
+}
+
+/// A collection-level `expireAfterSeconds` needs a clustered or time-series
+/// collection, and `serverStatus` reports the TTL monitor.
+#[test]
+fn collection_ttl_needs_clustering_and_the_monitor_is_reported() {
+    with_wt(|c| {
+        let reply = dispatch(&doc! {"create": "plain", "expireAfterSeconds": 60}, c);
+        assert_eq!(reply.get_i32("code").ok(), Some(72), "{reply}");
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "'expireAfterSeconds' is only supported on time-series collections or when the \
+             'clusteredIndex' option is specified"
+        );
+        let status = dispatch(&doc! {"serverStatus": 1}, c);
+        let ttl = status
+            .get_document("metrics")
+            .unwrap()
+            .get_document("ttl")
+            .unwrap_or_else(|_| panic!("no metrics.ttl in {status}"));
+        for field in [
+            "deletedDocuments",
+            "invalidTTLIndexSkips",
+            "passes",
+            "subPasses",
+        ] {
+            assert!(ttl.get_i64(field).is_ok(), "{field} in {ttl}");
+        }
+    });
+}

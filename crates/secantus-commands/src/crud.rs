@@ -88,13 +88,28 @@ fn insert_reply(
     Ok(reply)
 }
 
+/// An `_id` of a type mongod cannot hold: 53 `InvalidIdField`, measured
+/// 8.2.11 (2026-10-10) for an array and a regex. Both were stored.
+fn id_type_error(index: usize, type_name: &str) -> Document {
+    doc! {
+        "index": index as i32,
+        "code": 53,
+        "errmsg": format!("The '_id' value cannot be of type {type_name}"),
+    }
+}
+
 /// The `_id`-may-not-contain-`$`-prefixed-fields pre-check run over raw BSON
 /// (no full decode). Mirrors the decoded path exactly: reports the `_id`
 /// sub-document's first key when *any* key is `$`-prefixed.
 fn raw_id_dollar_key_error(raw: &[u8], index: usize) -> Option<Document> {
     let rd = bson::RawDocument::from_bytes(raw).ok()?;
-    let Ok(Some(bson::RawBsonRef::Document(idd))) = rd.get("_id") else {
-        return None;
+    let idd = match rd.get("_id") {
+        Ok(Some(bson::RawBsonRef::Document(idd))) => idd,
+        Ok(Some(bson::RawBsonRef::Array(_))) => return Some(id_type_error(index, "array")),
+        Ok(Some(bson::RawBsonRef::RegularExpression(_))) => {
+            return Some(id_type_error(index, "regex"))
+        }
+        _ => return None,
     };
     let mut first_key: Option<String> = None;
     let mut has_dollar = false;
@@ -113,7 +128,7 @@ fn raw_id_dollar_key_error(raw: &[u8], index: usize) -> Option<Document> {
     let first = first_key.unwrap_or_default();
     Some(doc! {
         "index": index as i32,
-        "code": 2,
+        "code": 52,
         "errmsg": format!(
             "_id fields may not contain '$'-prefixed fields: {first} is not valid for storage."
         ),
@@ -292,12 +307,24 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             continue;
         };
+        let id_type = match d.get("_id") {
+            Some(Bson::Array(_)) => Some("array"),
+            Some(Bson::RegularExpression(_)) => Some("regex"),
+            _ => None,
+        };
+        if let Some(type_name) = id_type {
+            pre_errors.push(id_type_error(index, type_name));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         if let Some(Bson::Document(id_value)) = d.get("_id") {
             if id_value.keys().any(|k| k.starts_with('$')) {
                 let first = id_value.keys().next().map(String::as_str).unwrap_or("");
                 pre_errors.push(doc! {
                     "index": index as i32,
-                    "code": 2,
+                    "code": 52,
                     "errmsg": format!(
                         "_id fields may not contain '$'-prefixed fields: {first} is not valid for storage."
                     ),
@@ -699,6 +726,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         argtypes::require_object(spec, "collation", "update.updates.collation")?;
         argtypes::require_array_of_objects(spec, "arrayFilters", "update.updates.arrayFilters")?;
         argtypes::require_hint(spec, "hint")?;
+        argtypes::require_object(spec, "c", "update.updates.c")?;
 
         // An unresolvable `hint` fails THIS statement, not the batch (see the
         // note above the loop).
@@ -715,6 +743,40 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             continue;
         }
+
+        // Per-statement constants (`c`): more variables, for a PIPELINE update
+        // only. They were accepted and ignored, so `$$k` was an undefined
+        // variable (measured 8.2.11, 2026-10-10).
+        let constants = spec.get("c").and_then(Bson::as_document);
+        if constants.is_some() && !matches!(spec.get("u"), Some(Bson::Array(_))) {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": 51198,
+                "errmsg": "Constant values may only be specified for pipeline updates",
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
+        let stmt_vars: std::borrow::Cow<Document> = match constants {
+            Some(c) => {
+                let mut vars = let_vars.clone();
+                for (name, value) in c {
+                    vars.insert(name.clone(), value.clone());
+                }
+                std::borrow::Cow::Owned(vars)
+            }
+            None => std::borrow::Cow::Borrowed(&let_vars),
+        };
+        // `upsertSupplied`: when nothing matches, insert `c.new` as it stands
+        // instead of running the pipeline over the filter's fields.
+        let supplied: Option<Document> =
+            if bool_field(spec, "upsert", false) && bool_field(spec, "upsertSupplied", false) {
+                constants.and_then(|c| c.get_document("new").ok()).cloned()
+            } else {
+                None
+            };
 
         // MongoDB 8.0's per-spec `sort`: match in sort order and update the
         // FIRST one. Probed on 8.2.11 -- `multi: true` is rejected, and an
@@ -798,10 +860,13 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // generic BadValue — and it is per statement, so an earlier one in the
         // batch still applies (probed: `n: 1` with the error at `index: 1`).
         {
-            let bound: Vec<String> = match doc.get("let") {
+            let mut bound: Vec<String> = match doc.get("let") {
                 Some(Bson::Document(d)) => d.keys().cloned().collect(),
                 _ => Vec::new(),
             };
+            if let Some(c) = constants {
+                bound.extend(c.keys().cloned());
+            }
             let found = match spec.get("q") {
                 Some(Bson::Document(q)) => argtypes::expression_problem_in_filter(q, &bound)
                     .map(|(c, m)| (c, m, String::new())),
@@ -890,8 +955,8 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 &q,
                 stages,
                 multi,
-                upsert,
-                &let_vars,
+                upsert && supplied.is_none(),
+                &stmt_vars,
                 collation.as_ref(),
                 validator.as_ref(),
                 validator_moderate,
@@ -933,7 +998,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 multi,
                 upsert,
                 &array_filters,
-                &let_vars,
+                &stmt_vars,
                 collation.as_ref(),
                 validator.as_ref(),
                 validator_moderate,
@@ -945,7 +1010,26 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Ok(outcome) => {
                 n += outcome.matched as i32;
                 n_modified += outcome.modified as i32;
-                if let Some(id) = outcome.upserted_id {
+                let mut upserted_id = outcome.upserted_id;
+                if let (0, Some(mut new)) = (outcome.matched, supplied) {
+                    if !new.contains_key("_id") {
+                        new.insert("_id", bson::oid::ObjectId::new());
+                    }
+                    let id = new.get("_id").cloned().unwrap_or(Bson::Null);
+                    let (_, mut errors) = storage
+                        .insert(&ctx.db_name, &coll, vec![encode_doc(&new)?], true)
+                        .map_err(command_error)?;
+                    if let Some(mut err) = errors.pop() {
+                        err.insert("index", index as i32);
+                        write_errors.push(Bson::Document(err));
+                        if ordered {
+                            break;
+                        }
+                        continue;
+                    }
+                    upserted_id = Some(id);
+                }
+                if let Some(id) = upserted_id {
                     upserted.push(Bson::Document(doc! { "index": index as i32, "_id": id }));
                     n += 1;
                 }
