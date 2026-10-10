@@ -2085,21 +2085,46 @@ fn op_max_min_n(arg: &Bson, ctx: &Ctx, largest: bool) -> R {
     let (n, arr) = nelem_n_and_input(arg, ctx)?;
     // mongod ignores null elements; the rest must be in the sortable subset so
     // `order::cmp` reproduces Python's `_SortKey` order (else defer).
-    let mut vals: Vec<Bson> = arr.into_iter().filter(|x| !is_null(x)).collect();
+    let vals: Vec<Bson> = arr.into_iter().filter(|x| !is_null(x)).collect();
     if !vals.iter().all(crate::order::is_sortable) {
         return Err(Fallback::Defer);
     }
-    // Descending via `cmp(b, a)` keeps equal elements in original order (stable),
-    // matching Python's `sorted(reverse=True)`.
-    vals.sort_by(|a, b| {
-        if largest {
-            crate::order::cmp(b, a)
-        } else {
-            crate::order::cmp(a, b)
+    // mongod keeps the n best in an ordered multiset: a value goes in AFTER
+    // the values equal to it, and once the set is full a value displaces the
+    // worst only when strictly better. `$minN` reads the set forwards and
+    // `$maxN` backwards, so among equal values `$maxN` lists the LATER one
+    // first. Equal is not identical -- `1` and `1.0`, or `"b"` and `"B"`
+    // under a collation -- so the order shows (measured 8.2.11, 2026-10-10:
+    // `$maxN` of `[1, 2.0, long 2, 0, decimal 2, 2]`, n 3, is decimal, long,
+    // double).
+    use std::cmp::Ordering as O;
+    let mut kept: Vec<Bson> = Vec::with_capacity(n.min(vals.len()) + 1);
+    for v in vals {
+        if n == 0 {
+            break;
         }
-    });
-    let n = n.min(vals.len());
-    Ok(Bson::Array(vals[..n].to_vec()))
+        if kept.len() == n {
+            let better = if largest {
+                crate::order::cmp(&v, &kept[0]) == O::Greater
+            } else {
+                crate::order::cmp(&v, &kept[n - 1]) == O::Less
+            };
+            if !better {
+                continue;
+            }
+            if largest {
+                kept.remove(0);
+            } else {
+                kept.pop();
+            }
+        }
+        let at = kept.partition_point(|k| crate::order::cmp(k, &v) != O::Greater);
+        kept.insert(at, v);
+    }
+    if largest {
+        kept.reverse();
+    }
+    Ok(Bson::Array(kept))
 }
 
 fn op_concat_arrays(arg: &Bson, ctx: &Ctx) -> R {
@@ -3651,9 +3676,16 @@ fn op_set_equals(arg: &Bson, ctx: &Ctx) -> R {
             ),
         ));
     }
-    let base = set_dedup_sorted(arrays[0].clone());
+    // Element by element through `order::cmp`, which is what reads the
+    // active collation; `!=` on the arrays compared the strings' bytes.
+    let members = |v: &[Bson]| match set_dedup_sorted(v.to_vec()) {
+        Bson::Array(a) => a,
+        _ => Vec::new(),
+    };
+    let base = members(&arrays[0]);
     for other in &arrays[1..] {
-        if set_dedup_sorted(other.clone()) != base {
+        let other = members(other);
+        if other.len() != base.len() || !other.iter().zip(&base).all(|(a, b)| set_eq(a, b)) {
             return Ok(Bson::Boolean(false));
         }
     }
@@ -8017,7 +8049,12 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     }
     Ok(match (a, b) {
         (Bson::Null, Bson::Null) => true,
-        (Bson::String(x), Bson::String(y)) => x == y,
+        // Equal by the active collation when an aggregation or update runs
+        // with one. The change-stream diff turns it off first (`diff.rs`):
+        // whether a write CHANGED a value is never a collation question.
+        (Bson::String(x), Bson::String(y)) => {
+            x == y || crate::collation::active_compare(x, y) == std::cmp::Ordering::Equal
+        }
         (Bson::ObjectId(x), Bson::ObjectId(y)) => x == y,
         (Bson::DateTime(x), Bson::DateTime(y)) => x == y,
         (Bson::Timestamp(x), Bson::Timestamp(y)) => x == y,

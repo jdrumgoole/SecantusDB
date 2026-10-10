@@ -23,10 +23,15 @@ build.
 Every Rust operator engine is pinned byte-for-byte to its pure-Python
 counterpart by parity test suites (curated corpora plus randomized fuzz).
 Where an exact reproduction isn't achievable — Python-`re` regex semantics,
-some collation and Decimal128 edges — the Rust engine **defers**: it
+some Decimal128 edges — the Rust engine **defers**: it
 rejects the construct with a clean error rather than return a subtly
 different answer. That discipline is why the conformance numbers of the two
 servers track each other so closely.
+
+Collation is the exception. The Rust server compares strings through ICU4X,
+the Rust implementation of the algorithm and locale data `mongod` gets from
+ICU, and is checked against `mongod` directly; the Python server has its own
+approximation. The parity suites leave collated cases out.
 
 ## Storage
 

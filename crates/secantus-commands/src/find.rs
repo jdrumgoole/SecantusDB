@@ -30,8 +30,8 @@ use crate::argtypes;
 use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
 use crate::storage::Storage;
 use crate::util::{
-    as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
-    encode_docs_ref, resolve_let_vars,
+    as_i64, bool_field, coll_arg, command_error, doc_field, docs_to_bson, encode_docs_ref,
+    resolve_let_vars,
 };
 use crate::{
     CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
@@ -416,7 +416,8 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     let hint = natural_hint.as_ref().or_else(|| doc.get("hint"));
-    let collation = collation_of(doc);
+    let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
+    let _active = secantus_core::collation::activate(collation.as_ref());
     // Command `let` → vars visible to `$expr` in the filter.
     let let_vars = resolve_let_vars(doc.get("let"));
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,

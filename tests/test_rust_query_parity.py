@@ -119,7 +119,15 @@ def test_collation_fuzz():
     for _ in range(4000):
         doc = {"n": rng.choice(words)}
         target = rng.choice(words)
-        op = rng.choice(["eq", "$gt", "$gte", "$lt", "$lte", "$ne", "$in"])
+        # EQUALITY only. The range operators are left out on purpose since
+        # 2026-10-10: the Rust engine orders strings under a collation by
+        # ICU4X, as mongod does (`apple` before `B`), and the Python engine
+        # by its folded code points (`B` first at strength 3). mongod is the
+        # reference for each, so a range under a collation is no longer a
+        # place the two can be held to each other. What this gives up: drift
+        # in collated `$gt` / `$lt` between the engines goes unnoticed here;
+        # `tools/probes/collation.py` measures the Rust side against mongod.
+        op = rng.choice(["eq", "$ne", "$in"])
         if op == "eq":
             query = {"n": target}
         elif op == "$in":

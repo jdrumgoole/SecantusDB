@@ -49,7 +49,10 @@ fn record_ambiguous(path: &str, segments: &[Bson], acc: &mut Acc) {
     }
 }
 
+/// Never by collation: this asks whether a write changed the stored bytes'
+/// VALUE, and `"a"` over `"A"` is a change under every collation.
 fn eq(a: &Bson, b: &Bson) -> R<bool> {
+    let _binary = crate::collation::activate(None);
     expressions::py_eq(a, b)
 }
 

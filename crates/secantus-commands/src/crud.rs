@@ -40,8 +40,7 @@ pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Doc
 
 use crate::argtypes;
 use crate::util::{
-    as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, resolve_let_vars,
-    write_error,
+    as_i64, bool_field, coll_arg, command_error, doc_field, resolve_let_vars, write_error,
 };
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
@@ -239,6 +238,9 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let db = ctx.db_name.clone();
     let storage = ctx.storage()?;
     let ordered = bool_field(doc, "ordered", true);
+    // A validator compares under the collection's default collation.
+    let default_collation = crate::util::default_collation(storage, &ctx.db_name, &coll);
+    let _active = secantus_core::collation::activate(default_collation.as_ref());
 
     // Document validation: a collection `validator` rejects non-matching inserts
     // with code 121 unless `validationAction` is "warn"/"off" or
@@ -438,7 +440,21 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         let filter = doc_field(spec, "q");
         // `collation` is per-delete-statement (inside each `deletes[]` entry).
-        let collation = collation_of(spec);
+        let collation = match crate::util::effective_collation(storage, &ctx.db_name, &coll, spec) {
+            Ok(c) => c,
+            Err(e) => {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg.clone(),
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        };
+        let _active = secantus_core::collation::activate(collation.as_ref());
         // `limit: 0` ⇒ delete all matches, `1` ⇒ at most one. mongod defines
         // nothing else and refuses the whole command (measured 8.2.11,
         // 2026-10-01); `limit: 5` used to delete up to five.
@@ -489,6 +505,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "count")?;
     argtypes::require_object(doc, "query", "count.query")?;
+    argtypes::require_object(doc, "collation", "count.collation")?;
     // Two adjacent numeric slots, two families: `limit` answers BadValue with
     // its own wording and rejects null, `skip` answers the ordinary numeric
     // type error and accepts one. Probed on 8.2.11.
@@ -514,7 +531,8 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let storage = ctx.storage()?;
     let filter = doc_field(doc, "query");
-    let collation = collation_of(doc);
+    let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
+    let _active = secantus_core::collation::activate(collation.as_ref());
 
     // View support: a collection created with `viewOn` is a read-only view; its
     // count runs the view's pipeline (plus the count's query as a trailing
@@ -538,7 +556,18 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             pipeline.push(Bson::Document(doc! { "$match": filter.clone() }));
         }
         pipeline.push(Bson::Document(doc! { "$count": "n" }));
-        let agg = doc! { "aggregate": view_on, "pipeline": pipeline, "cursor": {} };
+        // Under the VIEW's collation, said outright so the base collection's
+        // default does not stand in for it.
+        let view_collation = match &collation {
+            Some(c) => c.spec().clone(),
+            None => doc! { "locale": "simple" },
+        };
+        let agg = doc! {
+            "aggregate": view_on,
+            "pipeline": pipeline,
+            "cursor": {},
+            "collation": view_collation,
+        };
         let reply = crate::aggregate::aggregate(&agg, ctx)?;
         reply
             .get_document("cursor")
@@ -809,7 +838,21 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
         // `collation` is per-update-statement (inside each `updates[]` entry),
         // not a command-level field — collation-aware filter matching (COLLSCAN).
-        let collation = collation_of(spec);
+        let collation = match crate::util::effective_collation(storage, &ctx.db_name, &coll, spec) {
+            Ok(c) => c,
+            Err(e) => {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg.clone(),
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        };
+        let _active = secantus_core::collation::activate(collation.as_ref());
         let mut q = doc_field(spec, "q");
         if let Some(sort) = &sort_spec {
             // Resolve WHICH document sorts first, then pin the update to it.

@@ -223,20 +223,36 @@ pub fn densify_stage(spec: &Bson, docs: &[Document]) -> R<Vec<Document>> {
         }
         keyed.sort_by(|(a, _), (b, _)| cmp(*a, *b).unwrap_or(Ordering::Equal));
 
-        let mut carry = Document::new();
-        let first = keyed[0].1;
-        for f in &partition_fields {
-            let v = paths::get_path(first, f).cloned().unwrap_or(Bson::Null);
-            carry.insert((*f).to_string(), v);
-        }
+        // A filler past the last document carries that document's partition
+        // values; one before a document carries that document's (see
+        // `densify_partition`).
+        let carry = carry_of(keyed[keyed.len() - 1].1, &partition_fields);
 
         let (lo, hi) = match bounds_pair {
             Some((l, h)) => (l, h),
             None => (keyed[0].0, keyed[keyed.len() - 1].0),
         };
-        out.extend(densify_partition(field, &keyed, lo, hi, step, &carry)?);
+        out.extend(densify_partition(
+            field,
+            &keyed,
+            lo,
+            hi,
+            step,
+            &carry,
+            &partition_fields,
+        )?);
     }
     Ok(out)
+}
+
+/// The partition fields of `doc`, as a filler carries them.
+fn carry_of(doc: &Document, fields: &[&str]) -> Document {
+    let mut carry = Document::new();
+    for f in fields {
+        let v = paths::get_path(doc, f).cloned().unwrap_or(Bson::Null);
+        carry.insert((*f).to_string(), v);
+    }
+    carry
 }
 
 fn partition_key(doc: &Document, fields: &[&str]) -> R<Vec<GKey>> {
@@ -270,6 +286,7 @@ fn densify_partition(
     hi: Num,
     step: Num,
     carry: &Document,
+    partition_fields: &[&str],
 ) -> R<Vec<Document>> {
     let existing: HashSet<NumVal> = keyed.iter().map(|(n, _)| numval(*n)).collect();
     let mut out: Vec<Document> = Vec::new();
@@ -289,7 +306,14 @@ fn densify_partition(
             }
         }
         if !existing.contains(&numval(cursor)) {
-            let mut filler = carry.clone();
+            // The partition values are those of the document the filler
+            // leads up to. They can differ within one partition under a
+            // collation: between `"a"` and `"A"` mongod writes `"A"`
+            // (measured 8.2.11, 2026-10-10).
+            let mut filler = match next {
+                Some((_, upcoming)) => carry_of(upcoming, partition_fields),
+                None => carry.clone(),
+            };
             filler.insert(field.to_string(), canon_to_bson(cursor)?);
             out.push(filler);
         }

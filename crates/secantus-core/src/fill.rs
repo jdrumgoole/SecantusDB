@@ -105,6 +105,24 @@ pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Do
 
     let sort_field: Option<String> = sort_by.and_then(|s| s.keys().next().cloned());
 
+    // mongod sorts by the partition key before filling, so the partitions
+    // come out in key order, not in the order they were first seen (measured
+    // 8.2.11, 2026-10-10: partitions "b", "B", "z" are emitted B, b, z).
+    if part_fields.is_some() || part_by.is_some() {
+        let mut keyed: Vec<(Bson, Vec<Document>)> = Vec::with_capacity(groups.len());
+        for group in groups {
+            let key = match group.first() {
+                Some(d) => partition_value(d, part_fields.as_deref(), part_by, vars)?,
+                None => Bson::Null,
+            };
+            keyed.push((key, group));
+        }
+        if keyed.iter().all(|(k, _)| order::is_sortable(k)) {
+            keyed.sort_by(|a, b| order::cmp(&a.0, &b.0));
+        }
+        groups = keyed.into_iter().map(|(_, g)| g).collect();
+    }
+
     for group in groups.iter_mut() {
         if let Some(s) = sort_by {
             sort_partition(group, s)?;
@@ -138,7 +156,20 @@ fn partition_key(
     by: Option<&Bson>,
     vars: &Document,
 ) -> R<Vec<u8>> {
-    let key_val: Bson = if let Some(fields) = fields {
+    let key_val = partition_value(doc, fields, by, vars)?;
+    let mut wrap = Document::new();
+    wrap.insert("k", crate::collation::fold_active(key_val));
+    bson::to_vec(&wrap).map_err(|_| Fallback::Defer)
+}
+
+/// The value a doc is partitioned by.
+fn partition_value(
+    doc: &Document,
+    fields: Option<&[String]>,
+    by: Option<&Bson>,
+    vars: &Document,
+) -> R<Bson> {
+    Ok(if let Some(fields) = fields {
         let mut d = Document::new();
         for f in fields {
             d.insert(f.clone(), field_value(doc, f));
@@ -148,10 +179,7 @@ fn partition_key(
         expressions::evaluate(doc, by, vars)?
     } else {
         Bson::Null
-    };
-    let mut wrap = Document::new();
-    wrap.insert("k", key_val);
-    bson::to_vec(&wrap).map_err(|_| Fallback::Defer)
+    })
 }
 
 /// Stable multi-field sort by `sortBy` (BSON order, like `$sort` / `_SortKey`):
@@ -168,7 +196,10 @@ fn sort_partition(part: &mut [Document], sort_by: &Document) -> R<()> {
     }
     for (field, desc) in fields.iter().rev() {
         part.sort_by(|a, b| {
-            let o = order::cmp(&field_value(a, field), &field_value(b, field));
+            let o = order::cmp(
+                &order::sort_repr(field_value(a, field), *desc),
+                &order::sort_repr(field_value(b, field), *desc),
+            );
             if *desc {
                 o.reverse()
             } else {
@@ -187,9 +218,9 @@ fn apply_locf(part: &mut [Document], field: &str) {
         match paths::get_path(doc, field) {
             Some(v) if !matches!(v, Bson::Null) => last = Some(v.clone()),
             _ => {
-                if let Some(l) = last.clone() {
-                    let _ = paths::set_path(doc, field, l);
-                }
+                // With nothing to carry forward the field is still
+                // written, as null (measured 8.2.11, 2026-10-10).
+                let _ = paths::set_path(doc, field, last.clone().unwrap_or(Bson::Null));
             }
         }
     }

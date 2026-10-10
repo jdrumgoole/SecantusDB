@@ -45,6 +45,15 @@ type R = Result<bool, Fallback>;
 /// Python (the query uses something not ported yet). `vars` carries user vars
 /// for `$expr`; `coll` is the active collation (or `None`).
 pub fn matches(doc: &Document, query: &Document, vars: &Document, coll: Option<&Collation>) -> R {
+    // A caller with no collation of its own inherits the active one: an
+    // `arrayFilters` or `$pull` condition inside a collated update, a
+    // `$match` inside a collated pipeline.
+    let inherited = if coll.is_none() {
+        collation::active()
+    } else {
+        None
+    };
+    let coll = coll.or(inherited.as_ref());
     for (k, v) in query.iter() {
         if !match_clause(doc, k, v, vars, coll)? {
             return Ok(false);
@@ -69,6 +78,12 @@ pub fn matches_raw(
     vars: &Document,
     coll: Option<&Collation>,
 ) -> R {
+    let inherited = if coll.is_none() {
+        collation::active()
+    } else {
+        None
+    };
+    let coll = coll.or(inherited.as_ref());
     for (k, v) in query.iter() {
         if !match_clause_raw(raw, k, v, vars, coll)? {
             return Ok(false);
@@ -131,7 +146,7 @@ fn match_clause_raw(
         // These operators inspect the whole document, so there's nothing to save
         // by staying raw — decode once and delegate this clause to the owned
         // matcher.
-        "$expr" | "$jsonSchema" => {
+        "$expr" | "$jsonSchema" | "$alwaysTrue" | "$alwaysFalse" => {
             let doc: Document = raw.try_into().map_err(|_| Fallback::Defer)?;
             match_clause(&doc, key, cond, vars, coll)
         }
@@ -218,6 +233,74 @@ fn resolve_path_raw(raw: &RawDocument, path: &str) -> Result<Vec<(Option<Bson>, 
 }
 
 /// One `$and` / `$or` / `$nor` entry, which must be a document.
+/// What mongod 8.2.11 does with `{$expr: {$in: ["$field", [constants]]}}`
+/// under a collation, reproduced because it changes the documents returned.
+///
+/// mongod adds a plain `{field: {$in: [...]}}` beside such an `$expr` so an
+/// index can serve it, and that added predicate compares by VALUE, ignoring
+/// the collation. Both must hold, so the collation never widens the match:
+/// with strength 2, `{$expr: {$in: ["$s", ["B"]]}}` finds `"B"` and not
+/// `"b"`, while `{$expr: {$eq: ["$s", "B"]}}` finds both. Measured
+/// 2026-10-10 for a field path or `$$ROOT.path` against an array (or a
+/// `$literal` array) of scalars, at the top of the `$expr` or under its
+/// `$and`. Under `$or` / `$not`, with a computed left side, or with an array
+/// among the constants, the collation applies and this is not reached.
+fn expr_in_by_value(doc: &Document, expr: &Bson, vars: &Document, coll: Option<&Collation>) -> R {
+    if coll.is_none() {
+        return Ok(true);
+    }
+    let Bson::Document(e) = expr else {
+        return Ok(true);
+    };
+    if let Some(Bson::Array(parts)) = e.get("$and") {
+        for p in parts {
+            if !expr_in_by_value(doc, p, vars, coll)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    let Some(Bson::Array(pair)) = e.get("$in").filter(|_| e.len() == 1) else {
+        return Ok(true);
+    };
+    let [Bson::String(path), list] = pair.as_slice() else {
+        return Ok(true);
+    };
+    let path = path
+        .strip_prefix("$$ROOT.")
+        .or_else(|| path.strip_prefix('$').filter(|p| !p.starts_with('$')));
+    let list = match list {
+        Bson::Array(a) => a,
+        Bson::Document(d) if d.len() == 1 => match d.get("$literal") {
+            Some(Bson::Array(a)) => a,
+            _ => return Ok(true),
+        },
+        _ => return Ok(true),
+    };
+    let constant = |v: &Bson| match v {
+        Bson::Array(_) | Bson::Document(_) => false,
+        Bson::String(s) => !s.starts_with('$'),
+        _ => true,
+    };
+    let Some(path) = path.filter(|_| list.iter().all(constant)) else {
+        return Ok(true);
+    };
+    let _binary = collation::activate(None);
+    let mut by_value = Document::new();
+    by_value.insert(path, bson::doc! { "$in": list.clone() });
+    match_field_binary(doc, &by_value, vars)
+}
+
+/// `matches` with no collation at all, the active one included.
+fn match_field_binary(doc: &Document, query: &Document, vars: &Document) -> R {
+    for (k, v) in query.iter() {
+        if !match_clause(doc, k, v, vars, None)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn as_doc_entry<'a>(key: &str, b: &'a Bson) -> Result<&'a Document, Fallback> {
     match b {
         Bson::Document(d) => Ok(d),
@@ -267,10 +350,35 @@ fn match_clause(
         "$expr" => {
             // _truthy(evaluate(cond, doc, vars)); the evaluator defers (and so
             // do we) for any expression operator it doesn't yet handle.
-            let value = expressions::evaluate(doc, cond, vars)?;
-            Ok(expressions::truthy(&value))
+            // The expression engine reads the ACTIVE collation, so the one
+            // this match was given is made active for the evaluation.
+            let value = {
+                let _on = coll.map(|c| collation::activate(Some(c)));
+                expressions::evaluate(doc, cond, vars)?
+            };
+            Ok(expressions::truthy(&value) && expr_in_by_value(doc, cond, vars, coll)?)
         }
-        "$jsonSchema" => validate_json_schema(&Bson::Document(doc.clone()), cond),
+        // A schema compares by value alone: `enum: ["A"]` does not admit
+        // `"a"` under any collation (measured 8.2.11, 2026-10-10).
+        "$jsonSchema" => {
+            let _binary = collation::activate(None);
+            validate_json_schema(&Bson::Document(doc.clone()), cond)
+        }
+        // `$alwaysTrue: 1` / `$alwaysFalse: 1`; any other value is refused.
+        "$alwaysTrue" | "$alwaysFalse" => {
+            let one = match cond {
+                Bson::Int32(1) | Bson::Int64(1) => true,
+                Bson::Double(d) => *d == 1.0,
+                _ => false,
+            };
+            if !one {
+                return Err(Fallback::mongo(
+                    9,
+                    format!("{key} must be an integer value of 1"),
+                ));
+            }
+            Ok(key == "$alwaysTrue")
+        }
         // $where runs user JavaScript. SecantusDB embeds no script engine, and
         // mongod has a supported configuration with the same property --
         // `--noscripting` -- which refuses $where with exactly this code and
@@ -2502,6 +2610,9 @@ fn op_elem_match(values: &[Cand], cond: &Bson, field: &str) -> R {
         return Ok(false); // Python: non-mapping condition -> False
     };
     let scalar_form = is_operator_dict(condd);
+    // The element comparisons follow the collation the command runs under.
+    let active = collation::active();
+    let coll = active.as_ref();
     for c in values {
         let Some(Bson::Array(arr)) = c.value else {
             continue;
@@ -2514,12 +2625,12 @@ fn op_elem_match(values: &[Cand], cond: &Bson, field: &str) -> R {
                 // inside an element that is itself an array. It did, and matched
                 // `[[5]]` and `[1, [2, [3]]]`, which mongod matches neither
                 // (probed 8.2.11, 2026-09-06). No collation, as on the Python side.
-                if field_matches_descend(&[Cand::plain(Some(elem))], cond, None, field, false)? {
+                if field_matches_descend(&[Cand::plain(Some(elem))], cond, coll, field, false)? {
                     return Ok(true);
                 }
             } else if let Bson::Document(ed) = elem {
                 // Python's $elemMatch recurses with no vars and no collation.
-                if matches(ed, condd, &Document::new(), None)? {
+                if matches(ed, condd, &Document::new(), coll)? {
                     return Ok(true);
                 }
             } else if matches!(elem, Bson::Array(_)) && condd.is_empty() {
@@ -3322,13 +3433,7 @@ mod tests {
 
     #[test]
     fn collation_ascii_case_insensitive() {
-        let coll = Collation {
-            strength: 2,
-            case_level: false,
-            case_first_upper: false,
-            backwards: false,
-            numeric_ordering: false,
-        };
+        let coll = collation::parse(&doc! {"locale": "en", "strength": 2}).unwrap();
         assert!(matches(
             &doc! {"n": "PING"},
             &doc! {"n": "ping"},

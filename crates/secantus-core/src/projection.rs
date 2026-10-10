@@ -478,7 +478,7 @@ fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bs
             Bson::Document(ed) if !value_predicate => query::matches(ed, sub_filter, &empty, None)?,
             other => {
                 let cands = [query::Cand::new(Some(other), false)];
-                query::field_matches(&cands, &cond, None, "_")?
+                query::field_matches(&cands, &cond, crate::collation::active().as_ref(), "_")?
             }
         };
         if hit {

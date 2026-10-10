@@ -34,11 +34,17 @@ regex = "1"
 # pattern matching at each length; `regex` only offers leftmost-first. Already
 # in the lock tree as a dependency of `regex`.
 regex-automata = "0.4"
-# NFKD decomposition for accent-insensitive collation (strength 1). Already in
-# the lock tree transitively, so this is a direct edge rather than a new crate.
-# `char::is_combining_mark` is the `category == Mn` test `collation.py` uses.
-unicode-normalization = "0.1"
-unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# Collation. ICU4X is the Rust implementation of the algorithm and data
+# mongod gets from ICU; see `src/collation.rs` for how closely the two were
+# measured to agree. `unstable` is what exposes sort keys, which an index
+# entry and a group key need. The versions are pinned exactly because a sort
+# key is written to disk (`collation::KEY_FORMAT`): a data update that changes
+# its bytes has to be a deliberate bump, not something `cargo update` does.
+icu_collator = { version = "=2.3.1", features = ["unstable"] }
+icu_collator_data = "=2.3.0"
+icu_normalizer = "2"
+icu_locale_core = "2"
+icu_provider = { version = "2", features = ["sync"] }
 # Backtracking regex with lookaround + backreference support (Python `re`-style),
 # used only when the linear `regex` engine above can't compile a pattern — e.g.
 # the negative-lookahead `^(?!system\.)` pymongo emits for listCollections name

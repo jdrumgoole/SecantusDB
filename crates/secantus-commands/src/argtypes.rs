@@ -3267,6 +3267,28 @@ fn stage_group_problem(spec: &Bson) -> Option<(i32, String)> {
             "a group specification must include an _id".to_string(),
         ));
     }
+    // An `_id` document's own fields are expressions, and a bare number or
+    // bool there reads as a projection's `field: 1`. Measured 8.2.11,
+    // 2026-10-10: `{_id: {n: 1}}`, `{n: 0}` and `{n: true}` are refused;
+    // `{n: "x"}`, `{k: {n: 1}}` and `{n: {$literal: 1}}` are accepted.
+    if let Some(Bson::Document(id)) = d.get("_id") {
+        let inclusion = |v: &Bson| {
+            matches!(
+                v,
+                Bson::Int32(_)
+                    | Bson::Int64(_)
+                    | Bson::Double(_)
+                    | Bson::Decimal128(_)
+                    | Bson::Boolean(_)
+            )
+        };
+        if !id.keys().any(|k| k.starts_with('$')) && id.values().any(inclusion) {
+            return Some((
+                17390,
+                "$group does not support inclusion-style expressions".to_string(),
+            ));
+        }
+    }
     None
 }
 

@@ -8818,6 +8818,82 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.070 Collation -- 2026-10-10
+
+`tools/probes/collation.py`, mongod 8.2.11: 764 scenarios (reads under 29
+collations, 39 malformed specs on every command, the expression and query
+operators, and a fresh database per scenario for defaults, indexes, views and
+writes). The Rust server went from 462 results different to 8. It now
+compares through ICU4X (`crates/secantus-core/src/collation.rs`), which
+ordered 157 strings as mongod does under 40 collations with the one exception
+listed first below. What is left, there and beside it:
+
+- [ ] **RUST MongoDB server: canonically equivalent strings are always
+      equal.** mongod with `normalization: false` (the default) tells
+      `"ö\u0323"` from `"o\u0323\u0308"`; ICU4X normalises always, so the
+      Rust server calls them equal under every collation. Also, under
+      `alternate: "shifted", maxVariable: "space"` the Rust server calls
+      `"a\u00a0b"` and `"a\u200bb"` equal to their neighbours and mongod
+      does not. mongod links ICU 57.1 and ICU4X carries newer CLDR data, so a
+      character or tailoring added since can order differently; none was
+      found in 24 locales.
+- [ ] **RUST MongoDB server: `_id` is not unique by the collection's default
+      collation.** With a strength-2 default, mongod refuses `_id: "A"` after
+      `_id: "a"` (insert, upsert and a clustered collection: 3 of the 8). The
+      `_id` index is keyed by value on disk, so this needs a second, collated
+      key for such collections. Reads by `_id` do follow the collation.
+- [ ] **RUST MongoDB server: a query never uses a collated index.** An index
+      with a collation now holds collation sort keys (catalog marker
+      `collationKeys`), which is what makes its `unique` right, and the
+      planner passes it over: a query with a collation scans. Correct, slow
+      on a large collection. A hint naming such an index is accepted and
+      scans.
+- [ ] **RUST and PYTHON MongoDB servers disagree on disk about a collated
+      index.** The Rust server writes ICU4X sort keys under the marker; the
+      Python server writes its own folded strings and does not know the
+      marker. A store with a collated index handed from one server to the
+      other gives wrong answers from that index. Before 2026-10-10 the Rust
+      server wrote plain values there, so the two disagreed then as well.
+      An index the Rust server built before that date has no marker and keeps
+      comparing by value until it is dropped and rebuilt.
+- [ ] **RUST MongoDB server: five collation types are refused.** `search`,
+      `searchjl`, `big5han`, `gb2312han` and `phonetic` (as
+      `@collation=<type>`) are not in ICU4X's bundled data; the server
+      answers 2 naming the type, mongod accepts them.
+- [ ] **RUST MongoDB server: smaller collation differences.** `Did you
+      mean` is missing or different for a three-letter code (`eng`, `en_USA`)
+      and for `zh@collation=stroke` (mongod: `zh_Hant`); a duplicate-key
+      error quotes ICU4X's sort key, whose bytes are not ICU 57's (`2b0105`
+      for mongod's `290105`), and for a string inside a document it quotes
+      the string where mongod quotes the key (1 of the 8); `$lookup` from a
+      view whose collation differs from the pipeline's answers (mongod: 167,
+      1 of the 8); `$merge` onto a collated unique index does not raise the
+      duplicate key mongod does (1 of the 8); `hashed` and `text` indexes
+      with a collation are refused as all such indexes are (2 of the 8);
+      a validator on an `update` reads the statement's collation, not the
+      collection's.
+- [ ] **RUST MongoDB server: `$densify` with `bounds: "full"` and
+      `partitionByFields` fills each partition only to its own ends.**
+      mongod fills every partition across the whole collection's range, and
+      its output has a quirk: the second document in sort order, when it
+      starts a new partition, is emitted as it stands and its partition is
+      then filled from the start, repeating that value (`[(a,0), (c,1),
+      (a,2), (b,3)]` gives a generated `(c,1)` beside the stored one). Not
+      reproduced; the rule needs more than the six shapes measured.
+- [ ] **RUST MongoDB server: `$setWindowFields` emits partitions in the
+      order first seen.** `$fill` was measured on 2026-10-10 to emit them in
+      partition-key order and now does; an older note in `windowfields.rs`
+      records first-seen order as measured for `$setWindowFields`, which was
+      not re-measured.
+- [ ] **PYTHON MongoDB server: 434 of 764 collation results differ from
+      mongod** (same probe). Not changed, and not read through. It also has
+      the tie rule the wrong way round in `$min` / `$max` (`$group` over int
+      1, double 1, long 1 keeps the first; mongod keeps the last), lists
+      equal values in `$maxN` in input order, leaves `q` out where `$fill`
+      `locf` has nothing to carry, sorts an array as a whole in `$top` and
+      `$setWindowFields`, and accepts `{$group: {_id: {n: 1}}}`. The engine
+      parity suites leave these cases out, with the reason beside each.
+
 ### 7.069 A WiredTiger panic opening a store, in CI on macOS -- 2026-10-10
 
 - [ ] **OPEN — `wiredtiger_open` panicked once in the `test-durable
@@ -8904,13 +8980,11 @@ to 3. What is left, and what the same probes say about the Python server:
 ### 7.067 Index management -- 2026-10-10
 
 `tools/probes/index_admin.py`, mongod 8.2.11: the Rust server went from 68
-of 87 results different to 9, and to 8 of 90 on 2026-10-10 (the partial-filter
-operator check landed, and the probe now drops the `text`, `hashed` and
-bad-locale indexes straight after building them, so one index built on one
-side only is no longer a shifted count in every later reply). The eight:
-`text` and `hashed` are not built (out of scope) and so cannot be dropped
-(four); the bad-locale collation is built, and so can be dropped (two); and
-`listIndexes` twice, for the collation it does not expand and for its order.
+of 87 results different to 9, to 8 of 90 on 2026-10-10 (the partial-filter
+operator check), and to 5 of 90 the same day when collation landed (a bad
+locale is refused and `listIndexes` shows the collation in full; see 7.070).
+The five: `text` and `hashed` are not built (out of scope) and so cannot be
+dropped (four), and `listIndexes` lists by name.
 
 - [ ] **RUST MongoDB server: `$near` runs without a geo index.** `mongod`
       8.2.11 refuses (291, `unable to find index for $geoNear query`), which
@@ -8925,10 +8999,6 @@ side only is no longer a shifted count in every later reply). The eight:
       `within`); `mongod` 8.2.11 includes them. The Rust engine was moved
       2026-10-10. The parity corpus has no boundary point, so the suite did
       not notice. Hidden indexes on the Python server were not probed.
-- [ ] **RUST MongoDB server: an index `collation` is neither checked nor
-      expanded.** `{locale: "zz_nope"}` is accepted (`mongod`: 2, `Field
-      'locale' is invalid`), and `listIndexes` echoes the collation as given
-      where `mongod` fills in every default and a `version`.
 - [ ] **RUST MongoDB server: `listIndexes` is in name order after `_id_`.**
       `mongod` lists in creation order. The storage layer keeps no creation
       order for indexes.
