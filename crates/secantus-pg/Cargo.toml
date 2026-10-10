@@ -65,13 +65,13 @@ pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.7", path = "../se
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
 # The pure query engine, for filtering VIRTUAL tables' computed rows --
 # storage filters real tables, but a virtual row never reaches storage.
-secantus-core = { version = "=0.5.3-beta.176", path = "../secantus-core" }
+secantus-core = { version = "=0.5.3-beta.177", path = "../secantus-core" }
 secantus-pgcatalog = { version = "=0.1.0-beta.7", path = "../secantus-pgcatalog" }
 secantus-pgplan = { version = "=0.1.0-beta.7", path = "../secantus-pgplan" }
-secantus-storage = { version = "=0.5.3-beta.176", path = "../secantus-storage" }
+secantus-storage = { version = "=0.5.3-beta.177", path = "../secantus-storage" }
 # The SCRAM-SHA-256 verifier `CREATE ROLE ... PASSWORD` stores, derived as
 # PostgreSQL derives it, and the exchange a login is checked by.
-secantus-auth = { version = "=0.5.3-beta.176", path = "../secantus-auth" }
+secantus-auth = { version = "=0.5.3-beta.177", path = "../secantus-auth" }
 # PostgreSQL's own PL/pgSQL grammar (`parse_plpgsql`) and scanner, for user
 # functions; the JSON tree the former returns.
 pg_query = "6"

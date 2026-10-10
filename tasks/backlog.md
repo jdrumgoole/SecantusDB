@@ -8788,6 +8788,36 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.069 A WiredTiger panic opening a store, in CI on macOS -- 2026-10-10
+
+- [ ] **OPEN — `wiredtiger_open` panicked once in the `test-durable
+      (macos-14, 3.12, 3)` lane: a log write failed with `Bad address`.**
+      Run [38040336462](https://github.com/jdrumgoole/SecantusDB/actions/runs/38040336462/job/114179135784),
+      on PR #1860, whose whole diff is version strings. The PYTHON server's
+      storage, in the fixture of
+      `tests/test_sql_ddl_name_resolution.py::TestSequenceAsARelation::test_tracks_the_value_actually_handed_out`
+      (2,900 passed, 1 error):
+
+      ```
+      __posix_file_write, 629: .../popen-gw1/test_tracks_the_value_actually0/./WiredTigerTmplog.0000000001:
+          handle-write: pwrite: failed to write 128 bytes at offset 0: Bad address
+      __log_fs_write, 218: ./WiredTigerTmplog.0000000001: fatal log failure: Bad address
+      __log_fs_write, 218: the process must exit and restart: WT_PANIC: WiredTiger library panic
+      ```
+
+      So `pwrite` returned EFAULT for the first 128 bytes of a brand-new log
+      file, while the connection was still opening. Nothing had been written
+      to that store yet, so no data was at risk in this instance, but the
+      cause is not known. EFAULT means the kernel could not read the buffer
+      it was handed. Two readings, neither tested: the buffer WiredTiger
+      passed was bad (a bug in this build of WT or in one of the
+      `cmake/patch_wt_*.py` patches, which would be serious), or the runner
+      could not page the buffer in (a host condition). Not reproduced
+      locally; one occurrence. What would tell them apart: whether it ever
+      happens off the macOS runners, and whether it is always the log
+      header write at open. `gh run rerun --failed` is not available on
+      this workflow, so a re-run is a push.
+
 ### 7.068 The `bulkWrite` command and TTL indexes -- 2026-10-10
 
 `tools/probes/bulk_write_command.py` and `tools/probes/ttl_indexes.py`, mongod
