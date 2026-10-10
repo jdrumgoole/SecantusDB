@@ -9385,8 +9385,9 @@ _GSE_PG15: list[tuple[str, object]] = [
         [("a", 0, 7), ("b", 0, 7), (None, 0, 7), (None, 1, 7)],
     ),
     (
-        "SELECT CASE WHEN g IS NULL THEN 'T' ELSE g END, sum(v) FROM gse_t GROUP BY ROLLUP (g) "
-        "ORDER BY 2, 1",
+        "SELECT CASE WHEN g IS NULL THEN 'T' ELSE g END, sum(v) FROM gse_t GROUP BY "
+        "ROLLUP (g) ORDER "
+        "BY 2, 1",
         [("a", 3), ("b", 3), ("T", 4), ("T", 10)],
     ),
     (
@@ -9402,8 +9403,9 @@ _GSE_PG15: list[tuple[str, object]] = [
         [(10, 1)],
     ),
     (
-        "SELECT g, count(*) FROM (SELECT g, z, sum(v) s FROM gse_t GROUP BY CUBE (g, z)) q "
-        "GROUP BY g ORDER BY 1",
+        "SELECT g, count(*) FROM (SELECT g, z, sum(v) s FROM gse_t GROUP BY CUBE (g, z)) "
+        "q GROUP BY "
+        "g ORDER BY 1",
         [("a", 3), ("b", 2), (None, 5)],
     ),
     (
@@ -9417,6 +9419,80 @@ _GSE_PG15: list[tuple[str, object]] = [
     ),
     ("SELECT count(*) FROM (SELECT g FROM gse_t GROUP BY GROUPING SETS ((g), ())) q", [(4,)]),
     ("SELECT EXISTS (SELECT 1 FROM gse_t GROUP BY ROLLUP (g) HAVING count(*) > 3)", [(True,)]),
+    ("SELECT g, count(*) FROM gse_t GROUP BY ROLLUP (g) HAVING g || 'x' = 'ax'", [("a", 2)]),
+    (
+        "SELECT upper(g) || 'x' FROM gse_t GROUP BY ROLLUP (upper(g)) ORDER BY 1",
+        [("Ax",), ("Bx",), (None,), (None,)],
+    ),
+    ("SELECT g, count(*) FROM gse_t GROUP BY ROLLUP (g) HAVING g = 'a'", [("a", 2)]),
+    (
+        "SELECT g, count(*) FROM gse_t GROUP BY CUBE (g) HAVING g IS NULL ORDER BY 2",
+        [(None, 1), (None, 4)],
+    ),
+    (
+        "SELECT g, count(*) FROM gse_t GROUP BY CUBE (g, z) HAVING coalesce(g, z) = 'a' "
+        "OR length(z) "
+        "> 5 ORDER BY 1, 2",
+        [("a", 1), ("a", 1), ("a", 2)],
+    ),
+    (
+        "SELECT g, z, sum(v), grouping(g) + 10, grouping(g, z) FROM gse_t GROUP BY GROUPING SETS "
+        "((g, z), (g), ()) HAVING sum(v) + 0 > 2 ORDER BY 1, 2, 3",
+        [
+            ("a", None, 3, 10, 1),
+            ("b", "p", 3, 10, 0),
+            ("b", None, 3, 10, 1),
+            (None, "q", 4, 10, 0),
+            (None, None, 4, 10, 1),
+            (None, None, 10, 11, 3),
+        ],
+    ),
+    (
+        "SELECT upper(g), length(upper(g)), count(*) FROM gse_t GROUP BY CUBE (upper(g), v % 2) "
+        "HAVING length(upper(g)) = 1 ORDER BY 1, 3",
+        [("A", 1, 1), ("A", 1, 1), ("A", 1, 2), ("B", 1, 1), ("B", 1, 1)],
+    ),
+    (
+        "SELECT upper(g) || (v % 2)::text, count(*) FROM gse_t GROUP BY ROLLUP (upper(g), v % 2) "
+        "ORDER BY 1, 2",
+        [("A0", 1), ("A1", 1), ("B1", 1), (None, 1), (None, 1), (None, 1), (None, 2), (None, 4)],
+    ),
+    (
+        "SELECT coalesce(g, 'all'), count(*) FROM gse_t GROUP BY ROLLUP (g) ORDER BY count(*), 1",
+        [("all", 1), ("b", 1), ("a", 2), ("all", 4)],
+    ),
+    (
+        "SELECT g, count(*) FROM gse_t GROUP BY ROLLUP (g) ORDER BY g || 'x' DESC, 2",
+        [(None, 1), (None, 4), ("b", 1), ("a", 2)],
+    ),
+    ("SELECT DISTINCT g IS NULL FROM gse_t GROUP BY CUBE (g, z) ORDER BY 1", [(False,), (True,)]),
+    (
+        "SELECT CASE WHEN grouping(g) = 1 THEN 'total' ELSE g END, sum(v) FROM gse_t "
+        "GROUP BY ROLLUP "
+        "(g) ORDER BY 2",
+        [("a", 3), ("b", 3), (None, 4), ("total", 10)],
+    ),
+    (
+        "SELECT g, (SELECT 1) FROM gse_t GROUP BY ROLLUP (g) ORDER BY 1",
+        [("a", 1), ("b", 1), (None, 1), (None, 1)],
+    ),
+    (
+        "SELECT g, (SELECT max(v) FROM gse_t i WHERE i.g = o.g) FROM gse_t o GROUP BY ROLLUP (g) "
+        "ORDER BY 1",
+        [("a", 2), ("b", 3), (None, None), (None, None)],
+    ),
+    ("SELECT z || 'x' FROM gse_t GROUP BY ROLLUP (g)", "42803"),
+    ("SELECT g FROM gse_t GROUP BY ROLLUP (upper(g))", "42803"),
+    (
+        "SELECT g, count(*) FROM gse_t GROUP BY (g, z) ORDER BY 1, 2",
+        [("a", 1), ("a", 1), ("b", 1), (None, 1)],
+    ),
+    (
+        "SELECT g, z FROM gse_t GROUP BY (g, z), v ORDER BY 1, 2",
+        [("a", "p"), ("a", "q"), ("b", "p"), (None, "q")],
+    ),
+    ("SELECT count(*) FROM gse_t GROUP BY ROW(g, z) ORDER BY 1", [(1,), (1,), (1,), (1,)]),
+    ("SELECT g, count(*) FROM gse_t GROUP BY ROLLUP (g) HAVING z = 'p'", "42803"),
 ]
 _LF_SETUP = [
     "DROP TABLE IF EXISTS lf_t, lf_w CASCADE",
@@ -9707,6 +9783,55 @@ _LF_PG15: list[tuple[str, object]] = [
     ("SELECT k FROM lf_t WHERE s = 10", [(10,)]),
 ]
 
+_SPP_SETUP = [
+    "DROP TABLE IF EXISTS sppub_t CASCADE",
+    "DROP SEQUENCE IF EXISTS sppub_s",
+    "CREATE TABLE sppub_t (k int primary key, t text)",
+    "INSERT INTO sppub_t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    "CREATE VIEW sppub_v AS SELECT t FROM sppub_t",
+    "CREATE VIEW sppub_w AS SELECT t FROM sppub_v WHERE t < 'c'",
+    "CREATE SEQUENCE sppub_s",
+]
+_SPP_PG15: list[tuple[str, object]] = [
+    ("SELECT t FROM sppub_t ORDER BY 1", [("a",), ("b",), ("c",)]),
+    ("SET search_path TO pg_catalog", "SET"),
+    ("SELECT t FROM sppub_t ORDER BY 1", "42P01"),
+    ("SELECT t FROM public.sppub_t ORDER BY 1", [("a",), ("b",), ("c",)]),
+    ("SELECT t FROM sppub_v", "42P01"),
+    ("SELECT t FROM public.sppub_v ORDER BY 1", [("a",), ("b",), ("c",)]),
+    ("SELECT t FROM public.sppub_w ORDER BY 1", [("a",), ("b",)]),
+    ("SELECT (SELECT count(*) FROM public.sppub_v)", [(3,)]),
+    (
+        "SELECT t, (SELECT count(*) FROM public.sppub_v v WHERE v.t = z.t) FROM public.sppub_t z "
+        "ORDER BY 1",
+        [("a", 1), ("b", 1), ("c", 1)],
+    ),
+    ("SELECT count(*) FROM public.sppub_t WHERE t IN (SELECT t FROM sppub_v)", "42P01"),
+    ("SELECT count(*) FROM public.sppub_t z JOIN sppub_t y ON y.t = z.t", "42P01"),
+    ("WITH sppub_t AS (SELECT 1 AS t) SELECT t FROM sppub_t", [(1,)]),
+    ("SELECT count(*) FROM pg_class WHERE relname = 'sppub_t'", [(1,)]),
+    ("INSERT INTO sppub_t VALUES (9, 'x')", "42P01"),
+    ("INSERT INTO public.sppub_t SELECT k + 10, t FROM sppub_t", "42P01"),
+    ("UPDATE sppub_t SET t = 'q'", "42P01"),
+    ("DELETE FROM sppub_t", "42P01"),
+    ("TRUNCATE sppub_t", "42P01"),
+    ("COPY sppub_t TO STDOUT", "42P01"),
+    ("ALTER TABLE sppub_t ADD COLUMN z int", "42P01"),
+    ("CREATE INDEX ON sppub_t (t)", "42P01"),
+    ("COMMENT ON TABLE sppub_t IS 'x'", "42P01"),
+    ("DROP TABLE sppub_t", "42P01"),
+    ("DROP VIEW sppub_v", "42P01"),
+    ("SELECT count(*) FROM public.sppub_t", [(3,)]),
+    ("SET search_path TO ''", "SET"),
+    ("SELECT t FROM sppub_t", "42P01"),
+    ('SET search_path TO "$user"', "SET"),
+    ("SELECT t FROM sppub_t", "42P01"),
+    ("SET search_path TO pg_catalog, public", "SET"),
+    ("SELECT count(*) FROM sppub_t", [(3,)]),
+    ("RESET search_path", "RESET"),
+    ("SELECT count(*) FROM sppub_t", [(3,)]),
+]
+
 
 def _answers(conn: psycopg.Connection, statements: list[str]) -> list[tuple[str, object]]:
     """Each statement's rows, its command tag when it returns none, or its
@@ -9751,6 +9876,90 @@ def test_a_grouping_set_query_computes_expressions_over_its_keys(home: Path) -> 
         got = _answers(c, [sql for sql, _ in _GSE_PG15])
     assert [g for g in got if g not in _GSE_PG15] == []
     assert got == _GSE_PG15
+
+
+def test_a_grouped_query_computes_over_grouping_set_keys_in_any_clause(home: Path) -> None:
+    """Under GROUPING SETS / ROLLUP / CUBE, a HAVING term, a select-list
+    expression or an ORDER BY key computed over the keys -- an expression
+    key (`rollup (upper(g))`) and `GROUPING()` inside an expression
+    included -- is grouped in an inner query and computed in an outer one,
+    as it is for a plain GROUP BY; these were refused. `GROUP BY (a, b)` is
+    its two keys. The answers are in `_GSE_PG15` with the rest of the
+    corpus; this names the shapes."""
+    with _Server(home) as server, server.connect() as c:
+        for sql in _GSE_SETUP:
+            c.execute(sql)
+
+        def q(sql: str) -> list[tuple]:
+            return c.execute(sql).fetchall()
+
+        assert q("select g, count(*) from gse_t group by rollup (g) having g || 'x' = 'ax'") == [
+            ("a", 2)
+        ]
+        assert q("select upper(g) || 'x' from gse_t group by rollup (upper(g)) order by 1") == [
+            ("Ax",),
+            ("Bx",),
+            (None,),
+            (None,),
+        ]
+        assert q(
+            "select case when grouping(g) = 1 then 'total' else g end, sum(v) "
+            "from gse_t group by rollup (g) order by 2"
+        ) == [("a", 3), ("b", 3), (None, 4), ("total", 10)]
+        assert q("select g, count(*) from gse_t group by (g, z) order by 1, 2") == [
+            ("a", 1),
+            ("a", 1),
+            ("b", 1),
+            (None, 1),
+        ]
+
+
+def test_a_public_relation_is_found_only_with_public_on_the_path(home: Path) -> None:
+    """A table, view or sequence in `public` is stored under its bare name,
+    so with `public` off the `search_path` a bare name still found it --
+    and an INSERT, UPDATE or DELETE wrote a table PostgreSQL says is not
+    there. It is 42P01 now, read or written; a name given its schema, and a
+    view created over such a table, work as before. PostgreSQL 15's answers
+    (`tools/probes/pg_corpora/search_path_public.sql`)."""
+    with _Server(home) as server, server.connect() as c:
+        for sql in _SPP_SETUP:
+            c.execute(sql)
+        got = _answers(c, [sql for sql, _ in _SPP_PG15])
+    assert [g for g in got if g not in _SPP_PG15] == []
+    assert got == _SPP_PG15
+
+
+def test_an_unterminated_literal_has_its_error_position(home: Path) -> None:
+    """A string, identifier or comment left open runs to the end of the
+    text; the error points at where it opens, as PostgreSQL 15's does. It
+    had no position at all."""
+    with _Server(home) as server, server.connect() as c:
+
+        def err(sql: str) -> tuple[str | None, str | None, str | None]:
+            with pytest.raises(psycopg.errors.SyntaxError) as e:
+                c.execute(sql)
+            d = e.value.diag
+            return (d.sqlstate, d.message_primary, d.statement_position)
+
+        quoted = "unterminated quoted string at or near "
+        assert err("select 'abc") == ("42601", quoted + '"\'abc"', "8")
+        assert err("  select 1, 'abc;") == ("42601", quoted + '"\'abc;"', "13")
+        assert err('select "abc') == (
+            "42601",
+            'unterminated quoted identifier at or near ""abc"',
+            "8",
+        )
+        assert err("select 1 /* open") == (
+            "42601",
+            'unterminated /* comment at or near "/* open"',
+            "10",
+        )
+        assert err("select $q$abc") == (
+            "42601",
+            'unterminated dollar-quoted string at or near "$q$abc"',
+            "8",
+        )
+        assert err("select 1;\nselect '\u00e9', 'x") == ("42601", quoted + '"\'x"', "23")
 
 
 def test_a_string_literal_compared_with_bytea_is_read_as_bytea(home: Path) -> None:

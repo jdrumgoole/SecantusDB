@@ -200,7 +200,34 @@ pub fn search_path() -> Vec<String> {
 /// Is the path one that can only ever resolve to `public` -- nothing to
 /// rewrite?
 fn path_is_trivial(path: &[String]) -> bool {
-    path.iter().all(|s| !is_user_schema(s)) && !session_has_temp()
+    path.iter().all(|s| !is_user_schema(s))
+        && path.iter().any(|s| s == "public")
+        && !session_has_temp()
+}
+
+thread_local! {
+    /// Set while the statement being rewritten is one a client sent, not a
+    /// stored definition the server is reading back.
+    pub(crate) static AS_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is `name` a relation of `public` that the path does not reach? `public`
+/// keeps its relations under their bare names, so with `public` off the
+/// path the bare name would still find one PostgreSQL does not see.
+fn hidden_in_public(name: &str, path: &[String]) -> bool {
+    AS_SENT.with(std::cell::Cell::get)
+        && !path.iter().any(|s| s == "public")
+        && !name.contains('.')
+        && relation_exists(name)
+        && resolve_unqualified(name) == name
+}
+
+/// PostgreSQL's answer for a relation no schema on the path holds.
+fn not_on_path(name: &str, location: i32) -> Error {
+    if location >= 0 {
+        crate::set_error_location(location);
+    }
+    Error::UndefinedTable(name.to_string())
 }
 
 fn relation_exists(key: &str) -> bool {
@@ -500,6 +527,13 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 if target.is_some_and(|t| std::ptr::eq(t, r)) {
                     continue;
                 }
+                let r = &mut *r;
+                if r.schemaname.is_empty()
+                    && !ctes.contains(&r.relname)
+                    && hidden_in_public(&r.relname, &path)
+                {
+                    return Err(not_on_path(&r.relname, r.location));
+                }
                 if let Some(s) = qualify_reference(&mut *r, &ctes, trivial) {
                     if !schemas.contains(&s) {
                         schemas.push(s);
@@ -615,6 +649,26 @@ pub fn qualify(node: &mut N) -> Result<()> {
             let index = ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectIndex);
             for o in &mut d.objects {
                 if let Some(N::List(l)) = o.node.as_mut() {
+                    // A bare name `public` holds, with `public` off the
+                    // path: PostgreSQL finds nothing to drop. (With IF
+                    // EXISTS it skips; that is not done here.)
+                    if relation_kind && !d.missing_ok {
+                        if let Some([name]) = strings(l).as_deref() {
+                            if hidden_in_public(name, &path) {
+                                let kind = match ObjectType::try_from(d.remove_type) {
+                                    Ok(ObjectType::ObjectView) => "view",
+                                    Ok(ObjectType::ObjectSequence) => "sequence",
+                                    Ok(ObjectType::ObjectMatview) => "materialized view",
+                                    Ok(ObjectType::ObjectForeignTable) => "foreign table",
+                                    _ => "table",
+                                };
+                                return Err(Error::Sqlstate(
+                                    "42P01",
+                                    format!("{kind} \"{name}\" does not exist"),
+                                ));
+                            }
+                        }
+                    }
                     if relation_kind {
                         qualify_name_list(l, 0, trivial);
                     } else if index {
@@ -647,6 +701,11 @@ pub fn qualify(node: &mut N) -> Result<()> {
             if let (Some(rest), Some(N::List(l))) =
                 (rest, c.object.as_mut().and_then(|o| o.node.as_mut()))
             {
+                if let Some(parts) = strings(l) {
+                    if parts.len() == 1 + rest && hidden_in_public(&parts[0], &path) {
+                        return Err(not_on_path(&parts[0], -1));
+                    }
+                }
                 qualify_name_list(l, rest, trivial);
             }
         }
@@ -801,6 +860,56 @@ mod tests {
             assert!(
                 matches!(err, Error::Sqlstate("3F000", m) if m == "schema \"nope\" does not exist")
             );
+        });
+    }
+
+    #[test]
+    fn a_public_relation_is_not_found_off_the_path() {
+        let as_sent = |sql: &str| {
+            let mut tree = pg_query::parse(sql).unwrap().protobuf;
+            let n = tree.stmts[0].stmt.as_mut().unwrap().node.as_mut().unwrap();
+            let previous = AS_SENT.with(|f| f.replace(true));
+            let out = qualify(n).map(|()| tree.deparse().unwrap());
+            AS_SENT.with(|f| f.set(previous));
+            out
+        };
+        with_env("pg_catalog", &["s"], &["t", "s.u"], || {
+            for sql in [
+                "select * from t",
+                "insert into t values (1)",
+                "update t set a = 1",
+                "delete from t",
+                "select 1 from public.t x join t y on true",
+                "comment on table t is 'x'",
+            ] {
+                assert!(
+                    matches!(as_sent(sql), Err(Error::UndefinedTable(ref n)) if n == "t"),
+                    "{sql}"
+                );
+            }
+            assert!(matches!(
+                as_sent("drop table t"),
+                Err(Error::Sqlstate("42P01", ref m)) if m == "table \"t\" does not exist"
+            ));
+            // Named with its schema, shadowed by a CTE, or not a relation
+            // of `public` at all: left to the lookup.
+            assert_eq!(
+                as_sent("select * from public.t").unwrap(),
+                "SELECT * FROM public.t"
+            );
+            assert_eq!(
+                as_sent("with t as (select 1) select * from t").unwrap(),
+                "WITH t AS (SELECT 1) SELECT * FROM t"
+            );
+            assert_eq!(
+                as_sent("select * from pg_class").unwrap(),
+                "SELECT * FROM pg_class"
+            );
+            // A stored definition keeps reading what it was created over.
+            assert_eq!(deparsed("select * from t"), "SELECT * FROM t");
+        });
+        with_env("s, public", &["s"], &["t"], || {
+            assert_eq!(as_sent("select * from t").unwrap(), "SELECT * FROM t");
         });
     }
 

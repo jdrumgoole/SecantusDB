@@ -3755,6 +3755,16 @@ fn parse_one(sql: &str) -> Result<N> {
     Ok(node)
 }
 
+/// `parse_one` for a statement as its client wrote it: a bare name the
+/// search path does not reach is not found. (A stored definition -- a
+/// view's body -- keeps reading what it was created over.)
+fn parse_one_as_sent(sql: &str) -> Result<N> {
+    let previous = schemas::AS_SENT.with(|f| f.replace(true));
+    let out = parse_one(sql);
+    schemas::AS_SENT.with(|f| f.set(previous));
+    out
+}
+
 /// Lower one statement. `lookup` resolves a table name to its catalog entry;
 /// `CREATE TABLE` does not consult it.
 pub fn plan(sql: &str, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<Statement> {
@@ -3774,7 +3784,7 @@ pub fn plan_with_params(
 ) -> Result<Statement> {
     joins::clear_planned_joins();
     let mut node = pg_query::protobuf::Node {
-        node: Some(parse_one(sql)?),
+        node: Some(parse_one_as_sent(sql)?),
     };
     pullup::rewrite(&mut node);
     prune_outputs::rewrite(&mut node, lookup, params);
@@ -3813,7 +3823,7 @@ pub fn plan_with_subqueries(
     run: SubqueryRunner<'_>,
 ) -> Result<Statement> {
     let mut node = pg_query::protobuf::Node {
-        node: Some(parse_one(sql)?),
+        node: Some(parse_one_as_sent(sql)?),
     };
     if let Some(e) = sql_json_absent(&node, sql, params) {
         return Err(e);
@@ -20055,6 +20065,17 @@ fn finish_aggregate(
             }
             continue;
         }
+        // `GROUP BY (a, b)`: a parenthesised list is its keys, as
+        // PostgreSQL flattens it (`ROW(a, b)` written out is one key).
+        if let Some(N::RowExpr(r)) = g.node.as_ref() {
+            if r.row_format == pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32 {
+                for arg in &r.args {
+                    let index = push_key(arg, &mut group_by, &mut group_prints)?;
+                    elements.push(GroupElement::Key(index));
+                }
+                continue;
+            }
+        }
         let node = match g.node.as_ref() {
             Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Ival(_))) => {
                 let Some(a_const::Val::Ival(i)) = &c.val else {
@@ -20155,6 +20176,17 @@ fn finish_aggregate(
                 // `coalesce(sum(n), 0)`, `g + count(*)`. Its aggregates become
                 // ordinary items and the arithmetic runs over their results.
                 if group_prints.iter().all(|p| *p != print) {
+                    // `GROUPING(k)` inside an expression is computed with
+                    // the groups and read by the expression afterwards: the
+                    // split's work (`agg_hoist::split_expressions`). Left
+                    // here it planned, and failed when the row was computed.
+                    if val.node.as_ref().is_some_and(|n| {
+                        n.nodes()
+                            .iter()
+                            .any(|(n, ..)| matches!(n, pg_query::NodeRef::GroupingFunc(_)))
+                    }) {
+                        return Err(Error::Unsupported("GROUPING() inside an expression".into()));
+                    }
                     let mut rewritten = val.clone();
                     let mut slots: Vec<RowField> = Vec::new();
                     let has_aggregate =

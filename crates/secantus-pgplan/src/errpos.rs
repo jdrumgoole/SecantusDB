@@ -44,6 +44,19 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     if head == "create cast" || head == "drop cast" {
         return None;
     }
+    // An unterminated string, identifier or comment runs to the end of the
+    // text, which then has no tokens to look among: the message quotes it
+    // from where it opens.
+    if sqlstate == "42601" {
+        let m = message.split('\n').next().unwrap_or("");
+        if let Some(rest) = m.strip_prefix("unterminated ") {
+            let near = rest
+                .split_once(" at or near \"")
+                .and_then(|(_, n)| n.strip_suffix('"'))?;
+            let start = sql.len().checked_sub(near.len())?;
+            return (sql.get(start..) == Some(near)).then(|| sql[..start].chars().count() + 1);
+        }
+    }
     let scanned = pg_query::scan(sql).ok()?;
     let toks: Vec<Tok> = scanned
         .tokens

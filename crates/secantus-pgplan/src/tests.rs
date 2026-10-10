@@ -3479,3 +3479,42 @@ fn citext_internal_functions() {
         ])
     );
 }
+
+#[test]
+fn an_unterminated_literal_is_positioned_where_it_opens() {
+    let at = |sql: &str, message: &str| error_position(sql, "42601", message);
+    assert_eq!(
+        at(
+            "select 'abc",
+            "unterminated quoted string at or near \"'abc\""
+        ),
+        Some(8)
+    );
+    assert_eq!(
+        at(
+            "  select 1, 'abc;",
+            "unterminated quoted string at or near \"'abc;\""
+        ),
+        Some(13)
+    );
+    // Counted in characters, not bytes.
+    assert_eq!(
+        at(
+            "select 'é', \"ab",
+            "unterminated quoted identifier at or near \"\"ab\""
+        ),
+        Some(13)
+    );
+    assert_eq!(
+        at(
+            "select 1 /* open",
+            "unterminated /* comment at or near \"/* open\""
+        ),
+        Some(10)
+    );
+    // A message that does not quote the end of this text: no guess.
+    assert_eq!(
+        at("select 1", "unterminated quoted string at or near \"'abc\""),
+        None
+    );
+}
