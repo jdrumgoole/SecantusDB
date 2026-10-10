@@ -217,6 +217,9 @@ fn an_expiry_writes_a_delete_to_the_oplog() {
         st.insert_one("app", "c", &enc(&doc! {"_id": 7, "t": secs_ago(200)}))
             .unwrap();
         assert_eq!(st.prune_ttl("app", "c", now()).unwrap(), 1);
+        // With the async drainer (a CI lane runs every test that way) the
+        // entry is written behind the delete; wait for it.
+        st.flush_oplog();
         let deletes: Vec<Document> = st
             .read_oplog(0, 1000)
             .unwrap()
