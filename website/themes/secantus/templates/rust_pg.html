@@ -56,7 +56,7 @@
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Scored by someone else's tests</h3>
-        <p>All <strong>5,729</strong> of psycopg 3's own tests run against it unmodified. It passes every one that exercises the server: <strong>5,545 pass, one fails</strong>, and that one is a static-typing check on psycopg's own class hierarchy rather than anything this server answers.</p>
+        <p>psycopg 3's own tests run against it unmodified. Of the <strong>5,731</strong> that ran in the last measurement, <strong>5,544 pass and none fail</strong>; the rest are tests psycopg itself skips or expects to fail.</p>
       </div>
     </div>
   </div>
@@ -84,7 +84,7 @@
         </tbody>
       </table>
     </div>
-    <p class="perf-note" style="margin-top: 24px;">Where that leaves it, measured on 2026-09-18 against the current build: of psycopg 3's <strong>5,729</strong> tests the server passes <strong>5,545</strong>, fails <strong>one</strong>, and skips 183 that need something out of scope. The single failure is <code>test_typing.py::test_generic_connect</code> &mdash; a check on psycopg's own generic classes that never reaches the wire. Whole type suites that a real client leans on &mdash; <code>uuid</code>, <code>inet</code>, enums, composites, ranges, <code>COPY</code>, server cursors &mdash; pass end to end. We are not publishing a head-to-head against the Python SQL server here: its last report predates the widening of this gauge, so the two ran different suites and the comparison would flatter one of them by accident.</p>
+    <p class="perf-note" style="margin-top: 24px;">Where that leaves it, measured on 2026-10-10 on macOS against a build of the main branch made after 0.1.0-beta.7, with psycopg 3.3.4: of the <strong>5,731</strong> tests that ran, the server passes <strong>5,544</strong> and fails <strong>none</strong>. psycopg skips 149 that need something out of scope and marks 34 as expected to fail; 4 more that it expects to fail pass here. Another 58 are left out on macOS, as psycopg's own CI leaves them out there: the tests that need its proxy fixture or assert wall-clock budgets of a few milliseconds, and two more that fail the same way against PostgreSQL itself. Whole type suites that a real client leans on &mdash; <code>uuid</code>, <code>inet</code>, enums, composites, ranges, <code>COPY</code>, server cursors &mdash; pass end to end. We are not publishing a head-to-head against the Python SQL server here: its last report predates the widening of this gauge, so the two ran different suites and the comparison would flatter one of them by accident.</p>
   </div>
 </section>
 

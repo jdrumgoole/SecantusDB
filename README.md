@@ -184,14 +184,16 @@ savepoints and two-phase commit, `COPY`, server-side cursors,
 `LISTEN` / `NOTIFY`, and the catalog tables a client introspects.
 
 The **Rust PostgreSQL server** parses SQL with `libpg_query` — the real
-PostgreSQL grammar — and passes **5,545 of 5,729** of psycopg 3's own
-unmodified test suite (183 skipped, one failure that never reaches the
-wire). That gauge measures the protocol and the type system; the query
-language is narrower. Joins, aggregates, `GROUP BY` with `GROUPING SETS`,
-uncorrelated subqueries and CTEs, window functions, `ALTER TABLE` and
-`ON CONFLICT` work. Correlated subqueries, `SELECT *` over a join,
-`CREATE INDEX`, `CREATE VIEW`, triggers and `EXPLAIN` are still refused,
-with SQLSTATE `0A000` rather than a wrong answer.
+PostgreSQL grammar. Of the 5,731 tests of psycopg 3's own unmodified
+suite that ran against it on 2026-10-10 (macOS, psycopg 3.3.4), it passes
+**5,544 and fails none**; psycopg skips 149 and expects 34 to fail. That
+gauge measures the protocol and the type system. The query language now
+covers joins, correlated subqueries and CTEs, window functions, `GROUP BY`
+with `GROUPING SETS`, views, indexes, `ALTER TABLE`, `ON CONFLICT`,
+`MERGE`, triggers and PL/pgSQL functions. Not yet: TLS, a foreign table's
+rows, and a collection written through the MongoDB server read as a table.
+`EXPLAIN` prints a plan with zero costs. What it does not do it refuses
+with SQLSTATE `0A000` rather than answering wrongly.
 
 The **Python PostgreSQL server** has the wider SQL surface, including
 schema-on-read over MongoDB collections (nested documents surface as
