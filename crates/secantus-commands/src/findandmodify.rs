@@ -23,9 +23,7 @@
 use bson::{doc, Bson, Document};
 
 use crate::argtypes;
-use crate::util::{
-    bool_field, collation_of, command_error, command_error_during, doc_field, resolve_let_vars,
-};
+use crate::util::{bool_field, command_error, command_error_during, doc_field, resolve_let_vars};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
@@ -191,7 +189,8 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // Command `let` (visible to `$expr` in `query`) + `collation` apply to the
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.
     let let_vars = resolve_let_vars(doc.get("let"));
-    let collation = collation_of(doc);
+    let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
+    let _active = secantus_core::collation::activate(collation.as_ref());
     // `arrayFilters` ($[ident] identifiers) for an operator-form update.
     let array_filters: Vec<Document> = doc
         .get("arrayFilters")
@@ -559,6 +558,9 @@ fn storage_err_reply(e: StorageError, validator: Option<&Document>) -> Document 
             }
             if let Some(kv) = info.key_value {
                 r.insert("keyValue", kv);
+            }
+            if let Some(extra) = info.extra {
+                r.extend(extra);
             }
             r
         }

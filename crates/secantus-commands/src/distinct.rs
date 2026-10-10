@@ -11,7 +11,7 @@ use secantus_core::collation::Collation;
 use secantus_core::get_path;
 
 use crate::argtypes;
-use crate::util::{coll_arg, collation_of, command_error, doc_field};
+use crate::util::{coll_arg, command_error, doc_field};
 use crate::{CommandContext, CommandError, HandlerResult};
 
 /// `distinct` — return the distinct values of `key` over docs matching `query`.
@@ -65,7 +65,8 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     let filter = doc_field(doc, "query");
-    let collation = collation_of(doc);
+    let collation = crate::util::effective_collation(ctx.storage()?, &ctx.db_name, &coll, doc)?;
+    let _active = secantus_core::collation::activate(collation.as_ref());
     // `distinct` takes a hint like every other read, and mongod REFUSES the
     // command when it names no index rather than scanning (probed 8.2.11,
     // 2026-08-31: code 2; a valid index name or key spec is accepted). This

@@ -56,7 +56,7 @@ use bson::{doc, Bson, Document};
 use crate::argtypes;
 use crate::find::split_docs_into_cursor_checked;
 use crate::util::{
-    as_i64, bool_field, collation_of, command_error, decode_docs, decode_docs_minimal, encode_docs,
+    as_i64, bool_field, command_error, decode_docs, decode_docs_minimal, encode_docs,
     resolve_let_vars,
 };
 use crate::{CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE};
@@ -259,7 +259,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Command `let` → resolved query vars ($$NOW seeded, values evaluated),
     // visible to `$expr` in `$match` and to pipeline expressions.
     let vars = resolve_let_vars(doc.get("let"));
-    let collation = collation_of(doc);
+    // The collation the command names, else the default of the namespace it
+    // names -- a VIEW's own, never its base collection's.
+    let collation = match &coll {
+        Some(c) => crate::util::effective_collation(storage, &ctx.db_name, c, doc)?,
+        None => crate::util::requested_collation(doc)?.named().flatten(),
+    };
+    let _active = secantus_core::collation::activate(collation.as_ref());
 
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
@@ -269,33 +275,6 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // (recursively for a view-on-a-view). The reply ns keeps the queried
             // (view) name; only the fetch reads the base collection. Mirrors
             // commands._resolve_view.
-            // A view reads in its own default collation and no other: a
-            // request naming a different one is refused, not obeyed.
-            if let Some(requested) = doc.get("collation").and_then(Bson::as_document) {
-                let opts = storage
-                    .get_collection_options(&ctx.db_name, c)
-                    .unwrap_or_default();
-                if opts.contains_key("viewOn") {
-                    let own = opts.get_document("collation").ok();
-                    let locale = |d: Option<&Document>| {
-                        d.and_then(|d| d.get_str("locale").ok())
-                            .unwrap_or("simple")
-                            .to_string()
-                    };
-                    let same = match own {
-                        Some(own) => locale(Some(own)) == locale(Some(requested)),
-                        None => locale(Some(requested)) == "simple",
-                    };
-                    if !same {
-                        return Ok(CommandError::new(
-                            167,
-                            "OptionNotSupportedOnView",
-                            "Cannot override a view's default collation",
-                        )
-                        .into_reply());
-                    }
-                }
-            }
             let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline);
             let c = base_coll.as_str();
             // Stages that generate / read their own input start from no docs.

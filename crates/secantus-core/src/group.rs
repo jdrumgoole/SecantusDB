@@ -97,6 +97,9 @@ pub enum GKey {
     Regex(String, String),
     Code(String),
     Str(String),
+    /// A string under the active collation: its sort key, so two strings the
+    /// collation calls equal share a bucket.
+    Collated(Vec<u8>),
     Date(i64),
     Oid([u8; 12]),
     Doc(Vec<(String, GKey)>), // sorted by field name
@@ -133,7 +136,10 @@ pub fn gkey(v: &Bson) -> R<GKey> {
                 None => Err(Fallback::Defer),
             }
         }
-        Bson::String(s) => Ok(GKey::Str(s.clone())),
+        Bson::String(s) => Ok(match crate::collation::active() {
+            Some(c) => GKey::Collated(crate::collation::sort_key(s, &c)),
+            None => GKey::Str(s.clone()),
+        }),
         Bson::DateTime(d) => Ok(GKey::Date(d.timestamp_millis())),
         Bson::ObjectId(o) => Ok(GKey::Oid(o.bytes())),
         Bson::Document(d) => {
@@ -669,8 +675,13 @@ fn topn_result(
     items.sort_by(|a, b| {
         for (i, desc) in dirs.iter().enumerate() {
             let (av, bv) = (a.0.get(i), b.0.get(i));
+            // An array sorts by its smallest element (largest, descending),
+            // as in every other sort.
             let ord = match (av, bv) {
-                (Some(x), Some(y)) => crate::order::cmp(x, y),
+                (Some(x), Some(y)) => crate::order::cmp(
+                    &crate::order::sort_repr(x.clone(), *desc),
+                    &crate::order::sort_repr(y.clone(), *desc),
+                ),
                 _ => Ordering::Equal,
             };
             let ord = if *desc { ord.reverse() } else { ord };
@@ -766,10 +777,14 @@ fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
     match cur {
         None => *cur = Some(v),
         Some(existing) => {
-            // $max replaces when existing < v; $min when v < existing.
+            // On a tie the LATER value wins: `$min` over int 1, double 1,
+            // long 1 in that order is the long, and reversed is the int
+            // (measured 8.2.11, 2026-10-10; the same for `$max`, and for two
+            // strings a collation calls equal). So a value replaces unless
+            // it is strictly worse.
             let replace = match want {
-                Ordering::Greater => crate::order::bson_lt(existing, &v),
-                _ => crate::order::bson_lt(&v, existing),
+                Ordering::Greater => crate::order::bson_lt(&v, existing).map(|worse| !worse),
+                _ => crate::order::bson_lt(existing, &v).map(|worse| !worse),
             };
             match replace {
                 Some(true) => *cur = Some(v),
@@ -1838,7 +1853,8 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
     }
     let mut keyed: Vec<(Vec<u8>, Bson, &Document)> = Vec::with_capacity(pairs.len());
     for (v, d) in pairs {
-        let k = crate::sortkey::encode_value(&v, None).map_err(|_| Fallback::Defer)?;
+        let k = crate::sortkey::encode_sort_value(&v, crate::collation::active().as_ref())
+            .map_err(|_| Fallback::Defer)?;
         keyed.push((k, v, d));
     }
     keyed.sort_by(|a, b| a.0.cmp(&b.0));

@@ -768,7 +768,7 @@ fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
         // untouched even though `1` is inside the element. Routing this through
         // the query engine gave it membership and silently emptied arrays of
         // arrays (measured 8.2.11, 2026-09-08).
-        _ => crate::query::eq_scalar(element, criterion, None),
+        _ => crate::query::eq_scalar(element, criterion, crate::collation::active().as_ref()),
     }
 }
 
@@ -1150,6 +1150,7 @@ fn apply_op(
                     // places it first. `sortkey::encode_value` already encodes
                     // that correctly, so this defers to it rather than
                     // re-deriving the rule.
+                    let active = crate::collation::active();
                     let should_set = match get_path(result, &cpath) {
                         None => true,
                         Some(current) => {
@@ -1159,8 +1160,8 @@ fn apply_op(
                                 (current, value)
                             };
                             match (
-                                crate::sortkey::encode_value(lhs, None),
-                                crate::sortkey::encode_value(rhs, None),
+                                crate::sortkey::encode_sort_value(lhs, active.as_ref()),
+                                crate::sortkey::encode_sort_value(rhs, active.as_ref()),
                             ) {
                                 (Ok(a), Ok(b)) => a < b,
                                 // Anything the sort key cannot encode falls

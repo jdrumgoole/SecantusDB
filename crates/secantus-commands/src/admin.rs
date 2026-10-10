@@ -32,9 +32,7 @@ use bson::{doc, Bson, Document};
 
 use crate::argtypes;
 use crate::find::split_into_cursor;
-use crate::util::{
-    as_i64, bool_field, coll_arg, collation_of, command_error, docs_to_bson, encode_docs,
-};
+use crate::util::{as_i64, bool_field, coll_arg, command_error, docs_to_bson, encode_docs};
 use crate::{
     CommandContext, CommandError, HandlerResult, StorageError, DEFAULT_BATCH_SIZE, SERVER_VERSION,
 };
@@ -209,6 +207,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "storageEngine", "create.storageEngine")?;
     argtypes::require_object(doc, "validator", "create.validator")?;
     argtypes::require_object(doc, "timeseries", "create.timeseries")?;
+    argtypes::require_object(doc, "collation", "create.collation")?;
     // `capped` is bool-OR-number here; `size` / `max` are plain numeric. A null
     // in any of the three is ACCEPTED as absent and then answers the semantic
     // error ("the 'size' field is required when 'capped' is true"), not a type
@@ -323,6 +322,37 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
     let mut opts = collection_option_subset(doc);
+    // The default collation is stored spelled out in full, and `simple` as no
+    // collation, which is how mongod stores and compares them.
+    if let Some(Bson::Document(given)) = doc.get("collation") {
+        match secantus_core::collation::parse_strict(
+            given,
+            secantus_core::collation::Context::CREATE,
+        )
+        .map_err(crate::util::collation_error)?
+        {
+            Some(c) => opts.insert("collation", c.spec().clone()),
+            None => opts.remove("collation"),
+        };
+    }
+    // A view on a view reads through both, so the two must agree.
+    if let Some(Bson::String(view_on)) = doc.get("viewOn") {
+        let storage = ctx.storage()?;
+        let target = storage
+            .get_collection_options(&ctx.db_name, view_on)
+            .unwrap_or_default();
+        if target.contains_key("viewOn") && target.get("collation") != opts.get("collation") {
+            return Ok(CommandError::new(
+                167,
+                "OptionNotSupportedOnView",
+                format!(
+                    "View {db}.{coll} has conflicting collation with view {db}.{view_on}",
+                    db = ctx.db_name
+                ),
+            )
+            .into_reply());
+        }
+    }
     // An empty validator is no validator: mongod stores nothing for it.
     if matches!(opts.get("validator"), Some(Bson::Document(v)) if v.is_empty()) {
         opts.remove("validator");
@@ -615,6 +645,26 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut reply = doc! { "ok": 1.0 };
     // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
     if let Some(Bson::Document(index_spec)) = doc.get("index") {
+        // The fields `collMod.index` takes; anything else is refused before
+        // the index is looked up (measured 8.2.11, 2026-10-10 -- `collation`
+        // and `sparse` among them: neither can be changed on an index).
+        const KNOWN: &[&str] = &[
+            "name",
+            "keyPattern",
+            "expireAfterSeconds",
+            "hidden",
+            "unique",
+            "prepareUnique",
+            "forceNonUnique",
+        ];
+        if let Some(unknown) = index_spec.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+            return Ok(CommandError::new(
+                40415,
+                "Location40415",
+                format!("BSON field 'collMod.index.{unknown}' is an unknown field."),
+            )
+            .into_reply());
+        }
         let indexes = storage
             .list_indexes(&ctx.db_name, &coll)
             .map_err(command_error)?;
@@ -884,7 +934,10 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     };
     let sort = sort.filter(|_| natural_hint.is_none());
     let hint = natural_hint.as_ref().or(hint);
-    let collation = collation_of(&inner);
+    if cmd_name == "find" {
+        argtypes::require_object_expected(&inner, "collation")?;
+    }
+    let collation = crate::util::effective_collation(ctx.storage()?, &ctx.db_name, &coll, &inner)?;
     // Aggregate lifts a leading $match into the fetch — explain reports the same.
     if cmd_name == "aggregate" && filter.is_empty() {
         if let Some(Bson::Array(p)) = inner.get("pipeline") {
@@ -1415,15 +1468,20 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // A clustered collection has no separate `_id_` index (the clustering
         // key IS the index), so mongod omits `idIndex` for it — same as views.
         if !is_view && !is_clustered {
-            entry.insert(
-                "idIndex",
-                doc! {
-                    "v": 2,
-                    "key": { "_id": 1 },
-                    "name": "_id_",
-                    "ns": format!("{}.{}", ctx.db_name, n),
-                },
-            );
+            let mut id_index = doc! {
+                "v": 2,
+                "key": { "_id": 1 },
+                "name": "_id_",
+                "ns": format!("{}.{}", ctx.db_name, n),
+            };
+            let collation = entry
+                .get_document("options")
+                .ok()
+                .and_then(|o| o.get_document("collation").ok());
+            if let Some(collation) = collation {
+                id_index.insert("collation", collation.clone());
+            }
+            entry.insert("idIndex", id_index);
         }
         entries.push(entry);
     }
@@ -1546,6 +1604,15 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     for ix in &mut indexes {
         ix.remove("multikey");
         ix.remove("entryFormat");
+        ix.remove("collationKeys");
+    }
+    // The `_id` index of a collection with a default collation carries it.
+    if let Some(default) = crate::util::default_collation(storage, &ctx.db_name, &coll) {
+        for ix in &mut indexes {
+            if ix.get_str("name") == Ok("_id_") {
+                ix.insert("collation", default.spec().clone());
+            }
+        }
     }
     // A clustered collection's clustering key IS its index: mongod reports a
     // single entry carrying `clustered: true` (with the user's name) in place of
@@ -1840,6 +1907,41 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // The `_id` index always exists, under its own name: asking for it
         // again, whatever the request calls it, creates nothing.
         if key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
+            // It has the collection's collation and takes no other.
+            let full = |c: Option<secantus_core::collation::Collation>| match c {
+                Some(c) => c.spec().clone(),
+                None => doc! { "locale": "simple" },
+            };
+            let own = full(crate::util::default_collation(storage, &ctx.db_name, &coll));
+            let asked = match s.get_document("collation") {
+                Ok(given) if !given.is_empty() => full(
+                    secantus_core::collation::parse_strict(
+                        given,
+                        secantus_core::collation::Context::COMMAND,
+                    )
+                    .map_err(crate::util::collation_error)?,
+                ),
+                _ => own.clone(),
+            };
+            if asked != own {
+                // Nothing is built, the collection included.
+                if created_coll {
+                    storage
+                        .drop_collection(&ctx.db_name, &coll)
+                        .map_err(command_error)?;
+                }
+                return Ok(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "The _id index must have the same collation as the collection. Index \
+                         collation: {}, collection collation: {}",
+                        argtypes::render_stage_value(&Bson::Document(asked)),
+                        argtypes::render_stage_value(&Bson::Document(own)),
+                    ),
+                )
+                .into_reply());
+            }
             any_existed = true;
             continue;
         }
@@ -1965,6 +2067,58 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 spec.remove(opt);
             }
         }
+        // The collation is stored spelled out in full, as mongod stores it:
+        // the one given, else the collection's default. `simple` is stored
+        // as no collation at all.
+        match s.get_document("collation") {
+            Ok(given) if given.is_empty() => {
+                return Ok(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "Error in specification {spec_text} :: caused by :: The field \
+                         'collation' cannot be an empty object."
+                    ),
+                )
+                .into_reply());
+            }
+            Ok(given) => {
+                match secantus_core::collation::parse_strict(
+                    given,
+                    secantus_core::collation::Context::COMMAND,
+                ) {
+                    Ok(Some(c)) => {
+                        spec.insert("collation", c.spec().clone());
+                    }
+                    Ok(None) => {
+                        spec.remove("collation");
+                    }
+                    Err(e) => {
+                        let mut shown = s.clone();
+                        if !shown.contains_key("v") {
+                            shown.insert("v", 2i32);
+                        }
+                        return Ok(CommandError::new(
+                            e.code,
+                            crate::util::error_code_name(e.code),
+                            format!(
+                                "failed to add collation information to index spec for index \
+                                 creation: {} :: caused by :: {}",
+                                argtypes::render_stage_value(&Bson::Document(shown)),
+                                e.message
+                            ),
+                        )
+                        .into_reply());
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(default) = crate::util::default_collation(storage, &ctx.db_name, &coll)
+                {
+                    spec.insert("collation", default.spec().clone());
+                }
+            }
+        }
         if let Some(e) = index_conflict(&existing, &name, &key, &spec) {
             return Ok(e.into_reply());
         }
@@ -1995,6 +2149,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 }
                 if let Some(kv) = info.key_value {
                     reply.insert("keyValue", kv);
+                }
+                if let Some(extra) = info.extra {
+                    reply.extend(extra);
                 }
                 return Ok(reply);
             }
@@ -2463,7 +2620,7 @@ fn conflict_spec_text(spec: &Document) -> String {
     let mut out = Document::new();
     out.insert("v", 2i32);
     for (k, v) in spec {
-        if !matches!(k.as_str(), "v" | "key" | "name" | "ns")
+        if !matches!(k.as_str(), "v" | "key" | "name" | "ns" | "collation")
             && !INDEX_CATALOG_ONLY.contains(&k.as_str())
         {
             out.insert(k.clone(), v.clone());
@@ -2474,6 +2631,10 @@ fn conflict_spec_text(spec: &Document) -> String {
     }
     if let Some(n) = spec.get("name") {
         out.insert("name", n.clone());
+    }
+    // The collation is the exception: it follows the name.
+    if let Some(c) = spec.get("collation") {
+        out.insert("collation", c.clone());
     }
     argtypes::render_stage_value(&Bson::Document(out))
 }
@@ -2504,7 +2665,7 @@ fn equivalent_spec_text(spec: &Document) -> String {
 /// The options that make two index specs different indexes.
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
-const INDEX_CATALOG_ONLY: &[&str] = &["entryFormat", "multikey"];
+const INDEX_CATALOG_ONLY: &[&str] = &["entryFormat", "multikey", "collationKeys"];
 
 fn index_options(spec: &Document) -> Document {
     spec.iter()
@@ -2700,9 +2861,38 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
         (None, Some(Bson::Document(key))) => {
-            let named = listed
+            let same_key: Vec<&Document> = listed
                 .iter()
-                .find(|idx| idx.get_document("key").map(|k| k == key).unwrap_or(false))
+                .filter(|idx| idx.get_document("key").map(|k| k == key).unwrap_or(false))
+                .collect();
+            // Several indexes can share a key when their collations differ;
+            // a key then names none of them.
+            if same_key.len() > 1 {
+                let shown = |ix: &Document| {
+                    let mut out = doc! { "v": 2i32 };
+                    for (k, v) in ix {
+                        if k != "v" && k != "ns" && !INDEX_CATALOG_ONLY.contains(&k.as_str()) {
+                            out.insert(k.clone(), v.clone());
+                        }
+                    }
+                    argtypes::render_stage_value(&Bson::Document(out))
+                };
+                return Ok(CommandError::new(
+                    181,
+                    "AmbiguousIndexKeyPattern",
+                    format!(
+                        "{} indexes found for key: {}, identify by name instead. Conflicting \
+                         indexes: {}, {}",
+                        same_key.len(),
+                        argtypes::render_stage_value(&Bson::Document(key.clone())),
+                        shown(same_key[0]),
+                        shown(same_key[1]),
+                    ),
+                )
+                .into_reply());
+            }
+            let named = same_key
+                .first()
                 .and_then(|idx| idx.get_str("name").ok().map(str::to_string));
             match named {
                 Some(name) if name == "_id_" => return Ok(id_index()),

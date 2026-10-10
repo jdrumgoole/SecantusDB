@@ -1336,6 +1336,10 @@ struct IndexDesc {
     sparse: bool,
     /// Hidden from the query planner; maintained like any other index.
     hidden: bool,
+    /// The collation the entries are keyed by (see [`COLLATION_KEYS`]). Such
+    /// an index enforces uniqueness by the collation and is passed over by
+    /// the planner, whose bounds are plain value keys.
+    collation: Option<Collation>,
     unique: bool,
     /// `prepareUnique` (set via `collMod`): enforce uniqueness on *new* writes
     /// (block dup inserts with 11000) while pre-existing duplicates are tolerated
@@ -1504,6 +1508,85 @@ pub struct UniqueConflict {
     pub index: String,
     pub key_pattern: Document,
     pub key_value: Document,
+    /// The index's collation when its entries are keyed by one. `key_value`
+    /// then holds, for each string, the hex of its collation sort key, as
+    /// mongod reports it.
+    pub collation: Option<Document>,
+}
+
+impl UniqueConflict {
+    fn new(
+        namespace: String,
+        index: &str,
+        key_pattern: &Document,
+        doc: &Document,
+        kb: &[u8],
+        coll: Option<&Collation>,
+    ) -> Self {
+        let mut key_value = conflict_key_value(doc, key_pattern, kb, coll);
+        if let Some(c) = coll {
+            for (_, v) in key_value.iter_mut() {
+                if let Bson::String(s) = v {
+                    let key = secantus_core::collation::sort_key(s, c);
+                    *v = Bson::String(key.iter().map(|b| format!("{b:02x}")).collect());
+                }
+            }
+        }
+        UniqueConflict {
+            namespace,
+            index: index.to_string(),
+            key_pattern: key_pattern.clone(),
+            key_value,
+            collation: coll.map(|c| c.spec().clone()),
+        }
+    }
+
+    /// mongod's `E11000` message for this conflict.
+    pub fn errmsg(&self) -> String {
+        let Some(collation) = &self.collation else {
+            return format_dup_key_errmsg(&self.namespace, &self.index, &self.key_value);
+        };
+        let hex = self.hex_encoded();
+        let inner: Vec<String> = self
+            .key_value
+            .iter()
+            .zip(&hex)
+            .map(|((k, v), is_hex)| match v {
+                Bson::String(h) if *is_hex => format!("{k}: \"CollationKey(0x{h})\""),
+                Bson::Document(_) | Bson::Array(_) => {
+                    format!("{k}: {}", secantus_core::query::bson_value_repr(v))
+                }
+                _ => format!("{k}: {}", shell_value(v)),
+            })
+            .collect();
+        format!(
+            "E11000 duplicate key error collection: {} index: {} collation: {} dup key: {{ {} }}",
+            self.namespace,
+            self.index,
+            secantus_core::query::bson_value_repr(&Bson::Document(collation.clone())),
+            inner.join(", ")
+        )
+    }
+
+    /// Which `key_value` fields are hex sort keys.
+    fn hex_encoded(&self) -> Vec<bool> {
+        self.key_value
+            .values()
+            .map(|v| self.collation.is_some() && matches!(v, Bson::String(_)))
+            .collect()
+    }
+
+    /// The reply fields mongod adds after `keyValue` for a collated index.
+    pub fn extra(&self) -> Option<Document> {
+        let collation = self.collation.as_ref()?;
+        let mut out = Document::new();
+        let hex = self.hex_encoded();
+        if hex.iter().any(|h| *h) {
+            out.insert("hexEncoded", hex);
+        }
+        out.insert("collation", collation.clone());
+        Some(out)
+    }
 }
 
 /// A query hint: either an index name (or the `"_id_"` sentinel) or a key-spec
@@ -2162,7 +2245,28 @@ pub fn format_dup_key_errmsg(namespace: &str, index_name: &str, key_value: &Docu
 /// Direction-aware sort-key encoding for one value (defers to Python on the
 /// constructs the Rust encoder can't reproduce).
 fn enc_dir(v: &Bson, direction: i32) -> Result<Vec<u8>> {
-    sortkey::encode_value_directed(v, direction, None).map_err(|_| StorageError::UnsupportedValue)
+    enc_dir_c(v, direction, None)
+}
+
+/// [`enc_dir`] under an index's collation: every string in the value (at any
+/// depth) is encoded as its collation sort key.
+fn enc_dir_c(v: &Bson, direction: i32, coll: Option<&Collation>) -> Result<Vec<u8>> {
+    sortkey::encode_value_directed(v, direction, coll).map_err(|_| StorageError::UnsupportedValue)
+}
+
+/// Catalog marker on an index whose entries hold COLLATION sort keys: the
+/// `collation::KEY_FORMAT` they were written with. Set at build for an index
+/// with a collation; an index without the marker holds plain value keys
+/// whatever its `collation` option says, which is how every index built
+/// before 2026-10-10 reads. Not a user option: `listIndexes` strips it.
+const COLLATION_KEYS: &str = "collationKeys";
+
+/// The collation an index's ENTRIES are keyed by, from its catalog options.
+fn index_key_collation(opts: &Document) -> Option<Collation> {
+    if opts.get_i32(COLLATION_KEYS).ok()? != secantus_core::collation::KEY_FORMAT {
+        return None;
+    }
+    secantus_core::collation::parse(opts.get_document("collation").ok()?)
 }
 
 /// Order-preserving escape so `\x00\x00` is unambiguous as a separator: every
@@ -2429,7 +2533,18 @@ fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
 /// across each field's candidate values. A `sparse` index produces no keys only
 /// when the doc has NONE of the indexed fields (see `sparse_covers`). Missing
 /// fields otherwise encode as `null`. Mirrors `storage._index_key_variants`.
+#[cfg(test)]
 fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Result<Vec<Vec<u8>>> {
+    index_key_variants_c(doc, key_spec, sparse, None)
+}
+
+/// [`index_key_variants`] for an index keyed by a collation.
+fn index_key_variants_c(
+    doc: &Document,
+    key_spec: &Document,
+    sparse: bool,
+    coll: Option<&Collation>,
+) -> Result<Vec<Vec<u8>>> {
     let fields: Vec<(&String, i32)> = key_spec
         .iter()
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
@@ -2452,7 +2567,7 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut uniq: Vec<Bson> = Vec::new();
         for cand in cands {
-            let eb = enc_dir(&cand, *d)?;
+            let eb = enc_dir_c(&cand, *d, coll)?;
             if seen.insert(eb) {
                 uniq.push(cand);
             }
@@ -2465,7 +2580,7 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for val in &per_field[0] {
-            let kb = enc_dir(val, d)?;
+            let kb = enc_dir_c(val, d, coll)?;
             if seen.insert(kb.clone()) {
                 keys.push(kb);
             }
@@ -2501,7 +2616,7 @@ fn index_key_variants(doc: &Document, key_spec: &Document, sparse: bool) -> Resu
     for combo in &combos {
         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
         for (i, (_f, d)) in fields.iter().enumerate() {
-            parts.push(enc_dir(combo[i], *d)?);
+            parts.push(enc_dir_c(combo[i], *d, coll)?);
         }
         let kb = compound_join(&parts);
         if seen.insert(kb.clone()) {
@@ -2530,7 +2645,12 @@ fn is_regex_value(v: &Bson) -> bool {
 /// combination that encodes to `kb`, falling back to `get_path` if none does.
 /// Only called once a duplicate has been found, so the walk costs nothing on
 /// the happy path. Mirrors `storage._conflict_key_value`.
-fn conflict_key_value(doc: &Document, key_spec: &Document, kb: &[u8]) -> Document {
+fn conflict_key_value(
+    doc: &Document,
+    key_spec: &Document,
+    kb: &[u8],
+    coll: Option<&Collation>,
+) -> Document {
     let fields: Vec<(&String, i32)> = key_spec
         .iter()
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
@@ -2547,7 +2667,7 @@ fn conflict_key_value(doc: &Document, key_spec: &Document, kb: &[u8]) -> Documen
         'outer: loop {
             let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
             for (i, (_, d)) in fields.iter().enumerate() {
-                match enc_dir(&per_field[i][idx[i]], *d) {
+                match enc_dir_c(&per_field[i][idx[i]], *d, coll) {
                     Ok(b) => parts.push(b),
                     Err(_) => break,
                 }
@@ -8637,13 +8757,14 @@ impl Storage {
                     }
                     // Unique-index pre-check (collect a write-error rather than abort).
                     if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
-                        let ns = format!("{db}.{coll}");
                         let mut e = Document::new();
                         e.insert("index", index as i32);
                         e.insert("code", 11000i32);
-                        e.insert("errmsg", format_dup_key_errmsg(&ns, &c.index, &c.key_value));
+                        e.insert("errmsg", c.errmsg());
+                        let extra = c.extra();
                         e.insert("keyPattern", Bson::Document(c.key_pattern));
                         e.insert("keyValue", Bson::Document(c.key_value));
+                        e.extend(extra.unwrap_or_default());
                         errors.push(e);
                         if ordered {
                             stopped = true;
@@ -9780,6 +9901,14 @@ impl Storage {
             self.with_statement_txn(&session, || {
                 ensure_collection(&session, dst_db, dst_coll, self.data_nonlogged)?;
                 let rc = session.open_cursor(COLL_TABLE, None)?;
+                // Options and UUID travel with the collection (see the note
+                // in `rename_collection_in_txn`).
+                if let Some(options) = coll_options_raw(&session, src_db, src_coll)? {
+                    rc.set_key_ss(dst_db, dst_coll);
+                    rc.set_value_u(&options);
+                    rc.insert()?;
+                    rc.reset()?;
+                }
                 rc.set_key_ss(src_db, src_coll);
                 match rc.search() {
                     Ok(()) => {
@@ -9922,6 +10051,16 @@ impl Storage {
         }
         ensure_collection(session, dst_db, dst_coll, self.data_nonlogged)?;
         let rc = session.open_cursor(COLL_TABLE, None)?;
+        // The collection keeps its options and its UUID under the new name:
+        // validator, capped limits, default collation. Until 2026-10-10 the
+        // destination was created bare, so a rename silently dropped the
+        // validator and every later write went unchecked.
+        if let Some(options) = coll_options_raw(session, src_db, src_coll)? {
+            rc.set_key_ss(dst_db, dst_coll);
+            rc.set_value_u(&options);
+            rc.insert()?;
+            rc.reset()?;
+        }
         rc.set_key_ss(src_db, src_coll);
         match rc.search() {
             Ok(()) => {
@@ -10476,6 +10615,19 @@ impl Storage {
         // `multikey`), and the options-conflict check compares only the
         // enumerated user-facing options, so it never provokes a false conflict.
         stored_options.insert("entryFormat", ENTRY_FORMAT);
+        // An index with a collation keys its entries by collation sort keys,
+        // and says so in the catalog (see `COLLATION_KEYS`).
+        let key_coll: Option<Collation> = if geo.is_none() && geo_sphere.is_none() {
+            options
+                .get_document("collation")
+                .ok()
+                .and_then(secantus_core::collation::parse)
+        } else {
+            None
+        };
+        if key_coll.is_some() {
+            stored_options.insert(COLLATION_KEYS, secantus_core::collation::KEY_FORMAT);
+        }
         let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
             // multikey so the regular (numeric) pickers skip it.
@@ -10550,26 +10702,30 @@ impl Storage {
                 }
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
-                    if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
+                    if !query_matches(&d, pf, &Document::new(), key_coll.as_ref())
+                        .map_err(query_fault)?
+                    {
                         continue;
                     }
                 }
                 if !multikey && doc_makes_multikey(&d, key_spec) {
                     multikey = true;
                 }
-                for kb in index_key_variants(&d, key_spec, sparse)? {
+                for kb in index_key_variants_c(&d, key_spec, sparse, key_coll.as_ref())? {
                     // Uniqueness is checked against the same key variants the
                     // entries are built from — mongod's unique-multikey rule is
                     // "no two docs share any generated key".
                     if unique && !seen.insert(kb.clone()) {
                         // A pre-existing doc already holds this key — can't
                         // build a unique index over the data.
-                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
-                            namespace: format!("{db}.{coll}"),
-                            index: name.to_string(),
-                            key_pattern: key_spec.clone(),
-                            key_value: conflict_key_value(&d, key_spec, &kb),
-                        })));
+                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict::new(
+                            format!("{db}.{coll}"),
+                            name,
+                            key_spec,
+                            &d,
+                            &kb,
+                            key_coll.as_ref(),
+                        ))));
                     }
                     entries.push((kb, rid));
                 }
@@ -10792,7 +10948,9 @@ impl Storage {
             // Grouped over every key the doc contributes (sparse: none),
             // matching what `unique_conflict` would refuse — on a multikey
             // index two docs collide as soon as they share one generated key.
-            for kb in index_key_variants(&doc, &desc.key_spec, desc.sparse)? {
+            for kb in
+                index_key_variants_c(&doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
+            {
                 match index_of.get(&kb) {
                     Some(&i) => groups[i].push(id.clone()),
                     None => {
@@ -10939,15 +11097,38 @@ impl Storage {
         coll: &str,
     ) -> Result<Vec<(String, Document, Document)>> {
         let mut indexes = self.iter_indexes(session, db, coll)?;
-        indexes.retain(|(_, _, opts)| !opts.get_bool("hidden").unwrap_or(false));
+        indexes.retain(|(_, _, opts)| {
+            !opts.get_bool("hidden").unwrap_or(false) && !opts.contains_key(COLLATION_KEYS)
+        });
         Ok(indexes)
+    }
+
+    /// Whether a hint names an index keyed by a collation. Such an index is
+    /// real, so the hint is accepted, but its entries are collation sort keys
+    /// the planner cannot bound: the query is answered by a scan, which
+    /// returns the same documents.
+    fn is_collation_keyed(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        named: impl Fn(&str, &Document) -> bool,
+    ) -> Result<bool> {
+        Ok(self
+            .iter_indexes(session, db, coll)?
+            .iter()
+            .any(|(n, k, o)| {
+                o.contains_key(COLLATION_KEYS)
+                    && !o.get_bool("hidden").unwrap_or(false)
+                    && named(n, k)
+            }))
     }
 
     /// [`Self::index_descs`] without the hidden indexes (see
     /// [`Self::visible_indexes`]).
     fn planner_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
         let mut descs = self.index_descs(session, db, coll)?;
-        descs.retain(|d| !d.hidden);
+        descs.retain(|d| !d.hidden && d.collation.is_none());
         Ok(descs)
     }
 
@@ -11494,7 +11675,7 @@ impl Storage {
         if !self.doc_in_partial(doc, desc)? {
             return Ok(out);
         }
-        for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+        for kb in index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())? {
             out.push(pack_entry(&kb, recordid));
         }
         Ok(out)
@@ -11536,19 +11717,23 @@ impl Storage {
             {
                 continue;
             }
-            for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+            for kb in
+                index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
+            {
                 claims.reset()?;
                 claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
                 claims.set_value_q(recordid);
                 match claims.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
-                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
-                            namespace: format!("{db}.{coll}"),
-                            index: desc.name.clone(),
-                            key_pattern: desc.key_spec.clone(),
-                            key_value: conflict_key_value(doc, &desc.key_spec, &kb),
-                        })));
+                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict::new(
+                            format!("{db}.{coll}"),
+                            &desc.name,
+                            &desc.key_spec,
+                            doc,
+                            &kb,
+                            desc.collation.as_ref(),
+                        ))));
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -11589,7 +11774,9 @@ impl Storage {
         let claims = session.open_cursor(UNIQ_TABLE, None)?;
         for desc in descs {
             if desc.name != "_id_" && (desc.unique || desc.prepare_unique) {
-                for kb in index_key_variants(doc, &desc.key_spec, desc.sparse)? {
+                for kb in
+                    index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
+                {
                     claims.reset()?;
                     claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
                     match claims.search() {
@@ -11761,7 +11948,9 @@ impl Storage {
     fn doc_in_partial(&self, doc: &Document, desc: &IndexDesc) -> Result<bool> {
         match &desc.partial {
             None => Ok(true),
-            Some(pf) => query_matches(doc, pf, &Document::new(), None).map_err(query_fault),
+            // A partial filter is read under the index's own collation.
+            Some(pf) => query_matches(doc, pf, &Document::new(), desc.collation.as_ref())
+                .map_err(query_fault),
         }
     }
 
@@ -11784,6 +11973,7 @@ impl Storage {
                     key_spec,
                     sparse: opts.get_bool("sparse").unwrap_or(false),
                     hidden: opts.get_bool("hidden").unwrap_or(false),
+                    collation: index_key_collation(&opts),
                     unique: opts.get_bool("unique").unwrap_or(false),
                     prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
                     partial,
@@ -11818,7 +12008,12 @@ impl Storage {
             if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
                 continue;
             }
-            for kb in index_key_variants(candidate, &desc.key_spec, desc.sparse)? {
+            for kb in index_key_variants_c(
+                candidate,
+                &desc.key_spec,
+                desc.sparse,
+                desc.collation.as_ref(),
+            )? {
                 let esc_kb = escape_kb(&kb);
                 let mut seed = esc_kb.clone();
                 seed.extend_from_slice(ENTRY_SEP);
@@ -11849,12 +12044,14 @@ impl Storage {
                     // "not me" rather than silently matching.
                     let is_self = row_id.is_some() && exclude_recordid == row_id;
                     if !is_self {
-                        return Ok(Some(UniqueConflict {
-                            namespace: format!("{db}.{coll}"),
-                            index: desc.name.clone(),
-                            key_pattern: desc.key_spec.clone(),
-                            key_value: conflict_key_value(candidate, &desc.key_spec, &kb),
-                        }));
+                        return Ok(Some(UniqueConflict::new(
+                            format!("{db}.{coll}"),
+                            &desc.name,
+                            &desc.key_spec,
+                            candidate,
+                            &kb,
+                            desc.collation.as_ref(),
+                        )));
                     }
                     more = cur.next()?;
                 }
@@ -13904,6 +14101,7 @@ impl Storage {
                                 index: ID_INDEX_NAME.to_string(),
                                 key_pattern: bson::doc! { "_id": 1i32 },
                                 key_value: bson::doc! { "_id": id.clone() },
+                                collation: None,
                             })));
                         }
                         Err(e) => return Err(e),
@@ -14423,6 +14621,9 @@ impl Storage {
                         return Ok(ResolvedHint::Named(name));
                     }
                 }
+                if self.is_collation_keyed(session, db, coll, |n, _| n == s)? {
+                    return Ok(ResolvedHint::Natural);
+                }
                 Err(StorageError::BadHint(format!(
                     "hint {s:?} does not correspond to an existing index"
                 )))
@@ -14444,6 +14645,9 @@ impl Storage {
                     if &key_spec == spec {
                         return Ok(ResolvedHint::Named(name));
                     }
+                }
+                if self.is_collation_keyed(session, db, coll, |_, k| k == spec)? {
+                    return Ok(ResolvedHint::Natural);
                 }
                 // `{spec:?}` was Rust's `Debug` on a `Document`, which leaked
                 // the RUST TYPE NAMES to the client:

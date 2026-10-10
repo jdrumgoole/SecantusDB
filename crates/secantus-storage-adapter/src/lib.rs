@@ -856,12 +856,9 @@ fn map_err(e: WtError) -> StorageError {
         // against 8.2.11, 2026-10-01). Every path that reaches here is applying
         // a write to a stored document, hence `exec`.
         WtError::DuplicateKey(conflict) => StorageError::DuplicateKey(Box::new(DuplicateKey {
-            errmsg: secantus_storage::format_dup_key_errmsg(
-                &conflict.namespace,
-                &conflict.index,
-                &conflict.key_value,
-            ),
+            errmsg: conflict.errmsg(),
             exec: true,
+            extra: conflict.extra(),
             key_pattern: Some(conflict.key_pattern),
             key_value: Some(conflict.key_value),
         })),

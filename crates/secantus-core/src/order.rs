@@ -66,6 +66,19 @@ fn type_rank(v: &Bson) -> u8 {
 ///
 /// Returns `None` when an element is not faithfully sortable, so the caller can
 /// raise its own module's `Fallback`. Mirrors `ordering.py::_array_sort_value`.
+/// The value a SORT compares for `v`: an array's smallest element ascending,
+/// its largest descending ([`array_sort_value`]); any other value itself. An
+/// array with no usable representative is compared whole.
+pub fn sort_repr(v: Bson, descending: bool) -> Bson {
+    if !matches!(v, Bson::Array(_)) {
+        return v;
+    }
+    match array_sort_value(v.clone(), descending) {
+        Some(Bson::Undefined) | None => v,
+        Some(r) => r,
+    }
+}
+
 pub fn array_sort_value(v: Bson, reverse: bool) -> Option<Bson> {
     let Bson::Array(items) = v else {
         return Some(v);
@@ -153,7 +166,9 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
         // Two nulls / two MinKeys / two MaxKeys: Python's native `<` is False
         // both ways -> equal (stable).
         (Bson::Null, _) | (Bson::MinKey, _) | (Bson::MaxKey, _) => Ordering::Equal,
-        (Bson::String(x), Bson::String(y)) => x.cmp(y),
+        // Under an active collation (an aggregation or an update running
+        // with one) two strings compare by it; otherwise by code point.
+        (Bson::String(x), Bson::String(y)) => crate::collation::active_compare(x, y),
         (Bson::Boolean(x), Bson::Boolean(y)) => x.cmp(y),
         (Bson::DateTime(x), Bson::DateTime(y)) => x.timestamp_millis().cmp(&y.timestamp_millis()),
         (Bson::Timestamp(x), Bson::Timestamp(y)) => {
@@ -347,6 +362,9 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
             Some(x.len() < y.len())
         }
         _ => {
+            if let (Bson::String(x), Bson::String(y)) = (a, b) {
+                return Some(crate::collation::active_compare(x, y) == Ordering::Less);
+            }
             if let Some(x) = lt_text(a) {
                 return Some(x < lt_text(b)?);
             }
