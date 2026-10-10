@@ -307,12 +307,15 @@ one request path:
   the catalog in `secantus-pgcatalog`. Plan: `tasks/rust-pgserver-plan.md` — but
   that file's status header predates most of the work; **reproduce before
   believing it**. Current shape, measured 2026-09-18 rather than read:
-  - Scored by psycopg 3's own unmodified suite: **5,545 of 5,729 pass, one fails**
-    (183 skipped), measured 2026-09-18 against a build of current `main`. The one
-    failure is `test_typing.py::test_generic_connect`, a static-typing check on
-    psycopg's own classes that never reaches the wire. Run it with
+  - Scored by psycopg 3's own unmodified suite: **5,544 pass, none fail**, of
+    5,731 that ran (149 skipped, 34 xfailed, 4 xpassed; 58 more deselected by
+    the gauge's macOS list), measured 2026-10-10 on macOS with psycopg 3.3.4
+    against the tree of PR #1855, in 1,184 s. The 2026-09-18 run this
+    replaces was 5,545 of 5,729 with one failure,
+    `test_typing.py::test_generic_connect`, a static-typing check that never
+    reaches the wire; it passes with `mypy` 2.3.0 installed. Run it with
     `SECANTUS_GAUGE_SERVER=rust uv run --no-sync python -m psycopg_validation.runner`
-    (~17 min; it writes `.validation/psycopg-raw-rust.json`, a *different* file
+    (~20 min; it writes `.validation/psycopg-raw-rust.json`, a *different* file
     from the Python server's — do not use `invoke validate-psycopg`, which
     hardcodes the Python path and would overwrite the Python report).
   - **Do not compare that to the Python PG server's published 98.6%.** That report
