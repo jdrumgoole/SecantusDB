@@ -74,12 +74,14 @@ class _Server:
         *,
         databases: tuple[str, ...] = (),
         env: dict[str, str] | None = None,
+        args: tuple[str, ...] = (),
     ) -> None:
         self.home = home
         self.port = 0
         self.proc: subprocess.Popen[str] | None = None
         self.databases = databases
         self.env = env
+        self.args = args
 
     def __enter__(self) -> _Server:
         # Bind port 0 and let the KERNEL name the port, then read it back from
@@ -99,6 +101,7 @@ class _Server:
                 str(self.home),
                 "127.0.0.1:0",
                 *(f"--database={name}" for name in self.databases),
+                *self.args,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -19676,3 +19679,172 @@ def test_a_cancel_that_lands_before_execution_still_cancels(home: Path) -> None:
             assert res.status == pq.ExecStatus.TUPLES_OK, res.error_message
         finally:
             pgconn.finish()
+
+
+class _Certificates:
+    """An ephemeral CA, a server certificate it signed, and a CA that did not."""
+
+    def __init__(self, directory: Path) -> None:
+        import trustme
+
+        ca = trustme.CA()
+        issued = ca.issue_cert("localhost", "127.0.0.1")
+        self.cert = directory / "server.crt"
+        self.key = directory / "server.key"
+        self.ca = directory / "ca.pem"
+        self.other_ca = directory / "other-ca.pem"
+        self.cert.write_bytes(b"".join(blob.bytes() for blob in issued.cert_chain_pems))
+        issued.private_key_pem.write_to_path(str(self.key))
+        ca.cert_pem.write_to_path(str(self.ca))
+        trustme.CA().cert_pem.write_to_path(str(self.other_ca))
+
+    @property
+    def args(self) -> tuple[str, ...]:
+        return ("--tls-cert-file", str(self.cert), "--tls-key-file", str(self.key))
+
+
+def _tls_connect(server: _Server, **params: str) -> psycopg.Connection:
+    return psycopg.connect(
+        host="127.0.0.1",
+        port=server.port,
+        dbname="postgres",
+        user=params.pop("user", "test"),
+        autocommit=True,
+        connect_timeout=15,
+        **params,
+    )
+
+
+def test_a_server_with_a_certificate_serves_tls(home: Path, tmp_path: Path) -> None:
+    """`--tls-cert-file` / `--tls-key-file`: a client that asks for TLS gets it.
+
+    Each step below was run against PostgreSQL 15.19 with `ssl = on` and the
+    same certificate (2026-10-10) and answered the same: `require`,
+    `verify-ca`, `verify-full` and a TLS 1.2 ceiling connect, a CA that did
+    not sign the certificate is refused by the client, a client that does not
+    ask is served in the clear, `ssl` reads `on` on both kinds of connection
+    and survives `RESET ALL`, and `SET ssl` is 55P02.
+    """
+    certs = _Certificates(tmp_path)
+    with _Server(home, args=certs.args) as server:
+        modes: tuple[dict[str, str], ...] = (
+            {"sslmode": "require"},
+            {"sslmode": "verify-ca", "sslrootcert": str(certs.ca)},
+            # `verify-full` checks the name too: the certificate is for
+            # 127.0.0.1, the host the client connects to.
+            {"sslmode": "verify-full", "sslrootcert": str(certs.ca)},
+            {"sslmode": "require", "ssl_max_protocol_version": "TLSv1.2"},
+        )
+        for n, params in enumerate(modes):
+            with _tls_connect(server, **params) as conn:
+                assert conn.pgconn.ssl_in_use, params
+                assert conn.execute("show ssl").fetchone() == ("on",), params
+                conn.execute("create table if not exists t (id int primary key, v text)")
+                conn.execute("insert into t values (%s, %s)", (n, params["sslmode"]))
+        with _tls_connect(server, sslmode="require") as conn:
+            assert conn.execute("select count(*) from t").fetchone() == (len(modes),)
+
+        with pytest.raises(psycopg.OperationalError, match="certificate verify failed"):
+            _tls_connect(server, sslmode="verify-full", sslrootcert=str(certs.other_ca))
+
+        # Not asked for, not imposed -- and the refused handshake above did
+        # not disturb the server.
+        with _tls_connect(server, sslmode="disable") as conn:
+            assert not conn.pgconn.ssl_in_use
+            assert conn.execute("show ssl").fetchone() == ("on",)
+            conn.execute("reset all")
+            assert conn.execute("select current_setting('ssl')").fetchone() == ("on",)
+            with pytest.raises(psycopg.Error) as refused:
+                conn.execute("set ssl = off")
+            assert refused.value.sqlstate == "55P02"
+
+
+def test_a_password_is_checked_over_tls(home: Path, tmp_path: Path) -> None:
+    """SCRAM-SHA-256 runs inside the TLS session as it does outside one.
+
+    Channel binding (`SCRAM-SHA-256-PLUS`) is not offered, so a client that
+    REQUIRES it gives up. PostgreSQL 15.19 offers it and that client connects:
+    a divergence, listed in tasks/backlog.md. The other three steps answer as
+    PostgreSQL does.
+    """
+    certs = _Certificates(tmp_path)
+    with _Server(home, args=certs.args) as server:
+        with _tls_connect(server, sslmode="require") as conn:
+            conn.execute("create role alice login password 'correct horse'")
+
+        with _tls_connect(
+            server, sslmode="require", user="alice", password="correct horse"
+        ) as conn:
+            assert conn.pgconn.ssl_in_use
+            assert conn.execute("select current_user").fetchone() == ("alice",)
+
+        with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
+            _tls_connect(server, sslmode="require", user="alice", password="wrong")
+
+        with pytest.raises(psycopg.OperationalError, match="channel binding"):
+            _tls_connect(
+                server,
+                sslmode="require",
+                channel_binding="require",
+                user="alice",
+                password="correct horse",
+            )
+
+
+def test_without_a_certificate_a_tls_request_is_declined(home: Path) -> None:
+    """No certificate: PostgreSQL's `ssl = off`.
+
+    The server answers the request with `N`. A client that prefers TLS
+    carries on in the clear; one that requires it gives up.
+    """
+    with _Server(home) as server:
+        with _tls_connect(server, sslmode="prefer") as conn:
+            assert not conn.pgconn.ssl_in_use
+            assert conn.execute("show ssl").fetchone() == ("off",)
+        with pytest.raises(psycopg.OperationalError, match="server does not support SSL"):
+            _tls_connect(server, sslmode="require")
+
+
+def test_a_server_that_cannot_use_its_certificate_does_not_start(
+    home: Path, tmp_path: Path
+) -> None:
+    """Half a pair, a missing file, a mismatched key: the server exits.
+
+    Starting anyway would serve in the clear to every client that only
+    PREFERS TLS, which is libpq's default -- so each of these is an exit with
+    the reason, never a server without the TLS it was asked for.
+    """
+    certs = _Certificates(tmp_path)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other = _Certificates(other_dir)
+    cases: list[tuple[tuple[str, ...], str]] = [
+        (("--tls-cert-file", str(certs.cert)), "--tls-cert-file needs --tls-key-file"),
+        (("--tls-key-file", str(certs.key)), "--tls-key-file needs --tls-cert-file"),
+        (
+            ("--tls-cert-file", str(tmp_path / "absent.crt"), "--tls-key-file", str(certs.key)),
+            "absent.crt",
+        ),
+        (
+            ("--tls-cert-file", str(certs.cert), "--tls-key-file", str(other.key)),
+            "cannot be used together",
+        ),
+        (
+            ("--tls-cert-file", str(certs.key), "--tls-key-file", str(certs.key)),
+            "holds no certificate",
+        ),
+        # A misspelt option used to become the storage path, and the server
+        # came up over a directory named after it.
+        (("--tls-cert", str(certs.cert)), "unknown option: --tls-cert"),
+    ]
+    for args, expected in cases:
+        done = subprocess.run(
+            [str(BINARY), str(home), "127.0.0.1:0", *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode != 0, args
+        assert expected in done.stdout + done.stderr, (args, done.stdout, done.stderr)
+        assert "listening on" not in done.stdout, args

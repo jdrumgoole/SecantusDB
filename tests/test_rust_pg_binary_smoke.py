@@ -163,6 +163,68 @@ def test_binary_serves_psycopg_and_exits_cleanly(daemon: subprocess.Popen[str]) 
     assert daemon.wait(timeout=60) == 0, "the daemon did not stop cleanly"
 
 
+def test_binary_serves_tls(tmp_path: pathlib.Path) -> None:
+    """The artifact itself can complete a TLS handshake a client verifies.
+
+    TLS is the one part of this binary whose code is chosen at BUILD time: the
+    crypto provider is a cargo feature, and its assembly is compiled per
+    target. A source-tree test says nothing about whether the archive about
+    to be published has it, so this runs against that archive. `trustme` is
+    imported unguarded for the same reason the binary path is fatal: under the
+    release workflow a skip here would publish a binary whose TLS nobody ran.
+    """
+    import trustme
+
+    assert _BIN is not None
+    ca = trustme.CA()
+    issued = ca.issue_cert("localhost", "127.0.0.1")
+    cert, key, ca_file = tmp_path / "server.crt", tmp_path / "server.key", tmp_path / "ca.pem"
+    cert.write_bytes(b"".join(blob.bytes() for blob in issued.cert_chain_pems))
+    issued.private_key_pem.write_to_path(str(key))
+    ca.cert_pem.write_to_path(str(ca_file))
+
+    proc = subprocess.Popen(
+        [
+            str(_BIN),
+            str(tmp_path / "data"),
+            "127.0.0.1:0",
+            "--tls-cert-file",
+            str(cert),
+            "--tls-key-file",
+            str(key),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        **_SPAWN_KWARGS,
+    )
+    try:
+        host, port = _bound_address(proc)
+        with psycopg.connect(
+            host=host,
+            port=port,
+            dbname="postgres",
+            user="smoke",
+            # The strictest mode: the chain is verified against the CA and
+            # the certificate's name against the host.
+            sslmode="verify-full",
+            sslrootcert=str(ca_file),
+            autocommit=True,
+            connect_timeout=30,
+        ) as conn:
+            assert conn.pgconn.ssl_in_use
+            assert conn.execute("show ssl").fetchone() == ("on",)
+            conn.execute("CREATE TABLE over_tls (id int PRIMARY KEY, v text)")
+            conn.execute("INSERT INTO over_tls VALUES (1, 'encrypted')")
+            assert conn.execute("SELECT v FROM over_tls").fetchall() == [("encrypted",)]
+        _request_shutdown(proc)
+        assert proc.wait(timeout=60) == 0, "the daemon did not stop cleanly"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
 def test_data_survives_a_restart(tmp_path: pathlib.Path) -> None:
     """The storage path is a real WiredTiger home, not a scratch buffer.
 

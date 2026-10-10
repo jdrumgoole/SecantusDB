@@ -218,7 +218,7 @@ jobs:
         env:
           SECANTUSD_PG_BIN: ${{ env.BIN }}
         run: >-
-          uv run --no-project --with "psycopg[binary]" --with pytest
+          uv run --no-project --with "psycopg[binary]" --with pytest --with trustme
           python -m pytest tests/test_rust_pg_binary_smoke.py
           -o addopts= -p no:cacheprovider -q
 

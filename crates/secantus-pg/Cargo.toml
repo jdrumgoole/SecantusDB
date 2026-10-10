@@ -58,7 +58,13 @@ futures = "0.3"
 # `pgwire` here. A fork rather than `[patch.crates-io]`, because crates.io
 # ignores `[patch]` in a published crate: see that crate's README for what it
 # changes, and tasks/rust-packages-plan.md section 5.2 step 2.
-pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.8", path = "../secantus-pgwire", default-features = false, features = ["server-api"] }
+pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.8", path = "../secantus-pgwire", default-features = false, features = ["server-api-ring"] }
+# Server-side TLS (src/tls.rs). The same rustls and `ring` provider the wire
+# crate's `server-api-ring` selects, and the one the Rust MongoDB server uses:
+# `ring` needs no cmake or NASM, which `aws-lc-rs` does. The PEM reader is
+# `rustls-pki-types`' own, so the unmaintained `rustls-pemfile` stays out.
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = { version = "1.10", features = ["std"] }
 # "sync" is for the shutdown `watch` channel the accept loop and every
 # connection task select on -- do not rely on another crate's feature
 # unification to supply it.
@@ -104,6 +110,8 @@ libc = { version = "0.2", optional = true }
 # has to prove that writes the SERVER acknowledged over the wire survive
 # `stop()`, which a direct `Storage` call would not show.
 tokio-postgres = "0.7"
+# A self-signed certificate for the TLS tests, made per test and never stored.
+rcgen = "0.13"
 tempfile = "3"
 
 [[bin]]
