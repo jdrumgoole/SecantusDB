@@ -70,7 +70,7 @@ crates.io, not inside the Python wheel:
 
 ```bash
 cargo install secantus-mdb --version 0.5.3-beta.177   # MongoDB: the `secantusd-rs` daemon
-cargo install secantus-pg --version 0.1.0-beta.8      # PostgreSQL: the `secantusd-pg` daemon
+cargo install secantus-pg --version 0.1.0-beta.9      # PostgreSQL: the `secantusd-pg` daemon
 secantusd-rs --port 27017 --storage-path ./secantus-data
 ```
 
@@ -190,9 +190,10 @@ suite that ran against it on 2026-10-10 (macOS, psycopg 3.3.4), it passes
 gauge measures the protocol and the type system. The query language now
 covers joins, correlated subqueries and CTEs, window functions, `GROUP BY`
 with `GROUPING SETS`, views, indexes, `ALTER TABLE`, `ON CONFLICT`,
-`MERGE`, triggers and PL/pgSQL functions. TLS is on `main` and not yet in a
-release (`--tls-cert-file` / `--tls-key-file`). Not yet: a foreign table's
-rows, and a collection written through the MongoDB server read as a table.
+`MERGE`, triggers and PL/pgSQL functions, and it offers TLS
+(`--tls-cert-file` / `--tls-key-file`). Not yet: TLS client certificates and
+channel binding, a foreign table's rows, and a collection written through
+the MongoDB server read as a table.
 `EXPLAIN` prints a plan with zero costs. What it does not do it refuses
 with SQLSTATE `0A000` rather than answering wrongly.
 
@@ -226,7 +227,7 @@ carry the Rust servers (see below). macOS Intel (x86_64) is not in the
 wheel matrix.
 
 Both Rust servers install from crates.io: `cargo install secantus-mdb
---version 0.5.3-beta.177` and `cargo install secantus-pg --version 0.1.0-beta.8`.
+--version 0.5.3-beta.177` and `cargo install secantus-pg --version 0.1.0-beta.9`.
 Each needs a Rust toolchain and builds WiredTiger as part of the crate.
 
 Standalone archives of `secantusd-rs` (Linux x86_64, macOS arm64,
