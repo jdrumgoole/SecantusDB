@@ -2244,3 +2244,385 @@ fn collection_ttl_needs_clustering_and_the_monitor_is_reported() {
         }
     });
 }
+
+fn index_on_t(c: &mut CommandContext, spec: Document) -> Document {
+    common::dispatch_full(&doc! {"createIndexes": "t", "indexes": [spec]}, c)
+}
+
+fn first_batch(reply: &Document) -> Vec<Document> {
+    reply
+        .get_document("cursor")
+        .unwrap_or_else(|_| panic!("no cursor in {reply}"))
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.as_document().cloned())
+        .collect()
+}
+
+fn ids(reply: &Document) -> Vec<i32> {
+    first_batch(reply)
+        .iter()
+        .map(|d| d.get_i32("_id").unwrap())
+        .collect()
+}
+
+const STRENGTH_2_FULL: &str = "{ locale: \"en\", caseLevel: false, caseFirst: \"off\", \
+    strength: 2, numericOrdering: false, alternate: \"non-ignorable\", maxVariable: \"punct\", \
+    normalization: false, backwards: false, version: \"57.1\" }";
+
+fn seed_cases(c: &mut CommandContext, coll: &str) {
+    let reply = common::dispatch_full(
+        &doc! {"insert": coll, "documents": [
+            {"_id": 1, "s": "a"}, {"_id": 2, "s": "A"}, {"_id": 3, "s": "b"}, {"_id": 4, "s": "á"},
+        ]},
+        c,
+    );
+    assert_eq!(reply.get_i32("n").ok(), Some(4), "{reply}");
+}
+
+/// A collection's default collation is stored spelled out, shown on the
+/// `_id` index, and used by every read and write that names none. All
+/// measured against mongod 8.2.11 (`tools/probes/collation.py`).
+#[test]
+fn a_default_collation_is_stored_in_full_and_inherited() {
+    with_wt(|c| {
+        let s2 = doc! {"locale": "en", "strength": 2};
+        let reply = common::dispatch_full(&doc! {"create": "t", "collation": s2.clone()}, c);
+        assert_eq!(reply.get_f64("ok").ok(), Some(1.0), "{reply}");
+        let stored = collection_options(c, "t");
+        let full = stored.get_document("collation").unwrap();
+        assert_eq!(full.get_i32("strength").ok(), Some(2));
+        assert_eq!(full.get_str("version").ok(), Some("57.1"));
+        assert_eq!(full.get_str("alternate").ok(), Some("non-ignorable"));
+        let listed = first_batch(&common::dispatch_full(&doc! {"listIndexes": "t"}, c));
+        assert_eq!(listed[0].get_document("collation").ok(), Some(full));
+
+        seed_cases(c, "t");
+        let find = |c: &mut CommandContext, extra: Document| {
+            let mut cmd = doc! {"find": "t", "filter": {"s": "A"}, "sort": {"_id": 1}};
+            cmd.extend(extra);
+            ids(&common::dispatch_full(&cmd, c))
+        };
+        assert_eq!(find(c, doc! {}), vec![1, 2]);
+        assert_eq!(find(c, doc! {"collation": {"locale": "simple"}}), vec![2]);
+        assert_eq!(
+            find(c, doc! {"collation": {"locale": "en", "strength": 1}}),
+            vec![1, 2, 4]
+        );
+        let count = common::dispatch_full(&doc! {"count": "t", "query": {"s": "A"}}, c);
+        assert_eq!(count.get_i32("n").ok(), Some(2), "{count}");
+        let update = common::dispatch_full(
+            &doc! {"update": "t", "updates": [{"q": {"s": "A"}, "u": {"$set": {"x": 1}}, "multi": true}]},
+            c,
+        );
+        assert_eq!(update.get_i32("nModified").ok(), Some(2), "{update}");
+        // An index built with no collation takes the default; `simple` opts out.
+        common::dispatch_full(
+            &doc! {"createIndexes": "t", "indexes": [
+                {"key": {"s": 1}, "name": "inherits"},
+                {"key": {"s": 1}, "name": "plain", "collation": {"locale": "simple"}},
+            ]},
+            c,
+        );
+        let listed = first_batch(&common::dispatch_full(&doc! {"listIndexes": "t"}, c));
+        let by_name = |n: &str| {
+            listed
+                .iter()
+                .find(|ix| ix.get_str("name") == Ok(n))
+                .unwrap()
+        };
+        assert_eq!(
+            by_name("inherits").get_document("collation").ok(),
+            Some(full)
+        );
+        assert!(!by_name("plain").contains_key("collation"));
+        assert!(!by_name("inherits").contains_key("collationKeys"));
+
+        // The same options again are the same collection; others are not.
+        let again = common::dispatch_full(&doc! {"create": "t", "collation": s2}, c);
+        assert_eq!(again.get_f64("ok").ok(), Some(1.0), "{again}");
+        let other = common::dispatch_full(&doc! {"create": "t"}, c);
+        assert_eq!(other.get_i32("code").ok(), Some(48), "{other}");
+    });
+}
+
+/// What `mongod` refuses in a collation document, on the commands that take
+/// one, with its codes and messages.
+#[test]
+fn a_malformed_collation_is_refused_everywhere() {
+    with_wt(|c| {
+        seed_cases(c, "t");
+        let find =
+            common::dispatch_full(&doc! {"find": "t", "collation": {"locale": "zz_nope"}}, c);
+        assert_eq!(find.get_i32("code").ok(), Some(2), "{find}");
+        assert_eq!(
+            find.get_str("errmsg").unwrap(),
+            "Field 'locale' is invalid in: { locale: \"zz_nope\" }"
+        );
+        let agg = common::dispatch_full(
+            &doc! {"aggregate": "t", "pipeline": [], "cursor": {}, "collation": {"locale": "en", "strength": 6}},
+            c,
+        );
+        assert_eq!(
+            agg.get_str("errmsg").unwrap(),
+            "BSON field 'strength' value must be <= 5, actual value '6'"
+        );
+        let create = common::dispatch_full(&doc! {"create": "fresh", "collation": {}}, c);
+        assert_eq!(create.get_i32("code").ok(), Some(40414), "{create}");
+        assert_eq!(
+            create.get_str("errmsg").unwrap(),
+            "BSON field 'create.collation.locale' is missing but a required field"
+        );
+        // A write statement's bad collation fails that statement.
+        let update = common::dispatch_full(
+            &doc! {"update": "t", "updates": [
+                {"q": {}, "u": {"$set": {"x": 1}}, "collation": {"locale": "en", "bogus": 1}},
+            ]},
+            c,
+        );
+        assert_eq!(update.get_f64("ok").ok(), Some(1.0), "{update}");
+        let errors = update.get_array("writeErrors").unwrap();
+        let first = errors[0].as_document().unwrap();
+        assert_eq!(first.get_i32("code").ok(), Some(40415));
+        assert_eq!(
+            first.get_str("errmsg").unwrap(),
+            "BSON field 'collation.bogus' is an unknown field."
+        );
+        let index = index_on_t(
+            c,
+            doc! {"key": {"s": 1}, "name": "ix", "collation": {"locale": "EN"}},
+        );
+        assert_eq!(index.get_i32("code").ok(), Some(2), "{index}");
+        assert_eq!(
+            index.get_str("errmsg").unwrap(),
+            "failed to add collation information to index spec for index creation: { key: { s: 1 }, \
+             name: \"ix\", collation: { locale: \"EN\" }, v: 2 } :: caused by :: Field 'locale' is \
+             invalid in: { locale: \"EN\" }. Did you mean 'en'?"
+        );
+        let empty = index_on_t(c, doc! {"key": {"s": 1}, "name": "ix", "collation": {}});
+        assert!(
+            empty
+                .get_str("errmsg")
+                .unwrap()
+                .ends_with("The field 'collation' cannot be an empty object."),
+            "{empty}"
+        );
+        assert_eq!(index_names(c, "t"), vec!["_id_"]);
+    });
+}
+
+/// A unique index with a collation refuses two values the collation calls
+/// equal: on insert, on update, on build, and inside its partial filter.
+/// Until 2026-10-10 the Rust server compared the bytes and stored both.
+#[test]
+fn a_collated_unique_index_enforces_by_the_collation() {
+    with_wt(|c| {
+        let s2 = doc! {"locale": "en", "strength": 2};
+        let built = index_on_t(
+            c,
+            doc! {"key": {"s": 1}, "name": "ix", "unique": true, "collation": s2.clone()},
+        );
+        assert_eq!(built.get_f64("ok").ok(), Some(1.0), "{built}");
+        let reply = common::dispatch_full(
+            &doc! {"insert": "t", "documents": [{"_id": 1, "s": "a"}, {"_id": 2, "s": "A"}]},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").ok(), Some(1), "{reply}");
+        let error = reply.get_array("writeErrors").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert_eq!(error.get_i32("code").ok(), Some(11000));
+        let message = error.get_str("errmsg").unwrap();
+        let head = format!(
+            "E11000 duplicate key error collection: t.t index: ix collation: \
+             {STRENGTH_2_FULL} dup key: {{ s: \"CollationKey(0x"
+        );
+        assert!(message.starts_with(&head), "{message}");
+        assert_eq!(
+            error.get_array("hexEncoded").ok(),
+            Some(&vec![Bson::Boolean(true)])
+        );
+        assert!(error.get_document("collation").is_ok(), "{error}");
+
+        // An accent is a different key at strength 2; an update into a taken
+        // one is not.
+        let reply = common::dispatch_full(
+            &doc! {"insert": "t", "documents": [{"_id": 3, "s": "á"}]},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").ok(), Some(1), "{reply}");
+        let update = common::dispatch_full(
+            &doc! {"update": "t", "updates": [{"q": {"_id": 3}, "u": {"$set": {"s": "A"}}}]},
+            c,
+        );
+        assert!(update.get_array("writeErrors").is_ok(), "{update}");
+        // Changing only the case of the document's own value is allowed, and
+        // is a real change.
+        let update = common::dispatch_full(
+            &doc! {"update": "t", "updates": [{"q": {"_id": 1}, "u": {"$set": {"s": "A"}}}]},
+            c,
+        );
+        assert_eq!(update.get_i32("nModified").ok(), Some(1), "{update}");
+
+        // The build fails over existing duplicates.
+        seed_cases(c, "u");
+        let built = common::dispatch_full(
+            &doc! {"createIndexes": "u", "indexes": [
+                {"key": {"s": 1}, "name": "ix", "unique": true, "collation": s2.clone()},
+            ]},
+            c,
+        );
+        assert_eq!(built.get_i32("code").ok(), Some(11000), "{built}");
+
+        // A query still answers by its OWN collation with the index there,
+        // and a hint naming the index is accepted.
+        let plain =
+            common::dispatch_full(&doc! {"find": "t", "filter": {"s": "a"}, "hint": "ix"}, c);
+        assert_eq!(ids(&plain), Vec::<i32>::new(), "{plain}");
+        let folded = common::dispatch_full(
+            &doc! {"find": "t", "filter": {"s": "a"}, "collation": s2.clone()},
+            c,
+        );
+        assert_eq!(ids(&folded), vec![1]);
+
+        // The partial filter is read under the index's collation too.
+        let built = common::dispatch_full(
+            &doc! {"createIndexes": "p", "indexes": [{
+                "key": {"s": 1}, "name": "ix", "unique": true, "collation": s2,
+                "partialFilterExpression": {"s": "a"},
+            }]},
+            c,
+        );
+        assert_eq!(built.get_f64("ok").ok(), Some(1.0), "{built}");
+        let reply = common::dispatch_full(
+            &doc! {"insert": "p", "documents": [
+                {"_id": 1, "s": "a"}, {"_id": 2, "s": "A"}, {"_id": 3, "s": "b"}, {"_id": 4, "s": "B"},
+            ], "ordered": false},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").ok(), Some(3), "{reply}");
+    });
+}
+
+/// Two indexes can share a key when their collations differ, and a key then
+/// names neither.
+#[test]
+fn indexes_that_differ_only_by_collation_coexist() {
+    with_wt(|c| {
+        for (name, collation) in [
+            ("s2", Some(doc! {"locale": "en", "strength": 2})),
+            ("s1", Some(doc! {"locale": "en", "strength": 1})),
+            ("plain", None),
+        ] {
+            let mut spec = doc! {"key": {"s": 1}, "name": name};
+            if let Some(collation) = collation {
+                spec.insert("collation", collation);
+            }
+            let reply = index_on_t(c, spec);
+            assert_eq!(reply.get_f64("ok").ok(), Some(1.0), "{name}: {reply}");
+        }
+        let drop = common::dispatch_full(&doc! {"dropIndexes": "t", "index": {"s": 1}}, c);
+        assert_eq!(drop.get_i32("code").ok(), Some(181), "{drop}");
+        assert!(
+            drop.get_str("errmsg")
+                .unwrap()
+                .starts_with("3 indexes found for key: { s: 1 }, identify by name instead."),
+            "{drop}"
+        );
+        // The `_id` index has the collection's collation and takes no other.
+        let reply = index_on_t(
+            c,
+            doc! {"key": {"_id": 1}, "name": "_id_", "collation": {"locale": "en"}},
+        );
+        assert_eq!(reply.get_i32("code").ok(), Some(2), "{reply}");
+        assert!(
+            reply
+                .get_str("errmsg")
+                .unwrap()
+                .ends_with("collection collation: { locale: \"simple\" }"),
+            "{reply}"
+        );
+        let reply = common::dispatch_full(
+            &doc! {"collMod": "t", "index": {"name": "plain", "collation": {"locale": "en"}}},
+            c,
+        );
+        assert_eq!(reply.get_i32("code").ok(), Some(40415), "{reply}");
+    });
+}
+
+/// A view reads in its own collation, never its base collection's, and a
+/// view on a view must agree with it.
+#[test]
+fn a_view_has_its_own_collation() {
+    with_wt(|c| {
+        let s2 = doc! {"locale": "en", "strength": 2};
+        seed_cases(c, "t");
+        common::dispatch_full(
+            &doc! {"create": "v", "viewOn": "t", "pipeline": [], "collation": s2.clone()},
+            c,
+        );
+        let find = |c: &mut CommandContext, name: &str, extra: Document| {
+            let mut cmd = doc! {"find": name, "filter": {"s": "A"}, "sort": {"_id": 1}};
+            cmd.extend(extra);
+            common::dispatch_full(&cmd, c)
+        };
+        assert_eq!(ids(&find(c, "v", doc! {})), vec![1, 2]);
+        assert_eq!(
+            ids(&find(c, "v", doc! {"collation": s2.clone()})),
+            vec![1, 2]
+        );
+        let other = find(c, "v", doc! {"collation": {"locale": "en", "strength": 1}});
+        assert_eq!(other.get_i32("code").ok(), Some(167), "{other}");
+        let count = common::dispatch_full(&doc! {"count": "v", "query": {"s": "A"}}, c);
+        assert_eq!(count.get_i32("n").ok(), Some(2), "{count}");
+
+        let stacked =
+            common::dispatch_full(&doc! {"create": "w", "viewOn": "v", "pipeline": []}, c);
+        assert_eq!(stacked.get_i32("code").ok(), Some(167), "{stacked}");
+        assert_eq!(
+            stacked.get_str("errmsg").unwrap(),
+            "View t.w has conflicting collation with view t.v"
+        );
+
+        // The other way round: a plain view on a collated collection is binary.
+        common::dispatch_full(&doc! {"create": "ct", "collation": s2}, c);
+        seed_cases(c, "ct");
+        common::dispatch_full(&doc! {"create": "cv", "viewOn": "ct", "pipeline": []}, c);
+        assert_eq!(ids(&find(c, "cv", doc! {})), vec![2]);
+    });
+}
+
+/// A rename keeps the collection's options and UUID. Until 2026-10-10 the
+/// destination was created bare: the validator was gone and every later
+/// write went unchecked.
+#[test]
+fn rename_keeps_the_collection_options() {
+    with_wt(|c| {
+        let reply = common::dispatch_full(
+            &doc! {"create": "r1", "validator": {"a": {"$gt": 0}}, "validationLevel": "moderate",
+            "collation": {"locale": "en", "strength": 2}},
+            c,
+        );
+        assert_eq!(reply.get_f64("ok").ok(), Some(1.0), "{reply}");
+        common::dispatch_full(&doc! {"insert": "r1", "documents": [{"_id": 1, "a": 5}]}, c);
+        let before = collection_options(c, "r1");
+        let was_db = std::mem::replace(&mut c.db_name, "admin".to_string());
+        let reply = common::dispatch_full(&doc! {"renameCollection": "t.r1", "to": "t.r2"}, c);
+        c.db_name = was_db;
+        assert_eq!(reply.get_f64("ok").ok(), Some(1.0), "{reply}");
+        assert_eq!(collection_options(c, "r2"), before);
+        let refused = common::dispatch_full(
+            &doc! {"insert": "r2", "documents": [{"_id": 2, "a": -1}]},
+            c,
+        );
+        let errors = refused
+            .get_array("writeErrors")
+            .expect("the validator still applies");
+        assert_eq!(
+            errors[0].as_document().unwrap().get_i32("code").ok(),
+            Some(121)
+        );
+    });
+}

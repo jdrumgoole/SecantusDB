@@ -138,24 +138,33 @@ def test_curated_directed_parity(value):
         assert same(_rust_encode_directed(v, direction), _pure.encode_value_directed(v, direction))
 
 
+# COLLATED keys are deliberately NOT pinned to the Python encoder any more.
+# Since 2026-10-10 the Rust engine encodes a string under a collation as its
+# ICU4X sort key, which is what makes it order and match as mongod does
+# (`tools/probes/collation.py`: 8 of 764 results differ from 8.2.11, where the
+# previous fold shared with Python differed in 462). The Python encoder still
+# writes its own folded string, so the two produce different bytes by design
+# and neither is the other's reference. What this gives up: this suite no
+# longer notices a change to either engine's collated encoding. The Rust side
+# is covered by `crates/secantus-core/src/collation.rs` tests and the probe;
+# the on-disk consequence is recorded in tasks/backlog.md 7.070.
+#
+# What can still be said without a reference is checked below: two strings
+# the collation calls equal encode alike, and unequal ones do not.
 @pytest.mark.parametrize(
-    "s,strength,case_level,numeric_ordering",
+    "a,b,strength,equal",
     [
-        ("PING", 2, False, False),  # case-insensitive -> "ping"
-        ("Hello World", 2, False, False),
-        ("abc", 3, False, False),  # strength 3 identity
-        ("ABC", 1, True, False),  # accent-insensitive, case kept (ASCII identity)
-        ("a10", 3, False, True),  # numericOrdering -> raw bytes (identity)
-        ("café", 2, False, False),  # non-ASCII under case-insensitive -> defer
+        ("PING", "ping", 2, True),
+        ("PING", "ping", 3, False),
+        ("café", "CAFE", 1, True),
+        ("café", "cafe", 2, False),
+        ("Hello World", "hello world", 2, True),
     ],
 )
-def test_collation_encoding_parity(s, strength, case_level, numeric_ordering):
-    wire = {"strength": strength, "caseLevel": case_level, "numericOrdering": numeric_ordering}
-    obj = _Collation(strength=strength, case_level=case_level, numeric_ordering=numeric_ordering)
-    rust = _rust_encode(s, wire)
-    if rust is None:
-        return  # rust deferred (non-ASCII transform) -> pure Python
-    assert same(rust, _pure.encode_value(s, collation=obj)), f"s={s!r} wire={wire}"
+def test_collated_keys_agree_exactly_when_the_collation_does(a, b, strength, equal):
+    wire = {"locale": "en", "strength": strength}
+    assert (_rust_encode(a, wire) == _rust_encode(b, wire)) is equal
+    assert _rust_encode(a, wire) != _rust_encode(a)
 
 
 @pytest.mark.parametrize("value", _curated_values())
@@ -167,16 +176,15 @@ def test_curated_id_key_parity(value):
     assert same(rust, _pure.encode_id_key(v))
 
 
-@pytest.mark.parametrize("strength", [1, 2, 3])
-def test_nested_strings_take_the_collation(strength):
-    """Entry format 4 applies an index's collation to strings INSIDE documents
-    and arrays, as mongod's comparison does -- on both engines identically."""
-    wire = {"strength": strength, "caseLevel": False, "numericOrdering": False}
-    obj = _Collation(strength=strength, case_level=False, numeric_ordering=False)
-    for v in ({"a": "PING", "b": ["X", {"c": "y"}]}, ["B", "b", {"k": "Hello"}]):
-        rust = _rust_encode(v, wire)
-        assert rust is not None, f"rust deferred an ASCII value: {v!r}"
-        assert same(rust, _pure.encode_value(v, collation=obj)), f"v={v!r} wire={wire}"
+def test_nested_strings_take_the_collation():
+    """An index's collation applies to strings INSIDE documents and arrays, as
+    mongod's comparison does. (Not compared with the Python encoder: see the
+    note above `test_collated_keys_agree_exactly_when_the_collation_does`.)"""
+    wire = {"locale": "en", "strength": 2}
+    upper = {"a": "PING", "b": ["X", {"c": "y"}]}
+    lower = {"a": "ping", "b": ["x", {"c": "Y"}]}
+    assert _rust_encode(upper, wire) == _rust_encode(lower, wire)
+    assert _rust_encode(upper) != _rust_encode(lower)
 
 
 def test_cross_type_numeric_collision_matches_python():

@@ -2206,12 +2206,15 @@ dependencies = [
  "chrono-tz",
  "fancy-regex",
  "geo",
+ "icu_collator",
+ "icu_collator_data",
+ "icu_locale_core",
+ "icu_normalizer",
+ "icu_provider",
  "libc",
  "rand 0.9.5",
  "regex",
  "regex-automata",
- "unicode-normalization",
- "unicode-properties",
 ]
 
 [[package]]

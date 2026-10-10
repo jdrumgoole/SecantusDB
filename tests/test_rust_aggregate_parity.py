@@ -1301,6 +1301,19 @@ def _has_count_stage(pipeline) -> bool:
     return False
 
 
+_TOP_BOTTOM = ("$top", "$bottom", "$topN", "$bottomN")
+
+
+def _has_top_or_bottom(pipeline) -> bool:
+    """Whether a `$group` in `pipeline` uses `$top` / `$bottom` / `$topN` /
+    `$bottomN`."""
+    for stage in pipeline:
+        for acc in (stage.get("$group") or {}).values():
+            if isinstance(acc, dict) and any(op in acc for op in _TOP_BOTTOM):
+                return True
+    return False
+
+
 @pytest.mark.parametrize("seed", [0xA66E, 1, 2, 0xBEEF, 0xC0FFEE])
 def test_pipeline_fuzz(seed):
     rng = random.Random(seed)
@@ -1322,6 +1335,15 @@ def test_pipeline_fuzz(seed):
         # disagrees. The curated `$count` cases above still pin it on
         # non-empty input.
         known = _has_count_stage(pipeline)
+        # A second one, since 2026-10-10: the `sortBy` of `$top` / `$bottom`
+        # (and the N forms) over an ARRAY value. mongod 8.2.11 sorts an array
+        # by its smallest element ascending and largest descending, and an
+        # empty one below null, as every sort does; the Rust engine was moved
+        # to that and the Python engine still compares the array whole
+        # (tasks/backlog.md 7.070). What this gives up: other drift in a
+        # pipeline holding one of the four that disagrees. The curated cases
+        # still pin them over scalar sort values.
+        known = known or _has_top_or_bottom(pipeline)
         try:
             py = _pure.apply_pipeline(docs, pipeline, _PipelineContext())
         except Exception:

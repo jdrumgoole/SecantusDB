@@ -58,6 +58,9 @@ pub struct DuplicateKey {
     pub exec: bool,
     pub key_pattern: Option<Document>,
     pub key_value: Option<Document>,
+    /// Fields that follow `keyValue` in the reply: `hexEncoded` and
+    /// `collation`, for a conflict on an index with a collation.
+    pub extra: Option<Document>,
 }
 
 /// A storage failure, pre-classified by the adapter into the shape command

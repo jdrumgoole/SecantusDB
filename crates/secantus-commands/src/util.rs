@@ -3,6 +3,8 @@
 
 use bson::{doc, Bson, Document};
 
+use secantus_core::collation::{Collation, Context as CollationContext};
+
 use crate::{CommandError, StorageError};
 
 /// Resolve a command-level `let` field into query vars. Seeds `$$NOW` (a Date
@@ -23,14 +25,98 @@ pub(crate) fn resolve_let_vars(let_field: Option<&Bson>) -> Document {
     vars
 }
 
-/// Parse a command's `collation` sub-document into a [`Collation`]. Returns
-/// `None` when absent or empty (`{}` / `{locale: "simple"}` → no collation). A
-/// collation the engine can't reproduce (non-ASCII / numericOrdering) still
-/// parses here but surfaces as a `BadValue` at query time when it hits real data.
-pub(crate) fn collation_of(doc: &Document) -> Option<secantus_core::collation::Collation> {
-    doc.get("collation")
-        .and_then(Bson::as_document)
+/// What a command said about collation.
+pub(crate) enum Requested {
+    /// No `collation` field, or an empty one: the namespace's default applies.
+    Absent,
+    /// `{locale: "simple"}`: binary comparison, whatever the default is.
+    Simple,
+    Given(Collation),
+}
+
+impl Requested {
+    /// The collation named, if the command named one at all.
+    pub(crate) fn named(self) -> Option<Option<Collation>> {
+        match self {
+            Requested::Absent => None,
+            Requested::Simple => Some(None),
+            Requested::Given(c) => Some(Some(c)),
+        }
+    }
+}
+
+/// A refused collation document as the command error mongod sends.
+pub(crate) fn collation_error(e: secantus_core::collation::SpecError) -> CommandError {
+    CommandError::new(e.code, error_code_name(e.code), e.message)
+}
+
+/// Read and VALIDATE the `collation` field of a command or of one write
+/// statement, with mongod's checks. The field's type is the caller's to check
+/// first (each command words that refusal its own way); a value that is not a
+/// document is read here as absent.
+pub(crate) fn requested_collation(doc: &Document) -> Result<Requested, CommandError> {
+    match doc.get("collation").and_then(Bson::as_document) {
+        None => Ok(Requested::Absent),
+        Some(d) if d.is_empty() => Ok(Requested::Absent),
+        Some(d) => {
+            match secantus_core::collation::parse_strict(d, CollationContext::COMMAND)
+                .map_err(collation_error)?
+            {
+                Some(c) => Ok(Requested::Given(c)),
+                None => Ok(Requested::Simple),
+            }
+        }
+    }
+}
+
+/// The default collation of a collection or view: what `create` was given.
+/// `None` for a namespace that does not exist, or has none.
+pub(crate) fn default_collation(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+) -> Option<Collation> {
+    storage
+        .get_collection_options(db, coll)
+        .ok()?
+        .get_document("collation")
+        .ok()
         .and_then(secantus_core::collation::parse)
+}
+
+/// The collation a command on `db.coll` runs under: the one it names, else the
+/// namespace's default. Refuses a malformed collation, and a collation that
+/// is not a VIEW's own (`167`): a view reads in its default and no other.
+pub(crate) fn effective_collation(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    doc: &Document,
+) -> Result<Option<Collation>, CommandError> {
+    let requested = requested_collation(doc)?;
+    let options = storage.get_collection_options(db, coll).unwrap_or_default();
+    let default = options
+        .get_document("collation")
+        .ok()
+        .and_then(secantus_core::collation::parse);
+    let Some(named) = requested.named() else {
+        return Ok(default);
+    };
+    if options.contains_key("viewOn") {
+        let same = match (&named, &default) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        if !same {
+            return Err(CommandError::new(
+                167,
+                "OptionNotSupportedOnView",
+                "Cannot override a view's default collation",
+            ));
+        }
+    }
+    Ok(named)
 }
 
 /// The collection name from a string-valued command field (`doc[cmd]`).
@@ -299,6 +385,9 @@ pub(crate) fn write_error(index: usize, err: StorageError, command: &str) -> Doc
             }
             if let Some(kv) = info.key_value {
                 e.insert("keyValue", kv);
+            }
+            if let Some(extra) = info.extra {
+                e.extend(extra);
             }
             e
         }

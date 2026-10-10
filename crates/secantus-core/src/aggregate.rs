@@ -47,6 +47,10 @@ pub fn apply_pipeline(
     vars: &Document,
     coll: Option<&Collation>,
 ) -> R<Vec<Document>> {
+    // Every comparison a stage makes -- an expression's `$eq`, a `$group`
+    // key, `$sortArray` -- reads the active collation. A pipeline with none
+    // leaves whatever its caller set.
+    let _active = coll.map(|c| crate::collation::activate(Some(c)));
     for stage in pipeline {
         let Bson::Document(s) = stage else {
             return Err(Fallback::Defer);

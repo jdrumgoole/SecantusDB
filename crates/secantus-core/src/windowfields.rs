@@ -175,8 +175,15 @@ pub fn set_window_fields_stage(
             Some(by) => expressions::evaluate(doc, by, vars)?,
             None => Bson::Null,
         };
+        if matches!(key_val, Bson::Array(_)) {
+            return Err(Fallback::mongo(
+                14,
+                "An expression used to partition cannot evaluate to value of type array",
+            )
+            .exec());
+        }
         let mut wrap = Document::new();
-        wrap.insert("k", key_val);
+        wrap.insert("k", crate::collation::fold_active(key_val));
         let key = bson::to_vec(&wrap).map_err(|_| Fallback::Defer)?;
         let idx = *key_index.entry(key).or_insert_with(|| {
             partitions.push(Vec::new());
@@ -331,7 +338,11 @@ fn sorted_slots(part: &[usize], docs: &[Document], sort_by: Option<&Document>) -
     }
     for (field, desc) in fields.iter().rev() {
         slots.sort_by(|&a, &b| {
-            let o = order::cmp(&field_value(&docs[a], field), &field_value(&docs[b], field));
+            // An array sorts by its smallest element (largest, descending).
+            let o = order::cmp(
+                &order::sort_repr(field_value(&docs[a], field), *desc),
+                &order::sort_repr(field_value(&docs[b], field), *desc),
+            );
             if *desc {
                 o.reverse()
             } else {
@@ -372,10 +383,11 @@ fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>)
     for i in 1..n {
         doc_number[i] = i as i32 + 1;
         let tied = match sort_by {
-            Some(sb) => sb.keys().all(|f| {
+            Some(sb) => sb.iter().all(|(f, dir)| {
+                let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
                 order::cmp(
-                    &field_value(&docs[slots[i]], f),
-                    &field_value(&docs[slots[i - 1]], f),
+                    &order::sort_repr(field_value(&docs[slots[i]], f), desc),
+                    &order::sort_repr(field_value(&docs[slots[i - 1]], f), desc),
                 ) == Ordering::Equal
             }),
             None => false,

@@ -1,460 +1,1088 @@
-//! Collation-aware string normalisation — Rust counterpart of
-//! `secantus.collation`, intentionally scoped to what is **version-independent**.
+//! Collation: string comparison by language rules, as `mongod` does it.
 //!
-//! The Python implementation leans on `unicodedata` (NFKD + `category('Mn')`)
-//! and `str.casefold()`, both of which depend on the Unicode version bundled
-//! with the running CPython. Reproducing those in Rust would risk drift on rare
-//! characters. So this module handles only the cases where the transformation
-//! is unambiguous regardless of Unicode version:
+//! `mongod` hands every collated comparison to ICU. This module hands it to
+//! ICU4X (`icu_collator`), which implements the same algorithm (UCA with CLDR
+//! tailorings) in Rust. Measured against `mongod` 8.2.11 on 2026-10-10 over
+//! 157 strings and 40 collations (every option, 24 locales), the two put the
+//! strings in the same order and the same equivalence classes, with one
+//! exception recorded in `tasks/backlog.md`: ICU4X always treats canonically
+//! equivalent strings as equal, where `mongod` with `normalization: false`
+//! (the default) tells `"ö\u{323}"` from `"o\u{323}\u{308}"`.
 //!
-//! * **ASCII strings** — accent stripping is a no-op (ASCII has no combining
-//!   marks / decompositions) and `casefold()` is exactly ASCII-lowercasing
-//!   (no special cases like ß→ss live in ASCII).
-//! * **No active transform** (strength 3, no `caseLevel` effect) — the string
-//!   passes through unchanged, so *any* string is fine.
+//! `mongod` 8.2 links ICU 57.1 and ICU4X carries newer CLDR data, so a
+//! character added to Unicode since, or a tailoring CLDR has revised, can
+//! order differently. Nothing here claims otherwise.
 //!
-//! Anything else — a non-ASCII string under an accent/case-insensitive
-//! collation, or `numericOrdering` (needs Python's `\d`/`isdigit` + tuple
-//! ordering) — returns `None` ("defer to Python"), and the caller falls back to
-//! the pure-Python collation path, which is authoritative.
+//! Three things live here:
+//!
+//! * [`Collation`] and the two parsers. [`parse_strict`] applies `mongod`'s
+//!   own checks and answers with its codes and messages; [`parse`] is the
+//!   lenient form for callers that have already validated.
+//! * [`compare`] / [`equal`] and the sort key ([`sort_key`]), which is what an
+//!   index entry or a group key holds for a string under a collation.
+//! * The ACTIVE collation: a thread-local the aggregation and update engines
+//!   set for the length of one evaluation ([`activate`]), read by
+//!   `order::cmp`, the group key and the set operators. It is how
+//!   `{$eq: ["a", "A"]}` sees the collation without every expression operator
+//!   taking a parameter.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use unicode_normalization::UnicodeNormalization;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bson::{Bson, Document};
+use icu_collator::options::{AlternateHandling, CaseLevel, CollatorOptions, MaxVariable, Strength};
+use icu_collator::preferences::{CollationCaseFirst, CollationNumericOrdering};
+use icu_collator::provider::{
+    Baked, CollationDiacriticsV1, CollationJamoV1, CollationMetadata, CollationMetadataV1,
+    CollationReorderingV1, CollationRootV1, CollationSpecialPrimariesV1, CollationTailoringV1,
+};
+use icu_collator::{Collator, CollatorPreferences};
+use icu_normalizer::provider::{NormalizerNfdDataV1, NormalizerNfdTablesV1};
+use icu_provider::prelude::*;
 
+/// The collator version `mongod` 8.2 reports and requires (its ICU).
+pub const MONGOD_COLLATOR_VERSION: &str = "57.1";
+
+/// What an on-disk index entry's collation keys were made with. Bump it when
+/// `icu_collator` or its data changes the bytes of a sort key, and rebuild the
+/// indexes that carry the older number.
+pub const KEY_FORMAT: i32 = 1;
+
+/// Every locale `mongod` 8.2.11 accepts, found by asking it for each one
+/// (all two- and three-letter languages, then each with every script and
+/// region). `simple` is separate: it means no collation at all.
+const LOCALES: &[&str] = &[
+    "af",
+    "am",
+    "ar",
+    "as",
+    "az",
+    "be",
+    "bg",
+    "bn",
+    "bo",
+    "bs",
+    "bs_Cyrl",
+    "ca",
+    "chr",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "de_AT",
+    "dsb",
+    "dz",
+    "ee",
+    "el",
+    "en",
+    "en_US",
+    "en_US_POSIX",
+    "eo",
+    "es",
+    "et",
+    "fa",
+    "fa_AF",
+    "fi",
+    "fil",
+    "fo",
+    "fr",
+    "fr_CA",
+    "ga",
+    "gl",
+    "gu",
+    "ha",
+    "haw",
+    "he",
+    "hi",
+    "hr",
+    "hsb",
+    "hu",
+    "hy",
+    "id",
+    "ig",
+    "is",
+    "it",
+    "ja",
+    "ka",
+    "kk",
+    "kl",
+    "km",
+    "kn",
+    "ko",
+    "kok",
+    "ky",
+    "lb",
+    "lkt",
+    "ln",
+    "lo",
+    "lt",
+    "lv",
+    "mk",
+    "ml",
+    "mn",
+    "mr",
+    "ms",
+    "mt",
+    "my",
+    "nb",
+    "ne",
+    "nl",
+    "nn",
+    "om",
+    "or",
+    "pa",
+    "pl",
+    "ps",
+    "pt",
+    "ro",
+    "ru",
+    "se",
+    "si",
+    "sk",
+    "sl",
+    "smn",
+    "sq",
+    "sr",
+    "sr_Latn",
+    "sv",
+    "sw",
+    "ta",
+    "te",
+    "th",
+    "to",
+    "tr",
+    "ug",
+    "uk",
+    "ur",
+    "vi",
+    "wae",
+    "yi",
+    "yo",
+    "zh",
+    "zh_Hant",
+    "zu",
+];
+
+/// `@collation=<type>` values every locale takes, and the ones only some do
+/// (measured the same way).
+const COMMON_TYPES: &[&str] = &["search", "eor", "emoji"];
+const LOCALE_TYPES: &[(&str, &[&str])] = &[
+    ("ar", &["compat"]),
+    ("bn", &["traditional"]),
+    ("de", &["phonebook"]),
+    ("de_AT", &["phonebook"]),
+    ("es", &["traditional"]),
+    ("fi", &["traditional"]),
+    ("ja", &["unihan"]),
+    ("kn", &["traditional"]),
+    ("ko", &["unihan", "searchjl"]),
+    ("ln", &["phonetic"]),
+    ("si", &["dictionary"]),
+    ("sv", &["standard"]),
+    ("vi", &["traditional"]),
+    (
+        "zh",
+        &[
+            "standard",
+            "stroke",
+            "zhuyin",
+            "big5han",
+            "gb2312han",
+            "unihan",
+        ],
+    ),
+    (
+        "zh_Hant",
+        &[
+            "standard",
+            "pinyin",
+            "zhuyin",
+            "big5han",
+            "gb2312han",
+            "unihan",
+        ],
+    ),
+];
+
+/// Collation types `mongod` accepts that the bundled ICU4X data does not
+/// carry. ICU4X would silently fall back to the locale's standard order, which
+/// is a different answer, so these are refused by name.
+const UNSUPPORTED_TYPES: &[&str] = &["search", "searchjl", "big5han", "gb2312han", "phonetic"];
+
+/// A parsed, usable collation. Never `simple`: that is `None` everywhere.
+#[derive(Clone)]
 pub struct Collation {
-    pub strength: i32,
-    pub case_level: bool,
-    pub numeric_ordering: bool,
-    /// `"upper"` flips the tertiary (case) level so capitals sort first.
-    pub case_first_upper: bool,
-    /// French ordering: the secondary (accent) level is compared from the END
-    /// of the string, which is what makes `coté` sort before `côte`.
-    pub backwards: bool,
+    collator: Arc<Collator>,
+    /// The collation as `mongod` stores and echoes it: every option spelled
+    /// out, in its order, with `version`.
+    spec: Document,
+}
+
+impl std::fmt::Debug for Collation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Collation({})", self.spec)
+    }
 }
 
 impl Collation {
-    fn case_insensitive(&self) -> bool {
-        self.strength <= 2 && !self.case_level
+    /// The full document `listIndexes` and `listCollections` show.
+    pub fn spec(&self) -> &Document {
+        &self.spec
     }
 
-    fn accent_insensitive(&self) -> bool {
-        self.strength <= 1
+    /// Two collations are the same when their full specs are.
+    pub fn same(&self, other: &Collation) -> bool {
+        self.spec == other.spec
     }
 }
 
-/// Parse the wire form `{strength, caseLevel, numericOrdering}`. An empty
-/// document means "no collation" (`None`).
+/// A refused collation document: `mongod`'s code and message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpecError {
+    pub code: i32,
+    pub message: String,
+}
+
+fn err<T>(code: i32, message: String) -> Result<T, SpecError> {
+    Err(SpecError { code, message })
+}
+
+/// How the caller's command names and prints a collation in its errors.
+#[derive(Clone, Copy)]
+pub struct Context<'a> {
+    /// The field path in a type error: `collation` for `find`,
+    /// `create.collation` for `create`.
+    pub path: &'a str,
+    /// `create` prints the spec with every default filled in.
+    pub print_defaults: bool,
+}
+
+impl Context<'static> {
+    pub const COMMAND: Context<'static> = Context {
+        path: "collation",
+        print_defaults: false,
+    };
+    pub const CREATE: Context<'static> = Context {
+        path: "create.collation",
+        print_defaults: true,
+    };
+}
+
+#[derive(Default)]
+struct Fields {
+    locale: Option<String>,
+    strength: Option<i32>,
+    case_level: Option<bool>,
+    case_first: Option<String>,
+    numeric_ordering: Option<bool>,
+    alternate: Option<String>,
+    max_variable: Option<String>,
+    normalization: Option<bool>,
+    backwards: Option<bool>,
+    version: Option<String>,
+}
+
+fn type_name(v: &Bson) -> &'static str {
+    crate::query::bson_type_name(v)
+}
+
+/// The first pass: types, unknown fields and the `strength` range, in the
+/// order the document gives them.
+fn read_fields(d: &Document, ctx: Context<'_>) -> Result<Fields, SpecError> {
+    let path = ctx.path;
+    let mut f = Fields::default();
+    let wrong = |k: &str, v: &Bson, want: &str| -> SpecError {
+        SpecError {
+            code: 14,
+            message: format!(
+                "BSON field '{path}.{k}' is the wrong type '{}', expected type '{want}'",
+                type_name(v)
+            ),
+        }
+    };
+    for (k, v) in d {
+        let null = matches!(v, Bson::Null | Bson::Undefined);
+        match k.as_str() {
+            "locale" | "caseFirst" | "alternate" | "maxVariable" | "version" => {
+                let s = match v {
+                    _ if null => None,
+                    Bson::String(s) => Some(s.clone()),
+                    _ => return Err(wrong(k, v, "string")),
+                };
+                let allowed: &[&str] = match k.as_str() {
+                    "caseFirst" => &["upper", "lower", "off"],
+                    "alternate" => &["non-ignorable", "shifted"],
+                    "maxVariable" => &["punct", "space"],
+                    _ => &[],
+                };
+                if let Some(s) = &s {
+                    if !allowed.is_empty() && !allowed.contains(&s.as_str()) {
+                        return err(
+                            2,
+                            format!(
+                                "Enumeration value '{s}' for field '{path}.{k}' is not a valid value."
+                            ),
+                        );
+                    }
+                }
+                match k.as_str() {
+                    "locale" => f.locale = s,
+                    "caseFirst" => f.case_first = s,
+                    "alternate" => f.alternate = s,
+                    "maxVariable" => f.max_variable = s,
+                    _ => f.version = s,
+                }
+            }
+            "caseLevel" | "numericOrdering" | "normalization" => {
+                let b = match v {
+                    _ if null => None,
+                    Bson::Boolean(b) => Some(*b),
+                    _ => return Err(wrong(k, v, "bool")),
+                };
+                match k.as_str() {
+                    "caseLevel" => f.case_level = b,
+                    "numericOrdering" => f.numeric_ordering = b,
+                    _ => f.normalization = b,
+                }
+            }
+            "backwards" => match v {
+                Bson::Boolean(b) => f.backwards = Some(*b),
+                _ => {
+                    return err(
+                        14,
+                        format!(
+                            "Field 'backwards' should be a boolean value, but found: {}",
+                            type_name(v)
+                        ),
+                    )
+                }
+            },
+            "strength" => {
+                // Truncated toward zero and clamped to an int32, as mongod's
+                // "safe int" does; NaN is 0.
+                let n: i64 = match v {
+                    _ if null => continue,
+                    Bson::Int32(n) => i64::from(*n),
+                    Bson::Int64(n) => *n,
+                    Bson::Double(x) if x.is_nan() => 0,
+                    Bson::Double(x) => x.trunc().clamp(-2147483648.0, 2147483647.0) as i64,
+                    Bson::Decimal128(x) => {
+                        let x: f64 = x.to_string().parse().unwrap_or(f64::NAN);
+                        if x.is_nan() {
+                            0
+                        } else {
+                            x.trunc().clamp(-2147483648.0, 2147483647.0) as i64
+                        }
+                    }
+                    _ => {
+                        return err(
+                            14,
+                            format!(
+                                "BSON field '{path}.strength' is the wrong type '{}', expected \
+                                 types '[double, decimal, long, int]'",
+                                type_name(v)
+                            ),
+                        )
+                    }
+                };
+                let n = n.clamp(-2147483648, 2147483647);
+                if n > 5 {
+                    return err(
+                        2,
+                        format!("BSON field 'strength' value must be <= 5, actual value '{n}'"),
+                    );
+                }
+                if n < 0 {
+                    return err(
+                        2,
+                        format!("BSON field 'strength' value must be >= 0, actual value '{n}'"),
+                    );
+                }
+                if n == 0 {
+                    return err(
+                        2,
+                        "Enumeration value '0' for field 'collation.strength' is not a valid \
+                         value."
+                            .to_string(),
+                    );
+                }
+                f.strength = Some(n as i32);
+            }
+            _ => {
+                return err(
+                    40415,
+                    format!("BSON field '{path}.{k}' is an unknown field."),
+                )
+            }
+        }
+    }
+    if f.locale.is_none() {
+        return err(
+            40414,
+            format!("BSON field '{path}.locale' is missing but a required field"),
+        );
+    }
+    Ok(f)
+}
+
+/// The spec as an error message prints it: as given, or (for `create`) with
+/// the defaults filled in and `backwards` / `version` only when given.
+fn printed(d: &Document, f: &Fields, ctx: Context<'_>) -> String {
+    if !ctx.print_defaults {
+        return crate::query::bson_value_repr(&Bson::Document(d.clone()));
+    }
+    let mut out = defaulted(f);
+    out.remove("backwards");
+    out.remove("version");
+    if let Some(b) = f.backwards {
+        out.insert("backwards", b);
+    }
+    if let Some(v) = &f.version {
+        out.insert("version", v.clone());
+    }
+    crate::query::bson_value_repr(&Bson::Document(out))
+}
+
+/// Every option spelled out, in `mongod`'s order.
+fn defaulted(f: &Fields) -> Document {
+    let locale = f.locale.clone().unwrap_or_default();
+    let mut out = Document::new();
+    out.insert("locale", locale.clone());
+    out.insert("caseLevel", f.case_level.unwrap_or(false));
+    out.insert(
+        "caseFirst",
+        f.case_first.clone().unwrap_or_else(|| "off".to_string()),
+    );
+    out.insert("strength", f.strength.unwrap_or(3));
+    out.insert("numericOrdering", f.numeric_ordering.unwrap_or(false));
+    out.insert(
+        "alternate",
+        f.alternate
+            .clone()
+            .unwrap_or_else(|| "non-ignorable".to_string()),
+    );
+    out.insert(
+        "maxVariable",
+        f.max_variable
+            .clone()
+            .unwrap_or_else(|| "punct".to_string()),
+    );
+    out.insert("normalization", f.normalization.unwrap_or(false));
+    out.insert(
+        "backwards",
+        f.backwards.unwrap_or(locale_is_backwards(&locale)),
+    );
+    out.insert("version", MONGOD_COLLATOR_VERSION);
+    out
+}
+
+/// Canadian French is the one locale whose accents compare from the end of
+/// the string unless told otherwise.
+fn locale_is_backwards(locale: &str) -> bool {
+    locale.split('@').next() == Some("fr_CA")
+}
+
+fn types_for(base: &str) -> impl Iterator<Item = &'static str> {
+    let own = LOCALE_TYPES
+        .iter()
+        .find(|(l, _)| *l == base)
+        .map(|(_, t)| *t)
+        .unwrap_or(&[]);
+    COMMON_TYPES.iter().chain(own.iter()).copied()
+}
+
+/// Whether `mongod` accepts this locale string exactly as written.
+fn locale_is_valid(locale: &str) -> bool {
+    match locale.split_once('@') {
+        None => LOCALES.contains(&locale),
+        Some((base, keyword)) => {
+            LOCALES.contains(&base)
+                && keyword
+                    .strip_prefix("collation=")
+                    .is_some_and(|t| types_for(base).any(|x| x == t))
+        }
+    }
+}
+
+/// The valid locale nearest an invalid one, for `Did you mean`: the string in
+/// ICU's casing, then with the keyword, variant, region and script dropped in
+/// turn. `mongod` asks ICU for the functional equivalent, which also maps
+/// three-letter codes (`eng`, `USA`) and knows `zh@collation=stroke` belongs
+/// to `zh_Hant`; those it suggests and this does not.
+fn nearest_locale(locale: &str) -> Option<String> {
+    let (base, keyword) = match locale.split_once('@') {
+        Some((b, k)) => (b, Some(k)),
+        None => (locale, None),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (i, p) in base.split(['_', '-']).enumerate() {
+        if p.is_empty() {
+            break;
+        }
+        let alpha = p.chars().all(|c| c.is_ascii_alphabetic());
+        parts.push(if i == 0 {
+            p.to_ascii_lowercase()
+        } else if p.len() == 4 && alpha {
+            let mut s = p.to_ascii_lowercase();
+            s[..1].make_ascii_uppercase();
+            s
+        } else {
+            p.to_ascii_uppercase()
+        });
+    }
+    if let Some(k) = keyword {
+        let whole = format!("{}@{k}", parts.join("_"));
+        if locale_is_valid(&whole) {
+            return Some(whole);
+        }
+    }
+    while !parts.is_empty() {
+        let candidate = parts.join("_");
+        if LOCALES.contains(&candidate.as_str()) {
+            return Some(candidate);
+        }
+        parts.pop();
+    }
+    None
+}
+
+/// `mongod`'s locale name as the BCP 47 tag ICU4X takes.
+fn bcp47(locale: &str) -> Result<String, SpecError> {
+    let (base, keyword) = match locale.split_once('@') {
+        Some((b, k)) => (b, k.strip_prefix("collation=")),
+        None => (locale, None),
+    };
+    let mut tag = base.replace('_', "-").replace("-POSIX", "-posix");
+    let co = match (base, keyword) {
+        (_, Some(t)) if UNSUPPORTED_TYPES.contains(&t) => {
+            return err(
+                2,
+                format!(
+                    "collation type '{t}' in locale \"{locale}\" is not supported by this server"
+                ),
+            )
+        }
+        // ICU 57's Swedish default is the reformed order and its `standard`
+        // the older one (v and w alike); CLDR has since renamed them.
+        ("sv", Some("standard")) => Some("trad"),
+        (_, Some("standard")) | (_, None) => None,
+        (_, Some("phonebook")) => Some("phonebk"),
+        (_, Some("traditional")) => Some("trad"),
+        (_, Some("dictionary")) => Some("dict"),
+        (_, Some(t)) => Some(t),
+    };
+    if let Some(co) = co {
+        tag.push_str("-u-co-");
+        tag.push_str(co);
+    }
+    Ok(tag)
+}
+
+/// ICU4X decides the French accent order from locale data alone. This
+/// provider hands the collator its normal data with that one bit set as the
+/// collation document asks.
+struct WithBackwards(bool);
+
+macro_rules! delegate {
+    ($provider:path => $($marker:ty),*) => {$(
+        impl DataProvider<$marker> for WithBackwards {
+            fn load(&self, req: DataRequest) -> Result<DataResponse<$marker>, DataError> {
+                DataProvider::<$marker>::load(&$provider, req)
+            }
+        }
+    )*};
+}
+delegate!(Baked => CollationSpecialPrimariesV1, CollationRootV1, CollationTailoringV1,
+    CollationDiacriticsV1, CollationJamoV1, CollationReorderingV1);
+delegate!(icu_normalizer::provider::Baked => NormalizerNfdDataV1, NormalizerNfdTablesV1);
+
+impl DataProvider<CollationMetadataV1> for WithBackwards {
+    fn load(&self, req: DataRequest) -> Result<DataResponse<CollationMetadataV1>, DataError> {
+        /// `CollationMetadata`'s backward-second-level bit.
+        const BACKWARD_SECOND_LEVEL: u32 = 1 << 7;
+        let found = DataProvider::<CollationMetadataV1>::load(&Baked, req)?;
+        let mut metadata: CollationMetadata = *found.payload.get();
+        if self.0 {
+            metadata.bits |= BACKWARD_SECOND_LEVEL;
+        } else {
+            metadata.bits &= !BACKWARD_SECOND_LEVEL;
+        }
+        Ok(DataResponse {
+            metadata: found.metadata,
+            payload: DataPayload::from_owned(metadata),
+        })
+    }
+}
+
+fn build(full: &Document) -> Result<Collator, SpecError> {
+    let text = |k: &str| full.get_str(k).unwrap_or_default();
+    let flag = |k: &str| full.get_bool(k).unwrap_or(false);
+    let locale = text("locale");
+    let tag = bcp47(locale)?;
+    let parsed: icu_locale_core::Locale = tag.parse().map_err(|_| SpecError {
+        code: 2,
+        message: format!("Field 'locale' is invalid in: {{ locale: \"{locale}\" }}"),
+    })?;
+    let mut prefs = CollatorPreferences::from(&parsed);
+    prefs.numeric_ordering = Some(if flag("numericOrdering") {
+        CollationNumericOrdering::True
+    } else {
+        CollationNumericOrdering::False
+    });
+    prefs.case_first = Some(match text("caseFirst") {
+        "upper" => CollationCaseFirst::Upper,
+        "lower" => CollationCaseFirst::Lower,
+        _ => CollationCaseFirst::False,
+    });
+    let mut options = CollatorOptions::default();
+    options.strength = Some(match full.get_i32("strength").unwrap_or(3) {
+        1 => Strength::Primary,
+        2 => Strength::Secondary,
+        3 => Strength::Tertiary,
+        4 => Strength::Quaternary,
+        _ => Strength::Identical,
+    });
+    options.case_level = Some(if flag("caseLevel") {
+        CaseLevel::On
+    } else {
+        CaseLevel::Off
+    });
+    options.alternate_handling = Some(if text("alternate") == "shifted" {
+        AlternateHandling::Shifted
+    } else {
+        AlternateHandling::NonIgnorable
+    });
+    options.max_variable = Some(if text("maxVariable") == "space" {
+        MaxVariable::Space
+    } else {
+        MaxVariable::Punctuation
+    });
+    Collator::try_new_unstable(&WithBackwards(flag("backwards")), prefs, options).map_err(|e| {
+        SpecError {
+            code: 2,
+            message: format!("collation for locale \"{locale}\" could not be loaded: {e}"),
+        }
+    })
+}
+
+/// One collator per distinct spec: building one reads locale data, and a
+/// workload repeats the same few collations on every command.
+fn collator_for(full: &Document) -> Result<Arc<Collator>, SpecError> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Collator>>>> = OnceLock::new();
+    let key = full.to_string();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(found) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return Ok(found);
+    }
+    let built = Arc::new(build(full)?);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, built.clone());
+    }
+    Ok(built)
+}
+
+/// Parse a collation document with `mongod`'s checks. `Ok(None)` is the
+/// `simple` locale: binary comparison, no collation.
+///
+/// An EMPTY document is the caller's to decide (`find` takes it as absent,
+/// `create` refuses it); here it is a missing `locale`.
+pub fn parse_strict(d: &Document, ctx: Context<'_>) -> Result<Option<Collation>, SpecError> {
+    let f = read_fields(d, ctx)?;
+    let locale = f.locale.clone().unwrap_or_default();
+    if locale == "simple" {
+        return Ok(None);
+    }
+    let shown = || printed(d, &f, ctx);
+    if locale.contains('\0') {
+        return err(
+            2,
+            format!(
+                "Field 'locale' cannot contain null byte. Collation spec: {}",
+                shown()
+            ),
+        );
+    }
+    if locale.is_empty() {
+        return err(
+            2,
+            format!("Field 'locale' cannot be the empty string in: {}", shown()),
+        );
+    }
+    if !locale_is_valid(&locale) {
+        let hint = match nearest_locale(&locale) {
+            Some(n) if n != locale => format!(". Did you mean '{n}'?"),
+            _ => String::new(),
+        };
+        return err(
+            2,
+            format!("Field 'locale' is invalid in: {}{hint}", shown()),
+        );
+    }
+    if let Some(v) = &f.version {
+        if v != MONGOD_COLLATOR_VERSION {
+            return err(
+                161,
+                format!(
+                    "Requested collation version {v} but the only available collator version \
+                     was {MONGOD_COLLATOR_VERSION}. Requested collation spec: {}",
+                    shown()
+                ),
+            );
+        }
+    }
+    let strength = f.strength.unwrap_or(3);
+    let case_first_on = f.case_first.as_deref().is_some_and(|c| c != "off");
+    if case_first_on && strength < 3 && !f.case_level.unwrap_or(false) {
+        return err(
+            2,
+            format!(
+                "'caseFirst' is invalid unless 'caseLevel' is on or 'strength' is greater than 2 \
+                 in: {}",
+                shown()
+            ),
+        );
+    }
+    if f.backwards == Some(true) && strength == 1 {
+        return err(
+            2,
+            format!(
+                "'backwards' is invalid with 'strength' of 1 in: {}",
+                shown()
+            ),
+        );
+    }
+    let spec = defaulted(&f);
+    let collator = collator_for(&spec)?;
+    Ok(Some(Collation { collator, spec }))
+}
+
+/// Parse a collation document that has already been validated, or that comes
+/// from the catalog. Anything unusable is no collation. A document with
+/// options and no `locale` is read as `en`: the engine-parity bindings send
+/// `{strength, caseLevel}` alone.
 pub fn parse(d: &Document) -> Option<Collation> {
     if d.is_empty() {
         return None;
     }
-    let strength = match d.get("strength") {
-        Some(Bson::Int32(n)) => *n,
-        Some(Bson::Int64(n)) => *n as i32,
-        _ => 3,
-    };
-    let flag = |k: &str| matches!(d.get(k), Some(Bson::Boolean(true)));
-    Some(Collation {
-        strength,
-        case_level: flag("caseLevel"),
-        numeric_ordering: flag("numericOrdering"),
-        case_first_upper: matches!(d.get("caseFirst"), Some(Bson::String(s)) if s == "upper"),
-        backwards: flag("backwards"),
+    if d.contains_key("locale") {
+        return parse_strict(d, Context::COMMAND).ok().flatten();
+    }
+    let mut with_locale = d.clone();
+    with_locale.insert("locale", "en");
+    parse_strict(&with_locale, Context::COMMAND).ok().flatten()
+}
+
+/// Collation-aware string equality. `Some` always; the `Option` is the old
+/// "defer" signal the callers still unwrap.
+pub fn equal(a: &str, b: &str, c: &Collation) -> Option<bool> {
+    Some(c.collator.as_borrowed().compare(a, b) == Ordering::Equal)
+}
+
+/// Collation-aware string ordering.
+pub fn compare(a: &str, b: &str, c: &Collation) -> Option<Ordering> {
+    Some(c.collator.as_borrowed().compare(a, b))
+}
+
+/// The string's sort key: bytes that order as the collation orders, and are
+/// equal exactly when the collation calls two strings equal.
+pub fn sort_key(s: &str, c: &Collation) -> Vec<u8> {
+    let mut key = Vec::with_capacity(s.len() * 2 + 4);
+    let Ok(()) = c.collator.as_borrowed().write_sort_key_to(s, &mut key);
+    key
+}
+
+/// The bytes an index entry holds for a string under the collation.
+pub fn normalize_index_bytes(s: &str, c: &Collation) -> Option<Vec<u8>> {
+    Some(sort_key(s, c))
+}
+
+/// The bytes a sort compares for a string under the collation.
+pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
+    sort_key(s, c)
+}
+
+thread_local! {
+    static ACTIVE: RefCell<Option<Collation>> = const { RefCell::new(None) };
+}
+
+/// Restores the previously active collation when dropped.
+pub struct ActiveGuard(Option<Collation>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|a| *a.borrow_mut() = self.0.take());
+    }
+}
+
+/// Make `c` the collation every value comparison on this thread uses until
+/// the guard drops. `None` turns collation off for the same span, which is
+/// what a nested evaluation with no collation needs.
+#[must_use]
+pub fn activate(c: Option<&Collation>) -> ActiveGuard {
+    ACTIVE.with(|a| ActiveGuard(a.replace(c.cloned())))
+}
+
+/// The collation [`activate`] set, if any.
+pub fn active() -> Option<Collation> {
+    ACTIVE.with(|a| a.borrow().clone())
+}
+
+/// Compare two strings under the active collation, or by code point when
+/// there is none.
+pub fn active_compare(a: &str, b: &str) -> Ordering {
+    ACTIVE.with(|c| match &*c.borrow() {
+        Some(c) => c.collator.as_borrowed().compare(a, b),
+        None => a.cmp(b),
     })
 }
 
-/// Python's `unicodedata.category(c) == "Mn"` -- NONSPACING mark only. Not
-/// `unicode_normalization::char::is_combining_mark`, which is true for all of
-/// `M*` (Mc and Me as well, measured 2026-09-07): that strips a Devanagari
-/// vowel sign such as U+093E, which `_strip_accents` KEEPS, so the two engines
-/// would disagree on any Indic string.
-fn is_mn(c: char) -> bool {
-    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
-    c.general_category() == GeneralCategory::NonspacingMark
-}
-
-/// Python's `unicodedata.combining(ch)` -- nonzero canonical combining class.
-/// `sort_levels` uses THIS, not the `Mn` test above, and the two are not the
-/// same set (an `Mn` with ccc 0 exists, e.g. U+0900). Mirror each site exactly.
-fn is_ccc_mark(c: char) -> bool {
-    unicode_normalization::char::canonical_combining_class(c) != 0
-}
-
-/// Normalise a string under the collation, or `None` if the case can't be
-/// reproduced version-independently (non-ASCII transform, or numericOrdering).
-fn normalize(s: &str, c: &Collation) -> Option<String> {
-    if c.numeric_ordering {
-        return None; // needs Python's digit-run tuple ordering
-    }
-    // Non-ASCII used to `return None` (defer) here, exactly as it did in
-    // `normalize_index_bytes` -- and with the same consequence on the Rust
-    // server, which has no Python behind a defer: every collated EQUALITY or
-    // RANGE query against a non-ASCII string answered `2 BadValue: query uses
-    // a construct the Rust server does not support`. Fixing only the index
-    // path left this one live; the tests caught it.
-    normalize_index_bytes(s, c).map(|b| String::from_utf8_lossy(&b).into_owned())
-}
-
-/// Collation-aware string equality, or `None` to defer to Python.
-pub fn equal(a: &str, b: &str, c: &Collation) -> Option<bool> {
-    Some(normalize(a, c)? == normalize(b, c)?)
-}
-
-/// Collation-aware string ordering, or `None` to defer to Python. Normalised
-/// ASCII strings compare by byte order, which equals Python's codepoint
-/// ordering of the same normalised strings.
-pub fn compare(a: &str, b: &str, c: &Collation) -> Option<Ordering> {
-    Some(normalize(a, c)?.cmp(&normalize(b, c)?))
-}
-
-/// Normalised UTF-8 bytes for index-key encoding (`normalize_for_index_bytes`),
-/// or `None` to defer. Differs from `normalize` in one way: a `numericOrdering`
-/// collation has `supports_index_encoding == false`, so Python's `_encode_string`
-/// skips normalisation and emits the **raw** UTF-8 — i.e. numericOrdering is an
-/// identity transform here (not a defer, as it is for query comparison).
-pub fn normalize_index_bytes(s: &str, c: &Collation) -> Option<Vec<u8>> {
-    if c.numeric_ordering {
-        return Some(s.as_bytes().to_vec()); // !supports_index_encoding -> raw
-    }
-    let (accent, case) = (c.accent_insensitive(), c.case_insensitive());
-    if !accent && !case {
-        return Some(s.as_bytes().to_vec()); // identity
-    }
-    // Non-ASCII used to `return None` here, meaning "defer to the pure engine".
-    // That is right on the Python server and WRONG on the Rust one, which has
-    // no Python behind a defer: it surfaced as
-    // `2 BadValue: an indexed value is of a type the Rust server does not
-    // support` for any case- or accent-insensitive query or sort touching a
-    // non-ASCII character -- `á`, `ß`, `日` alike. Measured against 8.2.11 on
-    // 2026-09-07, where mongod (and the Python server) answer normally.
-    //
-    // The order below is `collation.py`'s `normalize_for_index_bytes`, and it
-    // MUST stay identical: the two engines' bytes are compared to each other by
-    // the parity suite, and an index written by one server is read by the other.
-    let mut out = s.to_string();
-    if accent {
-        // NFKD splits an accented character into base + combining marks, and
-        // dropping the marks leaves the base -- `unicodedata.category(c) !=
-        // "Mn"` in the Python.
-        out = out.nfkd().filter(|c| !is_mn(*c)).collect();
-    }
-    if case {
-        out = case_fold(&out);
-    }
-    Some(out.into_bytes())
-}
-
-/// Unicode case folding, as Python's `str.casefold` does it.
-///
-/// NOT `to_lowercase`: folding is the case-insensitive-comparison mapping and
-/// is more aggressive. The difference is load-bearing here -- `ß` folds to
-/// `ss`, and mongod sorts `["ß", "s", "t"]` as `["s", "ß", "t"]`, which only
-/// comes out right if `ß` compares as `ss`. `to_lowercase` leaves `ß` alone and
-/// sorts it after `t`.
-///
-/// `to_lowercase` supplies the common mapping; the table is Unicode's FULL
-/// case-folding entries whose result differs from lowercasing (CaseFolding.txt,
-/// status `F`), restricted to the ones reachable from BSON text. Kept explicit
-/// rather than pulling a second crate for a handful of characters.
-fn case_fold(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            'ß' => out.push_str("ss"),
-            'ﬀ' => out.push_str("ff"),
-            'ﬁ' => out.push_str("fi"),
-            'ﬂ' => out.push_str("fl"),
-            'ﬃ' => out.push_str("ffi"),
-            'ﬄ' => out.push_str("ffl"),
-            'ﬅ' | 'ﬆ' => out.push_str("st"),
-            // Greek final sigma folds to the ordinary one, so "ΟΔΟΣ" and
-            // "οδός" compare equal on their last letter.
-            'ς' => out.push('σ'),
-            'ΐ' => out.push_str("\u{3b9}\u{308}\u{301}"),
-            'ΰ' => out.push_str("\u{3c5}\u{308}\u{301}"),
-            other => {
-                for lowered in other.to_lowercase() {
-                    out.push(lowered);
-                }
+/// `v` with every string (at any depth) replaced by its sort key under the
+/// active collation, so that two values the collation calls equal have the
+/// same bytes. The value itself when no collation is active. For keys that
+/// are hashed rather than compared: a window or `$fill` partition.
+pub fn fold_active(v: Bson) -> Bson {
+    fn fold(v: Bson, c: &Collation) -> Bson {
+        match v {
+            Bson::String(s) => Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::UserDefined(0xC0),
+                bytes: sort_key(&s, c),
+            }),
+            Bson::Array(a) => Bson::Array(a.into_iter().map(|x| fold(x, c)).collect()),
+            Bson::Document(d) => {
+                Bson::Document(d.into_iter().map(|(k, x)| (k, fold(x, c))).collect())
             }
+            other => other,
         }
     }
-    out
-}
-
-//: The order combining marks sort in. NOT codepoint order -- acute sorts before
-//: grave and the codepoints run the other way -- so this is a measured table,
-//: identical to `collation.py`'s `_MARK_ORDER`. Both engines must agree: they
-//: are compared to each other by the parity suite.
-const MARK_ORDER: [u32; 20] = [
-    0x332, // low line
-    0x301, // acute
-    0x300, // grave
-    0x306, // breve
-    0x302, // circumflex
-    0x30C, // caron
-    0x30A, // ring above
-    0x308, // diaeresis
-    0x30B, // double acute
-    0x303, // tilde
-    0x307, // dot above
-    0x327, // cedilla
-    0x328, // ogonek
-    0x304, // macron
-    0x309, // hook above
-    0x30F, // double grave
-    0x311, // inverted breve
-    0x323, // dot below
-    0x326, // comma below
-    0x331, // macron below
-];
-
-/// Secondary weight for one combining mark: `(table rank, codepoint)`.
-/// An unlisted mark sorts after every listed one, by codepoint -- which keeps
-/// the key total and deterministic.
-fn mark_weight(cp: u32) -> (u32, u32) {
-    match MARK_ORDER.iter().position(|m| *m == cp) {
-        Some(rank) => (rank as u32, 0),
-        None => (MARK_ORDER.len() as u32, cp),
+    match active() {
+        Some(c) => fold(v, &c),
+        None => v,
     }
 }
 
-/// The secondary weight `ß` carries over its `ss` expansion.
-const SHARP_S_SECONDARY: (u32, u32) = (0, 0xDF);
-
-/// A BYTE-COMPARABLE multi-level ordering key for `s`, in the shape ICU uses
-/// and `collation.py`'s `sort_levels` produces.
-///
-/// Ordering is not the same problem as matching. The single-level fold that
-/// `normalize_index_bytes` produces answers "are these equal under this
-/// collation"; it cannot answer "which comes first", because two strings
-/// differing only in an accent fold to the same bytes and then fall back to
-/// comparing whole codepoints -- which puts every accented word after `z`
-/// instead of beside its base letter, and drops case order entirely.
-///
-/// Three levels, compared in order, each terminated by a byte no level body can
-/// contain so that a shorter level sorts before a longer one that extends it:
-///
-/// * **primary** -- base letters: accents removed, case folded. Under
-///   `numericOrdering` a digit run is emitted as a fixed-width number so that
-///   `a2 < a10`.
-/// * **secondary** -- the accents, one group per base character, weighted by
-///   `MARK_ORDER`. `backwards` (French) REVERSES this level, which is what
-///   makes `cote < côte < coté` rather than `cote < coté < côte`.
-/// * **tertiary** -- case, one rank per base character. `caseFirst: "upper"`
-///   flips it.
-///
-/// `strength` truncates: 1 keeps the primary alone, 2 adds the secondary, 3
-/// adds the tertiary; `caseLevel` re-adds the case rank at strength 1 and 2.
-///
-/// This feeds the in-memory SORT only. Index entries are encoded with no
-/// collation at all (the one collated `encode_value` call site is the sort-key
-/// builder), so nothing here changes bytes already on disk.
-pub fn sort_level_bytes(s: &str, c: &Collation) -> Vec<u8> {
-    let mut bases: Vec<char> = Vec::new();
-    let mut marks: Vec<Vec<(u32, u32)>> = Vec::new();
-    let mut cases: Vec<u8> = Vec::new();
-    let mut compat: Vec<u8> = Vec::new();
-    for ch in s.nfd() {
-        if is_ccc_mark(ch) {
-            if let Some(last) = marks.last_mut() {
-                last.push(mark_weight(ch as u32));
-            }
-            continue;
-        }
-        // `ß` is `ss` at the primary level and differs at the SECONDARY:
-        // mongod ties `Straße` / `Strasse` at strength 1 and puts `Strasse`
-        // first at 2 and 3 (measured 8.2.11, 2026-10-07). Any secondary weight
-        // puts it after plain `ss`; where it falls among accented `ss` forms
-        // was not measured.
-        if ch == '\u{df}' || ch == '\u{1e9e}' {
-            for _ in 0..2 {
-                bases.push('s');
-                marks.push(Vec::new());
-                cases.push(u8::from(ch.is_uppercase()));
-                compat.push(0);
-            }
-            if let Some(last) = marks.last_mut() {
-                last.push(SHARP_S_SECONDARY);
-            }
-            continue;
-        }
-        // A COMPATIBILITY character (`ﬁ`) is its expansion (`f`, `i`) at the
-        // primary and secondary levels and differs only at the tertiary --
-        // ICU's rule and mongod's answer: `fi` and `ﬁ` tie at strength 2 and
-        // `fi < ﬁ` at strength 3 (measured 8.2.11, 2026-10-07).
-        let expansion: Vec<char> = std::iter::once(ch).nfkd().collect();
-        let is_compat = expansion.len() != 1 || expansion[0] != ch;
-        for part in expansion {
-            if is_ccc_mark(part) {
-                if let Some(last) = marks.last_mut() {
-                    last.push(mark_weight(part as u32));
-                }
-                continue;
-            }
-            bases.push(part);
-            marks.push(Vec::new());
-            cases.push(u8::from(ch.is_uppercase()));
-            compat.push(u8::from(is_compat));
-        }
-    }
-    let primary_text = case_fold(&bases.iter().collect::<String>());
-
-    let mut out: Vec<u8> = Vec::with_capacity(primary_text.len() + 8);
-    if c.numeric_ordering {
-        // Digit runs compare as NUMBERS, text runs as bytes. The tag byte keeps
-        // the two kinds from interleaving, and the fixed width makes the number
-        // byte-comparable.
-        let mut rest = primary_text.as_str();
-        while !rest.is_empty() {
-            let digits = rest
-                .find(|ch: char| !ch.is_ascii_digit())
-                .unwrap_or(rest.len());
-            if digits > 0 {
-                let (run, tail) = rest.split_at(digits);
-                out.push(0x01);
-                out.extend_from_slice(&run.parse::<u128>().unwrap_or(u128::MAX).to_be_bytes());
-                rest = tail;
-            } else {
-                let end = rest
-                    .find(|ch: char| ch.is_ascii_digit())
-                    .unwrap_or(rest.len());
-                let (run, tail) = rest.split_at(end);
-                out.push(0x02);
-                push_escaped(&mut out, run.as_bytes());
-                rest = tail;
-            }
-        }
-    } else {
-        push_escaped(&mut out, primary_text.as_bytes());
-    }
-    if c.strength <= 1 {
-        if c.case_level {
-            out.extend_from_slice(&[0x00, 0x00]);
-            push_case_ranks(&mut out, &cases, c.case_first_upper);
-        }
-        return out;
-    }
-    out.extend_from_slice(&[0x00, 0x00]);
-    if c.backwards {
-        marks.reverse();
-    }
-    for group in &marks {
-        for (rank, cp) in group {
-            out.push(0x01);
-            out.extend_from_slice(&rank.to_be_bytes());
-            out.extend_from_slice(&cp.to_be_bytes());
-        }
-        out.push(0x00); // end of this base character's marks
-    }
-    if c.strength == 2 {
-        if c.case_level {
-            out.extend_from_slice(&[0x00, 0x00]);
-            push_case_ranks(&mut out, &cases, c.case_first_upper);
-        }
-        return out;
-    }
-    out.extend_from_slice(&[0x00, 0x00]);
-    // The full tertiary: case, then the compatibility variant above it.
-    for (rank, k) in cases.iter().zip(&compat) {
-        out.push(if c.case_first_upper { 1 - *rank } else { *rank } + 1 + 2 * k);
-    }
-    out
-}
-
-fn push_case_ranks(out: &mut Vec<u8>, cases: &[u8], upper_first: bool) {
-    for rank in cases {
-        out.push(if upper_first { 1 - *rank } else { *rank } + 1);
-    }
-}
-
-/// Null-escape so a level body can never contain the `00 00` separator.
-fn push_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
-    for b in bytes {
-        out.push(*b);
-        if *b == 0x00 {
-            out.push(0xFF);
-        }
-    }
+/// Whether a collation is active on this thread.
+pub fn is_active() -> bool {
+    ACTIVE.with(|a| a.borrow().is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bson::doc;
 
-    fn coll(strength: i32, case_level: bool) -> Collation {
-        Collation {
-            strength,
-            case_level,
-            numeric_ordering: false,
-            case_first_upper: false,
-            backwards: false,
-        }
+    fn c(d: Document) -> Collation {
+        parse_strict(&d, Context::COMMAND).unwrap().unwrap()
+    }
+
+    fn refusal(d: Document) -> (i32, String) {
+        let e = parse_strict(&d, Context::COMMAND).unwrap_err();
+        (e.code, e.message)
     }
 
     #[test]
-    fn case_insensitive_ascii() {
-        let c = coll(2, false);
-        assert_eq!(equal("PING", "ping", &c), Some(true));
-        assert_eq!(compare("Apple", "banana", &c), Some(Ordering::Less));
+    fn strength_decides_what_is_equal() {
+        let s1 = c(doc! {"locale": "en", "strength": 1});
+        let s2 = c(doc! {"locale": "en", "strength": 2});
+        let s3 = c(doc! {"locale": "en"});
+        assert_eq!(equal("a", "Á", &s1), Some(true));
+        assert_eq!(equal("a", "A", &s2), Some(true));
+        assert_eq!(equal("a", "á", &s2), Some(false));
+        assert_eq!(equal("a", "A", &s3), Some(false));
+        assert_eq!(equal("ss", "ß", &s1), Some(true));
     }
 
     #[test]
-    fn case_sensitive_strength3_identity() {
-        let c = coll(3, false);
-        assert_eq!(equal("PING", "ping", &c), Some(false));
-        // strength 3 has no transform, so even non-ASCII is handled (identity).
-        assert_eq!(equal("café", "café", &c), Some(true));
+    fn order_is_the_languages_not_the_code_points() {
+        let en = c(doc! {"locale": "en"});
+        // Code points put every capital before every small letter.
+        assert_eq!(compare("a", "B", &en), Some(Ordering::Less));
+        assert_eq!(compare("_a", "9", &en), Some(Ordering::Less));
+        let numeric = c(doc! {"locale": "en", "numericOrdering": true});
+        assert_eq!(compare("10", "9", &numeric), Some(Ordering::Greater));
+        assert_eq!(compare("10", "9", &en), Some(Ordering::Less));
+        let sv = c(doc! {"locale": "sv"});
+        assert_eq!(compare("ä", "z", &sv), Some(Ordering::Greater));
+        assert_eq!(compare("ä", "z", &en), Some(Ordering::Less));
     }
 
     #[test]
-    fn non_ascii_transform_is_handled_not_deferred() {
-        // This used to assert `None` ("defer to Python"), which pinned a bug:
-        // the Rust server has no Python behind a defer, so every collated
-        // comparison touching a non-ASCII character answered `2 BadValue`.
-        // mongod 8.2.11 compares these equal under a case-insensitive
-        // collation (accents kept at strength 2, case ignored).
-        let c = coll(2, false);
-        assert_eq!(equal("café", "CAFÉ", &c), Some(true));
-        // Strength 2 keeps accents, so these stay distinct.
-        assert_eq!(equal("café", "cafe", &c), Some(false));
-        // Strength 1 also folds the accent away.
-        assert_eq!(equal("café", "CAFE", &coll(1, false)), Some(true));
+    fn backwards_compares_accents_from_the_end() {
+        let fr = c(doc! {"locale": "fr"});
+        let back = c(doc! {"locale": "fr", "backwards": true});
+        let ca = c(doc! {"locale": "fr_CA"});
+        let ca_off = c(doc! {"locale": "fr_CA", "backwards": false});
+        assert_eq!(compare("coté", "côte", &fr), Some(Ordering::Less));
+        assert_eq!(compare("coté", "côte", &back), Some(Ordering::Greater));
+        assert_eq!(compare("coté", "côte", &ca), Some(Ordering::Greater));
+        assert_eq!(compare("coté", "côte", &ca_off), Some(Ordering::Less));
+        assert_eq!(ca.spec().get_bool("backwards"), Ok(true));
     }
 
     #[test]
-    fn numeric_ordering_defers() {
-        let c = Collation {
-            strength: 3,
-            case_level: false,
-            case_first_upper: false,
-            backwards: false,
-            numeric_ordering: true,
-        };
-        assert_eq!(compare("a2", "a10", &c), None);
-    }
-
-    #[test]
-    fn case_level_keeps_case() {
-        // strength 1 + caseLevel: accent-insensitive but case-sensitive.
-        let c = coll(1, true);
-        assert_eq!(equal("PING", "ping", &c), Some(false));
-    }
-
-    #[test]
-    fn sharp_s_is_ss_with_a_secondary_difference() {
-        // mongod 8.2.11 (2026-10-07): ties at strength 1, after `ss` at 2 / 3.
-        for (strength, want) in [
-            (1, ["Strase", "Straße", "Strasse"]),
-            (2, ["Strase", "Strasse", "Straße"]),
-            (3, ["Strase", "Strasse", "Straße"]),
+    fn sort_keys_agree_with_compare() {
+        let words = [
+            "a", "A", "á", "b", "ab", "a b", "10", "9", "", "côte", "coté", "ss", "ß",
+        ];
+        for spec in [
+            doc! {"locale": "en"},
+            doc! {"locale": "en", "strength": 1},
+            doc! {"locale": "en", "strength": 2, "caseLevel": true},
+            doc! {"locale": "en", "alternate": "shifted", "strength": 4},
+            doc! {"locale": "en", "numericOrdering": true, "caseFirst": "upper"},
+            doc! {"locale": "fr_CA"},
+            doc! {"locale": "de@collation=phonebook"},
         ] {
-            let c = coll(strength, false);
-            let mut words = ["Straße", "Strasse", "Strase"];
-            words.sort_by_key(|w| sort_level_bytes(w, &c));
-            assert_eq!(words, want, "strength {strength}");
+            let coll = c(spec.clone());
+            for a in words {
+                for b in words {
+                    assert_eq!(
+                        sort_key(a, &coll).cmp(&sort_key(b, &coll)),
+                        compare(a, b, &coll).unwrap(),
+                        "{spec} {a:?} {b:?}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn the_full_spec_is_mongods() {
+        let got = c(doc! {"locale": "en", "strength": 2.9});
+        assert_eq!(
+            got.spec(),
+            &doc! {"locale": "en", "caseLevel": false, "caseFirst": "off", "strength": 2,
+            "numericOrdering": false, "alternate": "non-ignorable", "maxVariable": "punct",
+            "normalization": false, "backwards": false, "version": "57.1"}
+        );
+        assert!(got.same(&c(
+            doc! {"locale": "en", "strength": 2_i64, "caseLevel": false}
+        )));
+    }
+
+    #[test]
+    fn simple_is_no_collation_whatever_else_it_says() {
+        let simple = |d| parse_strict(&d, Context::COMMAND).map(|c| c.is_none());
+        assert_eq!(simple(doc! {"locale": "simple"}), Ok(true));
+        assert_eq!(
+            simple(doc! {"locale": "simple", "strength": 1, "version": "1"}),
+            Ok(true)
+        );
+        assert_eq!(refusal(doc! {"locale": "simple", "strength": 9}).0, 2);
+    }
+
+    #[test]
+    fn refusals_carry_mongods_code_and_message() {
+        assert_eq!(
+            refusal(doc! {"strength": 2}),
+            (
+                40414,
+                "BSON field 'collation.locale' is missing but a required field".into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": 5}),
+            (
+                14,
+                "BSON field 'collation.locale' is the wrong type 'int', expected type 'string'"
+                    .into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "zz_nope"}),
+            (
+                2,
+                "Field 'locale' is invalid in: { locale: \"zz_nope\" }".into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "EN"}),
+            (
+                2,
+                "Field 'locale' is invalid in: { locale: \"EN\" }. Did you mean 'en'?".into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "en-US"}).1,
+            "Field 'locale' is invalid in: { locale: \"en-US\" }. Did you mean 'en_US'?"
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "de@collation=nope"}).1,
+            "Field 'locale' is invalid in: { locale: \"de@collation=nope\" }. Did you mean 'de'?"
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "en", "strength": 6}),
+            (
+                2,
+                "BSON field 'strength' value must be <= 5, actual value '6'".into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "en", "strength": 0}).1,
+            "Enumeration value '0' for field 'collation.strength' is not a valid value."
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "en", "backwards": 1}),
+            (
+                14,
+                "Field 'backwards' should be a boolean value, but found: int".into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "en", "strength": 1, "backwards": true}).1,
+            "'backwards' is invalid with 'strength' of 1 in: { locale: \"en\", strength: 1, \
+             backwards: true }"
+        );
+        assert_eq!(refusal(doc! {"locale": "en", "version": "1"}).0, 161);
+        assert_eq!(
+            refusal(doc! {"locale": "en", "bogus": 1}),
+            (
+                40415,
+                "BSON field 'collation.bogus' is an unknown field.".into()
+            )
+        );
+        assert_eq!(
+            refusal(doc! {"locale": "en", "strength": 1, "caseFirst": "upper"}).1,
+            "'caseFirst' is invalid unless 'caseLevel' is on or 'strength' is greater than 2 in: \
+             { locale: \"en\", strength: 1, caseFirst: \"upper\" }"
+        );
+    }
+
+    #[test]
+    fn create_prints_the_defaults() {
+        let e = parse_strict(&doc! {"locale": "EN"}, Context::CREATE).unwrap_err();
+        assert_eq!(
+            e.message,
+            "Field 'locale' is invalid in: { locale: \"EN\", caseLevel: false, caseFirst: \
+             \"off\", strength: 3, numericOrdering: false, alternate: \"non-ignorable\", \
+             maxVariable: \"punct\", normalization: false }. Did you mean 'en'?"
+        );
+    }
+
+    #[test]
+    fn a_type_the_data_lacks_is_refused_not_approximated() {
+        let (code, message) = refusal(doc! {"locale": "en@collation=search"});
+        assert_eq!(code, 2);
+        assert!(
+            message.contains("not supported by this server"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_active_collation_is_scoped() {
+        assert_eq!(active_compare("a", "B"), Ordering::Greater);
+        {
+            let en = c(doc! {"locale": "en"});
+            let _on = activate(Some(&en));
+            assert_eq!(active_compare("a", "B"), Ordering::Less);
+            {
+                let _off = activate(None);
+                assert_eq!(active_compare("a", "B"), Ordering::Greater);
+            }
+            assert!(is_active());
+        }
+        assert!(!is_active());
     }
 }
