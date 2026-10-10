@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
@@ -3150,6 +3150,39 @@ type EntryOps = Vec<(String, Vec<u8>)>;
 /// The per-collection write-lock registry: `(db, coll) → lock`.
 type CollLocks = HashMap<(String, String), Arc<Mutex<()>>>;
 
+/// The TTL monitor's runtime state, shared by the background sweeper and the
+/// commands that tune and report it.
+struct TtlMonitor {
+    /// `ttlMonitorSleepSecs` as a client set it; 0 until one does.
+    sleep_secs: AtomicI64,
+    enabled: AtomicBool,
+    passes: AtomicU64,
+    deleted: AtomicU64,
+    last_pass: Mutex<Option<Instant>>,
+}
+
+impl Default for TtlMonitor {
+    fn default() -> Self {
+        Self {
+            sleep_secs: AtomicI64::new(0),
+            enabled: AtomicBool::new(true),
+            passes: AtomicU64::new(0),
+            deleted: AtomicU64::new(0),
+            last_pass: Mutex::new(None),
+        }
+    }
+}
+
+/// A snapshot of [`Storage::ttl_monitor`].
+#[derive(Clone, Copy, Debug)]
+pub struct TtlMonitorState {
+    /// 0 when no client has set it (the server's configured cadence applies).
+    pub sleep_secs: i64,
+    pub enabled: bool,
+    pub passes: u64,
+    pub deleted: u64,
+}
+
 /// WiredTiger-backed storage. Writes to one collection serialise on that
 /// collection's lock (`coll_lock`); DDL takes the global `lock` *plus* the
 /// affected collection lock(s); read-only methods run lock-free — see
@@ -3232,6 +3265,8 @@ pub struct Storage {
     /// Which oplog shard tables this process has already created (bit per shard
     /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
     oplog_shards_created: Arc<AtomicU32>,
+    /// The TTL monitor's runtime settings and counters.
+    ttl: TtlMonitor,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
     /// `storage.enable_oplog`. Default `true`.
     enable_oplog: bool,
@@ -5120,6 +5155,7 @@ impl Storage {
             ddl_generation: AtomicU64::new(0),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
+            ttl: TtlMonitor::default(),
             enable_oplog: true,
             oplog,
             oplog_cv,
@@ -8906,82 +8942,74 @@ impl Storage {
         })
     }
 
-    /// Delete docs whose TTL-indexed `DateTime` field is older than `now -
-    /// expireAfterSeconds`, returning the number pruned. For every index with a
-    /// non-negative `expireAfterSeconds` option, the leading field is checked;
-    /// docs missing the field, holding a non-date value, or inside the TTL
-    /// window are left in place. The clock is injected (`now`) so tests can drive
-    /// expiry — there is no background sweeper (mirrors `storage.prune_ttl`, sans
-    /// the sub-phase-3 oplog emission).
+    /// Delete the documents a TTL index has expired, returning how many.
+    ///
+    /// A TTL index is a single-field index with a non-negative
+    /// `expireAfterSeconds`. A document expires when the field holds a date
+    /// before `now - expireAfterSeconds`, or an array holding one; any other
+    /// value never expires. The clock is injected (`now`) so tests can
+    /// drive expiry.
+    ///
+    /// Each index is one ordinary delete, `{field: {$lt: <cutoff>}}` plus
+    /// the index's partial filter, because that is exactly mongod's rule and
+    /// an ordinary delete does everything a delete must: the oplog entry a
+    /// change stream and recovery read, the pre-image, the index entries.
+    /// This used to remove the rows directly, which wrote no oplog entry at
+    /// all, ignored the partial filter (deleting documents the index does not
+    /// cover) and did not look inside an array. Measured against mongod
+    /// 8.2.11, 2026-10-10.
     pub fn prune_ttl(&self, db: &str, coll: &str, now: bson::DateTime) -> Result<usize> {
-        self.retry_write_conflicts("prune_ttl", || {
-            let lock = self.coll_lock(db, coll);
-            let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let session = OpSession::Fresh(self.conn.open_session()?);
-            self.with_statement_txn(&session, || {
-                // TTL indexes as (leading field, ttl seconds).
-                let mut ttl: Vec<(String, f64)> = Vec::new();
-                for (_name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
-                    let secs = match opts.get("expireAfterSeconds") {
-                        Some(Bson::Int32(i)) => f64::from(*i),
-                        Some(Bson::Int64(i)) => *i as f64,
-                        Some(Bson::Double(d)) => *d,
-                        _ => continue,
-                    };
-                    if secs < 0.0 {
-                        continue;
-                    }
-                    match key_spec.keys().next() {
-                        Some(field) => ttl.push((field.clone(), secs)),
-                        None => continue,
-                    }
+        let mut filters: Vec<Document> = Vec::new();
+        {
+            let session = self.conn.open_session()?;
+            for (_name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
+                let secs = match opts.get("expireAfterSeconds") {
+                    Some(Bson::Int32(i)) => f64::from(*i),
+                    Some(Bson::Int64(i)) => *i as f64,
+                    Some(Bson::Double(d)) => *d,
+                    _ => continue,
+                };
+                // NaN is skipped with the negatives.
+                if secs.is_nan() || secs < 0.0 || key_spec.len() != 1 {
+                    continue;
                 }
-                if ttl.is_empty() {
-                    return Ok(0);
+                let Some((field, direction)) = key_spec.iter().next() else {
+                    continue;
+                };
+                // `_id` takes no TTL, and neither does a geo / text / hashed key.
+                if field == "_id" || direction_of(direction).is_none() {
+                    continue;
                 }
-
-                let when_ms = now.timestamp_millis();
-                let descs = self.index_descs(&session, db, coll)?;
-                // Snapshot candidates before mutating (no cursor walk while deleting).
-                let candidates = self.scan_docs(&session, db, coll)?;
-                let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-                let mut pruned = 0usize;
-                for (recordid, id_k, blob) in candidates {
-                    let doc = decode_doc(&blob)?;
-                    let expired = ttl.iter().any(|(field, secs)| match get_path(&doc, field) {
-                        Some(Bson::DateTime(v)) => {
-                            (when_ms - v.timestamp_millis()) as f64 / 1000.0 > *secs
-                        }
-                        _ => false,
-                    });
-                    if !expired {
-                        continue;
-                    }
-                    // Doc row first, entries after: a lock-free reader hitting a stale
-                    // index/nat entry skips the not-found doc, whereas removing the
-                    // entries first would make an index-routed read miss a still-live
-                    // doc.
-                    doc_cur.reset()?;
-                    note_row(db, coll, recordid)?;
-                    doc_cur.set_key_ssq(db, coll, recordid);
-                    match doc_cur.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
-                    self.delete_nat_entry(&session, db, coll, &id_k)?;
-                    pruned += 1;
+                let cutoff = now
+                    .timestamp_millis()
+                    .saturating_sub((secs * 1000.0) as i64);
+                let mut expired = Document::new();
+                expired.insert("$lt", bson::DateTime::from_millis(cutoff));
+                let mut filter = Document::new();
+                filter.insert(field.clone(), Bson::Document(expired));
+                if let Ok(partial) = opts.get_document("partialFilterExpression") {
+                    let mut both = Document::new();
+                    both.insert(
+                        "$and",
+                        vec![Bson::Document(filter), Bson::Document(partial.clone())],
+                    );
+                    filter = both;
                 }
-                Ok(pruned)
-            })
-        })
+                filters.push(filter);
+            }
+        }
+        let mut pruned = 0usize;
+        for filter in filters {
+            pruned += self.delete_matching(db, coll, &filter, 0, &Document::new(), None)?;
+        }
+        Ok(pruned)
     }
 
     /// Run `prune_ttl` against every collection in every database, returning the
-    /// total docs pruned. Per-collection errors (e.g. a concurrent drop) are
-    /// suppressed so a global sweep never aborts. Mirrors
-    /// `storage.prune_ttl_all_collections`.
+    /// total docs pruned. One collection failing does not stop the pass, but
+    /// the first failure is returned once every collection has been tried: a
+    /// sweep that silently skipped a collection used to report success.
+    /// Mirrors `storage.prune_ttl_all_collections`.
     pub fn prune_ttl_all_collections(&self, now: bson::DateTime) -> Result<usize> {
         // Snapshot all (db, coll) under the lock, then prune each (prune_ttl
         // takes the lock itself, so it isn't held across the per-coll work).
@@ -8998,12 +9026,74 @@ impl Storage {
             pairs
         };
         let mut total = 0usize;
+        let mut first_error: Option<StorageError> = None;
         for (db, coll) in pairs {
-            if let Ok(n) = self.prune_ttl(&db, &coll, now) {
-                total += n;
+            match self.prune_ttl(&db, &coll, now) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
             }
         }
-        Ok(total)
+        self.ttl.passes.fetch_add(1, Ordering::Relaxed);
+        self.ttl.deleted.fetch_add(total as u64, Ordering::Relaxed);
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
+    }
+
+    /// The TTL monitor's settings and counters, as `serverStatus` and
+    /// `getParameter` report them.
+    pub fn ttl_monitor(&self) -> TtlMonitorState {
+        TtlMonitorState {
+            sleep_secs: self.ttl.sleep_secs.load(Ordering::Relaxed),
+            enabled: self.ttl.enabled.load(Ordering::Relaxed),
+            passes: self.ttl.passes.load(Ordering::Relaxed),
+            deleted: self.ttl.deleted.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Change how often the monitor passes (`ttlMonitorSleepSecs`) and whether
+    /// it runs at all (`ttlMonitorEnabled`). `None` leaves a setting alone.
+    pub fn set_ttl_monitor(&self, sleep_secs: Option<i64>, enabled: Option<bool>) {
+        if let Some(secs) = sleep_secs {
+            self.ttl.sleep_secs.store(secs, Ordering::Relaxed);
+        }
+        if let Some(on) = enabled {
+            self.ttl.enabled.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// One tick of the background monitor: run a pass when the monitor is
+    /// enabled and its period has elapsed since the last one, and say how
+    /// many documents it deleted (`None` when no pass was due). The period is
+    /// `ttlMonitorSleepSecs` once a client has set it, else `default_period`,
+    /// the server's own configured cadence. Callers tick often and cheaply.
+    pub fn ttl_monitor_tick(&self, default_period: Duration) -> Result<Option<usize>> {
+        if !self.ttl.enabled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let period = match self.ttl.sleep_secs.load(Ordering::Relaxed) {
+            secs if secs > 0 => Duration::from_secs(secs as u64),
+            _ => default_period,
+        };
+        {
+            let mut last = self.ttl.last_pass.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            match *last {
+                Some(at) if now.duration_since(at) < period => return Ok(None),
+                // The first tick only starts the clock, as a fixed-period
+                // sweeper would.
+                None => {
+                    *last = Some(now);
+                    return Ok(None);
+                }
+                _ => *last = Some(now),
+            }
+        }
+        self.prune_ttl_all_collections(bson::DateTime::now())
+            .map(Some)
     }
 
     pub fn collection_exists(&self, db: &str, coll: &str) -> Result<bool> {
@@ -13743,6 +13833,38 @@ impl Storage {
                     if !new.contains_key("_id") {
                         new.insert("_id", Bson::ObjectId(ObjectId::new()));
                     }
+                    // An `_id` mongod cannot hold. Measured 8.2.11, 2026-10-10:
+                    // an array is 53 from an operator update and 54 from a
+                    // replacement; a regex is 53 from both. (A pipeline update
+                    // answers 54 for an array too; this path cannot tell it
+                    // from an operator update and answers 53.)
+                    match new.get("_id") {
+                        Some(Bson::Array(_)) if is_replacement => {
+                            return Err(StorageError::QueryError {
+                                code: 54,
+                                errmsg: "After applying the update to the document, the \
+                                         (immutable) field '_id' was found to be an array or \
+                                         array descendant."
+                                    .to_string(),
+                                exec: true,
+                            });
+                        }
+                        Some(Bson::Array(_)) => {
+                            return Err(StorageError::QueryError {
+                                code: 53,
+                                errmsg: "The '_id' value cannot be of type array".to_string(),
+                                exec: true,
+                            });
+                        }
+                        Some(Bson::RegularExpression(_)) => {
+                            return Err(StorageError::QueryError {
+                                code: 53,
+                                errmsg: "The '_id' value cannot be of type regex".to_string(),
+                                exec: true,
+                            });
+                        }
+                        _ => {}
+                    }
                     // mongod's field order for an upserted document -- see
                     // `order_upserted_doc`. Only an OPERATOR upsert gets it; a
                     // REPLACEMENT upsert inserts the document the client sent,
@@ -13771,7 +13893,21 @@ impl Storage {
                     }
                     // Mint the RecordId + write the `_id` index first, then key the
                     // doc row by that RecordId (framed value carries the id_key).
-                    let recordid = self.write_nat_entry(&session, db, coll, &new_id_key)?;
+                    let recordid = match self.write_nat_entry(&session, db, coll, &new_id_key) {
+                        Ok(r) => r,
+                        // The upserted `_id` is taken: mongod names the
+                        // collection, the index and the key, as it does for
+                        // any other unique index.
+                        Err(StorageError::DuplicateId) => {
+                            return Err(StorageError::DuplicateKey(Box::new(UniqueConflict {
+                                namespace: format!("{db}.{coll}"),
+                                index: ID_INDEX_NAME.to_string(),
+                                key_pattern: bson::doc! { "_id": 1i32 },
+                                key_value: bson::doc! { "_id": id.clone() },
+                            })));
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
                     cur.set_key_ssq(db, coll, recordid);

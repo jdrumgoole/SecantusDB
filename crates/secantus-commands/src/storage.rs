@@ -618,6 +618,17 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// The TTL monitor as `(ttlMonitorSleepSecs, enabled, passes, deleted)`;
+    /// the sleep is 0 until a client sets it. Default: `None`, a backend with
+    /// no monitor.
+    fn ttl_monitor(&self) -> Option<(i64, bool, u64, u64)> {
+        None
+    }
+
+    /// Set `ttlMonitorSleepSecs` and / or `ttlMonitorEnabled`; `None` leaves
+    /// a setting alone. Default: nothing to set.
+    fn set_ttl_monitor(&self, _sleep_secs: Option<i64>, _enabled: Option<bool>) {}
+
     /// Run TTL pruning across every collection, returning the number of docs
     /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
     /// backend also sweeps on a background cadence). Default: unsupported; the

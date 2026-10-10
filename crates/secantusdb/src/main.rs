@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bson::Timestamp;
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
@@ -268,16 +268,23 @@ fn run(cli: CliArgs) -> Result<(), String> {
 
     // TTL sweeper: prune expired docs across all collections every N seconds
     // (mongod's default is 60s). 0 disables it. Mirrors the Python daemon.
+    // The monitor is TICKED twice a second and decides for itself whether a
+    // pass is due, so `setParameter ttlMonitorSleepSecs` takes effect without a
+    // restart.
     if cli.ttl_sweep_seconds > 0.0 {
-        workers.push(spawn_interval(cli.ttl_sweep_seconds, shutdown.clone(), {
-            let storage = storage.clone();
-            move || {
-                let now = bson::DateTime::from_millis(now_millis());
-                if let Err(e) = storage.prune_ttl_all_collections(now) {
-                    log::warn!("TTL sweep failed: {e:?}");
+        let period = Duration::from_secs_f64(cli.ttl_sweep_seconds);
+        workers.push(spawn_interval(
+            cli.ttl_sweep_seconds.min(0.5),
+            shutdown.clone(),
+            {
+                let storage = storage.clone();
+                move || {
+                    if let Err(e) = storage.ttl_monitor_tick(period) {
+                        log::warn!("TTL sweep failed: {e:?}");
+                    }
                 }
-            }
-        }));
+            },
+        ));
     }
 
     // The smoke test (and any wrapping launcher) reads this line to learn the
@@ -320,14 +327,6 @@ fn run(cli: CliArgs) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Milliseconds since the Unix epoch (for the TTL sweep's `now`).
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Spawn a background thread that runs `task` every `period_seconds`, waking

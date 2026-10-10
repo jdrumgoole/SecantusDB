@@ -16,7 +16,10 @@ client.database("mydb").collection("users")
 
 `Server::builder()` sets a persistent store, a port, auth, TLS, the WiredTiger
 cache and the background sweepers. Like the daemon, it expires TTL-indexed
-documents every 60 seconds. A server started this way advertises a
+documents every 60 seconds. A test that needs an expiry sooner sets
+`ttlMonitorSleepSecs` with `setParameter`, as it would on `mongod`, and can
+wait for `serverStatus().metrics.ttl.passes` to move instead of sleeping. A
+server started this way advertises a
 single-node replica set named `secantus` and enables test commands, because
 it is a test's server.
 

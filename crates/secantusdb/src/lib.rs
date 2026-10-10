@@ -368,9 +368,11 @@ impl Builder {
         let mut sweepers = Vec::new();
         if let Some(every) = self.ttl_sweep {
             let storage = storage.clone();
-            sweepers.push(spawn_sweeper(every, stop_sweepers.clone(), move || {
-                let now = bson::DateTime::now();
-                if let Err(e) = storage.prune_ttl_all_collections(now) {
+            // Ticked often; the monitor decides whether a pass is due, so
+            // `setParameter ttlMonitorSleepSecs` applies to a running server.
+            let tick = every.min(Duration::from_millis(500));
+            sweepers.push(spawn_sweeper(tick, stop_sweepers.clone(), move || {
+                if let Err(e) = storage.ttl_monitor_tick(every) {
                     eprintln!("secantus-mdb: TTL sweep failed: {e}");
                 }
             }));

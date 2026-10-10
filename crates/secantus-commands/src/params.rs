@@ -88,12 +88,19 @@ pub enum ParamKind {
     LogLevel,
     /// A boolean parameter, which mongod coerces from any BSON value.
     Bool,
+    /// A whole number of seconds greater than zero (`ttlMonitorSleepSecs`).
+    PositiveInt,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
 const SETTABLE: &[(&str, ParamKind)] = &[
     ("logLevel", ParamKind::LogLevel),
     ("quiet", ParamKind::Bool),
+    // The TTL monitor, which these reach in the storage layer as well as
+    // being stored here: a test sets the sleep to 1 to see a document expire
+    // without waiting a minute.
+    ("ttlMonitorEnabled", ParamKind::Bool),
+    ("ttlMonitorSleepSecs", ParamKind::PositiveInt),
 ];
 
 /// mongod's highest log level; `setParameter` clamps rather than refusing.
@@ -192,6 +199,10 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
                 (truncated as i64).min(MAX_LOG_LEVEL as i64) as i32
             ))
         }
+        ParamKind::PositiveInt => match whole(value) {
+            Some(n) if n > 0 => Some(Bson::Int32(n.min(i64::from(i32::MAX)) as i32)),
+            _ => None,
+        },
         // Accepts every BSON type; only these four are falsey.
         ParamKind::Bool => Some(Bson::Boolean(
             !matches!(
@@ -199,6 +210,29 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
                 Bson::Boolean(false) | Bson::Null | Bson::Int32(0) | Bson::Int64(0)
             ) && *value != Bson::Double(0.0),
         )),
+    }
+}
+
+/// A number truncated toward zero, or `None` for anything that is not one.
+fn whole(value: &Bson) -> Option<i64> {
+    match value {
+        Bson::Int32(i) => Some(i64::from(*i)),
+        Bson::Int64(i) => Some(*i),
+        Bson::Double(d) if d.is_finite() => Some(d.trunc() as i64),
+        _ => None,
+    }
+}
+
+/// mongod's words for a value `coerce` refused (measured 8.2.11).
+fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
+    match (kind, whole(value)) {
+        (ParamKind::PositiveInt, Some(n)) => {
+            format!("Invalid value for parameter {name}: {n} is not greater than 0")
+        }
+        (ParamKind::PositiveInt, None) => {
+            format!("Failed validating {name}: Unable to coerce value to integral type")
+        }
+        _ => format!("Invalid value for {name}: {}", render_element(name, value)),
     }
 }
 
@@ -285,11 +319,7 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             ));
         };
         if coerce(kind, value).is_none() {
-            return Err(CommandError::new(
-                2,
-                "BadValue",
-                format!("Invalid value for {name}: {}", render_element(name, value)),
-            ));
+            return Err(CommandError::new(2, "BadValue", refusal(kind, name, value)));
         }
     }
 
@@ -307,6 +337,17 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             // `getParameter` reports the coerced value (`logLevel: 99` reads
             // back as 5, `quiet: "yes"` as true).
             if let Some(coerced) = coerce(kind_of(name).expect("validated above"), value) {
+                if let Ok(storage) = ctx.storage() {
+                    match (name.as_str(), &coerced) {
+                        ("ttlMonitorSleepSecs", Bson::Int32(n)) => {
+                            storage.set_ttl_monitor(Some(i64::from(*n)), None)
+                        }
+                        ("ttlMonitorEnabled", Bson::Boolean(on)) => {
+                            storage.set_ttl_monitor(None, Some(*on))
+                        }
+                        _ => {}
+                    }
+                }
                 s.set(name, coerced);
             }
         }
@@ -341,6 +382,46 @@ mod tests {
         // and it sticks
         let r2 = set_parameter(&doc! {"setParameter": 1, "logLevel": 5_i32}, &mut c).unwrap();
         assert_eq!(r2.get_i32("was").unwrap(), 3);
+    }
+
+    /// The TTL monitor's two parameters (mongod 8.2.11, 2026-10-10). Both
+    /// were "unrecognized", so a test could not shorten the monitor's sleep.
+    #[test]
+    fn the_ttl_monitor_parameters_are_settable() {
+        let mut c = ctx();
+        let r = set_parameter(
+            &doc! {"setParameter": 1, "ttlMonitorSleepSecs": 1_i32},
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(r.get_i32("was").unwrap(), 60);
+        let r = set_parameter(
+            &doc! {"setParameter": 1, "ttlMonitorEnabled": false},
+            &mut c,
+        )
+        .unwrap();
+        assert!(r.get_bool("was").unwrap());
+
+        let e = set_parameter(
+            &doc! {"setParameter": 1, "ttlMonitorSleepSecs": "x"},
+            &mut c,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, 2);
+        assert_eq!(
+            e.errmsg,
+            "Failed validating ttlMonitorSleepSecs: Unable to coerce value to integral type"
+        );
+        let e = set_parameter(
+            &doc! {"setParameter": 1, "ttlMonitorSleepSecs": 0_i32},
+            &mut c,
+        )
+        .unwrap_err();
+        assert_eq!(e.code, 2);
+        assert_eq!(
+            e.errmsg,
+            "Invalid value for parameter ttlMonitorSleepSecs: 0 is not greater than 0"
+        );
     }
 
     #[test]

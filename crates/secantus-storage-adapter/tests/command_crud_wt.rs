@@ -370,7 +370,9 @@ fn insert_id_with_dollar_prefix_rejected() {
         let we = reply.get_array("writeErrors").unwrap();
         assert_eq!(we.len(), 1);
         let e = we[0].as_document().unwrap();
-        assert_eq!(e.get_i32("code").unwrap(), 2);
+        // 52 `DollarPrefixedFieldName` on mongod 8.2.11 (2026-10-10); this
+        // asserted the 2 the server used to answer.
+        assert_eq!(e.get_i32("code").unwrap(), 52);
         assert!(e.get_str("errmsg").unwrap().contains("$bad"));
     });
 }
@@ -417,7 +419,7 @@ fn insert_pre_error_index_remap_unordered() {
         assert_eq!(we.len(), 2);
         let pre = we[0].as_document().unwrap();
         assert_eq!(pre.get_i32("index").unwrap(), 0);
-        assert_eq!(pre.get_i32("code").unwrap(), 2);
+        assert_eq!(pre.get_i32("code").unwrap(), 52);
         let dup = we[1].as_document().unwrap();
         assert_eq!(dup.get_i32("index").unwrap(), 2);
         assert_eq!(dup.get_i32("code").unwrap(), 11000);
@@ -893,5 +895,307 @@ fn bulk_write_results_page_through_a_cursor() {
             .unwrap_or_else(|_| panic!("getMore reply: {more:?}"));
         assert_eq!(cur.get_array("nextBatch").unwrap().len(), 3);
         assert_eq!(cur.get_i64("id").unwrap(), 0, "drained, so it closes");
+    });
+}
+
+fn first_write_error(reply: &Document) -> Document {
+    reply
+        .get_array("writeErrors")
+        .unwrap_or_else(|_| panic!("no writeErrors in {reply}"))[0]
+        .as_document()
+        .unwrap()
+        .clone()
+}
+
+/// An `_id` mongod cannot hold is refused on insert and on upsert. An array
+/// and a regex were both stored (mongod 8.2.11, 2026-10-10).
+#[test]
+fn an_array_or_regex_id_is_refused() {
+    with_wt(|c| {
+        let regex = Bson::RegularExpression(bson::Regex {
+            pattern: "a".into(),
+            options: String::new(),
+        });
+        for (value, type_name) in [(bson::bson!([1, 2]), "array"), (regex, "regex")] {
+            let reply = dispatch(
+                &doc! {"insert": "c", "documents": [{"_id": value.clone()}]},
+                c,
+            );
+            let err = first_write_error(&reply);
+            assert_eq!(err.get_i32("code").unwrap(), 53, "{reply}");
+            assert_eq!(
+                err.get_str("errmsg").unwrap(),
+                format!("The '_id' value cannot be of type {type_name}")
+            );
+            let reply = dispatch(
+                &doc! {"update": "c", "updates": [
+                    {"q": {"k": 1}, "u": {"$set": {"_id": value.clone()}}, "upsert": true}
+                ]},
+                c,
+            );
+            let err = first_write_error(&reply);
+            assert_eq!(err.get_i32("code").unwrap(), 53, "{reply}");
+            assert_eq!(
+                err.get_str("errmsg").unwrap(),
+                format!(
+                    "Plan executor error during update :: caused by :: The '_id' value cannot \
+                     be of type {type_name}"
+                )
+            );
+        }
+        // A replacement that would insert an array `_id` is the immutable-field error.
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [
+                {"q": {"k": 1}, "u": {"_id": [1], "z": 1}, "upsert": true}
+            ]},
+            c,
+        );
+        assert_eq!(
+            first_write_error(&reply).get_i32("code").unwrap(),
+            54,
+            "{reply}"
+        );
+        assert_eq!(count(c), 0);
+    });
+}
+
+/// An upsert that lands on a taken `_id` names the collection, the index and
+/// the key, as every other duplicate key does. It answered a bare
+/// `E11000 duplicate key error`.
+#[test]
+fn an_upsert_onto_a_taken_id_reports_the_key() {
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [
+                {"q": {"u": 5}, "u": {"$set": {"_id": 1}}, "upsert": true}
+            ]},
+            c,
+        );
+        let err = first_write_error(&reply);
+        assert_eq!(err.get_i32("code").unwrap(), 11000);
+        assert_eq!(
+            err.get_str("errmsg").unwrap(),
+            "Plan executor error during update :: caused by :: E11000 duplicate key error \
+             collection: t.c index: _id_ dup key: { _id: 1 }"
+        );
+        assert_eq!(err.get_document("keyPattern").unwrap(), &doc! {"_id": 1});
+        assert_eq!(err.get_document("keyValue").unwrap(), &doc! {"_id": 1});
+    });
+}
+
+/// An update statement's constants (`c`) are variables for a pipeline update,
+/// and `upsertSupplied` inserts `c.new` as it stands. Both were ignored.
+#[test]
+fn update_constants_and_upsert_supplied() {
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [
+                {"q": {"_id": 1}, "u": [{"$set": {"b": "$$k"}}], "c": {"k": 7}}
+            ]},
+            c,
+        );
+        assert_eq!(reply.get_i32("nModified").unwrap(), 1, "{reply}");
+
+        // Constants on anything but a pipeline are refused, per statement.
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [
+                {"q": {"_id": 1}, "u": {"$set": {"b": 1}}, "c": {"k": 7}}
+            ]},
+            c,
+        );
+        let err = first_write_error(&reply);
+        assert_eq!(err.get_i32("code").unwrap(), 51198);
+        assert_eq!(
+            err.get_str("errmsg").unwrap(),
+            "Constant values may only be specified for pipeline updates"
+        );
+
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{
+                "q": {"_id": 60}, "u": [{"$set": {"a": 1}}], "upsert": true,
+                "upsertSupplied": true, "c": {"new": {"_id": 60, "z": 1}},
+            }]},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").unwrap(), 1, "{reply}");
+        assert!(reply.get_array("upserted").is_ok(), "{reply}");
+        let found = dispatch_full(&doc! {"find": "c", "filter": {}, "sort": {"_id": 1}}, c);
+        let docs = fb(&found, c);
+        assert_eq!(
+            docs,
+            vec![
+                Bson::Document(doc! {"_id": 1, "b": 7}),
+                Bson::Document(doc! {"_id": 60, "z": 1}),
+            ]
+        );
+    });
+}
+
+fn bulk(c: &mut CommandContext, body: Document) -> Document {
+    c.db_name = "admin".into();
+    let mut cmd = doc! {"bulkWrite": 1};
+    cmd.extend(body);
+    let reply = dispatch(&cmd, c);
+    c.db_name = "t".into();
+    reply
+}
+
+fn bulk_results(reply: &Document) -> Vec<Document> {
+    reply
+        .get_document("cursor")
+        .unwrap_or_else(|_| panic!("no cursor in {reply}"))
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .map(|b| b.as_document().unwrap().clone())
+        .collect()
+}
+
+/// `bulkWrite` checks the whole command before it writes anything. A
+/// malformed later op used to leave the earlier ops applied (mongod 8.2.11,
+/// 2026-10-10).
+#[test]
+fn bulk_write_checks_every_op_before_writing_any() {
+    with_wt(|c| {
+        let ns = bson::bson!([{"ns": "t.c"}]);
+        let good = doc! {"insert": 0, "document": {"_id": 1}};
+        let cases: Vec<(Document, i32, &str)> = vec![
+            (
+                doc! {"insert": 0},
+                40414,
+                "BSON field 'bulkWrite.ops.document' is missing but a required field",
+            ),
+            (
+                doc! {"delete": 0, "filter": {}, "bogus": 1},
+                40415,
+                "BSON field 'bulkWrite.ops.bogus' is an unknown field.",
+            ),
+            (
+                doc! {"document": {}, "insert": 0},
+                40415,
+                "BSON field 'bulkWrite.document' is an unknown field.",
+            ),
+            (
+                doc! {"insert": 5, "document": {"_id": 2}},
+                2,
+                "BulkWrite ops entry { insert: 5, document: { _id: 2 } } has an invalid nsInfo \
+                 index.",
+            ),
+            (
+                doc! {"insert": -1, "document": {}},
+                2,
+                "BSON field 'insert' value must be >= 0, actual value '-1'",
+            ),
+            (
+                doc! {"update": 0, "filter": {}, "updateMods": 5},
+                9,
+                "Update argument must be either an object or an array",
+            ),
+            (
+                doc! {"update": 0, "updateMods": {"$set": {"a": 1}}},
+                40414,
+                "BSON field 'bulkWrite.ops.filter' is missing but a required field",
+            ),
+            (
+                doc! {"delete": 0, "filter": {}, "hint": 5},
+                9,
+                "Hint must be a string or an object",
+            ),
+            (
+                doc! {"delete": 0, "filter": {}, "multi": 1},
+                14,
+                "BSON field 'bulkWrite.ops.multi' is the wrong type 'int', expected type 'bool'",
+            ),
+        ];
+        for (bad, code, errmsg) in cases {
+            let reply = bulk(
+                c,
+                doc! {"ops": [good.clone(), bad.clone()], "nsInfo": ns.clone()},
+            );
+            assert_eq!(reply.get_i32("code").ok(), Some(code), "{bad} -> {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), errmsg, "{bad}");
+            assert_eq!(count(c), 0, "{bad} wrote something");
+        }
+        // A namespace no write may touch fails the command when an op uses it,
+        // and is harmless when none does.
+        let two = bson::bson!([{"ns": "t.c"}, {"ns": "t.system.views"}]);
+        let reply = bulk(
+            c,
+            doc! {"ops": [good.clone(), {"insert": 1, "document": {"_id": "x"}}], "nsInfo": two.clone()},
+        );
+        assert_eq!(reply.get_i32("code").ok(), Some(73), "{reply}");
+        assert_eq!(count(c), 0);
+        let reply = bulk(c, doc! {"ops": [good.clone()], "nsInfo": two});
+        assert_eq!(reply.get_i32("nInserted").unwrap(), 1, "{reply}");
+        // Every nsInfo entry must be a namespace, used or not.
+        let reply = bulk(
+            c,
+            doc! {"ops": [{"insert": 0, "document": {"_id": 2}}],
+            "nsInfo": [{"ns": "t.c"}, {"ns": "nodot"}]},
+        );
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "Invalid namespace specified for bulkWrite: 'nodot'"
+        );
+        assert_eq!(count(c), 1);
+    });
+}
+
+/// What a failed op's entry carries, and that a view takes no writes through
+/// `bulkWrite` either (it did: the ops bypass the dispatch-level refusal).
+#[test]
+fn bulk_write_reports_each_failed_op_as_mongod_does() {
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
+        dispatch(&doc! {"create": "vw", "viewOn": "c", "pipeline": []}, c);
+        dispatch(
+            &doc! {"create": "d", "validator": {"v": {"$type": "int"}}},
+            c,
+        );
+        let ns = bson::bson!([{"ns": "t.c"}, {"ns": "t.vw"}, {"ns": "t.d"}]);
+
+        let reply = bulk(
+            c,
+            doc! {"ordered": false, "nsInfo": ns.clone(), "ops": [
+                {"insert": 1, "document": {"_id": 9}},
+                {"update": 1, "filter": {}, "updateMods": {"$set": {"a": 1}}},
+                {"insert": 2, "document": {"_id": 9, "v": "no"}},
+                {"update": 0, "filter": {"_id": 1}, "updateMods": {"$nope": 1}},
+                {"insert": 0, "document": {"_id": 2}},
+            ]},
+        );
+        let results = bulk_results(&reply);
+        assert_eq!(reply.get_i32("nErrors").unwrap(), 4, "{reply}");
+        assert_eq!(reply.get_i32("nInserted").unwrap(), 1);
+        // A view: 166, for the insert and for the update.
+        for entry in &results[0..2] {
+            assert_eq!(entry.get_i32("code").unwrap(), 166, "{entry}");
+            assert_eq!(
+                entry.get_str("errmsg").unwrap(),
+                "Namespace t.vw is a view, not a collection"
+            );
+        }
+        // A failed update entry ends `n, nModified`; an insert's ends `n`.
+        assert_eq!(results[1].keys().last().unwrap(), "nModified");
+        assert_eq!(results[0].keys().last().unwrap(), "n");
+        assert_eq!(results[3].get_i32("nModified").unwrap(), 0);
+        // A failed validation carries its errInfo.
+        assert_eq!(results[2].get_i32("code").unwrap(), 121);
+        assert!(results[2].get_document("errInfo").is_ok(), "{}", results[2]);
+        assert_eq!(count(c), 2);
+
+        // An unacknowledged write reports counters and no per-op results.
+        let reply = bulk(
+            c,
+            doc! {"nsInfo": ns, "writeConcern": {"w": 0}, "ops": [
+                {"insert": 0, "document": {"_id": 3}},
+                {"insert": 0, "document": {"_id": 3}},
+            ]},
+        );
+        assert!(bulk_results(&reply).is_empty(), "{reply}");
+        assert_eq!(reply.get_i32("nErrors").unwrap(), 1);
+        assert_eq!(reply.get_i32("nInserted").unwrap(), 1);
     });
 }

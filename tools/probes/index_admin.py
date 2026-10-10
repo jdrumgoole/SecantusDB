@@ -86,12 +86,9 @@ SEQUENCE = [
         ci("c", ix({"pf3": 1}, sparse=True, partialFilterExpression={"a": 1})),
     ),
     ("create partial not object", ci("c", ix({"pf4": 1}, partialFilterExpression=5))),
-    ("create text", ci("c", ix({"t": "text"}))),
-    ("create hashed", ci("c", ix({"a": "hashed"}))),
     ("create wildcard", ci("c", ix({"$**": 1}))),
     ("create 2dsphere", ci("c", ix({"loc": "2dsphere"}))),
     ("create collation", ci("c", ix({"cl": 1}, collation={"locale": "en", "strength": 2}))),
-    ("create collation bad locale", ci("c", ix({"cl2": 1}, collation={"locale": "zz_nope"}))),
     ("create v 1", ci("c", ix({"v1": 1}, v=1))),
     ("create v 3", ci("c", ix({"v3": 1}, v=3))),
     ("create background", ci("c", ix({"bg": 1}, background=True))),
@@ -101,6 +98,16 @@ SEQUENCE = [
     ("create name star", ci("c", {"key": {"st": 1}, "name": "*"})),
     ("create 32 fields", ci("c", {"key": {f"f{i}": 1 for i in range(32)}, "name": "wide32"})),
     ("create 33 fields", ci("c", {"key": {f"g{i}": 1 for i in range(33)}, "name": "wide33"})),
+    # Three specs the servers are KNOWN to answer differently, kept to the end
+    # of the builds and dropped again at once, so that one index built on one
+    # side and not the other is one difference and not a shifted index count
+    # in every reply after it.
+    ("create text", ci("c", ix({"t": "text"}))),
+    ("create hashed", ci("c", ix({"a": "hashed"}))),
+    ("create collation bad locale", ci("c", ix({"cl2": 1}, collation={"locale": "zz_nope"}))),
+    ("drop the text index", {"dropIndexes": "c", "index": "t_text"}),
+    ("drop the hashed index", {"dropIndexes": "c", "index": "a_hashed"}),
+    ("drop the bad-locale index", {"dropIndexes": "c", "index": "cl2_1"}),
     ("listIndexes", {"listIndexes": "c"}),
     ("listIndexes missing", {"listIndexes": "nosuch"}),
     ("listIndexes batchSize", {"listIndexes": "c", "cursor": {"batchSize": 2}}),
