@@ -2967,6 +2967,12 @@ pub struct PgHandler {
     /// of the values (see `plan_cache`): an Execute whose statement has one
     /// substitutes its values instead of planning again.
     plan_cache: Mutex<HashMap<PlanKey, PlanEntry>>,
+    /// Hashes of the plan keys this session has planned once. A template is
+    /// learned when a key comes round a SECOND time: learning plans the
+    /// statement twice more, which a statement sent once never earns back --
+    /// and an unprepared statement with a literal in it is a new text, so a
+    /// new key, every time (it cost two thirds of such a read).
+    plan_seen: Mutex<std::collections::HashSet<u64>>,
     /// What an extended Execute allows its statement (`portal_stream`):
     /// requested before planning, armed for the top-level SELECT only, and
     /// whether the result it produced is a stream (not to be materialised).
@@ -3437,6 +3443,7 @@ impl PgHandler {
             session_lastval_seq: Mutex::new(None),
             describe_cache: Mutex::new(HashMap::new()),
             plan_cache: Mutex::new(HashMap::new()),
+            plan_seen: Mutex::new(std::collections::HashSet::new()),
             stream_request: std::sync::atomic::AtomicU8::new(0),
             stream_portal: std::sync::atomic::AtomicU8::new(0),
             streamed: AtomicBool::new(false),
@@ -17942,13 +17949,18 @@ impl SimpleQueryHandler for PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        let stmts = match secantus_pgplan::split_statements(query) {
-            Ok(stmts) => stmts,
-            Err(e) => {
-                self.note_failure();
-                self.flush_notices(_c).await?;
-                return Err(Self::err_in(&e, query));
-            }
+        // One command plainly on its own is not parsed just to be split.
+        let lone = secantus_pgplan::lone_command(query);
+        let stmts = match lone {
+            Some(one) => vec![one.to_string()],
+            None => match secantus_pgplan::split_statements(query) {
+                Ok(stmts) => stmts,
+                Err(e) => {
+                    self.note_failure();
+                    self.flush_notices(_c).await?;
+                    return Err(Self::err_in(&e, query));
+                }
+            },
         };
         let live = live_notices::LiveNotices::install(self, _c);
         let out = if stmts.len() <= 1 && !self.runs_user_code(query) {
@@ -17974,6 +17986,17 @@ impl SimpleQueryHandler for PgHandler {
             self.run_batch(&stmts, query).await
         };
         drop(live);
+        // The syntax error of a command that was not split is reported as
+        // the split would have: against the text as the client sent it.
+        let out = match out {
+            Err(PgWireError::UserError(info)) if lone.is_some() && info.code == "42601" => {
+                Err(match secantus_pgplan::split_statements(query) {
+                    Err(e) => Self::err_in(&e, query),
+                    Ok(_) => PgWireError::UserError(info),
+                })
+            }
+            out => out,
+        };
         // A simple query inside an extended-protocol statement group runs in
         // the group's transaction and ends it, as PostgreSQL's does
         // (`exec_simple_query` finishes the transaction command).
@@ -21143,6 +21166,13 @@ impl PgHandler {
         let templated = plan_key
             .as_ref()
             .and_then(|k| self.templated_plan(k, params));
+        // An unprepared statement carries its values in its text: it is
+        // looked up by the text with those taken out.
+        let family = match (&plan_key, &templated) {
+            (Some(_), None) if params.is_empty() => plan_cache::literal_family(sql),
+            _ => None,
+        };
+        let templated = templated.or_else(|| self.family_plan(family.as_ref()?));
         let reused = templated.is_some();
         let planned = match templated {
             Some(stmt) => Ok(stmt),
@@ -21161,8 +21191,13 @@ impl PgHandler {
         };
         self.collect_planner_warnings();
         if !reused && planned.is_ok() {
-            if let Some(key) = plan_key {
-                self.learn_plan_template(key, params, param_types, &tz);
+            if let Some(key) = plan_key.filter(|k| self.planned_before(k)) {
+                self.learn_plan_template(key, params, param_types, &tz, None);
+            } else if let Some(family) = family {
+                let key = Self::family_key(&family);
+                if self.planned_before(&key) {
+                    self.learn_plan_template(key, &[], &[], &tz, Some((sql, &family)));
+                }
             }
         }
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
@@ -36606,14 +36641,68 @@ impl PgHandler {
         plan_cache::substitute(plan, stand_ins, params)
     }
 
+    /// The plan-cache key of a family: its text, marked so that it is never
+    /// a prepared statement's, and the kinds of its values.
+    fn family_key(family: &plan_cache::Family) -> PlanKey {
+        let tags = family
+            .values
+            .iter()
+            .map(|v| v.element_type() as u8)
+            .collect();
+        (format!("{}\u{1f}", family.text), Vec::new(), tags)
+    }
+
+    /// The plan learned for `family`, with its values substituted -- `None`
+    /// when there is none valid now.
+    fn family_plan(&self, family: &plan_cache::Family) -> Option<Statement> {
+        let key = Self::family_key(family);
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (v, g, role, template) = cache.get(&key)?;
+        if *v != version || *g != generation || *role != self.current_role_name() {
+            return None;
+        }
+        let (stand_ins, plan) = template.as_ref()?;
+        let values = plan_cache::as_kinds_of(&family.values, stand_ins)?;
+        plan_cache::substitute(plan, stand_ins, &values)
+    }
+
+    /// Has this session planned `key` before? Records that it has now.
+    fn planned_before(&self, key: &PlanKey) -> bool {
+        use std::hash::BuildHasher;
+        const MAX_SEEN: usize = 4096;
+        // One fixed hasher: the answer has to be the same on the second call.
+        static HASHER: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+            std::sync::OnceLock::new();
+        let hash = HASHER.get_or_init(Default::default).hash_one(key);
+        let mut seen = self.plan_seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= MAX_SEEN {
+            seen.clear();
+        }
+        !seen.insert(hash)
+    }
+
     /// Learn whether `key`'s statement can be templated, planning it twice
     /// with stand-in values (see `plan_cache`), and record the answer.
+    ///
+    /// With `family`, the statement is an unprepared one read as a family
+    /// (`plan_cache::literal_family`): `key` is the family's, and the
+    /// stand-ins are WRITTEN INTO the text where its own values were, so what
+    /// is checked is the planner's reading of a literal there.
     fn learn_plan_template(
         &self,
         key: PlanKey,
         params: &[Bson],
         param_types: &[Option<String>],
         tz: &secantus_pgplan::TimeZoneSetting,
+        family: Option<(&str, &plan_cache::Family)>,
     ) {
         let version = catalog_cache()
             .version
@@ -36633,7 +36722,10 @@ impl PgHandler {
             }
         }
         let template = (|| {
-            let relations = plan_cache::eligible_sql(&key.0)?;
+            let relations = plan_cache::eligible_sql(match family {
+                Some((_, f)) => &f.text,
+                None => &key.0,
+            })?;
             // Every relation a plain table (or a catalog / sequence the
             // executor reads afresh): a view expands to a query of its own,
             // a rule rewrites the statement, and a row-security policy adds
@@ -36647,7 +36739,10 @@ impl PgHandler {
                     return None;
                 }
             }
-            let (a, b) = plan_cache::sentinels(params)?;
+            let (a, b) = plan_cache::sentinels(match family {
+                Some((_, f)) => &f.values,
+                None => params,
+            })?;
             let ran_subquery = std::cell::Cell::new(false);
             let touched_temp = std::cell::Cell::new(false);
             let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
@@ -36662,10 +36757,14 @@ impl PgHandler {
                 def
             };
             let plan = |values: &[Bson]| {
+                let written = match family {
+                    Some((sql, f)) => Some(f.with_literals(sql, values)?),
+                    None => None,
+                };
                 secantus_pgplan::plan_with_session_types_and_subqueries(
-                    &key.0,
+                    written.as_deref().unwrap_or(&key.0),
                     &lookup,
-                    values,
+                    if written.is_some() { &[] } else { values },
                     param_types,
                     tz,
                     Some(&run),
@@ -36679,6 +36778,12 @@ impl PgHandler {
             let _ = secantus_pgplan::take_warnings();
             let _ = secantus_pgplan::take_error_location();
             let (plan_a, plan_b) = (plan_a?, plan_b?);
+            // A literal's plan holds the value as the planner typed it: an
+            // integer compared with an `int8` column is there in 64 bits.
+            let (a, b) = match family {
+                Some(_) => plan_cache::as_planned(&plan_a, a, b),
+                None => (a, b),
+            };
             if ran_subquery.get() || touched_temp.get() {
                 return None;
             }

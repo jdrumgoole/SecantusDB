@@ -206,6 +206,214 @@ fn params_stand_alone(sql: &str, stmt: &pg_query::NodeEnum) -> bool {
     alone == total
 }
 
+/// A statement sent with its values written into the text, read as the same
+/// statement with the values taken out: `select v from t where k = 5` and
+/// `... where k = 6` are one FAMILY, and a plan learned for it serves both
+/// (an unprepared statement was otherwise a new text, parsed and planned
+/// whole, every time).
+pub(crate) struct Family {
+    /// The text with each value replaced by `$n`: what `eligible_sql` judges.
+    pub(crate) text: String,
+    /// The values, in order: an integer literal (int32 where it fits, as the
+    /// scanner types it) or the content of a plain string literal.
+    pub(crate) values: Vec<Bson>,
+    /// Where each value's literal sits in the original text.
+    spans: Vec<std::ops::Range<usize>>,
+}
+
+const MAX_FAMILY_VALUES: usize = 64;
+
+/// The family of `sql`, or `None` when it has no value to take out or its
+/// bytes are not plainly readable. This is NOT a SQL scanner: it reads the
+/// subset in which a literal's extent is certain and refuses everything else
+/// (a comment, a dollar sign, a backslash, a prefixed or continued string, a
+/// number with a point or an exponent), and a refusal only means the
+/// statement is planned as it always was. A value it does take out is not
+/// trusted to be one the planner copies -- `learn` plans the text twice with
+/// stand-in literals in these same places, and only a plan that follows them
+/// is kept.
+///
+/// A statement with more values than `MAX_FAMILY_VALUES` (a bulk INSERT) is
+/// not read as a family: substitution looks each plan value up among the
+/// stand-ins, which for thousands of values costs more than planning.
+pub(crate) fn literal_family(sql: &str) -> Option<Family> {
+    let b = sql.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let mut text = String::with_capacity(sql.len() + 8);
+    let mut values = Vec::new();
+    let mut spans = Vec::new();
+    // The word before this point, when nothing but blanks came since.
+    let mut last_word: Option<&str> = None;
+    // The last byte that was not a blank, for telling `k = -5` from `k - 5`.
+    let mut last_mark = b' ';
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'$' | b'\\' | b';' => return None,
+            b'-' if b.get(i + 1) == Some(&b'-') => return None,
+            b'/' if b.get(i + 1) == Some(&b'*') => return None,
+            b'"' => {
+                // A quoted identifier: kept as written.
+                i += 1;
+                loop {
+                    match b.get(i)? {
+                        b'"' if b.get(i + 1) == Some(&b'"') => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+                (last_word, last_mark) = (None, b'"');
+            }
+            b'\'' => {
+                let start = i;
+                let mut content = String::new();
+                i += 1;
+                let mut from = i;
+                loop {
+                    match b.get(i)? {
+                        b'\\' => return None,
+                        b'\'' if b.get(i + 1) == Some(&b'\'') => {
+                            content.push_str(&sql[from..=i]);
+                            i += 2;
+                            from = i;
+                        }
+                        b'\'' => break,
+                        _ => i += 1,
+                    }
+                }
+                content.push_str(&sql[from..i]);
+                i += 1;
+                // `'a'` then a newline then `'b'` is one literal, `'ab'`.
+                let rest = sql[i..].trim_start();
+                if rest.starts_with('\'') && sql[i..sql.len() - rest.len()].contains('\n') {
+                    return None;
+                }
+                text.push_str(&sql[copied..start]);
+                values.push(Bson::String(content));
+                text.push_str(&format!("${}", values.len()));
+                spans.push(start..i);
+                copied = i;
+                (last_word, last_mark) = (None, b'\'');
+            }
+            b'0'..=b'9' => {
+                let digits = i;
+                while b.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                if b.get(i).is_some_and(|&n| word(n) || n == b'.') || last_mark == b'.' {
+                    return None;
+                }
+                // A count, not a value: the planner reads it, and it stays
+                // part of the text.
+                if last_word.is_some_and(|w| {
+                    w.eq_ignore_ascii_case("limit") || w.eq_ignore_ascii_case("offset")
+                }) {
+                    (last_word, last_mark) = (None, b'0');
+                    continue;
+                }
+                let magnitude: i64 = sql[digits..i].parse().ok()?;
+                // A sign written against the number is the number's own
+                // (the grammar folds it in) where a value is due: after a
+                // bracket or a comma, or set off by a blank from a comparison
+                // -- without the blank, `!=-5` is the operator `!=-`.
+                let negative = digits > 0 && b[digits - 1] == b'-' && {
+                    let before = &sql[..digits - 1];
+                    let apart = before.ends_with(|c: char| c.is_ascii_whitespace());
+                    match before.trim_end().as_bytes().last() {
+                        Some(b'(' | b',') => true,
+                        Some(b'=' | b'<' | b'>') => apart,
+                        _ => false,
+                    }
+                };
+                let start = if negative { digits - 1 } else { digits };
+                let n = if negative { -magnitude } else { magnitude };
+                // The scanner types by the digits: past int4 they are int8,
+                // whatever the sign makes of them.
+                values.push(match i32::try_from(magnitude) {
+                    Ok(_) => Bson::Int32(n as i32),
+                    Err(_) => Bson::Int64(n),
+                });
+                text.push_str(&sql[copied..start]);
+                text.push_str(&format!("${}", values.len()));
+                spans.push(start..i);
+                copied = i;
+                (last_word, last_mark) = (None, b'0');
+            }
+            _ if word(c) => {
+                let start = i;
+                while b.get(i).is_some_and(|&n| word(n)) {
+                    i += 1;
+                }
+                // `E'..'`, `B'..'`, `X'..'`, `N'..'`, `U&'..'`: not plain.
+                if matches!(b.get(i), Some(b'\'') | Some(b'&')) {
+                    return None;
+                }
+                (last_word, last_mark) = (Some(&sql[start..i]), b'a');
+            }
+            _ => {
+                if !c.is_ascii_whitespace() {
+                    (last_word, last_mark) = (None, c);
+                }
+                i += 1;
+            }
+        }
+    }
+    if values.is_empty() || values.len() > MAX_FAMILY_VALUES {
+        return None;
+    }
+    text.push_str(&sql[copied..]);
+    Some(Family {
+        text,
+        values,
+        spans,
+    })
+}
+
+impl Family {
+    /// The original text with `values` written where its own were.
+    pub(crate) fn with_literals(&self, sql: &str, values: &[Bson]) -> Option<String> {
+        let mut out = String::with_capacity(sql.len() + 16);
+        let mut at = 0;
+        for (span, v) in self.spans.iter().zip(values) {
+            out.push_str(&sql[at..span.start]);
+            match v {
+                Bson::Int32(n) => out.push_str(&n.to_string()),
+                Bson::Int64(n) => out.push_str(&n.to_string()),
+                Bson::String(s) => {
+                    out.push('\'');
+                    out.push_str(&s.replace('\'', "''"));
+                    out.push('\'');
+                }
+                _ => return None,
+            }
+            at = span.end;
+        }
+        out.push_str(&sql[at..]);
+        Some(out)
+    }
+}
+
+/// `values` as the kinds `like` holds, where that loses nothing: an int32
+/// for an int64 stand-in is the same number in 64 bits. `None` when a value
+/// is of another kind altogether.
+pub(crate) fn as_kinds_of(values: &[Bson], like: &[Bson]) -> Option<Vec<Bson>> {
+    if values.len() != like.len() {
+        return None;
+    }
+    values
+        .iter()
+        .zip(like)
+        .map(|(v, l)| match (v, l) {
+            (Bson::Int32(n), Bson::Int64(_)) => Some(Bson::Int64(i64::from(*n))),
+            _ if std::mem::discriminant(v) == std::mem::discriminant(l) => Some(v.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The two stand-in sets for `params`, or `None` when one of them cannot be
 /// stood in for (a NULL, or a type outside the handled four).
 pub(crate) fn sentinels(params: &[Bson]) -> Option<(Vec<Bson>, Vec<Bson>)> {
@@ -412,6 +620,28 @@ fn substitute_counting(
     Some((s, hits))
 }
 
+/// The stand-ins `a` / `b` as `plan_a` holds them: an int32 the plan does
+/// not have where substitution looks is taken in 64 bits instead, which is
+/// how the planner types an integer literal compared with an `int8` column.
+/// (Whether the plan really holds it that way is still `is_template`'s to
+/// say.)
+pub(crate) fn as_planned(plan_a: &Statement, a: Vec<Bson>, b: Vec<Bson>) -> (Vec<Bson>, Vec<Bson>) {
+    let Some((_, hits)) = substitute_counting(plan_a, &a, &b) else {
+        return (a, b);
+    };
+    let wide = |values: Vec<Bson>| {
+        values
+            .into_iter()
+            .zip(&hits)
+            .map(|(v, hit)| match (hit, widened(&v)) {
+                (false, Some(w)) => w,
+                _ => v,
+            })
+            .collect()
+    };
+    (wide(a), wide(b))
+}
+
 /// Where `plan` STORES one of the stand-ins `a`: `(table, field, value)` for
 /// each field of an INSERT's rows or an UPDATE's SET holding one. The caller
 /// checks each against its column (`stores_verbatim`).
@@ -463,6 +693,106 @@ mod tests {
         assert!(eligible_sql("select 1; select 2").is_none());
         assert!(eligible_sql("select current_user").is_none());
         assert!(eligible_sql("create table x (a int)").is_none());
+    }
+
+    #[test]
+    fn a_family_is_the_text_with_its_values_taken_out() {
+        let fam = |sql: &str| literal_family(sql).map(|f| (f.text, f.values));
+        assert_eq!(
+            fam("select v from t where k = 5 and s = 'it''s'"),
+            Some((
+                "select v from t where k = $1 and s = $2".to_string(),
+                vec![Bson::Int32(5), Bson::String("it's".into())]
+            ))
+        );
+        // Typed as the scanner types the digits; a sign is the number's own
+        // only where a value is due and nothing else can claim it.
+        for (sql, text, value) in [
+            ("k = 2147483647", "k = $1", Bson::Int32(i32::MAX)),
+            ("k = 2147483648", "k = $1", Bson::Int64(2_147_483_648)),
+            ("k = -5", "k = $1", Bson::Int32(-5)),
+            ("k = -2147483648", "k = $1", Bson::Int64(-2_147_483_648)),
+            ("k in (-5)", "k in ($1)", Bson::Int32(-5)),
+            ("values (1, -5)", "values ($1, $2)", Bson::Int32(1)),
+            ("k =-5", "k =-$1", Bson::Int32(5)),
+            ("k !=-5", "k !=-$1", Bson::Int32(5)),
+            ("k - 5", "k - $1", Bson::Int32(5)),
+            ("k -5", "k -$1", Bson::Int32(5)),
+            ("k = - 5", "k = - $1", Bson::Int32(5)),
+            ("k = 007", "k = $1", Bson::Int32(7)),
+        ] {
+            let (t, v) = fam(sql).expect(sql);
+            assert_eq!((t.as_str(), &v[0]), (text, &value), "{sql}");
+        }
+        // A count stays in the text, and so does a name with digits in it.
+        assert_eq!(
+            fam("select c1 from t2 where \"k 9\" = 3 limit 10 offset 20"),
+            Some((
+                "select c1 from t2 where \"k 9\" = $1 limit 10 offset 20".to_string(),
+                vec![Bson::Int32(3)]
+            ))
+        );
+        // Nothing to take out, or not plainly readable: planned as before.
+        for sql in [
+            "select v from t",
+            "select v from t limit 5",
+            "select 1.5",
+            "select 1e5",
+            "select 0x10",
+            "select 1_000",
+            "select .5",
+            "select 99999999999999999999",
+            "select $1 + 5",
+            "select $$a$$, 5",
+            "select E'a', 5",
+            "select e'a', 5",
+            "select B'1', 5",
+            "select U&'a', 5",
+            "select 'a\\b', 5",
+            "select 'a'\n'b', 5",
+            "select 5 -- c",
+            "select 5 /* c */",
+            "select 5; select 6",
+            "select 'open, 5",
+            "select \"open, 5",
+        ] {
+            assert!(literal_family(sql).is_none(), "{sql}");
+        }
+        let many = |n: usize| format!("insert into t values ({})", vec!["1"; n].join(", "));
+        assert!(literal_family(&many(MAX_FAMILY_VALUES)).is_some());
+        assert!(literal_family(&many(MAX_FAMILY_VALUES + 1)).is_none());
+        // Written back, a value is a literal again.
+        let sql = "insert into t values (5, 'a', -7)";
+        let f = literal_family(sql).unwrap();
+        assert_eq!(
+            f.with_literals(
+                sql,
+                &[
+                    Bson::Int32(23_011),
+                    Bson::String(" S'x ".into()),
+                    Bson::Int64(9)
+                ]
+            )
+            .as_deref(),
+            Some("insert into t values (23011, ' S''x ', 9)")
+        );
+    }
+
+    #[test]
+    fn a_literal_is_taken_in_the_width_the_plan_holds() {
+        assert_eq!(
+            as_kinds_of(
+                &[Bson::Int32(5), Bson::String("a".into())],
+                &[Bson::Int64(1), Bson::String(String::new())]
+            ),
+            Some(vec![Bson::Int64(5), Bson::String("a".into())])
+        );
+        assert_eq!(as_kinds_of(&[Bson::Int64(5)], &[Bson::Int32(1)]), None);
+        assert_eq!(
+            as_kinds_of(&[Bson::Int32(5)], &[Bson::String(String::new())]),
+            None
+        );
+        assert_eq!(as_kinds_of(&[Bson::Int32(5)], &[]), None);
     }
 
     #[test]

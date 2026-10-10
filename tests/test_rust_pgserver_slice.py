@@ -9333,6 +9333,465 @@ def test_a_reused_plan_takes_each_executions_values(home: Path) -> None:
         assert q("select k, vc, n from pc_v order by k") == [(1, "cd", 6), (2, "a", 0), (3, "b", 0)]
 
 
+_GSE_SETUP = [
+    "DROP TABLE IF EXISTS gse_t CASCADE",
+    "CREATE TABLE gse_t (k int primary key, g text, z text, v int)",
+    "INSERT INTO gse_t VALUES (1, 'a', 'p', 1), (2, 'a', 'q', 2), (3, 'b', 'p', 3), (4, NULL, "
+    "'q', 4)",
+]
+_GSE_PG15: list[tuple[str, object]] = [
+    (
+        "SELECT 1 FROM gse_t GROUP BY CUBE (g, z)",
+        [(1,), (1,), (1,), (1,), (1,), (1,), (1,), (1,), (1,), (1,)],
+    ),
+    (
+        "SELECT 1 AS one, 'x' FROM gse_t GROUP BY ROLLUP (g)",
+        [(1, "x"), (1, "x"), (1, "x"), (1, "x")],
+    ),
+    (
+        "SELECT NULL FROM gse_t GROUP BY GROUPING SETS ((g), ())",
+        [(None,), (None,), (None,), (None,)],
+    ),
+    (
+        "SELECT 2, g FROM gse_t GROUP BY CUBE (g) ORDER BY 2",
+        [(2, "a"), (2, "b"), (2, None), (2, None)],
+    ),
+    (
+        "SELECT g || 'x' FROM gse_t GROUP BY CUBE (g) ORDER BY 1",
+        [("ax",), ("bx",), (None,), (None,)],
+    ),
+    (
+        "SELECT g || 'x', count(*) FROM gse_t GROUP BY CUBE (g) ORDER BY 1, 2",
+        [("ax", 2), ("bx", 1), (None, 1), (None, 4)],
+    ),
+    (
+        "SELECT coalesce(g, '-') || coalesce(z, '-') FROM gse_t GROUP BY CUBE (g, z) ORDER BY 1",
+        [("--",), ("--",), ("-p",), ("-q",), ("-q",), ("a-",), ("ap",), ("aq",), ("b-",), ("bp",)],
+    ),
+    (
+        "SELECT upper(g) FROM gse_t GROUP BY GROUPING SETS ((g), (z)) ORDER BY 1",
+        [("A",), ("B",), (None,), (None,), (None,)],
+    ),
+    (
+        "SELECT gse_t.g || 'x', length(g) FROM gse_t GROUP BY ROLLUP (gse_t.g) ORDER BY 1",
+        [("ax", 1), ("bx", 1), (None, None), (None, None)],
+    ),
+    (
+        "SELECT q.g || 'y' FROM gse_t q GROUP BY ROLLUP (q.g) ORDER BY 1",
+        [("ay",), ("by",), (None,), (None,)],
+    ),
+    (
+        "SELECT g, GROUPING(g), 7 FROM gse_t GROUP BY ROLLUP (g) ORDER BY 1, 2",
+        [("a", 0, 7), ("b", 0, 7), (None, 0, 7), (None, 1, 7)],
+    ),
+    (
+        "SELECT CASE WHEN g IS NULL THEN 'T' ELSE g END, sum(v) FROM gse_t GROUP BY ROLLUP (g) "
+        "ORDER BY 2, 1",
+        [("a", 3), ("b", 3), ("T", 4), ("T", 10)],
+    ),
+    (
+        "SELECT (SELECT 1), g FROM gse_t GROUP BY CUBE (g) ORDER BY 2",
+        [(1, "a"), (1, "b"), (1, None), (1, None)],
+    ),
+    ("SELECT v + 1 FROM gse_t GROUP BY CUBE (g)", "42803"),
+    ("SELECT v + count(*) FROM gse_t GROUP BY CUBE (g)", "42803"),
+    ("SELECT z FROM gse_t GROUP BY ROLLUP (g)", "42803"),
+    ("SELECT count(*) FROM (SELECT g, z, sum(v) s FROM gse_t GROUP BY CUBE (g, z)) q", [(10,)]),
+    (
+        "SELECT max(s), min(s) FROM (SELECT g, z, sum(v) s FROM gse_t GROUP BY CUBE (g, z)) q",
+        [(10, 1)],
+    ),
+    (
+        "SELECT g, count(*) FROM (SELECT g, z, sum(v) s FROM gse_t GROUP BY CUBE (g, z)) q "
+        "GROUP BY g ORDER BY 1",
+        [("a", 3), ("b", 2), (None, 5)],
+    ),
+    (
+        "SELECT g, (SELECT count(*) FROM (SELECT z FROM gse_t GROUP BY ROLLUP (z)) r) FROM gse_t "
+        "ORDER BY k",
+        [("a", 3), ("a", 3), ("b", 3), (None, 3)],
+    ),
+    (
+        "WITH q AS (SELECT g, z, sum(v) s FROM gse_t GROUP BY CUBE (g, z)) SELECT count(*) FROM q",
+        [(10,)],
+    ),
+    ("SELECT count(*) FROM (SELECT g FROM gse_t GROUP BY GROUPING SETS ((g), ())) q", [(4,)]),
+    ("SELECT EXISTS (SELECT 1 FROM gse_t GROUP BY ROLLUP (g) HAVING count(*) > 3)", [(True,)]),
+]
+_LF_SETUP = [
+    "DROP TABLE IF EXISTS lf_t, lf_w CASCADE",
+    "CREATE TABLE lf_t (k int primary key, b bigint, s smallint, t text, vc varchar(5), c "
+    "char(5), f float8, n numeric(10,2), d date, x bytea)",
+    "INSERT INTO lf_t SELECT i, i::bigint * 1000000000, i, 'v' || i, 'c' || i, 'h' || i, i + 0.5, "
+    "i + 0.25, date '2024-01-01' + i, ('x' || i)::bytea FROM generate_series(0, 11) i",
+    "INSERT INTO lf_t VALUES (-5, -5000000000, -5, 'neg', 'n', 'n', -5.5, -5.25, '2023-12-31', "
+    "'n'), (100, 2147483648, 100, 'it''s', ' sp ', ' sp ', 0, 0, NULL, NULL), (102, 3, 102, '5', "
+    "'5', '5', 5, 5, NULL, NULL)",
+    "CREATE TABLE lf_w (k int primary key, t text NOT NULL, i int CHECK (i < 1000), b bigint, vc "
+    "varchar(4), s smallint)",
+]
+_LF_PG15: list[tuple[str, object]] = [
+    ("SELECT t FROM lf_t WHERE k = 1", [("v1",)]),
+    ("SELECT t FROM lf_t WHERE k = 2", [("v2",)]),
+    ("SELECT t FROM lf_t WHERE k = 3", [("v3",)]),
+    ("SELECT t FROM lf_t WHERE k = 99", []),
+    ("SELECT t FROM lf_t WHERE k = -5", [("neg",)]),
+    ("SELECT t FROM lf_t WHERE k = 100", [("it's",)]),
+    ("SELECT t FROM lf_t WHERE k = 007", [("v7",)]),
+    ("SELECT t FROM lf_t WHERE k = 2147483647", []),
+    ("SELECT t FROM lf_t WHERE k = 2147483648", []),
+    ("SELECT t FROM lf_t WHERE k = -2147483648", []),
+    ("SELECT t FROM lf_t WHERE k = 9223372036854775807", []),
+    ("SELECT t FROM lf_t WHERE k = 9223372036854775808", []),
+    ("SELECT t FROM lf_t WHERE k = 5.0", [("v5",)]),
+    ("SELECT t FROM lf_t WHERE k = 5e0", [("v5",)]),
+    ("SELECT t FROM lf_t WHERE k = +5", [("v5",)]),
+    ("SELECT t FROM lf_t WHERE k = '5'", [("v5",)]),
+    ("SELECT t FROM lf_t WHERE k = 'x'", "22P02"),
+    ("SELECT t FROM lf_t WHERE k = NULL", []),
+    (
+        "SELECT t FROM lf_t WHERE k = k",
+        [
+            ("v0",),
+            ("v1",),
+            ("v2",),
+            ("v3",),
+            ("v4",),
+            ("v5",),
+            ("v6",),
+            ("v7",),
+            ("v8",),
+            ("v9",),
+            ("v10",),
+            ("v11",),
+            ("neg",),
+            ("it's",),
+            ("5",),
+        ],
+    ),
+    ("SELECT t FROM lf_t WHERE k = (5)", [("v5",)]),
+    ("SELECT t FROM lf_t WHERE k = -5", [("neg",)]),
+    (
+        "SELECT t FROM lf_t WHERE k !=1",
+        [
+            ("v0",),
+            ("v2",),
+            ("v3",),
+            ("v4",),
+            ("v5",),
+            ("v6",),
+            ("v7",),
+            ("v8",),
+            ("v9",),
+            ("v10",),
+            ("v11",),
+            ("neg",),
+            ("it's",),
+            ("5",),
+        ],
+    ),
+    (
+        "SELECT t FROM lf_t WHERE k !=2",
+        [
+            ("v0",),
+            ("v1",),
+            ("v3",),
+            ("v4",),
+            ("v5",),
+            ("v6",),
+            ("v7",),
+            ("v8",),
+            ("v9",),
+            ("v10",),
+            ("v11",),
+            ("neg",),
+            ("it's",),
+            ("5",),
+        ],
+    ),
+    (
+        "SELECT t FROM lf_t WHERE k !=3",
+        [
+            ("v0",),
+            ("v1",),
+            ("v2",),
+            ("v4",),
+            ("v5",),
+            ("v6",),
+            ("v7",),
+            ("v8",),
+            ("v9",),
+            ("v10",),
+            ("v11",),
+            ("neg",),
+            ("it's",),
+            ("5",),
+        ],
+    ),
+    ("SELECT t FROM lf_t WHERE k !=-5", "42883"),
+    (
+        "SELECT t FROM lf_t WHERE k != -5",
+        [
+            ("v0",),
+            ("v1",),
+            ("v2",),
+            ("v3",),
+            ("v4",),
+            ("v5",),
+            ("v6",),
+            ("v7",),
+            ("v8",),
+            ("v9",),
+            ("v10",),
+            ("v11",),
+            ("it's",),
+            ("5",),
+        ],
+    ),
+    ("SELECT k FROM lf_t WHERE k IN (1, 3) ORDER BY k", [(1,), (3,)]),
+    ("SELECT k FROM lf_t WHERE k IN (2, 3) ORDER BY k", [(2,), (3,)]),
+    ("SELECT k FROM lf_t WHERE k IN (4, 3) ORDER BY k", [(3,), (4,)]),
+    ("SELECT k FROM lf_t WHERE k IN (-5, 3) ORDER BY k", [(-5,), (3,)]),
+    ("SELECT k FROM lf_t WHERE k IN (3, 3) ORDER BY k", [(3,)]),
+    ("SELECT k FROM lf_t WHERE b = 1", []),
+    ("SELECT k FROM lf_t WHERE b = 2", []),
+    ("SELECT k FROM lf_t WHERE b = 3000000000", [(3,)]),
+    ("SELECT k FROM lf_t WHERE b = 3", [(102,)]),
+    ("SELECT k FROM lf_t WHERE b = -5000000000", [(-5,)]),
+    ("SELECT k FROM lf_t WHERE b = 2147483648", [(100,)]),
+    ("SELECT k FROM lf_t WHERE b = 9223372036854775808", []),
+    ("SELECT k FROM lf_t WHERE s = 1", [(1,)]),
+    ("SELECT k FROM lf_t WHERE s = 2", [(2,)]),
+    ("SELECT k FROM lf_t WHERE s = 3", [(3,)]),
+    ("SELECT k FROM lf_t WHERE s = 40000", []),
+    ("SELECT k FROM lf_t WHERE s = -5", [(-5,)]),
+    ("SELECT k FROM lf_t WHERE s = 3000000000", []),
+    ("SELECT k FROM lf_t WHERE t = 'v1'", [(1,)]),
+    ("SELECT k FROM lf_t WHERE t = 'v2'", [(2,)]),
+    ("SELECT k FROM lf_t WHERE t = 'v3'", [(3,)]),
+    ("SELECT k FROM lf_t WHERE t = 'V3'", []),
+    ("SELECT k FROM lf_t WHERE t = 'v3 '", []),
+    ("SELECT k FROM lf_t WHERE t = ''", []),
+    ("SELECT k FROM lf_t WHERE t = 'it''s'", [(100,)]),
+    ("SELECT k FROM lf_t WHERE t = '5'", [(102,)]),
+    ("SELECT k FROM lf_t WHERE t = 5", "42883"),
+    ("SELECT k FROM lf_t WHERE t = 'neg'", [(-5,)]),
+    ("SELECT k FROM lf_t WHERE t = E'v4'", [(4,)]),
+    ("SELECT k FROM lf_t WHERE t = 'v' 'x'", "42601"),
+    ("SELECT k FROM lf_t WHERE t = $$v5$$", [(5,)]),
+    ("SELECT k FROM lf_t WHERE t = NULL", []),
+    ("SELECT k FROM lf_t WHERE vc = 'c1'", [(1,)]),
+    ("SELECT k FROM lf_t WHERE vc = 'c2'", [(2,)]),
+    ("SELECT k FROM lf_t WHERE vc = 'c3'", [(3,)]),
+    ("SELECT k FROM lf_t WHERE vc = 'c3 '", []),
+    ("SELECT k FROM lf_t WHERE vc = ' sp '", [(100,)]),
+    ("SELECT k FROM lf_t WHERE vc = ' sp'", []),
+    ("SELECT k FROM lf_t WHERE vc = '5'", [(102,)]),
+    ("SELECT k FROM lf_t WHERE vc = 'toolong'", []),
+    ("SELECT k FROM lf_t WHERE c = 'h1'", [(1,)]),
+    ("SELECT k FROM lf_t WHERE c = 'h2'", [(2,)]),
+    ("SELECT k FROM lf_t WHERE c = 'h3'", [(3,)]),
+    ("SELECT k FROM lf_t WHERE c = 'h3 '", [(3,)]),
+    ("SELECT k FROM lf_t WHERE c = ' sp'", [(100,)]),
+    ("SELECT k FROM lf_t WHERE c = ' sp '", [(100,)]),
+    ("SELECT k FROM lf_t WHERE c = '5'", [(102,)]),
+    ("SELECT k FROM lf_t WHERE x = 'x1'", [(1,)]),
+    ("SELECT k FROM lf_t WHERE x = 'x2'", [(2,)]),
+    ("SELECT k FROM lf_t WHERE x = 'x3'", [(3,)]),
+    ("SELECT k FROM lf_t WHERE x = '\\x7833'", [(3,)]),
+    ("SELECT k FROM lf_t WHERE x = '\\xZZ'", "22023"),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 2", [(3,), (4,)]),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 1", [(3,)]),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 2", [(3,), (4,)]),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 3", [(3,), (4,), (5,)]),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 0", []),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 2 OFFSET 1", [(4,), (5,)]),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 2 OFFSET 2", [(5,), (6,)]),
+    ("SELECT k FROM lf_t WHERE k >= 3 ORDER BY k LIMIT 2 OFFSET 3", [(6,), (7,)]),
+    ("SELECT k FROM lf_t WHERE k = 4 % 3", [(1,)]),
+    ("SELECT k FROM lf_t WHERE k = 5 % 3", [(2,)]),
+    ("SELECT k FROM lf_t WHERE k = 6 % 3", [(0,)]),
+    ("INSERT INTO lf_w VALUES (1, 'a', 1, 1, 'a', 1)", "INSERT 0 1"),
+    ("INSERT INTO lf_w VALUES (2, 'a', 1, 1, 'a', 1)", "INSERT 0 1"),
+    ("INSERT INTO lf_w VALUES (3, 'a', 1, 1, 'a', 1)", "INSERT 0 1"),
+    ("INSERT INTO lf_w VALUES (3, 'a', 1, 1, 'a', 1)", "23505"),
+    ("INSERT INTO lf_w VALUES (-4, 'a', 1, 1, 'a', 1)", "INSERT 0 1"),
+    ("INSERT INTO lf_w VALUES (2147483648, 'a', 1, 1, 'a', 1)", "22003"),
+    ("INSERT INTO lf_w VALUES ('9', 'a', 1, 1, 'a', 1)", "INSERT 0 1"),
+    ("INSERT INTO lf_w VALUES (NULL, 'a', 1, 1, 'a', 1)", "23502"),
+    ("INSERT INTO lf_w (k, t, i) VALUES (31, 'a', 5)", "INSERT 0 1"),
+    ("INSERT INTO lf_w (k, t, i) VALUES (32, 'b', 6)", "INSERT 0 1"),
+    ("INSERT INTO lf_w (k, t, i) VALUES (33, 'c', 999)", "INSERT 0 1"),
+    ("INSERT INTO lf_w (k, t, i) VALUES (34, 'd', 1000)", "23514"),
+    ("INSERT INTO lf_w (k, t, i) VALUES (35, 'e', -7)", "INSERT 0 1"),
+    ("INSERT INTO lf_w (k, t, vc) VALUES (51, 'a', 'ab')", "INSERT 0 1"),
+    ("INSERT INTO lf_w (k, t, vc) VALUES (52, 'b', 'cd')", "INSERT 0 1"),
+    ("INSERT INTO lf_w (k, t, vc) VALUES (53, 'c', 'toolong')", "22001"),
+    ("INSERT INTO lf_w (k, t, vc) VALUES (54, 'd', 'abcd')", "INSERT 0 1"),
+    ("UPDATE lf_w SET i = 5 WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET i = 6 WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET i = 7 WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET i = 1000 WHERE k = 2", "23514"),
+    ("UPDATE lf_w SET i = -3 WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET i = 3000000000 WHERE k = 2", "22003"),
+    ("UPDATE lf_w SET i = i + 1 WHERE k = 3", "UPDATE 1"),
+    ("UPDATE lf_w SET i = i + 2 WHERE k = 3", "UPDATE 1"),
+    ("UPDATE lf_w SET i = i + 3 WHERE k = 3", "UPDATE 1"),
+    ("UPDATE lf_w SET i = i + 2000 WHERE k = 3", "23514"),
+    ("UPDATE lf_w SET vc = 'a' WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET vc = 'b' WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET vc = 'c' WHERE k = 2", "UPDATE 1"),
+    ("UPDATE lf_w SET vc = 'toolong' WHERE k = 2", "22001"),
+    ("DELETE FROM lf_w WHERE k = 61", "DELETE 0"),
+    ("DELETE FROM lf_w WHERE k = 62", "DELETE 0"),
+    ("DELETE FROM lf_w WHERE k = 64", "DELETE 0"),
+    ("DELETE FROM lf_w WHERE k = 999", "DELETE 0"),
+    (
+        "SELECT k, t, i, b, vc, s FROM lf_w WHERE k > -100 ORDER BY k",
+        [
+            (-4, "a", 1, 1, "a", 1),
+            (1, "a", 1, 1, "a", 1),
+            (2, "a", -3, 1, "c", 1),
+            (3, "a", 7, 1, "a", 1),
+            (9, "a", 1, 1, "a", 1),
+            (31, "a", 5, None, None, None),
+            (32, "b", 6, None, None, None),
+            (33, "c", 999, None, None, None),
+            (35, "e", -7, None, None, None),
+            (51, "a", None, None, "ab", None),
+            (52, "b", None, None, "cd", None),
+            (54, "d", None, None, "abcd", None),
+        ],
+    ),
+    (
+        "SELECT k, t, i, b, vc, s FROM lf_w WHERE k > -99 ORDER BY k",
+        [
+            (-4, "a", 1, 1, "a", 1),
+            (1, "a", 1, 1, "a", 1),
+            (2, "a", -3, 1, "c", 1),
+            (3, "a", 7, 1, "a", 1),
+            (9, "a", 1, 1, "a", 1),
+            (31, "a", 5, None, None, None),
+            (32, "b", 6, None, None, None),
+            (33, "c", 999, None, None, None),
+            (35, "e", -7, None, None, None),
+            (51, "a", None, None, "ab", None),
+            (52, "b", None, None, "cd", None),
+            (54, "d", None, None, "abcd", None),
+        ],
+    ),
+    (
+        "SELECT k, t, i, b, vc, s FROM lf_w WHERE k > -98 ORDER BY k",
+        [
+            (-4, "a", 1, 1, "a", 1),
+            (1, "a", 1, 1, "a", 1),
+            (2, "a", -3, 1, "c", 1),
+            (3, "a", 7, 1, "a", 1),
+            (9, "a", 1, 1, "a", 1),
+            (31, "a", 5, None, None, None),
+            (32, "b", 6, None, None, None),
+            (33, "c", 999, None, None, None),
+            (35, "e", -7, None, None, None),
+            (51, "a", None, None, "ab", None),
+            (52, "b", None, None, "cd", None),
+            (54, "d", None, None, "abcd", None),
+        ],
+    ),
+    ("SELECT t FROM lf_t WHERE k = 4", [("v4",)]),
+    ("ALTER TABLE lf_t RENAME COLUMN t TO tt", "ALTER TABLE"),
+    ("SELECT t FROM lf_t WHERE k = 5", "42703"),
+    ("SELECT tt FROM lf_t WHERE k = 5", [("v5",)]),
+    ("ALTER TABLE lf_t RENAME COLUMN tt TO t", "ALTER TABLE"),
+    ("SELECT t FROM lf_t WHERE k = 6", [("v6",)]),
+    ("SELECT k FROM lf_t WHERE s = 9", [(9,)]),
+    ("SELECT k FROM lf_t WHERE s = 10", [(10,)]),
+]
+
+
+def _answers(conn: psycopg.Connection, statements: list[str]) -> list[tuple[str, object]]:
+    """Each statement's rows, its command tag when it returns none, or its
+    SQLSTATE -- sent as text, with no parameters."""
+    out: list[tuple[str, object]] = []
+    for sql in statements:
+        try:
+            cur = conn.execute(sql)
+            out.append((sql, cur.fetchall() if cur.description else cur.statusmessage))
+        except psycopg.Error as e:
+            out.append((sql, e.sqlstate))
+    return out
+
+
+def test_an_unprepared_statement_takes_its_own_literals(home: Path) -> None:
+    """A statement sent with its values in its text is planned once per SHAPE
+    and afterwards reuses that plan with its own values put in
+    (`plan_cache::literal_family`). Every answer is PostgreSQL 15's
+    (`tools/probes/pg_corpora/literal_families.sql`): each shape runs twice
+    before the values that matter -- a sign, an int8, a quote, blanks, a
+    string for a number, an overflow, a CHECK -- and a renamed column is seen
+    by the next statement of a shape already learned."""
+    with _Server(home) as server, server.connect() as c:
+        for sql in _LF_SETUP:
+            c.execute(sql)
+        got = _answers(c, [sql for sql, _ in _LF_PG15])
+    assert [g for g in got if g not in _LF_PG15] == []
+    assert got == _LF_PG15
+
+
+def test_a_grouping_set_query_computes_expressions_over_its_keys(home: Path) -> None:
+    """Under GROUPING SETS / ROLLUP / CUBE a select-list expression with no
+    aggregate in it -- a constant, `g || 'x'` -- is computed from each output
+    row's keys, NULL where the row's set leaves one out; it was refused. An
+    aggregate over such a query in FROM was refused with it, because the outer
+    query needs none of the inner columns and the inner list becomes a
+    constant. A column that is not a key is 42803. PostgreSQL 15's answers
+    (`tools/probes/pg_corpora/grouping_set_exprs.sql`)."""
+    with _Server(home) as server, server.connect() as c:
+        for sql in _GSE_SETUP:
+            c.execute(sql)
+        got = _answers(c, [sql for sql, _ in _GSE_PG15])
+    assert [g for g in got if g not in _GSE_PG15] == []
+    assert got == _GSE_PG15
+
+
+def test_a_string_literal_compared_with_bytea_is_read_as_bytea(home: Path) -> None:
+    """`x = 'x1'` over a bytea column compares bytes, the literal read in
+    either input format; left a string it matched no row at all. A literal
+    that is not bytea input is PostgreSQL's 22023."""
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table by_t (k int primary key, x bytea)")
+        c.execute("insert into by_t values (1, 'x1'), (2, 'x2'), (3, '\\x00ff')")
+
+        def q(sql: str) -> list[tuple]:
+            return c.execute(sql).fetchall()
+
+        assert q("select k from by_t where x = 'x1'") == [(1,)]
+        assert q("select k from by_t where x = '\\x7832'") == [(2,)]
+        assert q("select k from by_t where x <> 'x1' order by k") == [(2,), (3,)]
+        assert q("select k from by_t where x > 'x1' order by k") == [(2,)]
+        assert q("select k from by_t where x in ('x1', '\\x00ff') order by k") == [(1,), (3,)]
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            c.execute("select k from by_t where x = '\\xZZ'")
+
+
+def test_a_lone_commands_syntax_error_counts_from_what_was_sent(home: Path) -> None:
+    """One command on its own is not parsed just to be split from its
+    neighbours; its syntax error is still PostgreSQL 15's, positioned in the
+    text as the client sent it and naming a stray `;`."""
+    with _Server(home) as server, server.connect() as c:
+
+        def err(sql: str) -> tuple[str | None, str | None, str | None]:
+            with pytest.raises(psycopg.errors.SyntaxError) as e:
+                c.execute(sql)
+            d = e.value.diag
+            return (d.sqlstate, d.message_primary, d.statement_position)
+
+        assert err("selct 1") == ("42601", 'syntax error at or near "selct"', "1")
+        assert err("  select 1 +") == ("42601", "syntax error at end of input", "13")
+        assert err("select 1 +;") == ("42601", 'syntax error at or near ";"', "11")
+        assert err("select * frm t;") == ("42601", 'syntax error at or near "frm"', "10")
+        assert c.execute("  select 4 ;  ").fetchall() == [(4,)]
+
+
 def test_a_reused_write_plan_stores_each_value_and_keeps_every_check(home: Path) -> None:
     """An INSERT's row and an UPDATE's SET are reused plans too (`plan_cache`),
     where the column takes any value of the parameter's kind: each execution

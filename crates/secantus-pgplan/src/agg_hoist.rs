@@ -93,7 +93,7 @@ fn bare_output_name(item: &pg_query::protobuf::Node, out_names: &[String]) -> bo
     }
 }
 
-fn contains_sublink(n: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn contains_sublink(n: &pg_query::protobuf::Node) -> bool {
     let mut found = false;
     let mut n = n.clone();
     let _ = walk_expr(&mut n, &mut |x| {

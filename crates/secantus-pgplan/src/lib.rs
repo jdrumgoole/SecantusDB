@@ -3553,6 +3553,32 @@ fn parse_error(e: pg_query::Error) -> Error {
     Error::Parse(m)
 }
 
+/// `sql` as its one command, when its bytes alone show it is one: nothing
+/// in it can end a command or hide one. `split_statements` runs the whole
+/// parser, and the command is parsed again to be planned, so this saves a
+/// parse on the statement most clients send -- one command, with or without
+/// its `;`.
+///
+/// No `;` anywhere means one command at most. A single trailing `;` is taken
+/// off only when the text has no quote or dollar sign, so that `;` cannot be
+/// inside a literal or an identifier. A text that could hold a comment goes
+/// to the parser, which is what knows a comment alone is no command at all.
+///
+/// A syntax error is then found by the parse that plans the command, which
+/// sees the command without its blanks and `;` -- so the caller, on a syntax
+/// error, asks `split_statements` for the error PostgreSQL reports (its
+/// position counts from the start of what the client sent, and a stray `;`
+/// is named).
+pub fn lone_command(sql: &str) -> Option<&str> {
+    let text = sql.trim();
+    let text = match text.strip_suffix(';') {
+        Some(rest) if !rest.contains(['\'', '"', '$']) => rest.trim_end(),
+        _ => text,
+    };
+    (!text.is_empty() && !text.contains(';') && !text.contains("--") && !text.contains("/*"))
+        .then_some(text)
+}
+
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     let parts = pg_query::split_with_parser(sql).map_err(parse_error)?;
     Ok(parts
@@ -3583,7 +3609,13 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     }
     func_cast::check_numeric_junk(sql)?;
     let tree = Arc::new(parse_guarded(sql)?.protobuf);
-    check_depth(&tree)?;
+    // A level of nesting costs at least a character of text (`- - - 1` is
+    // the densest: a level every two), so a statement this short is several
+    // times too small to reach the limit and is not walked to find out.
+    const TOO_SHORT_TO_NEST: usize = 512;
+    if sql.len() > TOO_SHORT_TO_NEST {
+        check_depth(&tree)?;
+    }
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= MAX_ENTRIES {
         guard.clear();
@@ -20125,7 +20157,17 @@ fn finish_aggregate(
                 if group_prints.iter().all(|p| *p != print) {
                     let mut rewritten = val.clone();
                     let mut slots: Vec<RowField> = Vec::new();
-                    if extract_aggregates(&mut rewritten, &def, &mut items, &mut slots, params)? {
+                    let has_aggregate =
+                        extract_aggregates(&mut rewritten, &def, &mut items, &mut slots, params)?;
+                    // Under GROUPING SETS an expression over the keys alone
+                    // (`g || 'x'`, a constant) is computed the same way, from
+                    // each output row's keys -- NULL where its set leaves a
+                    // key out. (A plain GROUP BY's is split off before here.)
+                    // Only where every key is a plain column: an expression
+                    // key (`rollup(upper(g))`) has no slot to be read from.
+                    let over_keys =
+                        grouping_sets.is_some() && group_by.iter().all(|k| k.expr.is_none());
+                    if has_aggregate || over_keys {
                         for (i, key) in group_by.iter().enumerate() {
                             let _ = i;
                             if key.expr.is_none() {
@@ -20134,6 +20176,29 @@ fn finish_aggregate(
                                     key.field.clone(),
                                     key.pg_type.clone(),
                                 ));
+                            }
+                        }
+                        // What is left reads the keys and the aggregates'
+                        // results; any other column is PostgreSQL's 42803.
+                        // (Told apart only where every key is a plain column
+                        // and no subquery brings names of its own.)
+                        if group_by.iter().all(|k| k.expr.is_none())
+                            && !agg_hoist::contains_sublink(&rewritten)
+                        {
+                            let read = rewritten.node.as_ref().map(|n| n.nodes());
+                            for (node, ..) in read.unwrap_or_default() {
+                                let pg_query::NodeRef::ColumnRef(c) = node else {
+                                    continue;
+                                };
+                                let known = column_ref_name(c)
+                                    .is_some_and(|n| slots.iter().any(|(name, ..)| *name == n));
+                                if !known {
+                                    return Err(Error::Grouping(format!(
+                                        "column \"{}\" must appear in the GROUP BY clause \
+                                         or be used in an aggregate function",
+                                        grouping_error_name(c, s)
+                                    )));
+                                }
                             }
                         }
                         let mut sample = Document::new();
@@ -34103,7 +34168,7 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         Some("jsonb") => Err(Error::Unsupported("a jsonb comparison".into())),
         Some(
             ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
-            | "timestamptz" | "interval" | "oid" | "money"),
+            | "timestamptz" | "interval" | "oid" | "money" | "bytea"),
         ) => cast_value(value, ty),
         // A date is stored as its text, but the literal is read AS a date
         // first: `d < '2020-01-01 10:00'` compares with `2020-01-01`.

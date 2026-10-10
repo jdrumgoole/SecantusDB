@@ -3015,14 +3015,21 @@ These work end-to-end but cut corners.
       (binaries and crates), and `rust_pg.html` was rewritten against the
       released macOS binary, each claim checked by a probe of 68 statements.
       The page's performance table is the `bb904163` measurement below, not
-      re-measured on the release. The probe found one refusal:
+      re-measured on the release. The probe found one refusal, fixed
+      2026-10-10: an aggregate over a `CUBE` / `ROLLUP` / `GROUPING SETS`
+      query in FROM. The subquery was not the cause. The outer query needs
+      none of the inner columns, so the inner list is pruned to a constant,
+      and under grouping sets ANY select-list expression with no aggregate
+      in it (`select 1 ... group by cube (g)`, `g || 'x'`) was refused.
+      `tools/probes/pg_corpora/grouping_set_exprs.sql` against PostgreSQL
+      15.19 is 2 of 25, both left open:
 
-      - [ ] **RUST PG server: a `GROUP BY CUBE` / `ROLLUP` / `GROUPING SETS`
-            query inside a FROM subquery is refused.** `select count(*) from
-            (select g, z, sum(v) s from w group by cube(g, z)) q` answers
-            `0A000 this target is not supported yet` on 0.1.0-beta.7; the
-            inner query alone works, and so does a plain `GROUP BY g` in the
-            same position. Not compared with PostgreSQL beyond that.
+      - [ ] **RUST PG server, grouping sets: a HAVING term over a key, and
+            an expression over an expression key, are refused (0A000).**
+            `select g, count(*) from t group by rollup (g) having g || 'x' =
+            'ax'` and `select upper(g) || 'x' from t group by rollup
+            (upper(g))`. The second is kept refused on purpose: computing it
+            from the keys answered `42703 column "g" does not exist`.
 
       The third has only its measurement, taken on a DigitalOcean `c-16`,
       ext4, PostgreSQL 16 defaults, a release build of `bb904163` (PR
@@ -3033,7 +3040,52 @@ These work end-to-end but cut corners.
       against 2,832 / 9,193 / 14,350; select by PK, 12,259 / 42,358 / 58,602
       against 9,654 / 32,339 / 41,181.
 
-      3. **Reads.** Same droplet and build, server CPU per statement by
+      3. **Reads: the unprepared statement, DONE 2026-10-10 (measured on the
+         development Mac only; the droplet figures below are the BEFORE).**
+         A `sample` of the server here gave a different picture from the
+         droplet profile: of one statement's time, 52% was
+         `learn_plan_template` (a parse of its own and two more full plans,
+         for a text that never came again), 37% the plan that runs (a third
+         of that libpg_query's protobuf pack) and 8% execution; splitting the
+         one command from its neighbours was another parse on top.
+         Three changes: a template is learned on a statement's second
+         planning; one command alone is not parsed to be split; and an
+         unprepared statement is looked up by its text with the integer and
+         plain string literals taken out (`plan_cache::literal_family`), so
+         the second `where k = <n>` learns a plan and the third reuses it.
+         `bench/pg_statement_cost.py` has a `select_row_var` stage for it
+         (a different literal every statement): 118.1 us before, 80 with
+         the first two changes, 43.0 with all three, against PostgreSQL
+         15.19's 41.8 and 42.1 for the same text repeated.
+         `tools/probes/pg_corpora/literal_families.sql` (252 statements,
+         each shape run twice before the values that matter) is 0
+         divergences with `--types`.
+
+         What it leaves:
+         - a statement whose shape is not templated still pays one parse,
+           and 70% of a parse is libpg_query packing its tree to protobuf
+           (`protobuf_c_message_pack` walks all ~270 alternatives of the
+           `Node` oneof for every node, twice). Not ours to change, and
+           `pg_query` 6.2 has no parse that skips it;
+         - a decimal or exponent literal, a negative number written against
+           its operator (`k =-5`), a string with a backslash or an `E''`
+           prefix: not taken out, planned every time;
+         - the plan cache is per connection and holds 256 entries, cleared
+           whole when full;
+         - NOT re-measured on Linux. The droplet numbers below predate all
+           of this.
+
+         Found on the way, pre-existing and open:
+         - [ ] **RUST PG server: a table in `public` is found with `public`
+               off the `search_path`.** `set search_path to pg_catalog;
+               select t from zq` returns rows; PostgreSQL 15 answers 42P01.
+         - [ ] **RUST PG server: `select 'abc` (unterminated string) has no
+               error position.** PostgreSQL 15 sends position 8.
+         Fixed on the way: a string literal compared with a `bytea` column
+         matched no row.
+
+         The measurement that opened this, kept as the BEFORE: same
+         droplet and build, server CPU per statement by
          `perf stat -p` (PostgreSQL: the connection's backend), 30,000
          statements over a 1,000-row table, two passes within 2%:
 
