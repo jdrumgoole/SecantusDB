@@ -3022,14 +3022,28 @@ These work end-to-end but cut corners.
       and under grouping sets ANY select-list expression with no aggregate
       in it (`select 1 ... group by cube (g)`, `g || 'x'`) was refused.
       `tools/probes/pg_corpora/grouping_set_exprs.sql` against PostgreSQL
-      15.19 is 2 of 25, both left open:
+      15.19 was 2 of 25, both fixed 2026-10-10: a HAVING term over a key,
+      and an expression over an expression key (`rollup (upper(g))`). The
+      planner's split of a grouped query into an inner grouping and an
+      outer computation (`agg_hoist::split_expressions`) refused grouping
+      sets; it takes them now, with `GROUPING()` computed by the inner
+      query. The corpus is 3 of 45, each left open:
 
-      - [ ] **RUST PG server, grouping sets: a HAVING term over a key, and
-            an expression over an expression key, are refused (0A000).**
-            `select g, count(*) from t group by rollup (g) having g || 'x' =
-            'ax'` and `select upper(g) || 'x' from t group by rollup
-            (upper(g))`. The second is kept refused on purpose: computing it
-            from the keys answered `42703 column "g" does not exist`.
+      - [ ] **RUST PG server: a parenthesised step inside `ROLLUP` / `CUBE`
+            is refused with a wrong 42803.** `group by rollup ((g, z), v)`
+            answers `column "gse_t.g" must appear in the GROUP BY clause`.
+            `GroupElement::Rollup` holds single keys; a step of several
+            needs a list of lists. (`GROUP BY (a, b)` on its own works.)
+      - [ ] **RUST PG server: a grouped query's subquery cannot name the
+            outer table by its own name.** `select g, (select max(v) from t i
+            where i.g = t.g) from t group by g` is `42P01 invalid reference
+            to FROM-clause entry for table "t"`; with an alias on the outer
+            table (`from t o ... o.g`) it works. Not a grouping-set matter:
+            the plain GROUP BY above fails the same way.
+      - [ ] **RUST PG server: a 42803 raised from HAVING names the column
+            without its table.** PostgreSQL writes `column "t.z" must
+            appear...`; the HAVING path writes `"z"` (`having_subject` has
+            no statement to take the qualifier from).
 
       The third has only its measurement, taken on a DigitalOcean `c-16`,
       ext4, PostgreSQL 16 defaults, a release build of `bb904163` (PR
@@ -3076,11 +3090,23 @@ These work end-to-end but cut corners.
            of this.
 
          Found on the way, pre-existing and open:
-         - [ ] **RUST PG server: a table in `public` is found with `public`
-               off the `search_path`.** `set search_path to pg_catalog;
-               select t from zq` returns rows; PostgreSQL 15 answers 42P01.
-         - [ ] **RUST PG server: `select 'abc` (unterminated string) has no
-               error position.** PostgreSQL 15 sends position 8.
+         Both fixed 2026-10-10: a relation in `public` named bare with
+         `public` off the `search_path` is 42P01, read or written (it WAS
+         written: `insert` / `update` / `delete` went through), and an
+         unterminated string, identifier or comment has its error position.
+         `tools/probes/pg_corpora/search_path_public.sql` is 2 of 37. Left:
+         - [ ] **RUST PG server: with `public` off the `search_path`, a
+               relation of `public` is still found from a STRING and by
+               `DROP ... IF EXISTS`.** `select nextval('s')` and
+               `'t'::regclass` answer where PostgreSQL 15 says 42P01, and
+               `drop table if exists t` DROPS the table where PostgreSQL
+               skips it with a notice. The check is on the statement's
+               relation references (`schemas::hidden_in_public`); these
+               three resolve the name elsewhere.
+         - [ ] **RUST PG server: a syntax error from Parse (the extended
+               protocol) carries no position.** `selct 1` sent with
+               `prepare=True` has `P` unset; sent as a simple query it is 1.
+               Every syntax error, not only the unterminated ones.
          Fixed on the way: a string literal compared with a `bytea` column
          matched no row.
 

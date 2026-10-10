@@ -341,6 +341,13 @@ impl Slots<'_> {
             }
         }
         match n.node.as_mut() {
+            // `GROUPING(k)` is the grouped query's to answer, like an
+            // aggregate: the inner query computes it.
+            Some(N::GroupingFunc(_)) if stack.is_empty() => {
+                let slot = self.agg_slot(n);
+                *n = slot_ref(&self.alias, &slot);
+                return;
+            }
             Some(N::FuncCall(f)) if is_aggregate_call(f) && f.over.is_none() => {
                 if agg_is_ours(n, stack, &self.ours) {
                     let slot = self.agg_slot(n);
@@ -742,6 +749,26 @@ fn check_stray(
     Ok(())
 }
 
+/// The key expressions of one GROUP BY item: itself, or what a
+/// `ROLLUP` / `CUBE` / `GROUPING SETS` (nested or not) is made of.
+fn grouping_keys<'a>(g: &'a pg_query::protobuf::Node, out: &mut Vec<&'a pg_query::protobuf::Node>) {
+    match g.node.as_ref() {
+        Some(N::GroupingSet(set)) => {
+            for c in &set.content {
+                grouping_keys(c, out);
+            }
+        }
+        // `rollup ((a, b), c)`: a parenthesised pair is one step of two keys.
+        Some(N::RowExpr(r)) => {
+            for c in &r.args {
+                grouping_keys(c, out);
+            }
+        }
+        Some(_) => out.push(g),
+        None => {}
+    }
+}
+
 fn split_inner_with(
     s: &pg_query::protobuf::SelectStmt,
     force: bool,
@@ -764,9 +791,6 @@ fn split_inner_with(
         || !s.window_clause.is_empty()
         || has_window(s)
         || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
-        || s.group_clause
-            .iter()
-            .any(|g| matches!(g.node.as_ref(), Some(N::GroupingSet(_))))
     {
         return None;
     }
@@ -785,13 +809,24 @@ fn split_inner_with(
         inner_targets: Vec::new(),
         ungrouped: None,
     };
-    for (i, g) in s.group_clause.iter().enumerate() {
-        let slot = format!("__g{}", i + 1);
+    // Under `ROLLUP` / `CUBE` / `GROUPING SETS` the keys are the
+    // expressions the sets are made of; the inner query keeps the clause
+    // and yields each key once, NULL in a row whose set leaves it out.
+    let mut keys: Vec<&pg_query::protobuf::Node> = Vec::new();
+    for g in &s.group_clause {
+        grouping_keys(g, &mut keys);
+    }
+    for g in keys {
+        let print = node_print(g);
+        if slots.groups.iter().any(|(p, _, _)| *p == print) {
+            continue;
+        }
+        let slot = format!("__g{}", slots.groups.len() + 1);
         let col = match g.node.as_ref() {
             Some(N::ColumnRef(c)) => column_ref_name(c),
             _ => None,
         };
-        slots.groups.push((node_print(g), col, slot.clone()));
+        slots.groups.push((print, col, slot.clone()));
         slots.inner_targets.push(target(&slot, g.clone()));
     }
     let mut outer_targets = Vec::new();
