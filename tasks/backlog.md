@@ -4303,9 +4303,10 @@ These work end-to-end but cut corners.
 
 ### 3.1 Authentication
 
-- [ ] **RUST PG server: TLS is server-side only (landed 2026-10-10).**
-  `secantusd-pg --tls-cert-file C --tls-key-file K` (`PgBuilder::tls`,
-  `bind_tls`) offers TLS; `crates/secantus-pg/src/tls.rs`. Measured against
+- [ ] **RUST PG server: TLS has no channel binding, no client
+  certificates and no `pg_stat_ssl`.** The server side is in since
+  2026-10-10: `secantusd-pg --tls-cert-file C --tls-key-file K`
+  (`PgBuilder::tls`, `bind_tls`), `crates/secantus-pg/src/tls.rs`. Measured against
   PostgreSQL 15.19 with `ssl = on` and the same certificate
   (`require` / `verify-ca` / `verify-full` / a TLS 1.2 ceiling / `disable`,
   `SHOW ssl`, `RESET ALL`, `SET ssl` 55P02, SCRAM over TLS): the same. Open:
