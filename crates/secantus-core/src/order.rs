@@ -68,14 +68,18 @@ fn type_rank(v: &Bson) -> u8 {
 /// raise its own module's `Fallback`. Mirrors `ordering.py::_array_sort_value`.
 /// The value a SORT compares for `v`: an array's smallest element ascending,
 /// its largest descending ([`array_sort_value`]); any other value itself. An
-/// array with no usable representative is compared whole.
+/// EMPTY array has no element to stand for it and sorts below null, which
+/// `MinKey` stands in for here (measured 8.2.11, 2026-10-10: ascending
+/// `[], null, 46`; descending `46, null, []`). An array whose elements cannot
+/// be ordered is compared whole.
 pub fn sort_repr(v: Bson, descending: bool) -> Bson {
     if !matches!(v, Bson::Array(_)) {
         return v;
     }
     match array_sort_value(v.clone(), descending) {
-        Some(Bson::Undefined) | None => v,
+        Some(Bson::Undefined) => Bson::MinKey,
         Some(r) => r,
+        None => v,
     }
 }
 
