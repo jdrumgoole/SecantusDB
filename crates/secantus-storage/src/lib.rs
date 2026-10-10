@@ -1334,6 +1334,8 @@ struct IndexDesc {
     name: String,
     key_spec: Document,
     sparse: bool,
+    /// Hidden from the query planner; maintained like any other index.
+    hidden: bool,
     unique: bool,
     /// `prepareUnique` (set via `collMod`): enforce uniqueness on *new* writes
     /// (block dup inserts with 11000) while pre-existing duplicates are tolerated
@@ -10836,6 +10838,29 @@ impl Storage {
         })
     }
 
+    /// The indexes a QUERY may use: every index that is not hidden. A hidden
+    /// index is still maintained on every write and still enforces
+    /// uniqueness and TTL -- only the planner, sorts and hints pass it over,
+    /// as on mongod. Until 2026-10-10 `hidden` was recorded and ignored.
+    fn visible_indexes(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(String, Document, Document)>> {
+        let mut indexes = self.iter_indexes(session, db, coll)?;
+        indexes.retain(|(_, _, opts)| !opts.get_bool("hidden").unwrap_or(false));
+        Ok(indexes)
+    }
+
+    /// [`Self::index_descs`] without the hidden indexes (see
+    /// [`Self::visible_indexes`]).
+    fn planner_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
+        let mut descs = self.index_descs(session, db, coll)?;
+        descs.retain(|d| !d.hidden);
+        Ok(descs)
+    }
+
     /// Walk the registry for `(db, coll)`: `(name, key_spec, options)` per index.
     fn iter_indexes(
         &self,
@@ -11668,6 +11693,7 @@ impl Storage {
                     name,
                     key_spec,
                     sparse: opts.get_bool("sparse").unwrap_or(false),
+                    hidden: opts.get_bool("hidden").unwrap_or(false),
                     unique: opts.get_bool("unique").unwrap_or(false),
                     prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
                     partial,
@@ -14256,7 +14282,7 @@ impl Storage {
                 if s == ID_INDEX_NAME {
                     return Ok(ResolvedHint::IdIndex);
                 }
-                for (name, _k, _o) in self.iter_indexes(session, db, coll)? {
+                for (name, _k, _o) in self.visible_indexes(session, db, coll)? {
                     if &name == s {
                         return Ok(ResolvedHint::Named(name));
                     }
@@ -14278,7 +14304,7 @@ impl Storage {
                 if spec.len() == 1 && spec.get("_id").and_then(direction_of) == Some(1) {
                     return Ok(ResolvedHint::IdIndex);
                 }
-                for (name, key_spec, _o) in self.iter_indexes(session, db, coll)? {
+                for (name, key_spec, _o) in self.visible_indexes(session, db, coll)? {
                     if &key_spec == spec {
                         return Ok(ResolvedHint::Named(name));
                     }
@@ -14330,7 +14356,7 @@ impl Storage {
             ResolvedHint::Named(name) => {
                 let mut leading: Option<(String, i32)> = None;
                 let mut found: Option<(Document, Document)> = None;
-                for (n, key_spec, o) in self.iter_indexes(session, db, coll)? {
+                for (n, key_spec, o) in self.visible_indexes(session, db, coll)? {
                     if &n == name {
                         if let Some((f, dv)) = key_spec.iter().next() {
                             leading = Some((f.clone(), direction_of(dv).unwrap_or(1)));
@@ -14514,7 +14540,7 @@ impl Storage {
     ) -> Result<Option<(String, bool)>> {
         let inverted: Vec<(String, i32)> =
             sort_fields.iter().map(|(f, d)| (f.clone(), -d)).collect();
-        for (name, key_spec, opts) in self.iter_indexes(session, db, coll)? {
+        for (name, key_spec, opts) in self.visible_indexes(session, db, coll)? {
             if opts.get_bool("multikey").unwrap_or(false) {
                 continue;
             }
@@ -14725,7 +14751,7 @@ impl Storage {
         coll: &str,
         field: &str,
     ) -> Result<Option<(String, Geo2d)>> {
-        for desc in self.index_descs(session, db, coll)? {
+        for desc in self.planner_descs(session, db, coll)? {
             if let Some(g) = &desc.geo_2d {
                 if g.field == field {
                     return Ok(Some((desc.name.clone(), g.clone())));
@@ -14792,7 +14818,7 @@ impl Storage {
         coll: &str,
         field: &str,
     ) -> Result<Option<(String, GeoSphere)>> {
-        for desc in self.index_descs(session, db, coll)? {
+        for desc in self.planner_descs(session, db, coll)? {
             if let Some(g) = &desc.geo_sphere {
                 if g.field == field {
                     return Ok(Some((desc.name.clone(), g.clone())));
@@ -14890,7 +14916,7 @@ impl Storage {
         query: &Document,
     ) -> Result<Option<(String, i32, bool)>> {
         let mut compound_fallback: Option<(String, i32, bool)> = None;
-        for desc in self.index_descs(session, db, coll)? {
+        for desc in self.planner_descs(session, db, coll)? {
             if let Some(pf) = &desc.partial {
                 if !query_implies_partial(query, pf) {
                     continue;
@@ -14936,7 +14962,7 @@ impl Storage {
         coll: &str,
         name: &str,
     ) -> Result<Option<Document>> {
-        for desc in self.index_descs(session, db, coll)? {
+        for desc in self.planner_descs(session, db, coll)? {
             if desc.name == name {
                 return Ok(desc.partial.clone());
             }
@@ -15506,7 +15532,7 @@ impl Storage {
         coll: &str,
         name: &str,
     ) -> Result<Option<Document>> {
-        for (n, key_spec, _opts) in self.iter_indexes(session, db, coll)? {
+        for (n, key_spec, _opts) in self.visible_indexes(session, db, coll)? {
             if n == name {
                 return Ok(Some(key_spec));
             }
@@ -15532,7 +15558,7 @@ impl Storage {
     ) -> Result<Option<(String, Document)>> {
         let filter_fields: HashSet<&str> = filter.keys().map(|s| s.as_str()).collect();
         let mut best: Option<(String, Document)> = None;
-        for desc in self.index_descs(session, db, coll)? {
+        for desc in self.planner_descs(session, db, coll)? {
             if desc.sparse && !sparse_index_usable(&desc.key_spec, filter) {
                 continue;
             }
@@ -15658,7 +15684,7 @@ impl Storage {
         let eq_set: HashSet<&str> = eq_fields.keys().map(|s| s.as_str()).collect();
         let target = eq_set.len();
         let mut best: Option<(String, Document)> = None;
-        for desc in self.index_descs(session, db, coll)? {
+        for desc in self.planner_descs(session, db, coll)? {
             if desc.sparse && !sparse_index_usable(&desc.key_spec, filter) {
                 continue;
             }

@@ -232,7 +232,11 @@ fn haversine(lng_a: f64, lat_a: f64, lng_b: f64, lat_b: f64) -> f64 {
 
 fn within(doc: &Geometry<f64>, q: &QGeom) -> bool {
     match q {
-        QGeom::Planar(g) => doc.relate(g).is_within(),
+        // COVERED BY, not WITHIN: DE-9IM "within" leaves out a geometry that
+        // lies wholly on the boundary, so a point on a `$box` edge or corner
+        // was not found. mongod 8.2.11 includes it for `$box`, `$polygon` and
+        // a `$geometry` polygon alike, with or without an index.
+        QGeom::Planar(g) => doc.relate(g).is_coveredby(),
         // Every coordinate of the doc geometry must lie inside the cap (a Point
         // is one coord), matching `geo.geo_within`'s vertex test.
         QGeom::Sphere { lng, lat, rad } => doc
@@ -646,6 +650,11 @@ mod tests {
     fn box_contains_point() {
         let q = doc! {"$box": [[0.0, 0.0], [10.0, 10.0]]};
         assert!(within(xy(5.0, 5.0), q.clone()).unwrap());
+        // A point on an edge or a corner is inside, as on mongod.
+        assert!(within(xy(0.0, 0.0), q.clone()).unwrap());
+        assert!(within(xy(10.0, 5.0), q.clone()).unwrap());
+        assert!(within(xy(10.0, 10.0), q.clone()).unwrap());
+        assert!(!within(xy(10.0000001, 5.0), q.clone()).unwrap());
         assert!(!within(xy(50.0, 5.0), q).unwrap());
     }
 

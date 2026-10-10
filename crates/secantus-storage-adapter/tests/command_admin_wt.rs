@@ -438,8 +438,9 @@ fn collmod_index_expire_after_seconds_reflection() {
             c,
         );
         assert_eq!(r.get_f64("ok").unwrap(), 1.0);
-        assert_eq!(r.get_i32("expireAfterSeconds_old").unwrap(), 3);
-        assert_eq!(r.get_i32("expireAfterSeconds_new").unwrap(), 1000);
+        // Both are int64 on mongod 8.2.11 (this asserted int32 until 2026-10-10).
+        assert_eq!(r.get_i64("expireAfterSeconds_old").unwrap(), 3);
+        assert_eq!(r.get_i64("expireAfterSeconds_new").unwrap(), 1000);
         // Persisted: listIndexes reports the new expiry.
         let li = dispatch(&doc! {"listIndexes": "c"}, c);
         let idx = li
@@ -578,7 +579,9 @@ fn create_indexes_and_list() {
             c,
         );
         assert!(reply.get_bool("createdCollectionAutomatically").unwrap());
-        assert_eq!(reply.get_i32("numIndexesBefore").unwrap(), 0);
+        // The collection the build creates already has its `_id` index when
+        // mongod counts (this asserted 0 until 2026-10-10).
+        assert_eq!(reply.get_i32("numIndexesBefore").unwrap(), 1);
         assert_eq!(reply.get_i32("numIndexesAfter").unwrap(), 3);
         assert_eq!(index_names(c, "c"), vec!["_id_", "a_1", "b_-1"]);
     });
@@ -1623,4 +1626,396 @@ fn out_and_merge_report_a_validation_failure_with_its_details() {
             assert!(info.get_document("details").is_ok(), "{stage}: {reply}");
         }
     });
+}
+
+// --- index management: every expectation is what mongod 8.2.11 answered
+// --- (2026-10-10).
+
+fn create_index(c: &mut CommandContext, spec: Document) -> Document {
+    dispatch(&doc! {"createIndexes": "c", "indexes": [spec]}, c)
+}
+
+#[test]
+fn drop_indexes_never_drops_the_id_index() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1, "a": 1, "b": 1}]},
+            c,
+        );
+        for key in ["a", "b", "t"] {
+            create_index(c, doc! {"key": {key: 1}, "name": format!("{key}_1")});
+        }
+        for (cmd, code, msg) in [
+            // By key it used to be dropped.
+            (
+                doc! {"dropIndexes": "c", "index": {"_id": 1}},
+                72,
+                "cannot drop _id index",
+            ),
+            (
+                doc! {"dropIndexes": "c", "index": "_id_"},
+                72,
+                "cannot drop _id index",
+            ),
+            (
+                doc! {"dropIndexes": "c", "index": ["a_1", "_id_"]},
+                72,
+                "cannot drop _id index",
+            ),
+            (
+                doc! {"dropIndexes": "c", "index": ["a_1", "nope"]},
+                27,
+                "index not found with name [nope]",
+            ),
+            (
+                doc! {"dropIndexes": "c"},
+                40414,
+                "BSON field 'dropIndexes.index' is missing but a required field",
+            ),
+            (
+                doc! {"dropIndexes": "nosuch", "index": "*"},
+                26,
+                "ns not found t.nosuch",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        // Nothing was dropped by the refused lists.
+        assert_eq!(index_names(c, "c"), vec!["_id_", "a_1", "b_1", "t_1"]);
+        let reply = dispatch(&doc! {"dropIndexes": "c", "index": ["a_1", "b_1"]}, c);
+        assert_eq!(reply.get_i32("nIndexesWas").unwrap(), 4, "{reply}");
+        assert_eq!(index_names(c, "c"), vec!["_id_", "t_1"]);
+        let reply = dispatch(&doc! {"dropIndexes": "c", "index": "*"}, c);
+        assert_eq!(
+            reply.get_str("msg").unwrap(),
+            "non-_id indexes dropped for collection"
+        );
+        assert_eq!(index_names(c, "c"), vec!["_id_"]);
+    });
+}
+
+#[test]
+fn create_indexes_refuses_a_bad_spec_before_building_anything() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 1, "a": 1}, {"_id": 2, "a": 1}]},
+            c,
+        );
+        for (spec, code, msg) in [
+            (
+                doc! {"key": {"z": 0}, "name": "z_0"},
+                67,
+                "Error in specification { key: { z: 0 }, name: \"z_0\" } :: caused by :: Values \
+                 in the index key pattern cannot be 0.",
+            ),
+            (
+                doc! {"key": {"": 1}, "name": "ef"},
+                67,
+                "Error in specification { key: { : 1 }, name: \"ef\" } :: caused by :: Index \
+                 keys cannot be an empty field.",
+            ),
+            (
+                doc! {"key": {"$x": 1}, "name": "dx"},
+                67,
+                "Error in specification { key: { $x: 1 }, name: \"dx\" } :: caused by :: Index \
+                 key contains an illegal field name: field name starts with '$'.",
+            ),
+            (
+                doc! {"key": {"u": 1}, "bogus": true, "name": "u_1"},
+                197,
+                "Error in specification { key: { u: 1 }, bogus: true, name: \"u_1\" } :: caused \
+                 by :: The field 'bogus' is not valid for an index specification. Specification: \
+                 { key: { u: 1 }, bogus: true, name: \"u_1\" }",
+            ),
+            (
+                doc! {"key": {"n": 1}, "name": ""},
+                67,
+                "Error in specification { key: { n: 1 }, name: \"\", v: 2 } :: caused by :: \
+                 index name cannot be empty",
+            ),
+            (
+                doc! {"key": {"s": 1}, "name": "*"},
+                2,
+                "The index name '*' is not valid.",
+            ),
+            (
+                doc! {"key": {"_id": -1}, "name": "_id_-1"},
+                2,
+                "The field 'key' for an _id index must be {_id: 1}, but got { _id: -1 }",
+            ),
+            (
+                doc! {"key": {"_id": 1}, "name": "_id_", "sparse": true},
+                197,
+                "The field 'sparse' is not valid for an _id index specification. Specification: \
+                 { key: { _id: 1 }, name: \"_id_\", sparse: true, v: 2 }",
+            ),
+            (
+                doc! {"key": {"w": 1}, "expireAfterSeconds": -1, "name": "w_1"},
+                67,
+                ". Index spec: { key: { w: 1 }, expireAfterSeconds: -1, name: \"w_1\" } :: \
+                 caused by :: TTL index 'expireAfterSeconds' option cannot be less than 0",
+            ),
+            (
+                doc! {"key": {"w": 1, "a": 1}, "expireAfterSeconds": 10, "name": "w_1_a_1"},
+                67,
+                "TTL indexes are single-field indexes, compound indexes do not support TTL. \
+                 Index spec: { key: { w: 1, a: 1 }, expireAfterSeconds: 10, name: \"w_1_a_1\" }",
+            ),
+            (
+                doc! {"key": {"p": 1}, "sparse": true, "partialFilterExpression": {"a": 1},
+                "name": "p_1"},
+                67,
+                "Error in specification { key: { p: 1 }, sparse: true, partialFilterExpression: \
+                 { a: 1 }, name: \"p_1\", v: 2 } :: caused by :: cannot mix \
+                 \"partialFilterExpression\" and \"sparse\" options",
+            ),
+        ] {
+            let reply = create_index(c, spec.clone());
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{spec}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{spec}");
+        }
+        let empty = dispatch(&doc! {"createIndexes": "c", "indexes": []}, c);
+        assert_eq!(
+            empty.get_str("errmsg").unwrap(),
+            "Must specify at least one index to create"
+        );
+        // A bad spec after a good one builds neither, and creates no collection.
+        let reply = dispatch(
+            &doc! {"createIndexes": "fresh", "indexes": [
+            {"key": {"a": 1}, "name": "a_1"}, {"key": {"z": 0}, "name": "z_0"}]},
+            c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 67, "{reply}");
+        assert_eq!(
+            dispatch(&doc! {"listIndexes": "fresh"}, c)
+                .get_i32("code")
+                .unwrap(),
+            26
+        );
+        assert_eq!(index_names(c, "c"), vec!["_id_"]);
+
+        // A number is a boolean: `unique: 1` is unique, and these duplicate.
+        let reply = create_index(c, doc! {"key": {"a": 1}, "name": "a_1", "unique": 1_i32});
+        assert_eq!(reply.get_i32("code").unwrap(), 11000, "{reply}");
+        // The `_id` index under another name already exists.
+        let reply = create_index(c, doc! {"key": {"_id": 1}, "name": "myid"});
+        assert_eq!(
+            reply.get_str("note").unwrap(),
+            "all indexes already exist",
+            "{reply}"
+        );
+        assert!(!reply.contains_key("createdCollectionAutomatically"));
+        // A collection created by the build counts its `_id` index as before.
+        let reply = dispatch(
+            &doc! {"createIndexes": "fresh", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+            c,
+        );
+        assert_eq!(
+            (
+                reply.get_i32("numIndexesBefore").unwrap(),
+                reply.get_i32("numIndexesAfter").unwrap()
+            ),
+            (1, 2)
+        );
+        assert!(reply.get_bool("createdCollectionAutomatically").unwrap());
+    });
+}
+
+#[test]
+fn coll_mod_hides_an_index_and_says_what_changed() {
+    with_wt(|c| {
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1, "a": 1}]}, c);
+        create_index(c, doc! {"key": {"a": 1}, "name": "a_1"});
+        create_index(
+            c,
+            doc! {"key": {"w": 1}, "name": "w_1", "expireAfterSeconds": 3600_i32},
+        );
+        let hide = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "a_1", "hidden": true}},
+            c,
+        );
+        assert_eq!(
+            hide,
+            doc! {"hidden_old": false, "hidden_new": true, "ok": 1.0}
+        );
+        // Already hidden: nothing to report.
+        let again = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "a_1", "hidden": true}},
+            c,
+        );
+        assert_eq!(again, doc! {"ok": 1.0});
+        let show = dispatch(
+            &doc! {"collMod": "c", "index": {"keyPattern": {"a": 1}, "hidden": false}},
+            c,
+        );
+        assert_eq!(
+            show,
+            doc! {"hidden_old": true, "hidden_new": false, "ok": 1.0}
+        );
+        let ttl = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "w_1", "expireAfterSeconds": 60_i32}},
+            c,
+        );
+        assert_eq!(
+            ttl,
+            doc! {"expireAfterSeconds_old": 3600_i64, "expireAfterSeconds_new": 60_i64, "ok": 1.0}
+        );
+        let first = dispatch(
+            &doc! {"collMod": "c", "index": {"name": "a_1", "expireAfterSeconds": 60_i32}},
+            c,
+        );
+        assert_eq!(first, doc! {"expireAfterSeconds_new": 60_i64, "ok": 1.0});
+        for (index, code, msg) in [
+            (
+                doc! {"name": "_id_", "hidden": true},
+                2,
+                "can't hide _id index",
+            ),
+            (
+                doc! {"name": "nope", "hidden": true},
+                27,
+                "cannot find index nope for ns t.c",
+            ),
+            (
+                doc! {"hidden": true},
+                72,
+                "Must specify either index name or key pattern.",
+            ),
+            (
+                doc! {"name": "a_1"},
+                72,
+                "no expireAfterSeconds, hidden, unique, or prepareUnique field",
+            ),
+        ] {
+            let reply = dispatch(&doc! {"collMod": "c", "index": index.clone()}, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{index}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{index}");
+        }
+    });
+}
+
+fn winning_stage(c: &mut CommandContext, find: Document) -> String {
+    let reply = dispatch(&doc! {"explain": find, "verbosity": "queryPlanner"}, c);
+    let mut plan = reply
+        .get_document("queryPlanner")
+        .unwrap()
+        .get_document("winningPlan")
+        .unwrap()
+        .clone();
+    // The scan is the innermost stage.
+    while let Ok(inner) = plan.get_document("inputStage").cloned() {
+        plan = inner;
+    }
+    plan.get_str("stage").unwrap().to_string()
+}
+
+/// A hidden index is passed over by the planner, by sorts and by hints, and
+/// still enforces uniqueness (mongod 8.2.11).
+#[test]
+fn a_hidden_index_is_not_used_by_queries_but_still_enforced() {
+    with_wt(|c| {
+        let docs: Vec<Bson> = (0..20_i32)
+            .map(|i| Bson::Document(doc! {"_id": i, "a": i, "u": i}))
+            .collect();
+        dispatch(&doc! {"insert": "c", "documents": docs}, c);
+        create_index(c, doc! {"key": {"a": 1}, "name": "a_1"});
+        create_index(c, doc! {"key": {"u": 1}, "name": "u_1", "unique": true});
+        let by_a = doc! {"find": "c", "filter": {"a": 5}};
+        assert_eq!(winning_stage(c, by_a.clone()), "IXSCAN");
+        for name in ["a_1", "u_1"] {
+            dispatch(
+                &doc! {"collMod": "c", "index": {"name": name, "hidden": true}},
+                c,
+            );
+        }
+        assert_eq!(winning_stage(c, by_a.clone()), "COLLSCAN");
+        assert_eq!(
+            winning_stage(c, doc! {"find": "c", "filter": {"a": {"$gt": 5}}}),
+            "COLLSCAN"
+        );
+        assert_eq!(
+            winning_stage(c, doc! {"find": "c", "sort": {"a": 1}}),
+            "COLLSCAN"
+        );
+        // Same answer, with or without the index.
+        assert_eq!(view_ids(c, by_a.clone()), vec![5]);
+        // A hint naming it is a hint naming no index.
+        for hint in [Bson::String("a_1".into()), Bson::Document(doc! {"a": 1})] {
+            let reply = dispatch(&doc! {"find": "c", "filter": {"a": 5}, "hint": hint}, c);
+            assert_eq!(reply.get_i32("code").unwrap(), 2, "{reply}");
+        }
+        let reply = dispatch(
+            &doc! {"update": "c", "updates": [{"q": {"a": 5}, "u": {"$set": {"z": 1}}, "hint": "a_1"}]},
+            c,
+        );
+        assert_eq!(reply.get_array("writeErrors").unwrap().len(), 1, "{reply}");
+        // Uniqueness is still enforced through the hidden index.
+        let reply = dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 100, "u": 3}]},
+            c,
+        );
+        let errors = reply.get_array("writeErrors").unwrap();
+        assert_eq!(
+            errors[0].as_document().unwrap().get_i32("code").unwrap(),
+            11000
+        );
+        // A new document is indexed while hidden, so unhiding finds it.
+        dispatch(
+            &doc! {"insert": "c", "documents": [{"_id": 200, "a": 77, "u": 77}]},
+            c,
+        );
+        dispatch(
+            &doc! {"collMod": "c", "index": {"name": "a_1", "hidden": false}},
+            c,
+        );
+        assert_eq!(winning_stage(c, by_a), "IXSCAN");
+        assert_eq!(
+            view_ids(c, doc! {"find": "c", "filter": {"a": 77}}),
+            vec![200]
+        );
+        let listed = dispatch(&doc! {"listIndexes": "c"}, c).to_string();
+        assert!(!listed.contains("\"hidden\": false"), "{listed}");
+    });
+}
+
+/// A point on the boundary of a `$geoWithin` box or polygon is inside it
+/// (mongod 8.2.11, every shape, with and without an index).
+#[test]
+fn geo_within_includes_points_on_the_boundary() {
+    for index in [None, Some("2d"), Some("2dsphere")] {
+        with_wt(|c| {
+            let points = [
+                (0, [1, 1]),
+                (1, [0, 0]),
+                (2, [2, 2]),
+                (3, [1, 0]),
+                (4, [2, 1]),
+                (5, [3, 1]),
+            ];
+            let docs: Vec<Bson> = points
+                .iter()
+                .map(|(id, p)| Bson::Document(doc! {"_id": *id, "loc": [p[0], p[1]]}))
+                .collect();
+            dispatch(&doc! {"insert": "c", "documents": docs}, c);
+            if let Some(kind) = index {
+                create_index(c, doc! {"key": {"loc": kind}, "name": "loc"});
+            }
+            let square = bson::bson!([[0, 0], [2, 0], [2, 2], [0, 2]]);
+            let ring = bson::bson!([[[0, 0], [2, 0], [2, 2], [0, 2], [0, 0]]]);
+            for shape in [
+                doc! {"$box": [[0, 0], [2, 2]]},
+                doc! {"$polygon": square.clone()},
+                doc! {"$geometry": {"type": "Polygon", "coordinates": ring.clone()}},
+            ] {
+                let mut ids = view_ids(
+                    c,
+                    doc! {"find": "c", "filter": {"loc": {"$geoWithin": shape.clone()}}},
+                );
+                ids.sort();
+                assert_eq!(ids, vec![0, 1, 2, 3, 4], "{shape} index={index:?}");
+            }
+        });
+    }
 }

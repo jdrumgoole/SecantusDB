@@ -8704,6 +8704,41 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.067 Index management -- 2026-10-10
+
+`tools/probes/index_admin.py`, mongod 8.2.11: the Rust server went from 68
+of 87 results different to 9. Seven are `text` / `hashed` indexes (out of
+scope) and the index counts that follow from not building them.
+
+- [ ] **RUST MongoDB server: `$near` runs without a geo index.** `mongod`
+      8.2.11 refuses (291, `unable to find index for $geoNear query`), which
+      is also what it answers when the only geo index is hidden; the Rust
+      server sorts by distance with no index. Lenient, not wrong data.
+- [ ] **RUST MongoDB server: a hint that names no usable index is worded
+      differently.** Same code (2) as `mongod`, whose message is a dump of
+      the query tree ending `hint provided does not correspond to an existing
+      index`; ours is `hint "a_1" does not correspond to an existing index`.
+- [ ] **PYTHON MongoDB server: `$geoWithin` leaves out points on the
+      boundary** of a `$box`, `$polygon` or `$geometry` polygon (Shapely
+      `within`); `mongod` 8.2.11 includes them. The Rust engine was moved
+      2026-10-10. The parity corpus has no boundary point, so the suite did
+      not notice. Hidden indexes on the Python server were not probed.
+- [ ] **RUST MongoDB server: a `partialFilterExpression` with an operator
+      mongod does not allow is accepted.** `{a: {$ne: 1}}` is 67 on `mongod`
+      8.2.11, `Expression not supported in partial index: $not` followed by a
+      rendering of the expression tree.
+- [ ] **RUST MongoDB server: an index `collation` is neither checked nor
+      expanded.** `{locale: "zz_nope"}` is accepted (`mongod`: 2, `Field
+      'locale' is invalid`), and `listIndexes` echoes the collation as given
+      where `mongod` fills in every default and a `version`.
+- [ ] **RUST MongoDB server: `listIndexes` is in name order after `_id_`.**
+      `mongod` lists in creation order. The storage layer keeps no creation
+      order for indexes.
+- [ ] **PYTHON MongoDB server: 69 of 87 index-management results differ from
+      `mongod`** (same probe). Not changed, and not read through: check
+      whether `dropIndexes` with the key `{_id: 1}` drops the `_id` index
+      there too.
+
 ### 7.066 Views and `$count` -- 2026-10-09
 
 `tools/probes/views.py`, mongod 8.2.11: the Rust server went from 52 of 70

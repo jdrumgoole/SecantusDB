@@ -624,28 +624,66 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 })
                 .cloned()
         } else {
-            None
-        };
-        let Some(target) = target else {
             return Ok(CommandError::new(
-                27,
-                "IndexNotFound",
-                format!("cannot find index for ns {}.{}", ctx.db_name, coll),
+                72,
+                "InvalidOptions",
+                "Must specify either index name or key pattern.",
             )
             .into_reply());
         };
+        let Some(target) = target else {
+            let wanted = match index_spec.get("name") {
+                Some(Bson::String(n)) => n.clone(),
+                _ => index_spec
+                    .get("keyPattern")
+                    .map(argtypes::render_stage_value)
+                    .unwrap_or_default(),
+            };
+            return Ok(CommandError::new(
+                27,
+                "IndexNotFound",
+                format!("cannot find index {wanted} for ns {}.{}", ctx.db_name, coll),
+            )
+            .into_reply());
+        };
+        if !["expireAfterSeconds", "hidden", "unique", "prepareUnique"]
+            .iter()
+            .any(|f| index_spec.contains_key(*f))
+        {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                "no expireAfterSeconds, hidden, unique, or prepareUnique field",
+            )
+            .into_reply());
+        }
         let target_name = target.get_str("name").unwrap_or("").to_string();
-        // `expireAfterSeconds` retunes a TTL index: echo the old/new expiry and
-        // persist the new one. Mirrors commands.py::_coll_mod.
+        // `hidden` was accepted and ignored: the reply said ok and the index
+        // stayed as it was. The reply names the change only when there is one.
+        if let Some(hide) = index_spec.get("hidden").and_then(Bson::as_bool) {
+            if target_name == "_id_" {
+                return Ok(CommandError::new(2, "BadValue", "can't hide _id index").into_reply());
+            }
+            let hidden = target.get_bool("hidden").unwrap_or(false);
+            if hidden != hide {
+                reply.insert("hidden_old", hidden);
+                reply.insert("hidden_new", hide);
+                storage
+                    .set_index_options(&ctx.db_name, &coll, &target_name, &doc! {"hidden": hide})
+                    .map_err(command_error)?;
+            }
+        }
         if let Some(new_expiry) = index_spec.get("expireAfterSeconds") {
+            // Both as int64, and no `_old` for an index that had no TTL.
+            if let Some(old) = target.get("expireAfterSeconds").and_then(as_i64) {
+                reply.insert("expireAfterSeconds_old", old);
+            }
             reply.insert(
-                "expireAfterSeconds_old",
-                target
-                    .get("expireAfterSeconds")
-                    .cloned()
-                    .unwrap_or(Bson::Null),
+                "expireAfterSeconds_new",
+                as_i64(new_expiry)
+                    .map(Bson::Int64)
+                    .unwrap_or(new_expiry.clone()),
             );
-            reply.insert("expireAfterSeconds_new", new_expiry.clone());
             storage
                 .set_index_options(
                     &ctx.db_name,
@@ -1435,6 +1473,16 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // `_id_` is always listed first, as on mongod. The rest come back in name
+    // order here (mongod: creation order), which put an index named `$**_1`
+    // or `A_1` ahead of it.
+    indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
+    // `hidden` is listed only on an index that is hidden.
+    for ix in &mut indexes {
+        if ix.get_bool("hidden") == Ok(false) {
+            ix.remove("hidden");
+        }
+    }
     // A collection that exists always has at least the synthesised `_id_` index, so
     // an empty result means the namespace doesn't exist — mongod errors
     // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
@@ -1675,6 +1723,41 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         }
     }
 
+    // A number is a boolean to an index option: `unique: 1` is a unique
+    // index. It used to be read as "not unique".
+    let specs: Vec<Bson> = specs
+        .into_iter()
+        .map(|spec| match spec {
+            Bson::Document(mut s) => {
+                for flag in ["unique", "sparse", "hidden", "background"] {
+                    if let Some(n) = s.get(flag).and_then(|v| match v {
+                        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => as_i64(v),
+                        _ => None,
+                    }) {
+                        s.insert(flag, n != 0);
+                    }
+                }
+                Bson::Document(s)
+            }
+            other => other,
+        })
+        .collect();
+    // Every spec is checked before anything is created: an invalid spec used
+    // to leave the collection, and the specs before it, created.
+    if specs.is_empty() {
+        return Ok(
+            CommandError::new(2, "BadValue", "Must specify at least one index to create")
+                .into_reply(),
+        );
+    }
+    for spec in &specs {
+        if let Bson::Document(s) = spec {
+            if let Some(problem) = index_spec_problem(s) {
+                return Ok(problem.into_reply());
+            }
+        }
+    }
+
     let before = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?
@@ -1688,6 +1771,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
     let mut any_created = false;
+    let mut any_existed = false;
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         let key = s
@@ -1700,6 +1784,12 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // be ACCEPTED: an empty key built an index over nothing, and a missing
         // name was invented from the key.
         let spec_text = argtypes::render_stage_value(&Bson::Document(s.clone()));
+        // The `_id` index always exists, under its own name: asking for it
+        // again, whatever the request calls it, creates nothing.
+        if key.len() == 1 && key.get("_id").and_then(as_i64) == Some(1) {
+            any_existed = true;
+            continue;
+        }
         if key.is_empty() {
             return Ok(CommandError::new(
                 67,
@@ -1858,25 +1948,214 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             Err(e) => return Err(command_error(e)),
         };
         any_created |= created;
+        any_existed |= !created;
     }
 
     let after = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?
         .len();
+    // mongod's reply, in its order: the two counts, whether the collection
+    // was created (left out when nothing was built), the commit quorum a
+    // replica-set member reports, and the no-op note.
+    let all_existed = !any_created && !specs.is_empty();
+    // A collection created here already has its `_id` index when counted.
+    let before = if created_coll { before.max(1) } else { before };
     let mut reply = doc! {
-        "createdCollectionAutomatically": created_coll,
         "numIndexesBefore": before as i32,
         "numIndexesAfter": after as i32,
-        "ok": 1.0,
     };
+    if !all_existed {
+        reply.insert("createdCollectionAutomatically", created_coll);
+    }
+    if ctx.replica_set_name.is_some() {
+        let quorum = doc
+            .get("commitQuorum")
+            .cloned()
+            .unwrap_or_else(|| Bson::String("votingMembers".into()));
+        reply.insert("commitQuorum", quorum);
+    }
+    if any_created && any_existed {
+        reply.insert("note", "index already exists");
+    }
     // When every requested index already existed, mongod adds
     // `note: "all indexes already exist"` so drivers report a no-op (mongocxx's
     // `index_view::create_one` returns an empty optional off this).
-    if !any_created && !specs.is_empty() {
+    if all_existed {
         reply.insert("note", "all indexes already exist");
     }
+    reply.insert("ok", 1.0);
     Ok(reply)
+}
+
+/// Why mongod refuses an index spec before building anything, or `None`.
+/// Each message is what 8.2.11 answered (2026-10-10); all of these specs
+/// used to be accepted and an index built from them.
+fn index_spec_problem(spec: &Document) -> Option<CommandError> {
+    let text = argtypes::render_stage_value(&Bson::Document(spec.clone()));
+    // Some checks run after mongod has filled in the index version.
+    let mut versioned = spec.clone();
+    if !versioned.contains_key("v") {
+        versioned.insert("v", 2_i32);
+    }
+    let versioned_text = argtypes::render_stage_value(&Bson::Document(versioned));
+    let in_spec = |code: i32, name: &str, text: &str, why: &str| {
+        CommandError::new(
+            code,
+            name,
+            format!("Error in specification {text} :: caused by :: {why}"),
+        )
+    };
+    let cannot = |why: &str| in_spec(67, "CannotCreateIndex", &text, why);
+    let Some(Bson::Document(key)) = spec.get("key") else {
+        return spec.get("key").is_none().then(|| {
+            in_spec(
+                9,
+                "FailedToParse",
+                &text,
+                "The 'key' field is a required property of an index specification",
+            )
+        });
+    };
+    for (field, value) in key {
+        if field.is_empty() {
+            return Some(cannot("Index keys cannot be an empty field."));
+        }
+        if field.starts_with('$') && field != "$**" {
+            return Some(cannot(
+                "Index key contains an illegal field name: field name starts with '$'.",
+            ));
+        }
+        match value {
+            Bson::Boolean(_) => {
+                return Some(cannot(
+                    "Values in v:2 index key pattern cannot be of type bool. Only numbers > 0, \
+                     numbers < 0, and strings are allowed.",
+                ))
+            }
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)
+                if value.as_f64().or(as_i64(value).map(|n| n as f64)) == Some(0.0) =>
+            {
+                return Some(cannot("Values in the index key pattern cannot be 0."))
+            }
+            _ => {}
+        }
+    }
+    if key.len() > 32 {
+        return Some(CommandError::new(
+            13103,
+            "Location13103",
+            "too many compound keys",
+        ));
+    }
+    if let Some(v) = spec.get("v").and_then(as_i64) {
+        if !(1..=2).contains(&v) {
+            return Some(cannot(&format!(
+                "Invalid index specification {text}; cannot create an index with v={v}"
+            )));
+        }
+    }
+    let name = spec.get_str("name").ok();
+    if name == Some("") {
+        return Some(in_spec(
+            67,
+            "CannotCreateIndex",
+            &versioned_text,
+            "index name cannot be empty",
+        ));
+    }
+    if name == Some("*") {
+        return Some(CommandError::new(
+            2,
+            "BadValue",
+            "The index name '*' is not valid.",
+        ));
+    }
+    // The `_id` index is `{_id: 1}` and takes no options of its own.
+    if key.len() == 1 && key.contains_key("_id") {
+        if as_i64(&key["_id"]) != Some(1) {
+            return Some(CommandError::new(
+                2,
+                "BadValue",
+                format!(
+                    "The field 'key' for an _id index must be {{_id: 1}}, but got {}",
+                    argtypes::render_stage_value(&Bson::Document(key.clone()))
+                ),
+            ));
+        }
+        if let Some(option) = spec
+            .keys()
+            .find(|k| !matches!(k.as_str(), "key" | "name" | "v" | "ns" | "collation"))
+        {
+            return Some(CommandError::new(
+                197,
+                "InvalidIndexSpecificationOption",
+                format!(
+                    "The field '{option}' is not valid for an _id index specification. \
+                     Specification: {versioned_text}"
+                ),
+            ));
+        }
+    }
+    if let Some(unknown) = spec.keys().find(|k| {
+        !matches!(k.as_str(), "key" | "name") && !INDEX_SPEC_KNOWN_OPTIONS.contains(&k.as_str())
+    }) {
+        return Some(in_spec(
+            197,
+            "InvalidIndexSpecificationOption",
+            &text,
+            &format!(
+                "The field '{unknown}' is not valid for an index specification. Specification: \
+                 {text}"
+            ),
+        ));
+    }
+    if spec.contains_key("partialFilterExpression")
+        && matches!(spec.get("sparse"), Some(Bson::Boolean(true)))
+    {
+        return Some(in_spec(
+            67,
+            "CannotCreateIndex",
+            &versioned_text,
+            "cannot mix \"partialFilterExpression\" and \"sparse\" options",
+        ));
+    }
+    // TTL: one field, and a non-negative 32-bit number of seconds.
+    if let Some(seconds) = spec.get("expireAfterSeconds") {
+        let ttl = |why: &str| {
+            CommandError::new(
+                67,
+                "CannotCreateIndex",
+                format!(". Index spec: {text} :: caused by :: {why}"),
+            )
+        };
+        if let Some(n) = as_i64(seconds) {
+            if matches!(seconds, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
+                if n < 0 {
+                    return Some(ttl(
+                        "TTL index 'expireAfterSeconds' option cannot be less than 0",
+                    ));
+                }
+                if n > i32::MAX as i64 {
+                    return Some(ttl(
+                        "TTL index 'expireAfterSeconds' must be within the range of a 32-bit \
+                         integer",
+                    ));
+                }
+                if key.len() > 1 {
+                    return Some(CommandError::new(
+                        67,
+                        "CannotCreateIndex",
+                        format!(
+                            "TTL indexes are single-field indexes, compound indexes do not \
+                             support TTL. Index spec: {text}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The index plugin names mongod 8.2 recognises in a key pattern.
@@ -2078,55 +2357,97 @@ fn index_conflict(
 
 /// `dropIndexes` — drop a named index, or all of them with `"*"`.
 pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    argtypes::require_index_name_or_key(doc, "index", "dropIndexes.index")?;
+    // A list of names is a third form `index` takes, beside a name and a key.
+    let names: Option<Vec<String>> = match doc.get("index") {
+        Some(Bson::Array(a)) => a.iter().map(|v| v.as_str().map(String::from)).collect(),
+        _ => None,
+    };
+    if doc.get("index").is_none() {
+        return Ok(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            "BSON field 'dropIndexes.index' is missing but a required field",
+        )
+        .into_reply());
+    }
+    if names.is_none() {
+        argtypes::require_index_name_or_key(doc, "index", "dropIndexes.index")?;
+    }
     let coll = coll_arg(doc, "dropIndexes")?;
     let storage = ctx.storage()?;
-    let before = storage
-        .list_indexes(&ctx.db_name, &coll)
+    let exists = storage
+        .list_collections(&ctx.db_name)
         .map_err(command_error)?
-        .len();
+        .iter()
+        .any(|c| c == &coll);
+    if !exists {
+        return Ok(CommandError::new(
+            26,
+            "NamespaceNotFound",
+            format!("ns not found {}.{coll}", ctx.db_name),
+        )
+        .into_reply());
+    }
+    let listed = storage
+        .list_indexes(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let before = listed.len();
+    // The `_id` index is never dropped, by name, by key or in a list. By key
+    // it used to be: `{dropIndexes: c, index: {_id: 1}}` removed it.
+    let id_index = || CommandError::new(72, "InvalidOptions", "cannot drop _id index").into_reply();
+    let not_found = |name: &str| {
+        CommandError::new(
+            27,
+            "IndexNotFound",
+            format!("index not found with name [{name}]"),
+        )
+        .into_reply()
+    };
+    let has = |name: &str| listed.iter().any(|ix| ix.get_str("name") == Ok(name));
 
-    match doc.get("index") {
-        Some(Bson::String(s)) if s == "*" => {
+    let mut reply = doc! { "nIndexesWas": before as i32 };
+    match (names, doc.get("index")) {
+        // Every name is checked before any index is dropped.
+        (Some(names), _) => {
+            if names.iter().any(|n| n == "_id_") {
+                return Ok(id_index());
+            }
+            if let Some(missing) = names.iter().find(|n| !has(n)) {
+                return Ok(not_found(missing));
+            }
+            for name in &names {
+                storage
+                    .drop_index(&ctx.db_name, &coll, name)
+                    .map_err(command_error)?;
+            }
+        }
+        (None, Some(Bson::String(s))) if s == "*" => {
             storage
                 .drop_all_indexes(&ctx.db_name, &coll)
                 .map_err(command_error)?;
+            reply.insert("msg", "non-_id indexes dropped for collection");
         }
-        Some(Bson::String(name)) => {
+        (None, Some(Bson::String(name))) => {
             if let Some(e) = crate::nul_in_namespace("index name", name) {
                 return Ok(e.into_reply());
             }
-            // mongod refuses outright (72), before looking the index up; this
-            // answered `27 index not found` (measured 8.2.11, 2026-10-01).
             if name == "_id_" {
-                return Ok(
-                    CommandError::new(72, "InvalidOptions", "cannot drop _id index").into_reply(),
-                );
+                return Ok(id_index());
             }
             let existed = storage
                 .drop_index(&ctx.db_name, &coll, name)
                 .map_err(command_error)?;
             if !existed {
-                return Ok(CommandError::new(
-                    27,
-                    "IndexNotFound",
-                    format!("index not found with name [{name}]"),
-                )
-                .into_reply());
+                return Ok(not_found(name));
             }
         }
-        // Drop by KEY PATTERN rather than by name. This answered code 1
-        // (InternalError) — the crash code — for a shape mongod handles
-        // routinely, so a supported operation looked like a server fault. The
-        // lookup is just a scan of the catalog for a matching `key`.
-        Some(Bson::Document(key)) => {
-            let named = storage
-                .list_indexes(&ctx.db_name, &coll)
-                .map_err(command_error)?
-                .into_iter()
+        (None, Some(Bson::Document(key))) => {
+            let named = listed
+                .iter()
                 .find(|idx| idx.get_document("key").map(|k| k == key).unwrap_or(false))
                 .and_then(|idx| idx.get_str("name").ok().map(str::to_string));
             match named {
+                Some(name) if name == "_id_" => return Ok(id_index()),
                 Some(name) => {
                     storage
                         .drop_index(&ctx.db_name, &coll, &name)
@@ -2154,10 +2475,10 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply())
         }
     }
-    Ok(doc! { "nIndexesWas": before as i32, "ok": 1.0 })
+    reply.insert("ok", 1.0);
+    Ok(reply)
 }
 
-/// `dropDatabase` — drop the current database.
 pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     storage.drop_database(&ctx.db_name).map_err(command_error)?;
@@ -2805,7 +3126,11 @@ mod parity_tests {
         )
         .unwrap();
         let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        // mongod 8.2.11 answers 197 (this asserted 40415 until 2026-10-10).
+        assert_eq!(
+            (code, name.as_str()),
+            (197, "InvalidIndexSpecificationOption")
+        );
         assert!(msg.contains("invalid"), "{msg}");
     }
 

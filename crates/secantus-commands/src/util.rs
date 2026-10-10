@@ -75,7 +75,13 @@ pub(crate) fn validate_write_hint(
     if !storage.collection_exists(db, coll).unwrap_or(true) {
         return Ok(());
     }
-    let indexes = storage.list_indexes(db, coll).unwrap_or_default();
+    // A hidden index is no index to a hint, on a write as on a read.
+    let indexes: Vec<Document> = storage
+        .list_indexes(db, coll)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| i.get_bool("hidden") != Ok(true))
+        .collect();
     let known = match hint {
         Bson::String(s) => {
             // `"$natural"` is deliberately absent: mongod takes only the
