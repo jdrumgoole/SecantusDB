@@ -3010,39 +3010,29 @@ These work end-to-end but cut corners.
       `--sync-on-commit`, which runs the same patched code.
 
       **Left open when the 2026-10-09 session closed** (three things Joe
-      asked for in order; the first two were not started, the third has only
-      its measurement):
+      asked for in order). The first two were done 2026-10-10: the sync patch
+      shipped in `secantusdb-v0.5.3-beta.175` and `secantusd-pg-v0.1.0-beta.7`
+      (binaries and crates), and `rust_pg.html` was rewritten against the
+      released macOS binary, each claim checked by a probe of 68 statements.
+      The page's performance table is the `bb904163` measurement below, not
+      re-measured on the release. The probe found one refusal:
 
-      1. **Release the sync patch** (`cmake/patch_wt_fsync_group.py`, PR
-         #1846). It changes `secantus-wiredtiger-sys`, so the MongoDB line
-         must be bumped and tagged FIRST and its crates published, then the PG
-         line (`0.1.0-beta.7`), then the website tags and a post. The
-         published `0.1.0-beta.6` does not carry it.
-      2. **`website/themes/secantus/templates/rust_pg.html` is stale in two
-         places.** Its "Not yet" row lists `CREATE INDEX`, `pg_constraint`,
-         multi-column `FOREIGN KEY` and password verification: all four work
-         (run against a build of `bb904163`, with a unique index enforced and
-         a wrong password refused). Its "What it speaks" rows predate joins,
-         CTEs, correlated subqueries, windows, views, `ALTER TABLE`,
-         sequences, PL/pgSQL functions, triggers, full-text search, jsonpath,
-         `MERGE`, `ON CONFLICT` and `EXPLAIN`, each of which answered
-         correctly in the same run. Its performance table and the "1.75x /
-         2.48x" note are an old measurement. Numbers to replace them with,
-         measured for that purpose: DigitalOcean `c-16`, ext4, PostgreSQL
-         16 defaults, a release build of `bb904163` (PR #1846's head),
-         `bench/pg_concurrency.py` 10s x3, ops/s, PostgreSQL then ours:
+      - [ ] **RUST PG server: a `GROUP BY CUBE` / `ROLLUP` / `GROUPING SETS`
+            query inside a FROM subquery is refused.** `select count(*) from
+            (select g, z, sum(v) s from w group by cube(g, z)) q` answers
+            `0A000 this target is not supported yet` on 0.1.0-beta.7; the
+            inner query alone works, and so does a plain `GROUP BY g` in the
+            same position. Not compared with PostgreSQL beyond that.
 
-         | workload | clients | PostgreSQL 16 | secantusd-pg |
-         | --- | --- | --- | --- |
-         | insert, one table each | 1 / 4 / 8 | 5,473 / 14,647 / 21,639 | 3,426 / 10,812 / 15,624 |
-         | insert, shared table | 8 | 21,722 | 14,410 |
-         | update by PK | 1 / 4 / 8 | 4,902 / 13,393 / 21,409 | 2,832 / 9,193 / 14,350 |
-         | select by PK | 1 / 4 / 8 | 12,259 / 42,358 / 58,602 | 9,654 / 32,339 / 41,181 |
+      The third has only its measurement, taken on a DigitalOcean `c-16`,
+      ext4, PostgreSQL 16 defaults, a release build of `bb904163` (PR
+      #1846's head). `bench/pg_concurrency.py` 10s x3, ops/s, at 1 / 4 / 8
+      clients, was: insert, one table each, PostgreSQL 5,473 / 14,647 /
+      21,639 against 3,426 / 10,812 / 15,624; insert into a shared table at 8
+      clients, 21,722 against 14,410; update by PK, 4,902 / 13,393 / 21,409
+      against 2,832 / 9,193 / 14,350; select by PK, 12,259 / 42,358 / 58,602
+      against 9,654 / 32,339 / 41,181.
 
-         The page is hand-written (the table is not generated), and the
-         durable-write rows there are from a machine and a sync method this
-         table does not match, so replace the table whole and say which
-         machine. Re-measure if the release differs from `bb904163`.
       3. **Reads.** Same droplet and build, server CPU per statement by
          `perf stat -p` (PostgreSQL: the connection's backend), 30,000
          statements over a 1,000-row table, two passes within 2%:
