@@ -1750,6 +1750,48 @@ fn split_statements_respects_quoting() {
     }
 }
 
+/// A command its bytes show to be alone is not sent to the parser to be
+/// split -- and where that shortcut answers, it is the parser's answer.
+#[test]
+fn a_lone_command_is_what_the_parser_would_split_off() {
+    for sql in [
+        "select 1",
+        "  select 1  ",
+        "select 1;",
+        "select 1 ;  ",
+        "select v from t where k = 5;",
+        "select 'a' from t",
+        "select \"a\" from t",
+        "select $1",
+        "selct 1",
+    ] {
+        let one = lone_command(sql).unwrap_or_else(|| panic!("{sql:?} is alone"));
+        if let Ok(parts) = pg_query::split_with_parser(sql) {
+            let parts: Vec<&str> = parts.into_iter().map(str::trim).collect();
+            assert_eq!(parts, vec![one], "for {sql:?}");
+        }
+    }
+    // Anything that could end a command, hide one, or be no command at all
+    // is the parser's to split.
+    for sql in [
+        "",
+        "  ",
+        ";",
+        "select 1;;",
+        "select 1; select 2",
+        "select 'a;b'",
+        "select 'a';",
+        "select \"a\";",
+        "select $$a$$;",
+        "-- nothing",
+        "select 1 -- one",
+        "/* nothing */",
+        "select 1 /* one */",
+    ] {
+        assert_eq!(lone_command(sql), None, "for {sql:?}");
+    }
+}
+
 /// The extended protocol takes ONE command: it has a single parameter list and
 /// a single row description, which two commands cannot share. PostgreSQL says
 /// so with 42601, not with "not supported".

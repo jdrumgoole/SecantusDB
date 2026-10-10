@@ -15,6 +15,9 @@ confounded by concurrency, and report microseconds of wall time per statement
   select_const   + parse + plan of `SELECT 1`
   select_const_p same, but the statement is PREPARED once and re-executed
   select_row     + catalog lookup + storage read of one row by primary key
+  select_row_var the same read, NOT prepared, with a different literal each
+                 time -- the server's caches are keyed by statement text, so
+                 this is the one stage that parses and plans every statement
   select_row_p   same, prepared
 
 `select 1` is the load-bearing row: it touches no table, so everything it costs
@@ -81,10 +84,13 @@ def _wait(host: str, port: int, timeout: float = 30.0) -> None:
     raise RuntimeError("no listener")
 
 
+_BATCHES = 5
+
+
 def _time_loop(fn, iters: int) -> float:
     """Median microseconds per call over 5 batches (median kills outliers)."""
     batches = []
-    for _ in range(5):
+    for _ in range(_BATCHES):
         t0 = time.perf_counter()
         for _ in range(iters):
             fn()
@@ -101,6 +107,10 @@ def measure(dsn: str, iters: int, in_transaction: bool = False) -> dict[str, flo
             cur.execute("drop table if exists attr_t")
             cur.execute("create table attr_t (k bigint primary key, v bigint)")
             cur.execute("insert into attr_t (k, v) values (1, 42)")
+            # One row per `select_row_var` call, so each of its statements
+            # is a text the server has not seen and still finds its row.
+            rows = _BATCHES * iters + 1
+            cur.execute(f"insert into attr_t (k, v) select g, g from generate_series(2, {rows}) g")
 
         # Protocol floor: psycopg's own no-op round trip.
         out["ping"] = _time_loop(lambda: conn.pgconn.exec_(b" ").status, iters)
@@ -109,6 +119,10 @@ def measure(dsn: str, iters: int, in_transaction: bool = False) -> dict[str, flo
             out["select_const"] = _time_loop(lambda: cur.execute("select 1"), iters)
             out["select_row"] = _time_loop(
                 lambda: cur.execute("select v from attr_t where k = 1"), iters
+            )
+            keys = iter(range(2, _BATCHES * iters + 2))
+            out["select_row_var"] = _time_loop(
+                lambda: cur.execute(f"select v from attr_t where k = {next(keys)}"), iters
             )
             # prepare_threshold=0 makes psycopg prepare on first use and reuse.
             out["select_const_p"] = _time_loop(lambda: cur.execute("select 1", prepare=True), iters)
@@ -163,6 +177,7 @@ def main() -> int:
         "select_const",
         "select_const_p",
         "select_row",
+        "select_row_var",
         "select_row_p",
         "update_row_p",
     ]
@@ -176,6 +191,7 @@ def main() -> int:
         ("...saved by preparing", "select_const", "select_const_p"),
         ("catalog+storage row read", "select_row", "select_const"),
         ("...saved by preparing", "select_row", "select_row_p"),
+        ("a new literal each time", "select_row_var", "select_row"),
         ("UPDATE by PK over PK read", "update_row_p", "select_row_p"),
     ]
     for label, a, b in steps:
