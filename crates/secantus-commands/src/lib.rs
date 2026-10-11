@@ -54,6 +54,7 @@ pub mod roles;
 pub mod slowop;
 pub mod stepdown;
 pub mod storage;
+mod timeseries;
 pub mod topstats;
 pub mod transactions;
 mod util;

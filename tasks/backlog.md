@@ -8818,6 +8818,44 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.071 Time-series collections -- 2026-10-11
+
+`tools/probes/time_series.py`, mongod 8.2.11: 187 scenarios on a fresh
+database each (what `create` accepts, inserts, reads, the restricted writes,
+indexes, `collMod`, rename and the rest). The Rust server went from 139
+results different to 25. It checked nothing about a definition before, took
+a measurement with no date, and let any update through or refused it with
+one message. mongod keeps the rows as buckets in `system.buckets.<name>` and
+presents the collection as a view; this server keeps ordinary documents, and
+most of what is left follows from that:
+
+- [ ] **RUST MongoDB server: there is no `system.buckets.<name>`.** mongod
+      lists it (and `system.views`), counts and reads it, indexes it, drops
+      and renames it, and refuses an insert into it by its bucket schema (9
+      of the 25). `$collStats` and `collStats` count buckets and report a
+      `timeseries` section; `validate` reports the bucket index (3 more).
+- [ ] **RUST MongoDB server: measurements come back in insertion order and
+      field order.** mongod returns them bucket by bucket (grouped by meta
+      value), puts the time field first and the meta field second, and
+      sorts the keys of a meta document. The probe compares documents as
+      mappings, so only the row order shows (2 of the 25).
+- [ ] **RUST MongoDB server: smaller time-series differences.** A
+      measurement inserted with no `_id` is given one (mongod stores none);
+      `distinct` answers `ok` as a double (mongod: an int32 on a
+      time-series collection); a `hint` of `{_id: 1}` is honoured (mongod:
+      2); an index on `{_id: 1}` reports that it already exists (mongod
+      builds one); a `hashed` or wildcard index is refused as on any
+      collection (mongod builds the first and words the second by its
+      bucket fields); `listCollections` with `authorizedCollections` leaves
+      out the two storage collections.
+- [ ] **RUST MongoDB server: `convertToCapped`, `cloneCollectionAsCapped`,
+      `compact` and `reIndex` are not commands** (59). On mongod the first
+      two answer 166 for a time-series collection and the last two answer
+      20 on a replica-set member, for any collection.
+- [ ] **PYTHON MongoDB server: 140 of 187 time-series results differ from
+      mongod** (same probe). Not changed, and not read through. Whether
+      its `$out` keeps the target's validator and indexes was not measured.
+
 ### 7.070 Collation -- 2026-10-10
 
 `tools/probes/collation.py`, mongod 8.2.11: 764 scenarios (reads under 29

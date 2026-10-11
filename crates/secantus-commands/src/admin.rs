@@ -257,6 +257,24 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(e) = validation_enum_problem(doc, "create") {
         return Ok(e.into_reply());
     }
+    // A time-series definition is checked whole, with the options it cannot
+    // be combined with, before anything is created.
+    let ns = format!("{}.{coll}", ctx.db_name);
+    let ts_def = crate::timeseries::definition(doc, &ns)?;
+    if ts_def.is_none() && coll.starts_with("system.buckets.") {
+        return Ok(CommandError::new(
+            20,
+            "IllegalOperation",
+            "Creation of a timeseries bucket collection without timeseries options is not allowed",
+        )
+        .into_reply());
+    }
+    let ts_expire = match doc.get("expireAfterSeconds") {
+        Some(v) if ts_def.is_some() && !matches!(v, Bson::Null) => {
+            Some(crate::timeseries::expire_after("create", v)?)
+        }
+        _ => None,
+    };
     // A view's definition is checked when it is created, not when it is first
     // read: a pipeline that is not an array, an unknown or write stage, an
     // empty `viewOn` and a cycle were all accepted and stored.
@@ -314,7 +332,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(CommandError::new(
             40415,
             "Location40415",
-            format!("BSON field 'create.{unknown}' is an unknown field"),
+            format!("BSON field 'create.{unknown}' is an unknown field."),
         )
         .into_reply());
     }
@@ -430,6 +448,15 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             doc! { "v": 2i32, "key": { "_id": 1i32 }, "name": name, "unique": true },
         );
     }
+    // The definition is stored as mongod lists it: defaults filled in, and
+    // after every other option.
+    opts.remove("timeseries");
+    if let Some(def) = &ts_def {
+        if let Some(seconds) = ts_expire {
+            opts.insert("expireAfterSeconds", Bson::Int64(seconds));
+        }
+        opts.insert("timeseries", def.clone());
+    }
     let storage = ctx.storage()?;
     // The validator is parsed as the collection is created, so an existing
     // collection still answers 48 first (measured 8.2.11, 2026-10-06).
@@ -462,6 +489,20 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if existing == opts {
             return Ok(doc! { "ok": 1.0 });
         }
+        // A time-series collection on either side has its own wording.
+        let message = match (existing.contains_key("timeseries"), ts_def.is_some()) {
+            (true, true) => Some(format!("A timeseries collection already exists. NS: {ns}")),
+            (false, true) => Some(format!("Collection {ns} already exists.")),
+            (true, false) => Some(format!(
+                "namespace {ns} already exists, but is a view on {db}.system.buckets.{coll} \
+                 rather than {db}",
+                db = ctx.db_name
+            )),
+            (false, false) => None,
+        };
+        if let Some(message) = message {
+            return Ok(CommandError::new(48, "NamespaceExists", message).into_reply());
+        }
         let uuid = storage
             .collection_uuid(&ctx.db_name, &coll)
             .ok()
@@ -480,6 +521,18 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ),
         )
         .into_reply());
+    }
+    // A time-series collection with a meta field starts with an index on
+    // the meta and time fields.
+    if let Some((name, key)) = ts_def
+        .as_ref()
+        .and_then(|_| crate::timeseries::Fields::of(&opts))
+        .and_then(|f| f.default_index())
+    {
+        let spec = doc! { "key": key.clone(), "name": name.clone() };
+        storage
+            .create_index(&ctx.db_name, &coll, &name, &key, &spec)
+            .map_err(command_error)?;
     }
     Ok(doc! { "ok": 1.0 })
 }
@@ -641,6 +694,67 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("option only supported on a view: {option}"),
         )
         .into_reply());
+    }
+    // A time-series collection takes a wider bucket and a TTL, and none of
+    // the validation options; `timeseries` belongs to no other collection.
+    let stored_options = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .unwrap_or_default();
+    let ts_now = stored_options.get_document("timeseries").ok();
+    let mut ts_changes = Document::new();
+    match ts_now {
+        Some(current) => {
+            const NOT_ON_TIME_SERIES: [&str; 4] = [
+                "validator",
+                "validationLevel",
+                "validationAction",
+                "changeStreamPreAndPostImages",
+            ];
+            if let Some(option) = doc
+                .keys()
+                .find(|k| NOT_ON_TIME_SERIES.contains(&k.as_str()) && given(k))
+            {
+                return Ok(CommandError::new(
+                    72,
+                    "InvalidOptions",
+                    format!("option not supported on a time-series collection: {option}"),
+                )
+                .into_reply());
+            }
+            if let Some(Bson::Document(change)) = doc.get("timeseries") {
+                ts_changes.insert("timeseries", crate::timeseries::modified(current, change)?);
+            }
+            match doc.get("expireAfterSeconds") {
+                None => {}
+                Some(Bson::String(s)) if s == "off" => {
+                    ts_changes.insert("expireAfterSeconds", Bson::Null);
+                }
+                Some(Bson::String(s)) => {
+                    return Ok(CommandError::new(
+                        72,
+                        "InvalidOptions",
+                        format!(
+                            "Invalid string value for the 'clusteredIndex::expireAfterSeconds' \
+                             option. Got: '{s}'. Accepted value is 'off'"
+                        ),
+                    )
+                    .into_reply());
+                }
+                Some(v) => {
+                    let seconds = crate::timeseries::expire_after("collMod", v)?;
+                    ts_changes.insert("expireAfterSeconds", Bson::Int64(seconds));
+                }
+            }
+        }
+        None if given("timeseries") => {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                "option only supported on a time-series collection: timeseries",
+            )
+            .into_reply());
+        }
+        None => {}
     }
     let mut reply = doc! { "ok": 1.0 };
     // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
@@ -832,6 +946,10 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     let mut opts = collection_option_subset(doc);
+    // The `timeseries` field of a `collMod` is a change, not a definition:
+    // what is stored is the definition it produces.
+    opts.remove("timeseries");
+    opts.extend(ts_changes);
     // A `collMod` that touches validation leaves the collection with BOTH
     // `validationLevel` and `validationAction` written out (the defaults
     // where neither was ever given). An empty validator removes the
@@ -1267,6 +1385,15 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .list_indexes(&ctx.db_name, &coll)
         .map(|ix| ix.len().max(1))
         .unwrap_or(1);
+    // A time-series collection has no `_id` index to count.
+    let n_indexes = if storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        n_indexes - 1
+    } else {
+        n_indexes
+    };
     let was_view = crate::views::is_view(storage, &ctx.db_name, &coll);
     let existed = storage
         .drop_collection(&ctx.db_name, &coll)
@@ -1427,6 +1554,10 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // `uuid` is an internal option (the collection identity) — it's surfaced
         // under `info.uuid`, not as a collection option. Strip it from `options`.
         options.remove("uuid");
+        // A collection-level TTL turned `off` by `collMod` is stored as null.
+        if matches!(options.get("expireAfterSeconds"), Some(Bson::Null)) {
+            options.remove("expireAfterSeconds");
+        }
         // mongod stores/reports capped `size` / `max` as int32; we may hold the
         // driver-sent int64. Normalise so the round-tripped options match.
         for k in ["size", "max"] {
@@ -1467,7 +1598,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         };
         // A clustered collection has no separate `_id_` index (the clustering
         // key IS the index), so mongod omits `idIndex` for it — same as views.
-        if !is_view && !is_clustered {
+        if !is_view && !is_clustered && coll_type != "timeseries" {
             let mut id_index = doc! {
                 "v": 2,
                 "key": { "_id": 1 },
@@ -1594,6 +1725,13 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("ns does not exist: {}.{}", ctx.db_name, coll),
         )
         .into_reply());
+    }
+    // A time-series collection has no `_id` index to list.
+    if storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
     }
     // `multikey` is SecantusDB's internal catalog flag. mongod keeps the
     // equivalent in the durable catalog and never echoes it from `listIndexes`
@@ -1890,10 +2028,23 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     let existing = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
+    // A time-series collection lists no `_id` index and restricts the rest.
+    let ts_fields = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .ok()
+        .and_then(|o| crate::timeseries::Fields::of(&o));
+    let unlisted = usize::from(ts_fields.is_some());
+    let before = before.saturating_sub(unlisted);
     let mut any_created = false;
     let mut any_existed = false;
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
+        if let Some(e) = ts_fields
+            .as_ref()
+            .and_then(|f| crate::timeseries::index_problem(s, f))
+        {
+            return Ok(e.into_reply());
+        }
         let key = s
             .get("key")
             .and_then(Bson::as_document)
@@ -2164,13 +2315,18 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     let after = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?
-        .len();
+        .len()
+        .saturating_sub(unlisted);
     // mongod's reply, in its order: the two counts, whether the collection
     // was created (left out when nothing was built), the commit quorum a
     // replica-set member reports, and the no-op note.
     let all_existed = !any_created && !specs.is_empty();
     // A collection created here already has its `_id` index when counted.
-    let before = if created_coll { before.max(1) } else { before };
+    let before = if created_coll && ts_fields.is_none() {
+        before.max(1)
+    } else {
+        before
+    };
     let mut reply = doc! {
         "numIndexesBefore": before as i32,
         "numIndexesAfter": after as i32,
@@ -2810,10 +2966,25 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let listed = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
-    let before = listed.len();
+    let is_time_series = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("timeseries"));
+    // A time-series collection lists no `_id` index, so none is counted.
+    let before = listed.len().saturating_sub(usize::from(is_time_series));
     // The `_id` index is never dropped, by name, by key or in a list. By key
     // it used to be: `{dropIndexes: c, index: {_id: 1}}` removed it.
-    let id_index = || CommandError::new(72, "InvalidOptions", "cannot drop _id index").into_reply();
+    let id_index = || {
+        if is_time_series {
+            CommandError::new(
+                5979800,
+                "Location5979800",
+                "It is illegal to drop the clusteredIndex",
+            )
+            .into_reply()
+        } else {
+            CommandError::new(72, "InvalidOptions", "cannot drop _id index").into_reply()
+        }
+    };
     let not_found = |name: &str| {
         CommandError::new(
             27,
@@ -2930,6 +3101,12 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     storage.drop_database(&ctx.db_name).map_err(command_error)?;
+    // A replica-set member answers `{ok: 1}` alone (measured 8.2.11,
+    // 2026-10-11, for an empty database, one with a collection and one with
+    // a view). `dropped` is the standalone reply.
+    if ctx.replica_set_name.is_some() {
+        return Ok(doc! { "ok": 1.0 });
+    }
     Ok(doc! { "dropped": ctx.db_name.clone(), "ok": 1.0 })
 }
 
@@ -2977,6 +3154,29 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     let (dst_db, dst_coll) = split_ns(&to);
 
     let storage = ctx.storage()?;
+    // mongod presents a time-series collection as a view, and a view is
+    // neither renamed nor renamed onto.
+    let is_time_series = |db: &str, coll: &str| {
+        storage
+            .get_collection_options(db, coll)
+            .is_ok_and(|o| o.contains_key("timeseries"))
+    };
+    if is_time_series(&src_db, &src_coll) {
+        return Ok(CommandError::new(
+            166,
+            "CommandNotSupportedOnView",
+            format!("cannot rename view: {src}"),
+        )
+        .into_reply());
+    }
+    if is_time_series(&dst_db, &dst_coll) {
+        return Ok(CommandError::new(
+            48,
+            "NamespaceExists",
+            format!("a view already exists with that name: {to}"),
+        )
+        .into_reply());
+    }
     let (ok_, msg) = storage
         .rename_collection(&src_db, &src_coll, &dst_db, &dst_coll, drop_target)
         .map_err(command_error)?;
