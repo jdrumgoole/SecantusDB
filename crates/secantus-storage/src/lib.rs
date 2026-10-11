@@ -5739,6 +5739,48 @@ impl Storage {
         Ok(buf)
     }
 
+    /// The oplog entry for a collection's creation, with the `_id` index
+    /// mongod records.
+    fn emit_create_oplog(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<()> {
+        let ui = collection_uuid(session, db, coll)?;
+        let mut id_key_spec = Document::new();
+        id_key_spec.insert("_id", 1i32);
+        let mut id_index = Document::new();
+        id_index.insert("v", 2i32);
+        id_index.insert("key", Bson::Document(id_key_spec));
+        id_index.insert("name", ID_INDEX_NAME);
+        let mut o = Document::new();
+        o.insert("create", coll);
+        for (k, v) in options {
+            o.insert(k.clone(), v.clone());
+        }
+        o.insert("idIndex", Bson::Document(id_index));
+        let mut entry = Document::new();
+        entry.insert("op", "c");
+        entry.insert("ns", format!("{db}.$cmd"));
+        entry.insert("ui", uuid_binary(&ui));
+        entry.insert("o", Bson::Document(o));
+        self.emit_oplog(session, vec![entry], vec![None])?;
+        Ok(())
+    }
+
+    /// Make sure the collection exists for a write about to land in it, and
+    /// record its creation when the write is what creates it: a change
+    /// stream sees a `create` event before the first insert (mongod 8.2.11,
+    /// with `showExpandedEvents`).
+    fn create_for_write(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        if ensure_collection(session, db, coll, self.data_nonlogged)? && self.enable_oplog {
+            self.emit_create_oplog(session, db, coll, &Document::new())?;
+        }
+        Ok(())
+    }
+
     /// Owned-`Document` oplog entries (the rare DDL / noop / findAndModify paths).
     /// Wraps each as [`OplogEntry::Doc`] and defers to [`Self::emit_oplog_entries`].
     fn emit_oplog(
@@ -5747,6 +5789,7 @@ impl Storage {
         entries: Vec<Document>,
         pre_images: Vec<Option<Vec<u8>>>,
     ) -> Result<i64> {
+        let _ = &session;
         self.emit_oplog_entries(
             session,
             entries.into_iter().map(OplogEntry::Doc).collect(),
@@ -5771,6 +5814,16 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        // A transaction statement's writes name the transaction, as mongod's
+        // do. Stamped here, on the statement's thread, whichever thread later
+        // writes the entries.
+        let entries = match OPLOG_SESSION.with(|s| s.borrow().clone()) {
+            Some((lsid, txn)) => entries
+                .into_iter()
+                .map(|entry| stamp_oplog_session(entry, &lsid, txn))
+                .collect::<Result<Vec<_>>>()?,
+            None => entries,
+        };
         // User-transaction dirty accounting — BEFORE the async-oplog branch,
         // which early-returns after buffering (in async mode the guard never
         // saw the bytes and the CI async-oplog lane hit the raw cache error
@@ -6758,6 +6811,19 @@ impl Storage {
     /// for internal option writes such as `create`'s). Mirrors mongod's collMod
     /// oplog (`o = {collMod: <coll>, <changed fields>}`).
     pub fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<()> {
+        self.coll_mod_recording(db, coll, opts, opts)
+    }
+
+    /// [`Self::coll_mod`], recording `given` in the oplog: the change event
+    /// describes what the command said, not every option the server wrote
+    /// out with it.
+    pub fn coll_mod_recording(
+        &self,
+        db: &str,
+        coll: &str,
+        opts: &Document,
+        given: &Document,
+    ) -> Result<()> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -6778,7 +6844,7 @@ impl Storage {
             let ui = collection_uuid(&session, db, coll)?;
             let mut o = Document::new();
             o.insert("collMod", coll);
-            for (k, v) in opts {
+            for (k, v) in given {
                 o.insert(k.clone(), v.clone());
             }
             // `uuid` is set explicitly and any inbound one dropped, so the
@@ -8642,7 +8708,7 @@ impl Storage {
 
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                self.create_for_write(&session, db, coll)?;
                 let meta = coll_meta(&session, db, coll)?;
                 // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
                 if meta.timeseries {
@@ -8764,7 +8830,7 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                self.create_for_write(&session, db, coll)?;
                 let descs = self.index_descs(&session, db, coll)?;
                 let ns = format!("{db}.{coll}");
                 let oplog_on = self.enable_oplog;
@@ -9376,25 +9442,7 @@ impl Storage {
                     write_coll_options(&session, db, coll, &current)?;
                 }
                 if self.enable_oplog {
-                    let ui = collection_uuid(&session, db, coll)?;
-                    let mut id_key_spec = Document::new();
-                    id_key_spec.insert("_id", 1i32);
-                    let mut id_index = Document::new();
-                    id_index.insert("v", 2i32);
-                    id_index.insert("key", Bson::Document(id_key_spec));
-                    id_index.insert("name", ID_INDEX_NAME);
-                    let mut o = Document::new();
-                    o.insert("create", coll);
-                    for (k, v) in options {
-                        o.insert(k.clone(), v.clone());
-                    }
-                    o.insert("idIndex", Bson::Document(id_index));
-                    let mut entry = Document::new();
-                    entry.insert("op", "c");
-                    entry.insert("ns", format!("{db}.$cmd"));
-                    entry.insert("ui", uuid_binary(&ui));
-                    entry.insert("o", Bson::Document(o));
-                    self.emit_oplog(&session, vec![entry], vec![None])?;
+                    self.emit_create_oplog(&session, db, coll, options)?;
                 }
                 Ok(true)
             })
@@ -9853,9 +9901,9 @@ impl Storage {
                     t.set_key_ss(dst_db, dst_coll);
                     t.set_value_u(b"");
                     t.insert()?;
-                    if let Some(du) = &dst_ui {
-                        self.emit_drop_oplog(&session, dst_db, dst_coll, du)?;
-                    }
+                    // The replaced target gets no `drop` entry of its own:
+                    // mongod records it as the rename's `dropTarget`, and a
+                    // stream on it sees the rename, then an invalidate.
                     Ok(())
                 })
             })?;
@@ -11059,10 +11107,9 @@ impl Storage {
                 // Capture the spec before removal: mongod's showExpandedEvents
                 // `dropIndexes` event describes the dropped index in full
                 // (`{v, key, name}`, probed 7.0.12), not just its name.
-                let key_spec = decode_doc(&c.get_value_u()?)
-                    .ok()
-                    .and_then(|d| d.get_document("key").ok().cloned())
-                    .unwrap_or_default();
+                let payload = decode_doc(&c.get_value_u()?).unwrap_or_default();
+                let key_spec = payload.get_document("key").cloned().unwrap_or_default();
+                let spec = index_event_spec(&payload, name);
                 c.remove()?;
                 self.delete_entries_prefix(&session, db, coll, name)?;
                 // The index is gone, so its claims must go too — otherwise
@@ -11078,6 +11125,7 @@ impl Storage {
                     o.insert("dropIndexes", coll);
                     o.insert("index", name);
                     o.insert("key", Bson::Document(key_spec));
+                    o.insert("spec", Bson::Document(spec));
                     let mut entry = Document::new();
                     entry.insert("op", "c");
                     entry.insert("ns", format!("{db}.$cmd"));
@@ -11104,12 +11152,18 @@ impl Storage {
         self.retry_write_conflicts("drop_all_indexes", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                let dropped: Vec<(String, Document)> = self
+                let dropped: Vec<(String, Document, Document)> = self
                     .iter_indexes(&session, db, coll)?
                     .into_iter()
-                    .map(|(n, key_spec, _)| (n, key_spec))
+                    .map(|(n, key_spec, opts)| {
+                        let mut payload = Document::new();
+                        payload.insert("key", Bson::Document(key_spec.clone()));
+                        payload.insert("options", Bson::Document(opts));
+                        let spec = index_event_spec(&payload, &n);
+                        (n, key_spec, spec)
+                    })
                     .collect();
-                for (name, _) in &dropped {
+                for (name, _, _) in &dropped {
                     let c = session.open_cursor(IDX_TABLE, None)?;
                     c.set_key_sss(db, coll, name);
                     if c.search().is_ok() {
@@ -11123,11 +11177,12 @@ impl Storage {
                 if self.enable_oplog && !dropped.is_empty() {
                     let ui = collection_uuid(&session, db, coll)?;
                     let mut entries = Vec::with_capacity(dropped.len());
-                    for (name, key_spec) in &dropped {
+                    for (name, key_spec, spec) in &dropped {
                         let mut o = Document::new();
                         o.insert("dropIndexes", coll);
                         o.insert("index", name.as_str());
                         o.insert("key", Bson::Document(key_spec.clone()));
+                        o.insert("spec", Bson::Document(spec.clone()));
                         let mut entry = Document::new();
                         entry.insert("op", "c");
                         entry.insert("ns", format!("{db}.$cmd"));
@@ -13757,7 +13812,7 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let rids: Vec<i64> = {
                 let session = self.op_session()?;
-                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                self.create_for_write(&session, db, coll)?;
                 let mut rids = Vec::new();
                 for (recordid, _id_k, blob) in
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
@@ -14038,7 +14093,7 @@ impl Storage {
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                self.create_for_write(&session, db, coll)?;
                 let ns = format!("{db}.{coll}");
                 let descs = self.index_descs(&session, db, coll)?;
                 let oplog_on = self.enable_oplog;
@@ -16373,11 +16428,41 @@ fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool
 }
 
 /// Register `(db, coll)` in the collections table if not already present.
-fn ensure_collection(session: &Session, db: &str, coll: &str, data_nonlogged: bool) -> Result<()> {
+/// An index as a change event describes it: `v`, its options, then `key`
+/// and `name` (mongod 8.2.11's order). Internal catalog flags are left out.
+fn index_event_spec(payload: &Document, name: &str) -> Document {
+    let mut spec = Document::new();
+    spec.insert("v", 2i32);
+    if let Ok(options) = payload.get_document("options") {
+        for (k, v) in options {
+            if !matches!(
+                k.as_str(),
+                "v" | "key" | "name" | "ns" | "multikey" | "entryFormat" | "collationKeys"
+            ) {
+                spec.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    spec.insert(
+        "key",
+        Bson::Document(payload.get_document("key").cloned().unwrap_or_default()),
+    );
+    spec.insert("name", name);
+    spec
+}
+
+/// Register the collection if it is not registered, answering whether it was
+/// created here.
+fn ensure_collection(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    data_nonlogged: bool,
+) -> Result<bool> {
     let probe = session.open_cursor(COLL_TABLE, None)?;
     probe.set_key_ss(db, coll);
     match probe.search() {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(false),
         Err(e) if e.is_not_found() => {
             let cur: Cursor = session.open_cursor(COLL_TABLE, None)?;
             // `opts` must outlive `insert()`: set_value_u stores a pointer to the
@@ -16398,7 +16483,7 @@ fn ensure_collection(session: &Session, db: &str, coll: &str, data_nonlogged: bo
                 &doc_table_for(db, coll),
                 &data_table_cfg(DOC_TABLE_CFG, data_nonlogged),
             )?;
-            Ok(())
+            Ok(true)
         }
         Err(e) => Err(e.into()),
     }
@@ -16453,6 +16538,45 @@ fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Docume
         Err(e) if e.is_not_found() => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+thread_local! {
+    /// The session and transaction number of the transaction statement
+    /// running on this thread, stamped on the oplog entries of its writes.
+    static OPLOG_SESSION: std::cell::RefCell<Option<(Document, i64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Name the transaction the writes on this thread belong to, or `None` for
+/// none. The command layer sets it around a transaction statement.
+pub fn set_oplog_session(session: Option<(Document, i64)>) {
+    OPLOG_SESSION.with(|s| *s.borrow_mut() = session);
+}
+
+/// `entry` with the session and transaction number added, when it records a
+/// write (a command entry is not a transaction's).
+fn stamp_oplog_session(entry: OplogEntry, lsid: &Document, txn: i64) -> Result<OplogEntry> {
+    Ok(match entry {
+        OplogEntry::Doc(mut d) => {
+            if matches!(d.get_str("op"), Ok("i" | "u" | "d")) {
+                d.insert("lsid", Bson::Document(lsid.clone()));
+                d.insert("txnNumber", txn);
+            }
+            OplogEntry::Doc(d)
+        }
+        OplogEntry::Raw(mut buf) => {
+            if buf
+                .get_str("op")
+                .is_ok_and(|op| matches!(op, "i" | "u" | "d"))
+            {
+                let lsid_raw = bson::RawDocumentBuf::from_document(lsid)
+                    .map_err(|e| StorageError::Bson(e.to_string()))?;
+                buf.append("lsid", bson::RawBson::Document(lsid_raw));
+                buf.append("txnNumber", bson::RawBsonRef::Int64(txn).to_raw_bson());
+            }
+            OplogEntry::Raw(buf)
+        }
+    })
 }
 
 /// Set once any collection options carrying `timeseries` are written in this
@@ -18141,14 +18265,15 @@ mod tests {
             let mut s = Storage::open(src.to_str().unwrap()).unwrap();
             s.set_oplog_archive_dir(Some(archive_s.clone()));
             s.set_oplog_max_entries(2);
+            // The first insert also records the collection's creation (seq 1).
             s.insert("app", "c", vec![enc(1), enc(2)], true).unwrap();
-            s.archive_base_snapshot(&archive_s).unwrap(); // base head = seq 2
+            s.archive_base_snapshot(&archive_s).unwrap(); // base head = seq 3
             s.insert("app", "c", vec![enc(3)], true).unwrap();
             s.insert("app", "c", vec![enc(4)], true).unwrap();
             s.insert("app", "c", vec![enc(5)], true).unwrap();
-            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive seq 1,2,3
-            assert!(pruned >= 3, "pruned {pruned}");
-            assert_eq!(s.oplog_floor_seq().unwrap(), 4); // live oplog no longer reaches seq 3
+            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive seq 1..4
+            assert!(pruned >= 4, "pruned {pruned}");
+            assert_eq!(s.oplog_floor_seq().unwrap(), 5); // live oplog no longer reaches seq 4
         }
 
         // v1 can't restore the src (floor past genesis); v2 stitches base + segments.
@@ -18169,7 +18294,7 @@ mod tests {
             .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
             .collect();
         ids.sort();
-        assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + archived seq 3
+        assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + archived seq 4
     }
 
     #[test]

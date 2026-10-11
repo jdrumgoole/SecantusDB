@@ -287,6 +287,30 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // `$changeStream` anywhere but first, and the split stage without it.
+    for (i, stage) in pipeline.iter().enumerate() {
+        let Some(d) = stage.as_document() else {
+            continue;
+        };
+        if i > 0 && d.contains_key("$changeStream") {
+            return Ok(CommandError::new(
+                40602,
+                "Location40602",
+                "$_internalChangeStreamOplogMatch is only valid as the first stage in a pipeline",
+            )
+            .into_reply());
+        }
+        if d.contains_key("$changeStreamSplitLargeEvent")
+            && !first_stage_has(&pipeline, "$changeStream")
+        {
+            return Ok(CommandError::new(
+                20,
+                "IllegalOperation",
+                "$changeStreamSplitLargeEvent can only be used in a $changeStream pipeline",
+            )
+            .into_reply());
+        }
+    }
     // A change stream cannot be opened on a time-series collection.
     if first_stage_has(&pipeline, "$changeStream") {
         if let (Some(c), Ok(storage)) = (&coll, ctx.storage()) {

@@ -8839,6 +8839,53 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.074 Change streams, command by command -- 2026-10-11
+
+`tools/probes/change_stream_commands.py`, mongod 8.2.11 as a replica-set
+member: 115 scenarios over a raw connection (what `$changeStream` accepts,
+every event's shape, `getMore`, the invalidating operations, resuming by
+`resumeAfter` / `startAfter` / `startAtOperationTime`, the three scopes,
+pre-images, transactions), each on a database of its own. The Rust server
+went from 111 results different to 5. The harness salts database names
+per run, because mongod keeps the oplog of earlier runs and a stream
+started in the past would see them. What is left:
+
+- [ ] **RUST MongoDB server: a resume token mongod cannot decode gets this
+      server's one error.** mongod parses a token as a KeyString and
+      reports where it failed (`Invalid advance (8) past end of buffer`,
+      15; `KeyString format error: Unknown type: 0`, 50811) for `_data`
+      that is valid hex but not a token; this server answers 40647 for all
+      of them. Its tokens are its own encoding (hex of a BSON document),
+      not mongod's, so a token from one cannot be given to the other (3 of
+      the 5).
+- [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
+      server's plan.** mongod explains the oplog scan it would run, with
+      the full match over `local.oplog.rs`; not reproduced, like the rest
+      of mongod's planner output (1 of the 5).
+- [ ] **RUST MongoDB server: a `delete` with `limit: 0` after a `multi`
+      update deletes in natural order.** mongod 8.2.11 deleted the two
+      documents in the reverse order; why was not measured (1 of the 5).
+- [ ] **RUST MongoDB server: smaller change-stream differences.** The
+      `lsid` on a transaction's events carries the SHA-256 of the empty
+      string as `uid` whoever is authenticated (mongod hashes the user). A
+      280 error's message shows the whole token; mongod shows 128
+      characters and `...`, and this server's tokens are usually shorter.
+      `startAfter` the token of a `dropDatabase` event at database scope
+      delivers nothing; mongod delivers the `invalidate` again. A token
+      from before 2026-10-11 is lower-case hex and still resumes.
+- [ ] **RUST MongoDB server: not probed.** `fullDocumentBeforeChange`
+      under a transaction; a stream on a sharded-only event type
+      (`shardCollection`, `reshardCollection`); `showSystemEvents`;
+      `matchCollectionUUIDForUpdateLookup`; events over 16 MB that are
+      actually split; `endOfTransaction` (mongod shows it only with
+      `showExpandedEvents` on 8.2? not measured).
+- [ ] **PYTHON MongoDB server: not measured on this probe**, which takes a
+      server URI and was run against the Rust server only. Known from the
+      code: it stamps `splitEvent: {fragment: 1, of: 1}` on every event
+      under `$changeStreamSplitLargeEvent` (mongod does not), and its
+      `$changeStream` spec checks, resume rules and cursor field order
+      were not compared.
+
 ### 7.073 The cursor commands -- 2026-10-11
 
 `tools/probes/cursor_commands.py`, mongod 8.2.11: 85 scenarios (`find`'s
