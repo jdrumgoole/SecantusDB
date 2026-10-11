@@ -42,6 +42,12 @@ duplicate key for the document its own first attempt had inserted.
   opened it (50736 to 50741). `killSessions` kills the session's cursors.
 - `endSessions` no longer aborts the session's open transaction; `mongod`
   leaves it to the client or to the transaction lifetime.
+- A transaction idle for its lifetime (60 seconds) is aborted about a second
+  later, whatever else the server is doing. It used to be aborted only when
+  another transaction command arrived, so a writer waiting on a document an
+  abandoned transaction held could wait for ever.
+- A `commitTransaction` whose commit failed in the storage engine answered
+  `ok: 1`. It now reports the error and the transaction is aborted.
 - A malformed `readConcern` gets `mongod`'s error, and a command that is not
   a read refuses a level above `local`.
 - A write sent with `w: 0` reports `n: 0` and no write errors.
