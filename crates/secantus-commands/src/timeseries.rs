@@ -3,9 +3,9 @@
 //!
 //! `mongod` stores a time-series collection as buckets in
 //! `system.buckets.<name>` and presents the collection as a view over them.
-//! This server stores the measurements as ordinary documents, so there are no
-//! buckets to show; what it reproduces is the behaviour a client meets: the
-//! option checks, the stored and listed definition, the rule that every
+//! This server stores the measurements as ordinary documents and derives the
+//! buckets when they are asked for (see `ts_buckets`). This module is the
+//! behaviour a client meets when it defines and writes one: the option checks, the stored and listed definition, the rule that every
 //! measurement carries a date in the time field, the meta-only update rule,
 //! and the index and `collMod` restrictions. Every code and message here was
 //! measured against `mongod` 8.2.11 on 2026-10-11
@@ -403,6 +403,30 @@ pub(crate) fn index_problem(spec: &Document, fields: &Fields) -> Option<CommandE
         ));
     }
     let key = spec.get_document("key").ok()?;
+    // A wildcard key becomes two on the buckets (the lower and the upper
+    // bound), and an index takes one wildcard field.
+    if key.keys().any(|k| k == "$**" || k.ends_with(".$**")) {
+        if let Some(layout) = crate::ts_buckets::Layout::of(&doc! {"timeseries": {
+            "timeField": fields.time.clone(),
+            "metaField": fields.meta.clone(),
+        }}) {
+            let mut shown = Document::new();
+            if let Some(name) = spec.get("name") {
+                shown.insert("name", name.clone());
+            }
+            shown.insert("key", crate::ts_buckets::bucket_key(key, &layout));
+            shown.insert("originalSpec", spec.clone());
+            return Some(CommandError::new(
+                7246201,
+                "Location7246201",
+                format!(
+                    "Error in specification {} :: caused by :: Index Key can contain only one \
+                     wildcard index field",
+                    secantus_core::query::bson_value_repr(&Bson::Document(shown))
+                ),
+            ));
+        }
+    }
     if key.values().any(|v| v.as_str() == Some("text")) {
         return Some(invalid(
             "Text indexes are not supported on time-series collections",

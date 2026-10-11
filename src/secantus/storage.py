@@ -6819,20 +6819,41 @@ class Storage:
         drive expiry with an injected ``now``. Returns the number of docs
         pruned.
         """
-        ttl_indexes: list[tuple[str, str, float]] = []
-        for name, key_spec, opts in self._iter_indexes(db, coll):
-            ttl = opts.get("expireAfterSeconds")
-            if not isinstance(ttl, (int, float)) or ttl < 0:
-                continue
-            field = next(iter(key_spec), None)
-            if not isinstance(field, str):
-                continue
-            ttl_indexes.append((name, field, float(ttl)))
-        if not ttl_indexes:
-            return 0
         when = now if now is not None else _dt.datetime.now(_dt.timezone.utc)
         if when.tzinfo is None:
             when = when.replace(tzinfo=_dt.timezone.utc)
+        # One filter per TTL index: the field holds a date before the cutoff
+        # (an array expires by any date in it, which is what the range
+        # operator already means), and the document is in the index. A
+        # partial index expires only what its filter covers; ignoring the
+        # filter deleted documents the index does not hold.
+        ttl_filters: list[dict[str, Any]] = []
+        for _name, key_spec, opts in self._iter_indexes(db, coll):
+            ttl = opts.get("expireAfterSeconds")
+            if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                continue
+            if ttl != ttl or ttl < 0:
+                continue
+            # mongod expires by a single-field index only, never by ``_id``
+            # and never by a geo / text / hashed key.
+            if len(key_spec) != 1:
+                continue
+            field, direction = next(iter(key_spec.items()))
+            if not isinstance(field, str) or field == "_id":
+                continue
+            if isinstance(direction, bool) or not isinstance(direction, (int, float)):
+                continue
+            try:
+                cutoff = when - _dt.timedelta(seconds=float(ttl))
+            except OverflowError:
+                continue
+            ttl_filter: dict[str, Any] = {field: {"$lt": cutoff}}
+            partial = opts.get("partialFilterExpression")
+            if isinstance(partial, Mapping) and partial:
+                ttl_filter = {"$and": [ttl_filter, dict(partial)]}
+            ttl_filters.append(ttl_filter)
+        if not ttl_filters:
+            return 0
         pruned = 0
         oplog_entries: list[dict[str, Any]] = []
         pre_images: list[bytes | None] = []
@@ -6849,15 +6870,7 @@ class Storage:
             candidates = list(self._scan_docs(db, coll))
             for recordid, id_k, blob in candidates:
                 doc = bson.decode(blob)
-                expired = False
-                for _name, field, ttl_seconds in ttl_indexes:
-                    value = get_path(doc, field)
-                    if not isinstance(value, _dt.datetime):
-                        continue
-                    value_aware = value if value.tzinfo else value.replace(tzinfo=_dt.timezone.utc)
-                    if (when - value_aware).total_seconds() > ttl_seconds:
-                        expired = True
-                        break
+                expired = any(matches(doc, ttl_filter) for ttl_filter in ttl_filters)
                 if not expired:
                     continue
                 self._delete_index_entries(db, coll, doc, indexes, partials, recordid=recordid)

@@ -36,6 +36,7 @@ pub mod aggregate;
 pub mod argtypes;
 pub mod auth;
 mod bulkwrite;
+mod capped_admin;
 pub mod changestream;
 pub mod crud;
 pub mod cursors;
@@ -56,6 +57,9 @@ pub mod slowop;
 pub mod stepdown;
 pub mod storage;
 mod timeseries;
+mod ts_bucket_ns;
+mod ts_buckets;
+pub use ts_buckets::{BUCKETS_PREFIX, BUCKETS_STAGE, VIEWS_STAGE};
 pub mod topstats;
 pub mod transactions;
 mod util;
@@ -502,6 +506,10 @@ fn lookup(name: &str) -> Option<Handler> {
         "create" => admin::create,
         "collMod" => admin::coll_mod,
         "collmod" => admin::coll_mod,
+        "convertToCapped" => capped_admin::convert_to_capped,
+        "cloneCollectionAsCapped" => capped_admin::clone_collection_as_capped,
+        "compact" => capped_admin::compact,
+        "reIndex" => capped_admin::re_index,
         "explain" => admin::explain,
         "drop" => admin::drop,
         "secantusAdmin.backupArchive" => admin::backup_archive,
@@ -776,6 +784,8 @@ fn is_write_concern_command(name: &str) -> bool {
             | "create"
             | "collMod"
             | "collmod"
+            | "convertToCapped"
+            | "cloneCollectionAsCapped"
             | "createIndexes"
             | "drop"
             | "dropIndexes"
@@ -1134,6 +1144,10 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             // (A statement of a transaction is refused inside it, in
             // `session`, because the refusal aborts the transaction.)
             if doc.get("autocommit") != Some(&Bson::Boolean(false)) {
+                // `system.buckets.<name>` of a time-series collection.
+                if let Some(reply) = ts_bucket_ns::intercept(name, doc, ctx) {
+                    return reply;
+                }
                 if let Some(reply) = views::refusal(name, doc, ctx) {
                     return reply;
                 }

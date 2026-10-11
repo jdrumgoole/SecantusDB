@@ -351,7 +351,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline);
             let c = base_coll.as_str();
             // Stages that generate / read their own input start from no docs.
-            if first_stage_has_any(&pipeline, &["$collStats", "$indexStats", "$documents"]) {
+            if first_stage_has_any(
+                &pipeline,
+                &[
+                    "$collStats",
+                    "$indexStats",
+                    "$documents",
+                    crate::ts_buckets::BUCKETS_STAGE,
+                    crate::ts_buckets::VIEWS_STAGE,
+                ],
+            ) {
                 (ns, Vec::new(), pipeline)
             } else {
                 // Lift a leading $match into the fetch filter (dropping it from
@@ -380,6 +389,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         &vars,
                     )
                     .map_err(command_error)?;
+                // A time-series collection scans bucket by bucket.
+                let bytes = crate::ts_buckets::as_read(storage, &ctx.db_name, c, bytes, false)?;
                 // Reduce the leading $skip/$limit/$match prefix over raw BSON so
                 // only the survivors that reach the first heavier stage are
                 // decoded (tasks/rust-perf-findings.md).
@@ -464,6 +475,8 @@ fn is_storage_backed(name: &str) -> bool {
             | "$merge"
             | "$geoNear"
             | "$unionWith"
+            | crate::ts_buckets::BUCKETS_STAGE
+            | crate::ts_buckets::VIEWS_STAGE
     )
 }
 
@@ -1253,6 +1266,12 @@ fn apply_storage_stage(
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
         "$indexStats" => apply_index_stats(db, coll, storage),
+        // A read of `system.buckets.<name>`: the stage names the collection.
+        crate::ts_buckets::VIEWS_STAGE => crate::ts_buckets::view_definitions(storage, db),
+        crate::ts_buckets::BUCKETS_STAGE => {
+            let name = spec.and_then(Bson::as_str).unwrap_or_default();
+            crate::ts_buckets::of_collection(storage, db, name)
+        }
         // A document the target's validator refuses is reported under the
         // SOURCE namespace's executor prefix, as mongod reports it.
         "$out" | "$merge" => {
@@ -1262,7 +1281,12 @@ fn apply_storage_stage(
                 apply_merge(spec, docs, db, storage, bypass_validation)
             };
             written.map_err(|mut e| {
-                if e.code == 121 || e.code == 166 || e.code == 7406103 {
+                if e.code == 121
+                    || e.code == 166
+                    || e.code == 7406103
+                    || (e.code == 66 && e.errmsg.starts_with(MERGE_UPDATE_PREFIX))
+                    || (name == "$out" && (e.code == 11000 || e.code == 17152))
+                {
                     let ns = format!("{db}.{}", coll.unwrap_or(""));
                     e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(&ns));
                 }
@@ -1877,11 +1901,10 @@ pub(crate) fn collection_documents(
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     if !crate::views::is_view(storage, db, coll) {
-        return decode_docs(
-            storage
-                .find(db, coll, filter, None, None)
-                .map_err(command_error)?,
-        );
+        let found = storage
+            .find(db, coll, filter, None, None)
+            .map_err(command_error)?;
+        return decode_docs(crate::ts_buckets::as_read(storage, db, coll, found, false)?);
     }
     let mut tail: Vec<Bson> = Vec::new();
     if !filter.is_empty() {
@@ -2132,12 +2155,29 @@ fn apply_coll_stats(
 ) -> Result<Vec<Document>, CommandError> {
     let coll = coll.ok_or_else(|| bad_value("$collStats requires a collection"))?;
     let spec = spec.and_then(Bson::as_document);
-    let count = storage
-        .count_matching(db, coll, &Document::new())
-        .map_err(command_error)? as i64;
+    // A time-series collection's statistics are its buckets': their
+    // namespace, and how many there are.
+    let buckets = if storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        Some(crate::ts_buckets::of_collection(storage, db, coll)?.len() as i64)
+    } else {
+        None
+    };
+    let count = match buckets {
+        Some(n) => n,
+        None => storage
+            .count_matching(db, coll, &Document::new())
+            .map_err(command_error)? as i64,
+    };
     let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let ns = match buckets {
+        Some(_) => format!("{db}.{}{coll}", crate::ts_buckets::BUCKETS_PREFIX),
+        None => format!("{db}.{coll}"),
+    };
     let mut out = doc! {
-        "ns": format!("{db}.{coll}"),
+        "ns": ns,
         "host": "secantus",
         "localTime": bson::DateTime::now(),
     };
@@ -2190,7 +2230,10 @@ fn apply_coll_stats(
         );
     }
     if spec.is_some_and(|s| s.contains_key("count")) {
-        out.insert("count", count);
+        match buckets {
+            Some(n) => out.insert("count", crate::admin::int_bson(n)),
+            None => out.insert("count", count),
+        };
     }
     Ok(vec![out])
 }
@@ -2295,6 +2338,13 @@ fn apply_out(
         Document::new()
     };
     options.remove("uuid");
+    if options.get_bool("capped").unwrap_or(false) {
+        return Err(CommandError::new(
+            17152,
+            "Location17152",
+            format!("namespace '{out_db}.{out_coll}' is capped so it can't be used for $out"),
+        ));
+    }
     let indexes: Vec<Document> = if existed {
         storage
             .list_indexes(&out_db, &out_coll)
@@ -2343,31 +2393,55 @@ fn apply_out(
             }
         }
     }
-    storage
-        .drop_collection(&out_db, &out_coll)
-        .map_err(command_error)?;
-    storage
-        .create_collection_with_options(&out_db, &out_coll, &options)
-        .map_err(command_error)?;
-    if !docs.is_empty() {
-        let encoded = encode_docs(docs)?;
+    // The replacement is built beside the target and swapped in, so a
+    // document or index build it refuses (a duplicate `_id`, a unique index
+    // the output breaks) leaves the target as it was. It used to be dropped
+    // first, and a failed `$out` destroyed what it was meant to replace.
+    let tmp = format!("tmp.agg_out.{}", bson::oid::ObjectId::new().to_hex());
+    let build = (|| {
         storage
-            .insert(&out_db, &out_coll, encoded, true)
+            .create_collection_with_options(&out_db, &tmp, &options)
             .map_err(command_error)?;
+        if !docs.is_empty() {
+            insert_or_fail(storage, &out_db, &tmp, encode_docs(docs)?)?;
+        }
+        for ix in &indexes {
+            let (Ok(name), Ok(key)) = (ix.get_str("name"), ix.get_document("key")) else {
+                continue;
+            };
+            storage
+                .create_index(&out_db, &tmp, name, key, ix)
+                .map_err(command_error)?;
+        }
+        if let Some((name, key)) = default_index {
+            let index = doc! { "key": key.clone(), "name": name.clone() };
+            storage
+                .create_index(&out_db, &tmp, &name, &key, &index)
+                .map_err(command_error)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = build {
+        storage
+            .drop_collection(&out_db, &tmp)
+            .map_err(command_error)?;
+        return Err(e);
     }
-    for ix in &indexes {
-        let (Ok(name), Ok(key)) = (ix.get_str("name"), ix.get_document("key")) else {
-            continue;
-        };
+    let (renamed, why) = storage
+        .rename_collection(&out_db, &tmp, &out_db, &out_coll, true)
+        .map_err(command_error)?;
+    if !renamed {
         storage
-            .create_index(&out_db, &out_coll, name, key, ix)
+            .drop_collection(&out_db, &tmp)
             .map_err(command_error)?;
-    }
-    if let Some((name, key)) = default_index {
-        let index = doc! { "key": key.clone(), "name": name.clone() };
-        storage
-            .create_index(&out_db, &out_coll, &name, &key, &index)
-            .map_err(command_error)?;
+        return Err(CommandError::new(
+            8,
+            "UnknownError",
+            format!(
+                "$out could not replace {out_db}.{out_coll}: {}",
+                why.unwrap_or_default()
+            ),
+        ));
     }
     Ok(Vec::new())
 }
@@ -2427,6 +2501,7 @@ fn apply_merge(
     // mongod requires a unique index covering a non-`_id` `on` so the match is
     // guaranteed to hit at most one target doc.
     merge_validate_on(storage, &out_db, &out_coll, &on)?;
+    let target_collation = crate::util::default_collation(storage, &out_db, &out_coll);
     for d in docs {
         let mut filter = Document::new();
         for field in &on {
@@ -2435,13 +2510,23 @@ fn apply_merge(
                 .unwrap_or(Bson::Null);
             filter.insert(field.clone(), v);
         }
-        let existing = decode_docs(
-            storage
-                .find(&out_db, &out_coll, &filter, None, None)
-                .map_err(command_error)?,
-        )?
-        .into_iter()
-        .next();
+        // The target's default collation decides what matches, as it does
+        // for any read of that collection.
+        let found = match &target_collation {
+            Some(c) => storage.find_collated(
+                &out_db,
+                &out_coll,
+                &filter,
+                None,
+                None,
+                Some(c),
+                &Document::new(),
+            ),
+            None => storage.find(&out_db, &out_coll, &filter, None, None),
+        };
+        let existing = decode_docs(found.map_err(command_error)?)?
+            .into_iter()
+            .next();
 
         match existing {
             Some(existing) => {
@@ -2457,6 +2542,9 @@ fn apply_merge(
                         let result =
                             core_run(vec![existing.clone()], pipeline, &pvars, None, None)?;
                         let mut newdoc = result.into_iter().next().unwrap_or(existing);
+                        if let Some(changed) = merge_changes_id(&existing_id, newdoc.get("_id")) {
+                            return Err(merge_altered_id(changed));
+                        }
                         newdoc.insert("_id", existing_id);
                         storage
                             .update_matching(&out_db, &out_coll, &id_filter, &newdoc, false, false)
@@ -2486,18 +2574,30 @@ fn apply_merge(
                             .map_err(command_error)?;
                     }
                     "replace" => {
+                        if let Some(changed) = merge_changes_id(&existing_id, d.get("_id")) {
+                            return Err(merge_altered_id(changed));
+                        }
                         storage
                             .delete_matching(&out_db, &out_coll, &id_filter, 1)
                             .map_err(command_error)?;
                         let mut new = d;
                         new.entry("_id".to_string()).or_insert(existing_id);
-                        storage
-                            .insert(&out_db, &out_coll, encode_docs(vec![new])?, true)
-                            .map_err(command_error)?;
+                        insert_or_fail(storage, &out_db, &out_coll, encode_docs(vec![new])?)?;
                     }
                     // default: "merge" — deep-merge the result doc over the
                     // existing one (existing `_id` preserved), then replace.
                     _ => {
+                        if merge_changes_id(&existing_id, d.get("_id")).is_some() {
+                            return Err(CommandError::new(
+                                66,
+                                "ImmutableField",
+                                format!(
+                                    "{}Performing an update on the path '_id' would modify \
+                                     the immutable field '_id'",
+                                    MERGE_UPDATE_PREFIX
+                                ),
+                            ));
+                        }
                         let mut merged = deep_merge_docs(&existing, &d);
                         merged.insert("_id", existing_id);
                         storage
@@ -2514,14 +2614,66 @@ fn apply_merge(
                     ));
                 }
                 _ => {
-                    storage
-                        .insert(&out_db, &out_coll, encode_docs(vec![d])?, true)
-                        .map_err(command_error)?;
+                    insert_or_fail(storage, &out_db, &out_coll, encode_docs(vec![d])?)?;
                 }
             },
         }
     }
     Ok(Vec::new())
+}
+
+/// Insert into a stage's target, failing on the first document the storage
+/// refuses. `Storage::insert` REPORTS a refused document in its result rather
+/// than failing, and dropping that result lost the document without a word.
+pub(crate) fn insert_or_fail(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    docs: Vec<Vec<u8>>,
+) -> Result<(), CommandError> {
+    let (_, errors) = storage
+        .insert(db, coll, docs, true)
+        .map_err(command_error)?;
+    let Some(first) = errors.into_iter().next() else {
+        return Ok(());
+    };
+    let code = first.get_i32("code").unwrap_or(8);
+    let errmsg = first
+        .get_str("errmsg")
+        .unwrap_or("write failed")
+        .to_string();
+    let mut extra = first.clone();
+    for key in ["index", "code", "errmsg"] {
+        extra.remove(key);
+    }
+    Err(CommandError::new(code, crate::util::error_code_name(code), errmsg).with_extra(extra))
+}
+
+/// The incoming `_id` when it is not the matched document's. The two can
+/// match and still differ: the target's default collation decides the match
+/// (`"M"` finds `"m"` at strength 2), and mongod then refuses to change the
+/// `_id` (measured 8.2.11).
+fn merge_changes_id<'a>(existing: &Bson, incoming: Option<&'a Bson>) -> Option<&'a Bson> {
+    incoming.filter(|new| secantus_core::order::cmp(existing, new) != std::cmp::Ordering::Equal)
+}
+
+/// What mongod puts before the update error a `$merge` ran into (after the
+/// source namespace's executor prefix, which the stage dispatch adds).
+const MERGE_UPDATE_PREFIX: &str = "$merge failed to update the matching document, did you \
+     attempt to modify the _id or the shard key? :: caused by :: Plan executor error during \
+     update :: caused by :: ";
+
+/// mongod's error for a replacement that would change the matched `_id`.
+fn merge_altered_id(new_id: &Bson) -> CommandError {
+    CommandError::new(
+        66,
+        "ImmutableField",
+        format!(
+            "{MERGE_UPDATE_PREFIX}After applying the update, the (immutable) field '_id' was \
+             found to have been altered to _id: {}",
+            secantus_core::query::bson_value_repr(new_id)
+        ),
+    )
 }
 
 /// Parse `$merge`'s spec into `(db, coll, on, whenMatched, whenNotMatched)`.

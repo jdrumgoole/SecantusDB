@@ -1650,6 +1650,64 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         }
         entries.push(entry);
     }
+    // What mongod keeps views and time-series collections in: `system.views`,
+    // and a `system.buckets.<name>` per time-series collection. Neither is
+    // stored here, and both read as mongod's do (see `ts_buckets`).
+    let mut derived: Vec<Document> = Vec::new();
+    for entry in &entries {
+        let (Ok(name), Ok("timeseries")) = (entry.get_str("name"), entry.get_str("type")) else {
+            continue;
+        };
+        let Ok(definition) = entry
+            .get_document("options")
+            .and_then(|o| o.get_document("timeseries"))
+        else {
+            continue;
+        };
+        let time = definition.get_str("timeField").unwrap_or_default();
+        let mut info = doc! { "readOnly": false };
+        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, name) {
+            info.insert("uuid", crate::ts_buckets::derived_uuid(&uuid, 1));
+        }
+        derived.push(doc! {
+            "name": format!("{}{name}", crate::ts_buckets::BUCKETS_PREFIX),
+            "type": "collection",
+            "options": {
+                "validator": crate::ts_buckets::validator(time),
+                "clusteredIndex": true,
+                "timeseries": definition.clone(),
+            },
+            "info": info,
+        });
+    }
+    if entries
+        .iter()
+        .any(|e| matches!(e.get_str("type"), Ok("view" | "timeseries")))
+    {
+        derived.push(doc! {
+            "name": "system.views",
+            "type": "collection",
+            "options": {},
+            "info": {
+                "readOnly": false,
+                "uuid": crate::ts_buckets::derived_uuid(ctx.db_name.as_bytes(), 2),
+            },
+            "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+        });
+    }
+    // Each bucket namespace follows its collection, and `system.views` is
+    // last. mongod's own order is not one a client can rely on.
+    for entry in derived {
+        let after = entry
+            .get_str("name")
+            .ok()
+            .and_then(|n| n.strip_prefix(crate::ts_buckets::BUCKETS_PREFIX))
+            .and_then(|base| entries.iter().position(|e| e.get_str("name") == Ok(base)));
+        match after {
+            Some(i) => entries.insert(i + 1, entry),
+            None => entries.push(entry),
+        }
+    }
     // `filter` is evaluated against the full entry (so `{name: …}`,
     // `{type: …}`, `{"options.capped": true}` all work); apply it before the
     // `nameOnly` projection so a filter on `options` still matches.
@@ -2868,7 +2926,7 @@ fn equivalent_spec_text(spec: &Document) -> String {
 /// The options that make two index specs different indexes.
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
-const INDEX_CATALOG_ONLY: &[&str] = &["entryFormat", "multikey", "collationKeys"];
+pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &["entryFormat", "multikey", "collationKeys"];
 
 fn index_options(spec: &Document) -> Document {
     spec.iter()
@@ -3289,6 +3347,50 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .map_err(command_error)?;
     let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
     let avg_obj_size = if count > 0 { size / count } else { 0 };
+    // A time-series collection reports its buckets. Only what follows from
+    // the measurements is given: mongod's write counters (how many buckets
+    // were opened, closed, reopened and why) are a history this server does
+    // not have.
+    let buckets = if storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        Some(crate::ts_buckets::of_collection(
+            storage,
+            &ctx.db_name,
+            &coll,
+        )?)
+    } else {
+        None
+    };
+    if let Some(buckets) = buckets {
+        let bucket_size: i64 = buckets
+            .iter()
+            .map(|b| bson::to_vec(b).map(|v| v.len() as i64).unwrap_or(0))
+            .sum();
+        let n = buckets.len() as i64;
+        let mut index_sizes = index_sizes;
+        index_sizes.remove("_id_");
+        let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
+        return Ok(doc! {
+            "ns": format!("{}.{}", ctx.db_name, coll),
+            "size": int_bson(bucket_size),
+            "timeseries": {
+                "bucketsNs": format!(
+                    "{}.{}{coll}", ctx.db_name, crate::ts_buckets::BUCKETS_PREFIX
+                ),
+                "bucketCount": int_bson(n),
+                "avgBucketSize": int_bson(if n > 0 { bucket_size / n } else { 0 }),
+            },
+            "storageSize": int_bson(bucket_size),
+            "capped": false,
+            "nindexes": index_sizes.len() as i32,
+            "totalIndexSize": int_bson(total_index_size),
+            "indexSizes": index_sizes,
+            "scaleFactor": 1_i32,
+            "ok": 1.0,
+        });
+    }
     let mut reply = doc! {
         "ns": format!("{}.{}", ctx.db_name, coll),
         "count": count as i32,
@@ -3519,9 +3621,18 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
-    let nrecords = storage
-        .count_matching(&ctx.db_name, &coll, &Document::new())
-        .map_err(command_error)? as i64;
+    // A time-series collection is validated as its buckets: mongod counts
+    // them, names their namespace and shows each index as it lies on them.
+    let options = storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let layout = crate::ts_buckets::Layout::of(&options);
+    let nrecords = match &layout {
+        Some(_) => crate::ts_buckets::of_collection(storage, &ctx.db_name, &coll)?.len() as i64,
+        None => storage
+            .count_matching(&ctx.db_name, &coll, &Document::new())
+            .map_err(command_error)? as i64,
+    };
     let indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
@@ -3529,29 +3640,76 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut index_details = Document::new();
     let mut n_indexes = 0i32;
     for ix in &indexes {
-        if let Ok(name) = ix.get_str("name") {
-            keys_per_index.insert(name, nrecords);
-            index_details.insert(name, doc! { "valid": true });
-            n_indexes += 1;
+        let Ok(name) = ix.get_str("name") else {
+            continue;
+        };
+        if layout.is_some() && name == "_id_" {
+            continue;
         }
+        let mut spec = doc! { "v": 2 };
+        if let Ok(key) = ix.get_document("key") {
+            spec.insert(
+                "key",
+                match &layout {
+                    Some(l) => crate::ts_buckets::bucket_key(key, l),
+                    None => key.clone(),
+                },
+            );
+        }
+        spec.insert("name", name);
+        for (option, value) in ix {
+            if !matches!(option.as_str(), "v" | "key" | "name" | "ns")
+                && !INDEX_CATALOG_ONLY.contains(&option.as_str())
+            {
+                spec.insert(option.clone(), value.clone());
+            }
+        }
+        keys_per_index.insert(name, int_bson(nrecords));
+        index_details.insert(name, doc! { "valid": true, "spec": spec });
+        n_indexes += 1;
     }
-    Ok(doc! {
-        "ns": format!("{}.{}", ctx.db_name, coll),
-        "nInvalidDocuments": 0i64,
-        "nNonCompliantDocuments": 0i64,
-        "nrecords": nrecords,
-        "nIndexes": n_indexes,
-        "keysPerIndex": keys_per_index,
-        "indexDetails": index_details,
+    let ns = match &layout {
+        Some(_) => format!(
+            "{}.{}{coll}",
+            ctx.db_name,
+            crate::ts_buckets::BUCKETS_PREFIX
+        ),
+        None => format!("{}.{}", ctx.db_name, coll),
+    };
+    // mongod's field order (measured 8.2.11).
+    let mut reply = doc! {
         "valid": true,
         "repaired": false,
+        "repairMode": "None",
+        "ns": ns,
+    };
+    if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, &coll) {
+        if uuid.len() == 16 {
+            let uuid = match &layout {
+                Some(_) => crate::ts_buckets::derived_uuid(&uuid, 1),
+                None => Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid,
+                    bytes: uuid,
+                }),
+            };
+            reply.insert("uuid", uuid);
+        }
+    }
+    reply.extend(doc! {
         "warnings": Bson::Array(vec![]),
         "errors": Bson::Array(vec![]),
         "extraIndexEntries": Bson::Array(vec![]),
         "missingIndexEntries": Bson::Array(vec![]),
+        "nInvalidDocuments": 0_i32,
+        "nNonCompliantDocuments": 0_i32,
+        "nrecords": int_bson(nrecords),
         "corruptRecords": Bson::Array(vec![]),
+        "nIndexes": n_indexes,
+        "keysPerIndex": keys_per_index,
+        "indexDetails": index_details,
         "ok": 1.0,
-    })
+    });
+    Ok(reply)
 }
 
 /// `profile` — get / set per-database profiling level. `{profile: -1}` reads;

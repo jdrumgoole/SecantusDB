@@ -452,6 +452,23 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(message) = refused {
             return Ok(CommandError::new(168, "InvalidPipelineOperator", message).into_reply());
         }
+        // The buckets are clustered: there is no `{_id: 1}` index to hint.
+        // (mongod does take the NAME `_id_`.)
+        if let Some(Bson::Document(spec)) = argtypes::given_hint(doc) {
+            if spec.len() == 1 && spec.contains_key("_id") {
+                return Ok(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "hint {} does not correspond to an existing index",
+                        secantus_core::aggregate::render_value_compact(&Bson::Document(
+                            spec.clone()
+                        ))
+                    ),
+                )
+                .into_reply());
+            }
+        }
     }
 
     let filter = doc_field(doc, "filter");
@@ -586,7 +603,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
 
-    let mut docs = storage
+    let docs = storage
         .find_collated(
             &ctx.db_name,
             &coll,
@@ -599,6 +616,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .map_err(|e| {
             crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll))
         })?;
+
+    // A time-series collection scans bucket by bucket, and returns each
+    // measurement with its time and meta fields first.
+    let mut docs = crate::ts_buckets::as_read(storage, &ctx.db_name, &coll, docs, sort.is_some())?;
 
     // Validate the filter even when nothing matched: against a non-empty
     // collection the storage scan evaluates the filter per doc and an

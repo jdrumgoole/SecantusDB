@@ -477,6 +477,44 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
+        // `system.buckets.<name>` of a time-series collection is not stored:
+        // it reads as a view that derives the buckets from the measurements.
+        if let Some(name) = coll.strip_prefix(secantus_commands::BUCKETS_PREFIX) {
+            let base = self
+                .inner
+                .get_collection_options(db, name)
+                .map_err(map_err)?;
+            if base.contains_key("timeseries")
+                && !self.inner.collection_exists(db, coll).map_err(map_err)?
+            {
+                let mut view = Document::new();
+                view.insert("viewOn", name);
+                view.insert(
+                    "viewPipeline",
+                    vec![bson::doc! { secantus_commands::BUCKETS_STAGE: name }],
+                );
+                return Ok(view);
+            }
+        }
+        // `system.views` likewise: it lists the database's views, and its
+        // time-series collections, when there are any.
+        if coll == "system.views" && !self.inner.collection_exists(db, coll).map_err(map_err)? {
+            for name in self.inner.list_collections(db).map_err(map_err)? {
+                let options = self
+                    .inner
+                    .get_collection_options(db, &name)
+                    .map_err(map_err)?;
+                if options.contains_key("viewOn") || options.contains_key("timeseries") {
+                    let mut view = Document::new();
+                    view.insert("viewOn", coll);
+                    view.insert(
+                        "viewPipeline",
+                        vec![bson::doc! { secantus_commands::VIEWS_STAGE: 1 }],
+                    );
+                    return Ok(view);
+                }
+            }
+        }
         self.inner.get_collection_options(db, coll).map_err(map_err)
     }
 

@@ -6280,6 +6280,28 @@ def _coll_mod(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             }
         new_expiry = index_spec.get("expireAfterSeconds")
         if new_expiry is not None:
+            # mongod refuses these (measured 8.2.11). A TTL stored on a
+            # compound index went on to delete documents.
+            ttl_problem = None
+            if (
+                isinstance(new_expiry, (int, float))
+                and not isinstance(new_expiry, bool)
+                and new_expiry < 0
+            ):
+                ttl_problem = "TTL index 'expireAfterSeconds' option cannot be less than 0"
+            elif target.get("name") == "_id_":
+                ttl_problem = "the _id field does not support TTL indexes"
+            elif len(target.get("key", {})) > 1:
+                ttl_problem = (
+                    "TTL indexes are single-field indexes, compound indexes do not support TTL"
+                )
+            if ttl_problem is not None:
+                return {
+                    "ok": 0.0,
+                    "errmsg": ttl_problem,
+                    "code": 72,
+                    "codeName": "InvalidOptions",
+                }
             reply["expireAfterSeconds_old"] = target.get("expireAfterSeconds")
             reply["expireAfterSeconds_new"] = new_expiry
             ctx.storage.set_index_expiry(ctx.db_name, coll, target["name"], new_expiry)

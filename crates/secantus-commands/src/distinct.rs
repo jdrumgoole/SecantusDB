@@ -102,7 +102,13 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let hint = argtypes::given_hint(doc);
     argtypes::require_natural_hint(hint)?;
     let storage = ctx.storage()?;
+    // A time-series collection is a view over its buckets on mongod, and
+    // answers as one.
     let on_view = crate::views::is_view(storage, &ctx.db_name, &coll);
+    let as_view = on_view
+        || storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .is_ok_and(|o| o.contains_key("timeseries"));
     // A view has no rows of its own: its documents are its pipeline's output
     // over the collection it is defined on. Reading the view's own (empty)
     // storage answered `[]` for every `distinct` on a view.
@@ -157,7 +163,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     values.dedup_by(|later, first| {
         secantus_core::order::cmp(later, first) == std::cmp::Ordering::Equal
     });
-    if on_view {
+    if as_view {
         // mongod runs a view's `distinct` as an aggregation and answers
         // `ok` as an int32 there, where a collection's is a double.
         return Ok(doc! { "values": values, "ok": 1_i32 });
