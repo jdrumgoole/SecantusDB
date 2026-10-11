@@ -29,7 +29,7 @@ fn with_db(body: impl FnOnce(&Storage)) {
     // mode mints post-commit, so there is no window to test. Pin the mode
     // explicitly so the SECANTUS_OPLOG_ASYNC=1 CI lane still exercises the
     // sync invariants (the option beats the env var).
-    let st = Storage::open_with_options(
+    let mut st = Storage::open_with_options(
         home.to_str().unwrap(),
         &StorageOptions {
             oplog_async: Some(false),
@@ -37,6 +37,13 @@ fn with_db(body: impl FnOnce(&Storage)) {
         },
     )
     .unwrap();
+    // The collections written below exist before the first counted write:
+    // a write that creates its collection records the creation too.
+    st.set_enable_oplog(false);
+    for coll in ["x", "y", "z"] {
+        st.create_collection("app", coll).unwrap();
+    }
+    st.set_enable_oplog(true);
     body(&st);
     drop(st);
     let _ = std::fs::remove_dir_all(&home);

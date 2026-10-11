@@ -316,10 +316,11 @@ fn stable_checkpoint_marker_roundtrips() {
             .unwrap();
     }
     // Reopen: the marker must read back as the seq the checkpoint anchored
-    // (1 — the second insert happened after), via the same load path open uses.
+    // (2: the collection's creation, then the first insert; the second insert
+    // happened after), via the same load path open uses.
     {
         let st = Storage::open(home.to_str().unwrap()).unwrap();
-        assert_eq!(st.stable_checkpoint_seq(), 1);
+        assert_eq!(st.stable_checkpoint_seq(), 2);
     } // close BEFORE deleting the home — a live connection's close checkpoint
       // over a removed directory is a guaranteed WT panic.
     let _ = std::fs::remove_dir_all(&home);
