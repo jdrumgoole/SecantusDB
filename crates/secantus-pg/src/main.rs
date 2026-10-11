@@ -17,7 +17,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pg::{bind_with, ClientCert, DatabaseRegistry, ServerOptions, TlsConfig};
+use secantus_pg::{
+    bind_with, ClientCert, ClientName, DatabaseRegistry, ServerOptions, TlsConfig, TlsReloader,
+};
 
 /// Unblock SIGINT / SIGTERM in the calling thread and give them their
 /// default disposition, undoing whatever the parent left. POSIX only:
@@ -57,6 +59,52 @@ fn version_text() -> String {
 // NOT `#[tokio::main]`: `bind` owns the runtime, and `RunningPgServer::stop`
 // drops it -- which panics if it happens inside a runtime context. `main` is a
 // plain blocking function that waits on a signal.
+/// Set by SIGHUP; the reload itself is no work for a signal handler.
+#[cfg(unix)]
+static RELOAD_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn request_reload(_: libc::c_int) {
+    RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Re-read the TLS files on SIGHUP, as PostgreSQL does on `pg_ctl reload`.
+/// Only a server started with TLS has anything to re-read; one without
+/// keeps SIGHUP as a request to stop. Windows has no SIGHUP, and
+/// `select pg_reload_conf()` is the way there.
+#[cfg(unix)]
+fn watch_for_reload(reloader: Option<TlsReloader>) {
+    let Some(reloader) = reloader else {
+        return;
+    };
+    // SAFETY: `signal` with a valid signal number and a handler that only
+    // stores to an atomic, which is async-signal-safe. This replaces the
+    // stop handler `ctrlc` installed for SIGHUP and leaves its others.
+    unsafe {
+        libc::signal(
+            libc::SIGHUP,
+            request_reload as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+    let watcher = std::thread::Builder::new()
+        .name("secantus-pg-reload".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if RELOAD_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                match reloader.reload() {
+                    Ok(()) => eprintln!("secantusd-pg: TLS configuration reloaded"),
+                    Err(e) => eprintln!("secantusd-pg: TLS configuration was not reloaded: {e}"),
+                }
+            }
+        });
+    if let Err(e) = watcher {
+        eprintln!("secantusd-pg: SIGHUP will not reload the TLS files: {e}");
+    }
+}
+
+#[cfg(not(unix))]
+fn watch_for_reload(_reloader: Option<TlsReloader>) {}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FIRST, before any thread exists (a thread inherits the mask it is
     // spawned with): take back SIGINT and SIGTERM. A process inherits its
@@ -78,6 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_ca_file: Option<String> = None;
     let mut tls_client_cert: Option<ClientCert> = None;
     let mut tls_require = false;
+    let mut tls_crl_file: Option<String> = None;
+    let mut tls_ident_file: Option<String> = None;
+    let mut tls_user_map: Option<String> = None;
+    let mut tls_client_name: Option<ClientName> = None;
     let mut refuse_unknown_users = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -103,7 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  USAGE:\n    \
                  secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n                \
                  [--tls-cert-file PATH --tls-key-file PATH [--tls-require]\n                 \
-                 [--tls-ca-file PATH [--tls-client-cert MODE]]]\n                \
+                 [--tls-ca-file PATH [--tls-client-cert MODE] [--tls-crl-file PATH]\n                  \
+                 [--tls-client-name CN|DN]\n                  \
+                 [--tls-ident-file PATH --tls-user-map NAME]]]\n                \
                  [--refuse-unknown-users]\n\
                  \n\
                  ARGS:\n    \
@@ -131,6 +185,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  the user name, beside the password. `cert`: the same,\n                     \
                  and no password is asked for. Each needs\n                     \
                  --tls-ca-file and refuses a connection that is not TLS.\n    \
+                 --tls-crl-file PATH   PEM revocation lists (ssl_crl_file). A client\n                     \
+                 certificate one of them names is refused, and so is\n                     \
+                 one whose CA has no list here or an expired one.\n    \
+                 --tls-client-name CN|DN  What of the certificate names the user:\n                     \
+                 its common name (the default) or its whole subject,\n                     \
+                 as in `CN=alice,O=Example`. With verify-full or cert.\n    \
+                 --tls-ident-file PATH  A pg_ident.conf. With --tls-user-map NAME\n                     \
+                 and `--tls-client-cert cert`, a certificate logs in as\n                     \
+                 the roles that map gives it.\n    \
+                 --tls-user-map NAME   The map in --tls-ident-file to use.\n    \
                  --refuse-unknown-users  Ask a user there is no role for to give a\n                     \
                  password, which fails. By default such a user\n                     \
                  connects without one.\n    \
@@ -167,6 +231,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode.parse()
                     .map_err(|e| format!("--tls-client-cert: {e}"))?,
             );
+        } else if arg == "--tls-crl-file" {
+            tls_crl_file = Some(args.next().ok_or("--tls-crl-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--tls-crl-file=") {
+            tls_crl_file = Some(path.to_string());
+        } else if arg == "--tls-ident-file" {
+            tls_ident_file = Some(args.next().ok_or("--tls-ident-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--tls-ident-file=") {
+            tls_ident_file = Some(path.to_string());
+        } else if arg == "--tls-user-map" {
+            tls_user_map = Some(args.next().ok_or("--tls-user-map needs a map name")?);
+        } else if let Some(name) = arg.strip_prefix("--tls-user-map=") {
+            tls_user_map = Some(name.to_string());
+        } else if arg == "--tls-client-name" {
+            let name = args.next().ok_or("--tls-client-name needs CN or DN")?;
+            tls_client_name = Some(
+                name.parse()
+                    .map_err(|e| format!("--tls-client-name: {e}"))?,
+            );
+        } else if let Some(name) = arg.strip_prefix("--tls-client-name=") {
+            tls_client_name = Some(
+                name.parse()
+                    .map_err(|e| format!("--tls-client-name: {e}"))?,
+            );
         } else if arg == "--tls-require" {
             tls_require = true;
         } else if arg == "--refuse-unknown-users" {
@@ -193,6 +280,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (tls_ca_file.is_some(), "--tls-ca-file"),
             (tls_client_cert.is_some(), "--tls-client-cert"),
             (tls_require, "--tls-require"),
+            (tls_crl_file.is_some(), "--tls-crl-file"),
+            (tls_ident_file.is_some(), "--tls-ident-file"),
+            (tls_user_map.is_some(), "--tls-user-map"),
+            (tls_client_name.is_some(), "--tls-client-name"),
         ] {
             if given {
                 return Err(format!("{option} needs --tls-cert-file and --tls-key-file").into());
@@ -207,6 +298,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut tls = TlsConfig::new(cert, key).require_tls(tls_require);
             if let Some(ca) = tls_ca_file {
                 tls = tls.ca_file(ca);
+            }
+            if let Some(crl) = tls_crl_file {
+                tls = tls.crl_file(crl);
+            }
+            if let Some(name) = tls_client_name {
+                tls = tls.client_name(name);
+            }
+            match (tls_ident_file, tls_user_map) {
+                (Some(file), Some(map)) => tls = tls.user_map(file, map),
+                (Some(_), None) => return Err("--tls-ident-file needs --tls-user-map".into()),
+                (None, Some(_)) => return Err("--tls-user-map needs --tls-ident-file".into()),
+                (None, None) => {}
             }
             Some(tls.client_cert(tls_client_cert.unwrap_or_default()))
         }
@@ -266,6 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // while the client had been told the writes succeeded. `stop` drains the
     // connections and drops the last `Arc<Storage>`, which is where the
     // close-checkpoint runs. The handler was installed above, before startup.
+    watch_for_reload(server.tls_reloader());
     let _ = rx.recv();
 
     server.stop();

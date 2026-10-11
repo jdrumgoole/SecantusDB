@@ -158,9 +158,57 @@ secantusd-pg ./secantus-pg-data 127.0.0.1:5432 \
 version, the cipher under OpenSSL's name, and the client certificate's
 subject, serial number and issuer.
 
-Not supported: a certificate revocation list, a user name map
-(`pg_ident.conf`), matching on the certificate's whole DN (`clientname=DN`),
-a key with a passphrase, and reloading the files without a restart.
+Four more, after 0.1.0-beta.11, say which certificates are accepted and
+which roles they may log in as:
+
+| Option | What it does | PostgreSQL's equivalent |
+| --- | --- | --- |
+| `--tls-crl-file crl.pem` | Refuses a client certificate that a revocation list in this PEM file names. | `ssl_crl_file` |
+| `--tls-client-name DN` | Compares the certificate's whole subject with the user name, in place of its common name. With `verify-full` or `cert`. | `clientname=DN` |
+| `--tls-ident-file pg_ident.conf` | A user name map file. With `--tls-user-map`. | `ident_file` |
+| `--tls-user-map NAME` | Under `cert`, a certificate logs in as the roles the map `NAME` gives it, and only those. | `map=NAME` |
+
+With a revocation list, every certificate in a client's chain needs a list
+from its issuer that is in date, as OpenSSL requires of PostgreSQL: a
+certificate whose CA has no list in the file, or only an expired one, is
+refused. A list with no extensions, which `openssl ca -gencrl` writes by
+default, is read. A list with a critical extension (one scoped by a
+distribution point, a delta list) stops the server from starting.
+
+The subject under `--tls-client-name DN` is written as RFC 2253 has it, the
+last attribute first: `CN=alice,O=Example`. That is seldom a user name, so
+it goes with a map:
+
+```
+# pg_ident.conf: map name, what the certificate says, role
+staff   "/^CN=(.*),O=Example$"   \1
+staff   build-agent              ci
+```
+
+A line whose second field begins with `/` is a regular expression, and `\1`
+in the role is what its first group matched. The expressions are the Rust
+`regex` crate's, which agree with PostgreSQL's on what such a map is
+written with; one that does not compile stops the server from starting.
+
+The TLS files are read again on SIGHUP, and on `select pg_reload_conf()`
+from a superuser: the certificate and key, the CA file, the revocation list
+and the map. A connection made from then on gets what they hold. When they
+cannot be used the server logs why and keeps what it had. SIGHUP reloads
+only on a server started with TLS; without TLS it stops the server, as
+before.
+
+A certificate whose signature is RSA-PSS is bound to with the hash its
+parameters name. One signed with Ed25519 names no hash: channel binding is
+offered, as PostgreSQL offers it, and a login that takes it up fails with
+"could not find digest for NID UNDEF". libpq takes it up by default, so a
+client of such a server needs `channel_binding=disable`.
+
+Not supported: a choice of these rules by user or database (`pg_hba.conf`
+chooses by line), and a key with a passphrase.
+
+A password file (`~/.pgpass`, or libpq's `passfile`) works as it does with
+PostgreSQL. It is read by the client library, which sends the password it
+finds there; the server sees an ordinary password login.
 
 A user name there is no role for connects without a password, as a role
 with no password does. `--refuse-unknown-users` (since 0.1.0-beta.11) stops

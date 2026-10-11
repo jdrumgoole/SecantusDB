@@ -38,6 +38,7 @@ mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
 mod collations;
+mod crl;
 mod db_settings;
 mod distinct_set;
 mod do_block;
@@ -49,6 +50,7 @@ mod expr_index;
 mod external_sort;
 mod fdw;
 mod grace_join;
+mod ident;
 mod largeobjects;
 mod live_notices;
 mod merge;
@@ -83,7 +85,7 @@ pub use server::{
     bind, bind_tls, bind_with, open_storage, open_storage_with_cache, sync_on_commit,
     RunningPgServer, ServerOptions,
 };
-pub use tls::{ClientCert, TlsConfig};
+pub use tls::{ClientCert, ClientName, TlsConfig, TlsReloader};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2956,6 +2958,8 @@ pub struct PgHandler {
     ssl: bool,
     /// What a login to a server with TLS is held to; `None` without TLS.
     tls: Option<Arc<tls::TlsPolicy>>,
+    /// Re-reads the server's TLS files, for `pg_reload_conf()`.
+    tls_reloader: Option<tls::TlsReloader>,
     /// Ask a user this server has no role for to prove a password, which it
     /// cannot, where the default is to trust it.
     refuse_unknown_users: bool,
@@ -3481,6 +3485,7 @@ impl PgHandler {
             storage,
             ssl: false,
             tls: None,
+            tls_reloader: None,
             refuse_unknown_users: false,
             db: OnceLock::new(),
             databases,
@@ -3569,6 +3574,12 @@ impl PgHandler {
         let ssl = policy.is_some();
         self.tls = policy;
         self.with_ssl(ssl)
+    }
+
+    /// A handler whose `pg_reload_conf()` re-reads the server's TLS files.
+    pub(crate) fn with_tls_reloader(mut self, reloader: Option<tls::TlsReloader>) -> Self {
+        self.tls_reloader = reloader;
+        self
     }
 
     /// A handler for a server that does, or does not, trust a user it has
@@ -17756,11 +17767,11 @@ impl PgHandler {
 
     /// The server certificate's hash, when this connection is one a SCRAM
     /// exchange can be bound to.
-    fn binding_hash<C: ClientInfo>(&self, client: &C) -> Option<&[u8]> {
+    fn binding_hash<C: ClientInfo>(&self, client: &C) -> Option<&x509::EndPoint> {
         if !client.is_secure() {
             return None;
         }
-        self.tls.as_ref()?.end_point_hash.as_deref()
+        self.tls.as_ref()?.end_point.as_ref()
     }
 
     /// The end of a login that `method` let in: the certificate's common
@@ -17780,13 +17791,31 @@ impl PgHandler {
             .map_or(ClientCert::Optional, |policy| policy.client_cert);
         if matches!(mode, ClientCert::VerifyFull | ClientCert::Cert) {
             let user = client.metadata().get("user").cloned().unwrap_or_default();
-            let named = self
+            let policy = self.tls.as_ref();
+            // What the certificate says its holder is called: the common
+            // name, or the whole subject under `clientname=DN`.
+            let holder = self
                 .backend
                 .tls
                 .get()
                 .and_then(|session| session.peer.as_ref())
-                .and_then(|peer| peer.common_name.as_deref())
-                == Some(user.as_str());
+                .and_then(|peer| {
+                    match policy.map(|policy| policy.client_name).unwrap_or_default() {
+                        tls::ClientName::CommonName => peer.common_name.as_deref(),
+                        tls::ClientName::DistinguishedName => {
+                            Some(peer.distinguished_name.as_str())
+                        }
+                    }
+                });
+            // With a user name map the certificate may log in as the roles
+            // the map gives it, and only those; without one, as the role it
+            // names.
+            let named = holder.is_some_and(|holder| {
+                match policy.and_then(|policy| policy.user_map.as_ref()) {
+                    Some(map) => map.allows(holder, &user),
+                    None => holder == user,
+                }
+            });
             if !named {
                 let (code, message) = match (mode, method) {
                     (ClientCert::Cert, _) => (
@@ -18058,6 +18087,19 @@ impl PgHandler {
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
+        // `pg_reload_conf()` is a superuser's by default; the answer is
+        // taken at login.
+        let may_reload = self.is_superuser(&self.session_user_name());
+        let reloader = self.tls_reloader.clone();
+        secantus_pgplan::scalar::set_reload_conf(Some(Box::new(move || {
+            if !may_reload {
+                return false;
+            }
+            if let Some(Err(e)) = reloader.as_ref().map(tls::TlsReloader::reload) {
+                eprintln!("secantusd-pg: TLS configuration was not reloaded: {e}");
+            }
+            true
+        })));
         // ErrorResponse / NoticeResponse fields leave in the session's
         // `client_encoding`, like every other text the server sends: a LATIN9
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,

@@ -12,21 +12,21 @@ use sha2::Digest;
 
 /// One DER element: its tag, its contents, and the whole encoding.
 #[derive(Clone, Copy)]
-struct Tlv<'a> {
-    tag: u8,
-    body: &'a [u8],
-    raw: &'a [u8],
+pub(crate) struct Tlv<'a> {
+    pub tag: u8,
+    pub body: &'a [u8],
+    pub raw: &'a [u8],
 }
 
-const SEQUENCE: u8 = 0x30;
+pub(crate) const SEQUENCE: u8 = 0x30;
 const SET: u8 = 0x31;
-const INTEGER: u8 = 0x02;
-const OID: u8 = 0x06;
+pub(crate) const INTEGER: u8 = 0x02;
+pub(crate) const OID: u8 = 0x06;
 /// `[0] EXPLICIT`, the optional version at the head of a TBSCertificate.
 const VERSION: u8 = 0xa0;
 
 /// The element at the head of `input`, and what follows it.
-fn read(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
+pub(crate) fn read(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
     let (&tag, after_tag) = input.split_first()?;
     // A tag number past 30 takes more octets; no field read here has one.
     if tag & 0x1f == 0x1f {
@@ -59,13 +59,13 @@ fn read(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
 }
 
 /// The next element of `input`, which must carry `tag`.
-fn expect(input: &[u8], tag: u8) -> Option<(Tlv<'_>, &[u8])> {
+pub(crate) fn expect(input: &[u8], tag: u8) -> Option<(Tlv<'_>, &[u8])> {
     let (tlv, rest) = read(input)?;
     (tlv.tag == tag).then_some((tlv, rest))
 }
 
 /// An OBJECT IDENTIFIER's contents as dotted decimal.
-fn oid_text(body: &[u8]) -> Option<String> {
+pub(crate) fn oid_text(body: &[u8]) -> Option<String> {
     let mut arcs: Vec<u64> = Vec::new();
     let mut value: u64 = 0;
     let mut open = false;
@@ -95,18 +95,23 @@ fn oid_text(body: &[u8]) -> Option<String> {
 }
 
 /// The parts of a certificate read here.
-struct Certificate<'a> {
-    serial: &'a [u8],
-    issuer: &'a [u8],
-    subject: &'a [u8],
+pub(crate) struct Certificate<'a> {
+    pub serial: &'a [u8],
+    pub issuer: &'a [u8],
+    pub subject: &'a [u8],
+    /// The SubjectPublicKeyInfo's contents: an AlgorithmIdentifier and the
+    /// key in a BIT STRING.
+    pub public_key_info: &'a [u8],
     signature_algorithm: String,
+    /// What follows the OID in the signature's AlgorithmIdentifier.
+    signature_parameters: &'a [u8],
 }
 
-fn certificate(der: &[u8]) -> Option<Certificate<'_>> {
+pub(crate) fn certificate(der: &[u8]) -> Option<Certificate<'_>> {
     let (cert, _) = expect(der, SEQUENCE)?;
     let (tbs, after_tbs) = expect(cert.body, SEQUENCE)?;
     let (algorithm, _) = expect(after_tbs, SEQUENCE)?;
-    let (algorithm_oid, _) = expect(algorithm.body, OID)?;
+    let (algorithm_oid, signature_parameters) = expect(algorithm.body, OID)?;
 
     let mut fields = tbs.body;
     if let Some((_, rest)) = expect(fields, VERSION) {
@@ -116,37 +121,107 @@ fn certificate(der: &[u8]) -> Option<Certificate<'_>> {
     let (_, fields) = expect(fields, SEQUENCE)?; // signature
     let (issuer, fields) = expect(fields, SEQUENCE)?;
     let (_, fields) = expect(fields, SEQUENCE)?; // validity
-    let (subject, _) = expect(fields, SEQUENCE)?;
+    let (subject, fields) = expect(fields, SEQUENCE)?;
+    let (public_key_info, _) = expect(fields, SEQUENCE)?;
     Some(Certificate {
         serial: serial.body,
         issuer: issuer.body,
         subject: subject.body,
+        public_key_info: public_key_info.body,
         signature_algorithm: oid_text(algorithm_oid.body)?,
+        signature_parameters,
     })
 }
 
-/// `tls-server-end-point` (RFC 5929) for a server certificate: the
-/// certificate hashed with its signature's own hash, or with SHA-256 where
-/// that hash is MD5 or SHA-1.
-///
-/// `None` for a signature whose hash is not named by its algorithm (RSA-PSS,
-/// Ed25519) or is not one of these; the server then offers no channel
-/// binding.
-pub(crate) fn end_point_hash(der: &[u8]) -> Option<Vec<u8>> {
+/// What a SCRAM channel binding to a server certificate carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndPoint {
+    /// `tls-server-end-point` (RFC 5929): the certificate hashed with its
+    /// signature's own hash, or with SHA-256 where that hash is MD5 or
+    /// SHA-1.
+    Hash(Vec<u8>),
+    /// The signature names no hash (Ed25519). PostgreSQL offers channel
+    /// binding all the same and fails the login of a client that takes it
+    /// up, with "could not find digest for NID UNDEF".
+    NoDigest,
+}
+
+/// The hash a signature algorithm uses, as OpenSSL's
+/// `X509_get_signature_info` reports it to PostgreSQL.
+#[derive(Clone, Copy)]
+enum Hash {
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl Hash {
+    /// A hash by its own OID. MD5 and SHA-1 are replaced by SHA-256, as
+    /// RFC 5929 has it.
+    fn by_oid(oid: &str) -> Option<Self> {
+        match oid {
+            "1.2.840.113549.2.5" | "1.3.14.3.2.26" | "2.16.840.1.101.3.4.2.1" => Some(Hash::Sha256),
+            "2.16.840.1.101.3.4.2.2" => Some(Hash::Sha384),
+            "2.16.840.1.101.3.4.2.3" => Some(Hash::Sha512),
+            "2.16.840.1.101.3.4.2.4" => Some(Hash::Sha224),
+            _ => None,
+        }
+    }
+
+    fn of(self, der: &[u8]) -> Vec<u8> {
+        match self {
+            Hash::Sha224 => sha2::Sha224::digest(der).to_vec(),
+            Hash::Sha256 => sha2::Sha256::digest(der).to_vec(),
+            Hash::Sha384 => sha2::Sha384::digest(der).to_vec(),
+            Hash::Sha512 => sha2::Sha512::digest(der).to_vec(),
+        }
+    }
+}
+
+/// `[0] EXPLICIT`, the hash in RSASSA-PSS parameters.
+const PSS_HASH: u8 = 0xa0;
+
+/// The hash RSASSA-PSS parameters name. An absent field is the default,
+/// SHA-1, which becomes SHA-256.
+fn pss_digest(parameters: &[u8]) -> Option<Hash> {
+    let Some((sequence, _)) = expect(parameters, SEQUENCE) else {
+        return Some(Hash::Sha256);
+    };
+    let Some((hash, _)) = expect(sequence.body, PSS_HASH) else {
+        return Some(Hash::Sha256);
+    };
+    let (algorithm, _) = expect(hash.body, SEQUENCE)?;
+    let (oid, _) = expect(algorithm.body, OID)?;
+    Hash::by_oid(&oid_text(oid.body)?)
+}
+
+/// What a SCRAM exchange binds to for a server certificate. `None` for a
+/// certificate this reader cannot follow.
+pub(crate) fn end_point(der: &[u8]) -> Option<EndPoint> {
     let cert = certificate(der)?;
-    match cert.signature_algorithm.as_str() {
+    let digest = match cert.signature_algorithm.as_str() {
         // md5WithRSA, sha1WithRSA, sha256WithRSA; ecdsa-with-SHA1, -SHA256.
         "1.2.840.113549.1.1.4"
         | "1.2.840.113549.1.1.5"
         | "1.2.840.113549.1.1.11"
         | "1.2.840.10045.4.1"
-        | "1.2.840.10045.4.3.2" => Some(sha2::Sha256::digest(der).to_vec()),
+        | "1.2.840.10045.4.3.2" => Some(Hash::Sha256),
+        // sha224WithRSA, ecdsa-with-SHA224.
+        "1.2.840.113549.1.1.14" | "1.2.840.10045.4.3.1" => Some(Hash::Sha224),
         // sha384WithRSA, ecdsa-with-SHA384.
-        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => Some(sha2::Sha384::digest(der).to_vec()),
+        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => Some(Hash::Sha384),
         // sha512WithRSA, ecdsa-with-SHA512.
-        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => Some(sha2::Sha512::digest(der).to_vec()),
+        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => Some(Hash::Sha512),
+        // RSASSA-PSS: the hash is in the parameters.
+        "1.2.840.113549.1.1.10" => pss_digest(cert.signature_parameters),
+        // Ed25519, Ed448 and anything else: no hash to name.
         _ => None,
-    }
+    };
+    Some(match digest {
+        Some(digest) => EndPoint::Hash(digest.of(der)),
+        None => EndPoint::NoDigest,
+    })
 }
 
 /// What a client certificate says about its holder.
@@ -157,6 +232,9 @@ pub(crate) struct Peer {
     pub common_name: Option<String>,
     /// The subject, as `pg_stat_ssl.client_dn` prints it.
     pub subject: String,
+    /// The subject as RFC 2253 writes it, which `clientname=DN` compares
+    /// with the user name or hands to the user name map.
+    pub distinguished_name: String,
     /// The issuer, as `pg_stat_ssl.issuer_dn` prints it.
     pub issuer: String,
     /// The serial number in decimal.
@@ -176,6 +254,7 @@ pub(crate) fn peer(der: &[u8]) -> Option<Peer> {
                 Value::Other(_) => None,
             }),
         subject: one_line(&subject),
+        distinguished_name: rfc2253(cert.subject)?,
         issuer: one_line(&issuer),
         serial: integer_text(cert.serial),
     })
@@ -303,6 +382,60 @@ fn escape_into(text: &str, out: &mut String) {
     }
 }
 
+/// A name as OpenSSL's `XN_FLAG_RFC2253` prints it, which is what PostgreSQL
+/// matches under `clientname=DN`: the last RDN first, RDNs joined by `,`
+/// and a multi-valued RDN's attributes by `+`, an attribute type OpenSSL has
+/// no short name for as its dotted OID with the value's DER in hex, and a
+/// byte outside ASCII as `\XX`.
+fn rfc2253(mut rdns: &[u8]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    while !rdns.is_empty() {
+        let (rdn, rest) = expect(rdns, SET)?;
+        rdns = rest;
+        let mut part = String::new();
+        let mut attributes = rdn.body;
+        while !attributes.is_empty() {
+            let (attribute, rest) = expect(attributes, SEQUENCE)?;
+            attributes = rest;
+            let (oid, after_oid) = expect(attribute.body, OID)?;
+            let (value, _) = read(after_oid)?;
+            let oid = oid_text(oid.body)?;
+            if !part.is_empty() {
+                part.push('+');
+            }
+            let short = short_name(&oid);
+            let known = short != "UNDEF";
+            part.push_str(if known { short } else { &oid });
+            part.push('=');
+            match string_value(value) {
+                Value::Text(text) if known => {
+                    let mut escaped = String::new();
+                    escape_into(&text, &mut escaped);
+                    for c in escaped.chars() {
+                        if c.is_ascii() {
+                            part.push(c);
+                        } else {
+                            let mut utf8 = [0u8; 4];
+                            for b in c.encode_utf8(&mut utf8).bytes() {
+                                part.push_str(&format!("\\{b:02X}"));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    part.push('#');
+                    for b in value.raw {
+                        part.push_str(&format!("{b:02X}"));
+                    }
+                }
+            }
+        }
+        parts.push(part);
+    }
+    parts.reverse();
+    Some(parts.join(","))
+}
+
 /// A DER INTEGER's contents in decimal.
 fn integer_text(body: &[u8]) -> String {
     let negative = body.first().is_some_and(|b| b & 0x80 != 0);
@@ -399,6 +532,50 @@ mod tests {
             one_line(&attributes),
             "/O=Acme\\, Inc./CN=\\ alice\\ /CN=zo\u{eb}/UNDEF=x/OU=#020105"
         );
+        // RFC 2253: last first, an unknown type by its OID with the value's
+        // DER, and a byte outside ASCII escaped.
+        assert_eq!(
+            rfc2253(&der).as_deref(),
+            Some("OU=#020105,1.3.6.1=#0C0178,CN=zo\\C3\\AB,CN=\\ alice\\ ,O=Acme\\, Inc.")
+        );
+        // A multi-valued RDN's attributes are joined by `+`.
+        let two = tlv(
+            SET,
+            &[
+                tlv(
+                    SEQUENCE,
+                    &[tlv(OID, &[0x55, 0x04, 0x03]), tlv(0x0c, b"a")].concat(),
+                ),
+                tlv(
+                    SEQUENCE,
+                    &[tlv(OID, &[0x55, 0x04, 0x0b]), tlv(0x0c, b"b")].concat(),
+                ),
+            ]
+            .concat(),
+        );
+        assert_eq!(rfc2253(&two).as_deref(), Some("CN=a+OU=b"));
+    }
+
+    #[test]
+    fn rsa_pss_parameters_name_the_hash() {
+        let algorithm = |oid: &[u8]| tlv(SEQUENCE, &tlv(OID, oid));
+        let sha384 = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+        let parameters = tlv(SEQUENCE, &tlv(PSS_HASH, &algorithm(&sha384)));
+        assert!(matches!(pss_digest(&parameters), Some(Hash::Sha384)));
+        // SHA-1, named or by default, becomes SHA-256.
+        let sha1 = tlv(
+            SEQUENCE,
+            &tlv(PSS_HASH, &algorithm(&[0x2b, 0x0e, 0x03, 0x02, 0x1a])),
+        );
+        assert!(matches!(pss_digest(&sha1), Some(Hash::Sha256)));
+        assert!(matches!(
+            pss_digest(&tlv(SEQUENCE, &[])),
+            Some(Hash::Sha256)
+        ));
+        assert!(matches!(pss_digest(&[]), Some(Hash::Sha256)));
+        // A hash this reader does not know is no digest.
+        let odd = tlv(SEQUENCE, &tlv(PSS_HASH, &algorithm(&[0x2b, 0x06, 0x01])));
+        assert!(pss_digest(&odd).is_none());
     }
 
     #[test]
@@ -408,8 +585,12 @@ mod tests {
         let der: &[u8] = made.cert.der();
         // rcgen signs with ECDSA over SHA-256, so that is the hash.
         assert_eq!(
-            end_point_hash(der),
-            Some(sha2::Sha256::digest(der).to_vec())
+            end_point(der),
+            Some(EndPoint::Hash(sha2::Sha256::digest(der).to_vec()))
+        );
+        assert_eq!(
+            peer(der).unwrap().distinguished_name,
+            "CN=rcgen self signed cert"
         );
         let peer = peer(der).expect("a certificate");
         assert_eq!(peer.common_name.as_deref(), Some("rcgen self signed cert"));
@@ -438,6 +619,6 @@ mod tests {
         assert!(read(&[SEQUENCE, 0x80, 0, 0]).is_none());
         assert!(certificate(&whole).is_none());
         assert!(peer(&[]).is_none());
-        assert!(end_point_hash(&[0x30]).is_none());
+        assert!(end_point(&[0x30]).is_none());
     }
 }

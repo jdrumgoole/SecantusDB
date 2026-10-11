@@ -20237,3 +20237,539 @@ def test_a_server_that_cannot_use_its_certificate_does_not_start(
         assert done.returncode != 0, args
         assert expected in done.stdout + done.stderr, (args, done.stdout, done.stderr)
         assert "listening on" not in done.stdout, args
+
+
+class _Authority:
+    """A CA made with `cryptography`, for what `trustme` cannot issue: a
+    subject of our choosing, a revocation list, and a certificate whose
+    signature is RSA-PSS or Ed25519."""
+
+    def __init__(self, directory: Path, name: str, *, kind: str = "rsa") -> None:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+        from cryptography.x509.oid import NameOID
+
+        self._directory = directory
+        self._kind = kind
+        self._key = (
+            ed25519.Ed25519PrivateKey.generate()
+            if kind == "ed25519"
+            else rsa.generate_private_key(65537, 2048)
+        )
+        self._name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+        self._issued: dict[str, x509.Certificate] = {}
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(self._name)
+            .issuer_name(self._name)
+            .public_key(self._key.public_key())
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        )
+        self.pem = directory / f"{name}.pem"
+        self.pem.write_bytes(self._sign(builder).public_bytes(_pem()))
+
+    def _signing(self) -> dict[str, object]:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        if self._kind == "ed25519":
+            return {"algorithm": None}
+        if self._kind == "pss384":
+            digest = hashes.SHA384()
+            return {
+                "algorithm": digest,
+                "rsa_padding": padding.PSS(
+                    mgf=padding.MGF1(digest), salt_length=padding.PSS.DIGEST_LENGTH
+                ),
+            }
+        return {"algorithm": hashes.SHA256()}
+
+    def _sign(self, builder: object) -> object:
+        from cryptography import x509
+
+        now = dt.datetime.now(dt.timezone.utc)
+        return (
+            builder.serial_number(x509.random_serial_number())  # type: ignore[attr-defined]
+            .not_valid_before(now - dt.timedelta(days=1))
+            .not_valid_after(now + dt.timedelta(days=30))
+            .sign(self._key, **self._signing())
+        )
+
+    def issue(self, stem: str, *subject: tuple[str, str], server: bool = False) -> dict[str, str]:
+        """A certificate for `subject`, attributes in the order given, as
+        libpq's `sslcert` / `sslkey`. `server=True` names it `localhost`."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        oids = {
+            "CN": NameOID.COMMON_NAME,
+            "O": NameOID.ORGANIZATION_NAME,
+            "OU": NameOID.ORGANIZATIONAL_UNIT_NAME,
+        }
+        key = rsa.generate_private_key(65537, 2048)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(
+                x509.Name([x509.NameAttribute(oids[kind], value) for kind, value in subject])
+            )
+            .issuer_name(self._name)
+            .public_key(key.public_key())
+        )
+        if server:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
+            )
+        cert = self._sign(builder)
+        self._issued[stem] = cert  # type: ignore[assignment]
+        cert_path, key_path = self._directory / f"{stem}.crt", self._directory / f"{stem}.key"
+        cert_path.write_bytes(cert.public_bytes(_pem()))  # type: ignore[attr-defined]
+        key_path.write_bytes(
+            key.private_bytes(
+                _pem(), serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+            )
+        )
+        key_path.chmod(0o600)
+        return {"sslcert": str(cert_path), "sslkey": str(key_path)}
+
+    def fingerprint(self, stem: str) -> bytes:
+        from cryptography.hazmat.primitives import serialization
+
+        return self._issued[stem].public_bytes(serialization.Encoding.DER)
+
+    def revocation_list(
+        self, stem: str, *revoked: str, expired: bool = False, version_1: bool = False
+    ) -> Path:
+        """A list naming the certificates issued as `revoked`."""
+        from cryptography import x509
+
+        now = dt.datetime.now(dt.timezone.utc)
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(self._name)
+            .last_update(now - dt.timedelta(days=10))
+            .next_update(now + dt.timedelta(days=-2 if expired else 30))
+        )
+        if not version_1:
+            builder = builder.add_extension(x509.CRLNumber(1), critical=False)
+        for name in revoked:
+            builder = builder.add_revoked_certificate(
+                x509.RevokedCertificateBuilder()
+                .serial_number(self._issued[name].serial_number)
+                .revocation_date(now - dt.timedelta(days=1))
+                .build()
+            )
+        path = self._directory / f"{stem}.pem"
+        path.write_bytes(builder.sign(self._key, **self._signing()).public_bytes(_pem()))
+        return path
+
+
+def _pem() -> object:
+    from cryptography.hazmat.primitives import serialization
+
+    return serialization.Encoding.PEM
+
+
+def _server_args(server_cert: dict[str, str], ca: _Authority, *more: str) -> tuple[str, ...]:
+    return (
+        "--tls-cert-file",
+        server_cert["sslcert"],
+        "--tls-key-file",
+        server_cert["sslkey"],
+        "--tls-ca-file",
+        str(ca.pem),
+        *more,
+    )
+
+
+def _login(
+    server: _Server, ca: _Authority, user: str, cert: dict[str, str] | None, **params: str
+) -> str:
+    """Log in as `user` over TLS and answer who the session is, or the
+    reason the login failed."""
+    absent = str(server.home / "absent")
+    cert = cert or {"sslcert": f"{absent}.crt", "sslkey": f"{absent}.key"}
+    try:
+        with _tls_connect(
+            server, user=user, sslmode="require", sslrootcert=str(ca.pem), **cert, **params
+        ) as conn:
+            return conn.execute("select current_user::text").fetchone()[0]
+    except psycopg.OperationalError as exc:
+        return str(exc).strip().splitlines()[-1].split("failed: ", 1)[-1]
+
+
+def test_a_revoked_client_certificate_is_refused(home: Path, tmp_path: Path) -> None:
+    """`--tls-crl-file` is PostgreSQL's `ssl_crl_file`.
+
+    Measured against PostgreSQL 15.19: a certificate the list names fails
+    the handshake with "certificate revoked"; with a list past its next
+    update every certificate fails with "certificate expired"; with a list
+    from another CA only, every certificate fails with "unknown ca". A
+    client that sends no certificate connects in all three. A list that
+    carries the CA's name and not its signature fails every certificate,
+    "decrypt error".
+    """
+    ca = _Authority(tmp_path, "ca")
+    other = _Authority(tmp_path, "other")
+    server_cert = ca.issue("server", ("CN", "localhost"), server=True)
+    good = ca.issue("good", ("CN", "postgres"))
+    revoked = ca.issue("revoked", ("CN", "postgres"))
+    (tmp_path / "forger").mkdir()
+    forger = _Authority(tmp_path / "forger", "ca")
+    forger._issued["revoked"] = ca._issued["revoked"]
+    lists = {
+        "current": ca.revocation_list("crl", "revoked"),
+        "expired": ca.revocation_list("crl-expired", "revoked", expired=True),
+        "other": other.revocation_list("crl-other"),
+        # No extensions: what `openssl ca -gencrl` writes by default. The
+        # TLS library's own check cannot read one; PostgreSQL can.
+        "plain": ca.revocation_list("crl-plain", "revoked", version_1=True),
+        "forged": forger.revocation_list("crl-forged", "revoked"),
+    }
+    expected = {
+        "current": ("postgres", "certificate revoked"),
+        "expired": ("certificate expired", "certificate expired"),
+        "other": ("unknown ca", "unknown ca"),
+        "plain": ("postgres", "certificate revoked"),
+        "forged": ("decrypt error", "decrypt error"),
+    }
+    for name, crl in lists.items():
+        with _Server(
+            home, args=_server_args(server_cert, ca, "--tls-crl-file", str(crl))
+        ) as server:
+            want_good, want_revoked = expected[name]
+            assert want_good in _login(server, ca, "postgres", good), name
+            assert want_revoked in _login(server, ca, "postgres", revoked), name
+            assert _login(server, ca, "postgres", None) == "postgres", name
+
+    # A file the server cannot use stops it from starting: starting without
+    # the list would let a revoked certificate in.
+    for args, message in ((("--tls-crl-file", str(ca.pem)), "holds no revocation list"),):
+        done = subprocess.run(
+            [str(BINARY), str(home), "127.0.0.1:0", *_server_args(server_cert, ca, *args)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode != 0 and message in done.stdout + done.stderr, (
+            done.stdout,
+            done.stderr,
+        )
+
+
+def test_a_user_name_map_says_which_roles_a_certificate_logs_in_as(
+    home: Path, tmp_path: Path
+) -> None:
+    """`--tls-ident-file` and `--tls-user-map` are `pg_ident.conf` and `map=`.
+
+    Each outcome is PostgreSQL 15.19's under `hostssl all all cert map=...`.
+    With a map, a certificate logs in as the roles its lines give it and no
+    other: one that names the user outright is refused unless a line says so.
+    """
+    ca = _Authority(tmp_path, "ca")
+    server_cert = ca.issue("server", ("CN", "localhost"), server=True)
+    certs = {
+        cn: ca.issue(f"client{i}", ("CN", cn))
+        for i, cn in enumerate(("alice", "alice_laptop", "shared", "bobcert", "carol@example.com"))
+    }
+    ident = tmp_path / "pg_ident.conf"
+    ident.write_text(
+        "# map  certificate  role\n"
+        "m alice_laptop alice\n"
+        "m shared alice\n"
+        "m shared postgres\n"
+        'm "/^(.*)@example\\.com$" \\1\n'
+        "other bobcert postgres\n"
+    )
+    refused = 'certificate authentication failed for user "{}"'
+    with (
+        _Server(home, args=_server_args(server_cert, ca)) as server,
+        _tls_connect(server, user="postgres", sslmode="require") as conn,
+    ):
+        conn.execute("create role alice login password 'pw'")
+        conn.execute("create role carol login")
+
+    def flags(*more: str) -> tuple[str, ...]:
+        return _server_args(server_cert, ca, "--tls-client-cert", "cert", *more)
+
+    with _Server(home, args=flags("--tls-ident-file", str(ident), "--tls-user-map", "m")) as server:
+        for cn, user, allowed in (
+            ("alice_laptop", "alice", True),
+            ("alice_laptop", "postgres", False),
+            ("alice", "alice", False),
+            ("shared", "alice", True),
+            ("shared", "postgres", True),
+            ("shared", "carol", False),
+            ("carol@example.com", "carol", True),
+            ("carol@example.com", "alice", False),
+            ("bobcert", "postgres", False),
+        ):
+            want = user if allowed else refused.format(user)
+            assert want in _login(server, ca, user, certs[cn]), (cn, user)
+        assert "connection requires a valid client certificate" in _login(server, ca, "alice", None)
+
+    with _Server(
+        home, args=flags("--tls-ident-file", str(ident), "--tls-user-map", "other")
+    ) as server:
+        assert _login(server, ca, "postgres", certs["bobcert"]) == "postgres"
+        assert refused.format("alice") in _login(server, ca, "alice", certs["alice_laptop"])
+
+    # A map no line names lets nobody in, as PostgreSQL has it.
+    with _Server(
+        home, args=flags("--tls-ident-file", str(ident), "--tls-user-map", "absent")
+    ) as server:
+        assert refused.format("alice") in _login(server, ca, "alice", certs["alice"])
+
+    bad = tmp_path / "bad_ident.conf"
+    bad.write_text("m alice_laptop alice\nm only-two\n")
+    for args, message in (
+        (flags("--tls-ident-file", str(ident)), "--tls-ident-file needs --tls-user-map"),
+        (flags("--tls-user-map", "m"), "--tls-user-map needs --tls-ident-file"),
+        (flags("--tls-ident-file", str(bad), "--tls-user-map", "m"), "line 2"),
+        (
+            _server_args(
+                server_cert,
+                ca,
+                "--tls-client-cert",
+                "verify-full",
+                "--tls-ident-file",
+                str(ident),
+                "--tls-user-map",
+                "m",
+            ),
+            "a user name map needs a client certificate mode of cert",
+        ),
+    ):
+        done = subprocess.run(
+            [str(BINARY), str(home), "127.0.0.1:0", *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode != 0 and message in done.stdout + done.stderr, (
+            args,
+            done.stdout,
+            done.stderr,
+        )
+
+
+def test_the_whole_subject_can_name_the_user(home: Path, tmp_path: Path) -> None:
+    """`--tls-client-name DN` is `clientname=DN`.
+
+    The subject is compared as RFC 2253 writes it, last attribute first:
+    `CN=alice,O=Example`. That is not a user name, so on its own it lets
+    nobody in, and PostgreSQL 15.19 answers the same; it is for a map.
+    """
+    ca = _Authority(tmp_path, "ca")
+    server_cert = ca.issue("server", ("CN", "localhost"), server=True)
+    plain = ca.issue("plain", ("CN", "alice"))
+    full = ca.issue("full", ("O", "Example"), ("CN", "alice"))
+    comma = ca.issue("comma", ("O", "Ex, ample"), ("OU", "Eng"), ("CN", "alice"))
+    ident = tmp_path / "pg_ident.conf"
+    ident.write_text('dn "/^CN=(.*),O=Example$" \\1\nexact "CN=alice,OU=Eng,O=Ex\\, ample" alice\n')
+    refused = 'certificate authentication failed for user "alice"'
+    with (
+        _Server(home, args=_server_args(server_cert, ca)) as server,
+        _tls_connect(server, user="postgres", sslmode="require") as conn,
+    ):
+        conn.execute("create role alice login password 'pw'")
+
+    def flags(*more: str) -> tuple[str, ...]:
+        return _server_args(
+            server_cert, ca, "--tls-client-cert", "cert", "--tls-client-name", "DN", *more
+        )
+
+    with _Server(home, args=flags()) as server:
+        for cert in (plain, full, comma):
+            assert refused in _login(server, ca, "alice", cert)
+    with _Server(
+        home, args=flags("--tls-ident-file", str(ident), "--tls-user-map", "dn")
+    ) as server:
+        assert _login(server, ca, "alice", full) == "alice"
+        assert refused in _login(server, ca, "alice", plain)
+        assert refused in _login(server, ca, "alice", comma)
+    with _Server(
+        home, args=flags("--tls-ident-file", str(ident), "--tls-user-map", "exact")
+    ) as server:
+        assert _login(server, ca, "alice", comma) == "alice"
+        assert refused in _login(server, ca, "alice", full)
+
+    # Beside a password the failure reads as the password's, as it does
+    # when the common name is the wrong one.
+    args = _server_args(
+        server_cert, ca, "--tls-client-cert", "verify-full", "--tls-client-name", "DN"
+    )
+    with _Server(home, args=args) as server:
+        assert 'password authentication failed for user "alice"' in _login(
+            server, ca, "alice", full, password="pw"
+        )
+
+    done = subprocess.run(
+        [
+            str(BINARY),
+            str(home),
+            "127.0.0.1:0",
+            *_server_args(server_cert, ca, "--tls-client-name", "DN"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode != 0 and "verify-full or cert" in done.stdout + done.stderr, (
+        done.stdout,
+        done.stderr,
+    )
+
+
+def test_channel_binding_with_an_rsa_pss_or_ed25519_certificate(home: Path, tmp_path: Path) -> None:
+    """A server certificate whose signature is RSA-PSS or Ed25519.
+
+    PostgreSQL 15.19 binds an RSA-PSS certificate with the hash its
+    parameters name. An Ed25519 signature names none: PostgreSQL offers
+    channel binding all the same, and a login that takes it up fails with
+    "could not find digest for NID UNDEF" (libpq says so before the server
+    can). This server used to offer no binding for either.
+    """
+    clients = _Authority(tmp_path, "clients")
+    with _Server(home) as server, _tls_connect(server, user="postgres") as conn:
+        conn.execute("create role alice login password 'pw'")
+
+    for kind in ("pss384", "ed25519"):
+        ca = _Authority(tmp_path, f"ca-{kind}", kind=kind)
+        server_cert = ca.issue(f"server-{kind}", ("CN", "localhost"), server=True)
+        with _Server(home, args=_server_args(server_cert, clients)) as server:
+            offered = _scram_first(server, _TrustOnly(ca.pem), None, "")
+            assert offered == ("SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"), kind
+            assert (
+                _login(server, ca, "alice", None, password="pw", channel_binding="disable")
+                == "alice"
+            )
+            bound = _login(server, ca, "alice", None, password="pw", channel_binding="require")
+            if kind == "pss384":
+                assert bound == "alice"
+                assert "password authentication failed" in _login(
+                    server, ca, "alice", None, password="no", channel_binding="require"
+                )
+            else:
+                assert bound != "alice", "nothing can bind to a certificate with no digest"
+
+
+class _TrustOnly:
+    """What `_scram_first` needs of a `_Certificates`: the CA to trust."""
+
+    def __init__(self, ca: Path) -> None:
+        self.ca = ca
+
+
+def _served_certificate(server: _Server, ca: _Authority) -> bytes:
+    """The certificate the server presents to a new connection, DER."""
+    import socket
+    import ssl
+
+    with socket.create_connection(("127.0.0.1", server.port), timeout=15) as sock:
+        sock.sendall(struct.pack("!II", 8, 80877103))
+        assert sock.recv(1) == b"S"
+        context = ssl.create_default_context(cafile=str(ca.pem))
+        context.check_hostname = False
+        with context.wrap_socket(sock) as tls:
+            return tls.getpeercert(binary_form=True)
+
+
+@pytest.mark.parametrize("how", ["pg_reload_conf", "sighup"])
+def test_the_tls_files_are_read_again_on_a_reload(home: Path, tmp_path: Path, how: str) -> None:
+    """`select pg_reload_conf()` and SIGHUP re-read the TLS files.
+
+    As PostgreSQL 15.19 does on `pg_ctl reload`: a new connection gets the
+    new certificate, files that cannot be used leave the old ones serving,
+    and a revocation list that has gained a name refuses it from then on.
+    """
+    if how == "sighup" and sys.platform == "win32":
+        pytest.skip("Windows has no SIGHUP; pg_reload_conf() is the way there")
+    ca = _Authority(tmp_path, "ca")
+    first = ca.issue("first", ("CN", "localhost"), server=True)
+    second = ca.issue("second", ("CN", "localhost"), server=True)
+    good = ca.issue("good", ("CN", "postgres"))
+    revoked = ca.issue("revoked", ("CN", "postgres"))
+    live = {"sslcert": str(tmp_path / "live.crt"), "sslkey": str(tmp_path / "live.key")}
+    crl = tmp_path / "live-crl.pem"
+
+    def install(cert: dict[str, str]) -> None:
+        for kind in ("sslcert", "sslkey"):
+            shutil.copy(cert[kind], live[kind])
+
+    install(first)
+    shutil.copy(ca.revocation_list("none-revoked"), crl)
+    with _Server(home, args=_server_args(live, ca, "--tls-crl-file", str(crl))) as server:
+
+        def reload() -> None:
+            if how == "sighup":
+                assert server.proc is not None
+                server.proc.send_signal(signal.SIGHUP)
+                time.sleep(1)
+            else:
+                with _tls_connect(server, user="postgres", sslmode="require", **good) as conn:
+                    assert conn.execute("select pg_reload_conf()").fetchone() == (True,)
+
+        assert _served_certificate(server, ca) == ca.fingerprint("first")
+        install(second)
+        assert _served_certificate(server, ca) == ca.fingerprint("first"), (
+            "nothing was reloaded yet"
+        )
+        reload()
+        assert _served_certificate(server, ca) == ca.fingerprint("second")
+
+        # Files that cannot be used: the server keeps what it had.
+        Path(live["sslcert"]).write_text("not a certificate\n")
+        reload()
+        assert _served_certificate(server, ca) == ca.fingerprint("second")
+        assert _login(server, ca, "postgres", good) == "postgres"
+
+        install(second)
+        assert _login(server, ca, "postgres", revoked) == "postgres"
+        shutil.copy(ca.revocation_list("one-revoked", "revoked"), crl)
+        reload()
+        assert "certificate revoked" in _login(server, ca, "postgres", revoked)
+        assert _login(server, ca, "postgres", good) == "postgres"
+
+        # Only a superuser may ask for a reload.
+        with _tls_connect(server, user="postgres", sslmode="require", **good) as conn:
+            conn.execute("create role reader login")
+        with (
+            _tls_connect(server, user="reader", sslmode="require", **good) as conn,
+            pytest.raises(psycopg.errors.InsufficientPrivilege, match="pg_reload_conf"),
+        ):
+            conn.execute("select pg_reload_conf()")
+
+
+def test_pg_reload_conf_answers_true_on_a_server_without_tls(home: Path) -> None:
+    with _Server(home) as server, _tls_connect(server, user="postgres") as conn:
+        assert conn.execute("select pg_reload_conf()").fetchone() == (True,)
+
+
+def test_a_password_file_supplies_the_password(home: Path, tmp_path: Path) -> None:
+    """`~/.pgpass` (libpq's `passfile`) is the client's: the library looks
+    the password up by host, port, database and user and sends it as if it
+    had been typed. Nothing in the server knows the file exists; this pins
+    that a login made that way is checked like any other."""
+    passfile = tmp_path / "pgpass"
+    with _Server(home) as server:
+        with _tls_connect(server, user="postgres") as conn:
+            conn.execute("create role alice login password 's3cret'")
+
+        def login() -> str:
+            try:
+                with _tls_connect(server, user="alice", passfile=str(passfile)) as conn:
+                    return conn.execute("select current_user::text").fetchone()[0]
+            except psycopg.OperationalError as exc:
+                return str(exc)
+
+        assert "no password supplied" in login(), "no file yet"
+        passfile.write_text(f"127.0.0.1:{server.port}:*:alice:s3cret\n")
+        passfile.chmod(0o600)
+        assert login() == "alice"
+        passfile.write_text(f"127.0.0.1:{server.port}:postgres:alice:wrong\n")
+        assert 'password authentication failed for user "alice"' in login()

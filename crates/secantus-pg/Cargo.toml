@@ -70,6 +70,9 @@ rustls-pki-types = { version = "1.10", features = ["std"] }
 # are the versions `secantus-auth` already builds.
 sha2 = "0.10"
 base64 = "0.22"
+# The patterns in a user name map (src/ident.rs). Already built: the planner
+# crate depends on it.
+regex = "1"
 # "sync" is for the shutdown `watch` channel the accept loop and every
 # connection task select on -- do not rely on another crate's feature
 # unification to supply it.

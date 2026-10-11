@@ -76,6 +76,7 @@ const CATALOG_NAMES: &[&str] = &[
     "current_catalog",
     "current_setting",
     "pg_backend_pid",
+    "pg_reload_conf",
     "format_type",
     "obj_description",
     "col_description",
@@ -242,6 +243,22 @@ thread_local! {
     /// The PID of the backend this thread serves, as its `BackendKeyData`
     /// carried it (`set_backend_pid`).
     static BACKEND_PID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// What `pg_reload_conf()` does on this thread's connection, and whether
+/// its user may ask for it.
+type ReloadConf = Box<dyn Fn() -> bool>;
+
+thread_local! {
+    static RELOAD_CONF: std::cell::RefCell<Option<ReloadConf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install what `pg_reload_conf()` runs on this thread. The hook answers
+/// `false` for a user who may not call it, and the call is then PostgreSQL's
+/// 42501.
+pub fn set_reload_conf(hook: Option<ReloadConf>) {
+    RELOAD_CONF.with(|h| *h.borrow_mut() = hook);
 }
 
 /// Install the PID `pg_backend_pid()` answers inside an expression on this
@@ -1667,6 +1684,19 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             Ok(Bson::Array(out))
         }
         "pg_backend_pid" => Ok(Bson::Int32(BACKEND_PID.with(|p| p.get()))),
+        // PostgreSQL answers true once the signal is sent, whatever the
+        // reload then makes of the files.
+        "pg_reload_conf" => {
+            let allowed = RELOAD_CONF.with(|h| h.borrow().as_ref().is_none_or(|hook| hook()));
+            if allowed {
+                Ok(Bson::Boolean(true))
+            } else {
+                Err(Error::Sqlstate(
+                    "42501",
+                    "permission denied for function pg_reload_conf".to_string(),
+                ))
+            }
+        }
         "current_setting" => {
             let Some(Bson::String(key)) = args.first() else {
                 return Ok(Bson::Null);

@@ -2243,6 +2243,7 @@ dependencies = [
  "postgres-types",
  "rand 0.9.5",
  "rcgen",
+ "regex",
  "rustls-pki-types",
  "secantus-auth",
  "secantus-core",

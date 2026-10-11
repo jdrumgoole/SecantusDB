@@ -229,9 +229,17 @@ pub struct RunningPgServer {
     /// Set by `stop` once the store is known to be closed (its last reference
     /// dropped, so the close-checkpoint ran).
     store_closed: bool,
+    tls: Option<Arc<crate::tls::LiveTls>>,
 }
 
 impl RunningPgServer {
+    /// A handle that re-reads the TLS files; `None` for a server started
+    /// without TLS. It outlives nothing: after `stop` a reload changes
+    /// what no connection will see.
+    pub fn tls_reloader(&self) -> Option<crate::tls::TlsReloader> {
+        self.tls.clone().map(crate::tls::TlsReloader)
+    }
+
     /// The address the listener actually BOUND. With `127.0.0.1:0` this is how
     /// the caller learns the kernel-assigned port; it is resolved inside
     /// [`bind`], before the handle exists, so there is never a window in which
@@ -463,7 +471,10 @@ pub fn bind_with(
     databases: Arc<DatabaseRegistry>,
     options: &ServerOptions,
 ) -> io::Result<RunningPgServer> {
-    let tls = options.tls.as_ref().map(TlsConfig::build).transpose()?;
+    let tls = match &options.tls {
+        Some(config) => Some(Arc::new(crate::tls::LiveTls::new(config)?)),
+        None => None,
+    };
     let refuse_unknown_users = options.refuse_unknown_users;
     // Statements are planned and run on each connection's own thread (see
     // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
@@ -518,7 +529,7 @@ pub fn bind_with(
             storage,
             databases,
             LoginRules {
-                tls,
+                tls: tls.clone(),
                 refuse_unknown_users,
             },
             stop_flag,
@@ -536,12 +547,14 @@ pub fn bind_with(
         active,
         storage: Some(storage),
         store_closed: false,
+        tls,
     })
 }
 
 /// What every connection's login is held to.
 struct LoginRules {
-    tls: Option<(pgwire::tokio::TlsAcceptor, Arc<crate::tls::TlsPolicy>)>,
+    /// Read afresh for each connection, so a reload reaches the next one.
+    tls: Option<Arc<crate::tls::LiveTls>>,
     refuse_unknown_users: bool,
 }
 
@@ -563,12 +576,13 @@ async fn accept_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
+        let (acceptor, policy) = login.tls.as_ref().map(|live| live.current()).unzip();
         let handler = Arc::new(
             PgHandler::new(storage.clone(), databases.clone())
-                .with_tls(login.tls.as_ref().map(|(_, policy)| policy.clone()))
+                .with_tls(policy)
+                .with_tls_reloader(login.tls.clone().map(crate::tls::TlsReloader))
                 .with_refuse_unknown_users(login.refuse_unknown_users),
         );
-        let acceptor = login.tls.as_ref().map(|(acceptor, _)| acceptor.clone());
         let active = active.clone();
         let mut conn_shutdown = shutdown.clone();
         // One OS thread per connection, running the connection on a runtime
