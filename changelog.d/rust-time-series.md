@@ -4,7 +4,7 @@ A time-series collection on the Rust server was a plain collection with a
 label. Measured against mongod 8.2.11 over 187 scenarios, 139 answers
 differed: any `timeseries` document was accepted, a measurement with no date
 in its time field was stored, and updates were either let through or refused
-with one message for every case. 25 now differ, nearly all of them because
+with one message for every case. 24 now differ, nearly all of them because
 mongod stores buckets in `system.buckets.<name>` and this server does not.
 
 One bug found on the way affects every collection: `$out` dropped its target
