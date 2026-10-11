@@ -208,7 +208,7 @@ Not supported: a key with a passphrase.
 ### A `pg_hba.conf`
 
 The options above apply one rule to every connection. `--hba-file` (since
-0.1.0-beta.11) takes a `pg_hba.conf` in their place, and its lines decide
+0.1.0-beta.12) takes a `pg_hba.conf` in their place, and its lines decide
 each login as PostgreSQL's do: the first line whose type, database, user
 and address match the connection says how it must prove who it is, and a
 connection no line matches is refused.
