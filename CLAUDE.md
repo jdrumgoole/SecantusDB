@@ -309,9 +309,12 @@ one request path:
   believing it**. Current shape, measured 2026-09-18 rather than read:
   - Scored by psycopg 3's own unmodified suite: **5,544 pass, none fail**, of
     5,731 that ran (149 skipped, 34 xfailed, 4 xpassed; 58 more deselected by
-    the gauge's macOS list), measured 2026-10-10 on macOS with psycopg 3.3.4
-    against the tree of PR #1864 (released as 0.1.0-beta.9), in 1,480 s; the
-    run before it, on PR #1858's tree (0.1.0-beta.8), had the same counts. The
+    the gauge's macOS list), measured 2026-10-11 on macOS with psycopg 3.3.4
+    against the tree of PR #1876 (released as 0.1.0-beta.10), in 1,046 s; the
+    run before it, on PR #1864's tree (0.1.0-beta.9), had the same counts in
+    1,480 s. A run on PR #1874's tree the same day had two failures, both
+    `test_cursor_raw_async.py::test_leak`, which counts Python objects in the
+    client process and passed on three re-runs. The
     2026-09-18 run this replaces was 5,545 of 5,729 with one failure,
     `test_typing.py::test_generic_connect`, a static-typing check that never
     reaches the wire; it passes with `mypy` 2.3.0 installed. Run it with
