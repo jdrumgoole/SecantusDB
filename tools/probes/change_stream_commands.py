@@ -29,6 +29,7 @@ from bson.binary import UUID_SUBTYPE  # noqa: E402
 DEFAULT_MONGOD = "mongodb://127.0.0.1:27441"
 NOISE = ("$clusterTime", "operationTime", "opTime", "electionId", "localTime")
 
+
 class Sid:
     """A session id. mongod remembers a session's transaction numbers, so
     each scenario run gets its own, salted by run."""
@@ -118,8 +119,13 @@ def scenario(name, *steps):
 # --- what aggregate accepts --------------------------------------------------
 
 scenario("open on an empty namespace", watch(), more())
-scenario("stage not first", {"aggregate": "c", "pipeline": [{"$match": {}}, {"$changeStream": {}}], "cursor": {}})
-scenario("spec not a document", {"aggregate": "c", "pipeline": [{"$changeStream": 1}], "cursor": {}})
+scenario(
+    "stage not first",
+    {"aggregate": "c", "pipeline": [{"$match": {}}, {"$changeStream": {}}], "cursor": {}},
+)
+scenario(
+    "spec not a document", {"aggregate": "c", "pipeline": [{"$changeStream": 1}], "cursor": {}}
+)
 scenario("unknown field", watch(bogus=1))
 scenario("fullDocument bad value", watch(fullDocument="everything"))
 scenario("fullDocument wrong type", watch(fullDocument=1))
@@ -129,33 +135,91 @@ scenario("resumeAfter not a document", watch(resumeAfter="abc"))
 scenario("resumeAfter _data not a string", watch(resumeAfter={"_data": 1}))
 scenario("resumeAfter bad hex", watch(resumeAfter={"_data": "zz"}))
 scenario("resumeAfter unknown key", watch(resumeAfter={"_data": "82", "x": 1}))
-scenario("resumeAfter and startAfter", watch(resumeAfter={"_data": "82"}, startAfter={"_data": "82"}))
-scenario("resumeAfter and startAtOperationTime", watch(resumeAfter={"_data": "82"}, startAtOperationTime=Timestamp(1, 1)))
+scenario(
+    "resumeAfter and startAfter", watch(resumeAfter={"_data": "82"}, startAfter={"_data": "82"})
+)
+scenario(
+    "resumeAfter and startAtOperationTime",
+    watch(resumeAfter={"_data": "82"}, startAtOperationTime=Timestamp(1, 1)),
+)
 scenario("startAtOperationTime wrong type", watch(startAtOperationTime=5))
 scenario("allChangesForCluster on a collection", watch(allChangesForCluster=True))
-scenario("allChangesForCluster on a database", {"aggregate": 1, "pipeline": [{"$changeStream": {"allChangesForCluster": True}}], "cursor": {}})
-scenario("cluster on admin", ("admin", {"aggregate": 1, "pipeline": [{"$changeStream": {"allChangesForCluster": True}}], "cursor": {}, "save": "k"}), ("admin", {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 300}))
-scenario("database scope opens", {"aggregate": 1, "pipeline": [{"$changeStream": {}}], "cursor": {}, "save": "k"}, insert({"_id": 1}), insert({"_id": 1}, coll="d"), {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400})
+scenario(
+    "allChangesForCluster on a database",
+    {"aggregate": 1, "pipeline": [{"$changeStream": {"allChangesForCluster": True}}], "cursor": {}},
+)
+scenario(
+    "cluster on admin",
+    (
+        "admin",
+        {
+            "aggregate": 1,
+            "pipeline": [{"$changeStream": {"allChangesForCluster": True}}],
+            "cursor": {},
+            "save": "k",
+        },
+    ),
+    ("admin", {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 300}),
+)
+scenario(
+    "database scope opens",
+    {"aggregate": 1, "pipeline": [{"$changeStream": {}}], "cursor": {}, "save": "k"},
+    insert({"_id": 1}),
+    insert({"_id": 1}, coll="d"),
+    {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400},
+)
 scenario("on the admin database", ("admin", watch()))
 scenario("on the local database", ("local", watch()))
 scenario("on the config database", ("config", watch()))
 scenario("on system.views", watch(coll="system.views"))
 scenario("on system.profile", watch(coll="system.profile"))
 scenario("on a view", {"create": "v", "viewOn": "c", "pipeline": []}, watch(coll="v"))
-scenario("on a time-series collection", {"create": "ts", "timeseries": {"timeField": "t"}}, watch(coll="ts"))
+scenario(
+    "on a time-series collection",
+    {"create": "ts", "timeseries": {"timeField": "t"}},
+    watch(coll="ts"),
+)
 scenario("with a collation", watch(collation={"locale": "en"}), more())
 scenario("with a $sort after it", watch({"$sort": {"_id": 1}}))
 scenario("with a $group after it", watch({"$group": {"_id": "$operationType"}}))
 scenario("with a $limit after it", watch({"$limit": 1}))
-scenario("with $lookup after it", watch({"$lookup": {"from": "d", "localField": "a", "foreignField": "a", "as": "j"}}))
+scenario(
+    "with $lookup after it",
+    watch({"$lookup": {"from": "d", "localField": "a", "foreignField": "a", "as": "j"}}),
+)
 scenario("with $out after it", watch({"$out": "o"}))
-scenario("with $match $project $addFields", watch({"$match": {"operationType": "insert"}}, {"$project": {"fullDocument": 1}}, {"$addFields": {"x": 1}}), insert({"_id": 1}), update({"_id": 1}, {"$set": {"a": 1}}), more())
+scenario(
+    "with $match $project $addFields",
+    watch(
+        {"$match": {"operationType": "insert"}},
+        {"$project": {"fullDocument": 1}},
+        {"$addFields": {"x": 1}},
+    ),
+    insert({"_id": 1}),
+    update({"_id": 1}, {"$set": {"a": 1}}),
+    more(),
+)
 scenario("projecting out _id", watch({"$project": {"_id": 0}}), insert({"_id": 1}), more())
 scenario("replacing _id", watch({"$addFields": {"_id": 7}}), insert({"_id": 1}), more())
-scenario("$replaceRoot off the event", watch({"$replaceRoot": {"newRoot": "$fullDocument"}}), insert({"_id": 1}), more())
+scenario(
+    "$replaceRoot off the event",
+    watch({"$replaceRoot": {"newRoot": "$fullDocument"}}),
+    insert({"_id": 1}),
+    more(),
+)
 scenario("batchSize zero", watch(batch=0), insert({"_id": 1}), more())
-scenario("batchSize one", watch(batch=1), insert({"_id": 1}, {"_id": 2}, {"_id": 3}), more(batchSize=1), more(batchSize=1), more())
-scenario("explain", {"aggregate": "c", "pipeline": [{"$changeStream": {}}], "cursor": {}, "explain": True})
+scenario(
+    "batchSize one",
+    watch(batch=1),
+    insert({"_id": 1}, {"_id": 2}, {"_id": 3}),
+    more(batchSize=1),
+    more(batchSize=1),
+    more(),
+)
+scenario(
+    "explain",
+    {"aggregate": "c", "pipeline": [{"$changeStream": {}}], "cursor": {}, "explain": True},
+)
 scenario("readConcern majority", watch(readConcern={"level": "majority"}), more())
 scenario("readConcern linearizable", watch(readConcern={"level": "linearizable"}))
 scenario("readConcern snapshot", watch(readConcern={"level": "snapshot"}))
@@ -165,7 +229,9 @@ scenario("readConcern snapshot", watch(readConcern={"level": "snapshot"}))
 scenario("getMore waits and answers empty", watch(), more(), more())
 scenario("getMore on another collection name", watch(), {"getMore": Cur(), "collection": "d"})
 scenario("getMore batchSize zero", watch(), insert({"_id": 1}), more(batchSize=0))
-scenario("getMore without maxTimeMS", watch(), insert({"_id": 1}), {"getMore": Cur(), "collection": "c"})
+scenario(
+    "getMore without maxTimeMS", watch(), insert({"_id": 1}), {"getMore": Cur(), "collection": "c"}
+)
 scenario("getMore maxTimeMS zero", watch(), insert({"_id": 1}), more(maxTimeMS=0))
 scenario("killCursors", watch(), {"killCursors": "c", "cursors": [Cur()]}, more())
 scenario("getMore after the stream ends", watch(), {"drop": "c"}, more(), more(), more())
@@ -175,88 +241,508 @@ scenario("getMore after the stream ends", watch(), {"drop": "c"}, more(), more()
 scenario("insert", watch(), insert({"_id": 1, "a": [1, {"b": 2}], "s": "x"}), more())
 scenario("insert with document _id", watch(), insert({"_id": {"k": 1, "j": "a"}, "a": 1}), more())
 scenario("insert many in one batch", watch(), insert({"_id": 1}, {"_id": 2}, {"_id": 3}), more())
-scenario("insert with a write error", watch(), insert({"_id": 1}), insert({"_id": 1}, {"_id": 2}, ordered=False), more())
-scenario("update", watch(), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"b": 2}, "$unset": {"a": ""}}), more())
-scenario("update no change", watch(), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 1}}), more())
-scenario("update lookup", watch(fullDocument="updateLookup"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more())
-scenario("update lookup after delete", watch(fullDocument="updateLookup", batch=0), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), delete({"_id": 1}), more())
-scenario("update whenAvailable required", watch(fullDocument="whenAvailable"), insert({"_id": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more(), watch(fullDocument="required", save="r"), update({"_id": 1}, {"$set": {"a": 3}}), delete({"_id": 1}), more("r"))
+scenario(
+    "insert with a write error",
+    watch(),
+    insert({"_id": 1}),
+    insert({"_id": 1}, {"_id": 2}, ordered=False),
+    more(),
+)
+scenario(
+    "update",
+    watch(),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"b": 2}, "$unset": {"a": ""}}),
+    more(),
+)
+scenario(
+    "update no change",
+    watch(),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 1}}),
+    more(),
+)
+scenario(
+    "update lookup",
+    watch(fullDocument="updateLookup"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+)
+scenario(
+    "update lookup after delete",
+    watch(fullDocument="updateLookup", batch=0),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    delete({"_id": 1}),
+    more(),
+)
+scenario(
+    "update whenAvailable required",
+    watch(fullDocument="whenAvailable"),
+    insert({"_id": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+    watch(fullDocument="required", save="r"),
+    update({"_id": 1}, {"$set": {"a": 3}}),
+    delete({"_id": 1}),
+    more("r"),
+)
 scenario("replace", watch(), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"b": 2}), more())
-scenario("replace with lookup", watch(fullDocument="updateLookup"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"b": 2}), more())
-scenario("upsert", watch(), update({"_id": 9}, {"$set": {"a": 1}}, upsert=True), update({"_id": 8}, {"a": 1}, upsert=True), more())
+scenario(
+    "replace with lookup",
+    watch(fullDocument="updateLookup"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"b": 2}),
+    more(),
+)
+scenario(
+    "upsert",
+    watch(),
+    update({"_id": 9}, {"$set": {"a": 1}}, upsert=True),
+    update({"_id": 8}, {"a": 1}, upsert=True),
+    more(),
+)
 scenario("delete", watch(), insert({"_id": 1, "a": 1}), delete({"_id": 1}), more())
-scenario("multi update and delete many", watch(), insert({"_id": 1}, {"_id": 2}), {"update": "c", "updates": [{"q": {}, "u": {"$set": {"m": 1}}, "multi": True}]}, {"delete": "c", "deletes": [{"q": {}, "limit": 0}]}, more())
-scenario("findAndModify", watch(), insert({"_id": 1, "a": 1}), {"findAndModify": "c", "query": {"_id": 1}, "update": {"$inc": {"a": 1}}}, {"findAndModify": "c", "query": {"_id": 1}, "remove": True}, more())
-scenario("pipeline update", watch(), insert({"_id": 1, "a": 1}), update({"_id": 1}, [{"$set": {"b": {"$add": ["$a", 1]}}}]), more())
-scenario("array changes", watch(showExpandedEvents=True), insert({"_id": 1, "arr": [1, 2, 3]}), update({"_id": 1}, {"$pop": {"arr": 1}}), update({"_id": 1}, {"$set": {"arr.0": 9}}), more())
+scenario(
+    "multi update and delete many",
+    watch(),
+    insert({"_id": 1}, {"_id": 2}),
+    {"update": "c", "updates": [{"q": {}, "u": {"$set": {"m": 1}}, "multi": True}]},
+    {"delete": "c", "deletes": [{"q": {}, "limit": 0}]},
+    more(),
+)
+scenario(
+    "findAndModify",
+    watch(),
+    insert({"_id": 1, "a": 1}),
+    {"findAndModify": "c", "query": {"_id": 1}, "update": {"$inc": {"a": 1}}},
+    {"findAndModify": "c", "query": {"_id": 1}, "remove": True},
+    more(),
+)
+scenario(
+    "pipeline update",
+    watch(),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, [{"$set": {"b": {"$add": ["$a", 1]}}}]),
+    more(),
+)
+scenario(
+    "array changes",
+    watch(showExpandedEvents=True),
+    insert({"_id": 1, "arr": [1, 2, 3]}),
+    update({"_id": 1}, {"$pop": {"arr": 1}}),
+    update({"_id": 1}, {"$set": {"arr.0": 9}}),
+    more(),
+)
 scenario("drop", watch(), insert({"_id": 1}), {"drop": "c"}, more(), more())
-scenario("drop other collection", watch(), insert({"_id": 1}, coll="d"), {"drop": "d"}, insert({"_id": 1}), more())
-scenario("rename", watch(), insert({"_id": 1}), ("admin", {"renameCollection": "@db.c", "to": "@db.d"}), more(), more())
-scenario("rename onto it", watch(), insert({"_id": 1}, coll="d"), ("admin", {"renameCollection": "@db.d", "to": "@db.c", "dropTarget": True}), more(), more())
+scenario(
+    "drop other collection",
+    watch(),
+    insert({"_id": 1}, coll="d"),
+    {"drop": "d"},
+    insert({"_id": 1}),
+    more(),
+)
+scenario(
+    "rename",
+    watch(),
+    insert({"_id": 1}),
+    ("admin", {"renameCollection": "@db.c", "to": "@db.d"}),
+    more(),
+    more(),
+)
+scenario(
+    "rename onto it",
+    watch(),
+    insert({"_id": 1}, coll="d"),
+    ("admin", {"renameCollection": "@db.d", "to": "@db.c", "dropTarget": True}),
+    more(),
+    more(),
+)
 scenario("dropDatabase", watch(), insert({"_id": 1}), {"dropDatabase": 1}, more(), more())
-scenario("create and index events hidden", watch(), {"create": "c"}, {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]}, {"dropIndexes": "c", "index": "a_1"}, insert({"_id": 1}), more())
-scenario("create event expanded", watch(showExpandedEvents=True), {"create": "c", "capped": True, "size": 4096}, more())
-scenario("createIndexes event expanded", watch(showExpandedEvents=True), {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1", "unique": True}]}, {"dropIndexes": "c", "index": "a_1"}, more())
-scenario("collMod event expanded", watch(showExpandedEvents=True), {"create": "c"}, {"collMod": "c", "validator": {"a": {"$gt": 0}}}, {"collMod": "c", "changeStreamPreAndPostImages": {"enabled": True}}, more())
-scenario("expanded update", watch(showExpandedEvents=True), insert({"_id": 1, "a": {"b": 1}}), update({"_id": 1}, {"$set": {"a.b": 2}}), more())
-scenario("documentKey order", watch(), insert({"_id": 1, "z": 1, "a": 1}), update({"_id": 1}, {"$set": {"z": 2}}), more())
-scenario("split large event", watch({"$changeStreamSplitLargeEvent": {}}), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more())
+scenario(
+    "create and index events hidden",
+    watch(),
+    {"create": "c"},
+    {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+    {"dropIndexes": "c", "index": "a_1"},
+    insert({"_id": 1}),
+    more(),
+)
+scenario(
+    "create event expanded",
+    watch(showExpandedEvents=True),
+    {"create": "c", "capped": True, "size": 4096},
+    more(),
+)
+scenario(
+    "createIndexes event expanded",
+    watch(showExpandedEvents=True),
+    {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1", "unique": True}]},
+    {"dropIndexes": "c", "index": "a_1"},
+    more(),
+)
+scenario(
+    "collMod event expanded",
+    watch(showExpandedEvents=True),
+    {"create": "c"},
+    {"collMod": "c", "validator": {"a": {"$gt": 0}}},
+    {"collMod": "c", "changeStreamPreAndPostImages": {"enabled": True}},
+    more(),
+)
+scenario(
+    "expanded update",
+    watch(showExpandedEvents=True),
+    insert({"_id": 1, "a": {"b": 1}}),
+    update({"_id": 1}, {"$set": {"a.b": 2}}),
+    more(),
+)
+scenario(
+    "documentKey order",
+    watch(),
+    insert({"_id": 1, "z": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"z": 2}}),
+    more(),
+)
+scenario(
+    "split large event",
+    watch({"$changeStreamSplitLargeEvent": {}}),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+)
 scenario("split stage not last", watch({"$changeStreamSplitLargeEvent": {}}, {"$match": {}}))
-scenario("split stage without change stream", {"aggregate": "c", "pipeline": [{"$changeStreamSplitLargeEvent": {}}], "cursor": {}})
+scenario(
+    "split stage without change stream",
+    {"aggregate": "c", "pipeline": [{"$changeStreamSplitLargeEvent": {}}], "cursor": {}},
+)
 
 # --- pre-images -----------------------------------------------------------
 
 PRE = {"create": "c", "changeStreamPreAndPostImages": {"enabled": True}}
-scenario("pre-image on update and delete", PRE, watch(fullDocumentBeforeChange="whenAvailable"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), delete({"_id": 1}), more())
-scenario("pre-image required", PRE, watch(fullDocumentBeforeChange="required"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more())
-scenario("pre-image required without images", watch(fullDocumentBeforeChange="required"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more())
-scenario("pre-image whenAvailable without images", watch(fullDocumentBeforeChange="whenAvailable"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more())
-scenario("pre-image off", PRE, watch(fullDocumentBeforeChange="off"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), more())
-scenario("pre-image on replace", PRE, watch(fullDocumentBeforeChange="required", fullDocument="updateLookup"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"b": 1}), more())
-scenario("pre-image enabled later", watch(fullDocumentBeforeChange="whenAvailable"), insert({"_id": 1, "a": 1}), update({"_id": 1}, {"$set": {"a": 2}}), {"collMod": "c", "changeStreamPreAndPostImages": {"enabled": True}}, update({"_id": 1}, {"$set": {"a": 3}}), more())
+scenario(
+    "pre-image on update and delete",
+    PRE,
+    watch(fullDocumentBeforeChange="whenAvailable"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    delete({"_id": 1}),
+    more(),
+)
+scenario(
+    "pre-image required",
+    PRE,
+    watch(fullDocumentBeforeChange="required"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+)
+scenario(
+    "pre-image required without images",
+    watch(fullDocumentBeforeChange="required"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+)
+scenario(
+    "pre-image whenAvailable without images",
+    watch(fullDocumentBeforeChange="whenAvailable"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+)
+scenario(
+    "pre-image off",
+    PRE,
+    watch(fullDocumentBeforeChange="off"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    more(),
+)
+scenario(
+    "pre-image on replace",
+    PRE,
+    watch(fullDocumentBeforeChange="required", fullDocument="updateLookup"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"b": 1}),
+    more(),
+)
+scenario(
+    "pre-image enabled later",
+    watch(fullDocumentBeforeChange="whenAvailable"),
+    insert({"_id": 1, "a": 1}),
+    update({"_id": 1}, {"$set": {"a": 2}}),
+    {"collMod": "c", "changeStreamPreAndPostImages": {"enabled": True}},
+    update({"_id": 1}, {"$set": {"a": 3}}),
+    more(),
+)
 
 # --- resuming -------------------------------------------------------------
 
 THREE = [insert({"_id": 1}), insert({"_id": 2}), insert({"_id": 3})]
-scenario("resumeAfter an event", watch(), *THREE, more(), watch(resumeAfter=Tok(0), save="r"), more("r"))
-scenario("resumeAfter the last event", watch(), *THREE, more(), watch(resumeAfter=Tok(2), save="r"), more("r"))
-scenario("startAfter an event", watch(), *THREE, more(), watch(startAfter=Tok(1), save="r"), more("r"))
-scenario("resumeAfter postBatchResumeToken", watch(), more(), *THREE, watch(resumeAfter=Pbrt(), save="r"), more("r"))
-scenario("resume token from a getMore batch", watch(batch=0), *THREE, more(batchSize=1), more(batchSize=1), watch(resumeAfter=Pbrt(), save="r"), more("r"))
-scenario("resumeAfter invalidate", watch(), insert({"_id": 1}), {"drop": "c"}, more(), more(), watch(resumeAfter=Tok(2), save="r"))
-scenario("startAfter invalidate", watch(), insert({"_id": 1}), {"drop": "c"}, more(), more(), watch(startAfter=Tok(2), save="r"), insert({"_id": 5}), more("r"))
-DB_END = [{"aggregate": 1, "pipeline": [{"$changeStream": {}}], "cursor": {}, "save": "k"}, insert({"_id": 1}), {"dropDatabase": 1}, {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400, "save": "k"}]
-scenario("startAfter invalidate at database scope", *DB_END, {"aggregate": 1, "pipeline": [{"$changeStream": {"startAfter": Tok(3)}}], "cursor": {}, "save": "r"}, insert({"_id": 2}), {"getMore": Cur("r"), "collection": "$cmd.aggregate", "maxTimeMS": 400})
-scenario("startAfter the dropDatabase event", *DB_END, {"aggregate": 1, "pipeline": [{"$changeStream": {"startAfter": Tok(2)}}], "cursor": {}, "save": "r"}, insert({"_id": 2}), {"getMore": Cur("r"), "collection": "$cmd.aggregate", "maxTimeMS": 400})
-scenario("resume token of a projected event", watch({"$project": {"operationType": 1}}), insert({"_id": 1}), insert({"_id": 2}), more(), watch(resumeAfter=Tok(0), save="r"), more("r"))
-scenario("resume token not in the oplog", watch(resumeAfter={"_data": "8200000001000000012B022C0100296E5A1004" + "00" * 16 + "463C5F6964003C6100000004"}))
-scenario("resume token from another namespace", watch(), insert({"_id": 1}), more(), watch(coll="d", resumeAfter=Tok(0), save="r"), insert({"_id": 1}, coll="d"), more("r", coll="d"))
-scenario("startAtOperationTime now", watch(), insert({"_id": 1}), more(), watch(startAtOperationTime=OpTime(), save="r"), insert({"_id": 2}), more("r"))
-scenario("startAtOperationTime in the past", insert({"_id": 1}), {"drop": "c"}, watch(startAtOperationTime=Timestamp(1, 1)))
-scenario("startAtOperationTime in the future", watch(startAtOperationTime=Timestamp(2**31 - 1, 1)), insert({"_id": 1}), more())
-scenario("resume with a different pipeline", watch(), *THREE, more(), watch({"$match": {"documentKey._id": 3}}, resumeAfter=Tok(0), save="r"), more("r"))
-scenario("resume after the collection is recreated", watch(), insert({"_id": 1}), {"drop": "c"}, more(), insert({"_id": 2}), watch(resumeAfter=Tok(0), save="r"), more("r"))
+scenario(
+    "resumeAfter an event", watch(), *THREE, more(), watch(resumeAfter=Tok(0), save="r"), more("r")
+)
+scenario(
+    "resumeAfter the last event",
+    watch(),
+    *THREE,
+    more(),
+    watch(resumeAfter=Tok(2), save="r"),
+    more("r"),
+)
+scenario(
+    "startAfter an event", watch(), *THREE, more(), watch(startAfter=Tok(1), save="r"), more("r")
+)
+scenario(
+    "resumeAfter postBatchResumeToken",
+    watch(),
+    more(),
+    *THREE,
+    watch(resumeAfter=Pbrt(), save="r"),
+    more("r"),
+)
+scenario(
+    "resume token from a getMore batch",
+    watch(batch=0),
+    *THREE,
+    more(batchSize=1),
+    more(batchSize=1),
+    watch(resumeAfter=Pbrt(), save="r"),
+    more("r"),
+)
+scenario(
+    "resumeAfter invalidate",
+    watch(),
+    insert({"_id": 1}),
+    {"drop": "c"},
+    more(),
+    more(),
+    watch(resumeAfter=Tok(2), save="r"),
+)
+scenario(
+    "startAfter invalidate",
+    watch(),
+    insert({"_id": 1}),
+    {"drop": "c"},
+    more(),
+    more(),
+    watch(startAfter=Tok(2), save="r"),
+    insert({"_id": 5}),
+    more("r"),
+)
+DB_END = [
+    {"aggregate": 1, "pipeline": [{"$changeStream": {}}], "cursor": {}, "save": "k"},
+    insert({"_id": 1}),
+    {"dropDatabase": 1},
+    {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400, "save": "k"},
+]
+scenario(
+    "startAfter invalidate at database scope",
+    *DB_END,
+    {
+        "aggregate": 1,
+        "pipeline": [{"$changeStream": {"startAfter": Tok(3)}}],
+        "cursor": {},
+        "save": "r",
+    },
+    insert({"_id": 2}),
+    {"getMore": Cur("r"), "collection": "$cmd.aggregate", "maxTimeMS": 400},
+)
+scenario(
+    "startAfter the dropDatabase event",
+    *DB_END,
+    {
+        "aggregate": 1,
+        "pipeline": [{"$changeStream": {"startAfter": Tok(2)}}],
+        "cursor": {},
+        "save": "r",
+    },
+    insert({"_id": 2}),
+    {"getMore": Cur("r"), "collection": "$cmd.aggregate", "maxTimeMS": 400},
+)
+scenario(
+    "resume token of a projected event",
+    watch({"$project": {"operationType": 1}}),
+    insert({"_id": 1}),
+    insert({"_id": 2}),
+    more(),
+    watch(resumeAfter=Tok(0), save="r"),
+    more("r"),
+)
+scenario(
+    "resume token not in the oplog",
+    watch(
+        resumeAfter={
+            "_data": "8200000001000000012B022C0100296E5A1004"
+            + "00" * 16
+            + "463C5F6964003C6100000004"
+        }
+    ),
+)
+scenario(
+    "resume token from another namespace",
+    watch(),
+    insert({"_id": 1}),
+    more(),
+    watch(coll="d", resumeAfter=Tok(0), save="r"),
+    insert({"_id": 1}, coll="d"),
+    more("r", coll="d"),
+)
+scenario(
+    "startAtOperationTime now",
+    watch(),
+    insert({"_id": 1}),
+    more(),
+    watch(startAtOperationTime=OpTime(), save="r"),
+    insert({"_id": 2}),
+    more("r"),
+)
+scenario(
+    "startAtOperationTime in the past",
+    insert({"_id": 1}),
+    {"drop": "c"},
+    watch(startAtOperationTime=Timestamp(1, 1)),
+)
+scenario(
+    "startAtOperationTime in the future",
+    watch(startAtOperationTime=Timestamp(2**31 - 1, 1)),
+    insert({"_id": 1}),
+    more(),
+)
+scenario(
+    "resume with a different pipeline",
+    watch(),
+    *THREE,
+    more(),
+    watch({"$match": {"documentKey._id": 3}}, resumeAfter=Tok(0), save="r"),
+    more("r"),
+)
+scenario(
+    "resume after the collection is recreated",
+    watch(),
+    insert({"_id": 1}),
+    {"drop": "c"},
+    more(),
+    insert({"_id": 2}),
+    watch(resumeAfter=Tok(0), save="r"),
+    more("r"),
+)
 
 # --- scopes ---------------------------------------------------------------
 
 DB_WATCH = {"aggregate": 1, "pipeline": [{"$changeStream": {}}], "cursor": {}, "save": "k"}
 DB_MORE = {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400, "save": "k"}
-scenario("database scope events", DB_WATCH, insert({"_id": 1}), insert({"_id": 1}, coll="d"), {"drop": "d"}, ("admin", {"renameCollection": "@db.c", "to": "@db.e"}), DB_MORE)
-scenario("database scope ignores system and other dbs", DB_WATCH, {"create": "v", "viewOn": "c", "pipeline": []}, ("@other", insert({"_id": 1})), insert({"_id": 1}), DB_MORE)
-scenario("database scope dropDatabase", DB_WATCH, insert({"_id": 1}), {"dropDatabase": 1}, DB_MORE, DB_MORE)
-CL_WATCH = ("admin", {"aggregate": 1, "pipeline": [{"$changeStream": {"allChangesForCluster": True}}], "cursor": {}, "save": "k"})
-CL_MORE = ("admin", {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400, "save": "k"})
-scenario("cluster scope events", CL_WATCH, insert({"_id": 1}), ("@other", insert({"_id": 2})), {"dropDatabase": 1}, CL_MORE, CL_MORE)
-scenario("cluster scope expanded", ("admin", {"aggregate": 1, "pipeline": [{"$changeStream": {"allChangesForCluster": True, "showExpandedEvents": True}}], "cursor": {}, "save": "k"}), {"create": "c"}, {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]}, CL_MORE)
-scenario("cluster scope ignores admin local config", CL_WATCH, ("admin", insert({"_id": 1}, coll="x")), ("config", insert({"_id": 1}, coll="x")), insert({"_id": 1}), CL_MORE, ("admin", {"drop": "x"}), ("config", {"drop": "x"}))
+scenario(
+    "database scope events",
+    DB_WATCH,
+    insert({"_id": 1}),
+    insert({"_id": 1}, coll="d"),
+    {"drop": "d"},
+    ("admin", {"renameCollection": "@db.c", "to": "@db.e"}),
+    DB_MORE,
+)
+scenario(
+    "database scope ignores system and other dbs",
+    DB_WATCH,
+    {"create": "v", "viewOn": "c", "pipeline": []},
+    ("@other", insert({"_id": 1})),
+    insert({"_id": 1}),
+    DB_MORE,
+)
+scenario(
+    "database scope dropDatabase",
+    DB_WATCH,
+    insert({"_id": 1}),
+    {"dropDatabase": 1},
+    DB_MORE,
+    DB_MORE,
+)
+CL_WATCH = (
+    "admin",
+    {
+        "aggregate": 1,
+        "pipeline": [{"$changeStream": {"allChangesForCluster": True}}],
+        "cursor": {},
+        "save": "k",
+    },
+)
+CL_MORE = (
+    "admin",
+    {"getMore": Cur(), "collection": "$cmd.aggregate", "maxTimeMS": 400, "save": "k"},
+)
+scenario(
+    "cluster scope events",
+    CL_WATCH,
+    insert({"_id": 1}),
+    ("@other", insert({"_id": 2})),
+    {"dropDatabase": 1},
+    CL_MORE,
+    CL_MORE,
+)
+scenario(
+    "cluster scope expanded",
+    (
+        "admin",
+        {
+            "aggregate": 1,
+            "pipeline": [
+                {"$changeStream": {"allChangesForCluster": True, "showExpandedEvents": True}}
+            ],
+            "cursor": {},
+            "save": "k",
+        },
+    ),
+    {"create": "c"},
+    {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+    CL_MORE,
+)
+scenario(
+    "cluster scope ignores admin local config",
+    CL_WATCH,
+    ("admin", insert({"_id": 1}, coll="x")),
+    ("config", insert({"_id": 1}, coll="x")),
+    insert({"_id": 1}),
+    CL_MORE,
+    ("admin", {"drop": "x"}),
+    ("config", {"drop": "x"}),
+)
 
 # --- transactions and sessions ------------------------------------------
 
 TX = {"lsid": lsid(), "txnNumber": Int64(1), "autocommit": False}
-scenario("events from a transaction", watch(), {**insert({"_id": 1}), **TX, "startTransaction": True}, {**insert({"_id": 2}), **TX}, {**update({"_id": 1}, {"$set": {"a": 1}}), **TX}, ("admin", {"commitTransaction": 1, **TX}), more())
-scenario("aborted transaction", watch(), {**insert({"_id": 1}), **TX, "startTransaction": True}, ("admin", {"abortTransaction": 1, **TX}), insert({"_id": 2}), more())
-scenario("retryable write", watch(), {**insert({"_id": 1}), "lsid": lsid(), "txnNumber": Int64(5)}, {**insert({"_id": 1}), "lsid": lsid(), "txnNumber": Int64(5)}, more())
-scenario("stream opened in a session", {**watch(), "lsid": lsid("w")}, insert({"_id": 1}), {**more(), "lsid": lsid("w")}, more())
+scenario(
+    "events from a transaction",
+    watch(),
+    {**insert({"_id": 1}), **TX, "startTransaction": True},
+    {**insert({"_id": 2}), **TX},
+    {**update({"_id": 1}, {"$set": {"a": 1}}), **TX},
+    ("admin", {"commitTransaction": 1, **TX}),
+    more(),
+)
+scenario(
+    "aborted transaction",
+    watch(),
+    {**insert({"_id": 1}), **TX, "startTransaction": True},
+    ("admin", {"abortTransaction": 1, **TX}),
+    insert({"_id": 2}),
+    more(),
+)
+scenario(
+    "retryable write",
+    watch(),
+    {**insert({"_id": 1}), "lsid": lsid(), "txnNumber": Int64(5)},
+    {**insert({"_id": 1}), "lsid": lsid(), "txnNumber": Int64(5)},
+    more(),
+)
+scenario(
+    "stream opened in a session",
+    {**watch(), "lsid": lsid("w")},
+    insert({"_id": 1}),
+    {**more(), "lsid": lsid("w")},
+    more(),
+)
 scenario("stream opened in a transaction", {**watch(), **TX, "startTransaction": True})
 
 
@@ -393,12 +879,22 @@ def main():
 
     # Self-check: the reference must deliver an insert event and a resume
     # token the probe can hand back.
-    check = run_scenario(mongod_uri, 0, [watch(), insert({"_id": 1}), more(), watch(resumeAfter=Tok(0), save="r"), insert({"_id": 2}), more("r")])
+    check = run_scenario(
+        mongod_uri,
+        0,
+        [
+            watch(),
+            insert({"_id": 1}),
+            more(),
+            watch(resumeAfter=Tok(0), save="r"),
+            insert({"_id": 2}),
+            more("r"),
+        ],
+    )
     try:
-        ok = (
-            check[2]["cursor"]["nextBatch"][0]["operationType"] == "insert"
-            and check[5]["cursor"]["nextBatch"][0]["documentKey"] == {"_id": 2}
-        )
+        ok = check[2]["cursor"]["nextBatch"][0]["operationType"] == "insert" and check[5]["cursor"][
+            "nextBatch"
+        ][0]["documentKey"] == {"_id": 2}
     except (KeyError, IndexError, TypeError):
         ok = False
     if not ok:
