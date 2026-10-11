@@ -156,8 +156,9 @@ fn find_single_batch_never_opens_cursor() {
         seed(c, (0..5).map(|i| doc! {"_id": i}).collect());
         let reply = dispatch_full(&doc! {"find": "c", "batchSize": 2, "singleBatch": true}, c);
         let cur = reply.get_document("cursor").unwrap();
-        // singleBatch overrides batchSize splitting: all docs, id 0.
-        assert_eq!(batch_ids(cur, "firstBatch").len(), 5);
+        // One batch of `batchSize` and no cursor for the rest (mongod
+        // 8.2.11; this used to pin all five).
+        assert_eq!(batch_ids(cur, "firstBatch").len(), 2);
         assert_eq!(cur.get_i64("id").unwrap(), 0);
     });
 }

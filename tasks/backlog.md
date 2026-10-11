@@ -8821,6 +8821,42 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.073 The cursor commands -- 2026-10-11
+
+`tools/probes/cursor_commands.py`, mongod 8.2.11: 85 scenarios (`find`'s
+cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
+listing commands, tailable cursors, `count`, `distinct`). The Rust server
+went from BEFORE scenarios different to AFTER. `singleBatch` returned every
+document, a tailable cursor dropped its filter and projection after the
+first batch, `min` / `max` compared documents and not index keys, `distinct`
+kept one value per BSON type, and most malformed arguments were accepted.
+What is left:
+
+- [ ] **RUST MongoDB server: a cursor is the result as it was when the
+      command ran.** `find` and `aggregate` read every matching document and
+      keep the rest for `getMore`. mongod reads on as the cursor is read, so
+      its `getMore` sees a document inserted, changed or deleted since
+      (measured: an insert appears, a delete disappears). Tests that write
+      between batches see the difference; so does memory, for a large
+      result. One scenario.
+- [ ] **RUST MongoDB server: `listIndexes` answers in name order.** mongod
+      answers in the order the indexes were built (`_id_` first on both).
+      The catalog keeps no build order, so this needs a field on disk, which
+      the Python server would then have to carry too. One scenario.
+- [ ] **RUST MongoDB server: a cursor outlives the index it was reading.**
+      After `dropIndexes`, mongod answers the cursor's next `getMore` 175
+      (`query plan killed :: index 'v_1' dropped`). One scenario.
+- [ ] **RUST MongoDB server: smaller cursor differences.** A projection of
+      `{$meta: "recordId"}` or `{$meta: "indexKey"}` adds nothing (mongod:
+      the record id, the index key). A `$`-prefixed field `find` does not
+      know (`$hint`) is accepted like the protocol's own (mongod: 40415).
+      An unknown hint is refused with the code and this server's own text,
+      a decision already made (`tests/test_rust_hint_error_message.py`).
+      Not probed: `oplogReplay`, `$meta: "textScore"` sorts, an
+      `explain: true` aggregate.
+- [ ] **PYTHON MongoDB server: not measured on this probe** (it takes a
+      server URI and was run against the Rust server only).
+
 ### 7.072 Sessions, transactions and retryable writes -- 2026-10-11
 
 `tools/probes/transactions.py`, mongod 8.2.11 as a replica-set member: 251
