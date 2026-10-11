@@ -50,8 +50,10 @@ mod expr_index;
 mod external_sort;
 mod fdw;
 mod grace_join;
+mod hba;
 mod ident;
 mod largeobjects;
+mod live;
 mod live_notices;
 mod merge;
 mod object_acl;
@@ -81,11 +83,12 @@ mod x509;
 mod xids;
 
 pub use embedded::{Error, PgBuilder, PgServer, DEFAULT_CACHE_SIZE, DEFAULT_DATABASE};
+pub use live::Reloader;
 pub use server::{
     bind, bind_tls, bind_with, open_storage, open_storage_with_cache, sync_on_commit,
     RunningPgServer, ServerOptions,
 };
-pub use tls::{ClientCert, ClientName, TlsConfig, TlsReloader};
+pub use tls::{ClientCert, ClientName, TlsConfig};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2959,7 +2962,18 @@ pub struct PgHandler {
     /// What a login to a server with TLS is held to; `None` without TLS.
     tls: Option<Arc<tls::TlsPolicy>>,
     /// Re-reads the server's TLS files, for `pg_reload_conf()`.
-    tls_reloader: Option<tls::TlsReloader>,
+    reloader: Option<live::Reloader>,
+    /// The `pg_hba.conf` a login is decided by; `None` on a server started
+    /// without one, whose logins the TLS options decide.
+    hba: Option<Arc<hba::HbaPolicy>>,
+    /// The line of it that decided this connection.
+    hba_rule: std::sync::OnceLock<hba::Rule>,
+    /// A cleartext password asked for and not yet given: the user, and the
+    /// stored verifier to check it against.
+    cleartext_auth: Mutex<Option<(String, Option<String>)>>,
+    /// The database a login asked for is not there: said once the login
+    /// has been proved, on a server with a `pg_hba.conf`.
+    database_error: Mutex<Option<ErrorInfo>>,
     /// Ask a user this server has no role for to prove a password, which it
     /// cannot, where the default is to trust it.
     refuse_unknown_users: bool,
@@ -3485,7 +3499,11 @@ impl PgHandler {
             storage,
             ssl: false,
             tls: None,
-            tls_reloader: None,
+            reloader: None,
+            hba: None,
+            hba_rule: std::sync::OnceLock::new(),
+            cleartext_auth: Mutex::new(None),
+            database_error: Mutex::new(None),
             refuse_unknown_users: false,
             db: OnceLock::new(),
             databases,
@@ -3576,9 +3594,15 @@ impl PgHandler {
         self.with_ssl(ssl)
     }
 
-    /// A handler whose `pg_reload_conf()` re-reads the server's TLS files.
-    pub(crate) fn with_tls_reloader(mut self, reloader: Option<tls::TlsReloader>) -> Self {
-        self.tls_reloader = reloader;
+    /// A handler whose `pg_reload_conf()` re-reads the server's login files.
+    pub(crate) fn with_reloader(mut self, reloader: Option<live::Reloader>) -> Self {
+        self.reloader = reloader;
+        self
+    }
+
+    /// A handler whose logins a `pg_hba.conf` decides.
+    pub(crate) fn with_hba(mut self, hba: Option<Arc<hba::HbaPolicy>>) -> Self {
+        self.hba = hba;
         self
     }
 
@@ -17555,7 +17579,11 @@ impl StartupHandler for PgHandler {
 
         // Whether this connection may log in at all comes first, as the
         // `pg_hba.conf` match does: before the database is looked up.
-        if let Some(refusal) = self.check_transport(client) {
+        let refusal = match self.hba.clone() {
+            Some(hba) => self.check_hba(client, &hba),
+            None => self.check_transport(client),
+        };
+        if let Some(refusal) = refusal {
             return self.fail_login(client, "28000", refusal).await;
         }
 
@@ -17569,11 +17597,21 @@ impl StartupHandler for PgHandler {
             .unwrap_or_else(|| self.databases.default_db().to_string());
         if let Err(e) = self.select_database(&requested) {
             let info: ErrorInfo = e.into();
-            client
-                .send(PgWireBackendMessage::ErrorResponse(info.into()))
-                .await?;
-            client.close().await?;
-            return Ok(());
+            if self.hba.is_some() {
+                // PostgreSQL proves the login first and looks the database
+                // up after: a wrong password for a database that is not
+                // there is a wrong password.
+                *self
+                    .database_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(info);
+            } else {
+                client
+                    .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                    .await?;
+                client.close().await?;
+                return Ok(());
+            }
         }
 
         // A role that HAS a password must prove it -- SCRAM-SHA-256, as
@@ -17583,6 +17621,9 @@ impl StartupHandler for PgHandler {
         // working (PostgreSQL's `trust` for those).
         let user = client.metadata().get("user").cloned().unwrap_or_default();
         let role = self.role(&user)?;
+        if self.hba.is_some() {
+            return self.hba_login(client, user, role).await;
+        }
         if role.is_none() && self.refuse_unknown_users {
             return self.refuse_unknown_user(client, user).await;
         }
@@ -17679,6 +17720,32 @@ impl PgHandler {
     }
 }
 
+/// Is a stored password an md5 hash, `md5` and 32 hex digits?
+fn is_md5_hash(verifier: &str) -> bool {
+    verifier.len() == 35 && verifier.starts_with("md5")
+}
+
+/// Does a password given in the clear match a stored verifier? For a SCRAM
+/// verifier the keys are derived again with its salt and iteration count;
+/// for an md5 hash, it is `md5(password + user)`.
+fn plain_password_matches(user: &str, password: &str, verifier: &str) -> bool {
+    if let Some(stored) = scram_credentials(verifier) {
+        return secantus_auth::derive_credentials(
+            password,
+            Some(stored.iteration_count),
+            Some(stored.salt.clone()),
+        )
+        .is_ok_and(|derived| {
+            derived.stored_key == stored.stored_key && derived.server_key == stored.server_key
+        });
+    }
+    is_md5_hash(verifier)
+        && format!(
+            "md5{}",
+            secantus_pgplan::scalar::md5_hex(format!("{password}{user}").as_bytes())
+        ) == verifier
+}
+
 /// The SCRAM credentials in a stored `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`
 /// verifier, or `None` for any other form (an md5 hash).
 fn scram_credentials(verifier: &str) -> Option<secantus_auth::StoredCredentials> {
@@ -17743,11 +17810,19 @@ impl PgHandler {
                 client.socket_addr().ip()
             ));
         }
+        let has_certificate = self.record_tls_session(client);
+        let needs_certificate = policy.client_cert != ClientCert::Optional && !has_certificate;
+        needs_certificate.then(|| "connection requires a valid client certificate".to_string())
+    }
+
+    /// Record the TLS session `pg_stat_ssl` reports, and answer whether the
+    /// client sent a certificate (which rustls has by then verified).
+    fn record_tls_session<C: ClientInfo>(&self, client: &C) -> bool {
         let peer = client
             .client_certificates()
             .and_then(|chain| chain.first())
             .and_then(|leaf| x509::peer(leaf));
-        let needs_certificate = policy.client_cert != ClientCert::Optional && peer.is_none();
+        let has_certificate = peer.is_some();
         if let Some((version, suite)) = client.tls_session() {
             use tokio_rustls::rustls::ProtocolVersion;
             let (cipher, bits) = openssl_cipher(suite);
@@ -17762,7 +17837,158 @@ impl PgHandler {
                 peer,
             });
         }
-        needs_certificate.then(|| "connection requires a valid client certificate".to_string())
+        has_certificate
+    }
+
+    /// The first question of a login on a server with a `pg_hba.conf`:
+    /// which line decides this connection? Answers PostgreSQL's message
+    /// when none does, when the line is `reject`, and when the line wants a
+    /// client certificate the client did not send.
+    fn check_hba<C: ClientInfo>(&self, client: &C, policy: &hba::HbaPolicy) -> Option<String> {
+        let tls = client.is_secure();
+        let has_certificate = tls && self.record_tls_session(client);
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        // libpq sends the database; PostgreSQL takes the user name for one
+        // that is not sent.
+        let database = client.metadata().get("database").unwrap_or(&user).clone();
+        let host = client.socket_addr().ip().to_canonical();
+        let member_of = |user: &str, role: &str| self.role_is_member(user, role);
+        let connection = hba::Connection {
+            tls,
+            address: host,
+            local: None,
+            user: &user,
+            database: &database,
+        };
+        let encryption = if tls {
+            "SSL encryption"
+        } else {
+            "no encryption"
+        };
+        let whom =
+            format!("host \"{host}\", user \"{user}\", database \"{database}\", {encryption}");
+        match policy.hba.decide(&connection, &member_of) {
+            None => Some(format!("no pg_hba.conf entry for {whom}")),
+            Some(rule) if rule.method == hba::Method::Reject => {
+                Some(format!("pg_hba.conf rejects connection for {whom}"))
+            }
+            Some(rule) => {
+                let _ = self.hba_rule.set(rule.clone());
+                (rule.cert_check != hba::CertCheck::None && !has_certificate)
+                    .then(|| "connection requires a valid client certificate".to_string())
+            }
+        }
+    }
+
+    /// What a login is held to by way of a client certificate: the mode,
+    /// what of the certificate names the user, and the user name map. From
+    /// the `pg_hba.conf` line that decided the connection, or from the TLS
+    /// options on a server without one.
+    fn certificate_terms(&self) -> (ClientCert, tls::ClientName, Option<&ident::UserMap>) {
+        if let (Some(policy), Some(rule)) = (&self.hba, self.hba_rule.get()) {
+            let mode = match (rule.method, rule.cert_check) {
+                (hba::Method::Cert, _) => ClientCert::Cert,
+                (_, hba::CertCheck::VerifyFull) => ClientCert::VerifyFull,
+                (_, hba::CertCheck::VerifyCa) => ClientCert::VerifyCa,
+                (_, hba::CertCheck::None) => ClientCert::Optional,
+            };
+            let map = rule.map.as_deref().and_then(|name| policy.map(name));
+            return (mode, rule.client_name, map);
+        }
+        match &self.tls {
+            Some(policy) => (
+                policy.client_cert,
+                policy.client_name,
+                policy.user_map.as_ref(),
+            ),
+            None => (ClientCert::Optional, tls::ClientName::CommonName, None),
+        }
+    }
+
+    /// A login on a server with a `pg_hba.conf`, once a line has let the
+    /// connection this far: the line's method says what is asked for.
+    async fn hba_login<C>(
+        &self,
+        client: &mut C,
+        user: String,
+        role: Option<RoleInfo>,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::messages::startup::Authentication;
+        let Some(method) = self.hba_rule.get().map(|rule| rule.method) else {
+            return self
+                .fail_login(client, "XX000", "no pg_hba.conf line was chosen".into())
+                .await;
+        };
+        // The stored password a login can be checked against: none for a
+        // user there is no role for, a role with no password, and a
+        // password past its VALID UNTIL. PostgreSQL then runs the exchange
+        // all the same and fails it, saying only that authentication failed.
+        let verifier = role
+            .as_ref()
+            .filter(|role| !Self::password_expired(&role.valid_until))
+            .and_then(|role| role.password.clone());
+        match method {
+            hba::Method::Trust | hba::Method::Cert => {
+                self.complete_login(client, LoginMethod::Trust).await
+            }
+            hba::Method::Reject => {
+                self.fail_login(client, "28000", "pg_hba.conf rejects connection".into())
+                    .await
+            }
+            hba::Method::Password => {
+                *self
+                    .cleartext_auth
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((user, verifier));
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        Authentication::CleartextPassword,
+                    ))
+                    .await?;
+                client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
+                Ok(())
+            }
+            hba::Method::Scram | hba::Method::Md5 => {
+                if let Some(verifier) = &verifier {
+                    if let Some(creds) = scram_credentials(verifier) {
+                        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((user, creds, None));
+                        let mechanisms = scram_binding::mechanisms(self.binding_hash(client));
+                        client
+                            .send(PgWireBackendMessage::Authentication(Authentication::SASL(
+                                mechanisms,
+                            )))
+                            .await?;
+                        client.set_state(
+                            pgwire::api::PgWireConnectionState::AuthenticationInProgress,
+                        );
+                        return Ok(());
+                    }
+                    // A stored md5 hash answers an `md5` line's challenge; a
+                    // `scram-sha-256` line cannot use it.
+                    if method == hba::Method::Md5 && is_md5_hash(verifier) {
+                        let salt: [u8; 4] = rand::random();
+                        *self.md5_auth.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((user, verifier.clone(), salt));
+                        client
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::MD5Password(salt.to_vec()),
+                            ))
+                            .await?;
+                        client.set_state(
+                            pgwire::api::PgWireConnectionState::AuthenticationInProgress,
+                        );
+                        return Ok(());
+                    }
+                }
+                self.refuse_unknown_user(client, user).await
+            }
+        }
     }
 
     /// The server certificate's hash, when this connection is one a SCRAM
@@ -17785,13 +18011,9 @@ impl PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mode = self
-            .tls
-            .as_ref()
-            .map_or(ClientCert::Optional, |policy| policy.client_cert);
+        let (mode, client_name, user_map) = self.certificate_terms();
         if matches!(mode, ClientCert::VerifyFull | ClientCert::Cert) {
             let user = client.metadata().get("user").cloned().unwrap_or_default();
-            let policy = self.tls.as_ref();
             // What the certificate says its holder is called: the common
             // name, or the whole subject under `clientname=DN`.
             let holder = self
@@ -17799,22 +18021,16 @@ impl PgHandler {
                 .tls
                 .get()
                 .and_then(|session| session.peer.as_ref())
-                .and_then(|peer| {
-                    match policy.map(|policy| policy.client_name).unwrap_or_default() {
-                        tls::ClientName::CommonName => peer.common_name.as_deref(),
-                        tls::ClientName::DistinguishedName => {
-                            Some(peer.distinguished_name.as_str())
-                        }
-                    }
+                .and_then(|peer| match client_name {
+                    tls::ClientName::CommonName => peer.common_name.as_deref(),
+                    tls::ClientName::DistinguishedName => Some(peer.distinguished_name.as_str()),
                 });
             // With a user name map the certificate may log in as the roles
             // the map gives it, and only those; without one, as the role it
             // names.
-            let named = holder.is_some_and(|holder| {
-                match policy.and_then(|policy| policy.user_map.as_ref()) {
-                    Some(map) => map.allows(holder, &user),
-                    None => holder == user,
-                }
+            let named = holder.is_some_and(|holder| match user_map {
+                Some(map) => map.allows(holder, &user),
+                None => holder == user,
             });
             if !named {
                 let (code, message) = match (mode, method) {
@@ -17834,18 +18050,47 @@ impl PgHandler {
                 return self.fail_login(client, code, message).await;
             }
         }
-        if matches!(method, LoginMethod::NoRole) {
-            // The certificate was the whole proof and it held, so PostgreSQL
-            // has already said so when it goes to look the role up.
+        // PostgreSQL looks the role up once the login has been proved, and
+        // has by then said that it was. Under `cert` with no role, and for
+        // every login a `pg_hba.conf` line let in, that is the order here.
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        let unusable = if matches!(method, LoginMethod::NoRole) {
+            Some(format!("role \"{user}\" does not exist"))
+        } else if self.hba.is_some() {
+            match self.role(&user)? {
+                None => Some(format!("role \"{user}\" does not exist")),
+                Some(role) if !role.canlogin => {
+                    Some(format!("role \"{user}\" is not permitted to log in"))
+                }
+                Some(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(message) = unusable {
             client
                 .send(PgWireBackendMessage::Authentication(
                     pgwire::messages::startup::Authentication::Ok,
                 ))
                 .await?;
-            let user = client.metadata().get("user").cloned().unwrap_or_default();
-            return self
-                .fail_login(client, "28000", format!("role \"{user}\" does not exist"))
-                .await;
+            return self.fail_login(client, "28000", message).await;
+        }
+        let no_database = self
+            .database_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(info) = no_database {
+            client
+                .send(PgWireBackendMessage::Authentication(
+                    pgwire::messages::startup::Authentication::Ok,
+                ))
+                .await?;
+            client
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await?;
+            client.close().await?;
+            return Ok(());
         }
         self.finish_startup(client).await
     }
@@ -17903,6 +18148,31 @@ impl PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         use pgwire::messages::startup::Authentication;
+        // The answer to a `password` line's request: the password itself.
+        let cleartext = self
+            .cleartext_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((user, verifier)) = cleartext {
+            let answer = message.into_password()?.password;
+            let password = answer.trim_end_matches('\0');
+            if password.is_empty() {
+                return self
+                    .fail_login(client, "28P01", "empty password returned by client".into())
+                    .await;
+            }
+            if verifier.is_some_and(|verifier| plain_password_matches(&user, password, &verifier)) {
+                return self.complete_login(client, LoginMethod::Password).await;
+            }
+            return self
+                .fail_login(
+                    client,
+                    "28P01",
+                    format!("password authentication failed for user \"{user}\""),
+                )
+                .await;
+        }
         // An md5 challenge's answer: `md5` + md5(stored hash + salt).
         let md5 = self
             .md5_auth
@@ -18090,13 +18360,13 @@ impl PgHandler {
         // `pg_reload_conf()` is a superuser's by default; the answer is
         // taken at login.
         let may_reload = self.is_superuser(&self.session_user_name());
-        let reloader = self.tls_reloader.clone();
+        let reloader = self.reloader.clone();
         secantus_pgplan::scalar::set_reload_conf(Some(Box::new(move || {
             if !may_reload {
                 return false;
             }
-            if let Some(Err(e)) = reloader.as_ref().map(tls::TlsReloader::reload) {
-                eprintln!("secantusd-pg: TLS configuration was not reloaded: {e}");
+            if let Some(Err(e)) = reloader.as_ref().map(live::Reloader::reload) {
+                eprintln!("secantusd-pg: configuration was not reloaded: {e}");
             }
             true
         })));

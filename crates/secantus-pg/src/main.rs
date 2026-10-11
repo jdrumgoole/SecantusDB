@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use secantus_pg::{
-    bind_with, ClientCert, ClientName, DatabaseRegistry, ServerOptions, TlsConfig, TlsReloader,
+    bind_with, ClientCert, ClientName, DatabaseRegistry, Reloader, ServerOptions, TlsConfig,
 };
 
 /// Unblock SIGINT / SIGTERM in the calling thread and give them their
@@ -68,15 +68,15 @@ extern "C" fn request_reload(_: libc::c_int) {
     RELOAD_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Re-read the TLS files on SIGHUP, as PostgreSQL does on `pg_ctl reload`.
-/// Only a server started with TLS has anything to re-read; one without
-/// keeps SIGHUP as a request to stop. Windows has no SIGHUP, and
+/// Re-read the login files on SIGHUP, as PostgreSQL does on `pg_ctl reload`.
+/// Only a server started with TLS or a `pg_hba.conf` has anything to
+/// re-read; one without keeps SIGHUP as a request to stop. Windows has no SIGHUP, and
 /// `select pg_reload_conf()` is the way there.
 #[cfg(unix)]
-fn watch_for_reload(reloader: Option<TlsReloader>) {
-    let Some(reloader) = reloader else {
+fn watch_for_reload(reloader: Reloader) {
+    if !reloader.has_files() {
         return;
-    };
+    }
     // SAFETY: `signal` with a valid signal number and a handler that only
     // stores to an atomic, which is async-signal-safe. This replaces the
     // stop handler `ctrlc` installed for SIGHUP and leaves its others.
@@ -92,8 +92,8 @@ fn watch_for_reload(reloader: Option<TlsReloader>) {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if RELOAD_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 match reloader.reload() {
-                    Ok(()) => eprintln!("secantusd-pg: TLS configuration reloaded"),
-                    Err(e) => eprintln!("secantusd-pg: TLS configuration was not reloaded: {e}"),
+                    Ok(()) => eprintln!("secantusd-pg: configuration reloaded"),
+                    Err(e) => eprintln!("secantusd-pg: configuration was not reloaded: {e}"),
                 }
             }
         });
@@ -103,7 +103,7 @@ fn watch_for_reload(reloader: Option<TlsReloader>) {
 }
 
 #[cfg(not(unix))]
-fn watch_for_reload(_reloader: Option<TlsReloader>) {}
+fn watch_for_reload(_reloader: Reloader) {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FIRST, before any thread exists (a thread inherits the mask it is
@@ -130,6 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_ident_file: Option<String> = None;
     let mut tls_user_map: Option<String> = None;
     let mut tls_client_name: Option<ClientName> = None;
+    let mut hba_file: Option<String> = None;
+    let mut ident_file: Option<String> = None;
     let mut refuse_unknown_users = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -158,7 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  [--tls-ca-file PATH [--tls-client-cert MODE] [--tls-crl-file PATH]\n                  \
                  [--tls-client-name CN|DN]\n                  \
                  [--tls-ident-file PATH --tls-user-map NAME]]]\n                \
-                 [--refuse-unknown-users]\n\
+                 [--refuse-unknown-users]\n                \
+                 [--hba-file PATH [--ident-file PATH]]\n\
                  \n\
                  ARGS:\n    \
                  <storage-path>  WiredTiger home directory (default: ./secantus-pg-data)\n    \
@@ -195,6 +198,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  and `--tls-client-cert cert`, a certificate logs in as\n                     \
                  the roles that map gives it.\n    \
                  --tls-user-map NAME   The map in --tls-ident-file to use.\n    \
+                 --hba-file PATH  A pg_hba.conf. Its lines decide every login: the\n                     \
+                 first that matches a connection's type, database, user\n                     \
+                 and address says how it must prove who it is, and a\n                     \
+                 connection no line matches is refused. In place of\n                     \
+                 --tls-require, --tls-client-cert, --tls-client-name,\n                     \
+                 --tls-user-map and --refuse-unknown-users.\n    \
+                 --ident-file PATH  The pg_ident.conf for a map= in the pg_hba.conf.\n    \
                  --refuse-unknown-users  Ask a user there is no role for to give a\n                     \
                  password, which fails. By default such a user\n                     \
                  connects without one.\n    \
@@ -254,6 +264,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name.parse()
                     .map_err(|e| format!("--tls-client-name: {e}"))?,
             );
+        } else if arg == "--hba-file" {
+            hba_file = Some(args.next().ok_or("--hba-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--hba-file=") {
+            hba_file = Some(path.to_string());
+        } else if arg == "--ident-file" {
+            ident_file = Some(args.next().ok_or("--ident-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--ident-file=") {
+            ident_file = Some(path.to_string());
         } else if arg == "--tls-require" {
             tls_require = true;
         } else if arg == "--refuse-unknown-users" {
@@ -349,6 +367,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = ServerOptions::default()
         .tls(tls)
         .refuse_unknown_users(refuse_unknown_users);
+    let options = match hba_file {
+        Some(path) => options.hba_file(path),
+        None => options,
+    };
+    let options = match ident_file {
+        Some(path) => options.ident_file(path),
+        None => options,
+    };
     let mut server = bind_with(&addr, storage, databases, &options).map_err(|e| e.to_string())?;
 
     // One line, flushed, so a harness can wait for readiness. It reports the
@@ -369,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // while the client had been told the writes succeeded. `stop` drains the
     // connections and drops the last `Arc<Storage>`, which is where the
     // close-checkpoint runs. The handler was installed above, before startup.
-    watch_for_reload(server.tls_reloader());
+    watch_for_reload(server.reloader());
     let _ = rx.recv();
 
     server.stop();

@@ -73,8 +73,16 @@ pg_ident.conf --tls-user-map NAME` (`map=NAME`) lets a certificate log in
 as the roles a user name map gives it. The files are read again on SIGHUP
 and on `select pg_reload_conf()`. In a Rust test these are
 `TlsConfig::crl_file`, `client_name` and `user_map`, and
-`PgServer::reload_tls`. Not supported: a choice of rule by user or
-database, and a key with a passphrase.
+`PgServer::reload`. Not supported: a key with a passphrase.
+
+`--hba-file pg_hba.conf` (`PgBuilder::hba_file`, after 0.1.0-beta.11) takes
+a `pg_hba.conf` in place of those options: the first line that matches a
+connection's type, database, user and address says how it must prove who it
+is, and a connection no line matches is refused. It reads `host`,
+`hostssl` and `hostnossl`; the `trust`, `reject`, `scram-sha-256`, `md5`,
+`password` and `cert` methods; `clientcert=`, `clientname=` and `map=` (with
+`--ident-file`). A line it cannot apply, such as an `ldap` method or a host
+name for the address, stops the server from starting.
 
 A user name there is no role for connects without a password, as a role
 with no password does. `--refuse-unknown-users`

@@ -121,17 +121,14 @@ impl PgServer {
         &self.storage_path
     }
 
-    /// Read the TLS files again: the certificate and key, the CA file, the
-    /// revocation list and the user name map. A connection made from here on
-    /// gets what they hold now. On an error the server keeps what it had.
-    /// Nothing to do, and no error, for a server started without TLS.
-    pub fn reload_tls(&self) -> std::io::Result<()> {
-        match self
-            .running
-            .as_ref()
-            .and_then(RunningPgServer::tls_reloader)
-        {
-            Some(reloader) => reloader.reload(),
+    /// Read the login files again: the TLS certificate and key, the CA
+    /// file and revocation list, the `pg_hba.conf` and the user name map. A
+    /// connection made from here on gets what they hold now. On an error
+    /// the server keeps what it had. Nothing to do, and no error, for a
+    /// server started with none of them.
+    pub fn reload(&self) -> std::io::Result<()> {
+        match &self.running {
+            Some(running) => running.reloader().reload(),
             None => Ok(()),
         }
     }
@@ -196,6 +193,8 @@ pub struct PgBuilder {
     cache_size: String,
     tls: Option<TlsConfig>,
     refuse_unknown_users: bool,
+    hba_file: Option<PathBuf>,
+    ident_file: Option<PathBuf>,
 }
 
 impl Default for PgBuilder {
@@ -208,6 +207,8 @@ impl Default for PgBuilder {
             cache_size: DEFAULT_CACHE_SIZE.to_string(),
             tls: None,
             refuse_unknown_users: false,
+            hba_file: None,
+            ident_file: None,
         }
     }
 }
@@ -277,6 +278,22 @@ impl PgBuilder {
         self
     }
 
+    /// Decide every login by the `pg_hba.conf` at `path`, as PostgreSQL
+    /// does: the first line that matches a connection says how it must
+    /// prove who it is, and a connection no line matches is refused. In
+    /// place of [`PgBuilder::refuse_unknown_users`] and of a [`TlsConfig`]'s
+    /// `require_tls`, `client_cert`, `client_name` and `user_map`.
+    pub fn hba_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.hba_file = Some(path.into());
+        self
+    }
+
+    /// The `pg_ident.conf` for a `map=` in the `pg_hba.conf`.
+    pub fn ident_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ident_file = Some(path.into());
+        self
+    }
+
     /// Open the store and start serving.
     pub fn start(self) -> Result<PgServer, Error> {
         if self.cache_size.trim().is_empty() || self.cache_size.contains([',', '(', ')', '=']) {
@@ -315,10 +332,20 @@ impl PgBuilder {
         let options = ServerOptions::default()
             .tls(self.tls.clone())
             .refuse_unknown_users(self.refuse_unknown_users);
+        let options = match &self.hba_file {
+            Some(path) => options.hba_file(path),
+            None => options,
+        };
+        let options = match &self.ident_file {
+            Some(path) => options.ident_file(path),
+            None => options,
+        };
         let running =
             bind_with(&addr, storage, databases, &options).map_err(|e| match e.kind() {
                 // A certificate or key that could not be used, not a socket.
-                std::io::ErrorKind::InvalidData => Error::Config(e.to_string()),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+                    Error::Config(e.to_string())
+                }
                 _ => Error::Io(e),
             })?;
         Ok(PgServer {

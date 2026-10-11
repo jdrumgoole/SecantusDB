@@ -229,15 +229,14 @@ pub struct RunningPgServer {
     /// Set by `stop` once the store is known to be closed (its last reference
     /// dropped, so the close-checkpoint ran).
     store_closed: bool,
-    tls: Option<Arc<crate::tls::LiveTls>>,
+    live: Arc<crate::live::Live>,
 }
 
 impl RunningPgServer {
-    /// A handle that re-reads the TLS files; `None` for a server started
-    /// without TLS. It outlives nothing: after `stop` a reload changes
-    /// what no connection will see.
-    pub fn tls_reloader(&self) -> Option<crate::tls::TlsReloader> {
-        self.tls.clone().map(crate::tls::TlsReloader)
+    /// A handle that re-reads the server's login files. After `stop` a
+    /// reload changes what no connection will see.
+    pub fn reloader(&self) -> crate::live::Reloader {
+        crate::live::Reloader(self.live.clone())
     }
 
     /// The address the listener actually BOUND. With `127.0.0.1:0` this is how
@@ -447,6 +446,11 @@ pub struct ServerOptions {
     /// Refuse a user there is no role for. By default such a user is
     /// trusted, as a role with no password is.
     pub refuse_unknown_users: bool,
+    /// A `pg_hba.conf`. With one, its lines decide every login and the
+    /// options that stand in for such lines may not be given.
+    pub hba_file: Option<std::path::PathBuf>,
+    /// The `pg_ident.conf` a `map=` in the `pg_hba.conf` is looked up in.
+    pub ident_file: Option<std::path::PathBuf>,
 }
 
 impl ServerOptions {
@@ -462,6 +466,72 @@ impl ServerOptions {
         self.refuse_unknown_users = refuse;
         self
     }
+
+    /// Decide every login by the `pg_hba.conf` at this path: the first line
+    /// that matches a connection's transport, database, user and address
+    /// says how it must prove who it is, and a connection no line matches
+    /// is refused. The file takes the place of
+    /// [`ServerOptions::refuse_unknown_users`] and of [`TlsConfig`]'s
+    /// `require_tls`, `client_cert`, `client_name` and `user_map`, and
+    /// giving one of those beside it is an error.
+    pub fn hba_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.hba_file = Some(path.into());
+        self
+    }
+
+    /// The `pg_ident.conf` for a `map=` in the `pg_hba.conf`.
+    pub fn ident_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.ident_file = Some(path.into());
+        self
+    }
+
+    /// The `pg_hba.conf` and what it needs, checked against the options it
+    /// replaces.
+    fn hba_files(&self) -> io::Result<Option<crate::hba::HbaFiles>> {
+        let Some(hba_file) = &self.hba_file else {
+            if self.ident_file.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a user name map file is for a pg_hba.conf, and none was given",
+                ));
+            }
+            return Ok(None);
+        };
+        let replaced = [
+            (self.refuse_unknown_users, "refusing unknown users"),
+            (
+                self.tls.as_ref().is_some_and(|tls| tls.require_tls),
+                "requiring TLS",
+            ),
+            (
+                self.tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.client_cert != crate::tls::ClientCert::Optional),
+                "a client certificate mode",
+            ),
+            (
+                self.tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.client_name != crate::tls::ClientName::CommonName),
+                "a client name",
+            ),
+            (
+                self.tls.as_ref().is_some_and(|tls| tls.user_map.is_some()),
+                "a user name map",
+            ),
+        ];
+        if let Some((_, what)) = replaced.iter().find(|(given, _)| *given) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{what} is said in the pg_hba.conf; it cannot be given beside one"),
+            ));
+        }
+        Ok(Some(crate::hba::HbaFiles {
+            hba_file: hba_file.clone(),
+            ident_file: self.ident_file.clone(),
+            has_ca: self.tls.as_ref().is_some_and(|tls| tls.ca_file.is_some()),
+        }))
+    }
 }
 
 /// [`bind_tls`] with everything [`ServerOptions`] can say.
@@ -471,10 +541,16 @@ pub fn bind_with(
     databases: Arc<DatabaseRegistry>,
     options: &ServerOptions,
 ) -> io::Result<RunningPgServer> {
-    let tls = match &options.tls {
-        Some(config) => Some(Arc::new(crate::tls::LiveTls::new(config)?)),
-        None => None,
-    };
+    let live = Arc::new(crate::live::Live {
+        hba: match options.hba_files()? {
+            Some(files) => Some(crate::hba::LiveHba::new(files)?),
+            None => None,
+        },
+        tls: match &options.tls {
+            Some(config) => Some(crate::tls::LiveTls::new(config)?),
+            None => None,
+        },
+    });
     let refuse_unknown_users = options.refuse_unknown_users;
     // Statements are planned and run on each connection's own thread (see
     // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
@@ -529,7 +605,7 @@ pub fn bind_with(
             storage,
             databases,
             LoginRules {
-                tls: tls.clone(),
+                live: live.clone(),
                 refuse_unknown_users,
             },
             stop_flag,
@@ -547,14 +623,14 @@ pub fn bind_with(
         active,
         storage: Some(storage),
         store_closed: false,
-        tls,
+        live,
     })
 }
 
 /// What every connection's login is held to.
 struct LoginRules {
     /// Read afresh for each connection, so a reload reaches the next one.
-    tls: Option<Arc<crate::tls::LiveTls>>,
+    live: Arc<crate::live::Live>,
     refuse_unknown_users: bool,
 }
 
@@ -576,11 +652,12 @@ async fn accept_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let (acceptor, policy) = login.tls.as_ref().map(|live| live.current()).unzip();
+        let (acceptor, policy) = login.live.tls.as_ref().map(|tls| tls.current()).unzip();
         let handler = Arc::new(
             PgHandler::new(storage.clone(), databases.clone())
                 .with_tls(policy)
-                .with_tls_reloader(login.tls.clone().map(crate::tls::TlsReloader))
+                .with_hba(login.live.hba.as_ref().map(|hba| hba.current()))
+                .with_reloader(Some(crate::live::Reloader(login.live.clone())))
                 .with_refuse_unknown_users(login.refuse_unknown_users),
         );
         let active = active.clone();
