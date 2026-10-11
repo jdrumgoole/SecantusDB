@@ -191,6 +191,18 @@ pub trait ClientInfo {
     /// Returns the client TLS certificates, if available.
     #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
     fn client_certificates<'a>(&self) -> Option<&[CertificateDer<'a>]>;
+
+    /// Returns the TLS protocol version and cipher suite the handshake
+    /// settled on, or `None` for a connection that is not TLS.
+    #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+    fn tls_session(
+        &self,
+    ) -> Option<(
+        tokio_rustls::rustls::ProtocolVersion,
+        tokio_rustls::rustls::CipherSuite,
+    )> {
+        None
+    }
 }
 
 /// Client Portal Store

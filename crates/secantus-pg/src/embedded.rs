@@ -242,6 +242,14 @@ impl PgBuilder {
         self
     }
 
+    /// [`PgBuilder::tls`] with everything a [`TlsConfig`] can say: a CA for
+    /// client certificates, whether one is required, and whether a
+    /// connection that is not TLS is refused.
+    pub fn tls_config(mut self, tls: TlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Open the store and start serving.
     pub fn start(self) -> Result<PgServer, Error> {
         if self.cache_size.trim().is_empty() || self.cache_size.contains([',', '(', ')', '=']) {

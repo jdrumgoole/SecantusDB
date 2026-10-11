@@ -130,8 +130,37 @@ secantusd-pg ./secantus-pg-data 127.0.0.1:5432 \
 A client that asks for TLS then gets it (`sslmode=require`, `verify-ca`,
 `verify-full`); one that does not ask is still served in the clear. Without
 the pair the server answers a TLS request with "not supported", as PostgreSQL
-does with `ssl = off`. Client certificates and SCRAM channel binding are not
-supported. The TLS options are in 0.1.0-beta.9 and later.
+does with `ssl = off`. These two options are in 0.1.0-beta.9 and later.
+
+A password login over TLS is offered SCRAM channel binding
+(`SCRAM-SHA-256-PLUS`), so a client with `channel_binding=require` connects.
+Three more options stand in for the `pg_hba.conf` this server does not have.
+Channel binding and these options are newer than 0.1.0-beta.9.
+
+| Option | What it does | PostgreSQL's equivalent |
+| --- | --- | --- |
+| `--tls-require` | Refuses a connection that is not TLS. | A `pg_hba.conf` with only `hostssl` lines |
+| `--tls-ca-file ca.pem` | Asks a TLS client for a certificate. One it sends must be signed by a CA in this PEM file; a client that sends none still connects. | `ssl_ca_file` |
+| `--tls-client-cert verify-ca` | A certificate must be sent. | `clientcert=verify-ca` |
+| `--tls-client-cert verify-full` | A certificate must be sent and its common name must be the user name. A role with a password still gives it. | `clientcert=verify-full` |
+| `--tls-client-cert cert` | The same check, and no password is asked for. | The `cert` method |
+
+`--tls-client-cert` needs `--tls-ca-file`, and it refuses a connection that
+is not TLS, as PostgreSQL allows `clientcert` on a `hostssl` line only.
+
+```bash
+secantusd-pg ./secantus-pg-data 127.0.0.1:5432 \
+    --tls-cert-file server.crt --tls-key-file server.key \
+    --tls-ca-file ca.pem --tls-client-cert verify-full
+```
+
+`pg_stat_ssl` has a row for each connection: whether it is TLS, the protocol
+version, the cipher under OpenSSL's name, and the client certificate's
+subject, serial number and issuer.
+
+Not supported: a certificate revocation list, a user name map
+(`pg_ident.conf`), matching on the certificate's whole DN (`clientname=DN`),
+a key with a passphrase, and reloading the files without a restart.
 
 The Python one needs the `sql` extra (`pip install "SecantusDB[sql]"`) and
 runs as `secantusd-py-pg`:

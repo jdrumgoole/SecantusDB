@@ -211,6 +211,26 @@ impl<T: 'static, S> ClientInfo for Framed<T, PgWireMessageServerCodec<S>> {
             _ => None,
         }
     }
+
+    #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
+    fn tls_session(
+        &self,
+    ) -> Option<(
+        tokio_rustls::rustls::ProtocolVersion,
+        tokio_rustls::rustls::CipherSuite,
+    )> {
+        let any = self.get_ref() as &dyn std::any::Any;
+        match any.downcast_ref::<MaybeTls>() {
+            Some(MaybeTls::Tls(tls)) => {
+                let (_, tls_session) = tls.get_ref();
+                Some((
+                    tls_session.protocol_version()?,
+                    tls_session.negotiated_cipher_suite()?.suite(),
+                ))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl<T, S> ClientPortalStore for Framed<T, PgWireMessageServerCodec<S>> {

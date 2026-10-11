@@ -67,6 +67,7 @@ mod row_waits;
 mod rules;
 mod scan_partitions;
 mod schema_rows;
+mod scram_binding;
 mod server;
 mod stream_join;
 mod table_locks;
@@ -74,13 +75,14 @@ mod tls;
 mod triggers;
 mod txn_gucs;
 mod wire_portals;
+mod x509;
 mod xids;
 
 pub use embedded::{Error, PgBuilder, PgServer, DEFAULT_CACHE_SIZE, DEFAULT_DATABASE};
 pub use server::{
     bind, bind_tls, open_storage, open_storage_with_cache, sync_on_commit, RunningPgServer,
 };
-pub use tls::TlsConfig;
+pub use tls::{ClientCert, TlsConfig};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -153,6 +155,40 @@ pub struct BackendEntry {
     /// When the running statement's `statement_timeout` expires, if it has
     /// one: a cancellation point past it answers 57014.
     deadline: Mutex<Option<std::time::Instant>>,
+    /// The connection's TLS session, set at startup: the row `pg_stat_ssl`
+    /// shows for this backend. Unset for a connection in the clear.
+    tls: OnceLock<TlsSession>,
+}
+
+/// What `pg_stat_ssl` reports for one backend over TLS.
+#[derive(Clone)]
+struct TlsSession {
+    /// `TLSv1.3`, as OpenSSL names it.
+    version: &'static str,
+    /// The cipher suite under OpenSSL's name, and its key size in bits.
+    cipher: &'static str,
+    bits: i32,
+    /// The client's certificate, when it sent one.
+    peer: Option<x509::Peer>,
+}
+
+/// OpenSSL's name and key size for a cipher suite the `ring` provider
+/// negotiates. PostgreSQL reports OpenSSL's names, and a TLS 1.2 suite's
+/// differs from its IANA name.
+fn openssl_cipher(suite: tokio_rustls::rustls::CipherSuite) -> (&'static str, i32) {
+    use tokio_rustls::rustls::CipherSuite as S;
+    match suite {
+        S::TLS13_AES_256_GCM_SHA384 => ("TLS_AES_256_GCM_SHA384", 256),
+        S::TLS13_AES_128_GCM_SHA256 => ("TLS_AES_128_GCM_SHA256", 128),
+        S::TLS13_CHACHA20_POLY1305_SHA256 => ("TLS_CHACHA20_POLY1305_SHA256", 256),
+        S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => ("ECDHE-ECDSA-AES256-GCM-SHA384", 256),
+        S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => ("ECDHE-ECDSA-AES128-GCM-SHA256", 128),
+        S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => ("ECDHE-ECDSA-CHACHA20-POLY1305", 256),
+        S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => ("ECDHE-RSA-AES256-GCM-SHA384", 256),
+        S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => ("ECDHE-RSA-AES128-GCM-SHA256", 128),
+        S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => ("ECDHE-RSA-CHACHA20-POLY1305", 256),
+        _ => ("unknown", 0),
+    }
 }
 
 /// A statement's OLD and NEW transition rows, for a trigger's REFERENCING
@@ -217,6 +253,7 @@ impl BackendEntry {
             inbox: Mutex::new(VecDeque::new()),
             wake: tokio::sync::Notify::new(),
             deadline: Mutex::new(None),
+            tls: OnceLock::new(),
             activity: Mutex::new(BackendActivity {
                 datname: datname.to_string(),
                 usename: String::new(),
@@ -2907,6 +2944,8 @@ pub struct PgHandler {
     /// Whether the server was started with a certificate: what `SHOW ssl`
     /// answers. A server fact, not a session's, so it survives `RESET ALL`.
     ssl: bool,
+    /// What a login to a server with TLS is held to; `None` without TLS.
+    tls: Option<Arc<tls::TlsPolicy>>,
     /// The database the startup packet named, once it has been checked
     /// against the registry; the registry's default until then.
     db: OnceLock<String>,
@@ -2999,7 +3038,7 @@ pub struct PgHandler {
         Option<(
             String,
             secantus_auth::StoredCredentials,
-            Option<secantus_auth::ScramState>,
+            Option<(secantus_auth::ScramState, scram_binding::ClientFirst)>,
         )>,
     >,
     /// An md5 password login in progress: the role, its stored
@@ -3434,6 +3473,7 @@ impl PgHandler {
         Self {
             storage,
             ssl: false,
+            tls: None,
             db: OnceLock::new(),
             databases,
             txn: Arc::new(Mutex::new(None)),
@@ -3514,6 +3554,13 @@ impl PgHandler {
         *self.settings.lock().unwrap_or_else(|e| e.into_inner()) =
             GucMap::from(self.server_defaults());
         self
+    }
+
+    /// A handler for a server that offers TLS under `policy`.
+    pub(crate) fn with_tls(mut self, policy: Option<Arc<tls::TlsPolicy>>) -> Self {
+        let ssl = policy.is_some();
+        self.tls = policy;
+        self.with_ssl(ssl)
     }
 
     /// The settings a fresh connection to THIS server starts with:
@@ -12973,6 +13020,21 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("waitstart", "timestamptz", false),
                 ],
             )),
+            // One row for every backend, PostgreSQL 15's columns: `ssl` false
+            // and the rest NULL for a connection in the clear.
+            "pg_stat_ssl" => Some(TableDef::new(
+                "pg_stat_ssl",
+                vec![
+                    secantus_pgcatalog::Column::new("pid", "int4", false),
+                    secantus_pgcatalog::Column::new("ssl", "bool", false),
+                    secantus_pgcatalog::Column::new("version", "text", false),
+                    secantus_pgcatalog::Column::new("cipher", "text", false),
+                    secantus_pgcatalog::Column::new("bits", "int4", false),
+                    secantus_pgcatalog::Column::new("client_dn", "text", false),
+                    secantus_pgcatalog::Column::new("client_serial", "numeric", false),
+                    secantus_pgcatalog::Column::new("issuer_dn", "text", false),
+                ],
+            )),
             "pg_stat_activity" => Some(TableDef::new(
                 "pg_stat_activity",
                 vec![
@@ -15356,6 +15418,40 @@ impl PgHandler {
                 }
                 rows
             }
+            "pg_stat_ssl" => {
+                let backends: Vec<(i32, Option<TlsSession>)> = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(pid, entry)| (*pid, entry.tls.get().cloned()))
+                    .collect();
+                let field = |name: &str| def.field_of(name).expect("column");
+                backends
+                    .into_iter()
+                    .map(|(pid, session)| {
+                        let peer = session.as_ref().and_then(|s| s.peer.as_ref());
+                        let text = |v: Option<&str>| v.map_or(Bson::Null, Bson::from);
+                        let mut d = Document::new();
+                        d.insert(field("pid"), Bson::Int32(pid));
+                        d.insert(field("ssl"), session.is_some());
+                        d.insert(field("version"), text(session.as_ref().map(|s| s.version)));
+                        d.insert(field("cipher"), text(session.as_ref().map(|s| s.cipher)));
+                        d.insert(
+                            field("bits"),
+                            session.as_ref().map_or(Bson::Null, |s| Bson::Int32(s.bits)),
+                        );
+                        d.insert(field("client_dn"), text(peer.map(|p| p.subject.as_str())));
+                        d.insert(
+                            field("client_serial"),
+                            peer.map_or(Bson::Null, |p| {
+                                secantus_pgplan::numeric::numeric_bson(&p.serial)
+                            }),
+                        );
+                        d.insert(field("issuer_dn"), text(peer.map(|p| p.issuer.as_str())));
+                        d
+                    })
+                    .collect()
+            }
             "pg_stat_activity" => {
                 let backends: Vec<(i32, BackendActivity)> = backend_registry()
                     .lock()
@@ -17431,6 +17527,12 @@ impl StartupHandler for PgHandler {
         pgwire::api::auth::protocol_negotiation(client, startup).await?;
         pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
 
+        // Whether this connection may log in at all comes first, as the
+        // `pg_hba.conf` match does: before the database is looked up.
+        if let Some(refusal) = self.check_transport(client) {
+            return self.fail_login(client, "28000", refusal).await;
+        }
+
         // libpq defaults `database` to the user name; a startup packet with
         // neither gets the server's default (PostgreSQL would look for a
         // database named after the user, which is not this server's model).
@@ -17464,7 +17566,14 @@ impl StartupHandler for PgHandler {
                     )
                     .await;
             }
-            if let Some(verifier) = role.password.as_deref() {
+            // Under `cert` the certificate is the whole proof: no password is
+            // asked for, as PostgreSQL's `cert` method asks for none.
+            let by_certificate = self
+                .tls
+                .as_ref()
+                .is_some_and(|policy| policy.client_cert == ClientCert::Cert);
+            let verifier = role.password.as_deref().filter(|_| !by_certificate);
+            if let Some(verifier) = verifier {
                 // A password past its VALID UNTIL cannot log in; PostgreSQL
                 // says only that authentication failed.
                 if Self::password_expired(&role.valid_until) {
@@ -17504,19 +17613,26 @@ impl StartupHandler for PgHandler {
                         .await;
                 };
                 *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = Some((user, creds, None));
+                let mechanisms = scram_binding::mechanisms(self.binding_hash(client));
                 client
                     .send(PgWireBackendMessage::Authentication(
-                        pgwire::messages::startup::Authentication::SASL(vec![
-                            "SCRAM-SHA-256".into()
-                        ]),
+                        pgwire::messages::startup::Authentication::SASL(mechanisms),
                     ))
                     .await?;
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
                 return Ok(());
             }
         }
-        self.finish_startup(client).await
+        self.complete_login(client, LoginMethod::Trust).await
     }
+}
+
+/// How a login was let in, which is what PostgreSQL names when a
+/// `clientcert=verify-full` check then fails it.
+#[derive(Clone, Copy)]
+enum LoginMethod {
+    Trust,
+    Password,
 }
 
 impl PgHandler {
@@ -17556,6 +17672,120 @@ impl PgHandler {
         Ok(())
     }
 
+    /// [`Self::fail_login`] for a refusal that carries a DETAIL.
+    async fn refuse_login<C>(
+        &self,
+        client: &mut C,
+        refusal: scram_binding::Refusal,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mut info = ErrorInfo::new("FATAL".into(), refusal.code.into(), refusal.message);
+        info.detail = refusal.detail.map(str::to_string);
+        client
+            .send(PgWireBackendMessage::ErrorResponse(info.into()))
+            .await?;
+        client.close().await?;
+        Ok(())
+    }
+
+    /// The first question of a login on a server with TLS: may a connection
+    /// over this transport log in at all? Answers PostgreSQL's message when
+    /// it may not, and records the TLS session `pg_stat_ssl` reports.
+    fn check_transport<C: ClientInfo>(&self, client: &C) -> Option<String> {
+        let policy = self.tls.as_ref()?;
+        if !client.is_secure() {
+            if !policy.require_tls {
+                return None;
+            }
+            // What PostgreSQL says when no `pg_hba.conf` line matches, and
+            // the only lines are `hostssl`.
+            let user = client.metadata().get("user").cloned().unwrap_or_default();
+            let database = client.metadata().get("database").unwrap_or(&user);
+            return Some(format!(
+                "no pg_hba.conf entry for host \"{}\", user \"{user}\", database \"{database}\", no encryption",
+                client.socket_addr().ip()
+            ));
+        }
+        let peer = client
+            .client_certificates()
+            .and_then(|chain| chain.first())
+            .and_then(|leaf| x509::peer(leaf));
+        let needs_certificate = policy.client_cert != ClientCert::Optional && peer.is_none();
+        if let Some((version, suite)) = client.tls_session() {
+            use tokio_rustls::rustls::ProtocolVersion;
+            let (cipher, bits) = openssl_cipher(suite);
+            let _ = self.backend.tls.set(TlsSession {
+                version: match version {
+                    ProtocolVersion::TLSv1_3 => "TLSv1.3",
+                    ProtocolVersion::TLSv1_2 => "TLSv1.2",
+                    _ => "unknown",
+                },
+                cipher,
+                bits,
+                peer,
+            });
+        }
+        needs_certificate.then(|| "connection requires a valid client certificate".to_string())
+    }
+
+    /// The server certificate's hash, when this connection is one a SCRAM
+    /// exchange can be bound to.
+    fn binding_hash<C: ClientInfo>(&self, client: &C) -> Option<&[u8]> {
+        if !client.is_secure() {
+            return None;
+        }
+        self.tls.as_ref()?.end_point_hash.as_deref()
+    }
+
+    /// The end of a login that `method` let in: the certificate's common
+    /// name must be the user name where the server asks for that
+    /// (`clientcert=verify-full`, `cert`), and then the startup finishes.
+    /// PostgreSQL makes this check after the password, and reports its
+    /// failure as that method's.
+    async fn complete_login<C>(&self, client: &mut C, method: LoginMethod) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mode = self
+            .tls
+            .as_ref()
+            .map_or(ClientCert::Optional, |policy| policy.client_cert);
+        if matches!(mode, ClientCert::VerifyFull | ClientCert::Cert) {
+            let user = client.metadata().get("user").cloned().unwrap_or_default();
+            let named = self
+                .backend
+                .tls
+                .get()
+                .and_then(|session| session.peer.as_ref())
+                .and_then(|peer| peer.common_name.as_deref())
+                == Some(user.as_str());
+            if !named {
+                let (code, message) = match (mode, method) {
+                    (ClientCert::Cert, _) => (
+                        "28000",
+                        format!("certificate authentication failed for user \"{user}\""),
+                    ),
+                    (_, LoginMethod::Password) => (
+                        "28P01",
+                        format!("password authentication failed for user \"{user}\""),
+                    ),
+                    (_, LoginMethod::Trust) => (
+                        "28000",
+                        format!("\"trust\" authentication failed for user \"{user}\""),
+                    ),
+                };
+                return self.fail_login(client, code, message).await;
+            }
+        }
+        self.finish_startup(client).await
+    }
+
     /// One client message of a SCRAM exchange: the client-first (answered
     /// with the server-first), then the client-final (checked, and answered
     /// with the server signature and the rest of the startup).
@@ -17582,7 +17812,7 @@ impl PgHandler {
             input.extend_from_slice(&salt);
             let expected = format!("md5{}", secantus_pgplan::scalar::md5_hex(&input));
             if answer.trim_end_matches('\0') == expected {
-                return self.finish_startup(client).await;
+                return self.complete_login(client, LoginMethod::Password).await;
             }
             return self
                 .fail_login(
@@ -17602,20 +17832,21 @@ impl PgHandler {
         match scram {
             None => {
                 let first = message.into_sasl_initial_response()?;
-                if first.auth_method != "SCRAM-SHA-256" {
-                    return self
-                        .fail_login(
-                            client,
-                            "28000",
-                            "selected SASL mechanism is not supported".into(),
-                        )
-                        .await;
-                }
                 let data = first.data.unwrap_or_default();
-                match secantus_auth::begin_scram_pg(&data, Some(creds.clone())) {
+                // The mechanism and the channel-binding header are checked
+                // here; the exchange sees the message without the header.
+                let checked = match scram_binding::client_first(
+                    &first.auth_method,
+                    &data,
+                    self.binding_hash(client),
+                ) {
+                    Ok(checked) => checked,
+                    Err(refusal) => return self.refuse_login(client, refusal).await,
+                };
+                match secantus_auth::begin_scram_pg(&checked.message, Some(creds.clone())) {
                     Ok((server_first, state)) => {
                         *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some((user, creds, Some(state)));
+                            Some((user, creds, Some((state, checked))));
                         client
                             .send(PgWireBackendMessage::Authentication(
                                 Authentication::SASLContinue(Bytes::from(server_first)),
@@ -17629,8 +17860,12 @@ impl PgHandler {
                     }
                 }
             }
-            Some(mut state) => {
+            Some((mut state, checked)) => {
                 let last = message.into_sasl_response()?;
+                // The binding before the proof, as PostgreSQL checks them.
+                if let Err(refusal) = scram_binding::client_final(&last.data, &checked) {
+                    return self.refuse_login(client, refusal).await;
+                }
                 match secantus_auth::continue_scram(&mut state, &last.data) {
                     Ok(server_final) => {
                         client
@@ -17638,7 +17873,7 @@ impl PgHandler {
                                 Authentication::SASLFinal(Bytes::from(server_final)),
                             ))
                             .await?;
-                        self.finish_startup(client).await
+                        self.complete_login(client, LoginMethod::Password).await
                     }
                     Err(_) => self.fail_login(client, "28P01", failed).await,
                 }
@@ -17727,6 +17962,7 @@ impl PgHandler {
         let (pid, secret) = _c.pid_and_secret_key();
         self.backend_pid
             .store(pid, std::sync::atomic::Ordering::Relaxed);
+        secantus_pgplan::scalar::set_backend_pid(pid);
         let _ = self.backend.secret.set(secret.to_bytes());
         {
             let mut activity = self

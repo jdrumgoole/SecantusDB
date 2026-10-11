@@ -419,7 +419,10 @@ pub fn bind_tls(
     databases: Arc<DatabaseRegistry>,
     tls: Option<&TlsConfig>,
 ) -> io::Result<RunningPgServer> {
-    let acceptor = tls.map(TlsConfig::acceptor).transpose()?;
+    let (acceptor, policy) = match tls.map(TlsConfig::build).transpose()? {
+        Some((acceptor, policy)) => (Some(acceptor), Some(policy)),
+        None => (None, None),
+    };
     // Statements are planned and run on each connection's own thread (see
     // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
     // overflowed on a 24-term `||` chain, which ABORTS the process -- every
@@ -473,6 +476,7 @@ pub fn bind_tls(
             storage,
             databases,
             acceptor,
+            policy,
             stop_flag,
             active,
             shutdown_rx,
@@ -496,6 +500,7 @@ async fn accept_loop(
     storage: Arc<Storage>,
     databases: Arc<DatabaseRegistry>,
     acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    policy: Option<Arc<crate::tls::TlsPolicy>>,
     stop_flag: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
@@ -509,9 +514,8 @@ async fn accept_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let handler = Arc::new(
-            PgHandler::new(storage.clone(), databases.clone()).with_ssl(acceptor.is_some()),
-        );
+        let handler =
+            Arc::new(PgHandler::new(storage.clone(), databases.clone()).with_tls(policy.clone()));
         let acceptor = acceptor.clone();
         let active = active.clone();
         let mut conn_shutdown = shutdown.clone();

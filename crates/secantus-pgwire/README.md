@@ -16,6 +16,8 @@ What the fork changes, against upstream 0.40.7 (regenerate the full diff with
   function-call (fastpath) handling the server's PostgreSQL fidelity work
   needed; see the SecantusDB history of `crates/secantus-pgwire` (formerly
   `crates/vendor/pgwire`).
+- `ClientInfo::tls_session` -- the TLS protocol version and cipher suite a
+  connection negotiated, which `pg_stat_ssl` reports.
 
 The fork is deleted once upstream carries these changes. Licence: MIT OR
 Apache-2.0, as upstream.

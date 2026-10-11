@@ -17,7 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pg::{bind_tls, DatabaseRegistry, TlsConfig};
+use secantus_pg::{bind_tls, ClientCert, DatabaseRegistry, TlsConfig};
 
 /// Unblock SIGINT / SIGTERM in the calling thread and give them their
 /// default disposition, undoing whatever the parent left. POSIX only:
@@ -75,6 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut databases: Vec<String> = Vec::new();
     let mut tls_cert_file: Option<String> = None;
     let mut tls_key_file: Option<String> = None;
+    let mut tls_ca_file: Option<String> = None;
+    let mut tls_client_cert: Option<ClientCert> = None;
+    let mut tls_require = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         // `--version` / `--help` BEFORE the positional fallthrough. Without
@@ -98,7 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  \n\
                  USAGE:\n    \
                  secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n                \
-                 [--tls-cert-file PATH --tls-key-file PATH]\n\
+                 [--tls-cert-file PATH --tls-key-file PATH [--tls-require]\n                 \
+                 [--tls-ca-file PATH [--tls-client-cert MODE]]]\n\
                  \n\
                  ARGS:\n    \
                  <storage-path>  WiredTiger home directory (default: ./secantus-pg-data)\n    \
@@ -115,6 +119,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  answers a TLS request with \"not supported\".\n    \
                  --tls-key-file PATH   PEM private key for that certificate, with no\n                     \
                  passphrase.\n    \
+                 --tls-require    Refuse a connection that is not TLS (a pg_hba.conf\n                     \
+                 with only `hostssl` lines).\n    \
+                 --tls-ca-file PATH    PEM certificate authorities. A TLS client is\n                     \
+                 asked for a certificate, and one it sends must be\n                     \
+                 signed by one of these.\n    \
+                 --tls-client-cert MODE  What a client must send. `verify-ca`: a\n                     \
+                 certificate. `verify-full`: one whose common name is\n                     \
+                 the user name, beside the password. `cert`: the same,\n                     \
+                 and no password is asked for. Each needs\n                     \
+                 --tls-ca-file and refuses a connection that is not TLS.\n    \
                  -V, --version    Print version and exit\n    \
                  -h, --help       Print this help and exit",
                 env!("CARGO_PKG_VERSION")
@@ -133,6 +147,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tls_key_file = Some(args.next().ok_or("--tls-key-file needs a path")?);
         } else if let Some(path) = arg.strip_prefix("--tls-key-file=") {
             tls_key_file = Some(path.to_string());
+        } else if arg == "--tls-ca-file" {
+            tls_ca_file = Some(args.next().ok_or("--tls-ca-file needs a path")?);
+        } else if let Some(path) = arg.strip_prefix("--tls-ca-file=") {
+            tls_ca_file = Some(path.to_string());
+        } else if arg == "--tls-client-cert" {
+            let mode = args.next().ok_or("--tls-client-cert needs a mode")?;
+            tls_client_cert = Some(
+                mode.parse()
+                    .map_err(|e| format!("--tls-client-cert: {e}"))?,
+            );
+        } else if let Some(mode) = arg.strip_prefix("--tls-client-cert=") {
+            tls_client_cert = Some(
+                mode.parse()
+                    .map_err(|e| format!("--tls-client-cert: {e}"))?,
+            );
+        } else if arg == "--tls-require" {
+            tls_require = true;
         } else if arg.starts_with("--") {
             // Never a storage path: an unknown or misspelt option fell through
             // to `home` and the server came up over a directory named after
@@ -148,8 +179,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Both or neither, checked before anything is opened: half a pair must
     // not start a server that then serves without TLS.
+    // The other TLS options say what a TLS connection is held to, so each
+    // needs the pair; and a client certificate needs a CA to be checked by.
+    if tls_cert_file.is_none() && tls_key_file.is_none() {
+        for (given, option) in [
+            (tls_ca_file.is_some(), "--tls-ca-file"),
+            (tls_client_cert.is_some(), "--tls-client-cert"),
+            (tls_require, "--tls-require"),
+        ] {
+            if given {
+                return Err(format!("{option} needs --tls-cert-file and --tls-key-file").into());
+            }
+        }
+    }
+    if tls_client_cert.is_some() && tls_ca_file.is_none() {
+        return Err("--tls-client-cert needs --tls-ca-file".into());
+    }
     let tls = match (tls_cert_file, tls_key_file) {
-        (Some(cert), Some(key)) => Some(TlsConfig::new(cert, key)),
+        (Some(cert), Some(key)) => {
+            let mut tls = TlsConfig::new(cert, key).require_tls(tls_require);
+            if let Some(ca) = tls_ca_file {
+                tls = tls.ca_file(ca);
+            }
+            Some(tls.client_cert(tls_client_cert.unwrap_or_default()))
+        }
         (None, None) => None,
         (Some(_), None) => return Err("--tls-cert-file needs --tls-key-file".into()),
         (None, Some(_)) => return Err("--tls-key-file needs --tls-cert-file".into()),
