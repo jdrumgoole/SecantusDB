@@ -110,7 +110,7 @@ Mongo daemons read the same `secantusd.toml` config (see
 ### SQL / PostgreSQL servers
 
 The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.9`), and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.10`), and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
@@ -135,7 +135,7 @@ does with `ssl = off`. These two options are in 0.1.0-beta.9 and later.
 A password login over TLS is offered SCRAM channel binding
 (`SCRAM-SHA-256-PLUS`), so a client with `channel_binding=require` connects.
 Three more options stand in for the `pg_hba.conf` this server does not have.
-Channel binding and these options are newer than 0.1.0-beta.9.
+Channel binding and these options are in 0.1.0-beta.10 and later.
 
 | Option | What it does | PostgreSQL's equivalent |
 | --- | --- | --- |
