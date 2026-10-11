@@ -14,6 +14,7 @@ mongod must be a replica-set member: a standalone refuses transactions.
 `PROBE_VERBOSE=1` prints both replies for every difference.
 """
 
+import contextlib
 import os
 import re
 import socket
@@ -79,10 +80,8 @@ class Wire:
         return out
 
     def close(self):
-        try:
+        with contextlib.suppress(OSError):
             self.sock.close()
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------- helpers
@@ -284,7 +283,11 @@ scenario(
     tx("s", 1, {"distinct": "c", "key": "v"}),
     tx("s", 1, agg("c", {"$count": "n"})),
     tx("s", 1, find("c", {"_id": 1}, projection={"v": 1, "_id": 0})),
-    tx("s", 1, agg("c", {"$lookup": {"from": "c", "localField": "_id", "foreignField": "v", "as": "j"}})),
+    tx(
+        "s",
+        1,
+        agg("c", {"$lookup": {"from": "c", "localField": "_id", "foreignField": "v", "as": "j"}}),
+    ),
     commit("s", 1),
 )
 
@@ -433,21 +436,56 @@ scenario(
     "a transaction number with no session",
     SEED,
     {**insert("c", {"_id": 3}), "txnNumber": Int64(1)},
-    {**insert("c", {"_id": 4}), "txnNumber": Int64(1), "autocommit": False, "startTransaction": True},
+    {
+        **insert("c", {"_id": 4}),
+        "txnNumber": Int64(1),
+        "autocommit": False,
+        "startTransaction": True,
+    },
     {**find("c"), "txnNumber": Int64(1)},
     ALL,
 )
 scenario(
     "transaction numbers of the wrong type or sign",
     SEED,
-    {**insert("c", {"_id": 3}), "lsid": lsid("s"), "txnNumber": 1, "autocommit": False, "startTransaction": True},
-    {**insert("c", {"_id": 4}), "lsid": lsid("t"), "txnNumber": 1.0, "autocommit": False, "startTransaction": True},
-    {**insert("c", {"_id": 5}), "lsid": lsid("u"), "txnNumber": "1", "autocommit": False, "startTransaction": True},
+    {
+        **insert("c", {"_id": 3}),
+        "lsid": lsid("s"),
+        "txnNumber": 1,
+        "autocommit": False,
+        "startTransaction": True,
+    },
+    {
+        **insert("c", {"_id": 4}),
+        "lsid": lsid("t"),
+        "txnNumber": 1.0,
+        "autocommit": False,
+        "startTransaction": True,
+    },
+    {
+        **insert("c", {"_id": 5}),
+        "lsid": lsid("u"),
+        "txnNumber": "1",
+        "autocommit": False,
+        "startTransaction": True,
+    },
     tx("v", -1, insert("c", {"_id": 6}), start=True),
     tx("w", 0, insert("c", {"_id": 7}), start=True),
     commit("w", 0),
-    {**insert("c", {"_id": 8}), "lsid": lsid("x"), "txnNumber": Int64(1), "autocommit": 0, "startTransaction": True},
-    {**insert("c", {"_id": 9}), "lsid": lsid("y"), "txnNumber": Int64(1), "autocommit": False, "startTransaction": 1},
+    {
+        **insert("c", {"_id": 8}),
+        "lsid": lsid("x"),
+        "txnNumber": Int64(1),
+        "autocommit": 0,
+        "startTransaction": True,
+    },
+    {
+        **insert("c", {"_id": 9}),
+        "lsid": lsid("y"),
+        "txnNumber": Int64(1),
+        "autocommit": False,
+        "startTransaction": 1,
+    },
     ALL,
 )
 scenario(
@@ -664,7 +702,10 @@ scenario(
 scenario(
     "a unique index across two transactions",
     SEED,
-    {"createIndexes": "c", "indexes": [{"key": {"k": 1}, "name": "k", "unique": True, "sparse": True}]},
+    {
+        "createIndexes": "c",
+        "indexes": [{"key": {"k": 1}, "name": "k", "unique": True, "sparse": True}],
+    },
     tx("s", 1, insert("c", {"_id": 3, "k": "x"}), start=True),
     ("b", None, tx("t", 1, insert("c", {"_id": 4, "k": "x"}), start=True)),
     commit("s", 1),
@@ -673,7 +714,10 @@ scenario(
 scenario(
     "a unique index against a committed value",
     SEED,
-    {"createIndexes": "c", "indexes": [{"key": {"k": 1}, "name": "k", "unique": True, "sparse": True}]},
+    {
+        "createIndexes": "c",
+        "indexes": [{"key": {"k": 1}, "name": "k", "unique": True, "sparse": True}],
+    },
     insert("c", {"_id": 3, "k": "x"}),
     tx("s", 1, insert("c", {"_id": 4, "k": "x"}), start=True),
     tx("s", 1, ALL),
@@ -784,24 +828,47 @@ REFUSED = [
     ("buildInfo", {"buildInfo": 1}),
     ("getMore of nothing", {"getMore": Int64(12345), "collection": "c"}),
     ("killCursors", {"killCursors": "c", "cursors": [Int64(12345)]}),
-    ("createIndexes on a collection with documents", {"createIndexes": "c", "indexes": [{"key": {"v": 1}, "name": "v"}]}),
+    (
+        "createIndexes on a collection with documents",
+        {"createIndexes": "c", "indexes": [{"key": {"v": 1}, "name": "v"}]},
+    ),
     ("create of an existing collection", {"create": "c"}),
     ("validate", {"validate": "c"}),
-    ("mapReduce", {"mapReduce": "c", "map": "function(){}", "reduce": "function(){}", "out": {"inline": 1}}),
+    (
+        "mapReduce",
+        {"mapReduce": "c", "map": "function(){}", "reduce": "function(){}", "out": {"inline": 1}},
+    ),
     ("$out", agg("c", {"$out": "o"})),
     ("$merge", agg("c", {"$merge": {"into": "o"}})),
     ("$changeStream", agg("c", {"$changeStream": {}})),
     ("$collStats", agg("c", {"$collStats": {"count": {}}})),
     ("$indexStats", agg("c", {"$indexStats": {}})),
     ("$unionWith", agg("c", {"$unionWith": "c"})),
-    ("$graphLookup", agg("c", {"$graphLookup": {"from": "c", "startWith": "$v", "connectFromField": "v", "connectToField": "_id", "as": "g"}})),
+    (
+        "$graphLookup",
+        agg(
+            "c",
+            {
+                "$graphLookup": {
+                    "from": "c",
+                    "startWith": "$v",
+                    "connectFromField": "v",
+                    "connectToField": "_id",
+                    "as": "g",
+                }
+            },
+        ),
+    ),
     ("$facet", agg("c", {"$facet": {"a": [{"$count": "n"}]}})),
     ("find with a tailable cursor", find("c", tailable=True)),
     ("find with $where", find("c", {"$where": "true"})),
     ("endSessions", {"endSessions": []}),
     ("startSession", {"startSession": 1}),
     ("refreshSessions", {"refreshSessions": []}),
-    ("insert with bypassDocumentValidation", insert("c", {"_id": 9}, bypassDocumentValidation=True)),
+    (
+        "insert with bypassDocumentValidation",
+        insert("c", {"_id": 9}, bypassDocumentValidation=True),
+    ),
     ("isMaster", {"isMaster": 1}),
     ("serverStatus", {"serverStatus": 1}),
     ("whatsmyuri", {"whatsmyuri": 1}),
@@ -812,13 +879,22 @@ REFUSED = [
     ("killSessions", {"killSessions": []}),
     ("a find that fails to parse", {"find": "c", "filter": 1}),
     ("an update with no statements", {"update": "c", "updates": []}),
-    ("$lookup with a pipeline", agg("c", {"$lookup": {"from": "c", "pipeline": [{"$limit": 1}], "as": "j"}})),
+    (
+        "$lookup with a pipeline",
+        agg("c", {"$lookup": {"from": "c", "pipeline": [{"$limit": 1}], "as": "j"}}),
+    ),
     ("$sample", agg("c", {"$sample": {"size": 1}}, {"$project": {"_id": 0, "x": {"$literal": 1}}})),
     ("$documents", {"aggregate": 1, "pipeline": [{"$documents": [{"a": 1}]}], "cursor": {}}),
     ("$listSessions", {"aggregate": 1, "pipeline": [{"$listLocalSessions": {}}], "cursor": {}}),
     ("$geoNear without an index", agg("c", {"$geoNear": {"near": [0, 0], "distanceField": "d"}})),
-    ("$setWindowFields", agg("c", {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"r": {"$rank": {}}}}})),
-    ("$group and $sort", agg("c", {"$group": {"_id": "$v", "n": {"$sum": 1}}}, {"$sort": {"_id": 1}})),
+    (
+        "$setWindowFields",
+        agg("c", {"$setWindowFields": {"sortBy": {"_id": 1}, "output": {"r": {"$rank": {}}}}}),
+    ),
+    (
+        "$group and $sort",
+        agg("c", {"$group": {"_id": "$v", "n": {"$sum": 1}}}, {"$sort": {"_id": 1}}),
+    ),
     ("distinct with a query", {"distinct": "c", "key": "v", "query": {"v": {"$gte": 2}}}),
     ("an expression that fails", agg("c", {"$project": {"x": {"$add": ["$v", "a"]}}})),
     ("find with maxTimeMS", find("c", maxTimeMS=1000)),
@@ -862,7 +938,10 @@ scenario(
             1,
             {
                 "bulkWrite": 1,
-                "ops": [{"insert": 0, "document": {"_id": 3}}, {"update": 0, "filter": {"_id": 1}, "updateMods": SET9}],
+                "ops": [
+                    {"insert": 0, "document": {"_id": 3}},
+                    {"update": 0, "filter": {"_id": 1}, "updateMods": SET9},
+                ],
                 "nsInfo": [{"ns": "@db.c"}],
             },
             start=True,
@@ -978,7 +1057,12 @@ scenario(
 )
 scenario(
     "createIndexes inside a transaction",
-    tx("s", 1, {"createIndexes": "n", "indexes": [{"key": {"v": 1}, "name": "v", "unique": True}]}, start=True),
+    tx(
+        "s",
+        1,
+        {"createIndexes": "n", "indexes": [{"key": {"v": 1}, "name": "v", "unique": True}]},
+        start=True,
+    ),
     tx("s", 1, insert("n", {"_id": 1, "v": 1})),
     tx("s", 1, insert("n", {"_id": 2, "v": 1})),
     commit("s", 1),
@@ -1037,7 +1121,11 @@ scenario(
     "an index built under a transaction",
     SEED,
     tx("s", 1, insert("c", {"_id": 3}), start=True),
-    ("b", None, {"createIndexes": "c", "indexes": [{"key": {"v": 1}, "name": "v"}], "maxTimeMS": 300}),
+    (
+        "b",
+        None,
+        {"createIndexes": "c", "indexes": [{"key": {"v": 1}, "name": "v"}], "maxTimeMS": 300},
+    ),
     commit("s", 1),
     ALL,
 )
@@ -1115,7 +1203,13 @@ scenario(
 scenario(
     "an aggregate cursor inside a transaction",
     insert("c", *[{"_id": i} for i in range(1, 8)]),
-    tx("s", 1, {"aggregate": "c", "pipeline": [{"$sort": {"_id": 1}}], "cursor": {"batchSize": 2}}, start=True, save="k"),
+    tx(
+        "s",
+        1,
+        {"aggregate": "c", "pipeline": [{"$sort": {"_id": 1}}], "cursor": {"batchSize": 2}},
+        start=True,
+        save="k",
+    ),
     tx("s", 1, insert("c", {"_id": 0})),
     tx("s", 1, {"getMore": Cur("k"), "collection": "c"}),
     commit("s", 1),
@@ -1415,20 +1509,56 @@ scenario(
 scenario(
     "a retried update batch",
     SEED,
-    retry("s", 1, {"update": "c", "updates": [
-        {"q": {"_id": 1}, "u": {"$inc": {"v": 1}}},
-        {"q": {"_id": 9}, "u": {"$set": {"v": 9}}, "upsert": True},
-        {"q": {"_id": 50}, "u": {"$set": {"v": 9}}},
-        {"q": {"_id": 2}, "u": {"$set": {"v": 2}}},
-    ]}),
-    retry("s", 1, {"update": "c", "updates": [
-        {"q": {"_id": 1}, "u": {"$inc": {"v": 1}}},
-        {"q": {"_id": 9}, "u": {"$set": {"v": 9}}, "upsert": True},
-        {"q": {"_id": 50}, "u": {"$set": {"v": 9}}},
-        {"q": {"_id": 2}, "u": {"$set": {"v": 2}}},
-    ]}),
-    retry("s", 2, {"delete": "c", "deletes": [{"q": {"_id": 1}, "limit": 1}, {"q": {"_id": 40}, "limit": 1}, {"q": {"_id": 2}, "limit": 1}]}),
-    retry("s", 2, {"delete": "c", "deletes": [{"q": {"_id": 1}, "limit": 1}, {"q": {"_id": 40}, "limit": 1}, {"q": {"_id": 2}, "limit": 1}]}),
+    retry(
+        "s",
+        1,
+        {
+            "update": "c",
+            "updates": [
+                {"q": {"_id": 1}, "u": {"$inc": {"v": 1}}},
+                {"q": {"_id": 9}, "u": {"$set": {"v": 9}}, "upsert": True},
+                {"q": {"_id": 50}, "u": {"$set": {"v": 9}}},
+                {"q": {"_id": 2}, "u": {"$set": {"v": 2}}},
+            ],
+        },
+    ),
+    retry(
+        "s",
+        1,
+        {
+            "update": "c",
+            "updates": [
+                {"q": {"_id": 1}, "u": {"$inc": {"v": 1}}},
+                {"q": {"_id": 9}, "u": {"$set": {"v": 9}}, "upsert": True},
+                {"q": {"_id": 50}, "u": {"$set": {"v": 9}}},
+                {"q": {"_id": 2}, "u": {"$set": {"v": 2}}},
+            ],
+        },
+    ),
+    retry(
+        "s",
+        2,
+        {
+            "delete": "c",
+            "deletes": [
+                {"q": {"_id": 1}, "limit": 1},
+                {"q": {"_id": 40}, "limit": 1},
+                {"q": {"_id": 2}, "limit": 1},
+            ],
+        },
+    ),
+    retry(
+        "s",
+        2,
+        {
+            "delete": "c",
+            "deletes": [
+                {"q": {"_id": 1}, "limit": 1},
+                {"q": {"_id": 40}, "limit": 1},
+                {"q": {"_id": 2}, "limit": 1},
+            ],
+        },
+    ),
     ALL,
 )
 scenario(
@@ -1499,13 +1629,35 @@ scenario(
 scenario(
     "writes with several statements in a transaction",
     SEED,
-    tx("s", 1, {"update": "c", "updates": [
-        {"q": {"_id": 1}, "u": SET9},
-        {"q": {"_id": 2}, "u": {"$bogus": 1}},
-        {"q": {"_id": 2}, "u": SET9},
-    ], "ordered": False}, start=True),
+    tx(
+        "s",
+        1,
+        {
+            "update": "c",
+            "updates": [
+                {"q": {"_id": 1}, "u": SET9},
+                {"q": {"_id": 2}, "u": {"$bogus": 1}},
+                {"q": {"_id": 2}, "u": SET9},
+            ],
+            "ordered": False,
+        },
+        start=True,
+    ),
     commit("s", 1),
-    tx("s", 2, {"delete": "c", "deletes": [{"q": {"_id": 1}, "limit": 1}, {"q": {"$bogus": 1}, "limit": 1}, {"q": {"_id": 2}, "limit": 1}], "ordered": False}, start=True),
+    tx(
+        "s",
+        2,
+        {
+            "delete": "c",
+            "deletes": [
+                {"q": {"_id": 1}, "limit": 1},
+                {"q": {"$bogus": 1}, "limit": 1},
+                {"q": {"_id": 2}, "limit": 1},
+            ],
+            "ordered": False,
+        },
+        start=True,
+    ),
     commit("s", 2),
     ALL,
 )
@@ -1636,7 +1788,9 @@ def clean(value, key=None):
         text = re.sub(r"\. (Statement ids|Got \{|Write command): .*$", ".", text)
         text = re.sub(r"\. Got \{.*$", ".", text)
         # A conflict on an index names mongod's own table for it, or nothing.
-        text = re.sub(r"Caused by :: (WiredTiger\S+ index: \S+ uri: \S+)? ::", "Caused by :: <index> ::", text)
+        text = re.sub(
+            r"Caused by :: (WiredTiger\S+ index: \S+ uri: \S+)? ::", "Caused by :: <index> ::", text
+        )
         return text
     return value
 
@@ -1660,16 +1814,19 @@ def run_scenario(uri, index, steps):
             where = db
         elif where == "@other":
             where = db + "_o"
-        for label_holder in (command.get("lsid"),):
-            if isinstance(label_holder, dict) and isinstance(label_holder.get("id"), Sess):
-                if "txnNumber" in command and isinstance(command["txnNumber"], int):
-                    open_txns[label_holder["id"].label] = command["txnNumber"]
+        session = command.get("lsid")
+        if (
+            isinstance(session, dict)
+            and isinstance(session.get("id"), Sess)
+            and isinstance(command.get("txnNumber"), int)
+        ):
+            open_txns[session["id"].label] = command["txnNumber"]
         wire = conns.get(conn)
         if wire is None:
             wire = conns[conn] = Wire(uri)
         try:
             reply = wire.command(where, resolve(command, run, db, cursors))
-        except (TimeoutError, socket.timeout):
+        except TimeoutError:
             wire.close()
             conns.pop(conn, None)
             replies.append({"probe": "TIMEOUT"})
@@ -1697,7 +1854,7 @@ def run_scenario(uri, index, steps):
             )
         for name in (db, db + "_o"):
             tidy.command(name, {"dropDatabase": 1})
-    except (TimeoutError, socket.timeout, ConnectionError, OSError):
+    except (TimeoutError, ConnectionError, OSError):
         print(f"  NOTE: cleanup of {db} did not finish on {uri}", file=sys.stderr)
     finally:
         tidy.close()
@@ -1740,7 +1897,7 @@ def main():
         want = run_scenario(mongod_uri, index, steps)
         got = run_scenario(server_uri, index, steps)
         steps_total += len(steps)
-        bad = [i for i, (w, g) in enumerate(zip(want, got)) if repr(w) != repr(g)]
+        bad = [i for i, (w, g) in enumerate(zip(want, got, strict=True)) if repr(w) != repr(g)]
         if not bad:
             continue
         divergent += 1
