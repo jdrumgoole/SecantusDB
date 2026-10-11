@@ -2,7 +2,7 @@
 
 We compared `find`'s cursor options, `getMore`, `killCursors`, tailable
 cursors, `count` and `distinct` on the Rust MongoDB server with `mongod`
-8.2.11: 85 scripts of commands. BEFORE differed. AFTER do now.
+8.2.11: 85 scripts of commands. 49 differed. 5 do now.
 
 Five of the differences were wrong results. `find` with `singleBatch`
 returned every matching document whatever `batchSize` said. A tailable cursor

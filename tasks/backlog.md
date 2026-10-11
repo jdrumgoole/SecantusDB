@@ -8826,7 +8826,7 @@ server turned out to be the Java gauge's own parallelism).
 `tools/probes/cursor_commands.py`, mongod 8.2.11: 85 scenarios (`find`'s
 cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
-went from BEFORE scenarios different to AFTER. `singleBatch` returned every
+went from 49 scenarios different to 5. `singleBatch` returned every
 document, a tailable cursor dropped its filter and projection after the
 first batch, `min` / `max` compared documents and not index keys, `distinct`
 kept one value per BSON type, and most malformed arguments were accepted.
