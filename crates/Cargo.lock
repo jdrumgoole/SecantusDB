@@ -1779,14 +1779,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.10"
+version = "0.1.0-beta.11"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.10"
+version = "0.1.0-beta.11"
 dependencies = [
  "aes",
  "blowfish 0.9.1",

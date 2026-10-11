@@ -41,7 +41,7 @@ the libpq key/value form, `.url()` the `postgresql://` form.
 ## The binary
 
 ```sh
-cargo install secantus-pg --version 0.1.0-beta.10   # a pre-release: cargo needs the version
+cargo install secantus-pg --version 0.1.0-beta.11   # a pre-release: cargo needs the version
 secantusd-pg ./pg-data 127.0.0.1:5433   # storage path, bind address
 ```
 
@@ -68,7 +68,7 @@ and matching on the certificate's whole DN.
 
 A user name there is no role for connects without a password, as a role
 with no password does. `--refuse-unknown-users`
-(`PgBuilder::refuse_unknown_users`, after 0.1.0-beta.10) asks such a user
+(`PgBuilder::refuse_unknown_users`, since 0.1.0-beta.11) asks such a user
 for a password, as PostgreSQL does, and none it gives is right.
 
 Prebuilt binaries are on the
