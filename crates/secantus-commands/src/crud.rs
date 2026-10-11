@@ -548,6 +548,45 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_count_limit(doc, "limit")?;
     argtypes::require_number(doc, "skip", "count.skip")?;
     argtypes::require_hint(doc, "hint")?;
+    const FIELDS: &[&str] = &[
+        "count",
+        "query",
+        "limit",
+        "skip",
+        "hint",
+        "collation",
+        "fields",
+        "let",
+        "encryptionInformation",
+        "mirrored",
+        "sampleId",
+        "rawData",
+        "includeQueryStatsMetrics",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'count.{key}' is an unknown field."),
+        ));
+    }
+    if let Some(Bson::Double(limit)) = doc.get("limit") {
+        if limit.fract() != 0.0 {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                format!("Expected an integer: limit: {limit}"),
+            ));
+        }
+    }
+    if let Some(n) = doc.get("skip").and_then(as_i64).filter(|n| *n < 0) {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field 'skip' value must be >= 0, actual value '{n}'"),
+        ));
+    }
+    argtypes::require_natural_hint(argtypes::given_hint(doc))?;
     // An undefined `$$variable` is a PARSE error (17276), not the storage
     // layer's generic "unsupported construct" BadValue.
     {
@@ -613,7 +652,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .and_then(Bson::as_document)
             .and_then(|d| d.get("n").and_then(as_i64))
             .unwrap_or(0)
-    } else if let Some(hint) = doc.get("hint") {
+    } else if let Some(hint) = argtypes::given_hint(doc) {
         // A `hint` forces a specific index; for an empty filter this still walks
         // that index, so hinting a sparse index counts only the docs present in
         // it (php-lib Count `testHintOption`). Count via the hinted find, which
@@ -639,7 +678,9 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if skip > 0 {
         n = (n - skip).max(0);
     }
-    let limit = doc.get("limit").and_then(as_i64).unwrap_or(0);
+    // A negative limit counts as its size (mongod reads it as the legacy
+    // "single batch" spelling of a limit).
+    let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).abs();
     if limit > 0 {
         n = n.min(limit);
     }

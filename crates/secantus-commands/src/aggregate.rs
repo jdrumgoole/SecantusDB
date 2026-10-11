@@ -98,13 +98,67 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply())
         }
     }
-    if let Some(bson::Bson::Document(c)) = doc.get("cursor") {
-        argtypes::require_number(c, "batchSize", "cursor.batchSize")?;
+    argtypes::require_cursor_options(doc, "cursor")?;
+    const FIELDS: &[&str] = &[
+        "aggregate",
+        "pipeline",
+        "explain",
+        "allowDiskUse",
+        "cursor",
+        "bypassDocumentValidation",
+        "collation",
+        "hint",
+        "let",
+        "needsMerge",
+        "fromMongos",
+        "fromRouter",
+        "isMapReduceCommand",
+        "collectionUUID",
+        "exchange",
+        "runtimeConstants",
+        "legacyRuntimeConstants",
+        "querySettings",
+        "passthroughToShard",
+        "encryptionInformation",
+        "sampleId",
+        "use44SortKeys",
+        "useNewUpsert",
+        "isClusterQueryWithoutShardKeyCmd",
+        "includeQueryStatsMetrics",
+        "requestReshardingResumeToken",
+        "requestResumeToken",
+        "resumeAfter",
+        "startAt",
+        "rawData",
+        "translatedForViewlessTimeseries",
+        "mirrored",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'aggregate.{key}' is an unknown field."),
+        ));
     }
     // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless).
     let coll = match doc.get("aggregate") {
+        Some(Bson::String(s)) if s.is_empty() => {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                format!("Invalid namespace specified: {}", ctx.db_name),
+            ))
+        }
         Some(Bson::String(s)) => Some(s.clone()),
-        _ => None,
+        Some(v) if as_i64(v) == Some(1) && !matches!(v, Bson::Boolean(_)) => None,
+        _ => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "Invalid command format: the 'aggregate' field must specify a collection name \
+                 or 1",
+            ))
+        }
     };
     let pipeline: Vec<Bson> = match doc.get("pipeline") {
         Some(Bson::Array(a)) => a.clone(),
@@ -376,8 +430,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // straight to the wire as `Bson` and encode only the cursor remainder for the
     // registry — no encode→decode round-trip on the docs the client gets now.
     let prefix = format!("Executor error during aggregate command on namespace: {ns}");
-    let (first_batch, cursor_id) =
+    let (first_batch, mut cursor_id) =
         split_docs_into_cursor_checked(result, batch_size, &ns, cursors, false, Some(&prefix))?;
+    // `batchSize: 0` asks for the cursor and no documents, and mongod opens
+    // one even over nothing -- a missing collection included.
+    if batch_size == 0 && cursor_id == 0 {
+        cursor_id = crate::find::open_cursor(cursors, &ns, Vec::new(), false)?;
+    }
     Ok(doc! {
         "cursor": {
             "firstBatch": first_batch,

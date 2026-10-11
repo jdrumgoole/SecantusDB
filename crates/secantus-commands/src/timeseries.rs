@@ -126,7 +126,7 @@ fn granularity(path: &str, v: &Bson) -> Result<Option<String>, CommandError> {
 fn unknown(path: &str, field: &str) -> CommandError {
     CommandError::new(
         40415,
-        "Location40415",
+        "IDLUnknownField",
         format!("BSON field '{path}.{field}' is an unknown field."),
     )
 }
@@ -177,7 +177,7 @@ pub(crate) fn definition(command: &Document, ns: &str) -> Result<Option<Document
     let Some(time) = time else {
         return Err(CommandError::new(
             40414,
-            "Location40414",
+            "IDLFailedToParse",
             format!("BSON field '{PATH}.timeField' is missing but a required field"),
         ));
     };

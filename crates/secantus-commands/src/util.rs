@@ -25,6 +25,30 @@ pub(crate) fn resolve_let_vars(let_field: Option<&Bson>) -> Document {
     vars
 }
 
+/// [`resolve_let_vars`], refusing a `let` expression that reads a field: the
+/// variables are bound before any document is looked at.
+pub(crate) fn checked_let_vars(let_field: Option<&Bson>) -> Result<Document, CommandError> {
+    fn reads_a_field(v: &Bson) -> bool {
+        match v {
+            Bson::String(s) => s.starts_with('$') && !s.starts_with("$$"),
+            Bson::Document(d) => !d.contains_key("$literal") && d.values().any(reads_a_field),
+            Bson::Array(a) => a.iter().any(reads_a_field),
+            _ => false,
+        }
+    }
+    if let Some(Bson::Document(d)) = let_field {
+        if d.values().any(reads_a_field) {
+            return Err(CommandError::new(
+                4890500,
+                "Location4890500",
+                "Command let Expression tried to access a field, but this is not allowed \
+                 becauseCommand let Expressions run before the query examines any documents.",
+            ));
+        }
+    }
+    Ok(resolve_let_vars(let_field))
+}
+
 /// What a command said about collation.
 pub(crate) enum Requested {
     /// No `collation` field, or an empty one: the namespace's default applies.

@@ -109,7 +109,7 @@ struct Entry {
     bounded: bool,
     /// Tombstoned by `kill_namespace`: the collection was dropped out from
     /// under a plain tailable cursor, and the next getMore must say so.
-    dropped: bool,
+    dropped: Option<String>,
     // The tailable fields below are written by `register_tailable` but only read
     // by the change-stream getMore slice (deferred), so they're allow(dead_code)
     // until that lands.
@@ -172,6 +172,7 @@ pub struct CursorInfo {
     pub await_data: bool,
     pub invalidated: bool,
     pub has_remaining: bool,
+    pub change_stream: bool,
 }
 
 /// A `currentOp`-style description of a live cursor (no mutable state leaked).
@@ -265,7 +266,7 @@ impl CursorRegistry {
                 tailable: false,
                 bounded,
                 change_stream: false,
-                dropped: false,
+                dropped: None,
                 await_data: false,
                 no_cursor_timeout: false,
                 producer: None,
@@ -306,7 +307,7 @@ impl CursorRegistry {
                 tailable: true,
                 bounded: false,
                 change_stream: opts.change_stream,
-                dropped: false,
+                dropped: None,
                 await_data: opts.await_data,
                 no_cursor_timeout: opts.no_cursor_timeout,
                 producer: Some(producer),
@@ -340,6 +341,7 @@ impl CursorRegistry {
             await_data: e.await_data,
             invalidated: e.invalidated,
             has_remaining: !e.remaining.is_empty(),
+            change_stream: e.change_stream,
         })
     }
 
@@ -497,25 +499,17 @@ impl CursorRegistry {
     /// * **Change streams** — left alone: they drive their own drop/rename
     ///   invalidation through the producer's final `invalidate` event, and
     ///   tombstoning would replace that event with an error.
-    pub fn kill_namespace(&self, namespace: &str) -> usize {
+    pub fn kill_namespace(&self, namespace: &str, reason: &str) -> usize {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let affected: Vec<i64> = inner
-            .cursors
-            .iter()
-            .filter(|(_, e)| e.namespace == namespace && !e.change_stream)
-            .map(|(&cid, _)| cid)
-            .collect();
-        for cid in &affected {
-            let tailable = inner.cursors.get(cid).is_some_and(|e| e.tailable);
-            if tailable {
-                if let Some(e) = inner.cursors.get_mut(cid) {
-                    e.dropped = true;
-                }
-            } else {
-                inner.cursors.remove(cid);
+        let mut affected = 0;
+        for e in inner.cursors.values_mut() {
+            if e.namespace == namespace && !e.change_stream {
+                e.dropped = Some(reason.to_string());
+                e.remaining.clear();
+                affected += 1;
             }
         }
-        affected.len()
+        affected
     }
 
     /// Remember the token of the last event handed to the client, so a later
@@ -573,9 +567,12 @@ impl CursorRegistry {
             .is_some_and(|e| e.time_limited)
     }
 
-    pub fn was_dropped(&self, cursor_id: i64) -> bool {
+    pub fn was_dropped(&self, cursor_id: i64) -> Option<String> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.cursors.get(&cursor_id).is_some_and(|e| e.dropped)
+        inner
+            .cursors
+            .get(&cursor_id)
+            .and_then(|e| e.dropped.clone())
     }
 
     /// Mark a cursor invalidated (a blocked tailable getMore wakes and ends).
@@ -674,14 +671,59 @@ fn mint_id(cursors: &HashMap<i64, Entry>, tailable: bool) -> Result<i64, CursorE
 pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // mongod PARSES before it looks the cursor up, so a wrong-typed argument is
     // its own error rather than CursorNotFound about a cursor that exists.
+    let cursor_id = match doc.get("getMore") {
+        Some(Bson::Int64(id)) => *id,
+        None | Some(Bson::Null) => {
+            return Err(CommandError::new(
+                40414,
+                "IDLFailedToParse",
+                "BSON field 'getMore.getMore' is missing but a required field",
+            ))
+        }
+        Some(other) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'getMore.getMore' is the wrong type '{}', expected type 'long'",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
+    };
     argtypes::require_required_string(doc, "collection", "getMore.collection")?;
     argtypes::require_number(doc, "batchSize", "getMore.batchSize")?;
     argtypes::require_number(doc, "maxTimeMS", "getMore.maxTimeMS")?;
-    let cursor_id = doc
-        .get("getMore")
-        .and_then(as_i64)
-        .ok_or_else(|| CommandError::new(2, "BadValue", "getMore requires a cursor id"))?;
+    const FIELDS: &[&str] = &[
+        "getMore",
+        "collection",
+        "batchSize",
+        "term",
+        "lastKnownCommittedOpTime",
+        "includeQueryStatsMetrics",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'getMore.{key}' is an unknown field."),
+        ));
+    }
+    if let Some(n) = doc.get("batchSize").and_then(as_i64).filter(|n| *n < 0) {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field 'batchSize' value must be >= 0, actual value '{n}'"),
+        ));
+    }
     let coll = doc.get("collection").and_then(Bson::as_str).unwrap_or("");
+    if coll.is_empty() {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            "Collection names cannot be empty",
+        ));
+    }
     // Tri-state like `find`'s, but the absent-default differs: mongod's 101
     // applies only to the FIRST batch — an unspecified getMore batchSize means
     // "fill up to 16MB". Only the tailable path keeps the small default (its
@@ -694,10 +736,29 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Ok(i) => i,
         Err(_) => return Ok(cursor_not_found(cursor_id)),
     };
-    // Ownership check: the caller's claimed namespace must match the cursor's,
-    // else we answer CursorNotFound (don't confirm cursor ids across conns).
+    // The namespace named must be the cursor's.
     if !info.namespace.is_empty() && ns != info.namespace {
-        return Ok(cursor_not_found(cursor_id));
+        return Ok(CommandError::new(
+            13,
+            "Unauthorized",
+            format!(
+                "Requested getMore on namespace '{ns}', but cursor belongs to a different \
+                 namespace {}",
+                info.namespace
+            ),
+        )
+        .into_reply());
+    }
+    // `maxTimeMS` on a getMore is how long an awaitData cursor waits for more;
+    // any other cursor has nothing to wait for and refuses it.
+    if !(info.tailable && info.await_data) && doc.get("maxTimeMS").is_some_and(|v| *v != Bson::Null)
+    {
+        return Ok(CommandError::new(
+            2,
+            "BadValue",
+            "cannot set maxTimeMS on getMore command for a non-awaitData cursor",
+        )
+        .into_reply());
     }
     // The collection was dropped out from under a plain tailable cursor: say so
     // before anything else, since any buffered rows are stale. mongod kills the
@@ -705,14 +766,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // mongo-php-driver's `cursor-tailable_error-001` asserts the message
     // mentions "collection dropped" rather than a bare CursorNotFound, which
     // wouldn't tell a tailing client why its tail ended.
-    if cursors.was_dropped(cursor_id) {
+    if let Some(reason) = cursors.was_dropped(cursor_id) {
         cursors.kill(&[cursor_id]);
-        return Ok(CommandError::new(
-            175,
-            "QueryPlanKilled",
-            format!("collection dropped: {}", info.namespace),
-        )
-        .into_reply());
+        return Ok(CommandError::new(175, "QueryPlanKilled", reason).into_reply());
     }
     if info.tailable {
         let storage = ctx.storage()?;
@@ -803,7 +859,9 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "id": Bson::Int64(if closed { 0 } else { cursor_id }),
             "ns": ns,
         };
-        if let Some(tok) = pbrt {
+        // A resume token belongs to a change stream; a tailable cursor on a
+        // capped collection has none.
+        if let Some(tok) = pbrt.filter(|_| info.change_stream) {
             cursor_doc.insert("postBatchResumeToken", tok);
         }
         // Raw splice, same as the plain getMore below: the event blobs go to
@@ -846,10 +904,34 @@ pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A non-array `cursors` used to fall through to an empty list and report
     // ok:1 — the caller was told cursors it named were killed when none were.
     argtypes::require_required_array(doc, "cursors", "killCursors.cursors")?;
-    let cursor_ids: Vec<i64> = match doc.get("cursors") {
-        Some(Bson::Array(a)) => a.iter().filter_map(as_i64).collect(),
-        _ => Vec::new(),
-    };
+    if let Some(key) = argtypes::unknown_field(doc, &["killCursors", "cursors"]) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'killCursors.{key}' is an unknown field."),
+        ));
+    }
+    let mut cursor_ids: Vec<i64> = Vec::new();
+    if let Some(Bson::Array(listed)) = doc.get("cursors") {
+        for (i, id) in listed.iter().enumerate() {
+            match id {
+                Bson::Int64(id) => cursor_ids.push(*id),
+                // A null names no cursor and is passed over (measured).
+                Bson::Null => {}
+                other => {
+                    return Err(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        format!(
+                            "BSON field 'killCursors.cursors.{i}' is the wrong type '{}', \
+                             expected type 'long'",
+                            secantus_core::query::bson_type_name(other)
+                        ),
+                    ))
+                }
+            }
+        }
+    }
     // A blocked tailable getMore waits on the STORAGE oplog condvar, not the
     // registry, so wake it via the storage's notify (best-effort: a cursorless
     // or storageless context just skips it).
@@ -1193,14 +1275,21 @@ mod tests {
     }
 
     #[test]
-    fn get_more_wrong_namespace_is_cursor_not_found() {
+    fn get_more_for_another_namespace_is_refused_by_name() {
         let reg = Arc::new(CursorRegistry::new());
         let id = reg.register("t.c", vec![enc(&doc! {"_id": 1})]).unwrap();
         let mut c = ctx_with_cursors(reg);
         c.db_name = "t".into();
-        // claim collection "other" ⇒ ns mismatch ⇒ CursorNotFound
         let reply = dispatch(&doc! {"getMore": id, "collection": "other"}, &mut c);
-        assert_eq!(reply.get_i32("code").unwrap(), 43);
+        assert_eq!(reply.get_i32("code").unwrap(), 13);
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "Requested getMore on namespace 't.other', but cursor belongs to a different \
+             namespace t.c"
+        );
+        // And the cursor is still there for its own namespace.
+        let reply = dispatch(&doc! {"getMore": id, "collection": "c"}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]
@@ -1215,10 +1304,16 @@ mod tests {
         let b = reg
             .register("t.other", vec![enc(&doc! {"_id": 1})])
             .unwrap();
-        assert_eq!(reg.kill_namespace("t.c"), 1);
+        assert_eq!(reg.kill_namespace("t.c", "collection dropped. UUID x"), 1);
         let mut c = ctx_with_cursors(reg);
         c.db_name = "t".into();
-        // The dropped-ns cursor is gone → CursorNotFound.
+        // The dropped-ns cursor says why it ended, once, and is then gone.
+        let reply = dispatch(&doc! {"getMore": a, "collection": "c"}, &mut c);
+        assert_eq!(reply.get_i32("code").unwrap(), 175);
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "collection dropped. UUID x"
+        );
         let reply = dispatch(&doc! {"getMore": a, "collection": "c"}, &mut c);
         assert_eq!(reply.get_i32("code").unwrap(), 43);
         // The other-ns cursor survives.
@@ -1281,23 +1376,22 @@ mod drop_tombstone_tests {
     fn a_dropped_collection_tombstones_a_plain_tailable_cursor() {
         let reg = CursorRegistry::new();
         let cid = tailable(&reg, "t.c", false);
-        assert_eq!(reg.kill_namespace("t.c"), 1);
+        assert_eq!(reg.kill_namespace("t.c", "gone"), 1);
         assert!(
-            reg.was_dropped(cid),
+            reg.was_dropped(cid).is_some(),
             "the entry must survive, flagged dropped"
         );
         assert!(reg.info(cid).is_ok(), "tombstoned, not removed");
     }
 
-    /// A non-tailable cursor is removed outright — a later getMore is
-    /// CursorNotFound (mongo-c-driver's `error_document/getmore`).
+    /// A non-tailable cursor is tombstoned too: mongod answers its next
+    /// getMore 175 with the reason, not CursorNotFound.
     #[test]
-    fn a_dropped_collection_removes_a_non_tailable_cursor() {
+    fn a_dropped_collection_tombstones_a_non_tailable_cursor() {
         let reg = CursorRegistry::new();
         let cid = reg.register("t.c", vec![vec![1, 2, 3]]).unwrap();
-        assert_eq!(reg.kill_namespace("t.c"), 1);
-        assert!(reg.info(cid).is_err(), "removed, not tombstoned");
-        assert!(!reg.was_dropped(cid));
+        assert_eq!(reg.kill_namespace("t.c", "gone"), 1);
+        assert_eq!(reg.was_dropped(cid).as_deref(), Some("gone"));
     }
 
     /// Change streams are left alone: they signal a drop through their own
@@ -1308,11 +1402,14 @@ mod drop_tombstone_tests {
         let reg = CursorRegistry::new();
         let cid = tailable(&reg, "t.c", true);
         assert_eq!(
-            reg.kill_namespace("t.c"),
+            reg.kill_namespace("t.c", "gone"),
             0,
             "change streams are not counted"
         );
-        assert!(!reg.was_dropped(cid), "no tombstone on a change stream");
+        assert!(
+            reg.was_dropped(cid).is_none(),
+            "no tombstone on a change stream"
+        );
         assert!(reg.info(cid).is_ok(), "and it stays alive");
     }
 
@@ -1321,8 +1418,8 @@ mod drop_tombstone_tests {
     fn other_namespaces_are_untouched() {
         let reg = CursorRegistry::new();
         let other = tailable(&reg, "t.other", false);
-        assert_eq!(reg.kill_namespace("t.c"), 0);
-        assert!(!reg.was_dropped(other));
+        assert_eq!(reg.kill_namespace("t.c", "gone"), 0);
+        assert!(reg.was_dropped(other).is_none());
     }
 }
 
