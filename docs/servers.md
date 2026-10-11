@@ -110,7 +110,7 @@ Mongo daemons read the same `secantusd.toml` config (see
 ### SQL / PostgreSQL servers
 
 The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.11`), and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.12`), and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
@@ -158,7 +158,7 @@ secantusd-pg ./secantus-pg-data 127.0.0.1:5432 \
 version, the cipher under OpenSSL's name, and the client certificate's
 subject, serial number and issuer.
 
-Four more, after 0.1.0-beta.11, say which certificates are accepted and
+Four more, since 0.1.0-beta.12, say which certificates are accepted and
 which roles they may log in as:
 
 | Option | What it does | PostgreSQL's equivalent |
@@ -207,7 +207,7 @@ Not supported: a key with a passphrase.
 
 ### A `pg_hba.conf`
 
-The options above apply one rule to every connection. `--hba-file` (after
+The options above apply one rule to every connection. `--hba-file` (since
 0.1.0-beta.11) takes a `pg_hba.conf` in their place, and its lines decide
 each login as PostgreSQL's do: the first line whose type, database, user
 and address match the connection says how it must prove who it is, and a
