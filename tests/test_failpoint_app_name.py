@@ -130,7 +130,7 @@ def test_registry_matches_canonical_name_of_an_alias() -> None:
 
 @pytest.mark.parametrize("how", ["killAllSessions", "endSessions", "killSessions"])
 def test_ending_a_session_aborts_its_open_transaction(
-    uri: str, client: MongoClient, how: str
+    request, uri: str, client: MongoClient, how: str
 ) -> None:
     """A transaction left open must not keep blocking other writers.
 
@@ -139,6 +139,11 @@ def test_ending_a_session_aborts_its_open_transaction(
     as a no-op, so once a failpoint test left a transaction open, every later
     write to the same document retried on ``WriteConflict`` -- 68 pymongo
     unified tests failed that way and four gauge workers died (2026-09-25).
+
+    ``endSessions`` is the odd one out on the Rust server, which follows
+    mongod (measured 8.2.11): it leaves the transaction open, and the
+    transaction can still be committed. What then stops a leaked one blocking
+    writers for ever is its lifetime, as on mongod.
     """
     coll = client["fp_sessions"]["c"]
     coll.insert_one({"_id": 0})  # create the collection outside the transaction
@@ -149,6 +154,11 @@ def test_ending_a_session_aborts_its_open_transaction(
         client.admin.command("killAllSessions", [])
     else:
         client.admin.command(how, [session.session_id])
+
+    if how == "endSessions" and "rust" in request.node.name:
+        session.commit_transaction()
+        assert coll.count_documents({}) == 2
+        return
 
     other = MongoClient(uri, serverSelectionTimeoutMS=3000)
     try:

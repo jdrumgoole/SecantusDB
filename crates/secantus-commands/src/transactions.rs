@@ -360,6 +360,9 @@ impl Applied {
 }
 
 type TxnFn = Box<dyn Fn(&mut Transaction) + Send + Sync>;
+/// The storage commit of a transaction. It can FAIL, and a failed commit must
+/// be told to the client: it used to be dropped, and the reply said `ok`.
+type CommitFn = Box<dyn Fn(&mut Transaction) -> Result<(), crate::StorageError> + Send + Sync>;
 type Clock = Box<dyn Fn() -> f64 + Send + Sync>;
 
 enum Kind {
@@ -391,7 +394,7 @@ const SESSION_LIFETIME_SECONDS: f64 = 30.0 * 60.0;
 /// cannot deadlock with the reaper or `abort_all`.
 pub struct TransactionRegistry {
     inner: Mutex<Inner>,
-    commit: TxnFn,
+    commit: CommitFn,
     rollback: TxnFn,
     lifetime: f64,
     clock: Clock,
@@ -400,7 +403,7 @@ pub struct TransactionRegistry {
 impl TransactionRegistry {
     /// `commit` / `rollback` perform the storage-side WT work for a transaction;
     /// `clock` returns monotonic seconds (injectable for deterministic tests).
-    pub fn new(commit: TxnFn, rollback: TxnFn, lifetime_seconds: f64, clock: Clock) -> Self {
+    pub fn new(commit: CommitFn, rollback: TxnFn, lifetime_seconds: f64, clock: Clock) -> Self {
         TransactionRegistry {
             inner: Mutex::new(Inner {
                 sessions: HashMap::new(),
@@ -533,10 +536,24 @@ impl TransactionRegistry {
             TxnState::Committed => None,
             TxnState::Aborted => Some(transaction_aborted(txn_number)),
             TxnState::InProgress => {
-                (self.commit)(&mut t);
-                t.state = TxnState::Committed;
                 t.last_use = (self.clock)();
-                None
+                match (self.commit)(&mut t) {
+                    Ok(()) => {
+                        t.state = TxnState::Committed;
+                        None
+                    }
+                    // Nothing of it was committed: the transaction is over,
+                    // and the client is told why.
+                    Err(e) => {
+                        t.state = TxnState::Aborted;
+                        let mut reply = crate::util::command_error(e).into_reply();
+                        let code = reply.get_i32("code").unwrap_or(0);
+                        if crate::failpoints::is_transient_txn_code(code) {
+                            add_label_first(&mut reply, TRANSIENT_LABEL);
+                        }
+                        Some(reply)
+                    }
+                }
             }
         }
     }
@@ -688,14 +705,23 @@ impl TransactionRegistry {
         }
     }
 
+    /// Abort the transactions that have sat idle past their lifetime. The
+    /// server calls this about once a second: a transaction nobody ends still
+    /// holds its documents, and a writer waiting on one of them is waiting on
+    /// this (mongod's periodic `abortExpiredTransactions`).
+    pub fn reap(&self) {
+        let _ = self.locked();
+    }
+
     /// Abort transactions idle past their lifetime, and, once a minute, forget
-    /// sessions idle past theirs. Runs on every access: there is no sweeper
-    /// thread.
+    /// sessions idle past theirs. Runs on every access and from `reap`.
     fn prune_locked(&self, inner: &mut Inner, now: f64) {
         let cutoff = now - self.lifetime;
         for session in inner.sessions.values() {
             if let Kind::Txn(c) = &session.kind {
-                let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
+                // A transaction running a statement is locked, and is not
+                // idle: leave it, and do not wait for it holding the registry.
+                let Ok(mut t) = c.try_lock() else { continue };
                 if t.state == TxnState::InProgress && t.last_use < cutoff {
                     (self.rollback)(&mut t);
                     t.state = TxnState::Aborted;
@@ -708,7 +734,7 @@ impl TransactionRegistry {
             inner.sessions.retain(|_, s| {
                 s.last_use >= stale
                     || matches!(&s.kind, Kind::Txn(c)
-                        if c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress)
+                        if c.try_lock().map_or(true, |t| t.state == TxnState::InProgress))
             });
         }
     }
@@ -728,6 +754,7 @@ mod tests {
         let r = TransactionRegistry::new(
             Box::new(move |_t| {
                 c2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }),
             Box::new(move |_t| {
                 r2.fetch_add(1, Ordering::SeqCst);
@@ -876,6 +903,45 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_that_fails_in_storage_is_reported_and_ends_the_transaction() {
+        let r = TransactionRegistry::new(
+            Box::new(|_t| Err(crate::StorageError::WriteConflict)),
+            Box::new(|_t| {}),
+            60.0,
+            Box::new(|| 0.0),
+        );
+        r.for_statement(LS, 1, true).unwrap();
+        let reply = r.commit(LS, 1).expect("the failure is reported");
+        assert_eq!(code(&reply), 112);
+        assert!(labelled_transient(&reply));
+        // Not committed: a second commit does not answer ok.
+        assert_eq!(code(&r.commit(LS, 1).unwrap()), 251);
+    }
+
+    #[test]
+    fn reap_aborts_an_idle_transaction_with_no_other_request() {
+        let now = Arc::new(AtomicU64::new(1000));
+        let n2 = now.clone();
+        let rollbacks = Arc::new(AtomicU64::new(0));
+        let r2 = rollbacks.clone();
+        let r = TransactionRegistry::new(
+            Box::new(|_t| Ok(())),
+            Box::new(move |_t| {
+                r2.fetch_add(1, Ordering::SeqCst);
+            }),
+            60.0,
+            Box::new(move || n2.load(Ordering::SeqCst) as f64),
+        );
+        r.for_statement(LS, 1, true).unwrap();
+        r.reap();
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 0);
+        now.fetch_add(61, Ordering::SeqCst);
+        r.reap();
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(r.in_progress_count(), 0);
+    }
+
+    #[test]
     fn a_large_insert_batch_is_remembered_as_runs() {
         let (r, _, _) = reg();
         r.begin_retryable(LS, 1).unwrap();
@@ -917,7 +983,7 @@ mod tests {
         let now = Arc::new(AtomicU64::new(1000));
         let n2 = now.clone();
         let r = TransactionRegistry::new(
-            Box::new(|_t| {}),
+            Box::new(|_t| Ok(())),
             Box::new(|_t| {}),
             60.0,
             Box::new(move || n2.load(Ordering::SeqCst) as f64),

@@ -74,10 +74,9 @@ pub fn with_transactions(c: &mut CommandContext) {
     let commit = c.storage.clone().unwrap();
     let rollback = c.storage.clone().unwrap();
     c.transactions = Some(Arc::new(TransactionRegistry::new(
-        Box::new(move |txn: &mut Transaction| {
-            if let Some(h) = txn.handle.as_mut() {
-                let _ = commit.commit_user_transaction(h.as_mut());
-            }
+        Box::new(move |txn: &mut Transaction| match txn.handle.as_mut() {
+            Some(h) => commit.commit_user_transaction(h.as_mut()),
+            None => Ok(()),
         }),
         Box::new(move |txn: &mut Transaction| {
             if let Some(h) = txn.handle.as_mut() {
