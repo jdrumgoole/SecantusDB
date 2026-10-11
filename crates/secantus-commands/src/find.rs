@@ -559,9 +559,13 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     // A tailable cursor is only valid on a capped collection (mongod rejects it
     // on a non-capped one with BadValue). Check before the fetch.
-    let exists = storage
-        .collection_exists(&ctx.db_name, &coll)
-        .unwrap_or(false);
+    // `local.oplog.rs` is a view of the oplog table with no entry of its own
+    // in the catalog; it is there all the same.
+    let is_oplog = ctx.db_name == "local" && coll == "oplog.rs";
+    let exists = is_oplog
+        || storage
+            .collection_exists(&ctx.db_name, &coll)
+            .unwrap_or(false);
     if tailable && !exists {
         // Nothing to tail: an empty batch and no cursor, not an error.
         return Ok(doc! {
@@ -655,7 +659,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .map_err(command_error)?;
         // An empty capped collection gives a tailable cursor no position to
         // hold: mongod answers with a dead cursor (measured 8.2.11).
-        if after.is_none() {
+        if after.is_none() && docs.is_empty() && !is_oplog {
             return Ok(doc! {
                 "cursor": { "firstBatch": [], "id": Bson::Int64(0), "ns": ns },
                 "ok": 1.0,
