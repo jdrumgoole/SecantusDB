@@ -41,7 +41,7 @@ the libpq key/value form, `.url()` the `postgresql://` form.
 ## The binary
 
 ```sh
-cargo install secantus-pg --version 0.1.0-beta.11   # a pre-release: cargo needs the version
+cargo install secantus-pg --version 0.1.0-beta.12   # a pre-release: cargo needs the version
 secantusd-pg ./pg-data 127.0.0.1:5433   # storage path, bind address
 ```
 
@@ -65,7 +65,7 @@ They and channel binding are in 0.1.0-beta.10 and later.
 not TLS. `pg_stat_ssl` shows each connection's protocol, cipher and client
 certificate.
 
-After 0.1.0-beta.11: `--tls-crl-file crl.pem` (`ssl_crl_file`) refuses a
+Since 0.1.0-beta.12: `--tls-crl-file crl.pem` (`ssl_crl_file`) refuses a
 client certificate a revocation list names; `--tls-client-name DN`
 (`clientname=DN`) compares the certificate's whole subject, as in
 `CN=alice,O=Example`, in place of its common name; and `--tls-ident-file
@@ -75,7 +75,7 @@ and on `select pg_reload_conf()`. In a Rust test these are
 `TlsConfig::crl_file`, `client_name` and `user_map`, and
 `PgServer::reload`. Not supported: a key with a passphrase.
 
-`--hba-file pg_hba.conf` (`PgBuilder::hba_file`, after 0.1.0-beta.11) takes
+`--hba-file pg_hba.conf` (`PgBuilder::hba_file`, since 0.1.0-beta.12) takes
 a `pg_hba.conf` in place of those options: the first line that matches a
 connection's type, database, user and address says how it must prove who it
 is, and a connection no line matches is refused. It reads `host`,
