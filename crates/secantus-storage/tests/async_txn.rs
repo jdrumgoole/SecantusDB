@@ -49,8 +49,9 @@ fn decode(b: &[u8]) -> Document {
 #[test]
 fn rolled_back_txn_leaves_no_oplog_trace() {
     with_async_db(|st| {
-        // Baseline committed write (seq 1) so the assertion below can tell
-        // "rollback left nothing" apart from "nothing works at all".
+        // Baseline committed write so the assertion below can tell
+        // "rollback left nothing" apart from "nothing works at all". The
+        // first insert also records the collection's creation: two entries.
         st.insert_one("app", "c", &enc(&doc! {"_id": 0})).unwrap();
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
@@ -63,7 +64,7 @@ fn rolled_back_txn_leaves_no_oplog_trace() {
         let rows = st.read_oplog(1, 100).unwrap();
         assert_eq!(
             rows.len(),
-            1,
+            2,
             "rolled-back transaction must not surface an oplog entry"
         );
         // The data really rolled back too — entry-less is consistent, not a
@@ -101,6 +102,11 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
             .iter()
             .map(|(_, b)| decode(b).get_str("op").unwrap().to_string())
             .collect();
-        assert_eq!(ops, vec!["i", "i"], "exactly the two inserts, exactly once");
+        // The collection's creation, then the two inserts, each exactly once.
+        assert_eq!(
+            ops,
+            vec!["c", "i", "i"],
+            "exactly the two inserts, exactly once"
+        );
     });
 }
