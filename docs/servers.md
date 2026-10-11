@@ -110,7 +110,7 @@ Mongo daemons read the same `secantusd.toml` config (see
 ### SQL / PostgreSQL servers
 
 The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.10`), and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.11`), and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
@@ -163,7 +163,7 @@ Not supported: a certificate revocation list, a user name map
 a key with a passphrase, and reloading the files without a restart.
 
 A user name there is no role for connects without a password, as a role
-with no password does. `--refuse-unknown-users` (after 0.1.0-beta.10) stops
+with no password does. `--refuse-unknown-users` (since 0.1.0-beta.11) stops
 that: such a user is asked for a password, as PostgreSQL asks one under a
 `scram-sha-256` line, and none it gives is right. A role with no password
 still connects without one, so give `postgres` a password
