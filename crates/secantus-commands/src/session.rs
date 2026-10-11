@@ -712,7 +712,7 @@ fn statement(
     let unparsed = matches!(code, 16 | 40414 | 40415)
         || result
             .get_str("errmsg")
-            .is_ok_and(|m| m.starts_with("BSON field '"));
+            .is_ok_and(|m| m.starts_with("BSON field '") || m.starts_with("Expected field "));
     if !ok(&result) && unparsed {
         // The command did not parse, so mongod never took it into the
         // transaction: one it would have started does not exist, and one
