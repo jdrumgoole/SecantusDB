@@ -15,19 +15,21 @@
 //! the registry can be unit-tested with fakes (mirroring the Python registry's
 //! injectable `commit_func` / `rollback_func`).
 //!
-//! State machine (spec-pinned by pymongo's `transactions/unified` suite):
-//! * statement for an unknown / aborted `(lsid, txnNumber)` → 251
-//!   `NoSuchTransaction` + `TransientTransactionError` label
-//! * statement for a committed `txnNumber` → 256 `TransactionCommitted`
-//! * `startTransaction` with a `txnNumber` lower than the session's newest → 225
-//!   `TransactionTooOld`
-//! * re-`startTransaction` of the in-progress `txnNumber` → 50911
-//! * `startTransaction` with a higher `txnNumber` while an older transaction is
-//!   in progress → the older one is implicitly aborted
-//! * `commitTransaction` on a committed transaction → `{ok: 1}` (commits are
-//!   retried by drivers; idempotency is load-bearing)
-//! * `commitTransaction` on an aborted / unknown transaction → 251 + label
-//! * `abortTransaction` on an aborted / unknown transaction → 251 with NO label
+//! State machine, measured against mongod 8.2.11 (`tools/probes/transactions.py`).
+//! A session has ONE active transaction number, shared by transactions and
+//! retryable writes, starting at -1:
+//! * a number below the active one -> 225 `TransactionTooOld`, on a statement,
+//!   a `startTransaction`, a commit, an abort or a retryable write alike
+//! * `startTransaction` at the active number -> 117
+//!   `ConflictingOperationInProgress`, whatever that number was used for
+//! * `startTransaction` above it -> the older transaction is aborted
+//! * a statement, commit or abort for a number that is not an open
+//!   transaction -> 251 `NoSuchTransaction` with `TransientTransactionError`;
+//!   the message says "has been aborted" when that is what happened
+//! * a statement or abort for a committed transaction -> 256
+//!   `TransactionCommitted`; a commit of one answers `{ok: 1}` again
+//! * a retryable write at the number of a transaction -> 217
+//!   `IncompleteTransactionHistory`
 //!
 //! Transactions idle past `lifetime_seconds` (default 60) are reaped
 //! opportunistically on every registry access — same no-background-sweeper
@@ -72,6 +74,9 @@ pub struct Transaction {
     pub last_use: f64,
     #[allow(dead_code)]
     pub started_at: f64,
+    /// The collections this transaction created, as `db.coll`, and whether
+    /// it has since put a document in each.
+    pub created: HashMap<String, bool>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -93,116 +98,238 @@ impl Transaction {
             handle: None,
             last_use: now,
             started_at: now,
+            created: HashMap::new(),
         }
     }
 }
 
-/// `251 NoSuchTransaction`, optionally carrying the transient label.
-pub fn no_such_transaction_reply(txn_number: i64, label: bool) -> Document {
-    let mut err = doc! {
-        "ok": 0.0,
-        "errmsg": format!(
-            "Given transaction number {txn_number} does not match any in-progress transactions."
-        ),
-        "code": 251,
-        "codeName": "NoSuchTransaction",
-    };
-    if label {
-        err.insert("errorLabels", vec![TRANSIENT_LABEL]);
+/// How mongod prints a session in a transaction error: the id, then the
+/// base64 SHA-256 of the user, then two fields a replica set leaves empty.
+/// The digest here is the one of no user.
+pub fn session_text(lsid: &[u8]) -> String {
+    format!(
+        "{} - 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU= -  - ",
+        uuid_text(lsid)
+    )
+}
+
+fn uuid_text(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    if hex.len() != 32 {
+        return hex;
     }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// An error reply with `errorLabels` FIRST, which is where mongod puts them.
+fn labelled(code: i32, code_name: &str, errmsg: String, label: Option<&str>) -> Document {
+    let mut err = Document::new();
+    if let Some(label) = label {
+        err.insert("errorLabels", vec![label]);
+    }
+    err.insert("ok", 0.0);
+    err.insert("errmsg", errmsg);
+    err.insert("code", code);
+    err.insert("codeName", code_name);
     err
 }
 
+/// Put `label` on `reply`, keeping `errorLabels` the first key.
+pub fn add_label_first(reply: &mut Document, label: &str) {
+    let mut labels: Vec<Bson> = match reply.remove("errorLabels") {
+        Some(Bson::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    if !labels.iter().any(|l| l.as_str() == Some(label)) {
+        labels.push(Bson::String(label.to_string()));
+    }
+    let rest = std::mem::take(reply);
+    reply.insert("errorLabels", labels);
+    for (k, v) in rest {
+        reply.insert(k, v);
+    }
+}
+
+/// `251 NoSuchTransaction` for a number that is not the session's open
+/// transaction. `active` is the session's active number, -1 when it has none.
+pub fn no_such_transaction_reply(lsid: &[u8], txn_number: i64, active: i64) -> Document {
+    labelled(
+        251,
+        "NoSuchTransaction",
+        format!(
+            "Given transaction number {txn_number} on session {} using txnRetryCounter 0 does \
+             not match any in-progress transactions. The active transaction number is {active}",
+            session_text(lsid)
+        ),
+        Some(TRANSIENT_LABEL),
+    )
+}
+
+fn transaction_aborted(txn_number: i64) -> Document {
+    labelled(
+        251,
+        "NoSuchTransaction",
+        format!("Transaction with {{ txnNumber: {txn_number} }} has been aborted."),
+        Some(TRANSIENT_LABEL),
+    )
+}
+
 fn transaction_committed(txn_number: i64) -> Document {
-    doc! {
-        "ok": 0.0,
-        "errmsg": format!("Transaction with {{ txnNumber: {txn_number} }} has been committed."),
-        "code": 256,
-        "codeName": "TransactionCommitted",
-    }
+    labelled(
+        256,
+        "TransactionCommitted",
+        format!("Transaction with {{ txnNumber: {txn_number} }} has been committed."),
+        None,
+    )
 }
 
-fn transaction_too_old(txn_number: i64, newest: i64) -> Document {
-    doc! {
-        "ok": 0.0,
-        "errmsg": format!(
-            "Cannot start transaction {txn_number} on session because a newer transaction \
-             {newest} has already started."
+fn transaction_too_old(lsid: &[u8], txn_number: i64, active: i64, retryable: bool) -> Document {
+    let newer = if retryable {
+        format!(
+            "retryable write with txnNumberAndRetryCounter {{ txnNumber: {active}, \
+             txnRetryCounter: -1 }}"
+        )
+    } else {
+        format!(
+            "transaction with txnNumberAndRetryCounter {{ txnNumber: {active}, \
+             txnRetryCounter: 0 }}"
+        )
+    };
+    labelled(
+        225,
+        "TransactionTooOld",
+        format!(
+            "Cannot start transaction with {{ txnNumber: {txn_number} }} on session {} because \
+             a newer {newer} has already started on this session.",
+            session_text(lsid)
         ),
-        "code": 225,
-        "codeName": "TransactionTooOld",
-    }
+        None,
+    )
 }
 
-fn cannot_restart(txn_number: i64) -> Document {
-    doc! {
-        "ok": 0.0,
-        "errmsg": format!(
-            "Cannot restart transaction {txn_number}: a transaction with the same number is \
-             already in progress or has finished."
+fn retryable_too_old(lsid: &[u8], txn_number: i64, active: i64, retryable: bool) -> Document {
+    let newer = if retryable {
+        "retryable write"
+    } else {
+        "transaction"
+    };
+    labelled(
+        225,
+        "TransactionTooOld",
+        format!(
+            "Retryable write with txnNumber {txn_number} is prohibited on session {} because a \
+             newer {newer} with txnNumber {active} has already started on this session.",
+            session_text(lsid)
         ),
-        "code": 50911,
-        "codeName": "Location50911",
-    }
+        None,
+    )
+}
+
+fn cannot_restart() -> Document {
+    labelled(
+        117,
+        "ConflictingOperationInProgress",
+        "Only servers in a sharded cluster can start a new transaction at the active \
+         transaction number"
+            .to_string(),
+        None,
+    )
+}
+
+fn converted_to_transaction() -> Document {
+    labelled(
+        217,
+        "IncompleteTransactionHistory",
+        "Cannot retry a retryable write that has been converted into a transaction".to_string(),
+        None,
+    )
+}
+
+/// What a statement of a retryable write did, kept so a retry of it is
+/// answered and not run again. mongod keeps the same in the oplog, and only
+/// for a statement that WROTE: one that matched nothing, or changed nothing,
+/// runs again on a retry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtRecord {
+    Insert {
+        id: Option<Bson>,
+    },
+    /// An update that modified a document, or upserted one (`upserted` is its
+    /// `_id`).
+    Update {
+        upserted: Option<Bson>,
+    },
+    Delete,
+    /// A `findAndModify` and the reply it gave.
+    FindAndModify {
+        reply: Document,
+        remove: bool,
+    },
+}
+
+thread_local! {
+    /// The statements the write command running on this thread has applied,
+    /// while a retryable write is collecting them.
+    static STATEMENTS: std::cell::RefCell<Option<Vec<(usize, StmtRecord)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, a write command's handler, and return with it the statements it
+/// applied: `(index in the command, what it did)`.
+pub fn collect_statements<R>(f: impl FnOnce() -> R) -> (R, Vec<(usize, StmtRecord)>) {
+    let outer = STATEMENTS.with(|s| s.borrow_mut().replace(Vec::new()));
+    let result = f();
+    let noted = STATEMENTS.with(|s| std::mem::replace(&mut *s.borrow_mut(), outer));
+    (result, noted.unwrap_or_default())
+}
+
+/// Called by a write handler when the statement at `index` has written. A
+/// no-op unless a retryable write is collecting.
+pub fn note_statement(index: usize, record: StmtRecord) {
+    STATEMENTS.with(|s| {
+        if let Some(noted) = s.borrow_mut().as_mut() {
+            noted.push((index, record));
+        }
+    });
 }
 
 type TxnFn = Box<dyn Fn(&mut Transaction) + Send + Sync>;
 type Clock = Box<dyn Fn() -> f64 + Send + Sync>;
 
+enum Kind {
+    Txn(Arc<Mutex<Transaction>>),
+    Retryable(HashMap<i32, StmtRecord>),
+}
+
+/// One session: its active transaction number and what that number is.
+struct Session {
+    active: i64,
+    kind: Kind,
+    last_use: f64,
+}
+
 struct Inner {
-    txns: HashMap<Vec<u8>, Arc<Mutex<Transaction>>>,
-    /// Newest `txnNumber` ever seen per session (transactions and retryable
-    /// writes share the per-session sequence).
-    last_number: HashMap<Vec<u8>, i64>,
-    /// Retryable-write records: `(lsid, txnNumber)` -> [`RetryableRecord`]. mongod keeps the equivalent in `config.transactions` so a
-    /// driver's automatic retry gets the ORIGINAL reply instead of re-applying
-    /// the write; without it a retried `{$inc: {n: 1}}` increments twice while
-    /// both replies claim `nModified: 1`. Mirrors the Python registry's
-    /// `_retryable`.
-    retryable: HashMap<RetryableKey, RetryableRecord>,
+    sessions: HashMap<Vec<u8>, Session>,
+    last_sweep: f64,
 }
 
-/// `(lsid, txnNumber)` — the pair mongod keys a retryable write on.
-type RetryableKey = (Vec<u8>, i64);
+/// How long an idle session's state is kept: mongod's
+/// `localLogicalSessionTimeoutMinutes`.
+const SESSION_LIFETIME_SECONDS: f64 = 30.0 * 60.0;
 
-/// A completed retryable write: its reply, when it was stored, and a digest of
-/// the command that produced it (so a replay only fires for the same write).
-type RetryableRecord = (Document, f64, [u8; 20]);
-
-/// How long a retryable-write record is kept, matching mongod's 30-minute
-/// sweep. A driver retrying later than this re-executes — as it would against
-/// mongod.
-const RETRYABLE_RECORD_LIFETIME_SECONDS: f64 = 30.0 * 60.0;
-
-/// Backstop on record count so a client minting unbounded sessions cannot grow
-/// the map without limit. Oldest-first eviction.
-const RETRYABLE_RECORD_MAX: usize = 10_000;
-
-/// Whether `reply` represents a write that fully took effect, and is therefore
-/// replayable. A failed or partially-failed write must re-execute on retry:
-/// caching an error would make a transient failure permanent, and caching a
-/// partial batch would report missing documents as written. A
-/// `writeConcernError` is deliberately NOT disqualifying — the write applied,
-/// only its replication did not confirm, so a retry must not apply it twice.
-fn is_recordable_reply(reply: &Document) -> bool {
-    let ok = match reply.get("ok") {
-        Some(Bson::Double(d)) => *d,
-        Some(Bson::Int32(i)) => *i as f64,
-        Some(Bson::Int64(i)) => *i as f64,
-        _ => 0.0,
-    };
-    if ok != 1.0 {
-        return false;
-    }
-    !matches!(reply.get("writeErrors"), Some(Bson::Array(a)) if !a.is_empty())
-}
-
-/// Thread-safe map of `lsid_bytes` → most-recent [`Transaction`].
+/// Thread-safe map of session -> its active transaction or retryable write.
 ///
-/// Lock discipline mirrors the Python registry: the registry `inner` mutex
-/// guards the maps; each transaction's own mutex guards its `state` / `handle`.
-/// The order is always inner → txn (or txn alone), never txn → inner, so
-/// statement execution can't deadlock with the reaper / `abort_all`.
+/// Lock discipline: the registry `inner` mutex guards the map; each
+/// transaction's own mutex guards its `state` / `handle`. The order is always
+/// inner -> txn (or txn alone), never txn -> inner, so statement execution
+/// cannot deadlock with the reaper or `abort_all`.
 pub struct TransactionRegistry {
     inner: Mutex<Inner>,
     commit: TxnFn,
@@ -211,46 +338,27 @@ pub struct TransactionRegistry {
     clock: Clock,
 }
 
-/// Copy `reply` without the fields that describe THIS attempt only.
-///
-/// A `writeConcernError` is a property of the attempt, not of the stored
-/// statement outcome: the write succeeded and only its durability
-/// acknowledgement failed. Replaying it makes the driver's retry see the very
-/// error it retried because of, so the retry "fails" too and the operation
-/// surfaces as an error even though the write is safely applied.
-///
-/// Probed on mongod 8.3.4 (single-node replica set, `failCommand` with
-/// `errorLabels: ["RetryableWriteError"]` + `writeConcernError: {code: 91}`,
-/// `mode: {times: 1}`): attempt 1 carries both fields, the retry carries
-/// neither. This is what kept libmongoc's
-/// `/command_monitoring/unified/writeConcernError` red -- the driver DID
-/// classify the write as retryable and DID retry (both attempts carried
-/// `txnNumber: 1`, confirmed by tracing), but got the replayed error back.
-///
-/// `errorLabels` goes with it: on a successful reply the only labels present
-/// are the ones the write-concern error carried.
-fn strip_per_attempt_fields(reply: &Document) -> Document {
-    let mut out = reply.clone();
-    out.remove("writeConcernError");
-    out.remove("errorLabels");
-    out
-}
-
 impl TransactionRegistry {
     /// `commit` / `rollback` perform the storage-side WT work for a transaction;
     /// `clock` returns monotonic seconds (injectable for deterministic tests).
     pub fn new(commit: TxnFn, rollback: TxnFn, lifetime_seconds: f64, clock: Clock) -> Self {
         TransactionRegistry {
             inner: Mutex::new(Inner {
-                retryable: HashMap::new(),
-                txns: HashMap::new(),
-                last_number: HashMap::new(),
+                sessions: HashMap::new(),
+                last_sweep: 0.0,
             }),
             commit,
             rollback,
             lifetime: lifetime_seconds,
             clock,
         }
+    }
+
+    fn locked(&self) -> (std::sync::MutexGuard<'_, Inner>, f64) {
+        let now = (self.clock)();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.prune_locked(&mut inner, now);
+        (inner, now)
     }
 
     /// Resolve the transaction a statement should run in. `Ok(txn)` to execute
@@ -263,46 +371,54 @@ impl TransactionRegistry {
         txn_number: i64,
         start: bool,
     ) -> Result<Arc<Mutex<Transaction>>, Document> {
-        let now = (self.clock)();
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        self.prune_locked(&mut inner, now);
-        let cur = inner.txns.get(lsid_bytes).cloned();
-        let last = inner.last_number.get(lsid_bytes).copied().unwrap_or(0);
+        let (mut inner, now) = self.locked();
+        let (active, retryable) = match inner.sessions.get(lsid_bytes) {
+            Some(s) => (s.active, matches!(s.kind, Kind::Retryable(_))),
+            None => (-1, false),
+        };
+        if txn_number < active {
+            return Err(transaction_too_old(
+                lsid_bytes, txn_number, active, retryable,
+            ));
+        }
         if start {
-            if txn_number < last {
-                return Err(transaction_too_old(txn_number, last));
+            if txn_number == active {
+                return Err(cannot_restart());
             }
-            if let Some(c) = &cur {
-                if c.lock().unwrap_or_else(|e| e.into_inner()).txn_number == txn_number {
-                    if c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::Committed {
-                        return Err(transaction_committed(txn_number));
-                    }
-                    return Err(cannot_restart(txn_number));
-                }
-            }
-            if txn_number == last && cur.is_none() {
-                // The number was consumed by a retryable write.
-                return Err(cannot_restart(txn_number));
-            }
-            if let Some(c) = &cur {
-                self.abort_locked(c);
+            if let Some(Session {
+                kind: Kind::Txn(old),
+                ..
+            }) = inner.sessions.get(lsid_bytes)
+            {
+                self.abort_locked(old);
             }
             let txn = Arc::new(Mutex::new(Transaction::new(
                 lsid_bytes.to_vec(),
                 txn_number,
                 now,
             )));
-            inner.txns.insert(lsid_bytes.to_vec(), txn.clone());
-            inner.last_number.insert(lsid_bytes.to_vec(), txn_number);
+            inner.sessions.insert(
+                lsid_bytes.to_vec(),
+                Session {
+                    active: txn_number,
+                    kind: Kind::Txn(txn.clone()),
+                    last_use: now,
+                },
+            );
             return Ok(txn);
         }
         // Continuation statement (no startTransaction flag).
-        match cur {
-            Some(c) if c.lock().unwrap_or_else(|e| e.into_inner()).txn_number == txn_number => {
+        match inner.sessions.get_mut(lsid_bytes) {
+            Some(session) if session.active == txn_number => {
+                session.last_use = now;
+                let Kind::Txn(c) = &session.kind else {
+                    return Err(no_such_transaction_reply(lsid_bytes, txn_number, active));
+                };
+                let c = c.clone();
                 let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
                 match t.state {
                     TxnState::Committed => Err(transaction_committed(txn_number)),
-                    TxnState::Aborted => Err(no_such_transaction_reply(txn_number, true)),
+                    TxnState::Aborted => Err(transaction_aborted(txn_number)),
                     TxnState::InProgress => {
                         t.last_use = now;
                         drop(t);
@@ -310,184 +426,186 @@ impl TransactionRegistry {
                     }
                 }
             }
-            _ => Err(no_such_transaction_reply(txn_number, true)),
+            _ => Err(no_such_transaction_reply(lsid_bytes, txn_number, active)),
         }
     }
 
-    /// Commit `(lsid, txnNumber)`. `Ok(None)` on success (or idempotent re-commit
-    /// of a committed txn); `Ok(Some(reply))` for a state error. If the commit
-    /// callback panics the txn is left aborted — but we can't catch a panic
-    /// cleanly here, so the callback must surface failures via its own state.
-    pub fn commit(&self, lsid_bytes: &[u8], txn_number: i64) -> Option<Document> {
-        let now = (self.clock)();
-        let cur = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            self.prune_locked(&mut inner, now);
-            inner.txns.get(lsid_bytes).cloned()
+    /// The session's transaction at `txn_number`, or the reply that says why
+    /// there is none.
+    fn ending(
+        &self,
+        lsid_bytes: &[u8],
+        txn_number: i64,
+    ) -> Result<Arc<Mutex<Transaction>>, Document> {
+        let (mut inner, now) = self.locked();
+        let Some(session) = inner.sessions.get_mut(lsid_bytes) else {
+            return Err(no_such_transaction_reply(lsid_bytes, txn_number, -1));
         };
-        let Some(c) = cur else {
-            return Some(no_such_transaction_reply(txn_number, true));
+        session.last_use = now;
+        let retryable = matches!(session.kind, Kind::Retryable(_));
+        if txn_number < session.active {
+            return Err(transaction_too_old(
+                lsid_bytes,
+                txn_number,
+                session.active,
+                retryable,
+            ));
+        }
+        match &session.kind {
+            Kind::Txn(c) if txn_number == session.active => Ok(c.clone()),
+            _ => Err(no_such_transaction_reply(
+                lsid_bytes,
+                txn_number,
+                session.active,
+            )),
+        }
+    }
+
+    /// Commit `(lsid, txnNumber)`. `None` on success (or the repeated commit
+    /// of a committed transaction, which drivers send); `Some(reply)` for a
+    /// state error.
+    pub fn commit(&self, lsid_bytes: &[u8], txn_number: i64) -> Option<Document> {
+        let c = match self.ending(lsid_bytes, txn_number) {
+            Ok(c) => c,
+            Err(reply) => return Some(reply),
         };
         let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
-        if t.txn_number != txn_number {
-            return Some(no_such_transaction_reply(txn_number, true));
-        }
         match t.state {
             TxnState::Committed => None,
-            TxnState::Aborted => Some(no_such_transaction_reply(txn_number, true)),
+            TxnState::Aborted => Some(transaction_aborted(txn_number)),
             TxnState::InProgress => {
                 (self.commit)(&mut t);
                 t.state = TxnState::Committed;
-                t.last_use = now;
+                t.last_use = (self.clock)();
                 None
             }
         }
     }
 
-    /// Abort `(lsid, txnNumber)`. `Ok(None)` on success; `Ok(Some(reply))` for a
-    /// state error. No transient label — drivers fire-and-forget aborts.
+    /// Abort `(lsid, txnNumber)`. `None` on success; `Some(reply)` for a state
+    /// error.
     pub fn abort(&self, lsid_bytes: &[u8], txn_number: i64) -> Option<Document> {
-        let now = (self.clock)();
-        let cur = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            self.prune_locked(&mut inner, now);
-            inner.txns.get(lsid_bytes).cloned()
-        };
-        let Some(c) = cur else {
-            return Some(no_such_transaction_reply(txn_number, false));
+        let c = match self.ending(lsid_bytes, txn_number) {
+            Ok(c) => c,
+            Err(reply) => return Some(reply),
         };
         let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
-        if t.txn_number != txn_number {
-            return Some(no_such_transaction_reply(txn_number, false));
-        }
         match t.state {
             TxnState::Committed => Some(transaction_committed(txn_number)),
-            TxnState::Aborted => Some(no_such_transaction_reply(txn_number, false)),
+            TxnState::Aborted => Some(transaction_aborted(txn_number)),
             TxnState::InProgress => {
                 (self.rollback)(&mut t);
                 t.state = TxnState::Aborted;
-                t.last_use = now;
+                t.last_use = (self.clock)();
                 None
             }
         }
     }
 
-    /// Server-side abort after a failed statement (mongod parity: any failed
-    /// statement aborts the transaction). No-op once terminal.
+    /// Server-side abort after a failed statement (any statement that fails
+    /// while running aborts its transaction). No-op once terminal.
     pub fn abort_in_progress(&self, txn: &Arc<Mutex<Transaction>>) {
         self.abort_locked(txn);
     }
 
-    /// A retryable write (`txnNumber` without `autocommit`) consumes the
-    /// session's txnNumber sequence and implicitly aborts an older in-progress
-    /// transaction, as in mongod.
-    pub fn on_retryable_write(&self, lsid_bytes: &[u8], txn_number: i64) {
+    /// Undo a `startTransaction` whose command turned out not to parse: roll
+    /// the transaction back and leave the session as if it had never been
+    /// sent.
+    pub fn forget_started(&self, lsid_bytes: &[u8], txn: &Arc<Mutex<Transaction>>) {
+        self.abort_locked(txn);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = inner.txns.get(lsid_bytes).cloned() {
-            if txn_number > c.lock().unwrap_or_else(|e| e.into_inner()).txn_number {
-                self.abort_locked(&c);
-                inner.txns.remove(lsid_bytes);
+        let ours = matches!(
+            inner.sessions.get(lsid_bytes),
+            Some(Session { kind: Kind::Txn(c), .. }) if Arc::ptr_eq(c, txn)
+        );
+        if ours {
+            inner.sessions.remove(lsid_bytes);
+        }
+    }
+
+    /// Begin, or continue, the retryable write `(lsid, txnNumber)`: the
+    /// statements of it that already ran, by statement id. A newer number
+    /// aborts the session's open transaction and starts with none.
+    pub fn begin_retryable(
+        &self,
+        lsid_bytes: &[u8],
+        txn_number: i64,
+    ) -> Result<HashMap<i32, StmtRecord>, Document> {
+        let (mut inner, now) = self.locked();
+        if let Some(session) = inner.sessions.get_mut(lsid_bytes) {
+            let retryable = matches!(session.kind, Kind::Retryable(_));
+            if txn_number < session.active {
+                return Err(retryable_too_old(
+                    lsid_bytes,
+                    txn_number,
+                    session.active,
+                    retryable,
+                ));
+            }
+            if txn_number == session.active {
+                session.last_use = now;
+                return match &session.kind {
+                    Kind::Retryable(done) => Ok(done.clone()),
+                    Kind::Txn(_) => Err(converted_to_transaction()),
+                };
+            }
+            if let Kind::Txn(old) = &session.kind {
+                self.abort_locked(old);
             }
         }
-        let last = inner.last_number.get(lsid_bytes).copied().unwrap_or(0);
-        if txn_number > last {
-            inner.last_number.insert(lsid_bytes.to_vec(), txn_number);
-        }
+        inner.sessions.insert(
+            lsid_bytes.to_vec(),
+            Session {
+                active: txn_number,
+                kind: Kind::Retryable(HashMap::new()),
+                last_use: now,
+            },
+        );
+        Ok(HashMap::new())
     }
 
-    /// The stored reply for an already-executed retryable write, if any.
-    ///
-    /// A driver retries with the SAME `lsid` + `txnNumber` after a network
-    /// blip, a `writeConcernError`, or a stepdown. mongod recognises the repeat
-    /// and replays its stored reply rather than executing the write a second
-    /// time; `None` means "not seen before, run it".
-    ///
-    /// `identity` must match the recorded command too. A retry re-sends a
-    /// byte-identical command, so a mismatch means the key was reused for a
-    /// DIFFERENT write — replaying one command's reply for another would be
-    /// worse than the double-apply this exists to prevent, so we execute.
-    pub fn retryable_reply(
+    /// Remember what statements of the retryable write `(lsid, txnNumber)`
+    /// did. Dropped if the session has moved on to another number.
+    pub fn record_statements(
         &self,
         lsid_bytes: &[u8],
         txn_number: i64,
-        identity: &[u8; 20],
-    ) -> Option<Document> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now = (self.clock)();
-        Self::prune_retryable(&mut inner, now);
-        match inner.retryable.get(&(lsid_bytes.to_vec(), txn_number)) {
-            Some((reply, _at, ident)) if ident == identity => Some(reply.clone()),
-            _ => None,
-        }
-    }
-
-    /// Store `reply` as the outcome of this retryable write. Only successful
-    /// writes are recorded (see [`is_recordable_reply`]).
-    pub fn record_retryable(
-        &self,
-        lsid_bytes: &[u8],
-        txn_number: i64,
-        identity: [u8; 20],
-        reply: &Document,
+        records: Vec<(i32, StmtRecord)>,
     ) {
-        if !is_recordable_reply(reply) {
+        if records.is_empty() {
             return;
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now = (self.clock)();
-        inner.retryable.insert(
-            (lsid_bytes.to_vec(), txn_number),
-            (strip_per_attempt_fields(reply), now, identity),
-        );
-        Self::prune_retryable(&mut inner, now);
-    }
-
-    /// Drop records past their lifetime and cap total size. Called on every
-    /// lookup / record, so an idle server sheds them without a background
-    /// sweeper — the opportunistic pattern the oplog and TTL pruning use.
-    fn prune_retryable(inner: &mut Inner, now: f64) {
-        let cutoff = now - RETRYABLE_RECORD_LIFETIME_SECONDS;
-        inner.retryable.retain(|_k, (_r, at, _i)| *at >= cutoff);
-        if inner.retryable.len() > RETRYABLE_RECORD_MAX {
-            let excess = inner.retryable.len() - RETRYABLE_RECORD_MAX;
-            let mut by_age: Vec<(RetryableKey, f64)> = inner
-                .retryable
-                .iter()
-                .map(|(k, (_r, at, _i))| (k.clone(), *at))
-                .collect();
-            by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (k, _at) in by_age.into_iter().take(excess) {
-                inner.retryable.remove(&k);
+        if let Some(Session {
+            active,
+            kind: Kind::Retryable(done),
+            ..
+        }) = inner.sessions.get_mut(lsid_bytes)
+        {
+            if *active == txn_number {
+                done.extend(records);
             }
         }
     }
 
-    /// `endSessions` / `killSessions`: abort the session's in-progress txn.
+    /// `killSessions`: abort the session's in-progress transaction.
     pub fn abort_for_session(&self, lsid_bytes: &[u8]) {
-        let cur = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .txns
-            .get(lsid_bytes)
-            .cloned();
-        if let Some(c) = cur {
-            self.abort_locked(&c);
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Session {
+            kind: Kind::Txn(c), ..
+        }) = inner.sessions.get(lsid_bytes)
+        {
+            self.abort_locked(c);
         }
     }
 
     /// `killAllSessions` / shutdown: abort everything.
     pub fn abort_all(&self) {
-        let txns: Vec<_> = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .txns
-            .values()
-            .cloned()
-            .collect();
-        for c in txns {
-            self.abort_locked(&c);
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for session in inner.sessions.values() {
+            if let Kind::Txn(c) = &session.kind {
+                self.abort_locked(c);
+            }
         }
     }
 
@@ -495,10 +613,15 @@ impl TransactionRegistry {
     pub fn in_progress_count(&self) -> usize {
         self.inner
             .lock()
-            .unwrap()
-            .txns
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
             .values()
-            .filter(|c| c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress)
+            .filter(|s| match &s.kind {
+                Kind::Txn(c) => {
+                    c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress
+                }
+                Kind::Retryable(_) => false,
+            })
             .count()
     }
 
@@ -510,14 +633,28 @@ impl TransactionRegistry {
         }
     }
 
+    /// Abort transactions idle past their lifetime, and, once a minute, forget
+    /// sessions idle past theirs. Runs on every access: there is no sweeper
+    /// thread.
     fn prune_locked(&self, inner: &mut Inner, now: f64) {
         let cutoff = now - self.lifetime;
-        for c in inner.txns.values() {
-            let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
-            if t.state == TxnState::InProgress && t.last_use < cutoff {
-                (self.rollback)(&mut t);
-                t.state = TxnState::Aborted;
+        for session in inner.sessions.values() {
+            if let Kind::Txn(c) = &session.kind {
+                let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
+                if t.state == TxnState::InProgress && t.last_use < cutoff {
+                    (self.rollback)(&mut t);
+                    t.state = TxnState::Aborted;
+                }
             }
+        }
+        if now - inner.last_sweep >= 60.0 {
+            inner.last_sweep = now;
+            let stale = now - SESSION_LIFETIME_SECONDS;
+            inner.sessions.retain(|_, s| {
+                s.last_use >= stale
+                    || matches!(&s.kind, Kind::Txn(c)
+                        if c.lock().unwrap_or_else(|e| e.into_inner()).state == TxnState::InProgress)
+            });
         }
     }
 }
@@ -527,7 +664,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// A registry with no-op commit/rollback and a manually-advanced clock.
+    /// A registry with counting commit/rollback and a settable clock.
     fn reg() -> (Arc<TransactionRegistry>, Arc<AtomicU64>, Arc<AtomicU64>) {
         let commits = Arc::new(AtomicU64::new(0));
         let rollbacks = Arc::new(AtomicU64::new(0));
@@ -546,80 +683,19 @@ mod tests {
         (Arc::new(r), commits, rollbacks)
     }
 
-    const LS: &[u8] = b"session-1";
+    const LS: &[u8] = &[7u8; 16];
 
-    /// Retryable-write records: keyed on (lsid, txnNumber) AND the command
-    /// identity. Mirrors the Python server's
-    /// `test_registry_isolates_sessions_and_verifies_identity`.
-    #[test]
-    fn retryable_records_are_keyed_by_session_number_and_identity() {
-        let (r, _c, _rb) = reg();
-        let ident = [1u8; 20];
-        let other = [2u8; 20];
-        let reply = doc! {"ok": 1.0, "n": 1};
-
-        r.record_retryable(b"session-a", 1, ident, &reply);
-
-        // Same session, same number, same command -> replay.
-        assert_eq!(r.retryable_reply(b"session-a", 1, &ident), Some(reply));
-        // Different session -> not a retry.
-        assert!(r.retryable_reply(b"session-b", 1, &ident).is_none());
-        // Different txnNumber -> a new write.
-        assert!(r.retryable_reply(b"session-a", 2, &ident).is_none());
-        // Same key, DIFFERENT command: replaying here would serve one write's
-        // answer for another, which is worse than the double-apply this
-        // prevents.
-        assert!(r.retryable_reply(b"session-a", 1, &other).is_none());
+    fn code(reply: &Document) -> i32 {
+        reply.get_i32("code").unwrap()
     }
 
-    /// Only writes that took effect are replayable. Caching a failure would
-    /// turn a transient error into a permanent one.
-    #[test]
-    fn retryable_records_skip_failed_writes() {
-        let (r, _c, _rb) = reg();
-        let ident = [3u8; 20];
-
-        r.record_retryable(b"s", 1, ident, &doc! {"ok": 0.0, "errmsg": "boom"});
-        assert!(r.retryable_reply(b"s", 1, &ident).is_none());
-
-        r.record_retryable(
-            b"s",
-            2,
-            ident,
-            &doc! {"ok": 1.0, "writeErrors": [{"index": 0}]},
-        );
-        assert!(r.retryable_reply(b"s", 2, &ident).is_none());
-
-        // A writeConcernError means the write DID apply — only replication of
-        // it did not confirm — so mongod records it and a retry must not apply
-        // it twice.
-        r.record_retryable(
-            b"s",
-            3,
-            ident,
-            &doc! {"ok": 1.0, "n": 1, "writeConcernError": {"code": 64}},
-        );
-        assert!(r.retryable_reply(b"s", 3, &ident).is_some());
-    }
-
-    /// Records age out, so a much later retry re-executes — as against mongod.
-    #[test]
-    fn retryable_records_expire() {
-        use std::sync::atomic::AtomicU64;
-        let now = Arc::new(AtomicU64::new(1000));
-        let n2 = now.clone();
-        let r = TransactionRegistry::new(
-            Box::new(|_t| {}),
-            Box::new(|_t| {}),
-            60.0,
-            Box::new(move || n2.load(Ordering::SeqCst) as f64),
-        );
-        let ident = [4u8; 20];
-        r.record_retryable(b"s", 1, ident, &doc! {"ok": 1.0, "n": 1});
-        assert!(r.retryable_reply(b"s", 1, &ident).is_some());
-
-        now.fetch_add(31 * 60, Ordering::SeqCst); // past the 30-minute lifetime
-        assert!(r.retryable_reply(b"s", 1, &ident).is_none());
+    fn labelled_transient(reply: &Document) -> bool {
+        reply.keys().next().map(String::as_str) == Some("errorLabels")
+            && reply
+                .get_array("errorLabels")
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str() == Some(TRANSIENT_LABEL))
     }
 
     #[test]
@@ -629,112 +705,149 @@ mod tests {
         assert!(r.for_statement(LS, 1, false).is_ok());
         assert!(r.commit(LS, 1).is_none());
         assert_eq!(commits.load(Ordering::SeqCst), 1);
-        // Re-commit is idempotent (drivers retry commits).
+        // A repeated commit answers ok again and commits nothing.
         assert!(r.commit(LS, 1).is_none());
         assert_eq!(commits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn continuation_for_unknown_txn_is_no_such_transaction() {
+    fn the_first_transaction_number_may_be_zero() {
+        let (r, _, _) = reg();
+        assert!(r.for_statement(LS, 0, true).is_ok());
+        assert!(r.commit(LS, 0).is_none());
+    }
+
+    #[test]
+    fn a_statement_for_no_transaction_names_the_session_and_active_number() {
         let (r, _, _) = reg();
         let err = r.for_statement(LS, 7, false).unwrap_err();
-        assert_eq!(err.get_i32("code").unwrap(), 251);
-        assert!(err
-            .get_array("errorLabels")
-            .unwrap()
-            .iter()
-            .any(|l| l.as_str() == Some(TRANSIENT_LABEL)));
+        assert_eq!(code(&err), 251);
+        assert!(labelled_transient(&err));
+        assert_eq!(
+            err.get_str("errmsg").unwrap(),
+            "Given transaction number 7 on session 07070707-0707-0707-0707-070707070707 - \
+             47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU= -  -  using txnRetryCounter 0 does not \
+             match any in-progress transactions. The active transaction number is -1"
+        );
     }
 
     #[test]
-    fn statement_after_commit_is_transaction_committed() {
+    fn after_commit_a_statement_and_an_abort_are_transaction_committed() {
         let (r, _, _) = reg();
         r.for_statement(LS, 1, true).unwrap();
-        r.commit(LS, 1).unwrap_none_ok();
-        let err = r.for_statement(LS, 1, false).unwrap_err();
-        assert_eq!(err.get_i32("code").unwrap(), 256);
+        assert!(r.commit(LS, 1).is_none());
+        assert_eq!(code(&r.for_statement(LS, 1, false).unwrap_err()), 256);
+        assert_eq!(code(&r.abort(LS, 1).unwrap()), 256);
     }
 
     #[test]
-    fn restart_in_progress_is_50911() {
-        let (r, _, _) = reg();
-        r.for_statement(LS, 1, true).unwrap();
-        let err = r.for_statement(LS, 1, true).unwrap_err();
-        assert_eq!(err.get_i32("code").unwrap(), 50911);
-    }
-
-    #[test]
-    fn older_start_is_transaction_too_old() {
-        let (r, _, _) = reg();
-        r.for_statement(LS, 5, true).unwrap();
-        let err = r.for_statement(LS, 3, true).unwrap_err();
-        assert_eq!(err.get_i32("code").unwrap(), 225);
-    }
-
-    #[test]
-    fn higher_start_aborts_older_in_progress() {
+    fn after_abort_everything_says_aborted_with_the_label() {
         let (r, _, rollbacks) = reg();
         r.for_statement(LS, 1, true).unwrap();
-        assert_eq!(r.in_progress_count(), 1);
+        assert!(r.abort(LS, 1).is_none());
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        for err in [
+            r.for_statement(LS, 1, false).unwrap_err(),
+            r.commit(LS, 1).unwrap(),
+            r.abort(LS, 1).unwrap(),
+        ] {
+            assert_eq!(code(&err), 251);
+            assert!(labelled_transient(&err));
+            assert_eq!(
+                err.get_str("errmsg").unwrap(),
+                "Transaction with { txnNumber: 1 } has been aborted."
+            );
+        }
+    }
+
+    #[test]
+    fn starting_at_the_active_number_is_117() {
+        let (r, _, _) = reg();
+        r.for_statement(LS, 1, true).unwrap();
+        assert_eq!(code(&r.for_statement(LS, 1, true).unwrap_err()), 117);
+        assert!(r.commit(LS, 1).is_none());
+        assert_eq!(code(&r.for_statement(LS, 1, true).unwrap_err()), 117);
+    }
+
+    #[test]
+    fn an_older_number_is_too_old_for_every_request() {
+        let (r, _, _) = reg();
+        r.for_statement(LS, 5, true).unwrap();
+        for err in [
+            r.for_statement(LS, 3, true).unwrap_err(),
+            r.for_statement(LS, 3, false).unwrap_err(),
+            r.commit(LS, 3).unwrap(),
+            r.abort(LS, 3).unwrap(),
+            r.begin_retryable(LS, 3).unwrap_err(),
+        ] {
+            assert_eq!(code(&err), 225);
+            assert!(err.get("errorLabels").is_none());
+        }
+    }
+
+    #[test]
+    fn a_higher_start_aborts_the_open_transaction() {
+        let (r, _, rollbacks) = reg();
+        r.for_statement(LS, 1, true).unwrap();
         r.for_statement(LS, 2, true).unwrap();
-        // The older txn was implicitly rolled back.
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(r.in_progress_count(), 1);
+        assert_eq!(code(&r.commit(LS, 1).unwrap()), 225);
     }
 
     #[test]
-    fn abort_unknown_has_no_label() {
-        let (r, _, _) = reg();
-        let err = r.abort(LS, 9).unwrap();
-        assert_eq!(err.get_i32("code").unwrap(), 251);
-        assert!(err.get("errorLabels").is_none());
-    }
-
-    #[test]
-    fn abort_in_progress_rolls_back() {
+    fn a_failed_statement_aborts() {
         let (r, _, rollbacks) = reg();
         let txn = r.for_statement(LS, 1, true).unwrap();
         r.abort_in_progress(&txn);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
-        // A continuation now sees NoSuchTransaction.
-        assert_eq!(
-            r.for_statement(LS, 1, false)
-                .unwrap_err()
-                .get_i32("code")
-                .unwrap(),
-            251
-        );
+        assert_eq!(code(&r.for_statement(LS, 1, false).unwrap_err()), 251);
     }
 
     #[test]
-    fn retryable_write_consumes_sequence() {
+    fn a_retryable_write_remembers_its_statements() {
         let (r, _, _) = reg();
-        r.on_retryable_write(LS, 4);
-        // A later startTransaction with a lower number is too old.
+        assert!(r.begin_retryable(LS, 4).unwrap().is_empty());
+        r.record_statements(LS, 4, vec![(0, StmtRecord::Delete)]);
         assert_eq!(
-            r.for_statement(LS, 3, true)
-                .unwrap_err()
-                .get_i32("code")
-                .unwrap(),
-            225
+            r.begin_retryable(LS, 4).unwrap().get(&0),
+            Some(&StmtRecord::Delete)
         );
-        // Reusing the consumed number can't start a transaction.
-        assert_eq!(
-            r.for_statement(LS, 4, true)
-                .unwrap_err()
-                .get_i32("code")
-                .unwrap(),
-            50911
-        );
+        // A newer number starts with nothing, and the old one is refused.
+        assert!(r.begin_retryable(LS, 5).unwrap().is_empty());
+        assert_eq!(code(&r.begin_retryable(LS, 4).unwrap_err()), 225);
+        // Another session has its own numbers.
+        assert!(r.begin_retryable(&[9u8; 16], 4).unwrap().is_empty());
     }
 
-    /// Tiny helper so `commit().unwrap_none()` reads cleanly in tests.
-    trait OptionExt {
-        fn unwrap_none_ok(self);
+    #[test]
+    fn a_retryable_write_and_a_transaction_share_the_numbers() {
+        let (r, _, rollbacks) = reg();
+        r.begin_retryable(LS, 4).unwrap();
+        assert_eq!(code(&r.for_statement(LS, 4, true).unwrap_err()), 117);
+        assert_eq!(code(&r.for_statement(LS, 4, false).unwrap_err()), 251);
+        r.for_statement(LS, 5, true).unwrap();
+        assert_eq!(code(&r.begin_retryable(LS, 5).unwrap_err()), 217);
+        // A newer retryable write aborts the open transaction.
+        r.begin_retryable(LS, 6).unwrap();
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
     }
-    impl OptionExt for Option<Document> {
-        fn unwrap_none_ok(self) {
-            assert!(self.is_none(), "expected ok (None), got {self:?}");
-        }
+
+    #[test]
+    fn an_idle_transaction_is_aborted_and_an_idle_session_forgotten() {
+        let now = Arc::new(AtomicU64::new(1000));
+        let n2 = now.clone();
+        let r = TransactionRegistry::new(
+            Box::new(|_t| {}),
+            Box::new(|_t| {}),
+            60.0,
+            Box::new(move || n2.load(Ordering::SeqCst) as f64),
+        );
+        r.for_statement(LS, 1, true).unwrap();
+        now.fetch_add(61, Ordering::SeqCst);
+        assert_eq!(code(&r.for_statement(LS, 1, false).unwrap_err()), 251);
+        now.fetch_add(31 * 60, Ordering::SeqCst);
+        // Forgotten: the number may be used afresh.
+        assert!(r.for_statement(LS, 1, true).is_ok());
     }
 }

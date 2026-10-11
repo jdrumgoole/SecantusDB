@@ -10118,8 +10118,12 @@ impl Storage {
             o.insert("max", max_entries);
             return Ok(o);
         }
-        // Lock-free read (see the `lock` field's invariants).
-        let session = self.conn.open_session()?;
+        // Lock-free read (see the `lock` field's invariants), on the
+        // transaction's session inside a user transaction: a collection that
+        // transaction created has options -- a validator, say -- that its own
+        // later statements must be held to, and a fresh session cannot see
+        // them before the commit.
+        let session = self.op_session()?;
         Ok(coll_options(&session, db, coll)?.unwrap_or_default())
     }
 
@@ -10131,8 +10135,9 @@ impl Storage {
         if self.is_oplog_rs(db, coll) {
             return Ok(true);
         }
-        // Lock-free read (see the `lock` field's invariants).
-        let session = self.conn.open_session()?;
+        // Lock-free read (see the `lock` field's invariants); the
+        // transaction's session inside one, as `get_collection_options`.
+        let session = self.op_session()?;
         Ok(coll_options(&session, db, coll)?
             .map(|o| o.get_bool("capped").unwrap_or(false))
             .unwrap_or(false))
