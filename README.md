@@ -191,9 +191,10 @@ gauge measures the protocol and the type system. The query language now
 covers joins, correlated subqueries and CTEs, window functions, `GROUP BY`
 with `GROUPING SETS`, views, indexes, `ALTER TABLE`, `ON CONFLICT`,
 `MERGE`, triggers and PL/pgSQL functions, and it offers TLS
-(`--tls-cert-file` / `--tls-key-file`). Not yet: TLS client certificates and
-channel binding, a foreign table's rows, and a collection written through
-the MongoDB server read as a table.
+(`--tls-cert-file` / `--tls-key-file`), with client certificates and SCRAM
+channel binding in the release after 0.1.0-beta.9. Not yet: a foreign
+table's rows, and a collection written through the MongoDB server read as a
+table.
 `EXPLAIN` prints a plan with zero costs. What it does not do it refuses
 with SQLSTATE `0A000` rather than answering wrongly.
 

@@ -2222,6 +2222,7 @@ name = "secantus-pg"
 version = "0.1.0-beta.9"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bson",
  "bytes",
  "futures",
@@ -2236,6 +2237,7 @@ dependencies = [
  "secantus-pgwire",
  "secantus-storage",
  "serde_json",
+ "sha2 0.10.9",
  "stacker",
  "tempfile",
  "tokio",

@@ -75,6 +75,7 @@ const CATALOG_NAMES: &[&str] = &[
     "current_database",
     "current_catalog",
     "current_setting",
+    "pg_backend_pid",
     "format_type",
     "obj_description",
     "col_description",
@@ -235,6 +236,18 @@ thread_local! {
     /// `(transaction start, statement start)` in Unix microseconds, as the
     /// executor installs them per statement (`set_clocks`).
     static CLOCKS: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// The PID of the backend this thread serves, as its `BackendKeyData`
+    /// carried it (`set_backend_pid`).
+    static BACKEND_PID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Install the PID `pg_backend_pid()` answers inside an expression on this
+/// thread. A connection's statements all run on its own thread.
+pub fn set_backend_pid(pid: i32) {
+    BACKEND_PID.with(|p| p.set(pid));
 }
 
 /// Install the transaction's and the statement's start for the statements
@@ -1653,6 +1666,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             out.extend(path.into_iter().map(Bson::String));
             Ok(Bson::Array(out))
         }
+        "pg_backend_pid" => Ok(Bson::Int32(BACKEND_PID.with(|p| p.get()))),
         "current_setting" => {
             let Some(Bson::String(key)) = args.first() else {
                 return Ok(Bson::Null);

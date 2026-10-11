@@ -19689,6 +19689,8 @@ class _Certificates:
 
         ca = trustme.CA()
         issued = ca.issue_cert("localhost", "127.0.0.1")
+        self._ca = ca
+        self._directory = directory
         self.cert = directory / "server.crt"
         self.key = directory / "server.key"
         self.ca = directory / "ca.pem"
@@ -19701,6 +19703,32 @@ class _Certificates:
     @property
     def args(self) -> tuple[str, ...]:
         return ("--tls-cert-file", str(self.cert), "--tls-key-file", str(self.key))
+
+    @property
+    def ca_args(self) -> tuple[str, ...]:
+        """`args`, with the CA a client certificate must be signed by."""
+        return (*self.args, "--tls-ca-file", str(self.ca))
+
+    def client(self, common_name: str, *, stranger: bool = False) -> dict[str, str]:
+        """libpq's parameters for a client certificate naming `common_name`,
+        signed by the CA, or by one the server has never seen."""
+        import trustme
+
+        ca = trustme.CA() if stranger else self._ca
+        issued = ca.issue_cert(f"{common_name}@example.com", common_name=common_name)
+        stem = f"{'stranger-' if stranger else ''}{common_name}"
+        cert = self._directory / f"{stem}.crt"
+        key = self._directory / f"{stem}.key"
+        cert.write_bytes(b"".join(blob.bytes() for blob in issued.cert_chain_pems))
+        issued.private_key_pem.write_to_path(str(key))
+        key.chmod(0o600)
+        return {"sslcert": str(cert), "sslkey": str(key)}
+
+    @property
+    def no_client(self) -> dict[str, str]:
+        """No client certificate, whatever is in the user's `~/.postgresql`."""
+        absent = self._directory / "absent"
+        return {"sslcert": f"{absent}.crt", "sslkey": f"{absent}.key"}
 
 
 def _tls_connect(server: _Server, **params: str) -> psycopg.Connection:
@@ -19760,12 +19788,12 @@ def test_a_server_with_a_certificate_serves_tls(home: Path, tmp_path: Path) -> N
 
 
 def test_a_password_is_checked_over_tls(home: Path, tmp_path: Path) -> None:
-    """SCRAM-SHA-256 runs inside the TLS session as it does outside one.
+    """SCRAM-SHA-256 runs inside the TLS session, bound to it when asked.
 
-    Channel binding (`SCRAM-SHA-256-PLUS`) is not offered, so a client that
-    REQUIRES it gives up. PostgreSQL 15.19 offers it and that client connects:
-    a divergence, listed in tasks/backlog.md. The other three steps answer as
-    PostgreSQL does.
+    Over TLS the server offers `SCRAM-SHA-256-PLUS`, so a client that
+    REQUIRES channel binding connects; in the clear there is no channel, and
+    libpq refuses before it sends anything. Every step answers as PostgreSQL
+    15.19 does (measured 2026-10-11).
     """
     certs = _Certificates(tmp_path)
     with _Server(home, args=certs.args) as server:
@@ -19781,14 +19809,289 @@ def test_a_password_is_checked_over_tls(home: Path, tmp_path: Path) -> None:
         with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
             _tls_connect(server, sslmode="require", user="alice", password="wrong")
 
-        with pytest.raises(psycopg.OperationalError, match="channel binding"):
+        for binding in ("require", "prefer", "disable"):
+            with _tls_connect(
+                server,
+                sslmode="require",
+                channel_binding=binding,
+                user="alice",
+                password="correct horse",
+            ) as conn:
+                assert conn.execute("select current_user").fetchone() == ("alice",), binding
+        with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
             _tls_connect(
                 server,
                 sslmode="require",
                 channel_binding="require",
                 user="alice",
+                password="wrong",
+            )
+        with pytest.raises(psycopg.OperationalError, match="channel binding"):
+            _tls_connect(
+                server,
+                sslmode="disable",
+                channel_binding="require",
+                user="alice",
                 password="correct horse",
             )
+
+
+def _scram_first(
+    server: _Server, certs: _Certificates | None, mechanism: str | None, header: str
+) -> tuple[str | None, ...]:
+    """Start a SCRAM login as `alice` by hand, over TLS when `certs` is given.
+
+    libpq picks the mechanism and the channel-binding header itself, and
+    never sends the pairs a server has to refuse. Returns the mechanisms
+    offered (for `mechanism=None`), or the server's answer to the first
+    message: `("continue",)`, or an error's SQLSTATE, message and detail.
+    """
+    import socket
+    import ssl
+
+    sock = socket.create_connection(("127.0.0.1", server.port), timeout=15)
+    try:
+        if certs is not None:
+            sock.sendall(struct.pack("!II", 8, 80877103))
+            assert sock.recv(1) == b"S"
+            context = ssl.create_default_context(cafile=str(certs.ca))
+            context.check_hostname = False
+            sock = context.wrap_socket(sock)
+        startup = struct.pack("!I", 196608) + b"user\0alice\0database\0postgres\0\0"
+        sock.sendall(struct.pack("!I", len(startup) + 4) + startup)
+
+        def read() -> tuple[bytes, bytes]:
+            head = b""
+            while len(head) < 5:
+                head += sock.recv(5 - len(head))
+            body = b""
+            while len(body) < struct.unpack("!I", head[1:])[0] - 4:
+                body += sock.recv(4096)
+            return head[:1], body
+
+        kind, body = read()
+        assert kind == b"R" and struct.unpack("!I", body[:4])[0] == 10, (kind, body)
+        if mechanism is None:
+            return tuple(name.decode() for name in body[4:].split(b"\0") if name)
+        first = f"{header}n=,r=rOprNGfwEbeRWgbNEkqO".encode()
+        message = mechanism.encode() + b"\0" + struct.pack("!I", len(first)) + first
+        sock.sendall(b"p" + struct.pack("!I", len(message) + 4) + message)
+        kind, body = read()
+        if kind == b"R":
+            assert struct.unpack("!I", body[:4])[0] == 11, body
+            return ("continue",)
+        fields = {chr(part[0]): part[1:].decode() for part in body.split(b"\0") if part}
+        return (fields.get("C"), fields.get("M"), fields.get("D"))
+    finally:
+        sock.close()
+
+
+def test_a_scram_login_cannot_be_talked_out_of_its_channel_binding(
+    home: Path, tmp_path: Path
+) -> None:
+    """The pairs of mechanism and GS2 header a server must refuse.
+
+    A client that can bind the exchange to TLS but was not offered it says so
+    (`y,,`). Over TLS this server DID offer it, so something between the two
+    removed the offer, and the login is refused: that check is what channel
+    binding exists for. Each answer is PostgreSQL 15.19's, SQLSTATE, message
+    and detail (measured 2026-10-11).
+    """
+    certs = _Certificates(tmp_path)
+    plain, plus = "SCRAM-SHA-256", "SCRAM-SHA-256-PLUS"
+    bound = "p=tls-server-end-point,,"
+    with _Server(home, args=certs.args) as server:
+        with _tls_connect(server, sslmode="require") as conn:
+            conn.execute("create role alice login password 'correct horse'")
+
+        assert _scram_first(server, certs, None, "") == (plus, plain)
+        assert _scram_first(server, None, None, "") == (plain,)
+
+        assert _scram_first(server, certs, plus, bound) == ("continue",)
+        assert _scram_first(server, certs, plain, "n,,") == ("continue",)
+        # In the clear nothing was offered, so `y,,` is the truth.
+        assert _scram_first(server, None, plain, "y,,") == ("continue",)
+
+        assert _scram_first(server, certs, plain, "y,,") == (
+            "28000",
+            "SCRAM channel binding negotiation error",
+            "The client supports SCRAM channel binding but thinks the server does not.  "
+            "However, this server does support channel binding.",
+        )
+        no_data = (
+            "08P01",
+            "malformed SCRAM message",
+            "The client selected SCRAM-SHA-256-PLUS, but the SCRAM message does not "
+            "include channel binding data.",
+        )
+        assert _scram_first(server, certs, plus, "n,,") == no_data
+        assert _scram_first(server, certs, plus, "y,,") == no_data
+        assert _scram_first(server, certs, plain, bound) == (
+            "08P01",
+            "malformed SCRAM message",
+            "The client selected SCRAM-SHA-256 without channel binding, but the SCRAM "
+            "message includes channel binding data.",
+        )
+        assert _scram_first(server, certs, plus, "p=tls-unique,,") == (
+            "08P01",
+            'unsupported SCRAM channel-binding type "tls-unique"',
+            None,
+        )
+        invalid = ("08P01", "client selected an invalid SASL authentication mechanism", None)
+        assert _scram_first(server, None, plus, bound) == invalid
+        assert _scram_first(server, certs, "SCRAM-SHA-1", "n,,") == invalid
+
+
+def test_a_server_can_refuse_a_connection_that_is_not_tls(home: Path, tmp_path: Path) -> None:
+    """`--tls-require`: a `pg_hba.conf` whose only lines are `hostssl`.
+
+    PostgreSQL 15.19 with such a file answers a plaintext startup with the
+    same message and 28000 (measured 2026-10-11). libpq's default,
+    `sslmode=prefer`, asks for TLS first and so connects.
+    """
+    certs = _Certificates(tmp_path)
+    with _Server(home, args=(*certs.args, "--tls-require")) as server:
+        with pytest.raises(
+            psycopg.OperationalError,
+            match='no pg_hba.conf entry for host "127.0.0.1", user "test", '
+            'database "postgres", no encryption',
+        ):
+            _tls_connect(server, sslmode="disable")
+        for mode in ("prefer", "require"):
+            with _tls_connect(server, sslmode=mode) as conn:
+                assert conn.pgconn.ssl_in_use, mode
+
+
+@pytest.mark.parametrize("mode", ["optional", "verify-ca", "verify-full", "cert"])
+def test_client_certificates(home: Path, tmp_path: Path, mode: str) -> None:
+    """`--tls-ca-file` and the three `--tls-client-cert` modes.
+
+    `alice` and `bob` have a password, `carol` has none; the certificate
+    names `alice`. Each cell is what PostgreSQL 15.19 answers with
+    `ssl_ca_file` set and `hostssl` lines carrying no option,
+    `clientcert=verify-ca`, `clientcert=verify-full`, or the `cert` method
+    (measured 2026-10-11). Under `verify-full` the name check comes AFTER
+    the password and fails as the method that let the login in, which is why
+    `bob` reads "password authentication failed" with the right password.
+    """
+    certs = _Certificates(tmp_path)
+    alice = certs.client("alice")
+    with (
+        _Server(home, args=certs.ca_args) as server,
+        _tls_connect(server, sslmode="require", **certs.no_client) as conn,
+    ):
+        conn.execute("create role alice login password 'pw'")
+        conn.execute("create role bob login password 'pw'")
+        conn.execute("create role carol login")
+
+    def attempt(user: str, cert: dict[str, str], password: str | None = "pw") -> str:
+        params = {"sslmode": "require", "user": user, **cert}
+        if password is not None and user != "carol":
+            params["password"] = password
+        try:
+            with _tls_connect(server, **params) as conn:
+                row = conn.execute("select current_user").fetchone()
+                assert row == (user,)
+                return "ok"
+        except psycopg.OperationalError as exc:
+            return str(exc).strip().splitlines()[-1].split("FATAL:  ")[-1]
+
+    needs_cert = "connection requires a valid client certificate"
+    expected = {
+        # (alice + cert, alice no cert, bob + alice's cert, carol + alice's cert)
+        "optional": ("ok", "ok", "ok", "ok"),
+        "verify-ca": ("ok", needs_cert, "ok", "ok"),
+        "verify-full": (
+            "ok",
+            needs_cert,
+            'password authentication failed for user "bob"',
+            '"trust" authentication failed for user "carol"',
+        ),
+        "cert": (
+            "ok",
+            needs_cert,
+            'certificate authentication failed for user "bob"',
+            'certificate authentication failed for user "carol"',
+        ),
+    }[mode]
+    flags = () if mode == "optional" else ("--tls-client-cert", mode)
+    with _Server(home, args=(*certs.ca_args, *flags)) as server:
+        got = (
+            attempt("alice", alice),
+            attempt("alice", certs.no_client),
+            attempt("bob", alice),
+            attempt("carol", alice),
+        )
+        assert got == expected
+        # A certificate the CA did not sign fails the handshake itself.
+        stranger = attempt("alice", certs.client("alice", stranger=True))
+        assert "unknown ca" in stranger, stranger
+        # `cert` asks for no password; the other modes still do.
+        no_password = attempt("alice", alice, password=None)
+        if mode == "cert":
+            assert no_password == "ok"
+        else:
+            assert no_password.endswith("fe_sendauth: no password supplied"), no_password
+        if mode != "optional":
+            # A client certificate is a TLS matter: `clientcert` goes on a
+            # `hostssl` line only, so the connection in the clear matches none.
+            with pytest.raises(psycopg.OperationalError, match="no encryption"):
+                _tls_connect(server, sslmode="disable", user="carol")
+
+
+def test_pg_stat_ssl_reports_each_backends_session(home: Path, tmp_path: Path) -> None:
+    """`pg_stat_ssl`: one row a backend, with OpenSSL's names for the session.
+
+    PostgreSQL 15.19 reports the same version, cipher and key size for the
+    same client, and prints the certificate's names the same way (measured
+    2026-10-11); the cipher is the one libpq 18 and each server settle on.
+    """
+    certs = _Certificates(tmp_path)
+    alice = certs.client("alice")
+    mine = (
+        "select ssl, version, cipher, bits, client_dn, client_serial, issuer_dn "
+        "from pg_stat_ssl where pid = pg_backend_pid()"
+    )
+    with _Server(home, args=certs.ca_args) as server:
+        with _tls_connect(server, sslmode="disable") as clear:
+            assert clear.execute(mine).fetchone() == (False, None, None, None, None, None, None)
+
+            with _tls_connect(server, sslmode="require", **certs.no_client) as conn:
+                assert conn.execute(mine).fetchone() == (
+                    True,
+                    "TLSv1.3",
+                    "TLS_AES_256_GCM_SHA384",
+                    256,
+                    None,
+                    None,
+                    None,
+                )
+                # Both backends are listed, one of them over TLS.
+                rows = clear.execute("select ssl from pg_stat_ssl order by ssl").fetchall()
+                assert rows == [(False,), (True,)]
+
+        with _tls_connect(
+            server, sslmode="require", ssl_max_protocol_version="TLSv1.2", **certs.no_client
+        ) as conn:
+            assert conn.execute(mine).fetchone()[:4] == (
+                True,
+                "TLSv1.2",
+                "ECDHE-ECDSA-AES256-GCM-SHA384",
+                256,
+            )
+
+        with _tls_connect(server, sslmode="require", **alice) as conn:
+            row = conn.execute(mine).fetchone()
+            assert row is not None
+            client_dn, client_serial, issuer_dn = row[4:]
+            assert re.fullmatch(r"/O=trustme v[^/]+/OU=Testing cert #[^/]+/CN=alice", client_dn)
+            assert re.fullmatch(r"/O=trustme v[^/]+/OU=Testing CA #[^/]+", issuer_dn)
+            # The serial as the certificate carries it, a number of about 48
+            # digits: wider than a float, and not rounded on the way out.
+            from cryptography import x509
+
+            loaded = x509.load_pem_x509_certificate(Path(alice["sslcert"]).read_bytes())
+            assert client_serial == Decimal(loaded.serial_number)
 
 
 def test_without_a_certificate_a_tls_request_is_declined(home: Path) -> None:
@@ -19836,6 +20139,22 @@ def test_a_server_that_cannot_use_its_certificate_does_not_start(
         # A misspelt option used to become the storage path, and the server
         # came up over a directory named after it.
         (("--tls-cert", str(certs.cert)), "unknown option: --tls-cert"),
+        # An option that says what a TLS connection is held to, with no TLS.
+        (("--tls-require",), "--tls-require needs --tls-cert-file and --tls-key-file"),
+        (
+            ("--tls-ca-file", str(certs.ca)),
+            "--tls-ca-file needs --tls-cert-file and --tls-key-file",
+        ),
+        # A client certificate nothing could check.
+        (
+            (*certs.args, "--tls-client-cert", "verify-ca"),
+            "--tls-client-cert needs --tls-ca-file",
+        ),
+        (
+            (*certs.ca_args, "--tls-client-cert", "required"),
+            "is not verify-ca, verify-full or cert",
+        ),
+        ((*certs.args, "--tls-ca-file", str(certs.key)), "holds no certificate"),
     ]
     for args, expected in cases:
         done = subprocess.run(

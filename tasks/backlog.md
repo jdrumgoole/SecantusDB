@@ -4303,28 +4303,31 @@ These work end-to-end but cut corners.
 
 ### 3.1 Authentication
 
-- [ ] **RUST PG server: TLS has no channel binding, no client
-  certificates and no `pg_stat_ssl`.** The server side is in since
-  2026-10-10: `secantusd-pg --tls-cert-file C --tls-key-file K`
-  (`PgBuilder::tls`, `bind_tls`), `crates/secantus-pg/src/tls.rs`. Measured against
-  PostgreSQL 15.19 with `ssl = on` and the same certificate
-  (`require` / `verify-ca` / `verify-full` / a TLS 1.2 ceiling / `disable`,
-  `SHOW ssl`, `RESET ALL`, `SET ssl` 55P02, SCRAM over TLS): the same. Open:
-  - **No channel binding.** `SCRAM-SHA-256-PLUS` is not offered, so
-    `channel_binding=require` with a password fails in the client
-    ("channel binding is required, but server did not offer an
-    authentication method that supports channel binding") where PostgreSQL
-    connects. It needs the `tls-server-end-point` hash of the server
-    certificate in `secantus_auth::begin_scram_pg`.
-  - **No client certificates**: no `clientcert=verify-ca` / `verify-full`
-    and no `cert` authentication. The acceptor is built
-    `with_no_client_auth`.
-  - **`pg_stat_ssl` cannot be read** (42P01; it is listed in `pg_class` and
-    was unreadable before TLS too). It needs the negotiated protocol and
-    cipher out of the wire crate's `ClientInfo`, and OpenSSL's names for
-    rustls' suites.
-  - **A plaintext connection is always accepted**; there is no `hostssl`
-    equivalent to refuse one.
+- [ ] **RUST PG server: TLS login policy is server-wide, with no
+  revocation list or name map.** TLS is in since 2026-10-10
+  (`crates/secantus-pg/src/tls.rs`), and since 2026-10-11 SCRAM channel
+  binding (`scram_binding.rs`), client certificates (`--tls-ca-file`,
+  `--tls-client-cert verify-ca|verify-full|cert`), `--tls-require` and
+  `pg_stat_ssl`. Measured against PostgreSQL 15.19 in five `pg_hba.conf`
+  configurations (open, `hostssl` only, `clientcert=verify-ca`,
+  `clientcert=verify-full`, `cert`), 154 scenarios through psycopg 3.3.4 and
+  a hand-written SCRAM client: 150 the same. Open:
+  - **A user this server has never heard of is trusted**, with or without
+    TLS; PostgreSQL asks it for a password. This is the four scenarios that
+    differ. Test fixtures connect as roles nobody created, so it is a
+    decision and not an oversight; under `verify-full` and `cert` the
+    certificate must still name the user.
+  - **One policy for every user and database.** `pg_hba.conf` chooses a
+    method by line; here `--tls-require` and `--tls-client-cert` apply to
+    every connection.
+  - **No certificate revocation list** (`ssl_crl_file`), **no user name map**
+    (`pg_ident.conf`, `map=`), and no match on the whole DN
+    (`clientname=DN`): the common name must be the user name.
+  - **Channel binding is not offered for a certificate signed with RSA-PSS
+    or Ed25519**, whose signature names no hash (`x509::end_point_hash`).
+    PostgreSQL 15 offers it and fails the login when the client takes it up.
+  - **`pg_stat_ssl` prints `UNDEF` for an attribute type outside
+    `x509::short_name`'s table**, where OpenSSL knows more names.
   - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
     PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
   - The key must have no passphrase, and the files are read once at

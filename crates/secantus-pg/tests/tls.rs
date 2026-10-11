@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls_pki_types::{CertificateDer, ServerName};
-use secantus_pg::{Error, PgServer};
+use secantus_pg::{ClientCert, Error, PgServer, TlsConfig};
 use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -93,8 +93,8 @@ async fn until_ready<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<(u8, Vec<u8>)>
     }
 }
 
-/// Log in as `postgres`, with no password.
-async fn startup<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
+/// Send the startup packet of a login as `postgres`.
+async fn send_startup<S: AsyncWrite + Unpin>(stream: &mut S) {
     let mut body = Vec::new();
     body.extend_from_slice(&196_608u32.to_be_bytes());
     body.extend_from_slice(b"user\0postgres\0database\0postgres\0\0");
@@ -103,7 +103,20 @@ async fn startup<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
         .await
         .expect("startup length");
     stream.write_all(&body).await.expect("startup");
+}
+
+/// Log in as `postgres`, with no password.
+async fn startup<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
+    send_startup(stream).await;
     until_ready(stream).await;
+}
+
+/// Try to log in as `postgres` and return the error the server refuses with.
+async fn refusal<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> String {
+    send_startup(stream).await;
+    let (kind, body) = read_message(stream).await;
+    assert_eq!(kind, b'E', "an ErrorResponse");
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 /// The single value the last statement of `sql` answers.
@@ -219,4 +232,120 @@ fn a_server_that_cannot_use_its_certificate_does_not_start() {
     assert!(start_error(&cert.cert_file(), &other.key_file()).contains("cannot be used together"));
     // The key file where the certificate should be.
     assert!(start_error(&cert.key_file(), &cert.key_file()).contains("holds no certificate"));
+}
+
+fn server_with(tls: TlsConfig) -> PgServer {
+    PgServer::builder()
+        .tls_config(tls)
+        .start()
+        .expect("start with TLS")
+}
+
+#[tokio::test]
+async fn a_server_that_requires_tls_refuses_a_connection_in_the_clear() {
+    let cert = Certificate::new();
+    let server = server_with(TlsConfig::new(cert.cert_file(), cert.key_file()).require_tls(true));
+
+    let mut plain = TcpStream::connect(server.address()).await.expect("connect");
+    let message = refusal(&mut plain).await;
+    // PostgreSQL's words for a connection no `pg_hba.conf` line matches,
+    // when the only lines are `hostssl`.
+    assert!(message.contains("C28000"), "{message}");
+    assert!(
+        message.contains(
+            "no pg_hba.conf entry for host \"127.0.0.1\", user \"postgres\", \
+             database \"postgres\", no encryption"
+        ),
+        "{message}"
+    );
+
+    let mut stream = TcpStream::connect(server.address()).await.expect("connect");
+    assert_eq!(ssl_request(&mut stream).await, b'S');
+    let name = ServerName::try_from("localhost").expect("a DNS name");
+    let mut tls = cert
+        .connector()
+        .connect(name, stream)
+        .await
+        .expect("handshake");
+    startup(&mut tls).await;
+    assert_eq!(query(&mut tls, "select 1").await, "1");
+}
+
+#[tokio::test]
+async fn a_required_client_certificate_that_is_not_sent_is_refused() {
+    let cert = Certificate::new();
+    // The server certificate doubles as the CA here: no client in this test
+    // presents anything for it to check.
+    let server = server_with(
+        TlsConfig::new(cert.cert_file(), cert.key_file())
+            .ca_file(cert.cert_file())
+            .client_cert(ClientCert::VerifyCa),
+    );
+
+    let stream = TcpStream::connect(server.address()).await.expect("connect");
+    let mut stream = stream;
+    assert_eq!(ssl_request(&mut stream).await, b'S');
+    let name = ServerName::try_from("localhost").expect("a DNS name");
+    // The handshake completes; it is the login that is refused, with a
+    // message the client can read.
+    let mut tls = cert
+        .connector()
+        .connect(name, stream)
+        .await
+        .expect("handshake");
+    let message = refusal(&mut tls).await;
+    assert!(
+        message.contains("connection requires a valid client certificate"),
+        "{message}"
+    );
+
+    // And a client certificate is a TLS matter, so the clear is refused too.
+    let mut plain = TcpStream::connect(server.address()).await.expect("connect");
+    assert!(refusal(&mut plain).await.contains("no encryption"));
+}
+
+#[tokio::test]
+async fn pg_stat_ssl_shows_each_backends_session() {
+    let cert = Certificate::new();
+    let server = tls_server(&cert);
+    let mine = "from pg_stat_ssl where pid = pg_backend_pid()";
+
+    let mut plain = TcpStream::connect(server.address()).await.expect("connect");
+    startup(&mut plain).await;
+    assert_eq!(query(&mut plain, &format!("select ssl {mine}")).await, "f");
+
+    let mut stream = TcpStream::connect(server.address()).await.expect("connect");
+    assert_eq!(ssl_request(&mut stream).await, b'S');
+    let name = ServerName::try_from("localhost").expect("a DNS name");
+    let mut tls = cert
+        .connector()
+        .connect(name, stream)
+        .await
+        .expect("handshake");
+    startup(&mut tls).await;
+    assert_eq!(query(&mut tls, &format!("select ssl {mine}")).await, "t");
+    assert_eq!(
+        query(&mut tls, &format!("select version {mine}")).await,
+        "TLSv1.3"
+    );
+    // OpenSSL's name for the suite, as PostgreSQL reports it.
+    let cipher = query(&mut tls, &format!("select cipher {mine}")).await;
+    assert!(cipher.starts_with("TLS_"), "{cipher}");
+    // One row a backend. (The whole view is not counted: the tests of this
+    // file share a process, and so a backend registry.)
+    assert_eq!(
+        query(&mut tls, &format!("select count(*) {mine}")).await,
+        "1"
+    );
+}
+
+#[test]
+fn a_client_certificate_cannot_be_required_without_a_ca_to_check_it() {
+    let cert = Certificate::new();
+    let tls = TlsConfig::new(cert.cert_file(), cert.key_file()).client_cert(ClientCert::Cert);
+    match PgServer::builder().tls_config(tls).start() {
+        Err(Error::Config(message)) => assert!(message.contains("CA file"), "{message}"),
+        Err(other) => panic!("expected a configuration error, got {other:?}"),
+        Ok(_) => panic!("the server started with a requirement it cannot check"),
+    }
 }
