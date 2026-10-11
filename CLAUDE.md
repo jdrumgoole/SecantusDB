@@ -310,8 +310,9 @@ one request path:
   - Scored by psycopg 3's own unmodified suite: **5,544 pass, none fail**, of
     5,731 that ran (149 skipped, 34 xfailed, 4 xpassed; 58 more deselected by
     the gauge's macOS list), measured 2026-10-11 on macOS with psycopg 3.3.4
-    against the tree of PR #1876 (released as 0.1.0-beta.10), in 1,046 s; the
-    run before it, on PR #1864's tree (0.1.0-beta.9), had the same counts in
+    against the tree of PR #1884 (released as 0.1.0-beta.11), in 1,364 s; the
+    run before it, on PR #1876's tree (0.1.0-beta.10), had the same counts in
+    1,046 s, and the one before that, on PR #1864's tree (0.1.0-beta.9), had the same counts in
     1,480 s. A run on PR #1874's tree the same day had two failures, both
     `test_cursor_raw_async.py::test_leak`, which counts Python objects in the
     client process and passed on three re-runs. The
