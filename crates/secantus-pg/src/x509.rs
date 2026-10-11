@@ -214,20 +214,22 @@ fn string_value(value: Tlv<'_>) -> Value {
         // TeletexString, which OpenSSL reads as Latin-1.
         0x14 => Some(value.body.iter().map(|&b| char::from(b)).collect()),
         // BMPString: UTF-16, big-endian.
-        0x1e if value.body.len() % 2 == 0 => {
-            let units: Vec<u16> = value
-                .body
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect();
-            String::from_utf16(&units).ok()
+        0x1e => {
+            let (pairs, rest) = value.body.as_chunks::<2>();
+            let units: Vec<u16> = pairs.iter().map(|c| u16::from_be_bytes(*c)).collect();
+            rest.is_empty()
+                .then(|| String::from_utf16(&units).ok())
+                .flatten()
         }
         // UniversalString: UTF-32, big-endian.
-        0x1c if value.body.len() % 4 == 0 => value
-            .body
-            .chunks_exact(4)
-            .map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
-            .collect(),
+        0x1c => {
+            let (quads, rest) = value.body.as_chunks::<4>();
+            let text: Option<String> = quads
+                .iter()
+                .map(|c| char::from_u32(u32::from_be_bytes(*c)))
+                .collect();
+            text.filter(|_| rest.is_empty())
+        }
         _ => None,
     };
     match text {

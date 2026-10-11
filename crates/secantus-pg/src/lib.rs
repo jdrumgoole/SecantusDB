@@ -160,6 +160,15 @@ pub struct BackendEntry {
     tls: OnceLock<TlsSession>,
 }
 
+/// A password login in progress: the role, its stored credentials, and --
+/// once the client's first SASL message arrived -- the SCRAM exchange with
+/// that message's checked channel-binding header.
+type PasswordLogin = (
+    String,
+    secantus_auth::StoredCredentials,
+    Option<(secantus_auth::ScramState, scram_binding::ClientFirst)>,
+);
+
 /// What `pg_stat_ssl` reports for one backend over TLS.
 #[derive(Clone)]
 struct TlsSession {
@@ -3034,13 +3043,7 @@ pub struct PgHandler {
     running_apart: AtomicBool,
     /// A password login in progress: the role, its stored credentials, and --
     /// once the client's first SASL message arrived -- the SCRAM exchange.
-    auth: Mutex<
-        Option<(
-            String,
-            secantus_auth::StoredCredentials,
-            Option<(secantus_auth::ScramState, scram_binding::ClientFirst)>,
-        )>,
-    >,
+    auth: Mutex<Option<PasswordLogin>>,
     /// An md5 password login in progress: the role, its stored
     /// `md5<hex>` hash, and the salt sent to the client.
     md5_auth: Mutex<Option<(String, String, [u8; 4])>>,
