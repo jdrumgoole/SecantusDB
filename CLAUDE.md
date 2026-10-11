@@ -668,6 +668,11 @@ one request path:
     `--tls-client-cert verify-ca|verify-full|cert`), `--tls-require` and
     `pg_stat_ssl`. The server has no `pg_hba.conf`: those options are the
     lines it can stand for, and `TlsPolicy` is what a login is held to.
+    Since 2026-10-11 also revocation lists (`--tls-crl-file`, checked by
+    `crl.rs` and not by rustls, which cannot read a list without
+    extensions), a user name map (`ident.rs`, `--tls-ident-file` /
+    `--tls-user-map`), `--tls-client-name DN`, and a reload of the files
+    on SIGHUP or `pg_reload_conf()` (`tls::LiveTls`).
     `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
     pass SCRAM-SHA-256; a role with none, and an unknown user, are still

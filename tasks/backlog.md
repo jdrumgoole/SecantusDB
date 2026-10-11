@@ -4303,8 +4303,7 @@ These work end-to-end but cut corners.
 
 ### 3.1 Authentication
 
-- [ ] **RUST PG server: TLS login policy is server-wide, with no
-  revocation list or name map.** TLS is in since 2026-10-10
+- [ ] **RUST PG server: TLS login policy is server-wide.** TLS is in since 2026-10-10
   (`crates/secantus-pg/src/tls.rs`), and since 2026-10-11 SCRAM channel
   binding (`scram_binding.rs`), client certificates (`--tls-ca-file`,
   `--tls-client-cert verify-ca|verify-full|cert`), `--tls-require` and
@@ -4324,18 +4323,33 @@ These work end-to-end but cut corners.
   - **One policy for every user and database.** `pg_hba.conf` chooses a
     method by line; here `--tls-require` and `--tls-client-cert` apply to
     every connection.
-  - **No certificate revocation list** (`ssl_crl_file`), **no user name map**
-    (`pg_ident.conf`, `map=`), and no match on the whole DN
-    (`clientname=DN`): the common name must be the user name.
-  - **Channel binding is not offered for a certificate signed with RSA-PSS
-    or Ed25519**, whose signature names no hash (`x509::end_point_hash`).
-    PostgreSQL 15 offers it and fails the login when the client takes it up.
+  - Revocation lists (`--tls-crl-file`), a user name map
+    (`--tls-ident-file` / `--tls-user-map`), `--tls-client-name DN`,
+    channel binding for RSA-PSS and Ed25519 certificates, and a reload on
+    SIGHUP / `pg_reload_conf()` landed 2026-10-11. A second comparison
+    (`tls_gaps_ref.py`, 480 scenarios: lists that are current,
+    empty, expired, dated in the future, from another CA, forged, with and
+    without extensions, through an intermediate CA; maps by exact name and
+    by pattern; `clientname=DN`; three server certificates; the reload):
+    480 the same. An earlier version of this entry said PostgreSQL 15
+    fails channel binding for RSA-PSS. It does not: it reads the hash from
+    the signature's parameters. Only Ed25519 fails, and this server now
+    fails it the same way. What these leave:
+    - **A revocation list with a critical extension is refused at
+      startup** (`crl.rs`): one scoped by an issuing distribution point, a
+      delta list, an indirect list. OpenSSL handles the first.
+    - **A user name map's patterns are the `regex` crate's**, not
+      PostgreSQL's advanced regular expressions; `@file` inclusion in
+      `pg_ident.conf` is refused.
+    - **`pg_reload_conf()` checks superuser as of login**, not the role
+      `SET ROLE` chose, and a GRANT of EXECUTE on it is not honoured.
+    - **SIGHUP reloads only on a server started with TLS**; without TLS it
+      still stops the server (`ctrlc`'s termination handler).
   - **`pg_stat_ssl` prints `UNDEF` for an attribute type outside
     `x509::short_name`'s table**, where OpenSSL knows more names.
   - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
     PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
-  - The key must have no passphrase, and the files are read once at
-    startup (no reload on SIGHUP).
+  - The key must have no passphrase.
   - The embedded Python handle (`_secantus_server.PgServer`) has no TLS
     parameter, and the psycopg gauge starts the server without a
     certificate, so no gauge exercises TLS.

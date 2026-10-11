@@ -121,6 +121,21 @@ impl PgServer {
         &self.storage_path
     }
 
+    /// Read the TLS files again: the certificate and key, the CA file, the
+    /// revocation list and the user name map. A connection made from here on
+    /// gets what they hold now. On an error the server keeps what it had.
+    /// Nothing to do, and no error, for a server started without TLS.
+    pub fn reload_tls(&self) -> std::io::Result<()> {
+        match self
+            .running
+            .as_ref()
+            .and_then(RunningPgServer::tls_reloader)
+        {
+            Some(reloader) => reloader.reload(),
+            None => Ok(()),
+        }
+    }
+
     /// Stop the server: close the listener, drain the connections, and close
     /// the store (WiredTiger's final checkpoint). Called by `Drop`; calling it
     /// first makes the moment explicit. Idempotent.

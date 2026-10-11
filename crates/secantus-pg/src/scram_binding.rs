@@ -5,7 +5,7 @@
 //! A client that binds the exchange to the TLS channel proves it is talking
 //! to the holder of the server certificate, not to something relaying the
 //! exchange. The binding data is `tls-server-end-point`: a hash of that
-//! certificate (see `x509::end_point_hash`).
+//! certificate (see `x509::end_point`).
 //!
 //! The exchange itself is `secantus_auth`'s. Its proof covers the client's
 //! first message without the GS2 header, and the client-final message
@@ -14,6 +14,8 @@
 //! compared before the proof is.
 
 use base64::Engine;
+
+use crate::x509::EndPoint;
 
 const PLAIN: &str = "SCRAM-SHA-256";
 const PLUS: &str = "SCRAM-SHA-256-PLUS";
@@ -38,8 +40,8 @@ fn protocol(message: impl Into<String>, detail: Option<&'static str>) -> Refusal
 
 /// The mechanisms to offer: with channel binding first, as PostgreSQL lists
 /// them, when the connection is TLS and the certificate's hash is known.
-pub(crate) fn mechanisms(end_point_hash: Option<&[u8]>) -> Vec<String> {
-    match end_point_hash {
+pub(crate) fn mechanisms(end_point: Option<&EndPoint>) -> Vec<String> {
+    match end_point {
         Some(_) => vec![PLUS.to_string(), PLAIN.to_string()],
         None => vec![PLAIN.to_string()],
     }
@@ -55,6 +57,9 @@ pub(crate) struct ClientFirst {
     /// Whether a mismatch there is a failed binding check or a malformed
     /// message.
     pub bound: bool,
+    /// The client bound to a certificate whose signature names no hash.
+    /// PostgreSQL finds that out when it goes to check the binding.
+    pub no_digest: bool,
 }
 
 /// Check the mechanism a client selected and its first message's GS2 header.
@@ -64,11 +69,11 @@ pub(crate) struct ClientFirst {
 pub(crate) fn client_first(
     mechanism: &str,
     data: &[u8],
-    end_point_hash: Option<&[u8]>,
+    end_point: Option<&EndPoint>,
 ) -> Result<ClientFirst, Refusal> {
     let bound = match mechanism {
         PLAIN => false,
-        PLUS if end_point_hash.is_some() => true,
+        PLUS if end_point.is_some() => true,
         _ => {
             return Err(protocol(
                 "client selected an invalid SASL authentication mechanism",
@@ -89,7 +94,7 @@ pub(crate) fn client_first(
         // was not offered it; on one that was, something between the two
         // removed the offer.
         Some(b'y') => {
-            if end_point_hash.is_some() {
+            if end_point.is_some() {
                 return Err(Refusal {
                     code: "28000",
                     message: "SCRAM channel binding negotiation error".into(),
@@ -126,7 +131,9 @@ pub(crate) fn client_first(
                 return Err(malformed());
             }
             let mut bound_data = header.to_vec();
-            bound_data.extend_from_slice(end_point_hash.unwrap_or_default());
+            if let Some(EndPoint::Hash(hash)) = end_point {
+                bound_data.extend_from_slice(hash);
+            }
             (header, b64.encode(bound_data))
         }
         _ => return Err(malformed()),
@@ -139,6 +146,7 @@ pub(crate) fn client_first(
         message,
         expected_binding: expected,
         bound,
+        no_digest: bound && end_point == Some(&EndPoint::NoDigest),
     })
 }
 
@@ -148,6 +156,13 @@ pub(crate) fn client_final(data: &[u8], first: &ClientFirst) -> Result<(), Refus
     let sent = data
         .split(|&b| b == b',')
         .find_map(|attribute| attribute.strip_prefix(b"c="));
+    if first.no_digest {
+        return Err(Refusal {
+            code: "XX000",
+            message: "could not find digest for NID UNDEF".into(),
+            detail: None,
+        });
+    }
     if sent == Some(first.expected_binding.as_bytes()) {
         return Ok(());
     }
@@ -171,15 +186,19 @@ mod tests {
 
     const HASH: &[u8] = &[7u8; 32];
 
+    fn hash() -> EndPoint {
+        EndPoint::Hash(HASH.to_vec())
+    }
+
     #[test]
     fn binding_is_offered_only_with_a_certificate_hash() {
-        assert_eq!(mechanisms(Some(HASH)), [PLUS, PLAIN]);
+        assert_eq!(mechanisms(Some(&hash())), [PLUS, PLAIN]);
         assert_eq!(mechanisms(None), [PLAIN]);
     }
 
     #[test]
     fn a_bound_first_message_is_handed_on_without_its_header() {
-        let first = client_first(PLUS, b"p=tls-server-end-point,,n=,r=abc", Some(HASH)).unwrap();
+        let first = client_first(PLUS, b"p=tls-server-end-point,,n=,r=abc", Some(&hash())).unwrap();
         assert_eq!(first.message, b"n,,n=,r=abc");
         assert!(first.bound);
         let mut data = b"p=tls-server-end-point,,".to_vec();
@@ -210,7 +229,7 @@ mod tests {
 
     #[test]
     fn a_client_that_thinks_binding_was_not_offered_is_refused_when_it_was() {
-        let err = client_first(PLAIN, b"y,,n=,r=abc", Some(HASH)).unwrap_err();
+        let err = client_first(PLAIN, b"y,,n=,r=abc", Some(&hash())).unwrap_err();
         assert_eq!(err.code, "28000");
         assert_eq!(err.message, "SCRAM channel binding negotiation error");
     }
@@ -218,13 +237,14 @@ mod tests {
     #[test]
     fn the_mechanism_and_the_header_must_agree() {
         for data in [&b"n,,n=,r=a"[..], b"y,,n=,r=a"] {
-            let err = client_first(PLUS, data, Some(HASH)).unwrap_err();
+            let err = client_first(PLUS, data, Some(&hash())).unwrap_err();
             assert_eq!(err.code, "08P01");
             assert!(err.detail.unwrap().contains("does not include"));
         }
-        let err = client_first(PLAIN, b"p=tls-server-end-point,,n=,r=a", Some(HASH)).unwrap_err();
+        let err =
+            client_first(PLAIN, b"p=tls-server-end-point,,n=,r=a", Some(&hash())).unwrap_err();
         assert!(err.detail.unwrap().contains("without channel binding"));
-        let err = client_first(PLUS, b"p=tls-unique,,n=,r=a", Some(HASH)).unwrap_err();
+        let err = client_first(PLUS, b"p=tls-unique,,n=,r=a", Some(&hash())).unwrap_err();
         assert_eq!(
             err.message,
             "unsupported SCRAM channel-binding type \"tls-unique\""
@@ -244,11 +264,25 @@ mod tests {
         let whole = b"p=tls-server-end-point,,n=,r=a";
         for cut in 0..24 {
             assert!(
-                client_first(PLUS, &whole[..cut], Some(HASH)).is_err(),
+                client_first(PLUS, &whole[..cut], Some(&hash())).is_err(),
                 "cut at {cut}"
             );
         }
-        assert!(client_first(PLUS, &whole[..24], Some(HASH)).is_ok());
-        assert!(client_first(PLUS, b"p=tls-server-end-point,a=me,n=", Some(HASH)).is_err());
+        assert!(client_first(PLUS, &whole[..24], Some(&hash())).is_ok());
+        assert!(client_first(PLUS, b"p=tls-server-end-point,a=me,n=", Some(&hash())).is_err());
+    }
+
+    #[test]
+    fn a_certificate_with_no_digest_is_offered_and_fails_at_the_binding_check() {
+        let none = EndPoint::NoDigest;
+        assert_eq!(mechanisms(Some(&none)), [PLUS, PLAIN]);
+        let first = client_first(PLUS, b"p=tls-server-end-point,,n=,r=abc", Some(&none)).unwrap();
+        assert!(first.no_digest);
+        let err = client_final(b"c=anything,r=abc,p=proof", &first).unwrap_err();
+        assert_eq!(err.code, "XX000");
+        assert_eq!(err.message, "could not find digest for NID UNDEF");
+        // Without binding the login goes ahead.
+        let plain = client_first(PLAIN, b"n,,n=,r=abc", Some(&none)).unwrap();
+        assert!(!plain.no_digest);
     }
 }

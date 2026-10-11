@@ -2229,6 +2229,7 @@ dependencies = [
  "pg_query",
  "postgres-types",
  "rand 0.9.5",
+ "regex",
  "rustls-pki-types",
  "secantus-auth",
  "secantus-core",

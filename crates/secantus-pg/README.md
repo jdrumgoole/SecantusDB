@@ -63,8 +63,18 @@ They and channel binding are in 0.1.0-beta.10 and later.
 
 `--tls-client-cert` needs `--tls-ca-file` and refuses a connection that is
 not TLS. `pg_stat_ssl` shows each connection's protocol, cipher and client
-certificate. Not supported: a certificate revocation list, a user name map,
-and matching on the certificate's whole DN.
+certificate.
+
+After 0.1.0-beta.11: `--tls-crl-file crl.pem` (`ssl_crl_file`) refuses a
+client certificate a revocation list names; `--tls-client-name DN`
+(`clientname=DN`) compares the certificate's whole subject, as in
+`CN=alice,O=Example`, in place of its common name; and `--tls-ident-file
+pg_ident.conf --tls-user-map NAME` (`map=NAME`) lets a certificate log in
+as the roles a user name map gives it. The files are read again on SIGHUP
+and on `select pg_reload_conf()`. In a Rust test these are
+`TlsConfig::crl_file`, `client_name` and `user_map`, and
+`PgServer::reload_tls`. Not supported: a choice of rule by user or
+database, and a key with a passphrase.
 
 A user name there is no role for connects without a password, as a role
 with no password does. `--refuse-unknown-users`
