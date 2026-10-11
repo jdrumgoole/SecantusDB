@@ -4303,7 +4303,7 @@ These work end-to-end but cut corners.
 
 ### 3.1 Authentication
 
-- [ ] **RUST PG server: TLS login policy is server-wide.** TLS is in since 2026-10-10
+- [ ] **RUST PG server: what the login rules leave.** TLS is in since 2026-10-10
   (`crates/secantus-pg/src/tls.rs`), and since 2026-10-11 SCRAM channel
   binding (`scram_binding.rs`), client certificates (`--tls-ca-file`,
   `--tls-client-cert verify-ca|verify-full|cert`), `--tls-require` and
@@ -4317,12 +4317,33 @@ These work end-to-end but cut corners.
     is a decision. `--refuse-unknown-users`
     (`PgBuilder::refuse_unknown_users`, 2026-10-11) answers as PostgreSQL
     does: with it, and 65 unknown-user scenarios added, 219 of 219 are the
-    same. Still open: **a role with no password is trusted**, flag or not,
-    where a `scram-sha-256` line refuses it. The comparison's `pg_hba.conf`
-    trusts those roles by name to match.
-  - **One policy for every user and database.** `pg_hba.conf` chooses a
-    method by line; here `--tls-require` and `--tls-client-cert` apply to
-    every connection.
+    same. Without a `pg_hba.conf` a role with no password is trusted,
+    flag or not; with one (below) a `scram-sha-256` line refuses it.
+  - **`--hba-file` (2026-10-11, `hba.rs`) takes a `pg_hba.conf`**, and with
+    one its lines decide every login. A third comparison (`hba_ref.py`, two
+    files, 118 scenarios through psycopg and a hand-written client: every
+    type, method, database and user form the reader takes, `clientcert=`,
+    `map=`, md5-stored passwords, and a reload): 118 the same. What it
+    leaves:
+    - **Refused at startup, by line number**: the methods that need an
+      outside service (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`,
+      `pam`, `bsd`), a host NAME for the address, `samenet`, `@file`
+      inclusion, and `include` directives (PostgreSQL 16's).
+    - **`samehost` matches loopback only**: the handler is not told the
+      address a connection arrived on.
+    - **`+role` and `samerole` go through `pg_has_role`'s membership**,
+      where PostgreSQL uses the form that does not count a superuser as a
+      member of everything. Not probed with a superuser that has no line.
+    - **A `map=` on a method other than `cert` is refused**; PostgreSQL
+      takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
+      read here.
+    - **Without a `pg_hba.conf` the database is still looked up before the
+      login is proved**, so a wrong password for a database that is not
+      there reads "database does not exist". With one the order is
+      PostgreSQL's.
+    - A password past its `VALID UNTIL` runs the exchange and fails it,
+      where the path without a file fails at once. PostgreSQL does the
+      first; not probed here.
   - Revocation lists (`--tls-crl-file`), a user name map
     (`--tls-ident-file` / `--tls-user-map`), `--tls-client-name DN`,
     channel binding for RSA-PSS and Ed25519 certificates, and a reload on

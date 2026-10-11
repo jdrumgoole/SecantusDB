@@ -30,7 +30,7 @@
 //!   names a map in a `pg_ident.conf` to say which roles a certificate may
 //!   log in as (`map=`).
 //!
-//! The files are read at startup and again on a reload ([`TlsReloader`]),
+//! The files are read at startup and again on a reload ([`crate::Reloader`]),
 //! which keeps what it had when the new files cannot be used.
 
 use std::io;
@@ -328,25 +328,6 @@ impl LiveTls {
         let fresh = self.config.build()?;
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         Ok(())
-    }
-}
-
-/// Re-reads a running server's TLS files: the certificate and key, the CA
-/// file, the revocation list and the user name map. What PostgreSQL does on
-/// `pg_ctl reload`.
-#[derive(Clone)]
-pub struct TlsReloader(pub(crate) Arc<LiveTls>);
-
-impl TlsReloader {
-    /// Read the files again. On an error the server keeps what it had.
-    pub fn reload(&self) -> io::Result<()> {
-        self.0.reload()
-    }
-}
-
-impl std::fmt::Debug for TlsReloader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TlsReloader")
     }
 }
 

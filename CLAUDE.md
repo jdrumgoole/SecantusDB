@@ -672,7 +672,9 @@ one request path:
     `crl.rs` and not by rustls, which cannot read a list without
     extensions), a user name map (`ident.rs`, `--tls-ident-file` /
     `--tls-user-map`), `--tls-client-name DN`, and a reload of the files
-    on SIGHUP or `pg_reload_conf()` (`tls::LiveTls`).
+    on SIGHUP or `pg_reload_conf()` (`live.rs`). And `--hba-file`
+    (`hba.rs`): with a `pg_hba.conf`, its lines decide every login and the
+    options that stood in for such lines are refused beside it.
     `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
     pass SCRAM-SHA-256; a role with none, and an unknown user, are still

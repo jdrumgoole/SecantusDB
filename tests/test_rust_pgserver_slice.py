@@ -20396,7 +20396,7 @@ def _login(
         ) as conn:
             return conn.execute("select current_user::text").fetchone()[0]
     except psycopg.OperationalError as exc:
-        return str(exc).strip().splitlines()[-1].split("failed: ", 1)[-1]
+        return str(exc).strip().splitlines()[-1].rsplit("failed: ", 1)[-1]
 
 
 def test_a_revoked_client_certificate_is_refused(home: Path, tmp_path: Path) -> None:
@@ -20773,3 +20773,193 @@ def test_a_password_file_supplies_the_password(home: Path, tmp_path: Path) -> No
         assert login() == "alice"
         passfile.write_text(f"127.0.0.1:{server.port}:postgres:alice:wrong\n")
         assert 'password authentication failed for user "alice"' in login()
+
+
+def _hba_login(server: _Server, user: str, database: str = "postgres", **params: str) -> str:
+    """Log in in the clear and answer who the session is, or why it failed."""
+    params.setdefault("sslmode", "disable")
+    try:
+        with psycopg.connect(
+            host="127.0.0.1",
+            port=server.port,
+            dbname=database,
+            user=user,
+            autocommit=True,
+            connect_timeout=15,
+            **params,
+        ) as conn:
+            return conn.execute("select current_user::text").fetchone()[0]
+    except psycopg.OperationalError as exc:
+        return str(exc).strip().splitlines()[-1].rsplit("failed: ", 1)[-1]
+
+
+_HBA = """\
+# TYPE      DATABASE   USER        ADDRESS        METHOD
+host        all        postgres    127.0.0.1/32   trust
+hostnossl   all        rejected    127.0.0.1/32   reject
+host        appdb      appuser     127.0.0.1/32   scram-sha-256
+host        all        alice,bob   127.0.0.1/32   scram-sha-256
+host        all        +team       127.0.0.1/32   trust
+host        sameuser   erin        127.0.0.1/32   trust
+host        all        dave        10.0.0.0/8     trust
+host        all        dave        127.0.0.1  255.255.255.255  password
+host        all        nopw        127.0.0.1/32   scram-sha-256
+host        appdb      nobody      127.0.0.1/32   trust
+"""
+
+
+def _hba_roles(home: Path) -> None:
+    with (
+        _Server(home, databases=("appdb", "erin")) as server,
+        _tls_connect(server, user="postgres") as conn,
+    ):
+        for role in ("alice", "bob", "dave", "erin", "appuser"):
+            conn.execute(f"create role {role} login password 'pw'")
+        conn.execute("create role nopw login")
+        conn.execute("create role team")
+        conn.execute("create role member login in role team")
+
+
+def test_a_pg_hba_conf_decides_every_login(home: Path, tmp_path: Path) -> None:
+    """`--hba-file`: the first line that matches a connection decides it.
+
+    Each answer is PostgreSQL 15.19's for the same file (measured
+    2026-10-11, 118 scenarios). What the options could not say and a file
+    can: a rule by user and by database, a role with no password refused
+    under a `scram-sha-256` line, and a connection no line matches refused.
+    """
+    _hba_roles(home)
+    hba = tmp_path / "pg_hba.conf"
+    hba.write_text(_HBA)
+    no_entry = 'no pg_hba.conf entry for host "127.0.0.1", user "{}", database "{}", no encryption'
+    failed = 'password authentication failed for user "{}"'
+    with _Server(home, databases=("appdb", "erin"), args=("--hba-file", str(hba))) as server:
+        assert _hba_login(server, "postgres") == "postgres"
+        assert _hba_login(server, "rejected") == (
+            'FATAL:  pg_hba.conf rejects connection for host "127.0.0.1", user "rejected", '
+            'database "postgres", no encryption'
+        )
+        # By database: appuser has a line for appdb and none for postgres.
+        assert _hba_login(server, "appuser", "appdb", password="pw") == "appuser"
+        assert failed.format("appuser") in _hba_login(server, "appuser", "appdb", password="no")
+        assert no_entry.format("appuser", "postgres") in _hba_login(
+            server, "appuser", password="pw"
+        )
+        # A list of users, a role's members, and the database named for the user.
+        assert _hba_login(server, "bob", password="pw") == "bob"
+        assert "no password supplied" in _hba_login(server, "alice")
+        assert _hba_login(server, "member") == "member"
+        assert 'role "team" is not permitted to log in' in _hba_login(server, "team")
+        assert _hba_login(server, "erin", "erin") == "erin"
+        assert no_entry.format("erin", "postgres") in _hba_login(server, "erin")
+        # The address: dave's first line is for another network.
+        assert _hba_login(server, "dave", password="pw") == "dave"
+        assert failed.format("dave") in _hba_login(server, "dave", password="no")
+        # A role with no password cannot pass a line that asks for one.
+        assert "no password supplied" in _hba_login(server, "nopw")
+        assert failed.format("nopw") in _hba_login(server, "nopw", password="pw")
+        # A user there is no role for: no line, and then a line and no role.
+        assert no_entry.format("nobody", "postgres") in _hba_login(server, "nobody")
+        assert 'role "nobody" does not exist' in _hba_login(server, "nobody", "appdb")
+        # The login is proved before the database is looked up.
+        assert failed.format("alice") in _hba_login(server, "alice", "absent", password="no")
+        assert 'database "absent" does not exist' in _hba_login(
+            server, "alice", "absent", password="pw"
+        )
+
+        # A reload takes up a changed file, and keeps the old one when the
+        # new one cannot be read.
+        hba.write_text("host all postgres 127.0.0.1/32 trust\nhost all bob 127.0.0.1/32 reject\n")
+        with _tls_connect(server, user="postgres") as conn:
+            conn.execute("select pg_reload_conf()")
+        assert "pg_hba.conf rejects connection" in _hba_login(server, "bob", password="pw")
+        assert no_entry.format("alice", "postgres") in _hba_login(server, "alice", password="pw")
+        hba.write_text("host all all 127.0.0.1/32 kerberos\n")
+        with _tls_connect(server, user="postgres") as conn:
+            conn.execute("select pg_reload_conf()")
+        assert "pg_hba.conf rejects connection" in _hba_login(server, "bob", password="pw")
+        assert _hba_login(server, "postgres") == "postgres"
+
+
+def test_a_pg_hba_conf_line_can_ask_for_a_certificate(home: Path, tmp_path: Path) -> None:
+    """`hostssl`, `cert`, `clientcert=` and `map=` in a `pg_hba.conf`."""
+    certs = _Certificates(tmp_path)
+    with _Server(home) as server, _tls_connect(server, user="postgres") as conn:
+        conn.execute("create role alice login password 'pw'")
+        conn.execute("create role bob login password 'pw'")
+    hba = tmp_path / "pg_hba.conf"
+    hba.write_text(
+        "host     all postgres 127.0.0.1/32 trust\n"
+        "hostssl  all alice    127.0.0.1/32 cert map=m\n"
+        "hostssl  all bob      127.0.0.1/32 scram-sha-256 clientcert=verify-full\n"
+    )
+    ident = tmp_path / "pg_ident.conf"
+    ident.write_text("m laptop alice\n")
+    args = (*certs.ca_args, "--hba-file", str(hba), "--ident-file", str(ident))
+    tls = {"sslmode": "require", "sslrootcert": str(certs.ca)}
+    with _Server(home, args=args) as server:
+        assert _hba_login(server, "alice", **tls, **certs.client("laptop")) == "alice"
+        assert 'certificate authentication failed for user "alice"' in _hba_login(
+            server, "alice", **tls, **certs.client("alice")
+        )
+        assert "connection requires a valid client certificate" in _hba_login(
+            server, "alice", **tls, **certs.no_client
+        )
+        # hostssl: in the clear there is no line for alice at all.
+        assert "no pg_hba.conf entry" in _hba_login(server, "alice", **certs.no_client)
+        assert _hba_login(server, "bob", password="pw", **tls, **certs.client("bob")) == "bob"
+        assert 'password authentication failed for user "bob"' in _hba_login(
+            server, "bob", password="pw", **tls, **certs.client("alice")
+        )
+
+
+def test_a_pg_hba_conf_the_server_cannot_apply_stops_it_starting(
+    home: Path, tmp_path: Path
+) -> None:
+    """A line this server cannot honour is an error naming the line, never a
+    rule that is silently skipped."""
+    certs = _Certificates(tmp_path)
+
+    def hba(text: str) -> str:
+        path = tmp_path / f"hba-{abs(hash(text))}.conf"
+        path.write_text(text)
+        return str(path)
+
+    good = hba("host all all 127.0.0.1/32 trust\n")
+    cases: list[tuple[tuple[str, ...], str]] = [
+        (("--hba-file", str(tmp_path / "absent.conf")), "absent.conf"),
+        (
+            ("--hba-file", hba("# fine\nhost all all 127.0.0.1/32 peer\n")),
+            "line 2: authentication method",
+        ),
+        (("--hba-file", hba("host all all db.example.com trust\n")), "host name"),
+        (
+            ("--hba-file", hba("host all all 127.0.0.1/32\n")),
+            "end-of-line before authentication method",
+        ),
+        (
+            (*certs.args, "--hba-file", hba("hostssl all all all cert\n")),
+            "a client certificate can only be checked with a CA file",
+        ),
+        (
+            (*certs.ca_args, "--hba-file", hba("hostssl all all all cert map=m\n")),
+            "map= needs a user name map file",
+        ),
+        (("--ident-file", str(certs.ca)), "is for a pg_hba.conf"),
+        (("--hba-file", good, "--refuse-unknown-users"), "cannot be given beside one"),
+        ((*certs.args, "--tls-require", "--hba-file", good), "cannot be given beside one"),
+        (
+            (*certs.ca_args, "--tls-client-cert", "verify-ca", "--hba-file", good),
+            "cannot be given beside one",
+        ),
+    ]
+    for args, expected in cases:
+        done = subprocess.run(
+            [str(BINARY), str(home), "127.0.0.1:0", *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode != 0, args
+        assert expected in done.stdout + done.stderr, (args, done.stdout, done.stderr)

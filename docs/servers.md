@@ -203,8 +203,51 @@ offered, as PostgreSQL offers it, and a login that takes it up fails with
 "could not find digest for NID UNDEF". libpq takes it up by default, so a
 client of such a server needs `channel_binding=disable`.
 
-Not supported: a choice of these rules by user or database (`pg_hba.conf`
-chooses by line), and a key with a passphrase.
+Not supported: a key with a passphrase.
+
+### A `pg_hba.conf`
+
+The options above apply one rule to every connection. `--hba-file` (after
+0.1.0-beta.11) takes a `pg_hba.conf` in their place, and its lines decide
+each login as PostgreSQL's do: the first line whose type, database, user
+and address match the connection says how it must prove who it is, and a
+connection no line matches is refused.
+
+```
+# TYPE     DATABASE  USER      ADDRESS        METHOD
+host       all       postgres  127.0.0.1/32   trust
+hostssl    appdb     +staff    10.0.0.0/8     scram-sha-256
+hostssl    all       agent     all            cert map=agents
+host       all       all       all            reject
+```
+
+```bash
+secantusd-pg ./secantus-pg-data 0.0.0.0:5432 \
+    --tls-cert-file server.crt --tls-key-file server.key --tls-ca-file ca.pem \
+    --hba-file pg_hba.conf --ident-file pg_ident.conf
+```
+
+| Part of a line | What is read |
+| --- | --- |
+| Type | `host`, `hostssl`, `hostnossl`. A `local` line is read and never matches: there is no Unix-domain socket. |
+| Database | `all`, `sameuser`, `samerole`, a name, or a list of these. |
+| User | `all`, a name, `+role` for a role and its members, or a list. |
+| Address | `all`, `samehost`, an address with a prefix length (`10.0.0.0/8`), or an address and a mask. |
+| Method | `trust`, `reject`, `scram-sha-256`, `md5`, `password`, `cert`. |
+| Options | `clientcert=verify-ca` or `verify-full`, `clientname=CN` or `DN`, and `map=` with `--ident-file`. |
+
+With a file, a role that has no password cannot pass a `scram-sha-256` line,
+and a user name with no role is refused, both as on PostgreSQL. The file is
+read again on SIGHUP and on `select pg_reload_conf()`; one that cannot be
+read leaves the old one in force.
+
+A line this server cannot apply stops it from starting, with the line's
+number, so that no rule is silently skipped: a method that needs a service
+outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`, `pam`,
+`bsd`), a host name for the address, `samenet`, and `@file` inclusion.
+`--hba-file` cannot be given with `--tls-require`, `--tls-client-cert`,
+`--tls-client-name`, `--tls-user-map` or `--refuse-unknown-users`: the file
+says what those say.
 
 A password file (`~/.pgpass`, or libpq's `passfile`) works as it does with
 PostgreSQL. It is read by the client library, which sends the password it
