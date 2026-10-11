@@ -41,7 +41,7 @@ the libpq key/value form, `.url()` the `postgresql://` form.
 ## The binary
 
 ```sh
-cargo install secantus-pg --version 0.1.0-beta.9   # a pre-release: cargo needs the version
+cargo install secantus-pg --version 0.1.0-beta.10   # a pre-release: cargo needs the version
 secantusd-pg ./pg-data 127.0.0.1:5433   # storage path, bind address
 ```
 
@@ -51,7 +51,7 @@ served in the clear. A password login over TLS is offered SCRAM channel
 binding (`SCRAM-SHA-256-PLUS`).
 
 Three more options stand in for the `pg_hba.conf` this server does not have.
-They are newer than 0.1.0-beta.9.
+They and channel binding are in 0.1.0-beta.10 and later.
 
 | option | what it does | PostgreSQL's equivalent |
 | --- | --- | --- |
