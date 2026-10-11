@@ -922,6 +922,49 @@ pub(crate) fn nul_in_namespace(kind: &str, value: &str) -> Option<CommandError> 
     }
 }
 
+/// Why the collection a command names cannot be one: mongod reads it before
+/// anything else of the command, and says the same thing for every command
+/// that takes a collection (measured 8.2.11 across eighteen of them).
+fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<CommandError> {
+    if !matches!(
+        name,
+        "find"
+            | "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "count"
+            | "distinct"
+            | "createIndexes"
+            | "drop"
+            | "create"
+            | "collMod"
+            | "collmod"
+            | "dropIndexes"
+            | "collStats"
+            | "collstats"
+            | "validate"
+            | "listIndexes"
+            | "killCursors"
+    ) {
+        return None;
+    }
+    let invalid = |message: String| Some(CommandError::new(73, "InvalidNamespace", message));
+    match doc.get(name) {
+        Some(Bson::String(coll)) if coll.is_empty() => invalid(match name {
+            "distinct" | "validate" => format!("Invalid namespace specified '{db}'"),
+            _ => format!("Invalid namespace specified: {db}"),
+        }),
+        Some(Bson::String(_)) => None,
+        Some(other) => invalid(format!(
+            "Collection name has invalid type {}",
+            secantus_core::query::bson_type_name(other)
+        )),
+        None => None,
+    }
+}
+
 fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     let name = command_name(doc);
 
@@ -979,6 +1022,9 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
     match lookup(name) {
         Some(handler) => {
+            if let Some(e) = collection_name_problem(name, doc, &ctx.db_name) {
+                return e.into_reply();
+            }
             // `maxTimeMS` is a generic command field — mongod's IDL validates
             // it on every command, so it belongs here rather than in the three
             // handlers that used to call it (the other 21 took a wrong-typed

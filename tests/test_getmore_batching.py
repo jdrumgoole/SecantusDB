@@ -116,3 +116,28 @@ def test_exhaust_cursor_streams_every_batch(client):
     coll.insert_many([{"_id": i} for i in range(5)])
     docs = list(coll.find({}, cursor_type=pymongo.CursorType.EXHAUST, batch_size=1))
     assert [d["_id"] for d in docs] == [0, 1, 2, 3, 4]
+
+
+def test_a_tailable_cursor_on_the_oplog_returns_entries(client):
+    """`local.oplog.rs` can be tailed although the catalog has no such collection.
+
+    pymongo's own `test_to_list_tailable` does exactly this. A tailable `find`
+    on a namespace that does not exist answers a closed, empty cursor, and the
+    oplog is a view with no catalog entry of its own -- so the Rust server
+    closed the cursor and the caller's wait for an entry never ended.
+    """
+    client.oplog_tail.c.insert_one({"_id": 1})
+    oplog = client.local.oplog.rs
+    last = oplog.find().sort("$natural", pymongo.DESCENDING).limit(-1).next()
+    cursor = oplog.find(
+        {"ts": {"$gte": last["ts"]}}, cursor_type=pymongo.CursorType.TAILABLE_AWAIT
+    ).max_await_time_ms(1)
+    try:
+        docs = []
+        for _ in range(50):
+            docs = cursor.to_list()
+            if docs:
+                break
+        assert docs, "the oplog entry at `ts` was never returned"
+    finally:
+        cursor.close()

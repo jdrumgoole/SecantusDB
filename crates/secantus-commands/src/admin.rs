@@ -331,7 +331,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(unknown) = first_unknown_field(doc, CREATE_KNOWN_OPTIONS) {
         return Ok(CommandError::new(
             40415,
-            "Location40415",
+            "IDLUnknownField",
             format!("BSON field 'create.{unknown}' is an unknown field."),
         )
         .into_reply());
@@ -774,7 +774,7 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(unknown) = index_spec.keys().find(|k| !KNOWN.contains(&k.as_str())) {
             return Ok(CommandError::new(
                 40415,
-                "Location40415",
+                "IDLUnknownField",
                 format!("BSON field 'collMod.index.{unknown}' is an unknown field."),
             )
             .into_reply());
@@ -1362,6 +1362,26 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
+/// What mongod tells a cursor whose collection was dropped under it.
+pub(crate) fn dropped_reason(storage: &dyn crate::Storage, db: &str, coll: &str) -> String {
+    format!(
+        "collection dropped. UUID {}",
+        collection_uuid_text(storage, db, coll)
+    )
+}
+
+fn collection_uuid_text(storage: &dyn crate::Storage, db: &str, coll: &str) -> String {
+    // Asking for the id of a collection that is not there would register it.
+    if !storage.collection_exists(db, coll).unwrap_or(false) {
+        return String::new();
+    }
+    storage
+        .collection_uuid(db, coll)
+        .ok()
+        .and_then(|b| uuid_text(&b))
+        .unwrap_or_default()
+}
+
 /// `drop` — drop a collection.
 pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "drop")?;
@@ -1375,7 +1395,7 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // getMore is CursorNotFound (mongo-c-driver's error_document/getmore).
     // Mirrors commands.py::_drop.
     if let Ok(cursors) = ctx.cursors() {
-        cursors.kill_namespace(&ns);
+        cursors.kill_namespace(&ns, &dropped_reason(storage, &ctx.db_name, &coll));
     }
     // mongod reports the index count the collection HAD, `_id_` included -- 3
     // for a collection with two secondary indexes, where this always said 1
@@ -1523,8 +1543,22 @@ pub fn archive_base_snapshot(doc: &Document, ctx: &mut CommandContext) -> Handle
 pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "filter", "listCollections.filter")?;
     argtypes::require_object(doc, "cursor", "listCollections.cursor")?;
-    if let Some(Bson::Document(c)) = doc.get("cursor") {
-        argtypes::require_number(c, "batchSize", "listCollections.cursor.batchSize")?;
+    argtypes::require_cursor_options(doc, "listCollections.cursor")?;
+    argtypes::require_bool_field(doc, "nameOnly", "listCollections.nameOnly")?;
+    const FIELDS: &[&str] = &[
+        "listCollections",
+        "cursor",
+        "filter",
+        "nameOnly",
+        "authorizedCollections",
+        "includePendingDrops",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'listCollections.{key}' is an unknown field."),
+        ));
     }
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -1694,9 +1728,22 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 /// `listIndexes` — a cursor over the indexes of a collection.
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Nullable here, unlike aggregate's -- mongod accepts `cursor: null`.
-    argtypes::require_cursor_object_nullable(doc)?;
-    if let Some(Bson::Document(c)) = doc.get("cursor") {
-        argtypes::require_number(c, "batchSize", "listIndexes.cursor.batchSize")?;
+    argtypes::require_object(doc, "cursor", "listIndexes.cursor")?;
+    argtypes::require_cursor_options(doc, "listIndexes.cursor")?;
+    const FIELDS: &[&str] = &[
+        "listIndexes",
+        "cursor",
+        "includeBuildUUIDs",
+        "includeIndexBuildInfo",
+        "isTimeseriesNamespace",
+        "rawData",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'listIndexes.{key}' is an unknown field."),
+        ));
     }
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
@@ -2144,7 +2191,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         if let Some(unknown) = first_unknown_field(&spec_opts, INDEX_SPEC_KNOWN_OPTIONS) {
             return Ok(CommandError::new(
                 40415,
-                "Location40415",
+                "IDLUnknownField",
                 format!("Error in specification {s:?}: the field '{unknown}' is an unknown field"),
             )
             .into_reply());
@@ -3100,6 +3147,15 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
+    // Every cursor open on one of its collections ends with that collection.
+    if let Ok(cursors) = ctx.cursors() {
+        for coll in storage.list_collections(&ctx.db_name).unwrap_or_default() {
+            cursors.kill_namespace(
+                &format!("{}.{coll}", ctx.db_name),
+                &dropped_reason(storage, &ctx.db_name, &coll),
+            );
+        }
+    }
     storage.drop_database(&ctx.db_name).map_err(command_error)?;
     // A replica-set member answers `{ok: 1}` alone (measured 8.2.11,
     // 2026-10-11, for an empty database, one with a collection and one with
@@ -3177,6 +3233,13 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         )
         .into_reply());
     }
+    // What the cursors open on either collection are told, worked out while
+    // both still have their ids.
+    let renamed = format!(
+        "collection renamed from '{src}' to '{to}'. UUID {}",
+        collection_uuid_text(storage, &src_db, &src_coll)
+    );
+    let replaced = dropped_reason(storage, &dst_db, &dst_coll);
     let (ok_, msg) = storage
         .rename_collection(&src_db, &src_coll, &dst_db, &dst_coll, drop_target)
         .map_err(command_error)?;
@@ -3200,9 +3263,9 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     // same as a drop — a later getMore then fails with CursorNotFound. Mirrors
     // commands.py::_rename_collection.
     if let Ok(cursors) = ctx.cursors() {
-        cursors.kill_namespace(&src);
+        cursors.kill_namespace(&src, &renamed);
         if drop_target {
-            cursors.kill_namespace(&to);
+            cursors.kill_namespace(&to, &replaced);
         }
     }
     Ok(doc! { "ok": 1.0 })
@@ -3756,7 +3819,7 @@ mod parity_tests {
     fn create_rejects_an_unknown_top_level_option() {
         let reply = create(&doc! {"create": "c", "invalid": true}, &mut ctx()).unwrap();
         let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (40415, "Location40415"));
+        assert_eq!((code, name.as_str()), (40415, "IDLUnknownField"));
         assert!(msg.contains("create.invalid"), "{msg}");
     }
 
@@ -3876,14 +3939,16 @@ mod parity_tests {
         c = c
             .with_storage(std::sync::Arc::new(FakeStorage))
             .with_cursors(std::sync::Arc::new(crate::CursorRegistry::new()));
-        let reply = list_indexes(
+        let err = list_indexes(
             &doc! {"listIndexes": "specs", "cursor": {"batchSize": -100_i32}},
             &mut c,
         )
-        .unwrap();
-        let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (2, "BadValue"));
-        assert!(msg.contains("must be >= 0"), "{msg}");
+        .unwrap_err();
+        assert_eq!((err.code, err.code_name.as_str()), (2, "BadValue"));
+        assert_eq!(
+            err.errmsg,
+            "BSON field 'batchSize' value must be >= 0, actual value '-100'"
+        );
     }
 
     #[test]

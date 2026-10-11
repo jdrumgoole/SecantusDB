@@ -7,8 +7,6 @@
 //! collapse to one).
 
 use bson::{doc, Bson, Document};
-use secantus_core::collation::Collation;
-use secantus_core::get_path;
 
 use crate::argtypes;
 use crate::util::{coll_arg, command_error, doc_field};
@@ -17,6 +15,25 @@ use crate::{CommandContext, CommandError, HandlerResult};
 /// `distinct` — return the distinct values of `key` over docs matching `query`.
 pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "distinct")?;
+    const FIELDS: &[&str] = &[
+        "distinct",
+        "key",
+        "query",
+        "collation",
+        "hint",
+        "mirrored",
+        "sampleId",
+        "rawData",
+        "includeQueryStatsMetrics",
+        "querySettings",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'distinctCommandRequest.{key}' is an unknown field."),
+        ));
+    }
     // mongod 8.2 reports every field under the IDL struct name
     // (`distinctCommandRequest`), `key` included -- an older probe had `key` as
     // `distinct.key`; re-measured 8.2.11, 2026-10-01.
@@ -64,6 +81,13 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply())
         }
     };
+    if key.contains('\0') {
+        return Err(CommandError::new(
+            31032,
+            "Location31032",
+            "Key field cannot contain an embedded null byte",
+        ));
+    }
     let filter = doc_field(doc, "query");
     let collation = crate::util::effective_collation(ctx.storage()?, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
@@ -75,7 +99,8 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Passing it validates AND honours the hint, including a sparse index's
     // reduced document set, the way `find` does.
     argtypes::require_hint(doc, "hint")?;
-    let hint = doc.get("hint");
+    let hint = argtypes::given_hint(doc);
+    argtypes::require_natural_hint(hint)?;
     let storage = ctx.storage()?;
     let on_view = crate::views::is_view(storage, &ctx.db_name, &coll);
     // A view has no rows of its own: its documents are its pipeline's output
@@ -111,38 +136,31 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         decoded
     };
 
+    // Every value the key reaches, through arrays of documents on the way and
+    // one level into an array at the end.
     let mut values: Vec<Bson> = Vec::new();
-    for d in documents {
-        match get_path(&d, &key) {
-            // An array value contributes each of its elements (one level).
-            Some(Bson::Array(arr)) => {
-                for e in arr {
-                    push_distinct(&mut values, e, collation.as_ref());
-                }
+    for d in &documents {
+        let (found, _) = secantus_core::get_path_values(d, &key);
+        for v in found {
+            match v {
+                Bson::Array(arr) => values.extend(arr.iter().cloned()),
+                other => values.push(other.clone()),
             }
-            Some(v) => push_distinct(&mut values, v, collation.as_ref()),
-            None => {}
         }
     }
+    // mongod answers the distinct values in BSON sort order, and "distinct"
+    // is BSON equality: 1, 1.0 and a Decimal128 1.0 are one value, as are 0
+    // and -0.0, and two strings the collation holds equal. The first one met
+    // is the one returned (the sort is stable). Comparing with `==` kept one
+    // of each TYPE.
+    values.sort_by(secantus_core::order::cmp);
+    values.dedup_by(|later, first| {
+        secantus_core::order::cmp(later, first) == std::cmp::Ordering::Equal
+    });
     if on_view {
         // mongod runs a view's `distinct` as an aggregation and answers
         // `ok` as an int32 there, where a collection's is a double.
         return Ok(doc! { "values": values, "ok": 1_i32 });
     }
     Ok(doc! { "values": values, "ok": 1.0 })
-}
-
-/// Add `v` if no existing value is equal — collation-aware for strings (two
-/// collation-equal strings collapse to one). Falls back to BSON equality when
-/// no collation, or when the collation can't compare the pair (non-ASCII).
-fn push_distinct(values: &mut Vec<Bson>, v: &Bson, collation: Option<&Collation>) {
-    let dup = values.iter().any(|e| match (collation, e, v) {
-        (Some(c), Bson::String(a), Bson::String(b)) => {
-            secantus_core::collation::equal(a, b, c).unwrap_or(a == b)
-        }
-        _ => e == v,
-    });
-    if !dup {
-        values.push(v.clone());
-    }
 }

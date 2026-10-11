@@ -389,6 +389,122 @@ pub fn array_filter_identifier_error(
 /// `find` / `count` / `aggregate` / `update` / `delete` / `findAndModify`, so
 /// one validator covers six commands. A *string* hint naming no index is a
 /// different, later error (the planner's), not this one.
+/// Fields mongod's parser takes on ANY command, beside the command's own.
+const GENERIC_FIELDS: &[&str] = &[
+    "apiVersion",
+    "apiStrict",
+    "apiDeprecationErrors",
+    "maxTimeMS",
+    "readConcern",
+    "writeConcern",
+    "lsid",
+    "txnNumber",
+    "txnRetryCounter",
+    "autocommit",
+    "startTransaction",
+    "stmtId",
+    "comment",
+    "coordinator",
+    "databaseVersion",
+    "shardVersion",
+    "expectPrefix",
+    "serialization_context",
+    "mayBypassWriteBlocking",
+    "allowImplicitCollectionCreation",
+    "isTimeseriesNamespace",
+    "versionContext",
+    "tracking_info",
+    "help",
+];
+
+/// The first field of `doc` a command does not take: not one of its own
+/// (`known`), not a generic one, and not a `$`-prefixed field of the protocol
+/// (`$db`, `$clusterTime`, `$readPreference` and the like).
+pub fn unknown_field<'a>(doc: &'a Document, known: &[&str]) -> Option<&'a str> {
+    doc.keys()
+        .map(String::as_str)
+        .find(|k| !k.starts_with('$') && !known.contains(k) && !GENERIC_FIELDS.contains(k))
+}
+
+/// The options of a command's `cursor` document, named under `path` in an
+/// error: only `batchSize`, which is not negative.
+pub fn require_cursor_options(doc: &Document, path: &str) -> Result<(), CommandError> {
+    let Some(Bson::Document(cursor)) = doc.get("cursor") else {
+        return Ok(());
+    };
+    require_number(cursor, "batchSize", &format!("{path}.batchSize"))?;
+    if let Some(key) = cursor.keys().find(|k| *k != "batchSize") {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field '{path}.{key}' is an unknown field."),
+        ));
+    }
+    if let Some(n) = cursor
+        .get("batchSize")
+        .and_then(crate::util::as_i64)
+        .filter(|n| *n < 0)
+    {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field 'batchSize' value must be >= 0, actual value '{n}'"),
+        ));
+    }
+    Ok(())
+}
+
+/// The `hint` a command gave, where an empty document is no hint at all.
+pub fn given_hint(doc: &Document) -> Option<&Bson> {
+    match doc.get("hint") {
+        Some(Bson::Document(d)) if d.is_empty() => None,
+        other => other,
+    }
+}
+
+/// A `$natural` hint names storage order and nothing else: its value is 1 or
+/// -1 and it has no other key.
+pub fn require_natural_hint(hint: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(Bson::Document(spec)) = hint else {
+        return Ok(());
+    };
+    let Some(direction) = spec.get("$natural") else {
+        return Ok(());
+    };
+    let unit = matches!(crate::util::as_i64(direction), Some(1 | -1))
+        && !matches!(direction, Bson::Boolean(_));
+    if spec.len() != 1 || !unit {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            "$natural hint cannot be set to a value other than -1 or 1.",
+        ));
+    }
+    Ok(())
+}
+
+/// The names in a command's `let`: a user variable starts with a lower-case
+/// letter (or is `CURRENT`).
+pub fn require_let_names(doc: &Document) -> Result<(), CommandError> {
+    let Some(Bson::Document(vars)) = doc.get("let") else {
+        return Ok(());
+    };
+    for name in vars.keys() {
+        let ok = name == "CURRENT"
+            || name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || !c.is_ascii());
+        if !ok {
+            return Err(failed_to_parse(format!(
+                "Invalid 'let' parameter :: caused by :: '{name}' starts with an invalid \
+                 character for a user variable name"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn require_hint(doc: &Document, field: &str) -> Result<(), CommandError> {
     match doc.get(field) {
         None | Some(Bson::String(_)) | Some(Bson::Document(_)) => Ok(()),
@@ -426,7 +542,7 @@ pub fn require_required_string(
         Some(Bson::String(_)) => Ok(()),
         None | Some(Bson::Null) => Err(CommandError::new(
             40414,
-            "Location40414",
+            "IDLFailedToParse",
             format!("BSON field '{path}' is missing but a required field"),
         )),
         Some(v) => Err(type_mismatch(format!(
@@ -442,7 +558,7 @@ pub fn require_required_array(doc: &Document, field: &str, path: &str) -> Result
         Some(Bson::Array(_)) => Ok(()),
         None | Some(Bson::Null) => Err(CommandError::new(
             40414,
-            "Location40414",
+            "IDLFailedToParse",
             format!("BSON field '{path}' is missing but a required field"),
         )),
         Some(v) => Err(type_mismatch(format!(

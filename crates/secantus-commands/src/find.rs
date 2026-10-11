@@ -31,7 +31,6 @@ use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
 use crate::storage::Storage;
 use crate::util::{
     as_i64, bool_field, coll_arg, command_error, doc_field, docs_to_bson, encode_docs_ref,
-    resolve_let_vars,
 };
 use crate::{
     CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
@@ -52,6 +51,13 @@ struct TailableFindProducer {
     coll: String,
     after: Option<i64>,
     fatal: Option<CommandError>,
+    /// The cursor's query: a document inserted later is returned only if it
+    /// matches, and in the cursor's projection. Both were dropped after the
+    /// first batch, so a filtered tail returned every new document whole.
+    filter: Document,
+    projection: Option<Document>,
+    let_vars: Document,
+    collation: Option<secantus_core::collation::Collation>,
 }
 
 impl CursorProducer for TailableFindProducer {
@@ -80,7 +86,43 @@ impl CursorProducer for TailableFindProducer {
         {
             Ok(rows) if !rows.is_empty() => {
                 self.after = Some(rows[rows.len() - 1].0);
-                rows.into_iter().map(|(_rid, doc)| doc).collect()
+                let blobs: Vec<Vec<u8>> = rows.into_iter().map(|(_rid, doc)| doc).collect();
+                if self.filter.is_empty() && self.projection.is_none() {
+                    return blobs;
+                }
+                let _active = secantus_core::collation::activate(self.collation.as_ref());
+                let mut out = Vec::with_capacity(blobs.len());
+                for blob in blobs {
+                    let Ok(d) = Document::from_reader(&mut blob.as_slice()) else {
+                        continue;
+                    };
+                    let keep = self.filter.is_empty()
+                        || secantus_core::query::matches(
+                            &d,
+                            &self.filter,
+                            &self.let_vars,
+                            self.collation.as_ref(),
+                        )
+                        .unwrap_or(false);
+                    if !keep {
+                        continue;
+                    }
+                    match &self.projection {
+                        None => out.push(blob),
+                        Some(spec) => {
+                            if let Ok(mut projected) =
+                                project_to_docs(vec![blob], spec, &self.filter)
+                            {
+                                if let Some(p) = projected.pop() {
+                                    if let Ok(mut enc) = crate::util::encode_docs(vec![p]) {
+                                        out.append(&mut enc);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                out
             }
             _ => Vec::new(),
         }
@@ -241,6 +283,20 @@ fn build_view_find_aggregate(doc: &Document, coll: &str, natural_hint: Option<&B
 
 pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "find")?;
+    if coll.starts_with('$') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Invalid collection name specified '{}.{coll}'", ctx.db_name),
+        ));
+    }
+    if let Some(key) = argtypes::unknown_field(doc, FIND_FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'FindCommandRequest.{key}' is an unknown field."),
+        ));
+    }
     // Argument types, before anything reads them. A wrong-typed slot used to be
     // silently ignored here (`and_then(as_i64)` yields None -> the default), so
     // `find.limit: "x"` returned every document and reported success. mongod
@@ -255,7 +311,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "let", "FindCommandRequest.let")?;
     // Negative `skip` / `limit` are refused, not clamped (measured 8.2.11,
     // 2026-10-01: `skip: -1` returned every document).
-    for field in ["skip", "limit"] {
+    for field in ["skip", "limit", "batchSize"] {
         if let Some(n) = doc.get(field).and_then(as_i64) {
             if n < 0 {
                 return Err(CommandError::new(
@@ -293,9 +349,47 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "returnKey",
         "showRecordId",
         "allowDiskUse",
+        "noCursorTimeout",
+        "allowPartialResults",
+        "readOnce",
     ] {
         argtypes::require_bool_value(doc, field)?;
     }
+    let tailable_asked = bool_field(doc, "tailable", false);
+    if bool_field(doc, "awaitData", false) && !tailable_asked {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "Cannot set 'awaitData' without also setting 'tailable'",
+        ));
+    }
+    if tailable_asked {
+        // A tailable cursor follows storage order and never ends, so it takes
+        // no other sort and no single batch.
+        let natural_forward = match doc.get("sort") {
+            None | Some(Bson::Null) => true,
+            Some(Bson::Document(sort)) => {
+                sort.is_empty()
+                    || (sort.len() == 1 && sort.get("$natural").and_then(as_i64) == Some(1))
+            }
+            _ => true,
+        };
+        if !natural_forward {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "cannot use tailable option with a sort other than {$natural: 1}",
+            ));
+        }
+        if bool_field(doc, "singleBatch", false) {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "cannot use tailable option with the 'singleBatch' option",
+            ));
+        }
+    }
+    argtypes::require_let_names(doc)?;
     argtypes::require_object(doc, "readConcern", "FindCommandRequest.readConcern")?;
     argtypes::require_hint(doc, "hint")?;
     // An undefined `$$variable` is a PARSE error (17276), not the storage
@@ -433,11 +527,12 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Ok(reply.into_reply());
         }
     }
-    let hint = natural_hint.as_ref().or_else(|| doc.get("hint"));
+    let hint = natural_hint.as_ref().or_else(|| argtypes::given_hint(doc));
+    argtypes::require_natural_hint(hint)?;
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
     // Command `let` → vars visible to `$expr` in the filter.
-    let let_vars = resolve_let_vars(doc.get("let"));
+    let let_vars = crate::util::checked_let_vars(doc.get("let"))?;
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,
     // explicit positive ⇒ that size. A present-but-non-numeric value (e.g. a
     // string) is a TypeMismatch — mongod rejects it, and the mongo-c-driver
@@ -464,6 +559,20 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     // A tailable cursor is only valid on a capped collection (mongod rejects it
     // on a non-capped one with BadValue). Check before the fetch.
+    // `local.oplog.rs` is a view of the oplog table with no entry of its own
+    // in the catalog; it is there all the same.
+    let is_oplog = ctx.db_name == "local" && coll == "oplog.rs";
+    let exists = is_oplog
+        || storage
+            .collection_exists(&ctx.db_name, &coll)
+            .unwrap_or(false);
+    if tailable && !exists {
+        // Nothing to tail: an empty batch and no cursor, not an error.
+        return Ok(doc! {
+            "cursor": { "firstBatch": [], "id": Bson::Int64(0), "ns": ns },
+            "ok": 1.0,
+        });
+    }
     if tailable
         && !storage
             .collection_is_capped(&ctx.db_name, &coll)
@@ -548,6 +657,18 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let after = storage_arc
             .collection_max_recordid(&ctx.db_name, &coll)
             .map_err(command_error)?;
+        // An empty capped collection gives a tailable cursor no position to
+        // hold: mongod answers with a dead cursor (measured 8.2.11).
+        if after.is_none() && docs.is_empty() && !is_oplog {
+            return Ok(doc! {
+                "cursor": { "firstBatch": [], "id": Bson::Int64(0), "ns": ns },
+                "ok": 1.0,
+            });
+        }
+        // The projection applies to every batch, this one and the producer's.
+        if let Some(spec) = projection {
+            docs = crate::util::encode_docs(project_to_docs(docs, spec, &filter)?)?;
+        }
         let bs = batch_size.max(0) as usize;
         let split = bs.min(docs.len());
         let first_batch = docs[..split].to_vec();
@@ -558,6 +679,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             coll: coll.clone(),
             after,
             fatal: None,
+            filter: filter.clone(),
+            projection: projection.cloned(),
+            let_vars: let_vars.clone(),
+            collation: collation.clone(),
         });
         let cursor_id = cursors
             .register_tailable(
@@ -611,10 +736,19 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 }
             }
         }
+        // `showRecordId` adds to the projected document; only `returnKey`
+        // replaces it.
+        let projected_first = match projection {
+            Some(spec) if !return_key => Some(project_to_docs(docs.clone(), spec, &filter)?),
+            _ => None,
+        };
         let mut rewritten: Vec<Document> = Vec::with_capacity(docs.len());
         for (i, bytes) in docs.iter().enumerate() {
-            let d = Document::from_reader(&mut bytes.as_slice())
-                .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+            let d = match &projected_first {
+                Some(projected) => projected[i].clone(),
+                None => Document::from_reader(&mut bytes.as_slice())
+                    .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?,
+            };
             if return_key {
                 let mut o = Document::new();
                 for f in &key_fields {
@@ -646,7 +780,12 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(spec) => {
             let projected = project_to_docs(docs, spec, &filter)?;
             let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
+                let mut projected = projected;
+                projected.truncate(batch_size.max(0) as usize);
                 (projected.into_iter().map(Bson::Document).collect(), 0)
+            } else if batch_size == 0 && exists {
+                let rest = crate::util::encode_docs(projected)?;
+                (Vec::new(), open_cursor(cursors, &ns, rest, limit > 0)?)
             } else {
                 split_docs_into_cursor(projected, batch_size, &ns, cursors, limit > 0)?
             };
@@ -662,7 +801,12 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         None => {
             let (first, cursor_id) = if single_batch {
+                docs.truncate(batch_size.max(0) as usize);
                 (docs, 0)
+            } else if batch_size == 0 && exists {
+                // `batchSize: 0` asks for the cursor and no documents, and
+                // mongod opens one even when nothing matches.
+                (Vec::new(), open_cursor(cursors, &ns, docs, limit > 0)?)
             } else {
                 // A positive `limit` bounds the result, so mongod closes the
                 // cursor the moment it is reached rather than spending a
@@ -683,6 +827,51 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 }
+
+/// Register a cursor over `remaining`, whatever it holds.
+pub(crate) fn open_cursor(
+    cursors: &CursorRegistry,
+    ns: &str,
+    remaining: Vec<Vec<u8>>,
+    bounded: bool,
+) -> Result<i64, CommandError> {
+    cursors
+        .register_bounded(ns, remaining, bounded)
+        .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))
+}
+
+/// The fields mongod's `find` takes (8.2.11); any other is 40415.
+const FIND_FIELDS: &[&str] = &[
+    "find",
+    "filter",
+    "sort",
+    "projection",
+    "hint",
+    "skip",
+    "limit",
+    "batchSize",
+    "singleBatch",
+    "max",
+    "min",
+    "returnKey",
+    "showRecordId",
+    "tailable",
+    "oplogReplay",
+    "noCursorTimeout",
+    "awaitData",
+    "allowPartialResults",
+    "collation",
+    "allowDiskUse",
+    "let",
+    "term",
+    "readOnce",
+    "maxTimeMSOpOnly",
+    "includeQueryStatsMetrics",
+    "querySettings",
+    "mirrored",
+    "sampleId",
+    "rawData",
+];
 
 /// Split the ordered result into `firstBatch` + a registered cursor for the
 /// remainder (`commands.py::_split_into_cursor`). `batchSize == 0` is a real
@@ -855,26 +1044,50 @@ fn resolve_index_key(
     }
 }
 
-/// Compare `doc`'s key tuple against `bound` over the bound's fields, in the
-/// index's per-field direction. `None` ⇒ the doc is missing a bound field (it
-/// has no index key, so it's outside any bound). `Some(Ordering)` is the tuple
-/// comparison (`Equal` when the doc matches the bound on every bound field).
-fn bound_cmp(
-    doc: &Document,
+/// The index keys `doc` has under the leading `fields` of an index: one tuple
+/// per combination of array elements, with a missing field as null. This is
+/// what `min` / `max` bound -- index KEYS, not documents -- so a document whose
+/// array holds one value inside the bounds is returned, and so is one that
+/// lacks the field when null is inside them.
+fn index_key_tuples(doc: &Document, fields: &[&String]) -> Vec<Vec<Bson>> {
+    let mut tuples: Vec<Vec<Bson>> = vec![Vec::new()];
+    for field in fields {
+        let (found, _) = secantus_core::get_path_values(doc, field);
+        let mut values: Vec<Bson> = Vec::new();
+        for v in found {
+            match v {
+                Bson::Array(items) if !items.is_empty() => values.extend(items.iter().cloned()),
+                Bson::Array(_) => values.push(Bson::Undefined),
+                other => values.push(other.clone()),
+            }
+        }
+        if values.is_empty() {
+            values.push(Bson::Null);
+        }
+        tuples = tuples
+            .into_iter()
+            .flat_map(|t| {
+                values.iter().map(move |v| {
+                    let mut next = t.clone();
+                    next.push(v.clone());
+                    next
+                })
+            })
+            .collect();
+    }
+    tuples
+}
+
+/// Compare a key tuple with a bound, column by column in the index's
+/// directions.
+fn tuple_cmp(
+    key: &[Bson],
     bound: &Document,
     key_spec: &Document,
-) -> Result<Option<std::cmp::Ordering>, CommandError> {
+) -> Result<std::cmp::Ordering, CommandError> {
     use std::cmp::Ordering;
-    for (field, bval) in bound {
-        let dir = match key_spec.get(field) {
-            Some(Bson::Int32(n)) => *n,
-            Some(Bson::Int64(n)) => *n as i32,
-            Some(Bson::Double(d)) => *d as i32,
-            _ => 1,
-        };
-        let Some(dval) = secantus_core::get_path(doc, field) else {
-            return Ok(None);
-        };
+    for (value, (field, bval)) in key.iter().zip(bound) {
+        let descending = key_spec.get(field).and_then(as_i64).is_some_and(|d| d < 0);
         // ASCENDING encodings compared and then negated, never the INVERTED
         // bytes: inversion does not reverse a PREFIX relationship, so `""`
         // (whose key is a strict prefix of every string's) compared as the
@@ -883,17 +1096,27 @@ fn bound_cmp(
             secantus_core::sortkey::encode_value(v, None)
                 .map_err(|_| CommandError::new(2, "BadValue", "min/max value not comparable"))
         };
-        let ord = enc(dval)?.cmp(&enc(bval)?);
-        match if dir < 0 { ord.reverse() } else { ord } {
+        let ord = enc(value)?.cmp(&enc(bval)?);
+        match if descending { ord.reverse() } else { ord } {
             Ordering::Equal => continue,
-            other => return Ok(Some(other)),
+            other => return Ok(other),
         }
     }
-    Ok(Some(Ordering::Equal))
+    Ok(Ordering::Equal)
+}
+
+/// A `min` / `max` refusal, under the prefix mongod's planner gives it.
+fn min_max_error(code: i32, ns: &str, reason: &str) -> CommandError {
+    CommandError::new(
+        code,
+        crate::util::error_code_name(code),
+        format!("error processing query: ns={ns} planner returned error :: caused by :: {reason}"),
+    )
 }
 
 /// Filter `docs` (already index-ordered) by the `min` (inclusive) / `max`
-/// (exclusive) index bounds. Mirrors `storage._apply_minmax_bounds`.
+/// (exclusive) bounds on the hinted index's keys.
+#[allow(clippy::too_many_arguments)]
 fn apply_min_max(
     docs: Vec<Vec<u8>>,
     min: Option<&Document>,
@@ -904,31 +1127,52 @@ fn apply_min_max(
     coll: &str,
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     use std::cmp::Ordering;
+    let ns = format!("{db}.{coll}");
     let hint = hint.ok_or_else(|| {
-        CommandError::new(
-            51173,
-            "Location51173",
+        min_max_error(
+            291,
+            &ns,
             "When using min()/max() a hint of which index to use must be provided",
         )
     })?;
+    if matches!(hint, Bson::Document(h) if h.contains_key("$natural")) {
+        return Err(min_max_error(
+            291,
+            &ns,
+            "min and max are incompatible with $natural",
+        ));
+    }
     let key_spec = resolve_index_key(storage, db, coll, hint)?;
     // Each bound's fields must be a leading prefix of the hinted index's key,
-    // in the same order — else mongod rejects with 51174 (the "wrong order"
-    // case in pymongo's test_min/test_max).
+    // in the same order.
     let index_fields: Vec<&String> = key_spec.keys().collect();
     for bound in [min, max].into_iter().flatten() {
         let bf: Vec<&String> = bound.keys().collect();
         let prefix_match =
             bf.len() <= index_fields.len() && (0..bf.len()).all(|i| bf[i] == index_fields[i]);
         if !prefix_match {
-            return Err(CommandError::new(
+            return Err(min_max_error(
                 51174,
-                "Location51174",
-                "The field order of the min/max query option does not match the order of the \
-                 hinted index's key pattern",
+                &ns,
+                "The index chosen is not compatible with min/max",
             ));
         }
     }
+    if let (Some(lo), Some(hi)) = (min, max) {
+        let low: Vec<Bson> = lo.values().cloned().collect();
+        if lo.len() == hi.len() && tuple_cmp(&low, hi, &key_spec)? != Ordering::Less {
+            return Err(min_max_error(
+                51175,
+                &ns,
+                "The value provided for min() does not come before the value provided for \
+                 max() in the hinted index",
+            ));
+        }
+    }
+    let width = min
+        .map_or(0, Document::len)
+        .max(max.map_or(0, Document::len));
+    let fields = &index_fields[..width.min(index_fields.len())];
     let mut out = Vec::with_capacity(docs.len());
     for bytes in docs {
         let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
@@ -938,16 +1182,24 @@ fn apply_min_max(
                 format!("failed to decode document: {e}"),
             )
         })?;
-        // min is inclusive (doc >= min ⇒ cmp != Less); max is exclusive (doc < max).
-        let keep_min = match min {
-            Some(m) => matches!(bound_cmp(&d, m, &key_spec)?, Some(o) if o != Ordering::Less),
-            None => true,
-        };
-        let keep_max = match max {
-            Some(m) => bound_cmp(&d, m, &key_spec)? == Some(Ordering::Less),
-            None => true,
-        };
-        if keep_min && keep_max {
+        // min is inclusive, max exclusive; one key inside both keeps the
+        // document.
+        let mut keep = false;
+        for key in index_key_tuples(&d, fields) {
+            let above = match min {
+                Some(m) => tuple_cmp(&key, m, &key_spec)? != Ordering::Less,
+                None => true,
+            };
+            let below = match max {
+                Some(m) => tuple_cmp(&key, m, &key_spec)? == Ordering::Less,
+                None => true,
+            };
+            if above && below {
+                keep = true;
+                break;
+            }
+        }
+        if keep {
             out.push(bytes);
         }
     }
@@ -1044,7 +1296,7 @@ fn projection_meta_error(spec: &Document, filter: &Document) -> Option<CommandEr
             return Some(CommandError::new(
                 17308,
                 "Location17308",
-                format!("Unsupported argument to $meta: {arg}"),
+                format!("Unsupported $meta field: {arg}"),
             ));
         }
         if arg == "textScore" && !query_has_text(filter) {
