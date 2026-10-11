@@ -300,12 +300,71 @@ pub fn note_statement(index: usize, record: StmtRecord) {
     });
 }
 
+/// The statements of a retryable write that have been applied.
+///
+/// A large insert batch is kept as runs of statement ids, not one record a
+/// document: every session holds its last write until its next one, and a
+/// record per document of a 100,000-document batch is megabytes a session.
+#[derive(Debug, Clone, Default)]
+pub struct Applied {
+    records: HashMap<i32, StmtRecord>,
+    /// `(first, count)` runs of inserted statement ids.
+    inserted: Vec<(i32, u32)>,
+}
+
+/// Above this many inserts in one command, they are kept as runs.
+const INSERT_RUN_THRESHOLD: usize = 16;
+
+impl Applied {
+    pub fn contains(&self, id: i32) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// What statement `id` did, if it has been applied.
+    pub fn get(&self, id: i32) -> Option<StmtRecord> {
+        if let Some(record) = self.records.get(&id) {
+            return Some(record.clone());
+        }
+        self.inserted
+            .iter()
+            .any(|(first, count)| {
+                let offset = i64::from(id) - i64::from(*first);
+                offset >= 0 && offset < i64::from(*count)
+            })
+            .then_some(StmtRecord::Insert { id: None })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.inserted.is_empty()
+    }
+
+    fn add(&mut self, records: Vec<(i32, StmtRecord)>) {
+        let inserts = records
+            .iter()
+            .all(|(_, r)| matches!(r, StmtRecord::Insert { .. }));
+        if !inserts || records.len() <= INSERT_RUN_THRESHOLD {
+            self.records.extend(records);
+            return;
+        }
+        let mut ids: Vec<i32> = records.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        for id in ids {
+            match self.inserted.last_mut() {
+                Some((first, count)) if i64::from(*first) + i64::from(*count) == i64::from(id) => {
+                    *count += 1
+                }
+                _ => self.inserted.push((id, 1)),
+            }
+        }
+    }
+}
+
 type TxnFn = Box<dyn Fn(&mut Transaction) + Send + Sync>;
 type Clock = Box<dyn Fn() -> f64 + Send + Sync>;
 
 enum Kind {
     Txn(Arc<Mutex<Transaction>>),
-    Retryable(HashMap<i32, StmtRecord>),
+    Retryable(Applied),
 }
 
 /// One session: its active transaction number and what that number is.
@@ -526,11 +585,7 @@ impl TransactionRegistry {
     /// Begin, or continue, the retryable write `(lsid, txnNumber)`: the
     /// statements of it that already ran, by statement id. A newer number
     /// aborts the session's open transaction and starts with none.
-    pub fn begin_retryable(
-        &self,
-        lsid_bytes: &[u8],
-        txn_number: i64,
-    ) -> Result<HashMap<i32, StmtRecord>, Document> {
+    pub fn begin_retryable(&self, lsid_bytes: &[u8], txn_number: i64) -> Result<Applied, Document> {
         let (mut inner, now) = self.locked();
         if let Some(session) = inner.sessions.get_mut(lsid_bytes) {
             let retryable = matches!(session.kind, Kind::Retryable(_));
@@ -557,11 +612,11 @@ impl TransactionRegistry {
             lsid_bytes.to_vec(),
             Session {
                 active: txn_number,
-                kind: Kind::Retryable(HashMap::new()),
+                kind: Kind::Retryable(Applied::default()),
                 last_use: now,
             },
         );
-        Ok(HashMap::new())
+        Ok(Applied::default())
     }
 
     /// Remember what statements of the retryable write `(lsid, txnNumber)`
@@ -583,7 +638,7 @@ impl TransactionRegistry {
         }) = inner.sessions.get_mut(lsid_bytes)
         {
             if *active == txn_number {
-                done.extend(records);
+                done.add(records);
             }
         }
     }
@@ -810,14 +865,38 @@ mod tests {
         assert!(r.begin_retryable(LS, 4).unwrap().is_empty());
         r.record_statements(LS, 4, vec![(0, StmtRecord::Delete)]);
         assert_eq!(
-            r.begin_retryable(LS, 4).unwrap().get(&0),
-            Some(&StmtRecord::Delete)
+            r.begin_retryable(LS, 4).unwrap().get(0),
+            Some(StmtRecord::Delete)
         );
         // A newer number starts with nothing, and the old one is refused.
         assert!(r.begin_retryable(LS, 5).unwrap().is_empty());
         assert_eq!(code(&r.begin_retryable(LS, 4).unwrap_err()), 225);
         // Another session has its own numbers.
         assert!(r.begin_retryable(&[9u8; 16], 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_large_insert_batch_is_remembered_as_runs() {
+        let (r, _, _) = reg();
+        r.begin_retryable(LS, 1).unwrap();
+        let batch: Vec<(i32, StmtRecord)> = (0..1000)
+            .filter(|i| *i != 500)
+            .map(|i| {
+                (
+                    i,
+                    StmtRecord::Insert {
+                        id: Some(Bson::Int32(i)),
+                    },
+                )
+            })
+            .collect();
+        r.record_statements(LS, 1, batch);
+        let applied = r.begin_retryable(LS, 1).unwrap();
+        assert_eq!(applied.inserted, vec![(0, 500), (501, 499)]);
+        assert!(applied.records.is_empty());
+        assert!(applied.contains(0) && applied.contains(999) && !applied.contains(500));
+        assert!(!applied.contains(1000) && !applied.contains(-1));
+        assert_eq!(applied.get(7), Some(StmtRecord::Insert { id: None }));
     }
 
     #[test]

@@ -920,15 +920,13 @@ fn retry_insert(
     doc: &Document,
     ctx: &mut CommandContext,
     ids: &[i32],
-    done: &HashMap<i32, StmtRecord>,
+    done: &transactions::Applied,
 ) -> Ran {
-    let fresh: Vec<usize> = (0..ids.len())
-        .filter(|i| !done.contains_key(&ids[*i]))
-        .collect();
+    let fresh: Vec<usize> = (0..ids.len()).filter(|i| !done.contains(ids[*i])).collect();
     let retried: Vec<i32> = ids
         .iter()
         .copied()
-        .filter(|id| done.contains_key(id))
+        .filter(|id| done.contains(*id))
         .collect();
     let id_of = |index: usize| -> Option<Bson> {
         doc.get_array("documents")
@@ -990,7 +988,7 @@ fn retry_batch(
     doc: &Document,
     ctx: &mut CommandContext,
     ids: &[i32],
-    done: &HashMap<i32, StmtRecord>,
+    done: &transactions::Applied,
 ) -> Ran {
     let key = if name == "update" {
         "updates"
@@ -1017,7 +1015,7 @@ fn retry_batch(
     let mut retried: Vec<usize> = Vec::new();
     let mut refused: Vec<usize> = Vec::new();
     for (index, statement) in statements.iter().enumerate() {
-        if done.contains_key(&ids[index]) {
+        if done.contains(ids[index]) {
             retried.push(index);
         } else if many(statement) {
             refused.push(index);
@@ -1091,9 +1089,9 @@ fn retry_batch(
         }
         // What an update answers for a statement already applied depends on
         // what that statement was: an insert reads as an upsert.
-        let upserted = match &done[&ids[*index]] {
-            StmtRecord::Insert { id } => Some(id.clone().unwrap_or(Bson::Null)),
-            StmtRecord::Update { upserted } => upserted.clone(),
+        let upserted = match done.get(ids[*index]) {
+            Some(StmtRecord::Insert { id }) => Some(id.unwrap_or(Bson::Null)),
+            Some(StmtRecord::Update { upserted }) => upserted,
             _ => None,
         };
         match upserted {
@@ -1102,10 +1100,7 @@ fn retry_batch(
                 "upserted",
                 doc! { "index": *index as i32, "_id": id },
             ),
-            None if !matches!(done[&ids[*index]], StmtRecord::Update { upserted: Some(_) }) => {
-                add_count(&mut reply, "nModified", 1)
-            }
-            None => {}
+            None => add_count(&mut reply, "nModified", 1),
         }
     }
     sort_by_index(&mut reply, "writeErrors");
@@ -1119,11 +1114,11 @@ fn retry_find_and_modify(
     doc: &Document,
     ctx: &mut CommandContext,
     ids: &[i32],
-    done: &HashMap<i32, StmtRecord>,
+    done: &transactions::Applied,
 ) -> Ran {
     let id = ids.first().copied().unwrap_or(0);
     let remove = doc.get("remove").is_some_and(crate::util::truthy);
-    if let Some(record) = done.get(&id) {
+    if let Some(record) = done.get(id) {
         let refuse = |code: i32, message: &str| {
             (
                 CommandError::new(code, format!("Location{code}"), message).into_reply(),

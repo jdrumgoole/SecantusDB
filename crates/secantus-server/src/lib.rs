@@ -1189,6 +1189,13 @@ fn stream_exhaust_getmore<S: Write>(
         if let Some(mt) = request.get("maxTimeMS") {
             getmore.insert("maxTimeMS", mt.clone());
         }
+        // The stream continues the client's getMore, in its session and
+        // transaction: a cursor is read on only by the session that opened it.
+        for field in ["lsid", "txnNumber", "autocommit"] {
+            if let Some(v) = request.get(field) {
+                getmore.insert(field, v.clone());
+            }
+        }
         let (reply, close, p) =
             run_dispatch(&getmore, None, conn_id, shared, conn_auth, peer_cert_dn);
         if close {

@@ -2206,7 +2206,15 @@ fn validate_read_concern(
     // takes no snapshot (measured 8.2.11).
     let reads = matches!(
         name,
-        "find" | "aggregate" | "distinct" | "count" | "getMore" | "killCursors" | "explain"
+        "find"
+            | "aggregate"
+            | "distinct"
+            | "count"
+            | "getMore"
+            | "killCursors"
+            | "explain"
+            | "mapReduce"
+            | "mapreduce"
     );
     let reason = if !reads {
         // An unknown command is CommandNotFound, whatever it carries.
