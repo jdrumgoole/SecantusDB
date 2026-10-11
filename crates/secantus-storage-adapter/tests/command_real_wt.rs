@@ -141,7 +141,10 @@ fn drop_kills_open_cursor_real_wt() {
         let cid = r.get_document("cursor").unwrap().get_i64("id").unwrap();
         assert_ne!(cid, 0);
         dispatch(&doc! {"drop": "c"}, c);
-        // The dropped collection's cursor is gone ⇒ getMore is CursorNotFound (43).
+        // The cursor says its collection was dropped (175, as mongod), and is
+        // then gone.
+        let r = dispatch_full(&doc! {"getMore": cid, "collection": "c"}, c);
+        assert_eq!(r.get_i32("code").unwrap(), 175, "{r}");
         let r = dispatch_full(&doc! {"getMore": cid, "collection": "c"}, c);
         assert_eq!(r.get_i32("code").unwrap(), 43);
     });
