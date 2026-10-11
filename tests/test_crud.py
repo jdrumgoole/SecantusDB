@@ -287,6 +287,21 @@ def test_collmod_unknown_index_errors(coll) -> None:
         )
 
 
+def test_collmod_refuses_a_ttl_on_a_compound_index(coll) -> None:
+    """mongod 8.2.11 answers 72; storing it went on to delete documents."""
+    from pymongo.errors import OperationFailure
+
+    coll.create_index([("t", 1), ("n", 1)])
+    with pytest.raises(OperationFailure) as exc:
+        coll.database.command(
+            "collMod", coll.name, index={"name": "t_1_n_1", "expireAfterSeconds": 60}
+        )
+    assert exc.value.code == 72
+    assert "compound indexes do not support TTL" in str(exc.value)
+    ix = next(i for i in coll.list_indexes() if i["name"] == "t_1_n_1")
+    assert "expireAfterSeconds" not in ix
+
+
 def test_server_status_open_cursor_count(coll) -> None:
     def open_cursors() -> int:
         return coll.database.command("serverStatus")["metrics"]["cursor"]["open"]["total"]

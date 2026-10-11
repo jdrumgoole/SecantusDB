@@ -1354,6 +1354,14 @@ struct IndexDesc {
     /// `Some` for a `2dsphere` S2 index — its field. Writes covering cells +
     /// ancestors per geometry, not `index_key_variants`.
     geo_sphere: Option<GeoSphere>,
+    /// The `_id` of a collection with a default collation: not a catalog
+    /// index and with no entries, only a claim in `UNIQ_TABLE` under the
+    /// collated key. The `_id` index proper is keyed by value, so it lets
+    /// `"A"` in beside `"a"`; mongod, whose `_id` index takes the
+    /// collection's collation, refuses it. See [`Storage::index_descs`].
+    id_claim: bool,
+    /// With `id_claim`: the collection is clustered.
+    clustered: bool,
 }
 
 /// A `2d` geohash index's parameters (field + bucketing range / precision).
@@ -1512,6 +1520,9 @@ pub struct UniqueConflict {
     /// then holds, for each string, the hex of its collation sort key, as
     /// mongod reports it.
     pub collation: Option<Document>,
+    /// The conflict is on the key of a CLUSTERED collection, which mongod
+    /// reports with no index name and with the value it found.
+    pub clustered: bool,
 }
 
 impl UniqueConflict {
@@ -1538,13 +1549,25 @@ impl UniqueConflict {
             key_pattern: key_pattern.clone(),
             key_value,
             collation: coll.map(|c| c.spec().clone()),
+            clustered: false,
         }
+    }
+
+    /// Mark the conflict as one on a clustered collection's key.
+    fn on_clustered(mut self, clustered: bool) -> Self {
+        self.clustered = clustered;
+        self
     }
 
     /// mongod's `E11000` message for this conflict.
     pub fn errmsg(&self) -> String {
         let Some(collation) = &self.collation else {
-            return format_dup_key_errmsg(&self.namespace, &self.index, &self.key_value);
+            let plain = format_dup_key_errmsg(&self.namespace, &self.index, &self.key_value);
+            if self.clustered {
+                let index = format!(" index: {} ", self.index);
+                return format!("{} found value: {{}}", plain.replacen(&index, " ", 1));
+            }
+            return plain;
         };
         let hex = self.hex_encoded();
         let inner: Vec<String> = self
@@ -1559,11 +1582,20 @@ impl UniqueConflict {
                 _ => format!("{k}: {}", shell_value(v)),
             })
             .collect();
+        let collation = secantus_core::query::bson_value_repr(&Bson::Document(collation.clone()));
+        if self.clustered {
+            return format!(
+                "E11000 duplicate key error collection: {} collation: {collation} dup key: \
+                 {{ {} }} found value: {{}}",
+                self.namespace,
+                inner.join(", ")
+            );
+        }
         format!(
-            "E11000 duplicate key error collection: {} index: {} collation: {} dup key: {{ {} }}",
+            "E11000 duplicate key error collection: {} index: {} collation: {collation} dup key: \
+             {{ {} }}",
             self.namespace,
             self.index,
-            secantus_core::query::bson_value_repr(&Bson::Document(collation.clone())),
             inner.join(", ")
         )
     }
@@ -1578,13 +1610,20 @@ impl UniqueConflict {
 
     /// The reply fields mongod adds after `keyValue` for a collated index.
     pub fn extra(&self) -> Option<Document> {
-        let collation = self.collation.as_ref()?;
+        let Some(collation) = self.collation.as_ref() else {
+            return self
+                .clustered
+                .then(|| bson::doc! { "foundValue": Document::new() });
+        };
         let mut out = Document::new();
         let hex = self.hex_encoded();
         if hex.iter().any(|h| *h) {
             out.insert("hexEncoded", hex);
         }
         out.insert("collation", collation.clone());
+        if self.clustered {
+            out.insert("foundValue", Document::new());
+        }
         Some(out)
     }
 }
@@ -8810,12 +8849,20 @@ impl Storage {
                             let mut ed = Document::new();
                             ed.insert("index", index as i32);
                             ed.insert("code", 11000i32);
-                            ed.insert(
-                                "errmsg",
-                                format_dup_key_errmsg(&ns, ID_INDEX_NAME, &key_value),
-                            );
+                            // A clustered collection has no `_id_` index to
+                            // name, and mongod adds the value it found.
+                            let clustered = is_clustered(&session, db, coll)?;
+                            let mut errmsg = format_dup_key_errmsg(&ns, ID_INDEX_NAME, &key_value);
+                            if clustered {
+                                errmsg = errmsg.replacen(" index: _id_ ", " ", 1);
+                                errmsg.push_str(" found value: {}");
+                            }
+                            ed.insert("errmsg", errmsg);
                             ed.insert("keyPattern", Bson::Document(key_pattern));
                             ed.insert("keyValue", Bson::Document(key_value));
+                            if clustered {
+                                ed.insert("foundValue", Document::new());
+                            }
                             errors.push(ed);
                             if ordered {
                                 stopped = true;
@@ -9860,7 +9907,8 @@ impl Storage {
                         after,
                         PURGE_CHUNK_MAX_ROWS,
                     )?;
-                    let dst_descs = self.index_descs(&session, dst_db, dst_coll)?;
+                    let dst_descs =
+                        self.rename_descs(&session, (src_db, src_coll), (dst_db, dst_coll))?;
                     let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
                     let mut last = after;
                     for (src_rid, id_k, blob) in &batch {
@@ -10008,6 +10056,7 @@ impl Storage {
         // Collect every src row, drop the src tables, then re-key into dst.
         let docs = self.scan_docs(session, src_db, src_coll)?;
         let idx_rows = self.collect_idx_rows(session, src_db, src_coll)?;
+        let src_id_claim = self.id_claim_desc(session, src_db, src_coll)?;
         self.purge_collection_tables(session, src_db, src_coll)?;
         // Sharded: dst rows go to the dst collection's shard (may differ from the
         // src shard — the src rows were already read into `docs` and purged above).
@@ -10045,7 +10094,10 @@ impl Storage {
         // entries carried the `id_key`, which survives a rename, so the copy was
         // safe then.) The index catalog rows are written above, so `index_descs`
         // sees the destination's indexes here.
-        let dst_descs = self.index_descs(session, dst_db, dst_coll)?;
+        let mut dst_descs = self.index_descs(session, dst_db, dst_coll)?;
+        if !dst_descs.iter().any(|d| d.id_claim) {
+            dst_descs.extend(src_id_claim);
+        }
         for (recordid, doc) in &moved {
             self.write_index_entries(session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
         }
@@ -11661,6 +11713,9 @@ impl Storage {
         recordid: i64,
     ) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
+        if desc.id_claim {
+            return Ok(out);
+        }
         // 2d geo index: one cell entry per point-valued field (point-only).
         if let Some(geo) = &desc.geo_2d {
             if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
@@ -11716,29 +11771,55 @@ impl Storage {
             // insert for no added guarantee — and the extra dirty content
             // pushed a large transaction over WiredTiger's cache before the
             // dirty-budget guard could report it (caught by txn_budget).
-            if desc.name == "_id_"
-                || (!desc.unique && !desc.prepare_unique)
-                || !self.doc_in_partial(doc, desc)?
-            {
+            // The exception is a collection with a default collation, whose
+            // `_id` is also unique by that collation (`id_claim`).
+            let claimed =
+                desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique));
+            if !claimed || !self.doc_in_partial(doc, desc)? {
                 continue;
             }
             for kb in
                 index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
             {
+                let esc = escape_kb(&kb);
                 claims.reset()?;
-                claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                claims.set_key_sssu(db, coll, &desc.name, &esc);
                 claims.set_value_q(recordid);
                 match claims.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
-                        return Err(StorageError::DuplicateKey(Box::new(UniqueConflict::new(
-                            format!("{db}.{coll}"),
-                            &desc.name,
-                            &desc.key_spec,
-                            doc,
-                            &kb,
-                            desc.collation.as_ref(),
-                        ))));
+                        if desc.id_claim {
+                            let owner = session.open_cursor(UNIQ_TABLE, None)?;
+                            owner.set_key_sssu(db, coll, &desc.name, &esc);
+                            let held = match owner.search() {
+                                Ok(()) => Some(owner.get_value_q()?),
+                                Err(e) if e.is_not_found() => None,
+                                Err(e) => return Err(e.into()),
+                            };
+                            let stale = match held {
+                                Some(id) if id == recordid => true,
+                                Some(id) => !self.claim_owner_exists(session, db, coll, id)?,
+                                None => true,
+                            };
+                            if stale {
+                                owner.reset()?;
+                                owner.set_key_sssu(db, coll, &desc.name, &esc);
+                                owner.set_value_q(recordid);
+                                owner.insert()?;
+                                continue;
+                            }
+                        }
+                        return Err(StorageError::DuplicateKey(Box::new(
+                            UniqueConflict::new(
+                                format!("{db}.{coll}"),
+                                &desc.name,
+                                &desc.key_spec,
+                                doc,
+                                &kb,
+                                desc.collation.as_ref(),
+                            )
+                            .on_clustered(desc.clustered),
+                        )));
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -11778,7 +11859,7 @@ impl Storage {
         // precisely so this can be checked.
         let claims = session.open_cursor(UNIQ_TABLE, None)?;
         for desc in descs {
-            if desc.name != "_id_" && (desc.unique || desc.prepare_unique) {
+            if desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique)) {
                 for kb in
                     index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
                 {
@@ -11962,7 +12043,7 @@ impl Storage {
     /// Parse every stored index into an `IndexDesc` (name, key_spec, sparse,
     /// unique, partial filter).
     fn index_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
-        Ok(self
+        let mut descs: Vec<IndexDesc> = self
             .iter_indexes(session, db, coll)?
             .into_iter()
             .map(|(name, key_spec, opts)| {
@@ -11984,9 +12065,73 @@ impl Storage {
                     partial,
                     geo_2d,
                     geo_sphere,
+                    id_claim: false,
+                    clustered: false,
                 }
             })
-            .collect())
+            .collect();
+        descs.extend(self.id_claim_desc(session, db, coll)?);
+        Ok(descs)
+    }
+
+    /// The `id_claim` descriptor of a collection with a default collation.
+    fn id_claim_desc(&self, session: &Session, db: &str, coll: &str) -> Result<Option<IndexDesc>> {
+        Ok(
+            default_collation(session, db, coll)?.map(|(collation, clustered)| IndexDesc {
+                name: ID_INDEX_NAME.to_string(),
+                key_spec: bson::doc! {"_id": 1},
+                sparse: false,
+                hidden: false,
+                collation: Some(collation),
+                unique: false,
+                prepare_unique: false,
+                partial: None,
+                geo_2d: None,
+                geo_sphere: None,
+                id_claim: true,
+                clustered,
+            }),
+        )
+    }
+
+    /// The destination's descriptors during a rename. Its options are written
+    /// last, so the collated `_id` claim is taken from the source, whose
+    /// options the destination is about to inherit.
+    fn rename_descs(
+        &self,
+        session: &Session,
+        src: (&str, &str),
+        dst: (&str, &str),
+    ) -> Result<Vec<IndexDesc>> {
+        let mut descs = self.index_descs(session, dst.0, dst.1)?;
+        if !descs.iter().any(|d| d.id_claim) {
+            descs.extend(self.id_claim_desc(session, src.0, src.1)?);
+        }
+        Ok(descs)
+    }
+
+    /// Whether the document a claim names is still there. A claim can outlive
+    /// its row (the Python server, sharing this store, does not release an
+    /// `_id` claim), and a RecordId is never reused, so a claim whose row is
+    /// gone belongs to nobody.
+    fn claim_owner_exists(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        recordid: i64,
+    ) -> Result<bool> {
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_ssq(db, coll, recordid);
+        match cur.search() {
+            Ok(()) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The first unique-index violation `candidate` would cause, or `None`.
@@ -12008,6 +12153,38 @@ impl Storage {
     ) -> Result<Option<UniqueConflict>> {
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
+            // The collated `_id` has no entries to probe: its claim is the
+            // record of who holds the key.
+            if desc.id_claim {
+                let claims = session.open_cursor(UNIQ_TABLE, None)?;
+                for kb in
+                    index_key_variants_c(candidate, &desc.key_spec, false, desc.collation.as_ref())?
+                {
+                    claims.reset()?;
+                    claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                    let owner = match claims.search() {
+                        Ok(()) => claims.get_value_q()?,
+                        Err(e) if e.is_not_found() => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    if exclude_recordid != Some(owner)
+                        && self.claim_owner_exists(session, db, coll, owner)?
+                    {
+                        return Ok(Some(
+                            UniqueConflict::new(
+                                format!("{db}.{coll}"),
+                                &desc.name,
+                                &desc.key_spec,
+                                candidate,
+                                &kb,
+                                desc.collation.as_ref(),
+                            )
+                            .on_clustered(desc.clustered),
+                        ));
+                    }
+                }
+                continue;
+            }
             // `prepareUnique` arms an index to reject dup *new* writes (11000)
             // before it's formally unique — so it enforces uniqueness here too.
             if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
@@ -14107,6 +14284,7 @@ impl Storage {
                                 key_pattern: bson::doc! { "_id": 1i32 },
                                 key_value: bson::doc! { "_id": id.clone() },
                                 collation: None,
+                                clustered: is_clustered(&session, db, coll)?,
                             })));
                         }
                         Err(e) => return Err(e),
@@ -16224,6 +16402,38 @@ fn ensure_collection(session: &Session, db: &str, coll: &str, data_nonlogged: bo
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// The collection's default collation, when it has one that is not `simple`.
+/// Read on every write, so the options are only decoded when the stored bytes
+/// name a collation at all.
+fn default_collation(session: &Session, db: &str, coll: &str) -> Result<Option<(Collation, bool)>> {
+    let Some(blob) = coll_options_raw(session, db, coll)? else {
+        return Ok(None);
+    };
+    const KEY: &[u8] = b"collation\0";
+    if !blob.windows(KEY.len()).any(|w| w == KEY) {
+        return Ok(None);
+    }
+    let opts = decode_doc(&blob)?;
+    Ok(opts
+        .get_document("collation")
+        .ok()
+        .and_then(secantus_core::collation::parse)
+        .map(|c| (c, opts.contains_key("clusteredIndex"))))
+}
+
+/// Whether the collection is clustered. Asked only when a duplicate `_id` is
+/// being reported.
+fn is_clustered(session: &Session, db: &str, coll: &str) -> Result<bool> {
+    let Some(blob) = coll_options_raw(session, db, coll)? else {
+        return Ok(false);
+    };
+    const KEY: &[u8] = b"clusteredIndex\0";
+    if !blob.windows(KEY.len()).any(|w| w == KEY) {
+        return Ok(false);
+    }
+    Ok(decode_doc(&blob)?.contains_key("clusteredIndex"))
 }
 
 /// The collection's options document (`{}` when registered with none), or

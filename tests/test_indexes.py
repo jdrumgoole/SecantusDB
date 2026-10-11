@@ -2053,6 +2053,65 @@ def test_multi_field_sort_skips_multikey_index(storage: Storage) -> None:
     assert plan["kind"] == "COLLSCAN"
 
 
+def test_ttl_prune_keeps_documents_outside_a_partial_filter(storage: Storage) -> None:
+    """A partial TTL index expires only what it holds. mongod 8.2.11 deletes
+    the one matching document of three expired; this deleted all three."""
+    import datetime as _dt
+
+    storage.create_index(
+        "db",
+        "c",
+        "t_1",
+        {"t": 1},
+        {"expireAfterSeconds": 60, "partialFilterExpression": {"gone": True}},
+    )
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    old = base - _dt.timedelta(seconds=600)
+    storage.insert(
+        "db",
+        "c",
+        [
+            {"_id": 1, "t": old, "gone": True},
+            {"_id": 2, "t": old, "gone": False},
+            {"_id": 3, "t": old},
+        ],
+    )
+    assert storage.prune_ttl("db", "c", now=base) == 1
+    assert sorted(d["_id"] for d in storage.find_matching("db", "c", {})) == [2, 3]
+
+
+def test_ttl_prune_ignores_a_compound_index(storage: Storage) -> None:
+    """mongod expires by a single-field index only."""
+    import datetime as _dt
+
+    storage.create_index("db", "c", "t_1_n_1", {"t": 1, "n": 1}, {"expireAfterSeconds": 60})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    storage.insert("db", "c", [{"_id": 1, "t": base - _dt.timedelta(seconds=600), "n": 1}])
+    assert storage.prune_ttl("db", "c", now=base) == 0
+    assert len(storage.find_matching("db", "c", {})) == 1
+
+
+def test_ttl_prune_expires_by_a_date_inside_an_array(storage: Storage) -> None:
+    """An array expires when any date in it has, directly or through a
+    dotted path, as on mongod."""
+    import datetime as _dt
+
+    storage.create_index("db", "c", "t_1", {"t": 1}, {"expireAfterSeconds": 60})
+    storage.create_index("db", "d", "a.t_1", {"a.t": 1}, {"expireAfterSeconds": 60})
+    base = _dt.datetime(2026, 5, 2, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    old = base - _dt.timedelta(seconds=600)
+    storage.insert(
+        "db",
+        "c",
+        [{"_id": 1, "t": [base, old]}, {"_id": 2, "t": [base, "x"]}, {"_id": 3, "t": []}],
+    )
+    storage.insert("db", "d", [{"_id": 1, "a": [{"t": base}, {"t": old}]}, {"_id": 2, "a": []}])
+    assert storage.prune_ttl("db", "c", now=base) == 1
+    assert sorted(d["_id"] for d in storage.find_matching("db", "c", {})) == [2, 3]
+    assert storage.prune_ttl("db", "d", now=base) == 1
+    assert [d["_id"] for d in storage.find_matching("db", "d", {})] == [2]
+
+
 # ---------------------------------------------------------------------
 # TTL sweeper: prune_ttl_all_collections + background thread
 # ---------------------------------------------------------------------
