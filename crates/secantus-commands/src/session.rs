@@ -1350,8 +1350,7 @@ mod tests {
             &doc! {"insert": "c", "lsid": lsid, "txnNumber": 0_i64, "autocommit": false,
             "startTransaction": true},
         )
-        .ok()
-        .expect("accepted");
+        .unwrap_or_else(|e| panic!("refused: {}", e.errmsg));
         assert!(env.in_txn && env.start && env.txn_number == Some(0));
     }
 

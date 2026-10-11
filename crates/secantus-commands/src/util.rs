@@ -518,6 +518,20 @@ fn code_name_for(code: i32) -> &'static str {
     }
 }
 
+/// Whether a BSON value reads as true where mongod takes a bool or a number.
+pub(crate) fn truthy(v: &Bson) -> bool {
+    match v {
+        Bson::Boolean(b) => *b,
+        Bson::Null => false,
+        other => as_i64(other).is_some_and(|n| n != 0),
+    }
+}
+
+/// A numeric field of a reply, 0 when absent.
+pub(crate) fn as_i64_field(doc: &Document, field: &str) -> i64 {
+    doc.get(field).and_then(as_i64).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::as_i64;
@@ -560,18 +574,4 @@ mod tests {
         // A non-number is rejected.
         assert_eq!(as_i64(&Bson::String("x".into())), None);
     }
-}
-
-/// Whether a BSON value reads as true where mongod takes a bool or a number.
-pub(crate) fn truthy(v: &Bson) -> bool {
-    match v {
-        Bson::Boolean(b) => *b,
-        Bson::Null => false,
-        other => as_i64(other).is_some_and(|n| n != 0),
-    }
-}
-
-/// A numeric field of a reply, 0 when absent.
-pub(crate) fn as_i64_field(doc: &Document, field: &str) -> i64 {
-    doc.get(field).and_then(as_i64).unwrap_or(0)
 }
