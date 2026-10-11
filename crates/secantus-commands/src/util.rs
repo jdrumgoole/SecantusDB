@@ -474,8 +474,8 @@ pub(crate) fn command_error_during(err: StorageError, command: &str) -> CommandE
         StorageError::WriteConflict => CommandError::new(
             112,
             "WriteConflict",
-            "WriteConflict error: this operation conflicted with another operation. Please retry \
-             your operation or multi-document transaction.",
+            "Caused by :: Write conflict during plan execution and yielding is disabled. :: \
+             Please retry your operation or multi-document transaction.",
         ),
     }
 }
@@ -516,6 +516,20 @@ fn code_name_for(code: i32) -> &'static str {
         168 => "InvalidPipelineOperator",
         _ => "Location",
     }
+}
+
+/// Whether a BSON value reads as true where mongod takes a bool or a number.
+pub(crate) fn truthy(v: &Bson) -> bool {
+    match v {
+        Bson::Boolean(b) => *b,
+        Bson::Null => false,
+        other => as_i64(other).is_some_and(|n| n != 0),
+    }
+}
+
+/// A numeric field of a reply, 0 when absent.
+pub(crate) fn as_i64_field(doc: &Document, field: &str) -> i64 {
+    doc.get(field).and_then(as_i64).unwrap_or(0)
 }
 
 #[cfg(test)]

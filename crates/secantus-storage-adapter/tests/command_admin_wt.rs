@@ -981,24 +981,7 @@ fn coll_stats_reports_a_capped_collections_bounds() {
 #[test]
 fn a_write_to_a_capped_collection_inside_a_transaction_is_refused() {
     with_wt(|c| {
-        // The registry the server builds: commit and rollback go to storage.
-        use secantus_commands::transactions::{Transaction, TransactionRegistry};
-        let commit = c.storage.clone().unwrap();
-        let rollback = c.storage.clone().unwrap();
-        c.transactions = Some(std::sync::Arc::new(TransactionRegistry::new(
-            Box::new(move |txn: &mut Transaction| {
-                if let Some(h) = txn.handle.as_mut() {
-                    let _ = commit.commit_user_transaction(h.as_mut());
-                }
-            }),
-            Box::new(move |txn: &mut Transaction| {
-                if let Some(h) = txn.handle.as_mut() {
-                    let _ = rollback.rollback_user_transaction(h.as_mut());
-                }
-            }),
-            secantus_commands::transactions::DEFAULT_LIFETIME_SECONDS,
-            Box::new(|| 0.0),
-        )));
+        common::with_transactions(c);
         create_capped(c, "tx", doc! {"capped": true, "size": 100000_i32});
         dispatch(&doc! {"insert": "tx", "documents": [{"_id": 1, "a": 1}]}, c);
         dispatch(&doc! {"insert": "plain", "documents": [{"_id": 1}]}, c);
@@ -1015,7 +998,7 @@ fn a_write_to_a_capped_collection_inside_a_transaction_is_refused() {
             cmd.insert("startTransaction", true);
             let reply = dispatch(&cmd, c);
             // The refusal aborts the transaction: committing it finds none.
-            let commit = dispatch(
+            let commit = common::dispatch_admin(
                 &doc! {"commitTransaction": 1, "lsid": lsid.clone(), "txnNumber": txn_number,
                 "autocommit": false},
                 c,

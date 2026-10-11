@@ -8821,6 +8821,53 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.072 Sessions, transactions and retryable writes -- 2026-10-11
+
+`tools/probes/transactions.py`, mongod 8.2.11 as a replica-set member: 251
+scenarios, each a script of commands over raw connections with the session
+fields written out (the transaction state rules, what a transaction refuses,
+conflicts, collections made in a transaction, cursors, the session commands,
+retryable writes). The Rust server went from 189 scenarios different to 11.
+It ran a write whose session fields were malformed, aborted a transaction on
+a command mongod merely refuses, replayed a retryable write by whole command
+and not by statement, and let any session read any cursor. What is left:
+
+- [ ] **RUST MongoDB server: a schema change does not wait for an open
+      transaction.** With a transaction holding a collection, mongod makes
+      `drop` and `createIndexes` on it wait (until `maxTimeMS`, or the
+      transaction ends); here both run at once (2 of the 11). What a
+      transaction that had WRITTEN to the dropped collection then commits
+      was not measured.
+- [ ] **RUST MongoDB server: change events of a transaction carry no
+      `txnNumber` and `lsid`.** mongod puts both first in every event a
+      transaction produced (2 of the 11). The oplog entries here do not
+      record the session.
+- [ ] **RUST MongoDB server: two transactions that both create one
+      collection conflict at the second insert.** mongod lets both insert
+      and fails the second COMMIT with 112 (`Collection namespace ... is
+      already in use`) (1 of the 11).
+- [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
+      does not see another session's uncommitted insert (mongod's fast count
+      does: it answered 3 for 2 committed documents). A write that waits on a
+      transaction's document past `maxTimeMS` answers a plain 50 (mongod adds
+      a `writeConcernError` and words it `Plan executor error during
+      update`). `$where` has no JavaScript to run, in or out of a
+      transaction, and `convertToCapped` is not a command (2 scenarios each;
+      section 7.071). An error that names the request or mongod's oplog entry
+      (40606 / 40607 / 40608 / 40612 on a mismatched `findAndModify` retry;
+      the two statement-id errors) has the code and a shorter text. A write
+      conflict on an insert has an empty cause where mongod names its index
+      table. `find` accepts a field it does not know (mongod: 40415); the
+      other session errors are worded for a session with no user.
+- [ ] **RUST MongoDB server: `bulkWrite` as a retryable write is not
+      replayed.** It takes the session's number and runs again on a retry.
+      Not measured against mongod.
+- [ ] **PYTHON MongoDB server: not measured on this probe**, which needs a
+      server URI and was run against the Rust server only. Its registry
+      (`src/secantus/transactions.py`) has the rules the Rust one had before:
+      50911 for a restart, whole-command replay, `endSessions` aborting the
+      session's transaction.
+
 ### 7.071 Time-series collections -- 2026-10-11
 
 `tools/probes/time_series.py`, mongod 8.2.11: 187 scenarios on a fresh

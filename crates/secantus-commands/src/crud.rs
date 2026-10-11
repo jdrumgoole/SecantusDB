@@ -504,7 +504,15 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &let_vars,
             collation.as_ref(),
         ) {
-            Ok(deleted) => n += deleted as i32,
+            Ok(deleted) => {
+                n += deleted as i32;
+                if deleted > 0 {
+                    crate::transactions::note_statement(
+                        index,
+                        crate::transactions::StmtRecord::Delete,
+                    );
+                }
+            }
             Err(StorageError::Internal(msg)) => {
                 return Ok(CommandError::new(1, "InternalError", msg).into_reply())
             }
@@ -1048,6 +1056,12 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Ok(outcome) => {
                 n += outcome.matched as i32;
                 n_modified += outcome.modified as i32;
+                if outcome.modified > 0 {
+                    crate::transactions::note_statement(
+                        index,
+                        crate::transactions::StmtRecord::Update { upserted: None },
+                    );
+                }
                 let mut upserted_id = outcome.upserted_id;
                 if let (0, Some(mut new)) = (outcome.matched, supplied) {
                     if !new.contains_key("_id") {
@@ -1068,6 +1082,12 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     upserted_id = Some(id);
                 }
                 if let Some(id) = upserted_id {
+                    crate::transactions::note_statement(
+                        index,
+                        crate::transactions::StmtRecord::Update {
+                            upserted: Some(id.clone()),
+                        },
+                    );
                     upserted.push(Bson::Document(doc! { "index": index as i32, "_id": id }));
                     n += 1;
                 }

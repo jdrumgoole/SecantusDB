@@ -560,10 +560,12 @@ mod tests {
             doc! {"refreshSessions": []},
             doc! {"killSessions": []},
             doc! {"killAllSessions": []},
-            doc! {"commitTransaction": 1},
-            doc! {"abortTransaction": 1},
         ] {
             assert_eq!(dispatch(&cmd, &mut ctx()).get_f64("ok").unwrap(), 1.0);
+        }
+        // Ending a transaction needs one: 125, as mongod answers.
+        for cmd in [doc! {"commitTransaction": 1}, doc! {"abortTransaction": 1}] {
+            assert_eq!(dispatch(&cmd, &mut ctx()).get_i32("code").unwrap(), 125);
         }
     }
 

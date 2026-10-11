@@ -103,3 +103,16 @@ def test_default_getmore_respects_16mb_byte_budget(client) -> None:
     # than one-per-doc, and every full batch carried multiple documents.
     assert 2 <= len(batches) <= 5
     assert batches[0] > 1
+
+
+def test_exhaust_cursor_streams_every_batch(client):
+    """An exhaust cursor's later batches are getMores the SERVER sends itself.
+
+    A cursor belongs to the session that opened it, and pymongo opens every
+    cursor in one, so a streamed getMore that left the session out was refused
+    on the Rust server (50737) once it started checking.
+    """
+    coll = client.exhaust_db.c
+    coll.insert_many([{"_id": i} for i in range(5)])
+    docs = list(coll.find({}, cursor_type=pymongo.CursorType.EXHAUST, batch_size=1))
+    assert [d["_id"] for d in docs] == [0, 1, 2, 3, 4]

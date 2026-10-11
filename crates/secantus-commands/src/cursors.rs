@@ -130,6 +130,36 @@ struct Entry {
     /// a non-tailable cursor's getMores by it; here it only decides whether the
     /// `maxTimeAlwaysTimeOut` failpoint applies to a getMore.
     time_limited: bool,
+    /// The session, and the transaction of it, that opened the cursor.
+    owner: Option<CursorOwner>,
+}
+
+/// The session a cursor was opened in, and the transaction number when it was
+/// opened by a statement of a transaction. mongod lets only that session, and
+/// only that transaction, read the cursor on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorOwner {
+    pub lsid: Vec<u8>,
+    pub txn_number: Option<i64>,
+}
+
+thread_local! {
+    /// The session of the command running on this thread; a cursor it
+    /// registers is stamped with it.
+    static OWNER: std::cell::RefCell<Option<CursorOwner>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` as the command of `owner`'s session.
+pub fn with_owner<R>(owner: Option<CursorOwner>, f: impl FnOnce() -> R) -> R {
+    let outer = OWNER.with(|o| o.replace(owner));
+    let result = f();
+    OWNER.with(|o| o.replace(outer));
+    result
+}
+
+fn current_owner() -> Option<CursorOwner> {
+    OWNER.with(|o| o.borrow().clone())
 }
 
 /// A read-only snapshot of a cursor's routing state, so the getMore handler can
@@ -246,6 +276,7 @@ impl CursorRegistry {
                 last_token: None,
                 fatal_error: None,
                 time_limited: false,
+                owner: current_owner(),
             },
         );
         Ok(id)
@@ -286,6 +317,7 @@ impl CursorRegistry {
                 last_token: None,
                 fatal_error: None,
                 time_limited: false,
+                owner: current_owner(),
             },
         );
         Ok(id)
@@ -508,7 +540,21 @@ impl CursorRegistry {
             .map(Bson::Document)
     }
 
-    /// Whether this cursor was tombstoned by a drop/rename of its collection.
+    /// The session that opened a live cursor: `None` when there is no such
+    /// cursor, `Some(None)` when it was opened outside any session.
+    pub fn owner(&self, cursor_id: i64) -> Option<Option<CursorOwner>> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.get(&cursor_id).map(|e| e.owner.clone())
+    }
+
+    /// Kill every cursor a session opened (`killSessions`).
+    pub fn kill_session(&self, lsid: &[u8]) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cursors
+            .retain(|_, e| e.owner.as_ref().is_none_or(|o| o.lsid != lsid));
+    }
+
     /// Flag a non-tailable cursor as opened under a `maxTimeMS`.
     pub fn mark_time_limited(&self, cursor_id: i64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

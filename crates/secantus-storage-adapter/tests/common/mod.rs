@@ -63,3 +63,37 @@ pub fn with_wt(body: impl FnOnce(&mut CommandContext)) {
     drop(ctx); // release the Arc<WtStorage> so the WT connection closes
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Give `c` the transaction registry the server builds: commit and rollback
+/// go to storage.
+#[allow(dead_code)]
+pub fn with_transactions(c: &mut CommandContext) {
+    use secantus_commands::transactions::{
+        Transaction, TransactionRegistry, DEFAULT_LIFETIME_SECONDS,
+    };
+    let commit = c.storage.clone().unwrap();
+    let rollback = c.storage.clone().unwrap();
+    c.transactions = Some(Arc::new(TransactionRegistry::new(
+        Box::new(move |txn: &mut Transaction| match txn.handle.as_mut() {
+            Some(h) => commit.commit_user_transaction(h.as_mut()),
+            None => Ok(()),
+        }),
+        Box::new(move |txn: &mut Transaction| {
+            if let Some(h) = txn.handle.as_mut() {
+                let _ = rollback.rollback_user_transaction(h.as_mut());
+            }
+        }),
+        DEFAULT_LIFETIME_SECONDS,
+        Box::new(|| 0.0),
+    )));
+}
+
+/// Dispatch `cmd` against the `admin` database, where a transaction is
+/// committed and aborted.
+#[allow(dead_code)]
+pub fn dispatch_admin(cmd: &Document, c: &mut CommandContext) -> Document {
+    let db = std::mem::replace(&mut c.db_name, "admin".into());
+    let reply = dispatch(cmd, c);
+    c.db_name = db;
+    reply
+}

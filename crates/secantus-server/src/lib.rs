@@ -358,10 +358,9 @@ pub fn bind(
         let s_commit = storage.clone();
         let s_rollback = storage.clone();
         Arc::new(TransactionRegistry::new(
-            Box::new(move |txn: &mut Transaction| {
-                if let Some(h) = txn.handle.as_mut() {
-                    let _ = s_commit.commit_user_transaction(h.as_mut());
-                }
+            Box::new(move |txn: &mut Transaction| match txn.handle.as_mut() {
+                Some(h) => s_commit.commit_user_transaction(h.as_mut()),
+                None => Ok(()),
             }),
             Box::new(move |txn: &mut Transaction| {
                 if let Some(h) = txn.handle.as_mut() {
@@ -418,7 +417,15 @@ pub fn bind(
 }
 
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+    let mut reaped = std::time::Instant::now();
     while !shared.stop.load(Ordering::SeqCst) {
+        // A transaction nobody ends is aborted when its lifetime runs out,
+        // whether or not another request ever touches the registry: a writer
+        // blocked on one of its documents is waiting for exactly that.
+        if reaped.elapsed() >= Duration::from_secs(1) {
+            reaped = std::time::Instant::now();
+            shared.transactions.reap();
+        }
         match listener.accept() {
             Ok((stream, _peer)) => {
                 // Disable Nagle: reply paths write small frames back-to-back
@@ -1188,6 +1195,13 @@ fn stream_exhaust_getmore<S: Write>(
         }
         if let Some(mt) = request.get("maxTimeMS") {
             getmore.insert("maxTimeMS", mt.clone());
+        }
+        // The stream continues the client's getMore, in its session and
+        // transaction: a cursor is read on only by the session that opened it.
+        for field in ["lsid", "txnNumber", "autocommit"] {
+            if let Some(v) = request.get(field) {
+                getmore.insert(field, v.clone());
+            }
         }
         let (reply, close, p) =
             run_dispatch(&getmore, None, conn_id, shared, conn_auth, peer_cert_dn);

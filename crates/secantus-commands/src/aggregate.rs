@@ -2051,8 +2051,10 @@ fn infer_geo_near_key(
     }
     match geo_fields.len() {
         1 => Ok(geo_fields.remove(0)),
-        0 => Err(bad_value(
-            "$geoNear requires a geo index; no `key` given and the collection has no 2d/2dsphere index",
+        0 => Err(CommandError::new(
+            27,
+            "IndexNotFound",
+            "$geoNear requires a 2d or 2dsphere index, but none were found",
         )),
         _ => Err(bad_value(
             "$geoNear: more than one geo index — specify `key` to disambiguate",

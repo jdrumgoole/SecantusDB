@@ -51,6 +51,7 @@ pub mod mongod_codes;
 pub mod params;
 pub mod rbac;
 pub mod roles;
+mod session;
 pub mod slowop;
 pub mod stepdown;
 pub mod storage;
@@ -531,7 +532,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "endSessions" => end_sessions,
         "killSessions" => kill_sessions,
         "killAllSessions" | "killAllSessionsByPattern" => kill_all_sessions,
-        "refreshSessions" => diagnostics::ok_session_noop,
+        "refreshSessions" => refresh_sessions,
         "commitTransaction" => commit_transaction,
         "abortTransaction" => abort_transaction,
         "saslStart" => auth::sasl_start,
@@ -601,10 +602,38 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let mut reply = dispatch_inner(doc, ctx);
+    unacknowledged_write_reply(doc, &mut reply);
     attach_write_concern_error(doc, &mut reply);
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
     reply
+}
+
+/// A write sent with `w: 0` asked not to be told what happened, and mongod
+/// tells it nothing: `n` (and `nModified`) are 0 and no write error or
+/// upserted id is reported, though the write ran (measured 8.2.11).
+/// `findAndModify` answers in full.
+fn unacknowledged_write_reply(doc: &Document, reply: &mut Document) {
+    let name = command_name(doc);
+    if !matches!(name, "insert" | "update" | "delete") || !reply.contains_key("n") {
+        return;
+    }
+    let w = doc
+        .get_document("writeConcern")
+        .ok()
+        .and_then(|wc| wc.get("w"));
+    if !matches!(w, Some(n @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)))
+        if write_concern_w_number(n) == 0)
+    {
+        return;
+    }
+    reply.insert("n", 0_i32);
+    if name == "update" {
+        reply.insert("nModified", 0_i32);
+    }
+    reply.remove("writeErrors");
+    reply.remove("upserted");
+    reply.remove("retriedStmtIds");
 }
 
 /// Attach a `writeConcernError` when the command carried an integer `w > 1`.
@@ -1056,11 +1085,15 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             }
             // Time profile-eligible commands so dispatch can record a
             // `system.profile` entry when the per-database level requires it.
-            if let Some(reply) = views::refusal(name, doc, ctx) {
-                return reply;
+            // (A statement of a transaction is refused inside it, in
+            // `session`, because the refusal aborts the transaction.)
+            if doc.get("autocommit") != Some(&Bson::Boolean(false)) {
+                if let Some(reply) = views::refusal(name, doc, ctx) {
+                    return reply;
+                }
             }
             let start = profile_eligible(name, doc).then(std::time::Instant::now);
-            let mut reply = run_with_txn_envelope(name, handler, doc, ctx);
+            let mut reply = session::run(name, handler, doc, ctx);
             // A failpoint-configured writeConcernError attaches to a successful reply,
             // AND so do the failpoint's errorLabels. The labels are what make the
             // write retryable in the driver's eyes: without `RetryableWriteError`
@@ -1110,37 +1143,101 @@ fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     }
 }
 
-/// Abort the in-progress transaction of every session listed under `key`
-/// (`endSessions` / `killSessions`). Mirrors `commands.py::_end_sessions` /
-/// `_kill_sessions`. Ending a session must release its transaction: otherwise
-/// its uncommitted writes keep conflicting with every later write to the same
-/// documents until the transaction lifetime expires.
-fn abort_listed_sessions(doc: &Document, key: &str, ctx: &CommandContext) -> HandlerResult {
-    if let (Some(reg), Ok(entries)) = (&ctx.transactions, doc.get_array(key)) {
-        for entry in entries {
-            if let Some(lsid) = lsid_bytes_from_arg(Some(entry)) {
-                reg.abort_for_session(&lsid);
-            }
+/// `endSessions` -- the listed sessions are no longer needed. mongod checks
+/// the list and leaves an open transaction of theirs alone (measured 8.2.11:
+/// a statement after `endSessions` still runs, and the commit succeeds); the
+/// transaction ends when the client ends it or its lifetime runs out.
+fn end_sessions(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    session::listed_sessions(
+        doc,
+        "endSessions",
+        "endSessions",
+        "endSessions.endSessionsFromClient",
+        true,
+    )?;
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `refreshSessions` -- checked like `endSessions`; there is no session
+/// timeout here to push back.
+fn refresh_sessions(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    session::listed_sessions(
+        doc,
+        "refreshSessions",
+        "refreshSessions",
+        "refreshSessions.refreshSessionsFromClient",
+        true,
+    )?;
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `killSessions` -- abort each listed session's open transaction and kill
+/// the cursors it opened. An empty list is every session.
+fn kill_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let sessions = session::listed_sessions(
+        doc,
+        "killSessions",
+        "KillSessionsCmd",
+        "KillSessionsCmd.killSessions",
+        false,
+    )?;
+    if sessions.is_empty() {
+        return kill_all_sessions(&doc! {"killAllSessions": []}, ctx);
+    }
+    for lsid in &sessions {
+        if let Some(reg) = &ctx.transactions {
+            reg.abort_for_session(lsid);
+        }
+        if let Some(cursors) = &ctx.cursors {
+            cursors.kill_session(lsid);
         }
     }
     Ok(doc! { "ok": 1.0 })
 }
 
-fn end_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    abort_listed_sessions(doc, "endSessions", ctx)
-}
-
-fn kill_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    abort_listed_sessions(doc, "killSessions", ctx)
-}
-
 /// `killAllSessions` / `killAllSessionsByPattern` — abort every open
-/// transaction. Mirrors `commands.py::_kill_all_sessions`, which likewise
-/// ignores the user / pattern filter. Driver test runners call it between
-/// tests precisely to clear a transaction an earlier test left open; as a
+/// transaction, whatever user or pattern is named. Driver test runners call
+/// it between tests to clear a transaction an earlier test left open; as a
 /// no-op it let one leaked transaction turn every later write into a
 /// `WriteConflict` retry storm (pymongo's unified transaction tests, 2026-09-25).
-fn kill_all_sessions(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name = command_name(doc);
+    let owner = if name == "killAllSessions" {
+        "KillAllSessionsCmd"
+    } else {
+        "KillAllSessionsByPatternCmd"
+    };
+    match doc.get(name) {
+        Some(Bson::Array(_)) | None => {}
+        Some(other) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field '{owner}.{name}' is the wrong type '{}', expected type 'array'",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
+    }
+    if name == "killAllSessionsByPattern" {
+        if let Some(Bson::Array(patterns)) = doc.get(name) {
+            for pattern in patterns {
+                let lsid = pattern
+                    .as_document()
+                    .and_then(|p| p.get_document("lsid").ok());
+                if lsid.is_some_and(|l| !l.contains_key("uid")) {
+                    return Err(CommandError::new(
+                        40414,
+                        "IDLFailedToParse",
+                        format!(
+                            "BSON field '{owner}.{name}.lsid.uid' is missing but a required field"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     if let Some(reg) = &ctx.transactions {
         reg.abort_all();
     }
@@ -1394,44 +1491,6 @@ fn mark_time_limited_cursor(reply: &Document, ctx: &CommandContext) {
     }
 }
 
-/// Commands permitted as statements inside a multi-document transaction
-/// (`commands.py::_TXN_ALLOWED_COMMANDS`). `commitTransaction` / `abortTransaction`
-/// are the controls, handled by their own handlers, not the statement path.
-fn txn_allowed_command(name: &str) -> bool {
-    matches!(
-        name,
-        "insert"
-            | "update"
-            | "delete"
-            | "findAndModify"
-            | "findandmodify"
-            | "find"
-            | "getMore"
-            | "killCursors"
-            | "aggregate"
-            | "distinct"
-            | "bulkWrite"
-            | "create"
-            | "createIndexes"
-    )
-}
-
-/// Aggregation stages mongod refuses inside a transaction.
-fn txn_blocked_agg_stage(stage: &str) -> bool {
-    matches!(
-        stage,
-        "$out"
-            | "$merge"
-            | "$changeStream"
-            | "$collStats"
-            | "$currentOp"
-            | "$indexStats"
-            | "$listLocalSessions"
-            | "$listSessions"
-    )
-}
-
-/// The mongod-shaped reason a statement can't run in a transaction, or `None`.
 /// The reply to a write on a capped collection inside a multi-document
 /// transaction, which mongod refuses and which aborts the transaction; `None`
 /// for anything else. Shapes measured on 8.2.11: `insert` / `update` /
@@ -1480,29 +1539,6 @@ fn capped_write_in_txn(name: &str, doc: &Document, ctx: &CommandContext) -> Opti
     })
 }
 
-fn txn_unsupported_reason(name: &str, doc: &Document) -> Option<String> {
-    if !txn_allowed_command(name) {
-        return Some(format!(
-            "Cannot run '{name}' in a multi-document transaction."
-        ));
-    }
-    if name == "aggregate" {
-        if let Some(Bson::Array(pipeline)) = doc.get("pipeline") {
-            for stage in pipeline {
-                if let Some(s) = stage.as_document().and_then(|d| d.keys().next()) {
-                    if txn_blocked_agg_stage(s) {
-                        return Some(format!(
-                            "Operation not permitted in transaction :: caused by :: Aggregation \
-                             stage {s} cannot run within a multi-document transaction."
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// The 16-byte UUID payload from a `lsid` argument (`{id: BinData(4, <uuid>)}`),
 /// or `None` for an unrecognised shape.
 fn lsid_bytes_from_arg(entry: Option<&Bson>) -> Option<Vec<u8>> {
@@ -1523,177 +1559,6 @@ fn txn_envelope(doc: &Document) -> (Option<Vec<u8>>, Option<i64>) {
         _ => None,
     };
     (lsid, txn_number)
-}
-
-/// The multi-document-transaction envelope around a statement (port of the
-/// `commands.py::dispatch` transaction block). When the command carries an
-/// `autocommit: false` + `lsid` + `txnNumber` envelope it resolves / runs inside
-/// the transaction; a bare `txnNumber` (retryable write) just advances the
-/// session sequence; everything else runs the handler directly.
-/// Commands mongod records a retryable-write result for. Drivers only attach a
-/// `txnNumber` to genuinely retryable operations (single-document writes) —
-/// `updateMany` / `deleteMany` are excluded by the spec and arrive without one
-/// — so the envelope alone is nearly sufficient. Naming the commands anyway
-/// keeps a stray `txnNumber` on a read from being cached and replayed.
-const RETRYABLE_WRITE_COMMANDS: &[&str] = &["insert", "update", "delete", "findAndModify"];
-
-/// Envelope fields a driver legitimately varies between the original attempt
-/// and its retry (gossip, routing, the session envelope itself). Excluded from
-/// the identity digest so a genuine retry still matches.
-const RETRY_IDENTITY_IGNORED: &[&str] = &[
-    "lsid",
-    "txnNumber",
-    "$clusterTime",
-    "$db",
-    "$readPreference",
-    "readConcern",
-    "writeConcern",
-    "apiVersion",
-    "apiStrict",
-    "apiDeprecationErrors",
-    "comment",
-];
-
-/// A stable digest of the write this command represents.
-///
-/// Two attempts of the same retryable write are byte-identical apart from the
-/// envelope fields above, so this matches on a genuine retry and differs when
-/// the `(lsid, txnNumber)` key has been reused for another write. Mirrors the
-/// Python server's `_retry_identity`.
-fn retry_identity(doc: &Document) -> [u8; 20] {
-    use sha2::{Digest, Sha256};
-
-    let mut body = Document::new();
-    for (k, v) in doc.iter() {
-        if !RETRY_IDENTITY_IGNORED.contains(&k.as_str()) {
-            body.insert(k.clone(), v.clone());
-        }
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    let payload = match body.to_writer(&mut buf) {
-        Ok(()) => buf.as_slice(),
-        // Unencodable body: fall back to a debug rendering. It only has to be
-        // consistent for a given command, not canonical.
-        Err(_) => {
-            buf = format!("{body:?}").into_bytes();
-            buf.as_slice()
-        }
-    };
-    let full = Sha256::digest(payload);
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&full[..20]);
-    out
-}
-
-fn run_with_txn_envelope(
-    name: &str,
-    handler: Handler,
-    doc: &Document,
-    ctx: &mut CommandContext,
-) -> Document {
-    let registry = match (&ctx.transactions, doc.contains_key("txnNumber")) {
-        (Some(r), true) => r.clone(),
-        _ => return run_handler(handler, doc, ctx),
-    };
-    let (Some(lsid), Some(txn_number)) = txn_envelope(doc) else {
-        return run_handler(handler, doc, ctx);
-    };
-    let autocommit_false = matches!(doc.get("autocommit"), Some(Bson::Boolean(false)));
-    if !autocommit_false {
-        // Retryable write: consumes the session's txnNumber sequence (and aborts
-        // an older in-progress transaction), then runs normally.
-        registry.on_retryable_write(&lsid, txn_number);
-        if !RETRYABLE_WRITE_COMMANDS.contains(&name) {
-            return run_handler(handler, doc, ctx);
-        }
-        // If this exact (lsid, txnNumber) already ran THIS command, replay the
-        // stored reply instead of executing the write again. Without it a
-        // retried `{$inc: {n: 1}}` applies twice while both replies claim
-        // `nModified: 1` — silent corruption on a path every driver exercises
-        // automatically after a network blip.
-        let identity = retry_identity(doc);
-        if let Some(cached) = registry.retryable_reply(&lsid, txn_number, &identity) {
-            return cached;
-        }
-        let result = run_handler(handler, doc, ctx);
-        registry.record_retryable(&lsid, txn_number, identity, &result);
-        return result;
-    }
-    // commit/abort carry the same envelope but are controls (own handlers).
-    if name == "commitTransaction" || name == "abortTransaction" {
-        return run_handler(handler, doc, ctx);
-    }
-    // A transaction's concerns are fixed when it starts: `readConcern` may ride
-    // only the FIRST statement, and `writeConcern` belongs on commit/abort,
-    // never on a statement. mongod rejects both with InvalidOptions (72); we
-    // accepted and silently ignored them, so a caller could believe a statement
-    // ran at a concern it did not. Drivers guard this client-side (the
-    // transactions spec marks these `isClientError: true`), so no gauge covers
-    // it — it matters for raw-command callers. Messages are mongod's verbatim,
-    // from the spec corpus the drivers vendor.
-    if doc.get("writeConcern").is_some() {
-        return CommandError::new(
-            72,
-            "InvalidOptions",
-            "Cannot set write concern after starting a transaction",
-        )
-        .into_reply();
-    }
-    let starting = matches!(
-        doc.get("startTransaction"),
-        Some(Bson::Boolean(true)) | Some(Bson::Int32(1)) | Some(Bson::Int64(1))
-    );
-    if !starting && doc.get("readConcern").is_some() {
-        return CommandError::new(
-            72,
-            "InvalidOptions",
-            "Cannot set read concern after starting a transaction",
-        )
-        .into_reply();
-    }
-    let start = matches!(
-        doc.get("startTransaction"),
-        Some(Bson::Boolean(true)) | Some(Bson::Int32(1)) | Some(Bson::Int64(1))
-    );
-    let txn = match registry.for_statement(&lsid, txn_number, start) {
-        Ok(t) => t,
-        Err(reply) => return reply,
-    };
-    // A disallowed statement aborts the transaction, then errors (263).
-    if let Some(reason) = txn_unsupported_reason(name, doc) {
-        registry.abort_in_progress(&txn);
-        return CommandError::new(263, "OperationNotSupportedInTransaction", reason).into_reply();
-    }
-    if let Some(reply) = capped_write_in_txn(name, doc, ctx) {
-        registry.abort_in_progress(&txn);
-        return reply;
-    }
-    let Some(storage) = ctx.storage.clone() else {
-        return run_handler(handler, doc, ctx);
-    };
-    // Create the WT transaction handle lazily at the first statement (the
-    // snapshot pins here).
-    {
-        let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
-        if t.handle.is_none() {
-            match storage.begin_user_transaction() {
-                Ok(h) => t.handle = Some(h),
-                Err(e) => {
-                    return CommandError::new(1, "InternalError", format!("{e:?}")).into_reply()
-                }
-            }
-        }
-    }
-    let mut result = {
-        let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
-        let handle = t.handle.as_mut().expect("handle created above").as_mut();
-        match storage.run_in_user_transaction(handle, &mut || run_handler(handler, doc, ctx)) {
-            Ok(r) => r,
-            Err(e) => CommandError::new(1, "InternalError", format!("{e:?}")).into_reply(),
-        }
-    };
-    finish_txn_statement(&registry, &txn, &mut result);
-    result
 }
 
 /// The `errorLabels` mongod puts on a `failCommand`-injected error.
@@ -1792,19 +1657,7 @@ fn finish_txn_statement(
     if !ok {
         let code = result.get_i32("code").unwrap_or(0);
         if failpoints::is_transient_txn_code(code) {
-            let labels = match result.get_array_mut("errorLabels") {
-                Ok(arr) => arr,
-                Err(_) => {
-                    result.insert("errorLabels", Bson::Array(Vec::new()));
-                    result.get_array_mut("errorLabels").unwrap()
-                }
-            };
-            if !labels
-                .iter()
-                .any(|l| l.as_str() == Some(transactions::TRANSIENT_LABEL))
-            {
-                labels.push(Bson::String(transactions::TRANSIENT_LABEL.to_string()));
-            }
+            transactions::add_label_first(result, transactions::TRANSIENT_LABEL);
         }
     }
 }
@@ -1827,12 +1680,13 @@ fn order_write_reply(req: &Document, reply: &mut Document) {
     if !matches!(cmd.as_str(), "insert" | "update" | "delete") || !reply.contains_key("n") {
         return;
     }
-    const LEADING: [&str; 6] = [
+    const LEADING: [&str; 7] = [
         "n",
         "electionId",
         "opTime",
-        "upserted",
         "writeErrors",
+        "retriedStmtIds",
+        "upserted",
         "nModified",
     ];
     let mut rest = std::mem::take(reply);
@@ -1922,7 +1776,9 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
         .get_document("readConcern")
         .ok()
         .and_then(|rc| rc.get_str("level").ok())
-        == Some("snapshot");
+        == Some("snapshot")
+        // A transaction's statements read at its snapshot and report no time.
+        && req.get("autocommit") != Some(&Bson::Boolean(false));
     let ok = matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
         || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
         || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0);
@@ -1935,7 +1791,15 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
             }
             _ => {
                 if !reply.contains_key("atClusterTime") {
-                    reply.insert("atClusterTime", Bson::Timestamp(ts));
+                    // Just before `ok`, where mongod has it.
+                    let mut out = Document::new();
+                    for (k, v) in std::mem::take(reply) {
+                        if k == "ok" {
+                            out.insert("atClusterTime", Bson::Timestamp(ts));
+                        }
+                        out.insert(k, v);
+                    }
+                    *reply = out;
                 }
             }
         }
@@ -2281,42 +2145,96 @@ fn validate_read_concern(
     let Some(Bson::Document(rc)) = doc.get("readConcern") else {
         return Ok(());
     };
-    let Some(level) = rc.get("level") else {
+    const FIELDS: [&str; 7] = [
+        "level",
+        "afterClusterTime",
+        "afterOpTime",
+        "atClusterTime",
+        "provenance",
+        "allowTransactionTableSnapshot",
+        "waitLastStableRecoveryTimestamp",
+    ];
+    let level = match rc.get("level") {
+        None | Some(Bson::Null) => None,
+        Some(Bson::String(l)) => Some(l.as_str()),
+        Some(other) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'readConcern.level' is the wrong type '{}', expected type \
+                     'string'",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
+    };
+    if let Some(l) = level {
+        if !VALID_READ_CONCERN_LEVELS.contains(&l) {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                format!(
+                    "Enumeration value '{l}' for field 'readConcern.level' is not a valid value."
+                ),
+            ));
+        }
+    }
+    if let Some(key) = rc.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'readConcern.{key}' is an unknown field."),
+        ));
+    }
+    // A statement of a transaction reads at the transaction's own snapshot,
+    // and its read concern is checked with the transaction (`session`).
+    if matches!(doc.get("autocommit"), Some(Bson::Boolean(false))) {
+        return Ok(());
+    }
+    let Some(level) = level.filter(|l| *l != "local") else {
         return Ok(());
     };
-    match level.as_str() {
-        Some(l) if VALID_READ_CONCERN_LEVELS.contains(&l) => {
-            if l == "snapshot" {
-                // Inside a multi-document transaction (`autocommit: false`) every
-                // read runs against the txn's pinned WT snapshot — exactly what
-                // `snapshot` asks for on a single node — so it's accepted. Outside
-                // a txn, a replica-set member accepts `snapshot` on the snapshot-
-                // session reads (find / aggregate / distinct / getMore /
-                // killCursors); everything else is rejected like a standalone.
-                let in_txn = matches!(doc.get("autocommit"), Some(Bson::Boolean(false)));
-                let snapshot_readable = matches!(
-                    name,
-                    "find" | "aggregate" | "distinct" | "getMore" | "killCursors"
-                ) && ctx.replica_set_name.is_some();
-                if !in_txn && !snapshot_readable {
-                    return Err(CommandError::new(
-                        246,
-                        "SnapshotUnavailable",
-                        "Snapshot read concern is not supported on standalone",
-                    ));
-                }
-            }
-            Ok(())
-        }
-        _ => Err(CommandError::new(
-            9,
-            "FailedToParse",
-            format!(
-                "Specified readConcern level {} is not valid",
-                py_repr(level)
-            ),
-        )),
+    if level == "snapshot" && ctx.replica_set_name.is_none() {
+        return Err(CommandError::new(
+            246,
+            "SnapshotUnavailable",
+            "Snapshot read concern is not supported on standalone",
+        ));
     }
+    // Only the read commands take a read concern above `local`, and `count`
+    // takes no snapshot (measured 8.2.11).
+    let reads = matches!(
+        name,
+        "find"
+            | "aggregate"
+            | "distinct"
+            | "count"
+            | "getMore"
+            | "killCursors"
+            | "explain"
+            | "mapReduce"
+            | "mapreduce"
+    );
+    let reason = if !reads {
+        // An unknown command is CommandNotFound, whatever it carries.
+        if lookup(name).is_none() {
+            return Ok(());
+        }
+        "read concern not supported"
+    } else if level == "snapshot" && name == "count" {
+        "read concern snapshot not supported"
+    } else {
+        return Ok(());
+    };
+    Err(CommandError::new(
+        72,
+        "InvalidOptions",
+        format!(
+            "Command {name} does not support {{ readConcern: {{ level: \"{level}\", provenance: \
+             \"clientSupplied\" }} }} :: caused by :: {reason}"
+        ),
+    ))
 }
 
 /// `apiVersion` / `apiStrict` validation (`commands.py::dispatch`). An
@@ -3039,14 +2957,44 @@ mod tests {
     }
 
     #[test]
-    fn invalid_read_concern_level_is_failed_to_parse() {
+    fn an_invalid_read_concern_is_refused_as_mongod_refuses_it() {
+        for (rc, code, errmsg) in [
+            (
+                doc! {"level": "bogus"},
+                2,
+                "Enumeration value 'bogus' for field 'readConcern.level' is not a valid value.",
+            ),
+            (
+                doc! {"level": 1},
+                14,
+                "BSON field 'readConcern.level' is the wrong type 'int', expected type 'string'",
+            ),
+            (
+                doc! {"level": "local", "bogus": 1},
+                40415,
+                "BSON field 'readConcern.bogus' is an unknown field.",
+            ),
+        ] {
+            let reply = dispatch(&doc! {"find": "c", "readConcern": rc}, &mut ctx());
+            assert_eq!(reply.get_i32("code").unwrap(), code);
+            assert_eq!(reply.get_str("errmsg").unwrap(), errmsg);
+        }
+        // A command that is not a read takes `local` and nothing above it.
         let reply = dispatch(
-            &doc! {"find": "c", "readConcern": {"level": "bogus"}},
+            &doc! {"ping": 1, "readConcern": {"level": "majority"}},
             &mut ctx(),
         );
-        assert_eq!(reply.get_i32("code").unwrap(), 9);
-        assert_eq!(reply.get_str("codeName").unwrap(), "FailedToParse");
-        assert!(reply.get_str("errmsg").unwrap().contains("'bogus'"));
+        assert_eq!(reply.get_i32("code").unwrap(), 72);
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "Command ping does not support { readConcern: { level: \"majority\", provenance: \
+             \"clientSupplied\" } } :: caused by :: read concern not supported"
+        );
+        let reply = dispatch(
+            &doc! {"ping": 1, "readConcern": {"level": "local"}},
+            &mut ctx(),
+        );
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]

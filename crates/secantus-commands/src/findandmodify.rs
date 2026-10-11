@@ -335,6 +335,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                     Err(e) => return Ok(storage_err_reply(e, validator.as_ref())),
                 };
                 let upserted_id = outcome.upserted_id.unwrap_or(Bson::Null);
+                crate::transactions::note_statement(0, crate::transactions::StmtRecord::Delete);
                 let value = if return_new && upserted_id != Bson::Null {
                     match outcome.post_image {
                         // The upserted doc, from the write itself — a re-`find`
@@ -393,6 +394,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 repick_count += 1;
                 continue;
             }
+            crate::transactions::note_statement(0, crate::transactions::StmtRecord::Delete);
             let value = project_value(matched_doc, fields, &query)?;
             // No `updatedExisting`: mongod reports it only for an UPDATE, and
             // drivers read `lastErrorObject` field by field.
@@ -479,6 +481,9 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             // Lost the race — the doc no longer satisfies the query. Re-pick.
             repick_count += 1;
             continue;
+        }
+        if outcome.modified > 0 {
+            crate::transactions::note_statement(0, crate::transactions::StmtRecord::Delete);
         }
 
         let value = if return_new {
