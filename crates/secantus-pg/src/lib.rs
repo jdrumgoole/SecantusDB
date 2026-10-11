@@ -80,7 +80,8 @@ mod xids;
 
 pub use embedded::{Error, PgBuilder, PgServer, DEFAULT_CACHE_SIZE, DEFAULT_DATABASE};
 pub use server::{
-    bind, bind_tls, open_storage, open_storage_with_cache, sync_on_commit, RunningPgServer,
+    bind, bind_tls, bind_with, open_storage, open_storage_with_cache, sync_on_commit,
+    RunningPgServer, ServerOptions,
 };
 pub use tls::{ClientCert, TlsConfig};
 
@@ -2955,6 +2956,9 @@ pub struct PgHandler {
     ssl: bool,
     /// What a login to a server with TLS is held to; `None` without TLS.
     tls: Option<Arc<tls::TlsPolicy>>,
+    /// Ask a user this server has no role for to prove a password, which it
+    /// cannot, where the default is to trust it.
+    refuse_unknown_users: bool,
     /// The database the startup packet named, once it has been checked
     /// against the registry; the registry's default until then.
     db: OnceLock<String>,
@@ -3477,6 +3481,7 @@ impl PgHandler {
             storage,
             ssl: false,
             tls: None,
+            refuse_unknown_users: false,
             db: OnceLock::new(),
             databases,
             txn: Arc::new(Mutex::new(None)),
@@ -3564,6 +3569,13 @@ impl PgHandler {
         let ssl = policy.is_some();
         self.tls = policy;
         self.with_ssl(ssl)
+    }
+
+    /// A handler for a server that does, or does not, trust a user it has
+    /// no role for.
+    pub(crate) fn with_refuse_unknown_users(mut self, refuse: bool) -> Self {
+        self.refuse_unknown_users = refuse;
+        self
     }
 
     /// The settings a fresh connection to THIS server starts with:
@@ -17559,7 +17571,11 @@ impl StartupHandler for PgHandler {
         // what keeps every fixture connecting as a password-less `postgres`
         // working (PostgreSQL's `trust` for those).
         let user = client.metadata().get("user").cloned().unwrap_or_default();
-        if let Some(role) = self.role(&user)? {
+        let role = self.role(&user)?;
+        if role.is_none() && self.refuse_unknown_users {
+            return self.refuse_unknown_user(client, user).await;
+        }
+        if let Some(role) = role {
             if !role.canlogin {
                 return self
                     .fail_login(
@@ -17636,6 +17652,9 @@ impl StartupHandler for PgHandler {
 enum LoginMethod {
     Trust,
     Password,
+    /// The `cert` method, for a user there is no role for: the certificate
+    /// is checked first, and then the login fails for want of the role.
+    NoRole,
 }
 
 impl PgHandler {
@@ -17778,7 +17797,7 @@ impl PgHandler {
                         "28P01",
                         format!("password authentication failed for user \"{user}\""),
                     ),
-                    (_, LoginMethod::Trust) => (
+                    (_, LoginMethod::Trust | LoginMethod::NoRole) => (
                         "28000",
                         format!("\"trust\" authentication failed for user \"{user}\""),
                     ),
@@ -17786,7 +17805,59 @@ impl PgHandler {
                 return self.fail_login(client, code, message).await;
             }
         }
+        if matches!(method, LoginMethod::NoRole) {
+            // The certificate was the whole proof and it held, so PostgreSQL
+            // has already said so when it goes to look the role up.
+            client
+                .send(PgWireBackendMessage::Authentication(
+                    pgwire::messages::startup::Authentication::Ok,
+                ))
+                .await?;
+            let user = client.metadata().get("user").cloned().unwrap_or_default();
+            return self
+                .fail_login(client, "28000", format!("role \"{user}\" does not exist"))
+                .await;
+        }
         self.finish_startup(client).await
+    }
+
+    /// The login of a user there is no role for, on a server told not to
+    /// trust one. PostgreSQL does not say the role is missing: it runs the
+    /// SCRAM exchange against a verifier nothing can match, and the login
+    /// fails as a wrong password does. Under `cert` no password is asked
+    /// for, so the certificate is checked and the role is then reported
+    /// missing.
+    async fn refuse_unknown_user<C>(&self, client: &mut C, user: String) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use base64::Engine;
+        let by_certificate = self
+            .tls
+            .as_ref()
+            .is_some_and(|policy| policy.client_cert == ClientCert::Cert);
+        if by_certificate {
+            return self.complete_login(client, LoginMethod::NoRole).await;
+        }
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let creds = secantus_auth::StoredCredentials::from_b64(
+            4096,
+            &b64.encode(rand::random::<[u8; 16]>()),
+            &b64.encode(rand::random::<[u8; 32]>()),
+            &b64.encode(rand::random::<[u8; 32]>()),
+        )
+        .map_err(|e| PgWireError::ApiError(format!("{e:?}").into()))?;
+        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = Some((user, creds, None));
+        let mechanisms = scram_binding::mechanisms(self.binding_hash(client));
+        client
+            .send(PgWireBackendMessage::Authentication(
+                pgwire::messages::startup::Authentication::SASL(mechanisms),
+            ))
+            .await?;
+        client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
+        Ok(())
     }
 
     /// One client message of a SCRAM exchange: the client-first (answered

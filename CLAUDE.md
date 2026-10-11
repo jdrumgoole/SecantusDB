@@ -670,7 +670,9 @@ one request path:
     `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
     pass SCRAM-SHA-256; a role with none, and an unknown user, are still
-    trusted (test fixtures rely on that).
+    trusted (test fixtures rely on that). `--refuse-unknown-users`
+    (2026-10-11) asks an unknown user for a password, which fails as it
+    does on PostgreSQL; a role with no password is trusted either way.
     **`UNIQUE` IS enforced** — the earlier claim that it was "accepted without
     being enforced" was stale when measured against PostgreSQL 14.24 on
     2026-09-20: a duplicate on a column-level or table-level `UNIQUE` raises

@@ -419,7 +419,52 @@ pub fn bind_tls(
     databases: Arc<DatabaseRegistry>,
     tls: Option<&TlsConfig>,
 ) -> io::Result<RunningPgServer> {
-    let tls = tls.map(TlsConfig::build).transpose()?;
+    bind_with(
+        addr,
+        storage,
+        databases,
+        &ServerOptions {
+            tls: tls.cloned(),
+            ..ServerOptions::default()
+        },
+    )
+}
+
+/// What a server is started with beyond its address and its store.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ServerOptions {
+    /// Offer TLS with this certificate and key; see [`bind_tls`].
+    pub tls: Option<TlsConfig>,
+    /// Refuse a user there is no role for. By default such a user is
+    /// trusted, as a role with no password is.
+    pub refuse_unknown_users: bool,
+}
+
+impl ServerOptions {
+    pub fn tls(mut self, tls: Option<TlsConfig>) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Refuse a user there is no role for. It is asked for a password, as
+    /// PostgreSQL asks one under a `scram-sha-256` line in `pg_hba.conf`,
+    /// and none it gives is right.
+    pub fn refuse_unknown_users(mut self, refuse: bool) -> Self {
+        self.refuse_unknown_users = refuse;
+        self
+    }
+}
+
+/// [`bind_tls`] with everything [`ServerOptions`] can say.
+pub fn bind_with(
+    addr: &str,
+    storage: Storage,
+    databases: Arc<DatabaseRegistry>,
+    options: &ServerOptions,
+) -> io::Result<RunningPgServer> {
+    let tls = options.tls.as_ref().map(TlsConfig::build).transpose()?;
+    let refuse_unknown_users = options.refuse_unknown_users;
     // Statements are planned and run on each connection's own thread (see
     // `accept_loop`; the runtime below accepts), and planning recurses once per expression level: tokio's 2 MiB default
     // overflowed on a 24-term `||` chain, which ABORTS the process -- every
@@ -472,7 +517,10 @@ pub fn bind_tls(
             listener,
             storage,
             databases,
-            tls,
+            LoginRules {
+                tls,
+                refuse_unknown_users,
+            },
             stop_flag,
             active,
             shutdown_rx,
@@ -491,11 +539,17 @@ pub fn bind_tls(
     })
 }
 
+/// What every connection's login is held to.
+struct LoginRules {
+    tls: Option<(pgwire::tokio::TlsAcceptor, Arc<crate::tls::TlsPolicy>)>,
+    refuse_unknown_users: bool,
+}
+
 async fn accept_loop(
     listener: TcpListener,
     storage: Arc<Storage>,
     databases: Arc<DatabaseRegistry>,
-    tls: Option<(pgwire::tokio::TlsAcceptor, Arc<crate::tls::TlsPolicy>)>,
+    login: LoginRules,
     stop_flag: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
@@ -511,9 +565,10 @@ async fn accept_loop(
         };
         let handler = Arc::new(
             PgHandler::new(storage.clone(), databases.clone())
-                .with_tls(tls.as_ref().map(|(_, policy)| policy.clone())),
+                .with_tls(login.tls.as_ref().map(|(_, policy)| policy.clone()))
+                .with_refuse_unknown_users(login.refuse_unknown_users),
         );
-        let acceptor = tls.as_ref().map(|(acceptor, _)| acceptor.clone());
+        let acceptor = login.tls.as_ref().map(|(acceptor, _)| acceptor.clone());
         let active = active.clone();
         let mut conn_shutdown = shutdown.clone();
         // One OS thread per connection, running the connection on a runtime

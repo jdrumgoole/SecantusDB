@@ -95,9 +95,13 @@ async fn until_ready<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<(u8, Vec<u8>)>
 
 /// Send the startup packet of a login as `postgres`.
 async fn send_startup<S: AsyncWrite + Unpin>(stream: &mut S) {
+    send_startup_as(stream, "postgres").await;
+}
+
+async fn send_startup_as<S: AsyncWrite + Unpin>(stream: &mut S, user: &str) {
     let mut body = Vec::new();
     body.extend_from_slice(&196_608u32.to_be_bytes());
-    body.extend_from_slice(b"user\0postgres\0database\0postgres\0\0");
+    body.extend_from_slice(format!("user\0{user}\0database\0postgres\0\0").as_bytes());
     stream
         .write_all(&((body.len() + 4) as u32).to_be_bytes())
         .await
@@ -337,6 +341,36 @@ async fn pg_stat_ssl_shows_each_backends_session() {
         query(&mut tls, &format!("select count(*) {mine}")).await,
         "1"
     );
+}
+
+/// The first message a login as `user` is answered with: its type byte and,
+/// for an authentication request, the request code.
+async fn first_answer(server: &PgServer, user: &str) -> (u8, u32) {
+    let mut stream = TcpStream::connect(server.address()).await.expect("connect");
+    send_startup_as(&mut stream, user).await;
+    let (kind, body) = read_message(&mut stream).await;
+    (
+        kind,
+        u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+    )
+}
+
+#[tokio::test]
+async fn a_user_there_is_no_role_for_is_trusted_unless_the_server_is_told_otherwise() {
+    // AuthenticationOk is request 0; AuthenticationSASL, the start of a
+    // password exchange, is 10.
+    let trusting = PgServer::builder().start().expect("start");
+    assert_eq!(first_answer(&trusting, "nobody").await, (b'R', 0));
+
+    let refusing = PgServer::builder()
+        .refuse_unknown_users(true)
+        .start()
+        .expect("start");
+    // Asked for a password, as PostgreSQL asks: it does not say there is no
+    // such role.
+    assert_eq!(first_answer(&refusing, "nobody").await, (b'R', 10));
+    // A role with no password is still trusted, `postgres` among them.
+    assert_eq!(first_answer(&refusing, "postgres").await, (b'R', 0));
 }
 
 #[test]

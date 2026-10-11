@@ -19837,9 +19837,13 @@ def test_a_password_is_checked_over_tls(home: Path, tmp_path: Path) -> None:
 
 
 def _scram_first(
-    server: _Server, certs: _Certificates | None, mechanism: str | None, header: str
+    server: _Server,
+    certs: _Certificates | None,
+    mechanism: str | None,
+    header: str,
+    user: str = "alice",
 ) -> tuple[str | None, ...]:
-    """Start a SCRAM login as `alice` by hand, over TLS when `certs` is given.
+    """Start a SCRAM login as `user` by hand, over TLS when `certs` is given.
 
     libpq picks the mechanism and the channel-binding header itself, and
     never sends the pairs a server has to refuse. Returns the mechanisms
@@ -19857,7 +19861,7 @@ def _scram_first(
             context = ssl.create_default_context(cafile=str(certs.ca))
             context.check_hostname = False
             sock = context.wrap_socket(sock)
-        startup = struct.pack("!I", 196608) + b"user\0alice\0database\0postgres\0\0"
+        startup = struct.pack("!I", 196608) + f"user\0{user}\0database\0postgres\0\0".encode()
         sock.sendall(struct.pack("!I", len(startup) + 4) + startup)
 
         def read() -> tuple[bytes, bytes]:
@@ -20037,6 +20041,72 @@ def test_client_certificates(home: Path, tmp_path: Path, mode: str) -> None:
             # `hostssl` line only, so the connection in the clear matches none.
             with pytest.raises(psycopg.OperationalError, match="no encryption"):
                 _tls_connect(server, sslmode="disable", user="carol")
+
+
+def test_a_server_can_refuse_a_user_it_has_no_role_for(home: Path, tmp_path: Path) -> None:
+    """`--refuse-unknown-users`: a user there is no role for is not trusted.
+
+    PostgreSQL never says a role is missing under a `scram-sha-256` line: it
+    asks for a password and fails the login as a wrong one, so a client with
+    no password gives up by itself. Under the `cert` method no password is
+    asked for, and the role is reported missing once the certificate has
+    been accepted. Each answer is PostgreSQL 15.19's (measured 2026-10-11);
+    its `pg_hba.conf` trusted `postgres` and `carol`, the roles with no
+    password, as this server does.
+    """
+    certs = _Certificates(tmp_path)
+    nobody = certs.client("nobody")
+
+    def attempt(server: _Server, user: str, **params: str) -> str:
+        try:
+            with _tls_connect(server, user=user, **params) as conn:
+                assert conn.execute("select current_user").fetchone() == (user,)
+                return "ok"
+        except psycopg.OperationalError as exc:
+            return str(exc).strip().splitlines()[-1].split("failed: ")[-1]
+
+    with _Server(home) as server:
+        # The default: `test` and `nobody` are roles nobody created.
+        assert attempt(server, "nobody") == "ok"
+        with _tls_connect(server) as conn:
+            conn.execute("create role alice login password 'pw'")
+            conn.execute("create role carol login")
+
+    failed = 'FATAL:  password authentication failed for user "nobody"'
+    no_password = "fe_sendauth: no password supplied"
+    with _Server(home, args=("--refuse-unknown-users",)) as server:
+        assert attempt(server, "nobody") == no_password
+        assert attempt(server, "nobody", password="pw") == failed
+        # The roles there are log in as they did.
+        assert attempt(server, "alice", password="pw") == "ok"
+        assert attempt(server, "alice", password="no") == (
+            'FATAL:  password authentication failed for user "alice"'
+        )
+        assert attempt(server, "carol") == "ok"
+        assert attempt(server, "postgres") == "ok"
+
+    tls = {"sslmode": "require"}
+    with _Server(home, args=(*certs.ca_args, "--refuse-unknown-users")) as server:
+        # Over TLS the exchange is offered channel binding like any other.
+        assert _scram_first(server, certs, None, "", user="nobody") == (
+            "SCRAM-SHA-256-PLUS",
+            "SCRAM-SHA-256",
+        )
+        assert attempt(server, "nobody", password="pw", **tls, **nobody) == failed
+
+    flags = (*certs.ca_args, "--tls-client-cert", "verify-full", "--refuse-unknown-users")
+    with _Server(home, args=flags) as server:
+        assert attempt(server, "nobody", **tls, **nobody) == no_password
+        assert attempt(server, "nobody", password="pw", **tls, **nobody) == failed
+
+    flags = (*certs.ca_args, "--tls-client-cert", "cert", "--refuse-unknown-users")
+    with _Server(home, args=flags) as server:
+        assert attempt(server, "nobody", **tls, **nobody) == (
+            'FATAL:  role "nobody" does not exist'
+        )
+        assert attempt(server, "nobody", **tls, **certs.client("alice")) == (
+            'FATAL:  certificate authentication failed for user "nobody"'
+        )
 
 
 def test_pg_stat_ssl_reports_each_backends_session(home: Path, tmp_path: Path) -> None:
