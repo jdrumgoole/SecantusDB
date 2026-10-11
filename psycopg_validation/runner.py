@@ -18,6 +18,12 @@ scores both servers. The runner:
    survives hangs).
 4. ``generate_report.py`` renders ``docs/validation-report-psycopg.md``.
 
+``SECANTUS_GAUGE_TLS=1`` (with ``SECANTUS_GAUGE_SERVER=rust``) runs the same
+suite with every connection over TLS: the server is started with a
+certificate made for the run, and libpq is told ``sslmode=verify-full``
+through ``PGSSLMODE``. Its report is a file of its own, so it never replaces
+the plain run's.
+
 Run via ``uv run python -m invoke validate-psycopg``. Needs only the project
 venv — psycopg[binary] ships libpq, and the suite's plugins (anyio,
 pytest-randomly, pytest-cov) ride the ``dev`` extra.
@@ -40,9 +46,27 @@ VENDOR = REPO_ROOT / "vendor" / "psycopg"
 
 #: Raw pytest JSON. Server-specific: a Rust run must not overwrite the Python
 #: server's recorded baseline, since the two are compared against each other.
-def _raw_out(which: str) -> Path:
+def _raw_out(which: str, tls: bool = False) -> Path:
     name = "psycopg-raw.json" if which == "python" else f"psycopg-raw-{which}.json"
+    if tls:
+        name = name.replace(".json", "-tls.json")
     return REPO_ROOT / ".validation" / name
+
+
+def _tls_files(directory: str) -> tuple[list[str], dict[str, str]]:
+    """A certificate for 127.0.0.1 made for this run: the server's options,
+    and the environment that makes every libpq connection verify it."""
+    import trustme
+
+    ca = trustme.CA()
+    issued = ca.issue_cert("127.0.0.1", "localhost")
+    cert, key, root = (os.path.join(directory, n) for n in ("server.crt", "server.key", "ca.pem"))
+    with open(cert, "wb") as out:
+        out.write(b"".join(blob.bytes() for blob in issued.cert_chain_pems))
+    issued.private_key_pem.write_to_path(key)
+    ca.cert_pem.write_to_path(root)
+    options = ["--tls-cert-file", cert, "--tls-key-file", key]
+    return options, {"PGSSLMODE": "verify-full", "PGSSLROOTCERT": root}
 
 
 if str(REPO_ROOT) not in sys.path:
@@ -87,17 +111,25 @@ def _wait_for_listener(host: str, port: int, timeout: float = 15.0) -> None:
     raise RuntimeError(f"pg daemon at {host}:{port} did not become ready within {timeout}s")
 
 
-def _verify_secantus_identity(host: str, port: int) -> None:
+def _verify_secantus_identity(host: str, port: int, tls_env: dict[str, str] | None = None) -> None:
     """Abort unless the daemon at ``host:port`` is SecantusDB.
 
     A stray real Postgres (or another session's daemon) on the picked port
-    would make every test pass vacuously."""
+    would make every test pass vacuously. On a TLS run it must also be
+    reachable over TLS under the settings the suite will run with: a run
+    that fell back to the clear would report a TLS number that measured
+    none."""
     import psycopg
 
+    tls = {}
+    if tls_env:
+        tls = {"sslmode": tls_env["PGSSLMODE"], "sslrootcert": tls_env["PGSSLROOTCERT"]}
     with psycopg.connect(
-        host=host, port=port, dbname="postgres", user="postgres", connect_timeout=5
+        host=host, port=port, dbname="postgres", user="postgres", connect_timeout=5, **tls
     ) as conn:
         (version,) = conn.execute("select version()").fetchone()
+        if tls_env and not conn.pgconn.ssl_in_use:
+            raise RuntimeError(f"the connection to {host}:{port} is not TLS on a TLS run")
     if "SecantusDB" not in version:
         raise RuntimeError(
             f"daemon at {host}:{port} does not identify as SecantusDB "
@@ -142,7 +174,12 @@ def main() -> int:
     if which not in ("python", "rust"):
         print(f"SECANTUS_GAUGE_SERVER must be 'python' or 'rust', got {which!r}", file=sys.stderr)
         return 2
-    raw_out = _raw_out(which)
+    tls = os.environ.get("SECANTUS_GAUGE_TLS") == "1"
+    if tls and which != "rust":
+        print("SECANTUS_GAUGE_TLS=1 needs SECANTUS_GAUGE_SERVER=rust", file=sys.stderr)
+        return 2
+    raw_out = _raw_out(which, tls)
+    tls_env: dict[str, str] = {}
 
     if which == "rust":
         if not RUST_BINARY.exists():
@@ -160,6 +197,9 @@ def main() -> int:
         # on purpose.
         require_fresh_pgserver(RUST_BINARY, repo_root=REPO_ROOT)
         argv = [str(RUST_BINARY), storage_dir, f"{host}:{port}"]
+        if tls:
+            tls_options, tls_env = _tls_files(tempfile.mkdtemp(prefix="secantus-psycopg-tls-"))
+            argv += tls_options
     else:
         argv = [
             sys.executable,
@@ -176,10 +216,11 @@ def main() -> int:
     daemon = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         _wait_for_listener(host, port)
-        _verify_secantus_identity(host, port)
+        _verify_secantus_identity(host, port, tls_env)
 
         env = {
             **os.environ,
+            **tls_env,
             "PSYCOPG_TEST_DSN": f"host={host} port={port} user=postgres dbname=postgres",
             # tests/test_module.py shells out to `mypy`; make it the venv's
             # (a bare `mypy` on this box is intercepted by pyenv and fails).

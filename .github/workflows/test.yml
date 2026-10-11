@@ -2304,3 +2304,43 @@ jobs:
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
             -p no:cacheprovider -rs
+
+      # The login rules (TLS options, revocation lists, user name maps,
+      # pg_hba.conf) are compared with a PostgreSQL 15 this job runs itself:
+      # each probe writes its own pg_hba.conf, certificates and revocation
+      # lists and starts a throwaway cluster from them, which the service
+      # container above cannot be made to do. 15 because that is the major
+      # the answers were measured against and the one the server reports.
+      - name: Add the PostgreSQL apt repository
+        shell: bash
+        run: |
+          if ! grep -rqs apt.postgresql.org /etc/apt/sources.list /etc/apt/sources.list.d/; then
+            sudo install -d /usr/share/postgresql-common/pgdg
+            sudo curl --fail --silent --show-error --location --retry 3 --max-time 60 \
+              -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+              https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            . /etc/os-release
+            echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/secantus-pgdg.list
+          fi
+          # The package would otherwise create and start a cluster of its
+          # own; the probes make theirs.
+          sudo mkdir -p /etc/postgresql-common
+          echo "create_main_cluster = false" | sudo tee -a /etc/postgresql-common/createcluster.conf
+
+      - name: Install PostgreSQL 15
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-15
+
+      - name: Run the login comparisons against PostgreSQL 15
+        # SECANTUS_REQUIRE_PG15 makes a missing directory a failure: these
+        # tests skip without one, and this is the only lane that has it.
+        shell: bash
+        env:
+          SECANTUS_PG15_BIN: /usr/lib/postgresql/15/bin
+          SECANTUS_REQUIRE_PG15: "1"
+        run: |
+          "$SECANTUS_PG15_BIN/postgres" --version
+          uv run python -m pytest tests/test_rust_pg_login_differential.py -q -n 3 \
+            -p no:cacheprovider -rs
