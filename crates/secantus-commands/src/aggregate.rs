@@ -233,6 +233,25 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // A change stream cannot be opened on a time-series collection.
+    if first_stage_has(&pipeline, "$changeStream") {
+        if let (Some(c), Ok(storage)) = (&coll, ctx.storage()) {
+            if storage
+                .get_collection_options(&ctx.db_name, c)
+                .is_ok_and(|o| o.contains_key("timeseries"))
+            {
+                return Ok(CommandError::new(
+                    166,
+                    "CommandNotSupportedOnView",
+                    format!(
+                        "Cannot run aggregation on timeseries with namespace {}.{c}",
+                        ctx.db_name
+                    ),
+                )
+                .into_reply());
+            }
+        }
+    }
     // $changeStream gate (must come before storage access). On a standalone
     // (no replica-set name) mongod rejects with IllegalOperation (40573).
     if first_stage_has(&pipeline, "$changeStream") {
@@ -1184,7 +1203,7 @@ fn apply_storage_stage(
                 apply_merge(spec, docs, db, storage, bypass_validation)
             };
             written.map_err(|mut e| {
-                if e.code == 121 {
+                if e.code == 121 || e.code == 166 || e.code == 7406103 {
                     let ns = format!("{db}.{}", coll.unwrap_or(""));
                     e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(&ns));
                 }
@@ -2122,7 +2141,14 @@ fn apply_index_stats(
     storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
     let coll = coll.ok_or_else(|| bad_value("$indexStats requires a collection"))?;
-    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let mut indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    // A time-series collection has no `_id` index.
+    if storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
+    }
     Ok(indexes
         .into_iter()
         .map(|ix| {
@@ -2193,16 +2219,93 @@ fn apply_out(
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll) = out_target(spec, db)?;
     enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation, false)?;
+    // `$out` replaces the target's DOCUMENTS. Its options and indexes stay:
+    // mongod builds the replacement with both and swaps it in (measured
+    // 8.2.11, 2026-10-11). Until then the target was dropped and created
+    // bare, so a validator and every index on it were silently lost.
+    let existed = storage
+        .collection_exists(&out_db, &out_coll)
+        .map_err(command_error)?;
+    let mut options = if existed {
+        storage
+            .get_collection_options(&out_db, &out_coll)
+            .map_err(command_error)?
+    } else {
+        Document::new()
+    };
+    options.remove("uuid");
+    let indexes: Vec<Document> = if existed {
+        storage
+            .list_indexes(&out_db, &out_coll)
+            .map_err(command_error)?
+            .into_iter()
+            .filter(|ix| ix.get_str("name") != Ok("_id_"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // `{db, coll, timeseries}` writes into a time-series collection: a new
+    // one with that definition, or an existing one that has it.
+    let ns = format!("{out_db}.{out_coll}");
+    let wanted = match spec {
+        Some(Bson::Document(d)) if d.contains_key("timeseries") => crate::timeseries::definition(
+            &doc! { "timeseries": d.get("timeseries").cloned() },
+            &ns,
+        )?,
+        _ => None,
+    };
+    let mut default_index = None;
+    if let Some(wanted) = wanted {
+        match options.get_document("timeseries") {
+            Ok(found) if found == &wanted => {}
+            Ok(found) => {
+                return Err(CommandError::new(
+                    7406103,
+                    "Location7406103",
+                    format!(
+                        "Time-series options inputted must match the existing time-series \
+                         collection. Received: {}Found: timeseries: {}",
+                        // The definition as the stage gave it, then as stored.
+                        argtypes::render_stage_value(
+                            spec.and_then(Bson::as_document)
+                                .and_then(|d| d.get("timeseries"))
+                                .unwrap_or(&Bson::Null)
+                        ),
+                        argtypes::render_stage_value(&Bson::Document(found.clone())),
+                    ),
+                ));
+            }
+            Err(_) => {
+                options.insert("timeseries", wanted);
+                default_index =
+                    crate::timeseries::Fields::of(&options).and_then(|f| f.default_index());
+            }
+        }
+    }
     storage
         .drop_collection(&out_db, &out_coll)
         .map_err(command_error)?;
     storage
-        .create_collection(&out_db, &out_coll)
+        .create_collection_with_options(&out_db, &out_coll, &options)
         .map_err(command_error)?;
     if !docs.is_empty() {
         let encoded = encode_docs(docs)?;
         storage
             .insert(&out_db, &out_coll, encoded, true)
+            .map_err(command_error)?;
+    }
+    for ix in &indexes {
+        let (Ok(name), Ok(key)) = (ix.get_str("name"), ix.get_document("key")) else {
+            continue;
+        };
+        storage
+            .create_index(&out_db, &out_coll, name, key, ix)
+            .map_err(command_error)?;
+    }
+    if let Some((name, key)) = default_index {
+        let index = doc! { "key": key.clone(), "name": name.clone() };
+        storage
+            .create_index(&out_db, &out_coll, &name, &key, &index)
             .map_err(command_error)?;
     }
     Ok(Vec::new())
@@ -2246,6 +2349,16 @@ fn apply_merge(
     bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll, on, when_matched, when_not_matched) = merge_spec(spec, db)?;
+    // `$merge` writes to a collection, and mongod presents a time-series
+    // collection as a view.
+    if storage
+        .get_collection_options(&out_db, &out_coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        return Err(crate::timeseries::is_a_view(&format!(
+            "{out_db}.{out_coll}"
+        )));
+    }
     enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation, true)?;
     storage
         .create_collection(&out_db, &out_coll)

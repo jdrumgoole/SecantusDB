@@ -266,14 +266,31 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
 
+    // A time-series collection checks every measurement's time field, so its
+    // documents take the decoded path however they arrived.
+    let ts_fields = storage
+        .get_collection_options(&db, &coll)
+        .ok()
+        .and_then(|o| crate::timeseries::Fields::of(&o));
     // Raw-BSON write fast path: documents arrived as an un-decoded kind-1 sequence.
-    if let Some(raw_docs) = raw_docs {
-        return insert_raw_path(&db, &coll, raw_docs, ordered, validator.as_ref(), storage);
-    }
+    let from_sequence: Option<Vec<Bson>> = match raw_docs {
+        Some(raw_docs) if ts_fields.is_none() => {
+            return insert_raw_path(&db, &coll, raw_docs, ordered, validator.as_ref(), storage);
+        }
+        Some(raw_docs) => Some(
+            raw_docs
+                .iter()
+                .map(|b| Document::from_reader(&mut &b[..]).map(Bson::Document))
+                .collect::<Result<_, _>>()
+                .map_err(|e| CommandError::new(22, "InvalidBSON", e.to_string()))?,
+        ),
+        None => None,
+    };
 
     // Decoded path: documents inline in the command body.
-    let documents = match doc.get("documents") {
-        Some(Bson::Array(a)) if !a.is_empty() => a,
+    let documents = match (&from_sequence, doc.get("documents")) {
+        (Some(a), _) if !a.is_empty() => a,
+        (None, Some(Bson::Array(a))) if !a.is_empty() => a,
         // mongod rejects an empty/absent `documents` array with InvalidLength,
         // which is code **16** — this said 4 (NoSuchKey) under a comment
         // asserting drivers gate on "this exact code/codeName combo". They
@@ -314,7 +331,8 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             Some(Bson::RegularExpression(_)) => Some("regex"),
             _ => None,
         };
-        if let Some(type_name) = id_type {
+        // A time-series collection keys nothing by `_id`, and takes any.
+        if let Some(type_name) = id_type.filter(|_| ts_fields.is_none()) {
             pre_errors.push(id_type_error(index, type_name));
             if ordered {
                 break;
@@ -336,6 +354,16 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 }
                 continue;
             }
+        }
+        if let Some(problem) = ts_fields
+            .as_ref()
+            .and_then(|f| crate::timeseries::measurement_problem(d, f))
+        {
+            pre_errors.push(doc! { "index": index as i32, "code": 2, "errmsg": problem });
+            if ordered {
+                break;
+            }
+            continue;
         }
         // Collection validator (code 121, DocumentValidationFailure). mongod
         // attaches an `errInfo` (failingDocumentId + per-operator details) that
@@ -652,34 +680,6 @@ fn update_spec_error(u: &Document) -> Option<(i32, String)> {
 /// here, threaded into `Storage::update_matching`); malformed `writeConcern` is
 /// rejected in `dispatch` before this handler. **Deferred:**
 /// `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
-///
-/// Whether a timeseries update's `u` touches only the metaField (mongod 7.0's
-/// rule): an operator-form update whose every modifier targets a path rooted at
-/// `meta`. Replacement / pipeline updates and an empty `meta` (no metaField
-/// declared) never qualify.
-fn ts_update_is_meta_only(u: Option<&Bson>, meta: &str) -> bool {
-    if meta.is_empty() {
-        return false;
-    }
-    let Some(Bson::Document(ud)) = u else {
-        return false;
-    };
-    if ud.is_empty() || !ud.keys().all(|k| k.starts_with('$')) {
-        return false;
-    }
-    for (_op, arg) in ud {
-        let Some(fields) = arg.as_document() else {
-            return false;
-        };
-        for fpath in fields.keys() {
-            if fpath.split('.').next().unwrap_or("") != meta {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
@@ -737,13 +737,8 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // freezing them.
     let validator_moderate = opts.get_str("validationLevel").unwrap_or("strict") == "moderate";
 
-    // mongod 7.0 restricts updates on a timeseries collection to the metaField
-    // only. `ts_meta` is `Some(metaField)` for a timeseries collection (an empty
-    // string when no metaField is declared — then nothing is updatable).
-    let ts_meta: Option<String> = opts
-        .get_document("timeseries")
-        .ok()
-        .map(|t| t.get_str("metaField").unwrap_or("").to_string());
+    // `Some` for a time-series collection, whose updates are restricted.
+    let ts_fields = crate::timeseries::Fields::of(&opts);
 
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
@@ -757,6 +752,23 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         argtypes::require_hint(spec, "hint")?;
         argtypes::require_object(spec, "c", "update.updates.c")?;
 
+        // A time-series collection takes a multi update of its meta field
+        // and no other; mongod says which rule a statement breaks before it
+        // looks at the hint.
+        if let Some(problem) = ts_fields
+            .as_ref()
+            .and_then(|f| crate::timeseries::update_problem(spec, f))
+        {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": 72,
+                "errmsg": problem,
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         // An unresolvable `hint` fails THIS statement, not the batch (see the
         // note above the loop).
         if let Err(e) =
@@ -924,23 +936,6 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     "index": index as i32,
                     "code": code,
                     "errmsg": argtypes::wrap_expression_problem(&msg, &stage),
-                }));
-                if ordered {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        // Timeseries (mongod 7.0): an update may only modify the metaField, via
-        // operator-form modifiers — no replacement / pipeline / non-meta paths.
-        if let Some(meta) = &ts_meta {
-            if !ts_update_is_meta_only(spec.get("u"), meta) {
-                write_errors.push(Bson::Document(doc! {
-                    "index": index as i32,
-                    "code": 2,
-                    "errmsg": "Cannot perform an update on a time-series collection \
-                               that modifies a field other than the metaField",
                 }));
                 if ordered {
                     break;

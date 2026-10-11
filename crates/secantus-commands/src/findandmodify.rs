@@ -185,6 +185,15 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
 
     let storage = ctx.storage()?;
+    // A time-series collection takes a `remove` with no sort, and nothing else.
+    if storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        if let Some(problem) = crate::timeseries::find_and_modify_problem(doc) {
+            return Ok(CommandError::new(72, "InvalidOptions", problem).into_reply());
+        }
+    }
     crate::util::validate_write_hint(storage, &ctx.db_name, &coll, doc.get("hint"))?;
     // Command `let` (visible to `$expr` in `query`) + `collation` apply to the
     // match. The subsequent update/delete is keyed by the matched doc's `_id`.

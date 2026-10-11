@@ -2626,3 +2626,317 @@ fn rename_keeps_the_collection_options() {
         );
     });
 }
+
+fn code_of(reply: &Document) -> Option<i32> {
+    reply.get_i32("code").ok()
+}
+
+fn write_error(reply: &Document) -> (i32, String) {
+    let errors = reply
+        .get_array("writeErrors")
+        .unwrap_or_else(|_| panic!("no writeErrors in {reply}"));
+    let first = errors[0].as_document().unwrap();
+    (
+        first.get_i32("code").unwrap(),
+        first.get_str("errmsg").unwrap().to_string(),
+    )
+}
+
+fn at(minute: i64) -> bson::DateTime {
+    bson::DateTime::from_millis(1_767_225_600_000 + minute * 60_000)
+}
+
+/// What `create` accepts as a time-series definition and how it is stored
+/// and listed. Measured against mongod 8.2.11 (`tools/probes/time_series.py`).
+#[test]
+fn a_time_series_definition_is_checked_and_stored_in_full() {
+    with_wt(|c| {
+        let reply = common::dispatch_full(
+            &doc! {"create": "w", "timeseries": {"timeField": "t", "metaField": "m"}},
+            c,
+        );
+        assert_eq!(reply.get_f64("ok").ok(), Some(1.0), "{reply}");
+        assert_eq!(
+            collection_options(c, "w"),
+            doc! {"timeseries": {"timeField": "t", "metaField": "m", "granularity": "seconds",
+            "bucketMaxSpanSeconds": 3600}}
+        );
+        // No `_id` index is listed, and the meta and time fields are indexed.
+        assert_eq!(index_names(c, "w"), vec!["m_1_t_1"]);
+        let listed = first_batch(&common::dispatch_full(&doc! {"listCollections": 1}, c));
+        let entry = listed
+            .iter()
+            .find(|e| e.get_str("name") == Ok("w"))
+            .unwrap();
+        assert_eq!(entry.get_str("type").ok(), Some("timeseries"));
+        assert!(!entry.contains_key("idIndex"), "{entry}");
+
+        for (definition, code, message) in [
+            (
+                doc! {"metaField": "m"},
+                40414,
+                "is missing but a required field",
+            ),
+            (
+                doc! {"timeField": "t", "granularity": "days"},
+                2,
+                "is not a valid value.",
+            ),
+            (
+                doc! {"timeField": "t", "metaField": "t"},
+                72,
+                "cannot be the same as 'timeField'",
+            ),
+            (doc! {"timeField": "a.t"}, 72, "must be a top-level field"),
+            (
+                doc! {"timeField": "t", "bucketMaxSpanSeconds": 600},
+                72,
+                "must be equal to",
+            ),
+            (
+                doc! {"timeField": "t", "bogus": 1},
+                40415,
+                "is an unknown field.",
+            ),
+        ] {
+            let reply = dispatch(&doc! {"create": "bad", "timeseries": definition.clone()}, c);
+            assert_eq!(code_of(&reply), Some(code), "{definition}: {reply}");
+            assert!(
+                reply.get_str("errmsg").unwrap().contains(message),
+                "{reply}"
+            );
+        }
+        let reply = dispatch(
+            &doc! {"create": "bad", "timeseries": {"timeField": "t"}, "capped": true, "size": 4096},
+            c,
+        );
+        assert_eq!(
+            reply.get_str("errmsg").ok(),
+            Some("t.bad: 'timeseries' is not allowed with 'capped'")
+        );
+        // The same definition again is the same collection; another is not.
+        let same = dispatch(
+            &doc! {"create": "w", "timeseries": {"timeField": "t", "metaField": "m"}},
+            c,
+        );
+        assert_eq!(same.get_f64("ok").ok(), Some(1.0), "{same}");
+        let other = dispatch(&doc! {"create": "w", "timeseries": {"timeField": "t"}}, c);
+        assert_eq!(
+            other.get_str("errmsg").ok(),
+            Some("A timeseries collection already exists. NS: t.w")
+        );
+    });
+}
+
+/// A measurement carries a date in the time field, and a time-series
+/// collection takes a multi update of its meta field and no other.
+#[test]
+fn a_time_series_collection_restricts_its_writes() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "w", "timeseries": {"timeField": "t", "metaField": "m"}},
+            c,
+        );
+        let reply = dispatch(
+            &doc! {"insert": "w", "documents": [
+                {"_id": 1, "t": at(0), "m": "a", "v": 1},
+                {"_id": 2, "m": "a"},
+                {"_id": 3, "t": "2026-01-01", "m": "a"},
+                {"_id": 4, "t": at(1), "m": "b", "v": 2},
+            ], "ordered": false},
+            c,
+        );
+        assert_eq!(reply.get_i32("n").ok(), Some(2), "{reply}");
+        assert_eq!(
+            write_error(&reply),
+            (
+                2,
+                "'t' must be present and contain a valid BSON UTC datetime value".into()
+            )
+        );
+        let update = |c: &mut CommandContext, statement: Document| {
+            dispatch(&doc! {"update": "w", "updates": [statement]}, c)
+        };
+        let ok = update(
+            c,
+            doc! {"q": {"m": "a"}, "u": {"$set": {"m": "z"}}, "multi": true},
+        );
+        assert_eq!(ok.get_i32("nModified").ok(), Some(1), "{ok}");
+        for (statement, message) in [
+            (
+                doc! {"q": {"m": "z"}, "u": {"$set": {"m": "y"}}},
+                "Cannot perform a non-multi update on a time-series collection",
+            ),
+            (
+                doc! {"q": {"v": 1}, "u": {"$set": {"m": "y"}}, "multi": true},
+                "Cannot perform an update or delete on a time-series collection when querying \
+                 on a field that is not the metaField 'm'",
+            ),
+            (
+                doc! {"q": {}, "u": {"$set": {"v": 9}}, "multi": true},
+                "Cannot perform an update on a time-series collection which updates a field \
+                 that is not the metaField 'm'",
+            ),
+            (
+                doc! {"q": {}, "u": [{"$set": {"m": 1}}], "multi": true},
+                "Cannot perform an update on a time-series collection using a pipeline update",
+            ),
+            (
+                doc! {"q": {"m": "q"}, "u": {"$set": {"m": 1}}, "multi": true, "upsert": true},
+                "Cannot perform an upsert on a time-series collection",
+            ),
+        ] {
+            let reply = update(c, statement.clone());
+            assert_eq!(
+                write_error(&reply),
+                (72, message.to_string()),
+                "{statement}"
+            );
+        }
+        // Deletes are not restricted; findAndModify takes only an unsorted remove.
+        let fam = dispatch(
+            &doc! {"findAndModify": "w", "query": {"_id": 1}, "update": {"$set": {"m": 1}}},
+            c,
+        );
+        assert_eq!(code_of(&fam), Some(72), "{fam}");
+        let removed = dispatch(
+            &doc! {"findAndModify": "w", "query": {"_id": 4}, "remove": true},
+            c,
+        );
+        assert_eq!(removed.get_f64("ok").ok(), Some(1.0), "{removed}");
+        let deleted = dispatch(
+            &doc! {"delete": "w", "deletes": [{"q": {"v": 1}, "limit": 0}]},
+            c,
+        );
+        assert_eq!(deleted.get_i32("n").ok(), Some(1), "{deleted}");
+    });
+}
+
+/// Index, `collMod` and rename rules for a time-series collection.
+#[test]
+fn a_time_series_collection_restricts_indexes_collmod_and_rename() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"create": "w", "timeseries": {"timeField": "t", "metaField": "m"}},
+            c,
+        );
+        let index = |c: &mut CommandContext, spec: Document| {
+            dispatch(&doc! {"createIndexes": "w", "indexes": [spec]}, c)
+        };
+        let unique = index(c, doc! {"key": {"m": 1}, "name": "u", "unique": true});
+        assert_eq!(
+            unique.get_str("errmsg").ok(),
+            Some("Unique indexes are not supported on time-series collections")
+        );
+        let ttl = index(
+            c,
+            doc! {"key": {"t": 1}, "name": "x", "expireAfterSeconds": 60},
+        );
+        assert_eq!(code_of(&ttl), Some(72), "{ttl}");
+        let built = index(c, doc! {"key": {"v": 1}, "name": "v_1"});
+        assert_eq!(built.get_i32("numIndexesBefore").ok(), Some(1), "{built}");
+        assert_eq!(built.get_i32("numIndexesAfter").ok(), Some(2), "{built}");
+
+        let wider = dispatch(
+            &doc! {"collMod": "w", "timeseries": {"granularity": "minutes"}},
+            c,
+        );
+        assert_eq!(wider.get_f64("ok").ok(), Some(1.0), "{wider}");
+        assert_eq!(
+            collection_options(c, "w")
+                .get_document("timeseries")
+                .unwrap(),
+            &doc! {"timeField": "t", "metaField": "m", "granularity": "minutes",
+            "bucketMaxSpanSeconds": 86400}
+        );
+        let narrower = dispatch(
+            &doc! {"collMod": "w", "timeseries": {"granularity": "seconds"}},
+            c,
+        );
+        assert_eq!(code_of(&narrower), Some(72), "{narrower}");
+        let validator = dispatch(&doc! {"collMod": "w", "validator": {"v": 1}}, c);
+        assert_eq!(
+            validator.get_str("errmsg").ok(),
+            Some("option not supported on a time-series collection: validator")
+        );
+        dispatch(&doc! {"collMod": "w", "expireAfterSeconds": 60}, c);
+        assert_eq!(
+            collection_options(c, "w")
+                .get_i64("expireAfterSeconds")
+                .ok(),
+            Some(60)
+        );
+        dispatch(&doc! {"collMod": "w", "expireAfterSeconds": "off"}, c);
+        assert!(!collection_options(c, "w").contains_key("expireAfterSeconds"));
+
+        let was_db = std::mem::replace(&mut c.db_name, "admin".to_string());
+        let renamed = dispatch(&doc! {"renameCollection": "t.w", "to": "t.u"}, c);
+        c.db_name = was_db;
+        assert_eq!(code_of(&renamed), Some(166), "{renamed}");
+        assert_eq!(
+            renamed.get_str("errmsg").ok(),
+            Some("cannot rename view: t.w")
+        );
+    });
+}
+
+/// `$out` replaces a collection's documents and keeps its options and
+/// indexes. Until 2026-10-11 the target was dropped and recreated bare, so
+/// its validator and indexes were lost.
+#[test]
+fn out_keeps_the_targets_options_and_indexes() {
+    with_wt(|c| {
+        dispatch(
+            &doc! {"insert": "s", "documents": [{"_id": 1, "a": 5}, {"_id": 2, "a": -1}]},
+            c,
+        );
+        dispatch(&doc! {"create": "o", "validator": {"a": {"$gt": 0}}}, c);
+        dispatch(
+            &doc! {"createIndexes": "o", "indexes": [{"key": {"a": 1}, "name": "a_ix"}]},
+            c,
+        );
+        let first = common::dispatch_full(
+            &doc! {"aggregate": "s", "pipeline": [{"$match": {"_id": 1}}, {"$out": "o"}], "cursor": {}},
+            c,
+        );
+        assert_eq!(first.get_f64("ok").ok(), Some(1.0), "{first}");
+        assert_eq!(
+            collection_options(c, "o"),
+            doc! {"validator": {"a": {"$gt": 0}}}
+        );
+        assert_eq!(index_names(c, "o"), vec!["_id_", "a_ix"]);
+        // So the validator still refuses what it refused before.
+        let second = common::dispatch_full(
+            &doc! {"aggregate": "s", "pipeline": [{"$out": "o"}], "cursor": {}},
+            c,
+        );
+        assert_eq!(code_of(&second), Some(121), "{second}");
+
+        // A `timeseries` target is created as one.
+        dispatch(
+            &doc! {"insert": "m", "documents": [{"_id": 1, "t": at(0), "k": "a"}]},
+            c,
+        );
+        let out = common::dispatch_full(
+            &doc! {"aggregate": "m", "pipeline": [
+                {"$out": {"db": "t", "coll": "ts", "timeseries": {"timeField": "t", "metaField": "k"}}},
+            ], "cursor": {}},
+            c,
+        );
+        assert_eq!(out.get_f64("ok").ok(), Some(1.0), "{out}");
+        assert!(collection_options(c, "ts").contains_key("timeseries"));
+        assert_eq!(index_names(c, "ts"), vec!["k_1_t_1"]);
+    });
+}
+
+/// A replica-set member's `dropDatabase` answers `{ok: 1}` alone.
+#[test]
+fn drop_database_on_a_replica_set_member_has_no_dropped_field() {
+    with_wt(|c| {
+        c.replica_set_name = Some("rs0".to_string());
+        dispatch(&doc! {"create": "c"}, c);
+        let reply = dispatch(&doc! {"dropDatabase": 1}, c);
+        assert_eq!(reply.get_f64("ok").ok(), Some(1.0), "{reply}");
+        assert!(!reply.contains_key("dropped"), "{reply}");
+    });
+}

@@ -75,8 +75,17 @@ def index(name, key, ix="ix", **more):
     return {"createIndexes": name, "indexes": [{"key": key, "name": ix, **more}]}
 
 
-LIST = {"listCollections": 1, "filter": {"name": {"$in": ["w", "system.buckets.w", "u", "v"]}}}
-NAMES = {"listCollections": 1, "nameOnly": True}
+#: mongod keeps a time-series collection's rows in `system.buckets.<name>`
+#: and lists that collection, and `system.views`, beside it. Those two are
+#: how mongod stores the data, not something a client asked for, so the
+#: listings here leave them out; the scenarios that name a buckets
+#: collection outright are kept.
+LIST = {"listCollections": 1, "filter": {"name": {"$in": ["w", "u", "v"]}}}
+NAMES = {
+    "listCollections": 1,
+    "nameOnly": True,
+    "filter": {"name": {"$not": {"$regex": "^system[.]"}}},
+}
 META = ts(metaField="m")
 W = create("w", META)
 ROWS = [
@@ -211,7 +220,7 @@ SCENARIOS = [
         [
             W,
             insert("w", {"t": at(0), "v": 1}),
-            find("w", projection={"_id": {"$type": "$_id"}, "v": 1}),
+            find("w", projection={"_id": 0, "id": {"$type": "$_id"}, "v": 1}),
         ],
     ),
     ("insert: mixed good and bad, ordered", [W, insert("w", ROWS[0], {"_id": 9}, ROWS[1]), ALL]),
@@ -542,10 +551,13 @@ SCENARIOS = [
     ("write: $merge from", [*SEED, agg("w", {"$merge": {"into": "u"}}), {"count": "u"}]),
     ("index: default list", [W, {"listIndexes": "w"}]),
     ("index: default without meta", [create("w", ts()), {"listIndexes": "w"}]),
-    ("index: on meta", [W, index("w", {"m": 1}), {"listIndexes": "w"}]),
-    ("index: on time", [W, index("w", {"t": -1}), {"listIndexes": "w"}]),
-    ("index: on a measurement", [W, index("w", {"v": 1}), {"listIndexes": "w"}]),
-    ("index: on meta subfield and time", [W, index("w", {"m.k": 1, "t": 1}), {"listIndexes": "w"}]),
+    ("index: on meta ~", [W, index("w", {"m": 1}), {"listIndexes": "w"}]),
+    ("index: on time ~", [W, index("w", {"t": -1}), {"listIndexes": "w"}]),
+    ("index: on a measurement ~", [W, index("w", {"v": 1}), {"listIndexes": "w"}]),
+    (
+        "index: on meta subfield and time ~",
+        [W, index("w", {"m.k": 1, "t": 1}), {"listIndexes": "w"}],
+    ),
     ("index: unique", [W, index("w", {"m": 1}, unique=True)]),
     ("index: sparse", [W, index("w", {"m": 1}, sparse=True)]),
     (
@@ -565,13 +577,16 @@ SCENARIOS = [
             {"listIndexes": "w"},
         ],
     ),
-    ("index: hidden", [W, index("w", {"m": 1}, hidden=True), {"listIndexes": "w"}]),
-    ("index: 2dsphere", [W, index("w", {"loc": "2dsphere"}), {"listIndexes": "w"}]),
+    ("index: hidden ~", [W, index("w", {"m": 1}, hidden=True), {"listIndexes": "w"}]),
+    ("index: 2dsphere ~", [W, index("w", {"loc": "2dsphere"}), {"listIndexes": "w"}]),
     ("index: text", [W, index("w", {"v": "text"})]),
     ("index: hashed", [W, index("w", {"m": "hashed"})]),
     ("index: wildcard", [W, index("w", {"$**": 1})]),
     ("index: on _id", [W, index("w", {"_id": 1})]),
-    ("index: same as default", [W, index("w", {"m": 1, "t": 1}, ix="again"), {"listIndexes": "w"}]),
+    (
+        "index: same as default ~",
+        [W, index("w", {"m": 1, "t": 1}, ix="again"), {"listIndexes": "w"}],
+    ),
     ("index: drop default", [W, {"dropIndexes": "w", "index": "m_1_t_1"}, {"listIndexes": "w"}]),
     (
         "index: drop all",
@@ -773,6 +788,10 @@ def outcome(client, command, bag):
             )
             return ("OK", "CURSOR LEFT OPEN")
         batch = [typed(d) for d in cursor["firstBatch"]]
+        # `listIndexes` order is a difference of its own, recorded with the
+        # index probe (mongod: creation order), so it is not counted again.
+        if "listIndexes" in command:
+            batch.sort(key=repr)
         if "explain" in command or "$changeStream" in str(command):
             return ("OK", "cursor")
         return ("OK", sorted(batch, key=repr) if bag else batch)

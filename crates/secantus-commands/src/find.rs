@@ -341,6 +341,24 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
+    // mongod answers a `find` on a time-series collection with an
+    // aggregation over its buckets, which takes none of these three.
+    if storage
+        .get_collection_options(&ctx.db_name, &coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        let refused = if matches!(doc.get("tailable"), Some(Bson::Boolean(true))) {
+            Some("Tailable cursors are not supported in aggregation.".to_string())
+        } else {
+            ["min", "max"]
+                .into_iter()
+                .find(|f| matches!(doc.get(*f), Some(Bson::Document(d)) if !d.is_empty()))
+                .map(|f| format!("Option {f} not supported in aggregation."))
+        };
+        if let Some(message) = refused {
+            return Ok(CommandError::new(168, "InvalidPipelineOperator", message).into_reply());
+        }
+    }
 
     let filter = doc_field(doc, "filter");
     // An unrecognized `$expr` expression operator is rejected by mongod at parse
