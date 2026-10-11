@@ -8913,35 +8913,51 @@ and not by statement, and let any session read any cursor. What is left:
 `tools/probes/time_series.py`, mongod 8.2.11: 187 scenarios on a fresh
 database each (what `create` accepts, inserts, reads, the restricted writes,
 indexes, `collMod`, rename and the rest). The Rust server went from 139
-results different to 24. It checked nothing about a definition before, took
+results different to 24, and to 6 when the buckets were derived (below). It
+checked nothing about a definition before, took
 a measurement with no date, and let any update through or refused it with
 one message. mongod keeps the rows as buckets in `system.buckets.<name>` and
 presents the collection as a view; this server keeps ordinary documents, and
 most of what is left follows from that:
 
-- [ ] **RUST MongoDB server: there is no `system.buckets.<name>`.** mongod
-      lists it (and `system.views`), counts and reads it, indexes it, drops
-      and renames it, and refuses an insert into it by its bucket schema (9
-      of the 24). `$collStats` and `collStats` count buckets and report a
-      `timeseries` section; `validate` reports the bucket index (3 more).
-- [ ] **RUST MongoDB server: measurements come back in insertion order and
-      field order.** mongod returns them bucket by bucket (grouped by meta
-      value), puts the time field first and the meta field second, and
-      sorts the keys of a meta document. The probe compares documents as
-      mappings, so only the row order shows (2 of the 24).
+- [ ] **RUST MongoDB server: the buckets are derived, not stored**
+      (2026-10-11; 6 of 187 still differ). The server keeps measurements as
+      ordinary documents, the format the Python server shares, and works the
+      buckets out when asked (`crates/secantus-commands/src/ts_buckets.rs`):
+      reads of `system.buckets.<name>` and `system.views`, the listings, the
+      scan order, `validate`, `collStats` and `$collStats`. What that leaves:
+      - **Placement can differ for a batch that runs backwards in time.**
+        mongod sorts an insert batch before placing it; the derivation sees
+        only insertion order, so such a batch can make more buckets here.
+        A bucket also never closes for size or a schema change here, only
+        at 1,000 measurements.
+      - **A bucket's `data` columns are valid but not mongod's bytes.** Each
+        value is a literal and each gap a skip. mongod 8.2.11 unpacks them to
+        the same measurements (checked by inserting one into its
+        `system.buckets`), but it writes delta-encoded runs.
+      - **A bucket cannot be written.** An insert that passes the bucket
+        schema, and any update or delete on `system.buckets.<name>`, answers
+        115. `renameCollection` on it answers 166 (mongod renames it).
+        An index on it must be one the collection can show.
+      - **`collStats` has no write counters** (`numBucketInserts`,
+        `numBucketsClosedDueTo...`): a history this server does not keep.
+        Its sizes are of the derived buckets, not of compressed ones.
+      - **An unsorted read of a time-series collection reads the whole
+        collection** to place the measurements, whatever its filter.
 - [ ] **RUST MongoDB server: smaller time-series differences.** A
       measurement inserted with no `_id` is given one (mongod stores none);
-      `distinct` answers `ok` as a double (mongod: an int32 on a
-      time-series collection); a `hint` of `{_id: 1}` is honoured (mongod:
-      2); an index on `{_id: 1}` reports that it already exists (mongod
-      builds one); a `hashed` or wildcard index is refused as on any
-      collection (mongod builds the first and words the second by its
-      bucket fields); `listCollections` with `authorizedCollections` leaves
-      out the two storage collections.
+      an index on `{_id: 1}` reports that it already exists (mongod builds
+      one); a `hashed` index is refused as on any collection (mongod builds
+      it); a hint of `{_id: 1}` is refused with this server's wording for an
+      unknown hint. `listCollections` puts each bucket namespace after its
+      collection and `system.views` last; mongod's order is not stable
+      between two runs of the same commands.
 - [ ] **RUST MongoDB server: `convertToCapped`, `cloneCollectionAsCapped`,
-      `compact` and `reIndex` are not commands** (59). On mongod the first
-      two answer 166 for a time-series collection and the last two answer
-      20 on a replica-set member, for any collection.
+      `compact` and `reIndex` (added 2026-10-11, 51 of 51 scenarios match
+      mongod as a replica-set member and standalone).** Not measured: a
+      `compact` or `reIndex` field mongod does not know (40415 there), the
+      events a change stream sees for `convertToCapped`, and either copy
+      inside a transaction.
 - [ ] **PYTHON MongoDB server: 140 of 187 time-series results differ from
       mongod** (same probe). Not changed, and not read through. Whether
       its `$out` keeps the target's validator and indexes was not measured.
@@ -8951,7 +8967,8 @@ most of what is left follows from that:
 `tools/probes/collation.py`, mongod 8.2.11: 764 scenarios (reads under 29
 collations, 39 malformed specs on every command, the expression and query
 operators, and a fresh database per scenario for defaults, indexes, views and
-writes). The Rust server went from 462 results different to 8. It now
+writes). The Rust server went from 462 results different to 8, and to 5 on
+2026-10-11 when `_id` took the collection's collation. It now
 compares through ICU4X (`crates/secantus-core/src/collation.rs`), which
 ordered 157 strings as mongod does under 40 collations with the one exception
 listed first below. What is left, there and beside it:
@@ -8965,11 +8982,23 @@ listed first below. What is left, there and beside it:
       does not. mongod links ICU 57.1 and ICU4X carries newer CLDR data, so a
       character or tailoring added since can order differently; none was
       found in 24 locales.
-- [ ] **RUST MongoDB server: `_id` is not unique by the collection's default
-      collation.** With a strength-2 default, mongod refuses `_id: "A"` after
-      `_id: "a"` (insert, upsert and a clustered collection: 3 of the 8). The
-      `_id` index is keyed by value on disk, so this needs a second, collated
-      key for such collections. Reads by `_id` do follow the collation.
+- [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left**
+      (the rule itself landed 2026-10-11: a claim per document in the
+      unique-keys table under the collated key). A collection created with a
+      default collation BEFORE that has no claims for the documents already
+      in it, so a second spelling of one of THEIR `_id`s is still accepted.
+      A duplicate whose `_id` is a document shows the value as written
+      (mongod shows each string in it as raw sort-key bytes). The Python
+      server does not enforce the rule and does not release a claim when it
+      deletes a document; the Rust server treats a claim whose document is
+      gone as free.
+- [ ] **RUST MongoDB server: `$out` and `$merge` after 2026-10-11.** `$out`
+      builds beside the target and renames over it, and a change stream on
+      the target sees `drop` then `invalidate` (mongod: `rename` then
+      `invalidate`; the same holds for any `renameCollection` with
+      `dropTarget`). `$merge` with `whenMatched: "fail"` has its own wording
+      for the duplicate. `$merge` into a collection with a default collation
+      scans it once per document.
 - [ ] **RUST MongoDB server: a query never uses a collated index.** An index
       with a collation now holds collation sort keys (catalog marker
       `collationKeys`), which is what makes its `unique` right, and the
@@ -9041,16 +9070,40 @@ listed first below. What is left, there and beside it:
 
       So `pwrite` returned EFAULT for the first 128 bytes of a brand-new log
       file, while the connection was still opening. Nothing had been written
-      to that store yet, so no data was at risk in this instance, but the
-      cause is not known. EFAULT means the kernel could not read the buffer
-      it was handed. Two readings, neither tested: the buffer WiredTiger
-      passed was bad (a bug in this build of WT or in one of the
-      `cmake/patch_wt_*.py` patches, which would be serious), or the runner
-      could not page the buffer in (a host condition). Not reproduced
-      locally; one occurrence. What would tell them apart: whether it ever
-      happens off the macOS runners, and whether it is always the log
-      header write at open. `gh run rerun --failed` is not available on
-      this workflow, so a re-run is a push.
+      to that store yet, so no data was at risk in this instance. EFAULT
+      means the kernel could not read the buffer it was handed.
+
+      **Looked at again 2026-10-11. The cause is still not known, and it has
+      not been reproduced.** What was established:
+
+      - **WiredTiger did not hand `pwrite` a bad pointer.** The write is the
+        log file header, from `__log_file_header` (`src/log/log.c`): it
+        takes a scratch buffer, zeroes all 128 bytes, fills in the
+        descriptor, checksums the 128 bytes, and passes that same pointer
+        and length to `__wt_log_fill`, which calls `pwrite`. A bad pointer
+        would have faulted in the `memset` or the checksum, in this
+        process, before the system call. So the pages were readable in user
+        space and unreadable to the kernel a few instructions later.
+      - **Neither log patch is on that path.** `patch_wt_dsync_group.py` and
+        `patch_wt_fsync_group.py` change `__log_write_internal` and
+        `__wt_log_release`; neither touches the header write or its buffer.
+      - **It is rare, and so far macOS only.** Every failed job of the last
+        400 `Tests` runs (2026-09-28 to 2026-10-11: 56 runs not green, 42
+        failed jobs, 11 of them macOS) was read for `Bad address`,
+        `WT_PANIC` and `fatal log failure`. This run is the only hit.
+      - **A local stress did not produce it.** 10 processes each opening,
+        writing and closing 400 durable stores (4,000 opens, macOS arm64,
+        load 18), with a thread per process spawning subprocesses and the
+        allocator churned: no failure
+        (`wtopen_stress.py`, not kept in the repository).
+
+      What is left is a page that became unreadable between two adjacent
+      uses: either the runner could not page it back in, or another thread
+      in the same process unmapped it (which would be a heap bug in some
+      extension loaded into the test worker, not necessarily WiredTiger).
+      Nothing here tells those apart. If it happens again, record whether
+      it is again the header write at open, which lane, and what else the
+      worker had loaded.
 
 ### 7.068 The `bulkWrite` command and TTL indexes -- 2026-10-10
 
@@ -9059,18 +9112,12 @@ listed first below. What is left, there and beside it:
 2 (both the hint wording filed under 7.067), and from 26 of 50 TTL results
 to 3. What is left, and what the same probes say about the Python server:
 
-- [ ] **PYTHON MongoDB server: a partial TTL index deletes documents outside
-      its filter.** Three expired documents, one matching
-      `partialFilterExpression: {gone: true}`: `mongod` 8.2.11 deletes that
-      one, the Python server all three. Silent data loss. The Rust server did
-      the same until 2026-10-10. The Python server also expires by a
-      COMPOUND index that `collMod` gave an `expireAfterSeconds` (`mongod`
-      refuses the `collMod`, 72), and does not expire a document whose field
-      is an ARRAY holding an expired date, directly or through a dotted path
-      (`mongod` does). Whether its expiries reach the oplog was not measured:
-      the probe's Python server runs without a replica set name, so the
-      change stream there is refused.
-- [ ] **PYTHON MongoDB server: 47 of 50 TTL results and 63 of 141 `bulkWrite`
+- [ ] **PYTHON MongoDB server: whether TTL expiries reach the oplog was not
+      measured.** The probe's Python server runs without a replica set name,
+      so the change stream there is refused. (The partial-index data loss,
+      the compound-index expiry and the missed array dates were fixed
+      2026-10-11.)
+- [ ] **PYTHON MongoDB server: 46 of 50 TTL results and 63 of 141 `bulkWrite`
       results differ from `mongod`** (same probes). Not changed and not read
       through beyond the entry above. Whether it stores an array or regex
       `_id` (the Rust server did, on `insert` and on upsert) was not probed.

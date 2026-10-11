@@ -618,15 +618,11 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .get_collection_options(&ctx.db_name, &coll)
         .ok()
         .and_then(|o| o.get_str("viewOn").ok().map(String::from));
-    let mut n = if let Some(view_on) = view_on {
-        let opts = storage
-            .get_collection_options(&ctx.db_name, &coll)
-            .map_err(command_error)?;
-        let mut pipeline: Vec<Bson> = opts
-            .get_array("viewPipeline")
-            .ok()
-            .cloned()
-            .unwrap_or_default();
+    let mut n = if view_on.is_some() {
+        // Run on the VIEW: the aggregation resolves it, through any views
+        // beneath it, and a view may hold a stage only a view may hold.
+        let view_on = coll.clone();
+        let mut pipeline: Vec<Bson> = Vec::new();
         if !filter.is_empty() {
             pipeline.push(Bson::Document(doc! { "$match": filter.clone() }));
         }

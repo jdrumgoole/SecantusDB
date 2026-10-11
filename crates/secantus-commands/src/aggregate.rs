@@ -351,7 +351,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline);
             let c = base_coll.as_str();
             // Stages that generate / read their own input start from no docs.
-            if first_stage_has_any(&pipeline, &["$collStats", "$indexStats", "$documents"]) {
+            if first_stage_has_any(
+                &pipeline,
+                &[
+                    "$collStats",
+                    "$indexStats",
+                    "$documents",
+                    crate::ts_buckets::BUCKETS_STAGE,
+                    crate::ts_buckets::VIEWS_STAGE,
+                ],
+            ) {
                 (ns, Vec::new(), pipeline)
             } else {
                 // Lift a leading $match into the fetch filter (dropping it from
@@ -380,6 +389,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         &vars,
                     )
                     .map_err(command_error)?;
+                // A time-series collection scans bucket by bucket.
+                let bytes = crate::ts_buckets::as_read(storage, &ctx.db_name, c, bytes, false)?;
                 // Reduce the leading $skip/$limit/$match prefix over raw BSON so
                 // only the survivors that reach the first heavier stage are
                 // decoded (tasks/rust-perf-findings.md).
@@ -464,6 +475,8 @@ fn is_storage_backed(name: &str) -> bool {
             | "$merge"
             | "$geoNear"
             | "$unionWith"
+            | crate::ts_buckets::BUCKETS_STAGE
+            | crate::ts_buckets::VIEWS_STAGE
     )
 }
 
@@ -1253,6 +1266,12 @@ fn apply_storage_stage(
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
         "$indexStats" => apply_index_stats(db, coll, storage),
+        // A read of `system.buckets.<name>`: the stage names the collection.
+        crate::ts_buckets::VIEWS_STAGE => crate::ts_buckets::view_definitions(storage, db),
+        crate::ts_buckets::BUCKETS_STAGE => {
+            let name = spec.and_then(Bson::as_str).unwrap_or_default();
+            crate::ts_buckets::of_collection(storage, db, name)
+        }
         // A document the target's validator refuses is reported under the
         // SOURCE namespace's executor prefix, as mongod reports it.
         "$out" | "$merge" => {
@@ -1882,11 +1901,10 @@ pub(crate) fn collection_documents(
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     if !crate::views::is_view(storage, db, coll) {
-        return decode_docs(
-            storage
-                .find(db, coll, filter, None, None)
-                .map_err(command_error)?,
-        );
+        let found = storage
+            .find(db, coll, filter, None, None)
+            .map_err(command_error)?;
+        return decode_docs(crate::ts_buckets::as_read(storage, db, coll, found, false)?);
     }
     let mut tail: Vec<Bson> = Vec::new();
     if !filter.is_empty() {
@@ -2137,12 +2155,29 @@ fn apply_coll_stats(
 ) -> Result<Vec<Document>, CommandError> {
     let coll = coll.ok_or_else(|| bad_value("$collStats requires a collection"))?;
     let spec = spec.and_then(Bson::as_document);
-    let count = storage
-        .count_matching(db, coll, &Document::new())
-        .map_err(command_error)? as i64;
+    // A time-series collection's statistics are its buckets': their
+    // namespace, and how many there are.
+    let buckets = if storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        Some(crate::ts_buckets::of_collection(storage, db, coll)?.len() as i64)
+    } else {
+        None
+    };
+    let count = match buckets {
+        Some(n) => n,
+        None => storage
+            .count_matching(db, coll, &Document::new())
+            .map_err(command_error)? as i64,
+    };
     let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let ns = match buckets {
+        Some(_) => format!("{db}.{}{coll}", crate::ts_buckets::BUCKETS_PREFIX),
+        None => format!("{db}.{coll}"),
+    };
     let mut out = doc! {
-        "ns": format!("{db}.{coll}"),
+        "ns": ns,
         "host": "secantus",
         "localTime": bson::DateTime::now(),
     };
@@ -2195,7 +2230,10 @@ fn apply_coll_stats(
         );
     }
     if spec.is_some_and(|s| s.contains_key("count")) {
-        out.insert("count", count);
+        match buckets {
+            Some(n) => out.insert("count", crate::admin::int_bson(n)),
+            None => out.insert("count", count),
+        };
     }
     Ok(vec![out])
 }
@@ -2587,7 +2625,7 @@ fn apply_merge(
 /// Insert into a stage's target, failing on the first document the storage
 /// refuses. `Storage::insert` REPORTS a refused document in its result rather
 /// than failing, and dropping that result lost the document without a word.
-fn insert_or_fail(
+pub(crate) fn insert_or_fail(
     storage: &dyn crate::storage::Storage,
     db: &str,
     coll: &str,
