@@ -4312,11 +4312,15 @@ These work end-to-end but cut corners.
   configurations (open, `hostssl` only, `clientcert=verify-ca`,
   `clientcert=verify-full`, `cert`), 154 scenarios through psycopg 3.3.4 and
   a hand-written SCRAM client: 150 the same. Open:
-  - **A user this server has never heard of is trusted**, with or without
-    TLS; PostgreSQL asks it for a password. This is the four scenarios that
-    differ. Test fixtures connect as roles nobody created, so it is a
-    decision and not an oversight; under `verify-full` and `cert` the
-    certificate must still name the user.
+  - **A user this server has never heard of is trusted BY DEFAULT**;
+    PostgreSQL asks it for a password. This is the four scenarios that
+    differ. Test fixtures connect as roles nobody created, so the default
+    is a decision. `--refuse-unknown-users`
+    (`PgBuilder::refuse_unknown_users`, 2026-10-11) answers as PostgreSQL
+    does: with it, and 65 unknown-user scenarios added, 219 of 219 are the
+    same. Still open: **a role with no password is trusted**, flag or not,
+    where a `scram-sha-256` line refuses it. The comparison's `pg_hba.conf`
+    trusts those roles by name to match.
   - **One policy for every user and database.** `pg_hba.conf` chooses a
     method by line; here `--tls-require` and `--tls-client-cert` apply to
     every connection.

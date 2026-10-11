@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::server::{bind_tls, open_storage_with_cache, RunningPgServer};
+use crate::server::{bind_with, open_storage_with_cache, RunningPgServer, ServerOptions};
 use crate::{DatabaseRegistry, TlsConfig};
 
 /// The WiredTiger cache cap for an embedded server. Smaller than the daemon's
@@ -180,6 +180,7 @@ pub struct PgBuilder {
     databases: Vec<String>,
     cache_size: String,
     tls: Option<TlsConfig>,
+    refuse_unknown_users: bool,
 }
 
 impl Default for PgBuilder {
@@ -191,6 +192,7 @@ impl Default for PgBuilder {
             databases: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE.to_string(),
             tls: None,
+            refuse_unknown_users: false,
         }
     }
 }
@@ -250,6 +252,16 @@ impl PgBuilder {
         self
     }
 
+    /// Refuse a user there is no role for. By default such a user connects
+    /// without a password, as a role with no password does. With this it is
+    /// asked for one, as PostgreSQL asks, and none it gives is right. A role
+    /// with no password still connects without one; give `postgres` a
+    /// password and every login needs one.
+    pub fn refuse_unknown_users(mut self, refuse: bool) -> Self {
+        self.refuse_unknown_users = refuse;
+        self
+    }
+
     /// Open the store and start serving.
     pub fn start(self) -> Result<PgServer, Error> {
         if self.cache_size.trim().is_empty() || self.cache_size.contains([',', '(', ')', '=']) {
@@ -285,8 +297,11 @@ impl PgBuilder {
             self.databases.clone(),
         ));
         let addr = format!("{}:{}", self.host, self.port);
+        let options = ServerOptions::default()
+            .tls(self.tls.clone())
+            .refuse_unknown_users(self.refuse_unknown_users);
         let running =
-            bind_tls(&addr, storage, databases, self.tls.as_ref()).map_err(|e| match e.kind() {
+            bind_with(&addr, storage, databases, &options).map_err(|e| match e.kind() {
                 // A certificate or key that could not be used, not a socket.
                 std::io::ErrorKind::InvalidData => Error::Config(e.to_string()),
                 _ => Error::Io(e),

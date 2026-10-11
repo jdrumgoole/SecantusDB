@@ -162,6 +162,13 @@ Not supported: a certificate revocation list, a user name map
 (`pg_ident.conf`), matching on the certificate's whole DN (`clientname=DN`),
 a key with a passphrase, and reloading the files without a restart.
 
+A user name there is no role for connects without a password, as a role
+with no password does. `--refuse-unknown-users` (after 0.1.0-beta.10) stops
+that: such a user is asked for a password, as PostgreSQL asks one under a
+`scram-sha-256` line, and none it gives is right. A role with no password
+still connects without one, so give `postgres` a password
+(`ALTER ROLE postgres PASSWORD '...'`) and every login then needs one.
+
 The Python one needs the `sql` extra (`pip install "SecantusDB[sql]"`) and
 runs as `secantusd-py-pg`:
 

@@ -17,7 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pg::{bind_tls, ClientCert, DatabaseRegistry, TlsConfig};
+use secantus_pg::{bind_with, ClientCert, DatabaseRegistry, ServerOptions, TlsConfig};
 
 /// Unblock SIGINT / SIGTERM in the calling thread and give them their
 /// default disposition, undoing whatever the parent left. POSIX only:
@@ -78,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_ca_file: Option<String> = None;
     let mut tls_client_cert: Option<ClientCert> = None;
     let mut tls_require = false;
+    let mut refuse_unknown_users = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         // `--version` / `--help` BEFORE the positional fallthrough. Without
@@ -102,7 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  USAGE:\n    \
                  secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n                \
                  [--tls-cert-file PATH --tls-key-file PATH [--tls-require]\n                 \
-                 [--tls-ca-file PATH [--tls-client-cert MODE]]]\n\
+                 [--tls-ca-file PATH [--tls-client-cert MODE]]]\n                \
+                 [--refuse-unknown-users]\n\
                  \n\
                  ARGS:\n    \
                  <storage-path>  WiredTiger home directory (default: ./secantus-pg-data)\n    \
@@ -129,6 +131,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  the user name, beside the password. `cert`: the same,\n                     \
                  and no password is asked for. Each needs\n                     \
                  --tls-ca-file and refuses a connection that is not TLS.\n    \
+                 --refuse-unknown-users  Ask a user there is no role for to give a\n                     \
+                 password, which fails. By default such a user\n                     \
+                 connects without one.\n    \
                  -V, --version    Print version and exit\n    \
                  -h, --help       Print this help and exit",
                 env!("CARGO_PKG_VERSION")
@@ -164,6 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         } else if arg == "--tls-require" {
             tls_require = true;
+        } else if arg == "--refuse-unknown-users" {
+            refuse_unknown_users = true;
         } else if arg.starts_with("--") {
             // Never a storage path: an unknown or misspelt option fell through
             // to `home` and the server came up over a directory named after
@@ -236,8 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = secantus_pg::open_storage(&home)?;
     // The error as a sentence: an unusable certificate is the likeliest thing
     // to go wrong here, and the `Debug` form buries which file it was.
-    let mut server =
-        bind_tls(&addr, storage, databases, tls.as_ref()).map_err(|e| e.to_string())?;
+    let options = ServerOptions::default()
+        .tls(tls)
+        .refuse_unknown_users(refuse_unknown_users);
+    let mut server = bind_with(&addr, storage, databases, &options).map_err(|e| e.to_string())?;
 
     // One line, flushed, so a harness can wait for readiness. It reports the
     // address the listener actually BOUND, not the one requested, so that

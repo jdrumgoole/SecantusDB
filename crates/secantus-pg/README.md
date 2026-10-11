@@ -66,6 +66,11 @@ not TLS. `pg_stat_ssl` shows each connection's protocol, cipher and client
 certificate. Not supported: a certificate revocation list, a user name map,
 and matching on the certificate's whole DN.
 
+A user name there is no role for connects without a password, as a role
+with no password does. `--refuse-unknown-users`
+(`PgBuilder::refuse_unknown_users`, after 0.1.0-beta.10) asks such a user
+for a password, as PostgreSQL does, and none it gives is right.
+
 Prebuilt binaries are on the
 [GitHub releases](https://github.com/jdrumgoole/SecantusDB/releases)
 (`secantusd-pg-v*`).
