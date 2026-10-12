@@ -96,7 +96,7 @@ def test_the_corpus_and_its_record_are_the_same_statements() -> None:
     assert recorded["reference"].startswith("15."), recorded["reference"]
     corpus = pg_differential._read(str(CORPORA / "builtin_coverage.sql"))
     assert [check[0] for check in recorded["checks"]] == corpus
-    assert len(corpus) >= 135
+    assert len(corpus) >= 153
 
 
 def test_builtin_functions_answer_as_postgresql_15_does(connection: psycopg.Connection) -> None:
