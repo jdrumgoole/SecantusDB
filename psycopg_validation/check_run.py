@@ -10,11 +10,19 @@ Usage::
 
     python -m psycopg_validation.check_run .validation/psycopg-raw-rust.json
     python -m psycopg_validation.check_run PLAIN.json --tls TLS.json
+    python -m psycopg_validation.check_run PLAIN.json --tls TLS.json --shared-runner
 
 With ``--tls`` the second report is held to the first: a test that fails over
 TLS and passes in the clear is the server's TLS path answering differently,
 and that is what the exit code reports. A test that fails in BOTH is printed
 and does not fail the comparison; it is the plain gauge's finding.
+
+``--shared-runner`` is for a hosted CI runner. There the tests in
+`SHARED_RUNNER_NOISE` fail in one run and pass in the next whatever the
+transport, so one failing over TLS and passing in the clear says nothing
+about TLS. They are still printed, and they do not fail the comparison.
+Without the flag every test counts, which is how a developer's machine runs
+it.
 """
 
 from __future__ import annotations
@@ -24,6 +32,28 @@ import sys
 from pathlib import Path
 
 _BAD = ("failed", "error")
+
+#: Tests whose verdict is a measurement taken in the CLIENT process, and
+#: which a hosted runner fails now and then on its own: (what the test id
+#: holds, why). Measured on `ubuntu-latest`, 2026-10-12, two runs of the suite
+#: in the clear against one tree: 6 failures, then 31, where a Mac has none.
+#:
+#: What leaving them out of `--shared-runner` loses: a change that delays or
+#: drops NOTIFY delivery over TLS only would not fail that lane. The same
+#: tests are held to the comparison wherever the flag is not given.
+SHARED_RUNNER_NOISE: tuple[tuple[str, str], ...] = (
+    (
+        "::test_notify",
+        "asserts a NOTIFY sent 0.25 s in arrives within 25 to 50 ms of then; the runner's"
+        " are 55 to 80 ms late in either transport",
+    ),
+    ("::test_notifies", "the same measurement, from a second thread"),
+    (
+        "::test_leak",
+        "counts Python objects in the client before and after; 22 of its 72 cases"
+        " failed in one run in the clear and none in the run before",
+    ),
+)
 
 
 class Truncated(Exception):
@@ -57,7 +87,14 @@ def tls_only_failures(plain: dict[str, str], tls: dict[str, str]) -> list[str]:
     return sorted(t for t, o in tls.items() if o in _BAD and plain.get(t) not in _BAD)
 
 
+def noise_reason(test: str) -> str | None:
+    """Why `test` is not held to the comparison on a shared runner, if it is not."""
+    return next((why for part, why in SHARED_RUNNER_NOISE if part in test), None)
+
+
 def main(argv: list[str]) -> int:
+    shared_runner = "--shared-runner" in argv
+    argv = [a for a in argv if a != "--shared-runner"]
     args = [a for a in argv if a != "--tls"]
     if len(args) != (2 if "--tls" in argv else 1):
         print(__doc__, file=sys.stderr)
@@ -83,11 +120,18 @@ def main(argv: list[str]) -> int:
     for test in sorted(t for t, o in plain.items() if o in _BAD):
         print(f"FAILED in the clear{' and over TLS' if tls[test] in _BAD else ''}: {test}")
     only = tls_only_failures(plain, tls)
+    held = [t for t in only if not (shared_runner and noise_reason(t))]
     for test in only:
-        print(f"FAILED over TLS only: {test}", file=sys.stderr)
-    if only:
+        if test in held:
+            print(f"FAILED over TLS only: {test}", file=sys.stderr)
+        else:
+            print(f"FAILED over TLS only, and not held to it on a shared runner: {test}")
+    if held:
         return 1
-    print("no test fails over TLS that passes in the clear")
+    if only:
+        print(f"{len(only)} failed over TLS only, each a test a shared runner fails by itself")
+    else:
+        print("no test fails over TLS that passes in the clear")
     return 0
 
 

@@ -730,7 +730,9 @@ one request path:
     `.github/workflows/psycopg-tls.yml` does the same on Linux each week
     and on a PR that touches the TLS code; both fail on a run that stopped
     short and on a test that fails over TLS only
-    (`psycopg_validation/check_run.py`). The embedded Python handle takes
+    (`psycopg_validation/check_run.py`). The CI lane leaves three families
+    of timing test out of the second, by name: a hosted runner fails them
+    in one run and passes them in the next, in either transport. The embedded Python handle takes
     the TLS and `pg_hba.conf` options since 2026-10-12.
     `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must

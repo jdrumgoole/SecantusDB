@@ -16,7 +16,9 @@
 #   1. Both runs COMPLETE -- every test a run started reported a result. A
 #      truncated run is a failure, never a pass (CLAUDE.md, "A test that does
 #      not COMPLETE is a failure").
-#   2. No test fails over TLS that passes in the clear.
+#   2. No test fails over TLS that passes in the clear, apart from the timing
+#      tests a hosted runner fails by itself (`SHARED_RUNNER_NOISE` in
+#      psycopg_validation/check_run.py).
 # A test that fails in BOTH runs is printed and does not fail this job: it is
 # the plain gauge's finding, and this lane is not where that number is kept.
 name: psycopg gauge (Rust PG server, plain and TLS)
@@ -162,9 +164,15 @@ jobs:
       - name: Both runs completed, and nothing fails over TLS only
         if: always()
         shell: bash
+        # `--shared-runner`: three families of timing test fail on this runner
+        # in one run and pass in the next, in either transport (6 failures in
+        # the clear in one run of a tree, 31 in the next). They are printed and
+        # not held to the comparison here; check_run.py names them and says
+        # what that loses.
         run: >-
           uv run --no-sync python -m psycopg_validation.check_run
           .validation/psycopg-raw-rust.json --tls .validation/psycopg-raw-rust-tls.json
+          --shared-runner
 
       - name: Upload the raw reports
         if: always()

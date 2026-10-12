@@ -68,3 +68,29 @@ def test_the_two_runs_must_have_run_the_same_tests(tmp_path: Path) -> None:
 def test_a_truncated_tls_run_fails_the_comparison(tmp_path: Path) -> None:
     plain = _report(tmp_path / "p.json", {"t::a": "passed"})
     assert check_run.main([str(plain), "--tls", str(tmp_path / "absent.json")]) == 1
+
+
+def test_a_shared_runner_does_not_hold_a_timing_test_to_the_comparison(tmp_path: Path) -> None:
+    """The tests a hosted runner fails by itself are printed, and do not fail
+    the lane; without the flag they count like any other."""
+    notify = "tests/test_notify.py::test_notify_query_notify[callback-client]"
+    leak = "tests/test_cursor_async.py::test_leak[asyncio-tuple_row-one-0-t]"
+    plain = _report(tmp_path / "p.json", {notify: "passed", leak: "passed", "t::a": "passed"})
+    noisy = _report(tmp_path / "n.json", {notify: "failed", leak: "failed", "t::a": "passed"})
+    assert check_run.main([str(plain), "--tls", str(noisy)]) == 1
+    assert check_run.main([str(plain), "--tls", str(noisy), "--shared-runner"]) == 0
+
+
+def test_a_shared_runner_still_fails_on_any_other_test(tmp_path: Path) -> None:
+    notify = "tests/test_notify.py::test_notify"
+    plain = _report(tmp_path / "p.json", {notify: "passed", "t::a": "passed"})
+    broken = _report(tmp_path / "b.json", {notify: "failed", "t::a": "failed"})
+    assert check_run.main([str(plain), "--tls", str(broken), "--shared-runner"]) == 1
+    assert check_run.noise_reason("t::a") is None
+    assert check_run.noise_reason(notify) is not None
+
+
+def test_a_truncated_run_fails_on_a_shared_runner_too(tmp_path: Path) -> None:
+    plain = _report(tmp_path / "p.json", {"t::a": "passed"})
+    absent = str(tmp_path / "absent.json")
+    assert check_run.main([str(plain), "--tls", absent, "--shared-runner"]) == 1

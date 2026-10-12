@@ -4871,29 +4871,49 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **OPEN — RUST pgserver on LINUX: six psycopg tests fail in CI
-      that pass on macOS (first measured 2026-10-12).** No Linux lane ran
+- [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
+      and pass on macOS (first measured 2026-10-12).** No Linux lane ran
       psycopg's suite against the Rust PostgreSQL server until
-      `.github/workflows/psycopg-tls.yml`; its first run, in the clear, on
-      `ubuntu-latest`: 5,665 pass and 6 fail of 5,788 that ran (80
-      skipped, 34 xfailed, 3 xpassed, 1 deselected), in 1,689 s. The same
-      tree on macOS has none.
-      - Five wait for a NOTIFY sent 0.25 s after the test starts and
-        measure when it arrives: `test_notify.py::test_notify` (0.326 s,
-        allowed 0.25 +/- 0.05), `::test_notify_timeout` (0.319, +/-
-        0.025), `test_notify_async.py::test_notify[asyncio]` (0.306),
-        `::test_notify_timeout[asyncio]` (0.309) and
-        `test_concurrency.py::test_notifies` (0.328). All five are 55 to
-        80 ms late. Not diagnosed: it is the runner, or it is how long
-        this server takes to hand a notification to an idle listening
-        connection on Linux. Measure the second on a quiet Linux box
-        before believing the first.
-      - `test_concurrency_async.py::test_type_error_shadow` hit the 20 s
-        per-test timeout.
+      `.github/workflows/psycopg-tls.yml`. Its first two runs, on
+      `ubuntu-latest`, 5,788 tests each (80 skipped, 34 xfailed, 3
+      xpassed, 1 deselected); the same tree on macOS has no failure:
 
-      That lane does not fail on them: it gates on a run stopping short
-      and on a test that fails over TLS only, and these fail in the
-      clear. Nothing gates the plain number on Linux.
+      | run | in the clear | over TLS |
+      | --- | --- | --- |
+      | 1 | 6 fail, 1,689 s | cut off at 98% by the runner's 1,800 s backstop |
+      | 2 | 31 fail, 2,492 s | 14 fail, 2,067 s |
+
+      - **The NOTIFY timing tests fail in every run, in either
+        transport**: `test_notify.py::test_notify` and
+        `::test_notify_timeout`, their `test_notify_async.py` twins, and
+        in run 2 the four `test_notify_query_notify` cases. Each sends a
+        NOTIFY 0.25 s after it starts, from a second connection it opens
+        then, and asserts when it arrives: 0.306 to 0.328 s measured,
+        where 0.25 +/- 0.025 or 0.05 is allowed. So 55 to 80 ms late.
+        Not diagnosed. The server wakes an idle listener by a
+        `tokio::sync::Notify` and sets `TCP_NODELAY`, so nothing polls;
+        what is left is the time a debug build takes to accept the second
+        connection and run the NOTIFY on a shared runner. Measure that on
+        a quiet Linux box, and with a release build, before calling it
+        the runner.
+      - `test_concurrency.py::test_notifies` is the same measurement and
+        fails in some runs and not others.
+      - **`test_cursor_async.py::test_leak` failed 22 of its 72 cases in
+        run 2 in the clear, and none in run 1 or over TLS.** It counts
+        Python objects in the client; it also failed twice on macOS on a
+        loaded machine and passed three times alone.
+      - `test_concurrency_async.py::test_type_error_shadow` hit the 20 s
+        per-test timeout in all three completed runs.
+
+      What the lane gates, given that: a run that stopped short, and a
+      test that fails over TLS only, apart from `::test_notify*`,
+      `::test_notifies` and `::test_leak` (`SHARED_RUNNER_NOISE` in
+      `psycopg_validation/check_run.py`, applied only with
+      `--shared-runner`). In run 2 five of those failed over TLS and
+      passed in the clear, which is the noise above and not TLS. **So a
+      change that delays NOTIFY over TLS only would not fail that lane**;
+      `./inv validate-psycopg-rust --tls` on a developer's machine holds
+      every test to it. Nothing gates the plain number on Linux.
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
       (2026-10-12).** The probe calls every immutable or stable function in
