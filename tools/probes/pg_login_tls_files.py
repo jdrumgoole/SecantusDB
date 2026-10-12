@@ -301,7 +301,12 @@ def fingerprint(port, cafile=None):
         return ("client", type(e).__name__, str(e)[:90])
 
 
-def raw_first(port, user, cert=None):
+#: What a client sees when the server's close reaches it before the TLS alert
+#: that says why.
+_CLOSED_FIRST = ("SSLEOFError", "ConnectionResetError", "BrokenPipeError")
+
+
+def _raw_first_once(port, user, cert=None):
     try:
         c = Raw(port, user=user, cert=cert)
         kind, body = c.read()
@@ -310,6 +315,25 @@ def raw_first(port, user, cert=None):
         return ("auth", struct.unpack("!I", body[:4])[0])
     except Exception as e:  # noqa: BLE001
         return ("client", type(e).__name__, re.sub(r"\(_ssl.c:\d+\)", "", str(e))[:90])
+
+
+def raw_first(port, user, cert=None):
+    """A server's first answer to a startup packet.
+
+    A certificate the server refuses is answered with a TLS alert as it
+    closes the connection, and a client now and then reads the close before
+    the alert: PostgreSQL 15.19 did that once in CI (2026-10-12, "good cert,
+    first answer" under a revocation list with no entry for the issuer), and
+    479 of 480 scenarios then matched. So a close is asked about again, on
+    either server, and the answer compared is the alert whenever the server
+    sends one. A server that only ever closes still answers with the close.
+    """
+    out = _raw_first_once(port, user, cert)
+    for _ in range(4):
+        if not (out[0] == "client" and out[1] in _CLOSED_FIRST):
+            break
+        out = _raw_first_once(port, user, cert)
+    return out
 
 
 def raw_scram(port, mechanism, gs2, cafile, hash_name="sha256", password="pw", user="alice"):
