@@ -1,0 +1,8 @@
+binary_version=secantusd-pg 0.1.0-beta.13
+binary_tree=add671e4bad8f45750e5519db3bbced6e5cbf79a
+postgres=16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)
+fsync=on
+synchronous_commit=on
+vcpus=16
+filesystem=ext4
+os=Ubuntu 24.04.5 LTS

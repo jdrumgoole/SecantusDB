@@ -3054,6 +3054,22 @@ These work end-to-end but cut corners.
       against 2,832 / 9,193 / 14,350; select by PK, 12,259 / 42,358 / 58,602
       against 9,654 / 32,339 / 41,181.
 
+      **Re-measured 2026-10-12** on a fresh `c-16`, the released
+      0.1.0-beta.13 binary against PostgreSQL 16.15, with
+      `invoke do-pg-bench --repeat 7` (medians of seven 10 s trials; raw
+      trials in `bench/results/pg-droplet/2026-10-12-0.1.0-beta.13/`):
+      insert, one table each, PostgreSQL 5,674 / 17,422 / 24,312 against
+      3,723 / 12,221 / 17,579; shared table at 8 clients, 24,234 against
+      16,310; update by PK, 5,272 / 16,847 / 23,873 against 3,024 / 9,880 /
+      15,807; select by PK, 12,256 / 45,590 / 65,959 against 9,579 / 36,268
+      / 45,230. Both servers are faster than on 2026-10-09 and the ratios
+      are where they were (1.4x to 1.7x on writes, 1.3x to 1.5x on reads).
+      The 8-client rows are within 4% across trials; at 1 and 4 clients a
+      trial moved by up to 21% on both servers, and two three-trial passes
+      the same hour gave select at 4 clients as 1.38x and 1.23x. The
+      unprepared-statement cost (`bench/pg_statement_cost.py`) is still
+      not measured on a droplet.
+
       3. **Reads: the unprepared statement, DONE 2026-10-10 (measured on the
          development Mac only; the droplet figures below are the BEFORE).**
          A `sample` of the server here gave a different picture from the

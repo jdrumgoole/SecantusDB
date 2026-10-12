@@ -214,6 +214,46 @@ same key and `known_hosts` the harness uses.
 
 ---
 
+### The `invoke` tasks
+
+Every command has a task, so nothing here needs the `cargo run` line typed
+out:
+
+| Task | Command | Spends? |
+| --- | --- | --- |
+| `invoke do-up [--server-size c-16] [--client-size c-2]` | `up` | **starts** |
+| `invoke do-status` | `status` | no |
+| `invoke do-deploy` | `deploy` | no |
+| `invoke do-run` | `run` | no |
+| `invoke do-perf` | `perf` | no |
+| `invoke do-ssh [--role server]` | `ssh <role>` | no |
+| `invoke do-suspend [--mode destroy]` | `suspend` | stops, or keeps a snapshot |
+| `invoke do-destroy` | `destroy`, then `status` | **stops** |
+| `invoke do-bench` | `all` | starts, and stops at the end |
+| `invoke release-benchmark` | `all`, three passes, for `docs/benchmark.md` | starts, and stops |
+| `invoke do-pg-bench [--version 0.1.0-beta.13]` | none: see below | no |
+
+### `invoke do-pg-bench`: the PostgreSQL server against PostgreSQL 16
+
+The table on the site's Rust PostgreSQL page is a different measurement from
+everything above: one droplet, loopback, `secantusd-pg` and PostgreSQL 16
+side by side, every commit synced on both. `bench/do_pg_bench.py` does it on
+the server droplet, which must be up at the size the page names:
+
+```bash
+invoke do-up --server-size c-16
+invoke do-pg-bench                 # the newest secantusd-pg-v* release
+invoke do-destroy
+```
+
+It installs PostgreSQL 16 and psycopg on the droplet, downloads the release
+binary and checks its SHA-256 against the release's, runs
+`bench/pg_concurrency.py` for four sweeps (10 s a trial, three trials), copies
+the raw trials to `bench/results/pg-droplet/<date>-<version>/`, and prints
+the table. It refuses a binary whose source tree is not the tag's. About 12
+minutes; it creates and destroys nothing. The two client droplets are idle
+for it.
+
 ## Option reference
 
 ### Cluster options (accepted by every command)
