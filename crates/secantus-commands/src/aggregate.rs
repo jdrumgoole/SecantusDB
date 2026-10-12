@@ -239,6 +239,19 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
+    // An operator the query language does not have is a parse error, whether
+    // or not the collection has a document to test it on.
+    for stage in pipeline.iter().filter_map(Bson::as_document) {
+        if let Some(Bson::Document(filter)) = stage.get("$match") {
+            if let Some((code, msg)) = argtypes::unknown_operator_in_filter(filter) {
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    msg,
+                ));
+            }
+        }
+    }
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct
     // from the top-level `explain` wrapper): return the plan instead of running

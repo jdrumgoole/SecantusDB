@@ -548,7 +548,7 @@ fn through_view(
             collation = c.clone();
         }
         let mut whole: Vec<Document> = options
-            .get_array("pipeline")
+            .get_array("viewPipeline")
             .map(|p| p.iter().filter_map(Bson::as_document).cloned().collect())
             .unwrap_or_default();
         whole.extend(pipeline);
@@ -589,9 +589,13 @@ fn refuse_view(coll: &str, ctx: &CommandContext) -> Result<(), CommandError> {
 }
 
 /// The command with its collection swapped for one that does not exist.
+/// What depends on the real collection's indexes is checked by the planner.
 fn dry(inner: &Document, name: &str) -> Document {
     let mut out = inner.clone();
     out.insert(name, DRY);
+    for field in ["hint", "min", "max"] {
+        out.remove(field);
+    }
     out
 }
 
