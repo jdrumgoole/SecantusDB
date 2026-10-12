@@ -789,6 +789,15 @@ fn aggregate(
             "The 'explain' option is illegal when a explain verbosity is also provided",
         ));
     }
+    // An explained aggregate takes no write concern, whatever it says and
+    // however the explain was asked for (mongod's wording, space and all).
+    if inner.contains_key("writeConcern") {
+        return Err(err(
+            9,
+            "FailedToParse",
+            "Aggregation explain does not support the'writeConcern' option",
+        ));
+    }
     let pipeline: Vec<Document> = match inner.get("pipeline") {
         None => {
             return Err(err(

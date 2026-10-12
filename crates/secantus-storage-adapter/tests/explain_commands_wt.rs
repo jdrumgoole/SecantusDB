@@ -542,6 +542,16 @@ fn explain_checks_its_arguments() {
             ),
             (72, "Command does not support writeConcern".to_string())
         );
+        // An explained aggregate takes no write concern, in either form.
+        let refused = "Aggregation explain does not support the'writeConcern' option";
+        let wrapped = doc! { "explain": {
+            "aggregate": "c", "pipeline": [], "cursor": {}, "writeConcern": { "w": 1 },
+        } };
+        assert_eq!(sent(c, wrapped), (9, refused.to_string()));
+        let inline = doc! {
+            "aggregate": "c", "pipeline": [], "explain": true, "writeConcern": { "j": true },
+        };
+        assert_eq!(sent(c, inline), (9, refused.to_string()));
         assert_eq!(
             sent(c, doc! { "explain": { "nope": "c" } }),
             (
