@@ -1053,6 +1053,18 @@ real defects:
   while the same pair counts as a change — so one predicate cannot serve both
   (`ordering.bson_same_stored_value` is the change-detection twin).
 
+- **A serde BSON decode in a Rust server** (found 2026-10-12, one root cause,
+  every code path). `bson::Document::from_reader` and `bson::from_slice` read
+  a sub-document that looks like extended JSON as the value it would stand
+  for: `{a: {$numberLong: "1"}}` comes back as `{a: Int64(1)}`, and `$oid`,
+  `$date`, `$numberInt` and the rest likewise. The Rust MongoDB server
+  decoded stored documents that way, so an update of ANY field of such a
+  document rewrote the sub-document. Decode with
+  `secantus_core::bsondoc::from_bytes`; `tests/test_rust_literal_bson_decode.py`
+  fails if a serde decode reappears in the MongoDB server crates. The
+  PostgreSQL crates still have seven and have not been measured
+  (`tasks/backlog.md` 7.077).
+
 - **Missing conflated with null** (3 instances). `get_path` returns `None` for
   both; `has_path` is what distinguishes them. mongod's rule differs by
   language — the *query* language treats them alike (`{a: null}` matches a
