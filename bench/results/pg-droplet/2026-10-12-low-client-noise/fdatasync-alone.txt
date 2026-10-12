@@ -1,0 +1,1 @@
+fdatasync alone, ops/s: 3249 3200 3176 2969 2950 2873 2963 | median 2969 spread 12.7%

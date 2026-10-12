@@ -1,0 +1,16 @@
+postgres   unpinned                   median    16863 spread   8.7%  steal 0.00%   16863 15780 16007 17061 17241 17165 16543
+postgres   server cpu2, client cpu3   median    17086 spread   3.3%  steal 0.00%   17086 17375 17210 17202 16806 16885 17028
+postgres   server cpu2, client cpu4   median    17232 spread   4.2%  steal 0.00%   17265 17232 17360 17112 17236 17122 16637
+postgres   server cpu2, client cpu6   median    17020 spread   7.4%  steal 0.00%   17020 17211 16135 16834 17226 17168 15973
+postgres   server cpu2, client cpu10  median    17205 spread   0.9%  steal 0.00%   17253 17205 17346 17252 17199 17182 17183
+postgres   server cpu2, client cpu15  median    17215 spread   2.3%  steal 0.00%   16949 16969 17311 17351 17245 17210 17215
+postgres   same cpu2                  median    11728 spread   2.2%  steal 0.01%   11724 11753 11705 11733 11728 11675 11930
+postgres   unpinned again             median    16162 spread  13.7%  steal 0.00%   14835 17052 16573 16162 16176 15898 14935
+secantusd  unpinned                   median    10275 spread  21.8%  steal 0.00%   11580 10674 10275 10034 9344 11179 9394
+secantusd  server cpu2, client cpu3   median    12038 spread   3.5%  steal 0.00%   11689 11884 11948 12049 12038 12064 12105
+secantusd  server cpu2, client cpu4   median    11884 spread   2.7%  steal 0.00%   11645 11885 11612 11646 11884 11939 11906
+secantusd  server cpu2, client cpu6   median    11890 spread   3.5%  steal 0.00%   11966 11911 11831 11890 11634 11701 12052
+secantusd  server cpu2, client cpu10  median    12004 spread   3.8%  steal 0.00%   12004 12130 12110 12040 11993 11849 11673
+secantusd  server cpu2, client cpu15  median    11871 spread   3.9%  steal 0.01%   11762 11842 11719 11871 12046 12185 12138
+secantusd  same cpu2                  median     7642 spread   1.4%  steal 0.00%   7616 7669 7657 7649 7631 7642 7565
+secantusd  unpinned again             median     9106 spread  22.9%  steal 0.00%   8618 9304 10411 8717 9106 8326 10221

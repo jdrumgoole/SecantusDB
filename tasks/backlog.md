@@ -3067,7 +3067,34 @@ These work end-to-end but cut corners.
       The 8-client rows are within 4% across trials; at 1 and 4 clients a
       trial moved by up to 21% on both servers, and two three-trial passes
       the same hour gave select at 4 clients as 1.38x and 1.23x. The site
-      publishes the 8-client rows only (Joe's call, 2026-10-12). The
+      publishes the 8-client rows only (Joe's call, 2026-10-12).
+
+      **Why the 1- and 4-client rows move, diagnosed the same day** on a
+      second `c-16` (data in
+      `bench/results/pg-droplet/2026-10-12-low-client-noise/`). Two causes,
+      neither a server's:
+      - **CPU placement.** One client selecting by primary key, seven 5 s
+        trials: unpinned, PostgreSQL 16,863 and 16,162 with 9% and 14%
+        spread, this server 10,275 and 9,106 with 22% and 23%. Server
+        pinned to one vCPU and the client to another (five pairs tried):
+        PostgreSQL 17,020 to 17,232, this server 11,871 to 12,038, spread
+        1% to 4% (one pair 7%). Both on ONE vCPU: 11,728 and 7,642,
+        steady. Steal time was 0.00% throughout, so it is not a neighbour.
+        The guest reports 16 one-thread cores, so which vCPUs share a
+        physical core cannot be seen, and no pair behaved like siblings.
+        **Unpinned costs this server 15% to 25% of its pinned rate and
+        PostgreSQL 2% to 6%**: its statement crosses more threads. That is
+        a real cost to a single connection and worth a look of its own.
+      - **The disk.** With servers on vCPUs 0-7 and clients on 8-15, the
+        select rows tighten (1 client: 5.5% and 1.8%) and the update rows
+        do not (9% to 12%). An 8 KiB write and `fdatasync` in a loop, no
+        database, gave 2,873 to 3,249 a second over seven 10 s windows:
+        12.7% spread. One client's write rate is the disk's sync rate.
+
+      So the read rows could be published from a pinned run
+      (`pg_concurrency.py` has no pinning option; it would need one), and
+      the low-client write rows cannot be made steady on this kind of
+      droplet. The
       unprepared-statement cost (`bench/pg_statement_cost.py`) is still
       not measured on a droplet.
 
