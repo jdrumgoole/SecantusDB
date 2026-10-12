@@ -269,6 +269,7 @@ fn plan_for(
             ));
         }
     }
+    let or_branches = parsed::or_branches(&s.filter);
     let q = Query {
         canonical,
         sort: s.sort.as_ref(),
@@ -282,6 +283,8 @@ fn plan_for(
         show_record_id: s.show_record_id,
         batch_size: s.batch_size,
         keys_only: false,
+        or_branches: or_branches.as_deref(),
+        wanted: None,
         implies: &implies,
     };
     Ok(match &s.kind {

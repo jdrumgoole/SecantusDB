@@ -39,6 +39,10 @@ pub(crate) struct Query<'a> {
     pub batch_size: bool,
     /// The command reads index keys only (`count`).
     pub keys_only: bool,
+    /// The branches of a filter that is only an `$or`, in the order given.
+    pub or_branches: Option<&'a [Document]>,
+    /// A field the command wants from the index itself (`distinct`'s key).
+    pub wanted: Option<&'a str>,
     /// Whether the query implies an index's partial filter.
     pub implies: &'a dyn Fn(&Document) -> bool,
 }
@@ -353,7 +357,20 @@ fn index_access(parts: &[Document], q: &Query, catalog: &[Rc<IndexInfo>]) -> Opt
             let covers = q
                 .projection
                 .is_some_and(|p| residual(u, parts).is_none() && covers(&u.index, p));
-            (u.bounded_fields, sorts, covers, usize::MAX - u.index.key.len())
+            let points = u
+                .bounds
+                .iter()
+                .filter(|list| matches!(list.as_slice(), [one] if one.is_point()))
+                .count();
+            let holds = q.wanted.is_some_and(|f| u.index.position(f).is_some());
+            (
+                u.bounded_fields,
+                holds,
+                points,
+                sorts,
+                covers,
+                usize::MAX - u.index.key.len(),
+            )
         };
         let best = uses.iter().map(score).max()?;
         let at = uses.iter().position(|u| score(u) == best)?;
@@ -446,8 +463,16 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
     let parts = clauses(q.canonical);
     // A filter that is only an `$or` is planned branch by branch.
     if let [only] = parts.as_slice() {
-        if let Ok(branches) = only.get_array("$or") {
+        if let Ok(parsed) = only.get_array("$or") {
             if q.hint == Hint::None {
+                // The scans come in the order the branches were written.
+                let given: Vec<Bson> = match q.or_branches {
+                    Some(list) if list.len() == parsed.len() => {
+                        list.iter().cloned().map(Bson::Document).collect()
+                    }
+                    _ => parsed.clone(),
+                };
+                let branches = &given;
                 return match or_access(branches, q, catalog) {
                     Some(scan) => Access {
                         scan,
@@ -634,6 +659,7 @@ pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str) -> Node 
         projection: None,
         skip: 0,
         limit: 0,
+        wanted: Some(key),
         ..q.clone()
     };
     let express = plan(&bare, catalog);

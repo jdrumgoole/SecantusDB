@@ -13311,7 +13311,14 @@ impl Storage {
             // directly — no `id_key -> _id index -> RecordId` hop. The doc's own
             // id_key comes back from the framed value, which is what the callers
             // (delete / update maintenance) need it for.
-            let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+            // Lazy shards: an absent shard holds no documents. Without this a
+            // count or delete by `_id` on a collection that was never written
+            // failed with WiredTiger's ENOENT where it should find nothing.
+            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
             let mut seen: HashSet<i64> = HashSet::new();
             let mut out = Vec::new();
             for recordid in recordids {
