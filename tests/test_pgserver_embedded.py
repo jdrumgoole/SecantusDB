@@ -218,13 +218,26 @@ def _tls_in_use(conn: psycopg.Connection) -> bool:
     )
 
 
+def _verified(server: Any, ca: str) -> psycopg.Connection:
+    """A connection that checks the server's certificate against `ca` and the
+    host name. The CA's path goes as a keyword, which psycopg quotes: written
+    into the connection string, a Windows path's backslashes are libpq's
+    escape character and the file is then not found."""
+    return psycopg.connect(
+        server.dsn,
+        sslmode="verify-full",
+        sslrootcert=ca,
+        autocommit=True,
+        connect_timeout=10,
+    )
+
+
 def test_tls_is_offered_and_verified(tmp_path: Path) -> None:
     """`tls_cert_file` / `tls_key_file`: a client that checks the certificate
     against the CA and the host name connects, and the session is TLS."""
     ca, cert, key = _certificates(tmp_path)
     with _server(tmp_path / "home", tls_cert_file=cert, tls_key_file=key) as server:
-        dsn = f"{server.dsn} sslmode=verify-full sslrootcert={ca}"
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+        with _verified(server, ca) as conn:
             assert _tls_in_use(conn)
         # TLS is offered, and a client that does not ask for it is still served.
         with psycopg.connect(f"{server.dsn} sslmode=disable", autocommit=True) as conn:
@@ -239,8 +252,7 @@ def test_tls_require_refuses_a_plain_connection(tmp_path: Path) -> None:
         with pytest.raises(psycopg.OperationalError) as refused:
             psycopg.connect(f"{server.dsn} sslmode=disable", connect_timeout=10).close()
         assert "no encryption" in str(refused.value)
-        dsn = f"{server.dsn} sslmode=verify-full sslrootcert={ca}"
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+        with _verified(server, ca) as conn:
             assert _tls_in_use(conn)
 
 

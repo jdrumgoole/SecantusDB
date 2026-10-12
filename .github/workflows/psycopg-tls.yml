@@ -8,7 +8,7 @@
 # the Rust server at all: `validate.yml`'s psycopg lane measures the Python
 # server, and `psycopg-windows.yml` is Windows.
 #
-# Two full runs of the suite are about 45 minutes with the build, so this does
+# Two full runs of the suite are about an hour with the build, so this does
 # NOT run on every PR: weekly, on demand, and on PRs that touch the server's
 # TLS and login code, the gauge runner or this file.
 #
@@ -47,7 +47,7 @@ permissions:
 jobs:
   psycopg-tls:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       UV_PYTHON: "3.10"
     steps:
@@ -125,6 +125,11 @@ jobs:
         shell: bash
         env:
           SECANTUS_GAUGE_SERVER: rust
+          # The suite took 1,689 s on this runner the first time, against
+          # about 1,050 s on a developer's Mac, and the TLS run is slower
+          # still: the runner's default 1,800 s backstop killed that one at
+          # 98%, which the last step reported as the truncated run it was.
+          SECANTUS_PSYCOPG_GAUGE_TIMEOUT: "3600"
           PYTHONUNBUFFERED: "1"
           PYTEST_ADDOPTS: "--durations=20 -rfE"
         run: |
@@ -143,6 +148,7 @@ jobs:
         env:
           SECANTUS_GAUGE_SERVER: rust
           SECANTUS_GAUGE_TLS: "1"
+          SECANTUS_PSYCOPG_GAUGE_TIMEOUT: "3600"
           PYTHONUNBUFFERED: "1"
           PYTEST_ADDOPTS: "--durations=20 -rfE"
         run: |
