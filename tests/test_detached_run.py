@@ -275,3 +275,28 @@ def test_the_state_file_records_the_exit_without_a_status_call(tmp_path: Path) -
             break
         time.sleep(0.2)
     assert recorded == 0
+
+
+def test_an_exit_that_came_before_the_state_file_is_recorded(tmp_path: Path) -> None:
+    """A command that ends at once can end before `start` has written its
+    state file: the supervisor then has nowhere to record the exit, and the
+    file written a moment later said `exit_code: null` until `status` was
+    called. That failed the test above in CI on a loaded macOS runner
+    (2026-10-12). `start` now looks for the exit file after it writes."""
+    spec = importlib.util.spec_from_file_location("detached_run", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    state = {"name": "quick", "pid": 1, "exit_code": None}
+    # The supervisor has not finished: nothing is recorded.
+    module._write_state(tmp_path, "quick", dict(state))
+    module._record_exit_that_came_first(tmp_path, "quick", dict(state))
+    assert json.loads((tmp_path / "quick.json").read_text())["exit_code"] is None
+
+    # It finished first, and left only its exit file.
+    (tmp_path / "quick.exit").write_text("3")
+    module._record_exit_that_came_first(tmp_path, "quick", dict(state))
+    recorded = json.loads((tmp_path / "quick.json").read_text())
+    assert recorded["exit_code"] == 3
+    assert "finished_at" in recorded

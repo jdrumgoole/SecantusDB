@@ -236,21 +236,39 @@ def cmd_start(args: argparse.Namespace) -> int:
         # The launcher's job forbids breakaway; detach as far as it allows.
         proc = subprocess.Popen(popen_args, **common, creationflags=fallback)  # type: ignore[call-overload]
 
-    _write_state(
-        state_dir,
-        args.name,
-        {
-            "name": args.name,
-            "pid": proc.pid,
-            "argv": args.command,
-            "cwd": str(args.cwd.resolve()),
-            "log": str(log.resolve()),
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "exit_code": None,
-        },
-    )
+    state: dict[str, object] = {
+        "name": args.name,
+        "pid": proc.pid,
+        "argv": args.command,
+        "cwd": str(args.cwd.resolve()),
+        "log": str(log.resolve()),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "exit_code": None,
+    }
+    _write_state(state_dir, args.name, state)
+    _record_exit_that_came_first(state_dir, args.name, state)
     print(f"started {args.name!r} pid {proc.pid}; log {log}")
     return 0
+
+
+def _record_exit_that_came_first(state_dir: Path, name: str, state: dict[str, object]) -> None:
+    """Record an exit the supervisor could not, because it ran before the
+    state file existed.
+
+    A command that ends at once can end before `cmd_start` has written
+    `<name>.json`. Its supervisor writes the exit file, finds no state file to
+    put the exit in, and is done; the state file written a moment later said
+    `exit_code: null` until something called `status` (seen in CI on a loaded
+    macOS runner, 2026-10-12: sixty seconds of polling the file, never an
+    exit). The exit file is written before the supervisor looks for the state
+    file, so whenever it missed, the exit file is here by now.
+    """
+    exit_file = state_dir / f"{name}.exit"
+    if not exit_file.exists():
+        return
+    state["exit_code"] = _read_exit_file(exit_file)
+    state["finished_at"] = datetime.now(timezone.utc).isoformat()
+    _write_state(state_dir, name, state)
 
 
 def cmd_status(args: argparse.Namespace) -> int:

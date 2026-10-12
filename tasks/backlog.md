@@ -5313,7 +5313,13 @@ These are explicit non-goals. Don't add them without a reason.
 
 - [x] **FIXED 2026-10-07 — `.detached-runs/<name>.json` could report `exit_code: null` for a
       process that finished long ago (2026-09-28).** The supervisor now writes
-      the exit into the state file itself (`test_the_state_file_records_the_exit_without_a_status_call`). The pymongo gauge finished
+      the exit into the state file itself (`test_the_state_file_records_the_exit_without_a_status_call`).
+      **That fix had a hole, closed 2026-10-12:** a command that ended
+      before `start` had written the state file left its supervisor with
+      nowhere to record the exit, and the file then said `exit_code: null`
+      again. Seen once in CI (`test-durable (macos-14, 3.12, 2)` on PR
+      #1905, sixty seconds of polling). `start` now looks for the exit
+      file after it writes the state. The pymongo gauge finished
       in 2m39s and wrote both artifacts; its state file still read
       `exit_code: null` two hours later with the recorded pid dead.
 
