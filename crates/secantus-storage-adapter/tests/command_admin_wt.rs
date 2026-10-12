@@ -472,9 +472,19 @@ fn explain_find_collscan_shape() {
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
         let qp = reply.get_document("queryPlanner").unwrap();
         assert_eq!(qp.get_str("namespace").unwrap(), "t.c");
+        // The collection does not exist: mongod plans nothing (8.2.11).
         let wp = qp.get_document("winningPlan").unwrap();
-        assert_eq!(wp.get_str("stage").unwrap(), "COLLSCAN");
+        assert_eq!(wp.get_str("stage").unwrap(), "EOF");
+        assert_eq!(wp.get_str("type").unwrap(), "nonExistentNamespace");
         assert!(reply.get_document("executionStats").is_ok());
+        dispatch(&doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}]}, c);
+        let reply = dispatch(&doc! {"explain": {"find": "c", "filter": {"x": 1}}}, c);
+        let wp = reply
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        assert_eq!(wp.get_str("stage").unwrap(), "COLLSCAN");
     });
 }
 
@@ -514,12 +524,27 @@ fn explain_with_majority_write_concern_rejected() {
 #[test]
 fn explain_aggregate_has_cursor_stages() {
     with_wt(|c| {
+        // A stage the planner does not absorb follows the cursor.
         let reply = dispatch(
-            &doc! {"explain": {"aggregate": "c", "pipeline": [{"$match": {"x": 1}}]}},
+            &doc! {"explain": {"aggregate": "c", "pipeline": [
+                {"$match": {"x": 1}}, {"$unwind": "$t"},
+            ]}},
             c,
         );
         let stages = reply.get_array("stages").unwrap();
         assert!(stages[0].as_document().unwrap().contains_key("$cursor"));
+        assert_eq!(
+            stages[1].as_document().unwrap().get_document("$unwind"),
+            Ok(&doc! {"path": "$t"})
+        );
+        // A pipeline the planner takes whole is one query plan (8.2.11).
+        let reply = dispatch(
+            &doc! {"explain": {"aggregate": "c", "pipeline": [{"$match": {"x": 1}}]}},
+            c,
+        );
+        assert!(reply.get("stages").is_none(), "{reply}");
+        let qp = reply.get_document("queryPlanner").unwrap();
+        assert_eq!(qp.get_bool("optimizedPipeline"), Ok(true));
     });
 }
 

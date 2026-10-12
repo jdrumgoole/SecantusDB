@@ -207,6 +207,10 @@ fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
         let Ok(key) = spec.get_document("key") else {
             continue;
         };
+        // A hidden index is not there as far as the planner is concerned.
+        if spec.get_bool("hidden").unwrap_or(false) {
+            continue;
+        }
         let name = spec.get_str("name").unwrap_or("").to_string();
         let plain = key.values().all(|v| matches!(as_i64(v), Some(1 | -1)))
             && !key.values().any(|v| matches!(v, Bson::String(_)));
