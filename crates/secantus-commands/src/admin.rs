@@ -206,6 +206,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "validator", "create.validator")?;
     argtypes::require_object(doc, "timeseries", "create.timeseries")?;
     argtypes::require_object(doc, "collation", "create.collation")?;
+    crate::ddl_checks::create(doc)?;
     // `capped` is bool-OR-number here; `size` / `max` are plain numeric. A null
     // in any of the three is ACCEPTED as absent and then answers the semantic
     // error ("the 'size' field is required when 'capped' is true"), not a type
@@ -250,6 +251,9 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let coll = coll_arg(doc, "create")?;
     if let Some(e) = invalid_collection_name(&ctx.db_name, &coll) {
+        return Ok(e.into_reply());
+    }
+    if let Some(e) = crate::ddl_checks::namespace_too_long(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
     }
     if let Some(e) = validation_enum_problem(doc, "create") {
@@ -540,6 +544,16 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// options into the collection's stored blob. Errors `NamespaceNotFound` (26)
 /// when the collection doesn't exist. (TTL-index `index` modification deferred.)
 pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    crate::ddl_checks::coll_mod(doc)?;
+    // mongod's reply ends with `ok`, after what the command changed.
+    let mut reply = coll_mod_inner(doc, ctx)?;
+    if let Some(ok) = reply.remove("ok") {
+        reply.insert("ok", ok);
+    }
+    Ok(reply)
+}
+
+fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "index", "collMod.index")?;
     argtypes::require_object(doc, "validator", "collMod.validator")?;
     argtypes::require_object(
@@ -615,9 +629,17 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
-            format!("ns does not exist: {}.{}", ctx.db_name, coll),
+            "ns does not exist",
         )
         .into_reply());
+    }
+    {
+        let options = storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .unwrap_or_default();
+        if let Some(refused) = crate::ddl_checks::coll_mod_on(doc, &options) {
+            return Err(refused);
+        }
     }
     if let Some(Bson::Document(v)) = doc.get("validator") {
         if let Some(mut problem) = validator_problem(v) {
@@ -1038,6 +1060,16 @@ fn collection_uuid_text(storage: &dyn crate::Storage, db: &str, coll: &str) -> S
 
 /// `drop` — drop a collection.
 pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    if let Some(field) = argtypes::unknown_field(
+        doc,
+        &["drop", "collectionUUID", "dropSystemBucketsCollection"],
+    ) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'drop.{field}' is an unknown field."),
+        ));
+    }
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
     let storage = ctx.storage()?;
@@ -1082,8 +1114,9 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(doc! { "ok": 1.0 });
     }
     // A view had no indexes to count: mongod answers `{ns, ok}`.
+    // Dropping a view reports nothing but success (mongod 8.2.11).
     if was_view {
-        return Ok(doc! { "ns": ns, "ok": 1.0 });
+        return Ok(doc! { "ok": 1.0 });
     }
     // mongod's field order: the count first, then the namespace.
     Ok(doc! { "nIndexesWas": n_indexes as i32, "ns": ns, "ok": 1.0 })
@@ -1199,6 +1232,31 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
     argtypes::require_object(doc, "cursor", "listCollections.cursor")?;
     argtypes::require_cursor_options(doc, "listCollections.cursor")?;
     argtypes::require_bool_field(doc, "nameOnly", "listCollections.nameOnly")?;
+    match doc.get("authorizedCollections") {
+        None | Some(Bson::Null | Bson::Boolean(_)) => {}
+        Some(other) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'listCollections.authorizedCollections' is the wrong type \
+                     '{}', expected type 'bool'",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
+    }
+    // mongod parses the filter before it lists anything, so an operator it
+    // does not know is refused even when nothing would have been tested.
+    if let Some(Bson::Document(f)) = doc.get("filter") {
+        if let Some((code, msg)) = argtypes::unknown_operator_in_filter(f) {
+            return Err(CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                msg,
+            ));
+        }
+    }
     const FIELDS: &[&str] = &[
         "listCollections",
         "cursor",
@@ -1242,6 +1300,23 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // `uuid` is an internal option (the collection identity) — it's surfaced
         // under `info.uuid`, not as a collection option. Strip it from `options`.
         options.remove("uuid");
+        // Options at their defaults are not listed: pre-images switched off,
+        // and the simple collation.
+        let off = |o: &Document, field: &str, key: &str, value: Bson| {
+            o.get_document(field)
+                .is_ok_and(|d| d.get(key) == Some(&value))
+        };
+        if off(
+            &options,
+            "changeStreamPreAndPostImages",
+            "enabled",
+            Bson::Boolean(false),
+        ) {
+            options.remove("changeStreamPreAndPostImages");
+        }
+        if off(&options, "collation", "locale", Bson::String("simple".into())) {
+            options.remove("collation");
+        }
         // A collection-level TTL turned `off` by `collMod` is stored as null.
         if matches!(options.get("expireAfterSeconds"), Some(Bson::Null)) {
             options.remove("expireAfterSeconds");
@@ -1265,7 +1340,8 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // (e.g. the go driver) read it as a Binary, so it must be present and the
         // right type.
         let mut info = doc! { "readOnly": is_view };
-        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, n) {
+        // A view is a definition, not a collection: it has no uuid.
+        if let (false, Ok(uuid)) = (is_view, storage.collection_uuid(&ctx.db_name, n)) {
             if uuid.len() == 16 {
                 info.insert(
                     "uuid",
@@ -1291,7 +1367,6 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
                 "v": 2,
                 "key": { "_id": 1 },
                 "name": "_id_",
-                "ns": format!("{}.{}", ctx.db_name, n),
             };
             let collation = entry
                 .get_document("options")
@@ -1362,20 +1437,19 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             None => entries.push(entry),
         }
     }
-    // `filter` is evaluated against the full entry (so `{name: …}`,
-    // `{type: …}`, `{"options.capped": true}` all work); apply it before the
-    // `nameOnly` projection so a filter on `options` still matches.
-    if let Some(f) = filter {
-        entries.retain(|e| {
-            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
-        });
-    }
+    // With `nameOnly` the filter sees what is returned, the name and the
+    // type: `{"options.capped": true}` then matches nothing (mongod 8.2.11).
     if name_only {
         for e in &mut entries {
             let name = e.get_str("name").unwrap_or("").to_string();
             let ty = e.get_str("type").unwrap_or("collection").to_string();
             *e = doc! { "name": name, "type": ty };
         }
+    }
+    if let Some(f) = filter {
+        entries.retain(|e| {
+            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
+        });
     }
     let ns = format!("{}.$cmd.listCollections", ctx.db_name);
     // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
@@ -1394,48 +1468,6 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
     })
 }
 
-/// `listDatabases` — descriptors for every database, honouring `filter` and
-/// `nameOnly`. Mirrors `commands._list_databases`: each descriptor is
-/// `{name, sizeOnDisk, empty}` (`sizeOnDisk` = summed BSON doc bytes across the
-/// db's collections; `empty` = size 0), reduced to `{name}` under `nameOnly`.
-/// The `filter` is a query predicate evaluated against each descriptor; it's
-/// applied after `totalSize` is accumulated, matching mongod.
-pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let storage = ctx.storage()?;
-    let name_only = bool_field(doc, "nameOnly", false);
-    let filter = doc
-        .get("filter")
-        .and_then(Bson::as_document)
-        .filter(|d| !d.is_empty());
-
-    let names = storage.list_databases().map_err(command_error)?;
-    let mut descriptors: Vec<Document> = Vec::new();
-    let mut total_size: i64 = 0;
-    for n in &names {
-        if name_only {
-            descriptors.push(doc! { "name": n });
-            continue;
-        }
-        let mut size: i64 = 0;
-        for coll in storage.list_collections(n).map_err(command_error)? {
-            size += storage
-                .collection_data_size(n, &coll)
-                .map_err(command_error)?;
-        }
-        total_size += size;
-        descriptors.push(doc! { "name": n, "sizeOnDisk": size, "empty": size == 0 });
-    }
-    if let Some(f) = filter {
-        descriptors.retain(|d| {
-            secantus_core::query::matches(d, f, &Document::new(), None).unwrap_or(false)
-        });
-    }
-    Ok(doc! {
-        "databases": Bson::Array(descriptors.into_iter().map(Bson::Document).collect()),
-        "totalSize": total_size,
-        "ok": 1.0,
-    })
-}
 
 /// `listIndexes` — a cursor over the indexes of a collection.
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
@@ -2857,7 +2889,8 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
-pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+pub fn drop_database(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    crate::stats_admin::drop_database_problem(doc)?;
     let storage = ctx.storage()?;
     // Every cursor open on one of its collections ends with that collection.
     if let Ok(cursors) = ctx.cursors() {
@@ -2880,6 +2913,11 @@ pub fn drop_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 
 /// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
 pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    argtypes::require_required_string(
+        doc,
+        "renameCollection",
+        "renameCollection.renameCollection",
+    )?;
     // The fields are PARSED first -- a wrong-typed `to` / `dropTarget` is
     // mongod's 14 / 40414 on any database (measured 8.2.11, 2026-10-07,
     // `arg_types_messages.py`) -- and only then is a non-`admin` database
@@ -2918,6 +2956,25 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         .get("dropTarget")
         .and_then(Bson::as_bool)
         .unwrap_or(false);
+    if let Some(field) = argtypes::unknown_field(
+        doc,
+        &[
+            "renameCollection",
+            "to",
+            "dropTarget",
+            "stayTemp",
+            "collectionUUID",
+        ],
+    ) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'renameCollection.{field}' is an unknown field."),
+        ));
+    }
+    if let Some(refused) = crate::ddl_checks::rename(&src, &to) {
+        return Err(refused);
+    }
     let (src_db, src_coll) = split_ns(&src);
     let (dst_db, dst_coll) = split_ns(&to);
 
@@ -2969,6 +3026,18 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         } else {
             (26, "NamespaceNotFound")
         };
+        // mongod's wording: no namespace after either, and a missing source
+        // in the SAME database is named as a collection.
+        let m = match (code, src_db == dst_db) {
+            (48, _) => "target namespace exists".to_string(),
+            (_, true) if m.to_lowercase().contains("source") => {
+                format!("Source collection {src} does not exist")
+            }
+            (_, false) if m.to_lowercase().contains("source") => {
+                "source namespace does not exist".to_string()
+            }
+            _ => m,
+        };
         return Ok(CommandError::new(code, name, m).into_reply());
     }
     // A rename invalidates cursors open on the source (and the dropped target),
@@ -2983,41 +3052,14 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `collStats` — per-collection size / count / index statistics.
-pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let coll = coll_arg(doc, "collStats")?;
+/// `collStats` for a time-series collection: its buckets, not its documents.
+pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
-    let count = storage
-        .count_matching(&ctx.db_name, &coll, &Document::new())
-        .map_err(command_error)? as i64;
-    let size = storage
-        .collection_data_size(&ctx.db_name, &coll)
-        .map_err(command_error)?;
     let index_sizes = storage
-        .index_sizes(&ctx.db_name, &coll)
+        .index_sizes(&ctx.db_name, coll)
         .map_err(command_error)?;
-    let capped = storage
-        .collection_is_capped(&ctx.db_name, &coll)
-        .map_err(command_error)?;
-    let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
-    let avg_obj_size = if count > 0 { size / count } else { 0 };
-    // A time-series collection reports its buckets. Only what follows from
-    // the measurements is given: mongod's write counters (how many buckets
-    // were opened, closed, reopened and why) are a history this server does
-    // not have.
-    let buckets = if storage
-        .get_collection_options(&ctx.db_name, &coll)
-        .is_ok_and(|o| o.contains_key("timeseries"))
+    let buckets = crate::ts_buckets::of_collection(storage, &ctx.db_name, coll)?;
     {
-        Some(crate::ts_buckets::of_collection(
-            storage,
-            &ctx.db_name,
-            &coll,
-        )?)
-    } else {
-        None
-    };
-    if let Some(buckets) = buckets {
         let bucket_size: i64 = buckets
             .iter()
             .map(|b| bson::to_vec(b).map(|v| v.len() as i64).unwrap_or(0))
@@ -3045,69 +3087,8 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "ok": 1.0,
         });
     }
-    let mut reply = doc! {
-        "ns": format!("{}.{}", ctx.db_name, coll),
-        "count": count as i32,
-        "size": size,
-        "avgObjSize": avg_obj_size,
-        "storageSize": size,
-        "nindexes": index_sizes.len() as i32,
-        "totalIndexSize": total_index_size,
-        "indexSizes": index_sizes,
-        "capped": capped,
-    };
-    if capped {
-        // mongod reports a capped collection's bounds here: `max` (0 when no
-        // document limit was given) and the byte bound as `maxSize`.
-        let opts = storage
-            .get_collection_options(&ctx.db_name, &coll)
-            .unwrap_or_default();
-        reply.insert(
-            "max",
-            int_bson(opts.get("max").and_then(as_i64).unwrap_or(0)),
-        );
-        if let Some(size) = opts.get("size").and_then(as_i64) {
-            reply.insert("maxSize", int_bson(size));
-        }
-    }
-    reply.insert("ok", 1.0);
-    Ok(reply)
 }
 
-/// `dbStats` — database-wide totals aggregated across collections.
-pub fn db_stats(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let storage = ctx.storage()?;
-    let colls = storage
-        .list_collections(&ctx.db_name)
-        .map_err(command_error)?;
-    let mut objects = 0i64;
-    let mut data_size = 0i64;
-    let mut indexes = 0i64;
-    let mut index_size = 0i64;
-    for c in &colls {
-        objects += storage
-            .count_matching(&ctx.db_name, c, &Document::new())
-            .map_err(command_error)? as i64;
-        data_size += storage
-            .collection_data_size(&ctx.db_name, c)
-            .map_err(command_error)?;
-        let isz = storage
-            .index_sizes(&ctx.db_name, c)
-            .map_err(command_error)?;
-        indexes += isz.len() as i64;
-        index_size += isz.values().filter_map(as_i64).sum::<i64>();
-    }
-    Ok(doc! {
-        "db": ctx.db_name.clone(),
-        "collections": colls.len() as i32,
-        "objects": objects,
-        "dataSize": data_size,
-        "storageSize": data_size,
-        "indexes": indexes,
-        "indexSize": index_size,
-        "ok": 1.0,
-    })
-}
 
 /// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
 /// live `metrics.cursor.open.total` so drivers can track cursor lifecycle
