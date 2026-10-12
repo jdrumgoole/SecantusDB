@@ -192,7 +192,16 @@ pub(crate) fn compute(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
             secantus_pgplan::user_agg::compute(agg, &values, item.source_type.as_deref())
                 .map_err(|e| crate::PgHandler::err(&e))
         }
-        AggFunc::BitAnd | AggFunc::BitOr => {
+        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
+            let symbol = match item.func {
+                AggFunc::BitAnd => "&",
+                AggFunc::BitOr => "|",
+                _ => "#",
+            };
+            // Bit strings: of one length, or 22026 as the operators say.
+            if let Some(out) = secantus_pgplan::bit_string_aggregate(&non_null, symbol) {
+                return out.map_err(|e| crate::PgHandler::err(&e));
+            }
             let ints: Vec<i64> = non_null
                 .iter()
                 .filter_map(|v| match v {
@@ -204,12 +213,10 @@ pub(crate) fn compute(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
             let Some(first) = ints.first() else {
                 return Ok(Bson::Null);
             };
-            let r = ints.iter().skip(1).fold(*first, |a, b| {
-                if item.func == AggFunc::BitAnd {
-                    a & b
-                } else {
-                    a | b
-                }
+            let r = ints.iter().skip(1).fold(*first, |a, b| match item.func {
+                AggFunc::BitAnd => a & b,
+                AggFunc::BitOr => a | b,
+                _ => a ^ b,
             });
             Ok(match non_null.first() {
                 Some(Bson::Int32(_)) => Bson::Int32(r as i32),

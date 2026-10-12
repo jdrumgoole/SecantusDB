@@ -1,0 +1,171 @@
+# The Rust PostgreSQL server (`secantusd-pg`) scored by psycopg 3's own,
+# unmodified test suite -- in the clear, and then again OVER TLS.
+#
+# Why its own workflow: the TLS run was by hand until now, so a change that
+# broke the protocol only on an encrypted connection (a short read off the TLS
+# stream, a COPY or a cancel that behaves differently there) would go unseen
+# until someone remembered to run it. And no Linux lane ran this gauge against
+# the Rust server at all: `validate.yml`'s psycopg lane measures the Python
+# server, and `psycopg-windows.yml` is Windows.
+#
+# Two full runs of the suite are about 45 minutes with the build, so this does
+# NOT run on every PR: weekly, on demand, and on PRs that touch the server's
+# TLS and login code, the gauge runner or this file.
+#
+# What it gates:
+#   1. Both runs COMPLETE -- every test a run started reported a result. A
+#      truncated run is a failure, never a pass (CLAUDE.md, "A test that does
+#      not COMPLETE is a failure").
+#   2. No test fails over TLS that passes in the clear.
+# A test that fails in BOTH runs is printed and does not fail this job: it is
+# the plain gauge's finding, and this lane is not where that number is kept.
+name: psycopg gauge (Rust PG server, plain and TLS)
+
+on:
+  schedule:
+    - cron: "43 5 * * 0"  # Sundays, off the hour
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/secantus-pg/src/tls.rs"
+      - "crates/secantus-pg/src/live.rs"
+      - "crates/secantus-pg/src/crl.rs"
+      - "crates/secantus-pg/src/x509.rs"
+      - "crates/secantus-pg/src/scram_binding.rs"
+      - "crates/secantus-pgwire/**"
+      - "psycopg_validation/**"
+      - ".github/workflows/psycopg-tls.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  psycopg-tls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      UV_PYTHON: "3.10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Checkout the WiredTiger and psycopg submodules
+        # Only these two feed this job; the other vendored submodules are
+        # driver-gauge repos with gigabytes of history.
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger vendor/psycopg ||
+          git submodule update --init vendor/wiredtiger vendor/psycopg
+
+      # The toolchain, WiredTiger cache and build steps below mirror test.yml's
+      # `pg-oracle` job, which builds this same binary. Keep them in sync.
+      - name: Install toolchain
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig liblz4-dev clang libclang-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.10"
+
+      - name: Pin the build interpreter so the cache can actually be reused
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find 3.10 2>/dev/null || uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          echo "cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "img=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the WiredTiger build
+        # The key `pg-oracle` and the `test` job's Linux 3.10 cell use, so this
+        # job normally restores their build and does not pay for its own.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.10-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
+
+      - name: Sync dependencies
+        # The `dev` extra carries what psycopg's suite needs (pytest-randomly,
+        # pproxy, pytest-json-report, mypy) and `trustme`, which makes the
+        # certificate the TLS run serves.
+        run: uv sync --extra dev
+
+      - name: Build secantusd-pg (debug, where the gauge runner looks)
+        shell: bash
+        run: |
+          WT="$PWD/$(ls -d build/*/wt-build | head -1)"
+          export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
+          # bindgen needs libclang; find it wherever the runner's LLVM put it.
+          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          export LIBCLANG_PATH="$(dirname "$lc")"
+          (cd crates/secantus-pg && cargo build --bin secantusd-pg)
+          crates/secantus-pg/target/debug/secantusd-pg --version
+
+      - name: Run the psycopg gauge in the clear
+        shell: bash
+        env:
+          SECANTUS_GAUGE_SERVER: rust
+          PYTHONUNBUFFERED: "1"
+          PYTEST_ADDOPTS: "--durations=20 -rfE"
+        run: |
+          # pytest exits non-zero on any failing test; what this job gates is
+          # in the comparison step below, which reads the reports.
+          set +e
+          # The runner image exports PGPASSWORD (for its own PostgreSQL), and
+          # tests/pq/test_pgconn.py::test_used_password then asserts the server
+          # ASKED for a password. secantusd-pg trusts a role with no password.
+          unset PGPASSWORD
+          uv run --no-sync python -m psycopg_validation.runner
+          echo "runner exit: $?"
+
+      - name: Run the psycopg gauge over TLS
+        shell: bash
+        env:
+          SECANTUS_GAUGE_SERVER: rust
+          SECANTUS_GAUGE_TLS: "1"
+          PYTHONUNBUFFERED: "1"
+          PYTEST_ADDOPTS: "--durations=20 -rfE"
+        run: |
+          set +e
+          unset PGPASSWORD
+          # The runner refuses to start the suite unless its own connection,
+          # made under the settings the suite will run with, is TLS.
+          uv run --no-sync python -m psycopg_validation.runner
+          echo "runner exit: $?"
+
+      - name: Both runs completed, and nothing fails over TLS only
+        if: always()
+        shell: bash
+        run: >-
+          uv run --no-sync python -m psycopg_validation.check_run
+          .validation/psycopg-raw-rust.json --tls .validation/psycopg-raw-rust-tls.json
+
+      - name: Upload the raw reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: psycopg-raw-rust-linux
+          path: |
+            .validation/psycopg-raw-rust.json
+            .validation/psycopg-raw-rust-tls.json
+          if-no-files-found: warn

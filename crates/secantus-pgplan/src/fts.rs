@@ -855,6 +855,47 @@ pub fn to_tsvector(cfg: Config, text: &str) -> TsVector {
     TsVector(map).normalise()
 }
 
+/// `to_tsvector([config,] json | jsonb)`: the document's STRING values, in
+/// the order they are written, each parsed as text. Keys, numbers, booleans
+/// and nulls are not indexed, and one position is left empty between two
+/// values so a phrase cannot match across them.
+pub(crate) fn json_to_tsvector(args: &[Bson]) -> Result<Bson> {
+    let (cfg, rest) = split_config(args, 1)?;
+    let [doc] = rest else {
+        return Err(wrong("to_tsvector"));
+    };
+    let json = crate::json::parse(&text_of(doc))
+        .map_err(|_| Error::InvalidText("invalid input syntax for type json".into()))?;
+    fn strings<'a>(v: &'a crate::json::Json, out: &mut Vec<&'a str>) {
+        match v {
+            // An empty string is not a value to parse: it leaves no gap.
+            crate::json::Json::Str(s) if s.is_empty() => {}
+            crate::json::Json::Str(s) => out.push(s),
+            crate::json::Json::Array(items) => items.iter().for_each(|i| strings(i, out)),
+            crate::json::Json::Object(members) => members.iter().for_each(|(_, m)| strings(m, out)),
+            _ => {}
+        }
+    }
+    let mut values = Vec::new();
+    strings(&json, &mut values);
+    let mut map: BTreeMap<String, Vec<(u16, Weight)>> = BTreeMap::new();
+    let mut last: u32 = 0;
+    for (i, value) in values.iter().enumerate() {
+        let base = if i == 0 { 0 } else { last + 1 };
+        last = base;
+        for (pos, lex) in parse_document(value, cfg) {
+            let at = base + u32::from(pos);
+            last = last.max(at);
+            if let Some(lex) = lex {
+                map.entry(lex)
+                    .or_default()
+                    .push((u16::try_from(at.min(16383)).unwrap_or(16383), 0));
+            }
+        }
+    }
+    Ok(vector_out(&TsVector(map).normalise()))
+}
+
 // ------------------------------------------------------------------------
 // tsquery
 // ------------------------------------------------------------------------
@@ -2600,14 +2641,14 @@ fn weights_arg(v: &Bson) -> Result<[f32; 4]> {
             .collect::<Result<_>>()?,
         _ => {
             return Err(Error::Sqlstate(
-                "22023",
+                "2202E",
                 "array of weight is too short".into(),
             ))
         }
     };
     if items.len() < 4 {
         return Err(Error::Sqlstate(
-            "22023",
+            "2202E",
             "array of weight is too short".into(),
         ));
     }

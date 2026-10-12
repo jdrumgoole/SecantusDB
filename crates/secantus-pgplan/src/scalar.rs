@@ -1457,10 +1457,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 "NFD" => subject.nfd().collect(),
                 "NFKC" => subject.nfkc().collect(),
                 "NFKD" => subject.nfkd().collect(),
-                other => {
+                _ => {
+                    // The form as it was written, not upper-cased.
                     return Err(Error::InvalidParameter(format!(
-                        "invalid normalization form: {other}"
-                    )))
+                        "invalid normalization form: {}",
+                        if args.len() > 1 { s(1) } else { form.clone() }
+                    )));
                 }
             }))
         }
@@ -1578,8 +1580,13 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" => float_math(name, args),
         "mod" => {
             need(2)?;
+            let whole = |v: &Bson| matches!(v, Bson::Int32(_) | Bson::Int64(_));
             match (arg(0), arg(1)) {
                 (_, b) if as_f64(&b) == Some(0.0) => Err(Error::DivisionByZero),
+                // `mod(numeric, numeric)` is the `%` operator: the
+                // remainder keeps its fraction (`mod(7.5, 2)` is 1.5), where
+                // truncating both to integers answered 1.
+                (a, b) if !(whole(&a) && whole(&b)) => crate::eval_binary("%", a, b),
                 (Bson::Int32(a), b) => Ok(Bson::Int32(
                     a % i32::try_from(as_i64(&b).unwrap_or(1)).unwrap_or(1),
                 )),
@@ -1596,6 +1603,22 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // the answer is a `numeric` -- not the `int8` the arithmetic suggests.
         "div" => {
             need(2)?;
+            let whole = |v: &Bson| matches!(v, Bson::Int32(_) | Bson::Int64(_));
+            if !(whole(&arg(0)) && whole(&arg(1))) {
+                // With a fraction on either side it is the quotient,
+                // truncated: `div(9.9, 0.3)` is 33. Truncating the operands
+                // first made that a division by zero.
+                if as_f64(&arg(1)) == Some(0.0) {
+                    return Err(Error::DivisionByZero);
+                }
+                let numeric = |v: Bson| match v {
+                    Bson::Int32(i) => parse_numeric(&i.to_string()),
+                    Bson::Int64(i) => parse_numeric(&i.to_string()),
+                    other => Ok(other),
+                };
+                let quotient = crate::eval_binary("/", numeric(arg(0))?, numeric(arg(1))?)?;
+                return eval("trunc", &[quotient]);
+            }
             let (a, b) = (
                 as_i64(&arg(0)).ok_or_else(|| wrong_args(name))?,
                 as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?,
@@ -2670,7 +2693,7 @@ fn size_bytes(text: &str) -> Result<Bson> {
         .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
         .unwrap_or(t.len());
     let (num, unit) = t.split_at(split);
-    let invalid = || Error::InvalidText(format!("invalid size: \"{text}\""));
+    let invalid = || Error::Sqlstate("22023", format!("invalid size: \"{text}\""));
     let value: f64 = num.trim().parse().map_err(|_| invalid())?;
     let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
         "" | "bytes" => 1.0,
@@ -2678,7 +2701,12 @@ fn size_bytes(text: &str) -> Result<Bson> {
         "mb" => 1024.0 * 1024.0,
         "gb" => 1024.0 * 1024.0 * 1024.0,
         "tb" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return Err(Error::InvalidText(format!("invalid size: \"{text}\""))),
+        _ => {
+            return Err(Error::Sqlstate(
+                "22023",
+                format!("invalid size: \"{text}\""),
+            ))
+        }
     };
     Ok(Bson::Int64((value * mult) as i64))
 }

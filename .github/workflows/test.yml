@@ -2026,11 +2026,12 @@ jobs:
         # embedded PostgreSQL-wire server (`_secantus_server.PgServer`) with a
         # real client. Without it that file `importorskip`s and this lane would
         # report a pass having run none of it -- the exact failure mode this
-        # step's list exists to prevent.
+        # step's list exists to prevent. `trustme` makes the certificates its
+        # TLS tests start the server with.
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
-          --with "psycopg[binary]"
+          --with "psycopg[binary]" --with trustme
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           tests/test_pgserver_embedded.py
