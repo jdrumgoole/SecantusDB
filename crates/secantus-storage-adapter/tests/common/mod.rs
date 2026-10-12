@@ -25,7 +25,7 @@ pub fn dispatch_full(cmd: &Document, c: &mut CommandContext) -> Document {
         let arr: Vec<Bson> = pb
             .batch
             .iter()
-            .map(|b| Bson::Document(Document::from_reader(&mut &b[..]).unwrap()))
+            .map(|b| Bson::Document(secantus_commands::bsondoc::from_bytes(b).unwrap()))
             .collect();
         if let Ok(cursor) = reply.get_document_mut("cursor") {
             let mut rebuilt = Document::new();

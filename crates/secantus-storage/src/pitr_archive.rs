@@ -284,7 +284,7 @@ pub fn restore_from_archive_dir(
                 }
                 for (seq, blob) in &batch {
                     if *seq > base_head {
-                        let entry = secantus_core::bsondoc::from_bytes(&blob)
+                        let entry = secantus_core::bsondoc::from_bytes(blob)
                             .map_err(|e| StorageError::Bson(e.to_string()))?;
                         rows.entry(*seq).or_insert(entry);
                         if carry_oplog && !pre_map.contains_key(seq) {

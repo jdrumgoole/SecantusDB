@@ -9032,6 +9032,78 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.077 `update` and `findAndModify` -- 2026-10-12
+
+`tools/probes/update_commands.py`, mongod 8.2.11: 30 scenarios, 1,295
+replies over a raw connection. Each case runs against a collection of its
+own and compares the reply AND the documents left behind. The Rust server
+differed on 213 of the first 1,096 replies and differs on 17 of 1,295.
+Pinned by `crates/secantus-storage-adapter/tests/update_commands_wt.rs`.
+
+The wrong WRITES, all fixed:
+
+- **A stored sub-document shaped like extended JSON was rewritten by any
+  update of its document.** `{a: {$numberLong: "1"}}` became `{a: 1}`, and
+  `{$oid: ...}`, `{$date: ...}`, `{$numberInt: ...}` likewise, when another
+  field was updated or the document passed through `aggregate`. The cause
+  is `bson::Document::from_reader`, whose serde visitor reads those shapes
+  as the values they stand for. Every decode in the MongoDB server crates
+  now goes through `secantus_core::bsondoc::from_bytes`.
+- New fields were added in the order the update wrote them. mongod adds
+  them in path order, across all operators.
+- `$` took the position from the queried array only. mongod has ONE
+  position per update: that of the last predicate, in its own order of
+  predicates, to walk an array. `{a: 3, b: 5}` with `a.$` writes `a.0`.
+- A pipeline update could change the `_id`. An operator that named the
+  `_id` and left it the same (`{$inc: {_id: 0}}`) was refused.
+- A replacement giving the `_id` as another numeric type was refused;
+  mongod stores it as given. A document `_id` with its fields reordered
+  was accepted as the same `_id`.
+- `{$set: {$x: 1}}` and `{$rename: {a: "$z"}}` stored a top-level `$`
+  field. `{$set: {$a: 1}}` in a pipeline (and in `aggregate`) did too.
+- `$bit` narrowed a long to an int. `$addToSet` read `{x: 1, $each: [..]}`
+  as the modifier form. `$pullAll` removed a document whose fields were in
+  another order. `$push` with `$sort: {field: 1}` sorted elements that are
+  not documents. `$pull` refused a condition opening with `$or`.
+- A pipeline `$set` of `a.b` over a scalar `a`, of a path through an array,
+  and of a nested document did what an operator `$set` does, not what the
+  aggregation stage does.
+- An upsert whose query had both `a` and `a.b` inserted a document; one
+  with `$expr` did too; `{$all: [{$elemMatch: ..}]}` was stored as a value.
+- An update with no `upsert` created the collection it named.
+- `Timestamp(0, 0)` at the top level of an inserted or replacement
+  document was stored; mongod fills it with the current time.
+- A document could nest deeper than 180 levels.
+- `findAndModify` read `upsert: 1` as false, ran with `arrayFilters` and
+  `remove`, and skipped a malformed pipeline or projection when nothing
+  matched.
+
+What is left, on the RUST MongoDB server:
+
+- [ ] **The seven `Document::from_reader` / `bson::from_slice` calls in the
+      PostgreSQL crates** (`secantus-pg` 5, `secantus-pgwire` 2) were not
+      changed here. Whether a `jsonb` value shaped like extended JSON is
+      rewritten by them has not been measured. `secantus-core-py`, the
+      parity binding, has 36 and was left too.
+- [ ] **The field order of a document upserted from two or more
+      equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
+      `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
+      keeps the order written. This server sorts them. No rule was found.
+- [ ] **`$where` in an update's query** is refused (no JavaScript).
+- [ ] **`$text` in an update's query** answers a generic refusal; mongod
+      answers 27, `text index required for $text query`.
+- [ ] **`$$CLUSTER_TIME`** in a pipeline update is refused.
+- [ ] **`$replaceWith` of a non-document in an update** names only the
+      fields the expression read as the input document; mongod prints the
+      whole document there (and only those fields in `aggregate`).
+- [ ] **An unknown hint's wording**, as under 7.075: seven replies here.
+- [ ] **A parse error in `$currentDate` against a collection that does not
+      exist** is no longer reported, since the statement is skipped.
+- [ ] **PYTHON MongoDB server:** not measured by this probe. It decodes
+      with `bson.decode`, which does not read extended JSON shapes, so the
+      first defect above is not expected there. The engine parity suites
+      now differ from the Rust engine where mongod sides with Rust.
+
 ### 7.076 DDL and admin commands -- 2026-10-12
 
 `tools/probes/ddl_admin_commands.py`, mongod 8.2.11: 37 scenarios, 809

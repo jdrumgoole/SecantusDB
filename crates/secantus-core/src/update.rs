@@ -2273,6 +2273,19 @@ fn operator_argument_error(op: &str, field: &str, value: &Bson) -> Option<String
         }
     }
     match (op, value) {
+        ("$rename", Bson::String(to)) if !field.is_empty() && !to.is_empty() && field == to => {
+            Some(format!(
+                "The source and target field for $rename must differ: {field}: \"{to}\""
+            ))
+        }
+        ("$rename", Bson::String(to))
+            if !field.is_empty() && !to.is_empty() && rename_same_path(field, to) =>
+        {
+            Some(format!(
+                "The source and target field for $rename must not be on the same path: \
+                 {field}: \"{to}\""
+            ))
+        }
         ("$push", Bson::Document(m)) if m.contains_key("$each") => push_modifier_error(m),
         ("$addToSet", Bson::Document(m))
             if m.len() > 1
@@ -3301,15 +3314,16 @@ mod tests {
     fn positional_dollar_uses_matches() {
         // $ resolves via positional_matches (computed from the query filter).
         // A predicate on the array itself resolves `$` (mongod sets `g.1`).
+        // The position is one for the whole update, under `$`.
         let pos = find_positional_matches(&doc! {"g": [5, 6, 7]}, &doc! {"g": 6});
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
         let pos = find_positional_matches(&doc! {"g": [5, 6, 7]}, &doc! {"g": {"$gt": 5}});
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
         let pos = find_positional_matches(
             &doc! {"g": [{"x": 1}, {"x": 2}]},
             &doc! {"g": {"$elemMatch": {"x": 2}}},
         );
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
         // A whole-array equality is not an element match.
         let pos = find_positional_matches(&doc! {"g": [5, 6]}, &doc! {"g": [5, 6]});
         assert!(pos.is_empty());
@@ -3329,6 +3343,33 @@ mod tests {
             &doc! {"g": [{"x": 1}, {"x": 2}, {"x": 2}]},
             &doc! {"g.x": 2},
         );
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
+    }
+
+    /// With several array predicates, the last in mongod's order of
+    /// predicates decides (measured 8.2.11, 2026-10-12).
+    #[test]
+    fn the_last_array_predicate_in_mongods_order_gives_the_position() {
+        let d = doc! {"a": [1, 2, 3, 2], "b": [5, 6, 7, 8], "o": [{"k": 1}, {"k": 2}]};
+        let at = |q: Document| find_positional_matches(&d, &q).get_i64("$").ok();
+        assert_eq!(at(doc! {"a": 3, "b": 5}), Some(0));
+        assert_eq!(at(doc! {"b": 8, "a": 1}), Some(3));
+        assert_eq!(at(doc! {"a": 3, "o.k": 2}), Some(1));
+        assert_eq!(at(doc! {"a": {"$gt": 1, "$lt": 3}}), Some(1));
+        assert_eq!(at(doc! {"a": {"$elemMatch": {"$gt": 2}}, "b": 6}), Some(1));
+        assert_eq!(at(doc! {"a": {"$in": [3]}, "b": 6}), Some(1));
+        assert_eq!(at(doc! {"$and": [{"a": 2}, {"a": 3}]}), Some(2));
+        assert_eq!(at(doc! {"$and": [{"a": 3}, {"a": 2}]}), Some(1));
+        assert_eq!(at(doc! {"$or": [{"a": 3}, {"a": 2}]}), Some(1));
+        for none in [
+            doc! {"$or": [{"a": 3}, {"b": 6}]},
+            doc! {"a.1": 2},
+            doc! {"a": {"$size": 4}},
+            doc! {"a": [1, 2, 3, 2]},
+            doc! {"a": {"$not": {"$gt": 5}}},
+            doc! {"$nor": [{"a": 9}]},
+        ] {
+            assert_eq!(at(none.clone()), None, "{none}");
+        }
     }
 }

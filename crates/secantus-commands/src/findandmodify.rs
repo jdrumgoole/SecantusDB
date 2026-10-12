@@ -650,7 +650,7 @@ fn pipeline_update_problem(stages: &[Bson]) -> Option<CommandError> {
 }
 
 fn decode(bytes: &[u8]) -> Result<Document, CommandError> {
-    secantus_core::bsondoc::from_bytes(&bytes[..])
+    secantus_core::bsondoc::from_bytes(bytes)
         .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))
 }
 

@@ -707,7 +707,7 @@ fn serve<S: Read + Write>(
             Ok(Op::Query(query)) => {
                 // Legacy OP_QUERY — the pymongo handshake. Decode the query doc,
                 // dispatch, reply with OP_REPLY.
-                let request = match secantus_commands::bsondoc::from_bytes(&query.query[..]) {
+                let request = match secantus_commands::bsondoc::from_bytes(query.query) {
                     Ok(d) => d,
                     Err(e) => {
                         send_bad_value(
@@ -880,7 +880,7 @@ fn escape_dn_value(value: &str) -> String {
 type RawInsertDocs = Vec<Vec<u8>>;
 
 fn merge_op_msg_body(msg: &OpMsg) -> Result<(Document, Option<RawInsertDocs>), WireError> {
-    let mut body = secantus_commands::bsondoc::from_bytes(&msg.body[..])
+    let mut body = secantus_commands::bsondoc::from_bytes(msg.body)
         .map_err(|e| WireError::MalformedBody(e.to_string()))?;
     let is_insert = body.keys().next().map(String::as_str) == Some("insert");
     let mut raw_insert: Option<Vec<Vec<u8>>> = None;

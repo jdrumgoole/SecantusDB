@@ -266,7 +266,7 @@ fn replay(
             break;
         }
         for (seq, blob) in &batch {
-            let entry = secantus_core::bsondoc::from_bytes(&blob)
+            let entry = secantus_core::bsondoc::from_bytes(blob)
                 .map_err(|e| StorageError::Bson(e.to_string()))?;
             if !within_bound(&entry, up_to_ts, up_to_wall_ms) {
                 break 'outer;

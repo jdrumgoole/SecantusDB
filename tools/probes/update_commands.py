@@ -138,7 +138,10 @@ scenario(
     "$mul",
     *each(
         NUMS,
-        *[{"$mul": {f: 2}} for f in ["i", "l", "d", "m", "s", "n", "b", "a", "nope", "big", "huge"]],
+        *[
+            {"$mul": {f: 2}}
+            for f in ["i", "l", "d", "m", "s", "n", "b", "a", "nope", "big", "huge"]
+        ],
         *[
             {"$mul": {"i": v}}
             for v in [Int64(2), 1.5, Decimal128("1.5"), "2", None, 0, float("nan"), -1]
@@ -920,7 +923,10 @@ scenario(
     {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"_id": 1, "u": 1}}]},
     {"update": "c", "updates": [{"q": {}, "u": {"$set": {"u": 3}}, "multi": True}]},
     {"find": "c", "filter": {"_id": {"$type": "number"}}, "sort": {"_id": 1}},
-    {"update": "c", "updates": [{"q": {"_id": 600}, "u": {"$set": {"b": 1}}, "upsert": True, "multi": True}]},
+    {
+        "update": "c",
+        "updates": [{"q": {"_id": 600}, "u": {"$set": {"b": 1}}, "upsert": True, "multi": True}],
+    },
     {"update": "c", "updates": [{"q": {"zz": 1}, "u": {"zz": 2}, "upsert": True, "multi": True}]},
 )
 
@@ -1044,7 +1050,10 @@ scenario(
 scenario(
     "update: the command",
     {"insert": "c", "documents": FIVE},
-    *[{"update": v, "updates": [{"q": {}, "u": {"$set": {"x": 1}}}]} for v in [1, None, "", {}, [], "a.b", "$x", "system.views"]],
+    *[
+        {"update": v, "updates": [{"q": {}, "u": {"$set": {"x": 1}}}]}
+        for v in [1, None, "", {}, [], "a.b", "$x", "system.views"]
+    ],
     *[{"update": "c", "updates": v} for v in [1, "x", None, {}, [], [1], [{}], [[]]]],
     {"update": "c"},
     *[
@@ -1069,20 +1078,56 @@ scenario(
             {"q": {"$text": {"$search": "x"}}, "u": {"$set": {"x": 1}}},
         ]
     ],
-    *[{"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}, "multi": v}]} for v in BOOLS],
-    *[{"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}, "upsert": v}]} for v in BOOLS],
-    *[{"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}}], "ordered": v} for v in BOOLS],
     *[
-        {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}}], "bypassDocumentValidation": v}
+        {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}, "multi": v}]}
+        for v in BOOLS
+    ],
+    *[
+        {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}, "upsert": v}]}
+        for v in BOOLS
+    ],
+    *[
+        {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}}], "ordered": v}
+        for v in BOOLS
+    ],
+    *[
+        {
+            "update": "c",
+            "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}}],
+            "bypassDocumentValidation": v,
+        }
         for v in BOOLS
     ],
     *[
         {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}, "hint": v}]}
-        for v in ["_id_", {"_id": 1}, "nope", {"nope": 1}, {"$natural": 1}, {"$natural": -1}, "$natural", 1, None, [], {}, ""]
+        for v in [
+            "_id_",
+            {"_id": 1},
+            "nope",
+            {"nope": 1},
+            {"$natural": 1},
+            {"$natural": -1},
+            "$natural",
+            1,
+            None,
+            [],
+            {},
+            "",
+        ]
     ],
     *[
         {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}, "collation": v}]}
-        for v in [{"locale": "en"}, {"locale": "simple"}, {"locale": "xx"}, {}, 1, "en", None, {"locale": "en", "strength": 9}, {"strength": 1}]
+        for v in [
+            {"locale": "en"},
+            {"locale": "simple"},
+            {"locale": "xx"},
+            {},
+            1,
+            "en",
+            None,
+            {"locale": "en", "strength": 9},
+            {"strength": 1},
+        ]
     ],
     *[
         {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"x": 1}}}], f: v}
@@ -1117,16 +1162,59 @@ scenario(
     {"update": "nope", "updates": [{"q": {"a": {"$nope": 1}}, "u": {"$set": {"x": 1}}}]},
     {"listCollections": 1, "nameOnly": True},
     {"update": "c", "updates": [{"q": {"_id": 0}, "u": {"$set": {"s": "a"}}}], "let": {"v": 1}},
-    {"update": "c", "updates": [{"q": {"s": "A"}, "u": {"$set": {"hit": 1}}, "collation": {"locale": "en", "strength": 2}}]},
-    {"update": "c", "updates": [{"q": {"s": "A"}, "u": {"$set": {"hit": 2}}}]},
-    {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$set": {"l": ["a", "B"]}}}]},
-    {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$pull": {"l": "b"}}, "collation": {"locale": "en", "strength": 2}}]},
-    {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$addToSet": {"l": "A"}}, "collation": {"locale": "en", "strength": 2}}]},
     {
         "update": "c",
-        "updates": [{"q": {"_id": 1}, "u": {"$set": {"l.$[e]": "z"}}, "arrayFilters": [{"e": "A"}], "collation": {"locale": "en", "strength": 2}}],
+        "updates": [
+            {
+                "q": {"s": "A"},
+                "u": {"$set": {"hit": 1}},
+                "collation": {"locale": "en", "strength": 2},
+            }
+        ],
     },
-    {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$max": {"s": "B"}}, "collation": {"locale": "en", "strength": 2}}]},
+    {"update": "c", "updates": [{"q": {"s": "A"}, "u": {"$set": {"hit": 2}}}]},
+    {"update": "c", "updates": [{"q": {"_id": 1}, "u": {"$set": {"l": ["a", "B"]}}}]},
+    {
+        "update": "c",
+        "updates": [
+            {
+                "q": {"_id": 1},
+                "u": {"$pull": {"l": "b"}},
+                "collation": {"locale": "en", "strength": 2},
+            }
+        ],
+    },
+    {
+        "update": "c",
+        "updates": [
+            {
+                "q": {"_id": 1},
+                "u": {"$addToSet": {"l": "A"}},
+                "collation": {"locale": "en", "strength": 2},
+            }
+        ],
+    },
+    {
+        "update": "c",
+        "updates": [
+            {
+                "q": {"_id": 1},
+                "u": {"$set": {"l.$[e]": "z"}},
+                "arrayFilters": [{"e": "A"}],
+                "collation": {"locale": "en", "strength": 2},
+            }
+        ],
+    },
+    {
+        "update": "c",
+        "updates": [
+            {
+                "q": {"_id": 1},
+                "u": {"$max": {"s": "B"}},
+                "collation": {"locale": "en", "strength": 2},
+            }
+        ],
+    },
     FIND,
 )
 
@@ -1166,13 +1254,28 @@ scenario(
             {"remove": True},
             {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {"v": 1}},
             {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {"v": 1}, "new": True},
-            {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {"x": 1, "_id": 0}, "new": True},
+            {
+                "query": {"_id": 1},
+                "update": {"$set": {"x": 1}},
+                "fields": {"x": 1, "_id": 0},
+                "new": True,
+            },
             {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {"v": 0}},
             {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {}},
             {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {"v": 1, "g": 0}},
-            {"query": {"_id": 1}, "update": {"$set": {"x": 1}}, "fields": {"t": {"$add": ["$v", 1]}}},
+            {
+                "query": {"_id": 1},
+                "update": {"$set": {"x": 1}},
+                "fields": {"t": {"$add": ["$v", 1]}},
+            },
             {"query": {"_id": 1}, "remove": True, "fields": {"v": 1}},
-            {"query": {"_id": 9}, "update": {"$set": {"x": 1}}, "upsert": True, "new": True, "fields": {"x": 1}},
+            {
+                "query": {"_id": 9},
+                "update": {"$set": {"x": 1}},
+                "upsert": True,
+                "new": True,
+                "fields": {"x": 1},
+            },
             {"query": {"_id": 1}, "update": {"$inc": {"v": "a"}}},
             {"query": {"_id": 1}, "update": {"$set": {"_id": 5}}},
             {"query": {"_id": 1}, "update": {"$nope": {"x": 1}}},
@@ -1195,19 +1298,36 @@ scenario(
     ),
     case({"_id": 1, "l": [1, 2, 3]}, fam(query={}, update={"$set": {"l.$[e]": 9}})),
     case({"_id": 1, "l": [1, 2, 3]}, fam(query={}, remove=True, arrayFilters=[{"e": 1}])),
-    case({"_id": 1, "l": [1, 2, 3]}, fam(query={}, update={"$set": {"x": 1}}, arrayFilters=[{"e": 1}])),
-    case({"_id": 1, "l": [1, 2, 3]}, fam(query={}, update=[{"$set": {"x": 1}}], arrayFilters=[{"e": 1}])),
+    case(
+        {"_id": 1, "l": [1, 2, 3]},
+        fam(query={}, update={"$set": {"x": 1}}, arrayFilters=[{"e": 1}]),
+    ),
+    case(
+        {"_id": 1, "l": [1, 2, 3]},
+        fam(query={}, update=[{"$set": {"x": 1}}], arrayFilters=[{"e": 1}]),
+    ),
     case({"_id": 1, "l": [1, 2, 3]}, fam(query={}, update={"$set": {"x": 1}}, arrayFilters=[])),
     case({"_id": 1, "l": [1, 2, 3]}, fam(query={}, update={"$set": {"x": 1}}, arrayFilters=1)),
     case(FIVE, {"findandmodify": "c", "query": {"_id": 1}, "update": {"$set": {"x": 1}}}),
     case(FIVE, {"findAndModify": "nope", "query": {"_id": 1}, "update": {"$set": {"x": 1}}}),
     case(FIVE, {"findAndModify": "nope", "query": {"_id": 1}, "remove": True}),
-    case(FIVE, {"findAndModify": "nope", "query": {"_id": 1}, "update": {"$set": {"x": 1}}, "upsert": True}),
+    case(
+        FIVE,
+        {
+            "findAndModify": "nope",
+            "query": {"_id": 1},
+            "update": {"$set": {"x": 1}},
+            "upsert": True,
+        },
+    ),
 )
 scenario(
     "findAndModify: the arguments",
     {"insert": "c", "documents": FIVE},
-    *[{"findAndModify": v, "query": {}, "update": {"$set": {"x": 1}}} for v in [1, None, "", {}, [], "a.b", "$x", "system.views"]],
+    *[
+        {"findAndModify": v, "query": {}, "update": {"$set": {"x": 1}}}
+        for v in [1, None, "", {}, [], "a.b", "$x", "system.views"]
+    ],
     fam(),
     fam(query={}),
     fam(query={}, update={"$set": {"x": 1}}, remove=True),
@@ -1221,20 +1341,70 @@ scenario(
     *[fam(query={"_id": 0}, update=v) for v in [1, "x", None, True, [1], [{"$nope": 1}]]],
     *[fam(query={"_id": 99}, remove=v) for v in BOOLS],
     *[fam(query={"_id": 0}, update={"$set": {"x": 1}}, new=v) for v in BOOLS],
-    *[fam(query={"_id": 99}, update={"$set": {"x": 1}}, upsert=v) for v in [1, 0, "x", None, {}, 2.5]],
-    *[fam(query={"_id": 0}, update={"$set": {"x": 1}}, sort=v) for v in [1, "x", None, [], {}, {"v": 0}, {"v": 2}, {"v": "x"}, {"v": {"$meta": "textScore"}}, {"": 1}]],
-    *[fam(query={"_id": 0}, update={"$set": {"x": 1}}, fields=v) for v in [1, "x", None, [], {"v": "x"}, {"v": 2}, {"$v": 1}, {"v": {"$nope": 1}}, {"l": {"$slice": 1}}, {"l": {"$elemMatch": {"a": 1}}}]],
+    *[
+        fam(query={"_id": 99}, update={"$set": {"x": 1}}, upsert=v)
+        for v in [1, 0, "x", None, {}, 2.5]
+    ],
+    *[
+        fam(query={"_id": 0}, update={"$set": {"x": 1}}, sort=v)
+        for v in [
+            1,
+            "x",
+            None,
+            [],
+            {},
+            {"v": 0},
+            {"v": 2},
+            {"v": "x"},
+            {"v": {"$meta": "textScore"}},
+            {"": 1},
+        ]
+    ],
+    *[
+        fam(query={"_id": 0}, update={"$set": {"x": 1}}, fields=v)
+        for v in [
+            1,
+            "x",
+            None,
+            [],
+            {"v": "x"},
+            {"v": 2},
+            {"$v": 1},
+            {"v": {"$nope": 1}},
+            {"l": {"$slice": 1}},
+            {"l": {"$elemMatch": {"a": 1}}},
+        ]
+    ],
     *[fam(query={"_id": 0}, update={"$set": {"x": 1}}, bypassDocumentValidation=v) for v in BOOLS],
     *[
         fam(query={"_id": 0}, update={"$set": {"x": 1}}, hint=v)
-        for v in ["_id_", {"_id": 1}, "nope", {"nope": 1}, {"$natural": 1}, "$natural", 1, None, [], {}]
+        for v in [
+            "_id_",
+            {"_id": 1},
+            "nope",
+            {"nope": 1},
+            {"$natural": 1},
+            "$natural",
+            1,
+            None,
+            [],
+            {},
+        ]
     ],
     *[
         fam(query={"_id": 0}, update={"$set": {"x": 1}}, collation=v)
         for v in [{"locale": "en"}, {"locale": "xx"}, {}, 1, "en", None]
     ],
-    *[fam(query={"_id": 0}, update={"$set": {"x": 1}}, let=v) for v in [{"v": 1}, {}, 1, "x", None, []]],
-    fam(query={"$expr": {"$eq": ["$_id", "$$v"]}}, update=[{"$set": {"y": "$$v"}}], let={"v": 3}, new=True),
+    *[
+        fam(query={"_id": 0}, update={"$set": {"x": 1}}, let=v)
+        for v in [{"v": 1}, {}, 1, "x", None, []]
+    ],
+    fam(
+        query={"$expr": {"$eq": ["$_id", "$$v"]}},
+        update=[{"$set": {"y": "$$v"}}],
+        let={"v": 3},
+        new=True,
+    ),
     fam(query={"$expr": {"$eq": ["$_id", "$$v"]}}, remove=True, let={"v": 3}),
     fam(query={"$expr": {"$eq": ["$_id", "$$v"]}}, update={"$set": {"x": 1}}),
     *[
@@ -1262,7 +1432,10 @@ scenario(
         ]
     ],
     FIND,
-    {"createIndexes": "c", "indexes": [{"key": {"u": 1}, "name": "u_1", "unique": True, "sparse": True}]},
+    {
+        "createIndexes": "c",
+        "indexes": [{"key": {"u": 1}, "name": "u_1", "unique": True, "sparse": True}],
+    },
     fam(query={"_id": 0}, update={"$set": {"u": 1}}),
     fam(query={"_id": 1}, update={"$set": {"u": 1}}),
     fam(query={"_id": 50}, update={"$set": {"u": 1}}, upsert=True),
@@ -1303,7 +1476,13 @@ scenario(
         {"$set": {"a": {"x": 1, "x2": 1}}},
     ),
     case({"_id": 1, "a": Timestamp(0, 0)}, upd({}, {"$set": {"b": Timestamp(0, 0)}})),
-    case([], {"insert": "c", "documents": [{"_id": 1, "a": Timestamp(0, 0), "b": {"t": Timestamp(0, 0)}}]}),
+    case(
+        [],
+        {
+            "insert": "c",
+            "documents": [{"_id": 1, "a": Timestamp(0, 0), "b": {"t": Timestamp(0, 0)}}],
+        },
+    ),
     case([], upd({"_id": 1}, {"a": Timestamp(0, 0), "b": {"t": Timestamp(0, 0)}}, upsert=True)),
     case([], upd({"_id": 1}, {"$set": {"a": Timestamp(0, 0)}}, upsert=True)),
     case({"_id": 1, "a": 1}, upd({}, {"t": Timestamp(0, 0)})),
@@ -1349,7 +1528,9 @@ scenario(
     case({"_id": 1, "a": {"$numberLong": "1"}}, {"distinct": "c", "key": "a"}),
     case({"_id": 1, "a": {"$numberLong": "1"}}, {"find": "c", "filter": {"a": 1}}),
     case({"_id": 1, "a": {"$numberLong": "1"}}, {"find": "c", "filter": {"a.$numberLong": "1"}}),
-    case({"_id": 1, "a": {"$numberLong": "1"}}, {"count": "c", "query": {"a": {"$type": "object"}}}),
+    case(
+        {"_id": 1, "a": {"$numberLong": "1"}}, {"count": "c", "query": {"a": {"$type": "object"}}}
+    ),
     case(
         {"_id": 1, "a": {"$numberLong": "1"}},
         {"delete": "c", "deletes": [{"q": {"a": {"$type": "long"}}, "limit": 0}]},

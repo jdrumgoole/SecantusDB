@@ -1184,13 +1184,11 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // An update that cannot insert leaves a collection that does not exist
         // alone. It used to create it (measured 8.2.11, 2026-10-12: the
         // collection was then listed).
-        if !upsert
+        // The statement is still read first: a malformed one is refused.
+        let absent = !upsert
             && !storage
                 .collection_exists(&ctx.db_name, &coll)
-                .unwrap_or(true)
-        {
-            continue;
-        }
+                .unwrap_or(true);
 
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
@@ -1254,6 +1252,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 }
                 continue;
             }
+            if absent {
+                continue;
+            }
             storage.update_matching_pipeline(
                 &ctx.db_name,
                 &coll,
@@ -1298,6 +1299,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 if ordered {
                     break;
                 }
+                continue;
+            }
+            if absent {
                 continue;
             }
             storage.update_matching_array_filters(
