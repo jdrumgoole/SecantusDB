@@ -445,8 +445,10 @@ pub trait Storage: Send + Sync {
         self.find(db, coll, filter, sort, hint)
     }
 
-    /// The plan `find` would use for these args, without executing — the input to
-    /// `explain`'s `winningPlan`. Returns `{kind: "COLLSCAN"}` or
+    /// The plan THIS server's index router would use for these args, without
+    /// executing. `explain` no longer reports it (it reports the plan mongod
+    /// runs, see `crate::explain`); this stays as the router's own account of
+    /// itself, for diagnostics. Returns `{kind: "COLLSCAN"}` or
     /// `{kind: "IXSCAN", indexName, keyPattern, direction, multikey}`. Default COLLSCAN; the
     /// WT adapter mirrors the storage index router.
     fn explain_plan(
@@ -460,6 +462,17 @@ pub trait Storage: Send + Sync {
         let mut d = Document::new();
         d.insert("kind", "COLLSCAN");
         Ok(d)
+    }
+
+    /// Whether some document gives the index an array to index.
+    fn index_is_multikey(&self, _db: &str, _coll: &str, _name: &str) -> bool {
+        false
+    }
+
+    /// Whether every document `query` matches also matches `partial`, as far
+    /// as the index router can prove it (it answers `false` when unsure).
+    fn query_implies_partial(&self, _query: &Document, _partial: &Document) -> bool {
+        false
     }
 
     // --- DDL / introspection ------------------------------------------------

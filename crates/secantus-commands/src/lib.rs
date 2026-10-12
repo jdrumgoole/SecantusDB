@@ -42,6 +42,7 @@ pub mod crud;
 pub mod cursors;
 pub mod diagnostics;
 pub mod distinct;
+mod explain;
 pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
@@ -510,7 +511,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "cloneCollectionAsCapped" => capped_admin::clone_collection_as_capped,
         "compact" => capped_admin::compact,
         "reIndex" => capped_admin::re_index,
-        "explain" => admin::explain,
+        "explain" => explain::explain,
         "drop" => admin::drop,
         "secantusAdmin.backupArchive" => admin::backup_archive,
         "secantusAdmin.archiveBaseSnapshot" => admin::archive_base_snapshot,
@@ -1838,7 +1839,9 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
         .and_then(|rc| rc.get_str("level").ok())
         == Some("snapshot")
         // A transaction's statements read at its snapshot and report no time.
-        && req.get("autocommit") != Some(&Bson::Boolean(false));
+        && req.get("autocommit") != Some(&Bson::Boolean(false))
+        // `explain` reads nothing a client could read again at that time.
+        && command_name(req) != "explain";
     let ok = matches!(reply.get("ok"), Some(Bson::Double(d)) if *d != 0.0)
         || matches!(reply.get("ok"), Some(Bson::Int32(n)) if *n != 0)
         || matches!(reply.get("ok"), Some(Bson::Int64(n)) if *n != 0);

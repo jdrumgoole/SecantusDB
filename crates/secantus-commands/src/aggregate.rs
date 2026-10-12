@@ -70,6 +70,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `cursor` is required unless the command is an inline explain (measured
     // 8.2.11, 2026-10-01); an aggregate without one used to run and return a
     // cursor anyway.
+    if let Some(other) = doc.get("explain") {
+        if !matches!(other, Bson::Boolean(_)) {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                "explain must be a boolean",
+            ));
+        }
+    }
     if !doc.contains_key("cursor") && doc.get("explain") != Some(&Bson::Boolean(true)) {
         return Err(CommandError::new(
             9,
@@ -230,6 +239,19 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
+    // An operator the query language does not have is a parse error, whether
+    // or not the collection has a document to test it on.
+    for stage in pipeline.iter().filter_map(Bson::as_document) {
+        if let Some(Bson::Document(filter)) = stage.get("$match") {
+            if let Some((code, msg)) = argtypes::unknown_operator_in_filter(filter) {
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    msg,
+                ));
+            }
+        }
+    }
 
     // Inline `explain: true` on the aggregate command (the legacy flag, distinct
     // from the top-level `explain` wrapper): return the plan instead of running
@@ -237,14 +259,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // the explain handler before any write stage runs; default verbosity is
     // `queryPlanner`. Mirrors `commands.py::_aggregate`.
     if doc.get("explain") == Some(&Bson::Boolean(true)) {
-        let mut inner = doc.clone();
-        inner.remove("explain");
         let verbosity = doc
             .get_str("verbosity")
             .unwrap_or("queryPlanner")
             .to_string();
-        let wrapped = doc! { "explain": inner, "verbosity": verbosity };
-        return crate::admin::explain(&wrapped, ctx);
+        // `$inline` tells the handler the flag came from the aggregate itself.
+        let wrapped = doc! { "explain": doc.clone(), "verbosity": verbosity, "$inline": true };
+        return crate::explain::explain(&wrapped, ctx);
     }
 
     // `$out` / `$merge` may only be the final pipeline stage — mongod rejects a

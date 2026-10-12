@@ -540,7 +540,8 @@ fn aggregate_explain_option_returns_plan_without_running() {
             c,
         );
         assert_eq!(r.get_f64("ok").unwrap(), 1.0);
-        assert!(r.get_array("stages").is_ok(), "explain output has stages");
+        // The planner takes a lone `$match` whole: one plan, no stages (8.2.11).
+        assert!(r.get("stages").is_none(), "{r}");
         assert!(r.get_document("queryPlanner").is_ok());
 
         // $out as the final stage with explain:true returns stages and is a dry

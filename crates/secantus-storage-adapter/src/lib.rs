@@ -551,6 +551,14 @@ impl CmdStorage for StorageAdapter {
         self.inner.get_collection_options(db, coll).map_err(map_err)
     }
 
+    fn index_is_multikey(&self, db: &str, coll: &str, name: &str) -> bool {
+        self.inner.index_is_multikey(db, coll, name)
+    }
+
+    fn query_implies_partial(&self, query: &Document, partial: &Document) -> bool {
+        secantus_storage::query_implies_partial(query, partial)
+    }
+
     fn explain_plan(
         &self,
         db: &str,

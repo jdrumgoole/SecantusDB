@@ -1633,12 +1633,51 @@ fn problem_in_reduce(arg: &Bson, bound: &[String]) -> Option<(i32, String)> {
 /// conservative rule [`undefined_variable_error`] follows — a false positive
 /// would reject a VALID query.
 ///
+/// An operator the query language does not have is refused here too. mongod
+/// refuses it when it PARSES the filter; the matcher only met it when it had
+/// a document to test, so over an empty or missing collection `count`,
+/// `distinct`, `aggregate`, `update`, `delete` and `findAndModify` answered
+/// as if the filter were valid (measured against 8.2.11, 2026-10-12).
+///
 /// This is the surface the pipeline walker did not cover: `find`, `count`,
 /// `distinct`, `findAndModify` and the `q` of an `update` / `delete` all take a
 /// filter, and an undefined variable in one answered the storage layer's
 /// generic `BadValue` (2) `query uses a construct the Rust server does not
 /// support` instead of mongod's 17276.
+/// The matcher's own refusal of an operator it does not know, found without
+/// a document: each clause is tried alone against an empty one, so no clause
+/// is skipped because an earlier one already decided the match.
+pub fn unknown_operator_in_filter(filter: &Document) -> Option<(i32, String)> {
+    for (key, value) in filter {
+        if matches!(key.as_str(), "$and" | "$or" | "$nor") {
+            if let Bson::Array(subs) = value {
+                for sub in subs.iter().filter_map(Bson::as_document) {
+                    if let Some(found) = unknown_operator_in_filter(sub) {
+                        return Some(found);
+                    }
+                }
+            }
+            continue;
+        }
+        let mut clause = Document::new();
+        clause.insert(key.clone(), value.clone());
+        let tried =
+            secantus_core::query::matches(&Document::new(), &clause, &Document::new(), None);
+        if let Err(refusal) = tried {
+            if let Some((2, msg)) = refusal.as_mongo() {
+                if msg.starts_with("unknown operator") || msg.starts_with("unknown top level") {
+                    return Some((2, msg.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Option<(i32, String)> {
+    if let Some(found) = unknown_operator_in_filter(filter) {
+        return Some(found);
+    }
     for (key, value) in filter {
         match key.as_str() {
             "$expr" => {

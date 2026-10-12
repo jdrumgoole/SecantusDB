@@ -252,6 +252,15 @@ plan = coll.find({"n": 5}).explain()["queryPlanner"]["winningPlan"]
 `Storage.explain_plan(...)` mirrors `find_matching`'s routing decisions
 without executing them and is exposed on the public storage API.
 
+The Rust MongoDB server (`secantusd-rs`) goes further: its `explain` reports
+the plan `mongod` 8.2.11 reports, with `indexBounds`, the residual filter,
+`EXPRESS_IXSCAN` for a point lookup through a unique index,
+`PROJECTION_COVERED`, and the stages `count`, `distinct`, `update`, `delete`
+and `findAndModify` have of their own. `executionStats` counts what that plan
+examines. `rejectedPlans` is always empty, and where several indexes could
+serve one query the server picks by a fixed order of preference where
+`mongod` picks by trial.
+
 ## Geospatial — `2d` and `2dsphere`
 
 Both index types ship and accelerate `$geoWithin` / `$geoIntersects`
