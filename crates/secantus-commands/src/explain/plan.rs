@@ -196,6 +196,17 @@ fn use_index(index: &Rc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Que
         }
         bounds.push(list.unwrap_or_else(|| vec![Interval::all()]));
     }
+    // An index whose leading field has no predicate is read end to end.
+    if !leads {
+        return IndexUse {
+            index: index.clone(),
+            bounds: vec![vec![Interval::all()]; index.key.len()],
+            covered: BTreeSet::new(),
+            on_key: BTreeSet::new(),
+            leads,
+            bounded_fields: 0,
+        };
+    }
     // A clause the partial filter states is true of every indexed document.
     if let Some(partial) = &index.partial {
         let stated = clauses(&secantus_core::canonical_match(&Bson::Document(partial.clone())));
@@ -518,6 +529,9 @@ fn covers(index: &IndexInfo, projection: &Document) -> bool {
         return false;
     }
     let mut id_out = false;
+    if projection.keys().all(|f| f == "_id") {
+        return false;
+    }
     for (field, value) in projection {
         if matches!(value, Bson::Document(_) | Bson::Array(_) | Bson::String(_)) {
             return false;

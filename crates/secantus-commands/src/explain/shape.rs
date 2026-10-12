@@ -120,6 +120,11 @@ pub(crate) fn find(coll: &str, inner: &Document) -> Result<Shape, CommandError> 
     let mut s = Shape::new(coll, Kind::Find, inner);
     s.filter = doc_arg(inner, "filter", "FindCommandRequest.filter")?;
     s.sort = inner.get_document("sort").ok().cloned();
+    // `sort: {$natural: ±1}` is storage order: a hint, and no sort at all.
+    if let Some(natural) = s.sort.as_ref().filter(|x| x.len() == 1).and_then(|x| x.get("$natural")) {
+        s.hint = Some(Bson::Document(doc! { "$natural": natural.clone() }));
+        s.sort = None;
+    }
     s.projection = inner.get_document("projection").ok().cloned();
     s.skip = int_arg(inner, "skip");
     s.limit = int_arg(inner, "limit");
@@ -393,6 +398,57 @@ pub(crate) fn find_as_pipeline(s: &Shape) -> Vec<Document> {
     }
     if let Some(p) = s.projection.as_ref().filter(|x| !x.is_empty()) {
         out.push(doc! { "$project": p.clone() });
+    }
+    out
+}
+
+/// The command as `explain` hands it back. `count` and `findAndModify` come
+/// back parsed, in their own field order and without `$db`; the rest come
+/// back as sent, with `$db` added.
+pub(crate) fn echo(inner: &Document, db: &str) -> Document {
+    let name = inner.keys().next().cloned().unwrap_or_default();
+    let wide = |v: &Bson| as_i64(v).map_or_else(|| v.clone(), Bson::Int64);
+    let late = ["maxTimeMS", "comment"];
+    let mut out = Document::new();
+    let ordered: &[&str] = match name.to_ascii_lowercase().as_str() {
+        "count" => &["query", "limit", "skip", "hint", "collation"],
+        "findandmodify" => &[
+            "query", "fields", "sort", "remove", "update", "new", "upsert",
+            "bypassDocumentValidation", "collation", "arrayFilters", "hint", "let",
+        ],
+        _ => {
+            let mut plain = inner.clone();
+            plain.insert("$db", db);
+            return plain;
+        }
+    };
+    let count = ordered[1] == "limit";
+    if let Some(target) = inner.get(&name) {
+        out.insert(if count { "count" } else { "findAndModify" }, target.clone());
+    }
+    for field in ordered {
+        let value = match (inner.get(*field), *field) {
+            (None | Some(Bson::Null), "query") if count => Bson::Document(Document::new()),
+            (None | Some(Bson::Null), _) => continue,
+            (Some(v), "limit") => Bson::Int64(as_i64(v).unwrap_or(0).abs()),
+            (Some(v), "skip") => wide(v),
+            (Some(Bson::String(s)), "hint") if count => Bson::Document(doc! { "$hint": s.clone() }),
+            (Some(v), "remove" | "new" | "upsert" | "bypassDocumentValidation") => {
+                Bson::Boolean(crate::util::truthy(v))
+            }
+            (Some(v), _) => v.clone(),
+        };
+        out.insert(*field, value);
+    }
+    for (k, v) in inner.iter().skip(1) {
+        if !ordered.contains(&k.as_str()) && !late.contains(&k.as_str()) && !k.starts_with('$') {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    for field in late {
+        if let Some(v) = inner.get(field) {
+            out.insert(field, if field == "maxTimeMS" { wide(v) } else { v.clone() });
+        }
     }
     out
 }

@@ -53,14 +53,17 @@ impl IndexInfo {
             out.insert("collation", c.spec().clone());
         }
         out.insert("isMultiKey", self.is_multikey());
-        let mut paths = Document::new();
-        for (field, parts) in self.key.keys().zip(&self.multikey_paths) {
-            paths.insert(
-                field.clone(),
-                parts.iter().cloned().map(Bson::String).collect::<Vec<_>>(),
-            );
+        // The `_id` index cannot be multikey, and mongod prints no paths for it.
+        if self.name != "_id_" {
+            let mut paths = Document::new();
+            for (field, parts) in self.key.keys().zip(&self.multikey_paths) {
+                paths.insert(
+                    field.clone(),
+                    parts.iter().cloned().map(Bson::String).collect::<Vec<_>>(),
+                );
+            }
+            out.insert("multiKeyPaths", paths);
         }
-        out.insert("multiKeyPaths", paths);
         out.insert("isUnique", self.unique);
         out.insert("isSparse", self.sparse);
         out.insert("isPartial", self.partial.is_some());

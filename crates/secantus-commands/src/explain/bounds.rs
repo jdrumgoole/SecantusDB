@@ -362,11 +362,19 @@ fn numbers() -> Interval {
 }
 
 fn type_bounds(v: &Bson, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
-    let codes: Vec<i64> = match v {
-        Bson::Array(a) => a.iter().filter_map(crate::util::as_i64).collect(),
-        other => vec![crate::util::as_i64(other)?],
+    let items: Vec<Bson> = match v {
+        Bson::Array(a) => a.clone(),
+        other => vec![other.clone()],
     };
     let numeric = [1, 16, 18, 19];
+    // The alias `number` stands for all four numeric codes.
+    let mut codes: Vec<i64> = Vec::new();
+    for item in &items {
+        match item {
+            Bson::String(s) if s == "number" => codes.extend(numeric),
+            other => codes.push(crate::util::as_i64(other)?),
+        }
+    }
     let mut list = Vec::new();
     let mut tight = Tight::Exact;
     let inexact = if ctx.multikey {

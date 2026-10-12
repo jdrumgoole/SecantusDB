@@ -15,6 +15,7 @@
 mod bounds;
 mod exec;
 mod node;
+mod parsed;
 mod plan;
 mod shape;
 
@@ -115,14 +116,17 @@ fn collection(inner: &Document, name: &str, db: &str) -> Result<String, CommandE
     }
 }
 
-fn bad_hint(ns: &str) -> CommandError {
+/// An unknown hint, in the words every command on this server uses for it
+/// (mongod prints its parse of the query here; `tasks/backlog.md`).
+fn bad_hint(hint: &Bson) -> CommandError {
+    let rendered = match hint {
+        Bson::String(s) => format!("\"{s}\""),
+        other => secantus_core::aggregate::render_value_compact(other),
+    };
     err(
         2,
         "BadValue",
-        format!(
-            "error processing query: ns={ns}Tree: $and\nSort: {{}}\nProj: {{}}\n planner returned \
-             error :: caused by :: hint provided does not correspond to an existing index"
-        ),
+        format!("hint {rendered} does not correspond to an existing index"),
     )
 }
 
@@ -137,20 +141,16 @@ fn same_key(a: &Document, b: &Document) -> bool {
         })
 }
 
-fn resolve_hint(
-    hint: Option<&Bson>,
-    catalog: &[Rc<IndexInfo>],
-    ns: &str,
-) -> Result<Hint, CommandError> {
+fn resolve_hint(hint: Option<&Bson>, catalog: &[Rc<IndexInfo>]) -> Result<Hint, CommandError> {
     match hint {
         None | Some(Bson::Null) => Ok(Hint::None),
-        Some(Bson::String(name)) => catalog
+        Some(given @ Bson::String(name)) => catalog
             .iter()
             .find(|ix| &ix.name == name)
             .map(|ix| Hint::Index(ix.name.clone()))
-            .ok_or_else(|| bad_hint(ns)),
+            .ok_or_else(|| bad_hint(given)),
         Some(Bson::Document(d)) if d.is_empty() => Ok(Hint::None),
-        Some(Bson::Document(d)) => {
+        Some(given @ Bson::Document(d)) => {
             if let Some(n) = d.get("$natural").and_then(as_i64) {
                 return Ok(Hint::Natural(n < 0));
             }
@@ -158,7 +158,7 @@ fn resolve_hint(
                 .iter()
                 .find(|ix| same_key(&ix.key, d))
                 .map(|ix| Hint::Index(ix.name.clone()))
-                .ok_or_else(|| bad_hint(ns))
+                .ok_or_else(|| bad_hint(given))
         }
         Some(_) => Err(err(9, "FailedToParse", "Hint must be a string or an object")),
     }
@@ -239,7 +239,7 @@ fn plan_for(
     }
     let storage = ctx.storage()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
-    let hint = resolve_hint(s.hint.as_ref(), &t.catalog, &ns)?;
+    let hint = resolve_hint(s.hint.as_ref(), &t.catalog)?;
     if let Some(which) = s.min_max {
         let Hint::Index(name) = &hint else {
             return Err(err(
@@ -305,7 +305,11 @@ fn query_planner(
     plan: &Node,
 ) -> Document {
     let mut out = doc! { "namespace": ns };
-    let fast_count = matches!(plan, Node::FastCount);
+    let fast_count = match plan {
+        Node::FastCount => true,
+        Node::Count(input) => matches!(**input, Node::Eof("nonExistentNamespace")),
+        _ => false,
+    };
     if !fast_count {
         out.insert("parsedQuery", canonical.clone());
         if let Some(c) = collation {
@@ -384,7 +388,7 @@ fn reply_for(
     let db = ctx.db_name.clone();
     let ns = format!("{db}.{}", s.coll);
     let collation = crate::util::effective_collation(storage, &db, &s.coll, &s.options)?;
-    let canonical = secantus_core::canonical_match(&Bson::Document(s.filter.clone()));
+    let canonical = parsed::parsed_query(&s.filter);
     let t = target(ctx, &s.coll)?;
     let plan = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
     let planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
@@ -513,8 +517,7 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ));
         }
     }
-    let mut echo = inner.clone();
-    echo.insert("$db", db.clone());
+    let echo = shape::echo(&inner, &db);
 
     let lowered = name.to_ascii_lowercase();
     let shape = match name.as_str() {
