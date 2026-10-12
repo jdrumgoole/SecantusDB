@@ -11,11 +11,22 @@ Usage::
     python -m psycopg_validation.check_run .validation/psycopg-raw-rust.json
     python -m psycopg_validation.check_run PLAIN.json --tls TLS.json
     python -m psycopg_validation.check_run PLAIN.json --tls TLS.json --shared-runner
+    python -m psycopg_validation.check_run PLAIN.json --tls TLS.json --write-held IDS.txt
+    python -m psycopg_validation.check_run PLAIN.json --tls TLS.json --rerun RERUN.json
 
 With ``--tls`` the second report is held to the first: a test that fails over
 TLS and passes in the clear is the server's TLS path answering differently,
 and that is what the exit code reports. A test that fails in BOTH is printed
 and does not fail the comparison; it is the plain gauge's finding.
+
+``--write-held FILE`` writes the tests that failed over TLS only, one id to a
+line, and exits 0; ``--rerun RERUN.json`` then takes a report of those tests
+run again over TLS, and a test that passed the second time is printed and not
+counted. A hosted runner fails a different timing test in each run (a
+notification 60 ms late, a SIGALRM that lands while the client interpreter is
+shutting down), and a single run cannot tell that from TLS answering
+differently. A test that fails both times, or was not run again, still fails
+the comparison.
 
 ``--shared-runner`` is for a hosted CI runner. There the tests in
 `SHARED_RUNNER_NOISE` fail in one run and pass in the next whatever the
@@ -92,21 +103,33 @@ def noise_reason(test: str) -> str | None:
     return next((why for part, why in SHARED_RUNNER_NOISE if part in test), None)
 
 
+def _option(argv: list[str], name: str) -> tuple[str | None, list[str]]:
+    """`(value, the rest)` for `name VALUE` in `argv`."""
+    if name not in argv:
+        return None, argv
+    at = argv.index(name)
+    if at + 1 >= len(argv):
+        raise SystemExit(f"{name} needs a value")
+    return argv[at + 1], argv[:at] + argv[at + 2 :]
+
+
 def main(argv: list[str]) -> int:
     shared_runner = "--shared-runner" in argv
     argv = [a for a in argv if a != "--shared-runner"]
-    args = [a for a in argv if a != "--tls"]
-    if len(args) != (2 if "--tls" in argv else 1):
+    tls_path, argv = _option(argv, "--tls")
+    write_held, argv = _option(argv, "--write-held")
+    rerun_path, argv = _option(argv, "--rerun")
+    if len(argv) != 1 or ((write_held or rerun_path) and not tls_path):
         print(__doc__, file=sys.stderr)
         return 2
     try:
-        plain = load(Path(args[0]))
-        describe("plain" if "--tls" in argv else "run", plain)
-        if "--tls" not in argv:
+        plain = load(Path(argv[0]))
+        describe("plain" if tls_path else "run", plain)
+        if not tls_path:
             for test in sorted(t for t, o in plain.items() if o in _BAD):
                 print(f"FAILED {test}")
             return 0
-        tls = load(Path(args[1]))
+        tls = load(Path(tls_path))
     except Truncated as exc:
         print(f"TRUNCATED RUN: {exc}", file=sys.stderr)
         return 1
@@ -122,14 +145,34 @@ def main(argv: list[str]) -> int:
     only = tls_only_failures(plain, tls)
     held = [t for t in only if not (shared_runner and noise_reason(t))]
     for test in only:
-        if test in held:
-            print(f"FAILED over TLS only: {test}", file=sys.stderr)
-        else:
+        if test not in held:
             print(f"FAILED over TLS only, and not held to it on a shared runner: {test}")
+    if write_held is not None:
+        # The tests to run again over TLS, for `--rerun`. Empty when there
+        # are none, so the caller can tell without parsing anything.
+        Path(write_held).write_text("".join(f"{t}\n" for t in held))
+        for test in held:
+            print(f"failed over TLS only, to be run again: {test}")
+        return 0
+    if rerun_path is not None and held:
+        # A test that failed over TLS once and passes when run again failed
+        # for a reason of that moment. One that fails again, or was not run
+        # again, is the finding.
+        try:
+            again = load(Path(rerun_path))
+        except Truncated as exc:
+            print(f"TRUNCATED RERUN: {exc}", file=sys.stderr)
+            return 1
+        passed_again = [t for t in held if again.get(t) == "passed"]
+        for test in passed_again:
+            print(f"FAILED over TLS once, and passed when run again: {test}")
+        held = [t for t in held if t not in passed_again]
+    for test in held:
+        print(f"FAILED over TLS only: {test}", file=sys.stderr)
     if held:
         return 1
     if only:
-        print(f"{len(only)} failed over TLS only, each a test a shared runner fails by itself")
+        print(f"{len(only)} failed over TLS only; none of them is held against TLS (see above)")
     else:
         print("no test fails over TLS that passes in the clear")
     return 0

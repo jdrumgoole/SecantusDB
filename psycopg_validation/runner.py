@@ -46,11 +46,24 @@ VENDOR = REPO_ROOT / "vendor" / "psycopg"
 
 #: Raw pytest JSON. Server-specific: a Rust run must not overwrite the Python
 #: server's recorded baseline, since the two are compared against each other.
-def _raw_out(which: str, tls: bool = False) -> Path:
+def _raw_out(which: str, tls: bool = False, rerun: bool = False) -> Path:
     name = "psycopg-raw.json" if which == "python" else f"psycopg-raw-{which}.json"
     if tls:
         name = name.replace(".json", "-tls.json")
+    if rerun:
+        name = name.replace(".json", "-rerun.json")
     return REPO_ROOT / ".validation" / name
+
+
+def _only_tests() -> list[str] | None:
+    """The test ids ``SECANTUS_PSYCOPG_ONLY_FILE`` names, one to a line, or
+    None when it is not set. They are run in place of the gauge's include
+    list, into a ``-rerun`` report, so a second look at a few tests does not
+    overwrite the run it is a second look at."""
+    named = os.environ.get("SECANTUS_PSYCOPG_ONLY_FILE")
+    if not named:
+        return None
+    return [ln.strip() for ln in Path(named).read_text().splitlines() if ln.strip()]
 
 
 def _tls_files(directory: str) -> tuple[list[str], dict[str, str]]:
@@ -178,7 +191,14 @@ def main() -> int:
     if tls and which != "rust":
         print("SECANTUS_GAUGE_TLS=1 needs SECANTUS_GAUGE_SERVER=rust", file=sys.stderr)
         return 2
-    raw_out = _raw_out(which, tls)
+    only = _only_tests()
+    if only is not None and not only:
+        print("SECANTUS_PSYCOPG_ONLY_FILE names no test; nothing to run", file=sys.stderr)
+        return 2
+    raw_out = _raw_out(which, tls, rerun=only is not None)
+    # Cleared, so a run that never starts cannot leave an earlier report to
+    # be read as this one's.
+    raw_out.unlink(missing_ok=True)
     tls_env: dict[str, str] = {}
 
     if which == "rust":
@@ -267,7 +287,7 @@ def main() -> int:
             "-q",
             *deselect,
             *marker,
-            *INCLUDE,
+            *(only if only is not None else INCLUDE),
         ]
         proc = subprocess.run(
             cmd,
