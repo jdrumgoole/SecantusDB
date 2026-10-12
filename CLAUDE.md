@@ -324,6 +324,8 @@ one request path:
     (~20 min; it writes `.validation/psycopg-raw-rust.json`, a *different* file
     from the Python server's — do not use `invoke validate-psycopg`, which
     hardcodes the Python path and would overwrite the Python report).
+    `./inv validate-psycopg-rust` is the same run, followed by a check that
+    every test it started reported a result.
   - **Do not compare that to the Python PG server's published 98.6%.** That report
     predates the widening of this gauge: it covers 39 modules / 4,238 tests, this
     run covers 72 / 5,729. Re-run both before putting them in one sentence.
@@ -656,12 +658,51 @@ one request path:
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
     With joins, subqueries (correlated too), CTEs, window functions, views,
-    indexes, `ALTER TABLE`, sequences and `information_schema` landed, the
-    next levers are the function surface (`fts`, `jsonpath_number`,
-    `json_record`, `datetimes`, `char_padding` and the statistical
-    aggregates are the corpora with the most divergences -- run
-    `tools/probes/pg_differential.py ... --rust` over `pg_corpora/` for the
-    current counts rather than trusting a number here).
+    indexes, `ALTER TABLE`, sequences and `information_schema` landed, what
+    is left is the function surface, and it is measured two ways.
+
+    **The corpora are nearly clean, and that says less than it looks.**
+    Measured 2026-10-12, all 261 corpora under `pg_corpora/` through
+    `tools/probes/pg_differential.py ... --rust`: 13 divergences in
+    9,737 checks. An earlier version of this paragraph named `fts`,
+    `datetimes` and `char_padding` as the corpora with the most divergences;
+    each was at none when measured. A corpus holds the statements somebody
+    thought to write, so a clean corpus is silent about the rest.
+
+    **`tools/probes/pg_builtin_coverage.py` measures the rest.** It calls
+    every immutable or stable function in PostgreSQL 15's `pg_proc` on both
+    servers, with one sample value for each argument type. On 2026-10-12, of
+    the 1,935 it can call, 619 answered the same before the batch of that
+    day and 1,439 after it. That first run found `sum(interval)` answering
+    zero, `substr` over a `bytea` answering the bytes' debug text and
+    `mod(7.5, 2)` answering 1, none of which a corpus line had asked. Its
+    summary splits what is still refused by what in the catalog refers to
+    the function (an operator, a type's input and output, an index), so
+    the functions a statement calls by name are counted on their own; run
+    it for the current list. `pg_corpora/builtin_coverage.sql` pins what
+    that batch fixed, with PostgreSQL 15.19's answers recorded beside it
+    (`--record`), and `tests/test_rust_pg_builtin_coverage.py` runs them in
+    CI without a PostgreSQL.
+
+    Three rules from that batch:
+
+    - **A built-in is picked by its argument TYPES, and the name-keyed
+      tables cannot do that.** `substr(bytea, int)` reached the text
+      `substr` and rendered the bytes first. An overload the name alone
+      does not settle goes in `secantus-pgplan/src/builtins.rs`, which is
+      asked before the name-keyed paths in all three places a call is
+      planned: the expression evaluator, a FROM-less select list, and a
+      call over one column.
+    - **Every operator is a function too**, and a call by that name
+      (`int4pl(a, b)`) is rewritten into the operator before planning
+      (`builtin_alias.rs`, from PostgreSQL 15's `pg_operator`). The table
+      holds only names measured as refused, and not one with a VARIADIC
+      overload: `jsonb_extract_path(j, 'a')` is the path's first step, and
+      rewriting it to `j #> 'a'` broke a call that had worked.
+    - **Run the corpora one at a time against a shared reference.** Four
+      at once reported 39 divergences where there were 13: an event
+      trigger in one corpus fires for another's DDL, and two corpora that
+      create one schema drop it under each other.
   - TLS since 2026-10-10 (`--tls-cert-file` / `--tls-key-file`,
     `PgBuilder::tls`; rustls with the `ring` provider, in
     `crates/secantus-pg/src/tls.rs`). Since 2026-10-11 also SCRAM channel
@@ -683,7 +724,13 @@ one request path:
     `pg-oracle` lane installs. **Without that variable it SKIPS**, so a
     green local suite says nothing about a login change: run it by name.
     `SECANTUS_GAUGE_TLS=1` gives the psycopg gauge a TLS run, written to
-    `.validation/psycopg-raw-rust-tls.json`.
+    `.validation/psycopg-raw-rust-tls.json`. `./inv validate-psycopg-rust
+    --tls` runs the plain gauge and then that one, and
+    `.github/workflows/psycopg-tls.yml` does the same on Linux each week
+    and on a PR that touches the TLS code; both fail on a run that stopped
+    short and on a test that fails over TLS only
+    (`psycopg_validation/check_run.py`). The embedded Python handle takes
+    the TLS and `pg_hba.conf` options since 2026-10-12.
     `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
     pass SCRAM-SHA-256; a role with none, and an unknown user, are still

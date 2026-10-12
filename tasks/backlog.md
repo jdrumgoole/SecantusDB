@@ -4871,6 +4871,102 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
+      (2026-10-12).** The probe calls every immutable or stable function in
+      PostgreSQL 15.19's `pg_proc` on both servers with one sample value
+      for each argument type. Of the 1,935 it can call, 619 answered the
+      same before the batch of 2026-10-12 and 1,439 after it; 428 are still
+      refused (42883 or 0A000) and 68 differ some other way. 325 more
+      read the server's own state and are not called, and 722 take a type
+      the probe has no sample for (`internal`, `cstring`, `record`,
+      `aclitem`, `regproc`, `xml`, `refcursor` and others), so nothing
+      here is said of them. Re-run it before working an item: the lists
+      below are from that day.
+
+      **Wrong answers the probe found and that batch did NOT fix** (each
+      is silent, so each is worth more than a refusal):
+      - `pg_lsn + numeric`, `pg_lsn - numeric` and `numeric + pg_lsn`
+        answer a `numeric` (`'0/16'::pg_lsn + 1.5` is 23.5, where
+        PostgreSQL answers `0/18`).
+      - `lseg ?# lseg` is true for two identical segments; PostgreSQL
+        answers false.
+      - `line <-> point` differs in the last digit (0.7071067811865475
+        against ...476), which is the FMA rule in `CLAUDE.md` again.
+      - `ts_headline` over `json` / `jsonb` answers the document's text as
+        `text`; PostgreSQL answers the document, of its own type, with the
+        headline applied to each string value.
+      - `"char"(int4)` and `"char"(text)` answer a `bpchar` of the whole
+        value; PostgreSQL answers one byte.
+      - `pg_relation_is_publishable` is true for a catalog relation.
+      - `array_agg` over an array column takes a NULL array, and arrays
+        of different lengths; PostgreSQL refuses the first (22004 `cannot
+        accumulate null arrays`) and the second (2202E `cannot accumulate
+        arrays of different dimensionality`).
+      - A function call PostgreSQL refuses for its argument types can
+        run: `int4pl(1.5, 2)` is `1.5 + 2` here and 42883 there
+        (`builtin_alias.rs` casts a literal the parameter would coerce and
+        leaves every other argument as it is).
+
+      **Refused where PostgreSQL answers, called by name** (57
+      signatures): `unnest` of a multirange and of a tsvector;
+      `setweight(tsvector, "char")` and `ts_filter` with a `"char"`
+      argument typed as such; `ts_rewrite` with three queries;
+      `json[b]_to_tsvector` with a filter; `ts_debug`, `ts_parse`,
+      `ts_token_type`; `json[b]_populate_record[set]` in a select list;
+      `range_merge` of a multirange; the `*_canonical` and `*_subdiff`
+      range functions; `like_escape`; `table_to_xml`, `schema_to_xml`,
+      `database_to_xml` and their schema forms; `pg_relation_is_updatable`,
+      `pg_is_other_temp_schema`, `pg_settings_get_flags`, `acldefault`,
+      `makeaclitem`, `mxid_age`. `json[b]_each[_text]` in a select list is
+      XX000 `a result row has more columns than its description`, an
+      internal error where PostgreSQL answers a record.
+
+      **Refused OPERATORS the probe reached through their functions** (82
+      signatures; each is `0A000` or `operator does not exist`):
+      - multirange `-|-`, `<<`, `>>`, `&<`, `&>` and its ordering
+        comparisons (`<`, `<=`, `>`, `>=`), with a multirange or a range
+        on either side;
+      - `macaddr` and `macaddr8` `&`, `|`, `~`;
+      - the text pattern comparisons `~<~`, `~<=~`, `~>=~`, `~>~`;
+      - `date + timetz` and `timetz + date`;
+      - geometric: `box # box`, `box <^ box`, `box >^ box`, circle
+        `&<` / `&>` / `&<|` / `|&>`, the closest-point operator `##` for
+        six pairs of types, `<->` between a line or a box and a segment,
+        `line # line`, `line ?# box`, `lseg ?# line`, the `path` count
+        comparisons, `point <> point`;
+      - `tsquery @> tsquery` and `<@` by their function names;
+      - `json[b]_extract_path[_text]` and `jsonb_delete` given their
+        path as `VARIADIC array`.
+
+      **Casts by function name** (12): `time(interval)`, `cidr(inet)`,
+      `int4("char")`, `pg_lsn(numeric)`, and the length-coercion forms
+      (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`,
+      `timestamp(timestamp, int4)` and the like) are refused or wrong.
+
+      **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
+      `byteacmp` answer what the C library's `memcmp` returns, which is
+      14 for `bttextcmp('b', 'a')` on macOS and 1 elsewhere; the `tid`
+      type does not exist here, so its six comparisons and `min` / `max`
+      over it are 42704; the type input and output functions (117), the
+      index support functions (103) and the aggregates' own transition
+      functions (57) take or return `cstring` and `internal` and are not
+      called by a statement.
+
+      **Error texts** (30): PostgreSQL 15 reworded `date_part` /
+      `date_trunc` / `extract` of an unknown unit to `unit "x" not
+      recognized for type timestamp with time zone`; this server still
+      says 14's `timestamp with time zone units "x" not recognized`. The
+      corpora that pin those lines are measured against the PostgreSQL 14
+      reference, so changing the text moves them to
+      `# reference-version: 15` in the same change. `date_part` and
+      `extract` of a `timetz` with an unknown unit are 22007 here, a
+      different error. A `jsonb` object or array cast to a number or a
+      boolean is 22P02 `invalid input syntax` here and 22023 `cannot cast
+      jsonb object to type integer` there. `make_timestamptz` with a zone
+      name that is none, `substring(s, pattern, escape)` with an escape
+      longer than one character, and `ts_headline` with options that do
+      not parse all answer where PostgreSQL refuses.
+
 - [ ] **OPEN — the Go gauge's 7 remaining failures, triaged (2026-09-29,
       re-measured 2026-09-30).** These were invisible until the truncation fix:
       the run was killed at 476 of 481 tests and the survivors scored 100.0%, so

@@ -2,8 +2,8 @@
 
 A new probe calls every immutable or stable function in PostgreSQL 15's
 `pg_proc` on PostgreSQL and on the Rust PostgreSQL server, with one sample
-value for each argument type. Of the 1,935 functions it can call, COV_BEFORE
-answered the same before this change and COV_AFTER answer the same after it.
+value for each argument type. Of the 1,935 functions it can call, 619
+answered the same before this change and 1,439 answer the same after it.
 The corpora written by hand had not reached most of what it found.
 
 #### Fixed
@@ -14,6 +14,8 @@ The corpora written by hand had not reached most of what it found.
 - `substr`, `substring`, `overlay`, `md5`, `btrim`, `ltrim`, `rtrim` and
   `trim` over a `bytea` ran the text function over a rendering of the
   bytes, or were refused. They are the `bytea` functions now.
+- `bytea LIKE bytea` answered NULL. It matches bytes, with `%` and `_` as
+  the wildcards.
 - `mod(7.5, 2)` answered 1 and `div(9.9, 0.3)` was a division by zero: both
   truncated their arguments to integers first.
 - `smallint` arithmetic answered `integer`, and never overflowed. It
@@ -50,7 +52,7 @@ The corpora written by hand had not reached most of what it found.
   `convert` (UTF8, LATIN1 and SQL_ASCII), `multirange(range)`,
   `trunc(macaddr)`, `trunc(macaddr8)` and `macaddr8_set7bit`.
 - A built-in called by the name of the function behind an operator:
-  `int4pl(a, b)` is `a + b`, `texteq`, `int48lt`, `textlike` and about 750
+  `int4pl(a, b)` is `a + b`, `texteq`, `int48lt`, `textlike` and about 740
   more, from PostgreSQL 15's `pg_operator`. Also the `*larger` /
   `*smaller` functions behind `max` / `min`, the numeric and date `*cmp`
   functions, and names such as `textlen`, `dexp` and `numeric_sqrt`.
@@ -73,7 +75,7 @@ The corpora written by hand had not reached most of what it found.
   error now.
 
 `tools/probes/pg_builtin_coverage.py` is the probe.
-`tools/probes/pg_corpora/builtin_coverage.sql` holds 135 statements over
+`tools/probes/pg_corpora/builtin_coverage.sql` holds 153 statements over
 what changed, with PostgreSQL 15.19's answers recorded beside it, and
 `tests/test_rust_pg_builtin_coverage.py` holds the server to them in CI.
 What the probe still reports is in `tasks/backlog.md`.

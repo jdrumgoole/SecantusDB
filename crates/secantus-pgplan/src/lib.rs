@@ -25,6 +25,8 @@ pub mod arrays;
 pub mod bits;
 mod builtin_alias;
 mod builtins;
+mod builtins_regex;
+mod builtins_text;
 pub mod bytea;
 pub mod catalog_stmts;
 pub mod correlated;
