@@ -1,6 +1,6 @@
 # pymongo async Validation Report
 
-Measured 2026-10-09 (raw artifact), generated 2026-10-09 — SecantusDB 0.7.0b2 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Measured 2026-10-12 (raw artifact), generated 2026-10-12 — SecantusDB 0.7.0b2 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the async sibling of the headline pymongo gauge: it drives pymongo's native `AsyncMongoClient` API (the async/await wire path that replaced Motor) over the same in-scope CRUD / cursor / change-stream / command-monitoring surface. A gap versus `docs/validation-report.md` means the async code path exercises something the sync path doesn't.
 
