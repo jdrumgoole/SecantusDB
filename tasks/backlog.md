@@ -4905,15 +4905,24 @@ These are explicit non-goals. Don't add them without a reason.
       - `test_concurrency_async.py::test_type_error_shadow` hit the 20 s
         per-test timeout in all three completed runs.
 
+      - Later runs each failed something else once: 3 and 5, then 10 and
+        10 (PR #1905), where
+        `test_concurrency_async.py::test_eintr[ITIMER_REAL-SIGALRM]` failed
+        over TLS only. Its client script was killed by its own interval
+        timer, which fires every 0.25 s and can land while the interpreter
+        is shutting down; nothing the server answered.
+
       What the lane gates, given that: a run that stopped short, and a
-      test that fails over TLS only, apart from `::test_notify*`,
-      `::test_notifies` and `::test_leak` (`SHARED_RUNNER_NOISE` in
-      `psycopg_validation/check_run.py`, applied only with
-      `--shared-runner`). In run 2 five of those failed over TLS and
-      passed in the clear, which is the noise above and not TLS. **So a
-      change that delays NOTIFY over TLS only would not fail that lane**;
-      `./inv validate-psycopg-rust --tls` on a developer's machine holds
-      every test to it. Nothing gates the plain number on Linux.
+      test that fails over TLS, passes in the clear, **and fails over TLS
+      again when run again by itself**. `::test_notify*`,
+      `::test_notifies` and `::test_leak` are left out of that by name
+      (`SHARED_RUNNER_NOISE` in `psycopg_validation/check_run.py`, applied
+      only with `--shared-runner`), because they fail in most runs in
+      either transport. **So a change that delays NOTIFY over TLS only
+      would not fail that lane**, and neither would a TLS fault that shows
+      once in two tries; `./inv validate-psycopg-rust --tls` on a
+      developer's machine holds every test to one run. Nothing gates the
+      plain number on Linux.
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
       (2026-10-12).** The probe calls every immutable or stable function in
