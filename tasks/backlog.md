@@ -4379,6 +4379,16 @@ These work end-to-end but cut corners.
     psycopg gauge has a TLS run (`SECANTUS_GAUGE_TLS=1`): 5,544 pass and
     none fail of 5,731, the plain run's counts (2026-10-12, macOS, psycopg
     3.3.4, 1,073 s, on the tree of 0.1.0-beta.12). What that leaves:
+    - **`pg_login_tls_files.py` failed once in CI, 479 of 480** (2026-10-12,
+      `pg-oracle` on PR #1900, a MongoDB version bump that touches no
+      PostgreSQL code; the same lane passed on #1899 an hour earlier). In
+      `crl intermediate only`, "good cert, first answer", PostgreSQL 15.19
+      gave the client `SSLEOFError` (the connection closed) where it
+      normally sends, and this server sent, the `unknown ca` alert. So the
+      reference's answer is not stable for a refused certificate: whether
+      the client reads the alert or the close is a race on PostgreSQL's
+      side. Not reproduced or fixed; the comparison should treat the two
+      as one answer, or it will fail again.
     - **The TLS gauge run is by hand.** No CI lane and no `invoke` task
       runs it, and it sets `PGSSLMODE` for libpq, so a test that names its
       own `sslmode` is not moved onto TLS by it.
