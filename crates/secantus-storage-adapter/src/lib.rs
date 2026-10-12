@@ -416,6 +416,30 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn delete_matching_hinted(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        let_vars: &Document,
+        collation: Option<&Collation>,
+        hint: Option<RawHint<'_>>,
+    ) -> Result<usize, StorageError> {
+        let resolved = hint.map(to_hint);
+        self.inner
+            .delete_matching_hinted(
+                db,
+                coll,
+                filter,
+                limit,
+                let_vars,
+                collation,
+                resolved.as_ref(),
+            )
+            .map_err(map_err)
+    }
+
     fn count_matching(
         &self,
         db: &str,

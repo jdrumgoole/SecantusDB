@@ -97,41 +97,393 @@ fn id_type_error(index: usize, type_name: &str) -> Document {
     }
 }
 
-/// The `_id`-may-not-contain-`$`-prefixed-fields pre-check run over raw BSON
-/// (no full decode). Mirrors the decoded path exactly: reports the `_id`
-/// sub-document's first key when *any* key is `$`-prefixed.
-fn raw_id_dollar_key_error(raw: &[u8], index: usize) -> Option<Document> {
+/// The first `$`-prefixed field name inside an `_id` document, at any depth
+/// and through arrays, in document order. A DBRef's `$ref` / `$id` / `$db`
+/// are allowed where the document has both `$ref` and `$id`. Measured 8.2.11
+/// (2026-10-12): `{_id: {a: {$b: 1}}}` is refused for `$b`, and
+/// `{_id: {x: 1, $y: 2}}` for `$y`. Only the top level was looked at, and the
+/// name reported was the document's first key.
+fn id_dollar_field(id: &Document) -> Option<String> {
+    fn within(value: &Bson) -> Option<String> {
+        match value {
+            Bson::Document(d) => id_dollar_field(d),
+            Bson::Array(items) => items.iter().find_map(within),
+            _ => None,
+        }
+    }
+    let dbref = id.contains_key("$ref") && id.contains_key("$id");
+    for (key, value) in id {
+        let reference = dbref && matches!(key.as_str(), "$ref" | "$id" | "$db");
+        if key.starts_with('$') && !reference {
+            return Some(key.clone());
+        }
+        if let Some(found) = within(value) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn id_dollar_error(index: usize, field: &str) -> Document {
+    doc! {
+        "index": index as i32,
+        "code": 52,
+        "errmsg": format!(
+            "_id fields may not contain '$'-prefixed fields: {field} is not valid for storage."
+        ),
+    }
+}
+
+/// The deepest a stored document may nest, the document itself counting as
+/// one. mongod refuses an insert past it with 15 (measured 8.2.11,
+/// 2026-10-12); these were stored.
+const MAX_NESTING_DEPTH: usize = 180;
+
+/// A document nested to the limit holds at least this many bytes: eight for
+/// each level. A shorter one is not walked.
+const DEEP_DOCUMENT_BYTES: usize = MAX_NESTING_DEPTH * 8;
+
+fn too_deep(value: &Bson, above: usize) -> bool {
+    match value {
+        Bson::Document(d) => {
+            above + 1 > MAX_NESTING_DEPTH || d.values().any(|v| too_deep(v, above + 1))
+        }
+        Bson::Array(a) => above + 1 > MAX_NESTING_DEPTH || a.iter().any(|v| too_deep(v, above + 1)),
+        _ => false,
+    }
+}
+
+fn raw_too_deep(value: bson::RawBsonRef<'_>, above: usize) -> bool {
+    match value {
+        bson::RawBsonRef::Document(d) => {
+            above + 1 > MAX_NESTING_DEPTH
+                || d.iter().flatten().any(|(_, v)| raw_too_deep(v, above + 1))
+        }
+        bson::RawBsonRef::Array(a) => {
+            above + 1 > MAX_NESTING_DEPTH
+                || a.into_iter().flatten().any(|v| raw_too_deep(v, above + 1))
+        }
+        _ => false,
+    }
+}
+
+fn too_deep_error(index: usize) -> Document {
+    doc! {
+        "index": index as i32,
+        "code": 15,
+        "errmsg": format!(
+            "cannot insert document because it exceeds {MAX_NESTING_DEPTH} levels of nesting"
+        ),
+    }
+}
+
+/// The `_id` and nesting pre-checks run over raw BSON (no full decode): an
+/// `_id` mongod cannot hold, a `$`-prefixed field inside an `_id` document,
+/// a document nested past the limit.
+fn raw_document_error(raw: &[u8], index: usize) -> Option<Document> {
     let rd = bson::RawDocument::from_bytes(raw).ok()?;
-    let idd = match rd.get("_id") {
-        Ok(Some(bson::RawBsonRef::Document(idd))) => idd,
+    match rd.get("_id") {
+        Ok(Some(bson::RawBsonRef::Document(idd))) => {
+            if let Some(field) = Document::try_from(idd)
+                .ok()
+                .and_then(|id| id_dollar_field(&id))
+            {
+                return Some(id_dollar_error(index, &field));
+            }
+        }
         Ok(Some(bson::RawBsonRef::Array(_))) => return Some(id_type_error(index, "array")),
         Ok(Some(bson::RawBsonRef::RegularExpression(_))) => {
             return Some(id_type_error(index, "regex"))
         }
-        _ => return None,
+        _ => {}
+    }
+    if raw.len() >= DEEP_DOCUMENT_BYTES && raw_too_deep(bson::RawBsonRef::Document(rd), 0) {
+        return Some(too_deep_error(index));
+    }
+    None
+}
+
+/// A double as C's `%g` writes it: six significant digits, trailing zeros
+/// dropped, an exponent below 1e-4 and from 1e+6. mongod prints a `limit` it
+/// refuses this way: `2.14748e+09`, `1e+06`, `0.1`.
+fn fmt_g(x: f64) -> String {
+    if x.is_nan() {
+        return "nan".to_string();
+    }
+    if x.is_infinite() {
+        return (if x > 0.0 { "inf" } else { "-inf" }).to_string();
+    }
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let trim = |s: &str| {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
     };
-    let mut first_key: Option<String> = None;
-    let mut has_dollar = false;
-    for elem in idd.into_iter() {
-        let Ok((k, _)) = elem else { return None };
-        if first_key.is_none() {
-            first_key = Some(k.to_string());
+    let rounded = format!("{x:.5e}");
+    let (mantissa, exp) = rounded.split_once('e').unwrap_or((&rounded, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if (-4..6).contains(&exp) {
+        trim(&format!("{x:.*}", (5 - exp) as usize))
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa), exp.abs())
+    }
+}
+
+/// A delete statement's `limit`: 0 removes every match and 1 the first.
+/// Any other number is refused, written as `%g` writes it; a value that is
+/// not a number reads as before.
+fn delete_limit(value: Option<&Bson>) -> Result<usize, CommandError> {
+    let number = match value {
+        Some(Bson::Int32(n)) => f64::from(*n),
+        Some(Bson::Int64(n)) => *n as f64,
+        Some(Bson::Double(n)) => *n,
+        Some(Bson::Decimal128(n)) => n.to_string().parse().unwrap_or(f64::NAN),
+        other => other.and_then(as_i64).unwrap_or(0) as f64,
+    };
+    if number == 0.0 {
+        Ok(0)
+    } else if number == 1.0 {
+        Ok(1)
+    } else {
+        Err(CommandError::new(
+            9,
+            "FailedToParse",
+            format!(
+                "The limit field in delete objects must be 0 or 1. Got {}",
+                fmt_g(number)
+            ),
+        ))
+    }
+}
+
+/// What mongod refuses about an `insert` or `delete` command's own fields
+/// before it runs anything, reading the fields in the order the command has
+/// them: an unknown field, a wrong type, a statement that is not a document
+/// or lacks `q` or `limit`, a `limit` that is not 0 or 1. Measured 8.2.11,
+/// 2026-10-12. Each was accepted before, and for `delete` that meant a
+/// statement with no `limit` removed every matching document, and the
+/// statements ahead of a bad one were applied.
+///
+/// `in_sequence` says the statements arrived in a document sequence of the
+/// message and are not in the command body.
+fn write_command_problem(doc: &Document, command: &str, in_sequence: bool) -> Option<CommandError> {
+    const INSERT_FIELDS: &[&str] = &[
+        "documents",
+        "ordered",
+        "bypassDocumentValidation",
+        "stmtIds",
+        "encryptionInformation",
+        "bypassEmptyTsReplacement",
+        "collectionUUID",
+        "originalQuery",
+        "originalCollation",
+        "rawData",
+    ];
+    const DELETE_FIELDS: &[&str] = &[
+        "deletes",
+        "ordered",
+        "bypassDocumentValidation",
+        "let",
+        "stmtIds",
+        "encryptionInformation",
+        "bypassEmptyTsReplacement",
+        "runtimeConstants",
+        "legacyRuntimeConstants",
+        "collectionUUID",
+        "originalQuery",
+        "originalCollation",
+        "rawData",
+    ];
+    const DELETE_STATEMENT_FIELDS: &[&str] = &["q", "limit", "collation", "hint", "sampleId"];
+    let (array, known) = if command == "insert" {
+        ("documents", INSERT_FIELDS)
+    } else {
+        ("deletes", DELETE_FIELDS)
+    };
+    let wrong_type = |path: String, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let missing = |path: String| {
+        CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            format!("BSON field '{path}' is missing but a required field"),
+        )
+    };
+    let unknown = |path: String| {
+        CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field '{path}' is an unknown field."),
+        )
+    };
+    let statement_problem = |statement: &Document| -> Option<CommandError> {
+        for (key, value) in statement {
+            match key.as_str() {
+                "q" if !matches!(value, Bson::Null | Bson::Document(_)) => {
+                    return Some(wrong_type("delete.deletes.q".to_string(), value, "object"))
+                }
+                "collation" if !matches!(value, Bson::Null | Bson::Document(_)) => {
+                    return Some(wrong_type(
+                        "delete.deletes.collation".to_string(),
+                        value,
+                        "object",
+                    ))
+                }
+                "hint" if !matches!(value, Bson::String(_) | Bson::Document(_)) => {
+                    return Some(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "Hint must be a string or an object",
+                    ))
+                }
+                "sampleId" if !matches!(value, Bson::Null | Bson::Binary(_)) => {
+                    return Some(wrong_type(
+                        "delete.deletes.sampleId".to_string(),
+                        value,
+                        "binData",
+                    ))
+                }
+                name if !name.starts_with('$') && !DELETE_STATEMENT_FIELDS.contains(&name) => {
+                    return Some(unknown(format!("delete.deletes.{name}")))
+                }
+                _ => {}
+            }
         }
-        if k.starts_with('$') {
-            has_dollar = true;
+        if !statement.contains_key("limit") {
+            return Some(missing("delete.deletes.limit".to_string()));
+        }
+        if matches!(statement.get("q"), None | Some(Bson::Null)) {
+            return Some(missing("delete.deletes.q".to_string()));
+        }
+        delete_limit(statement.get("limit")).err()
+    };
+    let mut given = in_sequence;
+    for (key, value) in doc {
+        match key.as_str() {
+            name if name == command || name.starts_with('$') => {}
+            name if name == array => match value {
+                Bson::Null => {}
+                Bson::Array(items) => {
+                    given = true;
+                    for (index, item) in items.iter().enumerate() {
+                        match item {
+                            // A null among them is no statement at all.
+                            Bson::Null => {}
+                            Bson::Document(statement) => {
+                                if command == "delete" {
+                                    if let Some(problem) = statement_problem(statement) {
+                                        return Some(problem);
+                                    }
+                                }
+                            }
+                            other => {
+                                return Some(wrong_type(
+                                    format!("{command}.{array}.{index}"),
+                                    other,
+                                    "object",
+                                ))
+                            }
+                        }
+                    }
+                }
+                other => return Some(wrong_type(format!("{command}.{array}"), other, "array")),
+            },
+            "ordered" => {
+                if let Err(e) =
+                    argtypes::require_bool_field(doc, "ordered", &format!("{command}.ordered"))
+                {
+                    return Some(e);
+                }
+            }
+            "bypassDocumentValidation" => {
+                if let Err(e) = argtypes::require_bool_or_number(
+                    doc,
+                    "bypassDocumentValidation",
+                    &format!("{command}.bypassDocumentValidation"),
+                ) {
+                    return Some(e);
+                }
+            }
+            "bypassEmptyTsReplacement" => {
+                if let Some(e) = empty_ts_flag_problem(doc) {
+                    return Some(e);
+                }
+            }
+            "let" if command == "delete" => {
+                if !matches!(value, Bson::Null | Bson::Document(_)) {
+                    return Some(wrong_type("delete.let".to_string(), value, "object"));
+                }
+            }
+            "isTimeseriesNamespace" => {
+                if matches!(value, Bson::Boolean(true)) {
+                    return Some(CommandError::new(
+                        5916400,
+                        "Location5916400",
+                        "'isTimeseriesNamespace' parameter can only be set when the request is \
+                         sent on system.buckets namespace",
+                    ));
+                }
+            }
+            "encryptionInformation" => {
+                if matches!(value, Bson::Document(e) if !e.contains_key("schema")) {
+                    return Some(missing(format!("{command}.encryptionInformation.schema")));
+                }
+            }
+            name => {
+                if !known.contains(&name) && !argtypes::is_generic_field(name) {
+                    return Some(unknown(format!("{command}.{name}")));
+                }
+            }
         }
     }
-    if !has_dollar {
-        return None;
+    if !given {
+        return Some(missing(format!("{command}.{array}")));
     }
-    let first = first_key.unwrap_or_default();
-    Some(doc! {
-        "index": index as i32,
-        "code": 52,
-        "errmsg": format!(
-            "_id fields may not contain '$'-prefixed fields: {first} is not valid for storage."
-        ),
-    })
+    None
+}
+
+/// `bypassEmptyTsReplacement` is a bool on every write command that takes it.
+fn empty_ts_flag_problem(doc: &Document) -> Option<CommandError> {
+    match doc.get("bypassEmptyTsReplacement") {
+        None | Some(Bson::Null) | Some(Bson::Boolean(_)) => None,
+        Some(other) => Some(CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "Field 'bypassEmptyTsReplacement' should be a boolean value, but found: {}",
+                secantus_core::query::bson_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// The documents or statements of a write, without the nulls mongod drops.
+fn write_statements<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
+    match doc.get(field) {
+        Some(Bson::Array(items)) => items.iter().filter(|v| !matches!(v, Bson::Null)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn empty_batch_error() -> CommandError {
+    CommandError::new(
+        16,
+        "InvalidLength",
+        "Write batch sizes must be between 1 and 100000. Got 0 operations.",
+    )
 }
 
 /// Raw-BSON write path: store the client's insert documents verbatim (the byte
@@ -183,6 +535,7 @@ fn insert_raw_path(
     raw_docs: Vec<Vec<u8>>,
     ordered: bool,
     validator: Option<&Document>,
+    fill_timestamps: bool,
     storage: &dyn crate::Storage,
 ) -> HandlerResult {
     if raw_docs.is_empty() {
@@ -197,7 +550,7 @@ fn insert_raw_path(
     let mut surviving: Vec<Vec<u8>> = Vec::new();
     let mut survivor_to_orig: Vec<usize> = Vec::new();
     for (index, raw) in raw_docs.into_iter().enumerate() {
-        if let Some(err) = raw_id_dollar_key_error(&raw, index) {
+        if let Some(err) = raw_document_error(&raw, index) {
             pre_errors.push(err);
             if ordered {
                 break;
@@ -223,7 +576,7 @@ fn insert_raw_path(
                 }
             }
         }
-        let raw = if raw_has_empty_timestamp(&raw) {
+        let raw = if fill_timestamps && raw_has_empty_timestamp(&raw) {
             match secantus_core::bsondoc::from_bytes(&raw[..])
                 .ok()
                 .and_then(|d| fill_empty_timestamps(&d, storage))
@@ -267,26 +620,205 @@ fn empty_batch(doc: &Document, field: &str) -> Result<(), CommandError> {
     }
 }
 
+/// A `$text` query needs a text index, and this server builds none: mongod's
+/// answer where there is none is 27 (measured 8.2.11, 2026-10-12).
+pub(crate) fn text_query_problem(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+) -> Option<(i32, String)> {
+    fn asks(filter: &Document) -> bool {
+        filter.iter().any(|(key, value)| match key.as_str() {
+            "$text" => true,
+            "$and" | "$or" | "$nor" => matches!(value, Bson::Array(subs) if subs
+                .iter()
+                .any(|sub| matches!(sub, Bson::Document(d) if asks(d)))),
+            _ => false,
+        })
+    }
+    if !asks(filter) {
+        return None;
+    }
+    if !storage.collection_exists(db, coll).unwrap_or(false) {
+        return Some((
+            27,
+            format!("text index required for $text query (no such collection '{db}.{coll}')"),
+        ));
+    }
+    // An index declared as text is not one this server can search; the
+    // query is left to fail as it did.
+    let declared = storage
+        .list_indexes(db, coll)
+        .unwrap_or_default()
+        .iter()
+        .any(|index| {
+            index
+                .get_document("key")
+                .is_ok_and(|key| key.values().any(|v| v.as_str() == Some("text")))
+        });
+    (!declared).then(|| (27, "text index required for $text query".to_string()))
+}
+
+/// The fields `count` and `distinct` share with every sampled or mirrored
+/// read: a bool `mirrored` and `rawData`, a binData `sampleId`, and an
+/// `encryptionInformation` that has a `schema`. `path` is the name mongod
+/// reports the command's fields under. Measured 8.2.11, 2026-10-12.
+pub(crate) fn read_option_problem(doc: &Document, path: &str) -> Option<CommandError> {
+    for (key, value) in doc {
+        match key.as_str() {
+            "mirrored" | "rawData" if !matches!(value, Bson::Null | Bson::Boolean(_)) => {
+                return Some(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "Field '{key}' should be a boolean value, but found: {}",
+                        secantus_core::query::bson_type_name(value)
+                    ),
+                ))
+            }
+            "sampleId" if !matches!(value, Bson::Null | Bson::Binary(_)) => {
+                return Some(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "BSON field '{path}.sampleId' is the wrong type '{}', expected type \
+                         'binData'",
+                        secantus_core::query::bson_type_name(value)
+                    ),
+                ))
+            }
+            "encryptionInformation" => {
+                if matches!(value, Bson::Document(e) if !e.contains_key("schema")) {
+                    return Some(CommandError::new(
+                        40414,
+                        "IDLFailedToParse",
+                        format!(
+                            "BSON field '{path}.encryptionInformation.schema' is missing but a \
+                             required field"
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `count`'s `limit` as mongod reads it: a whole number that fits 64 bits,
+/// and not the smallest one (its size, which a negative limit means, does
+/// not fit). Measured 8.2.11, 2026-10-12.
+fn count_limit(value: Option<&Bson>) -> Result<i64, CommandError> {
+    let unfit = |shown: String| {
+        CommandError::new(
+            9,
+            "FailedToParse",
+            format!("Cannot represent as a 64-bit integer: limit: {shown}"),
+        )
+    };
+    let whole = |x: f64| x.fract() == 0.0 && (-(2f64.powi(63))..2f64.powi(63)).contains(&x);
+    let limit = match value {
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Double(x)) => {
+            if x.is_nan() {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "Expected an integer, but found NaN in: limit: nan",
+                ));
+            }
+            if x.is_finite() && x.fract() != 0.0 {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!("Expected an integer: limit: {x}"),
+                ));
+            }
+            if !whole(*x) {
+                return Err(unfit(secantus_core::query::fmt_double_parse(*x)));
+            }
+            *x as i64
+        }
+        Some(Bson::Decimal128(d)) => {
+            let x: f64 = d.to_string().parse().unwrap_or(f64::NAN);
+            if !whole(x) {
+                return Err(unfit(d.to_string()));
+            }
+            x as i64
+        }
+        _ => 0,
+    };
+    if limit == i64::MIN {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            "limit value for count cannot be min long",
+        ));
+    }
+    Ok(limit)
+}
+
+/// `count`'s `skip` as mongod reads it: a double is cut to its whole part, a
+/// decimal is rounded to the nearest whole number (a half to the even one),
+/// NaN is 0, and a number past 64 bits is the largest that fits.
+fn count_skip(value: Option<&Bson>) -> i64 {
+    match value {
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Double(x)) => *x as i64,
+        Some(Bson::Decimal128(d)) => d
+            .to_string()
+            .parse::<f64>()
+            .map_or(0, |x| x.round_ties_even() as i64),
+        _ => 0,
+    }
+}
+
 pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "insert")?;
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
     }
-    argtypes::require_bool_field(doc, "ordered", "insert.ordered")?;
     argtypes::require_object(doc, "writeConcern", "insert.writeConcern")?;
-    // `bypassDocumentValidation` is the bool-OR-number family (`1.5` is valid),
-    // not the strict bool of `ordered` on the same command.
-    argtypes::require_bool_or_number(
-        doc,
-        "bypassDocumentValidation",
-        "insert.bypassDocumentValidation",
-    )?;
     // Take the raw-BSON write side-channel first, releasing the `&mut` borrow
     // before the immutable `storage()` / `db_name` borrows below.
     let raw_docs = ctx.raw_insert_documents.take();
+    if let Some(problem) = write_command_problem(doc, "insert", raw_docs.is_some()) {
+        return Err(problem);
+    }
     let db = ctx.db_name.clone();
     let storage = ctx.storage()?;
     let ordered = bool_field(doc, "ordered", true);
+    // `bypassEmptyTsReplacement: true` stores a `Timestamp(0, 0)` as given.
+    let fill_timestamps = !matches!(
+        doc.get("bypassEmptyTsReplacement"),
+        Some(Bson::Boolean(true))
+    );
+    // The buckets of a time-series collection that does not exist: mongod
+    // will not create them from an insert (20, per document).
+    if coll.starts_with("system.buckets.") && !storage.collection_exists(&db, &coll).unwrap_or(true)
+    {
+        let count = match &raw_docs {
+            Some(raw) => raw.len(),
+            None => write_statements(doc, "documents").len(),
+        };
+        if count == 0 {
+            return Err(empty_batch_error());
+        }
+        let refused: Vec<Bson> = (0..if ordered { 1 } else { count })
+            .map(|index| {
+                Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": 20,
+                    "errmsg": "Creation of a timeseries bucket collection without timeseries \
+                               options is not allowed",
+                })
+            })
+            .collect();
+        return Ok(doc! { "n": 0_i32, "writeErrors": refused, "ok": 1.0 });
+    }
     // A validator compares under the collection's default collation.
     let default_collation = crate::util::default_collation(storage, &ctx.db_name, &coll);
     let _active = secantus_core::collation::activate(default_collation.as_ref());
@@ -324,7 +856,15 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Raw-BSON write fast path: documents arrived as an un-decoded kind-1 sequence.
     let from_sequence: Option<Vec<Bson>> = match raw_docs {
         Some(raw_docs) if ts_fields.is_none() => {
-            return insert_raw_path(&db, &coll, raw_docs, ordered, validator.as_ref(), storage);
+            return insert_raw_path(
+                &db,
+                &coll,
+                raw_docs,
+                ordered,
+                validator.as_ref(),
+                fill_timestamps,
+                storage,
+            );
         }
         Some(raw_docs) => Some(
             raw_docs
@@ -336,24 +876,20 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None => None,
     };
 
-    // Decoded path: documents inline in the command body.
-    let documents = match (&from_sequence, doc.get("documents")) {
-        (Some(a), _) if !a.is_empty() => a,
-        (None, Some(Bson::Array(a))) if !a.is_empty() => a,
-        // mongod rejects an empty/absent `documents` array with InvalidLength,
-        // which is code **16** — this said 4 (NoSuchKey) under a comment
-        // asserting drivers gate on "this exact code/codeName combo". They
-        // gate on the codeName; the code was simply wrong, and `bulkWrite` in
-        // this same crate already answered 16. Probed on mongod 8.2.11.
-        _ => {
-            return Ok(doc! {
-                "ok": 0.0,
-                "errmsg": "Write batch sizes must be between 1 and 100000. Got 0 operations.",
-                "code": 16,
-                "codeName": "InvalidLength",
-            })
-        }
+    // Decoded path: documents inline in the command body, without the nulls
+    // mongod drops (`[{_id: 1}, null]` inserts one document).
+    let documents: Vec<&Bson> = match &from_sequence {
+        Some(a) => a.iter().collect(),
+        None => write_statements(doc, "documents"),
     };
+    // mongod rejects an empty `documents` array with InvalidLength, which is
+    // code **16** — this said 4 (NoSuchKey) under a comment asserting drivers
+    // gate on "this exact code/codeName combo". They gate on the codeName; the
+    // code was simply wrong, and `bulkWrite` in this same crate already
+    // answered 16. Probed on mongod 8.2.11.
+    if documents.is_empty() {
+        return Ok(empty_batch_error().into_reply());
+    }
 
     // Per-doc pre-checks (no storage): an `_id` may not carry top-level
     // `$`-prefixed keys. A failure is a per-doc writeError keyed by the doc's
@@ -361,7 +897,7 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut pre_errors: Vec<Document> = Vec::new();
     let mut surviving: Vec<Vec<u8>> = Vec::new();
     let mut survivor_to_orig: Vec<usize> = Vec::new();
-    for (index, entry) in documents.iter().enumerate() {
+    for (index, entry) in documents.iter().copied().enumerate() {
         let Bson::Document(d) = entry else {
             // Non-document batch entries are malformed input; mongod rejects
             // them. Surface a per-doc BadValue rather than choking the batch.
@@ -388,21 +924,23 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             continue;
         }
-        if let Some(Bson::Document(id_value)) = d.get("_id") {
-            if id_value.keys().any(|k| k.starts_with('$')) {
-                let first = id_value.keys().next().map(String::as_str).unwrap_or("");
-                pre_errors.push(doc! {
-                    "index": index as i32,
-                    "code": 52,
-                    "errmsg": format!(
-                        "_id fields may not contain '$'-prefixed fields: {first} is not valid for storage."
-                    ),
-                });
-                if ordered {
-                    break;
-                }
-                continue;
+        let id_field = match d.get("_id") {
+            Some(Bson::Document(id_value)) => id_dollar_field(id_value),
+            _ => None,
+        };
+        if let Some(field) = id_field {
+            pre_errors.push(id_dollar_error(index, &field));
+            if ordered {
+                break;
             }
+            continue;
+        }
+        if d.values().any(|v| too_deep(v, 1)) {
+            pre_errors.push(too_deep_error(index));
+            if ordered {
+                break;
+            }
+            continue;
         }
         if let Some(problem) = ts_fields
             .as_ref()
@@ -431,7 +969,12 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
         }
-        surviving.push(match fill_empty_timestamps(d, storage) {
+        let filled = if fill_timestamps {
+            fill_empty_timestamps(d, storage)
+        } else {
+            None
+        };
+        surviving.push(match filled {
             Some(filled) => encode_doc(&filled)?,
             None => encode_doc(d)?,
         });
@@ -456,16 +999,14 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
     }
-    argtypes::require_bool_field(doc, "ordered", "delete.ordered")?;
-    empty_batch(doc, "deletes")?;
-    for spec in array_field(doc, "deletes").iter() {
-        if let Bson::Document(spec) = spec {
-            argtypes::require_object(spec, "collation", "delete.deletes.collation")?;
-            argtypes::require_hint(spec, "hint")?;
-        }
+    if let Some(problem) = write_command_problem(doc, "delete", false) {
+        return Err(problem);
+    }
+    let deletes = write_statements(doc, "deletes");
+    if deletes.is_empty() {
+        return Err(empty_batch_error());
     }
     let storage = ctx.storage()?;
-    let deletes = array_field(doc, "deletes");
     // NOTE: an unresolvable `hint` is a PER-STATEMENT writeError, not a
     // command-level failure. mongod answers `ok: 1` with
     // `writeErrors: [{index, code: 2}]` and applies the other statements in the
@@ -479,9 +1020,36 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut write_errors: Vec<Bson> = Vec::new();
     // Command-level `let` → vars visible to `$expr` in each spec's `q` filter.
     let let_vars = resolve_let_vars(doc.get("let"));
-    for (index, spec) in deletes.iter().enumerate() {
+    // A `let` mongod refuses is reported for each statement it reaches.
+    let let_problem = match doc.get("let") {
+        Some(Bson::Document(vars)) => argtypes::let_problem(vars),
+        _ => None,
+    };
+    for (index, spec) in deletes.iter().copied().enumerate() {
         let Bson::Document(spec) = spec else { continue };
-        argtypes::require_write_statement(spec, "delete")?;
+        let mut refused: Option<(i32, String)> = let_problem.clone();
+        if refused.is_none() {
+            // `{$natural: 2}`, or `$natural` beside another field.
+            refused = argtypes::require_natural_hint(spec.get("hint"))
+                .err()
+                .map(|e| (e.code, e.errmsg));
+        }
+        if refused.is_none() {
+            if let Some(Bson::Document(q)) = spec.get("q") {
+                refused = text_query_problem(storage, &ctx.db_name, &coll, q);
+            }
+        }
+        if let Some((code, errmsg)) = refused {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": code,
+                "errmsg": errmsg,
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         // As in `update`: an undefined `$$variable` in the filter is a
         // per-statement writeError carrying mongod's 17276.
         {
@@ -536,25 +1104,17 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         };
         let _active = secantus_core::collation::activate(collation.as_ref());
         // `limit: 0` ⇒ delete all matches, `1` ⇒ at most one. mongod defines
-        // nothing else and refuses the whole command (measured 8.2.11,
-        // 2026-10-01); `limit: 5` used to delete up to five.
-        let limit = spec.get("limit").and_then(as_i64).unwrap_or(0);
-        if limit != 0 && limit != 1 {
-            return Ok(CommandError::new(
-                9,
-                "FailedToParse",
-                format!("The limit field in delete objects must be 0 or 1. Got {limit}"),
-            )
-            .into_reply());
-        }
-        let limit = limit as usize;
-        match storage.delete_matching_with_let(
+        // nothing else and refuses the whole command before any statement
+        // runs (`write_command_problem`).
+        let limit = delete_limit(spec.get("limit"))?;
+        match storage.delete_matching_hinted(
             &ctx.db_name,
             &coll,
             &filter,
             limit,
             &let_vars,
             collation.as_ref(),
+            argtypes::given_hint(spec),
         ) {
             Ok(deleted) => {
                 n += deleted as i32;
@@ -608,7 +1168,6 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "hint",
         "collation",
         "fields",
-        "let",
         "encryptionInformation",
         "mirrored",
         "sampleId",
@@ -622,20 +1181,23 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("BSON field 'count.{key}' is an unknown field."),
         ));
     }
-    if let Some(Bson::Double(limit)) = doc.get("limit") {
-        if limit.fract() != 0.0 {
-            return Err(CommandError::new(
-                9,
-                "FailedToParse",
-                format!("Expected an integer: limit: {limit}"),
-            ));
-        }
+    if let Some(problem) = read_option_problem(doc, "count") {
+        return Err(problem);
     }
-    if let Some(n) = doc.get("skip").and_then(as_i64).filter(|n| *n < 0) {
+    if coll.starts_with('.') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Collection names cannot start with '.': {coll}"),
+        ));
+    }
+    let limit = count_limit(doc.get("limit"))?;
+    let skip = count_skip(doc.get("skip"));
+    if skip < 0 {
         return Err(CommandError::new(
             2,
             "BadValue",
-            format!("BSON field 'skip' value must be >= 0, actual value '{n}'"),
+            format!("BSON field 'skip' value must be >= 0, actual value '{skip}'"),
         ));
     }
     argtypes::require_natural_hint(argtypes::given_hint(doc))?;
@@ -658,6 +1220,19 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let storage = ctx.storage()?;
     let filter = doc_field(doc, "query");
+    // A `$text` count of a collection that does not exist is 0.
+    if storage
+        .collection_exists(&ctx.db_name, &coll)
+        .unwrap_or(false)
+    {
+        if let Some((code, msg)) = text_query_problem(storage, &ctx.db_name, &coll, &filter) {
+            return Err(CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                msg,
+            ));
+        }
+    }
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
 
@@ -722,13 +1297,12 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
             .map_err(command_error)? as i64
     };
-    let skip = doc.get("skip").and_then(as_i64).unwrap_or(0);
     if skip > 0 {
-        n = (n - skip).max(0);
+        n = n.saturating_sub(skip).max(0);
     }
     // A negative limit counts as its size (mongod reads it as the legacy
     // "single batch" spelling of a limit).
-    let limit = doc.get("limit").and_then(as_i64).unwrap_or(0).abs();
+    let limit = limit.abs();
     if limit > 0 {
         n = n.min(limit);
     }
@@ -838,6 +1412,9 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
     };
     if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
         return Some(unknown(format!("update.{key}")));
+    }
+    if let Some(problem) = empty_ts_flag_problem(doc) {
+        return Some(problem);
     }
     if let Err(e) = argtypes::require_bool_or_number(
         doc,

@@ -37,6 +37,25 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // mongod 8.2 reports every field under the IDL struct name
     // (`distinctCommandRequest`), `key` included -- an older probe had `key` as
     // `distinct.key`; re-measured 8.2.11, 2026-10-01.
+    if let Some(problem) = crate::crud::read_option_problem(doc, "distinctCommandRequest") {
+        return Err(problem);
+    }
+    // mongod will not read a collection of a name it could not create
+    // (measured 8.2.11, 2026-10-12); these answered an empty list.
+    if coll.starts_with('.') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Collection names cannot start with '.': {coll}"),
+        ));
+    }
+    if coll.contains('$') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Invalid collection name specified '{}.{coll}'", ctx.db_name),
+        ));
+    }
     argtypes::require_object(doc, "query", "distinctCommandRequest.query")?;
     argtypes::require_object(doc, "collation", "distinctCommandRequest.collation")?;
     // An undefined `$$variable` is a PARSE error (17276), not the storage
@@ -89,6 +108,15 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ));
     }
     let filter = doc_field(doc, "query");
+    if let Some((code, msg)) =
+        crate::crud::text_query_problem(ctx.storage()?, &ctx.db_name, &coll, &filter)
+    {
+        return Err(CommandError::new(
+            code,
+            crate::util::error_code_name(code),
+            msg,
+        ));
+    }
     let collation = crate::util::effective_collation(ctx.storage()?, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
     // `distinct` takes a hint like every other read, and mongod REFUSES the

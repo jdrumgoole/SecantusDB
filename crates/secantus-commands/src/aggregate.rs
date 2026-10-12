@@ -1330,6 +1330,7 @@ fn apply_storage_stage(
                     || e.code == 166
                     || e.code == 7406103
                     || (e.code == 66 && e.errmsg.starts_with(MERGE_UPDATE_PREFIX))
+                    || (e.code == 11000 && e.errmsg.starts_with("$merge failed due to "))
                     || (name == "$out" && (e.code == 11000 || e.code == 17152))
                 {
                     let ns = format!("{db}.{}", coll.unwrap_or(""));
@@ -2593,7 +2594,7 @@ fn apply_merge(
                         newdoc.insert("_id", existing_id);
                         storage
                             .update_matching(&out_db, &out_coll, &id_filter, &newdoc, false, false)
-                            .map_err(command_error)?;
+                            .map_err(merge_write_error)?;
                         continue;
                     }
                 };
@@ -2622,12 +2623,17 @@ fn apply_merge(
                         if let Some(changed) = merge_changes_id(&existing_id, d.get("_id")) {
                             return Err(merge_altered_id(changed));
                         }
-                        storage
-                            .delete_matching(&out_db, &out_coll, &id_filter, 1)
-                            .map_err(command_error)?;
+                        // One replacement, as mongod does it. This deleted the
+                        // matched document and then inserted the new one, so a
+                        // replacement a unique index refused left NEITHER: the
+                        // document was gone (found 2026-10-12 against 8.2.11,
+                        // which keeps it). It also moved every replaced
+                        // document to the end of the collection.
                         let mut new = d;
                         new.entry("_id".to_string()).or_insert(existing_id);
-                        insert_or_fail(storage, &out_db, &out_coll, encode_docs(vec![new])?)?;
+                        storage
+                            .update_matching(&out_db, &out_coll, &id_filter, &new, false, false)
+                            .map_err(merge_write_error)?;
                     }
                     // default: "merge" — deep-merge the result doc over the
                     // existing one (existing `_id` preserved), then replace.
@@ -2647,7 +2653,7 @@ fn apply_merge(
                         merged.insert("_id", existing_id);
                         storage
                             .update_matching(&out_db, &out_coll, &id_filter, &merged, false, false)
-                            .map_err(command_error)?;
+                            .map_err(merge_write_error)?;
                     }
                 }
             }
@@ -2692,6 +2698,35 @@ pub(crate) fn insert_or_fail(
         extra.remove(key);
     }
     Err(CommandError::new(code, crate::util::error_code_name(code), errmsg).with_extra(extra))
+}
+
+/// A storage error from a `$merge` write, worded as mongod words a
+/// duplicate key there.
+fn merge_write_error(e: crate::StorageError) -> CommandError {
+    let info = match e {
+        crate::StorageError::DuplicateKey(info) => info,
+        other => return command_error(other),
+    };
+    let plain = info
+        .errmsg
+        .strip_prefix("Plan executor error during update :: caused by :: ")
+        .unwrap_or(&info.errmsg);
+    let error = CommandError::new(
+        11000,
+        "DuplicateKey",
+        format!(
+            "$merge failed due to a DuplicateKey error :: caused by :: Plan executor error \
+             during update :: caused by :: {plain}"
+        ),
+    );
+    let mut extra = Document::new();
+    if let Some(pattern) = info.key_pattern {
+        extra.insert("keyPattern", pattern);
+    }
+    if let Some(value) = info.key_value {
+        extra.insert("keyValue", value);
+    }
+    error.with_extra(extra)
 }
 
 /// The incoming `_id` when it is not the matched document's. The two can

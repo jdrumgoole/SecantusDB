@@ -468,6 +468,11 @@ pub fn let_problem(vars: &Document) -> Option<(i32, String)> {
     None
 }
 
+/// Whether every command takes a field of this name.
+pub fn is_generic_field(name: &str) -> bool {
+    GENERIC_FIELDS.contains(&name)
+}
+
 /// The first field of `doc` a command does not take: not one of its own
 /// (`known`), not a generic one, and not a `$`-prefixed field of the protocol
 /// (`$db`, `$clusterTime`, `$readPreference` and the like).
@@ -1732,6 +1737,12 @@ pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Opti
     for (key, value) in filter {
         match key.as_str() {
             "$expr" => {
+                // An operator mongod does not have is 168, on every command
+                // that takes a filter (measured 8.2.11, 2026-10-12). It
+                // reached the storage layer and came back as a generic 2.
+                if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(value) {
+                    return Some((168, format!("Unrecognized expression '{op}'")));
+                }
                 if let Some(found) = expression_problem(value, bound) {
                     return Some(found);
                 }

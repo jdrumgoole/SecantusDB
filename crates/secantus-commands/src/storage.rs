@@ -389,6 +389,23 @@ pub trait Storage: Send + Sync {
         self.delete_matching(db, coll, filter, limit)
     }
 
+    /// `delete_matching_with_let` reading the documents the way `hint` says,
+    /// which decides the document a `limit: 1` delete removes. The default
+    /// ignores the hint so fakes are unaffected.
+    #[allow(clippy::too_many_arguments)]
+    fn delete_matching_hinted(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        let_vars: &Document,
+        collation: Option<&Collation>,
+        _hint: Option<RawHint<'_>>,
+    ) -> Result<usize, StorageError> {
+        self.delete_matching_with_let(db, coll, filter, limit, let_vars, collation)
+    }
+
     /// Count documents matching `filter`.
     fn count_matching(
         &self,
