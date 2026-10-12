@@ -91,21 +91,21 @@
 <section class="section">
   <div class="wrap">
     <h2>Measured against PostgreSQL itself</h2>
-    <p class="section-lead">Not against our own expectations: a release build of <code>secantusd-pg</code> and <strong>PostgreSQL 16</strong> at its defaults, on the same 16-vCPU DigitalOcean droplet (ext4), every commit synced to disk on both. Statements a second with eight clients, the median of seven 10&nbsp;s trials, measured 2026-10-12 with the released 0.1.0-beta.13 binary against PostgreSQL 16.15.</p>
+    <p class="section-lead">Not against our own expectations: the released <code>secantusd-pg</code> 0.1.0-beta.13 and <strong>PostgreSQL 16</strong> at its defaults, on the same 16-vCPU DigitalOcean droplet (ext4), every commit synced to disk on both. Eight clients on two other droplets, four on each, reach the server over the private network. Statements a second, the median of seven 10&nbsp;s trials, measured 2026-10-12 against PostgreSQL 16.15.</p>
     <div class="compare-wrap">
       <table class="compare-table">
         <thead>
           <tr><th>Workload</th><th>Clients</th><th>PostgreSQL 16</th><th>Rust PG server</th><th>PostgreSQL is faster by</th></tr>
         </thead>
         <tbody>
-          <tr><th>insert, one table each</th><td>8</td><td>24,312 ops/s</td><td>17,579 ops/s</td><td>1.38<span class="unit-x">x</span></td></tr>
-          <tr><th>insert, shared table</th><td>8</td><td>24,234 ops/s</td><td>16,310 ops/s</td><td>1.49<span class="unit-x">x</span></td></tr>
-          <tr><th>update by primary key</th><td>8</td><td>23,873 ops/s</td><td>15,807 ops/s</td><td>1.51<span class="unit-x">x</span></td></tr>
-          <tr><th>select by primary key</th><td>8</td><td>65,959 ops/s</td><td>45,230 ops/s</td><td>1.46<span class="unit-x">x</span></td></tr>
+          <tr><th>insert, one table each</th><td>8</td><td>18,767 ops/s</td><td>13,900 ops/s</td><td>1.35<span class="unit-x">x</span></td></tr>
+          <tr><th>insert, shared table</th><td>8</td><td>18,316 ops/s</td><td>13,290 ops/s</td><td>1.38<span class="unit-x">x</span></td></tr>
+          <tr><th>update by primary key</th><td>8</td><td>18,364 ops/s</td><td>12,711 ops/s</td><td>1.44<span class="unit-x">x</span></td></tr>
+          <tr><th>select by primary key</th><td>8</td><td>38,401 ops/s</td><td>32,862 ops/s</td><td>1.17<span class="unit-x">x</span></td></tr>
         </tbody>
       </table>
     </div>
-    <p class="perf-note" style="margin-top: 20px;">PostgreSQL is faster on every row: <strong>1.4<span class="unit-x">x</span> to 1.5<span class="unit-x">x</span> on durable writes and 1.5<span class="unit-x">x</span> on reads by primary key</strong>, with eight clients. Eight clients writing one shared table cost us 7% against eight writing a table each. The seven trials of each row fall within 4% of each other on both servers. Runs with one and four clients are not published: on this droplet a single trial of those moved by up to 21%, for PostgreSQL as for us. Two things move them. The scheduler places a lone client and the server afresh each trial, sometimes on one CPU, where both servers run a third slower; and the droplet&#39;s disk syncs at a rate that itself drifts by 13% from one ten-second window to the next. Eight clients average both out. These are prepared statements. On an earlier run on this size of droplet, before 0.1.0-beta.8, a statement sent as text with a different literal each time was where we were furthest behind: 380 microseconds against PostgreSQL's 128 for one row by primary key. 0.1.0-beta.8 plans such a statement once per shape. On a Mac, with the released binaries, that took it from 111 microseconds to 43, against PostgreSQL 15's 40; it has not been measured on the droplet yet.</p>
+    <p class="perf-note" style="margin-top: 20px;">PostgreSQL is faster on every row: <strong>1.35<span class="unit-x">x</span> to 1.44<span class="unit-x">x</span> on durable writes and 1.17<span class="unit-x">x</span> on reads by primary key</strong>, with eight clients. Eight clients writing one shared table cost us 4% against eight writing a table each. The client droplets&#39; CPUs were at most 16% busy, so the server was the limit in every trial. An earlier version of this table ran the clients on the server&#39;s own droplet. A statement there pays no network round trip, so every figure was higher, and the gap was wider (1.4<span class="unit-x">x</span> to 1.5<span class="unit-x">x</span>). The clients also competed with the server for its CPUs, which made runs with fewer clients unsteady. The clients are on machines of their own now. These are prepared statements. On an earlier run with the client on the server&#39;s droplet, before 0.1.0-beta.8, a statement sent as text with a different literal each time was where we were furthest behind: 380 microseconds against PostgreSQL's 128 for one row by primary key. 0.1.0-beta.8 plans such a statement once per shape. On a Mac, with the released binaries, that took it from 111 microseconds to 43, against PostgreSQL 15's 40; it has not been measured on the droplet yet.</p>
   </div>
 </section>
 

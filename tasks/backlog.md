@@ -3091,10 +3091,27 @@ These work end-to-end but cut corners.
         database, gave 2,873 to 3,249 a second over seven 10 s windows:
         12.7% spread. One client's write rate is the disk's sync rate.
 
-      So the read rows could be published from a pinned run
-      (`pg_concurrency.py` has no pinning option; it would need one), and
-      the low-client write rows cannot be made steady on this kind of
-      droplet. The
+      **Clients moved to the client droplets the same day** (Joe: that was
+      the plan for the cluster from the start). `invoke do-pg-bench` now
+      runs them on the two client droplets by default, over the private
+      network. Third `c-16`, clients on two `c-8`, medians of seven 10 s
+      trials, in `bench/results/pg-droplet/2026-10-12-0.1.0-beta.13-remote-clients/`:
+      insert, one table each, PostgreSQL 3,159 / 11,178 / 18,767 against
+      2,368 / 8,321 / 13,900 (1.33x / 1.34x / 1.35x); shared table at 8,
+      18,316 against 13,290 (1.38x); update, 3,052 / 10,770 / 18,364
+      against 2,147 / 7,615 / 12,711 (1.42x / 1.41x / 1.44x); select, 5,444
+      / 21,438 / 38,401 against 4,909 / 18,911 / 32,862 (1.11x / 1.13x /
+      1.17x). The client droplets' CPUs were 16% busy at most. Spread
+      between trials is 2% to 9% on this server's rows at every client
+      count, where over loopback one client moved by up to 21%; PostgreSQL's
+      rows are 4% to 13%, and one of its seven 8-client insert trials was
+      14,645 against a median of 18,767. The site still publishes the
+      8-client rows only; the 1- and 4-client rows are now steady enough
+      to consider, which is Joe's call.
+
+      Over loopback the read rows could be steadied by pinning
+      (`pg_concurrency.py` has no pinning option), and the low-client
+      write rows could not. The
       unprepared-statement cost (`bench/pg_statement_cost.py`) is still
       not measured on a droplet.
 

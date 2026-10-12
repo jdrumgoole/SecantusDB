@@ -52,11 +52,6 @@ if str(REPO) not in sys.path:
 
 from tools.provenance import require_fresh_pgserver  # noqa: E402
 
-# A benchmark prints a table people paste into a document, so a stale
-# binary here becomes a published wrong number. `SECANTUS_ALLOW_STALE_ARTIFACT=1`
-# overrides, which is the honest way to measure an OLD build on purpose.
-require_fresh_pgserver(RUST_BINARY, repo_root=REPO)
-
 
 @dataclass
 class Result:
@@ -240,6 +235,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.repeat,
             )
         if args.server in ("rust", "both"):
+            # A benchmark prints a table people paste into a document, so a
+            # stale binary here becomes a published wrong number.
+            # `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides, which is the honest
+            # way to measure an OLD build on purpose. Checked where the binary
+            # is started, and not on import: `bench/pg_remote_client.py`
+            # borrows this module's worker on a machine with no server on it.
+            require_fresh_pgserver(RUST_BINARY, repo_root=REPO)
             port = _free_port()
             store = tempfile.mkdtemp(prefix="pgbench-")
             daemon = subprocess.Popen(

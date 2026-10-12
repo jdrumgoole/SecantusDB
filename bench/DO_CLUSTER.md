@@ -221,7 +221,7 @@ out:
 
 | Task | Command | Spends? |
 | --- | --- | --- |
-| `invoke do-up [--server-size c-16] [--client-size c-2]` | `up` | **starts** |
+| `invoke do-up [--server-size c-16] [--client-size c-8]` | `up` | **starts** |
 | `invoke do-status` | `status` | no |
 | `invoke do-deploy` | `deploy` | no |
 | `invoke do-run` | `run` | no |
@@ -235,24 +235,33 @@ out:
 
 ### `invoke do-pg-bench`: the PostgreSQL server against PostgreSQL 16
 
-The table on the site's Rust PostgreSQL page is a different measurement from
-everything above: one droplet, loopback, `secantusd-pg` and PostgreSQL 16
-side by side, every commit synced on both. `bench/do_pg_bench.py` does it on
-the server droplet, which must be up at the size the page names:
+The table on the site's Rust PostgreSQL page: a released `secantusd-pg` and
+PostgreSQL 16 at its defaults on the server droplet, every commit synced on
+both, driven from the two client droplets over the private network.
 
 ```bash
-invoke do-up --server-size c-16
-invoke do-pg-bench                 # the newest secantusd-pg-v* release
+invoke do-up --server-size c-16 --client-size c-8
+invoke do-pg-bench --repeat 7      # the newest secantusd-pg-v* release
 invoke do-destroy
 ```
 
-It installs PostgreSQL 16 and psycopg on the droplet, downloads the release
-binary and checks its SHA-256 against the release's, runs
-`bench/pg_concurrency.py` for four sweeps (10 s a trial, three trials), copies
-the raw trials to `bench/results/pg-droplet/<date>-<version>/`, and prints
-the table. It refuses a binary whose source tree is not the tag's. About 12
-minutes; it creates and destroys nothing. The two client droplets are idle
-for it.
+`bench/do_pg_bench.py` installs PostgreSQL 16 on the server droplet and
+psycopg on the clients, downloads the release binary and checks its SHA-256
+against the release's, and runs four sweeps of 10 s trials. Each client
+droplet runs half the clients (`bench/pg_remote_client.py`), all starting
+their window at one instant on the droplets' clock, and reports how busy its
+CPUs were, so a run limited by its clients says so. The two servers take
+turns on port 27017, the one port the cluster's firewall opens between
+droplets. The raw trials go to
+`bench/results/pg-droplet/<date>-<version>-remote-clients/`. It refuses a
+binary whose source tree is not the tag's, and it creates and destroys
+nothing. About 20 minutes at three trials and 45 at seven.
+
+`--clients-on server` runs the clients beside the server over loopback,
+which is how this was first measured. Do not publish its one- and
+four-client rows: a lone client and the server are then placed on the same
+16 CPUs afresh each trial, and a trial moved by up to 21%, for PostgreSQL as
+for this server (`bench/results/pg-droplet/2026-10-12-low-client-noise/`).
 
 ## Option reference
 

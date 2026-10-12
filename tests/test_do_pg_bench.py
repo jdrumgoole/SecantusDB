@@ -77,3 +77,48 @@ def test_the_harness_bundle_names_files_that_exist() -> None:
     bench = _module()
     for name in bench.HARNESS:
         assert (REPO / name).exists(), name
+
+
+def test_remote_clients_are_split_between_the_two_droplets() -> None:
+    bench = _module()
+    assert bench._split(1) == (1, 0)
+    assert bench._split(4) == (2, 2)
+    assert bench._split(8) == (4, 4)
+    assert bench._split(5) == (3, 2)
+
+
+def test_the_two_servers_take_turns_on_the_one_port_the_firewall_opens() -> None:
+    """The cluster's firewall lets its droplets reach the server on one port,
+    so each server is started there with the other stopped."""
+    bench = _module()
+    assert bench.WIRE_PORT == 27017
+    assert "pkill -x secantusd-pg" in bench._START["postgres"]
+    assert "systemctl start postgresql" in bench._START["postgres"]
+    assert "systemctl stop postgresql" in bench._START["rust"]
+    # An empty store each time, and listening beyond loopback.
+    assert "rm -rf /root/store" in bench._START["rust"]
+    assert "0.0.0.0:27017" in bench._START["rust"]
+    for start in bench._START.values():
+        assert start.endswith("grep -q ':27017 '")
+    install = bench._install_server("0.1.0-beta.13")
+    assert "port = 27017" in install and "listen_addresses = '*'" in install
+    assert "host all all 10.0.0.0/8 trust" in install
+    assert 'want" = "$got" ] ||' in install
+
+
+def test_a_remote_run_says_where_the_clients_were_and_how_busy(tmp_path: Path) -> None:
+    bench = _module()
+    for workload, mode, counts, _ in bench.SWEEPS:
+        servers = {
+            name: [
+                {"clients": int(c), "rates": [100.0, 110.0, 105.0], "client_cpu_busy": [9.0, 17.5]}
+                for c in counts.split(",")
+            ]
+            for name in ("postgres", "rust")
+        }
+        (tmp_path / f"{workload}-{mode}.json").write_text(
+            json.dumps({"clients_on": "two client droplets", "servers": servers})
+        )
+    table = bench.render(tmp_path)
+    assert "Clients on two client droplets, over the private network" in table
+    assert "was 18%." in table

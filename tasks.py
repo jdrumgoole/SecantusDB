@@ -820,22 +820,32 @@ def do_ssh(c: Context, role: str = "server") -> None:
         "version": "secantusd-pg release to measure (default: the newest secantusd-pg-v* tag).",
         "seconds": "Seconds per trial (default: 10).",
         "repeat": "Trials per client count (default: 3).",
-        "host": "The server droplet's address (default: read from `do-status`).",
+        "host": "The server droplet's address, with --clients-on server (default: `do-status`).",
+        "clients-on": "droplets (default: the two client droplets) | server (loopback).",
     },
 )
 def do_pg_bench(
-    c: Context, version: str = "", seconds: float = 10.0, repeat: int = 3, host: str = ""
+    c: Context,
+    version: str = "",
+    seconds: float = 10.0,
+    repeat: int = 3,
+    host: str = "",
+    clients_on: str = "droplets",
 ) -> None:
     """Measure a released `secantusd-pg` against PostgreSQL 16 on the server droplet.
 
-    The table on the site's Rust PostgreSQL page. Needs the droplets up, with
-    the size the page names: `invoke do-up --server-size c-16`. It installs
-    PostgreSQL 16 and the release binary on the server droplet, runs
-    `bench/pg_concurrency.py` there, and copies the trials back to
-    `bench/results/pg-droplet/`. It does not create or destroy a droplet:
-    `invoke do-destroy` afterwards. About 12 minutes.
+    The table on the site's Rust PostgreSQL page. Needs the droplets up, at
+    the sizes the page names: `invoke do-up --server-size c-16 --client-size
+    c-8`. It installs PostgreSQL 16 and the release binary on the server
+    droplet, drives both from the two client droplets over the private
+    network, and copies the trials back to `bench/results/pg-droplet/`. It
+    does not create or destroy a droplet: `invoke do-destroy` afterwards.
+    About 20 minutes at three trials, 45 at seven.
     """
-    cmd = f"uv run --no-sync python bench/do_pg_bench.py --seconds {seconds} --repeat {int(repeat)}"
+    cmd = (
+        f"uv run --no-sync python bench/do_pg_bench.py --seconds {seconds} "
+        f"--repeat {int(repeat)} --clients-on {shlex.quote(clients_on)}"
+    )
     if version:
         cmd += f" --version {shlex.quote(version)}"
     if host:
