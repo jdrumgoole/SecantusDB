@@ -731,6 +731,10 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let batch_size = doc.get("batchSize").and_then(as_i64).filter(|&b| b > 0);
     let ns = format!("{}.{}", ctx.db_name, coll);
     let cursors = ctx.cursors()?;
+    // Zero is the id of a closed cursor, never a live one.
+    if cursor_id == 0 {
+        return Ok(cursor_not_found(0));
+    }
 
     let info = match cursors.info(cursor_id) {
         Ok(i) => i,
@@ -817,9 +821,20 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ctx.awaited.set(ctx.awaited.get() + awaited);
 
         // A fatal projection error ends the stream with an `ok: 0` reply (the
-        // cursor was already dropped in the registry).
+        // cursor was already dropped in the registry). mongod leads the reply
+        // with the error's labels.
         if let Some(err) = fatal {
-            return Ok(err.into_reply());
+            let labelled = err.code == 280;
+            let mut reply = err.into_reply();
+            if labelled {
+                crate::transactions::add_label_first(&mut reply, "NonResumableChangeStreamError");
+            }
+            return Ok(reply);
+        }
+        // A stream that ended is gone: its id reads as 0 and a later getMore
+        // finds no cursor.
+        if closed {
+            cursors.kill(&[cursor_id]);
         }
 
         // postBatchResumeToken: the last event's token when this batch carried
@@ -855,15 +870,19 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 }
             }
         };
-        let mut cursor_doc = doc! {
-            "id": Bson::Int64(if closed { 0 } else { cursor_id }),
-            "ns": ns,
-        };
-        // A resume token belongs to a change stream; a tailable cursor on a
-        // capped collection has none.
+        // mongod's order: the batch (spliced first), its token, `invalidated`
+        // when the stream ended in this batch, the id, the namespace. A resume
+        // token belongs to a change stream; a tailable cursor on a capped
+        // collection has none.
+        let mut cursor_doc = Document::new();
         if let Some(tok) = pbrt.filter(|_| info.change_stream) {
             cursor_doc.insert("postBatchResumeToken", tok);
         }
+        if closed && info.change_stream {
+            cursor_doc.insert("invalidated", true);
+        }
+        cursor_doc.insert("id", Bson::Int64(if closed { 0 } else { cursor_id }));
+        cursor_doc.insert("ns", ns);
         // Raw splice, same as the plain getMore below: the event blobs go to
         // the wire encoder undecoded. The postBatchResumeToken only ever
         // needed the LAST blob (`post_batch_resume_token`), so nothing here

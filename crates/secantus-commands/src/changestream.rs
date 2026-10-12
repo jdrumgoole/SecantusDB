@@ -41,6 +41,31 @@ const CHANGE_STREAM_PIPELINE_STAGES: &[&str] = &[
     "$changeStreamSplitLargeEvent",
 ];
 
+/// Stages mongod knows that are outside API version 1.
+const KNOWN_STAGES: &[&str] = &[
+    "$currentOp",
+    "$indexStats",
+    "$listLocalSessions",
+    "$listSessions",
+    "$planCacheStats",
+    "$sample",
+    "$setWindowFields",
+    "$densify",
+    "$fill",
+    "$documents",
+    "$sortByCount",
+    "$bucketAuto",
+    "$searchMeta",
+    "$search",
+    "$vectorSearch",
+    "$geoNear",
+    "$graphLookup",
+    "$unionWith",
+    "$listSearchIndexes",
+    "$querySettings",
+    "$shardedDataDistribution",
+];
+
 /// The storage-backed producer stored in a change-stream cursor. Each `produce`
 /// polls the oplog tail from the current position and advances it.
 struct ChangeStreamProducer {
@@ -58,6 +83,31 @@ struct ChangeStreamProducer {
     /// mongod surfaces this as a getMore-time `ChangeStreamFatalError` (280),
     /// NOT at stream open, so it's detected here during projection.
     fatal_error: Option<CommandError>,
+    /// The `_data` of the token the stream resumes from. mongod re-reads the
+    /// token's own event and requires it to be the first the pipeline lets
+    /// through; it is then not delivered. A stream on another namespace, or a
+    /// pipeline that drops the event, cannot resume (280).
+    expect_token: Option<String>,
+}
+
+/// What mongod says when the token's event is not the first one seen.
+fn resume_token_missing(data: &str) -> CommandError {
+    CommandError::new(
+        280,
+        "ChangeStreamFatalError",
+        format!(
+            "Executor error during getMore :: caused by :: cannot resume stream; the resume \
+             token was not found. {{_data: \"{data}\"}}"
+        ),
+    )
+    .with_extra(doc! { "errorLabels": ["NonResumableChangeStreamError"] })
+}
+
+/// The `_data` of an encoded event's resume token.
+fn token_data(event: &[u8]) -> Option<String> {
+    let raw = bson::RawDocument::from_bytes(event).ok()?;
+    let id = raw.get_document("_id").ok()?;
+    id.get_str("_data").ok().map(str::to_string)
 }
 
 impl CursorProducer for ChangeStreamProducer {
@@ -82,7 +132,7 @@ impl CursorProducer for ChangeStreamProducer {
                     // pipeline strips the resume token.
                     self.fatal_error = Some(CommandError::new(code, "NoMatchingDocument", msg));
                 }
-                if self.pipeline.is_empty() {
+                let mut events = if self.pipeline.is_empty() {
                     batch.events
                 } else {
                     let (events, bad_token) = apply_event_pipeline(batch.events, &self.pipeline);
@@ -98,9 +148,21 @@ impl CursorProducer for ChangeStreamProducer {
                             None => "{}".to_string(),
                             Some(tok) => render_stage_value(&Bson::Document(doc! { "_id": tok })),
                         };
-                        let expected = render_stage_value(&Bson::Document(
-                            doc! { "_id": expected.unwrap_or(Bson::Null) },
-                        ));
+                        // mongod prints the first 128 characters of the token.
+                        let expected = match expected {
+                            Some(Bson::Document(mut tok)) => {
+                                if let Ok(data) = tok.get_str("_data") {
+                                    if data.len() > 128 {
+                                        let cut = format!("{}...", &data[..128]);
+                                        tok.insert("_data", cut);
+                                    }
+                                }
+                                render_stage_value(&Bson::Document(doc! { "_id": tok }))
+                            }
+                            other => render_stage_value(&Bson::Document(
+                                doc! { "_id": other.unwrap_or(Bson::Null) },
+                            )),
+                        };
                         self.fatal_error = Some(
                             CommandError::new(
                                 280,
@@ -121,7 +183,19 @@ impl CursorProducer for ChangeStreamProducer {
                         );
                     }
                     events
+                };
+                if let Some(expected) = self.expect_token.clone() {
+                    if let Some(first) = events.first() {
+                        if token_data(first).as_deref() == Some(expected.as_str()) {
+                            events.remove(0);
+                        } else {
+                            self.fatal_error = Some(resume_token_missing(&expected));
+                            events.clear();
+                        }
+                        self.expect_token = None;
+                    }
                 }
+                events
             }
             // A poll failure (decode / projection error) yields nothing this
             // round rather than tearing down the cursor; the next getMore retries.
@@ -171,7 +245,63 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         .ok_or_else(|| CommandError::new(1, "InternalError", "storage backend not configured"))?
         .clone();
 
-    let cs_spec = first_change_stream_spec(doc).unwrap_or_default();
+    let cs_spec = match first_change_stream_value(doc) {
+        Some(Bson::Document(d)) => d,
+        Some(other) => {
+            return Ok(CommandError::new(
+                6188500,
+                "Location6188500",
+                format!(
+                    "$changeStream must take a nested object but found: $changeStream: {}",
+                    secantus_core::aggregate::render_value_compact(&other)
+                ),
+            )
+            .into_reply())
+        }
+        None => Document::new(),
+    };
+    if let Some(problem) = spec_problem(&cs_spec) {
+        return Ok(problem.into_reply());
+    }
+    // allChangesForCluster takes the admin database and no collection; the
+    // internal databases and collections take no change stream at all.
+    let all_changes = cs_spec.get_bool("allChangesForCluster").unwrap_or(false);
+    let on_collection = doc.get("aggregate").and_then(Bson::as_str);
+    if all_changes && (ctx.db_name != "admin" || on_collection.is_some()) {
+        return Ok(CommandError::new(
+            72,
+            "InvalidOptions",
+            format!(
+                "A $changeStream with 'allChangesForCluster:true' may only be opened on the \
+                 'admin' database, and with no collection name; found {}.{}",
+                ctx.db_name,
+                on_collection.unwrap_or("$cmd.aggregate")
+            ),
+        )
+        .into_reply());
+    }
+    if !all_changes && matches!(ctx.db_name.as_str(), "admin" | "local" | "config") {
+        return Ok(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!(
+                "$changeStream may not be opened on the internal {} database",
+                ctx.db_name
+            ),
+        )
+        .into_reply());
+    }
+    if let Some(coll) = on_collection.filter(|c| c.starts_with("system.")) {
+        return Ok(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!(
+                "$changeStream may not be opened on the internal {}.{coll} collection",
+                ctx.db_name
+            ),
+        )
+        .into_reply());
+    }
 
     // Scope from the aggregate target + allChangesForCluster:
     //   coll.watch()   -> aggregate: "<coll>"            -> Coll
@@ -209,6 +339,10 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             .to_string(),
         show_expanded_events: cs_spec.get_bool("showExpandedEvents").unwrap_or(false),
         split_large_events: pipeline_has_split_stage(doc),
+        start_ts: match cs_spec.get("startAtOperationTime") {
+            Some(Bson::Timestamp(ts)) => Some(*ts),
+            _ => None,
+        },
     };
 
     // Start position (events read are strictly after it):
@@ -224,7 +358,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
                 260,
                 "InvalidResumeToken",
                 "Attempting to resume a change stream using 'resumeAfter' is not allowed \
-                 from an invalidate notification; use 'startAfter' instead",
+                 from an invalidate notification",
             )
             .into_reply());
         }
@@ -233,16 +367,31 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         .get("resumeAfter")
         .or_else(|| cs_spec.get("startAfter"))
         .and_then(Bson::as_document);
+    // The token's own event is read again and must be the first seen: so the
+    // stream starts one before it (see `expect_token`). A token that names
+    // only a position (an empty batch's), or an invalidate, starts after it.
+    let mut expect_token = None;
     let position = if let Some(tok) = resume_token {
-        storage.resume_token_seq(tok).ok_or_else(|| {
+        let seq = storage.resume_token_seq(tok).ok_or_else(|| {
             CommandError::new(
                 40647,
                 "Location40647",
                 "resumeAfter / startAfter resume token is not valid",
             )
-        })?
+        })?;
+        if storage.resume_token_is_event(tok) && !storage.resume_token_from_invalidate(tok) {
+            expect_token = tok.get_str("_data").ok().map(str::to_string);
+            seq - 1
+        } else {
+            seq
+        }
     } else if let Some(Bson::Timestamp(ts)) = cs_spec.get("startAtOperationTime") {
-        storage.seq_for_timestamp(*ts).saturating_sub(1)
+        // The first entry at or after the time, or the tail when there is
+        // none yet; the poll leaves out anything before the time.
+        match storage.seq_for_timestamp(*ts) {
+            0 => storage.oplog_tail_seq(),
+            seq => seq - 1,
+        }
     } else {
         storage.oplog_tail_seq()
     };
@@ -288,6 +437,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         limit: 1000,
         pipeline: user_pipeline,
         fatal_error: None,
+        expect_token,
     });
 
     // Poll once so events already available at the start position (the common
@@ -299,10 +449,42 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // beyond `batchSize` is buffered for the first getMore.
     let start_position = producer.position();
     let mut initial = producer.produce();
+    // A start far back in the oplog scans forward until something is found
+    // or the tail is reached, as mongod's first batch does.
+    let tail = storage.oplog_tail_seq();
+    let mut polls = 0;
+    while initial.is_empty()
+        && !producer.invalidated()
+        && producer.fatal_error().is_none()
+        && producer.position() < tail
+        && polls < 10_000
+    {
+        initial = producer.produce();
+        polls += 1;
+    }
     let split = batch_size.min(initial.len());
     let remainder = initial.split_off(split);
     let first_batch_bytes = initial;
     let open_position = producer.position();
+    // A resume whose token was not found fails the aggregate itself, under
+    // its prefix.
+    if let Some(err) = producer.fatal_error() {
+        if err.code == 280 {
+            let mut reply = CommandError::new(
+                err.code,
+                err.code_name.clone(),
+                err.errmsg.replacen(
+                    "Executor error during getMore :: caused by :: ",
+                    &format!("Executor error during aggregate command on namespace: {ns} :: caused by :: "),
+                    1,
+                ),
+            )
+            .into_reply();
+            crate::transactions::add_label_first(&mut reply, "NonResumableChangeStreamError");
+            return Ok(reply);
+        }
+    }
+    let invalidated_at_open = producer.invalidated();
 
     let hwm_token = |position| {
         let bytes = storage.high_water_mark_token(position);
@@ -318,26 +500,30 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // delivered, so the token must not move past them.
     let held_back = !remainder.is_empty();
     let cursors = ctx.cursors()?;
-    let cursor_id = cursors
-        .register_tailable(
-            &ns,
-            producer,
-            TailableOptions {
-                change_stream: true,
-                await_data: true,
-                no_cursor_timeout: false,
-                position_seq: open_position,
-                collection_uuid: None,
-                initial_remaining: remainder,
-            },
-        )
-        .map_err(|e| {
-            CommandError::new(
-                1,
-                "InternalError",
-                format!("cursor registration failed: {e:?}"),
+    let cursor_id = if invalidated_at_open {
+        0
+    } else {
+        cursors
+            .register_tailable(
+                &ns,
+                producer,
+                TailableOptions {
+                    change_stream: true,
+                    await_data: true,
+                    no_cursor_timeout: false,
+                    position_seq: open_position,
+                    collection_uuid: None,
+                    initial_remaining: remainder,
+                },
             )
-        })?;
+            .map_err(|e| {
+                CommandError::new(
+                    1,
+                    "InternalError",
+                    format!("cursor registration failed: {e:?}"),
+                )
+            })?
+    };
 
     // firstBatch carries any events already pending at open (mongod returns an
     // empty firstBatch only when nothing was waiting); getMore drives the rest.
@@ -351,11 +537,9 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         Some(Bson::Document(last)) => last.get("_id").cloned(),
         _ => None,
     };
-    let mut cursor_doc = doc! {
-        "firstBatch": Bson::Array(first_batch),
-        "id": Bson::Int64(cursor_id),
-        "ns": ns,
-    };
+    // mongod's order: the batch, its token, `invalidated` when the stream
+    // ended in it, the id, the namespace.
+    let mut cursor_doc = doc! { "firstBatch": Bson::Array(first_batch) };
     // `postBatchResumeToken`. With nothing held back it is the high-water mark
     // at the post-poll position -- mongod returns one even for an empty batch
     // so a client always has a token to resume from. With events held back it
@@ -373,10 +557,151 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     if let Some(tok) = open_pbrt {
         cursor_doc.insert("postBatchResumeToken", tok);
     }
+    if invalidated_at_open {
+        cursor_doc.insert("invalidated", true);
+    }
+    cursor_doc.insert("id", Bson::Int64(cursor_id));
+    cursor_doc.insert("ns", ns);
     Ok(doc! {
         "cursor": cursor_doc,
         "ok": 1.0,
     })
+}
+
+/// The `$changeStream` value of the first pipeline stage, whatever its type.
+fn first_change_stream_value(doc: &Document) -> Option<Bson> {
+    let pipeline = doc.get("pipeline")?.as_array()?;
+    let first = pipeline.first()?.as_document()?;
+    first.get("$changeStream").cloned()
+}
+
+/// What mongod 8.2.11 refuses in a `$changeStream` spec, in its words.
+fn spec_problem(spec: &Document) -> Option<CommandError> {
+    const FIELDS: &[&str] = &[
+        "resumeAfter",
+        "startAfter",
+        "startAtOperationTime",
+        "fullDocument",
+        "fullDocumentBeforeChange",
+        "allChangesForCluster",
+        "showExpandedEvents",
+        "allowToRunOnConfigDB",
+        "allowToRunOnSystemNS",
+        "showMigrationEvents",
+        "showSystemEvents",
+        "matchCollectionUUIDForUpdateLookup",
+        "showRawUpdateDescription",
+        "version",
+    ];
+    for key in spec.keys() {
+        if !FIELDS.contains(&key.as_str()) {
+            return Some(CommandError::new(
+                40415,
+                "IDLUnknownField",
+                format!("BSON field '$changeStream.{key}' is an unknown field."),
+            ));
+        }
+    }
+    let wrong_type = |field: &str, v: &Bson, want: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '$changeStream.{field}' is the wrong type '{}', expected type '{want}'",
+                secantus_core::query::bson_type_name(v)
+            ),
+        )
+    };
+    for (field, allowed) in [
+        (
+            "fullDocument",
+            &["default", "updateLookup", "whenAvailable", "required"][..],
+        ),
+        (
+            "fullDocumentBeforeChange",
+            &["off", "whenAvailable", "required"][..],
+        ),
+    ] {
+        match spec.get(field) {
+            None => {}
+            Some(Bson::String(s)) if allowed.contains(&s.as_str()) => {}
+            Some(Bson::String(s)) => {
+                return Some(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "Enumeration value '{s}' for field '$changeStream.{field}' is not a \
+                         valid value."
+                    ),
+                ))
+            }
+            Some(other) => return Some(wrong_type(field, other, "string")),
+        }
+    }
+    for field in ["showExpandedEvents", "allChangesForCluster"] {
+        if let Some(v) = spec.get(field) {
+            if !matches!(v, Bson::Boolean(_)) {
+                return Some(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "Field '{field}' should be a boolean value, but found: {}",
+                        secantus_core::query::bson_type_name(v)
+                    ),
+                ));
+            }
+        }
+    }
+    for field in ["resumeAfter", "startAfter"] {
+        if let Some(v) = spec.get(field) {
+            if !matches!(v, Bson::Document(_)) {
+                return Some(wrong_type(field, v, "object"));
+            }
+        }
+    }
+    if let Some(v) = spec.get("startAtOperationTime") {
+        if !matches!(v, Bson::Timestamp(_)) {
+            return Some(wrong_type("startAtOperationTime", v, "timestamp"));
+        }
+    }
+    if spec.contains_key("resumeAfter") && spec.contains_key("startAfter") {
+        return Some(CommandError::new(
+            50865,
+            "Location50865",
+            "Do not specify both 'resumeAfter' and 'startAfter' in a $changeStream stage",
+        ));
+    }
+    for field in ["resumeAfter", "startAfter"] {
+        let Some(Bson::Document(tok)) = spec.get(field) else {
+            continue;
+        };
+        match tok.get("_data") {
+            Some(Bson::String(hex)) => {
+                let is_hex = hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+                if !is_hex {
+                    return Some(CommandError::new(
+                        9,
+                        "FailedToParse",
+                        "resume token string was not a valid hex string",
+                    ));
+                }
+            }
+            _ => {
+                return Some(CommandError::new(
+                    40647,
+                    "Location40647",
+                    format!(
+                        "Bad resume token: _data of missing or of wrong type. Expected string, \
+                         got {}",
+                        secantus_core::aggregate::render_value_compact(&Bson::Document(
+                            tok.clone()
+                        ))
+                    ),
+                ))
+            }
+        }
+    }
+    None
 }
 
 /// Apply the user change-stream pipeline to a batch of projected event bytes:
@@ -467,13 +792,26 @@ fn extract_change_stream_pipeline(doc: &Document) -> Result<Vec<Bson>, CommandEr
             ));
         }
         if !CHANGE_STREAM_PIPELINE_STAGES.contains(&name) {
-            // mongod reports an unrecognised stage in a change-stream pipeline as
-            // Location40324 "Unrecognized pipeline stage name", not a generic
-            // BadValue (the drivers' "invalid aggregation stage" test asserts it).
+            // A stage mongod knows is "not permitted"; one it does not know is
+            // unrecognised (the drivers' "invalid aggregation stage" test).
+            if crate::api_v1_agg_stage(name) || KNOWN_STAGES.contains(&name) {
+                return Err(CommandError::new(
+                    20,
+                    "IllegalOperation",
+                    format!("{name} is not permitted in a $changeStream pipeline"),
+                ));
+            }
             return Err(CommandError::new(
                 40324,
                 "Location40324",
                 format!("Unrecognized pipeline stage name: '{name}'"),
+            ));
+        }
+        if name == "$changeStreamSplitLargeEvent" && stages.last() != Some(stage) {
+            return Err(CommandError::new(
+                7182802,
+                "Location7182802",
+                "$changeStreamSplitLargeEvent must be the last stage in the pipeline",
             ));
         }
         // Validate `$match` filter syntax up-front. A change-stream pipeline
@@ -544,13 +882,6 @@ fn pipeline_has_split_stage(doc: &Document) -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-/// The `$changeStream: {...}` spec document from the first pipeline stage.
-fn first_change_stream_spec(doc: &Document) -> Option<Document> {
-    let pipeline = doc.get("pipeline")?.as_array()?;
-    let first = pipeline.first()?.as_document()?;
-    first.get("$changeStream")?.as_document().cloned()
 }
 
 /// `cursor.batchSize`, defaulting to the wire default. Unused by R3b-a's

@@ -216,7 +216,33 @@ pub(crate) fn run(
         lsid,
         txn_number: env.txn_number.filter(|_| env.in_txn),
     });
-    crate::cursors::with_owner(owner, || run_checked(name, handler, doc, ctx, &env))
+    // A transaction statement's writes name the transaction in the oplog,
+    // by the logical session as mongod records it: the id the client sent
+    // and the SHA-256 of the user, which is of the empty string for none.
+    let txn_session = env
+        .lsid
+        .clone()
+        .zip(env.txn_number)
+        .filter(|_| env.in_txn)
+        .and_then(|(id, txn)| {
+            use sha2::Digest;
+            let lsid = doc! {
+                "id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: id },
+                "uid": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: sha2::Sha256::digest(b"").to_vec(),
+                },
+            };
+            bson::to_vec(&lsid).ok().map(|bytes| (bytes, txn))
+        });
+    if let Some(s) = ctx.storage.as_ref() {
+        s.set_oplog_session(txn_session);
+    }
+    let reply = crate::cursors::with_owner(owner, || run_checked(name, handler, doc, ctx, &env));
+    if let Some(s) = ctx.storage.as_ref() {
+        s.set_oplog_session(None);
+    }
+    reply
 }
 
 fn run_checked(

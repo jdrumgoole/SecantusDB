@@ -406,14 +406,11 @@ fn resume_token_round_trips() {
 }
 
 #[test]
-fn small_event_gets_single_fragment() {
+fn small_event_is_not_split() {
+    // mongod 8.2.11 adds `splitEvent` only to an event it split.
     let event = doc! {"operationType": "insert", "x": 1};
-    let frags = changestreams::stamp_split_event(event).unwrap();
-    assert_eq!(frags.len(), 1);
-    assert_eq!(
-        frags[0].get_document("splitEvent").unwrap(),
-        &doc! {"fragment": 1, "of": 1}
-    );
+    let frags = changestreams::stamp_split_event(event.clone()).unwrap();
+    assert_eq!(frags, vec![event]);
 }
 
 #[test]

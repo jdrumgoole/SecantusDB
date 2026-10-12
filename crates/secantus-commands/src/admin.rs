@@ -950,6 +950,9 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // what is stored is the definition it produces.
     opts.remove("timeseries");
     opts.extend(ts_changes);
+    // What the command said, for the change event; the defaults written out
+    // below are not part of it (mongod 8.2.11).
+    let given = opts.clone();
     // A `collMod` that touches validation leaves the collection with BOTH
     // `validationLevel` and `validationAction` written out (the defaults
     // where neither was ever given). An empty validator removes the
@@ -1001,7 +1004,7 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `coll_mod` (not `set_collection_options`) so a `showExpandedEvents` change
     // stream sees the resulting `modify` event.
     storage
-        .coll_mod(&ctx.db_name, &coll, &opts)
+        .coll_mod_recording(&ctx.db_name, &coll, &opts, &given)
         .map_err(command_error)?;
     Ok(reply)
 }

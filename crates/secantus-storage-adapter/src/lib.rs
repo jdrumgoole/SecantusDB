@@ -124,6 +124,12 @@ impl CmdStorage for StorageAdapter {
             new_position = seq;
             let entry = Document::from_reader(&mut blob.as_slice())
                 .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
+            // `startAtOperationTime`: nothing before it is an event.
+            if let Some(start) = opts.start_ts {
+                if matches!(entry.get("ts"), Some(bson::Bson::Timestamp(t)) if *t < start) {
+                    continue;
+                }
+            }
             let projected = changestreams::project(
                 seq,
                 &entry,
@@ -205,6 +211,33 @@ impl CmdStorage for StorageAdapter {
         changestreams::parse_resume_token(token)
             .map(|d| d.from_invalidate)
             .unwrap_or(false)
+    }
+
+    fn coll_mod_recording(
+        &self,
+        db: &str,
+        coll: &str,
+        opts: &Document,
+        given: &Document,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .coll_mod_recording(db, coll, opts, given)
+            .map_err(map_err)
+    }
+
+    fn resume_token_is_event(&self, token: &Document) -> bool {
+        changestreams::parse_resume_token(token)
+            .map(|d| !d.ns.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn set_oplog_session(&self, session: Option<(Vec<u8>, i64)>) {
+        let decoded = session.and_then(|(lsid, txn)| {
+            Document::from_reader(&mut lsid.as_slice())
+                .ok()
+                .map(|d| (d, txn))
+        });
+        secantus_storage::set_oplog_session(decoded);
     }
 
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {

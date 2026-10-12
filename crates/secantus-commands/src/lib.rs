@@ -2433,7 +2433,7 @@ fn non_v1_mongod_command(name: &str) -> bool {
 /// A pipeline stage outside this set under `apiStrict: true` is an
 /// `APIStrictError`. Deliberately excludes `$listLocalSessions` / `$listSessions`
 /// / `$currentOp` — the stages driver tests probe with.
-fn api_v1_agg_stage(stage: &str) -> bool {
+pub(crate) fn api_v1_agg_stage(stage: &str) -> bool {
     matches!(
         stage,
         "$addFields"

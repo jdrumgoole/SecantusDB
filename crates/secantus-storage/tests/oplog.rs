@@ -18,9 +18,21 @@ fn temp_home() -> PathBuf {
     dir
 }
 
+/// Open the store with the collections these tests write already there.
+/// A write that creates its collection records the creation in the oplog,
+/// and these tests count entries from the first write.
+fn open_quiet(home: &std::path::Path) -> Storage {
+    let mut st = Storage::open(home.to_str().unwrap()).unwrap();
+    st.set_enable_oplog(false);
+    st.create_collection("app", "c").unwrap();
+    st.create_collection("app", "other").unwrap();
+    st.set_enable_oplog(true);
+    st
+}
+
 fn with_db(body: impl FnOnce(&Storage)) {
     let home = temp_home();
-    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let st = open_quiet(&home);
     body(&st);
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
@@ -126,7 +138,7 @@ fn empty_oplog_reads_are_empty() {
 fn reopen_recovers_seq_counter() {
     let home = temp_home();
     {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        let st = open_quiet(&home);
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
@@ -289,7 +301,7 @@ fn no_pre_images_when_disabled() {
 
 fn with_db_mut(body: impl FnOnce(&mut Storage)) {
     let home = temp_home();
-    let mut st = Storage::open(home.to_str().unwrap()).unwrap();
+    let mut st = open_quiet(&home);
     body(&mut st);
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
@@ -403,7 +415,7 @@ fn find_seq_for_ts_locates_entry() {
 fn reopen_clamps_stale_meta_next_seq() {
     let home = temp_home();
     {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        let st = open_quiet(&home);
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
@@ -444,7 +456,7 @@ fn reopen_clamps_stale_meta_next_seq() {
 fn reopen_without_meta_row_recovers_from_oplog_tail() {
     let home = temp_home();
     {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        let st = open_quiet(&home);
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }

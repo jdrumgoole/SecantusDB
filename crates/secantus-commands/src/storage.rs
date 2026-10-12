@@ -126,10 +126,11 @@ pub struct ChangeStreamOptions {
     pub full_document_before_change: String,
     /// `showExpandedEvents: true` surfaces DDL events (create / modify / …).
     pub show_expanded_events: bool,
-    /// A `$changeStreamSplitLargeEvent` stage was present: every event carries a
-    /// `splitEvent: {fragment, of}` envelope (we never actually split, so always
-    /// `{fragment: 1, of: 1}`).
+    /// A `$changeStreamSplitLargeEvent` stage was present. An event over the
+    /// BSON limit is split; a smaller one is left as it is.
     pub split_large_events: bool,
+    /// `startAtOperationTime`: an entry before it is not an event.
+    pub start_ts: Option<bson::Timestamp>,
 }
 
 /// One poll of the oplog tail for a change-stream cursor: the projected event
@@ -249,6 +250,28 @@ pub trait Storage: Send + Sync {
     fn resume_token_from_invalidate(&self, _token: &Document) -> bool {
         false
     }
+
+    /// [`Self::coll_mod`], with `given` (what the command said) recorded for
+    /// change streams. Default: `coll_mod` with `opts`.
+    fn coll_mod_recording(
+        &self,
+        db: &str,
+        coll: &str,
+        opts: &Document,
+        _given: &Document,
+    ) -> Result<(), StorageError> {
+        self.coll_mod(db, coll, opts)
+    }
+
+    /// Whether the token names an event (as against the high-water mark of
+    /// an empty batch, which names only a position). Default: `true`.
+    fn resume_token_is_event(&self, _token: &Document) -> bool {
+        true
+    }
+
+    /// Name the transaction the writes on this thread belong to, so its
+    /// oplog entries carry the session, or `None` for none. Default: nothing.
+    fn set_oplog_session(&self, _session: Option<(Vec<u8>, i64)>) {}
 
     /// A high-water-mark resume token at oplog `seq` and the current cluster
     /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the

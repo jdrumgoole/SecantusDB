@@ -51,7 +51,7 @@ pub struct ResumeTokenData {
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        s.push_str(&format!("{b:02X}"));
     }
     s
 }
@@ -119,7 +119,8 @@ fn split_ns(ns: &str) -> (String, String) {
 
 fn scope_matches(ns: &str, scope: &Scope) -> bool {
     match scope {
-        Scope::Cluster => true,
+        // A cluster stream leaves the internal databases out.
+        Scope::Cluster => !matches!(split_ns(ns).0.as_str(), "admin" | "local" | "config"),
         Scope::Db(db) => &split_ns(ns).0 == db,
         Scope::Coll { db, coll } => {
             let (d, c) = split_ns(ns);
@@ -290,6 +291,8 @@ fn attach_full_document_before_change(
 /// unnoticed. Keys not listed keep their relative position after these.
 /// Mirrors the Python server's `_EVENT_FIELD_ORDER`.
 const EVENT_FIELD_ORDER: &[&str] = &[
+    "txnNumber",
+    "lsid",
     "_id",
     "operationType",
     "clusterTime",
@@ -427,6 +430,12 @@ fn project_unordered(
             from_invalidate: false,
         })?;
         let mut event = Document::new();
+        // A write made in a transaction names it, ahead of the token (mongod
+        // 8.2.11). A retryable write's session is not shown.
+        if let (Some(n), Some(l)) = (oplog_entry.get("txnNumber"), oplog_entry.get("lsid")) {
+            event.insert("txnNumber", n.clone());
+            event.insert("lsid", l.clone());
+        }
         event.insert("_id", Bson::Document(token));
         event.insert("operationType", op_type);
         event.insert("clusterTime", Bson::Timestamp(ts));
@@ -558,10 +567,12 @@ fn project_command(
         return Ok((Some(event), invalidates));
     }
     if let Ok(from_ns) = cmd.get_str("renameCollection") {
-        if !scope_matches(from_ns, scope) {
+        let to_ns = cmd.get_str("to").unwrap_or("");
+        // A rename is seen from either end: a stream on the target is
+        // invalidated by a rename onto it as one on the source is.
+        if !scope_matches(from_ns, scope) && !scope_matches(to_ns, scope) {
             return Ok((None, false));
         }
-        let to_ns = cmd.get_str("to").unwrap_or("");
         let (to_db, to_coll) = split_ns(to_ns);
         let mut to = Document::new();
         to.insert("db", to_db);
@@ -638,10 +649,16 @@ fn project_command(
             .ok()
             .and_then(|a| a.first())
             .and_then(|b| b.as_document());
+        // mongod's order: `v`, the options, then `key` and `name`.
         let indexes = match spec {
             Some(s) => {
                 let mut idx = Document::new();
                 idx.insert("v", s.get_i32("v").unwrap_or(2));
+                for (k, v) in s {
+                    if !matches!(k.as_str(), "v" | "key" | "name" | "ns") {
+                        idx.insert(k.clone(), v.clone());
+                    }
+                }
                 idx.insert(
                     "key",
                     Bson::Document(s.get_document("key").cloned().unwrap_or_default()),
@@ -675,8 +692,9 @@ fn project_command(
         // (`{v, key, name}`); the key spec rides in the oplog row. A legacy
         // row without it degrades to the name-only shape.
         let mut idx = Document::new();
-        match cmd.get_document("key") {
-            Ok(key) if !key.is_empty() => {
+        match (cmd.get_document("spec"), cmd.get_document("key")) {
+            (Ok(spec), _) => idx = spec.clone(),
+            (_, Ok(key)) if !key.is_empty() => {
                 idx.insert("v", 2i32);
                 idx.insert("key", key.clone());
                 idx.insert("name", cmd.get_str("index").unwrap_or(""));
@@ -783,9 +801,9 @@ const SPLIT_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
 const HEAVY_FIELD_BYTES: usize = 1024 * 1024;
 
 /// Split `event` into 16 MB-bounded fragments when over the BSON limit, tagging
-/// each with `splitEvent: {fragment, of}`. Always returns at least one event; a
-/// small event gets a single `{fragment: 1, of: 1}` fragment (the user's opt-in
-/// is honoured by the field's presence). Mirrors `changestreams.stamp_split_event`.
+/// each with `splitEvent: {fragment, of}`. An event under the limit is returned
+/// as it is: mongod 8.2.11 adds no `splitEvent` to an event it did not split
+/// (measured 2026-10-11). The Python server stamps `{fragment: 1, of: 1}`.
 pub fn stamp_split_event(mut event: Document) -> Result<Vec<Document>> {
     let encoded_size = encode_doc(&event)?.len();
     let split_one = |mut e: Document| -> Document {
@@ -796,7 +814,7 @@ pub fn stamp_split_event(mut event: Document) -> Result<Vec<Document>> {
         e
     };
     if encoded_size <= SPLIT_THRESHOLD_BYTES {
-        return Ok(vec![split_one(event)]);
+        return Ok(vec![event]);
     }
     // Classify each top-level field by its own BSON size.
     let mut heavy: Vec<String> = Vec::new();

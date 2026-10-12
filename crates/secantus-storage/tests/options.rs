@@ -50,7 +50,12 @@ fn oplog_async_option_engages_without_env() {
         }
         st.flush_oplog();
         let rows = st.read_oplog(1, 100).unwrap();
-        assert_eq!(rows.len(), 5, "drained oplog should hold all 5 inserts");
+        // The collection's creation, then the five inserts.
+        assert_eq!(
+            rows.len(),
+            6,
+            "drained oplog should hold the create and all 5 inserts"
+        );
         drop(st);
     }
     let _ = std::fs::remove_dir_all(&home);

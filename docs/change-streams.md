@@ -195,10 +195,12 @@ See [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/task
 
 - Transactional writes DO carry `txnNumber` / `lsid` on their events
   (all events from one transaction share the commit `clusterTime`).
-- `splitLargeChangeStreamEvents` is honoured at the envelope level —
-  every event carries `{splitEvent: {fragment:1, of:1}}` when the
-  flag is set — but events never actually split (oplog entries cap
-  well below 16 MB in our test surrogate workloads).
+- `$changeStreamSplitLargeEvent` is honoured at the envelope level on
+  the Python server — every event carries `{splitEvent: {fragment:1,
+  of:1}}` when the stage is given — but events never actually split
+  (oplog entries cap well below 16 MB in our test surrogate workloads).
+  The Rust server adds `splitEvent` only to an event it split, as
+  `mongod` 8.2.11 does.
 - No `noop` heartbeats — resume tokens advance only on real ops.
 - DDL "expanded" events (`createIndexes` / `dropIndexes`) are
   emitted only when the caller passes `show_expanded_events=True`
