@@ -34134,6 +34134,7 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
         AggFunc::Avg => wire_type(secantus_pgplan::avg_result_type(
             item.source_type.as_deref(),
         )),
+        AggFunc::StringAgg if item.source_type.as_deref() == Some("bytea") => Type::BYTEA,
         AggFunc::StringAgg => Type::TEXT,
         // The result type is PostgreSQL's, which is not a uniform widening:
         // `sum(int4)` is bigint but `sum(int8)` is numeric, and a float sums
@@ -34149,7 +34150,13 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
         AggFunc::ArrayAgg => item
             .source_type
             .as_deref()
-            .map(|t| wire_type(&format!("{t}[]")))
+            .map(|t| {
+                if t.ends_with("[]") {
+                    wire_type(t)
+                } else {
+                    wire_type(&format!("{t}[]"))
+                }
+            })
             .unwrap_or(Type::TEXT_ARRAY),
         // The extended families returned above.
         _ => Type::TEXT,
@@ -34470,6 +34477,28 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             if values.is_empty() {
                 return Bson::Null;
             }
+            // `string_agg(bytea, bytea)`: the bytes joined, a bytea.
+            if values.iter().all(|v| matches!(v, Bson::Binary(_))) {
+                let sep: &[u8] = match item.sep.as_ref() {
+                    Some(Bson::Binary(b)) => &b.bytes,
+                    _ => &[],
+                };
+                let mut parts: Vec<&[u8]> = values
+                    .iter()
+                    .filter_map(|v| match v {
+                        Bson::Binary(b) => Some(b.bytes.as_slice()),
+                        _ => None,
+                    })
+                    .collect();
+                if item.distinct {
+                    parts.sort();
+                    parts.dedup();
+                    if !distinct_agg_order(item).0 {
+                        parts.reverse();
+                    }
+                }
+                return secantus_pgplan::bytea::to_binary(parts.join(sep));
+            }
             let mut texts: Vec<String> = values
                 .iter()
                 .filter_map(|v| match v {
@@ -34500,6 +34529,9 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         AggFunc::Avg => {
             if values.is_empty() {
                 return Bson::Null;
+            }
+            if let Some(mean) = secantus_pgplan::interval_aggregate(&values, true) {
+                return mean.unwrap_or(Bson::Null);
             }
             let count = values.len();
             if values.iter().any(|v| matches!(v, Bson::Double(_))) {
@@ -34540,6 +34572,11 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         AggFunc::Sum => {
             if values.is_empty() {
                 return Bson::Null;
+            }
+            // Intervals add component by component. They are documents,
+            // which the numeric paths below read as zero.
+            if let Some(total) = secantus_pgplan::interval_aggregate(&values, false) {
+                return total.unwrap_or(Bson::Null);
             }
             // Integer inputs sum as int8; a numeric anywhere sums EXACTLY as
             // a numeric (PostgreSQL's `sum(numeric)` keeps the widest input

@@ -44,6 +44,10 @@ psycopg, JDBC and most ORMs send Bind messages with typed parameters rather
 than the interpolated SQL text that a literal corpus produces. Two real bugs
 here were binary-format-only.
 
+``--record=PATH`` also writes the REFERENCE's answers to a JSON file, which a
+test with no PostgreSQL to ask can hold the server to
+(``tests/test_rust_pg_builtin_coverage.py``).
+
 ``SECANTUS_PG_ORACLE_DSN`` overrides the reference server (default: the local
 PostgreSQL that ``tests/pg_oracle.py`` uses).
 
@@ -57,6 +61,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import json
 import os
 import pathlib
 import re
@@ -295,7 +300,15 @@ class _RustServer:
         shutil.rmtree(self.store_dir, ignore_errors=True)
 
 
-def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: str) -> int:
+def main(
+    setup_path: str,
+    corpus_path: str,
+    *,
+    types: bool,
+    tags: bool,
+    server: str,
+    record: str | None = None,
+) -> int:
     store = None
     if server == "rust":
         # The Rust server names its own database and user.
@@ -337,6 +350,7 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
     corpus = _read(corpus_path)
     diffs = 0
     checks = 0
+    recorded: list[list] = []
     for line in corpus:
         sql, args = _split_params(line)
         # A parameterised line is compared once per BINDING MODE, so the report
@@ -356,8 +370,19 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
         for label, want, got in runs:
             checks += 1
             diffs += _report(sql, label, want, got, types=types, tags=tags)
+            recorded.append([sql, label, want[0], want[1], want[3]])
 
     print(f"\n=== {diffs} divergences out of {checks} checks ({len(corpus)} corpus lines)")
+    if record:
+        # The reference's own answers, for a test that has no PostgreSQL to
+        # ask (tests/test_rust_pg_builtin_coverage.py). `--types` is what
+        # makes the type oids part of the record.
+        version = ref.execute("SHOW server_version").fetchone()[0]
+        # One check to a line, so a re-recording diffs statement by statement.
+        lines = ",\n".join(json.dumps(check, ensure_ascii=False) for check in recorded)
+        with open(record, "w") as fh:
+            fh.write(f'{{"reference": {json.dumps(version)}, "checks": [\n{lines}\n]}}\n')
+        print(f"recorded PostgreSQL {version}'s {len(recorded)} answers in {record}")
     sec.close()
     ref.close()
     srv.stop()
@@ -413,6 +438,7 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(2)
     server = "rust" if "--server=rust" in sys.argv or "--rust" in sys.argv else "python"
+    record = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--record=")), None)
     sys.exit(
         main(
             args[0],
@@ -420,5 +446,6 @@ if __name__ == "__main__":
             types="--types" in sys.argv,
             tags="--tag" in sys.argv,
             server=server,
+            record=record,
         )
     )

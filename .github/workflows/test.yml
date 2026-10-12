@@ -2026,11 +2026,12 @@ jobs:
         # embedded PostgreSQL-wire server (`_secantus_server.PgServer`) with a
         # real client. Without it that file `importorskip`s and this lane would
         # report a pass having run none of it -- the exact failure mode this
-        # step's list exists to prevent.
+        # step's list exists to prevent. `trustme` makes the certificates its
+        # TLS tests start the server with.
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
-          --with "psycopg[binary]"
+          --with "psycopg[binary]" --with trustme
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           tests/test_pgserver_embedded.py
@@ -2300,6 +2301,10 @@ jobs:
           # anywhere else it silently collects nothing -- a release gate that
           # runs in no lane is not a gate.
           files="$files tests/test_rust_pg_binary_smoke.py"
+          # The built-in functions, held to PostgreSQL 15's recorded answers
+          # (it needs the binary and no PostgreSQL). Same reasoning: it skips
+          # wherever the binary is not built, so it is named where it is.
+          files="$files tests/test_rust_pg_builtin_coverage.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \

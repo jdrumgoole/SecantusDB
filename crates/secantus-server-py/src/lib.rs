@@ -26,7 +26,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
@@ -35,7 +35,9 @@ use secantus_storage::{wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 #[cfg(feature = "pgserver")]
-use secantus_pg::{bind as pg_bind, DatabaseRegistry, RunningPgServer};
+use secantus_pg::{
+    bind_with as pg_bind_with, DatabaseRegistry, RunningPgServer, ServerOptions, TlsConfig,
+};
 
 /// An in-process handle to a running Rust SecantusDB server. Constructing it
 /// binds a socket and starts the accept loop; `stop()` (or `__exit__` / drop)
@@ -260,19 +262,87 @@ impl PgServer {
     ///   passing it in leaves a window in which another worker can take it.
     /// * `databases` -- extra database names a client may connect to without a
     ///   `CREATE DATABASE` first. `postgres` / `template1` always exist.
+    /// * `tls_cert_file` / `tls_key_file` -- offer TLS with this certificate
+    ///   and key (both or neither), as `secantusd-pg --tls-cert-file`.
+    /// * `tls_ca_file` -- the CAs a client certificate must chain to, and
+    ///   `tls_client_cert` what a client must send: `"verify-ca"`,
+    ///   `"verify-full"` or `"cert"`.
+    /// * `tls_require` -- refuse a connection that is not TLS.
+    /// * `refuse_unknown_users` -- refuse a user there is no role for.
+    /// * `hba_file` / `ident_file` -- a `pg_hba.conf`, whose lines then decide
+    ///   every login, and the `pg_ident.conf` its `map=` options name. The
+    ///   file takes the place of `tls_require`, `tls_client_cert` and
+    ///   `refuse_unknown_users`; giving one beside it is an error.
     #[new]
     #[pyo3(signature = (
         storage_path,
         port = 0,
         host = "127.0.0.1".to_string(),
         databases = None,
+        tls_cert_file = None,
+        tls_key_file = None,
+        tls_ca_file = None,
+        tls_client_cert = None,
+        tls_require = false,
+        refuse_unknown_users = false,
+        hba_file = None,
+        ident_file = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         storage_path: &str,
         port: u16,
         host: String,
         databases: Option<Vec<String>>,
+        tls_cert_file: Option<String>,
+        tls_key_file: Option<String>,
+        tls_ca_file: Option<String>,
+        tls_client_cert: Option<String>,
+        tls_require: bool,
+        refuse_unknown_users: bool,
+        hba_file: Option<String>,
+        ident_file: Option<String>,
     ) -> PyResult<Self> {
+        // The options are checked before the store is opened, so a mistake in
+        // them costs no WiredTiger open and leaves no directory behind.
+        let tls = match (tls_cert_file, tls_key_file) {
+            (Some(cert), Some(key)) => {
+                let mut tls = TlsConfig::new(cert, key).require_tls(tls_require);
+                if let Some(ca) = tls_ca_file {
+                    tls = tls.ca_file(ca);
+                }
+                if let Some(mode) = tls_client_cert {
+                    let mode = mode
+                        .parse()
+                        .map_err(|e| PyValueError::new_err(format!("tls_client_cert: {e}")))?;
+                    tls = tls.client_cert(mode);
+                }
+                Some(tls)
+            }
+            (None, None) => {
+                if tls_ca_file.is_some() || tls_client_cert.is_some() || tls_require {
+                    return Err(PyValueError::new_err(
+                        "tls_ca_file, tls_client_cert and tls_require need \
+                         tls_cert_file and tls_key_file",
+                    ));
+                }
+                None
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "tls_cert_file and tls_key_file go together: give both or neither",
+                ))
+            }
+        };
+        let mut options = ServerOptions::default()
+            .tls(tls)
+            .refuse_unknown_users(refuse_unknown_users);
+        if let Some(path) = hba_file {
+            options = options.hba_file(path);
+        }
+        if let Some(path) = ident_file {
+            options = options.ident_file(path);
+        }
         // WiredTiger requires the home directory to exist; create it so any
         // path "just works" (matching the one-or-two-line ergonomic).
         std::fs::create_dir_all(storage_path).map_err(|e| {
@@ -287,8 +357,11 @@ impl PgServer {
             databases.unwrap_or_default(),
         ));
         let addr = format!("{host}:{port}");
-        let running = pg_bind(&addr, storage, registry)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to bind {addr}: {e}")))?;
+        // The login files are read inside `bind_with`, before the socket is
+        // bound, so a file that cannot be used is this error and never a
+        // server that came up without what it was asked for.
+        let running = pg_bind_with(&addr, storage, registry, &options)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to start on {addr}: {e}")))?;
         let bound = running.address();
         Ok(PgServer {
             running: Some(running),
@@ -324,6 +397,20 @@ impl PgServer {
     #[getter]
     fn version(&self) -> &'static str {
         secantus_server::VERSION
+    }
+
+    /// Read the certificate, key, CA file and `pg_hba.conf` / `pg_ident.conf`
+    /// again, as SIGHUP does for `secantusd-pg`. A connection made afterwards
+    /// gets what they hold now. On an error the server keeps what it had.
+    fn reload(&self) -> PyResult<()> {
+        let running = self
+            .running
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("the server is stopped"))?;
+        running
+            .reloader()
+            .reload()
+            .map_err(|e| PyRuntimeError::new_err(format!("reload failed: {e}")))
     }
 
     /// Stop the server and close the store, checkpointing WiredTiger

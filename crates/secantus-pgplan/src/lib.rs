@@ -23,6 +23,10 @@ pub mod systypes;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
+mod builtin_alias;
+mod builtins;
+mod builtins_regex;
+mod builtins_text;
 pub mod bytea;
 pub mod catalog_stmts;
 pub mod correlated;
@@ -2290,9 +2294,10 @@ pub enum AggFunc {
     /// `range_agg` (a multirange of the union) and `range_intersect_agg`.
     RangeAgg,
     RangeIntersectAgg,
-    /// `bit_and` / `bit_or` over integers.
+    /// `bit_and` / `bit_or` / `bit_xor` over integers and bit strings.
     BitAnd,
     BitOr,
+    BitXor,
     /// A `CREATE AGGREGATE` aggregate; `AggItem::user` holds its definition.
     User,
 }
@@ -10936,6 +10941,17 @@ fn srf_rows(
                         }]
                     })
                     .collect(),
+                // The json flavour names the function; jsonb names the value.
+                Some((other, false)) => {
+                    return Err(Error::InvalidParameter(format!(
+                        "cannot call {name} on a {}",
+                        if matches!(other, json::Json::Object(_)) {
+                            "non-array"
+                        } else {
+                            "scalar"
+                        }
+                    )))
+                }
                 Some((other, _)) => {
                     return Err(Error::InvalidParameter(format!(
                         "cannot extract elements from {}",
@@ -11016,6 +11032,7 @@ fn srf_rows(
             };
             let (source, pattern) = (text(&a[0]), text(&a[1]));
             let flags = a.get(2).map(text).unwrap_or_default();
+            builtins::check_regex_flags(&flags)?;
             let re = regex::Regex::new(&format!(
                 "{}{}",
                 if flags.contains('i') { "(?i)" } else { "" },
@@ -11206,6 +11223,9 @@ fn srf_rows(
                 .collect::<Result<_>>()?;
             if a.iter().take(2).any(|v| *v == Bson::Null) {
                 return Ok(Some(one(Vec::new(), "text")));
+            }
+            if let Some(Bson::String(flags)) = a.get(2) {
+                builtins::check_regex_flags(flags)?;
             }
             let parts = scalar::call("regexp_split_to_array", &a)
                 .ok_or_else(|| Error::Unsupported("this FROM function".into()))??;
@@ -12481,7 +12501,25 @@ fn plan_table_targets(
                     && single_column_call(f, params).is_some_and(|(c, _)| {
                         def.column(&c)
                             .is_some_and(|col| datetime::is_datetime(&col.pg_type))
-                    })) =>
+                    }))
+                    // A built-in picked by its argument types takes the
+                    // general path, which types the column for it.
+                    && !single_column_call(f, params).is_some_and(|(col, _)| {
+                        let types: Vec<String> = f
+                            .args
+                            .iter()
+                            .zip(call_arg_types(f, params))
+                            .map(|(a, t)| match a.node.as_ref() {
+                                Some(N::ColumnRef(c))
+                                    if column_ref_name(c).as_deref() == Some(&col) =>
+                                {
+                                    def.column(&col).map_or(t, |c| c.pg_type.clone())
+                                }
+                                _ => t,
+                            })
+                            .collect();
+                        func_name(f).is_some_and(|n| builtins::result_type(&n, &types).is_some())
+                    }) =>
             {
                 let name = func_name(f).expect("checked");
                 let (column, args) = single_column_call(f, params).expect("checked");
@@ -13076,6 +13114,7 @@ pub(crate) fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc,
         "regr_r2" => (AggFunc::RegrR2, 2),
         "bit_and" => (AggFunc::BitAnd, 1),
         "bit_or" => (AggFunc::BitOr, 1),
+        "bit_xor" => (AggFunc::BitXor, 1),
         "range_agg" => (AggFunc::RangeAgg, 1),
         "range_intersect_agg" => (AggFunc::RangeIntersectAgg, 1),
         n if user_agg::is_user_aggregate(n) => (AggFunc::User, 1),
@@ -13289,7 +13328,7 @@ fn plan_aggregate_item(
             "function {name}(money) does not exist"
         )));
     }
-    if matches!(func, AggFunc::BitAnd | AggFunc::BitOr)
+    if matches!(func, AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor)
         && !matches!(
             item.source_type.as_deref(),
             Some("int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "bit" | "varbit")
@@ -13303,7 +13342,7 @@ fn plan_aggregate_item(
     if func == AggFunc::StringAgg
         && !matches!(
             item.source_type.as_deref(),
-            Some("text" | "varchar" | "bpchar" | "name" | "char")
+            Some("text" | "varchar" | "bpchar" | "name" | "char" | "bytea")
         )
         && !item
             .source_type
@@ -13523,8 +13562,14 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
             .source_type
             .clone()
             .unwrap_or_else(|| "text".to_string()),
-        AggFunc::ArrayAgg => format!("{}[]", item.source_type.as_deref().unwrap_or("text")),
+        // An array of arrays is an array of one more dimension, and the
+        // same type: `array_agg(int4[])` is `int4[]`.
+        AggFunc::ArrayAgg => match item.source_type.as_deref() {
+            Some(t) if t.ends_with("[]") => t.to_string(),
+            t => format!("{}[]", t.unwrap_or("text")),
+        },
         AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
+        AggFunc::StringAgg if item.source_type.as_deref() == Some("bytea") => "bytea".to_string(),
         AggFunc::StringAgg => "text".to_string(),
         AggFunc::VarSamp | AggFunc::VarPop | AggFunc::StddevSamp | AggFunc::StddevPop => {
             match item.source_type.as_deref() {
@@ -13574,7 +13619,11 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
                 base.to_string()
             }
         }
-        AggFunc::PercentileDisc | AggFunc::Mode | AggFunc::BitAnd | AggFunc::BitOr => {
+        AggFunc::PercentileDisc
+        | AggFunc::Mode
+        | AggFunc::BitAnd
+        | AggFunc::BitOr
+        | AggFunc::BitXor => {
             let base = item
                 .source_type
                 .clone()
@@ -15976,6 +16025,11 @@ fn numeric_signature(name: &str) -> Option<usize> {
 /// type at plan time, where this server would otherwise stringify.
 fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) -> Option<Error> {
     let name = func_name(f)?;
+    // An overload `builtins` answers exists, whatever the name-keyed checks
+    // below know of the name's other overloads.
+    if !correlated::user_function_named(&name) && builtins::result_type(&name, types).is_some() {
+        return None;
+    }
     // A SQL-syntax function (`EXTRACT`, `OVERLAY`) is `pg_catalog.`-qualified
     // by the grammar, and PostgreSQL names it so.
     let shown = match f.funcname.first().and_then(|n| n.node.as_ref()) {
@@ -20626,7 +20680,93 @@ fn selected_call_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     funcsig::selected_result_type(&name, &types)
 }
 
+/// The name and static argument types of a call `builtins` may answer: a
+/// plain call of a built-in, typed without running anything. A parameter is
+/// typed by its bound value, which costs nothing to read.
+fn builtin_call_types(
+    f: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Option<(String, Vec<String>)> {
+    let name = func_name(f)?;
+    if f.agg_star
+        || f.over.is_some()
+        || correlated::user_function_named(&name)
+        || f.args
+            .iter()
+            .any(|a| matches!(a.node, Some(N::NamedArgExpr(_))))
+    {
+        return None;
+    }
+    let types = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::ParamRef(_)) => {
+                let value = const_value(a, params).unwrap_or(Bson::Null);
+                static_type(a, &value)
+            }
+            _ => static_type(a, &Bson::Null),
+        })
+        .collect();
+    Some((name, types))
+}
+
+/// The options argument of a regular-expression function, checked as
+/// PostgreSQL's `parse_re_flags` checks it: a letter that is no option is
+/// 22023, where it used to be ignored.
+fn check_regex_options(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<()> {
+    let Some((name, types)) = builtin_call_types(f, params) else {
+        return Ok(());
+    };
+    let Some(at) = builtins::regex_flags_position(&name, &types) else {
+        return Ok(());
+    };
+    // PostgreSQL checks the numbers (start, n, end option, subexpression)
+    // before it reads the options, so a call wrong in both is told about
+    // the number.
+    let args = f
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    if args.contains(&Bson::Null) {
+        return Ok(());
+    }
+    builtins::check_regex_numbers(&name, &args)?;
+    match &args[at] {
+        Bson::String(flags) => builtins::check_regex_flags(flags),
+        _ => Ok(()),
+    }
+}
+
+/// A built-in that is picked by its argument types (`builtins`), run.
+fn builtin_by_type(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Option<Result<Bson>> {
+    if let Err(e) = check_regex_options(f, params) {
+        return Some(Err(e));
+    }
+    let (name, types) = builtin_call_types(f, params)?;
+    builtins::result_type(&name, &types)?;
+    let args = match f
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(a) => a,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(builtins::call(&name, &args, &types, f.func_variadic))
+}
+
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // A built-in picked by its argument types says its own result type.
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if let Some(t) = builtin_call_types(f, &[])
+            .and_then(|(name, types)| builtins::result_type(&name, &types))
+        {
+            return t;
+        }
+    }
     // `pg_trgm`: its functions and operators answer `real` (and `text[]`,
     // `boolean`), which a value alone -- a double -- does not say.
     match node.node.as_ref() {
@@ -21261,8 +21401,42 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     {
                         return "interval".to_string();
                     }
+                    // A prefix operator over a number keeps the number's
+                    // type: `-x` of a `real` is `real`, of a `smallint`
+                    // `smallint`. The value alone is a double, or an int4.
+                    if e.lexpr.is_none() && matches!(op, "-" | "+" | "~" | "@") {
+                        if let Some(t) = rt().filter(|t| {
+                            matches!(
+                                t.as_str(),
+                                "int2" | "int4" | "int8" | "float4" | "float8" | "numeric"
+                            ) && !(op == "~" && !t.starts_with("int"))
+                        }) {
+                            return t.clone();
+                        }
+                    }
+                    let integer = |t: &str| matches!(t, "int2" | "int4" | "int8");
+                    // A shift keeps its left operand's type.
+                    if matches!(op, "<<" | ">>") {
+                        if let (Some(l), Some(r)) = (lt(), rt()) {
+                            if integer(l) && integer(r) {
+                                return l.clone();
+                            }
+                        }
+                    }
                     if let (Some(lt), Some(rt)) = (lt(), rt()) {
                         let (lt, rt) = (lt.clone(), rt.clone());
+                        // Two integers answer the wider of their types:
+                        // `smallint + smallint` is `smallint`, where the
+                        // value (an int4, whatever it was computed from)
+                        // said `integer`.
+                        if matches!(op, "+" | "-" | "*" | "/" | "%" | "&" | "|" | "#")
+                            && integer(&lt)
+                            && integer(&rt)
+                        {
+                            if let Some(t) = wider_numeric(&lt, &rt) {
+                                return t;
+                            }
+                        }
                         if let Some(t) = datetime_arith_type(op, &lt, &rt) {
                             return t.to_string();
                         }
@@ -21638,6 +21812,7 @@ fn datetime_arith_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
         "+" => match (l, r) {
             ("date", "int") | ("int", "date") => Some("date"),
             ("date", "interval") | ("interval", "date") => Some("timestamp"),
+            ("date", "time") | ("time", "date") => Some("timestamp"),
             ("timestamp", "interval") | ("interval", "timestamp") => Some("timestamp"),
             ("timestamptz", "interval") | ("interval", "timestamptz") => Some("timestamptz"),
             ("time", "interval") | ("interval", "time") => Some("time"),
@@ -22266,6 +22441,24 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         continue;
                     }
                 }
+                check_regex_options(f, params)?;
+                if let Some(t) = builtin_call_types(f, params)
+                    .and_then(|(name, types)| builtins::result_type(&name, &types))
+                {
+                    let node = rt.val.as_deref().expect("a FuncCall target");
+                    let value = const_value(node, params)?;
+                    columns.push((
+                        if rt.name.is_empty() {
+                            func_name(f).unwrap_or_default()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(value),
+                        t,
+                        -1,
+                    ));
+                    continue;
+                }
                 let name = f
                     .funcname
                     .iter()
@@ -22511,7 +22704,15 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         {
                             declared.to_string()
                         } else {
-                            inferred_type(&value).to_string()
+                            // The value cannot tell a `smallint` from an
+                            // `integer` or a `real` from a `double precision`;
+                            // the overload the call resolves to can.
+                            let inferred = inferred_type(&value);
+                            match (inferred, selected_call_type(f).as_deref()) {
+                                ("int4", Some("int2")) => "int2".to_string(),
+                                ("float8", Some("float4")) => "float4".to_string(),
+                                _ => inferred.to_string(),
+                            }
                         };
                         columns.push((
                             if rt.name.is_empty() {
@@ -26477,6 +26678,46 @@ pub fn render_interval(iv: &Interval) -> String {
     parts.join(" ")
 }
 
+/// `sum` (or, with `avg`, the mean) of interval values: `None` unless every
+/// value is an interval. The sum is `interval_pl` and the mean
+/// `interval_div`, as the operators compute them.
+pub fn interval_aggregate(values: &[&Bson], avg: bool) -> Option<Result<Bson>> {
+    if values.is_empty() || !values.iter().all(|v| Interval::from_bson(v).is_some()) {
+        return None;
+    }
+    let mut total = (*values[0]).clone();
+    for v in &values[1..] {
+        total = match eval_binary("+", total, (*v).clone()) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+    }
+    if !avg {
+        return Some(Ok(total));
+    }
+    Some(eval_binary(
+        "/",
+        total,
+        Bson::Int64(i64::try_from(values.len()).unwrap_or(i64::MAX)),
+    ))
+}
+
+/// `bit_and` / `bit_or` / `bit_xor` over bit strings: `op` is `&`, `|` or
+/// `#`. `None` unless every value is a bit string.
+pub fn bit_string_aggregate(values: &[Bson], op: &str) -> Option<Result<Bson>> {
+    if values.is_empty() || !values.iter().all(|v| matches!(v, Bson::String(_))) {
+        return None;
+    }
+    let mut total = values[0].clone();
+    for v in &values[1..] {
+        total = match bits::binary(op, &total, v)? {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+    }
+    Some(Ok(total))
+}
+
 /// An interval VALUE as its canonical text, when the value is one.
 pub fn interval_value_text(v: &Bson) -> Option<String> {
     Interval::from_bson(v).map(|iv| render_interval(&iv))
@@ -29849,6 +30090,20 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             Bson::String(s) => NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok(),
             _ => None,
         };
+        // `date + time` is the timestamp at that time of that day.
+        if op == "+" {
+            let (date, time) = if as_ymd(&lhs).is_some() && is_time_text(&rhs) {
+                (Some(&lhs), Some(&rhs))
+            } else if as_ymd(&rhs).is_some() && is_time_text(&lhs) {
+                (Some(&rhs), Some(&lhs))
+            } else {
+                (None, None)
+            };
+            if let (Some(date), Some(time)) = (date, time) {
+                let since_midnight = cast_value(time.clone(), "interval")?;
+                return eval_binary("+", date.clone(), since_midnight);
+            }
+        }
         if let (Some(d), Some(n)) = (as_ymd(&lhs), as_int(&rhs)) {
             let out = d
                 .checked_add_signed(chrono::Duration::days(sign * n))
@@ -31933,12 +32188,39 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
     if depth == 0 {
         TYPE_MEMO.with(|m| m.borrow_mut().clear());
     }
-    let out = const_value_inner(node, params);
+    let out = const_value_inner(node, params).and_then(|v| smallint_in_range(node, v));
     CONST_DEPTH.with(|d| d.set(depth));
     if depth == 0 {
         TYPE_MEMO.with(|m| m.borrow_mut().clear());
     }
     out
+}
+
+/// `smallint` arithmetic answers `smallint`, and a result past its range is
+/// 22003. The value is computed as an int4, which holds what a smallint
+/// cannot, so the operator's own type is what says it overflowed.
+fn smallint_in_range(node: &pg_query::protobuf::Node, value: Bson) -> Result<Bson> {
+    let Bson::Int32(v) = value else {
+        return Ok(value);
+    };
+    if i16::try_from(v).is_ok() {
+        return Ok(value);
+    }
+    let Some(N::AExpr(e)) = node.node.as_ref() else {
+        return Ok(value);
+    };
+    if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp)
+        || !matches!(
+            operator_name(e).unwrap_or(""),
+            "+" | "-" | "*" | "/" | "%" | "<<"
+        )
+    {
+        return Ok(value);
+    }
+    if static_type(node, &Bson::Null) == "int2" {
+        return Err(Error::NumericOutOfRange("smallint out of range".into()));
+    }
+    Ok(value)
 }
 
 /// A cast whose answer depends on the SOURCE type, for the types in
@@ -32524,6 +32806,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             return correlated::call_sequence(&name, &args);
         }
         refuse_untyped_any_args(f)?;
+        if let Some(out) = builtin_by_type(f, params) {
+            return out;
+        }
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
         }
@@ -34450,6 +34735,30 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
     } else {
         (const_value(rexpr, params)?, None)
     };
+    // `bytea LIKE bytea` matches BYTES: `%` and `_` are the wildcards, and
+    // an untyped literal beside a bytea is one. This answered NULL.
+    if is_like
+        && !insensitive
+        && subject != Bson::Null
+        && pattern != Bson::Null
+        && (matches!(subject, Bson::Binary(_)) || matches!(pattern, Bson::Binary(_)))
+    {
+        let escape = match escape.map(u32::from).map(u8::try_from) {
+            Some(Ok(byte)) => Some(byte),
+            Some(Err(_)) => {
+                return Err(Error::Unsupported(
+                    "a LIKE escape that is not one byte".into(),
+                ))
+            }
+            None => None,
+        };
+        let m = like_match::like_match_bytes(
+            &bytea::parse(&subject)?,
+            &bytea::parse(&pattern)?,
+            escape,
+        )?;
+        return Ok(Bson::Boolean(m != negated));
+    }
     let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
         return Ok(Bson::Null);
     };
@@ -34499,6 +34808,10 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     // result where PostgreSQL raises, which is the silent-divergence class
     // this server refuses to ship. Measured on 14.13.
     if let Some(column) = def.columns.iter().find(|c| c.field() == field) {
+        // `bytea LIKE bytea` exists, and matches bytes: per row.
+        if column.pg_type == "bytea" && is_like && !insensitive {
+            return Err(Error::Unsupported("a pattern match over bytea".into()));
+        }
         if !matches!(
             column.pg_type.as_str(),
             "text" | "varchar" | "bpchar" | "name" | "citext"

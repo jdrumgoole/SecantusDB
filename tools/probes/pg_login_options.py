@@ -117,8 +117,12 @@ def error_fields(body):
     return (f.get("S"), f.get("C"), f.get("M"), f.get("D"))
 
 
-def raw_first(port, user, tls=True, cert=None):
-    """The server's first answer to a startup: an error's fields, or the request."""
+#: What a client sees when the server's close reaches it before the TLS alert
+#: that says why.
+_CLOSED_FIRST = ("SSLEOFError", "ConnectionResetError", "BrokenPipeError")
+
+
+def _raw_first_once(port, user, tls=True, cert=None):
     try:
         c = Raw(port, tls=tls, user=user, cert=cert)
         kind, body = c.read()
@@ -127,6 +131,22 @@ def raw_first(port, user, tls=True, cert=None):
         return ("auth", struct.unpack("!I", body[:4])[0])
     except Exception as e:  # noqa: BLE001
         return ("client", type(e).__name__, str(e)[:90])
+
+
+def raw_first(port, user, tls=True, cert=None):
+    """The server's first answer to a startup: an error's fields, or the request.
+
+    A certificate the server refuses is answered with a TLS alert as it
+    closes, and a client now and then reads the close first (PostgreSQL 15.19
+    did so once in CI, in `pg_login_tls_files.py`). A close is asked about
+    again, on either server, so the answer compared is the alert whenever
+    the server sends one."""
+    out = _raw_first_once(port, user, tls=tls, cert=cert)
+    for _ in range(4):
+        if not (out[0] == "client" and out[1] in _CLOSED_FIRST):
+            break
+        out = _raw_first_once(port, user, tls=tls, cert=cert)
+    return out
 
 
 def raw_scram(

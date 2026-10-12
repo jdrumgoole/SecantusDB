@@ -1384,6 +1384,48 @@ def validate_psycopg(c: Context) -> None:
     print("\nWrote docs/validation-report-psycopg.md")
 
 
+@task(name="validate-psycopg-rust")
+def validate_psycopg_rust(c: Context, tls: bool = False) -> None:
+    """Run psycopg 3's suite against the Rust PostgreSQL server, `secantusd-pg`.
+
+    Writes `.validation/psycopg-raw-rust.json`, a different file from the
+    Python server's, and no report under `docs/`. Build the server first with
+    `./inv rust-pgserver-build`; the runner refuses a binary that was not built
+    from this tree. About 20 minutes.
+
+    `--tls` runs the plain gauge and then the same suite again over TLS
+    (`SECANTUS_GAUGE_TLS=1`, a certificate made for the run, every libpq
+    connection verifying it), and fails when a test fails over TLS that
+    passes in the clear. Twice the time.
+
+    Either way a run that did not account for every test it started is a
+    failure: `psycopg_validation.check_run` is what says so.
+    """
+    import pathlib
+
+    if not pathlib.Path("vendor/psycopg/tests").exists():
+        c.run("git submodule update --init vendor/psycopg", pty=PTY)
+    runner = "uv run --no-sync python -m psycopg_validation.runner"
+    check = "uv run --no-sync python -m psycopg_validation.check_run"
+    plain = pathlib.Path(".validation/psycopg-raw-rust.json")
+    over_tls = pathlib.Path(".validation/psycopg-raw-rust-tls.json")
+    # Cleared first, so a run that never starts cannot leave an earlier run's
+    # report to be read as this one's.
+    plain.unlink(missing_ok=True)
+    c.run(runner, pty=PTY, warn=True, env={"SECANTUS_GAUGE_SERVER": "rust"})
+    if not tls:
+        c.run(f"{check} {plain}", pty=PTY)
+        return
+    over_tls.unlink(missing_ok=True)
+    c.run(
+        runner,
+        pty=PTY,
+        warn=True,
+        env={"SECANTUS_GAUGE_SERVER": "rust", "SECANTUS_GAUGE_TLS": "1"},
+    )
+    c.run(f"{check} {plain} --tls {over_tls}", pty=PTY)
+
+
 @task(name="validate-sqlalchemy")
 def validate_sqlalchemy(c: Context) -> None:
     """Run SQLAlchemy's dialect-compliance suite against a SecantusPGServer daemon.

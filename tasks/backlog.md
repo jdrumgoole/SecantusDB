@@ -4379,21 +4379,33 @@ These work end-to-end but cut corners.
     psycopg gauge has a TLS run (`SECANTUS_GAUGE_TLS=1`): 5,544 pass and
     none fail of 5,731, the plain run's counts (2026-10-12, macOS, psycopg
     3.3.4, 1,073 s, on the tree of 0.1.0-beta.12). What that leaves:
-    - **`pg_login_tls_files.py` failed once in CI, 479 of 480** (2026-10-12,
-      `pg-oracle` on PR #1900, a MongoDB version bump that touches no
-      PostgreSQL code; the same lane passed on #1899 an hour earlier). In
-      `crl intermediate only`, "good cert, first answer", PostgreSQL 15.19
-      gave the client `SSLEOFError` (the connection closed) where it
-      normally sends, and this server sent, the `unknown ca` alert. So the
-      reference's answer is not stable for a refused certificate: whether
-      the client reads the alert or the close is a race on PostgreSQL's
-      side. Not reproduced or fixed; the comparison should treat the two
-      as one answer, or it will fail again.
-    - **The TLS gauge run is by hand.** No CI lane and no `invoke` task
-      runs it, and it sets `PGSSLMODE` for libpq, so a test that names its
-      own `sslmode` is not moved onto TLS by it.
-    - **The embedded Python handle (`_secantus_server.PgServer`) has no
-      TLS parameter.**
+    - `pg_login_tls_files.py` failed once in CI, 479 of 480 (2026-10-12,
+      `pg-oracle` on PR #1900, a MongoDB version bump): in `crl
+      intermediate only`, "good cert, first answer", PostgreSQL 15.19 gave
+      the client `SSLEOFError` where it normally sends, and this server
+      sent, the `unknown ca` alert. The client read PostgreSQL's close
+      before its alert. `raw_first`, in all three login probes, now asks
+      again, up to four times, when the answer is the close, on either
+      server. **The libpq scenarios
+      (`attempt`) do not retry**; none has shown the race, and libpq
+      reports the alert it read before the close.
+    - The TLS gauge run has a task and a CI lane since 2026-10-12:
+      `./inv validate-psycopg-rust --tls` runs the plain gauge and then the
+      TLS one, and `.github/workflows/psycopg-tls.yml` does the same on
+      Linux weekly and on a PR that touches the server's TLS code or the
+      gauge runner. Both end in `psycopg_validation.check_run`, which fails
+      a run that did not account for every test it started, and fails a
+      test that fails over TLS and passes in the clear. What is left:
+      **the TLS run sets `PGSSLMODE` for libpq, so a test that names its
+      own `sslmode` is not moved onto TLS by it**; and a test that fails in
+      BOTH runs is printed and does not fail that lane, which is the plain
+      gauge's number and has no Linux lane that gates it.
+    - The embedded Python handle (`_secantus_server.PgServer`) takes
+      `tls_cert_file` / `tls_key_file` / `tls_ca_file` / `tls_client_cert`
+      / `tls_require`, `refuse_unknown_users`, `hba_file` / `ident_file`,
+      and has `reload()`, since 2026-10-12. **It does not take a
+      revocation list, a user name map or `clientname=DN` as options**;
+      a `pg_hba.conf` passed as `hba_file` can say the last two.
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
@@ -4858,6 +4870,146 @@ These are explicit non-goals. Don't add them without a reason.
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by **RecordId** (insertion order — the same order capped eviction uses; an `id_key` watermark dropped and redelivered docs when `_id`s weren't monotonic), and raises `CappedPositionLost` (136) on rollover.
 
 ## 5. Known bugs and edge cases to watch
+
+- [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
+      and pass on macOS (first measured 2026-10-12).** No Linux lane ran
+      psycopg's suite against the Rust PostgreSQL server until
+      `.github/workflows/psycopg-tls.yml`. Its first two runs, on
+      `ubuntu-latest`, 5,788 tests each (80 skipped, 34 xfailed, 3
+      xpassed, 1 deselected); the same tree on macOS has no failure:
+
+      | run | in the clear | over TLS |
+      | --- | --- | --- |
+      | 1 | 6 fail, 1,689 s | cut off at 98% by the runner's 1,800 s backstop |
+      | 2 | 31 fail, 2,492 s | 14 fail, 2,067 s |
+
+      - **The NOTIFY timing tests fail in every run, in either
+        transport**: `test_notify.py::test_notify` and
+        `::test_notify_timeout`, their `test_notify_async.py` twins, and
+        in run 2 the four `test_notify_query_notify` cases. Each sends a
+        NOTIFY 0.25 s after it starts, from a second connection it opens
+        then, and asserts when it arrives: 0.306 to 0.328 s measured,
+        where 0.25 +/- 0.025 or 0.05 is allowed. So 55 to 80 ms late.
+        Not diagnosed. The server wakes an idle listener by a
+        `tokio::sync::Notify` and sets `TCP_NODELAY`, so nothing polls;
+        what is left is the time a debug build takes to accept the second
+        connection and run the NOTIFY on a shared runner. Measure that on
+        a quiet Linux box, and with a release build, before calling it
+        the runner.
+      - `test_concurrency.py::test_notifies` is the same measurement and
+        fails in some runs and not others.
+      - **`test_cursor_async.py::test_leak` failed 22 of its 72 cases in
+        run 2 in the clear, and none in run 1 or over TLS.** It counts
+        Python objects in the client; it also failed twice on macOS on a
+        loaded machine and passed three times alone.
+      - `test_concurrency_async.py::test_type_error_shadow` hit the 20 s
+        per-test timeout in all three completed runs.
+
+      What the lane gates, given that: a run that stopped short, and a
+      test that fails over TLS only, apart from `::test_notify*`,
+      `::test_notifies` and `::test_leak` (`SHARED_RUNNER_NOISE` in
+      `psycopg_validation/check_run.py`, applied only with
+      `--shared-runner`). In run 2 five of those failed over TLS and
+      passed in the clear, which is the noise above and not TLS. **So a
+      change that delays NOTIFY over TLS only would not fail that lane**;
+      `./inv validate-psycopg-rust --tls` on a developer's machine holds
+      every test to it. Nothing gates the plain number on Linux.
+
+- [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
+      (2026-10-12).** The probe calls every immutable or stable function in
+      PostgreSQL 15.19's `pg_proc` on both servers with one sample value
+      for each argument type. Of the 1,935 it can call, 619 answered the
+      same before the batch of 2026-10-12 and 1,439 after it; 428 are still
+      refused (42883 or 0A000) and 68 differ some other way. 325 more
+      read the server's own state and are not called, and 722 take a type
+      the probe has no sample for (`internal`, `cstring`, `record`,
+      `aclitem`, `regproc`, `xml`, `refcursor` and others), so nothing
+      here is said of them. Re-run it before working an item: the lists
+      below are from that day.
+
+      **Wrong answers the probe found and that batch did NOT fix** (each
+      is silent, so each is worth more than a refusal):
+      - `pg_lsn + numeric`, `pg_lsn - numeric` and `numeric + pg_lsn`
+        answer a `numeric` (`'0/16'::pg_lsn + 1.5` is 23.5, where
+        PostgreSQL answers `0/18`).
+      - `lseg ?# lseg` is true for two identical segments; PostgreSQL
+        answers false.
+      - `line <-> point` differs in the last digit (0.7071067811865475
+        against ...476), which is the FMA rule in `CLAUDE.md` again.
+      - `ts_headline` over `json` / `jsonb` answers the document's text as
+        `text`; PostgreSQL answers the document, of its own type, with the
+        headline applied to each string value.
+      - `"char"(int4)` and `"char"(text)` answer a `bpchar` of the whole
+        value; PostgreSQL answers one byte.
+      - `pg_relation_is_publishable` is true for a catalog relation.
+      - `array_agg` over an array column takes a NULL array, and arrays
+        of different lengths; PostgreSQL refuses the first (22004 `cannot
+        accumulate null arrays`) and the second (2202E `cannot accumulate
+        arrays of different dimensionality`).
+      - A function call PostgreSQL refuses for its argument types can
+        run: `int4pl(1.5, 2)` is `1.5 + 2` here and 42883 there
+        (`builtin_alias.rs` casts a literal the parameter would coerce and
+        leaves every other argument as it is).
+
+      **Refused where PostgreSQL answers, called by name** (57
+      signatures): `unnest` of a multirange and of a tsvector;
+      `setweight(tsvector, "char")` and `ts_filter` with a `"char"`
+      argument typed as such; `ts_rewrite` with three queries;
+      `json[b]_to_tsvector` with a filter; `ts_debug`, `ts_parse`,
+      `ts_token_type`; `json[b]_populate_record[set]` in a select list;
+      `range_merge` of a multirange; the `*_canonical` and `*_subdiff`
+      range functions; `like_escape`; `table_to_xml`, `schema_to_xml`,
+      `database_to_xml` and their schema forms; `pg_relation_is_updatable`,
+      `pg_is_other_temp_schema`, `pg_settings_get_flags`, `acldefault`,
+      `makeaclitem`, `mxid_age`. `json[b]_each[_text]` in a select list is
+      XX000 `a result row has more columns than its description`, an
+      internal error where PostgreSQL answers a record.
+
+      **Refused OPERATORS the probe reached through their functions** (82
+      signatures; each is `0A000` or `operator does not exist`):
+      - multirange `-|-`, `<<`, `>>`, `&<`, `&>` and its ordering
+        comparisons (`<`, `<=`, `>`, `>=`), with a multirange or a range
+        on either side;
+      - `macaddr` and `macaddr8` `&`, `|`, `~`;
+      - the text pattern comparisons `~<~`, `~<=~`, `~>=~`, `~>~`;
+      - `date + timetz` and `timetz + date`;
+      - geometric: `box # box`, `box <^ box`, `box >^ box`, circle
+        `&<` / `&>` / `&<|` / `|&>`, the closest-point operator `##` for
+        six pairs of types, `<->` between a line or a box and a segment,
+        `line # line`, `line ?# box`, `lseg ?# line`, the `path` count
+        comparisons, `point <> point`;
+      - `tsquery @> tsquery` and `<@` by their function names;
+      - `json[b]_extract_path[_text]` and `jsonb_delete` given their
+        path as `VARIADIC array`.
+
+      **Casts by function name** (12): `time(interval)`, `cidr(inet)`,
+      `int4("char")`, `pg_lsn(numeric)`, and the length-coercion forms
+      (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`,
+      `timestamp(timestamp, int4)` and the like) are refused or wrong.
+
+      **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
+      `byteacmp` answer what the C library's `memcmp` returns, which is
+      14 for `bttextcmp('b', 'a')` on macOS and 1 elsewhere; the `tid`
+      type does not exist here, so its six comparisons and `min` / `max`
+      over it are 42704; the type input and output functions (117), the
+      index support functions (103) and the aggregates' own transition
+      functions (57) take or return `cstring` and `internal` and are not
+      called by a statement.
+
+      **Error texts** (30): PostgreSQL 15 reworded `date_part` /
+      `date_trunc` / `extract` of an unknown unit to `unit "x" not
+      recognized for type timestamp with time zone`; this server still
+      says 14's `timestamp with time zone units "x" not recognized`. The
+      corpora that pin those lines are measured against the PostgreSQL 14
+      reference, so changing the text moves them to
+      `# reference-version: 15` in the same change. `date_part` and
+      `extract` of a `timetz` with an unknown unit are 22007 here, a
+      different error. A `jsonb` object or array cast to a number or a
+      boolean is 22P02 `invalid input syntax` here and 22023 `cannot cast
+      jsonb object to type integer` there. `make_timestamptz` with a zone
+      name that is none, `substring(s, pattern, escape)` with an escape
+      longer than one character, and `ts_headline` with options that do
+      not parse all answer where PostgreSQL refuses.
 
 - [ ] **OPEN — the Go gauge's 7 remaining failures, triaged (2026-09-29,
       re-measured 2026-09-30).** These were invisible until the truncation fix:

@@ -32,6 +32,10 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 _secantus_server = pytest.importorskip("_secantus_server")
 
+# Imported plainly, after the two skips above: a lane that built the extension
+# and lacks `trustme` should fail here, and not report the TLS tests as run.
+import trustme  # noqa: E402
+
 pytestmark = pytest.mark.skipif(
     not getattr(_secantus_server, "HAS_PGSERVER", False),
     reason="_secantus_server built without the `pgserver` cargo feature",
@@ -195,3 +199,137 @@ def test_two_embedded_servers_coexist(tmp_path: Path) -> None:
             assert conn.execute("SELECT n FROM t").fetchall() == [(1,)]
         with _connect(two) as conn:
             assert conn.execute("SELECT n FROM t").fetchall() == [(2,)]
+
+
+def _certificates(tmp_path: Path) -> tuple[str, str, str]:
+    """A CA and a certificate for 127.0.0.1: (ca, cert, key) paths."""
+    ca = trustme.CA()
+    issued = ca.issue_cert("127.0.0.1", "localhost")
+    ca_file, cert_file, key_file = (tmp_path / n for n in ("ca.pem", "server.crt", "server.key"))
+    ca.cert_pem.write_to_path(str(ca_file))
+    issued.cert_chain_pems[0].write_to_path(str(cert_file))
+    issued.private_key_pem.write_to_path(str(key_file))
+    return str(ca_file), str(cert_file), str(key_file)
+
+
+def _tls_in_use(conn: psycopg.Connection) -> bool:
+    return bool(
+        conn.execute("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()").fetchone()[0]
+    )
+
+
+def _verified(server: Any, ca: str) -> psycopg.Connection:
+    """A connection that checks the server's certificate against `ca` and the
+    host name. The CA's path goes as a keyword, which psycopg quotes: written
+    into the connection string, a Windows path's backslashes are libpq's
+    escape character and the file is then not found."""
+    return psycopg.connect(
+        server.dsn,
+        sslmode="verify-full",
+        sslrootcert=ca,
+        autocommit=True,
+        connect_timeout=10,
+    )
+
+
+def test_tls_is_offered_and_verified(tmp_path: Path) -> None:
+    """`tls_cert_file` / `tls_key_file`: a client that checks the certificate
+    against the CA and the host name connects, and the session is TLS."""
+    ca, cert, key = _certificates(tmp_path)
+    with _server(tmp_path / "home", tls_cert_file=cert, tls_key_file=key) as server:
+        with _verified(server, ca) as conn:
+            assert _tls_in_use(conn)
+        # TLS is offered, and a client that does not ask for it is still served.
+        with psycopg.connect(f"{server.dsn} sslmode=disable", autocommit=True) as conn:
+            assert not _tls_in_use(conn)
+
+
+def test_tls_require_refuses_a_plain_connection(tmp_path: Path) -> None:
+    ca, cert, key = _certificates(tmp_path)
+    with _server(
+        tmp_path / "home", tls_cert_file=cert, tls_key_file=key, tls_require=True
+    ) as server:
+        with pytest.raises(psycopg.OperationalError) as refused:
+            psycopg.connect(f"{server.dsn} sslmode=disable", connect_timeout=10).close()
+        assert "no encryption" in str(refused.value)
+        with _verified(server, ca) as conn:
+            assert _tls_in_use(conn)
+
+
+def test_tls_options_are_checked_before_the_store_is_opened(tmp_path: Path) -> None:
+    """A mistake in the options is a `ValueError`, and costs no store: the
+    home directory is not even created."""
+    _ca, cert, _key = _certificates(tmp_path)
+    home = tmp_path / "home"
+    with pytest.raises(ValueError, match="give both or neither"):
+        _secantus_server.PgServer(str(home), tls_cert_file=cert)
+    with pytest.raises(ValueError, match="need tls_cert_file"):
+        _secantus_server.PgServer(str(home), tls_require=True)
+    with pytest.raises(ValueError, match="tls_client_cert"):
+        _secantus_server.PgServer(
+            str(home), tls_cert_file=cert, tls_key_file=_key, tls_client_cert="sometimes"
+        )
+    assert not home.exists()
+
+
+def test_a_certificate_that_cannot_be_read_stops_the_start(tmp_path: Path) -> None:
+    """Never a server that came up without the TLS it was asked for. The store
+    is released again, so a second start on the same home works."""
+    _ca, cert, key = _certificates(tmp_path)
+    home = tmp_path / "home"
+    with pytest.raises(RuntimeError, match="failed to start"):
+        _secantus_server.PgServer(
+            str(home), tls_cert_file=str(tmp_path / "absent.crt"), tls_key_file=key
+        )
+    with _server(home, tls_cert_file=cert, tls_key_file=key) as server:
+        assert server.port != 0
+
+
+def test_hba_file_decides_the_login_and_reload_reads_it_again(tmp_path: Path) -> None:
+    """`hba_file`: its lines decide every login, and `reload()` is what SIGHUP
+    is to the binary."""
+    hba = tmp_path / "pg_hba.conf"
+    hba.write_text("host all postgres 127.0.0.1/32 trust\n")
+    with _server(tmp_path / "home", hba_file=str(hba)) as server:
+        with _connect(server) as conn:
+            # Under a pg_hba.conf a user needs a role, as on PostgreSQL.
+            conn.execute("CREATE ROLE app LOGIN")
+        other = f"host=127.0.0.1 port={server.port} dbname=postgres user=app"
+        with pytest.raises(psycopg.OperationalError) as refused:
+            psycopg.connect(other, connect_timeout=10).close()
+        assert 'no pg_hba.conf entry for host "127.0.0.1", user "app"' in str(refused.value)
+
+        hba.write_text("host all all 127.0.0.1/32 trust\n")
+        # Not until it is asked to.
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(other, connect_timeout=10).close()
+        server.reload()
+        with psycopg.connect(other, autocommit=True, connect_timeout=10) as conn:
+            assert conn.execute("SELECT current_user").fetchone() == ("app",)
+
+        # A file that cannot be used is an error, and the old lines go on serving.
+        hba.write_text("host all all 127.0.0.1/32 ldap\n")
+        with pytest.raises(RuntimeError, match="reload failed"):
+            server.reload()
+        with psycopg.connect(other, autocommit=True, connect_timeout=10) as conn:
+            assert conn.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_hba_file_and_the_options_it_replaces_do_not_mix(tmp_path: Path) -> None:
+    hba = tmp_path / "pg_hba.conf"
+    hba.write_text("host all all 127.0.0.1/32 trust\n")
+    with pytest.raises(RuntimeError, match="pg_hba.conf"):
+        _secantus_server.PgServer(
+            str(tmp_path / "home"), hba_file=str(hba), refuse_unknown_users=True
+        )
+
+
+def test_refuse_unknown_users(tmp_path: Path) -> None:
+    with _server(tmp_path / "home", refuse_unknown_users=True) as server:
+        with _connect(server) as conn:
+            conn.execute("CREATE ROLE known LOGIN")
+        base = f"host=127.0.0.1 port={server.port} dbname=postgres"
+        with psycopg.connect(f"{base} user=known", connect_timeout=10) as conn:
+            assert conn.execute("SELECT current_user").fetchone() == ("known",)
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(f"{base} user=nobody password=x", connect_timeout=10).close()

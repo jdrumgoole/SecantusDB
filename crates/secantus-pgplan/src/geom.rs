@@ -1079,7 +1079,9 @@ pub fn cast(g: &Geo, target: &str) -> Result<Bson> {
         (Geo::Box(..) | Geo::Circle(..) | Geo::Lseg(..) | Geo::Polygon(_), "point") => {
             Geo::Point(center(g).ok_or_else(no)?)
         }
-        (Geo::Box(h, l), "lseg") => Geo::Lseg(*l, *h),
+        // The diagonal runs from the upper right corner to the lower left,
+        // the order a box prints its corners in.
+        (Geo::Box(h, l), "lseg") => Geo::Lseg(*h, *l),
         (Geo::Box(h, l), "polygon") => Geo::Polygon(box_pts(*h, *l)),
         (Geo::Box(h, l), "circle") => {
             let c = center(g).ok_or_else(no)?;

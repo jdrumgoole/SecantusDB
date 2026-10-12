@@ -265,9 +265,8 @@ pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> R
         // PostgreSQL puts bad bound flags in the SYNTAX class, not the
         // invalid-text one where a malformed literal goes.
         other => {
-            return Err(Error::Parse(format!(
-                "invalid range bound flags: \"{other}\""
-            )))
+            let _ = other;
+            return Err(Error::Parse("invalid range bound flags".into()));
         }
     };
     let text_of = |v: Option<&Bson>| match v {
