@@ -662,9 +662,9 @@ one request path:
     is left is the function surface, and it is measured two ways.
 
     **The corpora are nearly clean, and that says less than it looks.**
-    Measured 2026-10-12, all 261 corpora under `pg_corpora/` through
-    `tools/probes/pg_differential.py ... --rust`: 13 divergences in
-    9,737 checks. An earlier version of this paragraph named `fts`,
+    Measured 2026-10-12, all 261 corpora under `pg_corpora/`, one at a
+    time (`tools/probes/pg_corpora_sweep.py`): 13 divergences in 9,737
+    checks. An earlier version of this paragraph named `fts`,
     `datetimes` and `char_padding` as the corpora with the most divergences;
     each was at none when measured. A corpus holds the statements somebody
     thought to write, so a clean corpus is silent about the rest.
@@ -702,7 +702,8 @@ one request path:
     - **Run the corpora one at a time against a shared reference.** Four
       at once reported 39 divergences where there were 13: an event
       trigger in one corpus fires for another's DDL, and two corpora that
-      create one schema drop it under each other.
+      create one schema drop it under each other. `pg_corpora_sweep.py`
+      is serial unless told otherwise, and says so when it was not.
   - TLS since 2026-10-10 (`--tls-cert-file` / `--tls-key-file`,
     `PgBuilder::tls`; rustls with the `ring` provider, in
     `crates/secantus-pg/src/tls.rs`). Since 2026-10-11 also SCRAM channel
