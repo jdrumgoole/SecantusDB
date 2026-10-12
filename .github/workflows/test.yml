@@ -2301,6 +2301,10 @@ jobs:
           # anywhere else it silently collects nothing -- a release gate that
           # runs in no lane is not a gate.
           files="$files tests/test_rust_pg_binary_smoke.py"
+          # The built-in functions, held to PostgreSQL 15's recorded answers
+          # (it needs the binary and no PostgreSQL). Same reasoning: it skips
+          # wherever the binary is not built, so it is named where it is.
+          files="$files tests/test_rust_pg_builtin_coverage.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \

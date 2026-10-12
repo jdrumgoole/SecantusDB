@@ -12,7 +12,9 @@
 //! type, operator) was read from PostgreSQL 15.19's `pg_operator`, and holds
 //! the functions `tools/probes/pg_builtin_coverage.py` measured this server
 //! refusing. A function this server implements under its own name is not in
-//! it, and is not rewritten.
+//! it, and is not rewritten. Neither is one with a VARIADIC overload
+//! (`jsonb_extract_path(j, 'a', 'b')`): its two-argument call is the path's
+//! first step, where the operator's right side is the whole path.
 //!
 //! A literal argument is given the function's declared type where PostgreSQL
 //! would coerce it (`int8pl(1, 2)` is a `bigint`). Any other argument is left
@@ -326,7 +328,9 @@ fn string(s: &str) -> pg_query::protobuf::Node {
 /// `arg`, cast to `ty` when it is a literal the parameter would coerce and
 /// `ty` is a real type.
 fn typed(arg: &pg_query::protobuf::Node, ty: &str) -> pg_query::protobuf::Node {
-    if ty.is_empty() || ty.starts_with("any") || !literal_takes(arg, ty) {
+    // An array type is spelled `_elem` in the catalog; its literal is left
+    // for the operator to type.
+    if ty.is_empty() || ty.starts_with("any") || ty.starts_with('_') || !literal_takes(arg, ty) {
         return arg.clone();
     }
     pg_query::protobuf::Node {
@@ -503,6 +507,10 @@ mod tests {
         assert_eq!(rewritten("int4pl(DISTINCT a, b)"), None);
         // A schema other than pg_catalog is somebody's own function.
         assert_eq!(rewritten("app.int4pl(a, b)"), None);
+        // A function with a VARIADIC overload is not its operator: this is
+        // the path's first step.
+        assert_eq!(rewritten("jsonb_extract_path(j, 'a')"), None);
+        assert_eq!(rewritten("json_extract_path_text(j, 'a', 'b')"), None);
         // The comparison whose answer depends on the C library is refused.
         assert_eq!(rewritten("bttextcmp(a, b)"), None);
     }

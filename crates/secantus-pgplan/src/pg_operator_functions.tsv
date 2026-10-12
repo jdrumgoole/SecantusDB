@@ -236,6 +236,7 @@ inetmi_int8	2	inet	int8	-
 inetnot	1		inet	~
 inetor	2	inet	inet	|
 inetpl	2	inet	int8	+
+int2_mul_cash	2	int2	money	*
 int24div	2	int2	int4	/
 int24eq	2	int2	int4	=
 int24ge	2	int2	int4	>=
@@ -256,7 +257,6 @@ int28mi	2	int2	int8	-
 int28mul	2	int2	int8	*
 int28ne	2	int2	int8	<>
 int28pl	2	int2	int8	+
-int2_mul_cash	2	int2	money	*
 int2abs	1		int2	@
 int2and	2	int2	int2	&
 int2div	2	int2	int2	/
@@ -277,6 +277,7 @@ int2shr	2	int2	int4	>>
 int2um	1		int2	-
 int2up	1		int2	+
 int2xor	2	int2	int2	#
+int4_mul_cash	2	int4	money	*
 int42div	2	int4	int2	/
 int42eq	2	int4	int2	=
 int42ge	2	int4	int2	>=
@@ -297,7 +298,6 @@ int48mi	2	int4	int8	-
 int48mul	2	int4	int8	*
 int48ne	2	int4	int8	<>
 int48pl	2	int4	int8	+
-int4_mul_cash	2	int4	money	*
 int4abs	1		int4	@
 int4and	2	int4	int4	&
 int4div	2	int4	int4	/
@@ -318,6 +318,7 @@ int4shr	2	int4	int4	>>
 int4um	1		int4	-
 int4up	1		int4	+
 int4xor	2	int4	int4	#
+int8_mul_cash	2	int8	money	*
 int82div	2	int8	int2	/
 int82eq	2	int8	int2	=
 int82ge	2	int8	int2	>=
@@ -338,7 +339,6 @@ int84mi	2	int8	int4	-
 int84mul	2	int8	int4	*
 int84ne	2	int8	int4	<>
 int84pl	2	int8	int4	+
-int8_mul_cash	2	int8	money	*
 int8abs	1		int8	@
 int8and	2	int8	int8	&
 int8div	2	int8	int8	/
@@ -382,8 +382,6 @@ interval_pl_timetz	2	interval	timetz	+
 interval_um	1		interval	-
 json_array_element	2	json	int4	->
 json_array_element_text	2	json	int4	->>
-json_extract_path	2	json	_text	#>
-json_extract_path_text	2	json	_text	#>>
 json_object_field	2	json	text	->
 json_object_field_text	2	json	text	->>
 jsonb_array_element	2	jsonb	int4	->
@@ -391,14 +389,11 @@ jsonb_array_element_text	2	jsonb	int4	->>
 jsonb_concat	2	jsonb	jsonb	||
 jsonb_contained	2	jsonb	jsonb	<@
 jsonb_contains	2	jsonb	jsonb	@>
-jsonb_delete	2	jsonb		-
 jsonb_delete_path	2	jsonb	_text	#-
 jsonb_eq	2	jsonb	jsonb	=
 jsonb_exists	2	jsonb	text	?
 jsonb_exists_all	2	jsonb	_text	?&
 jsonb_exists_any	2	jsonb	_text	?|
-jsonb_extract_path	2	jsonb	_text	#>
-jsonb_extract_path_text	2	jsonb	_text	#>>
 jsonb_ge	2	jsonb	jsonb	>=
 jsonb_gt	2	jsonb	jsonb	>
 jsonb_le	2	jsonb	jsonb	<=
@@ -430,15 +425,6 @@ lseg_ne	2	lseg	lseg	<>
 lseg_parallel	2	lseg	lseg	?||
 lseg_perp	2	lseg	lseg	?-|
 lseg_vertical	1		lseg	?|
-macaddr8_and	2	macaddr8	macaddr8	&
-macaddr8_eq	2	macaddr8	macaddr8	=
-macaddr8_ge	2	macaddr8	macaddr8	>=
-macaddr8_gt	2	macaddr8	macaddr8	>
-macaddr8_le	2	macaddr8	macaddr8	<=
-macaddr8_lt	2	macaddr8	macaddr8	<
-macaddr8_ne	2	macaddr8	macaddr8	<>
-macaddr8_not	1		macaddr8	~
-macaddr8_or	2	macaddr8	macaddr8	|
 macaddr_and	2	macaddr	macaddr	&
 macaddr_eq	2	macaddr	macaddr	=
 macaddr_ge	2	macaddr	macaddr	>=
@@ -448,6 +434,15 @@ macaddr_lt	2	macaddr	macaddr	<
 macaddr_ne	2	macaddr	macaddr	<>
 macaddr_not	1		macaddr	~
 macaddr_or	2	macaddr	macaddr	|
+macaddr8_and	2	macaddr8	macaddr8	&
+macaddr8_eq	2	macaddr8	macaddr8	=
+macaddr8_ge	2	macaddr8	macaddr8	>=
+macaddr8_gt	2	macaddr8	macaddr8	>
+macaddr8_le	2	macaddr8	macaddr8	<=
+macaddr8_lt	2	macaddr8	macaddr8	<
+macaddr8_ne	2	macaddr8	macaddr8	<>
+macaddr8_not	1		macaddr8	~
+macaddr8_or	2	macaddr8	macaddr8	|
 mul_d_interval	2	float8	interval	*
 multirange_adjacent_multirange	2	anymultirange	anymultirange	-|-
 multirange_adjacent_range	2	anymultirange	anyrange	-|-

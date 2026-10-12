@@ -21,7 +21,11 @@ What it reports, most useful first:
 
 ``MISSING``     PostgreSQL answers (a value, or an error of its own about the
                 sample) and the Rust server says the function does not exist
-                (42883) or is not supported (0A000).
+                (42883) or is not supported (0A000). Each is labelled with
+                what in the catalog refers to the function -- an operator, a
+                type's input or output, an index, an aggregate, a cast --
+                and the summary counts them apart from the functions nothing
+                refers to, which are the ones a statement calls by name.
 ``CRASH``       the Rust server dropped the connection.
 ``SHOULD-ERROR`` / ``SPURIOUS-ERROR`` / ``ERRDIFF`` / ``VALUE`` / ``TYPE``
                 as ``pg_differential.py`` names them.
@@ -256,7 +260,26 @@ def _functions(ref: psycopg.Connection) -> list[dict]:
                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY a(typ, ord)
                   JOIN pg_type t ON t.oid = a.typ) AS argtypes,
                coalesce(ag.aggkind::text, '') AS aggkind,
-               pg_get_function_identity_arguments(p.oid) AS ident
+               pg_get_function_identity_arguments(p.oid) AS ident,
+               CASE
+                 WHEN EXISTS (SELECT 1 FROM pg_operator o WHERE o.oprcode = p.oid)
+                   THEN 'operator'
+                 WHEN EXISTS (SELECT 1 FROM pg_type t WHERE p.oid IN (
+                        t.typinput, t.typoutput, t.typreceive, t.typsend, t.typmodin,
+                        t.typmodout, t.typanalyze, t.typsubscript))
+                   THEN 'type input/output'
+                 WHEN EXISTS (SELECT 1 FROM pg_amproc a WHERE a.amproc = p.oid)
+                   THEN 'index support'
+                 WHEN EXISTS (SELECT 1 FROM pg_aggregate a WHERE p.oid IN (
+                        a.aggtransfn, a.aggfinalfn, a.aggcombinefn, a.aggserialfn,
+                        a.aggdeserialfn, a.aggmtransfn, a.aggminvtransfn, a.aggmfinalfn))
+                   THEN 'aggregate support'
+                 WHEN EXISTS (SELECT 1 FROM pg_cast c WHERE c.castfunc = p.oid)
+                   THEN 'cast'
+                 WHEN EXISTS (SELECT 1 FROM pg_operator o WHERE p.oid IN (o.oprrest, o.oprjoin))
+                   THEN 'selectivity'
+                 ELSE ''
+               END AS role
           FROM pg_proc p
           JOIN pg_namespace n ON n.oid = p.pronamespace
           LEFT JOIN pg_aggregate ag ON ag.aggfnoid = p.oid
@@ -266,7 +289,7 @@ def _functions(ref: psycopg.Connection) -> list[dict]:
          ORDER BY p.proname, p.oid
         """
     ).fetchall()
-    keys = ("oid", "name", "kind", "retset", "variadic", "argtypes", "aggkind", "ident")
+    keys = ("oid", "name", "kind", "retset", "variadic", "argtypes", "aggkind", "ident", "role")
     return [dict(zip(keys, r, strict=True)) for r in rows]
 
 
@@ -385,6 +408,7 @@ def main(argv: list[str]) -> int:
             counts[kind] = counts.get(kind, 0) + 1
             findings.append(
                 {"kind": kind, "name": fn["name"], "ident": fn["ident"], "sql": sql}
+                | {"role": fn["role"]}
                 | {"pg": list(want), "sec": list(got)}
             )
         order = ["CRASH", "MISSING", "SHOULD-ERROR", "SPURIOUS-ERROR", "VALUE", "TYPE", "ERRDIFF"]
@@ -395,13 +419,24 @@ def main(argv: list[str]) -> int:
 
         findings.sort(key=rank)
         for f in findings:
-            print(f"--- {f['kind']}  {f['name']}({f['ident']})")
+            role = f" [{f['role']}]" if f["role"] else ""
+            print(f"--- {f['kind']}{role}  {f['name']}({f['ident']})")
             print(f"  SQL: {f['sql']}\n   PG: {f['pg'][1:]}\n  SEC: {f['sec'][1:]}")
         differing = sum(counts.values())
         print(
             f"\n=== {called} functions called, {called - differing} the same, "
             f"{differing} differ: {dict(sorted(counts.items()))}"
         )
+        # A function nothing but an operator, a type or an index refers to is
+        # seldom called by its name; one with no such role is what a
+        # statement is written with.
+        roles: dict[str, int] = {}
+        for f in findings:
+            if f["kind"] == "MISSING":
+                key = f["role"] or "called by name"
+                roles[key] = roles.get(key, 0) + 1
+        if roles:
+            print(f"    MISSING by what refers to the function: {dict(sorted(roles.items()))}")
         print(
             f"    not called: {state} that read the server's own state, "
             f"{no_sample} with an argument type that has no sample "

@@ -4389,11 +4389,23 @@ These work end-to-end but cut corners.
       the client reads the alert or the close is a race on PostgreSQL's
       side. Not reproduced or fixed; the comparison should treat the two
       as one answer, or it will fail again.
-    - **The TLS gauge run is by hand.** No CI lane and no `invoke` task
-      runs it, and it sets `PGSSLMODE` for libpq, so a test that names its
-      own `sslmode` is not moved onto TLS by it.
-    - **The embedded Python handle (`_secantus_server.PgServer`) has no
-      TLS parameter.**
+    - The TLS gauge run has a task and a CI lane since 2026-10-12:
+      `./inv validate-psycopg-rust --tls` runs the plain gauge and then the
+      TLS one, and `.github/workflows/psycopg-tls.yml` does the same on
+      Linux weekly and on a PR that touches the server's TLS code or the
+      gauge runner. Both end in `psycopg_validation.check_run`, which fails
+      a run that did not account for every test it started, and fails a
+      test that fails over TLS and passes in the clear. What is left:
+      **the TLS run sets `PGSSLMODE` for libpq, so a test that names its
+      own `sslmode` is not moved onto TLS by it**; and a test that fails in
+      BOTH runs is printed and does not fail that lane, which is the plain
+      gauge's number and has no Linux lane that gates it.
+    - The embedded Python handle (`_secantus_server.PgServer`) takes
+      `tls_cert_file` / `tls_key_file` / `tls_ca_file` / `tls_client_cert`
+      / `tls_require`, `refuse_unknown_users`, `hba_file` / `ident_file`,
+      and has `reload()`, since 2026-10-12. **It does not take a
+      revocation list, a user name map or `clientname=DN` as options**;
+      a `pg_hba.conf` passed as `hba_file` can say the last two.
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 
