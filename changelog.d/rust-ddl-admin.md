@@ -3,7 +3,7 @@
 `secantusd-rs` now refuses the database names, `create` options and command
 arguments `mongod` 8.2.11 refuses, and reports what `mongod` reports from
 `listCollections`, `dbStats`, `collStats` and `listDatabases`. A comparison
-of 809 replies went from 268 different (of the first 670) to 3.
+of 809 replies went from 268 different (of the first 670) to 2.
 
 Several of the differences could leave a test passing on something `mongod`
 would have stopped: any database name was accepted, `dropDatabase` dropped

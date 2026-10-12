@@ -8887,7 +8887,7 @@ replies over a raw connection (`create` and every option it takes,
 `listCollections`, `collMod`, `renameCollection`, `drop`, `dropDatabase`,
 `dbStats`, `collStats`, `dataSize`, `listDatabases`, and invalid database
 names across thirteen commands). Byte counts are compared by type only. The
-Rust server differed on 268 of the first 670 replies and differs on 3 of 809.
+Rust server differed on 268 of the first 670 replies and differs on 2 of 809.
 Pinned by `crates/secantus-storage-adapter/tests/ddl_admin_commands_wt.rs`.
 
 The defects that could mislead a test, all fixed:
