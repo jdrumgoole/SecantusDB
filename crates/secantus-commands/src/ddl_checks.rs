@@ -41,7 +41,18 @@ pub(crate) fn invalid_database_name(db: &str, doc: &Document) -> Option<CommandE
         }));
     }
     // A `$` is refused only where the command would create the namespace.
-    if db.contains('$') && matches!(name.as_str(), "insert" | "create" | "createIndexes") {
+    if db.contains('$')
+        && matches!(
+            name.as_str(),
+            "insert"
+                | "update"
+                | "delete"
+                | "findAndModify"
+                | "findandmodify"
+                | "create"
+                | "createIndexes"
+        )
+    {
         if let Some(coll) = coll {
             return Some(invalid_namespace(format!("Invalid namespace: {db}.{coll}")));
         }
@@ -59,7 +70,11 @@ fn spaced(d: &Document) -> String {
 pub(crate) fn spaced_value(v: &Bson) -> String {
     let entries: Vec<(String, &Bson)> = match v {
         Bson::Document(d) => d.iter().map(|(k, x)| (k.clone(), x)).collect(),
-        Bson::Array(a) => a.iter().enumerate().map(|(i, x)| (i.to_string(), x)).collect(),
+        Bson::Array(a) => a
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (i.to_string(), x))
+            .collect(),
         other => return secantus_core::aggregate::render_value_compact(other),
     };
     if entries.is_empty() {
@@ -100,7 +115,11 @@ fn unknown(path: &str) -> CommandError {
 }
 
 /// A field that must be a document when it is given at all.
-fn object<'a>(doc: &'a Document, cmd: &str, field: &str) -> Result<Option<&'a Document>, CommandError> {
+fn object<'a>(
+    doc: &'a Document,
+    cmd: &str,
+    field: &str,
+) -> Result<Option<&'a Document>, CommandError> {
     match doc.get(field) {
         None | Some(Bson::Null) => Ok(None),
         Some(Bson::Document(d)) => Ok(Some(d)),
@@ -176,9 +195,8 @@ pub(crate) fn create(doc: &Document) -> Result<(), CommandError> {
     }
     if let Some(id_index) = object(doc, "create", "idIndex")? {
         let key = id_index.get_document("key").ok();
-        let is_id = key.is_some_and(|k| {
-            k.len() == 1 && k.get("_id").and_then(crate::util::as_i64) == Some(1)
-        });
+        let is_id = key
+            .is_some_and(|k| k.len() == 1 && k.get("_id").and_then(crate::util::as_i64) == Some(1));
         if let (Some(key), false) = (key, is_id) {
             return Err(CommandError::new(
                 2,
@@ -234,7 +252,11 @@ pub(crate) fn coll_mod(doc: &Document) -> Result<(), CommandError> {
     match doc.get("expireAfterSeconds") {
         None
         | Some(
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) | Bson::String(_),
+            Bson::Int32(_)
+            | Bson::Int64(_)
+            | Bson::Double(_)
+            | Bson::Decimal128(_)
+            | Bson::String(_),
         ) => {}
         Some(other) => {
             return Err(CommandError::new(
@@ -275,9 +297,9 @@ pub(crate) fn coll_mod_on(doc: &Document, options: &Document) -> Option<CommandE
     }
     match doc.get("expireAfterSeconds") {
         None => None,
-        Some(_) if !options.contains_key("clusteredIndex") => refused(
-            "'expireAfterSeconds' option is only supported on collections clustered by _id",
-        ),
+        Some(_) if !options.contains_key("clusteredIndex") => {
+            refused("'expireAfterSeconds' option is only supported on collections clustered by _id")
+        }
         Some(v) if crate::util::as_i64(v).is_some_and(|n| n < 0) => {
             refused("TTL index 'expireAfterSeconds' option cannot be less than 0")
         }
@@ -333,23 +355,37 @@ mod tests {
     use bson::doc;
 
     fn refused(db: &str, cmd: Document) -> String {
-        invalid_database_name(db, &cmd).map(|e| e.errmsg).unwrap_or_default()
+        invalid_database_name(db, &cmd)
+            .map(|e| e.errmsg)
+            .unwrap_or_default()
     }
 
     #[test]
     fn database_names_are_held_to_mongods_rules() {
         let find = doc! {"find": "c"};
-        assert_eq!(refused("a.b", find.clone()), "'.' is an invalid character in a db name: a.b");
+        assert_eq!(
+            refused("a.b", find.clone()),
+            "'.' is an invalid character in a db name: a.b"
+        );
         assert_eq!(refused("", find.clone()), "Invalid namespace specified: .c");
-        assert_eq!(refused("a b", find.clone()), "Invalid namespace specified: a b.c");
-        assert_eq!(refused("a b", doc! {"ping": 1}), "Invalid database name: 'a b'");
+        assert_eq!(
+            refused("a b", find.clone()),
+            "Invalid namespace specified: a b.c"
+        );
+        assert_eq!(
+            refused("a b", doc! {"ping": 1}),
+            "Invalid database name: 'a b'"
+        );
         assert_eq!(
             refused(&"x".repeat(64), find.clone()),
             "db name must be at most 63 characters, found: 64"
         );
         // A `$` is refused only where the namespace would be created.
         assert_eq!(refused("$x", find), "");
-        assert_eq!(refused("$x", doc! {"create": "c"}), "Invalid namespace: $x.c");
+        assert_eq!(
+            refused("$x", doc! {"create": "c"}),
+            "Invalid namespace: $x.c"
+        );
         assert_eq!(refused("ok_name-1", doc! {"create": "c"}), "");
     }
 
@@ -357,14 +393,23 @@ mod tests {
     fn create_options_are_parsed_before_anything_is_created() {
         let code = |d: Document| create(&d).err().map(|e| e.code);
         assert_eq!(code(doc! {"create": "c", "validationLevel": 1}), Some(14));
-        assert_eq!(code(doc! {"create": "c", "changeStreamPreAndPostImages": {}}), Some(40414));
+        assert_eq!(
+            code(doc! {"create": "c", "changeStreamPreAndPostImages": {}}),
+            Some(40414)
+        );
         assert_eq!(
             code(doc! {"create": "c", "changeStreamPreAndPostImages": {"enabled": 1}}),
             Some(14)
         );
         assert_eq!(code(doc! {"create": "c", "autoIndexId": true}), Some(40415));
-        assert_eq!(code(doc! {"create": "c", "clusteredIndex": true}), Some(5_979_703));
-        assert_eq!(code(doc! {"create": "c", "storageEngine": {"nope": {}}}), Some(72));
+        assert_eq!(
+            code(doc! {"create": "c", "clusteredIndex": true}),
+            Some(5_979_703)
+        );
+        assert_eq!(
+            code(doc! {"create": "c", "storageEngine": {"nope": {}}}),
+            Some(72)
+        );
         assert_eq!(
             code(doc! {"create": "c", "changeStreamPreAndPostImages": {"enabled": true}}),
             None

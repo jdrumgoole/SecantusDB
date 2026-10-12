@@ -463,6 +463,20 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             doc! { "v": 2i32, "key": { "_id": 1i32 }, "name": name, "unique": true },
         );
     }
+    // A clustered collection's expiry is one of its options.
+    if opts.contains_key("clusteredIndex") {
+        if let Some(seconds) = doc.get("expireAfterSeconds").and_then(as_i64) {
+            opts.insert("expireAfterSeconds", Bson::Int64(seconds));
+        }
+    }
+    // A view keeps what defines it and nothing else: mongod takes `capped`
+    // or a validator on a view and stores neither.
+    if opts.contains_key("viewOn") {
+        opts = opts
+            .into_iter()
+            .filter(|(k, _)| matches!(k.as_str(), "viewOn" | "viewPipeline" | "collation"))
+            .collect();
+    }
     // The definition is stored as mongod lists it: defaults filled in, and
     // after every other option.
     opts.remove("timeseries");
@@ -667,12 +681,7 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .iter()
         .any(|c| c == &coll);
     if !exists {
-        return Ok(CommandError::new(
-            26,
-            "NamespaceNotFound",
-            "ns does not exist",
-        )
-        .into_reply());
+        return Ok(CommandError::new(26, "NamespaceNotFound", "ns does not exist").into_reply());
     }
     {
         let options = storage
@@ -963,15 +972,43 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // `prepareUnique` arms the index: new dup writes are rejected (11000)
         // while pre-existing duplicates are tolerated — the staging step before
         // a `unique: true` conversion.
+        let already_unique = target.get_bool("unique").unwrap_or(false);
+        let mut prepared = target.get_bool("prepareUnique").unwrap_or(false);
         if let Some(prep) = index_spec.get("prepareUnique").and_then(Bson::as_bool) {
-            storage
-                .set_index_options(
-                    &ctx.db_name,
-                    &coll,
-                    &target_name,
-                    &doc! {"prepareUnique": prep},
-                )
-                .map_err(command_error)?;
+            // The reply names the change only when there is one, and a unique
+            // index has nothing left to prepare.
+            if !already_unique && prep != prepared {
+                reply.insert("prepareUnique_old", prepared);
+                reply.insert("prepareUnique_new", prep);
+                storage
+                    .set_index_options(
+                        &ctx.db_name,
+                        &coll,
+                        &target_name,
+                        &doc! {"prepareUnique": prep},
+                    )
+                    .map_err(command_error)?;
+                prepared = prep;
+            }
+        }
+        if index_spec.get("unique").and_then(Bson::as_bool) == Some(false) {
+            return Ok(
+                CommandError::new(2, "BadValue", "Cannot make index non-unique").into_reply(),
+            );
+        }
+        // The conversion is a second step: the index must already be refusing
+        // new duplicates.
+        if index_spec.get("unique").and_then(Bson::as_bool) == Some(true)
+            && !already_unique
+            && !prepared
+        {
+            return Ok(CommandError::new(
+                72,
+                "InvalidOptions",
+                "Cannot make index unique with 'prepareUnique=false'. Run collMod to set it \
+                 first.",
+            )
+            .into_reply());
         }
         // `unique: true` converts the index; if any docs already share a key the
         // conversion is refused with 359 and the offending `_id` groups reported
@@ -990,12 +1027,18 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let mut reply = CommandError::new(
                     359,
                     "CannotConvertIndexToUnique",
-                    format!("Cannot convert index {target_name} to unique: found duplicate values"),
+                    "Cannot convert the index to unique. Please resolve conflicting documents \
+                     before running collMod again.",
                 )
                 .into_reply();
                 reply.insert("violations", violations);
                 return Ok(reply);
             }
+            // A dry run stops at having found nothing in the way.
+            if doc.get("dryRun").is_some_and(crate::util::truthy) {
+                return Ok(reply);
+            }
+            reply.insert("unique_new", true);
             storage
                 .set_index_options(
                     &ctx.db_name,
@@ -1349,7 +1392,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // Options at their defaults are not listed: pre-images switched off,
         // and the simple collation.
         // mongod lists the options in its own order, not the order given.
-        const ORDER: [&str; 8] = [
+        const ORDER: [&str; 10] = [
             "capped",
             "size",
             "max",
@@ -1358,6 +1401,8 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             "validationLevel",
             "validationAction",
             "indexOptionDefaults",
+            "viewOn",
+            "pipeline",
         ];
         let mut ordered = Document::new();
         for key in ORDER {
@@ -1383,7 +1428,12 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         ) {
             options.remove("changeStreamPreAndPostImages");
         }
-        if off(&options, "collation", "locale", Bson::String("simple".into())) {
+        if off(
+            &options,
+            "collation",
+            "locale",
+            Bson::String("simple".into()),
+        ) {
             options.remove("collation");
         }
         // A collection-level TTL turned `off` by `collMod` is stored as null.
@@ -1537,7 +1587,6 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
     })
 }
 
-
 /// `listIndexes` — a cursor over the indexes of a collection.
 pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Nullable here, unlike aggregate's -- mongod accepts `cursor: null`.
@@ -1572,6 +1621,10 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     for ix in &mut indexes {
         if ix.get_bool("hidden") == Ok(false) {
             ix.remove("hidden");
+        }
+        // Listed only while it is armed: a unique index has nothing to prepare.
+        if ix.get_bool("prepareUnique") == Ok(false) || ix.get_bool("unique") == Ok(true) {
+            ix.remove("prepareUnique");
         }
     }
     // A collection that exists always has at least the synthesised `_id_` index, so
@@ -3157,7 +3210,6 @@ pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResu
         });
     }
 }
-
 
 /// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
 /// live `metrics.cursor.open.total` so drivers can track cursor lifecycle

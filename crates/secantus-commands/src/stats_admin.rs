@@ -81,9 +81,13 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
         t.objects += storage
             .count_matching(db, &c, &Document::new())
             .map_err(command_error)? as i64;
-        t.data_size += storage.collection_data_size(db, &c).map_err(command_error)?;
+        t.data_size += storage
+            .collection_data_size(db, &c)
+            .map_err(command_error)?;
         let sizes = storage.index_sizes(db, &c).map_err(command_error)?;
-        t.indexes += storage.list_indexes(db, &c).map_or(sizes.len(), |l| l.len()) as i64;
+        t.indexes += storage
+            .list_indexes(db, &c)
+            .map_or(sizes.len(), |l| l.len()) as i64;
         t.index_size += sizes.values().filter_map(as_i64).sum::<i64>();
     }
     // The views are documents in `system.views`, a collection with an `_id` index.
@@ -181,7 +185,9 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Namespace {ns} is a view, not a collection"),
         ));
     }
-    let options = storage.get_collection_options(&db, &coll).unwrap_or_default();
+    let options = storage
+        .get_collection_options(&db, &coll)
+        .unwrap_or_default();
     if options.contains_key("timeseries") {
         return crate::admin::time_series_stats(&coll, ctx);
     }
@@ -189,7 +195,9 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let count = storage
         .count_matching(&db, &coll, &Document::new())
         .map_err(command_error)? as i64;
-    let size = storage.collection_data_size(&db, &coll).map_err(command_error)?;
+    let size = storage
+        .collection_data_size(&db, &coll)
+        .map_err(command_error)?;
     let measured = storage.index_sizes(&db, &coll).map_err(command_error)?;
     // Every index is listed, one that holds no entry yet included.
     let mut sizes = Document::new();
@@ -220,7 +228,9 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(out);
     }
     out.insert("freeStorageSize", 0_i32);
-    let capped = storage.collection_is_capped(&db, &coll).map_err(command_error)?;
+    let capped = storage
+        .collection_is_capped(&db, &coll)
+        .map_err(command_error)?;
     out.insert("capped", capped);
     if capped {
         out.insert("max", int(options.get("max").and_then(as_i64).unwrap_or(0)));
@@ -255,7 +265,9 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         None => String::new(),
     };
-    let Some((db, coll)) = ns.split_once('.').filter(|(d, c)| !d.is_empty() && !c.is_empty())
+    let Some((db, coll)) = ns
+        .split_once('.')
+        .filter(|(d, c)| !d.is_empty() && !c.is_empty())
     else {
         return Err(err(
             73,
@@ -268,7 +280,9 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let count = storage
         .count_matching(db, coll, &Document::new())
         .map_err(command_error)? as i64;
-    let size = storage.collection_data_size(db, coll).map_err(command_error)?;
+    let size = storage
+        .collection_data_size(db, coll)
+        .map_err(command_error)?;
     let mut out = doc! {
         "size": Bson::Int64(size),
         "numObjects": Bson::Int64(count),

@@ -268,6 +268,24 @@ scenario(
     {"find": "system.views", "filter": {}, "sort": {"_id": 1}},
 )
 
+for bad in ["", "a.b", "a b", "$x", "x" * 64, 'a"b', "a/b", "a\\b", "a\x00b"]:
+    scenario(
+        f"a database named {bad[:8]!r}",
+        (bad, {"find": "c"}),
+        (bad, {"insert": "c", "documents": [{"_id": 1}]}),
+        (bad, {"count": "c"}),
+        (bad, {"listCollections": 1}),
+        (bad, {"create": "c"}),
+        (bad, {"drop": "c"}),
+        (bad, {"dbStats": 1}),
+        (bad, {"ping": 1}),
+        (bad, {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]}),
+        (bad, {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}, "upsert": True}]}),
+        (bad, {"aggregate": "c", "pipeline": [], "cursor": {}}),
+        (bad, {"dropDatabase": 1}),
+        admin({"listDatabases": 1, "filter": {"name": bad}, "nameOnly": True}),
+    )
+
 # --------------------------------------------------------- listCollections
 
 scenario(
@@ -392,6 +410,31 @@ scenario(
     {"collMod": "c", "index": {"name": "a_1", "unique": True}},
     {"collMod": "c", "index": {"name": "a_1", "nope": 1}},
     {"listIndexes": "c"},
+)
+scenario(
+    "collMod: converting an index to unique",
+    {"insert": "c", "documents": [{"_id": 1, "a": 1}, {"_id": 2, "a": 2}]},
+    {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+    {"collMod": "c", "index": {"name": "a_1", "unique": True}},
+    {"collMod": "c", "index": {"name": "a_1", "prepareUnique": True}},
+    {"collMod": "c", "index": {"name": "a_1", "prepareUnique": True}},
+    {"listIndexes": "c"},
+    {"insert": "c", "documents": [{"_id": 3, "a": 1}]},
+    {"collMod": "c", "index": {"name": "a_1", "unique": True}, "dryRun": True},
+    {"listIndexes": "c"},
+    {"collMod": "c", "index": {"name": "a_1", "unique": True}},
+    {"listIndexes": "c"},
+    {"insert": "c", "documents": [{"_id": 4, "a": 2}]},
+    {"collMod": "c", "index": {"name": "a_1", "prepareUnique": False}},
+    {"collMod": "c", "index": {"name": "a_1", "unique": False}},
+    {"collMod": "c", "index": {"name": "a_1", "unique": True}},
+    {"listIndexes": "c"},
+    {"insert": "d", "documents": [{"_id": 1, "a": 1}, {"_id": 2, "a": 1}]},
+    {"createIndexes": "d", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+    {"collMod": "d", "index": {"name": "a_1", "prepareUnique": True}},
+    {"collMod": "d", "index": {"name": "a_1", "unique": True}, "dryRun": True},
+    {"collMod": "d", "index": {"name": "a_1", "unique": True}},
+    {"listIndexes": "d"},
 )
 scenario(
     "collMod: a view",

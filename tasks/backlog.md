@@ -8880,6 +8880,51 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.076 DDL and admin commands -- 2026-10-12
+
+`tools/probes/ddl_admin_commands.py`, mongod 8.2.11: 37 scenarios, 809
+replies over a raw connection (`create` and every option it takes,
+`listCollections`, `collMod`, `renameCollection`, `drop`, `dropDatabase`,
+`dbStats`, `collStats`, `dataSize`, `listDatabases`, and invalid database
+names across thirteen commands). Byte counts are compared by type only. The
+Rust server differed on 268 of the first 670 replies and differs on 3 of 809.
+Pinned by `crates/secantus-storage-adapter/tests/ddl_admin_commands_wt.rs`.
+
+The defects that could mislead a test, all fixed:
+
+- Any database name was accepted: `a.b`, `a b`, the empty name, `a/b`. A
+  write created the database.
+- `dropDatabase` dropped the database whatever its argument: `0`, `"x"`,
+  null.
+- `renameCollection` accepted an empty or dotless namespace, a rename onto
+  itself, and a rename onto `system.x`.
+- `create` accepted options it could not hold: a non-string
+  `validationLevel`, `changeStreamPreAndPostImages: {}` or a non-boolean
+  `enabled`, an unknown storage engine, `autoIndexId`, a 300-byte name.
+- `collMod` with `dryRun: true` applied the change; a null
+  `validationLevel` reset it to `strict`; `expireAfterSeconds` on a
+  collection that cannot expire was accepted.
+- `collMod {index: {unique: true}}` converted without `prepareUnique`.
+- `listCollections` with `nameOnly` matched a filter on fields it does not
+  return, and accepted an unknown operator.
+
+What is left, on the RUST MongoDB server:
+
+- [ ] **`listDatabases` lists `admin` and `config` only once something is
+      written to them.** mongod always has them. (`local` is listed, as
+      empty; mongod's holds the oplog.)
+- [ ] **`drop` of `system.views`** answers `{ok: 1}`; mongod answers
+      `nIndexesWas: 1` and the namespace. The views go either way.
+- [ ] **`listIndexes` after a conversion to unique** lists `unique` after
+      `expireAfterSeconds`; mongod lists it before. The same family as the
+      index build order under 7.071.
+- [ ] **`dbStats` reports `fsUsedSize` and `fsTotalSize` as 0.** The
+      filesystem's numbers are not read.
+- [ ] **A clustered collection's `expireAfterSeconds` is stored and listed,
+      and nothing expires.** No TTL pass reads it.
+- [ ] **PYTHON MongoDB server:** not measured by this probe. Whether it
+      accepts invalid database names or a `dropDatabase: 0` was not checked.
+
 ### 7.075 `explain`, command by command -- 2026-10-12
 
 `tools/probes/explain_commands.py`, mongod 8.2.11: 51 scenarios, 786
