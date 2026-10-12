@@ -1333,6 +1333,7 @@ pub struct UpdateOutcome {
 
 /// A stored index, with the options the write / lookup paths care about,
 /// parsed out of its registry `options` blob.
+#[derive(Clone)]
 struct IndexDesc {
     name: String,
     key_spec: Document,
@@ -2209,11 +2210,40 @@ fn shell_value(v: &Bson) -> String {
         Bson::Null => "null".to_string(),
         Bson::Int32(i) => i.to_string(),
         Bson::Int64(i) => i.to_string(),
-        // Match Python `str(float)`: integral doubles keep a trailing `.0`.
-        Bson::Double(d) if d.fract() == 0.0 && d.is_finite() => format!("{d:.1}"),
-        Bson::Double(d) => d.to_string(),
+        // The shortest form that reads back, a whole double keeping its `.0`
+        // and an exponent written with at least two digits: `1e+20`, `1e-07`.
+        Bson::Double(d) => {
+            let text = secantus_core::query::fmt_double_parse(*d);
+            match text.split_once('e') {
+                Some((mantissa, exp)) => {
+                    let (sign, digits) = match exp.strip_prefix(['-', '+']) {
+                        Some(digits) => (&exp[..1], digits),
+                        None => ("+", exp),
+                    };
+                    format!("{mantissa}e{sign}{digits:0>2}")
+                }
+                None => text,
+            }
+        }
         Bson::Decimal128(d) => d.to_string(),
-        other => format!("{other:?}"),
+        Bson::Binary(b) if b.subtype == bson::spec::BinarySubtype::Uuid && b.bytes.len() == 16 => {
+            let hex: String = b.bytes.iter().map(|x| format!("{x:02x}")).collect();
+            format!(
+                "UUID(\"{}-{}-{}-{}-{}\")",
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..]
+            )
+        }
+        // An empty array has no element to index, and its key is `undefined`.
+        Bson::Array(a) if a.is_empty() => "undefined".to_string(),
+        // Every other type as mongod prints it: `new Date(<ms>)`,
+        // `{ a: 1, b: "x" }`, `BinData(0, ABCD)`, `Timestamp(5, 6)`, `/a/i`.
+        // These reached the client as Rust's `Debug` text (measured against
+        // 8.2.11, 2026-10-12).
+        other => secantus_core::query::bson_value_repr(other),
     }
 }
 
@@ -2231,6 +2261,22 @@ pub fn format_dup_key_errmsg(namespace: &str, index_name: &str, key_value: &Docu
         format!("{{ {} }}", inner.join(", "))
     };
     format!("E11000 duplicate key error collection: {namespace} index: {index_name} dup key: {dup}")
+}
+
+/// The values of an `$in`, in the order an index of `direction` holds them.
+/// mongod walks the index once over the `$in`'s bounds, so the documents come
+/// back in index order whatever order the list was written in: over
+/// `{s: -1}`, `{s: {$in: ["x", "y"]}}` returns the `"y"` documents first
+/// (measured 8.2.11, 2026-10-12). Walking the list as written returned them
+/// in list order, and a `limit: 1` delete removed a different document.
+fn in_index_order(vals: &[Bson], direction: i32) -> Result<Vec<&Bson>> {
+    let mut keyed: Vec<(Vec<u8>, &Bson)> = Vec::with_capacity(vals.len());
+    for v in vals {
+        keyed.push((enc_dir(v, direction)?, v));
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.dedup_by(|later, first| later.0 == first.0);
+    Ok(keyed.into_iter().map(|(_, v)| v).collect())
 }
 
 /// Direction-aware sort-key encoding for one value (defers to Python on the
@@ -8669,7 +8715,11 @@ impl Storage {
                 // Reject unique-index violations before writing anything.
                 let descs = self.index_descs(&session, db, coll)?;
                 if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
-                    return Err(StorageError::DuplicateKey(Box::new(c)));
+                    // A repeated `_id` is the error mongod reports when both
+                    // are repeated; the write below raises it.
+                    if meta.timeseries || self.doc_recordid(&session, db, coll, &key)?.is_none() {
+                        return Err(StorageError::DuplicateKey(Box::new(c)));
+                    }
                 }
                 // Mint the RecordId + write the `_id` index (id_key -> RecordId);
                 // this overwrite=false insert is where a duplicate `_id` is caught.
@@ -8813,7 +8863,19 @@ impl Storage {
                         key.extend_from_slice(&self.timeseries_doc_suffix());
                     }
                     // Unique-index pre-check (collect a write-error rather than abort).
-                    if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                    // A document that also repeats an `_id` is reported for
+                    // the `_id`, as mongod does: the write below finds it.
+                    let conflict =
+                        match self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                            Some(_)
+                                if !timeseries
+                                    && self.doc_recordid(&session, db, coll, &key)?.is_some() =>
+                            {
+                                None
+                            }
+                            other => other,
+                        };
+                    if let Some(c) = conflict {
                         let mut e = Document::new();
                         e.insert("index", index as i32);
                         e.insert("code", 11000i32);
@@ -11757,6 +11819,15 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
+        // A document `_id` is also claimed by value (see `document_id_claim`).
+        let with_id_claim;
+        let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
+            Some(claim) => {
+                with_id_claim = [descs, std::slice::from_ref(&claim)].concat();
+                &with_id_claim
+            }
+            None => descs,
+        };
         if descs.is_empty() {
             return Ok(());
         }
@@ -11856,6 +11927,15 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
+        // A document `_id` is also claimed by value (see `document_id_claim`).
+        let with_id_claim;
+        let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
+            Some(claim) => {
+                with_id_claim = [descs, std::slice::from_ref(&claim)].concat();
+                &with_id_claim
+            }
+            None => descs,
+        };
         if descs.is_empty() {
             return Ok(());
         }
@@ -12081,6 +12161,53 @@ impl Storage {
         Ok(descs)
     }
 
+    /// The claim a document-valued `_id` takes, beside its row in the `_id` index.
+    ///
+    /// The `_id` index keys a document `_id` by its BSON bytes, so `{a: 1}` and
+    /// `{a: 1.0}` are two keys and both documents were stored; mongod, which
+    /// compares the values, refuses the second (measured 8.2.11, 2026-10-12).
+    /// Those key bytes are on disk and shared with the Python server, so they
+    /// stay as they are. The value is claimed in `UNIQ_TABLE` as well, under the
+    /// key an index would give it, where every number of one value is one key.
+    /// That is the claim a collated collection already takes for every `_id`
+    /// (`id_claim`), and such a collection needs no second one.
+    ///
+    /// A document stored before this claim existed holds none, so a second
+    /// document equal to it by value is still accepted; nothing stored is read
+    /// differently.
+    ///
+    /// A time-series collection keeps measurements that repeat an `_id`, and
+    /// claims none.
+    fn document_id_claim(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        doc: &Document,
+        descs: &[IndexDesc],
+    ) -> Result<Option<IndexDesc>> {
+        if !matches!(doc.get("_id"), Some(Bson::Document(_)))
+            || descs.iter().any(|d| d.id_claim)
+            || self.is_timeseries(session, db, coll)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(IndexDesc {
+            name: ID_INDEX_NAME.to_string(),
+            key_spec: bson::doc! {"_id": 1},
+            sparse: false,
+            hidden: false,
+            collation: None,
+            unique: false,
+            prepare_unique: false,
+            partial: None,
+            geo_2d: None,
+            geo_sphere: None,
+            id_claim: true,
+            clustered: false,
+        }))
+    }
+
     /// The `id_claim` descriptor of a collection with a default collation.
     fn id_claim_desc(&self, session: &Session, db: &str, coll: &str) -> Result<Option<IndexDesc>> {
         Ok(
@@ -12158,6 +12285,19 @@ impl Storage {
         descs: &[IndexDesc],
         exclude_recordid: Option<i64>,
     ) -> Result<Option<UniqueConflict>> {
+        // A document `_id` is also claimed by value (see `document_id_claim`).
+        let with_id_claim;
+        let descs: &[IndexDesc] =
+            match self.document_id_claim(session, db, coll, candidate, descs)? {
+                Some(claim) => {
+                    with_id_claim = [descs, std::slice::from_ref(&claim)].concat();
+                    &with_id_claim
+                }
+                None => descs,
+            };
+        if descs.is_empty() {
+            return Ok(None);
+        }
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             // The collated `_id` has no entries to probe: its claim is the
@@ -14392,6 +14532,26 @@ impl Storage {
         let_vars: &Document,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
+        self.delete_matching_hinted(db, coll, filter, limit, let_vars, coll_opt, None)
+    }
+
+    /// [`Self::delete_matching`] reading the documents the way `hint` says.
+    /// The hint decides WHICH document a `limit: 1` delete removes: mongod
+    /// removes the first one its plan reaches, so `{$natural: -1}` removes the
+    /// newest match and an index hint the first in that index's order
+    /// (measured 8.2.11, 2026-10-12). The hint used to be checked and then
+    /// dropped, and the delete removed whichever document the router met.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_matching_hinted(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        limit: usize,
+        let_vars: &Document,
+        coll_opt: Option<&Collation>,
+        hint: Option<&Hint>,
+    ) -> Result<usize> {
         let _admit = self.admit_write();
         // Unbounded deletes (limit == 0, deleteMany) outside a user
         // transaction run CHUNKED — the matched set's index-entry removals
@@ -14401,9 +14561,52 @@ impl Storage {
         // write units and non-atomic). Bounded deletes (limit >= 1) and
         // in-transaction deletes keep the single-transaction body.
         if limit == 0 && !self.in_user_txn() {
-            return self.delete_matching_chunked(db, coll, filter, let_vars, coll_opt);
+            return self.delete_matching_chunked(db, coll, filter, let_vars, coll_opt, hint);
         }
-        self.delete_matching_single_txn(db, coll, filter, limit, let_vars, coll_opt)
+        self.delete_matching_single_txn(db, coll, filter, limit, let_vars, coll_opt, hint)
+    }
+
+    /// The documents a delete tests, in the order it tests them: the
+    /// router's candidates, or with a `hint` the documents that hint reads.
+    fn delete_candidates(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        force_scan: bool,
+        hint: Option<&Hint>,
+    ) -> Result<Vec<ScannedDoc>> {
+        let Some(hint) = hint else {
+            return self.candidate_docs(session, db, coll, filter, force_scan);
+        };
+        if self.is_timeseries(session, db, coll)? {
+            return self.candidate_docs(session, db, coll, filter, force_scan);
+        }
+        let resolved = self.resolve_hint(session, db, coll, hint)?;
+        match resolved {
+            ResolvedHint::Natural => self.scan_docs(session, db, coll),
+            ResolvedHint::NaturalReverse => {
+                let mut docs = self.scan_docs(session, db, coll)?;
+                docs.reverse();
+                Ok(docs)
+            }
+            _ => {
+                // The hinted read returns documents; each one's row is found
+                // again through its `_id`.
+                let (blobs, _) =
+                    self.candidates_from_hint(session, db, coll, &resolved, None, 1)?;
+                let mut out = Vec::with_capacity(blobs.len());
+                for blob in blobs {
+                    let doc = decode_doc(&blob)?;
+                    let key = id_key(doc.get("_id").unwrap_or(&Bson::Null))?;
+                    if let Some(recordid) = self.doc_recordid(session, db, coll, &key)? {
+                        out.push((recordid, key, blob));
+                    }
+                }
+                Ok(out)
+            }
+        }
     }
 
     /// Chunked deleteMany driver — see `update_matching_chunked` for the
@@ -14415,6 +14618,7 @@ impl Storage {
         filter: &Document,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        hint: Option<&Hint>,
     ) -> Result<usize> {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
@@ -14425,7 +14629,7 @@ impl Storage {
             let session = self.op_session()?;
             let mut rids = Vec::new();
             for (recordid, _id_k, blob) in
-                self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+                self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?
             {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
@@ -14562,6 +14766,7 @@ impl Storage {
         limit: usize,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        hint: Option<&Hint>,
     ) -> Result<usize> {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
@@ -14589,7 +14794,7 @@ impl Storage {
                 let mut oplog_entries: Vec<OplogEntry> = Vec::new();
                 let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
                 let candidates =
-                    self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?;
+                    self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?;
                 for (recordid, id_k, blob) in candidates {
                     // Match over raw BSON first (decodes only the filter's fields);
                     // a rejected candidate skips the full decode. A matched
@@ -15617,12 +15822,12 @@ impl Storage {
                 Some(Bson::Array(a)) => a,
                 _ => return Ok(None),
             };
+            if vals.iter().any(|v| matches!(v, Bson::Document(_))) {
+                return Ok(None);
+            }
             let mut seen: HashSet<i64> = HashSet::new();
             let mut out: Vec<i64> = Vec::new();
-            for v in vals {
-                if matches!(v, Bson::Document(_)) {
-                    return Ok(None);
-                }
+            for v in in_index_order(vals, direction)? {
                 for id_k in self.eq_id_keys(session, db, coll, name, direction, is_compound, v)? {
                     if seen.insert(id_k) {
                         out.push(id_k);
@@ -16333,12 +16538,12 @@ impl Storage {
                 Some(Bson::Array(a)) => a,
                 _ => return Ok(None),
             };
+            if vals.iter().any(|v| matches!(v, Bson::Document(_))) {
+                return Ok(None);
+            }
             let mut seen: HashSet<i64> = HashSet::new();
             let mut out: Vec<i64> = Vec::new();
-            for v in vals {
-                if matches!(v, Bson::Document(_)) {
-                    return Ok(None);
-                }
+            for v in in_index_order(vals, op_dir)? {
                 let inner = make_kb(v)?;
                 for id_k in
                     self.scan_index_for_id_keys(session, db, coll, &name, &inner, use_prefix)?

@@ -9047,6 +9047,69 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.078 `insert`, `delete`, `count` and `distinct` -- 2026-10-12
+
+`tools/probes/insert_delete_count_distinct.py`, mongod 8.2.11: 38
+scenarios, 905 replies over a raw connection. Each case runs against a
+collection of its own and compares the reply AND the documents left
+behind, in the order the collection holds them. The Rust server differed
+on 162 replies and differs on 32. Pinned by
+`crates/secantus-storage-adapter/tests/insert_delete_count_distinct_wt.rs`.
+
+The wrong WRITES, all fixed:
+
+- **Two `_id` documents equal by value were both stored.** After
+  `{_id: {a: 1}}`, `{_id: {a: 1.0}}` was accepted; mongod refuses it. The
+  `_id` index keys a document by its BSON bytes (`encode_id_key`), and
+  those bytes are on disk and shared with the Python server, so they are
+  unchanged. A document `_id` now also takes a claim by value in
+  `UNIQ_TABLE`, the one a collated collection already takes
+  (`Storage::document_id_claim`). **A document stored before this fix
+  holds no claim**, so a second document equal to it by value is still
+  accepted until the first is rewritten; nothing backfills the claims.
+  The Python server takes none either.
+- **`$merge` with `whenMatched: "replace"` deleted the matched document
+  and then inserted the new one.** A replacement a unique index refused
+  left neither. It is one replacement now, and a replaced document keeps
+  its place in the collection.
+- A delete statement with no `limit` removed every matching document;
+  mongod refuses the command. A statement mongod refuses (`limit: 7`, an
+  unknown field) stopped the command only after the statements ahead of
+  it had run.
+- A `limit: 1` delete ignored its `hint`. mongod removes the first
+  document the hint reads: the newest for `{$natural: -1}`.
+- An `$in` over an index read the documents in the order of the list;
+  mongod reads them in the index's order. Both `find` and a `limit: 1`
+  delete returned or removed a different document.
+- `insert` stored a document with a `$`-prefixed field inside its `_id`
+  below the top level, a document nested past 180 levels, the documents
+  ahead of a batch element that is not a document, and a
+  `Timestamp(0, 0)` filled in under `bypassEmptyTsReplacement: true`.
+
+Still different, all 32:
+
+- **The message for a hint that names no index** (20, with 7.077's 7).
+  mongod prints its query tree. Joe's call, not made.
+- `$where` in a query (3): not run here.
+- `$near` with no geo index (2): mongod answers 291; this server finds
+  nothing.
+- `includeQueryStatsMetrics` (2): mongod adds a `metrics` document.
+- Which unique index a duplicate of two is reported for (1): mongod
+  checks them in the order they were built, which the catalog does not
+  record (the same gap as `listIndexes` order).
+- The collation key printed in a duplicate-key message under a collation
+  (1): ICU's bytes.
+- `$expr` that fails when folded (1): mongod adds `Failed to optimize
+  expression :: caused by ::`.
+- `distinct` over a multikey index (1): mongod returns `9` for a value
+  nested as `[8, [9]]`, where its collection scan returns `[9]`.
+- `distinct` with a collation over an index of that collation (1): mongod
+  leaves out `null`.
+
+Not measured: a `readConcern` with `atClusterTime` older than the oldest
+timestamp is `239 SnapshotTooOld` on `find`, `aggregate` and `distinct`;
+this server runs the read.
+
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
 `tools/probes/update_commands.py`, mongod 8.2.11: 30 scenarios, 1,295

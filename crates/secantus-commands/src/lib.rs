@@ -847,6 +847,30 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
             format!("BSON field 'WriteConcernOptions.{unknown}' is an unknown field."),
         ));
     }
+    // `j` and `fsync` are a bool or any number, and a wrong type is reported
+    // before anything about `w`: the first of the two as the document has
+    // them (measured 8.2.11, 2026-10-12).
+    for (field, value) in wc.iter().filter(|(k, _)| *k == "j" || *k == "fsync") {
+        if !matches!(
+            value,
+            Bson::Null
+                | Bson::Boolean(_)
+                | Bson::Int32(_)
+                | Bson::Int64(_)
+                | Bson::Double(_)
+                | Bson::Decimal128(_)
+        ) {
+            return Some(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'WriteConcernOptions.{field}' is the wrong type '{}', expected \
+                     types '[bool, double, long, decimal, int]'",
+                    secantus_core::query::bson_type_name(value)
+                ),
+            ));
+        }
+    }
     if let Some(w) = wc.get("w") {
         match w {
             // Any number: mongod reads it as `safeNumberLong` and bounds that
@@ -886,23 +910,17 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
             }
         }
     }
-    if let Some(j) = wc.get("j") {
-        if !matches!(j, Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_)) {
-            return Some(CommandError::new(
-                14,
-                "TypeMismatch",
-                "writeConcern.j must be a boolean or integer",
-            ));
-        }
-    }
-    if let Some(wt) = wc.get("wtimeout") {
-        if !matches!(wt, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)) {
-            return Some(CommandError::new(
-                14,
-                "TypeMismatch",
-                "writeConcern.wtimeout must be a number",
-            ));
-        }
+    // `j` and `fsync` together are refused when both are set; each alone, or
+    // either one false, is fine. `wtimeout` is read as a number whatever its
+    // type: mongod accepts a string or a document there (measured 8.2.11,
+    // 2026-10-12; this refused both).
+    let set = |field: &str| wc.get(field).is_some_and(crate::util::truthy);
+    if set("j") && set("fsync") {
+        return Some(CommandError::new(
+            9,
+            "FailedToParse",
+            "fsync and j options cannot be used together",
+        ));
     }
     None
 }
@@ -1036,6 +1054,9 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
         return e.into_reply();
     }
     if let Err(e) = validate_api(doc, name) {
+        return e.into_reply();
+    }
+    if let Err(e) = refuse_write_concern(doc, name) {
         return e.into_reply();
     }
 
@@ -2228,8 +2249,22 @@ fn validate_read_concern(
     name: &str,
     ctx: &CommandContext,
 ) -> Result<(), CommandError> {
-    let Some(Bson::Document(rc)) = doc.get("readConcern") else {
-        return Ok(());
+    let rc = match doc.get("readConcern") {
+        Some(Bson::Document(rc)) => rc,
+        None | Some(Bson::Null) => return Ok(()),
+        // `find` and `aggregate` report it under their own names.
+        Some(_) if matches!(name, "find" | "aggregate") || lookup(name).is_none() => return Ok(()),
+        Some(other) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field '{name}.readConcern' is the wrong type '{}', expected type \
+                     'object'",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
     };
     const FIELDS: [&str; 7] = [
         "level",
@@ -2313,14 +2348,78 @@ fn validate_read_concern(
     } else {
         return Ok(());
     };
+    let at = match rc.get("atClusterTime") {
+        Some(Bson::Timestamp(t)) => {
+            format!("atClusterTime: Timestamp({}, {}), ", t.time, t.increment)
+        }
+        _ => String::new(),
+    };
     Err(CommandError::new(
         72,
         "InvalidOptions",
         format!(
-            "Command {name} does not support {{ readConcern: {{ level: \"{level}\", provenance: \
+            "Command {name} does not support {{ readConcern: {{ level: \"{level}\", {at}provenance: \
              \"clientSupplied\" }} }} :: caused by :: {reason}"
         ),
     ))
+}
+
+/// The commands mongod refuses a `writeConcern` on: every one of these
+/// answered `72 Command does not support writeConcern` on 8.2.11
+/// (2026-10-12), and this server ran them. A command not listed was not
+/// measured, and is left alone.
+const NO_WRITE_CONCERN: &[&str] = &[
+    "find",
+    "count",
+    "distinct",
+    "listCollections",
+    "listIndexes",
+    "ping",
+    "hello",
+    "isMaster",
+    "ismaster",
+    "buildInfo",
+    "getMore",
+    "killCursors",
+    "listDatabases",
+    "dbStats",
+    "collStats",
+    "serverStatus",
+    "getParameter",
+    "connectionStatus",
+    "whatsmyuri",
+    "endSessions",
+    "validate",
+    "dataSize",
+    "currentOp",
+    "hostInfo",
+    "getCmdLineOpts",
+    "getLog",
+    "startSession",
+    "refreshSessions",
+    "killSessions",
+    "killAllSessions",
+    "replSetGetStatus",
+    "usersInfo",
+    "rolesInfo",
+    "top",
+    "profile",
+    "killOp",
+    "fsync",
+    "compact",
+    "reIndex",
+    "mapReduce",
+];
+
+fn refuse_write_concern(doc: &Document, name: &str) -> Result<(), CommandError> {
+    if NO_WRITE_CONCERN.contains(&name) && doc.contains_key("writeConcern") {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Command does not support writeConcern",
+        ));
+    }
+    Ok(())
 }
 
 /// `apiVersion` / `apiStrict` validation (`commands.py::dispatch`). An
@@ -2330,14 +2429,14 @@ fn validate_read_concern(
 fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
     if let Some(av) = doc.get("apiVersion") {
         if av.as_str() != Some("1") {
-            return Err(CommandError::new(
-                322,
-                "APIVersionError",
-                format!(
-                    "Provided apiVersion {} is not supported. Supported versions: [\"1\"]",
-                    py_repr(av)
-                ),
-            ));
+            // mongod's two wordings (measured 8.2.11, 2026-10-12): version
+            // "2" is named, and anything else is told what is accepted.
+            let message = if av.as_str() == Some("2") {
+                "Cannot accept API version 2"
+            } else {
+                "API version must be \"1\""
+            };
+            return Err(CommandError::new(322, "APIVersionError", message));
         }
     }
     if doc.get("apiStrict").and_then(Bson::as_bool) == Some(true) {
@@ -2495,16 +2594,6 @@ pub(crate) fn api_v1_agg_stage(stage: &str) -> bool {
             | "$unset"
             | "$unwind"
     )
-}
-
-/// Render a BSON value the way Python's `{!r}` does for the messages above:
-/// strings single-quoted, everything else via its `Display`. (Drivers gate on
-/// the integer `code`; this only shapes the human-readable `errmsg`.)
-fn py_repr(v: &Bson) -> String {
-    match v {
-        Bson::String(s) => format!("'{s}'"),
-        other => other.to_string(),
-    }
 }
 
 #[cfg(test)]
