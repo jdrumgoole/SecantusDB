@@ -173,7 +173,35 @@ def _stop_mongod(proc: subprocess.Popen, dbpath: str) -> None:
     )
 
 
+class _LostPortRace(RuntimeError):
+    """Another process bound the port between `_free_port()` and our mongod."""
+
+
 def _start_mongod(
+    env: Mapping[str, str] | None = None,
+    extra_args: Sequence[str] = (),
+) -> tuple[subprocess.Popen, str, str]:
+    """A throwaway standalone mongod of OUR OWN: ``(proc, uri, dbpath)``.
+
+    `_free_port()` has to close its probe socket before mongod binds, so
+    another xdist worker can take the port first; ours then exits, and
+    `_assert_owns_port` refuses to go on. That refusal used to be the end of
+    it: thirty errors in one CI lane on 2026-10-12, for a race that says
+    nothing about either server. The loser is reaped and another port is
+    tried. Four lost in a row is still an error, and never a comparison
+    against somebody else's mongod.
+    """
+    lost: _LostPortRace | None = None
+    for _ in range(4):
+        try:
+            return _start_mongod_once(env, extra_args)
+        except _LostPortRace as exc:
+            lost = exc
+    assert lost is not None
+    raise lost
+
+
+def _start_mongod_once(
     env: Mapping[str, str] | None = None,
     extra_args: Sequence[str] = (),
 ) -> tuple[subprocess.Popen, str, str]:
@@ -260,7 +288,7 @@ def _assert_owns_port(proc: subprocess.Popen, port: int) -> None:
     # `secantusd-pg` harness fixed it properly by binding :0 and reading the
     # port back, which mongod gives us no way to do.)
     if proc.poll() is not None:
-        raise RuntimeError(
+        raise _LostPortRace(
             f"mongod on port {port} exited during startup; the ping that "
             "succeeded reached a DIFFERENT server, so this gate would have "
             "compared against a mongod it does not own"
