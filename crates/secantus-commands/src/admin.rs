@@ -33,9 +33,7 @@ use bson::{doc, Bson, Document};
 use crate::argtypes;
 use crate::find::split_into_cursor;
 use crate::util::{as_i64, bool_field, coll_arg, command_error, docs_to_bson, encode_docs};
-use crate::{
-    CommandContext, CommandError, HandlerResult, StorageError, DEFAULT_BATCH_SIZE,
-};
+use crate::{CommandContext, CommandError, HandlerResult, StorageError, DEFAULT_BATCH_SIZE};
 
 /// Collection-option keys (from `create` / `collMod`) the Rust server persists.
 /// `validator` + `validationLevel`/`validationAction` drive document validation;

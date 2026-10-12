@@ -445,8 +445,10 @@ pub trait Storage: Send + Sync {
         self.find(db, coll, filter, sort, hint)
     }
 
-    /// The plan `find` would use for these args, without executing — the input to
-    /// `explain`'s `winningPlan`. Returns `{kind: "COLLSCAN"}` or
+    /// The plan THIS server's index router would use for these args, without
+    /// executing. `explain` no longer reports it (it reports the plan mongod
+    /// runs, see `crate::explain`); this stays as the router's own account of
+    /// itself, for diagnostics. Returns `{kind: "COLLSCAN"}` or
     /// `{kind: "IXSCAN", indexName, keyPattern, direction, multikey}`. Default COLLSCAN; the
     /// WT adapter mirrors the storage index router.
     fn explain_plan(

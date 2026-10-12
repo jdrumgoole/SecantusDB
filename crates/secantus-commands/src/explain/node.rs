@@ -381,7 +381,11 @@ impl Node {
             Node::ExpressWrite { index, delete, .. } => {
                 out.insert(
                     "stage",
-                    if *delete { "EXPRESS_DELETE" } else { "EXPRESS_UPDATE" },
+                    if *delete {
+                        "EXPRESS_DELETE"
+                    } else {
+                        "EXPRESS_UPDATE"
+                    },
                 );
                 out.insert("keyPattern", render_key_pattern(&index.key));
                 out.insert("indexName", index.name.clone());
@@ -405,8 +409,7 @@ impl Node {
                     out.insert("keysExamined", num(s.keys));
                 }
                 ix.index.describe(&mut out, false);
-                let (start, start_incl, end, end_incl) =
-                    ix.single_range().unwrap_or_default();
+                let (start, start_incl, end, end_incl) = ix.single_range().unwrap_or_default();
                 out.insert(
                     "indexBounds",
                     doc! {
@@ -440,10 +443,7 @@ impl Node {
                 input_of(&mut out, input);
             }
             Node::Delete { batched, input } => {
-                out.insert(
-                    "stage",
-                    if *batched { "BATCHED_DELETE" } else { "DELETE" },
-                );
+                out.insert("stage", if *batched { "BATCHED_DELETE" } else { "DELETE" });
                 counted(&mut out);
                 extra(&mut out);
                 input_of(&mut out, input);

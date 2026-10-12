@@ -112,7 +112,11 @@ fn collection(inner: &Document, name: &str, db: &str) -> Result<String, CommandE
             "InvalidNamespace",
             format!("Collection name has invalid type {}", bson_type_name(other)),
         )),
-        None => Err(err(73, "InvalidNamespace", "Collection name has invalid type missing")),
+        None => Err(err(
+            73,
+            "InvalidNamespace",
+            "Collection name has invalid type missing",
+        )),
     }
 }
 
@@ -160,7 +164,11 @@ fn resolve_hint(hint: Option<&Bson>, catalog: &[Rc<IndexInfo>]) -> Result<Hint, 
                 .map(|ix| Hint::Index(ix.name.clone()))
                 .ok_or_else(|| bad_hint(given))
         }
-        Some(_) => Err(err(9, "FailedToParse", "Hint must be a string or an object")),
+        Some(_) => Err(err(
+            9,
+            "FailedToParse",
+            "Hint must be a string or an object",
+        )),
     }
 }
 
@@ -183,7 +191,15 @@ fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
         });
     }
     let raw = storage
-        .find_collated(db, coll, &Document::new(), None, None, None, &Document::new())
+        .find_collated(
+            db,
+            coll,
+            &Document::new(),
+            None,
+            None,
+            None,
+            &Document::new(),
+        )
         .map_err(command_error)?;
     let docs = decode_docs(raw)?;
     let mut catalog = Vec::new();
@@ -314,7 +330,9 @@ fn query_planner(
         Node::FastCount | Node::ExpressWrite { .. } => true,
         Node::Count(input) => matches!(**input, Node::Eof("nonExistentNamespace")),
         Node::Update(input) => unparsed(input),
-        Node::Eof("nonExistentNamespace") => matches!(s.kind, Kind::Update { .. } | Kind::Delete { .. }),
+        Node::Eof("nonExistentNamespace") => {
+            matches!(s.kind, Kind::Update { .. } | Kind::Delete { .. })
+        }
         _ => false,
     };
     if !fast_count {
@@ -585,7 +603,10 @@ fn refuse_view(coll: &str, ctx: &CommandContext) -> Result<(), CommandError> {
         return Err(err(
             166,
             "CommandNotSupportedOnView",
-            format!("Namespace {}.{coll} is a view, not a collection", ctx.db_name),
+            format!(
+                "Namespace {}.{coll} is a view, not a collection",
+                ctx.db_name
+            ),
         ));
     }
     Ok(())
@@ -634,7 +655,11 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let verbosity = verbosity_of(doc)?;
     crate::argtypes::require_number(doc, "maxTimeMS", "explain.maxTimeMS")?;
     if doc.contains_key("writeConcern") {
-        return Err(err(72, "InvalidOptions", "Command does not support writeConcern"));
+        return Err(err(
+            72,
+            "InvalidOptions",
+            "Command does not support writeConcern",
+        ));
     }
     // An aggregate's own `explain: true` arrives here marked.
     let inline = doc.contains_key("$inline");
@@ -708,9 +733,19 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             refuse_view(&coll, ctx)?;
             s
         }
-        "explain" => return Err(err(20, "IllegalOperation", "Explain cannot explain itself.")),
+        "explain" => {
+            return Err(err(
+                20,
+                "IllegalOperation",
+                "Explain cannot explain itself.",
+            ))
+        }
         _ if known_command(&name) => {
-            return Err(err(20, "IllegalOperation", format!("Cannot explain cmd: {name}")))
+            return Err(err(
+                20,
+                "IllegalOperation",
+                format!("Cannot explain cmd: {name}"),
+            ))
         }
         _ => {
             return Err(err(
@@ -762,7 +797,11 @@ fn aggregate(
             a.iter().filter_map(Bson::as_document).cloned().collect()
         }
         Some(_) => {
-            return Err(err(14, "TypeMismatch", "A pipeline must be an array of objects"))
+            return Err(err(
+                14,
+                "TypeMismatch",
+                "A pipeline must be an array of objects",
+            ))
         }
     };
     // The command's own checks: over no documents, and without the stage

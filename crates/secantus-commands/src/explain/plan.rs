@@ -76,7 +76,11 @@ pub(crate) fn clauses(canonical: &Document) -> Vec<Document> {
     }
     if canonical.len() == 1 {
         if let Ok(parts) = canonical.get_array("$and") {
-            return parts.iter().filter_map(Bson::as_document).cloned().collect();
+            return parts
+                .iter()
+                .filter_map(Bson::as_document)
+                .cloned()
+                .collect();
         }
     }
     vec![canonical.clone()]
@@ -213,7 +217,9 @@ fn use_index(index: &Rc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Que
     }
     // A clause the partial filter states is true of every indexed document.
     if let Some(partial) = &index.partial {
-        let stated = clauses(&secantus_core::canonical_match(&Bson::Document(partial.clone())));
+        let stated = clauses(&secantus_core::canonical_match(&Bson::Document(
+            partial.clone(),
+        )));
         for (i, clause) in parts.iter().enumerate() {
             if stated.contains(clause) {
                 covered.insert(i);

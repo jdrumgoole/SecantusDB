@@ -146,8 +146,7 @@ fn tidy(value: Bson) -> Bson {
 
 /// The match expression as mongod parses and normalises it.
 pub(crate) fn parsed_query(filter: &Document) -> Document {
-    let canonical =
-        secantus_core::canonical_match(&Bson::Document(normalize_or(filter.clone())));
+    let canonical = secantus_core::canonical_match(&Bson::Document(normalize_or(filter.clone())));
     // `{a: {$nin: []}}` excludes nothing, and mongod says so its own way.
     if let [(_, Bson::Document(pred))] = canonical.iter().collect::<Vec<_>>()[..] {
         let empty_nin = pred

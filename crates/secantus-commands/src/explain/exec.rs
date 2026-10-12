@@ -65,7 +65,13 @@ pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) 
         }
         walk_doc(v, parts, at, out, arrays);
     }
-    fn walk_doc(v: &Bson, parts: &[&str], at: usize, out: &mut Vec<Bson>, arrays: &mut Vec<String>) {
+    fn walk_doc(
+        v: &Bson,
+        parts: &[&str],
+        at: usize,
+        out: &mut Vec<Bson>,
+        arrays: &mut Vec<String>,
+    ) {
         if at == parts.len() {
             out.push(v.clone());
             return;
@@ -78,7 +84,13 @@ pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) 
     }
     let parts: Vec<&str> = path.split('.').collect();
     let (mut out, mut arrays) = (Vec::new(), Vec::new());
-    walk_doc(&Bson::Document(doc.clone()), &parts, 0, &mut out, &mut arrays);
+    walk_doc(
+        &Bson::Document(doc.clone()),
+        &parts,
+        0,
+        &mut out,
+        &mut arrays,
+    );
     (out, arrays)
 }
 
@@ -164,9 +176,19 @@ fn ranges(list: &[Interval], reversed: bool) -> Ranges {
         .iter()
         .map(|i| {
             if reversed {
-                (directed(&i.hi, true), i.hi_incl, directed(&i.lo, true), i.lo_incl)
+                (
+                    directed(&i.hi, true),
+                    i.hi_incl,
+                    directed(&i.lo, true),
+                    i.lo_incl,
+                )
             } else {
-                (directed(&i.lo, false), i.lo_incl, directed(&i.hi, false), i.hi_incl)
+                (
+                    directed(&i.lo, false),
+                    i.lo_incl,
+                    directed(&i.hi, false),
+                    i.hi_incl,
+                )
             }
         })
         .collect();
@@ -450,7 +472,10 @@ impl<'a> Run<'a> {
                         return None;
                     };
                     let key = &scan.entries[scan.pos - 1].0;
-                    if self.prefixes.insert(key[..(*width).min(key.len())].to_vec()) {
+                    if self
+                        .prefixes
+                        .insert(key[..(*width).min(key.len())].to_vec())
+                    {
                         self.keys = self.prefixes.len() as i64;
                         return Some(row);
                     }
@@ -515,9 +540,10 @@ impl<'a> Run<'a> {
                 self.pos = 1;
                 let field = index.key.keys().next()?;
                 let want = sort_key(value);
-                let row = env.docs.iter().position(|d| {
-                    values_at(d, field).0.iter().any(|v| sort_key(v) == want)
-                })?;
+                let row = env
+                    .docs
+                    .iter()
+                    .position(|d| values_at(d, field).0.iter().any(|v| sort_key(v) == want))?;
                 self.keys = 1;
                 self.docs = 1;
                 Some(row)

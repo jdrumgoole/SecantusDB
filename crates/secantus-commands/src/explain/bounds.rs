@@ -579,7 +579,10 @@ pub(crate) fn render(v: &Bson) -> String {
         Bson::Timestamp(t) => format!("Timestamp({}, {})", t.time, t.increment),
         Bson::Document(d) if d.is_empty() => "{}".into(),
         Bson::Document(d) => {
-            let parts: Vec<String> = d.iter().map(|(k, v)| format!("{k}: {}", render(v))).collect();
+            let parts: Vec<String> = d
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", render(v)))
+                .collect();
             format!("{{ {} }}", parts.join(", "))
         }
         Bson::Array(a) if a.is_empty() => "[]".into(),
@@ -663,10 +666,7 @@ mod tests {
         assert_eq!(nin.0, ["[MinKey, 1)", "(1, 3)", "(3, MaxKey]"]);
         let not_gt = shown(doc! {"$not": {"$gt": 2}}, c).unwrap();
         assert_eq!(not_gt.0, ["[MinKey, 2]", "(inf, MaxKey]"]);
-        let sparse = Ctx {
-            sparse: true,
-            ..c
-        };
+        let sparse = Ctx { sparse: true, ..c };
         assert!(shown(doc! {"$not": {"$eq": 2}}, sparse).is_none());
     }
 

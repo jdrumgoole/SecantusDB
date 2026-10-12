@@ -8870,6 +8870,75 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.075 `explain`, command by command -- 2026-10-12
+
+`tools/probes/explain_commands.py`, mongod 8.2.11: 51 scenarios, 786
+`explain` replies over a raw connection (`find`, `count`, `distinct`,
+`aggregate`, `update`, `delete`, `findAndModify`; index bounds, sort,
+paging, projection, `$or`, hints, collation, views, execution counts, what
+the command refuses). Nearly every scenario offers the planner ONE usable
+index or none, so the plan is a rule and not the outcome of mongod's trial
+runs; the scenarios named `choice:` offer two. The Rust server went from 771
+replies different to 72. `explain` was rebuilt for it
+(`crates/secantus-commands/src/explain/`): the plan is derived from mongod's
+planning rules, and `executionStats` from walking that plan over the
+collection's documents. Pinned by
+`crates/secantus-storage-adapter/tests/explain_commands_wt.rs`.
+
+Two defects outside `explain` were found and fixed on the way:
+
+- An operator the query language does not have (`{a: {$nope: 1}}`) was
+  accepted by `count`, `distinct`, `aggregate`, `update`, `delete` and
+  `findAndModify` over an EMPTY or MISSING collection, because only the
+  matcher refused it and there was no document to match. `find` refused it
+  in other words than mongod's. All seven now refuse it when the filter is
+  parsed (`argtypes::unknown_operator_in_filter`).
+- `count` and `delete` by `_id` on a collection that was never written
+  answered an internal WiredTiger error (`No such file or directory`): the
+  index-routed lookup opened the lazily created document table without
+  allowing for its absence.
+
+What is left, all on the RUST MongoDB server:
+
+- [ ] **`explain` describes the plan mongod runs, which is not always how
+      this server reads the documents.** Results are the same; the access
+      path is not. Measured over 57 filter shapes, `explain` reports an
+      index scan and the storage router scans the collection for 19: `$ne`,
+      `$nin`, `$not`, `$exists`, `$type`, `$mod`, `$all` of one, both forms
+      of `$elemMatch`, an equality to a sub-document, a `$regex` (prefix or
+      not), a range on `_id`, and a filter written as an explicit `$and`.
+      Each is a place the router could use the index it has. Whether
+      `explain` should say what mongod does or what this server does is
+      Joe's call; it says what mongod does.
+- [ ] **No rejected plans.** `rejectedPlans` is always empty. Where two
+      indexes could serve a query, the winner agreed with mongod on all 20
+      `choice:` replies, by a fixed order of preference (`plan.rs`) and not
+      by trial. 19 replies differ only in the count of rejected plans.
+- [ ] **`aggregate` beyond the stages the planner absorbs** (about 24
+      replies). Not reproduced: `$group`, `$count`, `$sortByCount`,
+      `$bucket` and `$lookup` pushed into the query (mongod reports a
+      slot-based plan, `explainVersion: "2"`); `$group` served by a
+      `DISTINCT_SCAN`; the projection mongod adds for the fields later
+      stages need; a `$match` moved ahead of an `$unwind`; `$facet`,
+      `$documents`, `$project` and `$group` as mongod re-prints them; and
+      per-stage `nReturned` under a `$limit`, which here is the count of a
+      full run.
+- [ ] **`count` and `distinct` on a view** report the cursor and the
+      desugared stages, not mongod's slot-based `GROUP`.
+- [ ] **An unknown `hint` is worded as on every other command** (the entry
+      under 7.071), 9 replies.
+- [ ] **Smaller:** `$expr` is not rewritten (`{$expr: false}` is not an
+      `EOF`, an equality inside `$expr` adds no `$_internalExprEq`); a
+      comparison to an ARRAY bounds nothing; `$where` is refused by `find`
+      itself; `explain` of `mapReduce` and `bulkWrite` is refused;
+      `local.oplog.rs` and `system.views` report `EOF`; several intervals
+      on one multikey field take the first predicate's bounds, where mongod
+      races the alternatives.
+- [ ] **PYTHON MongoDB server:** not measured by this probe. Its `explain`
+      has the older, smaller shape (no `indexBounds`, no `EXPRESS_IXSCAN`,
+      no `count` / `distinct` / write stages), and the two defects above
+      were not checked on it.
+
 ### 7.074 Change streams, command by command -- 2026-10-11
 
 `tools/probes/change_stream_commands.py`, mongod 8.2.11 as a replica-set

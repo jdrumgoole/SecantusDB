@@ -120,7 +120,12 @@ pub(crate) fn find(coll: &str, inner: &Document) -> Result<Shape, CommandError> 
     s.filter = doc_arg(inner, "filter", "FindCommandRequest.filter")?;
     s.sort = inner.get_document("sort").ok().cloned();
     // `sort: {$natural: ±1}` is storage order: a hint, and no sort at all.
-    if let Some(natural) = s.sort.as_ref().filter(|x| x.len() == 1).and_then(|x| x.get("$natural")) {
+    if let Some(natural) = s
+        .sort
+        .as_ref()
+        .filter(|x| x.len() == 1)
+        .and_then(|x| x.get("$natural"))
+    {
         s.hint = Some(Bson::Document(doc! { "$natural": natural.clone() }));
         s.sort = None;
     }
@@ -128,7 +133,11 @@ pub(crate) fn find(coll: &str, inner: &Document) -> Result<Shape, CommandError> 
     s.skip = int_arg(inner, "skip");
     s.limit = int_arg(inner, "limit");
     if inner.contains_key("min") || inner.contains_key("max") {
-        s.min_max = Some(if inner.contains_key("min") { "min" } else { "max" });
+        s.min_max = Some(if inner.contains_key("min") {
+            "min"
+        } else {
+            "max"
+        });
         for field in ["min", "max"] {
             if let Some(v) = inner.get(field) {
                 s.options.insert(field, v.clone());
@@ -161,7 +170,11 @@ pub(crate) fn distinct(coll: &str, inner: &Document) -> Result<Shape, CommandErr
 }
 
 /// The single statement of an explained write batch.
-fn statement<'a>(inner: &'a Document, cmd: &str, field: &str) -> Result<&'a Document, CommandError> {
+fn statement<'a>(
+    inner: &'a Document,
+    cmd: &str,
+    field: &str,
+) -> Result<&'a Document, CommandError> {
     let list = match inner.get(field) {
         None => return Err(missing(&format!("{cmd}.{field}"))),
         Some(Bson::Array(a)) => a,
@@ -370,19 +383,17 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
 fn constified(v: &Bson) -> Bson {
     match v {
         Bson::String(s) if s.starts_with('$') => v.clone(),
-        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
-            Bson::Document(
-                d.iter()
-                    .map(|(op, arg)| {
-                        let arg = match arg {
-                            Bson::Array(items) => Bson::Array(items.iter().map(constified).collect()),
-                            other => constified(other),
-                        };
-                        (op.clone(), arg)
-                    })
-                    .collect(),
-            )
-        }
+        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => Bson::Document(
+            d.iter()
+                .map(|(op, arg)| {
+                    let arg = match arg {
+                        Bson::Array(items) => Bson::Array(items.iter().map(constified).collect()),
+                        other => constified(other),
+                    };
+                    (op.clone(), arg)
+                })
+                .collect(),
+        ),
         Bson::Document(d) => {
             Bson::Document(d.iter().map(|(k, x)| (k.clone(), constified(x))).collect())
         }
@@ -479,8 +490,18 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
     let ordered: &[&str] = match name.to_ascii_lowercase().as_str() {
         "count" => &["query", "limit", "skip", "hint", "collation"],
         "findandmodify" => &[
-            "query", "fields", "sort", "hint", "collation", "arrayFilters", "remove", "update",
-            "upsert", "new", "bypassDocumentValidation", "let",
+            "query",
+            "fields",
+            "sort",
+            "hint",
+            "collation",
+            "arrayFilters",
+            "remove",
+            "update",
+            "upsert",
+            "new",
+            "bypassDocumentValidation",
+            "let",
         ],
         _ => {
             let mut plain = inner.clone();
@@ -490,7 +511,10 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
     };
     let count = ordered[1] == "limit";
     if let Some(target) = inner.get(&name) {
-        out.insert(if count { "count" } else { "findAndModify" }, target.clone());
+        out.insert(
+            if count { "count" } else { "findAndModify" },
+            target.clone(),
+        );
     }
     for field in ordered {
         let value = match (inner.get(*field), *field) {
@@ -513,7 +537,14 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
     }
     for field in late {
         if let Some(v) = inner.get(field) {
-            out.insert(field, if field == "maxTimeMS" { wide(v) } else { v.clone() });
+            out.insert(
+                field,
+                if field == "maxTimeMS" {
+                    wide(v)
+                } else {
+                    v.clone()
+                },
+            );
         }
     }
     out
