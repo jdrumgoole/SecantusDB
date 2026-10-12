@@ -8936,8 +8936,9 @@ What is left, all on the RUST MongoDB server:
       races the alternatives.
 - [ ] **PYTHON MongoDB server:** not measured by this probe. Its `explain`
       has the older, smaller shape (no `indexBounds`, no `EXPRESS_IXSCAN`,
-      no `count` / `distinct` / write stages), and the two defects above
-      were not checked on it.
+      no `count` / `distinct` / write stages), it echoes `{$exists: false}`
+      as sent where mongod parses it as `{$not: {$exists: true}}`, and the
+      two defects above were not checked on it.
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

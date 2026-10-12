@@ -63,7 +63,7 @@ FILTERS: list[dict] = [
     {"a": {"$elemMatch": {"$gt": 1}}},
     {"a": {"$not": {"$eq": 1}}},
     {"a": 1, "$comment": "ignored"},
-    {"a": {"$gte": 1, "$lte": 9}, "z": {"$exists": False}},
+    {"a": {"$gte": 1, "$lte": 9}, "z": {"$exists": True}},
     {"nested": {"doc": 1}},
     {},
 ]
@@ -129,6 +129,10 @@ def test_the_normalisation_actually_happens(dbs) -> None:
     assert _parsed_query(rust_db, {"a": {"$type": "string"}}) == {"a": {"$type": [2]}}
     assert _parsed_query(rust_db, {"a": {"$bitsAllSet": 5}}) == {"a": {"$bitsAllSet": [0, 2]}}
     assert _parsed_query(rust_db, {"a": 1, "$comment": "ignored"}) == {"a": {"$eq": 1}}
+    # `$exists: false` is parsed as a negation. The Python server still echoes
+    # it as sent (`tasks/backlog.md` 7.075), so it is pinned here and not in
+    # the comparison above.
+    assert _parsed_query(rust_db, {"z": {"$exists": False}}) == {"z": {"$not": {"$exists": True}}}
     # The `$and` children come back in mongod's match-type order, so `b`'s
     # equality precedes `a`'s `$gt` -- not the order they were written in.
     assert _parsed_query(rust_db, {"a": {"$gt": 1}, "b": 2}) == {
@@ -162,6 +166,7 @@ IXSCAN_KEYS = [
     "isPartial",
     "indexVersion",
     "direction",
+    "indexBounds",
 ]
 
 
@@ -232,8 +237,19 @@ def test_is_cached_is_the_first_key_of_the_outermost_node(dbs) -> None:
     assert plan["isCached"] is False
 
 
+def _without_bounds(node):
+    """A plan without `indexBounds`, which only the Rust server reports."""
+    if isinstance(node, dict):
+        return {k: _without_bounds(v) for k, v in node.items() if k != "indexBounds"}
+    if isinstance(node, list):
+        return [_without_bounds(v) for v in node]
+    return node
+
+
 def test_plan_nodes_agree_with_the_python_server(indexed) -> None:
-    """The two servers must build the same node, key for key."""
+    """The two servers must build the same node, key for key -- but for the
+    index bounds, which the Rust server reports as mongod does and the Python
+    server does not report at all."""
     rust_db, py_db = indexed
     for body in (
         {"filter": {"a": 7}, "hint": "a_1"},
@@ -243,7 +259,14 @@ def test_plan_nodes_agree_with_the_python_server(indexed) -> None:
         {"filter": {}},
         {"filter": {"nope": 1}},
     ):
-        assert _winning(rust_db, body) == _winning(py_db, body), body
+        assert _without_bounds(_winning(rust_db, body)) == _winning(py_db, body), body
+
+
+def test_ixscan_reports_mongods_bounds(indexed) -> None:
+    """Measured on mongod 8.2.11 (`tools/probes/explain_commands.py`)."""
+    rust_db, _ = indexed
+    plan = _winning(rust_db, {"filter": {"a": {"$gt": 3, "$lte": 7}}, "hint": "a_1"})
+    assert plan["inputStage"]["indexBounds"] == {"a": ["(3, 7]"]}
 
 
 # --------------------------------------------------------------------------
