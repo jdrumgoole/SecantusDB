@@ -8879,7 +8879,8 @@ paging, projection, `$or`, hints, collation, views, execution counts, what
 the command refuses). Nearly every scenario offers the planner ONE usable
 index or none, so the plan is a rule and not the outcome of mongod's trial
 runs; the scenarios named `choice:` offer two. The Rust server went from 771
-replies different to 72. `explain` was rebuilt for it
+replies different to 72 (five replies added since, all matching, make it
+72 of 791). `explain` was rebuilt for it
 (`crates/secantus-commands/src/explain/`): the plan is derived from mongod's
 planning rules, and `executionStats` from walking that plan over the
 collection's documents. Pinned by
