@@ -3054,6 +3054,67 @@ These work end-to-end but cut corners.
       against 2,832 / 9,193 / 14,350; select by PK, 12,259 / 42,358 / 58,602
       against 9,654 / 32,339 / 41,181.
 
+      **Re-measured 2026-10-12** on a fresh `c-16`, the released
+      0.1.0-beta.13 binary against PostgreSQL 16.15, with
+      `invoke do-pg-bench --repeat 7` (medians of seven 10 s trials; raw
+      trials in `bench/results/pg-droplet/2026-10-12-0.1.0-beta.13/`):
+      insert, one table each, PostgreSQL 5,674 / 17,422 / 24,312 against
+      3,723 / 12,221 / 17,579; shared table at 8 clients, 24,234 against
+      16,310; update by PK, 5,272 / 16,847 / 23,873 against 3,024 / 9,880 /
+      15,807; select by PK, 12,256 / 45,590 / 65,959 against 9,579 / 36,268
+      / 45,230. Both servers are faster than on 2026-10-09 and the ratios
+      are where they were (1.4x to 1.7x on writes, 1.3x to 1.5x on reads).
+      The 8-client rows are within 4% across trials; at 1 and 4 clients a
+      trial moved by up to 21% on both servers, and two three-trial passes
+      the same hour gave select at 4 clients as 1.38x and 1.23x. The site
+      publishes the 8-client rows only (Joe's call, 2026-10-12).
+
+      **Why the 1- and 4-client rows move, diagnosed the same day** on a
+      second `c-16` (data in
+      `bench/results/pg-droplet/2026-10-12-low-client-noise/`). Two causes,
+      neither a server's:
+      - **CPU placement.** One client selecting by primary key, seven 5 s
+        trials: unpinned, PostgreSQL 16,863 and 16,162 with 9% and 14%
+        spread, this server 10,275 and 9,106 with 22% and 23%. Server
+        pinned to one vCPU and the client to another (five pairs tried):
+        PostgreSQL 17,020 to 17,232, this server 11,871 to 12,038, spread
+        1% to 4% (one pair 7%). Both on ONE vCPU: 11,728 and 7,642,
+        steady. Steal time was 0.00% throughout, so it is not a neighbour.
+        The guest reports 16 one-thread cores, so which vCPUs share a
+        physical core cannot be seen, and no pair behaved like siblings.
+        **Unpinned costs this server 15% to 25% of its pinned rate and
+        PostgreSQL 2% to 6%**: its statement crosses more threads. That is
+        a real cost to a single connection and worth a look of its own.
+      - **The disk.** With servers on vCPUs 0-7 and clients on 8-15, the
+        select rows tighten (1 client: 5.5% and 1.8%) and the update rows
+        do not (9% to 12%). An 8 KiB write and `fdatasync` in a loop, no
+        database, gave 2,873 to 3,249 a second over seven 10 s windows:
+        12.7% spread. One client's write rate is the disk's sync rate.
+
+      **Clients moved to the client droplets the same day** (Joe: that was
+      the plan for the cluster from the start). `invoke do-pg-bench` now
+      runs them on the two client droplets by default, over the private
+      network. Third `c-16`, clients on two `c-8`, medians of seven 10 s
+      trials, in `bench/results/pg-droplet/2026-10-12-0.1.0-beta.13-remote-clients/`:
+      insert, one table each, PostgreSQL 3,159 / 11,178 / 18,767 against
+      2,368 / 8,321 / 13,900 (1.33x / 1.34x / 1.35x); shared table at 8,
+      18,316 against 13,290 (1.38x); update, 3,052 / 10,770 / 18,364
+      against 2,147 / 7,615 / 12,711 (1.42x / 1.41x / 1.44x); select, 5,444
+      / 21,438 / 38,401 against 4,909 / 18,911 / 32,862 (1.11x / 1.13x /
+      1.17x). The client droplets' CPUs were 16% busy at most. Spread
+      between trials is 2% to 9% on this server's rows at every client
+      count, where over loopback one client moved by up to 21%; PostgreSQL's
+      rows are 4% to 13%, and one of its seven 8-client insert trials was
+      14,645 against a median of 18,767. The site still publishes the
+      8-client rows only; the 1- and 4-client rows are now steady enough
+      to consider, which is Joe's call.
+
+      Over loopback the read rows could be steadied by pinning
+      (`pg_concurrency.py` has no pinning option), and the low-client
+      write rows could not. The
+      unprepared-statement cost (`bench/pg_statement_cost.py`) is still
+      not measured on a droplet.
+
       3. **Reads: the unprepared statement, DONE 2026-10-10 (measured on the
          development Mac only; the droplet figures below are the BEFORE).**
          A `sample` of the server here gave a different picture from the

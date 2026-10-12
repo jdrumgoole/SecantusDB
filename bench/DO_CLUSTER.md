@@ -214,6 +214,55 @@ same key and `known_hosts` the harness uses.
 
 ---
 
+### The `invoke` tasks
+
+Every command has a task, so nothing here needs the `cargo run` line typed
+out:
+
+| Task | Command | Spends? |
+| --- | --- | --- |
+| `invoke do-up [--server-size c-16] [--client-size c-8]` | `up` | **starts** |
+| `invoke do-status` | `status` | no |
+| `invoke do-deploy` | `deploy` | no |
+| `invoke do-run` | `run` | no |
+| `invoke do-perf` | `perf` | no |
+| `invoke do-ssh [--role server]` | `ssh <role>` | no |
+| `invoke do-suspend [--mode destroy]` | `suspend` | stops, or keeps a snapshot |
+| `invoke do-destroy` | `destroy`, then `status` | **stops** |
+| `invoke do-bench` | `all` | starts, and stops at the end |
+| `invoke release-benchmark` | `all`, three passes, for `docs/benchmark.md` | starts, and stops |
+| `invoke do-pg-bench [--version 0.1.0-beta.13]` | none: see below | no |
+
+### `invoke do-pg-bench`: the PostgreSQL server against PostgreSQL 16
+
+The table on the site's Rust PostgreSQL page: a released `secantusd-pg` and
+PostgreSQL 16 at its defaults on the server droplet, every commit synced on
+both, driven from the two client droplets over the private network.
+
+```bash
+invoke do-up --server-size c-16 --client-size c-8
+invoke do-pg-bench --repeat 7      # the newest secantusd-pg-v* release
+invoke do-destroy
+```
+
+`bench/do_pg_bench.py` installs PostgreSQL 16 on the server droplet and
+psycopg on the clients, downloads the release binary and checks its SHA-256
+against the release's, and runs four sweeps of 10 s trials. Each client
+droplet runs half the clients (`bench/pg_remote_client.py`), all starting
+their window at one instant on the droplets' clock, and reports how busy its
+CPUs were, so a run limited by its clients says so. The two servers take
+turns on port 27017, the one port the cluster's firewall opens between
+droplets. The raw trials go to
+`bench/results/pg-droplet/<date>-<version>-remote-clients/`. It refuses a
+binary whose source tree is not the tag's, and it creates and destroys
+nothing. About 20 minutes at three trials and 45 at seven.
+
+`--clients-on server` runs the clients beside the server over loopback,
+which is how this was first measured. Do not publish its one- and
+four-client rows: a lone client and the server are then placed on the same
+16 CPUs afresh each trial, and a trial moved by up to 21%, for PostgreSQL as
+for this server (`bench/results/pg-droplet/2026-10-12-low-client-noise/`).
+
 ## Option reference
 
 ### Cluster options (accepted by every command)

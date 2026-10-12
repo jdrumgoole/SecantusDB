@@ -679,11 +679,29 @@ def do_perf(
 
 @task(
     name="do-up",
-    help={"region": "DigitalOcean region (default: lon1).", "fresh": "Ignore existing snapshots."},
+    help={
+        "region": "DigitalOcean region (default: lon1).",
+        "fresh": "Ignore existing snapshots.",
+        "server-size": "Server droplet size (default: c-4; the PostgreSQL table uses c-16).",
+        "client-size": "Client droplet size (default: c-2).",
+    },
 )
-def do_up(c: Context, region: str = "lon1", fresh: bool = False) -> None:
-    """Create (or wake) the three benchmark droplets and leave them running."""
-    cmd = f"{_DO_CLUSTER} up --region {shlex.quote(region)}"
+def do_up(
+    c: Context,
+    region: str = "lon1",
+    fresh: bool = False,
+    server_size: str = "c-4",
+    client_size: str = "c-2",
+) -> None:
+    """Create (or wake) the three benchmark droplets and leave them running.
+
+    This is the task that starts spending. `do-status` shows the live hourly
+    price, and `do-destroy` ends it.
+    """
+    cmd = (
+        f"{_DO_CLUSTER} up --region {shlex.quote(region)}"
+        f" --server-size {shlex.quote(server_size)} --client-size {shlex.quote(client_size)}"
+    )
     if fresh:
         cmd += " --fresh"
     c.run(cmd, pty=PTY)
@@ -777,6 +795,62 @@ def do_suspend(c: Context, mode: str = "destroy") -> None:
 def do_status(c: Context) -> None:
     """Show which benchmark droplets exist, their state, and the live hourly cost."""
     c.run(f"{_DO_CLUSTER} status", pty=PTY)
+
+
+@task(name="do-destroy")
+def do_destroy(c: Context) -> None:
+    """Destroy the benchmark droplets. Nothing is kept and nothing is billed.
+
+    `do-suspend` with its default does the same; this is the name to reach
+    for when the question is "is it off?".
+    """
+    c.run(f"{_DO_CLUSTER} destroy", pty=PTY)
+    c.run(f"{_DO_CLUSTER} status", pty=PTY)
+
+
+@task(name="do-ssh", help={"role": "server (default) | client-1 | client-2."})
+def do_ssh(c: Context, role: str = "server") -> None:
+    """Open a shell on a benchmark droplet, with the harness's key."""
+    c.run(f"{_DO_CLUSTER} ssh {shlex.quote(role)}", pty=PTY)
+
+
+@task(
+    name="do-pg-bench",
+    help={
+        "version": "secantusd-pg release to measure (default: the newest secantusd-pg-v* tag).",
+        "seconds": "Seconds per trial (default: 10).",
+        "repeat": "Trials per client count (default: 3).",
+        "host": "The server droplet's address, with --clients-on server (default: `do-status`).",
+        "clients-on": "droplets (default: the two client droplets) | server (loopback).",
+    },
+)
+def do_pg_bench(
+    c: Context,
+    version: str = "",
+    seconds: float = 10.0,
+    repeat: int = 3,
+    host: str = "",
+    clients_on: str = "droplets",
+) -> None:
+    """Measure a released `secantusd-pg` against PostgreSQL 16 on the server droplet.
+
+    The table on the site's Rust PostgreSQL page. Needs the droplets up, at
+    the sizes the page names: `invoke do-up --server-size c-16 --client-size
+    c-8`. It installs PostgreSQL 16 and the release binary on the server
+    droplet, drives both from the two client droplets over the private
+    network, and copies the trials back to `bench/results/pg-droplet/`. It
+    does not create or destroy a droplet: `invoke do-destroy` afterwards.
+    About 20 minutes at three trials, 45 at seven.
+    """
+    cmd = (
+        f"uv run --no-sync python bench/do_pg_bench.py --seconds {seconds} "
+        f"--repeat {int(repeat)} --clients-on {shlex.quote(clients_on)}"
+    )
+    if version:
+        cmd += f" --version {shlex.quote(version)}"
+    if host:
+        cmd += f" --host {shlex.quote(host)}"
+    c.run(cmd, pty=PTY)
 
 
 @task(
