@@ -518,6 +518,9 @@ pub(crate) fn error_code_name(code: i32) -> String {
 fn code_name_for(code: i32) -> &'static str {
     match code {
         2 => "BadValue",
+        40413 => "IDLDuplicateField",
+        40414 => "IDLFailedToParse",
+        40415 => "IDLUnknownField",
         // A `maxTimeMS` budget spent mid-operation. Reaches here via the
         // storage layer's MaxTimeExpired -> WriteError { code: 50 } mapping,
         // and without the entry would render the generic `Location50`.

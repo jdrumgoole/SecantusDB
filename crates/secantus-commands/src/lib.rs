@@ -40,6 +40,7 @@ mod capped_admin;
 pub mod changestream;
 pub mod crud;
 pub mod cursors;
+mod ddl_checks;
 pub mod diagnostics;
 pub mod distinct;
 mod explain;
@@ -55,6 +56,7 @@ pub mod rbac;
 pub mod roles;
 mod session;
 pub mod slowop;
+mod stats_admin;
 pub mod stepdown;
 pub mod storage;
 mod timeseries;
@@ -519,7 +521,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "secantusAdmin.pruneTtl" => admin::prune_ttl,
         "secantusAdmin.restoreArchive" => admin::restore_archive,
         "listCollections" => admin::list_collections,
-        "listDatabases" => admin::list_databases,
+        "listDatabases" => stats_admin::list_databases,
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
         "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
@@ -528,10 +530,11 @@ fn lookup(name: &str) -> Option<Handler> {
         "dropIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
-        "collStats" => admin::coll_stats,
+        "collStats" => stats_admin::coll_stats,
+        "dataSize" => stats_admin::data_size,
         // mongod accepts the lowercase `dbstats` spelling too (the C driver's
         // command_fully_qualified test sends it over the legacy OP_QUERY path).
-        "dbStats" | "dbstats" => admin::db_stats,
+        "dbStats" | "dbstats" => stats_admin::db_stats,
         "serverStatus" => admin::server_status,
         "currentOp" => admin::current_op,
         "killOp" => diagnostics::kill_op,
@@ -926,7 +929,13 @@ pub(crate) fn nul_in_namespace(kind: &str, value: &str) -> Option<CommandError> 
         Some(CommandError::new(
             73,
             "InvalidNamespace",
-            format!("Invalid {kind}: names cannot contain a NUL ('\\0') byte."),
+            // mongod's two wordings (8.2.11): one for a database name, one
+            // for anything with a collection in it.
+            if kind.starts_with("database") {
+                "namespace cannot have embedded null characters".to_string()
+            } else {
+                "namespaces cannot have embedded null characters".to_string()
+            },
         ))
     } else {
         None
@@ -983,16 +992,8 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     // component exceeds 63 bytes with InvalidNamespace before the command runs
     // (libmongoc's `long_namespace/unsupported_long_db` inserts into a
     // 64-character database and expects a server error). Mirrors commands.py.
-    if ctx.db_name.len() > 63 {
-        return CommandError::new(
-            73,
-            "InvalidNamespace",
-            format!(
-                "Invalid database name: '{}'. Database names must be at most 63 characters.",
-                ctx.db_name
-            ),
-        )
-        .into_reply();
+    if let Some(refused) = ddl_checks::invalid_database_name(&ctx.db_name, doc) {
+        return refused.into_reply();
     }
 
     // Embedded-NUL guard for the database + collection name. The collection is
