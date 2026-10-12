@@ -53,7 +53,7 @@ fn to_pyerr(e: StorageError) -> PyErr {
 
 /// Decode a BSON-encoded `Document` argument.
 fn decode_doc(b: &[u8]) -> PyResult<Document> {
-    secantus_core::bsondoc::from_bytes(b)
+    secantus_storage::bsondoc::from_bytes(b)
         .map_err(|e| PyValueError::new_err(format!("invalid BSON document: {e}")))
 }
 

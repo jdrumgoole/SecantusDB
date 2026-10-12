@@ -45,6 +45,9 @@ use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
 use secantus_core::{get_path, get_path_values};
 use secantus_wt::{Connection, Cursor, Session, WtError};
 
+/// The literal BSON decoder, for the crates that depend on this one.
+pub use secantus_core::bsondoc;
+
 pub mod admission;
 pub mod changestreams;
 pub mod pitr_archive;
