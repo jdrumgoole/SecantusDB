@@ -51,9 +51,23 @@ pub(crate) fn invalid_database_name(db: &str, doc: &Document) -> Option<CommandE
 
 /// A document as mongod prints one in a message: `{ a: 1 }`.
 fn spaced(d: &Document) -> String {
-    let parts: Vec<String> = d
+    spaced_value(&Bson::Document(d.clone()))
+}
+
+/// A value as mongod prints one in a message. An array prints as the
+/// document it is in BSON, keyed by position: `{ 0: { $match: {} } }`.
+pub(crate) fn spaced_value(v: &Bson) -> String {
+    let entries: Vec<(String, &Bson)> = match v {
+        Bson::Document(d) => d.iter().map(|(k, x)| (k.clone(), x)).collect(),
+        Bson::Array(a) => a.iter().enumerate().map(|(i, x)| (i.to_string(), x)).collect(),
+        other => return secantus_core::aggregate::render_value_compact(other),
+    };
+    if entries.is_empty() {
+        return "{}".to_string();
+    }
+    let parts: Vec<String> = entries
         .iter()
-        .map(|(k, v)| format!("{k}: {}", secantus_core::aggregate::render_value_compact(v)))
+        .map(|(k, x)| format!("{k}: {}", spaced_value(x)))
         .collect();
     format!("{{ {} }}", parts.join(", "))
 }

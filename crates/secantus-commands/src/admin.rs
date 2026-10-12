@@ -308,6 +308,14 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     match doc.get("viewOn") {
+        // A collection of that name answers "exists" before the definition
+        // is looked at.
+        Some(Bson::String(_))
+            if ctx
+                .storage()?
+                .collection_exists(&ctx.db_name, &coll)
+                .unwrap_or(false)
+                && !crate::views::is_view(ctx.storage()?, &ctx.db_name, &coll) => {}
         Some(Bson::String(view_on)) => {
             let storage = ctx.storage()?;
             if let Some(problem) = crate::views::definition_problem(
@@ -342,6 +350,11 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // by create_collection_with_options) — that's what lets PITR replay
     // reconstruct capped / validator / … rather than seeing a bare create.
     let mut opts = collection_option_subset(doc);
+    // An option given as null is an option not given.
+    opts = opts
+        .into_iter()
+        .filter(|(_, v)| !matches!(v, Bson::Null))
+        .collect();
     // The default collation is stored spelled out in full, and `simple` as no
     // collation, which is how mongod stores and compares them.
     if let Some(Bson::Document(given)) = doc.get("collation") {
@@ -492,6 +505,32 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Ok(doc! { "ok": 1.0 });
         }
         // A time-series collection on either side has its own wording.
+        // A view in the way is described by what it reads, or by its pipeline
+        // when it reads the same thing.
+        if let (Ok(on), false) = (
+            existing.get_str("viewOn"),
+            existing.contains_key("timeseries"),
+        ) {
+            let db = &ctx.db_name;
+            let wanted = doc.get_str("viewOn").unwrap_or("");
+            let pipeline = |d: &Document, key: &str| {
+                crate::ddl_checks::spaced_value(d.get(key).unwrap_or(&Bson::Array(vec![])))
+            };
+            let message = if wanted == on {
+                format!(
+                    "namespace {ns} already exists, but with pipeline {} rather than {}",
+                    pipeline(&existing, "viewPipeline"),
+                    pipeline(doc, "pipeline"),
+                )
+            } else {
+                let other = format!("{db}.{wanted}");
+                format!(
+                    "namespace {ns} already exists, but is a view on {db}.{on} rather than {}",
+                    other.trim_end_matches('.'),
+                )
+            };
+            return Ok(CommandError::new(48, "NamespaceExists", message).into_reply());
+        }
         let message = match (existing.contains_key("timeseries"), ts_def.is_some()) {
             (true, true) => Some(format!("A timeseries collection already exists. NS: {ns}")),
             (false, true) => Some(format!("Collection {ns} already exists.")),
@@ -547,8 +586,10 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     crate::ddl_checks::coll_mod(doc)?;
     // mongod's reply ends with `ok`, after what the command changed.
     let mut reply = coll_mod_inner(doc, ctx)?;
-    if let Some(ok) = reply.remove("ok") {
-        reply.insert("ok", ok);
+    if reply.get("ok").is_some_and(crate::util::truthy) {
+        if let Some(ok) = reply.remove("ok") {
+            reply.insert("ok", ok);
+        }
     }
     Ok(reply)
 }
@@ -966,6 +1007,11 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     let mut opts = collection_option_subset(doc);
+    // An option given as null is an option not given.
+    opts = opts
+        .into_iter()
+        .filter(|(_, v)| !matches!(v, Bson::Null))
+        .collect();
     // The `timeseries` field of a `collMod` is a change, not a definition:
     // what is stored is the definition it produces.
     opts.remove("timeseries");
@@ -1302,6 +1348,29 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         options.remove("uuid");
         // Options at their defaults are not listed: pre-images switched off,
         // and the simple collation.
+        // mongod lists the options in its own order, not the order given.
+        const ORDER: [&str; 8] = [
+            "capped",
+            "size",
+            "max",
+            "storageEngine",
+            "validator",
+            "validationLevel",
+            "validationAction",
+            "indexOptionDefaults",
+        ];
+        let mut ordered = Document::new();
+        for key in ORDER {
+            if let Some(v) = options.remove(key) {
+                ordered.insert(key, v);
+            }
+        }
+        ordered.extend(std::mem::take(&mut options));
+        options = ordered;
+        options = options
+            .into_iter()
+            .filter(|(_, v)| !matches!(v, Bson::Null))
+            .collect();
         let off = |o: &Document, field: &str, key: &str, value: Bson| {
             o.get_document(field)
                 .is_ok_and(|d| d.get(key) == Some(&value))
