@@ -14611,6 +14611,7 @@ impl Storage {
 
     /// Chunked deleteMany driver — see `update_matching_chunked` for the
     /// re-fetch-inside-the-chunk-transaction rationale.
+    #[allow(clippy::too_many_arguments)]
     fn delete_matching_chunked(
         &self,
         db: &str,
@@ -14758,6 +14759,7 @@ impl Storage {
         Ok((consumed, deleted))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn delete_matching_single_txn(
         &self,
         db: &str,

@@ -2816,8 +2816,12 @@ mod tests {
     #[test]
     fn write_concern_error_for_unsatisfiable_w() {
         // w > 1 can't be satisfied by the single-node "secantus" RS → 100.
-        let reply = dispatch(&doc! {"ping": 1, "writeConcern": {"w": 2}}, &mut ctx());
-        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        // `ping` takes no write concern (72 on mongod), so the error is
+        // attached here to the reply of a write that succeeded.
+        let refused = dispatch(&doc! {"ping": 1, "writeConcern": {"w": 2}}, &mut ctx());
+        assert_eq!(refused.get_i32("code").unwrap(), 72);
+        let mut reply = doc! {"n": 1, "ok": 1.0};
+        attach_write_concern_error(&doc! {"insert": "c", "writeConcern": {"w": 2}}, &mut reply);
         let wce = reply.get_document("writeConcernError").unwrap();
         assert_eq!(wce.get_i32("code").unwrap(), 100);
         assert_eq!(
