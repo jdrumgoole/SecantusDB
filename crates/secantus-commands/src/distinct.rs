@@ -135,7 +135,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let mut decoded = Vec::with_capacity(bytes.len());
         for b in bytes {
             decoded.push(
-                Document::from_reader(&mut b.as_slice())
+                secantus_core::bsondoc::from_bytes(b.as_slice())
                     .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))?,
             );
         }

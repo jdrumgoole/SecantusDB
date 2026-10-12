@@ -618,7 +618,7 @@ or an Atlas-compatible deployment to use this feature.";
 
 /// Whether `name` is a recognised aggregation stage (the set the Python
 /// `aggregate._STAGES` registry recognises). Keep in sync with that set.
-fn recognized_stage(name: &str) -> bool {
+pub(crate) fn recognized_stage(name: &str) -> bool {
     matches!(
         name,
         "$addFields"
@@ -763,7 +763,7 @@ fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
 /// would reject `{$group: {_id: "$g", p: {$push: "$s"}}}`, the plainest valid
 /// pipeline there is. The Python server hit exactly that; see
 /// `aggregate._expression_problem`.
-fn validate_unknown_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
+pub(crate) fn validate_unknown_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
     const WRAPPED: [&str; 3] = ["$project", "$addFields", "$set"];
     for stage in pipeline {
         let Some(d) = stage.as_document() else {

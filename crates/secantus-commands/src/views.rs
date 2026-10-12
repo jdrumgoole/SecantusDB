@@ -55,7 +55,9 @@ fn write_target(stage: &Document, db: &str) -> Option<(String, String)> {
 pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
     let storage = ctx.storage.as_ref()?;
     let db = ctx.db_name.as_str();
-    let view = |coll: &str| is_view(storage.as_ref(), db, coll);
+    // `system.views` holds the definitions and is not one of them: a write
+    // to it has a refusal of its own, which the handler gives.
+    let view = |coll: &str| coll != "system.views" && is_view(storage.as_ref(), db, coll);
     match name {
         // A write reports one error per statement, or only the first when the
         // batch is ordered (the default), and writes nothing.

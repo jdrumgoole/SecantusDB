@@ -97,7 +97,7 @@ fn read_segment_file(path: &Path) -> Result<Vec<(i64, Document, Option<Document>
         if off + len > data.len() {
             break;
         }
-        let doc = Document::from_reader(&mut std::io::Cursor::new(&data[off..off + len]))
+        let doc = secantus_core::bsondoc::from_bytes(&data[off..off + len])
             .map_err(|e| StorageError::Bson(e.to_string()))?;
         off += len;
         let seq = doc
@@ -284,7 +284,7 @@ pub fn restore_from_archive_dir(
                 }
                 for (seq, blob) in &batch {
                     if *seq > base_head {
-                        let entry = Document::from_reader(&mut std::io::Cursor::new(blob.clone()))
+                        let entry = secantus_core::bsondoc::from_bytes(blob)
                             .map_err(|e| StorageError::Bson(e.to_string()))?;
                         rows.entry(*seq).or_insert(entry);
                         if carry_oplog && !pre_map.contains_key(seq) {

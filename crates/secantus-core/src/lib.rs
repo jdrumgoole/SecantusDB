@@ -21,6 +21,7 @@
 // Public API: the engines the PyO3 bindings (and a future standalone server)
 // call directly.
 pub mod aggregate;
+pub mod bsondoc;
 pub mod collation;
 pub mod deadline;
 pub mod diff;

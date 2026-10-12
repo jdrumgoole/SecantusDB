@@ -93,7 +93,7 @@ impl CursorProducer for TailableFindProducer {
                 let _active = secantus_core::collation::activate(self.collation.as_ref());
                 let mut out = Vec::with_capacity(blobs.len());
                 for blob in blobs {
-                    let Ok(d) = Document::from_reader(&mut blob.as_slice()) else {
+                    let Ok(d) = secantus_core::bsondoc::from_bytes(blob.as_slice()) else {
                         continue;
                     };
                     let keep = self.filter.is_empty()
@@ -767,7 +767,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         for (i, bytes) in docs.iter().enumerate() {
             let d = match &projected_first {
                 Some(projected) => projected[i].clone(),
-                None => Document::from_reader(&mut bytes.as_slice())
+                None => secantus_core::bsondoc::from_bytes(bytes.as_slice())
                     .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?,
             };
             if return_key {
@@ -1196,7 +1196,7 @@ fn apply_min_max(
     let fields = &index_fields[..width.min(index_fields.len())];
     let mut out = Vec::with_capacity(docs.len());
     for bytes in docs {
-        let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
+        let d = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
             CommandError::new(
                 1,
                 "InternalError",
@@ -1235,7 +1235,40 @@ fn apply_min_max(
 /// inclusion-in-exclusion mirror, 31253). Operator specs (`$slice` / `$elemMatch`)
 /// are neutral here (handled by `apply_projection`). Mirrors mongod's parse-time
 /// validation that mongo-node-driver's projection-error tests assert.
-fn projection_mix_error(spec: &Document) -> Option<CommandError> {
+/// What mongod refuses about a projection's field names and operators when it
+/// parses it: a field that starts with `$`, and an operator it does not know.
+/// Measured on `findAndModify`'s `fields`, 8.2.11, 2026-10-12.
+pub(crate) fn projection_name_error(spec: &Document) -> Option<CommandError> {
+    for (field, value) in spec {
+        if field.starts_with('$') {
+            return Some(CommandError::new(
+                16410,
+                "Location16410",
+                format!(
+                    "Consider using $getField or $setField for a field path with '.' or '$'. \
+                     :: caused by :: FieldPath field names may not start with '$', given \
+                     '{field}'."
+                ),
+            ));
+        }
+        if let Bson::Document(d) = value {
+            if let Some(op) = d.keys().next().filter(|k| k.starts_with('$')) {
+                let known = matches!(op.as_str(), "$slice" | "$elemMatch" | "$meta")
+                    || secantus_core::expressions::KNOWN_EXPR_OPS.contains(&op.as_str());
+                if !known {
+                    return Some(CommandError::new(
+                        31325,
+                        "Location31325",
+                        format!("Unknown expression {op}"),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn projection_mix_error(spec: &Document) -> Option<CommandError> {
     let field_inclusion = |v: &Bson| -> Option<bool> {
         match v {
             Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false) => Some(false),
@@ -1356,7 +1389,7 @@ fn project_to_docs(
                     return Ok(projected);
                 }
             }
-            let d = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
+            let d = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
                 CommandError::new(
                     1,
                     "InternalError",

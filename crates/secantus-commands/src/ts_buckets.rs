@@ -361,7 +361,7 @@ fn stored(
 fn decoded(raw: &[Vec<u8>]) -> Result<Vec<Document>, CommandError> {
     raw.iter()
         .map(|b| {
-            Document::from_reader(&mut &b[..])
+            secantus_core::bsondoc::from_bytes(&b[..])
                 .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))
         })
         .collect()
@@ -406,7 +406,7 @@ pub(crate) fn as_read(
         return Ok(found);
     };
     let shaped = |raw: &Vec<u8>| -> Result<Vec<u8>, CommandError> {
-        let doc = Document::from_reader(&mut &raw[..])
+        let doc = secantus_core::bsondoc::from_bytes(&raw[..])
             .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
         bson::to_vec(&measurement(&doc, &layout))
             .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))

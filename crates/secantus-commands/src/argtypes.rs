@@ -81,7 +81,7 @@ pub fn require_write_statement(spec: &Document, command: &str) -> Result<(), Com
     };
     let path = |field: &str| format!("{command}.{container}.{field}");
     match spec.get("q") {
-        None => {
+        None | Some(Bson::Null) => {
             return Err(CommandError::new(
                 40414,
                 "IDLFailedToParse",
@@ -416,6 +416,57 @@ const GENERIC_FIELDS: &[&str] = &[
     "tracking_info",
     "help",
 ];
+
+/// What mongod refuses about a command's `let`: a name that is not a user
+/// variable's, or a value that reads a field. Measured 8.2.11, 2026-10-12.
+pub fn let_problem(vars: &Document) -> Option<(i32, String)> {
+    fn reads_a_field(value: &Bson) -> bool {
+        match value {
+            Bson::String(s) => s.starts_with('$') && !s.starts_with("$$"),
+            Bson::Array(items) => items.iter().any(reads_a_field),
+            Bson::Document(d) => d
+                .iter()
+                .any(|(k, v)| k != "$literal" && k != "$const" && reads_a_field(v)),
+            _ => false,
+        }
+    }
+    for (name, value) in vars {
+        let first_ok = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || !c.is_ascii());
+        if !first_ok {
+            return Some((
+                9,
+                format!(
+                    "Invalid 'let' parameter :: caused by :: '{name}' starts with an invalid \
+                     character for a user variable name"
+                ),
+            ));
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || !c.is_ascii()))
+        {
+            return Some((
+                9,
+                format!(
+                    "Invalid 'let' parameter :: caused by :: '{name}' contains an invalid \
+                     character for a variable name: '{bad}'"
+                ),
+            ));
+        }
+        if reads_a_field(value) {
+            return Some((
+                4890500,
+                "Command let Expression tried to access a field, but this is not allowed \
+                 becauseCommand let Expressions run before the query examines any documents."
+                    .to_string(),
+            ));
+        }
+    }
+    None
+}
 
 /// The first field of `doc` a command does not take: not one of its own
 /// (`known`), not a generic one, and not a `$`-prefixed field of the protocol
@@ -2666,6 +2717,25 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                     bson_type_name(spec)
                 ),
             )),
+            // A field these stages write may not start with `$`. It was
+            // written: `{$set: {$a: 1}}` gave the document a field `$a`
+            // (measured 8.2.11, 2026-10-12).
+            "$addFields" | "$set" | "$project" if matches!(spec, Bson::Document(d) if d.keys().any(|k| k.starts_with('$'))) =>
+            {
+                let field = spec
+                    .as_document()
+                    .and_then(|d| d.keys().find(|k| k.starts_with('$')))
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                Some((
+                    16410,
+                    format!(
+                        "Invalid {name} :: caused by :: Consider using $getField or $setField \
+                         for a field path with '.' or '$'. :: caused by :: FieldPath field \
+                         names may not start with '$', given '{field}'."
+                    ),
+                ))
+            }
             "$project" if !matches!(spec, Bson::Document(_)) => Some((
                 15969,
                 "$project specification must be an object".to_string(),

@@ -171,7 +171,7 @@ fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result
                     // doc; tolerate rather than corrupt the restore.
                     return Ok(false);
                 };
-                let pre = Document::from_reader(&mut std::io::Cursor::new(blob))
+                let pre = secantus_core::bsondoc::from_bytes(&blob)
                     .map_err(|e| StorageError::Bson(e.to_string()))?;
                 let diff = o.get_document("diff").unwrap();
                 secantus_core::diff::apply_update_description(pre, diff)
@@ -266,7 +266,7 @@ fn replay(
             break;
         }
         for (seq, blob) in &batch {
-            let entry = Document::from_reader(&mut std::io::Cursor::new(blob.clone()))
+            let entry = secantus_core::bsondoc::from_bytes(blob)
                 .map_err(|e| StorageError::Bson(e.to_string()))?;
             if !within_bound(&entry, up_to_ts, up_to_wall_ms) {
                 break 'outer;

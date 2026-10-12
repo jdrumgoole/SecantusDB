@@ -97,6 +97,37 @@ fn rename_array_field<'a>(doc: &'a Document, path: &'a str) -> Option<&'a str> {
 // (`$`, `$[]`, `$[ident]`) is expanded against the current document into the
 // concrete index paths the operator then writes to.
 
+/// The array a `$rename` destination would have to pass through, if any:
+/// `a` for `a.x` and for `a.0` over `{a: [..]}`.
+fn rename_through_array<'a>(doc: &'a Document, path: &'a str) -> Option<&'a str> {
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut cur = doc.get(first)?;
+    let mut holder = first;
+    for part in parts {
+        match cur {
+            Bson::Array(_) => return Some(holder),
+            Bson::Document(d) => {
+                cur = d.get(part)?;
+                holder = part;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The same value, byte for byte: type, and the order of a document's fields.
+fn same_bytes(a: &Bson, b: &Bson) -> bool {
+    match (
+        bson::to_vec(&doc! { "v": a.clone() }),
+        bson::to_vec(&doc! { "v": b.clone() }),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 /// An arrayFilter identifier: begins with a lowercase ASCII letter, then ASCII
 /// alphanumerics (mirrors Python's `^[a-z][a-zA-Z0-9]*$`).
 pub fn is_valid_af_ident(s: &str) -> bool {
@@ -250,40 +281,203 @@ fn index_array_filters(filters: &[Document]) -> HashMap<String, &Document> {
 /// construct the Rust server does not support" (measured against mongod 8.2.11,
 /// 2026-10-01, which sets `a.1`).
 pub fn find_positional_matches(doc: &Document, filter: &Document) -> Document {
-    let mut clauses: Vec<(&str, Document)> = Vec::new();
-    for (key, value) in filter {
-        if key.starts_with('$') {
-            continue;
-        }
-        let top = key.split_once('.').map_or(key.as_str(), |(t, _)| t);
-        if !matches!(doc.get(top), Some(Bson::Array(_))) {
-            continue;
-        }
-        match clauses.iter_mut().find(|(t, _)| *t == top) {
-            Some((_, d)) => {
-                d.insert(key.clone(), value.clone());
-            }
-            None => {
-                let mut d = Document::new();
-                d.insert(key.clone(), value.clone());
-                clauses.push((top, d));
-            }
-        }
-    }
+    let mut leaves = Vec::new();
+    positional_leaves(filter, &mut leaves);
+    // mongod evaluates the predicates in its canonical order -- by kind, then
+    // by path, the order as written breaking ties -- and the LAST one that
+    // walked an array is the position `$` stands for.
+    leaves.sort_by(|a, b| (a.rank, &a.path).cmp(&(b.rank, &b.path)));
     let mut out = Document::new();
-    for (top, sub_filter) in clauses {
-        if let Some(Bson::Array(arr)) = doc.get(top) {
-            for (i, elem) in arr.iter().enumerate() {
-                let mut one = Document::new();
-                one.insert(top, Bson::Array(vec![elem.clone()]));
-                if query::matches(&one, &sub_filter, &Document::new(), None).unwrap_or(false) {
-                    out.insert(top.to_string(), i as i64);
-                    break;
-                }
-            }
+    for leaf in &leaves {
+        if let Some(index) = first_array_match(doc, leaf) {
+            out.insert("$", index as i64);
         }
     }
     out
+}
+
+/// One predicate of a query, as the positional operator sees it.
+struct PositionalLeaf {
+    /// mongod's order for the predicate's kind.
+    rank: u8,
+    path: String,
+    /// The predicate alone, as a filter.
+    clause: Document,
+    /// An equality with an array: only an element that is itself an array can
+    /// be the match (the whole array matching names no element).
+    array_equality: bool,
+}
+
+/// mongod's order of predicate kinds, for the ones that record a position.
+/// `$ne`, `$nin`, `$not` and `$size` record none.
+fn positional_rank(op: &str) -> Option<u8> {
+    Some(match op {
+        "$elemMatch" => 2,
+        "$eq" => 5,
+        "$lte" => 6,
+        "$lt" => 7,
+        "$gt" => 8,
+        "$gte" => 9,
+        "$regex" => 10,
+        "$mod" => 11,
+        "$exists" => 12,
+        "$in" => 13, // one value is an equality: see `positional_leaves`
+        "$bitsAllSet" => 14,
+        "$bitsAllClear" => 15,
+        "$bitsAnySet" => 16,
+        "$bitsAnyClear" => 17,
+        "$type" => 20,
+        _ => return None,
+    })
+}
+
+fn positional_leaves(filter: &Document, out: &mut Vec<PositionalLeaf>) {
+    for (key, value) in filter {
+        if key == "$and" {
+            if let Bson::Array(branches) = value {
+                for branch in branches {
+                    if let Bson::Document(b) = branch {
+                        positional_leaves(b, out);
+                    }
+                }
+            }
+            continue;
+        }
+        if key == "$or" {
+            // An `$or` of equalities on one path is an `$in`; any other `$or`
+            // records no position.
+            if let Some((path, values)) = or_as_in(value) {
+                out.push(PositionalLeaf {
+                    rank: 13,
+                    clause: doc! { path.clone(): { "$in": values } },
+                    path,
+                    array_equality: false,
+                });
+            }
+            continue;
+        }
+        if key.starts_with('$') {
+            continue;
+        }
+        match value {
+            Bson::Document(ops) if !ops.is_empty() && ops.keys().all(|k| k.starts_with('$')) => {
+                for (op, arg) in ops {
+                    if op == "$all" {
+                        if let Bson::Array(items) = arg {
+                            for item in items {
+                                let inner = matches!(item, Bson::Document(d)
+                                    if d.keys().next().is_some_and(|k| k == "$elemMatch"));
+                                out.push(PositionalLeaf {
+                                    rank: if inner { 2 } else { 5 },
+                                    path: key.clone(),
+                                    clause: doc! { key.clone(): item.clone() },
+                                    array_equality: matches!(item, Bson::Array(_)),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(mut rank) = positional_rank(op) else {
+                        continue;
+                    };
+                    if op == "$in" && matches!(arg, Bson::Array(items) if items.len() == 1) {
+                        rank = 5;
+                    }
+                    let mut one = doc! { op.clone(): arg.clone() };
+                    if op == "$regex" {
+                        if let Some(options) = ops.get("$options") {
+                            one.insert("$options", options.clone());
+                        }
+                    }
+                    out.push(PositionalLeaf {
+                        rank,
+                        path: key.clone(),
+                        clause: doc! { key.clone(): one },
+                        array_equality: op == "$eq" && matches!(arg, Bson::Array(_)),
+                    });
+                }
+            }
+            other => out.push(PositionalLeaf {
+                rank: if matches!(other, Bson::RegularExpression(_)) {
+                    10
+                } else {
+                    5
+                },
+                path: key.clone(),
+                clause: doc! { key.clone(): other.clone() },
+                array_equality: matches!(other, Bson::Array(_)),
+            }),
+        }
+    }
+}
+
+/// `{$or: [{a: 3}, {a: 2}]}` as `("a", [3, 2])`.
+fn or_as_in(branches: &Bson) -> Option<(String, Vec<Bson>)> {
+    let Bson::Array(branches) = branches else {
+        return None;
+    };
+    let mut path: Option<&String> = None;
+    let mut values = Vec::new();
+    for branch in branches {
+        let Bson::Document(b) = branch else {
+            return None;
+        };
+        if b.len() != 1 {
+            return None;
+        }
+        let (key, value) = b.iter().next()?;
+        if key.starts_with('$') || path.is_some_and(|p| p != key) {
+            return None;
+        }
+        path = Some(key);
+        match value {
+            Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
+                if d.len() != 1 {
+                    return None;
+                }
+                values.push(d.get("$eq")?.clone());
+            }
+            Bson::RegularExpression(_) => return None,
+            other => values.push(other.clone()),
+        }
+    }
+    Some((path?.clone(), values))
+}
+
+/// The index of the first element, of the first array on the leaf's path, that
+/// satisfies the leaf on its own.
+fn first_array_match(doc: &Document, leaf: &PositionalLeaf) -> Option<usize> {
+    let parts: Vec<&str> = leaf.path.split('.').collect();
+    let mut cur = doc;
+    for (i, part) in parts.iter().enumerate() {
+        match cur.get(*part)? {
+            Bson::Document(d) => cur = d,
+            Bson::Array(arr) => {
+                // An explicit index walks no array: `{"a.1": 2}` names no element.
+                if parts
+                    .get(i + 1)
+                    .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return None;
+                }
+                for (j, elem) in arr.iter().enumerate() {
+                    if leaf.array_equality && !matches!(elem, Bson::Array(_)) {
+                        continue;
+                    }
+                    let mut one = doc! { *part: [elem.clone()] };
+                    for outer in parts[..i].iter().rev() {
+                        one = doc! { *outer: one };
+                    }
+                    if query::matches(&one, &leaf.clause, &Document::new(), None).unwrap_or(false) {
+                        return Some(j);
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Expand `path` (which may contain positional tokens) into the concrete index
@@ -300,19 +494,16 @@ fn expand_path(
     }
     let mut out = Vec::new();
     let mut prefix: Vec<String> = Vec::new();
-    walk_positional(
-        &Bson::Document(doc.clone()),
-        &parts,
-        &mut prefix,
-        &mut out,
-        filters,
-        pos,
-    )?;
+    let root = Bson::Document(doc.clone());
+    walk_positional(Some(&root), &parts, &mut prefix, &mut out, filters, pos)?;
     Ok(out)
 }
 
+/// `cur` is the value at `prefix`, or `None` when the document has nothing
+/// there. A path that leaves the document is still returned, whole: the write
+/// then creates it, pads an array to reach it, or refuses it, as mongod does.
 fn walk_positional(
-    cur: &Bson,
+    cur: Option<&Bson>,
     remaining: &[&str],
     prefix: &mut Vec<String>,
     out: &mut Vec<String>,
@@ -324,63 +515,85 @@ fn walk_positional(
         return Ok(());
     };
     let head = *head;
-    if head == "$" {
-        let Bson::Array(arr) = cur else { return Ok(()) };
-        let path_so_far = prefix.join(".");
-        let idx = pos.get(&path_so_far).and_then(as_int_like);
-        let idx = match idx {
-            Some(i) if i >= 0 && (i as usize) < arr.len() => i as usize,
-            // The query matched no element of this array: mongod's own words,
-            // under the executor wrapper (measured 8.2.11, 2026-10-01). A
-            // Defer here reached the client as "query uses a construct the
-            // Rust server does not support".
-            _ => {
+    if head == "$[]" || (head.starts_with("$[") && head.ends_with(']')) {
+        let arr = match cur {
+            Some(Bson::Array(arr)) => arr,
+            None => {
+                return Err(Fallback::mongo(
+                    2,
+                    format!(
+                        "The path '{}' must exist in the document in order to apply array \
+                         updates.",
+                        prefix.join(".")
+                    ),
+                )
+                .exec())
+            }
+            Some(other) => {
+                return Err(Fallback::mongo(
+                    2,
+                    format!(
+                        "Cannot apply array updates to non-array element {}: {}",
+                        prefix.last().map_or("", String::as_str),
+                        render_value(other)
+                    ),
+                )
+                .exec())
+            }
+        };
+        let sub = if head == "$[]" {
+            None
+        } else {
+            let name = &head[2..head.len() - 1];
+            Some((name, *filters.get(name).ok_or(Fallback::Defer)?))
+        };
+        for (i, elem) in arr.iter().enumerate() {
+            if let Some((name, sub)) = sub {
+                let mut elem_doc = Document::new();
+                elem_doc.insert(name.to_string(), elem.clone());
+                if !query::matches(&elem_doc, sub, &Document::new(), None)? {
+                    continue;
+                }
+            }
+            prefix.push(i.to_string());
+            walk_positional(Some(elem), rest, prefix, out, filters, pos)?;
+            prefix.pop();
+        }
+        return Ok(());
+    }
+    // `$` is the ONE array position the query matched, written into the path
+    // as text: `{a: 2}` with `b.$` writes `b.1`, and with `nope.$` creates
+    // `nope: {"1": ...}` (measured 8.2.11, 2026-10-12). The engine's own
+    // callers pass it under `$`; the Python binding passes one per path.
+    let part = if head == "$" {
+        let index = pos
+            .get("$")
+            .or_else(|| pos.get(prefix.join(".")))
+            .and_then(as_int_like)
+            .filter(|i| *i >= 0);
+        match index {
+            Some(i) => i.to_string(),
+            None => {
                 return Err(Fallback::mongo(
                     2,
                     "The positional operator did not find the match needed from the query.",
                 )
                 .exec())
             }
-        };
-        prefix.push(idx.to_string());
-        walk_positional(&arr[idx], rest, prefix, out, filters, pos)?;
-        prefix.pop();
-    } else if head == "$[]" {
-        let Bson::Array(arr) = cur else { return Ok(()) };
-        for (i, elem) in arr.iter().enumerate() {
-            prefix.push(i.to_string());
-            walk_positional(elem, rest, prefix, out, filters, pos)?;
-            prefix.pop();
         }
-    } else if head.starts_with("$[") && head.ends_with(']') {
-        let name = &head[2..head.len() - 1];
-        let Bson::Array(arr) = cur else { return Ok(()) };
-        let sub = filters.get(name).ok_or(Fallback::Defer)?;
-        for (i, elem) in arr.iter().enumerate() {
-            let mut elem_doc = Document::new();
-            elem_doc.insert(name.to_string(), elem.clone());
-            if query::matches(&elem_doc, sub, &Document::new(), None)? {
-                prefix.push(i.to_string());
-                walk_positional(elem, rest, prefix, out, filters, pos)?;
-                prefix.pop();
-            }
+    } else {
+        head.to_string()
+    };
+    let child = match cur {
+        Some(Bson::Document(d)) => d.get(&part),
+        Some(Bson::Array(a)) if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) => {
+            part.parse::<usize>().ok().and_then(|i| a.get(i))
         }
-    } else if let Bson::Document(d) = cur {
-        let child = d.get(head).cloned().unwrap_or(Bson::Null);
-        prefix.push(head.to_string());
-        walk_positional(&child, rest, prefix, out, filters, pos)?;
-        prefix.pop();
-    } else if let Bson::Array(a) = cur {
-        if head.bytes().all(|b| b.is_ascii_digit()) {
-            if let Ok(idx) = head.parse::<usize>() {
-                if idx < a.len() {
-                    prefix.push(head.to_string());
-                    walk_positional(&a[idx], rest, prefix, out, filters, pos)?;
-                    prefix.pop();
-                }
-            }
-        }
-    }
+        _ => None,
+    };
+    prefix.push(part);
+    walk_positional(child, rest, prefix, out, filters, pos)?;
+    prefix.pop();
     Ok(())
 }
 
@@ -393,8 +606,16 @@ fn set_path(doc: &mut Document, path: &str, value: Bson) -> R<()> {
     // in that case (as Python's did), so the update reported success and wrote
     // nothing. Defer: the Python engine raises the exact error, and the
     // standalone Rust server names it via `path_not_viable_error`.
-    if paths::path_block(doc, path).is_some() {
-        return Err(Fallback::Defer);
+    if let Some((key, container, field)) = paths::path_block(doc, path) {
+        let element = match key {
+            Some(k) => format!("{{{k}: {}}}", render_value(container)),
+            None => "{}".to_string(),
+        };
+        return Err(Fallback::mongo(
+            28,
+            format!("Cannot create field '{field}' in element {element}"),
+        )
+        .exec());
     }
     open_array_slots(doc, path)?;
     paths::set_path(doc, path, value).map_err(|_| Fallback::Defer)
@@ -553,47 +774,16 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
             return Ok(());
         }
     };
-    for k in m.keys() {
-        match k.as_str() {
-            "$each" | "$position" | "$slice" | "$sort" => {}
-            _ => return Err(Fallback::Defer), // unknown modifier -> Python raises
-        }
+    if let Some(problem) = push_modifier_error(m) {
+        return Err(Fallback::mongo(2, problem));
     }
-    let each = match m.get("$each") {
-        Some(Bson::Array(a)) => a,
-        // mongod names the type here, and words it differently from the
-        // `$addToSet` sibling above: `$push` keeps the colon before the type and
-        // answers code 2 where `$addToSet` answers 14. Both verbatim from an
-        // 8.2.11 probe (2026-09-06). This used to defer, which on the standalone
-        // Rust server told the client the server could not do `$push`.
-        Some(v) => {
-            return Err(Fallback::mongo(
-                2,
-                format!(
-                    "The argument to $each in $push must be an array but it was of type: {}",
-                    crate::query::bson_type_name(v)
-                ),
-            ));
-        }
-        None => return Err(Fallback::Defer),
+    let Some(Bson::Array(each)) = m.get("$each") else {
+        return Err(Fallback::Defer);
     };
     match m.get("$position") {
         None => arr.extend(each.iter().cloned()),
         Some(p) => {
-            // A bool $position is a parse error in mongod (code 2), not index 1
-            // -- `as_int_like` would coerce it, so guard first. mongod's own
-            // text, measured 8.2.11 (2026-09-08); this used to DEFER, which on
-            // this server is the generic "does not support" refusal.
-            if matches!(p, Bson::Boolean(_)) {
-                return Err(Fallback::mongo(
-                    2,
-                    format!(
-                        "The value for $position must be an integer value, not of type: {}",
-                        crate::query::bson_type_name(p)
-                    ),
-                ));
-            }
-            let n = as_int_like(p).ok_or(Fallback::Defer)?;
+            let n = whole_number(p).ok_or(Fallback::Defer)? as i128;
             let idx = if n >= 0 {
                 (n as usize).min(arr.len())
             } else {
@@ -609,32 +799,101 @@ fn push_apply(arr: &mut Vec<Bson>, value: &Bson) -> R<()> {
         push_sort(arr, spec)?;
     }
     if let Some(s) = m.get("$slice") {
-        // A bool $slice is a parse error in mongod (code 2), not "keep 1".
-        // mongod words this DIFFERENTLY from `$position` above -- "but was given
-        // type:" rather than "not of type:" -- which is why both are measured
-        // rather than shared (8.2.11, 2026-09-08).
-        if matches!(s, Bson::Boolean(_)) {
-            return Err(Fallback::mongo(
-                2,
-                format!(
-                    "The value for $slice must be an integer value but was given type: {}",
-                    crate::query::bson_type_name(s)
-                ),
-            ));
-        }
-        let n = as_int_like(s).ok_or(Fallback::Defer)?;
+        let n = whole_number(s).ok_or(Fallback::Defer)?;
         if n == 0 {
             arr.clear();
         } else if n > 0 {
             arr.truncate(n as usize);
         } else {
-            let keep = (-n) as usize;
+            let keep = n.unsigned_abs() as usize;
             if arr.len() > keep {
                 arr.drain(0..arr.len() - keep);
             }
         }
     }
     Ok(())
+}
+
+/// An int, a long, or a double with no fraction: what mongod takes where a
+/// `$push` modifier wants an integer (`$position: 1.0` is index 1).
+fn whole_number(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.fract() == 0.0 && d.abs() < 9.0e18 => Some(*d as i64),
+        _ => None,
+    }
+}
+
+/// What mongod says about a `$push` value written with `$each`, or `None` when
+/// its clauses are well formed. Every one of these is a parse error: mongod
+/// reports it before it looks at a document. Measured 8.2.11, 2026-10-12.
+fn push_modifier_error(m: &Document) -> Option<String> {
+    for (clause, value) in m {
+        match clause.as_str() {
+            "$each" => {
+                if !matches!(value, Bson::Array(_)) {
+                    // `$push` keeps the colon before the type and answers code
+                    // 2 where `$addToSet` answers 14.
+                    return Some(format!(
+                        "The argument to $each in $push must be an array but it was of type: {}",
+                        query::bson_type_name(value)
+                    ));
+                }
+            }
+            "$position" => {
+                if whole_number(value).is_none() {
+                    return Some(format!(
+                        "The value for $position must be an integer value, not of type: {}",
+                        query::bson_type_name(value)
+                    ));
+                }
+            }
+            "$slice" => {
+                // Worded differently from `$position`, and both are mongod's.
+                if whole_number(value).is_none() {
+                    return Some(format!(
+                        "The value for $slice must be an integer value but was given type: {}",
+                        query::bson_type_name(value)
+                    ));
+                }
+            }
+            "$sort" => match value {
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+                    if !matches!(whole_number(value), Some(1 | -1)) {
+                        return Some("The $sort element value must be either 1 or -1".to_string());
+                    }
+                }
+                Bson::Document(fields) => {
+                    if fields.is_empty() {
+                        return Some(
+                            "The sort pattern is empty when it should be a set of fields."
+                                .to_string(),
+                        );
+                    }
+                    for (field, direction) in fields {
+                        if field.is_empty() {
+                            return Some("The sort field cannot be empty".to_string());
+                        }
+                        if !matches!(whole_number(direction), Some(1 | -1)) {
+                            return Some(
+                                "The sort element value must be either 1 or -1".to_string(),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    return Some(
+                        "The $sort is invalid: use 1/-1 to sort the whole element, or \
+                         {field:1/-1} to sort embedded fields"
+                            .to_string(),
+                    )
+                }
+            },
+            other => return Some(format!("Unrecognized clause in $push: {other}")),
+        }
+    }
+    None
 }
 
 /// `$push` `$sort`: `1`/`-1` sorts whole elements in BSON order; a `{field: dir}`
@@ -649,7 +908,10 @@ fn push_sort(arr: &mut [Bson], spec: &Bson) -> R<()> {
             Bson::Document(d) => crate::paths::get_path(d, field)
                 .cloned()
                 .unwrap_or(Bson::Null),
-            other => other.clone(),
+            // An element that is not a document has no such field, and sorts
+            // as one that is missing it: `{$sort: {x: 1}}` leaves `[3, 1, 2]`
+            // in place (measured 8.2.11, 2026-10-12). It was keyed by itself.
+            _ => Bson::Null,
         }
     }
     // A valid sort direction is exactly 1 or -1, as an int or a whole double
@@ -746,16 +1008,59 @@ fn traverse_problem(doc: &Document, path: &str) -> Option<Fallback> {
     None
 }
 
+/// The operators that test one value. A `$pull` condition that opens with one
+/// of them is asked of each element; any other document is a filter the
+/// element must match as a document.
+const VALUE_OPERATORS: [&str; 25] = [
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$type",
+    "$regex",
+    "$options",
+    "$mod",
+    "$size",
+    "$all",
+    "$elemMatch",
+    "$not",
+    "$bitsAllSet",
+    "$bitsAnySet",
+    "$bitsAllClear",
+    "$bitsAnyClear",
+    "$geoWithin",
+    "$geoIntersects",
+    "$near",
+    "$nearSphere",
+];
+
 fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
     match criterion {
-        Bson::Document(c) if !c.is_empty() && c.keys().all(|k| k.starts_with('$')) => {
+        Bson::Document(c)
+            if c.keys()
+                .next()
+                .is_some_and(|k| VALUE_OPERATORS.contains(&k.as_str())) =>
+        {
             let d = doc! { "__e": element.clone() };
             let q = doc! { "__e": criterion.clone() };
             crate::query::matches(&d, &q, &Document::new(), None)
         }
+        // `{$pull: {o: {$or: [...]}}}` is a filter over each element, like any
+        // other document condition. It was read as a test of the value and
+        // refused as an unknown operator (measured 8.2.11, 2026-10-12).
         Bson::Document(c) => match element {
             Bson::Document(ed) => crate::query::matches(ed, c, &Document::new(), None),
-            _ => Ok(false),
+            _ => {
+                // Still parsed, so a condition mongod refuses is refused for
+                // an array of scalars too.
+                crate::query::matches(&Document::new(), c, &Document::new(), None)?;
+                Ok(false)
+            }
         },
         // A REGEX criterion traverses, like the operator form above.
         Bson::RegularExpression(_) => {
@@ -843,7 +1148,12 @@ fn apply_op(
                                     "The field '{cpath}' must be an array but is of type {} \
                                      in document {}",
                                     crate::query::bson_type_name(&other),
-                                    render_doc_id(result)
+                                    // An upsert's new document has none yet.
+                                    if result.contains_key("_id") {
+                                        render_doc_id(result)
+                                    } else {
+                                        "{no id}".to_string()
+                                    }
                                 ),
                             )
                             .exec());
@@ -943,7 +1253,12 @@ fn apply_op(
                     return Err(Fallback::mongo(56, "An empty update path is not valid."));
                 }
                 if old == "_id" || new == "_id" {
-                    return Err(Fallback::Defer); // immutable _id -> Python raises
+                    return Err(Fallback::mongo(
+                        66,
+                        "Performing an update on the path '_id' would modify the immutable \
+                         field '_id'",
+                    )
+                    .exec());
                 }
                 // mongod validation (Python raises 56 / 2; the Rust server renders
                 // BadValue). These previously silently corrupted the array or
@@ -951,14 +1266,21 @@ fn apply_op(
                 if old.is_empty() || new.is_empty() {
                     return Err(Fallback::Defer); // empty path -> Python raises 56
                 }
-                if old == new || rename_same_path(old, new) {
-                    // Named rather than deferred: on the standalone server a
-                    // defer reports "a construct the Rust server does not
-                    // support" for an ordinary bad argument. Probed 8.2.11.
+                if old == new {
                     return Err(Fallback::mongo(
                         2,
                         format!(
                             "The source and target field for $rename must differ: {old}: \"{new}\""
+                        ),
+                    ));
+                }
+                if rename_same_path(old, new) {
+                    // One inside the other has words of its own.
+                    return Err(Fallback::mongo(
+                        2,
+                        format!(
+                            "The source and target field for $rename must not be on the same \
+                             path: {old}: \"{new}\""
                         ),
                     ));
                 }
@@ -998,7 +1320,7 @@ fn apply_op(
                         )
                         .exec());
                     }
-                    if let Some(field) = rename_array_field(result, new) {
+                    if let Some(field) = rename_through_array(result, new) {
                         return Err(Fallback::mongo(
                             2,
                             format!(
@@ -1059,6 +1381,11 @@ fn apply_op(
                     }
                 };
                 let mut parsed: Vec<(&str, i64)> = Vec::with_capacity(ops.len());
+                // A long on either side makes the result a long: `5 & Int64(3)`
+                // and `Int64(5) & 3` are both `Int64(1)` (measured 8.2.11,
+                // 2026-10-12). The result was an int whenever it fitted, which
+                // narrowed a stored long.
+                let mut wide = ops.values().any(|m| matches!(m, Bson::Int64(_)));
                 for (bit_op, mask_b) in ops {
                     let op_s = bit_op.as_str();
                     if !matches!(op_s, "and" | "or" | "xor") {
@@ -1097,7 +1424,10 @@ fn apply_op(
                         // non-integral and mongod refuses it.
                         None => 0i64,
                         Some(Bson::Int32(n)) => *n as i64,
-                        Some(Bson::Int64(n)) => *n,
+                        Some(Bson::Int64(n)) => {
+                            wide = true;
+                            *n
+                        }
                         Some(other) => {
                             return Err(Fallback::mongo(
                                 2,
@@ -1120,11 +1450,9 @@ fn apply_op(
                             _ => cur ^ mask,
                         };
                     }
-                    // Python computes a plain int -> bson encodes it as int32 when
-                    // it fits, else int64. Match that so the BSON subtype agrees.
                     let val = match i32::try_from(cur) {
-                        Ok(v) => Bson::Int32(v),
-                        Err(_) => Bson::Int64(cur),
+                        Ok(v) if !wide => Bson::Int32(v),
+                        _ => Bson::Int64(cur),
                     };
                     set_path(result, &cpath, val)?;
                 }
@@ -1183,19 +1511,32 @@ fn apply_op(
             for (path, value) in payload {
                 // `$each` adds each element (deduped); otherwise the value itself.
                 let items: Vec<Bson> = match value {
-                    Bson::Document(d) if d.contains_key("$each") => match d.get("$each") {
-                        Some(Bson::Array(a)) => a.clone(),
-                        other => {
-                            return Err(Fallback::mongo(
-                                14,
-                                format!(
-                                    "The argument to $each in $addToSet must be an array but \
+                    // Only a document that OPENS with `$each` is the modifier
+                    // form; `{x: 1, $each: [9]}` is a value like any other.
+                    Bson::Document(d) if d.keys().next().is_some_and(|k| k == "$each") => {
+                        match d.get("$each") {
+                            Some(Bson::Array(_)) if d.len() > 1 => {
+                                return Err(Fallback::mongo(
+                                    2,
+                                    format!(
+                                        "Found unexpected fields after $each in $addToSet: {}",
+                                        render_value(value)
+                                    ),
+                                ));
+                            }
+                            Some(Bson::Array(a)) => a.clone(),
+                            other => {
+                                return Err(Fallback::mongo(
+                                    14,
+                                    format!(
+                                        "The argument to $each in $addToSet must be an array but \
                                      it was of type {}",
-                                    crate::query::bson_type_name(other.unwrap_or(&Bson::Null))
-                                ),
-                            ));
+                                        crate::query::bson_type_name(other.unwrap_or(&Bson::Null))
+                                    ),
+                                ));
+                            }
                         }
-                    },
+                    }
                     _ => vec![value.clone()],
                 };
                 for cpath in expand_path(result, path, filters, pos)? {
@@ -1264,7 +1605,13 @@ fn apply_op(
         "$pullAll" => {
             for (path, values) in payload {
                 let Bson::Array(vals) = values else {
-                    return Err(Fallback::Defer); // non-array arg -> Python raises
+                    return Err(Fallback::mongo(
+                        2,
+                        format!(
+                            "$pullAll requires an array argument but was given a {}",
+                            query::bson_type_name(values)
+                        ),
+                    ));
                 };
                 for cpath in expand_path(result, path, filters, pos)? {
                     // Remove every element equal to any listed value (literal
@@ -1276,7 +1623,9 @@ fn apply_op(
                             for e in a {
                                 let mut drop = false;
                                 for v in vals {
-                                    if expressions::py_eq(&e, v)? {
+                                    // A document is the same only with its
+                                    // fields in the same order.
+                                    if addtoset_eq(&e, v)? {
                                         drop = true;
                                         break;
                                     }
@@ -1329,7 +1678,9 @@ pub fn apply_update_with(
     // 6.0.16, which reports `nModified: 1` for it). Returning `doc.clone()`
     // here silently kept every field the client asked to drop. An empty
     // *pipeline* is the genuine no-op, and is a different entry point.
-    if let Some(unused) = unused_array_filter(array_filters, update) {
+    let has_op = is_operator_form(update);
+    // A replacement uses no filter and is not asked to (measured 8.2.11).
+    if let Some(unused) = unused_array_filter(array_filters, update).filter(|_| has_op) {
         // mongod names the identifier and quotes the update (measured 8.2.11,
         // 2026-10-01); a Defer told the client "query uses a construct the
         // Rust server does not support".
@@ -1341,7 +1692,7 @@ pub fn apply_update_with(
             ),
         ));
     }
-    if !array_filters_valid(array_filters, update) {
+    if has_op && !array_filters_valid(array_filters, update) {
         return Err(Fallback::Defer); // invalid arrayFilters -> Python raises the exact code
     }
     // An update whose operators touch overlapping paths is rejected by mongod
@@ -1361,24 +1712,75 @@ pub fn apply_update_with(
         }
         None => {}
     }
-    let has_op = is_operator_form(update);
     if has_op {
         if !update.keys().all(|k| k.starts_with('$')) {
             return Err(Fallback::Defer); // mixing operators with fields -> Python raises
         }
         let filters = index_array_filters(array_filters);
         let mut result = doc.clone();
+        // mongod applies an update's fields in the order of their PATHS, across
+        // all its operators, not in the order they were written: `{$set: {z: 1,
+        // b: 2}, $inc: {a: 1}}` over `{_id: 1}` stores `{_id, a, b, z}`
+        // (measured 8.2.11, 2026-10-12). They were applied as written, so a
+        // document's new fields were stored in another order.
+        let mut writes: Vec<(Vec<&str>, &str, Bson)> = Vec::new();
         for (op, payload) in update {
             if op == "$setOnInsert" && !is_upsert {
                 continue;
             }
-            apply_op(&mut result, op, payload, &filters, positional_matches)?;
-        }
-        // _id is immutable: a changed _id is an error (let Python raise).
-        if let Some(orig) = doc.get("_id") {
-            if result.get("_id") != Some(orig) {
+            let Bson::Document(fields) = payload else {
                 return Err(Fallback::Defer);
+            };
+            for (path, value) in fields {
+                // A `$rename` is placed by the field it creates.
+                let at = match (op.as_str(), value) {
+                    ("$rename", Bson::String(to)) => to.as_str(),
+                    _ => path.as_str(),
+                };
+                let mut one = Document::new();
+                one.insert(path.clone(), value.clone());
+                writes.push((at.split('.').collect(), op.as_str(), Bson::Document(one)));
             }
+        }
+        writes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, op, one) in &writes {
+            apply_op(&mut result, op, one, &filters, positional_matches)?;
+        }
+        // The `_id` may be written, so long as it comes out the same value of
+        // the same type: `{$inc: {_id: 0}}` and `{$max: {_id: 0}}` over `_id: 1`
+        // succeed (measured 8.2.11, 2026-10-12). Every operator naming `_id`
+        // used to be refused before it ran.
+        if let Some(orig) = doc.get("_id") {
+            let same = result.get("_id").is_some_and(|now| same_bytes(now, orig));
+            if !same {
+                return Err(Fallback::mongo(66, id_change_error(doc, update, &result)).exec());
+            }
+        }
+        // A top-level field the update wrote may not start with `$`, whether
+        // or not the document already had it. An upsert's new document is not
+        // held to this (measured 8.2.11, 2026-10-12).
+        if !is_upsert {
+            let wrote = |key: &str| {
+                writes
+                    .iter()
+                    .any(|(at, op, _)| *op != "$unset" && at.first() == Some(&key))
+            };
+            let keys: Vec<&String> = result.keys().collect();
+            for (i, key) in keys.iter().enumerate() {
+                if key.starts_with('$') && wrote(key) {
+                    let before = i.checked_sub(1).map(|j| keys[j].as_str());
+                    let after = keys.get(i + 1).map(|k| k.as_str());
+                    let value = result.get(key.as_str()).unwrap_or(&Bson::Null);
+                    return Err(dollar_field_error(key, value, before, after).exec());
+                }
+            }
+        }
+        if nesting_depth(&Bson::Document(result.clone()), 0) > MAX_NESTING_DEPTH {
+            return Err(Fallback::mongo(
+                15,
+                format!("Document exceeds maximum nesting depth of {MAX_NESTING_DEPTH}"),
+            )
+            .exec());
         }
         Ok(result)
     } else {
@@ -1394,31 +1796,177 @@ pub fn apply_update_with(
                 return Err(Fallback::mongo(52, replacement_dollar_error(field)).exec());
             }
         }
-        // Replacement-style: the update is the new doc, with _id preserved.
+        // Replacement-style: the update is the new doc.
         let mut new = update.clone();
         if let Some(orig) = doc.get("_id") {
-            match new.get("_id") {
-                Some(v) if v != orig => return Err(Fallback::Defer), // changed _id -> Python raises
-                _ => {
-                    // `_id` leads the stored document, as it does in mongod.
-                    // `insert` on a Document APPENDS when the key is absent,
-                    // and BSON preserves field order on the wire, so the
-                    // client got back bytes that differed from mongod's.
-                    // mongo-php-library's CodecCollectionFunctionalTest
-                    // compares raw BSON and caught exactly that.
-                    let mut ordered = Document::new();
-                    ordered.insert("_id".to_string(), orig.clone());
-                    for (k, v) in new.iter() {
-                        if k != "_id" {
-                            ordered.insert(k.clone(), v.clone());
-                        }
-                    }
-                    new = ordered;
+            let id = match new.get("_id") {
+                None => orig.clone(),
+                Some(Bson::Document(d)) if d.keys().any(|k| k.starts_with('$')) => {
+                    let field = d.keys().find(|k| k.starts_with('$')).expect("just found");
+                    return Err(Fallback::mongo(
+                        52,
+                        format!(
+                            "The dollar ($) prefixed field '{field}' in '_id.{field}' is not \
+                             allowed in the context of an update's replacement document. \
+                             Consider using an aggregation pipeline with $replaceWith."
+                        ),
+                    )
+                    .exec());
+                }
+                Some(Bson::Array(_)) => {
+                    return Err(
+                        Fallback::mongo(53, "The '_id' value cannot be of type array").exec(),
+                    );
+                }
+                // The same VALUE is enough here, and the document takes the
+                // `_id` as the replacement wrote it: `{_id: 1.0}` over `_id: 1`
+                // is stored as a double (measured 8.2.11, 2026-10-12). A
+                // document `_id` with its fields reordered is another value.
+                Some(given) if addtoset_eq(given, orig)? => given.clone(),
+                Some(given) => {
+                    return Err(Fallback::mongo(
+                        66,
+                        format!(
+                            "After applying the update, the (immutable) field '_id' was found \
+                             to have been altered to _id: {}",
+                            render_value(given)
+                        ),
+                    )
+                    .exec());
+                }
+            };
+            // `_id` leads the stored document, as it does in mongod.
+            // `insert` on a Document APPENDS when the key is absent,
+            // and BSON preserves field order on the wire, so the
+            // client got back bytes that differed from mongod's.
+            // mongo-php-library's CodecCollectionFunctionalTest
+            // compares raw BSON and caught exactly that.
+            let mut ordered = Document::new();
+            ordered.insert("_id".to_string(), id);
+            for (k, v) in new.iter() {
+                if k != "_id" {
+                    ordered.insert(k.clone(), v.clone());
                 }
             }
+            new = ordered;
         }
         Ok(new)
     }
+}
+
+/// Is this the `_id` the document already has? The same value is enough
+/// (`1.0` for `1`); a document `_id` must keep its field order.
+pub fn same_id_value(a: &Bson, b: &Bson) -> bool {
+    addtoset_eq(a, b).unwrap_or(false)
+}
+
+/// mongod's words for an operator update that left the `_id` changed.
+///
+/// A path that already exists is named as written; one the update had to
+/// create is reported as the whole new `_id` (measured 8.2.11, 2026-10-12).
+fn id_change_error(doc: &Document, update: &Document, result: &Document) -> String {
+    for payload in update.values() {
+        let Bson::Document(fields) = payload else {
+            continue;
+        };
+        for path in fields.keys() {
+            if path != "_id" && !path.starts_with("_id.") {
+                continue;
+            }
+            if path != "_id" && !has_path(doc, path) {
+                return format!(
+                    "Updating the path '_id' to _id: {} would modify the immutable field '_id'",
+                    render_value(result.get("_id").unwrap_or(&Bson::Null))
+                );
+            }
+            return format!(
+                "Performing an update on the path '{path}' would modify the immutable field '_id'"
+            );
+        }
+    }
+    "Performing an update on the path '_id' would modify the immutable field '_id'".to_string()
+}
+
+/// mongod's refusal of a top-level field an operator created whose name starts
+/// with `$`. The three DBRef names have words of their own.
+///
+/// `before` and `after` are the fields either side of it in the document.
+fn dollar_field_error(
+    key: &str,
+    value: &Bson,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Fallback {
+    let not_a_string = || {
+        Fallback::mongo(
+            55,
+            format!(
+                "The DBRef {key} field must be a String, not a {}",
+                query::bson_type_name(value)
+            ),
+        )
+    };
+    match key {
+        "$id" if before != Some("$ref") => Fallback::mongo(
+            55,
+            "Found $id field without a $ref before it, which is invalid.",
+        ),
+        "$ref" if !matches!(value, Bson::String(_)) => not_a_string(),
+        "$ref" if after != Some("$id") => {
+            Fallback::mongo(55, "The DBRef $ref field must be followed by a $id field")
+        }
+        "$db" if !matches!(value, Bson::String(_)) => not_a_string(),
+        "$db" if before != Some("$id") => Fallback::mongo(
+            55,
+            "Found $db field without a $id before it, which is invalid.",
+        ),
+        _ => Fallback::mongo(52, replacement_dollar_error(key)),
+    }
+}
+
+/// The deepest a stored document may nest: documents and arrays inside one
+/// another, the document itself counting as one.
+const MAX_NESTING_DEPTH: usize = 180;
+
+/// How deep `value` nests, giving up once past the limit. A scalar is 0.
+fn nesting_depth(value: &Bson, above: usize) -> usize {
+    if above > MAX_NESTING_DEPTH {
+        return 0;
+    }
+    match value {
+        Bson::Document(d) => {
+            1 + d
+                .values()
+                .map(|v| nesting_depth(v, above + 1))
+                .max()
+                .unwrap_or(0)
+        }
+        Bson::Array(a) => {
+            1 + a
+                .iter()
+                .map(|v| nesting_depth(v, above + 1))
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// Did a `$push` with `$sort` run over an array that holds anything?
+///
+/// mongod counts that as a modification whether or not the order changed:
+/// `{$push: {s: {$each: [], $sort: 1}}}` over `s: [1, 2, 3]` reports
+/// `nModified: 1`, and over `s: []` reports 0 (measured 8.2.11, 2026-10-12).
+/// The stored bytes cannot show it.
+pub fn push_sort_ran(new: &Document, update: &Document) -> bool {
+    let Some(Bson::Document(fields)) = update.get("$push") else {
+        return false;
+    };
+    fields.iter().any(|(path, value)| {
+        matches!(value, Bson::Document(m) if m.contains_key("$each") && m.contains_key("$sort"))
+            && !has_positional(path)
+            && matches!(get_path(new, path), Some(Bson::Array(a)) if !a.is_empty())
+    })
 }
 
 /// Returns the offending path and the conflict point when two operators target
@@ -1550,6 +2098,9 @@ pub enum UpdatePathFault {
     /// has ONE message for both and names the offending key without a `$` for
     /// the bare one. Its `FailedToParse` (9).
     UnknownModifier(String),
+    /// Anything else mongod refuses when it parses the update, with its code
+    /// and words.
+    Invalid(i32, String),
 }
 
 /// Update modifiers mongod accepts. Mirrors `secantus.update._KNOWN_UPDATE_OPS`
@@ -1587,6 +2138,7 @@ pub fn update_spec_error(update: &Document) -> Option<(i32, String)> {
             ),
         )),
         UpdatePathFault::Empty(message) => Some((56, message)),
+        UpdatePathFault::Invalid(code, message) => Some((code, message)),
         UpdatePathFault::Conflict { offending, at } => Some((
             40,
             format!("Updating the path '{offending}' would create a conflict at '{at}'"),
@@ -1628,9 +2180,22 @@ pub fn update_path_fault(update: &Document) -> Option<UpdatePathFault> {
             return Some(UpdatePathFault::UnknownModifier(op.clone()));
         }
         let Bson::Document(fields) = payload else {
-            continue;
+            // An operator takes a document of fields. This was a "construct
+            // the Rust server does not support" (measured 8.2.11, 2026-10-12).
+            return Some(UpdatePathFault::Invalid(
+                9,
+                format!(
+                    "Modifiers operate on fields but we found type {} instead. For example: \
+                     {{$mod: {{<field>: ...}}}} not {{{op}: {}}}",
+                    query::bson_type_name(payload),
+                    render_value(payload)
+                ),
+            ));
         };
         for (field, value) in fields.iter() {
+            if let Some(problem) = operator_argument_error(op, field, value) {
+                return Some(UpdatePathFault::Invalid(2, problem));
+            }
             let mut paths = vec![field.clone()];
             if op == "$rename" {
                 if let Some(dest) = value.as_str() {
@@ -1678,6 +2243,65 @@ pub fn update_path_fault(update: &Document) -> Option<UpdatePathFault> {
         }
     }
     None
+}
+
+/// What mongod refuses about one `field: value` of an operator when it parses
+/// the update: where a positional element may stand, and the shape of the
+/// array operators' arguments. All `BadValue` (2). Measured 8.2.11, 2026-10-12.
+fn operator_argument_error(op: &str, field: &str, value: &Bson) -> Option<String> {
+    if op != "$rename" {
+        let parts: Vec<&str> = field.split('.').collect();
+        match parts.first() {
+            Some(&"$") => {
+                return Some(format!(
+                    "Cannot have positional (i.e. '$') element in the first position in path \
+                     '{field}'"
+                ))
+            }
+            Some(first) if is_positional_token(first) => {
+                return Some(format!(
+                    "Cannot have array filter identifier (i.e. '$[<id>]') element in the first \
+                     position in path '{field}'"
+                ))
+            }
+            _ => {}
+        }
+        if parts.iter().filter(|p| **p == "$").count() > 1 {
+            return Some(format!(
+                "Too many positional (i.e. '$') elements found in path '{field}'"
+            ));
+        }
+    }
+    match (op, value) {
+        ("$rename", Bson::String(to)) if !field.is_empty() && !to.is_empty() && field == to => {
+            Some(format!(
+                "The source and target field for $rename must differ: {field}: \"{to}\""
+            ))
+        }
+        ("$rename", Bson::String(to))
+            if !field.is_empty() && !to.is_empty() && rename_same_path(field, to) =>
+        {
+            Some(format!(
+                "The source and target field for $rename must not be on the same path: \
+                 {field}: \"{to}\""
+            ))
+        }
+        ("$push", Bson::Document(m)) if m.contains_key("$each") => push_modifier_error(m),
+        ("$addToSet", Bson::Document(m))
+            if m.len() > 1
+                && matches!(m.iter().next(), Some((k, Bson::Array(_))) if k == "$each") =>
+        {
+            Some(format!(
+                "Found unexpected fields after $each in $addToSet: {}",
+                render_value(value)
+            ))
+        }
+        ("$pullAll", other) if !matches!(other, Bson::Array(_)) => Some(format!(
+            "$pullAll requires an array argument but was given a {}",
+            query::bson_type_name(other)
+        )),
+        _ => None,
+    }
 }
 
 /// mongod's message for a path conflict, if this update has one.
@@ -1831,6 +2455,7 @@ pub fn arith_overflow_error(doc: &Document, update: &Document) -> Option<String>
 fn render_arith_operand(v: &Bson) -> String {
     match v {
         Bson::Int64(n) => format!("(NumberLong){n}"),
+        Bson::Int32(n) => format!("(NumberInt){n}"),
         _ => render_scalar(v),
     }
 }
@@ -2689,15 +3314,16 @@ mod tests {
     fn positional_dollar_uses_matches() {
         // $ resolves via positional_matches (computed from the query filter).
         // A predicate on the array itself resolves `$` (mongod sets `g.1`).
+        // The position is one for the whole update, under `$`.
         let pos = find_positional_matches(&doc! {"g": [5, 6, 7]}, &doc! {"g": 6});
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
         let pos = find_positional_matches(&doc! {"g": [5, 6, 7]}, &doc! {"g": {"$gt": 5}});
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
         let pos = find_positional_matches(
             &doc! {"g": [{"x": 1}, {"x": 2}]},
             &doc! {"g": {"$elemMatch": {"x": 2}}},
         );
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
         // A whole-array equality is not an element match.
         let pos = find_positional_matches(&doc! {"g": [5, 6]}, &doc! {"g": [5, 6]});
         assert!(pos.is_empty());
@@ -2717,6 +3343,33 @@ mod tests {
             &doc! {"g": [{"x": 1}, {"x": 2}, {"x": 2}]},
             &doc! {"g.x": 2},
         );
-        assert_eq!(pos, doc! {"g": 1i64});
+        assert_eq!(pos, doc! {"$": 1i64});
+    }
+
+    /// With several array predicates, the last in mongod's order of
+    /// predicates decides (measured 8.2.11, 2026-10-12).
+    #[test]
+    fn the_last_array_predicate_in_mongods_order_gives_the_position() {
+        let d = doc! {"a": [1, 2, 3, 2], "b": [5, 6, 7, 8], "o": [{"k": 1}, {"k": 2}]};
+        let at = |q: Document| find_positional_matches(&d, &q).get_i64("$").ok();
+        assert_eq!(at(doc! {"a": 3, "b": 5}), Some(0));
+        assert_eq!(at(doc! {"b": 8, "a": 1}), Some(3));
+        assert_eq!(at(doc! {"a": 3, "o.k": 2}), Some(1));
+        assert_eq!(at(doc! {"a": {"$gt": 1, "$lt": 3}}), Some(1));
+        assert_eq!(at(doc! {"a": {"$elemMatch": {"$gt": 2}}, "b": 6}), Some(1));
+        assert_eq!(at(doc! {"a": {"$in": [3]}, "b": 6}), Some(1));
+        assert_eq!(at(doc! {"$and": [{"a": 2}, {"a": 3}]}), Some(2));
+        assert_eq!(at(doc! {"$and": [{"a": 3}, {"a": 2}]}), Some(1));
+        assert_eq!(at(doc! {"$or": [{"a": 3}, {"a": 2}]}), Some(1));
+        for none in [
+            doc! {"$or": [{"a": 3}, {"b": 6}]},
+            doc! {"a.1": 2},
+            doc! {"a": {"$size": 4}},
+            doc! {"a": [1, 2, 3, 2]},
+            doc! {"a": {"$not": {"$gt": 5}}},
+            doc! {"$nor": [{"a": 9}]},
+        ] {
+            assert_eq!(at(none.clone()), None, "{none}");
+        }
     }
 }

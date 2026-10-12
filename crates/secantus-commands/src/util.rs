@@ -173,6 +173,8 @@ pub(crate) fn validate_write_hint(
 ) -> Result<(), CommandError> {
     let hint = match hint {
         None | Some(Bson::Null) => return Ok(()),
+        // An empty document is no hint (measured 8.2.11, 2026-10-12).
+        Some(Bson::Document(d)) if d.is_empty() => return Ok(()),
         Some(h) => h,
     };
     // A hint is validated during query PLANNING, and there is nothing to plan
@@ -273,7 +275,7 @@ pub(crate) fn docs_to_bson(batch: Vec<Vec<u8>>) -> Result<Vec<Bson>, CommandErro
     batch
         .iter()
         .map(|b| {
-            bson::Document::from_reader(&mut b.as_slice())
+            secantus_core::bsondoc::from_bytes(b.as_slice())
                 .map(Bson::Document)
                 .map_err(|e| {
                     CommandError::new(
@@ -292,7 +294,7 @@ pub(crate) fn decode_docs(batch: Vec<Vec<u8>>) -> Result<Vec<Document>, CommandE
     batch
         .iter()
         .map(|b| {
-            Document::from_reader(&mut b.as_slice()).map_err(|e| {
+            secantus_core::bsondoc::from_bytes(b.as_slice()).map_err(|e| {
                 CommandError::new(
                     1,
                     "InternalError",

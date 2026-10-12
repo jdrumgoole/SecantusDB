@@ -491,7 +491,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         if bytes.is_empty() {
             None
         } else {
-            Document::from_reader(&mut bytes.as_slice())
+            secantus_core::bsondoc::from_bytes(bytes.as_slice())
                 .ok()
                 .map(Bson::Document)
         }
@@ -529,7 +529,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // empty firstBatch only when nothing was waiting); getMore drives the rest.
     let mut first_batch = Vec::with_capacity(first_batch_bytes.len());
     for bytes in first_batch_bytes {
-        let d = Document::from_reader(&mut bytes.as_slice())
+        let d = secantus_core::bsondoc::from_bytes(bytes.as_slice())
             .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
         first_batch.push(Bson::Document(d));
     }

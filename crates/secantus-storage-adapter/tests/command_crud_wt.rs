@@ -723,10 +723,12 @@ fn update_pipeline_unknown_stage_is_command_error() {
             &doc! {"update": "c", "updates": [{"q": {}, "u": [{"$badStage": {}}]}]},
             c,
         );
-        assert_eq!(reply.get_i32("code").unwrap(), 168);
+        // mongod's answer (8.2.11): the code and words `aggregate` gives for
+        // a stage it does not know. This pinned 168, which was this server's.
+        assert_eq!(reply.get_i32("code").unwrap(), 40324);
         assert_eq!(
-            reply.get_str("codeName").unwrap(),
-            "InvalidPipelineOperator"
+            reply.get_str("errmsg").unwrap(),
+            "Unrecognized pipeline stage name: '$badStage'"
         );
     });
 }
