@@ -36,7 +36,7 @@ def test_no_serde_bson_decode_in_the_server_sources() -> None:
     found = []
     for crate in SERVER_CRATES:
         for path in sorted((CRATES / crate / "src").rglob("*.rs")):
-            for number, line in enumerate(path.read_text().splitlines(), start=1):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
                 if line.lstrip().startswith("//"):
                     continue
                 if SERDE_DECODE.search(line):
