@@ -49,3 +49,30 @@ def test_suite_process_gets_the_default_sigint_even_from_a_background_launch():
         assert _child_hears_sigint(runner._default_sigint)
     finally:
         signal.signal(signal.SIGINT, previous)
+
+
+def test_the_runners_scratch_directories_are_removed_at_exit(tmp_path: Path) -> None:
+    """The gauge's server store and TLS files were left behind by every run
+    (about 100 MB each). A directory `_scratch_dir` makes is gone once the
+    process that made it has exited, however `main` returned."""
+    script = (
+        "import sys, tempfile\n"
+        f"tempfile.tempdir = {str(tmp_path)!r}\n"
+        "from psycopg_validation import runner\n"
+        "d = runner._scratch_dir('secantus-psycopg-gauge-')\n"
+        "open(d + '/WiredTiger', 'w').write('x')\n"
+        "print(d)\n"
+        "sys.exit(2)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=60,
+    )
+    assert done.returncode == 2, done.stderr
+    made = Path(done.stdout.strip())
+    assert made.parent == tmp_path and made.name.startswith("secantus-psycopg-gauge-")
+    assert not made.exists()
+    assert list(tmp_path.iterdir()) == []

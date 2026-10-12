@@ -31,7 +31,9 @@ pytest-randomly, pytest-cov) ride the ``dev`` extra.
 
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -64,6 +66,21 @@ def _only_tests() -> list[str] | None:
     if not named:
         return None
     return [ln.strip() for ln in Path(named).read_text().splitlines() if ln.strip()]
+
+
+def _scratch_dir(prefix: str) -> str:
+    """A temporary directory that is removed when this process exits.
+
+    The server's store and the TLS run's certificates were made with
+    `mkdtemp` and never removed: about 100 MB of WiredTiger for every gauge
+    run, seventeen of them on one machine by 2026-10-12. Removed at exit and
+    not in `main`'s `finally`, because `main` returns early in several places
+    after the store's directory exists; the daemon is stopped and reaped
+    before `main` returns, so nothing has the store open by then.
+    """
+    path = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(shutil.rmtree, path, ignore_errors=True)
+    return path
 
 
 def _tls_files(directory: str) -> tuple[list[str], dict[str, str]]:
@@ -179,7 +196,7 @@ def main() -> int:
     (REPO_ROOT / ".validation").mkdir(exist_ok=True)
     host = "127.0.0.1"
     port = _pick_ephemeral_port()
-    storage_dir = tempfile.mkdtemp(prefix="secantus-psycopg-gauge-")
+    storage_dir = _scratch_dir("secantus-psycopg-gauge-")
 
     # Which server to measure. Mirrors the MongoDB gauges' SECANTUS_GAUGE_SERVER
     # so one variable selects the persona everywhere.
@@ -218,7 +235,7 @@ def main() -> int:
         require_fresh_pgserver(RUST_BINARY, repo_root=REPO_ROOT)
         argv = [str(RUST_BINARY), storage_dir, f"{host}:{port}"]
         if tls:
-            tls_options, tls_env = _tls_files(tempfile.mkdtemp(prefix="secantus-psycopg-tls-"))
+            tls_options, tls_env = _tls_files(_scratch_dir("secantus-psycopg-tls-"))
             argv += tls_options
     else:
         argv = [
@@ -305,6 +322,8 @@ def main() -> int:
             daemon.wait(timeout=10)
         except subprocess.TimeoutExpired:
             daemon.kill()
+            # Reaped, so its store is no longer open when it is removed.
+            daemon.wait()
 
 
 if __name__ == "__main__":

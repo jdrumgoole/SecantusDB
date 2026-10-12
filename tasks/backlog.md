@@ -3066,7 +3066,8 @@ These work end-to-end but cut corners.
       are where they were (1.4x to 1.7x on writes, 1.3x to 1.5x on reads).
       The 8-client rows are within 4% across trials; at 1 and 4 clients a
       trial moved by up to 21% on both servers, and two three-trial passes
-      the same hour gave select at 4 clients as 1.38x and 1.23x. The
+      the same hour gave select at 4 clients as 1.38x and 1.23x. The site
+      publishes the 8-client rows only (Joe's call, 2026-10-12). The
       unprepared-statement cost (`bench/pg_statement_cost.py`) is still
       not measured on a droplet.
 
