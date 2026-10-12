@@ -480,6 +480,20 @@ fn drop_database_takes_one() {
             40415
         );
         assert_eq!(names(c), ["c"]);
+        // Dropping `system.views` drops every view.
+        ok(&dispatch_full(
+            &doc! { "create": "v", "viewOn": "c", "pipeline": [] },
+            c,
+        ));
+        ok(&dispatch_full(
+            &doc! { "create": "w", "viewOn": "c", "pipeline": [] },
+            c,
+        ));
+        assert_eq!(
+            dispatch_full(&doc! { "drop": "system.views" }, c),
+            doc! { "nIndexesWas": 1, "ns": "t.system.views", "ok": 1.0 }
+        );
+        assert_eq!(names(c), ["c"]);
         ok(&dispatch_full(&doc! { "dropDatabase": 1 }, c));
         assert!(names(c).is_empty());
     });

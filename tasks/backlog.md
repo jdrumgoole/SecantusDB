@@ -8913,8 +8913,6 @@ What is left, on the RUST MongoDB server:
 - [ ] **`listDatabases` lists `admin` and `config` only once something is
       written to them.** mongod always has them. (`local` is listed, as
       empty; mongod's holds the oplog.)
-- [ ] **`drop` of `system.views`** answers `{ok: 1}`; mongod answers
-      `nIndexesWas: 1` and the namespace. The views go either way.
 - [ ] **`listIndexes` after a conversion to unique** lists `unique` after
       `expireAfterSeconds`; mongod lists it before. The same family as the
       index build order under 7.071.

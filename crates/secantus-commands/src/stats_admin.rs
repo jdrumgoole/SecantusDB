@@ -101,7 +101,8 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
 
 /// `dbStats`.
 pub fn db_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    unknown_field(doc, "dbStats", &["dbStats", "scale", "freeStorage"])?;
+    let name = doc.keys().next().map_or("dbStats", String::as_str);
+    unknown_field(doc, "dbStats", &[name, "scale", "freeStorage"])?;
     let scale = scale_of(doc, "dbStats")?.unwrap_or(1);
     if !(1..=(1_i64 << 50)).contains(&scale) {
         return Err(err(

@@ -343,8 +343,9 @@ fn clustered_index_create_list_and_validation() {
             &doc! {"create": "b2", "clusteredIndex": {"key": {"_id": 1}}},
             c,
         );
+        // `unique` is a required field of the option (mongod 8.2.11).
         assert_eq!(bad_uniq.get_f64("ok").unwrap(), 0.0);
-        assert_eq!(bad_uniq.get_i32("code").unwrap(), 5979700);
+        assert_eq!(bad_uniq.get_i32("code").unwrap(), 40414);
     });
 }
 
@@ -715,7 +716,7 @@ fn db_stats_counts_collections() {
         dispatch(&doc! {"create": "b"}, c);
         let reply = dispatch(&doc! {"dbStats": 1}, c);
         assert_eq!(reply.get_str("db").unwrap(), "t");
-        assert_eq!(reply.get_i32("collections").unwrap(), 2);
+        assert_eq!(reply.get_i64("collections").unwrap(), 2);
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     });
 }

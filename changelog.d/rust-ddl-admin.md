@@ -35,6 +35,8 @@ applied the change.
   true` is refused until `prepareUnique: true` has been set; the replies
   carry `prepareUnique_old` / `prepareUnique_new` and `unique_new`;
   `unique: false` is refused.
+- **Dropping `system.views` drops every view.** It answered ok and left
+  them in place.
 - **`listCollections`**: no `ns` on `idIndex`, no `uuid` on a view, options
   in mongod's order, defaults left out; with `nameOnly` the filter sees the
   name and type only; an unknown operator in the filter is refused.

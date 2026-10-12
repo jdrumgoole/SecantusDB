@@ -1162,6 +1162,25 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
     let storage = ctx.storage()?;
+    // `system.views` holds every view's definition: dropping it drops them
+    // all. It used to answer ok and leave the views in place.
+    if coll == "system.views" {
+        let views: Vec<String> = storage
+            .list_collections(&ctx.db_name)
+            .map_err(command_error)?
+            .into_iter()
+            .filter(|c| crate::views::is_view(storage, &ctx.db_name, c))
+            .collect();
+        if views.is_empty() {
+            return Ok(doc! { "ok": 1.0 });
+        }
+        for view in &views {
+            storage
+                .drop_collection(&ctx.db_name, view)
+                .map_err(command_error)?;
+        }
+        return Ok(doc! { "nIndexesWas": 1_i32, "ns": ns, "ok": 1.0 });
+    }
     // Kill the collection's cursors BEFORE the storage drop, not after: the
     // drop emits an oplog entry that wakes any awaitData getMore parked on a
     // tailable cursor, and that getMore must observe the tombstone set here so
@@ -1203,9 +1222,8 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(doc! { "ok": 1.0 });
     }
     // A view had no indexes to count: mongod answers `{ns, ok}`.
-    // Dropping a view reports nothing but success (mongod 8.2.11).
     if was_view {
-        return Ok(doc! { "ok": 1.0 });
+        return Ok(doc! { "ns": ns, "ok": 1.0 });
     }
     // mongod's field order: the count first, then the namespace.
     Ok(doc! { "nIndexesWas": n_indexes as i32, "ns": ns, "ok": 1.0 })
@@ -3181,34 +3199,32 @@ pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResu
         .index_sizes(&ctx.db_name, coll)
         .map_err(command_error)?;
     let buckets = crate::ts_buckets::of_collection(storage, &ctx.db_name, coll)?;
-    {
-        let bucket_size: i64 = buckets
-            .iter()
-            .map(|b| bson::to_vec(b).map(|v| v.len() as i64).unwrap_or(0))
-            .sum();
-        let n = buckets.len() as i64;
-        let mut index_sizes = index_sizes;
-        index_sizes.remove("_id_");
-        let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
-        return Ok(doc! {
-            "ns": format!("{}.{}", ctx.db_name, coll),
-            "size": int_bson(bucket_size),
-            "timeseries": {
-                "bucketsNs": format!(
-                    "{}.{}{coll}", ctx.db_name, crate::ts_buckets::BUCKETS_PREFIX
-                ),
-                "bucketCount": int_bson(n),
-                "avgBucketSize": int_bson(if n > 0 { bucket_size / n } else { 0 }),
-            },
-            "storageSize": int_bson(bucket_size),
-            "capped": false,
-            "nindexes": index_sizes.len() as i32,
-            "totalIndexSize": int_bson(total_index_size),
-            "indexSizes": index_sizes,
-            "scaleFactor": 1_i32,
-            "ok": 1.0,
-        });
-    }
+    let bucket_size: i64 = buckets
+        .iter()
+        .map(|b| bson::to_vec(b).map(|v| v.len() as i64).unwrap_or(0))
+        .sum();
+    let n = buckets.len() as i64;
+    let mut index_sizes = index_sizes;
+    index_sizes.remove("_id_");
+    let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
+    Ok(doc! {
+        "ns": format!("{}.{}", ctx.db_name, coll),
+        "size": int_bson(bucket_size),
+        "timeseries": {
+            "bucketsNs": format!(
+                "{}.{}{coll}", ctx.db_name, crate::ts_buckets::BUCKETS_PREFIX
+            ),
+            "bucketCount": int_bson(n),
+            "avgBucketSize": int_bson(if n > 0 { bucket_size / n } else { 0 }),
+        },
+        "storageSize": int_bson(bucket_size),
+        "capped": false,
+        "nindexes": index_sizes.len() as i32,
+        "totalIndexSize": int_bson(total_index_size),
+        "indexSizes": index_sizes,
+        "scaleFactor": 1_i32,
+        "ok": 1.0,
+    })
 }
 
 /// `serverStatus` — a minimal subset (host / version / process / uptime), plus a
