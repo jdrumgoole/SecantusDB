@@ -244,7 +244,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .unwrap_or("queryPlanner")
             .to_string();
         let wrapped = doc! { "explain": inner, "verbosity": verbosity };
-        return crate::admin::explain(&wrapped, ctx);
+        return crate::explain::explain(&wrapped, ctx);
     }
 
     // `$out` / `$merge` may only be the final pipeline stage — mongod rejects a

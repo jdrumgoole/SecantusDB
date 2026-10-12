@@ -42,6 +42,7 @@ pub mod crud;
 pub mod cursors;
 pub mod diagnostics;
 pub mod distinct;
+mod explain;
 pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
@@ -510,7 +511,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "cloneCollectionAsCapped" => capped_admin::clone_collection_as_capped,
         "compact" => capped_admin::compact,
         "reIndex" => capped_admin::re_index,
-        "explain" => admin::explain,
+        "explain" => explain::explain,
         "drop" => admin::drop,
         "secantusAdmin.backupArchive" => admin::backup_archive,
         "secantusAdmin.archiveBaseSnapshot" => admin::archive_base_snapshot,

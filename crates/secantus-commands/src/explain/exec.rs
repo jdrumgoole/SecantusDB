@@ -1,0 +1,653 @@
+//! Running a plan to count what it examines.
+//!
+//! `executionStats` reports, per stage, how many index keys and documents the
+//! plan looked at. The counts here come from walking the reported plan over
+//! the collection's documents with mongod's stage rules: a `LIMIT` stops its
+//! input early, a multikey scan drops repeated documents, and a scan over
+//! several intervals examines the key that tells it an interval has ended.
+//! The documents are read from a collection scan, so this is a count of what
+//! the reported plan would touch and never a measurement of this server.
+
+use super::bounds::{sort_key, Interval};
+use super::node::{num, IndexInfo, IxScan, Node, Stats};
+use bson::{Bson, Document};
+use secantus_core::collation::Collation;
+use std::collections::BTreeSet;
+
+/// What the stages read: the documents, in storage order.
+pub(crate) struct Env<'a> {
+    pub docs: &'a [Document],
+    pub collation: Option<&'a Collation>,
+    /// `count`'s `skip` and `limit`; `limit` 0 is none.
+    pub skip: i64,
+    pub limit: i64,
+    /// The write being explained, for `UPDATE` and `DELETE`.
+    pub multi: bool,
+    pub upsert: bool,
+    pub update: Option<&'a Document>,
+    /// `findAndModify`: the write hands its document back.
+    pub returns: bool,
+}
+
+impl Env<'_> {
+    /// Whether the update being explained would change this document.
+    fn would_modify(&self, row: usize) -> bool {
+        self.update.is_none_or(|u| {
+            secantus_core::update::apply_update(&self.docs[row], u, false)
+                .map(|after| after != self.docs[row])
+                .unwrap_or(true)
+        })
+    }
+
+    fn matches(&self, row: usize, filter: &Option<Document>) -> bool {
+        match filter {
+            None => true,
+            Some(f) => {
+                secantus_core::query::matches(&self.docs[row], f, &Document::new(), self.collation)
+                    .unwrap_or(false)
+            }
+        }
+    }
+}
+
+/// The values a path holds in a document, one per array element on the way,
+/// and the path components that were arrays. No value: the field is missing.
+pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) {
+    fn walk(v: &Bson, parts: &[&str], at: usize, out: &mut Vec<Bson>, arrays: &mut Vec<String>) {
+        let prefix = || parts[..at].join(".");
+        if let Bson::Array(items) = v {
+            if at > 0 && !arrays.contains(&prefix()) {
+                arrays.push(prefix());
+            }
+            if at == parts.len() {
+                if items.is_empty() {
+                    out.push(Bson::Undefined);
+                }
+                out.extend(items.iter().cloned());
+                return;
+            }
+            for item in items {
+                if matches!(item, Bson::Document(_)) {
+                    walk_doc(item, parts, at, out, arrays);
+                }
+            }
+            return;
+        }
+        walk_doc(v, parts, at, out, arrays);
+    }
+    fn walk_doc(v: &Bson, parts: &[&str], at: usize, out: &mut Vec<Bson>, arrays: &mut Vec<String>) {
+        if at == parts.len() {
+            out.push(v.clone());
+            return;
+        }
+        if let Bson::Document(d) = v {
+            if let Some(next) = d.get(parts[at]) {
+                walk(next, parts, at + 1, out, arrays);
+            }
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    let (mut out, mut arrays) = (Vec::new(), Vec::new());
+    walk_doc(&Bson::Document(doc.clone()), &parts, 0, &mut out, &mut arrays);
+    (out, arrays)
+}
+
+/// Which components of each key field hold an array in some document.
+pub(crate) fn multikey_paths(docs: &[Document], key: &Document) -> Vec<Vec<String>> {
+    key.keys()
+        .map(|field| {
+            let mut found: Vec<String> = Vec::new();
+            for doc in docs {
+                for part in values_at(doc, field).1 {
+                    if !found.contains(&part) {
+                        found.push(part);
+                    }
+                }
+            }
+            found.sort();
+            found
+        })
+        .collect()
+}
+
+/// One index entry: the key per field in SCAN order, and the document.
+type Entry = (Vec<Vec<u8>>, usize);
+
+fn directed(v: &Bson, reversed: bool) -> Vec<u8> {
+    let bytes = sort_key(v);
+    if reversed {
+        bytes.iter().map(|b| !b).collect()
+    } else {
+        bytes
+    }
+}
+
+/// The index's entries in the order the scan meets them.
+fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
+    let fields = index.fields();
+    let mut out: Vec<Entry> = Vec::new();
+    for (row, doc) in env.docs.iter().enumerate() {
+        if let Some(partial) = &index.partial {
+            if !env.matches(row, &Some(partial.clone())) {
+                continue;
+            }
+        }
+        let per_field: Vec<Vec<Bson>> = fields
+            .iter()
+            .map(|(field, _)| values_at(doc, field).0)
+            .collect();
+        if index.sparse && per_field.iter().all(Vec::is_empty) {
+            continue;
+        }
+        let mut keys: Vec<Vec<Vec<u8>>> = vec![vec![]];
+        for (values, (_, dir)) in per_field.iter().zip(&fields) {
+            let reversed = (*dir < 0) != backward;
+            let mut encoded: Vec<Vec<u8>> = if values.is_empty() {
+                vec![directed(&Bson::Null, reversed)]
+            } else {
+                values.iter().map(|v| directed(v, reversed)).collect()
+            };
+            encoded.sort();
+            encoded.dedup();
+            keys = keys
+                .into_iter()
+                .flat_map(|k| {
+                    encoded.iter().map(move |e| {
+                        let mut next = k.clone();
+                        next.push(e.clone());
+                        next
+                    })
+                })
+                .collect();
+        }
+        out.extend(keys.into_iter().map(|k| (k, row)));
+    }
+    out.sort();
+    out
+}
+
+/// One field's intervals in scan order: `(low, inclusive, high, inclusive)`.
+type Ranges = Vec<(Vec<u8>, bool, Vec<u8>, bool)>;
+
+fn ranges(list: &[Interval], reversed: bool) -> Ranges {
+    let mut out: Ranges = list
+        .iter()
+        .map(|i| {
+            if reversed {
+                (directed(&i.hi, true), i.hi_incl, directed(&i.lo, true), i.lo_incl)
+            } else {
+                (directed(&i.lo, false), i.lo_incl, directed(&i.hi, false), i.hi_incl)
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn inside(key: &[u8], r: &(Vec<u8>, bool, Vec<u8>, bool)) -> bool {
+    let above = key > r.0.as_slice() || (r.1 && key == r.0.as_slice());
+    let below = key < r.2.as_slice() || (r.3 && key == r.2.as_slice());
+    above && below
+}
+
+/// A scan in progress.
+struct Scan {
+    entries: Vec<Entry>,
+    ranges: Vec<Ranges>,
+    /// The bounds are one contiguous run of keys: nothing outside is examined.
+    contiguous: bool,
+    multikey: bool,
+    filter: Option<Document>,
+    pos: usize,
+    done: bool,
+    seen: BTreeSet<usize>,
+    keys: i64,
+    returned: i64,
+}
+
+impl Scan {
+    fn new(ix: &IxScan, env: &Env) -> Scan {
+        let fields = ix.index.fields();
+        let ranges: Vec<Ranges> = if ix.no_bounds {
+            vec![]
+        } else {
+            ix.bounds
+                .iter()
+                .zip(&fields)
+                .map(|(list, (_, dir))| ranges(list, (*dir < 0) != ix.backward))
+                .collect()
+        };
+        // Points, then one interval, then everything: a single run of keys.
+        let mut contiguous = true;
+        let mut open = false;
+        for list in &ix.bounds {
+            let [one] = list.as_slice() else {
+                contiguous = false;
+                break;
+            };
+            if open && !one.is_all() {
+                contiguous = false;
+                break;
+            }
+            if !one.is_point() {
+                open = true;
+            }
+        }
+        Scan {
+            entries: entries(&ix.index, ix.backward, env),
+            ranges,
+            contiguous,
+            multikey: ix.index.is_multikey(),
+            filter: ix.filter.clone(),
+            pos: 0,
+            done: false,
+            seen: BTreeSet::new(),
+            keys: 0,
+            returned: 0,
+        }
+    }
+
+    /// The first field whose key is outside its bounds, and whether a later
+    /// interval of that field could still be reached.
+    fn outside(&self, key: &[Vec<u8>]) -> Option<(usize, bool)> {
+        for (f, (part, list)) in key.iter().zip(&self.ranges).enumerate() {
+            if list.iter().any(|r| inside(part, r)) {
+                continue;
+            }
+            let ahead = list
+                .iter()
+                .any(|r| part.as_slice() < r.0.as_slice() || (!r.1 && part == &r.0));
+            return Some((f, ahead));
+        }
+        None
+    }
+
+    /// The next entry inside the bounds, in scan order.
+    fn next_entry(&mut self) -> Option<usize> {
+        while !self.done && self.pos < self.entries.len() {
+            let key = self.entries[self.pos].0.clone();
+            let Some((field, ahead)) = self.outside(&key) else {
+                self.keys += 1;
+                self.pos += 1;
+                return Some(self.entries[self.pos - 1].1);
+            };
+            if self.contiguous {
+                // Before the run: not examined. After it: the scan is over.
+                if ahead {
+                    self.pos += 1;
+                    continue;
+                }
+                self.done = true;
+                return None;
+            }
+            self.keys += 1;
+            if !ahead && field == 0 {
+                self.done = true;
+                return None;
+            }
+            // Seek: past every key that fails the same way.
+            let prefix = key[..field].to_vec();
+            self.pos += 1;
+            while self.pos < self.entries.len() {
+                let other = &self.entries[self.pos].0;
+                if other[..field] != prefix[..] {
+                    break;
+                }
+                if ahead && !matches!(self.outside(other), Some((f, true)) if f == field) {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        self.done = true;
+        None
+    }
+
+    fn next(&mut self, env: &Env) -> Option<usize> {
+        loop {
+            let row = self.next_entry()?;
+            if self.multikey && !self.seen.insert(row) {
+                continue;
+            }
+            if !env.matches(row, &self.filter) {
+                continue;
+            }
+            self.returned += 1;
+            return Some(row);
+        }
+    }
+
+    /// Whether the index holds a key past the end of the bounds.
+    fn key_beyond(&self) -> bool {
+        self.entries[self.pos.min(self.entries.len())..]
+            .iter()
+            .any(|(key, _)| self.outside(key).is_some_and(|(_, ahead)| !ahead))
+    }
+}
+
+/// A stage being run: its own state and its inputs.
+struct Run<'a> {
+    node: &'a Node,
+    inputs: Vec<Run<'a>>,
+    scan: Option<Scan>,
+    pos: usize,
+    done: bool,
+    seen: BTreeSet<usize>,
+    prefixes: BTreeSet<Vec<Vec<u8>>>,
+    buffer: Option<Vec<usize>>,
+    returned: i64,
+    keys: i64,
+    docs: i64,
+    extra: Document,
+}
+
+impl<'a> Run<'a> {
+    fn new(node: &'a Node, env: &Env) -> Run<'a> {
+        let inputs: Vec<&Node> = match node {
+            Node::Fetch { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Projection { input, .. }
+            | Node::Delete { input, .. } => vec![input],
+            Node::Skip(_, input) | Node::Limit(_, input) => vec![input],
+            Node::ReturnKey(input)
+            | Node::Subplan(input)
+            | Node::Count(input)
+            | Node::Update(input) => vec![input],
+            Node::Or(inputs) | Node::SortMerge { inputs, .. } => inputs.iter().collect(),
+            _ => vec![],
+        };
+        let scan = match node {
+            Node::IxScan(ix) | Node::CountScan(ix) | Node::DistinctScan(ix, _) => {
+                Some(Scan::new(ix, env))
+            }
+            _ => None,
+        };
+        Run {
+            node,
+            inputs: inputs.into_iter().map(|n| Run::new(n, env)).collect(),
+            scan,
+            pos: 0,
+            done: false,
+            seen: BTreeSet::new(),
+            prefixes: BTreeSet::new(),
+            buffer: None,
+            returned: 0,
+            keys: 0,
+            docs: 0,
+            extra: Document::new(),
+        }
+    }
+
+    fn pull(&mut self, env: &Env) -> Option<usize> {
+        if self.done {
+            return None;
+        }
+        let row = self.step(env);
+        match row {
+            Some(_) => self.returned += 1,
+            None => self.done = true,
+        }
+        row
+    }
+
+    fn step(&mut self, env: &Env) -> Option<usize> {
+        match self.node {
+            Node::CollScan { filter, backward } => {
+                while self.pos < env.docs.len() {
+                    let row = if *backward {
+                        env.docs.len() - 1 - self.pos
+                    } else {
+                        self.pos
+                    };
+                    self.pos += 1;
+                    self.docs += 1;
+                    if env.matches(row, filter) {
+                        return Some(row);
+                    }
+                }
+                None
+            }
+            Node::IxScan(_) => {
+                let scan = self.scan.as_mut()?;
+                let row = scan.next(env);
+                self.keys = scan.keys;
+                row
+            }
+            Node::CountScan(_) => {
+                let scan = self.scan.as_mut()?;
+                let row = scan.next_entry();
+                self.keys = scan.keys;
+                if row.is_none() && scan.key_beyond() {
+                    self.keys += 1;
+                }
+                row
+            }
+            Node::DistinctScan(_, width) => {
+                // One entry per distinct value of the leading `width` fields.
+                let scan = self.scan.as_mut()?;
+                loop {
+                    let Some(row) = scan.next_entry() else {
+                        self.keys = self.prefixes.len() as i64 + i64::from(scan.key_beyond());
+                        return None;
+                    };
+                    let key = &scan.entries[scan.pos - 1].0;
+                    if self.prefixes.insert(key[..(*width).min(key.len())].to_vec()) {
+                        self.keys = self.prefixes.len() as i64;
+                        return Some(row);
+                    }
+                }
+            }
+            Node::Fetch { filter, .. } => loop {
+                let row = self.inputs[0].pull(env)?;
+                self.docs += 1;
+                if env.matches(row, filter) {
+                    return Some(row);
+                }
+            },
+            Node::Or(_) | Node::SortMerge { .. } => {
+                while self.pos < self.inputs.len() {
+                    match self.inputs[self.pos].pull(env) {
+                        Some(row) => {
+                            if self.seen.insert(row) {
+                                return Some(row);
+                            }
+                        }
+                        None => self.pos += 1,
+                    }
+                }
+                None
+            }
+            Node::Sort { limit, .. } => {
+                if self.buffer.is_none() {
+                    let mut all = Vec::new();
+                    while let Some(row) = self.inputs[0].pull(env) {
+                        all.push(row);
+                    }
+                    if let Some(n) = limit {
+                        all.truncate(*n as usize);
+                    }
+                    self.buffer = Some(all);
+                }
+                let row = self.buffer.as_ref()?.get(self.pos).copied();
+                self.pos += 1;
+                row
+            }
+            Node::Skip(n, _) => {
+                while (self.pos as i64) < *n {
+                    self.pos += 1;
+                    self.inputs[0].pull(env)?;
+                }
+                self.inputs[0].pull(env)
+            }
+            Node::Limit(n, _) => {
+                if self.returned >= *n {
+                    return None;
+                }
+                self.inputs[0].pull(env)
+            }
+            Node::Projection { .. } | Node::ReturnKey(_) | Node::Subplan(_) => {
+                self.inputs[0].pull(env)
+            }
+            Node::Eof(_) | Node::FastCount => None,
+            Node::Express { index, value } => {
+                if self.pos > 0 {
+                    return None;
+                }
+                self.pos = 1;
+                let field = index.key.keys().next()?;
+                let want = sort_key(value);
+                let row = env.docs.iter().position(|d| {
+                    values_at(d, field).0.iter().any(|v| sort_key(v) == want)
+                })?;
+                self.keys = 1;
+                self.docs = 1;
+                Some(row)
+            }
+            Node::IdHack(value) => {
+                if self.pos > 0 {
+                    return None;
+                }
+                self.pos = 1;
+                let want = sort_key(value);
+                let row = env
+                    .docs
+                    .iter()
+                    .position(|d| d.get("_id").is_some_and(|v| sort_key(v) == want))?;
+                self.keys = 1;
+                self.docs = 1;
+                Some(row)
+            }
+            Node::Count(input) => {
+                if self.pos > 0 {
+                    return None;
+                }
+                self.pos = 1;
+                let (mut counted, mut skipped) = (0i64, 0i64);
+                if matches!(**input, Node::FastCount) {
+                    (counted, skipped) = fast_count(env);
+                } else {
+                    while env.limit == 0 || counted < env.limit {
+                        if self.inputs[0].pull(env).is_none() {
+                            break;
+                        }
+                        if skipped < env.skip {
+                            skipped += 1;
+                        } else {
+                            counted += 1;
+                        }
+                    }
+                }
+                self.extra.insert("nCounted", num(counted));
+                self.extra.insert("nSkipped", num(skipped));
+                None
+            }
+            Node::Update(_) => {
+                if self.pos > 0 {
+                    return None;
+                }
+                self.pos = 1;
+                let (mut matched, mut modified) = (0i64, 0i64);
+                let mut first = None;
+                while let Some(row) = self.inputs[0].pull(env) {
+                    matched += 1;
+                    first.get_or_insert(row);
+                    modified += i64::from(env.would_modify(row));
+                    if !env.multi {
+                        break;
+                    }
+                }
+                self.extra.insert("nMatched", num(matched));
+                self.extra.insert("nWouldModify", num(modified));
+                self.extra
+                    .insert("nWouldUpsert", num(i64::from(env.upsert && matched == 0)));
+                first.filter(|_| env.returns)
+            }
+            Node::Delete { .. } => {
+                if self.pos > 0 {
+                    return None;
+                }
+                self.pos = 1;
+                let mut deleted = 0i64;
+                let mut first = None;
+                while let Some(row) = self.inputs[0].pull(env) {
+                    deleted += 1;
+                    first.get_or_insert(row);
+                    if !env.multi {
+                        break;
+                    }
+                }
+                self.extra.insert("nWouldDelete", num(deleted));
+                first.filter(|_| env.returns)
+            }
+            Node::ExpressWrite { value, delete, .. } => {
+                if self.pos > 0 {
+                    return None;
+                }
+                self.pos = 1;
+                let want = sort_key(value);
+                let row = env
+                    .docs
+                    .iter()
+                    .position(|d| d.get("_id").is_some_and(|v| sort_key(v) == want));
+                let found = i64::from(row.is_some());
+                self.keys = found;
+                self.docs = found;
+                let modify = row.is_some_and(|r| !*delete && env.would_modify(r));
+                self.extra.insert("nWouldModify", num(i64::from(modify)));
+                self.extra.insert("nWouldUpsert", 0_i32);
+                self.extra
+                    .insert("nWouldDelete", num(if *delete { found } else { 0 }));
+                row.filter(|_| env.returns)
+            }
+        }
+    }
+
+    fn stats(&self) -> Stats {
+        let mut extra = self.extra.clone();
+        match self.node {
+            Node::Sort { .. } => {
+                extra.insert("usedDisk", false);
+                extra.insert("spills", 0_i32);
+                extra.insert("spilledRecords", 0_i32);
+                extra.insert("spilledBytes", 0_i32);
+                extra.insert("spilledDataStorageSize", 0_i32);
+            }
+            Node::DistinctScan(..) => {
+                extra.insert("docsExamined", 0_i32);
+                extra.insert("chunkSkips", 0_i32);
+                extra.insert("orphanChunkSkips", 0_i32);
+            }
+            _ => {}
+        }
+        Stats {
+            n_returned: self.returned,
+            keys: self.keys,
+            docs: self.docs,
+            extra,
+            children: self.inputs.iter().map(Run::stats).collect(),
+        }
+    }
+}
+
+/// What a count that reads no documents reports: `(counted, skipped)`.
+fn fast_count(env: &Env) -> (i64, i64) {
+    let total = env.docs.len() as i64;
+    let skipped = env.skip.min(total);
+    let mut counted = total - skipped;
+    if env.limit > 0 {
+        counted = counted.min(env.limit);
+    }
+    (counted, skipped)
+}
+
+/// Run the plan to completion and report what each stage counted.
+pub(crate) fn run(plan: &Node, env: &Env) -> Stats {
+    let mut root = Run::new(plan, env);
+    if matches!(plan, Node::FastCount) {
+        let (counted, skipped) = fast_count(env);
+        root.extra.insert("nCounted", num(counted));
+        root.extra.insert("nSkipped", num(skipped));
+    }
+    while root.pull(env).is_some() {}
+    root.stats()
+}

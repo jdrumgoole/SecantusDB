@@ -462,6 +462,17 @@ pub trait Storage: Send + Sync {
         Ok(d)
     }
 
+    /// Whether some document gives the index an array to index.
+    fn index_is_multikey(&self, _db: &str, _coll: &str, _name: &str) -> bool {
+        false
+    }
+
+    /// Whether every document `query` matches also matches `partial`, as far
+    /// as the index router can prove it (it answers `false` when unsure).
+    fn query_implies_partial(&self, _query: &Document, _partial: &Document) -> bool {
+        false
+    }
+
     // --- DDL / introspection ------------------------------------------------
     //
     // These carry default no-op/empty implementations so test fakes that don't

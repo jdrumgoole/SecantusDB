@@ -2934,7 +2934,7 @@ fn clause_implies_bounds(qval: &Bson, pbound: &Document) -> bool {
 /// `false` (skip the index, full scan) for anything it can't prove implied.
 /// Supports bare-equality partial values and the `$eq`/`$lt`/`$lte`/`$gt`/`$gte`
 /// range operators on both sides. Mirrors `storage._query_implies_partial`.
-fn query_implies_partial(query: &Document, partial: &Document) -> bool {
+pub fn query_implies_partial(query: &Document, partial: &Document) -> bool {
     for (key, pval) in partial.iter() {
         let qval = match query.get(key) {
             Some(v) => v,
