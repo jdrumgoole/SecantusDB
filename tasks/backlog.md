@@ -9064,10 +9064,13 @@ The wrong WRITES, all fixed:
   those bytes are on disk and shared with the Python server, so they are
   unchanged. A document `_id` now also takes a claim by value in
   `UNIQ_TABLE`, the one a collated collection already takes
-  (`Storage::document_id_claim`). **A document stored before this fix
-  holds no claim**, so a second document equal to it by value is still
-  accepted until the first is rewritten; nothing backfills the claims.
-  The Python server takes none either.
+  (`Storage::document_id_claim`). A document stored before this fix is
+  given its claim the first time this version opens the store
+  (`backfill_document_id_claims`, once for a store; a row in `UNIQ_TABLE`
+  under an empty namespace records it). Two stored documents already
+  equal by value both stay, and the older holds the claim. **The Python
+  server takes no claim**, so a document it writes into a store after
+  that walk can still be duplicated by value.
 - **`$merge` with `whenMatched: "replace"` deleted the matched document
   and then inserted the new one.** A replacement a unique index refused
   left neither. It is one replacement now, and a replaced document keeps
