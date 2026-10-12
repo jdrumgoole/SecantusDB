@@ -180,6 +180,10 @@ pub(crate) fn like_match_bytes(subject: &[u8], pattern: &[u8], escape: Option<u8
     };
     if Some(first) == escape {
         let Some((&literal, rest)) = rest.split_first() else {
+            // Reached with nothing left to match, the pattern simply fails.
+            if subject.is_empty() {
+                return Ok(false);
+            }
             return Err(Error::Sqlstate(
                 "22025",
                 "LIKE pattern must not end with escape character".into(),
@@ -228,7 +232,8 @@ mod byte_tests {
         assert!(!m(b"abc", b"a\\%c"));
         assert!(m(&[0, 255, 1], &[0, b'%', 1]));
         // A pattern ending in its escape is an error once matching gets there.
-        assert!(like_match_bytes(b"a", b"a\\", Some(b'\\')).is_err());
+        assert!(like_match_bytes(b"ab", b"a\\", Some(b'\\')).is_err());
+        assert!(!like_match_bytes(b"a", b"a\\", Some(b'\\')).unwrap());
         assert!(!like_match_bytes(b"b", b"a\\", Some(b'\\')).unwrap());
     }
 }

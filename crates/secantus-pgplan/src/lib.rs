@@ -34806,6 +34806,10 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     // result where PostgreSQL raises, which is the silent-divergence class
     // this server refuses to ship. Measured on 14.13.
     if let Some(column) = def.columns.iter().find(|c| c.field() == field) {
+        // `bytea LIKE bytea` exists, and matches bytes: per row.
+        if column.pg_type == "bytea" && is_like && !insensitive {
+            return Err(Error::Unsupported("a pattern match over bytea".into()));
+        }
         if !matches!(
             column.pg_type.as_str(),
             "text" | "varchar" | "bpchar" | "name" | "citext"
