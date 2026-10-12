@@ -94,3 +94,41 @@ def test_a_truncated_run_fails_on_a_shared_runner_too(tmp_path: Path) -> None:
     plain = _report(tmp_path / "p.json", {"t::a": "passed"})
     absent = str(tmp_path / "absent.json")
     assert check_run.main([str(plain), "--tls", absent, "--shared-runner"]) == 1
+
+
+def test_a_test_that_passes_when_run_again_does_not_fail_the_comparison(tmp_path: Path) -> None:
+    """Failing over TLS once is not failing over TLS: the test is run again,
+    and only one that fails again, or was not run again, counts."""
+    eintr = "tests/test_concurrency_async.py::test_eintr[ITIMER_REAL-SIGALRM]"
+    plain = _report(tmp_path / "p.json", {eintr: "passed", "t::a": "passed", "t::b": "passed"})
+    tls = _report(tmp_path / "t.json", {eintr: "failed", "t::a": "failed", "t::b": "passed"})
+    held = tmp_path / "held.txt"
+    assert check_run.main([str(plain), "--tls", str(tls), "--write-held", str(held)]) == 0
+    assert held.read_text().splitlines() == ["t::a", eintr]
+
+    both_pass = _report(tmp_path / "r1.json", {eintr: "passed", "t::a": "passed"})
+    one_fails = _report(tmp_path / "r2.json", {eintr: "passed", "t::a": "failed"})
+    one_missing = _report(tmp_path / "r3.json", {eintr: "passed"})
+    assert check_run.main([str(plain), "--tls", str(tls), "--rerun", str(both_pass)]) == 0
+    assert check_run.main([str(plain), "--tls", str(tls), "--rerun", str(one_fails)]) == 1
+    assert check_run.main([str(plain), "--tls", str(tls), "--rerun", str(one_missing)]) == 1
+    # No second run at all: every one of them still counts.
+    assert check_run.main([str(plain), "--tls", str(tls), "--rerun", str(tmp_path / "no")]) == 1
+    assert check_run.main([str(plain), "--tls", str(tls)]) == 1
+
+
+def test_nothing_to_run_again_needs_no_second_report(tmp_path: Path) -> None:
+    plain = _report(tmp_path / "p.json", {"t::a": "passed", "t::b": "failed"})
+    tls = _report(tmp_path / "t.json", {"t::a": "passed", "t::b": "failed"})
+    held = tmp_path / "held.txt"
+    assert check_run.main([str(plain), "--tls", str(tls), "--write-held", str(held)]) == 0
+    assert held.read_text() == ""
+    assert check_run.main([str(plain), "--tls", str(tls), "--rerun", str(tmp_path / "no")]) == 0
+
+
+def test_a_truncated_run_fails_before_anything_is_listed(tmp_path: Path) -> None:
+    plain = _report(tmp_path / "p.json", {"t::a": "passed"})
+    held = tmp_path / "held.txt"
+    absent = str(tmp_path / "absent.json")
+    assert check_run.main([str(plain), "--tls", absent, "--write-held", str(held)]) == 1
+    assert not held.exists()

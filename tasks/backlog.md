@@ -4905,15 +4905,24 @@ These are explicit non-goals. Don't add them without a reason.
       - `test_concurrency_async.py::test_type_error_shadow` hit the 20 s
         per-test timeout in all three completed runs.
 
+      - Later runs each failed something else once: 3 and 5, then 10 and
+        10 (PR #1905), where
+        `test_concurrency_async.py::test_eintr[ITIMER_REAL-SIGALRM]` failed
+        over TLS only. Its client script was killed by its own interval
+        timer, which fires every 0.25 s and can land while the interpreter
+        is shutting down; nothing the server answered.
+
       What the lane gates, given that: a run that stopped short, and a
-      test that fails over TLS only, apart from `::test_notify*`,
-      `::test_notifies` and `::test_leak` (`SHARED_RUNNER_NOISE` in
-      `psycopg_validation/check_run.py`, applied only with
-      `--shared-runner`). In run 2 five of those failed over TLS and
-      passed in the clear, which is the noise above and not TLS. **So a
-      change that delays NOTIFY over TLS only would not fail that lane**;
-      `./inv validate-psycopg-rust --tls` on a developer's machine holds
-      every test to it. Nothing gates the plain number on Linux.
+      test that fails over TLS, passes in the clear, **and fails over TLS
+      again when run again by itself**. `::test_notify*`,
+      `::test_notifies` and `::test_leak` are left out of that by name
+      (`SHARED_RUNNER_NOISE` in `psycopg_validation/check_run.py`, applied
+      only with `--shared-runner`), because they fail in most runs in
+      either transport. **So a change that delays NOTIFY over TLS only
+      would not fail that lane**, and neither would a TLS fault that shows
+      once in two tries; `./inv validate-psycopg-rust --tls` on a
+      developer's machine holds every test to one run. Nothing gates the
+      plain number on Linux.
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
       (2026-10-12).** The probe calls every immutable or stable function in
@@ -5313,7 +5322,13 @@ These are explicit non-goals. Don't add them without a reason.
 
 - [x] **FIXED 2026-10-07 — `.detached-runs/<name>.json` could report `exit_code: null` for a
       process that finished long ago (2026-09-28).** The supervisor now writes
-      the exit into the state file itself (`test_the_state_file_records_the_exit_without_a_status_call`). The pymongo gauge finished
+      the exit into the state file itself (`test_the_state_file_records_the_exit_without_a_status_call`).
+      **That fix had a hole, closed 2026-10-12:** a command that ended
+      before `start` had written the state file left its supervisor with
+      nowhere to record the exit, and the file then said `exit_code: null`
+      again. Seen once in CI (`test-durable (macos-14, 3.12, 2)` on PR
+      #1905, sixty seconds of polling). `start` now looks for the exit
+      file after it writes the state. The pymongo gauge finished
       in 2m39s and wrote both artifacts; its state file still read
       `exit_code: null` two hours later with the recorded pid dead.
 

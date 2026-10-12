@@ -16,8 +16,9 @@
 #   1. Both runs COMPLETE -- every test a run started reported a result. A
 #      truncated run is a failure, never a pass (CLAUDE.md, "A test that does
 #      not COMPLETE is a failure").
-#   2. No test fails over TLS that passes in the clear, apart from the timing
-#      tests a hosted runner fails by itself (`SHARED_RUNNER_NOISE` in
+#   2. No test fails over TLS that passes in the clear AND fails over TLS
+#      again when run again, apart from the timing tests a hosted runner
+#      fails by itself (`SHARED_RUNNER_NOISE` in
 #      psycopg_validation/check_run.py).
 # A test that fails in BOTH runs is printed and does not fail this job: it is
 # the plain gauge's finding, and this lane is not where that number is kept.
@@ -35,7 +36,9 @@ on:
       - "crates/secantus-pg/src/crl.rs"
       - "crates/secantus-pg/src/x509.rs"
       - "crates/secantus-pg/src/scram_binding.rs"
-      - "crates/secantus-pgwire/**"
+      # The sources, not the manifest: a version bump is not a change to how
+      # the wire is spoken, and this lane is over an hour.
+      - "crates/secantus-pgwire/src/**"
       - "psycopg_validation/**"
       - ".github/workflows/psycopg-tls.yml"
 
@@ -161,18 +164,47 @@ jobs:
           uv run --no-sync python -m psycopg_validation.runner
           echo "runner exit: $?"
 
-      - name: Both runs completed, and nothing fails over TLS only
-        if: always()
+      - name: Both runs completed; list what failed over TLS only
+        id: held
         shell: bash
-        # `--shared-runner`: three families of timing test fail on this runner
-        # in one run and pass in the next, in either transport (6 failures in
-        # the clear in one run of a tree, 31 in the next). They are printed and
-        # not held to the comparison here; check_run.py names them and says
-        # what that loses.
-        run: >-
-          uv run --no-sync python -m psycopg_validation.check_run
-          .validation/psycopg-raw-rust.json --tls .validation/psycopg-raw-rust-tls.json
-          --shared-runner
+        # Fails here on a run that stopped short. Otherwise writes the tests
+        # that failed over TLS and passed in the clear, to be run again:
+        # a hosted runner fails a different timing test in each run, and one
+        # run cannot tell that from TLS answering differently.
+        #
+        # `--shared-runner`: three families of timing test fail on this
+        # runner in most runs, in either transport. They are printed and not
+        # run again; check_run.py names them and says what that loses.
+        run: |
+          uv run --no-sync python -m psycopg_validation.check_run \
+            .validation/psycopg-raw-rust.json --tls .validation/psycopg-raw-rust-tls.json \
+            --shared-runner --write-held .validation/tls-only.txt
+          echo "count=$(grep -c . .validation/tls-only.txt || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Run again, over TLS, what failed over TLS only
+        if: steps.held.outputs.count != '0'
+        shell: bash
+        env:
+          SECANTUS_GAUGE_SERVER: rust
+          SECANTUS_GAUGE_TLS: "1"
+          SECANTUS_PSYCOPG_ONLY_FILE: .validation/tls-only.txt
+          PYTHONUNBUFFERED: "1"
+          PYTEST_ADDOPTS: "-rfE"
+        run: |
+          set +e
+          unset PGPASSWORD
+          uv run --no-sync python -m psycopg_validation.runner
+          echo "runner exit: $?"
+
+      - name: Nothing fails over TLS only, twice
+        shell: bash
+        # A test that failed over TLS, passed in the clear and passed over
+        # TLS the second time is printed. One that failed both times, or was
+        # not run again, fails the job.
+        run: |
+          uv run --no-sync python -m psycopg_validation.check_run \
+            .validation/psycopg-raw-rust.json --tls .validation/psycopg-raw-rust-tls.json \
+            --shared-runner --rerun .validation/psycopg-raw-rust-tls-rerun.json
 
       - name: Upload the raw reports
         if: always()
@@ -182,4 +214,6 @@ jobs:
           path: |
             .validation/psycopg-raw-rust.json
             .validation/psycopg-raw-rust-tls.json
+            .validation/psycopg-raw-rust-tls-rerun.json
+            .validation/tls-only.txt
           if-no-files-found: warn
