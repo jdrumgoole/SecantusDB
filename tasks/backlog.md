@@ -4371,9 +4371,19 @@ These work end-to-end but cut corners.
   - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
     PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
   - The key must have no passphrase.
-  - The embedded Python handle (`_secantus_server.PgServer`) has no TLS
-    parameter, and the psycopg gauge starts the server without a
-    certificate, so no gauge exercises TLS.
+  - The three login comparisons are in the repository since 2026-10-12
+    (`tools/probes/pg_login_options.py`, `pg_login_tls_files.py`,
+    `pg_login_hba.py`), and `tests/test_rust_pg_login_differential.py`
+    runs them in CI's `pg-oracle` lane against a PostgreSQL 15 that lane
+    installs. Locally they run only with `SECANTUS_PG15_BIN` set. The
+    psycopg gauge has a TLS run (`SECANTUS_GAUGE_TLS=1`): 5,544 pass and
+    none fail of 5,731, the plain run's counts (2026-10-12, macOS, psycopg
+    3.3.4, 1,073 s, on the tree of 0.1.0-beta.12). What that leaves:
+    - **The TLS gauge run is by hand.** No CI lane and no `invoke` task
+      runs it, and it sets `PGSSLMODE` for libpq, so a test that names its
+      own `sslmode` is not moved onto TLS by it.
+    - **The embedded Python handle (`_secantus_server.PgServer`) has no
+      TLS parameter.**
 
 SCRAM-SHA-256 is implemented end-to-end. The wire-protocol shape (saslStart/saslContinue, `hello.saslSupportedMechs`, per-connection auth state, `--auth` gating) is conformant for pymongo and mongo-go-driver. The remaining gaps are mostly orthogonal:
 

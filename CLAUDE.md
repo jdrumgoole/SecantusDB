@@ -676,6 +676,14 @@ one request path:
     on SIGHUP or `pg_reload_conf()` (`live.rs`). And `--hba-file`
     (`hba.rs`): with a `pg_hba.conf`, its lines decide every login and the
     options that stood in for such lines are refused beside it.
+    The login rules have a standing comparison with PostgreSQL 15:
+    `tests/test_rust_pg_login_differential.py` runs three probes
+    (`tools/probes/pg_login_*.py`, 817 scenarios) and needs
+    `SECANTUS_PG15_BIN` set to a PostgreSQL 15 `bin` directory, which CI's
+    `pg-oracle` lane installs. **Without that variable it SKIPS**, so a
+    green local suite says nothing about a login change: run it by name.
+    `SECANTUS_GAUGE_TLS=1` gives the psycopg gauge a TLS run, written to
+    `.validation/psycopg-raw-rust-tls.json`.
     `tasks/backlog.md` section 3.1 has what is open.
   - Password verification works since 2026-09-29: a role with a password must
     pass SCRAM-SHA-256; a role with none, and an unknown user, are still
