@@ -305,9 +305,13 @@ fn query_planner(
     plan: &Node,
 ) -> Document {
     let mut out = doc! { "namespace": ns };
+    // Plans made without parsing the query say nothing about it.
+    let unparsed = |n: &Node| matches!(n, Node::Eof("nonExistentNamespace") | Node::IdHack(_));
     let fast_count = match plan {
-        Node::FastCount => true,
+        Node::FastCount | Node::ExpressWrite { .. } => true,
         Node::Count(input) => matches!(**input, Node::Eof("nonExistentNamespace")),
+        Node::Update(input) => unparsed(input),
+        Node::Eof("nonExistentNamespace") => matches!(s.kind, Kind::Update { .. } | Kind::Delete { .. }),
         _ => false,
     };
     if !fast_count {
@@ -377,31 +381,78 @@ fn server_parameters() -> Document {
     }
 }
 
-/// Plan and, above `queryPlanner`, run one shape; assemble the reply.
-fn reply_for(
-    s: &Shape,
+/// A namespace that does not exist: a command is run against it for its
+/// argument checks, so nothing in the real collection can fail the run.
+const DRY: &str = "explain.dry.run";
+
+/// How many documents come out of `pipeline` over `coll`.
+fn count_through(
+    ctx: &mut CommandContext,
+    coll: &str,
+    pipeline: &[Document],
+    options: &Document,
+) -> i64 {
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let mut cmd = doc! {
+        "aggregate": coll,
+        "pipeline": stages,
+        "cursor": { "batchSize": i32::MAX },
+    };
+    if let Some(c) = options.get("collation") {
+        cmd.insert("collation", c.clone());
+    }
+    let Ok(reply) = crate::aggregate::aggregate(&cmd, ctx) else {
+        return 0;
+    };
+    let Ok(cursor) = reply.get_document("cursor") else {
+        return 0;
+    };
+    if let Some(id) = cursor.get("id").and_then(as_i64).filter(|id| *id != 0) {
+        if let Ok(cursors) = ctx.cursors() {
+            cursors.kill(&[id]);
+        }
+    }
+    cursor.get_array("firstBatch").map_or(0, |b| b.len() as i64)
+}
+
+/// One explained command, ready to plan.
+struct Request {
+    shape: Shape,
     echo: Document,
-    verbosity: Verbosity,
-    ctx: &CommandContext,
-) -> HandlerResult {
-    let storage = ctx.storage()?;
+    /// The whole pipeline when the command is one, for per-stage counts.
+    pipeline: Vec<Document>,
+}
+
+/// Plan and, above `queryPlanner`, run one request; assemble the reply.
+fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> HandlerResult {
+    let s = &r.shape;
     let db = ctx.db_name.clone();
     let ns = format!("{db}.{}", s.coll);
+    let wanted = verbosity != Verbosity::QueryPlanner;
+    // What each stage after the cursor returns: the pipeline run that far.
+    let taken = r.pipeline.len() - s.rest.len();
+    let stage_counts: Vec<i64> = if wanted {
+        (0..s.rest.len())
+            .map(|i| count_through(ctx, &s.coll, &r.pipeline[..taken + i + 1], &s.options))
+            .collect()
+    } else {
+        vec![]
+    };
+    let storage = ctx.storage()?;
     let collation = crate::util::effective_collation(storage, &db, &s.coll, &s.options)?;
     let canonical = parsed::parsed_query(&s.filter);
     let t = target(ctx, &s.coll)?;
     let plan = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
     let planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
-    let stats = (verbosity != Verbosity::QueryPlanner).then(|| {
-        let (multi, upsert, update, returns) = match &s.kind {
+    let stats = wanted.then(|| {
+        let (multi, upsert, returns) = match &s.kind {
             Kind::Update {
                 multi,
                 upsert,
-                update,
                 returns,
-            } => (*multi, *upsert, update.as_ref(), *returns),
-            Kind::Delete { multi, returns } => (*multi, false, None, *returns),
-            _ => (true, false, None, false),
+            } => (*multi, *upsert, *returns),
+            Kind::Delete { multi, returns } => (*multi, false, *returns),
+            _ => (true, false, false),
         };
         let env = exec::Env {
             docs: &t.docs,
@@ -410,7 +461,6 @@ fn reply_for(
             limit: s.limit,
             multi,
             upsert,
-            update,
             returns,
         };
         exec::run(&plan, &env)
@@ -421,7 +471,7 @@ fn reply_for(
         if let Some(st) = &stats {
             reply.insert("executionStats", execution_stats(&plan, st, verbosity));
         }
-        reply.insert("command", echo);
+        reply.insert("command", r.echo.clone());
         reply.insert("serverInfo", server_info(ctx));
         reply.insert("serverParameters", server_parameters());
     } else {
@@ -429,47 +479,120 @@ fn reply_for(
         if let Some(st) = &stats {
             cursor.insert("executionStats", execution_stats(&plan, st, verbosity));
         }
-        let mut stages = vec![Bson::Document(doc! { "$cursor": cursor })];
-        stages.extend(
-            s.rest
-                .iter()
-                .map(|st| Bson::Document(shape::listed_stage(st, &db))),
-        );
+        let counted = |stage: &mut Document, n: i64| {
+            stage.insert("nReturned", Bson::Int64(n));
+            stage.insert("executionTimeMillisEstimate", Bson::Int64(0));
+        };
+        let mut first = doc! { "$cursor": cursor };
+        if let Some(st) = &stats {
+            counted(&mut first, st.n_returned);
+        }
+        let mut stages = vec![Bson::Document(first)];
+        for (i, stage) in s.rest.iter().enumerate() {
+            let mut listed = shape::listed_stage(stage, &db);
+            if let Some(n) = stage_counts.get(i) {
+                counted(&mut listed, *n);
+            }
+            stages.push(Bson::Document(listed));
+        }
         reply.insert("stages", stages);
         reply.insert("serverInfo", server_info(ctx));
         reply.insert("serverParameters", server_parameters());
-        reply.insert("command", echo);
+        reply.insert("command", r.echo.clone());
     }
     reply.insert("ok", 1.0);
     Ok(reply)
 }
 
-/// A read on a view is the view's pipeline with the read's own stages after.
-fn through_view(mut s: Shape, extra: Vec<Document>, ctx: &CommandContext) -> Result<Shape, CommandError> {
+/// The stages a `count` or `distinct` on a view adds after its `$match`.
+fn view_tail(kind: &Kind) -> Vec<Document> {
+    match kind {
+        Kind::Count => vec![doc! { "$count": "count" }],
+        Kind::Distinct(key) => vec![
+            doc! { "$replaceRoot": { "newRoot": {
+                "_internalUnwoundArray": { "$_internalFindAllValuesAtPath": key.clone() }
+            } } },
+            doc! { "$unwind": {
+                "path": "$_internalUnwoundArray",
+                "preserveNullAndEmptyArrays": true,
+            } },
+            doc! { "$group": {
+                "_id": Bson::Null,
+                "distinct": { "$addToSet": "$_internalUnwoundArray" },
+            } },
+        ],
+        _ => vec![],
+    }
+}
+
+/// A read on a view is an aggregate on what the view reads: the view's
+/// pipeline, then the read's own stages. mongod plans, and echoes, that.
+fn through_view(
+    s: &Shape,
+    own: Vec<Document>,
+    settings: bool,
+    ctx: &CommandContext,
+) -> Result<Request, CommandError> {
     let storage = ctx.storage()?;
-    let mut tail = extra;
+    let mut base = s.coll.clone();
+    let mut pipeline = own;
+    let mut collation = doc! { "locale": "simple" };
     for _ in 0..20 {
         let options = storage
-            .get_collection_options(&ctx.db_name, &s.coll)
+            .get_collection_options(&ctx.db_name, &base)
             .unwrap_or_default();
         let Ok(on) = options.get_str("viewOn") else {
             break;
         };
-        let mut pipeline: Vec<Document> = options
+        if let Ok(c) = options.get_document("collation") {
+            collation = c.clone();
+        }
+        let mut whole: Vec<Document> = options
             .get_array("pipeline")
             .map(|p| p.iter().filter_map(Bson::as_document).cloned().collect())
             .unwrap_or_default();
-        pipeline.extend(tail);
-        tail = pipeline;
-        s.coll = on.to_string();
+        whole.extend(pipeline);
+        pipeline = whole;
+        base = on.to_string();
     }
-    s.filter = Document::new();
-    s.sort = None;
-    s.projection = None;
-    s.skip = 0;
-    s.limit = 0;
-    shape::absorb(&mut s, &tail);
-    Ok(s)
+    let mut shape = shape::find(&base, &doc! { "find": base.clone() })?;
+    shape.hint = s.hint.clone();
+    shape.options = s.options.clone();
+    shape::absorb(&mut shape, &pipeline);
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let mut echo = doc! {
+        "aggregate": base,
+        "pipeline": stages,
+        "cursor": {},
+        "collation": collation,
+    };
+    if settings {
+        echo.insert("querySettings", Document::new());
+    }
+    Ok(Request {
+        shape,
+        echo,
+        pipeline,
+    })
+}
+
+fn refuse_view(coll: &str, ctx: &CommandContext) -> Result<(), CommandError> {
+    let storage = ctx.storage()?;
+    if crate::views::is_view(storage, &ctx.db_name, coll) {
+        return Err(err(
+            166,
+            "CommandNotSupportedOnView",
+            format!("Namespace {}.{coll} is a view, not a collection", ctx.db_name),
+        ));
+    }
+    Ok(())
+}
+
+/// The command with its collection swapped for one that does not exist.
+fn dry(inner: &Document, name: &str) -> Document {
+    let mut out = inner.clone();
+    out.insert(name, DRY);
+    out
 }
 
 /// `explain`.
@@ -506,6 +629,8 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if doc.contains_key("writeConcern") {
         return Err(err(72, "InvalidOptions", "Command does not support writeConcern"));
     }
+    // An aggregate's own `explain: true` arrives here marked.
+    let inline = doc.contains_key("$inline");
     let name = inner.keys().next().cloned().unwrap_or_default();
     let db = ctx.db_name.clone();
     if let Ok(other) = inner.get_str("$db") {
@@ -517,27 +642,49 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ));
         }
     }
+    if name == "find" {
+        if inner.contains_key("$db") {
+            return Err(err(
+                40413,
+                "IDLDuplicateField",
+                "BSON field 'FindCommandRequest.$db' is a duplicate field",
+            ));
+        }
+        if let Some(id) = inner.get_document("lsid").ok().and_then(|l| l.get("id")) {
+            if !matches!(id, Bson::Binary(_)) {
+                return Err(err(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "BSON field 'FindCommandRequest.lsid.id' is the wrong type '{}', \
+                         expected type 'binData'",
+                        bson_type_name(id)
+                    ),
+                ));
+            }
+        }
+    }
     let echo = shape::echo(&inner, &db);
 
     let lowered = name.to_ascii_lowercase();
     let shape = match name.as_str() {
         "find" => {
             let coll = collection(&inner, "find", &db)?;
-            validate(crate::find::find, &inner, ctx)?;
+            validate(crate::find::find, &dry(&inner, "find"), ctx)?;
             shape::find(&coll, &inner)?
         }
         "count" => {
             let coll = collection(&inner, "count", &db)?;
-            validate(crate::crud::count, &inner, ctx)?;
+            validate(crate::crud::count, &dry(&inner, "count"), ctx)?;
             shape::count(&coll, &inner)?
         }
         "distinct" => {
             let coll = collection(&inner, "distinct", &db)?;
             let s = shape::distinct(&coll, &inner)?;
-            validate(crate::distinct::distinct, &inner, ctx)?;
+            validate(crate::distinct::distinct, &dry(&inner, "distinct"), ctx)?;
             s
         }
-        "aggregate" => return aggregate(&inner, echo, verbosity, ctx),
+        "aggregate" => return aggregate(&inner, echo, inline, verbosity, ctx),
         "update" | "delete" => {
             let coll = collection(&inner, &name, &db)?;
             let s = if name == "update" {
@@ -567,34 +714,29 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     let storage = ctx.storage()?;
-    let shape = if crate::views::is_view(storage, &db, &shape.coll) {
-        let extra = shape::find_as_pipeline(&shape);
-        through_view(shape, extra, ctx)?
+    let request = if crate::views::is_view(storage, &db, &shape.coll) {
+        let mut own = shape::find_as_pipeline(&shape);
+        own.extend(view_tail(&shape.kind));
+        let settings = !matches!(shape.kind, Kind::Count);
+        through_view(&shape, own, settings, ctx)?
     } else {
-        shape
+        Request {
+            shape,
+            echo,
+            pipeline: vec![],
+        }
     };
-    reply_for(&shape, echo, verbosity, ctx)
-}
-
-fn refuse_view(coll: &str, ctx: &CommandContext) -> Result<(), CommandError> {
-    let storage = ctx.storage()?;
-    if crate::views::is_view(storage, &ctx.db_name, coll) {
-        return Err(err(
-            166,
-            "CommandNotSupportedOnView",
-            format!("Namespace {}.{coll} is a view, not a collection", ctx.db_name),
-        ));
-    }
-    Ok(())
+    reply_for(&request, verbosity, ctx)
 }
 
 fn aggregate(
     inner: &Document,
-    echo: Document,
+    mut echo: Document,
+    inline: bool,
     verbosity: Verbosity,
     ctx: &mut CommandContext,
 ) -> HandlerResult {
-    if inner.contains_key("explain") {
+    if inner.contains_key("explain") && !inline {
         return Err(err(
             9,
             "FailedToParse",
@@ -616,22 +758,40 @@ fn aggregate(
             return Err(err(14, "TypeMismatch", "A pipeline must be an array of objects"))
         }
     };
-    // The command's own checks, without the stage that would write.
-    let mut dry = inner.clone();
+    // The command's own checks: over no documents, and without the stage
+    // that would write.
+    let mut checked = inner.clone();
+    checked.remove("explain");
     let reads: Vec<Bson> = pipeline
         .iter()
         .filter(|s| !s.contains_key("$out") && !s.contains_key("$merge"))
         .cloned()
         .map(Bson::Document)
         .collect();
-    dry.insert("pipeline", reads);
-    if !dry.contains_key("cursor") {
-        dry.insert("cursor", Document::new());
+    checked.insert("pipeline", reads);
+    if !checked.contains_key("cursor") {
+        checked.insert("cursor", Document::new());
     }
-    validate(crate::aggregate::aggregate, &dry, ctx)?;
-    let Some(Bson::String(coll)) = inner.get("aggregate") else {
-        // A collectionless aggregate: the stages, as given.
-        let stages: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+    let target_coll = match inner.get("aggregate") {
+        Some(Bson::String(coll)) => Some(coll.clone()),
+        _ => None,
+    };
+    if target_coll.is_some() {
+        checked.insert("aggregate", DRY);
+    }
+    validate(crate::aggregate::aggregate, &checked, ctx)?;
+    let db = ctx.db_name.clone();
+    if inline {
+        echo = inner.clone();
+        echo.insert("$db", db.clone());
+    }
+    let own_source = pipeline.first().is_some_and(shape::own_source);
+    let Some(coll) = target_coll.filter(|_| !own_source) else {
+        // No collection is read through a query: the stages, as mongod lists them.
+        let stages: Vec<Bson> = pipeline
+            .iter()
+            .map(|s| Bson::Document(shape::listed_stage(s, &db)))
+            .collect();
         let mut reply = doc! { "explainVersion": "1", "stages": stages };
         reply.insert("serverInfo", server_info(ctx));
         reply.insert("serverParameters", server_parameters());
@@ -639,21 +799,21 @@ fn aggregate(
         reply.insert("ok", 1.0);
         return Ok(reply);
     };
-    let s = shape::find(coll, &doc! { "find": coll.clone() })?;
-    let mut s = Shape {
-        hint: inner.get("hint").cloned(),
-        options: match inner.get("collation") {
-            Some(c) => doc! { "collation": c.clone() },
-            None => Document::new(),
-        },
-        ..s
-    };
+    let mut s = shape::find(&coll, &doc! { "find": coll.clone() })?;
+    s.hint = inner.get("hint").cloned();
+    if let Some(c) = inner.get("collation") {
+        s.options.insert("collation", c.clone());
+    }
     let storage = ctx.storage()?;
-    let s = if crate::views::is_view(storage, &ctx.db_name, coll) {
-        through_view(s, pipeline, ctx)?
+    let request = if crate::views::is_view(storage, &db, &coll) {
+        through_view(&s, pipeline, false, ctx)?
     } else {
         shape::absorb(&mut s, &pipeline);
-        s
+        Request {
+            shape: s,
+            echo,
+            pipeline,
+        }
     };
-    reply_for(&s, echo, verbosity, ctx)
+    reply_for(&request, verbosity, ctx)
 }

@@ -46,7 +46,8 @@ impl IndexInfo {
     }
 
     /// The flags every index-scanning stage carries, in mongod's order.
-    fn describe(&self, out: &mut Document) {
+    /// `distinct`: a DISTINCT_SCAN states its fetching before the version.
+    fn describe(&self, out: &mut Document, distinct: bool) {
         out.insert("keyPattern", self.key.clone());
         out.insert("indexName", self.name.clone());
         if let Some(c) = &self.collation {
@@ -67,6 +68,10 @@ impl IndexInfo {
         out.insert("isUnique", self.unique);
         out.insert("isSparse", self.sparse);
         out.insert("isPartial", self.partial.is_some());
+        if distinct {
+            out.insert("isShardFiltering", false);
+            out.insert("isFetching", false);
+        }
         out.insert("indexVersion", self.version);
     }
 }
@@ -274,7 +279,7 @@ impl Node {
                     out.insert("filter", f.clone());
                 }
                 counted(&mut out);
-                ix.index.describe(&mut out);
+                ix.index.describe(&mut out, false);
                 out.insert("direction", ix.direction());
                 out.insert("indexBounds", ix.bounds_doc());
                 if let Some(s) = stats {
@@ -399,7 +404,7 @@ impl Node {
                 if let Some(s) = stats {
                     out.insert("keysExamined", num(s.keys));
                 }
-                ix.index.describe(&mut out);
+                ix.index.describe(&mut out, false);
                 let (start, start_incl, end, end_incl) =
                     ix.single_range().unwrap_or_default();
                 out.insert(
@@ -420,9 +425,7 @@ impl Node {
             Node::DistinctScan(ix, _) => {
                 out.insert("stage", "DISTINCT_SCAN");
                 counted(&mut out);
-                ix.index.describe(&mut out);
-                out.insert("isShardFiltering", false);
-                out.insert("isFetching", false);
+                ix.index.describe(&mut out, true);
                 out.insert("direction", ix.direction());
                 out.insert("indexBounds", ix.bounds_doc());
                 if let Some(s) = stats {

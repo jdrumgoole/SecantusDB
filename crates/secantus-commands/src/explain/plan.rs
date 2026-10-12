@@ -235,6 +235,10 @@ fn serves_sort(index: &IndexInfo, bounds: &[Vec<Interval>], sort: &Document) -> 
     let mut backward: Option<bool> = None;
     for (name, dir) in sort {
         let dir = crate::util::as_i64(dir)?;
+        // Sorting on a field every result shares is no sort at all.
+        if index.position(name).is_some_and(pinned) {
+            continue;
+        }
         while pos < fields.len() && fields[pos].0 != name && pinned(pos) {
             pos += 1;
         }
@@ -245,9 +249,6 @@ fn serves_sort(index: &IndexInfo, bounds: &[Vec<Interval>], sort: &Document) -> 
             }
             backward = Some(this);
             pos += 1;
-        } else if index.position(name).is_some_and(pinned) {
-            // Sorting on a field every result shares is no sort at all.
-            continue;
         } else {
             return None;
         }
@@ -426,7 +427,8 @@ fn or_access(branches: &[Bson], q: &Query, catalog: &[Rc<IndexInfo>]) -> Option<
 }
 
 fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
-    let whole = || (!q.canonical.is_empty()).then(|| q.canonical.clone());
+    let always = q.canonical.len() == 1 && q.canonical.contains_key("$alwaysTrue");
+    let whole = || (!q.canonical.is_empty() && !always).then(|| q.canonical.clone());
     let collscan = |subplan: bool, backward: bool| Access {
         scan: Node::CollScan {
             filter: whole(),

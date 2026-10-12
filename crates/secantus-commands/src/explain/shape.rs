@@ -15,7 +15,6 @@ pub(crate) enum Kind {
     Update {
         multi: bool,
         upsert: bool,
-        update: Option<Document>,
         returns: bool,
     },
     Delete {
@@ -185,16 +184,13 @@ fn statement<'a>(inner: &'a Document, cmd: &str, field: &str) -> Result<&'a Docu
 }
 
 /// An update document the server would refuse, as mongod words it.
-fn check_update(u: &Bson) -> Result<Option<Document>, CommandError> {
-    match u {
-        Bson::Document(d) => {
-            if let Some((code, msg)) = secantus_core::update::update_spec_error(d) {
-                return Err(err(code, &crate::util::error_code_name(code), msg));
-            }
-            Ok(Some(d.clone()))
+fn check_update(u: &Bson) -> Result<(), CommandError> {
+    if let Bson::Document(d) = u {
+        if let Some((code, msg)) = secantus_core::update::update_spec_error(d) {
+            return Err(err(code, &crate::util::error_code_name(code), msg));
         }
-        _ => Ok(None),
     }
+    Ok(())
 }
 
 pub(crate) fn update(coll: &str, inner: &Document) -> Result<Shape, CommandError> {
@@ -205,9 +201,9 @@ pub(crate) fn update(coll: &str, inner: &Document) -> Result<Shape, CommandError
     let kind = Kind::Update {
         multi: flag(st, "multi"),
         upsert: flag(st, "upsert"),
-        update: check_update(u)?,
         returns: false,
     };
+    check_update(u)?;
     let mut s = Shape::new(coll, kind, st);
     s.filter = doc_arg(st, "q", "update.updates.q")?;
     Ok(s)
@@ -261,12 +257,14 @@ pub(crate) fn find_and_modify(coll: &str, inner: &Document) -> Result<Shape, Com
             multi: false,
             returns: true,
         },
-        (false, Some(u)) => Kind::Update {
-            multi: false,
-            upsert: flag(inner, "upsert"),
-            update: check_update(u)?,
-            returns: true,
-        },
+        (false, Some(u)) => {
+            check_update(u)?;
+            Kind::Update {
+                multi: false,
+                upsert: flag(inner, "upsert"),
+                returns: true,
+            }
+        }
     };
     let mut s = Shape::new(coll, kind, inner);
     s.filter = filter;
@@ -368,17 +366,85 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
     shape.pipeline = true;
 }
 
+/// An expression as mongod prints it back: every literal wrapped in `$const`.
+fn constified(v: &Bson) -> Bson {
+    match v {
+        Bson::String(s) if s.starts_with('$') => v.clone(),
+        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
+            Bson::Document(
+                d.iter()
+                    .map(|(op, arg)| {
+                        let arg = match arg {
+                            Bson::Array(items) => Bson::Array(items.iter().map(constified).collect()),
+                            other => constified(other),
+                        };
+                        (op.clone(), arg)
+                    })
+                    .collect(),
+            )
+        }
+        Bson::Document(d) => {
+            Bson::Document(d.iter().map(|(k, x)| (k.clone(), constified(x))).collect())
+        }
+        other => Bson::Document(doc! { "$const": other.clone() }),
+    }
+}
+
 /// A stage the planner left in the pipeline, as `explain` lists it.
 pub(crate) fn listed_stage(stage: &Document, db: &str) -> Document {
     let Some((name, arg)) = stage.iter().next() else {
         return stage.clone();
     };
+    let wide = |v: &Bson| as_i64(v).map_or_else(|| v.clone(), Bson::Int64);
     match (name.as_str(), arg) {
         ("$unwind", Bson::String(path)) => doc! { "$unwind": { "path": path.clone() } },
         ("$sort", Bson::Document(spec)) => doc! { "$sort": { "sortKey": spec.clone() } },
         ("$out", Bson::String(coll)) => doc! { "$out": { "coll": coll.clone(), "db": db } },
+        ("$limit" | "$skip", n) => doc! { name.clone(): wide(n) },
+        ("$sample", Bson::Document(spec)) => {
+            let mut out = spec.clone();
+            if let Some(size) = spec.get("size") {
+                out.insert("size", wide(size));
+            }
+            doc! { "$sample": out }
+        }
+        ("$addFields" | "$set", Bson::Document(fields)) => {
+            let listed: Document = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), constified(v)))
+                .collect();
+            doc! { "$addFields": listed }
+        }
+        ("$merge", into) => {
+            let spec = match into {
+                Bson::Document(d) => d.clone(),
+                other => doc! { "into": other.clone() },
+            };
+            let target = match spec.get("into") {
+                Some(Bson::String(coll)) => doc! { "db": db, "coll": coll.clone() },
+                Some(Bson::Document(d)) => d.clone(),
+                _ => Document::new(),
+            };
+            let pick = |field: &str, default: Bson| spec.get(field).cloned().unwrap_or(default);
+            doc! { "$merge": {
+                "into": target,
+                "on": pick("on", Bson::String("_id".into())),
+                "whenMatched": pick("whenMatched", Bson::String("merge".into())),
+                "whenNotMatched": pick("whenNotMatched", Bson::String("insert".into())),
+                "allowMergeOnNullishValues": true,
+            } }
+        }
         _ => stage.clone(),
     }
+}
+
+/// Whether a stage reads something other than the collection's documents,
+/// so that no query is planned in front of it.
+pub(crate) fn own_source(stage: &Document) -> bool {
+    matches!(
+        stage.keys().next().map(String::as_str),
+        Some("$collStats" | "$indexStats" | "$documents" | "$currentOp" | "$listSessions")
+    )
 }
 
 /// The pipeline a `find` on a view runs after the view's own.
@@ -391,10 +457,10 @@ pub(crate) fn find_as_pipeline(s: &Shape) -> Vec<Document> {
         out.push(doc! { "$sort": sort.clone() });
     }
     if s.skip > 0 {
-        out.push(doc! { "$skip": s.skip });
+        out.push(doc! { "$skip": Bson::Int64(s.skip) });
     }
     if s.limit > 0 {
-        out.push(doc! { "$limit": s.limit });
+        out.push(doc! { "$limit": Bson::Int64(s.limit) });
     }
     if let Some(p) = s.projection.as_ref().filter(|x| !x.is_empty()) {
         out.push(doc! { "$project": p.clone() });
@@ -413,8 +479,8 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
     let ordered: &[&str] = match name.to_ascii_lowercase().as_str() {
         "count" => &["query", "limit", "skip", "hint", "collation"],
         "findandmodify" => &[
-            "query", "fields", "sort", "remove", "update", "new", "upsert",
-            "bypassDocumentValidation", "collation", "arrayFilters", "hint", "let",
+            "query", "fields", "sort", "hint", "collation", "arrayFilters", "remove", "update",
+            "upsert", "new", "bypassDocumentValidation", "let",
         ],
         _ => {
             let mut plain = inner.clone();
@@ -428,11 +494,11 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
     }
     for field in ordered {
         let value = match (inner.get(*field), *field) {
-            (None | Some(Bson::Null), "query") if count => Bson::Document(Document::new()),
+            (None | Some(Bson::Null), "query") => Bson::Document(Document::new()),
             (None | Some(Bson::Null), _) => continue,
             (Some(v), "limit") => Bson::Int64(as_i64(v).unwrap_or(0).abs()),
             (Some(v), "skip") => wide(v),
-            (Some(Bson::String(s)), "hint") if count => Bson::Document(doc! { "$hint": s.clone() }),
+            (Some(Bson::String(s)), "hint") => Bson::Document(doc! { "$hint": s.clone() }),
             (Some(v), "remove" | "new" | "upsert" | "bypassDocumentValidation") => {
                 Bson::Boolean(crate::util::truthy(v))
             }

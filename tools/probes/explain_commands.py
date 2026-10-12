@@ -1153,7 +1153,7 @@ scenario(
         ]
     ],
     {"count": "c"},
-    {"listIndexes": "c"},
+    {"listIndexes": "c", "cursor": {"batchSize": 0}},
 )
 scenario(
     "arguments: fields beside the command",

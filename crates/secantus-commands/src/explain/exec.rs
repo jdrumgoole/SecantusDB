@@ -24,21 +24,11 @@ pub(crate) struct Env<'a> {
     /// The write being explained, for `UPDATE` and `DELETE`.
     pub multi: bool,
     pub upsert: bool,
-    pub update: Option<&'a Document>,
     /// `findAndModify`: the write hands its document back.
     pub returns: bool,
 }
 
 impl Env<'_> {
-    /// Whether the update being explained would change this document.
-    fn would_modify(&self, row: usize) -> bool {
-        self.update.is_none_or(|u| {
-            secantus_core::update::apply_update(&self.docs[row], u, false)
-                .map(|after| after != self.docs[row])
-                .unwrap_or(true)
-        })
-    }
-
     fn matches(&self, row: usize, filter: &Option<Document>) -> bool {
         match filter {
             None => true,
@@ -199,6 +189,7 @@ struct Scan {
     multikey: bool,
     filter: Option<Document>,
     pos: usize,
+    started: bool,
     done: bool,
     seen: BTreeSet<usize>,
     keys: i64,
@@ -240,6 +231,7 @@ impl Scan {
             multikey: ix.index.is_multikey(),
             filter: ix.filter.clone(),
             pos: 0,
+            started: false,
             done: false,
             seen: BTreeSet::new(),
             keys: 0,
@@ -262,8 +254,35 @@ impl Scan {
         None
     }
 
+    /// The first seek goes straight to the low end of the first intervals:
+    /// the keys before it are never examined.
+    fn seek_start(&mut self) {
+        let start: Vec<&[u8]> = self
+            .ranges
+            .iter()
+            .map(|list| list.first().map_or(&[][..], |r| r.0.as_slice()))
+            .collect();
+        while self.pos < self.entries.len() {
+            let key = &self.entries[self.pos].0;
+            let before = key
+                .iter()
+                .map(Vec::as_slice)
+                .zip(start.iter().copied())
+                .find_map(|(k, s)| (k != s).then_some(k < s))
+                .unwrap_or(false);
+            if !before {
+                break;
+            }
+            self.pos += 1;
+        }
+    }
+
     /// The next entry inside the bounds, in scan order.
     fn next_entry(&mut self) -> Option<usize> {
+        if !self.started {
+            self.started = true;
+            self.seek_start();
+        }
         while !self.done && self.pos < self.entries.len() {
             let key = self.entries[self.pos].0.clone();
             let Some((field, ahead)) = self.outside(&key) else {
@@ -551,7 +570,9 @@ impl<'a> Run<'a> {
                 while let Some(row) = self.inputs[0].pull(env) {
                     matched += 1;
                     first.get_or_insert(row);
-                    modified += i64::from(env.would_modify(row));
+                    // mongod's explain does not apply the update: every
+                    // matched document counts as one it would modify.
+                    modified += 1;
                     if !env.multi {
                         break;
                     }
@@ -592,7 +613,7 @@ impl<'a> Run<'a> {
                 let found = i64::from(row.is_some());
                 self.keys = found;
                 self.docs = found;
-                let modify = row.is_some_and(|r| !*delete && env.would_modify(r));
+                let modify = row.is_some() && !*delete;
                 self.extra.insert("nWouldModify", num(i64::from(modify)));
                 self.extra.insert("nWouldUpsert", 0_i32);
                 self.extra
