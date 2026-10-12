@@ -5348,6 +5348,7 @@ impl Storage {
         storage.recover_pending_drops()?;
         storage.revive_prepared_xacts()?;
         storage.note_existing_timeseries()?;
+        storage.backfill_document_id_claims()?;
         Ok(storage)
     }
 
@@ -12172,9 +12173,8 @@ impl Storage {
     /// That is the claim a collated collection already takes for every `_id`
     /// (`id_claim`), and such a collection needs no second one.
     ///
-    /// A document stored before this claim existed holds none, so a second
-    /// document equal to it by value is still accepted; nothing stored is read
-    /// differently.
+    /// A document stored before this claim existed is given one the first
+    /// time this version opens the store (`backfill_document_id_claims`).
     ///
     /// A time-series collection keeps measurements that repeat an `_id`, and
     /// claims none.
@@ -12206,6 +12206,180 @@ impl Storage {
             id_claim: true,
             clustered: false,
         }))
+    }
+
+    /// Give every stored document-valued `_id` the claim a new one takes
+    /// (`document_id_claim`), once for a store.
+    ///
+    /// A document written before that claim existed holds none, so a second
+    /// document equal to it by value was still accepted. This walks the
+    /// `_id` index of every collection for the keys of document type and
+    /// claims each. Nothing stored is rewritten: the claims are new rows in
+    /// `UNIQ_TABLE`. A row there under an empty namespace, which no
+    /// collection can have, records that the walk is done; it sits in the
+    /// table the claims are in, so the two are kept or lost together.
+    ///
+    /// Two stored documents already equal by value cannot both hold the
+    /// claim. The older keeps it, both stay readable, and the count is
+    /// logged; inserting a third is refused.
+    ///
+    /// A document the Python server writes after this takes no claim.
+    fn backfill_document_id_claims(&self) -> Result<()> {
+        const DONE: &str = "$document_id_claims";
+        const CHUNK: usize = 500;
+        let session = self.conn.open_session()?;
+        {
+            let marker = session.open_cursor(UNIQ_TABLE, None)?;
+            marker.set_key_sssu("", "", DONE, b"");
+            match marker.search() {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // The collections that claim a document `_id`: not a time-series
+        // collection, which keeps measurements that repeat one, and not one
+        // with a default collation, whose every `_id` is claimed already.
+        let mut collections: Vec<(String, String)> = Vec::new();
+        {
+            let cur = session.open_cursor(COLL_TABLE, None)?;
+            let mut more = cur.next()?;
+            while more {
+                let (db, coll) = cur.get_key_ss()?;
+                let blob = cur.get_value_u()?;
+                let skip = !blob.is_empty()
+                    && (options_name_timeseries(&blob)?
+                        || default_collation(&session, &db, &coll)?.is_some());
+                if !skip {
+                    collections.push((db, coll));
+                }
+                more = cur.next()?;
+            }
+        }
+        let key_spec = bson::doc! {"_id": 1};
+        let (mut claimed, mut duplicates) = (0u64, 0u64);
+        for (db, coll) in &collections {
+            // The RecordIds under this collection's document-typed `_id` keys.
+            let mut rows: Vec<i64> = Vec::new();
+            {
+                let cur = match session.open_cursor(NAT_SEQ_TABLE, None) {
+                    Ok(c) => c,
+                    Err(e) if e.is_missing_table() => break,
+                    Err(e) => return Err(e.into()),
+                };
+                cur.set_key_ssu(db, coll, &[sortkey::RANK_DOCUMENT]);
+                let mut more = match cur.search_near() {
+                    Ok(cmp) => {
+                        if cmp < 0 {
+                            cur.next()?
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) if e.is_not_found() => false,
+                    Err(e) => return Err(e.into()),
+                };
+                while more {
+                    let (d, c, key) = cur.get_key_ssu()?;
+                    if &d != db || &c != coll || key.first() != Some(&sortkey::RANK_DOCUMENT) {
+                        break;
+                    }
+                    rows.push(cur.get_value_q()?);
+                    more = cur.next()?;
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let docs = match session.open_cursor(&doc_table_for(db, coll), None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for chunk in rows.chunks(CHUNK) {
+                session.begin_transaction(None)?;
+                let outcome = (|| -> Result<(u64, u64)> {
+                    let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
+                    let owners = session.open_cursor(UNIQ_TABLE, None)?;
+                    let (mut taken, mut held) = (0u64, 0u64);
+                    for &recordid in chunk {
+                        docs.reset()?;
+                        docs.set_key_ssq(db, coll, recordid);
+                        match docs.search() {
+                            Ok(()) => {}
+                            Err(e) if e.is_not_found() => continue,
+                            Err(e) => return Err(e.into()),
+                        }
+                        let value = docs.get_value_u()?;
+                        let (_, blob) = unframe_doc_value(&value)?;
+                        let doc = decode_doc(blob)?;
+                        if !matches!(doc.get("_id"), Some(Bson::Document(_))) {
+                            continue;
+                        }
+                        for kb in index_key_variants_c(&doc, &key_spec, false, None)? {
+                            let esc = escape_kb(&kb);
+                            claims.reset()?;
+                            claims.set_key_sssu(db, coll, ID_INDEX_NAME, &esc);
+                            claims.set_value_q(recordid);
+                            match claims.insert() {
+                                Ok(()) => taken += 1,
+                                Err(e) if e.is_duplicate_key() => {
+                                    owners.reset()?;
+                                    owners.set_key_sssu(db, coll, ID_INDEX_NAME, &esc);
+                                    let owner = match owners.search() {
+                                        Ok(()) => Some(owners.get_value_q()?),
+                                        Err(e) if e.is_not_found() => None,
+                                        Err(e) => return Err(e.into()),
+                                    };
+                                    match owner {
+                                        Some(id) if id == recordid => {}
+                                        Some(id)
+                                            if self
+                                                .claim_owner_exists(&session, db, coll, id)? =>
+                                        {
+                                            held += 1;
+                                        }
+                                        // Nobody's: the row it named is gone.
+                                        _ => {
+                                            owners.reset()?;
+                                            owners.set_key_sssu(db, coll, ID_INDEX_NAME, &esc);
+                                            owners.set_value_q(recordid);
+                                            owners.insert()?;
+                                            taken += 1;
+                                        }
+                                    }
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+                    }
+                    Ok((taken, held))
+                })();
+                match outcome {
+                    Ok((taken, held)) => {
+                        session.commit_transaction(None)?;
+                        claimed += taken;
+                        duplicates += held;
+                    }
+                    Err(e) => {
+                        let _ = session.rollback_transaction(None);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let marker = session.open_cursor(UNIQ_TABLE, None)?;
+        marker.set_key_sssu("", "", DONE, b"");
+        marker.set_value_q(0);
+        marker.insert()?;
+        if claimed > 0 || duplicates > 0 {
+            eprintln!(
+                "secantus-storage: claimed {claimed} document _id values stored by an earlier \
+                 version; {duplicates} more are duplicates by value of one of those, and stay \
+                 as they are"
+            );
+        }
+        Ok(())
     }
 
     /// The `id_claim` descriptor of a collection with a default collation.
@@ -17418,6 +17592,117 @@ mod tests {
         // Env-driven default: durable unless fast-storage is set.
         assert!(resolve_durable(None, false, false));
         assert!(!resolve_durable(None, false, true));
+    }
+
+    /// A store an earlier version wrote holds no claim on a document `_id`.
+    /// The first open by this version claims each, so a document equal to a
+    /// stored one by value is refused afterwards, and the walk runs once.
+    #[test]
+    fn a_stored_document_id_is_claimed_at_open() {
+        fn strip_claims(s: &Storage) {
+            let session = s.conn.open_session().unwrap();
+            let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
+            let mut keys = Vec::new();
+            let mut more = cur.next().unwrap();
+            while more {
+                keys.push(cur.get_key_sssu().unwrap());
+                more = cur.next().unwrap();
+            }
+            for (d, c, n, k) in keys {
+                cur.reset().unwrap();
+                cur.set_key_sssu(&d, &c, &n, &k);
+                cur.remove().unwrap();
+            }
+        }
+        fn claims(s: &Storage) -> Vec<(String, String, String)> {
+            let session = s.conn.open_session().unwrap();
+            let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
+            let mut out = Vec::new();
+            let mut more = cur.next().unwrap();
+            while more {
+                let (d, c, n, _) = cur.get_key_sssu().unwrap();
+                out.push((d, c, n));
+                more = cur.next().unwrap();
+            }
+            out
+        }
+        let insert = |s: &Storage, coll: &str, d: Document| {
+            let (n, errors) = s
+                .insert("app", coll, vec![encode_doc(&d).unwrap()], true)
+                .unwrap();
+            (n, errors.len())
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("db");
+        std::fs::create_dir_all(&home).unwrap();
+        let open = || {
+            Storage::open_with_config_durable(home.to_str().unwrap(), DEFAULT_CONFIG, Some(true))
+                .unwrap()
+        };
+        {
+            // As an earlier version left it: the documents, and no claim.
+            // `d` holds two documents that version let in as different.
+            let s = open();
+            assert_eq!(
+                insert(&s, "c", doc! {"_id": {"a": 1i32}, "v": 1i32}),
+                (1, 0)
+            );
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i32}}), (1, 0));
+            assert_eq!(insert(&s, "c", doc! {"_id": 7i32}), (1, 0));
+            assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i32}}), (1, 0));
+            strip_claims(&s);
+            assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1.0}}), (1, 0));
+            strip_claims(&s);
+            assert!(claims(&s).is_empty());
+        }
+        {
+            let s = open();
+            let held = claims(&s);
+            let of = |coll: &str| held.iter().filter(|(_, c, _)| c == coll).count();
+            // Two document `_id`s in `c`; one claim for the two documents of
+            // `d`; the row that says the walk is done.
+            assert_eq!((of("c"), of("d"), of("")), (2, 1, 1), "{held:?}");
+            // A stored `_id` written another way is a duplicate now.
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (0, 1));
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i64}}), (0, 1));
+            assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i64}}), (0, 1));
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 3i32}}), (1, 0));
+            // Nothing stored was touched: both of `d`'s documents are there.
+            assert_eq!(s.find_matching("app", "d", &doc! {}).unwrap().len(), 2);
+            assert_eq!(s.find_matching("app", "c", &doc! {}).unwrap().len(), 4);
+            // Deleting the claimed document frees the value.
+            assert_eq!(
+                s.delete_matching("app", "c", &doc! {"v": 1i32}, 0, &doc! {}, None)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (1, 0));
+        }
+        {
+            // The walk does not run again: a claim taken away stays away.
+            let s = open();
+            assert_eq!(
+                claims(&s).iter().filter(|(_, c, _)| c.is_empty()).count(),
+                1
+            );
+            let session = s.conn.open_session().unwrap();
+            let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
+            let mut more = cur.next().unwrap();
+            let mut gone = 0;
+            while more {
+                let (d, c, n, k) = cur.get_key_sssu().unwrap();
+                if c == "d" {
+                    let del = session.open_cursor(UNIQ_TABLE, None).unwrap();
+                    del.set_key_sssu(&d, &c, &n, &k);
+                    del.remove().unwrap();
+                    gone += 1;
+                }
+                more = cur.next().unwrap();
+            }
+            assert_eq!(gone, 1);
+        }
+        let s = open();
+        assert_eq!(claims(&s).iter().filter(|(_, c, _)| c == "d").count(), 0);
     }
 
     /// A durable close (`Drop` with `durable=true`) checkpoints and the data

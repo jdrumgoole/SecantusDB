@@ -10,8 +10,10 @@ comparing each reply and the documents left behind; 162 replies differed
 and 32 still do (`tasks/backlog.md` 7.078).
 
 No stored key changes. A document `_id` takes a second claim, by value,
-beside its row in the `_id` index. A document stored by an earlier version
-holds no claim, so a duplicate of it by value is still accepted.
+beside its row in the `_id` index. The first time this version opens a
+store it gives every stored document `_id` its claim, so a duplicate by
+value of an older document is refused too. Two documents an earlier
+version already stored as different both stay.
 
 #### Fixed
 
