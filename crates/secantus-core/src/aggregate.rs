@@ -1105,23 +1105,88 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
     // Every field is evaluated against the ORIGINAL doc (matching Python — a
     // computed field doesn't see another set in the same stage), so evaluate all
     // expressions first, then mutate `doc` in place rather than cloning it.
-    let mut computed = Vec::with_capacity(spec.len());
-    for (path, expr) in spec {
-        // `evaluate_or_missing`: a direct field path that doesn't exist is
-        // MISSING, not null, and mongod omits the key rather than adding it.
-        computed.push((path, evaluate_or_missing(expr, &doc, vars)?));
-    }
+    let mut computed: Vec<(String, Bson)> = Vec::with_capacity(spec.len());
+    add_fields_collect(spec, "", &doc, vars, &mut computed)?;
     for (path, v) in computed {
         // A computed value of `Bson::Undefined` is the "missing" marker (e.g. a
         // `$getField` on an absent field): mongod omits the field. Unset any
         // existing value at the path rather than writing the marker.
         if matches!(v, Bson::Undefined) {
-            paths::unset_path(&mut doc, path);
+            paths::unset_path(&mut doc, &path);
             continue;
         }
-        paths::set_path(&mut doc, path, v).map_err(|_| Fallback::Defer)?;
+        let parts: Vec<&str> = path.split('.').collect();
+        add_field_at(&mut doc, &parts, &v);
     }
     Ok(doc)
+}
+
+/// The `path: value` pairs a `$addFields` specification stands for.
+///
+/// A document that is not an expression is more specification, not a value:
+/// `{b: {d: 3}}` sets `b.d` and leaves the rest of `b` alone (measured
+/// 8.2.11, 2026-10-12, where it had replaced `b`).
+fn add_fields_collect(
+    spec: &Document,
+    prefix: &str,
+    doc: &Document,
+    vars: &Document,
+    out: &mut Vec<(String, Bson)>,
+) -> R<()> {
+    for (name, expr) in spec {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        match expr {
+            Bson::Document(inner)
+                if !inner.is_empty() && !inner.keys().any(|k| k.starts_with('$')) =>
+            {
+                add_fields_collect(inner, &path, doc, vars, out)?;
+            }
+            // `evaluate_or_missing`: a direct field path that doesn't exist is
+            // MISSING, not null, and mongod omits the key rather than adding it.
+            _ => out.push((path, evaluate_or_missing(expr, doc, vars)?)),
+        }
+    }
+    Ok(())
+}
+
+/// Set a dotted path the way the aggregation stages do, which is not the way
+/// an update's `$set` does. A component is always a field name, never an
+/// array index; an array on the way is entered and every element is given the
+/// field; and anything else on the way is replaced by a document that can hold
+/// it. So over `{a: 5, arr: [1, 2]}`, `a.b` makes `a: {b: ..}` and `arr.0`
+/// makes `arr: [{0: ..}, {0: ..}]` (measured 8.2.11, 2026-10-12).
+fn add_field_at(doc: &mut Document, parts: &[&str], value: &Bson) {
+    let Some((head, rest)) = parts.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        doc.insert(*head, value.clone());
+        return;
+    }
+    let child = doc
+        .entry((*head).to_string())
+        .or_insert_with(|| Bson::Document(Document::new()));
+    add_field_into(child, rest, value);
+}
+
+fn add_field_into(holder: &mut Bson, rest: &[&str], value: &Bson) {
+    match holder {
+        Bson::Document(d) => add_field_at(d, rest, value),
+        Bson::Array(items) => {
+            for item in items {
+                add_field_into(item, rest, value);
+            }
+        }
+        other => {
+            let mut d = Document::new();
+            add_field_at(&mut d, rest, value);
+            *other = Bson::Document(d);
+        }
+    }
 }
 
 fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document, subject: &str) -> R<Document> {

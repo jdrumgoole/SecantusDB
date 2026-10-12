@@ -189,7 +189,7 @@ fn lookup_creds(
         .storage()
         .ok()
         .and_then(|s| s.get_user(db, username).ok().flatten())
-        .and_then(|bytes| Document::from_reader(&mut bytes.as_slice()).ok());
+        .and_then(|bytes| secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok());
     let Some(record) = record else {
         return Ok(None);
     };
@@ -262,7 +262,7 @@ fn scram_credentials(
 /// if the user / roles can't be read.
 fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bson>> {
     let record_bytes = ctx.storage().ok()?.get_user(db, username).ok()??;
-    let record = Document::from_reader(&mut record_bytes.as_slice()).ok()?;
+    let record = secantus_core::bsondoc::from_bytes(record_bytes.as_slice()).ok()?;
     record.get_array("roles").ok().cloned()
 }
 
@@ -428,7 +428,7 @@ fn verify_x509(
 /// Decode a stored user record for `(db, username)`.
 fn lookup_user_doc(ctx: &CommandContext, db: &str, username: &str) -> Option<Document> {
     let bytes = ctx.storage().ok()?.get_user(db, username).ok()??;
-    Document::from_reader(&mut bytes.as_slice()).ok()
+    secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok()
 }
 
 /// `saslStart` with `mechanism: "MONGODB-X509"` — one-shot cert auth (no
@@ -681,7 +681,7 @@ pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("User '{username}@{db_name}' not found"),
         ));
     };
-    let mut record = Document::from_reader(&mut bytes.as_slice())
+    let mut record = secantus_core::bsondoc::from_bytes(bytes.as_slice())
         .map_err(|e| CommandError::new(1, "InternalError", format!("decode user record: {e}")))?;
 
     let pwd = doc.get_str("pwd").ok();
@@ -751,7 +751,7 @@ fn load_user_record(
             format!("User '{username}@{db_name}' not found"),
         ));
     };
-    Document::from_reader(&mut bytes.as_slice())
+    secantus_core::bsondoc::from_bytes(bytes.as_slice())
         .map_err(|e| CommandError::new(1, "InternalError", format!("decode user record: {e}")))
 }
 
@@ -860,7 +860,7 @@ pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -
             .map_err(crate::util::command_error)?;
         let n = batch.len();
         for bytes in &batch {
-            if let Ok(rec) = Document::from_reader(&mut bytes.as_slice()) {
+            if let Ok(rec) = secantus_core::bsondoc::from_bytes(bytes.as_slice()) {
                 if let Ok(user) = rec.get_str("user") {
                     if storage
                         .drop_user(&db_name, user)
@@ -958,7 +958,7 @@ pub fn users_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     let mut users = Vec::with_capacity(raw.len());
     for bytes in raw {
-        let mut record = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
+        let mut record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
             CommandError::new(1, "InternalError", format!("decode user record: {e}"))
         })?;
         if !show_credentials {

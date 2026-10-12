@@ -857,7 +857,7 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let hwm = if bytes.is_empty() {
                     None
                 } else {
-                    Document::from_reader(&mut bytes.as_slice())
+                    secantus_core::bsondoc::from_bytes(bytes.as_slice())
                         .ok()
                         .map(Bson::Document)
                 };
@@ -1005,7 +1005,7 @@ fn token_seq(tok: &Bson) -> i64 {
     let bytes: Vec<u8> = (0..hex.len() / 2)
         .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
         .collect();
-    Document::from_reader(&mut bytes.as_slice())
+    secantus_core::bsondoc::from_bytes(bytes.as_slice())
         .ok()
         .and_then(|d| d.get_i64("s").ok())
         .unwrap_or(-1)
@@ -1013,7 +1013,7 @@ fn token_seq(tok: &Bson) -> i64 {
 
 fn post_batch_resume_token(batch: &[Vec<u8>]) -> Option<Bson> {
     let last = batch.last()?;
-    let doc = Document::from_reader(&mut last.as_slice()).ok()?;
+    let doc = secantus_core::bsondoc::from_bytes(last.as_slice()).ok()?;
     doc.get("_id").cloned()
 }
 

@@ -178,7 +178,7 @@ fn get_role_doc(
     let Some(bytes) = ctx.storage()?.get_role(db, name).map_err(command_error)? else {
         return Ok(None);
     };
-    Document::from_reader(&mut bytes.as_slice())
+    secantus_core::bsondoc::from_bytes(bytes.as_slice())
         .map(Some)
         .map_err(|e| CommandError::new(1, "InternalError", format!("decode role record: {e}")))
 }
@@ -443,7 +443,7 @@ pub fn drop_all_roles_from_database(_doc: &Document, ctx: &mut CommandContext) -
             .map_err(command_error)?;
         let n = batch.len();
         for bytes in &batch {
-            if let Ok(rec) = Document::from_reader(&mut bytes.as_slice()) {
+            if let Ok(rec) = secantus_core::bsondoc::from_bytes(bytes.as_slice()) {
                 if let Ok(role) = rec.get_str("role") {
                     if storage.drop_role(&db_name, role).map_err(command_error)? {
                         removed += 1;
@@ -508,7 +508,7 @@ pub fn roles_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
     let mut roles = Vec::with_capacity(raw.len());
     for bytes in raw {
-        let record = Document::from_reader(&mut bytes.as_slice()).map_err(|e| {
+        let record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
             CommandError::new(1, "InternalError", format!("decode role record: {e}"))
         })?;
         roles.push(Bson::Document(record));
@@ -735,7 +735,7 @@ mod tests {
         let storage = c.storage().unwrap();
         let resolver = |db: &str, role: &str| -> Option<Document> {
             let bytes = storage.get_role(db, role).ok()??;
-            Document::from_reader(&mut bytes.as_slice()).ok()
+            secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok()
         };
         // direct grant
         assert!(rbac::check_privilege_resolved(

@@ -31,6 +31,9 @@
 //! gating + RBAC landed with R5; `writeConcernError` for an unsatisfiable `w > 1`
 //! is attached in [`dispatch`].) The [`CommandContext`] grows as families land.
 
+/// The literal BSON decoder, for the crates that depend on this one.
+pub use secantus_core::bsondoc;
+
 pub mod admin;
 pub mod aggregate;
 pub mod argtypes;
@@ -825,6 +828,25 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
             ));
         }
     };
+    const WRITE_CONCERN_FIELDS: [&str; 7] = [
+        "w",
+        "j",
+        "wtimeout",
+        "wtimeoutMS",
+        "fsync",
+        "getLastError",
+        "provenance",
+    ];
+    if let Some(unknown) = wc
+        .keys()
+        .find(|k| !WRITE_CONCERN_FIELDS.contains(&k.as_str()))
+    {
+        return Some(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'WriteConcernOptions.{unknown}' is an unknown field."),
+        ));
+    }
     if let Some(w) = wc.get("w") {
         match w {
             // Any number: mongod reads it as `safeNumberLong` and bounds that
@@ -1949,7 +1971,7 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
             let storage = ctx.storage.as_deref();
             let resolver = |db: &str, role: &str| -> Option<Document> {
                 let bytes = storage?.get_role(db, role).ok()??;
-                Document::from_reader(&mut bytes.as_slice()).ok()
+                secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok()
             };
             if !rbac::check_privilege_resolved(
                 &roles,

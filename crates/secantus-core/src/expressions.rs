@@ -765,7 +765,8 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     // the expression would not have run.
     check_required_fields(op, arg)?;
     match op {
-        "$literal" => Ok(arg.clone()),
+        // `$const` is the name mongod itself gives a literal, and takes one.
+        "$literal" | "$const" => Ok(arg.clone()),
         // $eq/$ne use Python `==` (total: null==null is true, different types
         // are unequal); the ordering ops use Python `<`/`>` (incomparable —
         // incl. null-vs-null — raises TypeError, caught as false).
@@ -955,6 +956,7 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
 /// (guarded by a test).
 pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$literal",
+    "$const",
     "$eq",
     "$ne",
     "$gt",

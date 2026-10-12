@@ -138,7 +138,7 @@ fn insert(doc: &Document, ctx: &CommandContext, layout: &Layout) -> Document {
     let documents: Vec<Document> = match &ctx.raw_insert_documents {
         Some(raw) => raw
             .iter()
-            .filter_map(|b| Document::from_reader(&mut &b[..]).ok())
+            .filter_map(|b| secantus_core::bsondoc::from_bytes(&b[..]).ok())
             .collect(),
         None => doc
             .get_array("documents")

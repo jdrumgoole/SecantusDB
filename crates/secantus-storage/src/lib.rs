@@ -2062,8 +2062,7 @@ fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
 }
 
 fn decode_doc(bytes: &[u8]) -> Result<Document> {
-    Document::from_reader(&mut std::io::Cursor::new(bytes))
-        .map_err(|e| StorageError::Bson(e.to_string()))
+    secantus_core::bsondoc::from_bytes(bytes).map_err(|e| StorageError::Bson(e.to_string()))
 }
 
 /// Encode a `{_id: <id>}` document — the oplog `o2` for every CRUD op (and the
@@ -2080,56 +2079,6 @@ fn encode_id_doc(id: &Bson) -> Result<Vec<u8>> {
 /// `sortkey::encode_id_key`).
 fn id_key(id: &Bson) -> Result<Vec<u8>> {
     sortkey::encode_id_key(id).map_err(|_| StorageError::UnsupportedId)
-}
-
-/// Whether applying `update` to a doc with `_id == old_id` would modify the
-/// immutable `_id` field (mongod rejects this with `ImmutableField`, code 66).
-/// Operator-form: any modifier touching `_id` (or an `_id.` sub-path), except a
-/// `$set`/`$setOnInsert` that sets `_id` to its current value. Replacement-form:
-/// a specified `_id` different from the current one.
-fn update_would_change_id(update: &Document, old_id: &Bson) -> bool {
-    let touches_id = |fields: &Document| fields.keys().any(|k| k == "_id" || k.starts_with("_id."));
-    if !update.keys().any(|k| k.starts_with('$')) {
-        // Replacement-style: only a *different* explicit `_id` is a violation.
-        return matches!(update.get("_id"), Some(v) if v != old_id);
-    }
-    for (op, arg) in update {
-        let Some(fields) = arg.as_document() else {
-            continue;
-        };
-        match op.as_str() {
-            "$set" | "$setOnInsert" => {
-                if let Some(v) = fields.get("_id") {
-                    if v != old_id {
-                        return true;
-                    }
-                }
-                if fields.keys().any(|k| k.starts_with("_id.")) {
-                    return true;
-                }
-            }
-            "$unset" | "$inc" | "$mul" | "$min" | "$max" | "$pop" | "$push" | "$pull"
-            | "$pullAll" | "$addToSet" | "$bit" | "$currentDate"
-                if touches_id(fields) =>
-            {
-                return true;
-            }
-            "$rename" => {
-                for (from, to) in fields {
-                    if from == "_id" || from.starts_with("_id.") {
-                        return true;
-                    }
-                    if let Bson::String(t) = to {
-                        if t == "_id" || t.starts_with("_id.") {
-                            return true;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 /// Resolve `$currentDate` to concrete clock values so the deterministic core
@@ -13577,29 +13526,8 @@ impl Storage {
             validator_moderate,
             want_post_image,
             &|doc, up| {
-                // mongod rejects any update that would change the immutable `_id`
-                // with ImmutableField (66) — surface that specific code rather than
-                // a generic "unsupported".
-                if let Some(old_id) = doc.get("_id") {
-                    if update_would_change_id(update, old_id) {
-                        // A REPLACEMENT is checked after it is applied, and mongod
-                        // says so, naming the new value (measured 8.2.11,
-                        // 2026-10-01); an operator update keeps the path wording.
-                        if is_replacement {
-                            let new_id = update.get("_id").cloned().unwrap_or(Bson::Null);
-                            return Err(StorageError::QueryError {
-                                code: 66,
-                                errmsg: format!(
-                                    "After applying the update, the (immutable) field '_id' was \
-                                     found to have been altered to _id: {}",
-                                    shell_value(&new_id)
-                                ),
-                                exec: true,
-                            });
-                        }
-                        return Err(StorageError::ImmutableField);
-                    }
-                }
+                // The engine holds the `_id` rules: it compares the document the
+                // update produced, which is what mongod does.
                 let pos = secantus_core::update::find_positional_matches(doc, filter);
                 secantus_core::update::apply_update_with(doc, update, up, array_filters, &pos)
                     .map_err(|fault| {
@@ -13687,13 +13615,23 @@ impl Storage {
             validator_moderate,
             want_post_image,
             &|doc, _up| {
+                // The pipeline was checked before any document was read, so
+                // what fails here failed while running, and mongod reports
+                // it under the executor's wrapper.
                 let out = secantus_core::aggregate::apply_pipeline(
                     vec![doc.clone()],
                     pipeline,
                     let_vars,
                     None,
                 )
-                .map_err(query_fault)?;
+                .map_err(|fault| match query_fault(fault) {
+                    StorageError::QueryError { code, errmsg, .. } => StorageError::QueryError {
+                        code,
+                        errmsg,
+                        exec: true,
+                    },
+                    other => other,
+                })?;
                 let mut new = out
                     .into_iter()
                     .next()
@@ -13702,9 +13640,26 @@ impl Storage {
                 // a `$replaceRoot`/`$replaceWith`/`$project` stage can drop it, but
                 // the stored doc keeps its `_id` (which is immutable). Re-add it if
                 // a stage removed it. (`encode_doc` then restores `_id`-first order.)
-                if !new.contains_key("_id") {
-                    if let Some(id) = doc.get("_id") {
-                        new.insert("_id", id.clone());
+                if let Some(id) = doc.get("_id") {
+                    match new.get("_id") {
+                        None => {
+                            new.insert("_id", id.clone());
+                        }
+                        // A stage may write the `_id`, but only the value it
+                        // already has (measured 8.2.11, 2026-10-12: a pipeline
+                        // that changed it was applied here).
+                        Some(now) if !secantus_core::update::same_id_value(now, id) => {
+                            return Err(StorageError::QueryError {
+                                code: 66,
+                                errmsg: format!(
+                                    "After applying the update, the (immutable) field '_id' was \
+                                     found to have been altered to _id: {}",
+                                    shell_value(now)
+                                ),
+                                exec: true,
+                            });
+                        }
+                        Some(_) => {}
                     }
                 }
                 Ok(new)
@@ -14243,15 +14198,30 @@ impl Storage {
                     let mut seed = Document::new();
                     let mut implied: Vec<(String, Bson)> = Vec::new();
                     let mut seen = std::collections::HashSet::new();
-                    if let Err(path) = collect_upsert_seed(filter, &mut implied, &mut seen) {
-                        // mongod's own text and code, as an EXECUTION-time error.
-                        return Err(StorageError::QueryError {
-                            code: 54,
-                            errmsg: format!(
-                                "cannot infer query fields to set, path '{path}' is matched twice"
-                            ),
-                            exec: true,
-                        });
+                    if let Err((code, errmsg, exec)) =
+                        collect_upsert_seed(filter, &mut implied, &mut seen)
+                    {
+                        return Err(StorageError::QueryError { code, errmsg, exec });
+                    }
+                    // One path inside another cannot both be set: `{a: 1,
+                    // "a.b": 2}`. mongod names the longer one first, whichever
+                    // way round the query has them (measured 8.2.11,
+                    // 2026-10-12). The document was inserted with one of them.
+                    for (longer, _) in &implied {
+                        if let Some((shorter, _)) = implied.iter().find(|(p, _)| {
+                            longer.len() > p.len()
+                                && longer.starts_with(p.as_str())
+                                && longer.as_bytes()[p.len()] == b'.'
+                        }) {
+                            return Err(StorageError::QueryError {
+                                code: 54,
+                                errmsg: format!(
+                                    "cannot infer query fields to set, both paths '{longer}' and \
+                                     '{shorter}' are matched"
+                                ),
+                                exec: true,
+                            });
+                        }
                     }
                     implied.sort_by(|a, b| a.0.cmp(&b.0));
                     for (k, v) in &implied {
@@ -16806,7 +16776,20 @@ fn doc_was_modified(new: &Document, old: &Document, update_spec: Option<&Documen
     if secantus_core::diff::doc_changed(new, old) {
         return true;
     }
-    update_spec.is_some_and(|u| secantus_core::update::arith_wrote_nan(new, u))
+    update_spec.is_some_and(|u| {
+        if !secantus_core::update::is_operator_form(u) {
+            // A replacement is a no-op only when it IS the stored document,
+            // byte for byte. One that leaves out the `_id` never is, so
+            // mongod counts it as a modification even when every other field
+            // is the same (measured 8.2.11, 2026-10-12).
+            return match (bson::to_vec(u), bson::to_vec(old)) {
+                (Ok(a), Ok(b)) => a != b,
+                _ => false,
+            };
+        }
+        secantus_core::update::arith_wrote_nan(new, u)
+            || secantus_core::update::push_sort_ran(new, u)
+    })
 }
 
 /// mongod's field order for an UPSERTED document: `_id` first, then the fields
@@ -16845,6 +16828,11 @@ fn implied_equality(value: &Bson) -> Option<Bson> {
     for op in ["$in", "$all"] {
         if let Some(Bson::Array(items)) = d.get(op) {
             if items.len() == 1 {
+                // `{$all: [{$elemMatch: ...}]}` is a test of the elements, not
+                // a value: it seeds nothing (measured 8.2.11, 2026-10-12).
+                if op == "$all" && is_op_doc(&items[0]) {
+                    return None;
+                }
                 return Some(items[0].clone());
             }
         }
@@ -16863,8 +16851,24 @@ fn collect_upsert_seed(
     query: &Document,
     into: &mut Vec<(String, Bson)>,
     seen: &mut std::collections::HashSet<String>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), (i32, String, bool)> {
+    let twice = |path: &str| {
+        (
+            54,
+            format!("cannot infer query fields to set, path '{path}' is matched twice"),
+            true,
+        )
+    };
     for (key, value) in query {
+        if key == "$expr" {
+            // Refused when the query is read, so not under the executor's
+            // wrapper (measured 8.2.11, 2026-10-12). It was ignored.
+            return Err((
+                224,
+                "$expr is not allowed in the query predicate for an upsert".to_string(),
+                false,
+            ));
+        }
         if key == "$and" || key == "$or" {
             let Bson::Array(branches) = value else {
                 continue;
@@ -16886,7 +16890,7 @@ fn collect_upsert_seed(
             if is_op_doc(value) {
                 if let Some(Bson::Array(items)) = d.get("$all") {
                     if items.len() > 1 {
-                        return Err(key.clone());
+                        return Err(twice(key));
                     }
                 }
             }
@@ -16895,7 +16899,7 @@ fn collect_upsert_seed(
             continue;
         };
         if !seen.insert(key.clone()) {
-            return Err(key.clone());
+            return Err(twice(key));
         }
         into.push((key.clone(), seed_value));
     }

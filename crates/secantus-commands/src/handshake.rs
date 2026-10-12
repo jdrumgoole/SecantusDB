@@ -430,7 +430,7 @@ fn validate_awaitable_arguments(doc: &Document, counter: i64) -> Result<(), Comm
 /// order, or `None` when there is no such user.
 fn user_scram_mechanisms(ctx: &CommandContext, db: &str, user: &str) -> Option<Vec<Bson>> {
     let bytes = ctx.storage.as_deref()?.get_user(db, user).ok()??;
-    let record = Document::from_reader(&mut bytes.as_slice()).ok()?;
+    let record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok()?;
     let creds = record.get_document("credentials").ok();
     Some(
         ["SCRAM-SHA-1", "SCRAM-SHA-256"]

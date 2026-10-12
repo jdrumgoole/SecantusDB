@@ -27,7 +27,59 @@ use crate::util::{bool_field, command_error, command_error_during, doc_field, re
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
 /// `findAndModify` / `findandmodify`.
+/// A bool-or-number argument read as mongod reads it: any number but zero is
+/// true. `as_bool` alone read `upsert: 1` as false, so nothing was inserted.
+fn truthy(value: Option<&Bson>) -> bool {
+    match value {
+        Some(Bson::Boolean(b)) => *b,
+        Some(Bson::Int32(n)) => *n != 0,
+        Some(Bson::Int64(n)) => *n != 0,
+        Some(Bson::Double(d)) => *d != 0.0,
+        Some(Bson::Decimal128(d)) => d.to_string().parse::<f64>().unwrap_or(0.0) != 0.0,
+        _ => false,
+    }
+}
+
 pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    const FIELDS: &[&str] = &[
+        "findAndModify",
+        "findandmodify",
+        "query",
+        "sort",
+        "remove",
+        "update",
+        "new",
+        "fields",
+        "upsert",
+        "bypassDocumentValidation",
+        "bypass_document_validation",
+        "arrayFilters",
+        "hint",
+        "collation",
+        "let",
+        "runtimeConstants",
+        "legacyRuntimeConstants",
+        "encryptionInformation",
+        "sampleId",
+        "bypassEmptyTsReplacement",
+        "rawData",
+        "originalQuery",
+        "originalCollation",
+        // Taken and ignored by mongod 8.2.11.
+        "batchSize",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'findAndModify.{key}' is an unknown field."),
+        ));
+    }
+    argtypes::require_bool_or_number(
+        doc,
+        "bypassDocumentValidation",
+        "findAndModify.bypassDocumentValidation",
+    )?;
     // `upsert` takes a bool OR any number here, unlike `update.updates.multi`.
     argtypes::require_bool_or_number(doc, "upsert", "findAndModify.upsert")?;
     argtypes::require_object(doc, "let", "findAndModify.let")?;
@@ -91,7 +143,8 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // passed as a findOneAnd* filter) with TypeMismatch (14) rather than treating
     // it as an empty filter — mongo-node-driver's "object ids as a query
     // predicate" tests assert the error.
-    if let Some(q) = doc.get("query") {
+    // A null `query` is no query, as for the other optional fields.
+    if let Some(q) = doc.get("query").filter(|q| !matches!(q, Bson::Null)) {
         if !matches!(q, Bson::Document(_)) {
             let ty = secantus_core::query::bson_type_name(q);
             return Ok(CommandError::new(
@@ -118,20 +171,13 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         .and_then(Bson::as_document)
         .filter(|_| natural_hint.is_none());
     let fields = doc.get("fields").and_then(Bson::as_document);
-    let return_new = doc.get("new").and_then(Bson::as_bool).unwrap_or(false);
-    let upsert = doc.get("upsert").and_then(Bson::as_bool).unwrap_or(false);
+    let return_new = truthy(doc.get("new"));
+    let upsert = truthy(doc.get("upsert"));
     // `as_bool` is None for a NUMBER, so `remove: 1` / `remove: 1.5` read as
     // "no remove" and then failed the update-or-remove check. mongod takes the
     // same bool-OR-number values the validator above accepts and reads a
     // nonzero one as true.
-    let is_remove = match doc.get("remove") {
-        Some(Bson::Boolean(b)) => *b,
-        Some(Bson::Int32(n)) => *n != 0,
-        Some(Bson::Int64(n)) => *n != 0,
-        Some(Bson::Double(d)) => *d != 0.0,
-        Some(Bson::Decimal128(d)) => d.to_string().parse::<f64>().unwrap_or(0.0) != 0.0,
-        _ => false,
-    };
+    let is_remove = truthy(doc.get("remove"));
     let update = doc.get("update");
 
     // Mutually-exclusive arg validation (FailedToParse, code 9). `remove` is
@@ -147,7 +193,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         )
         .into_reply());
     }
-    if is_remove && bool_field(doc, "new", false) {
+    if is_remove && return_new {
         return Ok(CommandError::new(
             9,
             "FailedToParse",
@@ -183,8 +229,66 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         )
         .into_reply());
     }
+    // `arrayFilters` belongs to an operator update and to nothing else
+    // (measured 8.2.11, 2026-10-12: both of these ran, ignoring it).
+    let has_array_filters = doc.get("arrayFilters").is_some_and(|f| f != &Bson::Null);
+    if has_array_filters && is_remove {
+        return Ok(CommandError::new(
+            9,
+            "FailedToParse",
+            "Cannot specify arrayFilters and remove=true",
+        )
+        .into_reply());
+    }
+    if has_array_filters && matches!(update, Some(Bson::Array(_))) {
+        return Ok(CommandError::new(
+            9,
+            "FailedToParse",
+            "Cannot specify arrayFilters and a pipeline update",
+        )
+        .into_reply());
+    }
+    // A pipeline is checked before any document is looked for, so a bad one
+    // is refused when nothing matches too. It was then a silent no-op.
+    if let Some(Bson::Array(stages)) = update {
+        if let Some(problem) = pipeline_update_problem(stages) {
+            return Ok(problem.into_reply());
+        }
+    }
+    if let Some(Bson::Document(vars)) = doc.get("let") {
+        if let Some((code, errmsg)) = argtypes::let_problem(vars) {
+            return Ok(
+                CommandError::new(code, crate::util::error_code_name(code), errmsg).into_reply(),
+            );
+        }
+    }
+    // So is the projection.
+    if let Some(Bson::Document(spec)) = doc.get("fields") {
+        if return_new && spec.keys().any(|k| k.ends_with(".$")) {
+            return Ok(CommandError::new(
+                2,
+                "BadValue",
+                "cannot use a positional projection and return the new document",
+            )
+            .into_reply());
+        }
+        if let Some(problem) = crate::find::projection_name_error(spec)
+            .or_else(|| crate::find::projection_mix_error(spec))
+        {
+            return Ok(problem.into_reply());
+        }
+    }
 
     let storage = ctx.storage()?;
+    // A replacement is a document given whole: an empty timestamp in it is
+    // filled, as on an insert.
+    let filled_update = match update {
+        Some(Bson::Document(u)) if !secantus_core::update::is_operator_form(u) => {
+            crate::crud::fill_empty_timestamps(u, storage).map(Bson::Document)
+        }
+        _ => None,
+    };
+    let update = filled_update.as_ref().or(update);
     // A time-series collection takes a `remove` with no sort, and nothing else.
     if storage
         .get_collection_options(&ctx.db_name, &coll)
@@ -506,8 +610,47 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
 
 // --- helpers -------------------------------------------------------------
 
+/// What mongod refuses about a pipeline given as the `update`, as a command
+/// error: a stage that is not a document, has no single name, or is unknown,
+/// one an update may not run, and a stage whose own argument is malformed.
+fn pipeline_update_problem(stages: &[Bson]) -> Option<CommandError> {
+    const ALLOWED: [&str; 6] = [
+        "$set",
+        "$addFields",
+        "$unset",
+        "$project",
+        "$replaceRoot",
+        "$replaceWith",
+    ];
+    if let Err(e) = crate::aggregate::validate_stage_names(stages) {
+        return Some(e);
+    }
+    for stage in stages {
+        let name = stage
+            .as_document()
+            .and_then(|s| s.keys().next())
+            .map(String::as_str)
+            .unwrap_or_default();
+        if !ALLOWED.contains(&name) {
+            return Some(CommandError::new(
+                72,
+                "InvalidOptions",
+                format!("{name} is not allowed to be used within an update"),
+            ));
+        }
+    }
+    if let Some((code, errmsg)) = argtypes::stage_spec_error(stages) {
+        return Some(CommandError::new(
+            code,
+            crate::util::error_code_name(code),
+            errmsg,
+        ));
+    }
+    crate::aggregate::validate_unknown_exprs(stages).err()
+}
+
 fn decode(bytes: &[u8]) -> Result<Document, CommandError> {
-    Document::from_reader(&mut &bytes[..])
+    secantus_core::bsondoc::from_bytes(&bytes[..])
         .map_err(|e| CommandError::new(1, "InternalError", format!("decode: {e}")))
 }
 

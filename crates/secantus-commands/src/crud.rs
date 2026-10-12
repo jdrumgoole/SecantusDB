@@ -139,6 +139,44 @@ fn raw_id_dollar_key_error(raw: &[u8], index: usize) -> Option<Document> {
 /// → storage-decode round-trip. Only the `_id` `$`-key pre-check runs over every
 /// document; a collection `validator` is the one case that forces a per-doc
 /// decode-and-match before the bytes go to storage.
+/// `doc` with every top-level `Timestamp(0, 0)` replaced by the current one,
+/// or `None` when it holds none.
+///
+/// mongod fills an empty timestamp in a document it is given whole -- an
+/// insert, a replacement, an upsert of a replacement -- and only at the top
+/// level, and never the `_id`. A `$set` of `Timestamp(0, 0)` stores it as
+/// written (measured 8.2.11, 2026-10-12). This server stored it in every case.
+pub(crate) fn fill_empty_timestamps(
+    doc: &Document,
+    storage: &dyn crate::Storage,
+) -> Option<Document> {
+    let empty = |v: &Bson| matches!(v, Bson::Timestamp(t) if t.time == 0 && t.increment == 0);
+    if !doc.iter().any(|(k, v)| k != "_id" && empty(v)) {
+        return None;
+    }
+    let now = Bson::Timestamp(storage.current_cluster_time());
+    let mut filled = Document::new();
+    for (k, v) in doc {
+        let value = if k != "_id" && empty(v) {
+            now.clone()
+        } else {
+            v.clone()
+        };
+        filled.insert(k.clone(), value);
+    }
+    Some(filled)
+}
+
+/// Does this encoded document hold a top-level `Timestamp(0, 0)` to fill?
+fn raw_has_empty_timestamp(raw: &[u8]) -> bool {
+    let Ok(doc) = bson::RawDocument::from_bytes(raw) else {
+        return false;
+    };
+    doc.iter().flatten().any(|(k, v)| {
+        k != "_id" && matches!(v, bson::RawBsonRef::Timestamp(t) if t.time == 0 && t.increment == 0)
+    })
+}
+
 fn insert_raw_path(
     db: &str,
     coll: &str,
@@ -170,7 +208,7 @@ fn insert_raw_path(
             // The one case the raw path must decode: match against the validator.
             // Wire-validated BSON always decodes; if it somehow doesn't, fall through
             // and let storage surface the error rather than dropping the doc.
-            if let Ok(d) = Document::from_reader(&mut &raw[..]) {
+            if let Ok(d) = secantus_core::bsondoc::from_bytes(&raw[..]) {
                 if !secantus_core::query::matches(&d, v, &Document::new(), None).unwrap_or(true) {
                     pre_errors.push(doc! {
                         "index": index as i32,
@@ -185,6 +223,17 @@ fn insert_raw_path(
                 }
             }
         }
+        let raw = if raw_has_empty_timestamp(&raw) {
+            match secantus_core::bsondoc::from_bytes(&raw[..])
+                .ok()
+                .and_then(|d| fill_empty_timestamps(&d, storage))
+            {
+                Some(filled) => encode_doc(&filled)?,
+                None => raw,
+            }
+        } else {
+            raw
+        };
         surviving.push(raw);
         survivor_to_orig.push(index);
     }
@@ -280,7 +329,7 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(raw_docs) => Some(
             raw_docs
                 .iter()
-                .map(|b| Document::from_reader(&mut &b[..]).map(Bson::Document))
+                .map(|b| secantus_core::bsondoc::from_bytes(&b[..]).map(Bson::Document))
                 .collect::<Result<_, _>>()
                 .map_err(|e| CommandError::new(22, "InvalidBSON", e.to_string()))?,
         ),
@@ -382,7 +431,10 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
         }
-        surviving.push(encode_doc(d)?);
+        surviving.push(match fill_empty_timestamps(d, storage) {
+            Some(filled) => encode_doc(&filled)?,
+            None => encode_doc(d)?,
+        });
         survivor_to_orig.push(index);
     }
 
@@ -725,9 +777,116 @@ fn update_spec_error(u: &Document) -> Option<(i32, String)> {
 /// here, threaded into `Storage::update_matching`); malformed `writeConcern` is
 /// rejected in `dispatch` before this handler. **Deferred:**
 /// `_reject_oplog_rs_write` (writes to `local.oplog.rs`).
+/// What mongod refuses about the `update` command's own fields before it runs
+/// any statement: an unknown field, `updates` that is not an array of
+/// documents, an unknown field of a statement. Measured 8.2.11, 2026-10-12;
+/// each of these was accepted, and the field ignored.
+fn update_command_problem(doc: &Document) -> Option<CommandError> {
+    const FIELDS: &[&str] = &[
+        "update",
+        "updates",
+        "ordered",
+        "bypassDocumentValidation",
+        "let",
+        "stmtIds",
+        "encryptionInformation",
+        "bypassEmptyTsReplacement",
+        "runtimeConstants",
+        "legacyRuntimeConstants",
+        "collectionUUID",
+        "originalQuery",
+        "originalCollation",
+        "sampleId",
+        "rawData",
+    ];
+    const STATEMENT_FIELDS: &[&str] = &[
+        "q",
+        "u",
+        "c",
+        "multi",
+        "upsert",
+        "upsertSupplied",
+        "collation",
+        "arrayFilters",
+        "hint",
+        "sort",
+        "sampleId",
+    ];
+    let wrong_type = |path: String, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let missing = |path: &str| {
+        CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            format!("BSON field '{path}' is missing but a required field"),
+        )
+    };
+    let unknown = |path: String| {
+        CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field '{path}' is an unknown field."),
+        )
+    };
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Some(unknown(format!("update.{key}")));
+    }
+    if let Err(e) = argtypes::require_bool_or_number(
+        doc,
+        "bypassDocumentValidation",
+        "update.bypassDocumentValidation",
+    ) {
+        return Some(e);
+    }
+    if matches!(doc.get("isTimeseriesNamespace"), Some(Bson::Boolean(true))) {
+        return Some(CommandError::new(
+            5916400,
+            "Location5916400",
+            "'isTimeseriesNamespace' parameter can only be set when the request is sent on \
+             system.buckets namespace",
+        ));
+    }
+    if matches!(doc.get("encryptionInformation"), Some(Bson::Document(e)) if !e.contains_key("schema"))
+    {
+        return Some(missing("update.encryptionInformation.schema"));
+    }
+    let statements = match doc.get("updates") {
+        None | Some(Bson::Null) => return Some(missing("update.updates")),
+        Some(Bson::Array(statements)) => statements,
+        Some(other) => return Some(wrong_type("update.updates".to_string(), other, "array")),
+    };
+    for (index, statement) in statements.iter().enumerate() {
+        let Bson::Document(statement) = statement else {
+            return Some(wrong_type(
+                format!("update.updates.{index}"),
+                statement,
+                "object",
+            ));
+        };
+        if let Some(key) = statement
+            .keys()
+            .find(|k| !k.starts_with('$') && !STATEMENT_FIELDS.contains(&k.as_str()))
+        {
+            return Some(unknown(format!("update.updates.{key}")));
+        }
+    }
+    None
+}
+
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
+    if let Some(problem) = update_command_problem(doc) {
+        return Err(problem);
+    }
     empty_batch(doc, "updates")?;
     let coll = coll_arg(doc, "update")?;
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
@@ -785,13 +944,30 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `Some` for a time-series collection, whose updates are restricted.
     let ts_fields = crate::timeseries::Fields::of(&opts);
 
+    // What is wrong with `let`, if anything. mongod reports it against each
+    // statement, not the command.
+    let let_problem = match doc.get("let") {
+        Some(Bson::Document(vars)) => argtypes::let_problem(vars),
+        _ => None,
+    };
+
     for (index, spec) in updates.iter().enumerate() {
         let Bson::Document(spec) = spec else { continue };
 
         argtypes::require_write_statement(spec, "update")?;
+        if let Some((code, errmsg)) = &let_problem {
+            write_errors.push(Bson::Document(doc! {
+                "index": index as i32, "code": *code, "errmsg": errmsg.clone(),
+            }));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         // Strict bool, unlike findAndModify's `upsert`, which takes a bool OR any
         // number. Adjacent slots, different rules -- probed, not inferred.
         argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
+        argtypes::require_bool_field(spec, "upsert", "update.updates.upsert")?;
         argtypes::require_object(spec, "collation", "update.updates.collation")?;
         argtypes::require_array_of_objects(spec, "arrayFilters", "update.updates.arrayFilters")?;
         argtypes::require_hint(spec, "hint")?;
@@ -929,7 +1105,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             });
             if let Ok(rows) = sorted {
                 if let Some(first) = rows.first() {
-                    if let Ok(d) = Document::from_reader(&mut first.as_slice()) {
+                    if let Ok(d) = secantus_core::bsondoc::from_bytes(first.as_slice()) {
                         if let Some(id) = d.get("_id") {
                             q = doc! { "_id": id.clone() };
                         }
@@ -1005,32 +1181,78 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
 
+        // An update that cannot insert leaves a collection that does not exist
+        // alone. It used to create it (measured 8.2.11, 2026-10-12: the
+        // collection was then listed).
+        if !upsert
+            && !storage
+                .collection_exists(&ctx.db_name, &coll)
+                .unwrap_or(true)
+        {
+            continue;
+        }
+
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
             // Validate the shape up-front — real mongod returns a command-level
             // error for a malformed/unknown stage, not a per-op writeError.
+            // A stage mongod does not know, or one with no name or two, fails
+            // the command. A stage it knows but does not run in an update
+            // fails the statement (measured 8.2.11, 2026-10-12).
+            let mut refused: Option<(i32, String)> = None;
             for stage in stages {
                 match stage {
                     Bson::Document(s) if s.len() == 1 => {
                         let name = s.keys().next().map(String::as_str).unwrap_or("");
-                        if !PIPELINE_UPDATE_STAGES.contains(&name) {
+                        if !crate::aggregate::recognized_stage(name) {
                             return Ok(CommandError::new(
-                                168,
-                                "InvalidPipelineOperator",
-                                format!("stage {name} not allowed in pipeline updates"),
+                                40324,
+                                "Location40324",
+                                format!("Unrecognized pipeline stage name: '{name}'"),
                             )
                             .into_reply());
+                        }
+                        if !PIPELINE_UPDATE_STAGES.contains(&name) && refused.is_none() {
+                            refused = Some((
+                                72,
+                                format!("{name} is not allowed to be used within an update"),
+                            ));
                         }
                     }
                     _ => {
                         return Ok(CommandError::new(
-                            9,
-                            "FailedToParse",
-                            "each pipeline stage must be a single-key document",
+                            40323,
+                            "Location40323",
+                            "A pipeline stage specification object must contain exactly one \
+                             field.",
                         )
                         .into_reply())
                     }
                 }
+            }
+            // What a stage holds is checked as `aggregate` checks it, and
+            // reported against the statement.
+            if refused.is_none() {
+                refused = argtypes::stage_spec_error(stages).or_else(|| {
+                    crate::aggregate::validate_unknown_exprs(stages)
+                        .err()
+                        .map(|e| (e.code, e.errmsg.clone()))
+                });
+            }
+            if refused.is_none() && spec.get("arrayFilters").is_some_and(|f| f != &Bson::Null) {
+                refused = Some((
+                    9,
+                    "arrayFilters may not be specified for pipeline-style updates".to_string(),
+                ));
+            }
+            if let Some((code, errmsg)) = refused {
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32, "code": code, "errmsg": errmsg,
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
             }
             storage.update_matching_pipeline(
                 &ctx.db_name,
@@ -1046,7 +1268,12 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 false,
             )
         } else {
-            let u = doc_field(spec, "u");
+            let mut u = doc_field(spec, "u");
+            if is_replacement_doc {
+                if let Some(filled) = fill_empty_timestamps(&u, storage) {
+                    u = filled;
+                }
+            }
             // arrayFilters (`$[ident]`) is per-update-statement. The `$` / `$[]`
             // positional operators resolve in storage regardless; `$[ident]`
             // needs these filter docs.

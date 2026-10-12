@@ -122,7 +122,7 @@ impl CmdStorage for StorageAdapter {
             // projects to nothing (noop heartbeats / other-scope writes) — that
             // keeps the resume token moving and the next poll cheap.
             new_position = seq;
-            let entry = Document::from_reader(&mut blob.as_slice())
+            let entry = secantus_commands::bsondoc::from_bytes(blob.as_slice())
                 .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
             // `startAtOperationTime`: nothing before it is an event.
             if let Some(start) = opts.start_ts {
@@ -233,7 +233,7 @@ impl CmdStorage for StorageAdapter {
 
     fn set_oplog_session(&self, session: Option<(Vec<u8>, i64)>) {
         let decoded = session.and_then(|(lsid, txn)| {
-            Document::from_reader(&mut lsid.as_slice())
+            secantus_commands::bsondoc::from_bytes(lsid.as_slice())
                 .ok()
                 .map(|d| (d, txn))
         });
