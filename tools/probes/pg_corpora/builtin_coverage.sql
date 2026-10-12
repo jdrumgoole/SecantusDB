@@ -46,6 +46,20 @@ SELECT regexp_split_to_array('abc', 'b', 'z')
 SELECT regexp_matches('abc', 'b', 'z')
 SELECT regexp_split_to_table('abc', 'b', 'z')
 SELECT regexp_like('abc', 'B', 'i'), regexp_count('abcabc', 'B', 1, 'i'), regexp_replace('abc', 'B', 'x', 'i')
+# A number out of range is reported before a bad option.
+SELECT regexp_count('abc', 'b', 0, 'z')
+SELECT regexp_substr('abc', 'b', 0, 1, 'z')
+SELECT regexp_substr('abc', 'b', 1, 0, 'z')
+SELECT regexp_substr('abc', 'b', 1, 1, 'z', -1)
+SELECT regexp_instr('abc', 'b', 0, 1, 0, 'z')
+SELECT regexp_instr('abc', 'b', 1, 0, 0, 'z')
+SELECT regexp_instr('abc', 'b', 1, 1, 2, 'z')
+SELECT regexp_instr('abc', 'b', 1, 1, 0, 'z', -1)
+SELECT regexp_replace('abc', 'b', 'X', 0, 1, 'z')
+SELECT regexp_replace('abc', 'b', 'X', 1, -1, 'z')
+SELECT regexp_replace('abc', 'b', 'X', 1, 1, 'z')
+SELECT regexp_count('abc', 'b', 1, 'g')
+SELECT regexp_match('abc', 'b', 'gz')
 # regexp_replace from a start position, the Nth match.
 SELECT regexp_replace('abcabcabc', 'b', 'X', 1), regexp_replace('abcabcabc', 'b', 'X', 3), regexp_replace('abcabcabc', 'b', 'X', 20)
 SELECT regexp_replace('abcabcabc', 'b', 'X', 1, 0), regexp_replace('abcabcabc', 'b', 'X', 1, 2), regexp_replace('abcabcabc', 'b', 'X', 1, 9), regexp_replace('abcabcabc', 'b', 'X', 4, 1)
@@ -127,7 +141,7 @@ SELECT date '2020-02-03' + time '04:05:06', time '04:05:06' + date '2020-02-03',
 # A built-in called by the name of the function behind its operator.
 SELECT int4pl(1, 2), int4mi(5, 2), int4mul(3, 4), int4div(7, 2), int8pl(1, 2), float8mul(1.5, 2), numeric_add(1.5, 2.5), numeric_sub(1.5, 2.5), int48pl(1, 2::int8)
 SELECT int4eq(1, 1), int4ne(1, 1), int4lt(1, 2), int4le(2, 2), int4gt(1, 2), int4ge(2, 2), texteq('a', 'a'), textne('a', 'b'), text_lt('a', 'b'), int48eq(1, 1::int8), booleq(true, false)
-SELECT textcat('a', 'b'), textlike('abc', 'a%'), textnlike('abc', 'a%'), texticlike('ABC', 'a%'), bytealike('\x6162'::bytea, '\x61%'::bytea), like('abc', 'a_c'), notlike('abc', 'a_c'), textregexeq('abc', '^a')
+SELECT textcat('a', 'b'), textlike('abc', 'a%'), textnlike('abc', 'a%'), texticlike('ABC', 'a%'), like('abc', 'a_c'), notlike('abc', 'a_c'), textregexeq('abc', '^a')
 SELECT int4larger(1, 2), int4smaller(1, 2), text_larger('a', 'b'), text_smaller('a', 'b'), int4larger(1, NULL), float8larger(1.5, 2.5), numeric_smaller(1.5, 1.25), date_larger('2020-01-01', '2020-02-01')
 SELECT btint4cmp(1, 2), btint4cmp(2, 2), btint4cmp(3, 2), numeric_cmp(1.5, 1.50), btint48cmp(1, 2::int8), btfloat8cmp(2.5, 1.5), btint4cmp(1, NULL)
 SELECT textlen('abc'), dexp(1), dlog1(1), dlog10(100), dround(2.5), dtrunc(2.7), dsqrt(16), dcbrt(27), dpow(2, 10), numeric_inc(1.5), int4inc(1), nameconcatoid('abc', 5)
@@ -138,7 +152,13 @@ SELECT id, int4pl(n, 1), int4larger(n, 6), textcat(g, '!'), btint4cmp(n, 6) FROM
 SELECT id FROM bc_a WHERE int4gt(n, 5) ORDER BY id
 SELECT int4pl(1, 2) AS named, int4pl(1, 2)
 SELECT int8pl(1, 2), pg_typeof(int8pl(1, 2)), float8mul(1.5, 2), pg_typeof(float8mul(1.5, 2)), pg_typeof(float8larger(1.5, 2.5)), date_larger('2020-01-01', '2020-02-01'), pg_typeof(date_larger('2020-01-01', '2020-02-01'))
-SELECT '\x616263'::bytea LIKE '\x616263'::bytea, like('\x6162'::bytea, '\x61%'::bytea), bytealike('\x6162'::bytea, '\x61%'::bytea), byteanlike('\x6162'::bytea, '\x61%'::bytea)
+# bytea LIKE bytea matches bytes; it answered NULL. `\x25` is `%`, `\x5f` is `_`.
+SELECT '\x616263'::bytea LIKE '\x616263'::bytea, '\x616263'::bytea LIKE '\x6125'::bytea, '\x616263'::bytea LIKE '\x615f63'::bytea, '\x616263'::bytea LIKE '\x615f'::bytea, '\x616263'::bytea NOT LIKE '\x6125'::bytea, '\x00ff01'::bytea LIKE '\x002501'::bytea
+SELECT '\x612563'::bytea LIKE '\x615c2563'::bytea, '\x616263'::bytea LIKE '\x615c2563'::bytea, '\x'::bytea LIKE '\x25'::bytea, '\x'::bytea LIKE '\x'::bytea, NULL::bytea LIKE '\x25'::bytea
+SELECT '\x61'::bytea LIKE '\x615c'::bytea
+SELECT like('\x6162'::bytea, '\x6125'::bytea), notlike('\x6162'::bytea, '\x6125'::bytea), bytealike('\x6162'::bytea, '\x6125'::bytea), byteanlike('\x6162'::bytea, '\x6125'::bytea)
+SELECT id, by LIKE '\x6125'::bytea, by LIKE '\x5f'::bytea FROM bc_a ORDER BY id
+SELECT id FROM bc_a WHERE by LIKE '\x25'::bytea ORDER BY id
 # to_tsvector over a JSON document indexes its string values only.
 SELECT to_tsvector('english', '{"a": "The Fat Rats", "b": "dog", "c": [1, "cats and dogs", {"d": "x y"}], "e": null, "f": true}'::json)
 SELECT to_tsvector('english', '{"a": "The Fat Rats", "b": "dog", "c": [1, "cats and dogs", {"d": "x y"}], "e": null, "f": true}'::jsonb)

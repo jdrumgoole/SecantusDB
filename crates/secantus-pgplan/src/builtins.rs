@@ -288,11 +288,40 @@ pub(crate) fn regex_flags_position(name: &str, types: &[String]) -> Option<usize
         ("regexp_count", 4) => 3,
         ("regexp_substr", 5 | 6) => 4,
         ("regexp_instr", 6 | 7) => 5,
+        // With a start position `regexp_replace` is this module's own, and
+        // checks its numbers before its options there.
         ("regexp_replace", 4) if !matches!(types[3].as_str(), "int2" | "int4" | "int8") => 3,
-        ("regexp_replace", 6) => 5,
         _ => return None,
     };
     Some(at)
+}
+
+/// The numeric arguments of `regexp_count` / `regexp_substr` /
+/// `regexp_instr`, checked in the order PostgreSQL checks them, which is
+/// before it reads the options.
+pub(crate) fn check_regex_numbers(name: &str, args: &[Bson]) -> Result<()> {
+    // (argument position, parameter name, least value allowed)
+    let checks: &[(usize, &str, i64)] = match name {
+        "regexp_count" => &[(2, "start", 1)],
+        "regexp_substr" => &[(2, "start", 1), (3, "n", 1), (5, "subexpr", 0)],
+        "regexp_instr" => &[
+            (2, "start", 1),
+            (3, "n", 1),
+            (4, "endoption", 0),
+            (6, "subexpr", 0),
+        ],
+        _ => return Ok(()),
+    };
+    for (at, param, least) in checks {
+        let Some(value) = args.get(*at) else { continue };
+        let Ok(n) = int(value, "integer") else {
+            continue;
+        };
+        if n < *least || (*param == "endoption" && n > 1) {
+            return Err(bad_parameter(param, n));
+        }
+    }
+    Ok(())
 }
 
 fn build_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {

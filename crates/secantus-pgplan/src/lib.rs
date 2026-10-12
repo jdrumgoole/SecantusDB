@@ -20719,8 +20719,20 @@ fn check_regex_options(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Res
     let Some(at) = builtins::regex_flags_position(&name, &types) else {
         return Ok(());
     };
-    match const_value(&f.args[at], params)? {
-        Bson::String(flags) => builtins::check_regex_flags(&flags),
+    // PostgreSQL checks the numbers (start, n, end option, subexpression)
+    // before it reads the options, so a call wrong in both is told about
+    // the number.
+    let args = f
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    if args.contains(&Bson::Null) {
+        return Ok(());
+    }
+    builtins::check_regex_numbers(&name, &args)?;
+    match &args[at] {
+        Bson::String(flags) => builtins::check_regex_flags(flags),
         _ => Ok(()),
     }
 }
@@ -34721,6 +34733,30 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
     } else {
         (const_value(rexpr, params)?, None)
     };
+    // `bytea LIKE bytea` matches BYTES: `%` and `_` are the wildcards, and
+    // an untyped literal beside a bytea is one. This answered NULL.
+    if is_like
+        && !insensitive
+        && subject != Bson::Null
+        && pattern != Bson::Null
+        && (matches!(subject, Bson::Binary(_)) || matches!(pattern, Bson::Binary(_)))
+    {
+        let escape = match escape.map(u32::from).map(u8::try_from) {
+            Some(Ok(byte)) => Some(byte),
+            Some(Err(_)) => {
+                return Err(Error::Unsupported(
+                    "a LIKE escape that is not one byte".into(),
+                ))
+            }
+            None => None,
+        };
+        let m = like_match::like_match_bytes(
+            &bytea::parse(&subject)?,
+            &bytea::parse(&pattern)?,
+            escape,
+        )?;
+        return Ok(Bson::Boolean(m != negated));
+    }
     let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
         return Ok(Bson::Null);
     };

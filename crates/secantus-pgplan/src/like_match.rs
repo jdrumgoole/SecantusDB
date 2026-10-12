@@ -170,3 +170,65 @@ mod tests {
         assert!(ends_in_escape("a\\", e) && !ends_in_escape("a\\\\", e));
     }
 }
+
+/// `bytea LIKE bytea`: `%` is any run of bytes, `_` any one byte, and the
+/// escape byte takes the next byte literally. A pattern that ends in its
+/// escape is 22025, and only when matching reaches it, as for text.
+pub(crate) fn like_match_bytes(subject: &[u8], pattern: &[u8], escape: Option<u8>) -> Result<bool> {
+    let Some((&first, rest)) = pattern.split_first() else {
+        return Ok(subject.is_empty());
+    };
+    if Some(first) == escape {
+        let Some((&literal, rest)) = rest.split_first() else {
+            return Err(Error::Sqlstate(
+                "22025",
+                "LIKE pattern must not end with escape character".into(),
+            ));
+        };
+        return match subject.split_first() {
+            Some((&b, tail)) if b == literal => like_match_bytes(tail, rest, escape),
+            _ => Ok(false),
+        };
+    }
+    match first {
+        b'%' => {
+            for skip in 0..=subject.len() {
+                if like_match_bytes(&subject[skip..], rest, escape)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        b'_' => match subject.split_first() {
+            Some((_, tail)) => like_match_bytes(tail, rest, escape),
+            None => Ok(false),
+        },
+        literal => match subject.split_first() {
+            Some((&b, tail)) if b == literal => like_match_bytes(tail, rest, escape),
+            _ => Ok(false),
+        },
+    }
+}
+
+#[cfg(test)]
+mod byte_tests {
+    use super::like_match_bytes;
+
+    #[test]
+    fn bytes_match_with_both_wildcards_and_an_escape() {
+        let m = |s: &[u8], p: &[u8]| like_match_bytes(s, p, Some(b'\\')).unwrap();
+        assert!(m(b"abc", b"abc"));
+        assert!(m(b"abc", b"a%"));
+        assert!(m(b"abc", b"%c"));
+        assert!(m(b"abc", b"a_c"));
+        assert!(m(b"", b"%"));
+        assert!(!m(b"abc", b"a_"));
+        assert!(!m(b"abc", b"abd"));
+        assert!(m(b"a%c", b"a\\%c"));
+        assert!(!m(b"abc", b"a\\%c"));
+        assert!(m(&[0, 255, 1], &[0, b'%', 1]));
+        // A pattern ending in its escape is an error once matching gets there.
+        assert!(like_match_bytes(b"a", b"a\\", Some(b'\\')).is_err());
+        assert!(!like_match_bytes(b"b", b"a\\", Some(b'\\')).unwrap());
+    }
+}
