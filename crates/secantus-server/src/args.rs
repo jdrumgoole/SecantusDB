@@ -451,7 +451,9 @@ OPTIONS:
                                  stable checkpoint. Create-time for fresh
                                  stores; an existing store keeps its recorded
                                  mode (default: off, or SECANTUS_DATA_NONLOGGED)
-    --checkpoint-seconds S       Stable-checkpoint cadence for --data-nonlogged
+    --checkpoint-seconds S       Seconds between checkpoints. A checkpoint is
+                                 what trims the log, and under --data-nonlogged
+                                 what makes the data durable
                                  (default: 60, or SECANTUS_CHECKPOINT_SECONDS)
     --noop-heartbeat-seconds S   Emit a periodic {{op:'n'}} oplog heartbeat every
                                  S seconds so quiet change-stream cursors keep

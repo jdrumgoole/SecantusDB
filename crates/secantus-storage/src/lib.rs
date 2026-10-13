@@ -3678,9 +3678,10 @@ pub struct Storage {
     /// floor after a crash and the prune clamp (entries above it are the
     /// recovery source and must not be pruned). 0 until the first checkpoint.
     stable_seq: Arc<AtomicI64>,
-    /// Periodic stable-checkpoint thread (data-nonlogged stores only; WT does
-    /// not checkpoint on its own under our config, and unlogged tables are
-    /// only as durable as their last checkpoint — the mongod cadence).
+    /// Periodic checkpoint thread (WT does not checkpoint on its own under
+    /// our config). For a data-nonlogged store it is the durability cadence
+    /// (unlogged tables are only as durable as their last checkpoint — the
+    /// mongod cadence); for a logged, durable store it is what trims the log.
     checkpoint_stop: Arc<AtomicBool>,
     /// Set by a cap-blocked prune to demand an anchor ahead of the cadence:
     /// the clamp forbids pruning entries above the stable seq, so without an
@@ -5516,7 +5517,12 @@ impl Storage {
             // gap idempotently, then re-anchor the stable point. On a clean
             // close the gap is empty and this is a no-op.
             storage.recover_from_oplog()?;
-            storage.spawn_stable_checkpoint_thread();
+            storage.spawn_checkpoint_thread(true);
+        } else if storage.durable && !storage.in_memory {
+            // A logged store's log is trimmed only by a checkpoint. Not in
+            // fast test mode (`durable=false`): those stores live for
+            // seconds and skip the close checkpoint for the same reason.
+            storage.spawn_checkpoint_thread(false);
         }
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
@@ -6700,10 +6706,19 @@ impl Storage {
         }
     }
 
-    /// Spawn the periodic stable-checkpoint thread (data-nonlogged stores).
-    /// Interval: `SECANTUS_CHECKPOINT_SECONDS` (default 60 — mongod's
-    /// cadence). Stopped + joined in `Drop` before the close checkpoint.
-    fn spawn_stable_checkpoint_thread(&self) {
+    /// Spawn the periodic checkpoint thread. Interval:
+    /// `SECANTUS_CHECKPOINT_SECONDS` (default 60 — mongod's cadence). Stopped
+    /// + joined in `Drop` before the close checkpoint.
+    ///
+    /// `stable` is the data-nonlogged mode: the checkpoint is what makes the
+    /// unlogged tables durable, and the thread records the stable marker
+    /// after it. Without it (a logged store) the checkpoint is what lets
+    /// WiredTiger REMOVE LOG FILES, and nothing else is written: until
+    /// 2026-10-13 a logged store checkpointed only when it closed, so its log
+    /// was never trimmed while it ran. Measured on `secantusd-pg` at 13,000
+    /// updates a second: 2.0 GB of log after 12 minutes over tables of a few
+    /// kilobytes, and 38 s to listen again after a SIGKILL.
+    fn spawn_checkpoint_thread(&self, stable: bool) {
         let interval = self
             .checkpoint_seconds
             .filter(|n| *n > 0)
@@ -6723,7 +6738,14 @@ impl Storage {
         let oplog = self.oplog.clone();
         let stable_seq = self.stable_seq.clone();
         let handle = thread::Builder::new()
-            .name("secantus-stable-checkpoint".into())
+            .name(
+                if stable {
+                    "secantus-stable-checkpoint"
+                } else {
+                    "secantus-checkpoint"
+                }
+                .into(),
+            )
             .spawn(move || {
                 let tick = std::time::Duration::from_millis(250);
                 let mut waited = std::time::Duration::ZERO;
@@ -6739,6 +6761,16 @@ impl Storage {
                         continue;
                     }
                     waited = std::time::Duration::ZERO;
+                    if !stable {
+                        // A logged store: the checkpoint alone. No stable
+                        // marker -- that row records the data-nonlogged
+                        // MODE, which a logged store must not acquire.
+                        let done = conn.open_session().and_then(|s| s.checkpoint(None));
+                        if let Err(e) = done {
+                            eprintln!("secantus-storage: periodic checkpoint failed: {e:?}");
+                        }
+                        continue;
+                    }
                     // Checkpoint-BEFORE-marker, same as stable_checkpoint()
                     // (see the invariant comment there): the marker is
                     // WAL-durable the moment it is written, so writing it
@@ -6782,7 +6814,7 @@ impl Storage {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(h);
             }
-            Err(e) => eprintln!("secantus-storage: could not spawn stable-checkpoint thread: {e}"),
+            Err(e) => eprintln!("secantus-storage: could not spawn checkpoint thread: {e}"),
         }
     }
 
