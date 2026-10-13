@@ -2799,7 +2799,7 @@ fn coll_stats_spec(spec: Option<&Bson>) -> Result<Document, CommandError> {
                         ));
                     };
                     if n < 1 {
-                        return Err(bad_value(&format!(
+                        return Err(bad_value(format!(
                             "BSON field 'scale' value must be >= 1, actual value '{n}'"
                         )));
                     }

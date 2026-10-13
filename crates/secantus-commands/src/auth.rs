@@ -1716,12 +1716,14 @@ mod tests {
         );
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply:?}");
         assert_eq!(reply.get_str("user").unwrap(), "CN=erin");
-        // authenticate with SCRAM mechanism is rejected on this path.
+        // A SCRAM mechanism does not run on this path, and mongod's answer
+        // to it is the failure it gives any authentication.
         let scram = dispatch(
             &doc! {"authenticate": 1, "mechanism": SCRAM_SHA_256, "user": "x", "$db": "admin"},
             &mut ctx,
         );
-        assert_eq!(scram.get_i32("code").unwrap(), 2);
+        assert_eq!(scram.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+        assert_eq!(scram.get_str("errmsg").unwrap(), "Authentication failed.");
     }
 
     #[test]

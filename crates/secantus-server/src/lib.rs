@@ -1039,10 +1039,8 @@ fn write_op_msg<S: Write>(
 ) -> io::Result<()> {
     let body_bytes = cursor_or_plain_body(reply, batch)?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, 0);
-    {
-        shared.top_stats.count_reply(frame.len());
-        stream.write_all(&frame)
-    }
+    shared.top_stats.count_reply(frame.len());
+    stream.write_all(&frame)
 }
 
 /// The reply body bytes: when a `PendingBatch` is present the batch blobs are
@@ -1078,10 +1076,8 @@ fn write_op_msg_flags<S: Write>(
         .to_writer(&mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, flags);
-    {
-        shared.top_stats.count_reply(frame.len());
-        stream.write_all(&frame)
-    }
+    shared.top_stats.count_reply(frame.len());
+    stream.write_all(&frame)
 }
 
 /// Stream the rest of an exhaust cursor over one socket. Called when a getMore
@@ -1128,10 +1124,8 @@ fn stream_exhaust_getmore<S: Write>(
         let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
         let body = cursor_or_plain_body(doc, pending)?;
         let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body, flags);
-        match {
-            shared.top_stats.count_reply(frame.len());
-            stream.write_all(&frame)
-        } {
+        shared.top_stats.count_reply(frame.len());
+        match stream.write_all(&frame) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -1401,10 +1395,8 @@ fn write_op_reply<S: Write>(
         0,
         0,
     );
-    {
-        shared.top_stats.count_reply(frame.len());
-        stream.write_all(&frame)
-    }
+    shared.top_stats.count_reply(frame.len());
+    stream.write_all(&frame)
 }
 
 /// Reply to a malformed-body request with `{ok:0, code:2 BadValue}` so the
