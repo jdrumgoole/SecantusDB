@@ -178,6 +178,58 @@ scenario(
         before=[{"$project": {"_id": {"$literal": 5}, "a": 1}}],
     ),
 )
+UNSORTED = {"_id": 9, "z": 1, "b": 2, "m": {"y": 1, "a": 2}}
+DOTTED = {**UNSORTED, "a.b": 5}
+scenario(
+    "$merge: the order of the fields it stores",
+    *[
+        merge({"into": "t", "whenMatched": matched}, source=[source], target=target)
+        for matched in MATCHED
+        for target in ([], [{"_id": 9, "q": 1, "m": {"k": 1}}])
+        for source in (UNSORTED, DOTTED)
+    ],
+    *[
+        merge(
+            {"into": "t", "on": "k", "whenMatched": matched},
+            source=[{"_id": 5, "k": "x", "q": 1}],
+            target=[{"_id": 1, "k": "x"}],
+            setup=[index({"k": 1}, unique=True)],
+        )
+        for matched in [*MATCHED, [{"$replaceWith": "$$new"}], [{"$set": {"p": "$$new._id"}}]]
+    ],
+    merge(
+        {"into": "t", "on": "k"},
+        source=[{"_id": 5, "q": 1}],
+        target=[{"_id": 1, "y": 1}],
+        setup=[index({"k": 1}, unique=True)],
+    ),
+    *[
+        merge(
+            {"into": "t", "whenMatched": matched},
+            source=[{"_id": 1, "a": 1}, {"_id": 2, "a": 20}],
+            target=[],
+            setup=[{"create": "t", "validator": {"a": {"$gt": 15}}}],
+        )
+        for matched in MATCHED
+    ],
+    *[
+        merge({"into": "t", "whenMatched": matched, "let": {"v": 1}})
+        for matched in ["keepExisting", "fail", []]
+    ],
+    merge({"into": "t", "whenMatched": [], "let": {"new": "$$ROOT"}}),
+    merge({"into": "t", "whenMatched": [], "let": {"v": "$$nope"}}),
+    merge({"into": "t", "whenMatched": "nope", "whenNotMatched": "nope"}),
+    merge({"into": "t", "whenNotMatched": "nope", "whenMatched": "nope"}),
+    merge({"into": "t", "on": 1, "into2": 1}),
+    merge({"into": "t", "on": [], "whenMatched": "keepExisting", "whenNotMatched": "fail"}),
+    merge({"into": "t", "whenMatched": "fail", "whenNotMatched": "fail", "let": {"V": 1}}),
+    merge({"into": "a$b", "on": "k"}),
+    merge({"into": "system.x", "on": "k"}),
+    merge({"into": "a$b"}, before=[{"$match": {"_id": 77}}]),
+    merge({"into": "t", "whenMatched": [{"$match": {}}]}, source=[]),
+    merge({"into": "t", "whenMatched": [{"$set": {"m": "$$nope"}}]}, source=[]),
+    merge({"into": "t", "on": "k"}, source=[]),
+)
 scenario(
     "$merge: a whenMatched pipeline",
     *[
@@ -518,7 +570,12 @@ scenario(
         ],
     ),
     out("v", setup=[{"create": "v", "viewOn": "t", "pipeline": []}]),
-    out("t", setup=[index({"b": 1}, expireAfterSeconds=1000), index({"k": "text"}, name="txt")]),
+    out(
+        "t",
+        target=[],
+        source=[{"_id": 1, "g": [1, 2]}],
+        setup=[index({"b": 1}, expireAfterSeconds=1000), index({"g": "2dsphere"}, name="geo")],
+    ),
     out("t", setup=[index({"b": 1}, hidden=True), index({"b": 1, "k": 1}, name="bk")]),
 )
 scenario(

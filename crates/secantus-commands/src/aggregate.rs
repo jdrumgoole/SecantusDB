@@ -286,6 +286,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    if let Some(problem) = nested_write_stage(&pipeline) {
+        return Ok(problem.into_reply());
+    }
+
     // `$out` / `$merge` are incompatible with readConcern level "linearizable"
     // (the only level mongod rejects here — local / available / majority all
     // run an output-stage aggregate fine). InvalidOptions (72).
@@ -298,11 +302,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .iter()
             .any(|s| matches!(stage_name(s), "$out" | "$merge"));
         if level == "linearizable" && has_output_stage {
+            let stage = pipeline.last().map(stage_name).unwrap_or("$out");
             return Ok(CommandError::new(
                 72,
                 "InvalidOptions",
-                "Aggregation stage $out/$merge cannot run with a readConcern \
-                 level of 'linearizable'",
+                format!(
+                    "Command aggregate does not support {{ readConcern: {{ level: \
+                     \"linearizable\", provenance: \"clientSupplied\" }} }} :: caused by :: \
+                     {stage} cannot be used with a 'linearizable' read concern level"
+                ),
             )
             .into_reply());
         }
@@ -1271,6 +1279,61 @@ fn core_run(
     })
 }
 
+/// A writing stage inside another stage's pipeline, which mongod refuses
+/// before it runs anything (measured 8.2.11, 2026-10-13). These RAN, and
+/// wrote to the target from inside a `$facet`.
+fn nested_write_stage(pipeline: &[Bson]) -> Option<CommandError> {
+    fn writer(stages: &[Bson]) -> Option<&str> {
+        stages
+            .iter()
+            .map(stage_name)
+            .find(|name| matches!(*name, "$out" | "$merge"))
+    }
+    for stage in pipeline {
+        let Bson::Document(stage) = stage else {
+            continue;
+        };
+        let Some((name, spec)) = stage.iter().next() else {
+            continue;
+        };
+        let inner: Vec<&[Bson]> = match (name.as_str(), spec) {
+            ("$facet", Bson::Document(facets)) => facets
+                .values()
+                .filter_map(|p| p.as_array().map(Vec::as_slice))
+                .collect(),
+            ("$lookup" | "$unionWith", Bson::Document(spec)) => spec
+                .get_array("pipeline")
+                .ok()
+                .map(|p| vec![p.as_slice()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for stages in inner {
+            if let Some(found) = writer(stages) {
+                let (code, errmsg) = match name.as_str() {
+                    "$facet" => (
+                        40600,
+                        format!("{found} is not allowed to be used within a $facet stage"),
+                    ),
+                    "$lookup" => (
+                        51047,
+                        format!("{found} is not allowed within a $lookup's sub-pipeline"),
+                    ),
+                    _ => (
+                        31441,
+                        format!("{found} is not allowed within a $unionWith's sub-pipeline"),
+                    ),
+                };
+                return Some(CommandError::new(code, format!("Location{code}"), errmsg));
+            }
+            if let Some(problem) = nested_write_stage(stages) {
+                return Some(problem);
+            }
+        }
+    }
+    None
+}
+
 /// mongod's two wrappers for an error raised inside a pipeline: a
 /// constant-folded expression fails at optimization time and says so, while a
 /// document-dependent one fails per document under the executor prefix.
@@ -1320,18 +1383,24 @@ fn apply_storage_stage(
         // A document the target's validator refuses is reported under the
         // SOURCE namespace's executor prefix, as mongod reports it.
         "$out" | "$merge" => {
-            let written = if name == "$out" {
-                apply_out(spec, docs, db, storage, bypass_validation)
-            } else {
-                apply_merge(spec, docs, db, storage, bypass_validation)
-            };
-            written.map_err(|mut e| {
-                if e.code == 121
-                    || e.code == 166
-                    || e.code == 7406103
-                    || (e.code == 66 && e.errmsg.starts_with(MERGE_UPDATE_PREFIX))
-                    || (e.code == 11000 && e.errmsg.starts_with("$merge failed due to "))
-                    || (name == "$out" && (e.code == 11000 || e.code == 17152))
+            // `$merge` puts its own write errors under the prefix.
+            if name == "$merge" {
+                return apply_merge(
+                    spec,
+                    docs,
+                    db,
+                    coll,
+                    vars,
+                    storage,
+                    collation,
+                    bypass_validation,
+                );
+            }
+            apply_out(spec, docs, db, storage, bypass_validation).map_err(|mut e| {
+                if matches!(
+                    e.code,
+                    121 | 166 | 7406103 | 7268700 | 11000 | 17152 | 20 | 52 | 53
+                ) && !e.errmsg.starts_with("Collection names cannot start")
                 {
                     let ns = format!("{db}.{}", coll.unwrap_or(""));
                     e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(&ns));
@@ -2323,7 +2392,6 @@ fn enforce_target_validator(
     coll: &str,
     docs: &[Document],
     bypass: bool,
-    through_update: bool,
 ) -> Result<(), CommandError> {
     if bypass {
         return Ok(());
@@ -2340,14 +2408,12 @@ fn enforce_target_validator(
     }
     for d in docs {
         if !secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(false) {
-            // `$merge` writes through the update executor and says so;
-            // `$out` inserts. Both carry the same `errInfo` an insert does.
-            let errmsg = if through_update {
-                "Plan executor error during update :: caused by :: Document failed validation"
-            } else {
-                "Document failed validation"
-            };
-            let mut e = CommandError::new(121, "DocumentValidationFailure", errmsg);
+            // The `errInfo` an insert carries.
+            let mut e = CommandError::new(
+                121,
+                "DocumentValidationFailure",
+                "Document failed validation",
+            );
             let mut extra = Document::new();
             extra.insert("errInfo", crate::crud::validation_error_info(&validator, d));
             e.extra = Some(Box::new(extra));
@@ -2368,7 +2434,16 @@ fn apply_out(
     bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
     let (out_db, out_coll) = out_target(spec, db)?;
-    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation, false)?;
+    // What an insert refuses about a document, `$out` refuses too, and
+    // leaves the target as it was.
+    if let Some((code, errmsg)) = docs.iter().find_map(crate::crud::insert_document_error) {
+        return Err(CommandError::new(
+            code,
+            crate::util::error_code_name(code),
+            errmsg,
+        ));
+    }
+    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation)?;
     // `$out` replaces the target's DOCUMENTS. Its options and indexes stay:
     // mongod builds the replacement with both and swaps it in (measured
     // 8.2.11, 2026-10-11). Until then the target was dropped and created
@@ -2412,6 +2487,13 @@ fn apply_out(
         _ => None,
     };
     let mut default_index = None;
+    if wanted.is_some() && existed && !options.contains_key("timeseries") {
+        return Err(CommandError::new(
+            7268700,
+            "Location7268700",
+            "Cannot create a time-series collection from a non time-series collection or view.",
+        ));
+    }
     if let Some(wanted) = wanted {
         match options.get_document("timeseries") {
             Ok(found) if found == &wanted => {}
@@ -2504,173 +2586,405 @@ fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), Command
             "InvalidNamespace",
             format!("Invalid $out target namespace, {db}"),
         )),
-        Some(Bson::String(c)) => Ok((db.to_string(), c.clone())),
+        Some(Bson::String(c)) => out_name(db.to_string(), c.clone()),
         Some(Bson::Document(d)) => {
-            let coll = d
-                .get_str("coll")
-                .map_err(|_| bad_value("$out target document requires 'coll'"))?;
-            let out_db = d.get_str("db").unwrap_or(db);
-            Ok((out_db.to_string(), coll.to_string()))
+            let wrong_type = |field: &str, value: &Bson, expected: &str| {
+                CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "BSON field '$out.{field}' is the wrong type '{}', expected type \
+                         '{expected}'",
+                        secantus_core::query::bson_type_name(value)
+                    ),
+                )
+            };
+            let (mut out_db, mut out_coll) = (None, None);
+            for (key, value) in d {
+                match (key.as_str(), value) {
+                    ("db", Bson::String(s)) => out_db = Some(s.clone()),
+                    ("coll", Bson::String(s)) => out_coll = Some(s.clone()),
+                    ("db" | "coll", Bson::Null) => {}
+                    ("db" | "coll", other) => return Err(wrong_type(key, other, "string")),
+                    ("timeseries", Bson::Document(_) | Bson::Null) => {}
+                    ("timeseries", other) => return Err(wrong_type(key, other, "object")),
+                    _ => {}
+                }
+            }
+            let coll = out_coll.ok_or_else(|| bad_value("$out target document requires 'coll'"))?;
+            // The document form names its database: it is not optional
+            // (measured 8.2.11, 2026-10-13; the current one was assumed).
+            let Some(out_db) = out_db else {
+                return Err(CommandError::new(
+                    40414,
+                    "IDLFailedToParse",
+                    "BSON field '$out.db' is missing but a required field",
+                ));
+            };
+            if out_db.is_empty() {
+                return Err(CommandError::new(
+                    73,
+                    "InvalidNamespace",
+                    format!("Invalid $out target namespace, .{coll}"),
+                ));
+            }
+            if coll.is_empty() {
+                return Err(CommandError::new(
+                    73,
+                    "InvalidNamespace",
+                    format!("Invalid $out target namespace, {out_db}"),
+                ));
+            }
+            out_name(out_db, coll)
         }
         _ => Err(bad_value("$out requires a collection name or {db, coll}")),
     }
 }
 
-/// `$merge` — merge the pipeline result into the target collection. Mirrors
-/// `aggregate._stage_merge`: per result doc, find the target doc(s) matching the
-/// `on` key, then apply `whenMatched` (`merge` deep-merge default / `replace` /
-/// `keepExisting` / `delete` / `fail`, or an inline pipeline with `$$new` bound
-/// to the incoming doc) or `whenNotMatched` (`insert` default / `discard` /
-/// `fail`). A non-`_id` `on` requires a matching unique index on the target.
+/// A `$out` target mongod will not write: a name no collection can have, or
+/// one of the system's own. These were written.
+fn out_name(db: String, coll: String) -> Result<(String, String), CommandError> {
+    if coll.starts_with('.') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Collection names cannot start with '.': {coll}"),
+        ));
+    }
+    if coll.starts_with("system.") {
+        return Err(CommandError::new(
+            17385,
+            "Location17385",
+            format!("Can't $out to special collection: {coll}"),
+        ));
+    }
+    let refused = if coll.contains('$') {
+        Some(format!("Invalid collection name: {coll}"))
+    } else {
+        crate::admin::invalid_write_namespace(&db, &coll).map(|e| e.errmsg)
+    };
+    match refused {
+        Some(reason) => Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            format!("error with target namespace: {reason}"),
+        )),
+        None => Ok((db, coll)),
+    }
+}
+
+/// `$merge` — write the pipeline's documents into the target collection.
+///
+/// mongod writes them with the commands a client would use, and this does
+/// the same, so the stage stores what those commands store (measured 8.2.11,
+/// 2026-10-13). For a document and the `on` fields' values `q`:
+///
+/// | `whenMatched`  | the write                                         |
+/// | -------------- | ------------------------------------------------- |
+/// | `merge`        | `update {q, u: {$set: doc}}`                      |
+/// | `replace`      | `update {q, u: doc}`                              |
+/// | `keepExisting` | `update {q, u: {$setOnInsert: doc}, upsert: true}` |
+/// | a pipeline     | `update {q, u: pipeline, c: {new: doc}}`          |
+/// | `fail`         | `insert doc`                                      |
+///
+/// `whenNotMatched: "insert"` makes the update an upsert. So `merge` sets
+/// each top-level field WHOLE (a sub-document is replaced, not merged into),
+/// a field name with a dot in it is a path, and new fields land in the
+/// order `$set` gives them. This used to merge sub-documents field by field
+/// and stored a different document.
+///
+/// The writes of a batch are all attempted and the first failure is what the
+/// stage reports, as an unordered batch: the documents after a refused one
+/// are still written. It used to check every document against the target's
+/// validator first and write none, and to stop at the first refused write.
+#[allow(clippy::too_many_arguments)]
 fn apply_merge(
     spec: Option<&Bson>,
     docs: Vec<Document>,
     db: &str,
+    source: Option<&str>,
+    vars: &Document,
     storage: &dyn crate::storage::Storage,
+    collation: Option<&Collation>,
     bypass_validation: bool,
 ) -> Result<Vec<Document>, CommandError> {
-    let (out_db, out_coll, on, when_matched, when_not_matched) = merge_spec(spec, db)?;
+    let merge = merge_spec(spec, db)?;
+    // A `let` that names a variable nobody defined.
+    if let Some(bindings) = &merge.let_vars {
+        let bound: Vec<String> = vars.keys().cloned().collect();
+        for expr in bindings.values() {
+            if let Some((code, errmsg)) = argtypes::expression_problem(expr, &bound) {
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    errmsg,
+                ));
+            }
+        }
+    }
+    let source_ns = format!("{db}.{}", source.unwrap_or(""));
+    let during = |mut e: CommandError| {
+        e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(&source_ns));
+        e
+    };
     // `$merge` writes to a collection, and mongod presents a time-series
     // collection as a view.
     if storage
-        .get_collection_options(&out_db, &out_coll)
+        .get_collection_options(&merge.db, &merge.coll)
         .is_ok_and(|o| o.contains_key("timeseries"))
     {
         return Err(crate::timeseries::is_a_view(&format!(
-            "{out_db}.{out_coll}"
+            "{}.{}",
+            merge.db, merge.coll
         )));
     }
-    enforce_target_validator(storage, &out_db, &out_coll, &docs, bypass_validation, true)?;
-    storage
-        .create_collection(&out_db, &out_coll)
-        .map_err(command_error)?;
     // mongod requires a unique index covering a non-`_id` `on` so the match is
     // guaranteed to hit at most one target doc.
-    merge_validate_on(storage, &out_db, &out_coll, &on)?;
-    let target_collation = crate::util::default_collation(storage, &out_db, &out_coll);
-    for d in docs {
-        let mut filter = Document::new();
-        for field in &on {
-            let v = secantus_core::get_path(&d, field)
-                .cloned()
-                .unwrap_or(Bson::Null);
-            filter.insert(field.clone(), v);
-        }
-        // The target's default collation decides what matches, as it does
-        // for any read of that collection.
-        let found = match &target_collation {
-            Some(c) => storage.find_collated(
-                &out_db,
-                &out_coll,
-                &filter,
-                None,
-                None,
-                Some(c),
-                &Document::new(),
-            ),
-            None => storage.find(&out_db, &out_coll, &filter, None, None),
-        };
-        let existing = decode_docs(found.map_err(command_error)?)?
-            .into_iter()
-            .next();
+    merge_validate_on(storage, &merge.db, &merge.coll, &merge.on, collation)?;
+    if merge.coll.starts_with('.') {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Collection names cannot start with '.': {}", merge.coll),
+        ));
+    }
+    if merge.coll.starts_with("system.") {
+        return Err(CommandError::new(
+            31319,
+            "Location31319",
+            format!("Cannot $merge to special collection: {}", merge.coll),
+        ));
+    }
+    if docs.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The names a write refuses are refused when the first document is
+    // written, so a pipeline that produces none says nothing about them.
+    if merge.coll.contains('$') {
+        return Err(during(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("Invalid collection name: {}", merge.coll),
+        )));
+    }
+    if let Some(e) = crate::admin::invalid_write_namespace(&merge.db, &merge.coll) {
+        return Err(during(e));
+    }
 
-        match existing {
-            Some(existing) => {
-                let existing_id = existing.get("_id").cloned().unwrap_or(Bson::Null);
-                let id_filter = doc! {"_id": existing_id.clone()};
-                let mode = match &when_matched {
-                    WhenMatched::Mode(m) => m.as_str(),
-                    WhenMatched::Pipeline(pipeline) => {
-                        // Run the inline pipeline over the existing doc with the
-                        // incoming doc bound to `$$new`; the result replaces it
-                        // (existing `_id` preserved).
-                        let pvars = doc! { "new": Bson::Document(d.clone()) };
-                        let result =
-                            core_run(vec![existing.clone()], pipeline, &pvars, None, None)?;
-                        let mut newdoc = result.into_iter().next().unwrap_or(existing);
-                        if let Some(changed) = merge_changes_id(&existing_id, newdoc.get("_id")) {
-                            return Err(merge_altered_id(changed));
-                        }
-                        newdoc.insert("_id", existing_id);
-                        storage
-                            .update_matching(&out_db, &out_coll, &id_filter, &newdoc, false, false)
-                            .map_err(merge_write_error)?;
-                        continue;
-                    }
-                };
-                match mode {
-                    "keepExisting" => {}
-                    "fail" => {
-                        // mongod's DuplicateKey carries keyPattern/keyValue so the
-                        // driver can inspect which key collided (the crud-spec
-                        // "$merge DuplicateKey error is accessible" test asserts it).
-                        return Err(CommandError::new(
-                            11000,
-                            "DuplicateKey",
-                            "$merge whenMatched=fail matched an existing document",
-                        )
-                        .with_extra(doc! {
-                            "keyPattern": { "_id": 1 },
-                            "keyValue": { "_id": existing_id.clone() },
-                        }));
-                    }
-                    "delete" => {
-                        storage
-                            .delete_matching(&out_db, &out_coll, &id_filter, 1)
-                            .map_err(command_error)?;
-                    }
-                    "replace" => {
-                        if let Some(changed) = merge_changes_id(&existing_id, d.get("_id")) {
-                            return Err(merge_altered_id(changed));
-                        }
-                        // One replacement, as mongod does it. This deleted the
-                        // matched document and then inserted the new one, so a
-                        // replacement a unique index refused left NEITHER: the
-                        // document was gone (found 2026-10-12 against 8.2.11,
-                        // which keeps it). It also moved every replaced
-                        // document to the end of the collection.
-                        let mut new = d;
-                        new.entry("_id".to_string()).or_insert(existing_id);
-                        storage
-                            .update_matching(&out_db, &out_coll, &id_filter, &new, false, false)
-                            .map_err(merge_write_error)?;
-                    }
-                    // default: "merge" — deep-merge the result doc over the
-                    // existing one (existing `_id` preserved), then replace.
-                    _ => {
-                        if merge_changes_id(&existing_id, d.get("_id")).is_some() {
-                            return Err(CommandError::new(
-                                66,
-                                "ImmutableField",
-                                format!(
-                                    "{}Performing an update on the path '_id' would modify \
-                                     the immutable field '_id'",
-                                    MERGE_UPDATE_PREFIX
-                                ),
-                            ));
-                        }
-                        let mut merged = deep_merge_docs(&existing, &d);
-                        merged.insert("_id", existing_id);
-                        storage
-                            .update_matching(&out_db, &out_coll, &id_filter, &merged, false, false)
-                            .map_err(merge_write_error)?;
+    // Each document with the values of its `on` fields.
+    let mut writes: Vec<(Document, Document)> = Vec::with_capacity(docs.len());
+    for mut doc in docs {
+        if merge.on.iter().any(|f| f == "_id") && !doc.contains_key("_id") {
+            let mut with_id = doc! { "_id": bson::oid::ObjectId::new() };
+            with_id.extend(doc);
+            doc = with_id;
+        }
+        let mut q = Document::new();
+        for field in &merge.on {
+            let value = match secantus_core::get_path(&doc, field) {
+                Some(Bson::Array(_)) => {
+                    return Err(during(CommandError::new(
+                        51185,
+                        "Location51185",
+                        format!("$merge write error: 'on' field '{field}' is an array"),
+                    )))
+                }
+                Some(v) => v.clone(),
+                None => Bson::Null,
+            };
+            q.insert(field.clone(), value);
+        }
+        writes.push((q, doc));
+    }
+
+    let upsert = merge.not_matched == "insert";
+    let mut first: Option<CommandError> = None;
+    let note = |e: CommandError, first: &mut Option<CommandError>| {
+        if first.is_none() {
+            *first = Some(e);
+        }
+    };
+    if matches!(&merge.matched, WhenMatched::Mode(m) if m == "fail") {
+        // Plain inserts, unordered: what is already there is the failure.
+        for chunk in writes.chunks(MERGE_BATCH) {
+            let mut encoded = Vec::with_capacity(chunk.len());
+            for (_, doc) in chunk {
+                if let Some((code, errmsg)) = crate::crud::insert_document_error(doc) {
+                    note(
+                        CommandError::new(code, crate::util::error_code_name(code), errmsg),
+                        &mut first,
+                    );
+                    continue;
+                }
+                if let Err(e) = enforce_target_validator(
+                    storage,
+                    &merge.db,
+                    &merge.coll,
+                    std::slice::from_ref(doc),
+                    bypass_validation,
+                ) {
+                    note(e, &mut first);
+                    continue;
+                }
+                encoded.extend(encode_docs(vec![doc.clone()])?);
+            }
+            if encoded.is_empty() {
+                continue;
+            }
+            let (_, errors) = storage
+                .insert(&merge.db, &merge.coll, encoded, false)
+                .map_err(command_error)?;
+            if let Some(error) = errors.into_iter().next() {
+                let mut e = write_error_of(&error);
+                if e.code == 11000 {
+                    e.errmsg = format!(
+                        "$merge with whenMatched: fail found an existing document with the same \
+                         values for the 'on' fields :: caused by :: {}",
+                        e.errmsg
+                    );
+                }
+                note(e, &mut first);
+            }
+            if first.is_some() {
+                break;
+            }
+        }
+        return match first {
+            Some(e) => Err(during(e)),
+            None => Ok(Vec::new()),
+        };
+    }
+
+    // The variables a `whenMatched` pipeline sees beside `$$new`: the
+    // command's own, and the stage's `let`, read from each source document.
+    let statement = |q: &Document, doc: &Document| -> Result<Document, CommandError> {
+        let mut st = doc! { "q": q.clone() };
+        match &merge.matched {
+            WhenMatched::Pipeline(pipeline) => {
+                let mut constants = vars.clone();
+                if let Some(bindings) = &merge.let_vars {
+                    for (name, expr) in bindings {
+                        let value = secantus_core::expressions::evaluate(doc, expr, vars)
+                            .map_err(|_| bad_value("$merge could not evaluate a 'let' variable"))?;
+                        constants.insert(name.clone(), value);
                     }
                 }
+                constants.insert("new", doc.clone());
+                st.insert("u", pipeline.clone());
+                st.insert("c", constants);
+                st.insert("upsert", upsert);
+                st.insert("upsertSupplied", upsert);
             }
-            None => match when_not_matched.as_str() {
-                "discard" => {}
-                "fail" => {
-                    return Err(bad_value(
-                        "$merge whenNotMatched=fail and no matching document exists",
-                    ));
+            WhenMatched::Mode(mode) => match mode.as_str() {
+                "replace" => {
+                    st.insert("u", doc.clone());
+                    st.insert("upsert", upsert);
+                }
+                "keepExisting" => {
+                    st.insert("u", doc! { "$setOnInsert": doc.clone() });
+                    st.insert("upsert", true);
                 }
                 _ => {
-                    insert_or_fail(storage, &out_db, &out_coll, encode_docs(vec![d])?)?;
+                    st.insert("u", doc! { "$set": doc.clone() });
+                    st.insert("upsert", upsert);
                 }
             },
         }
+        st.insert("multi", false);
+        Ok(st)
+    };
+    // `whenNotMatched: "fail"` needs each statement's own count, so those go
+    // one to a command.
+    let per_command = if merge.not_matched == "fail" {
+        1
+    } else {
+        MERGE_BATCH
+    };
+    for chunk in writes.chunks(per_command) {
+        let mut statements: Vec<Bson> = Vec::with_capacity(chunk.len());
+        for (q, doc) in chunk {
+            statements.push(Bson::Document(statement(q, doc)?));
+        }
+        let mut command = doc! {
+            "update": merge.coll.clone(),
+            "updates": statements,
+            "ordered": false,
+        };
+        if bypass_validation {
+            command.insert("bypassDocumentValidation", true);
+        }
+        let reply = match crate::crud::update_in(&command, &merge.db, storage) {
+            Ok(reply) => reply,
+            Err(e) => return Err(during(e)),
+        };
+        if reply.get_f64("ok").unwrap_or(0.0) != 1.0 {
+            return Err(during(write_error_of(&reply)));
+        }
+        if let Some(error) = reply
+            .get_array("writeErrors")
+            .ok()
+            .and_then(|errors| errors.first())
+            .and_then(Bson::as_document)
+        {
+            let mut e = write_error_of(error);
+            let prefix = match e.code {
+                11000 => "$merge failed due to a DuplicateKey error :: caused by :: ",
+                66 => {
+                    "$merge failed to update the matching document, did you attempt to modify \
+                     the _id or the shard key? :: caused by :: "
+                }
+                _ => "",
+            };
+            e.errmsg = format!("{prefix}{}", e.errmsg);
+            note(e, &mut first);
+        } else if merge.not_matched == "fail" && crate::util::as_i64_field(&reply, "n") == 0 {
+            note(
+                CommandError::new(
+                    13113,
+                    "MergeStageNoMatchingDocument",
+                    "$merge could not find a matching document in the target collection for at \
+                     least one document in the source collection",
+                ),
+                &mut first,
+            );
+        }
+        if first.is_some() && per_command > 1 {
+            break;
+        }
     }
-    Ok(Vec::new())
+    match first {
+        Some(e) => Err(during(e)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The most statements one write command takes, which is as many as mongod
+/// puts in one of the stage's batches.
+const MERGE_BATCH: usize = 100_000;
+
+/// A write error, or a failed reply, as the error a stage raises: its code
+/// and message, and whatever else it carried (`keyPattern`, `errInfo`).
+fn write_error_of(error: &Document) -> CommandError {
+    let code = crate::util::as_i64_field(error, "code") as i32;
+    let errmsg = error.get_str("errmsg").unwrap_or("write failed");
+    let mut extra = error.clone();
+    for key in [
+        "index",
+        "code",
+        "codeName",
+        "errmsg",
+        "ok",
+        "n",
+        "nModified",
+    ] {
+        extra.remove(key);
+    }
+    let e = CommandError::new(code, crate::util::error_code_name(code), errmsg);
+    if extra.is_empty() {
+        e
+    } else {
+        e.with_extra(extra)
+    }
 }
 
 /// Insert into a stage's target, failing on the first document the storage
@@ -2685,79 +2999,12 @@ pub(crate) fn insert_or_fail(
     let (_, errors) = storage
         .insert(db, coll, docs, true)
         .map_err(command_error)?;
-    let Some(first) = errors.into_iter().next() else {
-        return Ok(());
-    };
-    let code = first.get_i32("code").unwrap_or(8);
-    let errmsg = first
-        .get_str("errmsg")
-        .unwrap_or("write failed")
-        .to_string();
-    let mut extra = first.clone();
-    for key in ["index", "code", "errmsg"] {
-        extra.remove(key);
+    match errors.into_iter().next() {
+        Some(first) => Err(write_error_of(&first)),
+        None => Ok(()),
     }
-    Err(CommandError::new(code, crate::util::error_code_name(code), errmsg).with_extra(extra))
 }
 
-/// A storage error from a `$merge` write, worded as mongod words a
-/// duplicate key there.
-fn merge_write_error(e: crate::StorageError) -> CommandError {
-    let info = match e {
-        crate::StorageError::DuplicateKey(info) => info,
-        other => return command_error(other),
-    };
-    let plain = info
-        .errmsg
-        .strip_prefix("Plan executor error during update :: caused by :: ")
-        .unwrap_or(&info.errmsg);
-    let error = CommandError::new(
-        11000,
-        "DuplicateKey",
-        format!(
-            "$merge failed due to a DuplicateKey error :: caused by :: Plan executor error \
-             during update :: caused by :: {plain}"
-        ),
-    );
-    let mut extra = Document::new();
-    if let Some(pattern) = info.key_pattern {
-        extra.insert("keyPattern", pattern);
-    }
-    if let Some(value) = info.key_value {
-        extra.insert("keyValue", value);
-    }
-    error.with_extra(extra)
-}
-
-/// The incoming `_id` when it is not the matched document's. The two can
-/// match and still differ: the target's default collation decides the match
-/// (`"M"` finds `"m"` at strength 2), and mongod then refuses to change the
-/// `_id` (measured 8.2.11).
-fn merge_changes_id<'a>(existing: &Bson, incoming: Option<&'a Bson>) -> Option<&'a Bson> {
-    incoming.filter(|new| secantus_core::order::cmp(existing, new) != std::cmp::Ordering::Equal)
-}
-
-/// What mongod puts before the update error a `$merge` ran into (after the
-/// source namespace's executor prefix, which the stage dispatch adds).
-const MERGE_UPDATE_PREFIX: &str = "$merge failed to update the matching document, did you \
-     attempt to modify the _id or the shard key? :: caused by :: Plan executor error during \
-     update :: caused by :: ";
-
-/// mongod's error for a replacement that would change the matched `_id`.
-fn merge_altered_id(new_id: &Bson) -> CommandError {
-    CommandError::new(
-        66,
-        "ImmutableField",
-        format!(
-            "{MERGE_UPDATE_PREFIX}After applying the update, the (immutable) field '_id' was \
-             found to have been altered to _id: {}",
-            secantus_core::query::bson_value_repr(new_id)
-        ),
-    )
-}
-
-/// Parse `$merge`'s spec into `(db, coll, on, whenMatched, whenNotMatched)`.
-/// Accepts the string short-form (`$merge: "coll"`) or the document form.
 /// `$merge` `whenMatched`: either a named mode or an inline aggregation pipeline
 /// applied to each matched document (with the incoming doc bound to `$$new`).
 enum WhenMatched {
@@ -2765,13 +3012,34 @@ enum WhenMatched {
     Pipeline(Vec<Bson>),
 }
 
-fn merge_spec(
-    spec: Option<&Bson>,
-    db: &str,
-) -> Result<(String, String, Vec<String>, WhenMatched, String), CommandError> {
-    const VALID_MATCHED: &[&str] = &["merge", "replace", "keepExisting", "fail", "delete"];
-    const VALID_NOT_MATCHED: &[&str] = &["insert", "discard", "fail"];
-    let (out_db, out_coll, on, when_matched, when_not_matched) = match spec {
+/// A `$merge` stage as given: where it writes, the fields that pair a
+/// document with one already there, what to do with each kind, and the
+/// stage's own variables.
+struct MergeSpec {
+    db: String,
+    coll: String,
+    on: Vec<String>,
+    matched: WhenMatched,
+    not_matched: String,
+    let_vars: Option<Document>,
+}
+
+/// Parse `$merge`'s spec, refusing what mongod refuses in the order it
+/// refuses it (measured 8.2.11, 2026-10-13): each field as the document has
+/// it, then `whenNotMatched`'s value, the pair of modes, and `let`.
+fn merge_spec(spec: Option<&Bson>, db: &str) -> Result<MergeSpec, CommandError> {
+    let located = |code: i32, msg: String| CommandError::new(code, format!("Location{code}"), msg);
+    let wrong_type = |path: &str, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let fields = match spec {
         // Empty target: not a namespace. mongod QUOTES it here and does not in
         // `$out` -- the two messages really are shaped differently.
         Some(Bson::String(c)) if c.is_empty() => {
@@ -2781,87 +3049,306 @@ fn merge_spec(
                 format!("Invalid $merge target namespace: '{db}'"),
             ));
         }
-        Some(Bson::String(c)) => (
-            db.to_string(),
-            c.clone(),
-            vec!["_id".to_string()],
-            WhenMatched::Mode("merge".to_string()),
-            "insert".to_string(),
-        ),
-        Some(Bson::Document(d)) => {
-            let (odb, ocoll) = match d.get("into") {
-                Some(Bson::String(c)) => (db.to_string(), c.clone()),
-                Some(Bson::Document(into)) => {
-                    let coll = into
-                        .get_str("coll")
-                        .map_err(|_| bad_value("$merge into.coll must be a string"))?;
-                    (
-                        into.get_str("db").unwrap_or(db).to_string(),
-                        coll.to_string(),
-                    )
-                }
-                _ => return Err(bad_value("$merge requires 'into'")),
-            };
-            let on = match d.get("on") {
-                Some(Bson::String(s)) => vec![s.clone()],
-                Some(Bson::Array(a)) => a
-                    .iter()
-                    .filter_map(|b| b.as_str().map(String::from))
-                    .collect(),
-                None => vec!["_id".to_string()],
-                _ => {
-                    return Err(bad_value(
-                        "$merge 'on' must be a string or array of strings",
-                    ))
-                }
-            };
-            let wm = match d.get("whenMatched") {
-                Some(Bson::Array(p)) => WhenMatched::Pipeline(p.clone()),
-                Some(Bson::String(s)) => WhenMatched::Mode(s.clone()),
-                None => WhenMatched::Mode("merge".to_string()),
-                _ => {
-                    return Err(bad_value(
-                        "$merge whenMatched must be a mode string or a pipeline array",
-                    ))
-                }
-            };
-            let wnm = d.get_str("whenNotMatched").unwrap_or("insert").to_string();
-            (odb, ocoll, on, wm, wnm)
+        Some(Bson::String(c)) => {
+            return Ok(MergeSpec {
+                db: db.to_string(),
+                coll: c.clone(),
+                on: vec!["_id".to_string()],
+                matched: WhenMatched::Mode("merge".to_string()),
+                not_matched: "insert".to_string(),
+                let_vars: None,
+            })
         }
+        Some(Bson::Document(d)) => d,
         _ => return Err(bad_value("$merge requires a string or document spec")),
     };
-    if let WhenMatched::Mode(m) = &when_matched {
-        if !VALID_MATCHED.contains(&m.as_str()) {
-            return Err(bad_value(format!(
-                "$merge whenMatched must be one of {VALID_MATCHED:?} or a pipeline array"
-            )));
+    let mut target: Option<(String, String)> = None;
+    let mut on = vec!["_id".to_string()];
+    let mut matched = WhenMatched::Mode("merge".to_string());
+    let mut not_matched = "insert".to_string();
+    let mut let_vars: Option<Document> = None;
+    for (key, value) in fields {
+        match key.as_str() {
+            "into" => match value {
+                Bson::String(c) if c.is_empty() => {
+                    return Err(located(
+                        5786800,
+                        "$merge 'into' field cannot be an empty string".to_string(),
+                    ))
+                }
+                Bson::String(c) => target = Some((db.to_string(), c.clone())),
+                Bson::Document(into) => {
+                    let (mut out_db, mut out_coll) = (None, None);
+                    for (name, part) in into {
+                        let slot = match name.as_str() {
+                            "db" => &mut out_db,
+                            "coll" => &mut out_coll,
+                            other => {
+                                return Err(CommandError::new(
+                                    40415,
+                                    "IDLUnknownField",
+                                    format!("BSON field 'into.{other}' is an unknown field."),
+                                ))
+                            }
+                        };
+                        match part {
+                            Bson::String(s) => *slot = Some(s.clone()),
+                            Bson::Null => {}
+                            other => {
+                                return Err(wrong_type(&format!("into.{name}"), other, "string"))
+                            }
+                        }
+                    }
+                    let Some(out_coll) = out_coll.filter(|c| !c.is_empty()) else {
+                        return Err(located(
+                            5786801,
+                            "$merge 'into' field must specify a 'coll' that is not empty, null \
+                             or undefined"
+                                .to_string(),
+                        ));
+                    };
+                    let out_db = out_db.filter(|d| !d.is_empty());
+                    target = Some((out_db.unwrap_or_else(|| db.to_string()), out_coll));
+                }
+                other => {
+                    return Err(located(
+                        51178,
+                        format!(
+                            "$merge 'into' field  must be either a string or an object, but \
+                             found {}",
+                            secantus_core::query::bson_type_name(other)
+                        ),
+                    ))
+                }
+            },
+            "on" => {
+                on = match value {
+                    Bson::String(s) => vec![s.clone()],
+                    Bson::Array(items) => {
+                        let mut names = Vec::with_capacity(items.len());
+                        for item in items {
+                            match item {
+                                Bson::String(s) => names.push(s.clone()),
+                                other => {
+                                    return Err(located(
+                                        51134,
+                                        format!(
+                                            "$merge 'on' array elements must be strings, but \
+                                             found {}",
+                                            secantus_core::query::bson_type_name(other)
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        if names.is_empty() {
+                            return Err(located(
+                                51187,
+                                "If explicitly specifying $merge 'on', must include at least \
+                                 one field"
+                                    .to_string(),
+                            ));
+                        }
+                        names
+                    }
+                    other => {
+                        return Err(located(
+                            51186,
+                            format!(
+                                "$merge 'on' field  must be either a string or an array of \
+                                 strings, but found {}",
+                                secantus_core::query::bson_type_name(other)
+                            ),
+                        ))
+                    }
+                };
+                for (index, name) in on.iter().enumerate() {
+                    if name.is_empty() {
+                        return Err(located(
+                            40352,
+                            "FieldPath cannot be constructed with empty string".to_string(),
+                        ));
+                    }
+                    if on[..index].contains(name) {
+                        return Err(located(31465, format!("Found a duplicate field '{name}'")));
+                    }
+                }
+            }
+            "whenMatched" => {
+                matched = match value {
+                    Bson::Array(stages) => {
+                        for stage in stages {
+                            let Bson::Document(stage) = stage else {
+                                return Err(CommandError::new(
+                                    14,
+                                    "TypeMismatch",
+                                    "Each element of the 'pipeline' array must be an object",
+                                ));
+                            };
+                            let name = stage.keys().next().map(String::as_str).unwrap_or("");
+                            if !recognized_stage(name) {
+                                return Err(located(
+                                    40324,
+                                    format!("Unrecognized pipeline stage name: '{name}'"),
+                                ));
+                            }
+                        }
+                        WhenMatched::Pipeline(stages.clone())
+                    }
+                    Bson::String(mode) => {
+                        const MODES: &[&str] = &["merge", "replace", "keepExisting", "fail"];
+                        if !MODES.contains(&mode.as_str()) {
+                            return Err(bad_value(format!(
+                                "Enumeration value '{mode}' for field 'whenMatched' is not a \
+                                 valid value."
+                            )));
+                        }
+                        WhenMatched::Mode(mode.clone())
+                    }
+                    other => {
+                        return Err(located(
+                            51191,
+                            format!(
+                                "$merge 'whenMatched' field  must be either a string or an \
+                                 array, but found {}",
+                                secantus_core::query::bson_type_name(other)
+                            ),
+                        ))
+                    }
+                }
+            }
+            "whenNotMatched" => match value {
+                Bson::String(mode) if !["insert", "discard", "fail"].contains(&mode.as_str()) => {
+                    return Err(bad_value(format!(
+                        "Enumeration value '{mode}' for field '$merge.whenNotMatched' is not a \
+                         valid value."
+                    )))
+                }
+                Bson::String(mode) => not_matched = mode.clone(),
+                Bson::Null => {}
+                other => return Err(wrong_type("$merge.whenNotMatched", other, "string")),
+            },
+            "let" => match value {
+                Bson::Document(bindings) => let_vars = Some(bindings.clone()),
+                Bson::Null => {}
+                other => return Err(wrong_type("$merge.let", other, "object")),
+            },
+            other => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field '$merge.{other}' is an unknown field."),
+                ))
+            }
         }
     }
-    if !VALID_NOT_MATCHED.contains(&when_not_matched.as_str()) {
-        return Err(bad_value(format!(
-            "$merge whenNotMatched must be one of {VALID_NOT_MATCHED:?}"
-        )));
+    let Some((out_db, out_coll)) = target else {
+        return Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            "BSON field '$merge.into' is missing but a required field",
+        ));
+    };
+    let mode_name = match &matched {
+        WhenMatched::Mode(mode) => Some(mode.as_str()),
+        WhenMatched::Pipeline(_) => None,
+    };
+    // `keepExisting` and `fail` say what to do with a document that is
+    // already there, and only make sense when the others are inserted.
+    if matches!(mode_name, Some("keepExisting" | "fail")) && not_matched != "insert" {
+        return Err(located(
+            51181,
+            format!(
+                "Combination of $merge modes 'whenMatched: {}' and 'whenNotMatched: \
+                 {not_matched}' is not supported",
+                mode_name.unwrap_or_default()
+            ),
+        ));
     }
-    Ok((out_db, out_coll, on, when_matched, when_not_matched))
+    if let Some(bindings) = &let_vars {
+        if let Some(mode) = mode_name {
+            return Err(located(
+                51199,
+                format!("Cannot use 'let' variables with 'whenMatched: {mode}' mode"),
+            ));
+        }
+        for (name, expr) in bindings {
+            let starts = name.chars().next();
+            if !starts.is_some_and(|c| c.is_ascii_lowercase() || !c.is_ascii()) {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    format!("'{name}' starts with an invalid character for a user variable name"),
+                ));
+            }
+            if name == "new" && expr.as_str() != Some("$$ROOT") {
+                return Err(located(
+                    51273,
+                    "'let' may not define a value for the reserved 'new' variable other than \
+                     '$$ROOT'"
+                        .to_string(),
+                ));
+            }
+            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(expr) {
+                return Err(CommandError::new(
+                    168,
+                    "InvalidPipelineOperator",
+                    format!("Unrecognized expression '{op}'"),
+                ));
+            }
+        }
+    }
+    Ok(MergeSpec {
+        db: out_db,
+        coll: out_coll,
+        on,
+        matched,
+        not_matched,
+        let_vars,
+    })
 }
 
 /// Validate that a non-`_id` `$merge` `on` is backed by a unique index on the
 /// target whose key fields are exactly the `on` fields (mongod code 51183). The
 /// default `on: ["_id"]` is always satisfied (the `_id` index is unique).
+///
+/// The index holds every document (a partial one does not count) and
+/// compares as the pipeline does: one built under another collation, or on
+/// a collection whose default is another, does not count either.
 fn merge_validate_on(
     storage: &dyn crate::storage::Storage,
     db: &str,
     coll: &str,
     on: &[String],
+    collation: Option<&Collation>,
 ) -> Result<(), CommandError> {
     if on.len() == 1 && on[0] == "_id" {
         return Ok(());
     }
+    let simple = |spec: Option<&Document>| -> Option<(String, i64)> {
+        let spec = spec?;
+        let locale = spec.get_str("locale").unwrap_or("simple");
+        if locale == "simple" {
+            return None;
+        }
+        let strength = spec
+            .get("strength")
+            .and_then(crate::util::as_i64)
+            .unwrap_or(3);
+        Some((locale.to_string(), strength))
+    };
+    let pipeline_collation = simple(collation.map(|c| c.spec()));
+    let options = storage.get_collection_options(db, coll).unwrap_or_default();
+    let default_collation = options.get_document("collation").ok();
     let mut want: Vec<&str> = on.iter().map(String::as_str).collect();
     want.sort_unstable();
-    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let indexes = storage.list_indexes(db, coll).unwrap_or_default();
     for idx in &indexes {
-        if !idx.get_bool("unique").unwrap_or(false) {
+        if !idx.get_bool("unique").unwrap_or(false) || idx.contains_key("partialFilterExpression") {
+            continue;
+        }
+        let index_collation = simple(idx.get_document("collation").ok().or(default_collation));
+        if index_collation != pipeline_collation {
             continue;
         }
         if let Ok(key) = idx.get_document("key") {
@@ -2875,26 +3362,8 @@ fn merge_validate_on(
     Err(CommandError::new(
         51183,
         "Location51183",
-        format!("$merge: no unique index on the target collection matches the 'on' fields {on:?}"),
+        "Cannot find index to verify that join fields will be unique",
     ))
-}
-
-/// Recursive document merge for `$merge whenMatched: "merge"` (mirrors
-/// `aggregate._deep_merge_docs`): overlapping sub-documents merge recursively;
-/// arrays / scalars take the new value; non-overlapping keys from both survive.
-fn deep_merge_docs(existing: &Document, new: &Document) -> Document {
-    let mut result = existing.clone();
-    for (k, v) in new.iter() {
-        match (result.get(k), v) {
-            (Some(Bson::Document(e)), Bson::Document(n)) => {
-                result.insert(k.clone(), Bson::Document(deep_merge_docs(e, n)));
-            }
-            _ => {
-                result.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    result
 }
 
 /// Whether the first pipeline stage has `key`.

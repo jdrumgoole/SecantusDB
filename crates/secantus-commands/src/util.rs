@@ -491,7 +491,22 @@ pub(crate) fn command_error_during(err: StorageError, command: &str) -> CommandE
             error_code_name(code),
             exec_wrapped(errmsg, exec, command),
         ),
-        StorageError::DuplicateKey(info) => CommandError::new(11000, "DuplicateKey", info.errmsg),
+        // With the key it collided on, as mongod's reply has it.
+        StorageError::DuplicateKey(info) => {
+            let mut extra = Document::new();
+            if let Some(pattern) = info.key_pattern {
+                extra.insert("keyPattern", pattern);
+            }
+            if let Some(value) = info.key_value {
+                extra.insert("keyValue", value);
+            }
+            let e = CommandError::new(11000, "DuplicateKey", info.errmsg);
+            if extra.is_empty() {
+                e
+            } else {
+                e.with_extra(extra)
+            }
+        }
         StorageError::ValidationFailure(_) => CommandError::new(
             121,
             "DocumentValidationFailure",
