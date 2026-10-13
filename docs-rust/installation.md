@@ -10,7 +10,7 @@ included, and puts `secantusd-rs` on `PATH`. It needs a Rust toolchain, CMake
 and a C compiler:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.189
+cargo install secantus-mdb --version 0.5.3-beta.190
 secantusd-rs --version
 secantusd-rs --port 27017 --storage-path ./secantus-data
 ```
@@ -24,7 +24,7 @@ dev-dependency and start it in-process (see [Embedded](embedded.md)):
 
 ```toml
 [dev-dependencies]
-secantus-mdb = "0.5.3-beta.189"
+secantus-mdb = "0.5.3-beta.190"
 ```
 
 ## Prebuilt binary (no Rust toolchain)
