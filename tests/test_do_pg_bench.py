@@ -153,3 +153,63 @@ def test_the_footnote_names_the_processor_the_disk_and_the_absence_of_tls(tmp_pa
     assert "no TLS on either server" in footnote
     assert "16 vCPUs (Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz)" in footnote
     assert "ext4 (1,653 fdatasync calls a second by pg_test_fsync)" in footnote
+
+
+def test_a_slow_disk_is_refused_before_anything_is_measured(monkeypatch, capsys) -> None:
+    """On a disk that completes few commits a second both servers wait for
+    it, and the write rows compare the disk with itself."""
+    import pytest
+
+    mod = _module()
+    monkeypatch.setattr(mod, "probe_disk", lambda host, key: ("Xeon 8168", 1700))
+    with pytest.raises(SystemExit, match="1,700 fdatasync calls a second"):
+        mod.require_fast_disk("192.0.2.1", Path("key"), mod.MIN_FDATASYNC_PER_S)
+    monkeypatch.setattr(mod, "probe_disk", lambda host, key: ("Xeon 8280", 12000))
+    mod.require_fast_disk("192.0.2.1", Path("key"), mod.MIN_FDATASYNC_PER_S)
+    assert "Xeon 8280, 12,000 fdatasync calls a second" in capsys.readouterr().out
+    # 0 measures anywhere.
+    monkeypatch.setattr(mod, "probe_disk", lambda host, key: ("Xeon 8168", 1700))
+    mod.require_fast_disk("192.0.2.1", Path("key"), 0)
+
+
+def test_a_trial_records_what_the_server_droplet_did() -> None:
+    """Two samples of the droplet's counters bracket a trial: the disk's
+    flushes and their time, and the server's CPU."""
+    mod = _module()
+    before = [1000, 500, 200, 100, 3000, 100]
+    after = [1000 + 60000, 500 + 3000, 200 + 20000, 100 + 2000, 3000 + 700, 100]
+    seen = mod._evidence(before, after, committed=120000.0)
+    assert seen == {
+        "disk_flushes": 20000,
+        "disk_flush_ms_each": 0.1,
+        "disk_write_ms_each": 0.05,
+        # 700 ticks at 100 a second is 7 s, over 120,000 statements.
+        "server_cpu_us_per_statement": 58.3,
+    }
+    assert mod._evidence(before, before, committed=0.0)["disk_flush_ms_each"] == 0.0
+
+
+def test_an_unsteady_row_is_printed_trial_by_trial_with_its_evidence(tmp_path: Path) -> None:
+    mod = _module()
+    for workload, mode, counts, _ in mod.SWEEPS:
+        steady = {int(c): [100.0, 101.0, 102.0] for c in counts.split(",")}
+        _trials(tmp_path, workload, mode, steady, steady)
+    path = tmp_path / "update-distinct.json"
+    data = json.loads(path.read_text())
+    row = next(t for t in data["servers"]["rust"] if t["clients"] == 8)
+    row["rates"] = [12418.0, 12209.0, 8019.0]
+    row["server"] = [
+        {"disk_flush_ms_each": 0.08, "server_cpu_us_per_statement": 60.0},
+        {"disk_flush_ms_each": 0.08, "server_cpu_us_per_statement": 61.0},
+        {"disk_flush_ms_each": 0.31, "server_cpu_us_per_statement": 62.0},
+    ]
+    path.write_text(json.dumps(data))
+    table = mod.render(tmp_path)
+    assert "Unsteady: update by primary key, 8 clients, secantusd-pg" in table
+    assert "trial 3: 8,019 ops/s, a flush took 0.31 ms" in table
+    # A steady row is not listed, and a run from before the evidence was
+    # recorded still renders.
+    assert table.count("Unsteady:") == 1
+    del row["server"]
+    path.write_text(json.dumps(data))
+    assert "trial 3: 8,019 ops/s, nothing else was recorded" in mod.render(tmp_path)

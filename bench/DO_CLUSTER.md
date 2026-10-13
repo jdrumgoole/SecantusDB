@@ -240,10 +240,18 @@ PostgreSQL 16 at its defaults on the server droplet, every commit synced on
 both, driven from the two client droplets over the private network.
 
 ```bash
-invoke do-up --server-size c-16 --client-size c-8
+invoke do-pg-up                    # c-16 and two c-8, replaced until the disk is fast
 invoke do-pg-bench --repeat 7      # the newest secantusd-pg-v* release
 invoke do-destroy
 ```
+
+Droplets of one size are not one machine. On 2026-10-13 two of three `c-16`
+servers had a disk that completed about 1,700 `fdatasync` calls a second, and
+the third 12,000. On the slow ones both servers wait for the disk, and the
+write rows come out near 1.0x whatever the servers are. `do-pg-up` probes
+the server's disk and destroys and creates the droplets again while it is
+under 5,000 a second, four times at most. `do-pg-bench` makes the same probe
+and refuses a slow disk (`--min-fdatasync 0` on the script measures anyway).
 
 `bench/do_pg_bench.py` installs PostgreSQL 16 on the server droplet and
 psycopg on the clients, downloads the release binary and checks its SHA-256

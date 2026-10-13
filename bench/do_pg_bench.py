@@ -7,9 +7,9 @@ DigitalOcean droplet, every commit synced to disk on both, driven by
 `bench/pg_concurrency.py` over loopback. It was done by hand until
 2026-10-12, which is how it went four releases without being repeated.
 
-The droplets must exist first (`invoke do-up --server-size c-16
---client-size c-8`); this script never creates or destroys one, so it never
-starts or stops spending. It:
+The droplets must exist first, with a server whose disk is fast (`invoke
+do-pg-up` creates them and replaces them until it is); this script never
+creates or destroys one, so it never starts or stops spending. It:
 
 1. installs PostgreSQL 16 on the server droplet, and psycopg where the
    clients run;
@@ -113,7 +113,7 @@ def _server_address() -> str:
     if "server" not in found:
         raise SystemExit(
             "no server droplet is up (`do-cluster status` shows none). Create one with "
-            "`invoke do-up --server-size c-16`, or pass --host."
+            "`invoke do-pg-up`, or pass --host."
         )
     return found["server"]
 
@@ -143,6 +143,51 @@ def _ssh(host: str, key: Path, script: str, *, check: bool = True) -> str:
     if check and done.returncode != 0:
         raise SystemExit(f"on {host}: exit {done.returncode}\n{done.stdout}\n{done.stderr}")
     return done.stdout
+
+
+#: The fewest `fdatasync` calls a second a server droplet's disk may complete
+#: and still be measured. Droplets of one size are not one machine: on
+#: 2026-10-13 two of three `c-16` droplets completed about 1,700 and the third
+#: 12,000. On the slow ones a commit waits for the disk on both servers, so
+#: every write row comes out near 1.0x whatever the servers are.
+MIN_FDATASYNC_PER_S = 5000
+
+#: An 8 kB write and an `fdatasync`, for three seconds, counted. Python and
+#: not `pg_test_fsync`, so it runs on a droplet with nothing installed yet.
+_DISK_PROBE = """lscpu | sed -n 's/^Model name: *//p' | head -1
+python3 - <<'PY'
+import os, time
+fd = os.open("/root/fsync.probe", os.O_WRONLY | os.O_CREAT)
+block, count, end = b"x" * 8192, 0, time.monotonic() + 3
+while time.monotonic() < end:
+    os.pwrite(fd, block, 0)
+    os.fdatasync(fd)
+    count += 1
+print(count // 3)
+PY
+rm -f /root/fsync.probe
+"""
+
+
+def probe_disk(host: str, key: Path) -> tuple[str, int]:
+    """The server droplet's processor, and the `fdatasync` calls a second its
+    disk completes."""
+    lines = _ssh(host, key, _DISK_PROBE).strip().splitlines()
+    return lines[0].strip(), int(lines[-1])
+
+
+def require_fast_disk(host: str, key: Path, minimum: int) -> None:
+    """Stop before measuring on a droplet whose disk would decide the result."""
+    cpu, rate = probe_disk(host, key)
+    print(f"server droplet: {cpu}, {rate:,} fdatasync calls a second", flush=True)
+    if rate < minimum:
+        raise SystemExit(
+            f"this droplet's disk completes {rate:,} fdatasync calls a second, under the "
+            f"{minimum:,} this measurement needs: both servers would wait for the disk and "
+            "the write rows would say nothing about either. Replace the droplets "
+            "(`invoke do-pg-up` does it until the disk is fast enough), or pass "
+            "--min-fdatasync 0 to measure here anyway."
+        )
 
 
 def _remote_script(version: str, seconds: float, repeat: int) -> str:
@@ -271,6 +316,43 @@ _START = {
 }
 
 
+#: The server droplet's counters, read before and after every trial, so a
+#: trial that comes out slow says which it was: the disk, or the server's own
+#: CPU. Five numbers: writes completed on the root disk and the milliseconds
+#: they took, flushes completed and the milliseconds THEY took (a commit's
+#: `fdatasync` is a flush), and the CPU ticks of every server process, their
+#: exited children's included (a PostgreSQL backend is gone by the second
+#: reading, and its time is in the postmaster's).
+_SERVER_SAMPLE = """dev=$(lsblk -ndo NAME | head -1)
+disk=$(awk -v d="$dev" '$3 == d {print $8, $11, $19, $20}' /proc/diskstats)
+cpu=0
+for p in $(pgrep -x secantusd-pg; pgrep -x postgres); do
+  set -- $(cut -d')' -f2- /proc/$p/stat 2>/dev/null)
+  [ $# -ge 15 ] && cpu=$((cpu + ${12} + ${13} + ${14} + ${15}))
+done
+echo "$disk $cpu $(getconf CLK_TCK)"
+"""
+
+
+def _sample(server: str, key: Path) -> list[int]:
+    return [int(n) for n in _ssh(server, key, _SERVER_SAMPLE).split()]
+
+
+def _evidence(before: list[int], after: list[int], committed: float) -> dict[str, float]:
+    """What the server droplet did during one trial, from two samples."""
+    writes, write_ms, flushes, flush_ms, ticks = (
+        a - b for a, b in zip(after[:5], before[:5], strict=True)
+    )
+    return {
+        "disk_flushes": flushes,
+        "disk_flush_ms_each": round(flush_ms / flushes, 3) if flushes else 0.0,
+        "disk_write_ms_each": round(write_ms / writes, 3) if writes else 0.0,
+        "server_cpu_us_per_statement": round(1e6 * ticks / after[5] / committed, 1)
+        if committed
+        else 0.0,
+    }
+
+
 def _split(clients: int) -> tuple[int, int]:
     """How many clients each of the two client droplets runs."""
     return (clients + 1) // 2, clients // 2
@@ -355,14 +437,23 @@ def _measure_remote(
                 tables = (
                     [f"bench_{i}" for i in range(count)] if mode == "distinct" else ["bench_shared"]
                 )
-                rates, busy = [], []
+                rates, busy, evidence = [], [], []
                 for _ in range(repeat):
                     # Fresh tables for every trial, as the loopback harness has.
                     _ssh(clients[0], key, prepare + f"{','.join(tables)} {workload}")
+                    before = _sample(server, key)
                     rate, cpu = _remote_trial(clients, key, dsn, tables, workload, count, seconds)
+                    evidence.append(_evidence(before, _sample(server, key), rate * seconds))
                     rates.append(rate)
                     busy.append(cpu)
-                collected[name].append({"clients": count, "rates": rates, "client_cpu_busy": busy})
+                collected[name].append(
+                    {
+                        "clients": count,
+                        "rates": rates,
+                        "client_cpu_busy": busy,
+                        "server": evidence,
+                    }
+                )
                 print(
                     f"{label:24} {name:8} {count} clients: "
                     f"{statistics.median(rates):>9,.0f} ops/s  "
@@ -404,6 +495,45 @@ def _facts(results: Path) -> dict[str, str]:
     return dict(ln.split("=", 1) for ln in path.read_text().splitlines() if "=" in ln)
 
 
+#: A row whose trials differ by more than this much of their median is
+#: printed trial by trial under the table, with what the server droplet was
+#: doing in each.
+UNSTEADY_PCT = 20.0
+
+
+def _unsteady(results: Path) -> list[str]:
+    """Every row whose trials disagree, trial by trial, with the evidence.
+
+    On 2026-10-13 three of five trials of one row fell by a third and nothing
+    had been recorded that could say why. A row like that is now printed with
+    each trial's flush time and the server's CPU a statement: a slow disk
+    shows in the first, a slow server in the second."""
+    lines: list[str] = []
+    for workload, mode, _, label in SWEEPS:
+        data = json.loads((results / f"{workload}-{mode}.json").read_text())
+        for name, shown in (("postgres", "PostgreSQL 16"), ("rust", "secantusd-pg")):
+            for trial in data["servers"][name]:
+                rates = trial["rates"]
+                spread = 100.0 * (max(rates) - min(rates)) / statistics.median(rates)
+                if spread <= UNSTEADY_PCT:
+                    continue
+                lines.append("")
+                lines.append(
+                    f"Unsteady: {label}, {trial['clients']} clients, {shown}: the trials "
+                    f"differ by {spread:.0f}% of their median."
+                )
+                for i, rate in enumerate(rates):
+                    seen = (trial.get("server") or [{}] * len(rates))[i]
+                    detail = (
+                        f", a flush took {seen['disk_flush_ms_each']} ms, the server used "
+                        f"{seen['server_cpu_us_per_statement']} us of CPU a statement"
+                        if seen
+                        else ", nothing else was recorded"
+                    )
+                    lines.append(f"  trial {i + 1}: {rate:,.0f} ops/s{detail}")
+    return lines
+
+
 def render(results: Path) -> str:
     """The comparison as a Markdown table, from the fetched trials."""
     facts = _facts(results)
@@ -426,6 +556,7 @@ def render(results: Path) -> str:
                 f"{pg / rust:.2f}x | {spread(trial['rates']):.1f}% / "
                 f"{spread(ours[clients]):.1f}% |"
             )
+    lines.extend(_unsteady(results))
     placement = json.loads((results / "insert-distinct.json").read_text()).get("clients_on")
     if placement:
         busiest = max(
@@ -478,8 +609,9 @@ def _main_remote(args: argparse.Namespace, version: str) -> int:
     if missing:
         raise SystemExit(
             f"not up: {', '.join(missing)} (`do-cluster status`). Create them with "
-            "`invoke do-up --server-size c-16 --client-size c-8`."
+            "`invoke do-pg-up`."
         )
+    require_fast_disk(found["server"], args.ssh_key, args.min_fdatasync)
     print(
         f"measuring secantusd-pg {version} against PostgreSQL 16 on {found['server']}, "
         f"clients on {found['client-1']} and {found['client-2']}",
@@ -535,16 +667,33 @@ def main(argv: list[str] | None = None) -> int:
         default="droplets",
         help="where the clients run: the two client droplets (default), or beside the server",
     )
+    ap.add_argument(
+        "--min-fdatasync",
+        type=int,
+        default=MIN_FDATASYNC_PER_S,
+        help="refuse a server droplet whose disk completes fewer fdatasync calls a second "
+        f"(default: {MIN_FDATASYNC_PER_S}; 0 measures anywhere)",
+    )
+    ap.add_argument(
+        "--check-disk",
+        action="store_true",
+        help="probe the server droplet's disk, say whether it is fast enough, and stop",
+    )
     args = ap.parse_args(argv)
 
     if args.render_only:
         print(render(args.render_only))
         return 0
 
+    if args.check_disk:
+        require_fast_disk(args.host or _server_address(), args.ssh_key, args.min_fdatasync)
+        return 0
+
     version = args.version or _latest_version()
     if args.clients_on == "droplets":
         return _main_remote(args, version)
     host = args.host or _server_address()
+    require_fast_disk(host, args.ssh_key, args.min_fdatasync)
     print(f"measuring secantusd-pg {version} against PostgreSQL 16 on {host}")
     with tempfile.TemporaryDirectory() as tmp:
         bundle = Path(tmp) / "harness.tgz"
