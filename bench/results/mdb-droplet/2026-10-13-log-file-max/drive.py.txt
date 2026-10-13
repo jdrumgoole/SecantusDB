@@ -1,0 +1,85 @@
+"""secantusd-rs 0.5.3-beta.191 as released, at several --log-file-max sizes:
+throughput, latency, the store's size, and the time to restart after SIGKILL."""
+import json, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0, "/Users/jdrumgoole/GIT/SecantusDB")
+import bench.do_pg_bench as d
+
+sizes, passes, seconds, out = sys.argv[1].split(","), int(sys.argv[2]), float(sys.argv[3]), Path(sys.argv[4])
+workers = int(sys.argv[5]) if len(sys.argv) > 5 else 8
+key = Path.home() / ".ssh" / "secantus-bench"
+found = d._addresses()
+server, clients = found["server"], (found["client-1"], found["client-2"])
+private = d._ssh(server, key, "hostname -I | tr ' ' '\\n' | grep '^10\\.' | tail -1").strip()
+SUB = 64
+
+def value_for(index):
+    if index < SUB:
+        return float(index)
+    octave = index // SUB + 5
+    shift = octave - 6
+    return float((SUB + index % SUB) << shift) + (1 << shift) / 2
+
+def percentile(counts, total, p):
+    seen, target = 0, p / 100 * total
+    for idx in sorted(counts):
+        seen += counts[idx]
+        if seen >= target:
+            return value_for(idx) / 1000
+    return 0.0
+
+def start(size):
+    return (f"nohup /root/secantusd-rs --host 0.0.0.0 --port 27017 --storage-path /root/store --log-file-max {size} "
+            ">>/root/rs.log 2>&1 </dev/null & ")
+
+LISTEN = "for i in $(seq 6000); do ss -ltn | grep -q ':27017 ' && break; sleep 0.05; done; ss -ltn | grep -q ':27017 '"
+common = f"--addr {private}:27017 --workers {workers} --doc-bytes 1024 --preload 1000 --op-mix insert=50,update=50 --payload random"
+rows = json.loads(out.read_text()) if out.exists() else []
+with ThreadPoolExecutor(2) as pool:
+    for p in range(passes):
+        order = sizes[p % len(sizes):] + sizes[:p % len(sizes)]
+        for size in order:
+            d._ssh(server, key, "pkill -x secantusd-rs; pkill -x sizeloop; sleep 1; rm -rf /root/store /root/rs.log /root/sizes.log; "
+                   + start(size) + LISTEN)
+            empty = int(d._ssh(server, key, "du -sk /root/store | cut -f1"))
+            d._ssh(server, key, """cat > /root/sizes.sh <<'SH'
+while true; do echo "$(date +%s) $(du -sk /root/store 2>/dev/null | cut -f1) $(ls /root/store/WiredTigerLog.* 2>/dev/null | wc -l)"; sleep 5; done
+SH
+cp /bin/bash /root/sizeloop; setsid nohup /root/sizeloop /root/sizes.sh > /root/sizes.log 2>&1 </dev/null &
+""")
+            for k, h in enumerate(clients):
+                d._ssh(h, key, f"/root/do-client setup {common} --client-id c{k}")
+            preloaded = int(d._ssh(server, key, "du -sk /root/store | cut -f1"))
+            at = time.time() + 5
+            jobs = [pool.submit(d._ssh, h, key, f"/root/do-client run {common} --client-id c{k} --keep-data --duration {seconds} "
+                                f"--start-at {at} --seed {p * 10 + k} --out /root/r.json >/dev/null && cat /root/r.json")
+                    for k, h in enumerate(clients)]
+            reports = [json.loads(j.result()) for j in jobs]
+            after = d._ssh(server, key, f"""pkill -x sizeloop
+echo "$(du -sk /root/store | cut -f1) $(ls /root/store/WiredTigerLog.* | wc -l) $(sort -k2 -n /root/sizes.log | tail -1 | cut -d' ' -f2)"
+pkill -9 -x secantusd-rs; sleep 1
+t0=$(date +%s.%N); {start(size)}
+{LISTEN}
+t1=$(date +%s.%N); echo "$t1 - $t0" | bc
+""").split()
+            row = {"pass": p, "log_file_max": size, "workers": workers * 2,
+                   "ops_per_sec": sum(r["totals"]["ops_per_sec"] for r in reports),
+                   "errors": sum(r["totals"]["errors"] for r in reports) + sum(len(r["worker_failures"]) for r in reports),
+                   "client_cpu_busy_pct": [r["client_cpu_busy_pct"] for r in reports],
+                   "store_kb_empty": empty, "store_kb_preloaded": preloaded, "store_kb_end": int(after[0]),
+                   "log_files_end": int(after[1]), "store_kb_peak": int(after[2]), "restart_s": float(after[3])}
+            for op in ("insert", "update"):
+                counts, total = {}, 0
+                for r in reports:
+                    h = r["ops"][op]["hist"]
+                    total += h["total"]
+                    for idx, n in h["counts"].items():
+                        counts[int(idx)] = counts.get(int(idx), 0) + n
+                row[op] = {q: round(percentile(counts, total, v), 3) for q, v in (("p50_ms", 50), ("p99_ms", 99), ("p99.9_ms", 99.9))}
+                row[op]["max_ms"] = max(r["ops"][op]["hist"]["max_us"] for r in reports) / 1000
+            rows.append(row)
+            out.write_text(json.dumps(rows, indent=1))
+            print(f"{p} {size:>6} {row['ops_per_sec']:>9,.0f} ops/s  upd p99 {row['update']['p99_ms']} ms  p99.9 {row['update']['p99.9_ms']}  "
+                  f"store empty {empty // 1024} MB end {row['store_kb_end'] // 1024} MB peak {row['store_kb_peak'] // 1024} MB  "
+                  f"{row['log_files_end']} logs  restart {row['restart_s']:.1f} s  errors {row['errors']}", flush=True)

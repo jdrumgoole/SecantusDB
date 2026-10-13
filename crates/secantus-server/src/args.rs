@@ -418,9 +418,9 @@ OPTIONS:
     --cache-size SIZE            WiredTiger cache size, unit-suffixed string like
                                  '256M', '1G', '8G' (default: 4G)
     --log-file-max SIZE          WiredTiger WAL log file_max, unit-suffixed like
-                                 '128MB', '1GB', '2GB' (default: 2GB; 2GB is WT's
-                                 cap. Bigger = fewer log rotations under write
-                                 load = higher throughput; files are sparse.)
+                                 '128MB', '1GB', '2GB' (default: 128MB; 2GB is
+                                 WT's cap. A log file is allocated in full, so
+                                 this is the size of an empty store.)
     --session-max N              WiredTiger session_max — concurrent WT session
                                  cap (default: 1000)
     --block-compressor NAME      Compressor for newly created data tables:

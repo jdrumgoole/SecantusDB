@@ -1,0 +1,6 @@
+set -euo pipefail
+systemctl stop postgresql 2>/dev/null || true; pkill -x secantusd-pg || true
+cd /root && rm -rf rel && mkdir rel && cd rel
+base=https://github.com/jdrumgoole/SecantusDB/releases/download/secantusdb-v0.5.3-beta.191/secantusdb-0.5.3-beta.191-x86_64-unknown-linux-gnu.tar.gz
+curl -sLO $base && curl -sLO $base.sha256 && sha256sum -c *.sha256 && tar xzf *.tar.gz
+cp "$(find . -name secantusd-rs -type f | head -1)" /root/secantusd-rs && /root/secantusd-rs --version
