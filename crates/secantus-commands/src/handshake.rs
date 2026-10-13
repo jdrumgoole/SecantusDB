@@ -31,6 +31,13 @@ pub(crate) fn hello_process_id() -> ObjectId {
     *PROCESS_ID.get_or_init(ObjectId::new)
 }
 
+/// When this process first answered anything that asks: the start of the
+/// counts it keeps.
+pub(crate) fn process_started() -> DateTime {
+    static STARTED: OnceLock<DateTime> = OnceLock::new();
+    *STARTED.get_or_init(DateTime::now)
+}
+
 /// `hello` / `isMaster` / `ismaster`. Advertises a single-node `secantus`
 /// replica-set primary when a set name is configured (so pymongo's topology
 /// machinery accepts change streams), else a plain standalone primary.

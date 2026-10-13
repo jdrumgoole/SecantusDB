@@ -848,11 +848,10 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
             ));
         }
     };
-    const WRITE_CONCERN_FIELDS: [&str; 7] = [
+    const WRITE_CONCERN_FIELDS: [&str; 6] = [
         "w",
         "j",
         "wtimeout",
-        "wtimeoutMS",
         "fsync",
         "getLastError",
         "provenance",
@@ -1363,34 +1362,62 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     } else {
         "KillAllSessionsByPatternCmd"
     };
-    match doc.get(name) {
-        Some(Bson::Array(_)) | None => {}
-        Some(other) => {
-            return Err(CommandError::new(
-                14,
-                "TypeMismatch",
-                format!(
-                    "BSON field '{owner}.{name}' is the wrong type '{}', expected type 'array'",
-                    secantus_core::query::bson_type_name(other)
-                ),
-            ))
-        }
-    }
-    if name == "killAllSessionsByPattern" {
-        if let Some(Bson::Array(patterns)) = doc.get(name) {
-            for pattern in patterns {
-                let lsid = pattern
-                    .as_document()
-                    .and_then(|p| p.get_document("lsid").ok());
-                if lsid.is_some_and(|l| !l.contains_key("uid")) {
-                    return Err(CommandError::new(
-                        40414,
-                        "IDLFailedToParse",
-                        format!(
-                            "BSON field '{owner}.{name}.lsid.uid' is missing but a required field"
-                        ),
-                    ));
+    let path = format!("{owner}.{name}");
+    let wrong = |path: &str, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let missing = |path: &str| {
+        CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            format!("BSON field '{path}' is missing but a required field"),
+        )
+    };
+    let patterns = match doc.get(name) {
+        Some(Bson::Array(patterns)) => patterns.as_slice(),
+        None => &[],
+        Some(Bson::Null) => return Err(missing(&path)),
+        Some(other) => return Err(wrong(&path, other, "array")),
+    };
+    // Each entry is parsed whether or not any session matches it (mongod
+    // 8.2.11): a user is `{user, db}`, both strings, and a pattern has only
+    // the fields mongod's parser knows.
+    for (i, pattern) in patterns.iter().enumerate() {
+        let Bson::Document(pattern) = pattern else {
+            return Err(wrong(&format!("{path}.{i}"), pattern, "object"));
+        };
+        if name == "killAllSessions" {
+            for (key, value) in pattern {
+                if matches!(key.as_str(), "user" | "db") && !matches!(value, Bson::String(_)) {
+                    return Err(wrong(&format!("{path}.{key}"), value, "string"));
                 }
+            }
+            for required in ["db", "user"] {
+                if !pattern.contains_key(required) {
+                    return Err(missing(&format!("{path}.{required}")));
+                }
+            }
+        } else {
+            if let Some(key) = pattern
+                .keys()
+                .find(|k| !matches!(k.as_str(), "lsid" | "uid" | "users" | "roles"))
+            {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field '{path}.{key}' is an unknown field."),
+                ));
+            }
+            let lsid = pattern.get_document("lsid").ok();
+            if lsid.is_some_and(|l| !l.contains_key("uid")) {
+                return Err(missing(&format!("{path}.lsid.uid")));
             }
         }
     }
@@ -1867,6 +1894,17 @@ fn order_write_reply(req: &Document, reply: &mut Document) {
 fn attach_write_op_time(req: &Document, reply: &mut Document) {
     let Some(cmd) = req.keys().next() else { return };
     if !matches!(cmd.as_str(), "insert" | "update" | "delete") {
+        return;
+    }
+    // An unacknowledged write (`w: 0`) that is answered at all is answered
+    // without them.
+    let unacknowledged = req
+        .get_document("writeConcern")
+        .ok()
+        .and_then(|wc| wc.get("w"))
+        .and_then(util::as_i64)
+        == Some(0);
+    if unacknowledged {
         return;
     }
     let ok = matches!(reply.get("ok"), Some(Bson::Double(v)) if *v == 1.0)
@@ -2358,6 +2396,80 @@ fn validate_read_concern(
             "IDLUnknownField",
             format!("BSON field 'readConcern.{key}' is an unknown field."),
         ));
+    }
+    // The two cluster times and the provenance (mongod 8.2.11). They were
+    // read as absent when malformed, and a time this server has not reached
+    // yet, or one too old to have a snapshot of, was served as now.
+    for field in ["afterClusterTime", "atClusterTime"] {
+        if let Some(v) = rc.get(field).filter(|v| !matches!(v, Bson::Timestamp(_))) {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "\"{field}\" had the wrong type. Expected 17, found {}",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            ));
+        }
+    }
+    if let Some(Bson::String(source)) = rc.get("provenance") {
+        const SOURCES: [&str; 5] = [
+            "clientSupplied",
+            "implicitDefault",
+            "customDefault",
+            "getLastErrorDefaults",
+            "internalWriteDefault",
+        ];
+        if !SOURCES.contains(&source.as_str()) {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                format!(
+                    "Enumeration value '{source}' for field 'readConcern.provenance' is not a \
+                     valid value."
+                ),
+            ));
+        }
+    }
+    let invalid = |message: String| CommandError::new(72, "InvalidOptions", message);
+    if let Some(Bson::Timestamp(after)) = rc.get("afterClusterTime") {
+        if after.time == 0 && after.increment == 0 {
+            return Err(invalid("afterClusterTime cannot be a null timestamp".into()));
+        }
+        if let Some(now) = ctx.storage.as_ref().map(|s| s.current_cluster_time()) {
+            if (after.time, after.increment) > (now.time, now.increment) {
+                return Err(invalid(format!(
+                    "readConcern afterClusterTime value must not be greater than the current \
+                     clusterTime. Requested clusterTime: {{ ts: Timestamp({}, {}) }}; current \
+                     clusterTime: {{ ts: Timestamp({}, {}) }}",
+                    after.time, after.increment, now.time, now.increment
+                )));
+            }
+        }
+    }
+    if let Some(Bson::Timestamp(at)) = rc.get("atClusterTime") {
+        if level != Some("snapshot") {
+            return Err(invalid(
+                "atClusterTime field can be set only if level is equal to snapshot".into(),
+            ));
+        }
+        // mongod keeps the history a snapshot needs for five minutes
+        // (`minSnapshotHistoryWindowInSeconds`); this server keeps none
+        // older, so a time before that has no snapshot to read.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if u64::from(at.time) + 300 < now {
+            return Err(CommandError::new(
+                239,
+                "SnapshotTooOld",
+                format!(
+                    "Read timestamp Timestamp({}, {}) is older than the oldest available \
+                     timestamp.",
+                    at.time, at.increment
+                ),
+            ));
+        }
     }
     // A statement of a transaction reads at the transaction's own snapshot,
     // and its read concern is checked with the transaction (`session`).

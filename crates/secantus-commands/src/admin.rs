@@ -3464,6 +3464,34 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    // An option is on for any value but null, false and zero (a string too).
+    let on = |option: &str| match doc.get(option) {
+        None | Some(Bson::Null) | Some(Bson::Boolean(false)) => false,
+        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => {
+            crate::util::truthy(v)
+        }
+        Some(_) => true,
+    };
+    if on("repair") && ctx.replica_set_name.is_some() {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with { repair: true } can only be performed in \
+             standalone mode.",
+        ));
+    }
+    if on("metadata")
+        && ["full", "repair", "background", "checkBSONConformance"]
+            .iter()
+            .any(|other| on(other))
+    {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with { metadata: true } is not supported with any \
+             other options",
+        ));
+    }
     // mongod rejects full+background together (full needs an exclusive scan).
     if bool_field(doc, "full", false) && bool_field(doc, "background", false) {
         return Ok(CommandError::new(
@@ -3592,36 +3620,77 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "sampleRate": prev_rate,
         "ok": 1.0,
     };
-    let arg = match doc.get("profile") {
-        Some(Bson::Int32(n)) => Some(*n),
-        Some(Bson::Int64(n)) => Some(*n as i32),
-        Some(Bson::Double(d)) if d.fract() == 0.0 => Some(*d as i32),
-        _ => None,
-    };
-    match arg {
-        Some(-1) => Ok(was),
-        Some(level) if (0..=2).contains(&level) => {
-            let slowms = doc
-                .get("slowms")
-                .and_then(as_i64)
-                .map(|n| n as i32)
-                .unwrap_or(prev_slowms);
-            let rate = doc
-                .get("sampleRate")
-                .and_then(Bson::as_f64)
-                .unwrap_or(prev_rate);
-            storage
-                .set_profile(&db, level, slowms, rate)
-                .map_err(command_error)?;
-            if let Some(s) = &slow_ops {
-                s.set(slowms, rate);
-            }
-            Ok(was)
+    // mongod's reading of the arguments (8.2.11): the level is any number,
+    // truncated; one outside 0..=2 changes nothing and reads the settings.
+    // `slowms` is any number, truncated and not range-checked; `sampleRate`
+    // is a number from 0 to 1; `filter` is a document or the string "unset".
+    let number = |field: &str| -> Result<Option<f64>, CommandError> {
+        match doc.get(field) {
+            None => Ok(None),
+            Some(Bson::Null) if field != "profile" => Ok(None),
+            Some(Bson::Int32(n)) => Ok(Some(f64::from(*n))),
+            Some(Bson::Int64(n)) => Ok(Some(*n as f64)),
+            Some(Bson::Double(d)) => Ok(Some(*d)),
+            Some(v @ Bson::Decimal128(_)) => Ok(v.to_string().parse::<f64>().ok()),
+            Some(Bson::Null) => Err(CommandError::new(
+                40414,
+                "IDLFailedToParse",
+                "BSON field 'profile.profile' is missing but a required field",
+            )),
+            Some(v) => Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'profile.{field}' is the wrong type '{}', expected types \
+                     '[decimal, double, int, long]'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            )),
         }
-        _ => Ok(
-            CommandError::new(14, "TypeMismatch", "profile must be -1, 0, 1, or 2").into_reply(),
-        ),
+    };
+    let level = number("profile")?.map_or(-1, |n| n.trunc() as i64);
+    let slowms = number("slowms")?.map(|n| n.trunc() as i32);
+    let rate = number("sampleRate")?;
+    if rate.is_some_and(|r| !(0.0..=1.0).contains(&r)) {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            "'sampleRate' must be between 0.0 and 1.0 inclusive",
+        ));
     }
+    match doc.get("filter") {
+        None | Some(Bson::Null) => {}
+        Some(Bson::String(word)) if word == "unset" => {}
+        // A filter chooses what is profiled, and this profiler has none:
+        // taking one and profiling as before would be a setting that does
+        // nothing, so it is refused.
+        Some(Bson::Document(_)) => {
+            return Err(CommandError::new(
+                238,
+                "NotImplemented",
+                "a profile filter is not supported by this server",
+            ));
+        }
+        Some(_) => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "Expected an object, or the string 'unset'.",
+            ));
+        }
+    }
+    if !(0..=2).contains(&level) {
+        return Ok(was);
+    }
+    let slowms = slowms.unwrap_or(prev_slowms);
+    let rate = rate.unwrap_or(prev_rate);
+    storage
+        .set_profile(&db, level as i32, slowms, rate)
+        .map_err(command_error)?;
+    if let Some(s) = &slow_ops {
+        s.set(slowms, rate);
+    }
+    Ok(was)
 }
 
 /// Options mongod's index-spec IDL accepts, plus the legacy / deprecated forms

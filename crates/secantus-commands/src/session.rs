@@ -82,7 +82,7 @@ fn binary_subtype_name(subtype: bson::spec::BinarySubtype) -> &'static str {
 /// under `path` in an error.
 pub(crate) fn session_id(lsid: &Document, path: &str) -> Result<Vec<u8>, CommandError> {
     let id = match lsid.get("id") {
-        None => {
+        None | Some(Bson::Null) => {
             return Err(CommandError::new(
                 40414,
                 "IDLFailedToParse",
@@ -116,6 +116,11 @@ pub(crate) fn session_id(lsid: &Document, path: &str) -> Result<Vec<u8>, Command
                 "IDLUnknownField",
                 format!("BSON field '{path}.{key}' is an unknown field."),
             ));
+        }
+    }
+    if let Some(uid) = lsid.get("uid") {
+        if !matches!(uid, Bson::Binary(_) | Bson::Null) {
+            return Err(wrong_type(&format!("{path}.uid"), uid, "binData"));
         }
     }
     if lsid.contains_key("txnNumber") && !lsid.contains_key("txnUUID") {
@@ -180,6 +185,16 @@ pub(crate) fn parse(name: &str, doc: &Document) -> Result<Envelope, CommandError
     if start == Some(false) {
         return Err(invalid_options(
             "Specifying startTransaction=false is not allowed.",
+        ));
+    }
+    // A session id with a `txnUUID` is one mongod makes for itself, for a
+    // transaction it runs inside another command.
+    let internal = doc
+        .get_document("lsid")
+        .is_ok_and(|l| l.contains_key("txnUUID"));
+    if internal && autocommit.is_none() {
+        return Err(invalid_options(
+            "Internal sessions are not supported outside of transactions",
         ));
     }
     Ok(Envelope {
@@ -1212,14 +1227,23 @@ pub(crate) fn listed_sessions(
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     let list = match doc.get(command) {
         Some(Bson::Array(list)) => list,
+        // A null list is no list to the two commands a driver sends at
+        // shutdown, and a missing one to `killSessions`.
+        Some(Bson::Null) if !strict => {
+            return Err(CommandError::new(
+                40414,
+                "IDLFailedToParse",
+                format!("BSON field '{owner}.{command}' is missing but a required field"),
+            ))
+        }
+        Some(Bson::Null) | None => return Ok(Vec::new()),
         Some(other) => return Err(wrong_type(&format!("{owner}.{command}"), other, "array")),
-        None => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
-    for item in list {
+    for (i, item) in list.iter().enumerate() {
         match item {
             Bson::Document(d) => out.push(session_id(d, entry)?),
-            other => return Err(wrong_type(entry, other, "object")),
+            other => return Err(wrong_type(&format!("{entry}.{i}"), other, "object")),
         }
     }
     if strict {
