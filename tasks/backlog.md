@@ -3145,19 +3145,34 @@ These work end-to-end but cut corners.
         1.17x; 0.1.0-beta.14 is 1.13x. `bench/do_pg_bench.py` says
         `sslmode=disable` in every DSN and stops if `pg_stat_ssl` shows
         otherwise.
-      - [ ] **RUST PG server: three slow update trials, cause unknown.** In
-            the 0.1.0-beta.13 run of 2026-10-13, eight clients updating by
-            primary key gave 12,418 and 12,209 statements a second and then
-            8,019, 8,156 and 9,000, one server process throughout, with
-            PostgreSQL steady at 19,000 minutes before. A repeat of that
-            sweep gave 12,212 to 12,811 in all seven trials, and
-            0.1.0-beta.14 showed nothing like it in seven. It may be the
-            droplet's disk and it may be this server (a checkpoint, or
-            eviction, after many tables have been dropped and created).
-            Nothing was watching the server when it happened. The trials
-            are in `bench/results/pg-droplet/2026-10-13-0.1.0-beta.13-remote-clients/update-distinct.first-run.json`.
-            To look: run that sweep for longer with `iostat` and the
-            server's WiredTiger statistics recorded beside it.
+      - **Three slow update trials, never seen again, cause unknown.** In
+        the 0.1.0-beta.13 run of 2026-10-13, eight clients updating by
+        primary key gave 12,418 and 12,209 statements a second and then
+        8,019, 8,156 and 9,000, one server process throughout. Fifty-four
+        further trials of that row on three droplets had none (forty of
+        them on one process with `iostat` and `pidstat` beside it:
+        `bench/results/pg-droplet/2026-10-13-slow-update-trials/`). The
+        benchmark now records the disk's flush time and the server's CPU a
+        statement for every trial, and prints an unsteady row trial by
+        trial with them, so the next one says which it was.
+      - [ ] **Neither Rust server checkpoints while it runs, so the log is
+            never trimmed.** Found by watching the store during those
+            trials. WiredTiger removes a log file only after a checkpoint,
+            and in the default (logged) mode the only checkpoints are at
+            close, in a backup and in `fsync`; the periodic thread
+            (`spawn_stable_checkpoint_thread`) runs only for a
+            `SECANTUS_DATA_NONLOGGED` store. Measured on `secantusd-pg`
+            0.1.0-beta.13 at 13,000 updates a second: 2.0 GB and 125 log
+            files after 12 minutes, for tables of a few kilobytes; a
+            restart after SIGKILL then took 38 s to listen, and left the
+            files in place; a clean stop left one file and 19 MB. So a
+            server that runs for days under writes fills its disk, and its
+            crash recovery grows with its uptime. `secantusd-rs` opens the
+            store the same way and has not been measured. The fix is a
+            periodic plain checkpoint for a logged store (the nonlogged
+            thread also writes a stable marker, which a logged store must
+            not get), with its cost on throughput measured, and off under
+            `SECANTUS_TEST_FAST_STORAGE`.
       - **A `c-16` is not one machine.** The droplet of 2026-10-13 had a
         Xeon Platinum 8168 and a disk that completed 1,653 `fdatasync`
         calls a second; one client's inserts ran at 613 a second on
@@ -3165,7 +3180,10 @@ These work end-to-end but cut corners.
         gave 3,159 and 2,368. On such a disk both servers wait for it and
         the ratio closes to nothing. Each run now records the processor and
         `pg_test_fsync`'s rate in `facts.txt`, and the table's footnote
-        prints them; compare two runs only when those agree.
+        prints them; compare two runs only when those agree. Since
+        2026-10-13 `do-pg-bench` refuses a server whose disk completes
+        under 5,000 `fdatasync` calls a second, and `invoke do-pg-up`
+        replaces the droplets until one passes.
 
       **Clients moved to the client droplets the same day** (Joe: that was
       the plan for the cluster from the start). `invoke do-pg-bench` now

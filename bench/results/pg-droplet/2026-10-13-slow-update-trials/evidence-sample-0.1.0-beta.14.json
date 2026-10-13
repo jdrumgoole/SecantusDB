@@ -1,0 +1,79 @@
+{
+  "workload": "update",
+  "mode": "distinct",
+  "seconds": 10.0,
+  "repeat": 3,
+  "clients_on": "two client droplets",
+  "servers": {
+    "postgres": [
+      {
+        "clients": 8,
+        "rates": [
+          20723.0,
+          20910.6,
+          20722.8
+        ],
+        "client_cpu_busy": [
+          8.9,
+          8.8,
+          9.1
+        ],
+        "server": [
+          {
+            "disk_flushes": 88839,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.043,
+            "server_cpu_us_per_statement": 61.9
+          },
+          {
+            "disk_flushes": 89635,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.043,
+            "server_cpu_us_per_statement": 62.7
+          },
+          {
+            "disk_flushes": 88330,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.043,
+            "server_cpu_us_per_statement": 64.8
+          }
+        ]
+      }
+    ],
+    "rust": [
+      {
+        "clients": 8,
+        "rates": [
+          14973.7,
+          14648.3,
+          15099.7
+        ],
+        "client_cpu_busy": [
+          6.7,
+          6.8,
+          7.6
+        ],
+        "server": [
+          {
+            "disk_flushes": 73776,
+            "disk_flush_ms_each": 0.038,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 157.7
+          },
+          {
+            "disk_flushes": 70867,
+            "disk_flush_ms_each": 0.039,
+            "disk_write_ms_each": 0.05,
+            "server_cpu_us_per_statement": 163.1
+          },
+          {
+            "disk_flushes": 73718,
+            "disk_flush_ms_each": 0.037,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 157.6
+          }
+        ]
+      }
+    ]
+  }
+}

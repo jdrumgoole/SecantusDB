@@ -815,6 +815,41 @@ def do_ssh(c: Context, role: str = "server") -> None:
 
 
 @task(
+    name="do-pg-up",
+    help={
+        "attempts": "How many sets of droplets to try before giving up (default: 4).",
+        "min-fdatasync": "fdatasync calls a second the server's disk must complete "
+        "(default: the benchmark's own, 5000).",
+        "region": "DigitalOcean region (default: lon1).",
+    },
+)
+def do_pg_up(c: Context, attempts: int = 4, min_fdatasync: int = 0, region: str = "lon1") -> None:
+    """Create the droplets for `do-pg-bench`, replacing them until the disk is fast.
+
+    Droplets of one size are not one machine. On 2026-10-13 two of three
+    `c-16` servers had a disk that completed about 1,700 `fdatasync` calls a
+    second and the third 12,000; on the slow ones both servers wait for the
+    disk and the write rows say nothing. This creates the three droplets,
+    probes the server's disk, and destroys and creates them again while it is
+    too slow. If no attempt passes it leaves nothing running.
+    """
+    check = "uv run --no-sync python bench/do_pg_bench.py --check-disk"
+    if min_fdatasync:
+        check += f" --min-fdatasync {int(min_fdatasync)}"
+    for attempt in range(1, int(attempts) + 1):
+        c.run(
+            f"{_DO_CLUSTER} up --region {shlex.quote(region)} --server-size c-16 --client-size c-8",
+            pty=PTY,
+        )
+        if c.run(check, pty=PTY, warn=True).ok:
+            return
+        print(f"attempt {attempt} of {attempts}: the disk is too slow, replacing the droplets")
+        c.run(f"{_DO_CLUSTER} destroy", pty=PTY)
+    c.run(f"{_DO_CLUSTER} status", pty=PTY)
+    raise SystemExit(f"no droplet with a fast enough disk in {attempts} attempts; none is running")
+
+
+@task(
     name="do-pg-bench",
     help={
         "version": "secantusd-pg release to measure (default: the newest secantusd-pg-v* tag).",
@@ -835,12 +870,13 @@ def do_pg_bench(
     """Measure a released `secantusd-pg` against PostgreSQL 16 on the server droplet.
 
     The table on the site's Rust PostgreSQL page. Needs the droplets up, at
-    the sizes the page names: `invoke do-up --server-size c-16 --client-size
-    c-8`. It installs PostgreSQL 16 and the release binary on the server
-    droplet, drives both from the two client droplets over the private
-    network, and copies the trials back to `bench/results/pg-droplet/`. It
-    does not create or destroy a droplet: `invoke do-destroy` afterwards.
-    About 20 minutes at three trials, 45 at seven.
+    the sizes the page names and with a fast disk: `invoke do-pg-up`. It
+    refuses a server droplet whose disk is too slow. It installs PostgreSQL
+    16 and the release binary on the server droplet, drives both from the
+    two client droplets over the private network, and copies the trials
+    back to `bench/results/pg-droplet/`. It does not create or destroy a
+    droplet: `invoke do-destroy` afterwards. About 45 minutes at three
+    trials, 100 at seven.
     """
     cmd = (
         f"uv run --no-sync python bench/do_pg_bench.py --seconds {seconds} "

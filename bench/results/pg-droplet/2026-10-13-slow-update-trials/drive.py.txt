@@ -1,0 +1,47 @@
+"""Repeat the eight-client update trial against one server process, with the
+server droplet's disk and the server's CPU recorded beside each trial."""
+import json, sys, tarfile, tempfile, time, subprocess
+from pathlib import Path
+sys.path.insert(0, ".")
+import bench.do_pg_bench as d
+
+version, trials, out = sys.argv[1], int(sys.argv[2]), Path(sys.argv[3])
+which = sys.argv[4] if len(sys.argv) > 4 else "rust"
+key = Path.home() / ".ssh" / "secantus-bench"
+found = d._addresses()
+server, clients = found["server"], (found["client-1"], found["client-2"])
+if "--skip-install" not in sys.argv:
+    with tempfile.TemporaryDirectory() as tmp:
+        bundle = Path(tmp) / "harness.tgz"
+        with tarfile.open(bundle, "w:gz") as tar:
+            for name in d.HARNESS:
+                tar.add(d.REPO / name, arcname=name)
+        for h in clients:
+            subprocess.run(["scp", "-q", *d._ssh_options(key), str(bundle), f"root@{h}:/root/"], check=True)
+            d._ssh(h, key, d._INSTALL_CLIENT)
+    d._ssh(server, key, d._install_server(version))
+    d._ssh(server, key, "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sysstat >/dev/null 2>&1")
+private = d._ssh(server, key, "hostname -I | tr ' ' '\\n' | grep '^10\\.' | tail -1").strip()
+dsn = f"host={private} port={d.WIRE_PORT} dbname=postgres user=postgres sslmode=disable"
+d._ssh(server, key, d._START[which])
+d._ssh(server, key, f"""pkill iostat; pkill pidstat; rm -f /root/mon-*; cat > /root/sizes.sh <<'SH'
+while true; do echo "$(date +%s) $(du -sk /root/store 2>/dev/null | cut -f1) $(ls /root/store 2>/dev/null | wc -l) $(ls /root/store/journal 2>/dev/null | wc -l)"; sleep 2; done
+SH
+dev=$(lsblk -ndo NAME | head -1)
+setsid nohup iostat -xt $dev 1 > /root/mon-iostat.log 2>&1 </dev/null &
+pid=$(pgrep -x secantusd-pg || pgrep -o postgres)
+setsid nohup pidstat -u -d -r -h -p $pid 1 > /root/mon-pidstat.log 2>&1 </dev/null &
+pkill -x sizeloop; cp /bin/bash /root/sizeloop; setsid nohup /root/sizeloop /root/sizes.sh > /root/mon-sizes.log 2>&1 </dev/null &
+""")
+prepare = ("cd /root/repo && /root/venv/bin/python -c "
+           + d.shlex.quote("import sys; from bench.pg_concurrency import _prepare; _prepare(sys.argv[1], sys.argv[2].split(','), sys.argv[3])")
+           + f" {d.shlex.quote(dsn)} ")
+tables = [f"bench_{i}" for i in range(8)]
+rows = []
+for t in range(trials):
+    d._ssh(clients[0], key, prepare + f"{','.join(tables)} update")
+    start = float(d._ssh(server, key, "date +%s.%N").strip())
+    rate, cpu = d._remote_trial(clients, key, dsn, tables, "update", 8, 10.0)
+    rows.append({"trial": t, "server_time_before": start, "rate": rate})
+    print(f"{t:3d} {start:.0f} {rate:,.0f}", flush=True)
+    out.write_text(json.dumps(rows, indent=1))
