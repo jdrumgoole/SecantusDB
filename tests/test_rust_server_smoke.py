@@ -604,12 +604,26 @@ def test_get_log_returns_connection_lines(tmp_path) -> None:
         srv.stop()
 
 
-def test_geo_near_index_optimization_against_rust_server(tmp_path) -> None:
-    """A leading bounded ``$geoNear`` rides the geo index (conservative
-    ``$geoWithin`` candidate fetch) on the Rust server; output must be identical
-    to the brute-force scan. Compare an indexed collection against an unindexed
-    one over many random queries."""
+def test_geo_near_against_rust_server(tmp_path) -> None:
+    """A bounded ``$geoNear`` returns the documents inside the distance,
+    nearest first, each with its distance -- checked against the distances
+    worked out here -- and is refused without a geo index, as mongod refuses
+    it (291). It used to run over an unindexed collection."""
+    import math
     import random
+
+    import pytest
+    from pymongo.errors import OperationFailure
+
+    radius = 6_378_100.0  # mongod's
+
+    def metres(a, b) -> float:
+        (lng_a, lat_a), (lng_b, lat_b) = (map(math.radians, a), map(math.radians, b))
+        h = (
+            math.sin((lat_b - lat_a) / 2) ** 2
+            + math.cos(lat_a) * math.cos(lat_b) * math.sin((lng_b - lng_a) / 2) ** 2
+        )
+        return 2 * math.asin(math.sqrt(h)) * radius
 
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
     try:
@@ -628,14 +642,14 @@ def test_geo_near_index_optimization_against_rust_server(tmp_path) -> None:
         ]
         db.idx.insert_many(docs)
         db.noidx.insert_many(docs)
-        db.idx.create_index([("loc", "2dsphere")])  # only this one gets optimized
+        db.idx.create_index([("loc", "2dsphere")])
 
         for _ in range(40):
-            cx, cy = rng.uniform(-15, 15), rng.uniform(-15, 15)
+            centre = [rng.uniform(-15, 15), rng.uniform(-15, 15)]
             max_d = rng.uniform(50_000, 1_500_000)
             stage = {
                 "$geoNear": {
-                    "near": {"type": "Point", "coordinates": [cx, cy]},
+                    "near": {"type": "Point", "coordinates": centre},
                     "distanceField": "d",
                     "maxDistance": max_d,
                     "key": "loc",
@@ -643,13 +657,22 @@ def test_geo_near_index_optimization_against_rust_server(tmp_path) -> None:
                 }
             }
             pipeline: list[dict] = [stage]
+            wanted = docs
             if rng.random() < 0.4:
                 pipeline.append({"$match": {"v": {"$gte": 2}}})
+                wanted = [d for d in wanted if d["v"] >= 2]
             if rng.random() < 0.3:
                 stage["$geoNear"]["query"] = {"v": {"$lte": 4}}
-            opt = [(d["_id"], round(d["d"], 6)) for d in db.idx.aggregate(pipeline)]
-            brute = [(d["_id"], round(d["d"], 6)) for d in db.noidx.aggregate(pipeline)]
-            assert opt == brute, f"center={(cx, cy)} maxDistance={max_d}"
+                wanted = [d for d in wanted if d["v"] <= 4]
+            expected = sorted((metres(centre, d["loc"]["coordinates"]), d["_id"]) for d in wanted)
+            expected = [(dist, _id) for dist, _id in expected if dist <= max_d]
+            got = [(d["d"], d["_id"]) for d in db.idx.aggregate(pipeline)]
+            assert [i for _, i in got] == [i for _, i in expected], f"centre={centre}"
+            for (have, _), (want, _) in zip(got, expected, strict=True):
+                assert have == pytest.approx(want, abs=1e-3)
+            with pytest.raises(OperationFailure) as refused:
+                list(db.noidx.aggregate(pipeline))
+            assert refused.value.code == 291
     finally:
         srv.stop()
 
