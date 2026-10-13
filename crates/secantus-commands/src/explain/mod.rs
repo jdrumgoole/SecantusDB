@@ -904,7 +904,12 @@ fn aggregate(
     if target_coll.is_some() {
         checked.insert("aggregate", DRY);
     }
-    validate(crate::aggregate::aggregate, &checked, ctx)?;
+    match validate(crate::aggregate::aggregate, &checked, ctx) {
+        // The dry run's namespace is not there, which is all a `$collStats`
+        // stage is saying when it cannot read its count or its sizes.
+        Err(e) if e.code == 26 && e.errmsg.contains("in $collStats stage") => {}
+        other => other?,
+    }
     let db = ctx.db_name.clone();
     if inline {
         echo = inner.clone();

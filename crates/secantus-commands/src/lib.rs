@@ -2447,27 +2447,10 @@ fn validate_read_concern(
             }
         }
     }
-    if let Some(Bson::Timestamp(at)) = rc.get("atClusterTime") {
+    if let Some(Bson::Timestamp(_)) = rc.get("atClusterTime") {
         if level != Some("snapshot") {
             return Err(invalid(
                 "atClusterTime field can be set only if level is equal to snapshot".into(),
-            ));
-        }
-        // mongod keeps the history a snapshot needs for five minutes
-        // (`minSnapshotHistoryWindowInSeconds`); this server keeps none
-        // older, so a time before that has no snapshot to read.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        if u64::from(at.time) + 300 < now {
-            return Err(CommandError::new(
-                239,
-                "SnapshotTooOld",
-                format!(
-                    "Read timestamp Timestamp({}, {}) is older than the oldest available \
-                     timestamp.",
-                    at.time, at.increment
-                ),
             ));
         }
     }
@@ -2500,6 +2483,30 @@ fn validate_read_concern(
             | "mapReduce"
             | "mapreduce"
     );
+    // mongod keeps the history a snapshot needs for five minutes
+    // (`minSnapshotHistoryWindowInSeconds`); this server keeps none older,
+    // so a time before that has no snapshot to read. Said last: a command
+    // that takes no snapshot at all says that first.
+    let too_old = || -> Result<(), CommandError> {
+        let Some(Bson::Timestamp(at)) = rc.get("atClusterTime") else {
+            return Ok(());
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if u64::from(at.time) + 300 < now {
+            return Err(CommandError::new(
+                239,
+                "SnapshotTooOld",
+                format!(
+                    "Read timestamp Timestamp({}, {}) is older than the oldest available \
+                     timestamp.",
+                    at.time, at.increment
+                ),
+            ));
+        }
+        Ok(())
+    };
     let reason = if !reads {
         // An unknown command is CommandNotFound, whatever it carries.
         if lookup(name).is_none() {
@@ -2509,7 +2516,7 @@ fn validate_read_concern(
     } else if level == "snapshot" && name == "count" {
         "read concern snapshot not supported"
     } else {
-        return Ok(());
+        return too_old();
     };
     let at = match rc.get("atClusterTime") {
         Some(Bson::Timestamp(t)) => {
