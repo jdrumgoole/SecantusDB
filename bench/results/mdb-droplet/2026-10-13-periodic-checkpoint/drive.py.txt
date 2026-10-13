@@ -1,0 +1,53 @@
+"""Forty trials of eight clients updating by _id against one secantusd-rs
+process, then the store's size and the time to restart after SIGKILL."""
+import json, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0, "/Users/jdrumgoole/GIT/SecantusDB")
+import bench.do_pg_bench as d
+
+which, trials, out = sys.argv[1], int(sys.argv[2]), Path(sys.argv[3])
+key = Path.home() / ".ssh" / "secantus-bench"
+found = d._addresses()
+server, clients = found["server"], (found["client-1"], found["client-2"])
+here = Path(__file__).parent
+if "--install" in sys.argv:
+    for h in clients:
+        subprocess.run(["scp", "-q", *d._ssh_options(key), str(here / "client.py"), f"root@{h}:/root/client.py"], check=True)
+        d._ssh(h, key, "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null; apt-get install -y -qq python3-venv >/dev/null; "
+               "[ -x /root/venv/bin/python ] || python3 -m venv /root/venv; /root/venv/bin/pip -q install pymongo==4.15.3")
+private = d._ssh(server, key, "hostname -I | tr ' ' '\\n' | grep '^10\\.' | tail -1").strip()
+uri = f"mongodb://{private}:27017/?directConnection=true"
+START = (f"nohup /root/rs-{which} --host 0.0.0.0 --port 27017 --storage-path /root/store "
+         ">>/root/rs.log 2>&1 </dev/null & ")
+d._ssh(server, key, "pkill -x rs-base; pkill -x rs-fix; pkill -x sizeloop; sleep 1; rm -rf /root/store /root/rs.log; " + START
+       + "for i in $(seq 100); do ss -ltn | grep -q ':27017 ' && break; sleep 0.1; done; ss -ltn | grep -q ':27017 '")
+d._ssh(server, key, """cat > /root/sizes.sh <<'SH'
+while true; do echo "$(date +%s) $(du -sk /root/store 2>/dev/null | cut -f1) $(ls /root/store 2>/dev/null | wc -l) $(ls /root/store/WiredTigerLog.* 2>/dev/null | wc -l)"; sleep 30; done
+SH
+cp /bin/bash /root/sizeloop; setsid nohup /root/sizeloop /root/sizes.sh > /root/sizes-WHICH.log 2>&1 </dev/null &
+""".replace("WHICH", which))
+seed = ("from pymongo import MongoClient; import sys; db=MongoClient(sys.argv[1])['bench']\n"
+        "for i in range(8): db[f'c{i}'].insert_many([{'_id': k, 'n': 0, 'v': ''} for k in range(1000)])")
+d._ssh(clients[0], key, f"/root/venv/bin/python -c {d.shlex.quote(seed)} {d.shlex.quote(uri)}")
+rows = []
+with ThreadPoolExecutor(2) as pool:
+    for t in range(trials):
+        start = time.time() + 3
+        jobs = [pool.submit(d._ssh, h, key, f"/root/venv/bin/python /root/client.py {d.shlex.quote(uri)} {4 * k} 4 {start} 10")
+                for k, h in enumerate(clients)]
+        rate = sum(int(j.result().strip()) for j in jobs) / 10
+        rows.append({"trial": t, "start": start, "rate": rate})
+        print(f"{t:3d} {rate:,.0f}", flush=True)
+        out.write_text(json.dumps(rows, indent=1))
+print(d._ssh(server, key, f"""pkill -x sizeloop
+echo "store: $(du -sh /root/store | cut -f1), $(ls /root/store/WiredTigerLog.* | wc -l) log files"
+ls -la /root/store/WiredTigerLog.*
+pkill -9 -x rs-{which}; sleep 1
+t0=$(date +%s.%N); {START}
+for i in $(seq 3000); do ss -ltn | grep -q ':27017 ' && break; sleep 0.05; done
+t1=$(date +%s.%N); echo "listening $(echo "$t1 - $t0" | bc) s after restart"
+tail -5 /root/rs.log
+"""))
+count = "from pymongo import MongoClient; import sys; db=MongoClient(sys.argv[1])['bench']; print('documents after restart:', sum(db[f'c{i}'].count_documents({}) for i in range(8)))"
+print(d._ssh(clients[0], key, f"/root/venv/bin/python -c {d.shlex.quote(count)} {d.shlex.quote(uri)}"))

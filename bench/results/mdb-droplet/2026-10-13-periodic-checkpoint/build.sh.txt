@@ -1,0 +1,24 @@
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null
+apt-get install -y -qq git build-essential cmake swig clang libclang-dev llvm-dev ninja-build liblz4-dev zlib1g-dev pkg-config curl bc >/dev/null
+[ -x /root/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
+. /root/.cargo/env
+[ -x /root/.local/bin/uv ] || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+export PATH=/root/.local/bin:$PATH
+rm -rf /root/src && git clone -q --recurse-submodules --shallow-submodules --depth 30 https://github.com/jdrumgoole/SecantusDB.git /root/src 2>&1 | tail -2
+cd /root/src
+git checkout -q d111914a
+uv python install 3.12 >/dev/null 2>&1
+SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv build --wheel --out-dir dist-storage > /root/wheel.log 2>&1 || { tail -30 /root/wheel.log; exit 1; }
+libdir="/usr/lib/$(cc -print-multiarch)"
+export SECANTUS_WT_STATIC_COMPRESSORS=1 LIBZ_SYS_STATIC=1 SECANTUS_WT_EXTRA_LIBDIR=$libdir
+wt=$(ls -d "$PWD"/build/*/wt-build | head -1)
+export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+export CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+b() { cargo build --release --locked --manifest-path crates/secantusdb/Cargo.toml > /root/build-$1.log 2>&1 || { tail -30 /root/build-$1.log; exit 1; }; cp crates/secantusdb/target/release/secantusd-rs /root/rs-$1; }
+b fix
+git show HEAD~1:crates/secantus-storage/src/lib.rs > crates/secantus-storage/src/lib.rs
+b base
+ls -la /root/rs-fix /root/rs-base
+echo AB-BUILD-DONE

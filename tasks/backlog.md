@@ -3166,7 +3166,13 @@ These work end-to-end but cut corners.
         before and after: 13,815 and 13,864 statements a second; the store
         2.1 GB and 69 MB; a restart after SIGKILL 36.8 s and 1.4 s
         (`bench/results/pg-droplet/2026-10-13-periodic-checkpoint/`).
-        `secantusd-rs` gets it from the same code and was not measured.
+        `secantusd-rs`, sixty trials of eight pymongo clients updating:
+        15,690 and 15,724 updates a second; the store 4.1 GB and 2.1 GB
+        (its log files are 2 GB each, allocated in full, so one is the
+        floor); a restart after SIGKILL 81.2 s and 3.9 s
+        (`bench/results/mdb-droplet/2026-10-13-periodic-checkpoint/`).
+        Released in `secantus-mdb` 0.5.3-beta.191 and `secantus-pg`
+        0.1.0-beta.15.
       - [ ] **The Python servers have the same gap.** `storage.py`
             checkpoints at close, in a backup and in `fsync`, and nowhere
             else, so a long-running `secantusd-py` or `secantusd-py-pg`
