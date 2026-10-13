@@ -4,7 +4,7 @@ The commands a driver or a tool sends about the server and the connection
 (`hello`, `buildInfo`, `serverStatus`, `getParameter`, `dataSize`,
 `$collStats`, the session commands and the fields every command takes)
 were sent to the Rust MongoDB server and to mongod 8.2.11, 1,141 of them,
-and each reply compared. 492 differed; @@LEFT@@ do now
+and each reply compared. 492 differed; 160 do now
 (`tasks/backlog.md` 7.082).
 
 #### Fixed

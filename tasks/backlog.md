@@ -9217,7 +9217,7 @@ version no longer has. Most replies hold values that differ from one machine
 to the next, so a step is compared whole with the volatile keys reduced to
 their BSON type, or by its keys and types to a given depth. mongod answered
 the same on three runs against itself. The Rust server differed on 492
-replies and differs on @@LEFT@@. Pinned by
+replies and differs on 160. Pinned by
 `crates/secantus-storage-adapter/tests/diagnostic_commands_wt.rs` and the
 unit tests of `generic.rs`, `serverinfo.rs` and `handshake.rs`.
 
@@ -9248,7 +9248,7 @@ What was wrong, by how much it mattered:
   parameter it lacks; `listCommands`, `logout`, `getDefaultRWConcern`,
   `replSetGetConfig`, `shardingState` and `fsyncUnlock` were unknown.
 
-Still different, all @@LEFT@@:
+Still different, all 160:
 
 - [ ] **`validate` checks nothing.** It answers `valid: true` and reports
       each index as holding one key per document (mongod: 4 keys for the
