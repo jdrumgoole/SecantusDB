@@ -122,3 +122,34 @@ def test_a_remote_run_says_where_the_clients_were_and_how_busy(tmp_path: Path) -
     table = bench.render(tmp_path)
     assert "Clients on two client droplets, over the private network" in table
     assert "was 18%." in table
+
+
+def test_neither_server_is_measured_over_tls() -> None:
+    """Ubuntu's PostgreSQL offers TLS and psycopg takes it unless told not to,
+    so until 2026-10-13 PostgreSQL was measured encrypted and `secantusd-pg`
+    in the clear. Every DSN says `sslmode=disable`, and the run records what
+    PostgreSQL saw."""
+    mod = _module()
+    for script in (
+        mod._install_server("0.1.0-beta.13"),
+        mod._remote_script("0.1.0-beta.13", 10.0, 3),
+    ):
+        dsns = [ln for ln in script.splitlines() if ln.startswith("DSN=")]
+        assert dsns and all("sslmode=disable" in ln for ln in dsns)
+        assert "pg_stat_ssl" in script
+
+
+def test_the_footnote_names_the_processor_the_disk_and_the_absence_of_tls(tmp_path: Path) -> None:
+    for workload, mode, counts, _ in _module().SWEEPS:
+        rates = {int(c): [100.0, 110.0, 120.0] for c in counts.split(",")}
+        _trials(tmp_path, workload, mode, rates, rates)
+    (tmp_path / "facts.txt").write_text(
+        "binary_version=secantusd-pg 0.1.0-beta.13\nbinary_tree=abc\npostgres=16.15\n"
+        "fsync=on\nsynchronous_commit=on\ntls=f\nvcpus=16\n"
+        "cpu=Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz\nfdatasync_per_s=1653\n"
+        "filesystem=ext4\nos=Ubuntu 24.04.5 LTS\n"
+    )
+    footnote = _module().render(tmp_path).splitlines()[-1]
+    assert "no TLS on either server" in footnote
+    assert "16 vCPUs (Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz)" in footnote
+    assert "ext4 (1,653 fdatasync calls a second by pg_test_fsync)" in footnote

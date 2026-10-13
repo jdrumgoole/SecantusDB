@@ -399,5 +399,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rx.recv();
 
     server.stop();
+
+    // The instrumented stage of the release build only (the `pgo-instrument`
+    // feature; the symbols exist only under `-Cprofile-generate`). On the
+    // arm64 macOS release runner the profiling runtime does not write its
+    // profile as the process exits, which the MongoDB binary's build
+    // established, so the profile is written here, to the path in
+    // `SECANTUS_PGO_OUT`.
+    #[cfg(feature = "pgo-instrument")]
+    if let Ok(path) = std::env::var("SECANTUS_PGO_OUT") {
+        if let Ok(cpath) = std::ffi::CString::new(path) {
+            extern "C" {
+                fn __llvm_profile_set_filename(name: *const std::os::raw::c_char);
+                fn __llvm_profile_write_file() -> std::os::raw::c_int;
+            }
+            unsafe {
+                __llvm_profile_set_filename(cpath.as_ptr());
+                __llvm_profile_write_file();
+            }
+        }
+    }
     Ok(())
 }

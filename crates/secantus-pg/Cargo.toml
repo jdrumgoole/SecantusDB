@@ -47,6 +47,10 @@ default = ["bin", "mimalloc"]
 # Builds the `secantusd-pg` binary (signal handling). Off, the crate is the
 # library alone -- what a dev-dependency or the Python handle wants.
 bin = ["dep:ctrlc", "dep:libc"]
+# Only for the instrumented stage of the release build
+# (`scripts/build_pg_release.sh`): the binary writes its own profile to
+# `SECANTUS_PGO_OUT` as it stops. It links only under `-Cprofile-generate`.
+pgo-instrument = []
 
 [dependencies]
 # Anonymous files for an external sort's runs (`external_sort`).

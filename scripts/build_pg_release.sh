@@ -35,6 +35,7 @@ fi
 
 work=$(mktemp -d)
 raw="$work/raw"
+instrument=()
 mkdir -p "$raw"
 server=""
 cleanup() {
@@ -49,8 +50,36 @@ if [ -z "$profdata" ]; then
   exit 1
 fi
 
+case "$target" in
+  *-apple-darwin)
+    # The `cc` crate copies rustc's -Cprofile-generate and -Cprofile-use onto
+    # the C compiler, so every C dependency would be instrumented by Apple
+    # clang, in a profile format the Rust toolchain's runtime does not read.
+    # With Rust 1.99 the instrumented binary then died of a segmentation
+    # fault before it listened (measured here 2026-10-13; the MongoDB binary's
+    # build met the same thing). This wrapper drops those flags, so only Rust
+    # is profiled.
+    cat > "$work/cc-noprofile" <<'WRAP'
+#!/bin/bash
+args=()
+for a in "$@"; do
+  case "$a" in -fprofile-generate*|-fprofile-use*|-fprofile-instr-*) ;; *) args+=("$a") ;; esac
+done
+exec cc "${args[@]}"
+WRAP
+    chmod +x "$work/cc-noprofile"
+    export "CC_${target//-/_}=$work/cc-noprofile"
+    # On the macOS release runner the profile is not written as the process
+    # exits, so there the binary writes it itself (the `pgo-instrument`
+    # feature, to SECANTUS_PGO_OUT). Both are set: where the exit-time write
+    # works too, the two files are merged.
+    instrument=(--features pgo-instrument)
+    export SECANTUS_PGO_OUT="$raw/pg-self.profraw"
+    ;;
+esac
+
 echo "=== stage 1: instrumented build ===" >&2
-RUSTFLAGS="-Cprofile-generate=$raw" build >&2
+RUSTFLAGS="-Cprofile-generate=$raw" build ${instrument[@]+"${instrument[@]}"} >&2
 
 echo "=== stage 2: run the workload against the instrumented binary ===" >&2
 LLVM_PROFILE_FILE="$raw/pg-%p-%m.profraw" \
@@ -60,6 +89,7 @@ addr=""
 for _ in $(seq 1 120); do
   addr=$(sed -n 's/.*listening on \([0-9.]*:[0-9]*\).*/\1/p' "$work/server.log" | head -1)
   [ -n "$addr" ] && break
+  kill -0 "$server" 2>/dev/null || break
   sleep 0.5
 done
 if [ -z "$addr" ]; then

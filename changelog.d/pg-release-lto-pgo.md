@@ -14,7 +14,8 @@ profile as well 17,855.
 - The released binaries are built in two stages by
   `scripts/build_pg_release.sh`: an instrumented build runs
   `bench/pgo_workload_pg.py`, and the build that ships uses the profile it
-  wrote. `cargo install` cannot have the profile.
+  wrote. `cargo install` cannot have the profile. The two stages take 16
+  minutes on 16 vCPUs.
 
 #### Fixed
 
@@ -23,3 +24,7 @@ profile as well 17,855.
   server offers it, so PostgreSQL paid for encryption the other side did not.
   Every DSN the benchmark uses now says `sslmode=disable`, the run records
   `pg_stat_ssl` for its own connection, and it stops if that says TLS was on.
+- A benchmark droplet's disk decides the write rows, and one droplet of the
+  same size completed a fifth of the commits a second of the one before it.
+  The run now records the processor and `pg_test_fsync`'s rate, and the
+  table's footnote prints them.
