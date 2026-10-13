@@ -2247,6 +2247,27 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 }
                 return Ok(reply);
             }
+            // A document the index cannot hold stops the build's scan, and
+            // mongod reports it under the same wrapper.
+            Err(StorageError::WriteError { code, errmsg, .. })
+                if errmsg.starts_with("collection scan stopped.") =>
+            {
+                let coll_uuid = storage
+                    .collection_uuid(&ctx.db_name, &coll)
+                    .ok()
+                    .and_then(|b| uuid_text(&b))
+                    .unwrap_or_default();
+                let build = uuid_text(&bson::uuid::Uuid::new().bytes()).unwrap_or_default();
+                return Err(CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    format!(
+                        "Index build failed: {build}: Collection {}.{coll} ( {coll_uuid} ) :: \
+                         caused by :: {errmsg}",
+                        ctx.db_name
+                    ),
+                ));
+            }
             Err(e) => return Err(command_error(e)),
         };
         any_created |= created;

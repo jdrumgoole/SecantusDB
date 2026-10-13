@@ -217,7 +217,9 @@ fn line(v: Option<&Bson>) -> Parsed<Geom> {
     let Some(v) = v else {
         return bad("GeoJSON LineString must have at least 2 vertices, instead got 0 vertices: []");
     };
-    let points = vertices(v)?;
+    // A vertex repeated straight after itself is one vertex.
+    let mut points = vertices(v)?;
+    points.dedup();
     if points.len() < 2 {
         return bad(format!(
             "GeoJSON LineString must have at least 2 vertices, instead got {} vertices: {}",
@@ -420,6 +422,136 @@ pub fn stored(v: &Bson) -> Vec<Geom> {
             list.iter().filter_map(one).collect()
         }
         other => one(other).into_iter().collect(),
+    }
+}
+
+/// Every vertex of a geometry.
+fn all_points(g: &Geom, out: &mut Vec<P>) {
+    match g {
+        Geom::Point(p) => out.push(*p),
+        Geom::Line(l) => out.extend(l),
+        Geom::Polygon(loops) => out.extend(loops.iter().flatten()),
+        Geom::Multi(parts) => parts.iter().for_each(|g| all_points(g, out)),
+    }
+}
+
+/// The points a stored value holds, for a `2d` index: a legacy pair, or
+/// each of several.
+pub fn stored_points(v: &Bson) -> Vec<P> {
+    stored(v)
+        .into_iter()
+        .filter_map(|g| match g {
+            Geom::Point(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The box around each geometry a stored value holds: `(min x, min y, max x,
+/// max y)`, a point's box being the point.
+pub fn stored_boxes(v: &Bson) -> Vec<(f64, f64, f64, f64)> {
+    stored(v)
+        .iter()
+        .filter_map(|g| {
+            let mut points = Vec::new();
+            all_points(g, &mut points);
+            let first = *points.first()?;
+            Some(points.iter().fold(
+                (first.0, first.1, first.0, first.1),
+                |b, p| (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1)),
+            ))
+        })
+        .collect()
+}
+
+// ------------------------------------------------------- what an index holds
+
+/// Why a `2dsphere` index cannot hold `v`, the value of its field in a
+/// document being written: mongod's reason, or `None` when it can (or has
+/// nothing to index: null, a missing field, an empty array or document).
+pub fn sphere_key_problem(field: &str, v: Option<&Bson>) -> Option<String> {
+    let reason = |f: Fallback| match f {
+        Fallback::Mongo { message, .. } => message,
+        Fallback::Defer => "unknown GeoJSON type".to_string(),
+    };
+    let legacy = |v: &Bson| -> Option<String> {
+        match flat_point(Some(v)) {
+            Err(f) => Some(reason(f)),
+            Ok(p) if in_bounds(p).is_err() => Some(format!(
+                "can't project geometry into spherical CRS: {}",
+                bson_value_repr(v)
+            )),
+            Ok(_) => None,
+        }
+    };
+    match v? {
+        Bson::Null | Bson::Undefined => None,
+        Bson::Array(list) if list.is_empty() => None,
+        Bson::Document(d) if d.is_empty() => None,
+        v @ Bson::Array(_) => legacy(v),
+        v @ Bson::Document(d) => {
+            let numbers = d.values().take(2).filter(|x| num(x).is_some()).count();
+            if d.contains_key("type") {
+                geojson(d).err().map(reason)
+            } else if numbers == 2 {
+                legacy(v)
+            } else {
+                Some(format!("unknown GeoJSON type: {}", bson_value_repr(v)))
+            }
+        }
+        other => Some(format!(
+            "geo element must be an array or object: {field}: {}",
+            bson_value_repr(other)
+        )),
+    }
+}
+
+/// Why a `2d` index over `[lo, hi]` cannot hold `v`: mongod's code and
+/// reason, and whether it names the document after it.
+pub fn flat_key_problem(v: Option<&Bson>, lo: f64, hi: f64) -> Option<(i32, String, bool)> {
+    const SHAPE: (i32, &str, bool) = (
+        16804,
+        "location object expected, location array not in correct format",
+        false,
+    );
+    const PAIRS: (i32, &str, bool) = (
+        13026,
+        "geo values must be 'legacy coordinate pairs' for 2d indexes",
+        true,
+    );
+    let own = |(code, text, names): (i32, &str, bool)| Some((code, text.to_string(), names));
+    let pair = |v: &Bson, in_array: bool| -> Option<(i32, String, bool)> {
+        let parts = members(v)?;
+        let first = parts.first().copied()?;
+        if num(first).is_none() {
+            return own(if in_array { PAIRS } else { SHAPE });
+        }
+        let Some(second) = parts.get(1).copied() else {
+            return Some((13068, "geo field only has 1 element".to_string(), true));
+        };
+        let (Some(x), Some(y)) = (num(first), num(second)) else {
+            return own(PAIRS);
+        };
+        if [x, y].iter().any(|c| *c < lo || *c > hi) {
+            return Some((
+                13027,
+                format!("point not in interval of [ {lo}, {hi} ]"),
+                true,
+            ));
+        }
+        None
+    };
+    let v = v?;
+    let parts = members(v)?;
+    match parts.first().copied() {
+        None => None,
+        // Locations inside the value, each a pair of its own: an array of
+        // them, or a document whose members are.
+        Some(Bson::Array(_) | Bson::Document(_)) => parts.iter().find_map(|p| match p {
+            Bson::Array(_) | Bson::Document(_) => pair(p, true),
+            _ => own(PAIRS),
+        }),
+        Some(_) => pair(v, matches!(v, Bson::Array(_))),
     }
 }
 
