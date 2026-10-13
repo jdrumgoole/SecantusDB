@@ -760,6 +760,10 @@ pub(crate) mod sphere {
 
     pub type V = [f64; 3];
 
+    /// The angle mongod reports from a point to a line it lies on: not
+    /// nothing, but 6.42567661e-12 metres of it.
+    const ON_A_LINE: f64 = 1.007_459_37e-18;
+
     /// What counts as touching: about a centimetre on the ground, the width
     /// of the leaf cell mongod tests a point as.
     const NEAR: f64 = 1.5e-9;
@@ -999,7 +1003,7 @@ pub(crate) mod sphere {
                     .iter()
                     .map(|(a, b)| to_arc(c, *a, *b))
                     .fold(f64::INFINITY, f64::min)
-                    .max(f64::MIN_POSITIVE),
+                    .max(ON_A_LINE),
             })
             .fold(f64::INFINITY, f64::min)
     }
