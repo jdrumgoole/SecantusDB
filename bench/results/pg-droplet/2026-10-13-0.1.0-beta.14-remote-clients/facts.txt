@@ -1,0 +1,12 @@
+binary_version=secantusd-pg 0.1.0-beta.14
+binary_tree=82cb3bd38c945bd6f6538a1e3ba74ec0973ca0e8
+postgres=16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)
+fsync=on
+synchronous_commit=on
+tls=f
+vcpus=16
+cpu=Intel(R) Xeon(R) Platinum 8280 CPU @ 2.70GHz
+fdatasync_per_s=12388
+filesystem=ext4
+os=Ubuntu 24.04.5 LTS
+private=10.106.16.5

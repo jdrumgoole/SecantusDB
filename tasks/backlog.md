@@ -3131,15 +3131,33 @@ These work end-to-end but cut corners.
         are kept out of the profile and the binary writes its own, as the
         MongoDB binary's build does: with Rust 1.99 the instrumented binary
         otherwise dies before it listens.
-      - [ ] **The site's PostgreSQL droplet table was measured with
-            PostgreSQL over TLS and this server in the clear**, and has not
-            been measured again. Ubuntu's PostgreSQL has `ssl = on` and
-            psycopg's default `sslmode` is `prefer`. One client selecting
-            by primary key: 16,988 a second with TLS and 22,159 without, so
-            the table understates PostgreSQL's lead, most on reads.
-            `bench/do_pg_bench.py` says `sslmode=disable` in every DSN
-            since 2026-10-13 and stops if `pg_stat_ssl` shows otherwise.
-            What is left is the run, and the table.
+      - **The site's table was measured again on 2026-10-13 with neither
+        server using TLS** (it had measured PostgreSQL over TLS and this
+        server in the clear: Ubuntu's PostgreSQL has `ssl = on` and
+        psycopg's default `sslmode` is `prefer`). On one droplet (Xeon
+        8280, 12,388 `fdatasync` calls a second), eight clients, statements
+        a second for PostgreSQL / 0.1.0-beta.13 / 0.1.0-beta.14: insert
+        19,647 / 14,140 / 15,514; insert into a shared table 19,358 /
+        13,301 / 14,774; update 19,364 / 12,542 / 14,366; select 46,326 /
+        34,288 / 41,038. One client: insert 3,326 / 2,486 / 2,899, update
+        3,223 / 2,084 / 2,619, select 5,898 / 4,197 / 5,572. With TLS off,
+        0.1.0-beta.13 was 1.34x behind on reads where the site had said
+        1.17x; 0.1.0-beta.14 is 1.13x. `bench/do_pg_bench.py` says
+        `sslmode=disable` in every DSN and stops if `pg_stat_ssl` shows
+        otherwise.
+      - [ ] **RUST PG server: three slow update trials, cause unknown.** In
+            the 0.1.0-beta.13 run of 2026-10-13, eight clients updating by
+            primary key gave 12,418 and 12,209 statements a second and then
+            8,019, 8,156 and 9,000, one server process throughout, with
+            PostgreSQL steady at 19,000 minutes before. A repeat of that
+            sweep gave 12,212 to 12,811 in all seven trials, and
+            0.1.0-beta.14 showed nothing like it in seven. It may be the
+            droplet's disk and it may be this server (a checkpoint, or
+            eviction, after many tables have been dropped and created).
+            Nothing was watching the server when it happened. The trials
+            are in `bench/results/pg-droplet/2026-10-13-0.1.0-beta.13-remote-clients/update-distinct.first-run.json`.
+            To look: run that sweep for longer with `iostat` and the
+            server's WiredTiger statistics recorded beside it.
       - **A `c-16` is not one machine.** The droplet of 2026-10-13 had a
         Xeon Platinum 8168 and a disk that completed 1,653 `fdatasync`
         calls a second; one client's inserts ran at 613 a second on
