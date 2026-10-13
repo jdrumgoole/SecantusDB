@@ -408,6 +408,9 @@ TAGS = [
     {"_id": 4, "t": [["m"], "b"], "p": [{"q": [1, 3]}], "n": 2},
     {"_id": 9, "t": None, "p": None, "n": 1},
     {"_id": 10, "t": ["b", "a"], "p": [{"q": 2}, {"q": 3}], "n": 3},
+    # An element that is not a document, and an array inside the array.
+    {"_id": 11, "p": [5, {"q": 4}], "n": 1},
+    {"_id": 12, "t": "y", "p": [[{"q": 0}]], "n": 2},
 ]
 TAG_FILTERS = [
     {},

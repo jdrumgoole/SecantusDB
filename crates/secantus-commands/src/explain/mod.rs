@@ -221,7 +221,22 @@ fn catalog(
     docs: Option<&[Document]>,
 ) -> Result<Vec<Rc<IndexInfo>>, crate::storage::StorageError> {
     let mut catalog = Vec::new();
-    for spec in storage.list_indexes(db, coll)? {
+    // Without the documents, the store's one read of specs and paths.
+    let listed: Vec<(Document, Option<Vec<Vec<String>>>)> = match docs {
+        None => storage.planner_indexes(db, coll)?,
+        Some(_) => None,
+    }
+    .map(|list| list.into_iter().map(|(s, p)| (s, Some(p))).collect())
+    .map_or_else(
+        || {
+            storage
+                .list_indexes(db, coll)
+                .map(|list| list.into_iter().map(|s| (s, None)).collect())
+        },
+        Ok,
+    )?;
+    for (spec, stored_paths) in listed {
+        let spec = &spec;
         let Ok(key) = spec.get_document("key") else {
             continue;
         };
@@ -232,7 +247,10 @@ fn catalog(
         let name = spec.get_str("name").unwrap_or("").to_string();
         let plain = key.values().all(|v| matches!(as_i64(v), Some(1 | -1)))
             && !key.values().any(|v| matches!(v, Bson::String(_)));
-        let multikey_paths = if !storage.index_is_multikey(db, coll, &name) {
+        let multikey_paths = if let Some(mut paths) = stored_paths {
+            paths.resize(key.len(), vec![]);
+            paths
+        } else if !storage.index_is_multikey(db, coll, &name) {
             vec![vec![]; key.len()]
         } else if let Some(docs) = docs {
             exec::multikey_paths(docs, key)
@@ -257,6 +275,27 @@ fn catalog(
         }));
     }
     Ok(catalog)
+}
+
+/// The collection `explain` already read, for the planner to count over.
+struct Held<'a> {
+    docs: &'a [Document],
+    collation: Option<&'a Collation>,
+}
+
+impl plan::Whole for Held<'_> {
+    fn env(&self) -> Option<exec::Env<'_>> {
+        Some(exec::Env {
+            docs: self.docs,
+            collation: self.collation,
+            skip: 0,
+            limit: 0,
+            multi: true,
+            upsert: false,
+            returns: false,
+            known: None,
+        })
+    }
 }
 
 /// The plan for one command over one collection.
@@ -307,14 +346,14 @@ fn plan_for(
             ));
         }
     }
-    let trial = exec::Env {
+    let whole = Held {
         docs: &t.docs,
         collation,
-        skip: 0,
-        limit: 0,
-        multi: true,
-        upsert: false,
-        returns: false,
+    };
+    let trial = plan::Trial {
+        total: t.docs.len(),
+        matched: None,
+        whole: &whole,
     };
     let q = Query {
         canonical,
@@ -513,6 +552,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             multi,
             upsert,
             returns,
+            known: None,
         };
         exec::run(&plan, &env)
     });

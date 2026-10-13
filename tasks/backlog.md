@@ -9162,6 +9162,105 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.080 The order `find` returns documents in -- 2026-10-13
+
+`tools/probes/find_order.py`, mongod 8.2.11: 47 scenarios, 6,531 replies
+over a raw connection. A read is compared by the `_id`s it returns, in
+order; a write of one document (`delete` with `limit: 1`, `update` without
+`multi`, `findAndModify`) by its reply and by what the collection holds
+afterwards. mongod answered the same on three runs against itself. The
+Rust server differed on 1,189 replies and differs on 97. Pinned by
+`crates/secantus-storage-adapter/tests/find_order_wt.rs`.
+
+The store's index router reads documents its own way, so its order was its
+own. Now the store says only WHICH documents match (`Storage::matching_rows`,
+in insertion order) and the order is the plan mongod runs, walked over those
+documents (`crates/secantus-commands/src/explain/order.rs`, on the planner
+`explain` already had). `find`, the front of `aggregate`, `distinct`,
+`findAndModify` and the two write commands read through it. Collections that
+read in an order of their own are left as they were: time-series, clustered,
+the oplog view.
+
+Three of the differences were the wrong DOCUMENTS, and are fixed in the
+router itself:
+
+- **Two range bounds over an array index dropped a document.**
+  `{a: {$gt: 1, $lt: 9}}` over `{a: 1}` did not return `{a: [1, 9]}`: one
+  element is over 1 and another under 9, and the scan read only the keys
+  between. The router keeps one bound over a multikey index
+  (`flagged_multikey`). **Not checked on the Python server.**
+- **`{"p.q": null}` over an index on `p.q` dropped a document** whose array
+  `p` has an element without `q`. The entries hold nothing for that
+  element, where mongod indexes it as null. Such a predicate is no longer
+  read from the entries (`holds_missing_leaves`). The entries are not
+  changed, so the same hole is there on the Python server.
+- **A sort by `p.q` ranked that document by its other elements**; mongod
+  ranks it as null (`secantus_core::sort_path_values`).
+
+What the order follows, each measured:
+
+- An index scan returns its entries by key and then by insertion; a
+  backward scan returns equal keys last first.
+- `$ne`, `$nin`, `$exists`, `$type`, `$not`, `$mod` and a regex read the
+  index in mongod, and come back in its order. The router scans the
+  collection for them.
+- A hinted `_id` index reads in `_id` order.
+- `$or` branches that are one predicate on an index's leading field share
+  one scan of it; the scans come index by index, not in the order written.
+- A sort on a field that holds arrays is read from the index only when the
+  bounds leave no key out. Otherwise it is a sort of the scan.
+- A sort the predicate's index does not return: mongod also tries a walk
+  of an index that does and keeps the plan that finishes first. That is
+  counted here, in mongod's own steps, for a collection of up to 2,000
+  documents (`plan::walk_finishes_first`). Past that the predicate's index
+  is kept.
+- An index of another collation does not return a sort, and a regex is
+  still bounded by an index of plain strings under a query collation.
+- An empty array is indexed as `undefined`, between MinKey and null, and an
+  array element without the rest of the path as null.
+
+Still different, all 97:
+
+- [ ] **Ties under a sort with a limit** (62). mongod keeps the first
+      `limit` documents of a blocking sort in a heap, and the order the heap
+      leaves equal documents in is its standard library's (`make_heap` and
+      `pop_heap`; working libc++'s by hand gives mongod's answer for
+      `{a: 5}, sort {a: -1}, skip 1, limit 2`). This server keeps them in
+      the order they arrived. A Linux mongod is built on another library
+      and was not measured.
+- [ ] **Ties between the scans a sort merges** (about 15): `{a: {$in: [5,
+      3]}}, sort {b: 1}` over `{a: 1, b: 1}`. mongod merges one scan per
+      value through a priority queue; equal documents come out in the
+      queue's order. Here they come out scan by scan.
+- [ ] **An unknown hint's wording** on `aggregate` (15), as under 7.075.
+- [ ] **Which of several predicate indexes is read** (1): `{a: {$gt: 0},
+      b: 1}` with `a_1`, `b_1` and `a_1_b_1`. mongod reads `b_1`; the fixed
+      preference here takes `a_1_b_1`.
+- [ ] **A `$match` after `$addFields`** (1): mongod moves it ahead of the
+      stage when it reads no field the stage writes, and then reads its
+      index.
+- [ ] One regex under a collation with two indexes on the field, and two
+      `$in` sorts after writes that turn on the same merge.
+- [ ] **The multikey paths are not stored.** They are read from the
+      collection the first time a query needs them after the server starts
+      or an index is dropped, and kept current by writes after that
+      (`Storage::index_multikey_paths`). mongod's are in its catalog and
+      never shrink; after a restart these are what the documents hold.
+- [ ] **The cost.** Timed against the build before on 20,000 documents
+      (`find` by `_id`, by an indexed value, an indexed range, a multikey
+      value, a full scan, sorts, `update_one`): within 8% where the router
+      read the index the plan names, since its rows are already in order
+      (`already_in_order`), and for a scan. `{a: {$ne: 5}}` over `a_1`
+      costs 3.2 times as much (19,980 rows to put in index order where the
+      router scans), a sort with ties over a 500-document collection with
+      an index on each field 1.6 times (the trial reads the collection),
+      and `update_one` by an indexed value 1.2 times (the rows are read to
+      be ordered, then again to be written). An index scan in the store
+      that reads bounds in order would remove the first.
+- [ ] **Not measured:** the order under a transaction's own writes and on
+      a capped collection.
+- [ ] **PYTHON MongoDB server:** not measured by this probe.
+
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
 `tools/probes/out_and_merge.py`, mongod 8.2.11: 16 scenarios, 376 replies

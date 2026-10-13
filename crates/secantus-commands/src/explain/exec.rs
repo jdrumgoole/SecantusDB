@@ -26,10 +26,19 @@ pub(crate) struct Env<'a> {
     pub upsert: bool,
     /// `findAndModify`: the write hands its document back.
     pub returns: bool,
+    /// Per document, whether it matches the QUERY, when the caller already
+    /// knows: a stage's filter is then answered from this and not run, so
+    /// the documents need only hold the fields the indexes are keyed on.
+    /// Every filter a plan runs passes exactly the documents the query
+    /// matches, among those its scan returns.
+    pub known: Option<&'a [bool]>,
 }
 
 impl Env<'_> {
     pub(crate) fn matches(&self, row: usize, filter: &Option<Document>) -> bool {
+        if let (Some(known), Some(_)) = (self.known, filter) {
+            return known[row];
+        }
         match filter {
             None => true,
             Some(f) => {
@@ -57,14 +66,15 @@ pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) 
                 return;
             }
             for item in items {
+                // An element that does not have the rest of the path is
+                // indexed as null: a document without the field, and an
+                // element that is not a document.
+                let before = out.len();
                 if matches!(item, Bson::Document(_)) {
-                    // An element that does not have the rest of the path is
-                    // indexed as null.
-                    let before = out.len();
                     walk_doc(item, parts, at, out, arrays);
-                    if out.len() == before {
-                        out.push(Bson::Null);
-                    }
+                }
+                if out.len() == before {
+                    out.push(Bson::Null);
                 }
             }
             return;
@@ -90,13 +100,10 @@ pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) 
     }
     let parts: Vec<&str> = path.split('.').collect();
     let (mut out, mut arrays) = (Vec::new(), Vec::new());
-    walk_doc(
-        &Bson::Document(doc.clone()),
-        &parts,
-        0,
-        &mut out,
-        &mut arrays,
-    );
+    // The first component is read from the document as it stands: no copy.
+    if let Some(next) = doc.get(parts[0]) {
+        walk(next, &parts, 1, &mut out, &mut arrays);
+    }
     (out, arrays)
 }
 
@@ -354,12 +361,12 @@ impl Scan {
             self.seek_start();
         }
         while !self.done && self.pos < self.entries.len() {
-            let key = self.entries[self.pos].0.clone();
-            let Some((field, ahead)) = self.outside(&key) else {
+            let Some((field, ahead)) = self.outside(&self.entries[self.pos].0) else {
                 self.keys += 1;
                 self.pos += 1;
                 return Some(self.entries[self.pos - 1].1);
             };
+            let key = self.entries[self.pos].0.clone();
             if self.contiguous {
                 // Before the run: not examined. After it: the scan is over.
                 if ahead {

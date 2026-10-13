@@ -2560,6 +2560,16 @@ fn sparse_index_usable(key_spec: &Document, filter: &Document) -> bool {
 /// True if any field of `key_spec` is array-valued in `doc` — either an array
 /// leaf or a dotted path descending through an array. That's the signal that
 /// marks an index multikey. Mirrors `storage._doc_makes_multikey`.
+/// What [`Storage::matching_rows`] returns.
+#[derive(Debug, Default)]
+pub struct MatchedRows {
+    /// `(RecordId, document)`.
+    pub rows: Vec<(i64, Vec<u8>)>,
+    /// The one index whose entries gave the rows their order; `None` when
+    /// they are in RecordId order.
+    pub via: Option<String>,
+}
+
 /// One index's multikey paths: the DDL generation they were read under,
 /// whether the collection has been scanned for them yet, and per key field
 /// the path components that hold an array.
@@ -2595,6 +2605,31 @@ fn array_components(doc: &Document, path: &str, out: &mut Vec<String>) {
     }
     let parts: Vec<&str> = path.split('.').collect();
     in_doc(doc, &parts, 0, out);
+}
+
+/// Which index's entries the router read for the query in hand.
+#[derive(Default)]
+enum Routed {
+    #[default]
+    Nothing,
+    One(String),
+    Several,
+}
+
+thread_local! {
+    static ROUTED: RefCell<Routed> = const { RefCell::new(Routed::Nothing) };
+}
+
+/// An entry scan of index `name` ran on this thread.
+fn note_routed(name: &str) {
+    ROUTED.with(|r| {
+        let mut r = r.borrow_mut();
+        *r = match &*r {
+            Routed::Nothing => Routed::One(name.to_string()),
+            Routed::One(have) if have == name => return,
+            _ => Routed::Several,
+        };
+    });
 }
 
 thread_local! {
@@ -13738,9 +13773,10 @@ impl Storage {
         Ok(out)
     }
 
-    /// The documents matching `filter`, each with its RecordId, in RecordId
-    /// (insertion) order -- the matched SET, for a caller that orders it
-    /// itself. With a `hint` naming a sparse or partial index, only the
+    /// The documents matching `filter`, each with its RecordId -- the matched
+    /// SET, for a caller that orders it itself. They come in RecordId
+    /// (insertion) order, or, when `via` names an index, in the order of
+    /// that index's entries: the router read that one index and no other. With a `hint` naming a sparse or partial index, only the
     /// documents that index holds. `None` for a collection whose read order
     /// is its own (the oplog view, time-series, clustered) and under a read
     /// overlay: the caller reads those through `find_matching_with`.
@@ -13752,7 +13788,7 @@ impl Storage {
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
         vars: &Document,
-    ) -> Result<Option<Vec<(i64, Vec<u8>)>>> {
+    ) -> Result<Option<MatchedRows>> {
         if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
             return Ok(None);
         }
@@ -13769,7 +13805,7 @@ impl Storage {
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
         vars: &Document,
-    ) -> Result<Option<Vec<(i64, Vec<u8>)>>> {
+    ) -> Result<Option<MatchedRows>> {
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let session = self.op_session()?;
@@ -13804,61 +13840,156 @@ impl Storage {
                 }
             }
         }
-        let rows = if filter.is_empty() || coll_opt.is_some() || hint.is_some() {
-            self.scan_docs(&session, db, coll)?
-        } else {
-            let routed = match self.try_index_id_keys(&session, db, coll, filter)? {
-                Some(ids) => Some(ids),
-                None => match self.try_residual_index_id_keys(&session, db, coll, filter)? {
-                    Some(ids) => Some(ids),
-                    None => self.try_or_index_id_keys(&session, db, coll, filter)?,
-                },
-            };
-            match routed {
-                Some(ids) => self.rows_by_recordids(&session, db, coll, ids)?,
-                None => self.scan_docs(&session, db, coll)?,
-            }
-        };
-        let mut out: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
-        for (recordid, _id_k, blob) in rows {
-            if deadline::check().is_err() {
-                return Err(StorageError::MaxTimeExpired);
-            }
+        // Whether a document is one the caller is to have.
+        let keep = |blob: &[u8]| -> Result<bool> {
             if !filter.is_empty() {
-                let raw = bson::RawDocument::from_bytes(&blob)
+                let raw = bson::RawDocument::from_bytes(blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
                     .map_err(query_fault)?
                 {
-                    continue;
+                    return Ok(false);
                 }
             }
             if let Some((key_spec, sparse, partial)) = &held {
-                let d = decode_doc(&blob)?;
+                let d = decode_doc(blob)?;
                 if *sparse && !sparse_covers(&d, key_spec) {
-                    continue;
+                    return Ok(false);
                 }
                 if let Some(pf) = partial {
                     if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
-                        continue;
+                        return Ok(false);
                     }
                 }
             }
-            out.push((recordid, blob));
+            Ok(true)
+        };
+        let mut via: Option<String> = None;
+        let routed = if filter.is_empty() || coll_opt.is_some() || hint.is_some() {
+            None
+        } else {
+            ROUTED.with(|r| *r.borrow_mut() = Routed::Nothing);
+            match self.try_index_id_keys(&session, db, coll, filter)? {
+                Some(ids) => {
+                    if let Routed::One(name) = ROUTED.with(|r| r.take()) {
+                        via = Some(name);
+                    }
+                    Some(ids)
+                }
+                None => match self.try_residual_index_id_keys(&session, db, coll, filter)? {
+                    Some(ids) => Some(ids),
+                    None => self.try_or_index_id_keys(&session, db, coll, filter)?,
+                },
+            }
+        };
+        let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+        match routed {
+            Some(ids) => {
+                for (recordid, _id_k, blob) in self.rows_by_recordids(&session, db, coll, ids)? {
+                    if keep(&blob)? {
+                        out.push((recordid, blob));
+                    }
+                }
+                if via.is_none() {
+                    out.sort_unstable_by_key(|(recordid, _)| *recordid);
+                }
+            }
+            // The collection, in RecordId order: a document is copied only
+            // once it is known to be kept.
+            None => {
+                let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+                    Ok(c) => c,
+                    Err(e) if e.is_missing_table() => {
+                        return Ok(Some(MatchedRows::default()));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                cur.set_key_ssq(db, coll, i64::MIN);
+                let mut more = match cur.search_near() {
+                    Ok(cmp) => {
+                        if cmp < 0 {
+                            cur.next()?
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) if e.is_not_found() => false,
+                    Err(e) => return Err(e.into()),
+                };
+                while more {
+                    if deadline::check().is_err() {
+                        return Err(StorageError::MaxTimeExpired);
+                    }
+                    let (d, c, recordid) = cur.get_key_ssq()?;
+                    if d != db || c != coll {
+                        break;
+                    }
+                    let value = cur.get_value_u()?;
+                    let (_idk, blob) = unframe_doc_value(&value)?;
+                    if keep(blob)? {
+                        out.push((recordid, blob.to_vec()));
+                    }
+                    more = cur.next()?;
+                }
+            }
         }
-        out.sort_unstable_by_key(|(recordid, _)| *recordid);
-        Ok(Some(out))
+        Ok(Some(MatchedRows { rows: out, via }))
     }
 
-    /// Every document of the collection in insertion order, when it holds
-    /// no more than `cap` of them; `None` when it holds more, having read
+    /// How many documents the collection holds, when no more than `cap`;
+    /// `None` when it holds more. Reads keys only.
+    pub fn collection_count_at_most(
+        &self,
+        db: &str,
+        coll: &str,
+        cap: usize,
+    ) -> Result<Option<usize>> {
+        if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
+            return Ok(None);
+        }
+        let session = self.op_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Some(0)),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut count = 0usize;
+        while more {
+            let (d, c, _recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            if count == cap {
+                return Ok(None);
+            }
+            count += 1;
+            more = cur.next()?;
+        }
+        Ok(Some(count))
+    }
+
+    /// Every document of the collection with its RecordId, in insertion
+    /// order, when it holds no more than `cap` of them; `None` when it holds more, having read
     /// `cap + 1`. For a caller that needs the whole of a SMALL collection.
+    #[allow(clippy::type_complexity)]
     pub fn collection_at_most(
         &self,
         db: &str,
         coll: &str,
         cap: usize,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>> {
         if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
             return Ok(None);
         }
@@ -13882,7 +14013,7 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
-            let (d, c, _recordid) = cur.get_key_ssq()?;
+            let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
             }
@@ -13891,31 +14022,94 @@ impl Storage {
             }
             let value = cur.get_value_u()?;
             let (_idk, blob) = unframe_doc_value(&value)?;
-            out.push(blob.to_vec());
+            out.push((recordid, blob.to_vec()));
             more = cur.next()?;
         }
         Ok(Some(out))
     }
 
-    /// The order `sort` puts `blobs` in, as indexes into it; documents that
-    /// compare equal stay in the order given. The same comparison
-    /// `find_matching_with` sorts by. A sort it does not read is no reorder.
+    /// The order `sort` puts `blobs` in, as indexes into it, and for each
+    /// place in that order whether its document compares equal to the one
+    /// before. Documents that compare equal stay in the order given. The
+    /// same comparison `find_matching_with` sorts by. A sort it does not
+    /// read is no reorder, every document a tie.
     pub fn sort_permutation(
         &self,
         blobs: &[&[u8]],
         sort: &Document,
         coll_opt: Option<&Collation>,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<(Vec<usize>, Vec<bool>)> {
         let Some(spec) = multi_sort_spec(Some(sort)) else {
-            return Ok((0..blobs.len()).collect());
+            return Ok(((0..blobs.len()).collect(), vec![true; blobs.len()]));
         };
+        // Only the fields the sort reads are decoded: a sort key is built
+        // from those and nothing else of the document.
+        let tops: Vec<&str> = spec
+            .iter()
+            .map(|(f, _)| f.split('.').next().unwrap_or(f))
+            .collect();
         let mut keyed: Vec<(Vec<SortPart>, usize)> = Vec::with_capacity(blobs.len());
         for (at, blob) in blobs.iter().enumerate() {
-            let d = decode_doc(blob)?;
+            let raw =
+                bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
+            let mut d = Document::new();
+            for elem in raw {
+                let (key, val) = elem.map_err(|_| StorageError::QueryUnsupported)?;
+                if tops.contains(&key) {
+                    let val = Bson::try_from(val).map_err(|_| StorageError::QueryUnsupported)?;
+                    d.insert(key.to_string(), val);
+                }
+            }
             keyed.push((sort_key(&d, &spec, coll_opt)?, at));
         }
         keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
-        Ok(keyed.into_iter().map(|(_, at)| at).collect())
+        let mut tied = vec![false; keyed.len()];
+        for at in 1..keyed.len() {
+            tied[at] = compare_sort_keys(&keyed[at - 1].0, &keyed[at].0, &spec)
+                == std::cmp::Ordering::Equal;
+        }
+        Ok((keyed.into_iter().map(|(_, at)| at).collect(), tied))
+    }
+
+    /// Every index of the collection as `listIndexes` gives it, each with
+    /// its multikey paths, from one read of the catalog.
+    pub fn planner_indexes(
+        &self,
+        db: &str,
+        coll: &str,
+    ) -> Result<Vec<(Document, Vec<Vec<String>>)>> {
+        let session = self.op_session()?;
+        if !collection_registered(&session, db, coll)? {
+            return Ok(Vec::new());
+        }
+        let mut id_idx = Document::new();
+        id_idx.insert("v", 2i32);
+        let mut id_key_spec = Document::new();
+        id_key_spec.insert("_id", 1i32);
+        id_idx.insert("key", Bson::Document(id_key_spec));
+        id_idx.insert("name", ID_INDEX_NAME.to_string());
+        let mut out = vec![(id_idx, vec![Vec::new()])];
+        for (name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
+            let paths = if opts.get_bool("multikey").unwrap_or(false) {
+                self.multikey_paths_of(&session, db, coll, &name, &key_spec)?
+            } else {
+                vec![Vec::new(); key_spec.len()]
+            };
+            let mut e = Document::new();
+            e.insert("v", 2i32);
+            e.insert("key", Bson::Document(key_spec));
+            e.insert("name", name);
+            for (k, v) in &opts {
+                e.insert(k.clone(), v.clone());
+            }
+            out.push((e, paths));
+        }
+        out.sort_by(|a, b| {
+            a.0.get_str("name")
+                .unwrap_or("")
+                .cmp(b.0.get_str("name").unwrap_or(""))
+        });
+        Ok(out)
     }
 
     /// Per key field of index `name`, the path components that hold an array
@@ -13938,6 +14132,19 @@ impl Storage {
         if !opts.get_bool("multikey").unwrap_or(false) {
             return Ok(vec![Vec::new(); key_spec.len()]);
         }
+        self.multikey_paths_of(&session, db, coll, name, &key_spec)
+    }
+
+    /// The multikey paths of an index the catalog flags multikey: the cached
+    /// answer, or one scan of the collection.
+    fn multikey_paths_of(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+    ) -> Result<Vec<Vec<String>>> {
         let generation = self.ddl_generation.load(Ordering::Acquire);
         let cache_key = (db.to_string(), coll.to_string(), name.to_string());
         {
@@ -13965,7 +14172,7 @@ impl Storage {
             }
         }
         let mut found: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
-        for (_recordid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+        for (_recordid, _id_k, blob) in self.scan_docs(session, db, coll)? {
             let d = decode_doc(&blob)?;
             for (field, parts) in key_spec.keys().zip(found.iter_mut()) {
                 array_components(&d, field, parts);
@@ -16548,6 +16755,7 @@ impl Storage {
         kb: &[u8],
         prefix: bool,
     ) -> Result<Vec<i64>> {
+        note_routed(name);
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let esc_kb = escape_kb(kb);
         let seed = if prefix {
@@ -16613,6 +16821,7 @@ impl Storage {
         upper_inclusive: bool,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<i64>> {
+        note_routed(name);
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let esc_prefix = prefix.map(escape_kb);
         let esc_lower = lower.map(escape_kb);
@@ -16696,6 +16905,7 @@ impl Storage {
         upper: Option<&[u8]>,
         upper_inclusive: bool,
     ) -> Result<Vec<i64>> {
+        note_routed(name);
         let esc_compound_sep = escape_kb(COMPOUND_SEP);
         let esc_lower = lower.map(escape_kb);
         let esc_upper = upper.map(escape_kb);

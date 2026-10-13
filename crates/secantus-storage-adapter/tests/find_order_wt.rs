@@ -301,6 +301,127 @@ fn an_array_element_without_the_field_is_null() {
 }
 
 #[test]
+fn an_array_element_that_is_not_a_document_is_null_too() {
+    with_wt(|c| {
+        let mut docs = arrays();
+        docs.push(doc! { "_id": 11, "p": [5, { "q": 4 }], "n": 1 });
+        docs.push(doc! { "_id": 12, "p": [[{ "q": 0 }]], "n": 1 });
+        seed(c, docs.clone(), vec![]);
+        // It sorts as null, and `{"p.q": null}` still does not match it.
+        assert_eq!(
+            find(c, doc! {}, doc! { "sort": { "p.q": 1 } }),
+            [1, 7, 6, 9, 11, 12, 5, 4, 2, 10, 8, 3]
+        );
+        assert_eq!(
+            find(c, doc! {}, doc! { "sort": { "p.q": -1 } }),
+            [1, 3, 11, 5, 8, 4, 10, 2, 7, 6, 9, 12]
+        );
+        assert_eq!(find(c, doc! { "p.q": Bson::Null }, doc! {}), [1, 6, 9]);
+        seed(c, docs, vec![doc! { "p.q": 1 }]);
+        assert_eq!(find(c, doc! { "p.q": Bson::Null }, doc! {}), [1, 6, 9]);
+        assert_eq!(
+            find(c, doc! {}, doc! { "hint": "p.q_1" }),
+            [1, 7, 6, 9, 11, 12, 5, 4, 2, 10, 8, 3]
+        );
+    });
+}
+
+#[test]
+fn a_write_that_brings_an_array_changes_how_the_index_is_read() {
+    with_wt(|c| {
+        seed(
+            c,
+            vec![
+                doc! { "_id": 1, "a": 5 },
+                doc! { "_id": 2, "a": 3 },
+                doc! { "_id": 5, "a": 5 },
+            ],
+            vec![doc! { "a": 1 }],
+        );
+        let range = doc! { "a": { "$gt": 1, "$lt": 9 } };
+        let from_three = doc! { "a": { "$gte": 3 } };
+        let down = doc! { "sort": { "a": -1 } };
+        assert_eq!(find(c, from_three.clone(), down.clone()), [5, 1, 2]);
+        assert_eq!(find(c, range.clone(), doc! {}), [2, 1, 5]);
+        // Two arrays arrive after the index has been read once.
+        let reply = dispatch_full(
+            &doc! { "insert": "c", "documents": [{ "_id": 3, "a": [1, 9] }, { "_id": 4, "a": [5, 3] }] },
+            c,
+        );
+        assert_eq!(reply.get_i32("n"), Ok(2), "{reply}");
+        assert_eq!(find(c, from_three.clone(), down), [3, 4, 5, 1, 2]);
+        assert_eq!(find(c, range, doc! {}), [3, 2, 4, 1, 5]);
+        assert_eq!(find(c, from_three, doc! {}), [2, 4, 1, 5, 3]);
+    });
+}
+
+#[test]
+fn an_upsert_that_matches_nothing_still_inserts() {
+    with_wt(|c| {
+        seed(c, mixed(), vec![doc! { "a": 1 }]);
+        let reply = dispatch_full(
+            &doc! { "update": "c", "updates": [{ "q": { "a": 99 }, "u": { "$set": { "hit": 1 } }, "upsert": true }] },
+            c,
+        );
+        assert_eq!(reply.get_i32("n"), Ok(1), "{reply}");
+        assert_eq!(reply.get_array("upserted").map(Vec::len), Ok(1), "{reply}");
+        // A `$natural: -1` hint reads from the last document: the one just
+        // inserted, which already has the field.
+        let reply = dispatch_full(
+            &doc! { "update": "c", "updates": [{
+                "q": { "a": { "$gte": 3 } }, "u": { "$set": { "hit": 1 } }, "hint": { "$natural": -1 },
+            }] },
+            c,
+        );
+        assert_eq!(reply.get_i32("n"), Ok(1), "{reply}");
+        assert_eq!(reply.get_i32("nModified"), Ok(0), "{reply}");
+    });
+}
+
+#[test]
+fn a_collated_sort_is_not_read_from_an_index_of_plain_strings() {
+    with_wt(|c| {
+        let words = ["b", "A", "a", "B", "c", "á", "C", "ab", "Ab", "aB", ""];
+        let mut docs: Vec<Document> = words
+            .iter()
+            .enumerate()
+            .map(|(place, w)| doc! { "_id": place as i32, "w": *w })
+            .collect();
+        docs.push(doc! { "_id": 11, "w": Bson::Null });
+        seed(c, docs, vec![doc! { "w": 1 }]);
+        let ci = doc! { "locale": "en", "strength": 2 };
+        // The collection is scanned and sorted: equal words as inserted.
+        assert_eq!(
+            find(
+                c,
+                doc! {},
+                doc! { "sort": { "w": 1 }, "collation": ci.clone() }
+            ),
+            [11, 10, 1, 2, 5, 7, 8, 9, 0, 3, 4, 6]
+        );
+        // `$exists` reads the index, and the sort keeps equal words in its
+        // order, which is that of the plain strings read backward.
+        assert_eq!(
+            find(
+                c,
+                doc! { "w": { "$exists": true } },
+                doc! { "sort": { "w": -1 }, "collation": ci.clone() }
+            ),
+            [6, 4, 3, 0, 8, 9, 7, 5, 1, 2, 10, 11]
+        );
+        // A regex is still bounded by the index, whatever the collation.
+        assert_eq!(
+            find(
+                c,
+                doc! { "w": { "$regex": "^a" } },
+                doc! { "collation": ci }
+            ),
+            [2, 9, 7]
+        );
+    });
+}
+
+#[test]
 fn a_descending_index_reads_strings_in_reverse() {
     with_wt(|c| {
         let words = ["b", "A", "a", "B", "c", "á", "C", "ab", "Ab", "aB", ""];

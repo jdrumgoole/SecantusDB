@@ -21,7 +21,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 use secantus_commands::storage::{
     ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, IdKeyRows,
-    RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
+    MatchedRows, RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
 use secantus_storage::{
@@ -587,10 +587,27 @@ impl CmdStorage for StorageAdapter {
         hint: Option<RawHint<'_>>,
         collation: Option<&Collation>,
         let_vars: &Document,
-    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
+    ) -> Result<Option<MatchedRows>, StorageError> {
         let resolved = hint.map(to_hint);
         self.inner
             .matching_rows(db, coll, filter, resolved.as_ref(), collation, let_vars)
+            .map(|found| {
+                found.map(|m| MatchedRows {
+                    rows: m.rows,
+                    via: m.via,
+                })
+            })
+            .map_err(map_err)
+    }
+
+    fn collection_count_at_most(
+        &self,
+        db: &str,
+        coll: &str,
+        cap: usize,
+    ) -> Result<Option<usize>, StorageError> {
+        self.inner
+            .collection_count_at_most(db, coll, cap)
             .map_err(map_err)
     }
 
@@ -599,7 +616,7 @@ impl CmdStorage for StorageAdapter {
         db: &str,
         coll: &str,
         cap: usize,
-    ) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
         self.inner
             .collection_at_most(db, coll, cap)
             .map_err(map_err)
@@ -610,9 +627,20 @@ impl CmdStorage for StorageAdapter {
         blobs: &[&[u8]],
         sort: &Document,
         collation: Option<&Collation>,
-    ) -> Result<Vec<usize>, StorageError> {
+    ) -> Result<(Vec<usize>, Vec<bool>), StorageError> {
         self.inner
             .sort_permutation(blobs, sort, collation)
+            .map_err(map_err)
+    }
+
+    fn planner_indexes(
+        &self,
+        db: &str,
+        coll: &str,
+    ) -> Result<Option<Vec<(Document, Vec<Vec<String>>)>>, StorageError> {
+        self.inner
+            .planner_indexes(db, coll)
+            .map(Some)
             .map_err(map_err)
     }
 

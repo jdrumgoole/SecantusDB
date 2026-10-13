@@ -44,10 +44,25 @@ pub(crate) struct Query<'a> {
     pub wanted: Option<&'a str>,
     /// Whether the query implies an index's partial filter.
     pub implies: &'a dyn Fn(&Document) -> bool,
-    /// The whole collection, when the caller holds it: mongod runs its
-    /// candidate plans against the data and keeps the one that finishes
-    /// first, and with this the planner can count what each would read.
-    pub trial: Option<&'a Env<'a>>,
+    /// What the caller can say of the collection: mongod runs its candidate
+    /// plans against the data and keeps the one that finishes first, and
+    /// with this the planner can count what each would read.
+    pub trial: Option<&'a Trial<'a>>,
+}
+
+/// The collection, for counting what a candidate plan reads.
+pub(crate) struct Trial<'a> {
+    /// How many documents it holds.
+    pub total: usize,
+    /// How many of them the query matches, when the caller knows.
+    pub matched: Option<usize>,
+    /// The documents themselves, read only when a count needs them.
+    pub whole: &'a dyn Whole,
+}
+
+/// A collection's documents, for a plan to be run over.
+pub(crate) trait Whole {
+    fn env(&self) -> Option<Env<'_>>;
 }
 
 /// The scan a query reads through, before sort, paging and projection.
@@ -465,8 +480,10 @@ fn or_access(
         hint: Hint::None,
         ..q.clone()
     };
-    // Per index, in catalog order: the single-predicate branches reading it.
-    let mut shared: Vec<(usize, Vec<(IxScan, bool, Document)>)> = Vec::new();
+    // Per index, in catalog order: the single-predicate branches reading it,
+    // each its scan, whether its bounds decide it, and the branch.
+    type Branch = (IxScan, bool, Document);
+    let mut shared: Vec<(usize, Vec<Branch>)> = Vec::new();
     let mut own = Vec::new();
     for branch in branches {
         let doc = branch.as_document()?;
@@ -583,9 +600,9 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
         // The predicate's index leaves a sort to do, and another index (or
         // this one, read whole) returns the order: mongod tries both.
         let single = matches!(found.scan, Node::IxScan(_)) && q.hint == Hint::None;
-        if let (true, false, Some(env)) = (single, found.sorted, q.trial) {
+        if let (true, false, Some(trial)) = (single, found.sorted, q.trial) {
             if let Some(walk) = sort_provider(q, catalog, whole(), false) {
-                if walk_finishes_first(&found, &walk, q, env) {
+                if walk_finishes_first(&found, &walk, q, trial) {
                     return walk;
                 }
             }
@@ -662,11 +679,45 @@ fn sort_provider(
 /// takes one per key and one more to find it is over. The sort takes those,
 /// then one per document it hands over. Either plan takes a last step to
 /// report that it is done, when it runs out before the query has enough.
-fn walk_finishes_first(found: &Access, walk: &Access, q: &Query, env: &Env) -> bool {
+fn walk_finishes_first(found: &Access, walk: &Access, q: &Query, trial: &Trial) -> bool {
+    let need = q.skip + if q.limit > 0 { q.limit } else { 101 };
+    // Counted without the documents. A scan of one run of keys in an index
+    // that holds a document once, with nothing left to recheck, reads a key
+    // for each document the query matches; a walk of such an index reads a
+    // key for each document of the collection.
+    let once = |a: &Access| matches!(&a.scan, Node::IxScan(ix) if !ix.index.is_multikey() && ix.filter.is_none());
+    let one_run = matches!(&found.scan, Node::IxScan(ix) if {
+        let mut open = false;
+        ix.bounds.iter().all(|list| match list.as_slice() {
+            [one] => {
+                let fits = !open || one.is_all();
+                open |= !one.is_point();
+                fits
+            }
+            _ => false,
+        })
+    });
+    let whole = walk
+        .index
+        .as_ref()
+        .is_some_and(|ix| !ix.sparse && ix.partial.is_none());
+    let counted = once(found) && once(walk) && one_run && whole && found.fetch_filter.is_none();
+    if let Some(matched) = trial
+        .matched
+        .map(|m| m as i64)
+        .filter(|m| counted && *m < need)
+    {
+        // The walk's steps against the sort's: see below.
+        let (walk_works, sort_works) = (trial.total as i64 + 1, 2 * matched + 2);
+        return walk_works <= sort_works;
+    }
+    let Some(env) = trial.whole.env() else {
+        return false;
+    };
+    let env = &env;
     let fetched = |a: &Access| Node::fetch(a.fetch_filter.clone(), a.scan.clone());
     let sorting = exec::run(&fetched(found), env);
     let matched = sorting.n_returned;
-    let need = q.skip + if q.limit > 0 { q.limit } else { 101 };
     let (sort_works, walk_works) = if matched >= need {
         let limited = Node::Limit(need, Box::new(fetched(walk)));
         (
