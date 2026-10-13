@@ -145,7 +145,7 @@ fn full_wire_roundtrip() {
     assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
     assert!(reply.get_bool("isWritablePrimary").unwrap());
     assert_eq!(reply.get_str("setName").unwrap(), "secantus");
-    assert!(matches!(reply.get("connectionId"), Some(Bson::Int64(_))));
+    assert!(matches!(reply.get("connectionId"), Some(Bson::Int32(_))));
 
     // 2. ping.
     let reply = op_msg(&mut stream, 2, &doc! {"ping": 1, "$db": "admin"});

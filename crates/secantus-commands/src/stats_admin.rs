@@ -192,17 +192,34 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if options.contains_key("timeseries") {
         return crate::admin::time_series_stats(&coll, ctx);
     }
-    let exists = storage.collection_exists(&db, &coll).unwrap_or(false);
+    let mut out = doc! { "ns": ns };
+    out.extend(storage_stats(storage, &db, &coll, scale)?);
+    out.insert("ok", 1.0);
+    Ok(out)
+}
+
+/// A collection's sizes and counts, divided by `scale`: what `collStats`
+/// answers after `ns`, and the `storageStats` of a `$collStats` stage. One
+/// function, so the two cannot give different numbers for one collection
+/// (the stage once answered a size of 0 for every collection).
+pub(crate) fn storage_stats(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    scale: i64,
+) -> Result<Document, CommandError> {
+    let options = storage.get_collection_options(db, coll).unwrap_or_default();
+    let exists = storage.collection_exists(db, coll).unwrap_or(false);
     let count = storage
-        .count_matching(&db, &coll, &Document::new())
+        .count_matching(db, coll, &Document::new())
         .map_err(command_error)? as i64;
     let size = storage
-        .collection_data_size(&db, &coll)
+        .collection_data_size(db, coll)
         .map_err(command_error)?;
-    let measured = storage.index_sizes(&db, &coll).map_err(command_error)?;
+    let measured = storage.index_sizes(db, coll).map_err(command_error)?;
     // Every index is listed, one that holds no entry yet included.
     let mut sizes = Document::new();
-    for index in storage.list_indexes(&db, &coll).unwrap_or_default() {
+    for index in storage.list_indexes(db, coll).unwrap_or_default() {
         if let Ok(name) = index.get_str("name") {
             let size = measured.get(name).and_then(as_i64).unwrap_or(0);
             sizes.insert(name, Bson::Int64(size));
@@ -213,7 +230,7 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .iter()
         .map(|(k, v)| (k.clone(), int(as_i64(v).unwrap_or(0) / scale)))
         .collect();
-    let mut out = doc! { "ns": ns, "size": int(size / scale), "count": int(count) };
+    let mut out = doc! { "size": int(size / scale), "count": int(count) };
     if count > 0 {
         out.insert("avgObjSize", int(size / count));
     }
@@ -225,12 +242,11 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         out.insert("totalIndexSize", 0_i32);
         out.insert("indexSizes", Document::new());
         out.insert("scaleFactor", int(scale));
-        out.insert("ok", 1.0);
         return Ok(out);
     }
     out.insert("freeStorageSize", 0_i32);
     let capped = storage
-        .collection_is_capped(&db, &coll)
+        .collection_is_capped(db, coll)
         .map_err(command_error)?;
     out.insert("capped", capped);
     if capped {
@@ -245,14 +261,20 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     out.insert("indexSizes", scaled);
     out.insert("totalSize", int((size + index_total) / scale));
     out.insert("scaleFactor", int(scale));
-    out.insert("ok", 1.0);
     Ok(out)
 }
 
 /// `dataSize`: the bytes and documents of one namespace.
 pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let ns = match doc.get("dataSize") {
+    let ns = match doc.values().next() {
         Some(Bson::String(ns)) => ns.clone(),
+        None | Some(Bson::Null) => {
+            return Err(err(
+                40414,
+                "IDLFailedToParse",
+                "BSON field 'dataSize.dataSize' is missing but a required field".to_string(),
+            ))
+        }
         Some(other) => {
             return Err(err(
                 14,
@@ -264,8 +286,26 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ),
             ))
         }
-        None => String::new(),
     };
+    let object = |field: &str| -> Result<Option<&Document>, CommandError> {
+        match doc.get(field) {
+            None | Some(Bson::Null) => Ok(None),
+            Some(Bson::Document(d)) => Ok(Some(d)),
+            Some(other) => Err(err(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'dataSize.{field}' is the wrong type '{}', expected type \
+                     'object'",
+                    bson_type_name(other)
+                ),
+            )),
+        }
+    };
+    let pattern = object("keyPattern")?;
+    let min = object("min")?;
+    let max = object("max")?;
+    let estimate = crate::serverinfo::flag(doc, "dataSize", "estimate")?;
     let Some((db, coll)) = ns
         .split_once('.')
         .filter(|(d, c)| !d.is_empty() && !c.is_empty())
@@ -276,24 +316,140 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Namespace {ns}is not a valid collection name"),
         ));
     };
+    let bounds = match (min, max) {
+        (Some(min), Some(max)) => Some((min, max)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(err(
+                2,
+                "BadValue",
+                "Max must be set if min is set.".to_string(),
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(err(
+                2,
+                "BadValue",
+                "Max must not be set if min is not set.".to_string(),
+            ))
+        }
+    };
     let storage = ctx.storage()?;
     let exists = storage.collection_exists(db, coll).unwrap_or(false);
-    let count = storage
+    let total = storage
         .count_matching(db, coll, &Document::new())
         .map_err(command_error)? as i64;
-    let size = storage
+    let whole = storage
         .collection_data_size(db, coll)
         .map_err(command_error)?;
+    let (size, count) = match bounds {
+        Some(_) if !exists => (0, 0),
+        Some((min, max)) => {
+            let (size, count) = bounded_size(storage, db, coll, pattern, min, max)?;
+            // An estimate is the average document's size for each one counted.
+            match (estimate, total) {
+                (true, 1..) => ((whole / total) * count, count),
+                _ => (size, count),
+            }
+        }
+        None => (whole, total),
+    };
     let mut out = doc! {
         "size": Bson::Int64(size),
         "numObjects": Bson::Int64(count),
         "millis": Bson::Int64(0),
     };
     if exists {
-        out.insert("estimate", false);
+        out.insert("estimate", estimate);
     }
     out.insert("ok", 1.0);
     Ok(out)
+}
+
+/// The size and number of the documents whose key is in `[min, max)`, read
+/// the way mongod reads them: as a range of an index, so in the index's order
+/// of ALL values and not one type's. The bounds name the leading fields of
+/// an index (`_id` has one always), which must not be multikey.
+fn bounded_size(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pattern: Option<&Document>,
+    min: &Document,
+    max: &Document,
+) -> Result<(i64, i64), CommandError> {
+    let no_index = || {
+        err(
+            96,
+            "OperationFailed",
+            "Couldn't find valid index containing key pattern".to_string(),
+        )
+    };
+    let fields: Vec<&str> = match pattern {
+        Some(pattern) => pattern.keys().map(String::as_str).collect(),
+        None => min.keys().map(String::as_str).collect(),
+    };
+    let served = fields == ["_id"]
+        || storage
+            .list_indexes(db, coll)
+            .map_err(command_error)?
+            .iter()
+            .any(|index| {
+                let leads = index.get_document("key").is_ok_and(|key| {
+                    key.iter()
+                        .map(|(name, way)| (name.as_str(), as_i64(way)))
+                        .take(fields.len())
+                        .eq(fields.iter().map(|name| (*name, Some(1))))
+                });
+                leads
+                    && index
+                        .get_str("name")
+                        .is_ok_and(|name| !storage.index_is_multikey(db, coll, name))
+            });
+    if !served {
+        return Err(no_index());
+    }
+    for bound in [min, max] {
+        if !bound.keys().map(String::as_str).eq(fields.iter().copied()) {
+            return Err(err(
+                16634,
+                "Location16634",
+                format!(
+                    "field names of bound {} do not match those of keyPattern {}",
+                    secantus_core::query::bson_value_repr(&Bson::Document(bound.clone())),
+                    secantus_core::query::bson_value_repr(&Bson::Document(
+                        pattern.unwrap_or(min).clone()
+                    )),
+                ),
+            ));
+        }
+    }
+    let key_of = |source: &Document| -> Vec<Vec<u8>> {
+        fields
+            .iter()
+            .map(|name| {
+                let value = source.get(*name).cloned().unwrap_or(Bson::Null);
+                secantus_core::sortkey::encode_value(&value, None).unwrap_or_default()
+            })
+            .collect()
+    };
+    let (low, high) = (key_of(min), key_of(max));
+    let mut size = 0_i64;
+    let mut count = 0_i64;
+    for raw in storage
+        .find(db, coll, &Document::new(), None, None)
+        .map_err(command_error)?
+    {
+        let Ok(document) = crate::bsondoc::from_bytes(&raw) else {
+            continue;
+        };
+        let key = key_of(&document);
+        if key >= low && key < high {
+            size += raw.len() as i64;
+            count += 1;
+        }
+    }
+    Ok((size, count))
 }
 
 /// `listDatabases`.

@@ -16,7 +16,7 @@ use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
 use crate::util::command_error;
-use crate::{CommandContext, HandlerResult, SERVER_VERSION, SERVER_VERSION_ARRAY};
+use crate::{CommandContext, HandlerResult};
 
 /// `startSession` — mint a logical session id.
 pub fn start_session(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
@@ -39,11 +39,6 @@ pub fn ok_transaction(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResu
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `whatsmyuri` — the client's connection peer (placeholder; peer tracking TBD).
-pub fn whatsmyuri(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    Ok(doc! { "you": "127.0.0.1:0", "ok": 1.0 })
-}
-
 /// `fsync` — flush data to disk. WiredTiger checkpoints on its own cadence, so
 /// this reports success without forcing one. `lock: true` (which would block
 /// writes until `fsyncUnlock` — needs coordination we don't have) is rejected
@@ -59,48 +54,6 @@ pub fn fsync(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
     Ok(doc! { "numFiles": 1i32, "ok": 1.0 })
-}
-
-/// `killOp` — close a client connection by its `op` (our per-connection
-/// `conn_id`; we model one in-flight op per connection, so the opid a caller
-/// reads off `hello`'s `connectionId` / `currentOp` is directly killable). Real
-/// mongod signals a per-op interrupt flag long-running paths poll; SecantusDB's
-/// faithful analogue is "close the socket" — the connection thread's next read
-/// returns 0, the loop exits, and the connection unregisters. The opid is
-/// accepted as Int32 / Int64 / an integral Double / a numeric string (drivers
-/// serialise it differently). Mirrors `commands.py::_kill_op`.
-pub fn kill_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let op_id: i64 = match doc.get("op") {
-        Some(Bson::Int32(n)) => i64::from(*n),
-        Some(Bson::Int64(n)) => *n,
-        Some(Bson::Double(d)) if d.fract() == 0.0 => *d as i64,
-        Some(Bson::String(s)) if s.parse::<i64>().is_ok() => s.parse::<i64>().unwrap(),
-        other => {
-            return Err(crate::CommandError::new(
-                14,
-                "TypeMismatch",
-                format!("killOp requires an integer `op` field, got {other:?}"),
-            ));
-        }
-    };
-    let info = match &ctx.conn_killer {
-        None => "no connection registry",
-        Some(killer) if killer.kill(op_id) => "operation killed",
-        Some(_) => "no operation with that opid",
-    };
-    Ok(doc! { "info": info, "ok": 1.0 })
-}
-
-/// `connectionStatus` — auth info for the connection (empty until R5 auth).
-pub fn connection_status(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    Ok(doc! {
-        "authInfo": {
-            "authenticatedUsers": Vec::<Bson>::new(),
-            "authenticatedUserRoles": Vec::<Bson>::new(),
-            "authenticatedUserPrivileges": Vec::<Bson>::new(),
-        },
-        "ok": 1.0,
-    })
 }
 
 /// `getCmdLineOpts` — parsed command line; drivers read
@@ -132,102 +85,6 @@ pub fn host_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         "extra": {},
         "ok": 1.0,
     })
-}
-
-/// `getLog` — the server's in-memory log ring buffer. mongod returns the log as
-/// a list of pre-formatted strings (`"<ts> <level> <component> <msg>"`); we
-/// mirror that format so tooling that grep-parses the response keeps working.
-/// Without a buffer wired in (unit tests), reports an empty log. Mirrors
-/// `commands.py::_get_log`.
-pub fn get_log(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let Some(logs) = &ctx.logs else {
-        return Ok(doc! { "totalLinesWritten": 0_i32, "log": Vec::<Bson>::new(), "ok": 1.0 });
-    };
-    let entries = logs.tail(None);
-    let formatted: Vec<Bson> = entries
-        .iter()
-        .map(|e| {
-            let ts = e.ts.try_to_rfc3339_string().unwrap_or_default();
-            Bson::String(format!("{ts} {} {} {}", e.level, e.component, e.msg))
-        })
-        .collect();
-    Ok(doc! {
-        "totalLinesWritten": entries.len() as i32,
-        "log": formatted,
-        "ok": 1.0,
-    })
-}
-
-/// `getParameter` — a minimal set of well-known server parameters.
-pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let mut params = known_params(ctx.failpoints.is_some());
-    // A value `setParameter` changed wins over the compiled-in default, so the
-    // two commands cannot disagree about what the server currently holds.
-    if let Some(store) = ctx.server_params.as_ref() {
-        store.overlay(&mut params);
-    }
-    let arg = doc.get("getParameter");
-    // "*" or the legacy `{getParameter: 1}` with no names ⇒ all params.
-    let names: Vec<&String> = doc
-        .keys()
-        .filter(|k| *k != "getParameter" && !k.starts_with('$'))
-        .collect();
-    let want_all = matches!(arg, Some(Bson::String(s)) if s == "*") || names.is_empty();
-    let mut out = Document::new();
-    if want_all {
-        for (k, v) in params.iter() {
-            out.insert(k.clone(), v.clone());
-        }
-    } else {
-        for n in names {
-            if let Some(v) = params.get(n) {
-                out.insert(n.clone(), v.clone());
-            }
-        }
-    }
-    out.insert("ok", 1.0);
-    Ok(out)
-}
-
-/// The `featureCompatibilityVersion` string, derived from the version this
-/// server already advertises rather than written out a second time.
-///
-/// It read `"7.0"` until 2026-09-28 while `buildInfo` reported `8.2.11` — so the
-/// value contradicted the same server's own handshake, not merely mongod.
-/// Measured: a single-node replica-set mongod 8.2.11 answers
-/// `{"version": "8.2"}`, i.e. `<major>.<minor>` of the running binary.
-///
-/// Deriving it is the point. The previous value was a literal, and when the
-/// project retargeted from 6.0 to 8.x every other version surface moved while
-/// this one silently did not. Nothing failed, because the only tests that look
-/// at it assert the KEY is present and never read the value.
-fn feature_compatibility_version() -> String {
-    format!("{}.{}", SERVER_VERSION_ARRAY[0], SERVER_VERSION_ARRAY[1])
-}
-
-pub(crate) fn known_params(test_commands: bool) -> Document {
-    doc! {
-        "featureCompatibilityVersion": { "version": feature_compatibility_version() },
-        // The REAL value, not a constant. Drivers gate on this: while it said
-        // false, pymongo's harness skipped ~1,080 unified-spec failpoint tests
-        // (measured 2026-09-25). But hardcoding `true` would have made a server
-        // that refuses `configureFailPoint` claim to accept it, so the two now
-        // come from the same fact -- whether a FailPointRegistry was wired.
-        // mongod reports `false` when started without the parameter (measured
-        // 8.2.11, 2026-09-28).
-        "enableTestCommands": test_commands,
-        "logLevel": 0_i32,
-        "quiet": false,
-        "ttlMonitorEnabled": true,
-        "ttlMonitorSleepSecs": 60_i32,
-        // We implement SCRAM-SHA-256 + MONGODB-X509 (R5); advertise just those
-        // so driver test runners gating on other mechanisms self-skip.
-        "authenticationMechanisms": [
-            Bson::String("SCRAM-SHA-256".to_string()),
-            Bson::String("MONGODB-X509".to_string()),
-        ],
-        "version": SERVER_VERSION,
-    }
 }
 
 /// `top` — per-namespace operation counters, mongod-shaped.
@@ -434,6 +291,7 @@ mod top_counter_tests {
 mod tests {
     use super::*;
     use crate::dispatch;
+    use crate::SERVER_VERSION_ARRAY;
 
     fn ctx() -> CommandContext {
         CommandContext::new(1)
@@ -473,7 +331,7 @@ mod tests {
     fn kill_op_without_registry_reports_no_registry() {
         let reply = dispatch(&doc! {"killOp": 1, "op": 7_i32}, &mut ctx());
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        assert_eq!(reply.get_str("info").unwrap(), "no connection registry");
+        assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
     #[test]
@@ -484,7 +342,7 @@ mod tests {
         });
         let mut c = ctx().with_conn_killer(killer.clone());
         let reply = dispatch(&doc! {"killOp": 1, "op": 42_i64}, &mut c);
-        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
+        assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
         assert_eq!(
             *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
             vec![42]
@@ -499,25 +357,25 @@ mod tests {
         });
         let mut c = ctx().with_conn_killer(killer);
         let reply = dispatch(&doc! {"killOp": 1, "op": 99_i32}, &mut c);
-        assert_eq!(
-            reply.get_str("info").unwrap(),
-            "no operation with that opid"
-        );
+        assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
+    /// mongod takes a number and nothing else: a string of digits is a
+    /// type error, and nothing is closed for it.
     #[test]
-    fn kill_op_accepts_a_numeric_string_op() {
+    fn kill_op_refuses_a_numeric_string_op() {
         let killer = std::sync::Arc::new(FakeKiller {
             found: true,
             killed: Default::default(),
         });
         let mut c = ctx().with_conn_killer(killer.clone());
         let reply = dispatch(&doc! {"killOp": 1, "op": "7"}, &mut c);
-        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
-        assert_eq!(
-            *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
-            vec![7]
-        );
+        assert_eq!(reply.get_i32("code").unwrap(), 14);
+        assert!(killer
+            .killed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     #[test]

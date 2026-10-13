@@ -23,8 +23,12 @@ class Wire:
         self.request = 0
 
     def command(self, db, command):
+        return self.raw({**command, "$db": db})
+
+    def raw(self, command):
+        """Send `command` as it is, with whatever `$db` it has or lacks."""
         self.request += 1
-        body = bson.encode({**command, "$db": db})
+        body = bson.encode(command)
         payload = struct.pack("<I", 0) + b"\x00" + body
         header = struct.pack("<iiii", 16 + len(payload), self.request, 0, 2013)
         self.sock.sendall(header + payload)

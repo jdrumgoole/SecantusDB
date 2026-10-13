@@ -9206,6 +9206,97 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.082 Handshake, diagnostic and session commands -- 2026-10-13
+
+`tools/probes/diagnostic_commands.py`, mongod 8.2.11 (a replica-set member):
+56 scenarios, 1,141 replies over a raw connection. The commands about the
+server and the connection: `hello` and its older names, `ping`, `buildInfo`,
+`connectionStatus`, `getParameter`, `serverStatus`, the statistics commands,
+the session commands, the fields every command takes, and the commands this
+version no longer has. Most replies hold values that differ from one machine
+to the next, so a step is compared whole with the volatile keys reduced to
+their BSON type, or by its keys and types to a given depth. mongod answered
+the same on three runs against itself. The Rust server differed on 492
+replies and differs on 160. Pinned by
+`crates/secantus-storage-adapter/tests/diagnostic_commands_wt.rs` and the
+unit tests of `generic.rs`, `serverinfo.rs` and `handshake.rs`.
+
+What was wrong, by how much it mattered:
+
+- **`dataSize` with `min` and `max` sized the whole collection.** It now
+  reads the key range, in the index's order of all values.
+- **The `storageStats` of a `$collStats` stage said size 0** for every
+  collection. The stage and `collStats` now share one function.
+- **`serverStatus` was constants.** `pid`, `uptime` and every operation
+  counter were 0, and `network` three zeros. They are the process's own
+  numbers now, the counters counted as mongod counts them.
+- **A field of the wrong type was read as absent.** `$readPreference`,
+  `$clusterTime`, `apiStrict`, `readConcern.afterClusterTime` and
+  `atClusterTime` were each accepted with any value, and a read at an
+  `atClusterTime` of long ago was answered with today's documents (now
+  `239 SnapshotTooOld`).
+- **A command took a field it does not have.** `{ping: 1, bogus: 1}` ran.
+  `generic.rs` lists the commands mongod refuses that on, each measured.
+- **`hello` answered both `isWritablePrimary` and `ismaster`**, in an order
+  of its own, with an int64 `connectionId`, and took any `client` metadata
+  on any hello.
+- **The API Version 1 list was kept by hand and ten names were wrong.** It
+  is mongod's own `listCommands` table now (`mongod_commands.rs`,
+  generated), which also says which commands run only against `admin`.
+- `whatsmyuri` said port 0 to every client; `killOp` said whether it found
+  the operation; `getParameter` answered `ok: 1` and nothing for a
+  parameter it lacks; `listCommands`, `logout`, `getDefaultRWConcern`,
+  `replSetGetConfig`, `shardingState` and `fsyncUnlock` were unknown.
+
+Still different, all 160:
+
+- [ ] **`validate` checks nothing.** It answers `valid: true` and reports
+      each index as holding one key per document (mongod: 4 keys for the
+      three documents above, one of which holds an array). A check that
+      reads the store and compares each document's keys with the index's
+      entries is a storage change of its own, and the one item here that is
+      about data and not about a reply. `background`, `system.views` and
+      the count are the four replies.
+- [ ] **`serverStatus` sections** (about 30): `asserts`, `mem`,
+      `globalLock`, `transactions`, `repl`, `metrics` beyond the two this
+      server keeps, `wiredTiger` and the rest are absent. None is reported
+      as zeros.
+- [ ] **Server parameters** (about 35). `getParameter` reports the
+      thirteen parameters that are true of this server
+      (`serverinfo::parameters`) and mongod has several hundred.
+      `setParameter` changes four; mongod lets `cursorTimeoutMillis`,
+      `transactionLifetimeLimitSeconds` and others be changed while it
+      runs, and here each is 20 "not allowed to change at runtime".
+      `notablescan` is not there to set, so a scan is never refused.
+- [ ] **Replica-set commands** (about 25): `replSetInitiate`,
+      `replSetReconfig`, `replSetResizeOplog`, `appendOplogNote`,
+      `setFeatureCompatibilityVersion` and the like are unknown commands
+      here, and `local.oplog.rs`, `local.system.replset`,
+      `admin.system.version` and `config.system.sessions` are not listed
+      as collections. `replSetGetStatus` has no `electionCandidateMetrics`.
+- [ ] **Commands not there** (about 30): `dbHash`, `features`,
+      `connPoolStats`, `lockInfo`, `getClusterParameter`, `logRotate`, the
+      plan-cache and query-settings commands. An unknown command that
+      mongod runs only against `admin` answers that refusal from another
+      database, where mongod parses its arguments first.
+- [ ] **`rolesInfo` knows no built-in role** (`read`, `dbAdmin`), and
+      `usersInfo` and `rolesInfo` are otherwise unprobed: user and role
+      management is the next area to probe on its own.
+- [ ] **The profiler** (6): a `filter` document is refused (238), where
+      mongod stores it; `system.profile` is not created at level 1 or 2.
+- [ ] **`hello` names no compressor.** `OP_COMPRESSED` is not spoken, so a
+      `compression` list is checked and not answered (2).
+- [ ] `hostInfo` has four of mongod's twelve `system` fields and
+      `memSizeMB: 0`; `buildInfo` has no per-OS block and carries
+      `secantusVersion`; `collStats` has no `wiredTiger` or
+      `indexDetails`; `$indexStats` counts no use of an index and
+      `latencyStats` is zeros; `dbStats` leaves the view definitions out of
+      `avgObjSize`; `listDatabases` lists no `admin` or `config`;
+      `connectionStatus` lists no privileges for a user who has some;
+      `$listCatalog` is unknown; `authenticate` over X.509 without a
+      certificate says why, where mongod says only "Authentication
+      failed."; a base64 `saslStart` payload is not decoded.
+
 ### 7.081 Geo queries -- 2026-10-13
 
 `tools/probes/geo_queries.py`, mongod 8.2.11: 105 scenarios, 1,278 replies

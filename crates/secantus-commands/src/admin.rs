@@ -3339,14 +3339,40 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             },
         );
     }
+    // The process's own numbers: its id, and how long since it first
+    // answered a command. Each was a constant 0 before.
+    let now = bson::DateTime::now();
+    let up_millis =
+        (now.timestamp_millis() - crate::handshake::process_started().timestamp_millis()).max(0);
+    let host = match ctx.server_address.as_ref() {
+        Some((host, port)) => format!("{host}:{port}"),
+        None => "secantus".to_string(),
+    };
+    // Counted per command as mongod counts them; int64, as mongod sends them.
+    let counted = ctx
+        .top_stats
+        .as_ref()
+        .map(|s| s.opcounters())
+        .unwrap_or_default();
+    let opcounters: Document = crate::topstats::OPCOUNTERS
+        .iter()
+        .zip(counted)
+        .map(|(name, n)| (name.to_string(), Bson::Int64(n)))
+        .collect();
+    let network = ctx
+        .top_stats
+        .as_ref()
+        .map(|s| s.network())
+        .unwrap_or_default();
     Ok(doc! {
-        "host": "secantus",
+        "host": host,
         "version": crate::SERVER_VERSION,
         "process": "mongod",
-        "pid": Bson::Int64(0),
-        "uptime": 0.0,
-        "uptimeMillis": Bson::Int64(0),
-        "localTime": bson::DateTime::now(),
+        "pid": Bson::Int64(i64::from(std::process::id())),
+        "uptime": (up_millis / 1000) as f64,
+        "uptimeMillis": Bson::Int64(up_millis),
+        "uptimeEstimate": Bson::Int64(up_millis / 1000),
+        "localTime": now,
         "metrics": metrics,
         // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
         // `connections.totalCreated` off serverStatus to check the connection
@@ -3363,9 +3389,12 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "available": 0i32,
             "totalCreated": conns.total_created as i32,
         },
-        "opcounters": {
-            "insert": 0i32, "query": 0i32, "update": 0i32,
-            "delete": 0i32, "getmore": 0i32, "command": 0i32,
+        "opcounters": opcounters,
+        // What the server has read and written, counted off the sockets.
+        "network": {
+            "bytesIn": Bson::Int64(network[1]),
+            "bytesOut": Bson::Int64(network[2]),
+            "numRequests": Bson::Int64(network[0]),
         },
         // Storage-engine identity. Drivers gate real behaviour on this:
         // mongo-php-library's `skipIfTransactionsNotSupported` reads
@@ -3384,7 +3413,6 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "persistent": persistent,
             "backupCursorOpen": false,
         },
-        "network": { "numRequests": 0i32, "bytesIn": 0i32, "bytesOut": 0i32 },
         // Categorical self-identification: real mongod never has this key.
         // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         // checks it to prove it's talking to SecantusDB rather than an
@@ -3427,10 +3455,25 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         op.insert("clientMetadata", meta);
     }
 
-    Ok(doc! {
-        "inprog": vec![Bson::Document(op)],
-        "ok": 1.0,
-    })
+    // Every field that is not the command's own is a filter over the
+    // operations (`{currentOp: 1, op: "query"}`).
+    let filter: Document = doc
+        .iter()
+        .skip(1)
+        .filter(|(key, _)| {
+            !matches!(key.as_str(), "$all" | "$ownOps" | "$truncateOps")
+                && !crate::params::is_generic_arg(key)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let shown = filter.is_empty()
+        || secantus_core::query::matches(&op, &filter, &Document::new(), None).unwrap_or(false);
+    let inprog: Vec<Bson> = if shown {
+        vec![Bson::Document(op)]
+    } else {
+        Vec::new()
+    };
+    Ok(doc! { "inprog": inprog, "ok": 1.0 })
 }
 
 /// `validate` — mongod's collection consistency check. SecantusDB stores
@@ -3463,6 +3506,32 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ),
         )
         .into_reply());
+    }
+    // An option is on for any value but null, false and zero (a string too).
+    let on = |option: &str| match doc.get(option) {
+        None | Some(Bson::Null) | Some(Bson::Boolean(false)) => false,
+        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => crate::util::truthy(v),
+        Some(_) => true,
+    };
+    if on("repair") && ctx.replica_set_name.is_some() {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with { repair: true } can only be performed in \
+             standalone mode.",
+        ));
+    }
+    if on("metadata")
+        && ["full", "repair", "background", "checkBSONConformance"]
+            .iter()
+            .any(|other| on(other))
+    {
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "Running the validate command with { metadata: true } is not supported with any \
+             other options",
+        ));
     }
     // mongod rejects full+background together (full needs an exclusive scan).
     if bool_field(doc, "full", false) && bool_field(doc, "background", false) {
@@ -3592,36 +3661,77 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "sampleRate": prev_rate,
         "ok": 1.0,
     };
-    let arg = match doc.get("profile") {
-        Some(Bson::Int32(n)) => Some(*n),
-        Some(Bson::Int64(n)) => Some(*n as i32),
-        Some(Bson::Double(d)) if d.fract() == 0.0 => Some(*d as i32),
-        _ => None,
-    };
-    match arg {
-        Some(-1) => Ok(was),
-        Some(level) if (0..=2).contains(&level) => {
-            let slowms = doc
-                .get("slowms")
-                .and_then(as_i64)
-                .map(|n| n as i32)
-                .unwrap_or(prev_slowms);
-            let rate = doc
-                .get("sampleRate")
-                .and_then(Bson::as_f64)
-                .unwrap_or(prev_rate);
-            storage
-                .set_profile(&db, level, slowms, rate)
-                .map_err(command_error)?;
-            if let Some(s) = &slow_ops {
-                s.set(slowms, rate);
-            }
-            Ok(was)
+    // mongod's reading of the arguments (8.2.11): the level is any number,
+    // truncated; one outside 0..=2 changes nothing and reads the settings.
+    // `slowms` is any number, truncated and not range-checked; `sampleRate`
+    // is a number from 0 to 1; `filter` is a document or the string "unset".
+    let number = |field: &str| -> Result<Option<f64>, CommandError> {
+        match doc.get(field) {
+            None => Ok(None),
+            Some(Bson::Null) if field != "profile" => Ok(None),
+            Some(Bson::Int32(n)) => Ok(Some(f64::from(*n))),
+            Some(Bson::Int64(n)) => Ok(Some(*n as f64)),
+            Some(Bson::Double(d)) => Ok(Some(*d)),
+            Some(v @ Bson::Decimal128(_)) => Ok(v.to_string().parse::<f64>().ok()),
+            Some(Bson::Null) => Err(CommandError::new(
+                40414,
+                "IDLFailedToParse",
+                "BSON field 'profile.profile' is missing but a required field",
+            )),
+            Some(v) => Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'profile.{field}' is the wrong type '{}', expected types \
+                     '[decimal, double, int, long]'",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            )),
         }
-        _ => Ok(
-            CommandError::new(14, "TypeMismatch", "profile must be -1, 0, 1, or 2").into_reply(),
-        ),
+    };
+    let level = number("profile")?.map_or(-1, |n| n.trunc() as i64);
+    let slowms = number("slowms")?.map(|n| n.trunc() as i32);
+    let rate = number("sampleRate")?;
+    if rate.is_some_and(|r| !(0.0..=1.0).contains(&r)) {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            "'sampleRate' must be between 0.0 and 1.0 inclusive",
+        ));
     }
+    match doc.get("filter") {
+        None | Some(Bson::Null) => {}
+        Some(Bson::String(word)) if word == "unset" => {}
+        // A filter chooses what is profiled, and this profiler has none:
+        // taking one and profiling as before would be a setting that does
+        // nothing, so it is refused.
+        Some(Bson::Document(_)) => {
+            return Err(CommandError::new(
+                238,
+                "NotImplemented",
+                "a profile filter is not supported by this server",
+            ));
+        }
+        Some(_) => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "Expected an object, or the string 'unset'.",
+            ));
+        }
+    }
+    if !(0..=2).contains(&level) {
+        return Ok(was);
+    }
+    let slowms = slowms.unwrap_or(prev_slowms);
+    let rate = rate.unwrap_or(prev_rate);
+    storage
+        .set_profile(&db, level as i32, slowms, rate)
+        .map_err(command_error)?;
+    if let Some(s) = &slow_ops {
+        s.set(slowms, rate);
+    }
+    Ok(was)
 }
 
 /// Options mongod's index-spec IDL accepts, plus the legacy / deprecated forms

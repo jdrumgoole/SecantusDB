@@ -31,26 +31,74 @@ pub(crate) fn hello_process_id() -> ObjectId {
     *PROCESS_ID.get_or_init(ObjectId::new)
 }
 
+/// When this process first answered anything that asks: the start of the
+/// counts it keeps.
+pub(crate) fn process_started() -> DateTime {
+    static STARTED: OnceLock<DateTime> = OnceLock::new();
+    *STARTED.get_or_init(DateTime::now)
+}
+
 /// `hello` / `isMaster` / `ismaster`. Advertises a single-node `secantus`
 /// replica-set primary when a set name is configured (so pymongo's topology
 /// machinery accepts change streams), else a plain standalone primary.
 ///
-/// `topologyVersion.counter` and `connectionId` MUST be int64 on the wire — the
-/// Go driver rejects the handshake otherwise (see `commands.py::_hello`).
+/// The reply is mongod 8.2.11's, key for key (measured 2026-10-13 on a
+/// replica-set member and on a standalone):
+///
+/// - `hello` answers `isWritablePrimary` and the two older names answer
+///   `ismaster`; neither reply carries both.
+/// - `helloOk` is echoed first, and only to a request that carried it.
+/// - `connectionId` is an int32, `topologyVersion.counter` and
+///   `lastWrite.opTime.t` are int64.
+/// - A set member leads with `topologyVersion`, `hosts`, `setName`; a
+///   standalone leads with the primary flag. Empty `passives` and `arbiters`
+///   are not sent.
 pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    // Capture the driver `client` metadata from the handshake so `currentOp` can
-    // surface it as `clientMetadata`. Only the first hello carries it; later
-    // helloes (monitoring) omit it, so don't clobber a stored value with None.
-    if let Some(client) = doc.get_document("client").ok().cloned() {
-        if let Some(conn_auth) = ctx.conn_auth.as_ref() {
+    let legacy = doc.keys().next().is_some_and(|name| name != "hello");
+    let hello_ok = validate_hello_arguments(doc)?;
+
+    let topology_counter = ctx.step_down.as_ref().map_or(0, |s| s.topology_counter());
+    validate_awaitable_arguments(doc, topology_counter)?;
+
+    // The driver's `client` metadata comes with a connection's FIRST hello
+    // and with no later one: mongod answers 186 to a second, whether or not
+    // the first carried any. `currentOp` shows what was sent.
+    let first_hello = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok().map(|g| !g.hello_seen))
+        .unwrap_or(true);
+    if let Some(client) = doc.get("client") {
+        if !first_hello {
+            return Err(CommandError::new(
+                186,
+                "ClientMetadataCannotBeMutated",
+                "The client metadata document may only be sent in the first hello",
+            ));
+        }
+        validate_client_metadata(client, true)?;
+        if let (Some(conn_auth), Bson::Document(client)) = (ctx.conn_auth.as_ref(), client) {
             if let Ok(mut guard) = conn_auth.lock() {
-                guard.client_metadata = Some(client);
+                guard.client_metadata = Some(client.clone());
             }
         }
     }
 
-    let topology_counter = ctx.step_down.as_ref().map_or(0, |s| s.topology_counter());
-    validate_awaitable_arguments(doc, topology_counter)?;
+    // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
+    // attempt for a principal. mongod 8.2.11 lists the user's own SCRAM
+    // mechanisms, OMITS the field for an unknown user, and refuses a name with
+    // no `.` (measured 2026-09-30). This always said `["SCRAM-SHA-256"]`.
+    let mut mechanisms = None;
+    if let Ok(principal) = doc.get_str("saslSupportedMechs") {
+        let Some((db, user)) = principal.split_once('.') else {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "UserName must contain a '.' separated database.user pair",
+            ));
+        };
+        mechanisms = user_scram_mechanisms(ctx, db, user);
+    }
 
     let now = DateTime::now();
     // Inside a `replSetStepDown` window this node is a SECONDARY. The SDAM spec
@@ -58,28 +106,21 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // flip together with the write refusal -- a server that keeps claiming to be
     // primary while rejecting every write is worse than either alone.
     let stepped_down = ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down());
-    let mut response = doc! {
-        "isWritablePrimary": !stepped_down,
-        "ismaster": !stepped_down,
-        // The counter moves when the TOPOLOGY moves, which for a single-node
-        // surrogate means a `replSetStepDown`. A driver ignores a "not primary"
-        // error whose topologyVersion is not NEWER than the one it already has,
-        // so a counter frozen at 0 would make the step-down error look stale.
-        "topologyVersion": {
-            "processId": hello_process_id(),
-            "counter": Bson::Int64(topology_counter),
-        },
-        "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
-        "maxMessageSizeBytes": MAX_MESSAGE_SIZE,
-        "maxWriteBatchSize": 100_000_i32,
-        "localTime": now,
-        "logicalSessionTimeoutMinutes": 30_i32,
-        "connectionId": Bson::Int64(ctx.connection_id),
-        "minWireVersion": 0_i32,
-        "maxWireVersion": WIRE_VERSION,
-        "readOnly": false,
-        "ok": 1.0,
+    let primary_flag = if legacy {
+        "ismaster"
+    } else {
+        "isWritablePrimary"
     };
+    // The counter moves when the TOPOLOGY moves, which for a single-node
+    // surrogate means a `replSetStepDown`. A driver ignores a "not primary"
+    // error whose topologyVersion is not NEWER than the one it already has,
+    // so a counter frozen at 0 would make the step-down error look stale.
+    let topology = doc! {
+        "processId": hello_process_id(),
+        "counter": Bson::Int64(topology_counter),
+    };
+
+    let mut response = Document::new();
     // A driver puts `helloOk: true` in its handshake to ask whether this server
     // understands the modern `hello`; the server echoes it back to say yes, and
     // the driver then uses `hello` for the life of the connection. Measured on
@@ -92,7 +133,7 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // taking a different monitoring path from the one it takes against mongod
     // and failing `TestSDAMProse/heartbeats_processed_more_frequently` with 12
     // messages where the formula allows 10.
-    if doc.get_bool("helloOk").unwrap_or(false) {
+    if hello_ok {
         response.insert("helloOk", true);
     }
 
@@ -105,18 +146,22 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // time (strictly greater than the last write) so `startAtOperationTime`
         // resumes land just past it. Fall back to the supplied `ctx.cluster_time`
         // when no storage backend is wired (handshake-only fakes).
-        let ts = Bson::Timestamp(match ctx.storage.as_ref() {
+        let stamp = match ctx.storage.as_ref() {
             Some(s) => s.current_cluster_time(),
             None => ctx.cluster_time,
-        });
+        };
+        let ts = Bson::Timestamp(stamp);
+        // mongod reports the write dates to the second: they are the
+        // timestamp's own seconds.
+        let written = DateTime::from_millis(i64::from(stamp.time) * 1000);
         // Fixed sentinel electionId, matching commands.py.
         let election = ObjectId::parse_str("7fffffff0000000000000001")
             .expect("static electionId hex is valid");
+        response.insert("topologyVersion", topology);
+        response.insert("hosts", vec![Bson::String(addr.clone())]);
         response.insert("setName", set_name.clone());
         response.insert("setVersion", 1_i32);
-        response.insert("hosts", vec![Bson::String(addr.clone())]);
-        response.insert("passives", Vec::<Bson>::new());
-        response.insert("arbiters", Vec::<Bson>::new());
+        response.insert(primary_flag, !stepped_down);
         // Measured on a single-node replica set (mongod 8.2.11, 2026-09-29):
         // while a node is stepped down it reports `secondary: true` and DROPS
         // both `primary` and `electionId` -- there is no known primary and no
@@ -133,36 +178,195 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         response.insert(
             "lastWrite",
             doc! {
-                "opTime": {"ts": ts.clone(), "t": 1_i32},
-                "lastWriteDate": now,
-                "majorityOpTime": {"ts": ts, "t": 1_i32},
-                "majorityWriteDate": now,
+                "opTime": {"ts": ts.clone(), "t": 1_i64},
+                "lastWriteDate": written,
+                "majorityOpTime": {"ts": ts, "t": 1_i64},
+                "majorityWriteDate": written,
             },
         );
+    } else {
+        response.insert(primary_flag, !stepped_down);
+        response.insert("topologyVersion", topology);
     }
-
+    response.insert("maxBsonObjectSize", MAX_BSON_OBJECT_SIZE);
+    response.insert("maxMessageSizeBytes", MAX_MESSAGE_SIZE);
+    response.insert("maxWriteBatchSize", 100_000_i32);
+    response.insert("localTime", now);
+    response.insert("logicalSessionTimeoutMinutes", 30_i32);
+    // An int32, as mongod sends it; a driver reads either width.
+    response.insert("connectionId", ctx.connection_id as i32);
+    response.insert("minWireVersion", 0_i32);
+    response.insert("maxWireVersion", WIRE_VERSION);
+    response.insert("readOnly", false);
     if ctx.require_auth {
         response.insert("accessControlEnabled", true);
     }
+    if let Some(mechs) = mechanisms {
+        response.insert("saslSupportedMechs", mechs);
+    }
+    response.insert("ok", 1.0);
 
-    // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
-    // attempt for a principal. mongod 8.2.11 lists the user's own SCRAM
-    // mechanisms, OMITS the field for an unknown user, and refuses a name with
-    // no `.` (measured 2026-09-30). This always said `["SCRAM-SHA-256"]`.
-    if let Ok(principal) = doc.get_str("saslSupportedMechs") {
-        let Some((db, user)) = principal.split_once('.') else {
-            return Err(CommandError::new(
-                2,
-                "BadValue",
-                "UserName must contain a '.' separated database.user pair",
-            ));
-        };
-        if let Some(mechs) = user_scram_mechanisms(ctx, db, user) {
-            response.insert("saslSupportedMechs", mechs);
+    if let Some(conn_auth) = ctx.conn_auth.as_ref() {
+        if let Ok(mut guard) = conn_auth.lock() {
+            guard.hello_seen = true;
         }
     }
-
     Ok(response)
+}
+
+fn wrong_type(path: &str, value: &Bson, expected: &str) -> CommandError {
+    CommandError::new(
+        14,
+        "TypeMismatch",
+        format!(
+            "BSON field '{path}' is the wrong type '{}', expected {expected}",
+            secantus_core::query::bson_type_name(value)
+        ),
+    )
+}
+
+/// The fields of `hello` mongod's parser types, in the order they were sent
+/// (measured 8.2.11, 2026-10-13). A `null` is an absent field, the path says
+/// `hello.` for the older names too, and a field the parser does not know is
+/// accepted. Returns whether the client asked for `helloOk`.
+///
+/// `compression` is checked and then not answered: this server does not
+/// speak `OP_COMPRESSED`, so it names no compressor it shares.
+fn validate_hello_arguments(doc: &Document) -> Result<bool, CommandError> {
+    let mut hello_ok = false;
+    for (key, value) in doc {
+        if matches!(value, Bson::Null) {
+            continue;
+        }
+        let path = format!("hello.{key}");
+        match (key.as_str(), value) {
+            // Echoed for any bool or number, `false` and `0` included: the
+            // field being there is the question.
+            ("helloOk", v) => match crate::util::truthy_number_or_bool(v) {
+                Some(_) => hello_ok = true,
+                None => {
+                    return Err(wrong_type(
+                        &path,
+                        v,
+                        "types '[bool, long, int, decimal, double]'",
+                    ))
+                }
+            },
+            ("compression", Bson::Array(names)) => {
+                for (i, name) in names.iter().enumerate() {
+                    if !matches!(name, Bson::String(_)) {
+                        return Err(wrong_type(&format!("{path}.{i}"), name, "type 'string'"));
+                    }
+                }
+            }
+            ("compression", v) => return Err(wrong_type(&path, v, "type 'array'")),
+            ("saslSupportedMechs", Bson::String(_) | Bson::Document(_)) => {}
+            ("saslSupportedMechs", v) => {
+                return Err(wrong_type(&path, v, "types '[object, string]'"))
+            }
+            ("loadBalanced", Bson::Boolean(_)) => {}
+            ("loadBalanced", v) => return Err(wrong_type(&path, v, "type 'bool'")),
+            ("internalClient", Bson::Document(_)) => {}
+            ("internalClient", v) => return Err(wrong_type(&path, v, "type 'object'")),
+            ("speculativeAuthenticate", Bson::Document(spec)) => {
+                if spec.is_empty() {
+                    return Err(CommandError::new(
+                        2,
+                        "BadValue",
+                        "hello.speculativeAuthenticate must be a non-empty Object",
+                    ));
+                }
+            }
+            ("speculativeAuthenticate", v) => return Err(wrong_type(&path, v, "type 'object'")),
+            _ => {}
+        }
+    }
+    Ok(hello_ok)
+}
+
+/// mongod's check of a driver's `client` metadata (measured 8.2.11,
+/// 2026-10-13). The document is at most 512 bytes when it comes with `hello`
+/// (`sized`; the internal `$client` field is not measured). Its fields are
+/// read in the order sent, each sub-document finished before the next, and
+/// only then is a missing `driver` or `os` reported. Unknown fields pass.
+pub(crate) fn validate_client_metadata(client: &Bson, sized: bool) -> Result<(), CommandError> {
+    const WHERE: &str = "in the client metadata document";
+    let Bson::Document(client) = client else {
+        return Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "The client metadata document must be a document",
+        ));
+    };
+    if sized && bson::to_vec(client).map_or(0, |b| b.len()) > 512 {
+        return Err(CommandError::new(
+            185,
+            "ClientMetadataDocumentTooLarge",
+            "The client metadata document must be less than or equal to 512 bytes",
+        ));
+    }
+    let not_document = |field: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!("The '{field}' field is required to be a BSON document {WHERE}"),
+        )
+    };
+    let not_string = |field: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!("The '{field}' field must be a string {WHERE}"),
+        )
+    };
+    let missing = |what: &str, field: &str| {
+        CommandError::new(
+            183,
+            "ClientMetadataMissingField",
+            format!("Missing required {what} '{field}' {WHERE}"),
+        )
+    };
+    // Each required string of a sub-document: a wrong type as it is met,
+    // then the first one absent.
+    let strings = |parent: &str, sub: &Document, required: &[&str]| {
+        for (key, value) in sub {
+            if required.contains(&key.as_str()) && !matches!(value, Bson::String(_)) {
+                return Err(not_string(&format!("{parent}.{key}")));
+            }
+        }
+        match required.iter().find(|name| !sub.contains_key(**name)) {
+            Some(name) => Err(missing("field", &format!("{parent}.{name}"))),
+            None => Ok(()),
+        }
+    };
+    for (key, value) in client {
+        match (key.as_str(), value) {
+            ("application", Bson::Document(app)) => match app.get("name") {
+                Some(Bson::String(name)) if name.len() > 128 => {
+                    return Err(CommandError::new(
+                        184,
+                        "ClientMetadataAppNameTooLarge",
+                        format!(
+                            "The 'application.name' field must be less then or equal to 128 \
+                             bytes {WHERE}"
+                        ),
+                    ));
+                }
+                Some(Bson::String(_)) | None => {}
+                Some(_) => return Err(not_string("application.name")),
+            },
+            ("driver", Bson::Document(driver)) => strings("driver", driver, &["name", "version"])?,
+            ("os", Bson::Document(os)) => strings("os", os, &["type"])?,
+            ("application" | "driver" | "os", _) => return Err(not_document(key)),
+            _ => {}
+        }
+    }
+    for required in ["driver", "os"] {
+        if !client.contains_key(required) {
+            return Err(missing("sub-document", required));
+        }
+    }
+    Ok(())
 }
 
 /// `ping` — the trivial liveness probe.
@@ -265,14 +469,36 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
 /// so drivers enable the right feature flags; `secantusVersion` marks the actual
 /// build (the crate version here; `commands.py` reads `secantus.__version__`).
 pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    // mongod's keys in mongod's order (8.2.11), each saying what is true of
+    // THIS build: no source modules, no script engine, a Rust compiler, and
+    // WiredTiger as the one storage engine. `maxBsonObjectSize` is an int64
+    // here and an int32 in `hello`, as on mongod.
     Ok(doc! {
         "version": SERVER_VERSION,
         "secantusVersion": env!("CARGO_PKG_VERSION"),
-        "gitVersion": "0".repeat(40),
         "versionArray": SERVER_VERSION_ARRAY.iter().map(|n| Bson::Int32(*n)).collect::<Vec<_>>(),
+        "gitVersion": "0".repeat(40),
+        "modules": Vec::<Bson>::new(),
+        "allocator": "mimalloc",
+        "javascriptEngine": "none",
+        "sysinfo": "deprecated",
+        "openssl": {"running": "rustls"},
+        "buildEnvironment": {
+            "distmod": "",
+            "distarch": std::env::consts::ARCH,
+            "cc": "rustc",
+            "ccflags": "",
+            "cxx": "",
+            "cxxflags": "",
+            "linkflags": "",
+            "target_arch": std::env::consts::ARCH,
+            "target_os": std::env::consts::OS,
+            "cppdefines": "",
+        },
         "bits": 64_i32,
-        "debug": false,
-        "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
+        "debug": cfg!(debug_assertions),
+        "maxBsonObjectSize": Bson::Int64(i64::from(MAX_BSON_OBJECT_SIZE)),
+        "storageEngines": ["wiredTiger"],
         "ok": 1.0,
     })
 }

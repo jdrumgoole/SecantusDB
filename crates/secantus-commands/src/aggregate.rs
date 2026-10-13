@@ -180,6 +180,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    if let Err(e) = source_stage_problem(&pipeline, &ctx.db_name, coll.as_deref()) {
+        return Ok(e.into_reply());
+    }
+    let seen = ctx
+        .server_params
+        .as_ref()
+        .map(|p| p.sessions())
+        .unwrap_or_default();
+    SESSIONS.with(|sessions| *sessions.borrow_mut() = seen);
     // `$where` in a `$match` is refused with the aggregation-context code on
     // every mongod, script engine or not -- and it must be refused before the
     // leading-`$match` lift hands the filter to the query matcher.
@@ -334,6 +343,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let Some(d) = stage.as_document() else {
             continue;
         };
+        if let Some(first_only) = ["$collStats", "$indexStats"]
+            .iter()
+            .find(|name| i > 0 && d.contains_key(**name))
+        {
+            return Ok(CommandError::new(
+                40602,
+                "Location40602",
+                format!("{first_only} is only valid as the first stage in a pipeline"),
+            )
+            .into_reply());
+        }
         if i > 0 && d.contains_key("$changeStream") {
             return Ok(CommandError::new(
                 40602,
@@ -578,6 +598,160 @@ fn is_storage_backed(name: &str) -> bool {
             | crate::ts_buckets::BUCKETS_STAGE
             | crate::ts_buckets::VIEWS_STAGE
     )
+}
+
+/// Where the stages that read no collection may stand, and what each takes
+/// (mongod 8.2.11): `{aggregate: 1}` needs a first stage that makes its own
+/// documents; `$currentOp` runs only so, against `admin`; `$listLocalSessions`
+/// only so; `$listSessions` only over `config.system.sessions`; each is first
+/// or not at all, and takes a document of the options it knows.
+fn source_stage_problem(
+    pipeline: &[Bson],
+    db: &str,
+    coll: Option<&str>,
+) -> Result<(), CommandError> {
+    let namespace = |message: String| CommandError::new(73, "InvalidNamespace", message);
+    let first = pipeline
+        .first()
+        .and_then(Bson::as_document)
+        .and_then(|stage| stage.keys().next())
+        .map(String::as_str);
+    if coll.is_none() {
+        match first {
+            None => {
+                return Err(namespace(
+                    "{aggregate: 1} is not valid for an empty pipeline.".into(),
+                ))
+            }
+            Some(
+                "$currentOp" | "$listLocalSessions" | "$documents" | "$changeStream"
+                | "$listCatalog" | "$queryStats" | "$querySettings",
+            ) => {}
+            Some(other) => {
+                return Err(namespace(format!(
+                    "{{aggregate: 1}} is not valid for '{other}'; a collection is required."
+                )))
+            }
+        }
+    }
+    for (i, stage) in pipeline.iter().enumerate() {
+        let Some((name, spec)) = stage.as_document().and_then(|d| d.iter().next()) else {
+            continue;
+        };
+        let known: &[&str] = match name.as_str() {
+            "$currentOp" => &[
+                "allUsers",
+                "idleConnections",
+                "idleCursors",
+                "idleSessions",
+                "localOps",
+                "truncateOps",
+                "targetAllNodes",
+            ],
+            "$listLocalSessions" | "$listSessions" => &["allUsers", "users", "$_internalPredicate"],
+            _ => continue,
+        };
+        let Bson::Document(options) = spec else {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "{name} options must be specified in an object, but found: {}",
+                    secantus_core::query::bson_type_name(spec)
+                ),
+            ));
+        };
+        match (name.as_str(), coll) {
+            ("$currentOp", Some(_)) => {
+                return Err(namespace(
+                    "$currentOp must be run against the 'admin' database with {aggregate: 1}"
+                        .into(),
+                ))
+            }
+            ("$currentOp", None) if db != "admin" => {
+                return Err(namespace(
+                    "$currentOp must be run against the 'admin' database with {aggregate: 1}"
+                        .into(),
+                ))
+            }
+            ("$listLocalSessions", Some(_)) => {
+                return Err(namespace(
+                    "$listLocalSessions must be run against the database with {aggregate: 1}, \
+                     not a collection"
+                        .into(),
+                ))
+            }
+            ("$listSessions", _) if (db, coll) != ("config", Some("system.sessions")) => {
+                return Err(namespace(
+                    "$listSessions may only be run against config.system.sessions".into(),
+                ))
+            }
+            _ => {}
+        }
+        if i > 0 {
+            return Err(CommandError::new(
+                40602,
+                "Location40602",
+                format!("{name} is only valid as the first stage in a pipeline"),
+            ));
+        }
+        for (option, value) in options {
+            if !known.contains(&option.as_str()) {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field '{name}.{option}' is an unknown field."),
+                ));
+            }
+            if name == "$currentOp" && !matches!(value, Bson::Boolean(_)) {
+                return Err(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "The '{option}' parameter of the $currentOp stage must be a boolean \
+                         value, but found: {}",
+                        secantus_core::query::bson_type_name(value)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// The sessions the server has seen, for the pipeline this thread runs.
+    static SESSIONS: std::cell::RefCell<Vec<(Vec<u8>, bson::DateTime)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What the session stages list: the sessions commands have come in and
+/// that have not timed out, as mongod shows one
+/// (`{_id: {id, uid}, lastUse}`). (An operation's row once stood in for
+/// this.)
+fn known_sessions() -> Vec<Document> {
+    use sha2::Digest;
+    SESSIONS.with(|sessions| {
+        sessions
+            .borrow()
+            .iter()
+            .map(|(id, used)| {
+                doc! {
+                    "_id": {
+                        "id": bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Uuid,
+                            bytes: id.clone(),
+                        },
+                        "uid": bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: sha2::Sha256::digest(b"").to_vec(),
+                        },
+                    },
+                    "lastUse": *used,
+                }
+            })
+            .collect()
+    })
 }
 
 /// Source stages that ignore their input and emit a synthetic row, mirroring
@@ -1191,7 +1365,11 @@ fn run_segmented(
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
-            docs = apply_source_stage(name, db, coll, cmd_doc, client_metadata);
+            docs = if name == "$currentOp" {
+                apply_source_stage(name, db, coll, cmd_doc, client_metadata)
+            } else {
+                known_sessions()
+            };
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
                 docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
@@ -1420,7 +1598,7 @@ fn apply_storage_stage(
         "$facet" => apply_facet(spec, docs, db, coll, vars, storage, collation),
         "$sample" => apply_sample(spec, docs),
         "$collStats" => apply_coll_stats(spec, db, coll, storage),
-        "$indexStats" => apply_index_stats(db, coll, storage),
+        "$indexStats" => apply_index_stats(spec, db, coll, storage),
         // A read of `system.buckets.<name>`: the stage names the collection.
         crate::ts_buckets::VIEWS_STAGE => crate::ts_buckets::view_definitions(storage, db),
         crate::ts_buckets::BUCKETS_STAGE => {
@@ -2536,7 +2714,21 @@ fn apply_coll_stats(
     storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
     let coll = coll.ok_or_else(|| bad_value("$collStats requires a collection"))?;
-    let spec = spec.and_then(Bson::as_document);
+    let spec = coll_stats_spec(spec)?;
+    let spec = Some(&spec);
+    let ns_text = format!("{db}.{coll}");
+    let missing = |what: &str| {
+        CommandError::new(
+            26,
+            "NamespaceNotFound",
+            format!(
+                "Executor error during aggregate command on namespace: {ns_text} :: caused by \
+                 :: Unable to retrieve {what} in $collStats stage :: caused by :: Collection \
+                 [{ns_text}] not found."
+            ),
+        )
+    };
+    let exists = storage.collection_exists(db, coll).unwrap_or(false);
     // A time-series collection's statistics are its buckets': their
     // namespace, and how many there are.
     let buckets = if storage
@@ -2553,7 +2745,6 @@ fn apply_coll_stats(
             .count_matching(db, coll, &Document::new())
             .map_err(command_error)? as i64,
     };
-    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
     let ns = match buckets {
         Some(_) => format!("{db}.{}{coll}", crate::ts_buckets::BUCKETS_PREFIX),
         None => format!("{db}.{coll}"),
@@ -2563,41 +2754,17 @@ fn apply_coll_stats(
         "host": "secantus",
         "localTime": bson::DateTime::now(),
     };
-    if spec.is_some_and(|s| s.contains_key("storageStats")) {
-        let mut index_sizes = Document::new();
-        for ix in &indexes {
-            if let Ok(name) = ix.get_str("name") {
-                index_sizes.insert(name.to_string(), 0_i32);
-            }
+    if let Some(Bson::Document(options)) = spec.and_then(|s| s.get("storageStats")) {
+        if !exists {
+            return Err(missing("storageStats"));
         }
-        let mut storage_stats = doc! {
-            "size": 0_i32,
-            "count": count,
-            "avgObjSize": 0_i32,
-            "storageSize": 0_i32,
-            "indexSizes": index_sizes,
-            "totalIndexSize": 0_i32,
-            "scaleFactor": 1_i32,
-            "nindexes": indexes.len() as i32,
-        };
-        if storage.collection_is_capped(db, coll).unwrap_or(false) {
-            // mongod renames the user-set `size` to `maxSize` here, so a caller
-            // can tell the cap from the current data size. mongo-ruby-driver's
-            // `Collection#create ... applies the options` capped spec reads
-            // `storageStats.{capped, max, maxSize}` directly, so all three have
-            // to be present. Mirrors `aggregate._coll_stats`.
-            storage_stats.insert("capped", true);
-            // `as_i64` (the crate helper), not `Bson::as_i64` — the latter
-            // matches Int64 only, and drivers send these as Int32
-            // (mongo-ruby-driver sends `size: 4096, max: 512`), so both fields
-            // silently vanished from the reply.
-            let opts = storage.get_collection_options(db, coll).unwrap_or_default();
-            if let Some(size) = opts.get("size").and_then(as_i64) {
-                storage_stats.insert("maxSize", crate::admin::int_bson(size));
-            }
-            // 0 when the collection has no document limit, as mongod has it.
-            let max = opts.get("max").and_then(as_i64).unwrap_or(0);
-            storage_stats.insert("max", crate::admin::int_bson(max));
+        let scale = options
+            .get("scale")
+            .and_then(crate::util::as_i64)
+            .unwrap_or(1);
+        let mut storage_stats = crate::stats_admin::storage_stats(storage, db, coll, scale)?;
+        if let Some(n) = buckets {
+            storage_stats.insert("count", crate::admin::int_bson(n));
         }
         out.insert("storageStats", storage_stats);
     }
@@ -2612,20 +2779,117 @@ fn apply_coll_stats(
         );
     }
     if spec.is_some_and(|s| s.contains_key("count")) {
-        match buckets {
-            Some(n) => out.insert("count", crate::admin::int_bson(n)),
-            None => out.insert("count", count),
-        };
+        if !exists {
+            return Err(missing("count"));
+        }
+        out.insert("count", crate::admin::int_bson(count));
     }
     Ok(vec![out])
 }
 
+/// A `$collStats` specification, checked as mongod's parser checks it
+/// (8.2.11): a document of the sections it knows, each a document, with a
+/// `storageStats.scale` of 1 or more and a boolean `histograms`.
+fn coll_stats_spec(spec: Option<&Bson>) -> Result<Document, CommandError> {
+    let wrong = |path: &str, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected {expected}",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let spec = match spec {
+        Some(Bson::Document(spec)) => spec,
+        other => {
+            let shown =
+                other.map_or_else(|| "null".to_string(), secantus_core::query::bson_value_repr);
+            return Err(CommandError::new(
+                5447000,
+                "Location5447000",
+                format!("$collStats must take a nested object but found: $collStats: {shown}"),
+            ));
+        }
+    };
+    for (key, value) in spec {
+        let path = format!("$collStats.{key}");
+        match (key.as_str(), value) {
+            (
+                "latencyStats" | "storageStats" | "count" | "queryExecStats" | "operationStats",
+                Bson::Document(section),
+            ) => match (
+                key.as_str(),
+                section.get("scale"),
+                section.get("histograms"),
+            ) {
+                ("storageStats", Some(scale), _) if !matches!(scale, Bson::Null) => {
+                    let Some(n) = crate::util::as_i64(scale).filter(|_| {
+                        matches!(
+                            scale,
+                            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+                        )
+                    }) else {
+                        return Err(wrong(
+                            &format!("{path}.scale"),
+                            scale,
+                            "types '[decimal, double, int, long]'",
+                        ));
+                    };
+                    if n < 1 {
+                        return Err(bad_value(format!(
+                            "BSON field 'scale' value must be >= 1, actual value '{n}'"
+                        )));
+                    }
+                }
+                ("latencyStats", _, Some(flag)) if !matches!(flag, Bson::Boolean(_)) => {
+                    return Err(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        format!(
+                            "Field 'histograms' should be a boolean value, but found: {}",
+                            secantus_core::query::bson_type_name(flag)
+                        ),
+                    ));
+                }
+                _ => {}
+            },
+            (
+                "latencyStats" | "storageStats" | "count" | "queryExecStats" | "operationStats",
+                Bson::Null,
+            ) => {}
+            (
+                "latencyStats" | "storageStats" | "count" | "queryExecStats" | "operationStats",
+                v,
+            ) => return Err(wrong(&path, v, "type 'object'")),
+            ("targetAllNodes" | "$_requestOnTimeseriesView", _) => {}
+            _ => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field '{path}' is an unknown field."),
+                ));
+            }
+        }
+    }
+    Ok(spec.clone())
+}
+
 /// `$indexStats` — one doc per index (mirrors `aggregate._stage_index_stats`).
 fn apply_index_stats(
+    spec: Option<&Bson>,
     db: &str,
     coll: Option<&str>,
     storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
+    if !matches!(spec, Some(Bson::Document(d)) if d.is_empty()) {
+        return Err(CommandError::new(
+            28803,
+            "Location28803",
+            "The $indexStats stage specification must be an empty object",
+        ));
+    }
     let coll = coll.ok_or_else(|| bad_value("$indexStats requires a collection"))?;
     let mut indexes = storage.list_indexes(db, coll).map_err(command_error)?;
     // A time-series collection has no `_id` index.
@@ -2638,11 +2902,28 @@ fn apply_index_stats(
     Ok(indexes
         .into_iter()
         .map(|ix| {
+            // The index as `listIndexes` shows it, less what only the
+            // catalog keeps.
+            let mut spec = doc! {
+                "v": 2_i32,
+                "key": ix.get_document("key").cloned().unwrap_or_default(),
+                "name": ix.get_str("name").unwrap_or("").to_string(),
+            };
+            for (option, value) in &ix {
+                if !matches!(option.as_str(), "v" | "key" | "name" | "ns")
+                    && !crate::admin::INDEX_CATALOG_ONLY.contains(&option.as_str())
+                {
+                    spec.insert(option.clone(), value.clone());
+                }
+            }
             doc! {
                 "name": ix.get_str("name").unwrap_or("").to_string(),
                 "key": ix.get_document("key").cloned().unwrap_or_default(),
                 "host": "secantus",
-                "accesses": {"ops": 0_i64, "since": Bson::Null},
+                // Uses of an index are not counted here; `since` is when
+                // this process began, which is when the count began.
+                "accesses": {"ops": 0_i64, "since": crate::handshake::process_started()},
+                "spec": spec,
             }
         })
         .collect())

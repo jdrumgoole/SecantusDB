@@ -506,6 +506,7 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     // principals persist for the connection's lifetime.
     let mut auth_state = ConnectionAuth::new();
     auth_state.peer_loopback = tcp.peer_addr().is_ok_and(|a| a.ip().is_loopback());
+    auth_state.peer_address = tcp.peer_addr().ok().map(|a| a.to_string());
     let conn_auth = Arc::new(Mutex::new(auth_state));
 
     match shared.tls.clone() {
@@ -584,6 +585,7 @@ fn serve<S: Read + Write>(
         // concurrent large messages can't exhaust the heap; the reservation is
         // released at the end of this loop iteration when `_body_budget` drops.
         let _body_budget = shared.alloc_budget.acquire(body_len);
+        shared.top_stats.count_request(16 + body_len);
         let mut body = vec![0u8; body_len];
         match read_full(stream, &mut body, shared, &mut deadline)? {
             ReadOutcome::Filled => {}
@@ -602,14 +604,21 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let (reply, close_conn, pending) = run_dispatch(
-                    &request,
-                    raw_insert_docs,
-                    conn_id,
-                    shared,
-                    conn_auth,
-                    &peer_cert_dn,
-                );
+                // An OP_MSG names its database in `$db`; one without it, or
+                // with something that is not a string there, is refused the
+                // way mongod's parser refuses it.
+                let (reply, close_conn, pending) =
+                    match secantus_commands::db_field_problem(&request) {
+                        Some(refused) => (refused, false, None),
+                        None => run_dispatch(
+                            &request,
+                            raw_insert_docs,
+                            conn_id,
+                            shared,
+                            conn_auth,
+                            &peer_cert_dn,
+                        ),
+                    };
                 // A `closeConnection` failpoint drops the socket without replying,
                 // so the driver observes a network error.
                 if close_conn {
@@ -1030,6 +1039,7 @@ fn write_op_msg<S: Write>(
 ) -> io::Result<()> {
     let body_bytes = cursor_or_plain_body(reply, batch)?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, 0);
+    shared.top_stats.count_reply(frame.len());
     stream.write_all(&frame)
 }
 
@@ -1066,6 +1076,7 @@ fn write_op_msg_flags<S: Write>(
         .to_writer(&mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, flags);
+    shared.top_stats.count_reply(frame.len());
     stream.write_all(&frame)
 }
 
@@ -1113,6 +1124,7 @@ fn stream_exhaust_getmore<S: Write>(
         let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
         let body = cursor_or_plain_body(doc, pending)?;
         let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body, flags);
+        shared.top_stats.count_reply(frame.len());
         match stream.write_all(&frame) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
@@ -1383,6 +1395,7 @@ fn write_op_reply<S: Write>(
         0,
         0,
     );
+    shared.top_stats.count_reply(frame.len());
     stream.write_all(&frame)
 }
 

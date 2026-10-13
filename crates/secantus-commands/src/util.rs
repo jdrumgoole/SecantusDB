@@ -571,6 +571,20 @@ pub(crate) fn truthy(v: &Bson) -> bool {
     }
 }
 
+/// A value where mongod takes a bool or any number and nothing else: `Some`
+/// of how it reads, `None` for a value of another type.
+pub(crate) fn truthy_number_or_bool(v: &Bson) -> Option<bool> {
+    match v {
+        Bson::Boolean(b) => Some(*b),
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => Some(match v {
+            Bson::Double(d) => *d != 0.0,
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().is_ok_and(|f| f != 0.0),
+            other => as_i64(other).is_some_and(|n| n != 0),
+        }),
+        _ => None,
+    }
+}
+
 /// A numeric field of a reply, 0 when absent.
 pub(crate) fn as_i64_field(doc: &Document, field: &str) -> i64 {
     doc.get(field).and_then(as_i64).unwrap_or(0)

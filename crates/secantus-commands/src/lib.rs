@@ -47,6 +47,8 @@ mod ddl_checks;
 pub mod diagnostics;
 pub mod distinct;
 mod explain;
+mod generic;
+pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
@@ -54,10 +56,12 @@ pub mod handshake;
 pub mod logbuf;
 pub mod mapreduce;
 pub mod mongod_codes;
+mod mongod_commands;
 mod near;
 pub mod params;
 pub mod rbac;
 pub mod roles;
+pub mod serverinfo;
 mod session;
 pub mod slowop;
 mod stats_admin;
@@ -492,6 +496,15 @@ pub fn is_test_only_command(name: &str) -> bool {
     matches!(name, "configureFailPoint")
 }
 
+/// The commands of this server's own, which mongod does not have.
+pub(crate) const OWN_COMMANDS: &[&str] = &[
+    "secantusAdmin.archiveBaseSnapshot",
+    "secantusAdmin.backupArchive",
+    "secantusAdmin.pruneOplog",
+    "secantusAdmin.pruneTtl",
+    "secantusAdmin.restoreArchive",
+];
+
 fn lookup(name: &str) -> Option<Handler> {
     Some(match name {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
@@ -534,14 +547,14 @@ fn lookup(name: &str) -> Option<Handler> {
         "dropIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
-        "collStats" => stats_admin::coll_stats,
-        "dataSize" => stats_admin::data_size,
+        "collStats" | "collstats" => stats_admin::coll_stats,
+        "dataSize" | "datasize" => stats_admin::data_size,
         // mongod accepts the lowercase `dbstats` spelling too (the C driver's
         // command_fully_qualified test sends it over the legacy OP_QUERY path).
         "dbStats" | "dbstats" => stats_admin::db_stats,
         "serverStatus" => admin::server_status,
         "currentOp" => admin::current_op,
-        "killOp" => diagnostics::kill_op,
+        "killOp" => serverinfo::kill_op,
         "validate" => admin::validate,
         "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
@@ -570,16 +583,22 @@ fn lookup(name: &str) -> Option<Handler> {
         "grantRolesToRole" => roles::grant_roles_to_role,
         "revokeRolesFromRole" => roles::revoke_roles_from_role,
         "rolesInfo" => roles::roles_info,
-        "getParameter" => diagnostics::get_parameter,
+        "getParameter" => serverinfo::get_parameter,
         "setParameter" => params::set_parameter,
         "replSetStepDown" => stepdown::replset_step_down,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
-        "connectionStatus" => diagnostics::connection_status,
-        "whatsmyuri" => diagnostics::whatsmyuri,
+        "connectionStatus" => serverinfo::connection_status,
+        "whatsmyuri" => serverinfo::whatsmyuri,
+        "listCommands" => serverinfo::list_commands,
+        "logout" => serverinfo::logout,
+        "getDefaultRWConcern" => serverinfo::get_default_rw_concern,
+        "replSetGetConfig" => serverinfo::repl_set_get_config,
+        "shardingState" => serverinfo::sharding_state,
+        "fsyncUnlock" => serverinfo::fsync_unlock,
         "fsync" => diagnostics::fsync,
         "hostInfo" => diagnostics::host_info,
         "top" => diagnostics::top,
-        "getLog" => diagnostics::get_log,
+        "getLog" => serverinfo::get_log,
         "configureFailPoint" => configure_fail_point,
         _ => return None,
     })
@@ -617,6 +636,10 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// `commands.py::dispatch` runs first. Always returns a reply document (errors
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
+    handshake::process_started();
+    if let Some(stats) = &ctx.top_stats {
+        stats.count_op(doc);
+    }
     let mut reply = dispatch_inner(doc, ctx);
     unacknowledged_write_reply(doc, &mut reply);
     attach_write_concern_error(doc, &mut reply);
@@ -829,15 +852,8 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
             ));
         }
     };
-    const WRITE_CONCERN_FIELDS: [&str; 7] = [
-        "w",
-        "j",
-        "wtimeout",
-        "wtimeoutMS",
-        "fsync",
-        "getLastError",
-        "provenance",
-    ];
+    const WRITE_CONCERN_FIELDS: [&str; 6] =
+        ["w", "j", "wtimeout", "fsync", "getLastError", "provenance"];
     if let Some(unknown) = wc
         .keys()
         .find(|k| !WRITE_CONCERN_FIELDS.contains(&k.as_str()))
@@ -1051,6 +1067,12 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
         }
     }
 
+    // An unknown command says so before anything about its fields.
+    if lookup(name).is_some() {
+        if let Err(e) = generic::check(doc, name) {
+            return e.into_reply();
+        }
+    }
     if let Err(e) = validate_read_concern(doc, name, ctx) {
         return e.into_reply();
     }
@@ -1075,6 +1097,31 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     // duplicating a flag down here.
     if is_test_only_command(name) && ctx.failpoints.is_none() {
         return CommandError::command_not_found(name).into_reply();
+    }
+    // A command mongod runs only against `admin` says so from any other
+    // database before it reads its arguments (`{killOp: 1}` with no `op`
+    // answers this, not the missing field), and whether or not this server
+    // has the command. The ones excepted parse first or carry their own
+    // refusal.
+    if ctx.db_name != "admin"
+        && mongod_commands::admin_only(name)
+        && !matches!(
+            name,
+            "renameCollection"
+                | "bulkWrite"
+                | "setParameter"
+                | "top"
+                | "listDatabases"
+                | "abortTransaction"
+                | "commitTransaction"
+        )
+    {
+        return CommandError::new(
+            13,
+            "Unauthorized",
+            format!("{name} may only be run against the admin database."),
+        )
+        .into_reply();
     }
     match lookup(name) {
         Some(handler) => {
@@ -1313,34 +1360,62 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     } else {
         "KillAllSessionsByPatternCmd"
     };
-    match doc.get(name) {
-        Some(Bson::Array(_)) | None => {}
-        Some(other) => {
-            return Err(CommandError::new(
-                14,
-                "TypeMismatch",
-                format!(
-                    "BSON field '{owner}.{name}' is the wrong type '{}', expected type 'array'",
-                    secantus_core::query::bson_type_name(other)
-                ),
-            ))
-        }
-    }
-    if name == "killAllSessionsByPattern" {
-        if let Some(Bson::Array(patterns)) = doc.get(name) {
-            for pattern in patterns {
-                let lsid = pattern
-                    .as_document()
-                    .and_then(|p| p.get_document("lsid").ok());
-                if lsid.is_some_and(|l| !l.contains_key("uid")) {
-                    return Err(CommandError::new(
-                        40414,
-                        "IDLFailedToParse",
-                        format!(
-                            "BSON field '{owner}.{name}.lsid.uid' is missing but a required field"
-                        ),
-                    ));
+    let path = format!("{owner}.{name}");
+    let wrong = |path: &str, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let missing = |path: &str| {
+        CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            format!("BSON field '{path}' is missing but a required field"),
+        )
+    };
+    let patterns = match doc.get(name) {
+        Some(Bson::Array(patterns)) => patterns.as_slice(),
+        None => &[],
+        Some(Bson::Null) => return Err(missing(&path)),
+        Some(other) => return Err(wrong(&path, other, "array")),
+    };
+    // Each entry is parsed whether or not any session matches it (mongod
+    // 8.2.11): a user is `{user, db}`, both strings, and a pattern has only
+    // the fields mongod's parser knows.
+    for (i, pattern) in patterns.iter().enumerate() {
+        let Bson::Document(pattern) = pattern else {
+            return Err(wrong(&format!("{path}.{i}"), pattern, "object"));
+        };
+        if name == "killAllSessions" {
+            for (key, value) in pattern {
+                if matches!(key.as_str(), "user" | "db") && !matches!(value, Bson::String(_)) {
+                    return Err(wrong(&format!("{path}.{key}"), value, "string"));
                 }
+            }
+            for required in ["db", "user"] {
+                if !pattern.contains_key(required) {
+                    return Err(missing(&format!("{path}.{required}")));
+                }
+            }
+        } else {
+            if let Some(key) = pattern
+                .keys()
+                .find(|k| !matches!(k.as_str(), "lsid" | "uid" | "users" | "roles"))
+            {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field '{path}.{key}' is an unknown field."),
+                ));
+            }
+            let lsid = pattern.get_document("lsid").ok();
+            if lsid.is_some_and(|l| !l.contains_key("uid")) {
+                return Err(missing(&format!("{path}.lsid.uid")));
             }
         }
     }
@@ -1817,6 +1892,17 @@ fn order_write_reply(req: &Document, reply: &mut Document) {
 fn attach_write_op_time(req: &Document, reply: &mut Document) {
     let Some(cmd) = req.keys().next() else { return };
     if !matches!(cmd.as_str(), "insert" | "update" | "delete") {
+        return;
+    }
+    // An unacknowledged write (`w: 0`) that is answered at all is answered
+    // without them.
+    let unacknowledged = req
+        .get_document("writeConcern")
+        .ok()
+        .and_then(|wc| wc.get("w"))
+        .and_then(util::as_i64)
+        == Some(0);
+    if unacknowledged {
         return;
     }
     let ok = matches!(reply.get("ok"), Some(Bson::Double(v)) if *v == 1.0)
@@ -2309,6 +2395,65 @@ fn validate_read_concern(
             format!("BSON field 'readConcern.{key}' is an unknown field."),
         ));
     }
+    // The two cluster times and the provenance (mongod 8.2.11). They were
+    // read as absent when malformed, and a time this server has not reached
+    // yet, or one too old to have a snapshot of, was served as now.
+    for field in ["afterClusterTime", "atClusterTime"] {
+        if let Some(v) = rc.get(field).filter(|v| !matches!(v, Bson::Timestamp(_))) {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "\"{field}\" had the wrong type. Expected 17, found {}",
+                    secantus_core::query::bson_type_name(v)
+                ),
+            ));
+        }
+    }
+    if let Some(Bson::String(source)) = rc.get("provenance") {
+        const SOURCES: [&str; 5] = [
+            "clientSupplied",
+            "implicitDefault",
+            "customDefault",
+            "getLastErrorDefaults",
+            "internalWriteDefault",
+        ];
+        if !SOURCES.contains(&source.as_str()) {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                format!(
+                    "Enumeration value '{source}' for field 'readConcern.provenance' is not a \
+                     valid value."
+                ),
+            ));
+        }
+    }
+    let invalid = |message: String| CommandError::new(72, "InvalidOptions", message);
+    if let Some(Bson::Timestamp(after)) = rc.get("afterClusterTime") {
+        if after.time == 0 && after.increment == 0 {
+            return Err(invalid(
+                "afterClusterTime cannot be a null timestamp".into(),
+            ));
+        }
+        if let Some(now) = ctx.storage.as_ref().map(|s| s.current_cluster_time()) {
+            if (after.time, after.increment) > (now.time, now.increment) {
+                return Err(invalid(format!(
+                    "readConcern afterClusterTime value must not be greater than the current \
+                     clusterTime. Requested clusterTime: {{ ts: Timestamp({}, {}) }}; current \
+                     clusterTime: {{ ts: Timestamp({}, {}) }}",
+                    after.time, after.increment, now.time, now.increment
+                )));
+            }
+        }
+    }
+    if let Some(Bson::Timestamp(_)) = rc.get("atClusterTime") {
+        if level != Some("snapshot") {
+            return Err(invalid(
+                "atClusterTime field can be set only if level is equal to snapshot".into(),
+            ));
+        }
+    }
     // A statement of a transaction reads at the transaction's own snapshot,
     // and its read concern is checked with the transaction (`session`).
     if matches!(doc.get("autocommit"), Some(Bson::Boolean(false))) {
@@ -2338,6 +2483,30 @@ fn validate_read_concern(
             | "mapReduce"
             | "mapreduce"
     );
+    // mongod keeps the history a snapshot needs for five minutes
+    // (`minSnapshotHistoryWindowInSeconds`); this server keeps none older,
+    // so a time before that has no snapshot to read. Said last: a command
+    // that takes no snapshot at all says that first.
+    let too_old = || -> Result<(), CommandError> {
+        let Some(Bson::Timestamp(at)) = rc.get("atClusterTime") else {
+            return Ok(());
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if u64::from(at.time) + 300 < now {
+            return Err(CommandError::new(
+                239,
+                "SnapshotTooOld",
+                format!(
+                    "Read timestamp Timestamp({}, {}) is older than the oldest available \
+                     timestamp.",
+                    at.time, at.increment
+                ),
+            ));
+        }
+        Ok(())
+    };
     let reason = if !reads {
         // An unknown command is CommandNotFound, whatever it carries.
         if lookup(name).is_none() {
@@ -2347,7 +2516,7 @@ fn validate_read_concern(
     } else if level == "snapshot" && name == "count" {
         "read concern snapshot not supported"
     } else {
-        return Ok(());
+        return too_old();
     };
     let at = match rc.get("atClusterTime") {
         Some(Bson::Timestamp(t)) => {
@@ -2428,7 +2597,7 @@ fn refuse_write_concern(doc: &Document, name: &str) -> Result<(), CommandError> 
 /// a command outside API Version 1 is `APIStrictError` (323). The `apiStrict`
 /// aggregation-stage gate lands with the aggregate family.
 fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
-    if let Some(av) = doc.get("apiVersion") {
+    if let Some(av) = doc.get("apiVersion").filter(|v| !matches!(v, Bson::Null)) {
         if av.as_str() != Some("1") {
             // mongod's two wordings (measured 8.2.11, 2026-10-12): version
             // "2" is named, and anything else is told what is accepted.
@@ -2452,6 +2621,19 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
         // CommandNotFound below. This replaced a `name == "distinct"` canary
         // whose message ("Provided command ... is not in API Version 1") was
         // not mongod's either.
+        // An older spelling of a command is refused by name, whatever the
+        // command it stands for.
+        let modern = generic::struct_name(name);
+        if modern != name && name != "find" {
+            return Err(CommandError::new(
+                323,
+                "APIStrictError",
+                format!(
+                    "Command invocation with name '{name}' is not allowed in 'apiStrict' \
+                     mode, use '{modern}' instead"
+                ),
+            ));
+        }
         if !api_v1_command(name) && (lookup(name).is_some() || non_v1_mongod_command(name)) {
             return Err(CommandError::new(
                 323,
@@ -2462,6 +2644,20 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
                      API Version 1 can be found at \
                      https://dochub.mongodb.org/core/manual-versioned-api."
                 ),
+            ));
+        }
+        // The fields of a v1 command that are not themselves in v1, each
+        // sent alone to mongod 8.2.11.
+        let outside: &[&str] = match name {
+            "find" => &["tailable", "awaitData", "min", "max", "oplogReplay"],
+            "aggregate" => &["explain"],
+            _ => &[],
+        };
+        if let Some(field) = doc.keys().find(|k| outside.contains(&k.as_str())) {
+            return Err(CommandError::new(
+                323,
+                "APIStrictError",
+                format!("BSON field '{field}' is not allowed with apiStrict:true."),
             ));
         }
         // An aggregate whose pipeline uses a stage outside API Version 1 (e.g.
@@ -2488,63 +2684,17 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Commands inside MongoDB's **Stable API Version 1**, measured by sending each
-/// command the Python server implements to a real `mongod` 8.2.11 under
-/// `apiStrict: true` and recording which it refused with 323 (2026-09-27).
-/// Mirrors `commands.py::_API_V1_COMMANDS`. The surprises are why it was
-/// measured and not copied: `distinct`, `buildInfo`, `isMaster` and
-/// `serverStatus` are OUTSIDE v1, while `hello` and `count` are inside it.
+/// Whether `name` is in MongoDB's **Stable API Version 1**: mongod's own
+/// answer, from the `apiVersions` of its `listCommands` (8.2.11).
+///
+/// A list kept by hand stood here, measured by sending each command under
+/// `apiStrict: true` and recording which were refused. Ten of its names were
+/// wrong, because a command whose arguments did not parse answered the parse
+/// error first and was counted as accepted (`createUser`, `grantRolesToUser`
+/// and the like), and `collStats` was simply mistaken. An older spelling
+/// (`findandmodify`) is not in the table and gets its own refusal below.
 fn api_v1_command(name: &str) -> bool {
-    matches!(
-        name,
-        "abortTransaction"
-            | "aggregate"
-            | "authenticate"
-            | "bulkWrite"
-            | "collMod"
-            | "collStats"
-            | "commitTransaction"
-            | "count"
-            | "create"
-            | "createIndexes"
-            | "createRole"
-            | "createSearchIndexes"
-            | "createUser"
-            | "delete"
-            | "drop"
-            | "dropDatabase"
-            | "dropIndexes"
-            | "dropRole"
-            | "dropSearchIndex"
-            | "dropUser"
-            | "endSessions"
-            | "explain"
-            | "find"
-            | "findAndModify"
-            | "findandmodify"
-            | "getMore"
-            | "grantPrivilegesToRole"
-            | "grantRolesToRole"
-            | "grantRolesToUser"
-            | "hello"
-            | "insert"
-            | "killCursors"
-            | "listCollections"
-            | "listDatabases"
-            | "listIndexes"
-            | "ping"
-            | "refreshSessions"
-            | "renameCollection"
-            | "revokePrivilegesFromRole"
-            | "revokeRolesFromRole"
-            | "revokeRolesFromUser"
-            | "saslContinue"
-            | "saslStart"
-            | "update"
-            | "updateRole"
-            | "updateSearchIndex"
-            | "updateUser"
-    )
+    mongod_commands::api_v1(name)
 }
 
 /// Commands a real `mongod` HAS but this server does not implement, which sit
@@ -2553,6 +2703,7 @@ fn api_v1_command(name: &str) -> bool {
 /// outside the API. Mirrors `commands.py::_NON_V1_MONGOD_COMMANDS`.
 fn non_v1_mongod_command(name: &str) -> bool {
     matches!(name, "testVersion2" | "testDeprecationInVersion2")
+        || mongod_commands::row(name).is_some()
 }
 
 /// Aggregation stages inside API Version 1 (`commands.py::_API_V1_AGG_STAGES`).
@@ -2847,14 +2998,15 @@ mod tests {
         let reply = dispatch(&doc! {"hello": 1}, &mut ctx());
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
         assert!(reply.get_bool("isWritablePrimary").unwrap());
-        assert!(reply.get_bool("ismaster").unwrap());
+        // `hello` answers the modern name only, as mongod does.
+        assert!(!reply.contains_key("ismaster"));
         assert_eq!(reply.get_i32("maxWireVersion").unwrap(), WIRE_VERSION);
         assert_eq!(
             reply.get_i32("maxBsonObjectSize").unwrap(),
             MAX_BSON_OBJECT_SIZE
         );
-        // connectionId and topologyVersion.counter must be int64 on the wire.
-        assert!(matches!(reply.get("connectionId"), Some(Bson::Int64(7))));
+        // mongod's widths: an int32 connectionId, an int64 counter.
+        assert!(matches!(reply.get("connectionId"), Some(Bson::Int32(7))));
         let tv = reply.get_document("topologyVersion").unwrap();
         assert!(matches!(tv.get("counter"), Some(Bson::Int64(0))));
         // No replica-set fields without a configured set name.
@@ -3000,8 +3152,10 @@ mod tests {
     fn ismaster_alias_routes_to_hello() {
         let reply = dispatch(&doc! {"isMaster": 1}, &mut ctx());
         assert!(reply.get_bool("ismaster").unwrap());
+        // The older names answer `ismaster` and not the modern flag.
         let reply2 = dispatch(&doc! {"ismaster": 1}, &mut ctx());
-        assert!(reply2.get_bool("isWritablePrimary").unwrap());
+        assert!(reply2.get_bool("ismaster").unwrap());
+        assert!(!reply2.contains_key("isWritablePrimary"));
     }
 
     #[test]

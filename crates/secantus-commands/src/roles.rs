@@ -461,6 +461,25 @@ pub fn drop_all_roles_from_database(_doc: &Document, ctx: &mut CommandContext) -
 /// `rolesInfo` — return custom-role records. Accepts `1`/`true` (all roles in
 /// this db), a name string, a `{role, db}` doc, or a list thereof.
 pub fn roles_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    crate::serverinfo::principal_argument(doc.get("rolesInfo"), "RoleName", "role")?;
+    match doc.get("showPrivileges") {
+        None | Some(Bson::Null | Bson::Boolean(_)) => {}
+        Some(Bson::String(word)) if word == "asUserFragment" => {}
+        Some(other) => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                format!(
+                    "Failed to parse 'showPrivileges'. 'showPrivileges' should either be a \
+                     boolean or the string 'asUserFragment', given: showPrivileges: {}",
+                    secantus_core::query::bson_value_repr(other)
+                ),
+            ))
+        }
+    }
+    for option in ["showBuiltinRoles", "showAuthenticationRestrictions"] {
+        crate::serverinfo::flag(doc, "rolesInfo", option)?;
+    }
     let db_name = db_of(ctx);
     let storage = ctx.storage()?;
 
