@@ -66,11 +66,14 @@ pub struct ResolvedConfig {
 
     // ---- [storage] ---------------------------------------------------
     pub cache_size: String,
-    /// WiredTiger WAL log `file_max` (unit-suffixed, e.g. "2GB"). The standalone
-    /// daemon defaults to 2GB — the 128MB WT default forced constant log-file
-    /// rotation under a multi-writer write load (a measured ~+13-19% throughput
-    /// loss at 4-8 writers). 2GB is WT's hard cap; `prealloc=false` keeps the log
-    /// files sparse so a small workload still costs only what it writes.
+    /// WiredTiger WAL log `file_max` (unit-suffixed, e.g. "128MB"; 2GB is
+    /// WiredTiger's cap). 128MB, as the embedded handle has. WiredTiger
+    /// allocates a log file in full when it creates one, so this is the size
+    /// of a store that has taken no write. It was 2GB until 2026-10-13, from
+    /// a loopback sweep that measured 13-19% more throughput at 4-8 writers.
+    /// On a droplet with the clients on other droplets, 16 and 64 writers
+    /// got the same rate at 32MB, 128MB, 512MB and 2GB
+    /// (`bench/results/mdb-droplet/2026-10-13-log-file-max/`).
     pub log_file_max: String,
     pub session_max: u32,
     pub ttl_sweep_seconds: f64,
@@ -112,7 +115,7 @@ impl Default for ResolvedConfig {
             oplog_archive_dir: None,
             noop_heartbeat_seconds: 0.0,
             cache_size: "4G".to_string(),
-            log_file_max: "2GB".to_string(),
+            log_file_max: "128MB".to_string(),
             session_max: 1000,
             ttl_sweep_seconds: 60.0,
             sync_on_commit: false,

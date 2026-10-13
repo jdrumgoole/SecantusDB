@@ -4984,7 +4984,7 @@ const SPARSE_CHUNK: usize = 256 * 1024;
 /// Extract one tar entry, punching holes instead of writing runs of zeros.
 ///
 /// A WiredTiger backup contains `WiredTigerLog.*`, which WT **preallocates to
-/// `log_file_max`** — 2 GiB here. Almost all of it is zeros, so it compresses
+/// `log_file_max`** — 2 GiB at the daemon's default until 2026-10-13. Almost all of it is zeros, so it compresses
 /// to nothing (a 100-document store archives to 2.0 MB) and then expands to
 /// 2.0 GB on restore. Measured: every PITR restore wrote 2 GB regardless of
 /// database size, 99.8% of its time blocked in `write(2)`, which took 0.84s on

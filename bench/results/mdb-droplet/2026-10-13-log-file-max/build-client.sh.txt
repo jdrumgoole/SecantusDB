@@ -1,0 +1,10 @@
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null
+apt-get install -y -qq git build-essential pkg-config curl >/dev/null
+[ -x /root/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
+. /root/.cargo/env
+rm -rf /root/src && git clone -q --depth 1 https://github.com/jdrumgoole/SecantusDB.git /root/src
+cd /root/src/crates
+cargo build --release -p secantus-bench --bin do-client > /root/build-client.log 2>&1 || { tail -30 /root/build-client.log; exit 1; }
+cp target/release/do-client /root/do-client && /root/do-client --version

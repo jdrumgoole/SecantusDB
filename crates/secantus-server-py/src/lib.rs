@@ -132,9 +132,8 @@ impl RustServer {
         let mut storage = Storage::open_with_options(
             storage_path,
             &StorageOptions {
-                // Embedded handle keeps the 128MB log default (many ephemeral in-process
-                // instances in a test suite must not each carry a big sparse log); the
-                // standalone daemon opts into 2GB for write throughput.
+                // 128MB, the standalone daemon's default too since 2026-10-13: a
+                // log file is allocated in full, and a test suite opens many stores.
                 wt_config: Some(wt_config(&cache_size, session_max, sync_on_commit, "128MB")),
                 oplog_async,
                 oplog_nonlogged,

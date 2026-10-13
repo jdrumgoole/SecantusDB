@@ -19171,20 +19171,20 @@ consistent with every insert logging both the document row and a
 full-document oplog entry — the write-amplification hypothesis for the tail,
 now with a number attached.
 
-- [ ] **`log_file_max`: a disk-versus-throughput trade, NOT a free win**
-  (corrected 2026-08-22). The measurement above stands — 2GB retains 19x the
-  disk because WiredTiger reclaims only *completed* log files. But the claim
-  that it costs "under 1% of throughput" was wrong: `tasks/rust-perf-findings.md`
-  records a prior sweep of `file_max` 128MB→2GB measuring **+13-19% at 4-8
-  writers**, which is why the 2GB default was chosen. That sweep ran on Linux
-  under IO-bound conditions; the "<1%" reading here was macOS with a
-  compressible payload, where the log volume — and therefore the rotation cost
-  — was a fraction of the real thing.
-  So the real question is what a deployment should prefer: ~19x the journal
-  footprint, or up to ~19% of write throughput. Probably a **documented flag
-  with a smaller default** rather than a silent 2GB, since a user who does not
-  know the trade exists currently gets the disk-hungry end of it by default.
-  Re-measure on Linux with `--payload random` before deciding.
+- **`log_file_max` is 128MB by default since 2026-10-13** (it was 2GB).
+  Re-measured on Linux with `--payload random`, as the entry this replaces
+  asked: the released 0.5.3-beta.191 on a 16-vCPU droplet, clients on two
+  other droplets, at 2GB / 512MB / 128MB / 32MB. Operations a second at 16
+  writers 22,701 / 22,379 / 22,422 / 22,204, and at 64 writers 16,010 /
+  17,088 / 16,102 / 16,090, all within the spread between trials. A store
+  that has taken no write is the size of one log file, so 2,048 MB against
+  128 MB (`bench/results/mdb-droplet/2026-10-13-log-file-max/`). The
+  earlier sweep that measured 13-19% more throughput from 2GB at 4-8
+  writers had its clients on the server's machine and was not repeated.
+- [ ] **64 writers got less than 16 from `secantusd-rs`** in that run
+  (about 16,100 operations a second against 22,400, half inserts and half
+  updates of 1 KiB documents), with the clients' CPUs under 5% busy. Not
+  looked into.
 - [ ] Re-check whether the full-document oplog entry can be trimmed, now that
   the WAL cost of it is visible (2x logical data).
 

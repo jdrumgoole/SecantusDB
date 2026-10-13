@@ -1,0 +1,350 @@
+[
+ {
+  "pass": 0,
+  "log_file_max": "2GB",
+  "workers": 64,
+  "ops_per_sec": 17161.5,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.7,
+   4.4
+  ],
+  "store_kb_empty": 2097236,
+  "store_kb_preloaded": 2145376,
+  "store_kb_end": 5136988,
+  "log_files_end": 2,
+  "store_kb_peak": 5123684,
+  "restart_s": 17.604386427,
+  "insert": {
+   "p50_ms": 3.152,
+   "p99_ms": 8.64,
+   "p99.9_ms": 13.76,
+   "max_ms": 53.837469
+  },
+  "update": {
+   "p50_ms": 3.792,
+   "p99_ms": 9.792,
+   "p99.9_ms": 15.296,
+   "max_ms": 53.763712
+  }
+ },
+ {
+  "pass": 0,
+  "log_file_max": "512MB",
+  "workers": 64,
+  "ops_per_sec": 17099.5,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.4,
+   4.6
+  ],
+  "store_kb_empty": 524372,
+  "store_kb_preloaded": 560832,
+  "store_kb_end": 2526772,
+  "log_files_end": 3,
+  "store_kb_peak": 2483536,
+  "restart_s": 14.511822964,
+  "insert": {
+   "p50_ms": 3.184,
+   "p99_ms": 8.768,
+   "p99.9_ms": 13.504,
+   "max_ms": 86.475898
+  },
+  "update": {
+   "p50_ms": 3.824,
+   "p99_ms": 9.92,
+   "p99.9_ms": 15.296,
+   "max_ms": 87.960044
+  }
+ },
+ {
+  "pass": 0,
+  "log_file_max": "128MB",
+  "workers": 64,
+  "ops_per_sec": 17097.5,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.7,
+   4.5
+  ],
+  "store_kb_empty": 131156,
+  "store_kb_preloaded": 294016,
+  "store_kb_end": 2406192,
+  "log_files_end": 11,
+  "store_kb_peak": 2237472,
+  "restart_s": 14.139247997,
+  "insert": {
+   "p50_ms": 3.184,
+   "p99_ms": 8.768,
+   "p99.9_ms": 13.76,
+   "max_ms": 32.630852000000004
+  },
+  "update": {
+   "p50_ms": 3.824,
+   "p99_ms": 9.92,
+   "p99.9_ms": 15.168,
+   "max_ms": 33.367165
+  }
+ },
+ {
+  "pass": 0,
+  "log_file_max": "32MB",
+  "workers": 64,
+  "ops_per_sec": 17234.5,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   4.3,
+   4.5
+  ],
+  "store_kb_empty": 32848,
+  "store_kb_preloaded": 188132,
+  "store_kb_end": 2286608,
+  "log_files_end": 41,
+  "store_kb_peak": 2152500,
+  "restart_s": 14.318195218,
+  "insert": {
+   "p50_ms": 3.152,
+   "p99_ms": 8.64,
+   "p99.9_ms": 13.76,
+   "max_ms": 31.996319000000003
+  },
+  "update": {
+   "p50_ms": 3.792,
+   "p99_ms": 9.792,
+   "p99.9_ms": 15.04,
+   "max_ms": 31.521751000000002
+  }
+ },
+ {
+  "pass": 1,
+  "log_file_max": "512MB",
+  "workers": 64,
+  "ops_per_sec": 17087.8,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   4.1,
+   4.4
+  ],
+  "store_kb_empty": 524372,
+  "store_kb_preloaded": 552748,
+  "store_kb_end": 2539044,
+  "log_files_end": 3,
+  "store_kb_peak": 2494896,
+  "restart_s": 15.457727405,
+  "insert": {
+   "p50_ms": 3.184,
+   "p99_ms": 8.768,
+   "p99.9_ms": 13.632,
+   "max_ms": 105.369507
+  },
+  "update": {
+   "p50_ms": 3.824,
+   "p99_ms": 9.92,
+   "p99.9_ms": 15.04,
+   "max_ms": 68.481349
+  }
+ },
+ {
+  "pass": 1,
+  "log_file_max": "128MB",
+  "workers": 64,
+  "ops_per_sec": 16102.2,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.9,
+   4.2
+  ],
+  "store_kb_empty": 131156,
+  "store_kb_preloaded": 286888,
+  "store_kb_end": 2227936,
+  "log_files_end": 10,
+  "store_kb_peak": 2060300,
+  "restart_s": 14.102990513,
+  "insert": {
+   "p50_ms": 3.344,
+   "p99_ms": 9.536,
+   "p99.9_ms": 15.04,
+   "max_ms": 74.495686
+  },
+  "update": {
+   "p50_ms": 4.048,
+   "p99_ms": 10.688,
+   "p99.9_ms": 16.512,
+   "max_ms": 47.588426000000005
+  }
+ },
+ {
+  "pass": 1,
+  "log_file_max": "32MB",
+  "workers": 64,
+  "ops_per_sec": 16089.5,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   4.1,
+   4.1
+  ],
+  "store_kb_empty": 32848,
+  "store_kb_preloaded": 194880,
+  "store_kb_end": 2173784,
+  "log_files_end": 39,
+  "store_kb_peak": 2017348,
+  "restart_s": 14.465154411,
+  "insert": {
+   "p50_ms": 3.344,
+   "p99_ms": 9.408,
+   "p99.9_ms": 14.528,
+   "max_ms": 44.612697
+  },
+  "update": {
+   "p50_ms": 4.048,
+   "p99_ms": 10.688,
+   "p99.9_ms": 16.512,
+   "max_ms": 43.577251
+  }
+ },
+ {
+  "pass": 1,
+  "log_file_max": "2GB",
+  "workers": 64,
+  "ops_per_sec": 16010.099999999999,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   4.1,
+   4.0
+  ],
+  "store_kb_empty": 2097236,
+  "store_kb_preloaded": 2147308,
+  "store_kb_end": 5094396,
+  "log_files_end": 2,
+  "store_kb_peak": 5094396,
+  "restart_s": 17.594951254,
+  "insert": {
+   "p50_ms": 3.376,
+   "p99_ms": 9.536,
+   "p99.9_ms": 14.912,
+   "max_ms": 32.707093
+  },
+  "update": {
+   "p50_ms": 4.08,
+   "p99_ms": 10.688,
+   "p99.9_ms": 16.512,
+   "max_ms": 37.895311
+  }
+ },
+ {
+  "pass": 2,
+  "log_file_max": "128MB",
+  "workers": 64,
+  "ops_per_sec": 15572.2,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   4.2,
+   4.1
+  ],
+  "store_kb_empty": 131152,
+  "store_kb_preloaded": 318428,
+  "store_kb_end": 2073356,
+  "log_files_end": 9,
+  "store_kb_peak": 2037424,
+  "restart_s": 13.665039586,
+  "insert": {
+   "p50_ms": 3.472,
+   "p99_ms": 9.792,
+   "p99.9_ms": 15.04,
+   "max_ms": 34.071605999999996
+  },
+  "update": {
+   "p50_ms": 4.192,
+   "p99_ms": 11.072,
+   "p99.9_ms": 16.768,
+   "max_ms": 35.128969000000005
+  }
+ },
+ {
+  "pass": 2,
+  "log_file_max": "32MB",
+  "workers": 64,
+  "ops_per_sec": 15277.0,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.9,
+   3.9
+  ],
+  "store_kb_empty": 32848,
+  "store_kb_preloaded": 213992,
+  "store_kb_end": 2062576,
+  "log_files_end": 37,
+  "store_kb_peak": 1936824,
+  "restart_s": 14.463190241,
+  "insert": {
+   "p50_ms": 3.536,
+   "p99_ms": 10.048,
+   "p99.9_ms": 16.192,
+   "max_ms": 84.347105
+  },
+  "update": {
+   "p50_ms": 4.256,
+   "p99_ms": 11.328,
+   "p99.9_ms": 17.792,
+   "max_ms": 84.8319
+  }
+ },
+ {
+  "pass": 2,
+  "log_file_max": "2GB",
+  "workers": 64,
+  "ops_per_sec": 15375.1,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.8,
+   3.9
+  ],
+  "store_kb_empty": 2097236,
+  "store_kb_preloaded": 2153504,
+  "store_kb_end": 5053540,
+  "log_files_end": 2,
+  "store_kb_peak": 5053540,
+  "restart_s": 17.363051593,
+  "insert": {
+   "p50_ms": 3.504,
+   "p99_ms": 10.048,
+   "p99.9_ms": 15.68,
+   "max_ms": 35.60121099999999
+  },
+  "update": {
+   "p50_ms": 4.256,
+   "p99_ms": 11.2,
+   "p99.9_ms": 17.28,
+   "max_ms": 34.864199
+  }
+ },
+ {
+  "pass": 2,
+  "log_file_max": "512MB",
+  "workers": 64,
+  "ops_per_sec": 15030.7,
+  "errors": 0,
+  "client_cpu_busy_pct": [
+   3.9,
+   3.9
+  ],
+  "store_kb_empty": 524372,
+  "store_kb_preloaded": 574712,
+  "store_kb_end": 2421432,
+  "log_files_end": 3,
+  "store_kb_peak": 2405020,
+  "restart_s": 15.964177659,
+  "insert": {
+   "p50_ms": 3.568,
+   "p99_ms": 10.304,
+   "p99.9_ms": 15.936,
+   "max_ms": 38.127215
+  },
+  "update": {
+   "p50_ms": 4.32,
+   "p99_ms": 11.584,
+   "p99.9_ms": 17.536,
+   "max_ms": 46.033725
+  }
+ }
+]
