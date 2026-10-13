@@ -1686,18 +1686,27 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A clustered collection's clustering key IS its index: mongod reports a
     // single entry carrying `clustered: true` (with the user's name) in place of
     // the synthesised `_id_`. Mirrors commands.py.
-    if let Some(ci) = storage
+    let options = storage
         .get_collection_options(&ctx.db_name, &coll)
-        .ok()
-        .and_then(|o| o.get_document("clusteredIndex").ok().cloned())
-    {
-        let clustered = doc! {
+        .unwrap_or_default();
+    if let Ok(ci) = options.get_document("clusteredIndex") {
+        let mut clustered = doc! {
             "v": ci.get_i32("v").unwrap_or(2),
             "key": { "_id": 1i32 },
             "name": ci.get_str("name").unwrap_or("_id_").to_string(),
             "unique": true,
-            "clustered": true,
         };
+        // The collection's own expiry is its clustered index's (measured
+        // 8.2.11, 2026-10-13); it was left out.
+        if let Some(seconds) = options.get("expireAfterSeconds") {
+            // As an int where it fits one, which is how mongod lists it.
+            let listed = match crate::util::as_i64(seconds).map(i32::try_from) {
+                Some(Ok(n)) => Bson::Int32(n),
+                _ => seconds.clone(),
+            };
+            clustered.insert("expireAfterSeconds", listed);
+        }
+        clustered.insert("clustered", true);
         let mut rest: Vec<Document> = indexes
             .into_iter()
             .filter(|ix| ix.get_str("name") != Ok("_id_"))

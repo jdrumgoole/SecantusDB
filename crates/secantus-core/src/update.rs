@@ -1758,7 +1758,9 @@ pub fn apply_update_with(
         }
         // A top-level field the update wrote may not start with `$`, whether
         // or not the document already had it. An upsert's new document is not
-        // held to this (measured 8.2.11, 2026-10-12).
+        // held to this (measured 8.2.11, 2026-10-12), and nor is a write that
+        // leaves the field as it was: `{$set: {$c: 2}}` over `$c: 2` is a
+        // no-op mongod accepts (2026-10-13).
         if !is_upsert {
             let wrote = |key: &str| {
                 writes
@@ -1771,6 +1773,12 @@ pub fn apply_update_with(
                     let before = i.checked_sub(1).map(|j| keys[j].as_str());
                     let after = keys.get(i + 1).map(|k| k.as_str());
                     let value = result.get(key.as_str()).unwrap_or(&Bson::Null);
+                    if doc
+                        .get(key.as_str())
+                        .is_some_and(|was| same_bytes(was, value))
+                    {
+                        continue;
+                    }
                     return Err(dollar_field_error(key, value, before, after).exec());
                 }
             }
@@ -1822,7 +1830,9 @@ pub fn apply_update_with(
                 // `_id` as the replacement wrote it: `{_id: 1.0}` over `_id: 1`
                 // is stored as a double (measured 8.2.11, 2026-10-12). A
                 // document `_id` with its fields reordered is another value.
-                Some(given) if addtoset_eq(given, orig)? => given.clone(),
+                // Whatever collation the statement runs under: `"A"` is not
+                // the `_id` `"a"` (measured 8.2.11, 2026-10-13).
+                Some(given) if same_id_value(given, orig) => given.clone(),
                 Some(given) => {
                     return Err(Fallback::mongo(
                         66,
@@ -1857,6 +1867,9 @@ pub fn apply_update_with(
 /// Is this the `_id` the document already has? The same value is enough
 /// (`1.0` for `1`); a document `_id` must keep its field order.
 pub fn same_id_value(a: &Bson, b: &Bson) -> bool {
+    // Whatever collation the statement runs under: `"A"` is not the `_id`
+    // `"a"`, and mongod refuses the replacement (measured 8.2.11).
+    let _plain = crate::collation::activate(None);
     addtoset_eq(a, b).unwrap_or(false)
 }
 

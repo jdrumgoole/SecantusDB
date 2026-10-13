@@ -167,6 +167,32 @@ fn raw_too_deep(value: bson::RawBsonRef<'_>, above: usize) -> bool {
     }
 }
 
+/// What `insert` refuses about a document before it reaches storage: an
+/// `_id` of a type mongod cannot hold, a `$`-prefixed field inside an `_id`
+/// document, nesting past the limit. For the stages that insert (`$out`,
+/// `$merge`), which do not go through the command.
+pub(crate) fn insert_document_error(d: &Document) -> Option<(i32, String)> {
+    let text = |e: Document| {
+        (
+            e.get_i32("code").unwrap_or(2),
+            e.get_str("errmsg").unwrap_or_default().to_string(),
+        )
+    };
+    match d.get("_id") {
+        Some(Bson::Array(_)) => return Some(text(id_type_error(0, "array"))),
+        Some(Bson::RegularExpression(_)) => return Some(text(id_type_error(0, "regex"))),
+        Some(Bson::Document(id)) => {
+            if let Some(field) = id_dollar_field(id) {
+                return Some(text(id_dollar_error(0, &field)));
+            }
+        }
+        _ => {}
+    }
+    d.values()
+        .any(|v| too_deep(v, 1))
+        .then(|| text(too_deep_error(0)))
+}
+
 fn too_deep_error(index: usize) -> Document {
     doc! {
         "index": index as i32,
@@ -1459,6 +1485,16 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
 }
 
 pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    update_in(doc, &ctx.db_name, ctx.storage()?)
+}
+
+/// [`update`] against a named database: `$merge` writes its documents with
+/// it, as mongod writes them with the update command.
+pub(crate) fn update_in(
+    doc: &Document,
+    db_name: &str,
+    storage: &dyn crate::Storage,
+) -> HandlerResult {
     argtypes::require_object(doc, "let", "update.let")?;
     argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
     if let Some(problem) = update_command_problem(doc) {
@@ -1466,10 +1502,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     empty_batch(doc, "updates")?;
     let coll = coll_arg(doc, "update")?;
-    if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
+    if let Some(e) = crate::admin::invalid_write_namespace(db_name, &coll) {
         return Ok(e.into_reply());
     }
-    let storage = ctx.storage()?;
     let updates = array_field(doc, "updates");
     // NOTE: an unresolvable `hint` is a PER-STATEMENT writeError, not a
     // command-level failure. mongod answers `ok: 1` with
@@ -1494,7 +1529,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // is read once here (no storage lock held) and threaded into the storage
     // update so it can check the rewritten doc before writing.
     let opts = storage
-        .get_collection_options(&ctx.db_name, &coll)
+        .get_collection_options(db_name, &coll)
         .map_err(command_error)?;
     let validator = if bool_field(doc, "bypassDocumentValidation", false) {
         None
@@ -1569,8 +1604,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         // An unresolvable `hint` fails THIS statement, not the batch (see the
         // note above the loop).
-        if let Err(e) =
-            crate::util::validate_write_hint(storage, &ctx.db_name, &coll, spec.get("hint"))
+        if let Err(e) = crate::util::validate_write_hint(storage, db_name, &coll, spec.get("hint"))
         {
             write_errors.push(Bson::Document(doc! {
                 "index": index as i32,
@@ -1648,7 +1682,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
         // `collation` is per-update-statement (inside each `updates[]` entry),
         // not a command-level field — collation-aware filter matching (COLLSCAN).
-        let collation = match crate::util::effective_collation(storage, &ctx.db_name, &coll, spec) {
+        let collation = match crate::util::effective_collation(storage, db_name, &coll, spec) {
             Ok(c) => c,
             Err(e) => {
                 write_errors.push(Bson::Document(doc! {
@@ -1668,9 +1702,9 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // Resolve WHICH document sorts first, then pin the update to it.
             // Nothing matched -> leave the filter alone, so an upsert still
             // upserts.
-            let sorted = ctx.storage().and_then(|st| {
+            let sorted = Ok::<_, CommandError>(storage).and_then(|st| {
                 st.find_collated(
-                    &ctx.db_name,
+                    db_name,
                     &coll,
                     &q,
                     Some(sort),
@@ -1762,10 +1796,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // alone. It used to create it (measured 8.2.11, 2026-10-12: the
         // collection was then listed).
         // The statement is still read first: a malformed one is refused.
-        let absent = !upsert
-            && !storage
-                .collection_exists(&ctx.db_name, &coll)
-                .unwrap_or(true);
+        let absent = !upsert && !storage.collection_exists(db_name, &coll).unwrap_or(true);
 
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
@@ -1833,7 +1864,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
             storage.update_matching_pipeline(
-                &ctx.db_name,
+                db_name,
                 &coll,
                 &q,
                 stages,
@@ -1882,7 +1913,7 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
             storage.update_matching_array_filters(
-                &ctx.db_name,
+                db_name,
                 &coll,
                 &q,
                 &u,
@@ -1913,8 +1944,27 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         new.insert("_id", bson::oid::ObjectId::new());
                     }
                     let id = new.get("_id").cloned().unwrap_or(Bson::Null);
+                    // The supplied document is inserted as it stands, and is
+                    // held to the validator like any other. It was not.
+                    let refused = validator.as_ref().filter(|v| {
+                        !secantus_core::query::matches(&new, v, &Document::new(), None)
+                            .unwrap_or(true)
+                    });
+                    if let Some(v) = refused {
+                        write_errors.push(Bson::Document(doc! {
+                            "index": index as i32,
+                            "code": 121,
+                            "errmsg": "Plan executor error during update :: caused by :: \
+                                       Document failed validation",
+                            "errInfo": validation_error_info(v, &new),
+                        }));
+                        if ordered {
+                            break;
+                        }
+                        continue;
+                    }
                     let (_, mut errors) = storage
-                        .insert(&ctx.db_name, &coll, vec![encode_doc(&new)?], true)
+                        .insert(db_name, &coll, vec![encode_doc(&new)?], true)
                         .map_err(command_error)?;
                     if let Some(mut err) = errors.pop() {
                         err.insert("index", index as i32);

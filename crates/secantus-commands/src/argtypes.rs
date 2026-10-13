@@ -1596,7 +1596,7 @@ fn arity_problem(op: &str, arg: &Bson) -> Option<(i32, String)> {
     ))
 }
 
-fn expression_problem(expr: &Bson, bound: &[String]) -> Option<(i32, String)> {
+pub(crate) fn expression_problem(expr: &Bson, bound: &[String]) -> Option<(i32, String)> {
     match expr {
         Bson::String(s) => {
             let name = s.strip_prefix("$$")?;
@@ -3578,7 +3578,9 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
         _ => return None,
     };
     for field in d.keys() {
-        if known.contains(&field.as_str()) {
+        // `$merge` reads its fields in order and names an unknown one when
+        // it reaches it (`aggregate::merge_spec`).
+        if known.contains(&field.as_str()) || name == "$merge" {
             continue;
         }
         return Some(match name {

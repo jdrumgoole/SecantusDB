@@ -283,6 +283,26 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
         if s == "$$REMOVE" {
             return Ok(Bson::Undefined);
         }
+        // A path into a variable that leads nowhere is missing too:
+        // `{$set: {m: "$$new.a"}}` REMOVES `m` when `new` has no `a`
+        // (measured 8.2.11, 2026-10-13). It wrote a null.
+        if let Some((base, rest)) = s.strip_prefix("$$").and_then(|v| v.split_once('.')) {
+            let root = match ctx.vars.get(base) {
+                Some(v) => Some(v.clone()),
+                None if base == "ROOT" || base == "CURRENT" => {
+                    Some(Bson::Document(ctx.doc.clone()))
+                }
+                None => None,
+            };
+            match root {
+                Some(Bson::Document(d)) if paths::get_path(&d, rest).is_none() => {
+                    return Ok(Bson::Undefined)
+                }
+                Some(Bson::Document(_) | Bson::Array(_)) | None => {}
+                // A scalar has no fields.
+                Some(_) => return Ok(Bson::Undefined),
+            }
+        }
     }
     // The operators that RETURN one of their sub-expressions propagate its
     // missing-ness; the ones that COMPUTE a value collapse it to null.
@@ -1160,6 +1180,10 @@ pub fn first_unknown_expr_operator(expr: &Bson) -> Option<String> {
             if d.len() == 1 {
                 let (key, val) = d.iter().next().unwrap();
                 if key.starts_with('$') {
+                    // A literal is a value, whatever its fields are named.
+                    if key == "$literal" || key == "$const" {
+                        return None;
+                    }
                     if !KNOWN_EXPR_OPS.contains(&key.as_str()) {
                         return Some(key.clone());
                     }

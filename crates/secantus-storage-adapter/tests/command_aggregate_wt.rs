@@ -477,7 +477,7 @@ fn out_enforces_target_validator_unless_bypassed() {
 }
 
 #[test]
-fn merge_deep_merges_matched_and_inserts_unmatched() {
+fn merge_sets_each_field_whole_and_inserts_unmatched() {
     with_wt(|c| {
         seed(
             c,
@@ -495,10 +495,10 @@ fn merge_deep_merges_matched_and_inserts_unmatched() {
         assert_eq!(docs_of(&reply).len(), 0);
         let dst = read_all(c, "dst");
         let merged = dst.iter().find(|d| d.get_i32("_id") == Ok(1)).unwrap();
-        // deep merge: existing a.y kept, new a.x added, keep retained, new added.
-        let a = merged.get_document("a").unwrap();
-        assert_eq!(a.get_i32("x").unwrap(), 1);
-        assert_eq!(a.get_i32("y").unwrap(), 2);
+        // Each top-level field is set whole, as mongod's `$set` of the
+        // document does (8.2.11): `a` is the new `a`, not the two merged.
+        // This asserted the opposite, from the Python server's behaviour.
+        assert_eq!(merged.get_document("a").unwrap(), &doc! {"x": 1});
         assert_eq!(merged.get_str("keep").unwrap(), "g");
         assert_eq!(merged.get_str("new").unwrap(), "f");
         assert!(
