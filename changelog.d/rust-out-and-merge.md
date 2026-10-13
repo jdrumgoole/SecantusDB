@@ -9,7 +9,7 @@ stores what mongod stores.
 
 Found by sending 376 `$out` and `$merge` pipelines to the server and to
 mongod 8.2.11 and comparing each reply and what the source and target held
-afterwards. 191 of the first 327 differed; 5 of 376 do now
+afterwards. 191 of the first 327 differed; 4 of 376 do now
 (`tasks/backlog.md` 7.079).
 
 #### Fixed

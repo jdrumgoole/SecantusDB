@@ -1699,7 +1699,12 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // The collection's own expiry is its clustered index's (measured
         // 8.2.11, 2026-10-13); it was left out.
         if let Some(seconds) = options.get("expireAfterSeconds") {
-            clustered.insert("expireAfterSeconds", seconds.clone());
+            // As an int where it fits one, which is how mongod lists it.
+            let listed = match crate::util::as_i64(seconds).map(i32::try_from) {
+                Some(Ok(n)) => Bson::Int32(n),
+                _ => seconds.clone(),
+            };
+            clustered.insert("expireAfterSeconds", listed);
         }
         clustered.insert("clustered", true);
         let mut rest: Vec<Document> = indexes

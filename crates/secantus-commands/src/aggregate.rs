@@ -2733,10 +2733,10 @@ fn apply_merge(
         .get_collection_options(&merge.db, &merge.coll)
         .is_ok_and(|o| o.contains_key("timeseries"))
     {
-        return Err(crate::timeseries::is_a_view(&format!(
+        return Err(during(crate::timeseries::is_a_view(&format!(
             "{}.{}",
             merge.db, merge.coll
-        )));
+        ))));
     }
     // mongod requires a unique index covering a non-`_id` `on` so the match is
     // guaranteed to hit at most one target doc.

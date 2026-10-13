@@ -9113,7 +9113,7 @@ server turned out to be the Java gauge's own parallelism).
 `tools/probes/out_and_merge.py`, mongod 8.2.11: 16 scenarios, 376 replies
 over a raw connection. Each case compares the reply AND what the source
 and the target hold afterwards: documents in order, indexes, options. The
-Rust server differed on 191 of the first 327 replies and differs on 5 of
+Rust server differed on 191 of the first 327 replies and differs on 4 of
 376. Pinned by `crates/secantus-storage-adapter/tests/out_and_merge_wt.rs`.
 
 `$merge` is now written with the `update` command, one statement a
@@ -9150,7 +9150,7 @@ Found on the way, in code `$merge` does not own:
 - A duplicate key reported at the command level had no `keyPattern` or
   `keyValue`.
 
-Still different, all 5:
+Still different, all 4:
 
 - `cursor: {batchSize: 0}` (2): mongod does not run the stage until the
   first `getMore`. The lazy-cursor decision.
@@ -9158,12 +9158,16 @@ Still different, all 5:
   already created the target.
 - The collation key in a duplicate-key message under a collation (1):
   ICU's bytes.
-- `$out` into a collection with a `2dsphere` index (1): the probe's setup
-  differs; not looked at.
 
-Not measured: the order of several `on` fields in a document `$merge`
-inserts (the upsert seed order of 7.077); `$merge` into another database;
-`$out` and `$merge` in a transaction.
+A fifth comes and goes: with two `on` fields, one of them missing from
+the source document, mongod inserts `{_id, a: null, k}` on one run and
+`{_id, k, a: null}` on another. This server always stores them sorted.
+It is the upsert seed order of 7.077.
+
+`tools/probes/collation.py` went from 5 to 4 with this change.
+
+Not measured: `$merge` into another database; `$out` and `$merge` in a
+transaction.
 
 ### 7.078 `insert`, `delete`, `count` and `distinct` -- 2026-10-12
 
