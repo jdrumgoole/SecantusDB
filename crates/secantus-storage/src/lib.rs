@@ -2607,13 +2607,15 @@ fn named(why: String, names: bool, doc: &Document) -> String {
 fn geo_key_problem(doc: &Document, descs: &[IndexDesc]) -> Option<(i32, String)> {
     for desc in descs {
         if let Some(gs) = &desc.geo_sphere {
-            let why = secantus_core::geoshape::sphere_key_problem(&gs.field, get_path(doc, &gs.field));
+            let why =
+                secantus_core::geoshape::sphere_key_problem(&gs.field, get_path(doc, &gs.field));
             if let Some(why) = why {
                 return Some((16755, no_geo_keys(doc, &why)));
             }
         }
         if let Some(g) = &desc.geo_2d {
-            let found = secantus_core::geoshape::flat_key_problem(get_path(doc, &g.field), g.lo, g.hi);
+            let found =
+                secantus_core::geoshape::flat_key_problem(get_path(doc, &g.field), g.lo, g.hi);
             if let Some((code, why, names)) = found {
                 return Some((code, named(why, names, doc)));
             }
@@ -2629,8 +2631,13 @@ fn scan_stopped(scanned: usize, code: i32, why: &str) -> StorageError {
         code,
         errmsg: format!(
             "collection scan stopped. totalRecords: {scanned}; durationMillis: 0ms; phase: \
-             collection scan; collectionScanPosition: RecordId({scanned}); readSource: \
-             kMajorityCommitted :: caused by :: {why}"
+             collection scan; collectionScanPosition: {}; readSource: kMajorityCommitted :: \
+             caused by :: {why}",
+            if scanned == 0 {
+                "(None)".to_string()
+            } else {
+                format!("RecordId({scanned})")
+            }
         ),
         exec: false,
     }
@@ -10949,8 +10956,8 @@ impl Storage {
             // multikey so the regular (numeric) pickers skip it.
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-            let mut scanned = 0usize;
-            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+            let rows = self.scan_docs(session, db, coll)?;
+            for (scanned, (rid, _id_k, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
                 // collection can outlive its budget here even after the read
@@ -10966,7 +10973,6 @@ impl Storage {
                 ) {
                     return Err(scan_stopped(scanned, code, &named(why, names, &d)));
                 }
-                scanned += 1;
                 for kb in get_path(&d, &geo.field)
                     .map(|v| geo.cell_kbs(v))
                     .unwrap_or_default()
@@ -10988,8 +10994,8 @@ impl Storage {
                 .entry("2dsphereIndexVersion".to_string())
                 .or_insert(Bson::Int32(3));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-            let mut scanned = 0usize;
-            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+            let rows = self.scan_docs(session, db, coll)?;
+            for (scanned, (rid, _id_k, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
                 // collection can outlive its budget here even after the read
@@ -11003,7 +11009,6 @@ impl Storage {
                 {
                     return Err(scan_stopped(scanned, 16755, &no_geo_keys(&d, &why)));
                 }
-                scanned += 1;
                 if let Some(v) = get_path(&d, &gs.field) {
                     for kb in gs.cell_kbs(v) {
                         out.push((kb, rid));

@@ -286,6 +286,19 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // `$geoNear` reads the index itself: nothing may come before it.
+    if pipeline
+        .iter()
+        .skip(1)
+        .any(|stage| stage_name(stage) == "$geoNear")
+    {
+        return Err(CommandError::new(
+            40603,
+            "Location40603",
+            "$geoNear was not the first stage in the pipeline after optimization. Is \
+             optimization disabled or inhibited?",
+        ));
+    }
     if let Some(problem) = nested_write_stage(&pipeline) {
         return Ok(problem.into_reply());
     }
@@ -436,7 +449,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // in the order mongod's plan returns them is what puts its
                 // ties in mongod's order. mongod moves a `$match` that follows
                 // the `$sort` ahead of it, so that filter is read here too.
-                if crate::near::find_near(&filter).map_err(command_error)?.is_some() {
+                if crate::near::find_near(&filter)
+                    .map_err(command_error)?
+                    .is_some()
+                {
                     return Err(CommandError::new(
                         5626500,
                         "Location5626500",
@@ -1735,6 +1751,13 @@ fn apply_facet(
                         "$facet is not allowed to be used within a $facet stage",
                     ));
                 }
+                Bson::Document(d) if d.contains_key("$geoNear") => {
+                    return Err(CommandError::new(
+                        40600,
+                        "Location40600",
+                        "$geoNear is not allowed to be used within a $facet stage",
+                    ));
+                }
                 Bson::Document(d) if !d.is_empty() => {}
                 _ => {
                     return Err(CommandError::new(
@@ -2090,10 +2113,10 @@ fn geo_near_index_filter(
     storage: &dyn crate::storage::Storage,
 ) -> Option<Document> {
     const EARTH_RADIUS_METERS: f64 = 6_378_100.0; // matches secantus_core::geo
-    // The stage measures a line or a polygon by its nearest point, and a
-    // `$centerSphere` holds one only when every vertex is inside: the
-    // candidates would leave out documents the stage returns. Every document
-    // is read until there is a candidate shape that covers them.
+                                                  // The stage measures a line or a polygon by its nearest point, and a
+                                                  // `$centerSphere` holds one only when every vertex is inside: the
+                                                  // candidates would leave out documents the stage returns. Every document
+                                                  // is read until there is a candidate shape that covers them.
     if spec.as_document().is_some() {
         return None;
     }
@@ -2171,6 +2194,8 @@ struct GeoNearStage<'a> {
     /// Distances are given and returned in radians: a legacy point on the
     /// sphere.
     radians: bool,
+    /// The stage said `spherical: true`.
+    asked_spherical: bool,
     distance_field: Option<&'a str>,
     include_locs: Option<&'a str>,
     key: Option<&'a str>,
@@ -2180,7 +2205,8 @@ struct GeoNearStage<'a> {
 
 fn geo_near_stage(spec: &Document) -> Result<GeoNearStage<'_>, CommandError> {
     use secantus_core::geoshape::{Near, EARTH_RADIUS_METERS};
-    let fail = |code: i32, text: String| CommandError::new(code, crate::util::error_code_name(code), text);
+    let fail =
+        |code: i32, text: String| CommandError::new(code, crate::util::error_code_name(code), text);
     let number = |v: &Bson, wrong: &str, negative: &str| -> Result<f64, CommandError> {
         match bson_f64(v) {
             None => Err(fail(14, wrong.to_string())),
@@ -2251,8 +2277,8 @@ fn geo_near_stage(spec: &Document) -> Result<GeoNearStage<'_>, CommandError> {
                 )?
             }
             "spherical" => {
-                spherical = !matches!(v, Bson::Boolean(false) | Bson::Null)
-                    && bson_f64(v) != Some(0.0)
+                spherical =
+                    !matches!(v, Bson::Boolean(false) | Bson::Null) && bson_f64(v) != Some(0.0)
             }
             "query" => match v {
                 Bson::Document(q) => query = Some(q),
@@ -2298,14 +2324,20 @@ fn geo_near_stage(spec: &Document) -> Result<GeoNearStage<'_>, CommandError> {
             other => return Err(fail(2, format!("Unknown argument to $geoNear: {other}"))),
         }
     }
-    let near = near.ok_or_else(|| fail(5860400, "$geoNear requires a 'near' argument".to_string()))?;
+    let near =
+        near.ok_or_else(|| fail(5860400, "$geoNear requires a 'near' argument".to_string()))?;
     // A GeoJSON point is on the sphere whatever `spherical` says.
     let geojson = matches!(near, Bson::Document(d) if d.contains_key("type"));
     let centre = if geojson {
         let d = near.as_document().expect("a GeoJSON object");
         match secantus_core::geoshape::geojson(d) {
             Ok(secantus_core::geoshape::Geom::Point(p)) => p,
-            _ => return Err(fail(2, "invalid argument in geo near query: type".to_string())),
+            _ => {
+                return Err(fail(
+                    2,
+                    "invalid argument in geo near query: type".to_string(),
+                ))
+            }
         }
     } else {
         let parts: Vec<&Bson> = match near {
@@ -2337,6 +2369,7 @@ fn geo_near_stage(spec: &Document) -> Result<GeoNearStage<'_>, CommandError> {
             max: metres(max),
         },
         radians,
+        asked_spherical: spherical,
         distance_field,
         include_locs,
         key,
@@ -2400,10 +2433,16 @@ fn apply_geo_near(
             291,
             "NoQueryExecutionPlans",
             format!(
-                "error processing query: ns={db}.{coll}Tree: GEONEAR  field={key} maxdist={max} \
-                 isNearSphere={}\nSort: {{}}\nProj: {{}}\nCollation: {{ locale: \"simple\" }}\n \
-                 planner returned error :: caused by :: unable to find index for $geoNear query",
-                i32::from(stage.radians)
+                "error processing query: ns={db}.{coll}Tree: {}\nSort: {{}}\nProj: {{}}\nCollation: \
+                 {{ locale: \"simple\" }}\n planner returned error :: caused by :: unable to find \
+                 index for $geoNear query",
+                crate::near::tree(
+                    stage.query,
+                    &format!(
+                        "GEONEAR  field={key} maxdist={max} isNearSphere={}",
+                        i32::from(stage.asked_spherical)
+                    )
+                )
             ),
         ));
     }
@@ -2427,7 +2466,11 @@ fn apply_geo_near(
         let Some(value) = secantus_core::get_path(&doc, &key).cloned() else {
             continue;
         };
-        let Some(d) = stage.near.distance(&value).filter(|d| stage.near.admits(*d)) else {
+        let Some(d) = stage
+            .near
+            .distance(&value)
+            .filter(|d| stage.near.admits(*d))
+        else {
             continue;
         };
         let shaped =

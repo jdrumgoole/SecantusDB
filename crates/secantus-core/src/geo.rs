@@ -20,14 +20,10 @@
 
 use crate::query::Fallback;
 use bson::{Bson, Document};
-use geo::{BoundingRect, Coord, CoordsIter, Geometry, LineString, MultiLineString, MultiPoint};
-use geo::{MultiPolygon, Point, Polygon, Relate};
+use geo::{BoundingRect, Coord, Geometry, LineString, MultiLineString, MultiPoint};
+use geo::{MultiPolygon, Point, Polygon};
 
 type R = Result<bool, Fallback>;
-
-/// Mean Earth radius in metres — mongod's `$centerSphere` / `$nearSphere`
-/// constant. Mirrors `geo.EARTH_RADIUS_METERS`.
-const EARTH_RADIUS_METERS: f64 = 6_378_100.0;
 
 /// A parsed query geometry.
 enum QGeom {
@@ -102,28 +98,6 @@ fn geojson_to_geometry(d: &Document) -> Option<Geometry<f64>> {
         )),
         _ => return None,
     })
-}
-
-/// Coerce a doc field value into a geometry, or `None` if it isn't one (treated
-/// as "no match", mirroring `parse_doc_geometry` returning `None`). Mirrors
-/// `geo.parse_doc_geometry`.
-fn parse_doc_geometry(v: &Bson) -> Option<Geometry<f64>> {
-    match v {
-        Bson::Document(d) => {
-            if d.get_str("type").is_ok() {
-                geojson_to_geometry(d)
-            } else {
-                for (kx, ky) in [("x", "y"), ("lng", "lat"), ("longitude", "latitude")] {
-                    if let (Some(x), Some(y)) = (d.get(kx).and_then(num), d.get(ky).and_then(num)) {
-                        return Some(Geometry::Point(Point::new(x, y)));
-                    }
-                }
-                None
-            }
-        }
-        Bson::Array(_) => pair(v).map(|c| Geometry::Point(Point::from(c))),
-        _ => None,
-    }
 }
 
 /// Build the query geometry, or `None` to defer to Python (`$center`, malformed,
@@ -218,37 +192,6 @@ fn parse_center_sphere(b: &Bson) -> Option<QGeom> {
     })
 }
 
-/// Haversine angle (radians) between two `[lng, lat]` points. Mirrors
-/// `geo._great_circle_radians`.
-fn haversine(lng_a: f64, lat_a: f64, lng_b: f64, lat_b: f64) -> f64 {
-    let phi_a = lat_a.to_radians();
-    let phi_b = lat_b.to_radians();
-    let d_phi = phi_b - phi_a;
-    let d_lambda = (lng_b - lng_a).to_radians();
-    let h =
-        (d_phi / 2.0).sin().powi(2) + phi_a.cos() * phi_b.cos() * (d_lambda / 2.0).sin().powi(2);
-    2.0 * h.clamp(0.0, 1.0).sqrt().asin()
-}
-
-fn within(doc: &Geometry<f64>, q: &QGeom) -> bool {
-    match q {
-        // COVERED BY, not WITHIN: DE-9IM "within" leaves out a geometry that
-        // lies wholly on the boundary, so a point on a `$box` edge or corner
-        // was not found. mongod 8.2.11 includes it for `$box`, `$polygon` and
-        // a `$geometry` polygon alike, with or without an index.
-        QGeom::Planar(g) => doc.relate(g).is_coveredby(),
-        // Every coordinate of the doc geometry must lie inside the cap (a Point
-        // is one coord), matching `geo.geo_within`'s vertex test.
-        QGeom::Sphere { lng, lat, rad } => doc
-            .coords_iter()
-            .all(|c| haversine(*lng, *lat, c.x, c.y) <= *rad),
-        // Exact planar disk: every coord within radius (squared, no sqrt).
-        QGeom::Disk { cx, cy, r } => doc
-            .coords_iter()
-            .all(|c| (c.x - cx).powi(2) + (c.y - cy).powi(2) <= r * r),
-    }
-}
-
 /// `$geoWithin` (and its old name `$within`): whether some value of the
 /// field is a geometry inside the query's shape. The shape is parsed, and
 /// refused as mongod refuses it, whether or not there is a value to test.
@@ -270,140 +213,6 @@ pub fn op_geo_intersects(values: &[crate::query::Cand], arg: &Bson) -> R {
         .filter_map(|c| c.value)
         .flat_map(crate::geoshape::stored)
         .any(|g| crate::geoshape::is_intersecting(&g, &query)))
-}
-
-/// `(center, max, min, spherical, legacy)` for a `$near` arg, or `Fallback` on a
-/// shape Python rejects / we don't reproduce. Mirrors `query._parse_near_spec`
-/// for the non-sibling forms: the legacy `[x,y]`/`[x,y,max]` list and the
-/// GeoJSON `{$geometry: Point, $maxDistance, $minDistance}` doc. (The legacy
-/// *sibling* `$maxDistance` form falls back automatically — `$maxDistance` is a
-/// separate, unknown operator in the condition doc.)
-#[allow(clippy::type_complexity)]
-fn parse_near_spec(
-    arg: &Bson,
-    sibling_max: Option<&Bson>,
-    sibling_min: Option<&Bson>,
-    default_spherical: bool,
-) -> Result<((f64, f64), Option<f64>, Option<f64>, bool, bool), Fallback> {
-    // An ABSENT key means "unbounded"; an explicit `null` is INVALID and must
-    // not be conflated with it. Probed on mongod 8.3.4: `{$near: {$geometry: ...,
-    // $minDistance: null}}` is rejected with "$minDistance must be a number"
-    // (code 2). Negative bounds are rejected too ("must be non-negative").
-    //
-    // This block previously accepted `Bson::Null` as absent, justified by a
-    // comment claiming the Java driver "sends `$minDistance: null` when the
-    // caller passes no minimum". That claim is FALSE -- the driver omits the
-    // field entirely, in both serialisation paths:
-    //
-    //     Filters.java createNearFilterDocument:  if (minDistance != null) { ... }
-    //     Filters.java GeometryOperatorFilter:    if (minDistance != null) { ... }
-    //
-    // So null-tolerance was never needed for the Java gauge, and it made both
-    // servers silently run an unbounded query where mongod errors. Mirrors
-    // `query._opt_number`.
-    let opt_number = |b: Option<&Bson>| -> Result<Option<f64>, Fallback> {
-        match b {
-            None => Ok(None),
-            // Null / non-number / negative are all errors mongod names
-            // precisely; defer so the Python engine raises the exact message.
-            Some(Bson::Null) => Err(Fallback::Defer),
-            Some(v) => match num(v) {
-                Some(n) if n >= 0.0 => Ok(Some(n)),
-                _ => Err(Fallback::Defer),
-            },
-        }
-    };
-    match arg {
-        Bson::Document(d) => {
-            let geom = d.get_document("$geometry").map_err(|_| Fallback::Defer)?;
-            if geom.get_str("type") != Ok("Point") {
-                return Err(Fallback::Defer);
-            }
-            let c = pair(geom.get("coordinates").ok_or(Fallback::Defer)?).ok_or(Fallback::Defer)?;
-            Ok((
-                (c.x, c.y),
-                opt_number(d.get("$maxDistance"))?,
-                opt_number(d.get("$minDistance"))?,
-                true,  // GeoJSON form is spherical
-                false, // distances already in metres
-            ))
-        }
-        Bson::Array(a) if a.len() == 2 || a.len() == 3 => {
-            let cx = num(&a[0]).ok_or(Fallback::Defer)?;
-            let cy = num(&a[1]).ok_or(Fallback::Defer)?;
-            let mut max_d = if a.len() == 3 {
-                Some(num(&a[2]).ok_or(Fallback::Defer)?)
-            } else {
-                None
-            };
-            // Legacy mongod 2d shape lifts $maxDistance / $minDistance to the
-            // parent condition level — the list arg can't carry them itself, so
-            // overlay from the siblings ({geo: {$near: [x, y], $maxDistance: r}},
-            // what Java's Filters.near builds). Mirrors `query._parse_near_spec`.
-            if let Some(m) = opt_number(sibling_max)? {
-                max_d = Some(m);
-            }
-            let min_d = opt_number(sibling_min)?;
-            Ok(((cx, cy), max_d, min_d, default_spherical, true))
-        }
-        _ => Err(Fallback::Defer),
-    }
-}
-
-/// `$near` / `$nearSphere` *matching* (not ranking): a doc matches if a
-/// point-valued geometry lies within `[$minDistance, $maxDistance]` of the
-/// centre. Sort-by-distance is the command layer's job. Mirrors
-/// `query._op_geo_near`.
-pub fn op_geo_near(
-    values: &[crate::query::Cand],
-    arg: &Bson,
-    sibling_max: Option<&Bson>,
-    sibling_min: Option<&Bson>,
-    default_spherical: bool,
-) -> R {
-    let (center, mut max_d, mut min_d, spherical, legacy) =
-        parse_near_spec(arg, sibling_max, sibling_min, default_spherical)?;
-    // Legacy + spherical: the bound is radians on the unit sphere; convert to
-    // the metres that `distance(spherical=true)` returns.
-    if legacy && spherical {
-        max_d = max_d.map(|m| m * EARTH_RADIUS_METERS);
-        min_d = min_d.map(|m| m * EARTH_RADIUS_METERS);
-    }
-    for v in values.iter().filter_map(|c| c.value) {
-        // $near is restricted to point geometries (mirroring geo.distance,
-        // which returns None for non-points -> skipped).
-        let p = match parse_doc_geometry(v) {
-            Some(Geometry::Point(pt)) => (pt.x(), pt.y()),
-            _ => continue,
-        };
-        let d = if spherical {
-            haversine(center.0, center.1, p.0, p.1) * EARTH_RADIUS_METERS
-        } else {
-            ((center.0 - p.0).powi(2) + (center.1 - p.1).powi(2)).sqrt()
-        };
-        if max_d.is_some_and(|mx| d > mx) || min_d.is_some_and(|mn| d < mn) {
-            continue;
-        }
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-/// Distance from `near` (lng, lat) to the point geometry in `value`, for
-/// `$geoNear`'s `distanceField`. Metres (great-circle / haversine) when
-/// `spherical`, planar units otherwise. `None` when `value` isn't a point
-/// geometry (GeoJSON `Point` or legacy `[x, y]`). Mirrors `geo.distance` for the
-/// point case. Sort-by-distance is the command layer's job.
-pub fn point_distance(near: (f64, f64), value: &Bson, spherical: bool) -> Option<f64> {
-    let p = match parse_doc_geometry(value) {
-        Some(Geometry::Point(pt)) => (pt.x(), pt.y()),
-        _ => return None,
-    };
-    Some(if spherical {
-        haversine(near.0, near.1, p.0, p.1) * EARTH_RADIUS_METERS
-    } else {
-        ((near.0 - p.0).powi(2) + (near.1 - p.1).powi(2)).sqrt()
-    })
 }
 
 // --- 2d geohash index support (geo-2) -------------------------------------
@@ -466,24 +275,6 @@ pub fn encode_cell(cell: u64) -> [u8; 8] {
     cell.to_be_bytes()
 }
 
-/// The `(x, y)` of a point-like doc field value (GeoJSON Point, legacy `[x,y]`,
-/// `{x,y}`/`{lng,lat}`), or `None` — used to write `2d` index entries (mongod's
-/// `2d` index is point-only).
-pub fn doc_point(v: &Bson) -> Option<(f64, f64)> {
-    match parse_doc_geometry(v) {
-        Some(Geometry::Point(p)) => Some((p.x(), p.y())),
-        _ => None,
-    }
-}
-
-/// The bounding box `(min_x, min_y, max_x, max_y)` of any doc geometry, or
-/// `None` if the value isn't a geometry — used to S2-cover non-point docs for a
-/// `2dsphere` index (mongod / s2sphere cover shapes via their bounding rect).
-pub fn doc_bbox(v: &Bson) -> Option<(f64, f64, f64, f64)> {
-    let r = parse_doc_geometry(v)?.bounding_rect()?;
-    Some((r.min().x, r.min().y, r.max().x, r.max().y))
-}
-
 /// The bounding box `(min_x, min_y, max_x, max_y)` of a `$geoWithin` query
 /// geometry, for the `2d` covering range. `None` for shapes the post-filter
 /// can't evaluate.
@@ -510,373 +301,61 @@ mod tests {
         op_geo_within(
             &[crate::query::Cand::plain(Some(&field))],
             &Bson::Document(q),
+            "$geoWithin",
         )
     }
+
     fn xy(x: f64, y: f64) -> Bson {
         Bson::Array(vec![Bson::Double(x), Bson::Double(y)])
     }
 
-    /// The Java driver sends `$minDistance: null` when `Filters.nearSphere` is
-    /// An explicit null is INVALID, not absent. mongod rejects it ("$minDistance
-    /// must be a number"), so the engine defers and the Python side names the
-    /// error. These tests previously asserted the opposite, justified by a claim
-    /// that the Java driver sends `$minDistance: null` when called with no
-    /// minimum -- the driver source disproves it, omitting the field entirely
-    /// (`Filters.java`: `if (minDistance != null) { ... }`, both paths).
     #[test]
-    fn a_null_distance_bound_is_deferred() {
-        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
-        let near = doc! {
-            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
-            "$maxDistance": 10000.0,
-            "$minDistance": Bson::Null,
-        };
-        assert!(
-            op_geo_near(
-                &[crate::query::Cand::plain(Some(&point))],
-                &Bson::Document(near),
-                None,
-                None,
-                true
-            )
-            .is_err(),
-            "a null $minDistance is invalid and must defer, not run unbounded"
-        );
+    fn a_flat_shape_holds_a_point_on_its_edge() {
+        let b = doc! {"$box": [[0.0, 0.0], [3.0, 3.0]]};
+        assert_eq!(within(xy(3.0, 3.0), b.clone()), Ok(true));
+        assert_eq!(within(xy(4.0, 1.0), b), Ok(false));
+        let c = doc! {"$center": [[0.0, 0.0], 2.0_f64.sqrt()]};
+        assert_eq!(within(xy(1.0, 1.0), c), Ok(true));
     }
 
     #[test]
-    fn a_null_max_distance_is_deferred() {
-        // A null bound must NOT be read as "unbounded" -- that silently ran the
-        // query where mongod errors.
-        let point = Bson::Document(doc! {"type": "Point", "coordinates": [40.0, 40.0]});
-        let near = doc! {
-            "$geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
-            "$maxDistance": Bson::Null,
-        };
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&point))],
-            &Bson::Document(near),
-            None,
-            None,
-            true
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn an_absent_bound_still_means_unbounded() {
-        // The fix distinguishes absent from null; it must not reject both.
-        let point = Bson::Document(doc! {"type": "Point", "coordinates": [40.0, 40.0]});
-        let near = doc! {"$geometry": {"type": "Point", "coordinates": [1.0, 1.0]}};
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&point))],
-            &Bson::Document(near),
-            None,
-            None,
-            true
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn a_negative_distance_bound_is_deferred() {
-        // mongod: "$maxDistance must be non-negative".
-        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
-        let near = doc! {
-            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
-            "$maxDistance": -1.0,
-        };
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&point))],
-            &Bson::Document(near),
-            None,
-            None,
-            true
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn a_non_numeric_distance_bound_still_falls_back() {
-        // A string is invalid too (nothing is "forgiven" here any more).
-        let point = Bson::Document(doc! {"type": "Point", "coordinates": [1.0, 1.0]});
-        let near = doc! {
-            "$geometry": {"type": "Point", "coordinates": [1.01, 1.01]},
-            "$maxDistance": "far",
-        };
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&point))],
-            &Bson::Document(near),
-            None,
-            None,
-            true
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn a_null_sibling_bound_is_deferred_too() {
-        // The legacy pair form lifts the bounds to sibling keys. A null there is
-        // invalid on mongod too -- with its OWN codes, 16895 ($maxDistance) and
-        // 16893 ($minDistance), rather than the nested form's BadValue (2) --
-        // so defer and let the Python engine name it.
-        let point = xy(1.0, 1.0);
-        let near = Bson::Array(vec![Bson::Double(1.01), Bson::Double(1.01)]);
-        let null = Bson::Null;
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&point))],
-            &near,
-            Some(&null),
-            Some(&null),
-            false
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn box_contains_point() {
-        let q = doc! {"$box": [[0.0, 0.0], [10.0, 10.0]]};
-        assert!(within(xy(5.0, 5.0), q.clone()).unwrap());
-        // A point on an edge or a corner is inside, as on mongod.
-        assert!(within(xy(0.0, 0.0), q.clone()).unwrap());
-        assert!(within(xy(10.0, 5.0), q.clone()).unwrap());
-        assert!(within(xy(10.0, 10.0), q.clone()).unwrap());
-        assert!(!within(xy(10.0000001, 5.0), q.clone()).unwrap());
-        assert!(!within(xy(50.0, 5.0), q).unwrap());
-    }
-
-    #[test]
-    fn center_disk_contains_point() {
-        // $center: [[2,2], 4] — exact disk. (1,1) and (3,3) are within; (45,2)
-        // isn't (mongo-java-driver GeoFilters '$geoWithin $center').
-        let q = doc! {"$center": [[2.0, 2.0], 4.0]};
-        assert!(within(xy(1.0, 1.0), q.clone()).unwrap());
-        assert!(within(xy(3.0, 3.0), q.clone()).unwrap());
-        assert!(!within(xy(45.0, 2.0), q).unwrap());
-    }
-
-    #[test]
-    fn near_legacy_sibling_max_distance() {
-        // {$near: [1.01, 1.01], $maxDistance: 0.1} — the legacy 2d sibling form
-        // Java's Filters.near builds. (1,1) is within 0.1; (3,3) isn't.
-        let arg = xy(1.01, 1.01);
-        let max = Bson::Double(0.1);
-        let min = Bson::Double(0.0);
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(1.0, 1.0)))],
-            &arg,
-            Some(&max),
-            Some(&min),
-            false
-        )
-        .unwrap());
-        assert!(!op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(3.0, 3.0)))],
-            &arg,
-            Some(&max),
-            Some(&min),
-            false
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn polygon_query_contains_point() {
-        let q = doc! {"$polygon": [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]};
-        assert!(within(xy(5.0, 5.0), q.clone()).unwrap());
-        assert!(!within(xy(20.0, 20.0), q).unwrap());
-    }
-
-    #[test]
-    fn geometry_polygon_contains_point() {
-        let q = doc! {"$geometry": {
-            "type": "Polygon",
-            "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
-        }};
-        // GeoJSON Point doc + legacy {lng,lat} doc both work.
-        assert!(within(
-            Bson::Document(doc! {"type": "Point", "coordinates": [5.0, 5.0]}),
-            q.clone()
-        )
-        .unwrap());
-        assert!(within(Bson::Document(doc! {"lng": 5.0, "lat": 5.0}), q.clone()).unwrap());
-        assert!(!within(xy(99.0, 99.0), q).unwrap());
-    }
-
-    #[test]
-    fn center_sphere_cap() {
-        // ~0.1 rad cap at the origin. The origin is in; a point ~14 deg away is out.
-        let q = doc! {"$centerSphere": [[0.0, 0.0], 0.1]};
-        assert!(within(xy(0.0, 0.0), q.clone()).unwrap());
-        assert!(!within(xy(10.0, 10.0), q).unwrap());
-    }
-
-    #[test]
-    fn center_is_exact_disk() {
-        // $center is an exact planar disk (mongod semantics): a point ~1.41 away
-        // is inside radius 5, ~7.07 away is outside.
-        let q = doc! {"$center": [[0.0, 0.0], 5.0]};
-        assert!(within(xy(1.0, 1.0), q.clone()).unwrap());
-        assert!(!within(xy(5.0, 5.0), q).unwrap());
-    }
-
-    #[test]
-    fn non_geometry_value_does_not_match() {
-        let q = doc! {"$box": [[0.0, 0.0], [10.0, 10.0]]};
-        // A scalar field value isn't a geometry -> skipped, no match (not Fallback).
-        assert!(!within(Bson::Int32(5), q).unwrap());
-    }
-
-    #[test]
-    fn geo_intersects_requires_geometry() {
-        let arg = Bson::Document(doc! {"$box": [[0.0, 0.0], [10.0, 10.0]]});
-        assert!(
-            op_geo_intersects(&[crate::query::Cand::plain(Some(&xy(5.0, 5.0)))], &arg).is_err()
-        );
-        let q = Bson::Document(doc! {"$geometry": {
-            "type": "Polygon",
-            "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
-        }});
-        assert!(op_geo_intersects(&[crate::query::Cand::plain(Some(&xy(5.0, 5.0)))], &q).unwrap());
-    }
-
-    #[test]
-    fn near_legacy_planar_bound() {
-        // {$near: [0,0, 5]} (planar): a point ~1.41 away matches, ~7.07 doesn't.
-        let arg = Bson::Array(vec![0.0.into(), 0.0.into(), 5.0.into()]);
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(1.0, 1.0)))],
-            &arg,
-            None,
-            None,
-            false
-        )
-        .unwrap());
-        assert!(!op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(5.0, 5.0)))],
-            &arg,
-            None,
-            None,
-            false
-        )
-        .unwrap());
-        // Bound-less {$near: [0,0]} matches any point geometry.
-        let bare = Bson::Array(vec![0.0.into(), 0.0.into()]);
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(99.0, 99.0)))],
-            &bare,
-            None,
-            None,
-            false
-        )
-        .unwrap());
-        // ...but not a non-geometry value.
-        assert!(!op_geo_near(
-            &[crate::query::Cand::plain(Some(&Bson::Int32(3)))],
-            &bare,
-            None,
-            None,
-            false
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn near_geojson_is_spherical_meters() {
-        // GeoJSON form: distances in metres. 0.2 rad ~ 1.28e6 m at the equator.
-        let arg = Bson::Document(doc! {
-            "$geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
-            "$maxDistance": 1_500_000.0_f64,
-        });
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(0.0, 0.0)))],
-            &arg,
-            None,
-            None,
-            true
-        )
-        .unwrap()); // dist 0
-                    // ~10 deg away is ~1.11e6 m (< 1.5e6) -> in; tighten the bound to exclude.
-        let tight = Bson::Document(doc! {
-            "$geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
-            "$maxDistance": 100_000.0_f64,
-        });
-        assert!(!op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(10.0, 10.0)))],
-            &tight,
-            None,
-            None,
-            true
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn near_malformed_defers() {
-        // A doc arg without $geometry -> Python raises QueryError -> Fallback.
-        let arg = Bson::Document(doc! {"$maxDistance": 5.0_f64});
-        assert!(op_geo_near(
-            &[crate::query::Cand::plain(Some(&xy(0.0, 0.0)))],
-            &arg,
-            None,
-            None,
-            false
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn doc_point_extracts_point_shapes_only() {
-        assert_eq!(doc_point(&xy(3.0, 4.0)), Some((3.0, 4.0)));
+    fn several_locations_match_through_any_one() {
+        let both = Bson::Array(vec![xy(1.0, 1.0), xy(30.0, 30.0)]);
         assert_eq!(
-            doc_point(&Bson::Document(
-                doc! {"type": "Point", "coordinates": [1.0, 2.0]}
-            )),
-            Some((1.0, 2.0))
+            within(both, doc! {"$box": [[0.0, 0.0], [3.0, 3.0]]}),
+            Ok(true)
         );
-        assert_eq!(
-            doc_point(&Bson::Document(doc! {"lng": 5.0, "lat": 6.0})),
-            Some((5.0, 6.0))
-        );
-        assert_eq!(doc_point(&Bson::Int32(7)), None);
-        // A polygon doc isn't a point.
-        assert_eq!(
-            doc_point(&Bson::Document(doc! {
-                "type": "Polygon",
-                "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
-            })),
-            None
-        );
+    }
+
+    #[test]
+    fn a_value_that_is_no_geometry_does_not_match() {
+        let b = doc! {"$box": [[0.0, 0.0], [3.0, 3.0]]};
+        assert_eq!(within(Bson::String("x".into()), b.clone()), Ok(false));
+        assert_eq!(within(Bson::Null, b), Ok(false));
+    }
+
+    #[test]
+    fn a_bad_shape_is_refused_with_no_value_to_test() {
+        assert!(op_geo_within(&[], &Bson::Int32(1), "$geoWithin").is_err());
+        assert!(op_geo_intersects(&[], &Bson::Document(doc! {"$box": [[0, 0], [1, 1]]})).is_err());
     }
 
     #[test]
     fn covering_contains_in_box_cell() {
-        let (bits, lo, hi) = (8u32, -180.0, 180.0);
-        let (clo, chi) = covering_2d(0.0, 0.0, 10.0, 10.0, bits, lo, hi);
-        // Every cell of a point inside the bbox falls in the Z-order range.
-        for &(x, y) in &[(0.0, 0.0), (5.0, 5.0), (10.0, 10.0), (2.5, 7.5)] {
-            let c = cell_2d(x, y, bits, lo, hi);
-            assert!(
-                clo <= c && c <= chi,
-                "({x},{y}) cell {c} not in [{clo},{chi}]"
-            );
-        }
-        // encode_cell is order-preserving (lex bytes == numeric order).
-        assert!(encode_cell(clo) <= encode_cell(chi));
+        let (lo, hi) = covering_2d(0.0, 0.0, 10.0, 10.0, 26, -180.0, 180.0);
+        let cell = cell_2d(5.0, 5.0, 26, -180.0, 180.0);
+        assert!(lo <= cell && cell <= hi);
     }
 
     #[test]
     fn query_bbox_shapes() {
-        let b = query_within_bbox(&doc! {"$box": [[0.0, 0.0], [10.0, 20.0]]}).unwrap();
-        assert_eq!(b, (0.0, 0.0, 10.0, 20.0));
-        // $centerSphere -> center +/- radius-in-degrees.
-        let s = query_within_bbox(&doc! {"$centerSphere": [[0.0, 0.0], 0.1]}).unwrap();
-        let d = 0.1_f64.to_degrees();
-        assert!((s.0 + d).abs() < 1e-9 && (s.2 - d).abs() < 1e-9);
-        // $center -> centre +/- radius bounding box.
         assert_eq!(
-            query_within_bbox(&doc! {"$center": [[1.0, 2.0], 5.0]}),
-            Some((-4.0, -3.0, 6.0, 7.0))
+            query_within_bbox(&doc! {"$box": [[0.0, 0.0], [10.0, 10.0]]}),
+            Some((0.0, 0.0, 10.0, 10.0))
+        );
+        assert_eq!(
+            query_within_bbox(&doc! {"$center": [[5.0, 5.0], 2.0]}),
+            Some((3.0, 3.0, 7.0, 7.0))
         );
     }
 }

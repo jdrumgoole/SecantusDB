@@ -45,7 +45,11 @@ fn holds_near(v: &Bson) -> bool {
     }
 }
 
-fn walk(filter: &Document, found: &mut Vec<Found>, others: &mut Vec<String>) -> Result<(), StorageError> {
+fn walk(
+    filter: &Document,
+    found: &mut Vec<Found>,
+    others: &mut Vec<String>,
+) -> Result<(), StorageError> {
     for (key, value) in filter {
         match (key.as_str(), value) {
             ("$and", Bson::Array(clauses)) => {
@@ -94,6 +98,26 @@ pub(crate) fn find_near(filter: &Document) -> Result<Option<Found>, StorageError
     }))
 }
 
+/// A query's tree as mongod prints one it could not plan: the `$near` leaf,
+/// under an `$and` with the other clauses when `query` has any.
+pub(crate) fn tree(query: Option<&Document>, leaf: &str) -> String {
+    let others: Vec<String> = query
+        .into_iter()
+        .flat_map(|q| q.iter())
+        .map(|(field, v)| match v {
+            Bson::Document(_) => format!("{field} {}", bson_value_repr(v)),
+            _ => format!("{field} $eq {}", bson_value_repr(v)),
+        })
+        .collect();
+    if others.is_empty() {
+        return leaf.to_string();
+    }
+    let mut lines = vec!["$and".to_string()];
+    lines.extend(others.iter().map(|o| format!("    {o}")));
+    lines.push(format!("    {leaf}"));
+    lines.join("\n")
+}
+
 /// What the rest of the read asked for, which mongod prints with the query
 /// it could not plan.
 #[derive(Clone, Copy, Default)]
@@ -105,7 +129,9 @@ pub(crate) struct Asked<'a> {
 }
 
 fn shown(d: Option<&Document>) -> String {
-    d.map_or("{}".to_string(), |d| bson_value_repr(&Bson::Document(d.clone())))
+    d.map_or("{}".to_string(), |d| {
+        bson_value_repr(&Bson::Document(d.clone()))
+    })
 }
 
 impl Found {
@@ -163,11 +189,11 @@ impl Found {
             lines.join("\n")
         };
         let mut paging = String::new();
-        if asked.skip > 0 {
-            paging.push_str(&format!(" skip={}", asked.skip));
-        }
         if asked.limit > 0 {
             paging.push_str(&format!(" limit={}", asked.limit));
+        }
+        if asked.skip > 0 {
+            paging.push_str(&format!(" skip={}", asked.skip));
         }
         Err(refuse(
             291,

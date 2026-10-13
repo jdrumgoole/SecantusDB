@@ -636,7 +636,10 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     skip: skip as i64,
                     limit: limit as i64,
                     sort,
-                    projection: doc.get_document("projection").ok().filter(|p| !p.is_empty()),
+                    projection: doc
+                        .get_document("projection")
+                        .ok()
+                        .filter(|p| !p.is_empty()),
                 },
             },
         )

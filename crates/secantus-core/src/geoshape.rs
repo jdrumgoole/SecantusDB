@@ -182,7 +182,12 @@ fn polygon_loop(v: &Bson) -> Parsed<Vec<P>> {
                 continue;
             }
             let ((a, b), (c, d)) = (edge(i), edge(j));
-            if sphere::arcs_cross(sphere::unit(a), sphere::unit(b), sphere::unit(c), sphere::unit(d)) {
+            if sphere::arcs_cross(
+                sphere::unit(a),
+                sphere::unit(b),
+                sphere::unit(c),
+                sphere::unit(d),
+            ) {
                 return bad(format!(
                     "Loop is not valid: {} Edges {i} and {j} cross. Edge locations in degrees: \
                      {}-{} and {}-{}",
@@ -331,7 +336,10 @@ fn specifier(key: &str, v: &Bson) -> Option<Parsed<Shape>> {
 }
 
 fn echoed(op: &str, arg: &Document) -> String {
-    format!("{{ {op}: {} }}", bson_value_repr(&Bson::Document(arg.clone())))
+    format!(
+        "{{ {op}: {} }}",
+        bson_value_repr(&Bson::Document(arg.clone()))
+    )
 }
 
 /// The shape of a `$geoWithin` (or `$within`) query.
@@ -456,10 +464,13 @@ pub fn stored_boxes(v: &Bson) -> Vec<(f64, f64, f64, f64)> {
             let mut points = Vec::new();
             all_points(g, &mut points);
             let first = *points.first()?;
-            Some(points.iter().fold(
-                (first.0, first.1, first.0, first.1),
-                |b, p| (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1)),
-            ))
+            Some(
+                points
+                    .iter()
+                    .fold((first.0, first.1, first.0, first.1), |b, p| {
+                        (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1))
+                    }),
+            )
         })
         .collect()
 }
@@ -695,9 +706,7 @@ impl Near {
                     Some(sphere::distance(g, self.centre) * EARTH_RADIUS_METERS)
                 } else {
                     match g {
-                        Geom::Point(p) => {
-                            Some((p.0 - self.centre.0).hypot(p.1 - self.centre.1))
-                        }
+                        Geom::Point(p) => Some((p.0 - self.centre.0).hypot(p.1 - self.centre.1)),
                         _ => None,
                     }
                 }
@@ -932,7 +941,9 @@ pub(crate) mod sphere {
     }
 
     fn parts_meet(x: &Part, y: &Part) -> bool {
-        if part_points(x).iter().any(|p| covers(y, *p)) || part_points(y).iter().any(|p| covers(x, *p)) {
+        if part_points(x).iter().any(|p| covers(y, *p))
+            || part_points(y).iter().any(|p| covers(x, *p))
+        {
             return true;
         }
         let (ex, ey) = (part_edges(x), part_edges(y));
@@ -960,7 +971,9 @@ pub(crate) mod sphere {
             let swallowed = |hole: &Vec<V>| {
                 hole.iter()
                     .any(|p| own.first().is_some_and(|outer| winds_around(*p, outer)))
-                    || hole.iter().all(|p| own.iter().any(|ring| on_ring(*p, ring)))
+                    || hole
+                        .iter()
+                        .all(|p| own.iter().any(|ring| on_ring(*p, ring)))
             };
             if loops.iter().skip(1).any(swallowed) {
                 return false;
@@ -1060,7 +1073,10 @@ mod tests {
         // mongod: `[1, 1]` does not intersect the line from `[0, 0]` to `[2, 2]`.
         assert!(!is_intersecting(&line, &Geom::Point((1.0, 1.0))));
         assert!(is_intersecting(&line, &Geom::Point((0.0, 0.0))));
-        assert!(is_intersecting(&line, &Geom::Line(vec![(0.0, 3.0), (3.0, 0.0)])));
+        assert!(is_intersecting(
+            &line,
+            &Geom::Line(vec![(0.0, 3.0), (3.0, 0.0)])
+        ));
     }
 
     #[test]
@@ -1108,8 +1124,14 @@ mod tests {
     fn the_refusals_are_mongods() {
         let within = |arg: Bson| message(within_shape("$geoWithin", &arg));
         assert_eq!(within(Bson::Int32(1)), "geometry must be an object");
-        assert_eq!(within(doc! {}.into()), "geo query doesn't have any geometry");
-        assert_eq!(within(doc! { "$box": 1 }.into()), "unknown geo specifier: $box: 1");
+        assert_eq!(
+            within(doc! {}.into()),
+            "geo query doesn't have any geometry"
+        );
+        assert_eq!(
+            within(doc! { "$box": 1 }.into()),
+            "unknown geo specifier: $box: 1"
+        );
         assert_eq!(
             within(doc! { "$box": [[0, 0]] }.into()),
             "Point must be an array or object, instead got type missing"

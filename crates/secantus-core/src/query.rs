@@ -676,35 +676,6 @@ fn field_matches_descend(
                             return Ok(false);
                         }
                     }
-                    // `$maxDistance` / `$minDistance` are sibling modifiers of the
-                    // legacy 2d `$near` / `$nearSphere` form; consumed with them.
-                    "$maxDistance" | "$minDistance"
-                        if d.contains_key("$near") || d.contains_key("$nearSphere") =>
-                    {
-                        continue
-                    }
-                    "$near" => {
-                        if !crate::geo::op_geo_near(
-                            values,
-                            arg,
-                            d.get("$maxDistance"),
-                            d.get("$minDistance"),
-                            false,
-                        )? {
-                            return Ok(false);
-                        }
-                    }
-                    "$nearSphere" => {
-                        if !crate::geo::op_geo_near(
-                            values,
-                            arg,
-                            d.get("$maxDistance"),
-                            d.get("$minDistance"),
-                            true,
-                        )? {
-                            return Ok(false);
-                        }
-                    }
                     _ => {
                         if !op_matches(values, op, arg, coll, field, descend)? {
                             return Ok(false);
@@ -896,8 +867,18 @@ fn op_matches(
         // The legacy 2d *sibling* `$maxDistance`/`$minDistance` form is handled in
         // `field_matches` (it needs the parent condition dict); here (e.g. under
         // `$elemMatch`/`$not`) only the self-contained list / GeoJSON form is seen.
-        "$near" => crate::geo::op_geo_near(values, arg, None, None, false),
-        "$nearSphere" => crate::geo::op_geo_near(values, arg, None, None, true),
+        "$near" | "$nearSphere" | "$geoNear" => {
+            let mut cond = bson::Document::new();
+            cond.insert(op, arg.clone());
+            match crate::geoshape::near_condition(&cond)? {
+                Some(near) => Ok(values
+                    .iter()
+                    .filter_map(|c| c.value)
+                    .filter_map(|v| near.distance(v))
+                    .any(|dist| near.admits(dist))),
+                None => Ok(false),
+            }
+        }
         // A name mongod does not know at all is its own error (measured 8.2.11,
         // 2026-10-01); a Defer reached the client as "query uses a construct
         // the Rust server does not support". A KNOWN operator this engine does

@@ -2055,15 +2055,65 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             Bson::String(p) if !KNOWN_INDEX_PLUGINS.contains(&p.as_str()) => Some(p.clone()),
             _ => None,
         }) {
+            let why = match plugin.as_str() {
+                "" => "Values in the index key pattern cannot be empty strings".to_string(),
+                "geoHaystack" => {
+                    "GeoHaystack indexes cannot be created in version 5.0 and above".to_string()
+                }
+                other => format!("Unknown index plugin '{other}'"),
+            };
             return Ok(CommandError::new(
                 67,
                 "CannotCreateIndex",
-                format!(
-                    "Error in specification {spec_text} :: caused by :: Unknown index plugin \
-                     '{plugin}'"
-                ),
+                format!("Error in specification {spec_text} :: caused by :: {why}"),
             )
             .into_reply());
+        }
+        // A `2dsphere` index is one of three formats.
+        if key
+            .values()
+            .any(|v| matches!(v, Bson::String(p) if p == "2dsphere"))
+        {
+            if let Some(version) = s.get("2dsphereIndexVersion") {
+                let whole = match version {
+                    Bson::Int32(n) => Some(i64::from(*n)),
+                    Bson::Int64(n) => Some(*n),
+                    Bson::Double(d) if d.fract() == 0.0 => Some(*d as i64),
+                    _ => None,
+                };
+                let number = matches!(
+                    version,
+                    Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+                );
+                if !number {
+                    return Ok(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        format!(
+                            "Error in specification {spec_text} :: caused by :: The field \
+                             '2dsphereIndexVersion' must be a number, but got {}",
+                            secantus_core::query::bson_type_name(version)
+                        ),
+                    )
+                    .into_reply());
+                }
+                if let Some(n) = whole.filter(|n| !(1..=3).contains(n)) {
+                    // mongod has added the index version to the spec by now.
+                    let with_v = spec_text
+                        .strip_suffix(" }")
+                        .map_or(spec_text.clone(), |open| format!("{open}, v: 2 }}"));
+                    return Ok(CommandError::new(
+                        67,
+                        "CannotCreateIndex",
+                        format!(
+                            "Error in specification {with_v} :: caused by :: unsupported geo \
+                             index version {{ 2dsphereIndexVersion : 2dsphereIndexVersion: {n} }}, \
+                             only versions: [1,2,3] are supported"
+                        ),
+                    )
+                    .into_reply());
+                }
+            }
         }
         let Some(name) = s.get("name").and_then(Bson::as_str).map(str::to_string) else {
             return Ok(CommandError::new(
