@@ -270,3 +270,21 @@ fn server_status_counts_what_ran() {
         assert_eq!(moved, [2, 2, 1, 1, 0, 2]);
     });
 }
+
+/// `validate` reads the collection: the keys it reports are the keys mongod
+/// holds for the documents (4 for `5`, `"x"` and `[1, 2]`, where one per
+/// document was reported before), and the verdict is the store's own check.
+#[test]
+fn validate_checks_the_collection_and_counts_its_keys() {
+    with_wt(|c| {
+        seed(c);
+        let reply = dispatch_full(&doc! { "validate": "c" }, c);
+        assert_eq!(reply.get_bool("valid"), Ok(true), "{reply}");
+        assert_eq!(number(&reply, "nrecords"), 3);
+        let keys = reply.get_document("keysPerIndex").expect("keysPerIndex");
+        assert_eq!((number(keys, "_id_"), number(keys, "v_1")), (3, 4));
+        assert_eq!(reply.get_array("errors").map(Vec::len), Ok(0));
+        let details = reply.get_document("indexDetails").unwrap();
+        assert_eq!(details.get_document("v_1").unwrap().get_bool("valid"), Ok(true));
+    });
+}

@@ -9231,7 +9231,7 @@ version no longer has. Most replies hold values that differ from one machine
 to the next, so a step is compared whole with the volatile keys reduced to
 their BSON type, or by its keys and types to a given depth. mongod answered
 the same on three runs against itself. The Rust server differed on 492
-replies and differs on 160. Pinned by
+replies and differs on 159. Pinned by
 `crates/secantus-storage-adapter/tests/diagnostic_commands_wt.rs` and the
 unit tests of `generic.rs`, `serverinfo.rs` and `handshake.rs`.
 
@@ -9262,15 +9262,16 @@ What was wrong, by how much it mattered:
   parameter it lacks; `listCommands`, `logout`, `getDefaultRWConcern`,
   `replSetGetConfig`, `shardingState` and `fsyncUnlock` were unknown.
 
-Still different, all 160:
+Still different, all 159:
 
-- [ ] **`validate` checks nothing.** It answers `valid: true` and reports
-      each index as holding one key per document (mongod: 4 keys for the
-      three documents above, one of which holds an array). A check that
-      reads the store and compares each document's keys with the index's
-      entries is a storage change of its own, and the one item here that is
-      about data and not about a reply. `background`, `system.views` and
-      the count are the four replies.
+- [ ] **`validate` on `system.views`, and `background: true`** (3).
+      mongod validates `system.views` as the collection it is, and refuses
+      a background validation of a collection no checkpoint holds yet.
+      (`validate` itself reads the store since 2026-10-13:
+      `Storage::check_collection` compares every document with each index's
+      entries, both ways, and with the `_id` index. Its key counts match
+      mongod over seven index shapes. It repairs nothing, and it does not
+      check a time-series collection's buckets or a unique index's claims.)
 - [ ] **`serverStatus` sections** (about 30): `asserts`, `mem`,
       `globalLock`, `transactions`, `repl`, `metrics` beyond the two this
       server keeps, `wiredTiger` and the rest are absent. None is reported

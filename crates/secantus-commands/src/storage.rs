@@ -882,6 +882,13 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
 
+    /// A check of the collection against its indexes, for `validate`:
+    /// `{records, undecodable, indexes: [{name, keys, missing, extra}]}`.
+    /// `None` from a store that cannot check itself.
+    fn check_collection(&self, _db: &str, _coll: &str) -> Result<Option<Document>, StorageError> {
+        Ok(None)
+    }
+
     /// Per-index sizes in bytes (`{index_name: size}`), for `collStats` /
     /// `dbStats`.
     fn index_sizes(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
