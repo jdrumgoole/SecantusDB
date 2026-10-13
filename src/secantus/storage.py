@@ -1679,6 +1679,7 @@ class Storage:
         sync_on_commit: bool = False,
         oplog_archive_dir: str | None = None,
         durable: bool | None = None,
+        checkpoint_seconds: float | None = None,
     ) -> None:
         # When False, _emit_oplog short-circuits and writes nothing —
         # used in standalone (non-replica-set) mode to skip the per-write
@@ -1823,6 +1824,17 @@ class Storage:
                     f"log=(enabled=true,file_max=10MB,prealloc=false),"
                     f"{sync_part}"
                 )
+                # WiredTiger removes a log file only after a checkpoint, and
+                # until 2026-10-13 a store checkpointed only at close, in a
+                # backup and in ``fsync``. A server under writes kept every
+                # log file it had written and replayed them all after a
+                # crash. WiredTiger's own checkpoint thread runs it, so no
+                # Python thread or session is involved. The Rust servers
+                # read the same variable (``spawn_checkpoint_thread``).
+                if checkpoint_seconds is None:
+                    checkpoint_seconds = float(os.environ.get("SECANTUS_CHECKPOINT_SECONDS") or 60)
+                if checkpoint_seconds > 0:
+                    config += f",checkpoint=(wait={max(1, int(checkpoint_seconds))})"
             else:
                 # Fast test mode. Keep the journal ENABLED but skip the explicit
                 # close-checkpoint (see ``close``). Counter-intuitively, keeping
