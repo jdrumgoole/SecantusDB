@@ -3145,6 +3145,16 @@ These work end-to-end but cut corners.
         1.17x; 0.1.0-beta.14 is 1.13x. `bench/do_pg_bench.py` says
         `sslmode=disable` in every DSN and stops if `pg_stat_ssl` shows
         otherwise.
+      - **Measured again for 0.1.0-beta.15, 2026-10-13**, on another
+        droplet (Xeon 8280, 12,223 `fdatasync` calls a second), seven
+        trials a row, eight clients, PostgreSQL / 0.1.0-beta.15: insert
+        20,106 / 15,866 (1.27x); insert into a shared table 20,753 /
+        16,703 (1.24x); update 22,843 / 16,655 (1.37x); select 54,395 /
+        48,849 (1.11x). The ratios are 0.1.0-beta.14's to within the
+        spread; both servers' rates are higher than on that run's droplet,
+        so a rate is comparable only within one run. The psycopg gauge
+        against the released macOS binary: 5,544 pass, none fail, of
+        5,731, in 316 s.
       - **Three slow update trials, never seen again, cause unknown.** In
         the 0.1.0-beta.13 run of 2026-10-13, eight clients updating by
         primary key gave 12,418 and 12,209 statements a second and then

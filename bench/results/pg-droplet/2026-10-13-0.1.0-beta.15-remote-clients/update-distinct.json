@@ -1,0 +1,403 @@
+{
+  "workload": "update",
+  "mode": "distinct",
+  "seconds": 10.0,
+  "repeat": 7,
+  "clients_on": "two client droplets",
+  "servers": {
+    "postgres": [
+      {
+        "clients": 1,
+        "rates": [
+          4422.7,
+          4175.4,
+          4378.2,
+          4331.2,
+          4257.3,
+          4262.8,
+          4392.4
+        ],
+        "client_cpu_busy": [
+          2.7,
+          2.5,
+          3.1,
+          2.9,
+          2.6,
+          3.1,
+          2.7
+        ],
+        "server": [
+          {
+            "disk_flushes": 44228,
+            "disk_flush_ms_each": 0.03,
+            "disk_write_ms_each": 0.04,
+            "server_cpu_us_per_statement": 59.7
+          },
+          {
+            "disk_flushes": 41756,
+            "disk_flush_ms_each": 0.03,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 61.8
+          },
+          {
+            "disk_flushes": 43785,
+            "disk_flush_ms_each": 0.032,
+            "disk_write_ms_each": 0.042,
+            "server_cpu_us_per_statement": 61.0
+          },
+          {
+            "disk_flushes": 43313,
+            "disk_flush_ms_each": 0.03,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 59.1
+          },
+          {
+            "disk_flushes": 42575,
+            "disk_flush_ms_each": 0.029,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 60.4
+          },
+          {
+            "disk_flushes": 42629,
+            "disk_flush_ms_each": 0.031,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 61.2
+          },
+          {
+            "disk_flushes": 43927,
+            "disk_flush_ms_each": 0.031,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 62.2
+          }
+        ]
+      },
+      {
+        "clients": 4,
+        "rates": [
+          12627.2,
+          13276.6,
+          12824.4,
+          13099.4,
+          13117.8,
+          13499.7,
+          13420.9
+        ],
+        "client_cpu_busy": [
+          5.2,
+          4.7,
+          4.2,
+          4.8,
+          5.4,
+          4.7,
+          4.7
+        ],
+        "server": [
+          {
+            "disk_flushes": 93636,
+            "disk_flush_ms_each": 0.033,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 74.1
+          },
+          {
+            "disk_flushes": 99116,
+            "disk_flush_ms_each": 0.031,
+            "disk_write_ms_each": 0.039,
+            "server_cpu_us_per_statement": 67.0
+          },
+          {
+            "disk_flushes": 94556,
+            "disk_flush_ms_each": 0.033,
+            "disk_write_ms_each": 0.041,
+            "server_cpu_us_per_statement": 70.3
+          },
+          {
+            "disk_flushes": 96229,
+            "disk_flush_ms_each": 0.031,
+            "disk_write_ms_each": 0.04,
+            "server_cpu_us_per_statement": 68.0
+          },
+          {
+            "disk_flushes": 97098,
+            "disk_flush_ms_each": 0.031,
+            "disk_write_ms_each": 0.04,
+            "server_cpu_us_per_statement": 68.7
+          },
+          {
+            "disk_flushes": 100445,
+            "disk_flush_ms_each": 0.03,
+            "disk_write_ms_each": 0.039,
+            "server_cpu_us_per_statement": 66.9
+          },
+          {
+            "disk_flushes": 99947,
+            "disk_flush_ms_each": 0.03,
+            "disk_write_ms_each": 0.039,
+            "server_cpu_us_per_statement": 66.6
+          }
+        ]
+      },
+      {
+        "clients": 8,
+        "rates": [
+          22845.8,
+          23067.0,
+          22553.3,
+          22842.9,
+          22476.4,
+          22794.6,
+          23332.0
+        ],
+        "client_cpu_busy": [
+          9.1,
+          9.5,
+          9.5,
+          10.7,
+          10.6,
+          8.6,
+          9.4
+        ],
+        "server": [
+          {
+            "disk_flushes": 86650,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.045,
+            "server_cpu_us_per_statement": 66.6
+          },
+          {
+            "disk_flushes": 88544,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 65.2
+          },
+          {
+            "disk_flushes": 88093,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 68.7
+          },
+          {
+            "disk_flushes": 88373,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 66.5
+          },
+          {
+            "disk_flushes": 85142,
+            "disk_flush_ms_each": 0.037,
+            "disk_write_ms_each": 0.045,
+            "server_cpu_us_per_statement": 67.2
+          },
+          {
+            "disk_flushes": 87501,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 69.8
+          },
+          {
+            "disk_flushes": 89374,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 64.1
+          }
+        ]
+      }
+    ],
+    "rust": [
+      {
+        "clients": 1,
+        "rates": [
+          3239.7,
+          3053.0,
+          3204.8,
+          3147.4,
+          3137.8,
+          3128.6,
+          3170.8
+        ],
+        "client_cpu_busy": [
+          1.9,
+          1.7,
+          1.7,
+          1.7,
+          1.6,
+          1.8,
+          1.6
+        ],
+        "server": [
+          {
+            "disk_flushes": 32397,
+            "disk_flush_ms_each": 0.034,
+            "disk_write_ms_each": 0.043,
+            "server_cpu_us_per_statement": 127.5
+          },
+          {
+            "disk_flushes": 30537,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.051,
+            "server_cpu_us_per_statement": 131.3
+          },
+          {
+            "disk_flushes": 32055,
+            "disk_flush_ms_each": 0.034,
+            "disk_write_ms_each": 0.046,
+            "server_cpu_us_per_statement": 132.6
+          },
+          {
+            "disk_flushes": 31541,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 136.3
+          },
+          {
+            "disk_flushes": 31417,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 133.5
+          },
+          {
+            "disk_flushes": 31324,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.046,
+            "server_cpu_us_per_statement": 135.2
+          },
+          {
+            "disk_flushes": 31775,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 138.5
+          }
+        ]
+      },
+      {
+        "clients": 4,
+        "rates": [
+          10344.1,
+          10459.3,
+          10320.6,
+          10576.6,
+          10455.4,
+          10083.4,
+          9782.4
+        ],
+        "client_cpu_busy": [
+          4.1,
+          3.6,
+          4.5,
+          3.6,
+          4.4,
+          4.0,
+          3.6
+        ],
+        "server": [
+          {
+            "disk_flushes": 78106,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.045,
+            "server_cpu_us_per_statement": 154.5
+          },
+          {
+            "disk_flushes": 85784,
+            "disk_flush_ms_each": 0.034,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 150.6
+          },
+          {
+            "disk_flushes": 83566,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.045,
+            "server_cpu_us_per_statement": 154.9
+          },
+          {
+            "disk_flushes": 86175,
+            "disk_flush_ms_each": 0.034,
+            "disk_write_ms_each": 0.046,
+            "server_cpu_us_per_statement": 152.3
+          },
+          {
+            "disk_flushes": 85976,
+            "disk_flush_ms_each": 0.035,
+            "disk_write_ms_each": 0.044,
+            "server_cpu_us_per_statement": 151.7
+          },
+          {
+            "disk_flushes": 75893,
+            "disk_flush_ms_each": 0.036,
+            "disk_write_ms_each": 0.045,
+            "server_cpu_us_per_statement": 157.1
+          },
+          {
+            "disk_flushes": 71279,
+            "disk_flush_ms_each": 0.037,
+            "disk_write_ms_each": 0.047,
+            "server_cpu_us_per_statement": 158.7
+          }
+        ]
+      },
+      {
+        "clients": 8,
+        "rates": [
+          16568.4,
+          16654.6,
+          15684.5,
+          15840.7,
+          16711.6,
+          16766.1,
+          16780.2
+        ],
+        "client_cpu_busy": [
+          7.6,
+          7.2,
+          6.5,
+          6.6,
+          7.5,
+          6.4,
+          7.3
+        ],
+        "server": [
+          {
+            "disk_flushes": 77621,
+            "disk_flush_ms_each": 0.039,
+            "disk_write_ms_each": 0.049,
+            "server_cpu_us_per_statement": 170.7
+          },
+          {
+            "disk_flushes": 78821,
+            "disk_flush_ms_each": 0.038,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 174.2
+          },
+          {
+            "disk_flushes": 73082,
+            "disk_flush_ms_each": 0.04,
+            "disk_write_ms_each": 0.052,
+            "server_cpu_us_per_statement": 180.1
+          },
+          {
+            "disk_flushes": 72801,
+            "disk_flush_ms_each": 0.042,
+            "disk_write_ms_each": 0.052,
+            "server_cpu_us_per_statement": 176.3
+          },
+          {
+            "disk_flushes": 78449,
+            "disk_flush_ms_each": 0.038,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 169.3
+          },
+          {
+            "disk_flushes": 78592,
+            "disk_flush_ms_each": 0.037,
+            "disk_write_ms_each": 0.048,
+            "server_cpu_us_per_statement": 170.4
+          },
+          {
+            "disk_flushes": 78911,
+            "disk_flush_ms_each": 0.037,
+            "disk_write_ms_each": 0.047,
+            "server_cpu_us_per_statement": 166.9
+          }
+        ]
+      }
+    ]
+  }
+}
