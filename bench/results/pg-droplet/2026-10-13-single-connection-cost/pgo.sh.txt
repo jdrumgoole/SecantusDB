@@ -1,0 +1,40 @@
+set -e
+. /root/.cargo/env
+rustup component add llvm-tools >/dev/null 2>&1
+PROFDATA=$(find /root/.rustup -name llvm-profdata | head -1)
+rm -rf /root/pgo-raw; mkdir -p /root/pgo-raw
+bash /root/build.sh pgogen CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 "RUSTFLAGS=-Cprofile-generate=/root/pgo-raw"
+cat /root/build-pgogen.done
+# the workload: one client and eight, select / update / insert, through psycopg
+pkill -x secantusd-pg || true; rm -rf /root/st
+setsid nohup /root/b-pgogen/bin/secantusd-pg /root/st 127.0.0.1:5544 >/dev/null 2>&1 </dev/null &
+sleep 3
+cat > /root/pgo_load.py <<'PY'
+import sys, time, threading, psycopg
+DSN = "host=127.0.0.1 port=5544 dbname=postgres user=postgres"
+def worker(slot, secs):
+    with psycopg.connect(DSN, autocommit=True) as c, c.cursor() as cur:
+        t = f"pgo_{slot}"
+        c.execute(f"drop table if exists {t}"); c.execute(f"create table {t} (k bigint primary key, v bigint, s text)")
+        c.execute(f"insert into {t} values (0, 0, 'x')")
+        end = time.monotonic() + secs; i = 1
+        while time.monotonic() < end:
+            cur.execute(f"insert into {t} values (%s, %s, %s)", (i, i, "row")); 
+            cur.execute(f"select v from {t} where k = %s", (i,)); cur.fetchone()
+            cur.execute(f"update {t} set v = v + 1 where k = %s", (0,))
+            cur.execute(f"select v, s from {t} where k = %s", (0,)); cur.fetchone()
+            i += 1
+        with c.transaction():
+            cur.execute(f"select count(*), sum(v) from {t}"); cur.fetchone()
+for n in (1, 8):
+    ts = [threading.Thread(target=worker, args=(f"{n}_{s}", 20)) for s in range(n)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+PY
+/root/venv/bin/python /root/pgo_load.py
+pkill -TERM -x secantusd-pg; sleep 3
+ls /root/pgo-raw | wc -l
+$PROFDATA merge -o /root/pgo.profdata /root/pgo-raw
+ls -la /root/pgo.profdata
+bash /root/build.sh pgo CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 "RUSTFLAGS=-Cprofile-use=/root/pgo.profdata"
+cat /root/build-pgo.done; ls -la /root/b-pgo/bin/secantusd-pg
+echo PGO-FINISHED

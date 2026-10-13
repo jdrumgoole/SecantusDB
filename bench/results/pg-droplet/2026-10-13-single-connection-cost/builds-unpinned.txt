@@ -1,0 +1,12 @@
+pass 1 done
+pass 2 done
+pass 3 done
+pass 4 done
+                                                    select                update                insert
+postgres, TLS as psycopg defaults         16,223 (10.3%)         5,322 (28.9%)         5,779 (21.3%)  
+postgres, no TLS                          21,815 ( 6.7%)         6,698 (11.2%)         6,663 (19.4%)  
+released                                  11,738 ( 5.8%)         3,144 (13.3%)         3,684 (14.8%)  
+base                                      10,672 (17.1%)         2,924 (12.7%)         3,658 (22.2%)  
+thin                                      10,712 (26.1%)         2,964 (33.3%)         3,849 (18.8%)  
+fat                                       13,055 (23.0%)         3,470 ( 4.5%)         4,474 ( 8.7%)  
+pass 5 done

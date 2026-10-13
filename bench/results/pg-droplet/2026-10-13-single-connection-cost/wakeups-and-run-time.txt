@@ -1,0 +1,178 @@
+cat: /proc//task//schedstat: No such file or directory
+cat: /proc//task//schedstat: No such file or directory
+== postgres, TLS (psycopg default)
+CLIENT 16,818/s  sleeps/stmt 0.988  preempt/stmt 0.0124  user 24.8us sys 12.6us
+awk: cmd. line:1: (FILENAME=- FNR=1) fatal: division by zero attempted
+     567.021764 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.021772 [0005]  postgres[7230]                      0.050      0.009      0.040                                 
+     567.021812 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.021816 [0005]  python[7227]                        0.040      0.007      0.044                                 
+     567.021854 [0005]  postgres[7230]                      0.044      0.004      0.037                                 
+     567.021899 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.021909 [0005]  python[7227]                        0.037      0.000      0.054                                 
+     567.021942 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.021947 [0005]  postgres[7230]                      0.054      0.009      0.038                                 
+     567.021995 [0005]  python[7227]                        0.038      0.004      0.048                                 
+     567.022029 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.022037 [0005]  postgres[7230]                      0.048      0.000      0.041                                 
+     567.022078 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022082 [0005]  python[7227]                        0.041      0.007      0.044                                 
+     567.022120 [0005]  postgres[7230]                      0.044      0.004      0.038                                 
+     567.022165 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022175 [0005]  python[7227]                        0.038      0.000      0.054                                 
+     567.022209 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.022213 [0005]  postgres[7230]                      0.054      0.009      0.038                                 
+     567.022261 [0005]  python[7227]                        0.038      0.004      0.048                                 
+     567.022308 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.022316 [0005]  postgres[7230]                      0.048      0.000      0.055                                 
+     567.022360 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022365 [0005]  python[7227]                        0.055      0.008      0.048                                 
+     567.022405 [0005]  postgres[7230]                      0.048      0.004      0.039                                 
+     567.022450 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022460 [0005]  python[7227]                        0.039      0.000      0.055                                 
+     567.022494 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.022499 [0005]  postgres[7230]                      0.055      0.009      0.038                                 
+     567.022548 [0005]  python[7227]                        0.038      0.004      0.048                                 
+     567.022582 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.022590 [0005]  postgres[7230]                      0.048      0.000      0.042                                 
+     567.022630 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022635 [0005]  python[7227]                        0.042      0.008      0.044                                 
+     567.022673 [0005]  postgres[7230]                      0.044      0.004      0.037                                 
+     567.022717 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022728 [0005]  python[7227]                        0.037      0.000      0.055                                 
+     567.022762 [0005]  postgres[7230]                                                   awakened: python[7227]
+     567.022769 [0005]  postgres[7230]                      0.055      0.010      0.041                                 
+     567.022810 [0005]  python[7227]                                                     awakened: postgres[7230]
+     567.022814 [0005]  python[7227]                        0.041      0.007      0.044                                 
+== postgres, sslmode=disable
+CLIENT 21,321/s  sleeps/stmt 0.948  preempt/stmt 0.0520  user 18.5us sys 11.1us
+SERVER thread: on-cpu 21.5 us/stmt, waited runnable 0.01 us/stmt, 1.04 runs/stmt
+     574.708778 [0015]  postgres[7259]                                                   awakened: python[7256]
+     574.708785 [0015]  postgres[7259]                      0.037      0.008      0.026                                 
+     574.708812 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.708816 [0015]  python[7256]                        0.026      0.006      0.031                                 
+     574.708840 [0015]  postgres[7259]                      0.031      0.003      0.024                                 
+     574.708870 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.708874 [0015]  python[7256]                        0.024      0.000      0.033                                 
+     574.708897 [0015]  postgres[7259]                      0.033      0.003      0.023                                 
+     574.708927 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.708931 [0015]  python[7256]                        0.023      0.000      0.033                                 
+     574.708955 [0015]  postgres[7259]                      0.033      0.003      0.023                                 
+     574.708984 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.708992 [0015]  python[7256]                        0.023      0.000      0.037                                 
+     574.709013 [0015]  postgres[7259]                                                   awakened: python[7256]
+     574.709018 [0015]  postgres[7259]                      0.037      0.008      0.025                                 
+     574.709045 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709049 [0015]  python[7256]                        0.025      0.005      0.030                                 
+     574.709072 [0015]  postgres[7259]                      0.030      0.003      0.023                                 
+     574.709102 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709106 [0015]  python[7256]                        0.023      0.000      0.033                                 
+     574.709130 [0015]  postgres[7259]                      0.033      0.003      0.023                                 
+     574.709160 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709165 [0015]  python[7256]                        0.023      0.000      0.034                                 
+     574.709188 [0015]  postgres[7259]                      0.034      0.004      0.023                                 
+     574.709234 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709238 [0015]  python[7256]                        0.023      0.000      0.049                                 
+     574.709266 [0015]  postgres[7259]                      0.049      0.004      0.027                                 
+     574.709298 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709307 [0015]  python[7256]                        0.027      0.000      0.040                                 
+     574.709329 [0015]  postgres[7259]                                                   awakened: python[7256]
+     574.709334 [0015]  postgres[7259]                      0.040      0.008      0.027                                 
+     574.709361 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709365 [0015]  python[7256]                        0.027      0.005      0.030                                 
+     574.709389 [0015]  postgres[7259]                      0.030      0.003      0.024                                 
+     574.709419 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709423 [0015]  python[7256]                        0.024      0.000      0.034                                 
+     574.709447 [0015]  postgres[7259]                      0.034      0.003      0.024                                 
+     574.709477 [0015]  python[7256]                                                     awakened: postgres[7259]
+     574.709481 [0015]  python[7256]                        0.024      0.000      0.034                                 
+     574.709505 [0015]  postgres[7259]                      0.034      0.004      0.023                                 
+     574.709535 [0015]  python[7256]                                                     awakened: postgres[7259]
+== secantusd-pg
+CLIENT 10,903/s  sleeps/stmt 0.969  preempt/stmt 0.0310  user 21.2us sys 11.4us
+SERVER thread: on-cpu 0.0 us/stmt, waited runnable 0.00 us/stmt, 0.00 runs/stmt
+     584.634866 [0003]  <idle>                              0.062      0.000      0.024                                 
+     584.634869 [0013]  python[7315]                        0.055      0.005      0.030                                 
+     584.634919 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+     584.634924 [0013]  <idle>                              0.030      0.000      0.055                                 
+     584.634928 [0003]  secantus-pg-con[7319/7286]          0.024      0.005      0.061                                 
+     584.634946 [0013]  python[7315]                                                     awakened: secantus-pg-con[7319/7286]
+     584.634952 [0003]  <idle>                              0.061      0.000      0.023                                 
+     584.634954 [0013]  python[7315]                        0.055      0.005      0.030                                 
+     584.635005 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+     584.635010 [0013]  <idle>                              0.030      0.000      0.055                                 
+     584.635014 [0003]  secantus-pg-con[7319/7286]          0.023      0.005      0.062                                 
+     584.635032 [0013]  python[7315]                                                     awakened: secantus-pg-con[7319/7286]
+     584.635038 [0003]  <idle>                              0.062      0.000      0.023                                 
+     584.635040 [0013]  python[7315]                        0.055      0.005      0.030                                 
+     584.635090 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+     584.635095 [0013]  <idle>                              0.030      0.000      0.054                                 
+     584.635099 [0003]  secantus-pg-con[7319/7286]          0.023      0.005      0.061                                 
+     584.635117 [0013]  python[7315]                                                     awakened: secantus-pg-con[7319/7286]
+     584.635123 [0003]  <idle>                              0.061      0.000      0.023                                 
+     584.635126 [0013]  python[7315]                        0.054      0.005      0.030                                 
+     584.635188 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+     584.635195 [0013]  <idle>                              0.030      0.000      0.069                                 
+     584.635197 [0003]  secantus-pg-con[7319/7286]          0.023      0.005      0.074                                 
+     584.635219 [0013]  python[7315]                                                     awakened: secantus-pg-con[7319/7286]
+     584.635224 [0003]  <idle>                              0.074      0.000      0.027                                 
+     584.635227 [0013]  python[7315]                        0.069      0.006      0.032                                 
+     584.635238 [0010]  <idle>                              0.003      0.000      4.061                                 
+     584.635243 [0010]  rcu_preempt[17]                     4.061      0.007      0.004                                 
+     584.635286 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+     584.635291 [0013]  <idle>                              0.032      0.000      0.064                                 
+     584.635296 [0003]  secantus-pg-con[7319/7286]          0.027      0.005      0.071                                 
+     584.635315 [0013]  python[7315]                                                     awakened: secantus-pg-con[7319/7286]
+     584.635321 [0003]  <idle>                              0.071      0.000      0.024                                 
+     584.635323 [0013]  python[7315]                        0.064      0.005      0.031                                 
+     584.635376 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+     584.635382 [0013]  <idle>                              0.031      0.000      0.058                                 
+     584.635386 [0003]  secantus-pg-con[7319/7286]          0.024      0.005      0.065                                 
+     584.635404 [0013]  python[7315]                                                     awakened: secantus-pg-con[7319/7286]
+     584.635410 [0003]  <idle>                              0.065      0.000      0.023                                 
+     584.635412 [0013]  python[7315]                        0.058      0.005      0.030                                 
+     584.635464 [0003]  secantus-pg-con[7319/7286]                                       awakened: python[7315]
+== secantusd-pg again
+CLIENT 10,691/s  sleeps/stmt 0.962  preempt/stmt 0.0381  user 22.1us sys 11.7us
+SERVER thread: on-cpu 0.0 us/stmt, waited runnable 0.00 us/stmt, 0.00 runs/stmt
+     592.382873 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.382879 [0003]  <idle>                              0.062      0.000      0.024                                 
+     592.382882 [0014]  python[7384]                        0.055      0.005      0.030                                 
+     592.382932 [0003]  secantus-pg-con[7388/7286]                                       awakened: python[7384]
+     592.382937 [0014]  <idle>                              0.030      0.000      0.055                                 
+     592.382941 [0003]  secantus-pg-con[7388/7286]          0.024      0.005      0.062                                 
+     592.382959 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.382965 [0003]  <idle>                              0.062      0.000      0.023                                 
+     592.382968 [0014]  python[7384]                        0.055      0.005      0.030                                 
+     592.383017 [0003]  secantus-pg-con[7388/7286]                                       awakened: python[7384]
+     592.383023 [0014]  <idle>                              0.030      0.000      0.055                                 
+     592.383027 [0003]  secantus-pg-con[7388/7286]          0.023      0.005      0.061                                 
+     592.383045 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.383051 [0003]  <idle>                              0.061      0.000      0.024                                 
+     592.383053 [0014]  python[7384]                        0.055      0.005      0.030                                 
+     592.383112 [0003]  secantus-pg-con[7388/7286]                                       awakened: python[7384]
+     592.383118 [0014]  <idle>                              0.030      0.000      0.064                                 
+     592.383121 [0003]  secantus-pg-con[7388/7286]          0.024      0.005      0.069                                 
+     592.383142 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.383147 [0003]  <idle>                              0.069      0.000      0.026                                 
+     592.383151 [0014]  python[7384]                        0.064      0.006      0.032                                 
+     592.383189 [0010]  <idle>                              0.004      0.000      4.057                                 
+     592.383194 [0010]  rcu_preempt[17]                     4.057      0.007      0.005                                 
+     592.383202 [0003]  secantus-pg-con[7388/7286]                                       awakened: python[7384]
+     592.383207 [0014]  <idle>                              0.032      0.000      0.056                                 
+     592.383211 [0003]  secantus-pg-con[7388/7286]          0.026      0.005      0.063                                 
+     592.383230 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.383244 [0003]  <idle>                              0.063      0.000      0.032                                 
+     592.383247 [0014]  python[7384]                        0.056      0.005      0.039                                 
+     592.383320 [0003]  secantus-pg-con[7388/7286]                                       awakened: python[7384]
+     592.383326 [0014]  <idle>                              0.039      0.000      0.079                                 
+     592.383331 [0003]  secantus-pg-con[7388/7286]          0.032      0.014      0.087                                 
+     592.383352 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.383358 [0003]  <idle>                              0.087      0.000      0.027                                 
+     592.383362 [0014]  python[7384]                        0.079      0.006      0.035                                 
+     592.383417 [0003]  secantus-pg-con[7388/7286]                                       awakened: python[7384]
+     592.383423 [0014]  <idle>                              0.035      0.000      0.061                                 
+     592.383428 [0003]  secantus-pg-con[7388/7286]          0.027      0.006      0.069                                 
+     592.383448 [0014]  python[7384]                                                     awakened: secantus-pg-con[7388/7286]
+     592.383455 [0003]  <idle>                              0.069      0.000      0.026                                 
+     592.383458 [0014]  python[7384]                        0.061      0.006      0.034                                 

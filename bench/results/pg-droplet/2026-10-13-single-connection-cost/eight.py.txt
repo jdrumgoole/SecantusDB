@@ -1,0 +1,57 @@
+"""Eight clients, a table each, over loopback: released against the profile-guided build."""
+import os, subprocess, sys, time, statistics, shutil, collections, multiprocessing as mp
+import psycopg
+
+SECS, PASSES, N = 6.0, 3, 8
+SD = "host=127.0.0.1 port=5544 dbname=postgres user=postgres"
+PG = "host=127.0.0.1 port=5432 dbname=postgres user=postgres sslmode=disable"
+
+
+def client(dsn, workload, slot, start_at, q):
+    with psycopg.connect(dsn, autocommit=True) as c, c.cursor() as cur:
+        t = f"e_{slot}"
+        c.execute(f"drop table if exists {t}"); c.execute(f"create table {t} (k bigint primary key, v bigint)")
+        c.execute(f"insert into {t} values (0, 0)")
+        if workload == "select":
+            def op(i): cur.execute(f"select v from {t} where k = %s", (0,)); cur.fetchone()
+        elif workload == "update":
+            def op(i): cur.execute(f"update {t} set v = v + 1 where k = %s", (0,))
+        else:
+            def op(i): cur.execute(f"insert into {t} values (%s, %s)", (i, i))
+        for i in range(1, 300):
+            op(i)
+        while time.time() < start_at:
+            time.sleep(0.001)
+        n = 300; end = time.time() + SECS
+        while time.time() < end:
+            op(n); n += 1
+    q.put(n - 300)
+
+
+def trial(dsn, workload):
+    q = mp.Queue(); start_at = time.time() + 2.5
+    ps = [mp.Process(target=client, args=(dsn, workload, s, start_at, q)) for s in range(N)]
+    [p.start() for p in ps]; total = sum(q.get() for _ in ps); [p.join() for p in ps]
+    return total / SECS
+
+
+if __name__ == "__main__":
+    targets = [("postgres, no TLS", None, PG)] + [(a.split("=")[0], a.split("=")[1], SD) for a in sys.argv[1:]]
+    rates = collections.defaultdict(list)
+    for p in range(PASSES):
+        for label, path, dsn in targets:
+            d = None
+            if path:
+                subprocess.run(["pkill", "-x", "secantusd-pg"]); time.sleep(0.5); shutil.rmtree("/root/st", ignore_errors=True)
+                d = subprocess.Popen([path, "/root/st", "127.0.0.1:5544"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(2)
+            for w in ("select", "update", "insert"):
+                rates[(label, w)].append(trial(dsn, w))
+            if d:
+                d.terminate(); d.wait()
+    print(f"{'8 clients':24}{'select':>22}{'update':>22}{'insert':>22}")
+    for label, _, _ in targets:
+        row = f"{label:24}"
+        for w in ("select", "update", "insert"):
+            r = rates[(label, w)]
+            row += f"{statistics.median(r):>12,.0f} ({100 * (max(r) - min(r)) / statistics.median(r):4.1f}%)  "
+        print(row)

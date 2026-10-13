@@ -1,0 +1,60 @@
+"""One client, three workloads, several builds of the server, interleaved passes."""
+import os, subprocess, sys, time, statistics, shutil, collections
+import psycopg
+
+SECS, PASSES = float(os.environ.get("SECS", "5")), int(os.environ.get("PASSES", "5"))
+PORT = 5544
+SD = f"host=127.0.0.1 port={PORT} dbname=postgres user=postgres"
+PG = "host=127.0.0.1 port=5432 dbname=postgres user=postgres"
+
+
+def trial(dsn, workload):
+    with psycopg.connect(dsn, autocommit=True) as c, c.cursor() as cur:
+        c.execute("drop table if exists exp_t")
+        c.execute("create table exp_t (k bigint primary key, v bigint)")
+        c.execute("insert into exp_t values (0, 0)")
+        if workload == "select":
+            def op(i): cur.execute("select v from exp_t where k = %s", (0,)); cur.fetchone()
+        elif workload == "update":
+            def op(i): cur.execute("update exp_t set v = v + 1 where k = %s", (0,))
+        else:
+            def op(i): cur.execute("insert into exp_t values (%s, %s)", (i, i))
+        for i in range(1, 1500):
+            op(i)
+        n = 1500; start = n; end = time.monotonic() + SECS
+        while time.monotonic() < end:
+            op(n); n += 1
+    return (n - start) / SECS
+
+
+def with_server(binary):
+    subprocess.run(["pkill", "-x", "secantusd-pg"]); time.sleep(0.5)
+    shutil.rmtree("/root/st", ignore_errors=True)
+    d = subprocess.Popen(["taskset", "-c", "2", binary, "/root/st", f"127.0.0.1:{PORT}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    return d
+
+
+os.sched_setaffinity(0, {4})
+subprocess.run(["taskset", "-acp", "2", open("/var/run/postgresql/16-main.pid").readline().strip()], capture_output=True)
+targets = [("postgres, TLS as psycopg defaults", None, PG), ("postgres, no TLS", None, PG + " sslmode=disable")]
+for name in sys.argv[1:]:
+    label, path = name.split("=", 1)
+    targets.append((label, path, SD))
+rates = collections.defaultdict(list)
+for p in range(PASSES):
+    for label, path, dsn in targets:
+        d = with_server(path) if path else None
+        for w in ("select", "update", "insert"):
+            rates[(label, w)].append(trial(dsn, w))
+        if d:
+            d.terminate(); d.wait()
+    print(f"pass {p + 1} done", file=sys.stderr, flush=True)
+print(f"{'':36}{'select':>22}{'update':>22}{'insert':>22}")
+for label, _, _ in targets:
+    row = f"{label:36}"
+    for w in ("select", "update", "insert"):
+        r = rates[(label, w)]
+        row += f"{statistics.median(r):>12,.0f} ({100 * (max(r) - min(r)) / statistics.median(r):4.1f}%)  "
+    print(row)

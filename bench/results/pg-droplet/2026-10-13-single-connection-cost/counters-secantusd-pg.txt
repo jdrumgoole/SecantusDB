@@ -1,0 +1,17 @@
+== secantusd-pg
+           3291.55 msec task-clock                       #    0.822 CPUs utilized             
+        7701484182      cycles                           #    2.340 GHz                         (62.05%)
+        3712739134      instructions                     #    0.48  insn per cycle              (74.28%)
+         598359008      branches                         #  181.786 M/sec                       (74.63%)
+          25168185      branch-misses                    #    4.21% of all branches             (75.49%)
+         570931501      L1-icache-load-misses                                                   (75.83%)
+           8243100      iTLB-load-misses                                                        (75.13%)
+           2887356      dTLB-load-misses                                                        (49.56%)
+         101766064      L1-dcache-load-misses                                                   (49.39%)
+   <not supported>      LLC-load-misses                                                       
+        1660096638      cycles:u                                                              
+         893723924      instructions:u                   #    0.54  insn per cycle            
+         590735991      cycles:k                                                              
+         228740135      instructions:k                   #    0.39  insn per cycle            
+CLIENT 9,226/s  sleeps/stmt 0.994  preempt/stmt 0.0059  user 19.8us sys 12.9us
+tail: cannot open '/root/build-base.log' for reading: No such file or directory

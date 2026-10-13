@@ -1,0 +1,13 @@
+# build.sh <name> [ENV=VAL ...] : cargo install the released crate with a profile variant
+name=$1; shift
+export DEBIAN_FRONTEND=noninteractive
+if [ ! -x /root/.cargo/bin/cargo ]; then
+  apt-get install -y -qq build-essential cmake clang libclang-dev pkg-config zlib1g-dev liblz4-dev python3 swig >/dev/null 2>&1
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
+fi
+. /root/.cargo/env
+for kv in "$@"; do export "$kv"; done
+export CARGO_PROFILE_RELEASE_STRIP=false CARGO_TARGET_DIR=/root/target-$name
+start=$(date +%s)
+cargo install secantus-pg --version 0.1.0-beta.13 --locked --root /root/b-$name > /root/build-$name.log 2>&1
+echo "exit $? after $(( $(date +%s) - start ))s" > /root/build-$name.done
