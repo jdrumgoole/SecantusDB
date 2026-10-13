@@ -1,0 +1,25 @@
+"""On a client droplet: N processes, each updating documents by _id in a
+collection of its own, from an agreed start time for a fixed duration."""
+import multiprocessing as mp, sys, time
+from pymongo import MongoClient
+
+uri, first, count, start, seconds = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
+PAD = "x" * 100
+
+def work(i, q):
+    coll = MongoClient(uri)["bench"][f"c{i}"]
+    coll.find_one({"_id": 0})
+    while time.time() < start:
+        time.sleep(0.001)
+    end, n = start + seconds, 0
+    while time.time() < end:
+        coll.update_one({"_id": n % 1000}, {"$set": {"n": n, "v": PAD}})
+        n += 1
+    q.put(n)
+
+if __name__ == "__main__":
+    q = mp.Queue()
+    ps = [mp.Process(target=work, args=(first + k, q)) for k in range(count)]
+    [p.start() for p in ps]
+    print(sum(q.get() for _ in ps))
+    [p.join() for p in ps]

@@ -1,0 +1,19 @@
+== base ==
+store: 4.1G, 2 log files
+-rw-r--r-- 1 root root 2147258752 Oct 13 17:44 /root/store/WiredTigerLog.0000000001
+-rw-r--r-- 1 root root 2147483648 Oct 13 17:49 /root/store/WiredTigerLog.0000000002
+listening 81.247141077 s after restart
+secantusd-rs listening on 0.0.0.0:27017
+secantusd-rs listening on 0.0.0.0:27017
+
+documents after restart: 8000
+
+== fix ==
+store: 2.1G, 1 log files
+-rw-r--r-- 1 root root 2147483648 Oct 13 18:04 /root/store/WiredTigerLog.0000000002
+listening 3.931365669 s after restart
+secantusd-rs listening on 0.0.0.0:27017
+secantusd-rs listening on 0.0.0.0:27017
+
+documents after restart: 8000
+
