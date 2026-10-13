@@ -286,6 +286,19 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // `$geoNear` reads the index itself: nothing may come before it.
+    if pipeline
+        .iter()
+        .skip(1)
+        .any(|stage| stage_name(stage) == "$geoNear")
+    {
+        return Err(CommandError::new(
+            40603,
+            "Location40603",
+            "$geoNear was not the first stage in the pipeline after optimization. Is \
+             optimization disabled or inhibited?",
+        ));
+    }
     if let Some(problem) = nested_write_stage(&pipeline) {
         return Ok(problem.into_reply());
     }
@@ -436,6 +449,21 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // in the order mongod's plan returns them is what puts its
                 // ties in mongod's order. mongod moves a `$match` that follows
                 // the `$sort` ahead of it, so that filter is read here too.
+                if crate::near::find_near(&filter)
+                    .map_err(command_error)?
+                    .is_some()
+                {
+                    return Err(CommandError::new(
+                        5626500,
+                        "Location5626500",
+                        "$geoNear, $near, and $nearSphere are not allowed in this context, as \
+                         these operators require sorting geospatial data. If you do not need \
+                         sort, consider using $geoWithin instead. Check out \
+                         https://dochub.mongodb.org/core/near-sort-operation and \
+                         https://dochub.mongodb.org/core/nearSphere-sort-operationfor more \
+                         details.",
+                    ));
+                }
                 let lead = leading_sort(&rest, filter.is_empty());
                 let read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
@@ -450,6 +478,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             collation: collation.as_ref(),
                             vars: &vars,
                             limit,
+                            asked: Default::default(),
                         },
                     )
                 };
@@ -1722,6 +1751,13 @@ fn apply_facet(
                         "$facet is not allowed to be used within a $facet stage",
                     ));
                 }
+                Bson::Document(d) if d.contains_key("$geoNear") => {
+                    return Err(CommandError::new(
+                        40600,
+                        "Location40600",
+                        "$geoNear is not allowed to be used within a $facet stage",
+                    ));
+                }
                 Bson::Document(d) if !d.is_empty() => {}
                 _ => {
                     return Err(CommandError::new(
@@ -2077,6 +2113,13 @@ fn geo_near_index_filter(
     storage: &dyn crate::storage::Storage,
 ) -> Option<Document> {
     const EARTH_RADIUS_METERS: f64 = 6_378_100.0; // matches secantus_core::geo
+                                                  // The stage measures a line or a polygon by its nearest point, and a
+                                                  // `$centerSphere` holds one only when every vertex is inside: the
+                                                  // candidates would leave out documents the stage returns. Every document
+                                                  // is read until there is a candidate shape that covers them.
+    if spec.as_document().is_some() {
+        return None;
+    }
     let spec = spec.as_document()?;
     let max_distance = match spec.get("maxDistance") {
         Some(Bson::Int32(n)) => *n as f64,
@@ -2145,14 +2188,209 @@ fn geo_near_index_filter(
     Some(filter)
 }
 
-/// `$geoNear` — proximity search with attached distances. Mirrors
-/// `aggregate._stage_geo_near`: optional `query` pre-filter, distance from each
-/// doc's `key` field to `near` (`secantus_core::geo::point_distance`), drop docs
-/// outside `[minDistance, maxDistance]`, attach the distance (× `distanceMultiplier`)
-/// under `distanceField`, optionally echo the raw geometry under `includeLocs`,
-/// and return ascending by distance. A GeoJSON Point `near` is spherical; a
-/// legacy `[x, y]` is planar unless `spherical: true`. `key` is explicit or
-/// inferred from the collection's lone geo index (`infer_geo_near_key`).
+/// One `$geoNear` stage as mongod reads it.
+struct GeoNearStage<'a> {
+    near: secantus_core::geoshape::Near,
+    /// Distances are given and returned in radians: a legacy point on the
+    /// sphere.
+    radians: bool,
+    /// The stage said `spherical: true`.
+    asked_spherical: bool,
+    distance_field: Option<&'a str>,
+    include_locs: Option<&'a str>,
+    key: Option<&'a str>,
+    query: Option<&'a Document>,
+    multiplier: f64,
+}
+
+fn geo_near_stage(spec: &Document) -> Result<GeoNearStage<'_>, CommandError> {
+    use secantus_core::geoshape::{Near, EARTH_RADIUS_METERS};
+    let fail =
+        |code: i32, text: String| CommandError::new(code, crate::util::error_code_name(code), text);
+    let number = |v: &Bson, wrong: &str, negative: &str| -> Result<f64, CommandError> {
+        match bson_f64(v) {
+            None => Err(fail(14, wrong.to_string())),
+            Some(n) if n < 0.0 => Err(fail(2, negative.to_string())),
+            Some(n) => Ok(n),
+        }
+    };
+    let (mut near, mut spherical) = (None, false);
+    let (mut min, mut max, mut multiplier) = (None, None, 1.0);
+    let (mut distance_field, mut include_locs, mut key, mut query) = (None, None, None, None);
+    for (name, v) in spec {
+        match name.as_str() {
+            "near" => {
+                if !matches!(v, Bson::Document(_) | Bson::Array(_)) {
+                    return Err(fail(
+                        5860401,
+                        "$geoNear requires near argument to be a GeoJSON object or a legacy \
+                         point(array)"
+                            .to_string(),
+                    ));
+                }
+                near = Some(v);
+            }
+            "distanceField" => match v {
+                Bson::String(f) if f.is_empty() => {
+                    return Err(fail(
+                        40352,
+                        "FieldPath cannot be constructed with empty string".to_string(),
+                    ))
+                }
+                Bson::String(f) if f.starts_with('$') => {
+                    return Err(fail(
+                        16410,
+                        format!(
+                            "Consider using $getField or $setField for a field path with '.' or \
+                             '$'. :: caused by :: FieldPath field names may not start with '$', \
+                             given '{f}'."
+                        ),
+                    ))
+                }
+                Bson::String(f) => distance_field = Some(f.as_str()),
+                _ => {
+                    return Err(fail(
+                        16606,
+                        "$geoNear requires that the 'distanceField' option is a String".to_string(),
+                    ))
+                }
+            },
+            "maxDistance" => {
+                max = Some(number(
+                    v,
+                    "$geoNear requires $maxDistance to evaluate to a number",
+                    "maxDistance must be nonnegative",
+                )?)
+            }
+            "minDistance" => {
+                min = Some(number(
+                    v,
+                    "$geoNear requires $minDistance to evaluate to a number",
+                    "minDistance must be nonnegative",
+                )?)
+            }
+            "distanceMultiplier" => {
+                multiplier = number(
+                    v,
+                    "distanceMultiplier must be a number",
+                    "distanceMultiplier must be nonnegative",
+                )?
+            }
+            "spherical" => {
+                spherical =
+                    !matches!(v, Bson::Boolean(false) | Bson::Null) && bson_f64(v) != Some(0.0)
+            }
+            "query" => match v {
+                Bson::Document(q) => query = Some(q),
+                _ => return Err(fail(14, "query must be an object".to_string())),
+            },
+            "key" => match v {
+                Bson::String(k) if k.is_empty() => {
+                    return Err(fail(
+                        2,
+                        "$geoNear parameter 'key' cannot be the empty string".to_string(),
+                    ))
+                }
+                Bson::String(k) => key = Some(k.as_str()),
+                other => {
+                    return Err(fail(
+                        14,
+                        format!(
+                            "$geoNear parameter 'key' must be of type string but found type: {}",
+                            secantus_core::query::bson_type_name(other)
+                        ),
+                    ))
+                }
+            },
+            "includeLocs" => match v {
+                Bson::String(f) => include_locs = Some(f.as_str()),
+                _ => {
+                    return Err(fail(
+                        16607,
+                        "$geoNear requires that 'includeLocs' option is a String".to_string(),
+                    ))
+                }
+            },
+            "limit" | "num" => {
+                return Err(fail(
+                    if name == "limit" { 50858 } else { 50857 },
+                    format!(
+                        "$geoNear no longer supports the '{name}' parameter. Use a $limit stage \
+                         instead."
+                    ),
+                ))
+            }
+            "uniqueDocs" => {}
+            other => return Err(fail(2, format!("Unknown argument to $geoNear: {other}"))),
+        }
+    }
+    let near =
+        near.ok_or_else(|| fail(5860400, "$geoNear requires a 'near' argument".to_string()))?;
+    // A GeoJSON point is on the sphere whatever `spherical` says.
+    let geojson = matches!(near, Bson::Document(d) if d.contains_key("type"));
+    let centre = if geojson {
+        let d = near.as_document().expect("a GeoJSON object");
+        match secantus_core::geoshape::geojson(d) {
+            Ok(secantus_core::geoshape::Geom::Point(p)) => p,
+            _ => {
+                return Err(fail(
+                    2,
+                    "invalid argument in geo near query: type".to_string(),
+                ))
+            }
+        }
+    } else {
+        let parts: Vec<&Bson> = match near {
+            Bson::Array(a) => a.iter().collect(),
+            Bson::Document(d) => d.values().collect(),
+            _ => Vec::new(),
+        };
+        match (
+            parts.first().and_then(|v| bson_f64(v)),
+            parts.get(1).and_then(|v| bson_f64(v)),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return Err(fail(2, "invalid argument in geo near query: 0".to_string())),
+        }
+    };
+    let radians = spherical && !geojson;
+    let metres = |d: Option<f64>| d.map(|d| if radians { d * EARTH_RADIUS_METERS } else { d });
+    if let Some(q) = query {
+        if crate::near::find_near(q).map_err(command_error)?.is_some() {
+            return Err(fail(5626500, NEAR_NEEDS_A_SORT.to_string()));
+        }
+    }
+    Ok(GeoNearStage {
+        near: Near {
+            centre,
+            spherical: spherical || geojson,
+            geojson,
+            min: metres(min),
+            max: metres(max),
+        },
+        radians,
+        asked_spherical: spherical,
+        distance_field,
+        include_locs,
+        key,
+        query,
+        multiplier,
+    })
+}
+
+const NEAR_NEEDS_A_SORT: &str = "$geoNear, $near, and $nearSphere are not allowed in this \
+    context, as these operators require sorting geospatial data. If you do not need sort, \
+    consider using $geoWithin instead. Check out \
+    https://dochub.mongodb.org/core/near-sort-operation and \
+    https://dochub.mongodb.org/core/nearSphere-sort-operationfor more details.";
+
+/// `$geoNear`: the documents nearest first, each with its distance.
+///
+/// A GeoJSON `near` measures on the sphere in metres and reads a `2dsphere`
+/// index. A legacy point measures in the plane and reads a `2d` index, or
+/// with `spherical: true` on the sphere in radians and reads either. Every
+/// geometry the index holds is measured: a line or a polygon by its nearest
+/// point.
 fn apply_geo_near(
     spec: Option<&Bson>,
     docs: Vec<Document>,
@@ -2164,89 +2402,95 @@ fn apply_geo_near(
     let spec = spec
         .and_then(Bson::as_document)
         .ok_or_else(|| bad_value("$geoNear requires a document spec"))?;
-    let distance_field = spec
-        .get_str("distanceField")
-        .map_err(|_| bad_value("$geoNear requires a string `distanceField`"))?;
-    // `key` is optional: when absent, infer it from the collection's lone geo
-    // index (mongod does the same; ambiguous when there's more than one).
-    let key: String = match spec.get_str("key") {
-        Ok(k) => k.to_string(),
-        Err(_) => infer_geo_near_key(db, coll, storage)?,
+    let stage = geo_near_stage(spec)?;
+    let key: String = match stage.key {
+        Some(k) => k.to_string(),
+        None => infer_geo_near_key(db, coll, storage)?,
     };
-    let key = key.as_str();
-    let (spherical, center) = match spec.get("near") {
-        Some(Bson::Document(d)) if d.get_str("type").ok() == Some("Point") => {
-            let coords = d
-                .get_array("coordinates")
-                .map_err(|_| bad_value("$geoNear `near` Point needs coordinates"))?;
-            if coords.len() != 2 {
-                return Err(bad_value("$geoNear `near` Point needs [lng, lat]"));
-            }
-            let (x, y) = (bson_f64(&coords[0]), bson_f64(&coords[1]));
-            (
-                true,
-                (
-                    x.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
-                    y.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
-                ),
-            )
-        }
-        Some(Bson::Array(a)) if a.len() == 2 => {
-            let sph = spec.get_bool("spherical").unwrap_or(false);
-            let (x, y) = (bson_f64(&a[0]), bson_f64(&a[1]));
-            (
-                sph,
-                (
-                    x.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
-                    y.ok_or_else(|| bad_value("$geoNear `near` coords must be numbers"))?,
-                ),
-            )
-        }
-        _ => {
-            return Err(bad_value(
-                "$geoNear `near` must be a GeoJSON Point or [x, y]",
-            ))
-        }
+    let coll = coll.ok_or_else(|| bad_value("$geoNear requires a collection"))?;
+    // The index has to be one this kind of point reads.
+    let readable = |kind: &str| match kind {
+        "2dsphere" => stage.near.spherical,
+        "2d" => !stage.near.geojson,
+        _ => false,
     };
-    let pre_filter = spec.get("query").and_then(Bson::as_document);
-    let multiplier = spec
-        .get("distanceMultiplier")
-        .and_then(bson_f64)
-        .unwrap_or(1.0);
-    let max_distance = spec.get("maxDistance").and_then(bson_f64);
-    let min_distance = spec.get("minDistance").and_then(bson_f64);
-    let include_locs = spec.get_str("includeLocs").ok();
-
-    let mut scored: Vec<(f64, Document)> = Vec::new();
+    let indexed = storage
+        .list_indexes(db, coll)
+        .map_err(command_error)?
+        .iter()
+        .any(|ix| {
+            ix.get_document("key")
+                .ok()
+                .and_then(|k| k.get_str(&key).ok())
+                .is_some_and(readable)
+        });
+    if !indexed {
+        let max = match spec.get("maxDistance").and_then(bson_f64) {
+            Some(m) => crate::crud::fmt_g(m),
+            None => "1.79769e+308".to_string(),
+        };
+        return Err(CommandError::new(
+            291,
+            "NoQueryExecutionPlans",
+            format!(
+                "error processing query: ns={db}.{coll}Tree: {}\nSort: {{}}\nProj: {{}}\nCollation: \
+                 {{ locale: \"simple\" }}\n planner returned error :: caused by :: unable to find \
+                 index for $geoNear query",
+                crate::near::tree(
+                    stage.query,
+                    &format!(
+                        "GEONEAR  field={key} maxdist={max} isNearSphere={}",
+                        i32::from(stage.asked_spherical)
+                    )
+                )
+            ),
+        ));
+    }
+    let unit = if stage.radians {
+        secantus_core::geoshape::EARTH_RADIUS_METERS
+    } else {
+        1.0
+    };
+    let mut scored: Vec<(f64, bool, Document)> = Vec::new();
     for doc in docs {
-        if let Some(pf) = pre_filter {
-            if !secantus_core::query::matches(&doc, pf, vars, None).unwrap_or(false) {
+        if let Some(q) = stage.query {
+            if !secantus_core::query::matches(&doc, q, vars, None).map_err(|f| match f {
+                secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
+                    CommandError::new(code, crate::util::error_code_name(code), message)
+                }
+                _ => bad_value("query uses a construct the Rust server does not support"),
+            })? {
                 continue;
             }
         }
-        let Some(value) = secantus_core::get_path(&doc, key).cloned() else {
+        let Some(value) = secantus_core::get_path(&doc, &key).cloned() else {
             continue;
         };
-        let Some(d) = secantus_core::geo::point_distance(center, &value, spherical) else {
+        let Some(d) = stage
+            .near
+            .distance(&value)
+            .filter(|d| stage.near.admits(*d))
+        else {
             continue;
         };
-        if max_distance.is_some_and(|mx| d > mx) || min_distance.is_some_and(|mn| d < mn) {
-            continue;
-        }
+        let shaped =
+            matches!(&value, Bson::Document(g) if g.get_str("type").is_ok_and(|t| t != "Point"));
         let mut out = doc;
-        set_field_path(&mut out, distance_field, Bson::Double(d * multiplier));
-        if let Some(loc_field) = include_locs {
-            set_field_path(&mut out, loc_field, value);
+        if let Some(field) = stage.distance_field {
+            set_field_path(&mut out, field, Bson::Double(d / unit * stage.multiplier));
         }
-        scored.push((d, out));
+        if let Some(field) = stage.include_locs {
+            set_field_path(&mut out, field, value);
+        }
+        scored.push((d, shaped, out));
     }
-    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(scored.into_iter().map(|(_, d)| d).collect())
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    Ok(scored.into_iter().map(|(_, _, d)| d).collect())
 }
 
-/// Infer `$geoNear`'s `key` from the collection's geo index when the stage
-/// doesn't name one: the field of the lone `2d` / `2dsphere` index. Errors if
-/// there's no geo index or more than one (mongod's behaviour — ambiguous).
+/// The field `$geoNear` measures when the stage names none: that of the
+/// collection's `2d` index when it has one, else of its `2dsphere` index.
+/// Two of a kind is mongod's refusal.
 fn infer_geo_near_key(
     db: &str,
     coll: Option<&str>,
@@ -2254,27 +2498,32 @@ fn infer_geo_near_key(
 ) -> Result<String, CommandError> {
     let coll = coll.ok_or_else(|| bad_value("$geoNear requires a collection"))?;
     let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
-    let mut geo_fields: Vec<String> = Vec::new();
-    for idx in &indexes {
-        if let Ok(key) = idx.get_document("key") {
-            for (field, v) in key {
-                if matches!(v, Bson::String(s) if s == "2dsphere" || s == "2d") {
-                    geo_fields.push(field.clone());
-                }
+    let fields = |kind: &str| -> Vec<String> {
+        indexes
+            .iter()
+            .filter_map(|ix| ix.get_document("key").ok())
+            .flat_map(|key| key.iter())
+            .filter(|(_, v)| matches!(v, Bson::String(s) if s == kind))
+            .map(|(field, _)| field.clone())
+            .collect()
+    };
+    let not_found = |text: String| CommandError::new(27, "IndexNotFound", text);
+    for kind in ["2d", "2dsphere"] {
+        let mut found = fields(kind);
+        match found.len() {
+            0 => {}
+            1 => return Ok(found.remove(0)),
+            _ => {
+                return Err(not_found(format!(
+                    "There is more than one {kind} index on {db}.{coll}; unsure which to use for \
+                     $geoNear"
+                )))
             }
         }
     }
-    match geo_fields.len() {
-        1 => Ok(geo_fields.remove(0)),
-        0 => Err(CommandError::new(
-            27,
-            "IndexNotFound",
-            "$geoNear requires a 2d or 2dsphere index, but none were found",
-        )),
-        _ => Err(bad_value(
-            "$geoNear: more than one geo index — specify `key` to disambiguate",
-        )),
-    }
+    Err(not_found(
+        "$geoNear requires a 2d or 2dsphere index, but none were found".to_string(),
+    ))
 }
 
 /// `$collStats` — first-stage collection statistics. Minimal but driver-faithful

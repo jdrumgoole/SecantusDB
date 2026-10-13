@@ -632,6 +632,15 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 collation: collation.as_ref(),
                 vars: &let_vars,
                 limit: if limit > 0 { (skip + limit) as i64 } else { 0 },
+                asked: crate::near::Asked {
+                    skip: skip as i64,
+                    limit: limit as i64,
+                    sort,
+                    projection: doc
+                        .get_document("projection")
+                        .ok()
+                        .filter(|p| !p.is_empty()),
+                },
             },
         )
     }

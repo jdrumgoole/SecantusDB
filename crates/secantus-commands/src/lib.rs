@@ -54,6 +54,7 @@ pub mod handshake;
 pub mod logbuf;
 pub mod mapreduce;
 pub mod mongod_codes;
+mod near;
 pub mod params;
 pub mod rbac;
 pub mod roles;

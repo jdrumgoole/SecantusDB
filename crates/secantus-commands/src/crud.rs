@@ -232,7 +232,7 @@ fn raw_document_error(raw: &[u8], index: usize) -> Option<Document> {
 /// A double as C's `%g` writes it: six significant digits, trailing zeros
 /// dropped, an exponent below 1e-4 and from 1e+6. mongod prints a `limit` it
 /// refuses this way: `2.14748e+09`, `1e+06`, `0.1`.
-fn fmt_g(x: f64) -> String {
+pub(crate) fn fmt_g(x: f64) -> String {
     if x.is_nan() {
         return "nan".to_string();
     }
@@ -1147,6 +1147,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation: collation.as_ref(),
                     vars: &let_vars,
                     limit: 0,
+                    asked: Default::default(),
                 },
             )
             .unwrap_or(None)
@@ -1342,6 +1343,11 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .map_err(command_error)?
             .len() as i64
     } else {
+        // A `$near` needs its index whether or not the order matters.
+        if let Some(near) = crate::near::find_near(&filter).map_err(command_error)? {
+            near.check_index(storage, &ctx.db_name, &coll, Default::default())
+                .map_err(command_error)?;
+        }
         storage
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
             .map_err(command_error)? as i64
@@ -1737,6 +1743,7 @@ pub(crate) fn update_in(
                         collation: collation.as_ref(),
                         vars: &Document::new(),
                         limit: 1,
+                        asked: Default::default(),
                     },
                 )
                 .map_err(|_| CommandError::new(2, "BadValue", "sort resolution failed"))
@@ -1842,6 +1849,7 @@ pub(crate) fn update_in(
                     collation: collation.as_ref(),
                     vars: &stmt_vars,
                     limit: 0,
+                    asked: Default::default(),
                 },
             )
             .unwrap_or(None)

@@ -50,6 +50,9 @@ pub(crate) struct Ask<'a> {
     /// How many documents the caller takes from the front (`skip` plus
     /// `limit`); 0 is all of them. It is part of which plan mongod keeps.
     pub limit: i64,
+    /// The rest of what the read asked for, printed with a `$near` mongod
+    /// cannot plan.
+    pub asked: crate::near::Asked<'a>,
 }
 
 /// The largest collection read whole to count what each candidate plan
@@ -307,6 +310,10 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             return Ok(None);
         }
     }
+    let near = crate::near::find_near(ask.filter)?;
+    if let Some(near) = &near {
+        near.check_index(storage, ask.db, ask.coll, ask.asked)?;
+    }
     let Some(matched) = storage.matching_rows(
         ask.db,
         ask.coll,
@@ -319,6 +326,16 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         return Ok(None);
     };
     let (mut rows, mut via) = (matched.rows, matched.via);
+    // A `$near` is the order: nearest first, unless a sort says otherwise.
+    if let Some(near) = &near {
+        if via.take().is_some() {
+            rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+        }
+        rows = near.nearest_first(rows);
+        if ask.sort.is_none() {
+            return Ok(Some(rows));
+        }
+    }
     if rows.len() < 2 {
         return Ok(Some(rows));
     }

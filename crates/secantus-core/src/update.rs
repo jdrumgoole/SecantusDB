@@ -1011,7 +1011,7 @@ fn traverse_problem(doc: &Document, path: &str) -> Option<Fallback> {
 /// The operators that test one value. A `$pull` condition that opens with one
 /// of them is asked of each element; any other document is a filter the
 /// element must match as a document.
-const VALUE_OPERATORS: [&str; 25] = [
+const VALUE_OPERATORS: [&str; 26] = [
     "$eq",
     "$ne",
     "$gt",
@@ -1034,6 +1034,7 @@ const VALUE_OPERATORS: [&str; 25] = [
     "$bitsAllClear",
     "$bitsAnyClear",
     "$geoWithin",
+    "$within",
     "$geoIntersects",
     "$near",
     "$nearSphere",

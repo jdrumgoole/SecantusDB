@@ -1380,10 +1380,19 @@ struct Geo2d {
 impl Geo2d {
     /// The geohash cell (8-byte big-endian key bytes) for a point-like value, or
     /// `None` if the field value isn't a point (a `2d` index is point-only).
-    fn cell_kb(&self, value: &Bson) -> Option<Vec<u8>> {
-        let (x, y) = secantus_core::geo::doc_point(value)?;
-        let cell = secantus_core::geo::cell_2d(x, y, self.bits, self.lo, self.hi);
-        Some(secantus_core::geo::encode_cell(cell).to_vec())
+    fn cell_kbs(&self, value: &Bson) -> Vec<Vec<u8>> {
+        // A value may hold several locations (`[[1, 1], [30, 30]]`): a cell
+        // each, so the document is found through any of them.
+        let mut out: Vec<Vec<u8>> = secantus_core::geoshape::stored_points(value)
+            .into_iter()
+            .map(|(x, y)| {
+                let cell = secantus_core::geo::cell_2d(x, y, self.bits, self.lo, self.hi);
+                secantus_core::geo::encode_cell(cell).to_vec()
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -1431,17 +1440,22 @@ impl GeoSphere {
     /// geometry covers its bounding rect (over-covers; the `matches()` verifier
     /// filters false positives). Empty when the value isn't a geometry.
     fn cell_kbs(&self, value: &Bson) -> Vec<Vec<u8>> {
-        let cells = if let Some((x, y)) = secantus_core::geo::doc_point(value) {
-            s2_cells_for_point(x, y)
-        } else if let Some((min_x, min_y, max_x, max_y)) = secantus_core::geo::doc_bbox(value) {
-            s2_cells_for_bbox(min_x, min_y, max_x, max_y)
-        } else {
-            return Vec::new();
-        };
-        cells
-            .into_iter()
-            .map(|c| secantus_core::geo::encode_cell(c).to_vec())
-            .collect()
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for (min_x, min_y, max_x, max_y) in secantus_core::geoshape::stored_boxes(value) {
+            let cells = if (min_x, min_y) == (max_x, max_y) {
+                s2_cells_for_point(min_x, min_y)
+            } else {
+                s2_cells_for_bbox(min_x, min_y, max_x, max_y)
+            };
+            out.extend(
+                cells
+                    .into_iter()
+                    .map(|c| secantus_core::geo::encode_cell(c).to_vec()),
+            );
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -2568,6 +2582,65 @@ pub struct MatchedRows {
     /// The one index whose entries gave the rows their order; `None` when
     /// they are in RecordId order.
     pub via: Option<String>,
+}
+
+fn no_geo_keys(doc: &Document, why: &str) -> String {
+    format!(
+        "Can't extract geo keys: {}  {why}",
+        secantus_core::query::bson_value_repr(&Bson::Document(doc.clone()))
+    )
+}
+
+fn named(why: String, names: bool, doc: &Document) -> String {
+    if names {
+        format!(
+            "{why} :: caused by :: {}",
+            secantus_core::query::bson_value_repr(&Bson::Document(doc.clone()))
+        )
+    } else {
+        why
+    }
+}
+
+/// Why a geo index of the collection cannot hold `doc`: mongod's code and
+/// message, or `None` when every one can.
+fn geo_key_problem(doc: &Document, descs: &[IndexDesc]) -> Option<(i32, String)> {
+    for desc in descs {
+        if let Some(gs) = &desc.geo_sphere {
+            let why =
+                secantus_core::geoshape::sphere_key_problem(&gs.field, get_path(doc, &gs.field));
+            if let Some(why) = why {
+                return Some((16755, no_geo_keys(doc, &why)));
+            }
+        }
+        if let Some(g) = &desc.geo_2d {
+            let found =
+                secantus_core::geoshape::flat_key_problem(get_path(doc, &g.field), g.lo, g.hi);
+            if let Some((code, why, names)) = found {
+                return Some((code, named(why, names, doc)));
+            }
+        }
+    }
+    None
+}
+
+/// An index build that met a document it cannot index, after `scanned` it
+/// could: mongod's account of where its scan stopped.
+fn scan_stopped(scanned: usize, code: i32, why: &str) -> StorageError {
+    StorageError::QueryError {
+        code,
+        errmsg: format!(
+            "collection scan stopped. totalRecords: {scanned}; durationMillis: 0ms; phase: \
+             collection scan; collectionScanPosition: {}; readSource: kMajorityCommitted :: \
+             caused by :: {why}",
+            if scanned == 0 {
+                "(None)".to_string()
+            } else {
+                format!("RecordId({scanned})")
+            }
+        ),
+        exec: false,
+    }
 }
 
 /// One index's multikey paths: the DDL generation they were read under,
@@ -8817,6 +8890,13 @@ impl Storage {
                 }
                 // Reject unique-index violations before writing anything.
                 let descs = self.index_descs(&session, db, coll)?;
+                if let Some((code, errmsg)) = geo_key_problem(&doc, &descs) {
+                    return Err(StorageError::QueryError {
+                        code,
+                        errmsg,
+                        exec: false,
+                    });
+                }
                 if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
                     // A repeated `_id` is the error mongod reports when both
                     // are repeated; the write below raises it.
@@ -8964,6 +9044,20 @@ impl Storage {
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
                     if timeseries {
                         key.extend_from_slice(&self.timeseries_doc_suffix());
+                    }
+                    // A value a geo index cannot hold is that document's
+                    // write error, as a duplicate key is.
+                    if let Some((code, errmsg)) = geo_key_problem(&doc, &descs) {
+                        let mut e = Document::new();
+                        e.insert("index", index as i32);
+                        e.insert("code", code);
+                        e.insert("errmsg", errmsg);
+                        errors.push(e);
+                        if ordered {
+                            stopped = true;
+                            break;
+                        }
+                        continue;
                     }
                     // Unique-index pre-check (collect a write-error rather than abort).
                     // A document that also repeats an `_id` is reported for
@@ -9183,6 +9277,13 @@ impl Storage {
                 // Reject unique-index violations before mutating anything (the doc's own
                 // existing entries are excluded by its id_key).
                 let descs = self.index_descs(&session, db, coll)?;
+                if let Some((code, errmsg)) = geo_key_problem(&doc, &descs) {
+                    return Err(StorageError::QueryError {
+                        code,
+                        errmsg,
+                        exec: true,
+                    });
+                }
                 if let Some(c) =
                     self.unique_conflict(&session, db, coll, &doc, &descs, Some(recordid))?
                 {
@@ -10855,7 +10956,8 @@ impl Storage {
             // multikey so the regular (numeric) pickers skip it.
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+            let rows = self.scan_docs(session, db, coll)?;
+            for (scanned, (rid, _id_k, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
                 // collection can outlive its budget here even after the read
@@ -10864,7 +10966,17 @@ impl Storage {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 let d = decode_doc(&blob)?;
-                if let Some(kb) = get_path(&d, &geo.field).and_then(|v| geo.cell_kb(v)) {
+                if let Some((code, why, names)) = secantus_core::geoshape::flat_key_problem(
+                    get_path(&d, &geo.field),
+                    geo.lo,
+                    geo.hi,
+                ) {
+                    return Err(scan_stopped(scanned, code, &named(why, names, &d)));
+                }
+                for kb in get_path(&d, &geo.field)
+                    .map(|v| geo.cell_kbs(v))
+                    .unwrap_or_default()
+                {
                     out.push((kb, rid));
                 }
             }
@@ -10882,7 +10994,8 @@ impl Storage {
                 .entry("2dsphereIndexVersion".to_string())
                 .or_insert(Bson::Int32(3));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-            for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+            let rows = self.scan_docs(session, db, coll)?;
+            for (scanned, (rid, _id_k, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
                 // collection can outlive its budget here even after the read
@@ -10891,6 +11004,11 @@ impl Storage {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 let d = decode_doc(&blob)?;
+                if let Some(why) =
+                    secantus_core::geoshape::sphere_key_problem(&gs.field, get_path(&d, &gs.field))
+                {
+                    return Err(scan_stopped(scanned, 16755, &no_geo_keys(&d, &why)));
+                }
                 if let Some(v) = get_path(&d, &gs.field) {
                     for kb in gs.cell_kbs(v) {
                         out.push((kb, rid));
@@ -11891,7 +12009,10 @@ impl Storage {
         }
         // 2d geo index: one cell entry per point-valued field (point-only).
         if let Some(geo) = &desc.geo_2d {
-            if let Some(kb) = get_path(doc, &geo.field).and_then(|v| geo.cell_kb(v)) {
+            for kb in get_path(doc, &geo.field)
+                .map(|v| geo.cell_kbs(v))
+                .unwrap_or_default()
+            {
                 out.push(pack_entry(&kb, recordid));
             }
             return Ok(out);
@@ -14893,6 +15014,13 @@ impl Storage {
                     break;
                 }
             }
+            if let Some((code, errmsg)) = geo_key_problem(&new, &descs) {
+                return Err(StorageError::QueryError {
+                    code,
+                    errmsg,
+                    exec: true,
+                });
+            }
             if let Some(c) =
                 self.unique_conflict(session, db, coll, &new, &descs, Some(recordid))?
             {
@@ -15048,6 +15176,13 @@ impl Storage {
                             if !new_ok && !was_already_invalid {
                                 return Err(StorageError::DocumentValidationFailure(Box::new(new)));
                             }
+                        }
+                        if let Some((code, errmsg)) = geo_key_problem(&new, &descs) {
+                            return Err(StorageError::QueryError {
+                                code,
+                                errmsg,
+                                exec: true,
+                            });
                         }
                         if let Some(c) =
                             self.unique_conflict(&session, db, coll, &new, &descs, Some(recordid))?
@@ -15227,6 +15362,13 @@ impl Storage {
                         }
                     }
                     let id = new.get("_id").cloned().unwrap();
+                    if let Some((code, errmsg)) = geo_key_problem(&new, &descs) {
+                        return Err(StorageError::QueryError {
+                            code,
+                            errmsg,
+                            exec: true,
+                        });
+                    }
                     if let Some(c) = self.unique_conflict(&session, db, coll, &new, &descs, None)? {
                         return Err(StorageError::DuplicateKey(Box::new(c)));
                     }

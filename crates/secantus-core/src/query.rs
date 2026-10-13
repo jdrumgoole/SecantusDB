@@ -551,6 +551,7 @@ const KNOWN_FIELD_OPS: &[&str] = &[
     "$bitsAllClear",
     "$bitsAnyClear",
     "$geoWithin",
+    "$within",
     "$geoIntersects",
     "$near",
     "$nearSphere",
@@ -657,41 +658,21 @@ fn field_matches_descend(
                 }
                 regex_options_ok(opts)?;
             }
+            // A `$near` has the condition document to itself: its distance
+            // bounds are siblings, and nothing else may be.
+            if let Some(near) = crate::geoshape::near_condition(d)? {
+                return Ok(values
+                    .iter()
+                    .filter_map(|c| c.value)
+                    .filter_map(|v| near.distance(v))
+                    .any(|dist| near.admits(dist)));
+            }
             for (op, arg) in d.iter() {
                 match op.as_str() {
                     // `$options` is a sibling modifier of `$regex`, validated above.
                     "$options" => continue,
                     "$regex" => {
                         if !op_regex(values, arg, d.get("$options"), descend)? {
-                            return Ok(false);
-                        }
-                    }
-                    // `$maxDistance` / `$minDistance` are sibling modifiers of the
-                    // legacy 2d `$near` / `$nearSphere` form; consumed with them.
-                    "$maxDistance" | "$minDistance"
-                        if d.contains_key("$near") || d.contains_key("$nearSphere") =>
-                    {
-                        continue
-                    }
-                    "$near" => {
-                        if !crate::geo::op_geo_near(
-                            values,
-                            arg,
-                            d.get("$maxDistance"),
-                            d.get("$minDistance"),
-                            false,
-                        )? {
-                            return Ok(false);
-                        }
-                    }
-                    "$nearSphere" => {
-                        if !crate::geo::op_geo_near(
-                            values,
-                            arg,
-                            d.get("$maxDistance"),
-                            d.get("$minDistance"),
-                            true,
-                        )? {
                             return Ok(false);
                         }
                     }
@@ -881,13 +862,23 @@ fn op_matches(
         "$bitsAnySet" => op_bits(values, arg, |b| b, false, op, field, descend),
         "$bitsAllClear" => op_bits(values, arg, |b| !b, true, op, field, descend),
         "$bitsAnyClear" => op_bits(values, arg, |b| !b, false, op, field, descend),
-        "$geoWithin" => crate::geo::op_geo_within(values, arg),
+        "$geoWithin" | "$within" => crate::geo::op_geo_within(values, arg, op),
         "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
         // The legacy 2d *sibling* `$maxDistance`/`$minDistance` form is handled in
         // `field_matches` (it needs the parent condition dict); here (e.g. under
         // `$elemMatch`/`$not`) only the self-contained list / GeoJSON form is seen.
-        "$near" => crate::geo::op_geo_near(values, arg, None, None, false),
-        "$nearSphere" => crate::geo::op_geo_near(values, arg, None, None, true),
+        "$near" | "$nearSphere" | "$geoNear" => {
+            let mut cond = bson::Document::new();
+            cond.insert(op, arg.clone());
+            match crate::geoshape::near_condition(&cond)? {
+                Some(near) => Ok(values
+                    .iter()
+                    .filter_map(|c| c.value)
+                    .filter_map(|v| near.distance(v))
+                    .any(|dist| near.admits(dist))),
+                None => Ok(false),
+            }
+        }
         // A name mongod does not know at all is its own error (measured 8.2.11,
         // 2026-10-01); a Defer reached the client as "query uses a construct
         // the Rust server does not support". A KNOWN operator this engine does
@@ -2749,7 +2740,7 @@ pub(crate) fn coerce_int64_argument(value: &Bson, label: &str) -> Option<Result<
 /// Every field-level operator `op_matches` dispatches, plus the sibling
 /// modifiers that tune one. `$not` validates its inner document against this.
 /// Mirrors `query._KNOWN_FIELD_OPERATORS`.
-const KNOWN_FIELD_OPERATORS: [&str; 28] = [
+const KNOWN_FIELD_OPERATORS: [&str; 29] = [
     "$eq",
     "$ne",
     "$gt",
@@ -2772,6 +2763,7 @@ const KNOWN_FIELD_OPERATORS: [&str; 28] = [
     "$bitsAllClear",
     "$bitsAnyClear",
     "$geoWithin",
+    "$within",
     "$geoIntersects",
     "$near",
     "$nearSphere",

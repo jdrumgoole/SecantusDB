@@ -9202,6 +9202,84 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.081 Geo queries -- 2026-10-13
+
+`tools/probes/geo_queries.py`, mongod 8.2.11: 105 scenarios, 1,278 replies
+over a raw connection (`$geoWithin`, `$geoIntersects`, `$near`,
+`$nearSphere`, the `$geoNear` stage, and what a `2d` or `2dsphere` index
+holds and refuses). A read is compared by its whole reply, a double to nine
+digits; an index build or a write by its reply and by what the collection
+and its indexes hold afterwards. mongod answered the same on three runs
+against itself. The Rust server differed on 726 replies and differs on 137.
+Pinned by `crates/secantus-storage-adapter/tests/geo_queries_wt.rs`.
+
+The geo code was a port of the Python engine's, which tests every shape in
+the plane. mongod does not, and most of the 726 came from that:
+
+- **A flat shape holds points only.** `$box`, `$polygon` and `$center`
+  returned a line or a polygon lying inside them; mongod returns points (a
+  legacy pair, a two-number document, a GeoJSON `Point`).
+- **`$geometry` is on the sphere.** An edge is the great-circle arc between
+  its ends: `[1, 1]` is not on the line from `[0, 0]` to `[2, 2]`, and a
+  polygon across the antimeridian is the small one. Both were answered as
+  if the coordinates were a plane.
+- **A value with several locations** (`[[1, 1], [30, 30]]`) matched
+  nothing, and through a `2d` index was not found at all.
+- **`$near` was a filter and nothing else.** It ran without a geo index,
+  returned documents in storage order, measured points only, and was taken
+  inside `$or`, `$not` and `$match`. mongod refuses each of those, sorts
+  nearest first, and measures a line or a polygon by its nearest point.
+- **`$geoNear`** took a GeoJSON `near` over a `2d` index, ignored
+  `spherical` for a legacy point's units, and required `distanceField`.
+- **A geo index held anything.** A `2dsphere` index took `loc: "x"` and a
+  point at longitude 200; a `2d` index took GeoJSON. mongod refuses the
+  insert, the update and the build, each with the document in the message.
+- `$within` was an unknown operator, and about ninety argument errors had
+  another text or none.
+
+Where it is now: `secantus_core::geoshape` (shapes, the sphere, `$near`,
+what an index holds), `secantus-commands/src/near.rs` (where `$near` may
+stand, its index, nearest first), `aggregate::apply_geo_near`.
+
+Still different, all 137:
+
+- [ ] **The order under a geo index** (about 100). mongod returns a
+      `$geoWithin` or `$geoIntersects` in the order of its index scan: S2
+      cell order for `2dsphere`, geohash order for `2d`. Here it is storage
+      order. Documents at one distance from a `$near` come in that scan's
+      order too; here points first, then insertion order.
+- [ ] **`2d` index options** (11): `bits` outside 1 to 32 and `min` not
+      below `max` are refused by mongod (72) and built here; `bits`, `min`
+      and `max` are not listed as given.
+- [ ] **A `2d` index with its own range** (7): a `$near` centre outside
+      the range is mongod's 16433, and the two ends of the range.
+- [ ] **A hinted geo index** (10): `find({}, hint: <2dsphere index>)`
+      returns what the index holds in its order; a `$near` with a hint to
+      another index is refused.
+- [ ] `2dsphereIndexVersion: 2.5`, two indexes with one key in one
+      `createIndexes` (85), `$geoNear` inside `$lookup` and `$unionWith`
+      (mongod's wrapper on the 291).
+- [ ] **`$centerSphere` with a radius over pi** over a `2dsphere` index:
+      mongod leaves three far points out that it returns without the index.
+      Here they are returned either way.
+- [ ] **Approximations in the sphere tests.** A point is on an edge when it
+      is within 1.5e-9 radians of it, where mongod asks whether the polygon
+      may meet the point's leaf cell. A polygon is taken to be the side its
+      vertices' centre is on, so one larger than a hemisphere is read as its
+      complement, as mongod reads it without a `crs`; the `strictwinding`
+      `crs` is not read. `$centerSphere` holds a line or polygon when every
+      vertex is inside.
+- [ ] **A bounded `$geoNear` reads every document.** Its `$centerSphere`
+      candidate fetch left out a line or polygon whose nearest point is
+      inside the distance and a vertex outside (`geo_near_index_filter`,
+      switched off).
+- [ ] **An index built before this holds no entry for a value with
+      several locations**, or for a point written as a document other than
+      `{lng, lat}`. Drop it and build it again.
+- [ ] **PYTHON MongoDB server:** not measured by this probe. It tests
+      `$geometry` in the plane (Shapely), so the differences above are
+      expected there.
+
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
 `tools/probes/find_order.py`, mongod 8.2.11: 47 scenarios, 6,531 replies
@@ -9957,10 +10035,6 @@ to 3. What is left, and what the same probes say about the Python server:
       results differ from `mongod`** (same probes). Not changed and not read
       through beyond the entry above. Whether it stores an array or regex
       `_id` (the Rust server did, on `insert` and on upsert) was not probed.
-- [ ] **RUST MongoDB server: a 2dsphere index builds over a value that is not
-      a geometry.** `mongod` 8.2.11 fails the build (16755, `Can't extract
-      geo keys: ... geo element must be an array or object`); the Rust server
-      builds the index and leaves the document out of it.
 - [ ] **RUST MongoDB server: a clustered collection reports an `_id` index.**
       `createIndexes` on one answers `numIndexesBefore: 1`; `mongod` answers
       0, because the clustered key is not a separate index. Clustering is
@@ -9997,10 +10071,6 @@ locale is refused and `listIndexes` shows the collation in full; see 7.070).
 The five: `text` and `hashed` are not built (out of scope) and so cannot be
 dropped (four), and `listIndexes` lists by name.
 
-- [ ] **RUST MongoDB server: `$near` runs without a geo index.** `mongod`
-      8.2.11 refuses (291, `unable to find index for $geoNear query`), which
-      is also what it answers when the only geo index is hidden; the Rust
-      server sorts by distance with no index. Lenient, not wrong data.
 - [ ] **RUST MongoDB server: a hint that names no usable index is worded
       differently.** Same code (2) as `mongod`, whose message is a dump of
       the query tree ending `hint provided does not correspond to an existing
