@@ -137,13 +137,25 @@ fn aggregate_unrecognized_stage_is_location_40324() {
 #[test]
 fn aggregate_list_local_sessions_source_stage() {
     with_wt(|c| {
+        // The stage lists the session the command came in, which is how a
+        // driver's test finds one row; outside a session there is none.
+        let pipeline = vec![
+            doc! {"$listLocalSessions": {}},
+            doc! {"$limit": 1},
+            doc! {"$addFields": {"dummy": "dummy field"}},
+            doc! {"$project": {"_id": 0, "dummy": 1}},
+        ];
+        let bare = dispatch(
+            &doc! {"aggregate": 1, "pipeline": pipeline.clone(), "cursor": {}},
+            c,
+        );
+        assert_eq!(first_batch(&bare).len(), 0);
+        let lsid = doc! {"id": bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: vec![7; 16],
+        }};
         let reply = dispatch(
-            &doc! {"aggregate": 1, "pipeline": [
-                {"$listLocalSessions": {}},
-                {"$limit": 1},
-                {"$addFields": {"dummy": "dummy field"}},
-                {"$project": {"_id": 0, "dummy": 1}},
-            ], "cursor": {}},
+            &doc! {"aggregate": 1, "pipeline": pipeline, "cursor": {}, "lsid": lsid},
             c,
         );
         let fb = first_batch(&reply);
@@ -158,6 +170,8 @@ fn aggregate_list_local_sessions_source_stage() {
 #[test]
 fn aggregate_current_op_synthetic_shape() {
     with_wt(|c| {
+        // `$currentOp` runs against `admin` and nowhere else (mongod 8.2.11).
+        c.db_name = "admin".to_string();
         let reply = dispatch(
             &doc! {"aggregate": 1, "pipeline": [{"$currentOp": {}}], "cursor": {}},
             c,
@@ -169,7 +183,7 @@ fn aggregate_current_op_synthetic_shape() {
         assert_eq!(row.get_str("op").unwrap(), "command");
         let cmd = row.get_document("command").unwrap();
         assert!(cmd.contains_key("aggregate"));
-        assert_eq!(cmd.get_str("$db").unwrap(), "t");
+        assert_eq!(cmd.get_str("$db").unwrap(), "admin");
     });
 }
 
@@ -384,10 +398,11 @@ fn coll_stats_reports_count_and_index_sizes() {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get_str("ns").unwrap(), "t.c");
         let ss = out[0].get_document("storageStats").unwrap();
-        assert_eq!(ss.get_i64("count").unwrap(), 3);
+        // Counts are int32 until they need more, as mongod sends them.
+        assert_eq!(ss.get_i32("count").unwrap(), 3);
         assert_eq!(ss.get_i32("nindexes").unwrap(), 1);
         assert!(ss.get_document("indexSizes").unwrap().contains_key("_id_"));
-        assert_eq!(out[0].get_i64("count").unwrap(), 3);
+        assert_eq!(out[0].get_i32("count").unwrap(), 3);
     });
 }
 

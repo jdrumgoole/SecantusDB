@@ -713,6 +713,31 @@ fn source_stage_problem(
     Ok(())
 }
 
+/// What the session stages list: the session the command itself came in,
+/// as mongod shows one (`{_id: {id, uid}, lastUse}`). No other session is
+/// kept to list, and a command sent outside a session lists none. (An
+/// operation's row once stood in for this.)
+fn own_session(cmd_doc: &Document) -> Vec<Document> {
+    use sha2::Digest;
+    let Some(id) = cmd_doc
+        .get_document("lsid")
+        .ok()
+        .and_then(|lsid| lsid.get("id"))
+    else {
+        return Vec::new();
+    };
+    vec![doc! {
+        "_id": {
+            "id": id.clone(),
+            "uid": bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: sha2::Sha256::digest(b"").to_vec(),
+            },
+        },
+        "lastUse": bson::DateTime::now(),
+    }]
+}
+
 /// Source stages that ignore their input and emit a synthetic row, mirroring
 /// `aggregate._stage_current_op` (reused for `$listLocalSessions` /
 /// `$listSessions`). They need the command/db/coll context, so they're handled
@@ -1324,12 +1349,10 @@ fn run_segmented(
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
-            // The session stages list sessions, and none is kept to list:
-            // they answer no rows, where an operation's row once stood in.
             docs = if name == "$currentOp" {
                 apply_source_stage(name, db, coll, cmd_doc, client_metadata)
             } else {
-                Vec::new()
+                own_session(cmd_doc)
             };
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {

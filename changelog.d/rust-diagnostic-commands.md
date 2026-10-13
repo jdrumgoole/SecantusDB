@@ -35,8 +35,8 @@ and each reply compared. 492 differed; @@LEFT@@ do now
   `killAllSessions`, `usersInfo`, `rolesInfo`, `saslStart`,
   `saslContinue`, `$collStats`, `$indexStats`, `$currentOp`,
   `$listSessions` and `{aggregate: 1}` check their arguments.
-- `$listSessions` and `$listLocalSessions` answer no rows. They answered
-  a row describing an operation.
+- `$listSessions` and `$listLocalSessions` list the session the command
+  came in. They answered a row describing an operation.
 
 #### Added
 

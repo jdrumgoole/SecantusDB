@@ -569,7 +569,9 @@ def test_secantus_grant_revoke_roles_to_user(tmp_path) -> None:
 
 def test_kill_op_closes_a_connection(tmp_path) -> None:
     """killOp closes another connection by its conn_id (from hello.connectionId)
-    and reports {info, ok}; a bogus opid is reported not-found (issue #163)."""
+    and reports {info, ok} (issue #163). The reply does not say whether an
+    operation had that id: mongod 8.2.11 answers "attempting to kill op" to
+    an id nobody holds."""
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
     try:
         c1 = _client(srv)
@@ -578,10 +580,10 @@ def test_kill_op_closes_a_connection(tmp_path) -> None:
 
         killed = c2.admin.command({"killOp": 1, "op": cid1})
         assert killed["ok"] == 1.0
-        assert killed["info"] == "operation killed"
+        assert killed["info"] == "attempting to kill op"
 
         bogus = c2.admin.command({"killOp": 1, "op": 2_000_000_000})
-        assert bogus["info"] == "no operation with that opid"
+        assert bogus["info"] == "attempting to kill op"
 
         c1.close()
         c2.close()
