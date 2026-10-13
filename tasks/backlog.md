@@ -3115,35 +3115,39 @@ These work end-to-end but cut corners.
         this server's longer run makes it spread the two over two vCPUs,
         which then idle and wake in turn. That is the placement
         sensitivity measured on 2026-10-12.
-      - [ ] **RUST PG server: the release binary is built with no
-            link-time or profile-guided optimisation**, and the MongoDB
-            server's has both. Measured with the crate rebuilt on the
-            droplet, server and client pinned to separate vCPUs, medians
-            of five 4 s trials, statements a second for select / update /
-            insert by one client: released 12,052 / 3,075 / 3,992; fat LTO
-            with one codegen unit 14,402 / 3,577 / 4,441; that plus a
-            profile from a 40 s psycopg workload **17,855 / 4,472 /
-            5,418** (PostgreSQL without TLS 22,159 / 6,644 / 7,140). Thin
-            LTO measured no gain. At eight clients, a table each, unpinned:
-            released 44,713 / 15,227 / 16,848, with the profile 64,908 /
-            17,157 / 17,996 (PostgreSQL 85,187 / 24,043 / 25,813). The
-            work is a `[profile.release]` for `crates/secantus-pg`, a
-            PostgreSQL-side workload script (`bench/pgo_workload.py` is
-            MongoDB-only) and the two-stage build in
-            `release-pg-binaries.yml`. A fat build took 6 to 7 minutes on
-            16 vCPUs. A `cargo install` from crates.io can have the LTO
-            and not the profile.
-      - [ ] **The published PostgreSQL droplet table compares PostgreSQL
-            over TLS with this server in the clear.** Ubuntu's
-            PostgreSQL has `ssl = on` and psycopg's default `sslmode` is
-            `prefer`, so every `invoke do-pg-bench` run so far encrypted
-            PostgreSQL's connections (the `strace` shows TLS records) and
-            not this server's. One client selecting by primary key:
-            16,988 a second with TLS and 22,159 with `sslmode=disable`.
-            The table on the site therefore understates PostgreSQL's
-            lead, most on reads. `bench/do_pg_bench.py` should put
-            `sslmode=disable` in both DSNs and the table be measured
-            again; until then the site's ratios are too kind to us.
+      - **The release build has both since 2026-10-13**: `lto = "fat"` and
+        one codegen unit in the crate's release profile, and a profile
+        collected by `scripts/build_pg_release.sh` from
+        `bench/pgo_workload_pg.py`. What it was measured against, with the
+        crate rebuilt on the droplet, server and client pinned to separate
+        vCPUs, medians of five 4 s trials, statements a second for select /
+        update / insert by one client: released 12,052 / 3,075 / 3,992; fat
+        LTO with one codegen unit 14,402 / 3,577 / 4,441; that plus a
+        profile 17,855 / 4,472 / 5,418 (PostgreSQL without TLS 22,159 /
+        6,644 / 7,140). Thin LTO measured no gain. The script's own build,
+        on another droplet: select 10,046 released and 14,837 built by the
+        script; the binary went from 44 MB to 30. It takes 16 minutes on 16
+        vCPUs and under 9 on an M-series Mac. On macOS the C dependencies
+        are kept out of the profile and the binary writes its own, as the
+        MongoDB binary's build does: with Rust 1.99 the instrumented binary
+        otherwise dies before it listens.
+      - [ ] **The site's PostgreSQL droplet table was measured with
+            PostgreSQL over TLS and this server in the clear**, and has not
+            been measured again. Ubuntu's PostgreSQL has `ssl = on` and
+            psycopg's default `sslmode` is `prefer`. One client selecting
+            by primary key: 16,988 a second with TLS and 22,159 without, so
+            the table understates PostgreSQL's lead, most on reads.
+            `bench/do_pg_bench.py` says `sslmode=disable` in every DSN
+            since 2026-10-13 and stops if `pg_stat_ssl` shows otherwise.
+            What is left is the run, and the table.
+      - **A `c-16` is not one machine.** The droplet of 2026-10-13 had a
+        Xeon Platinum 8168 and a disk that completed 1,653 `fdatasync`
+        calls a second; one client's inserts ran at 613 a second on
+        PostgreSQL and 568 on this server, where the day before's droplet
+        gave 3,159 and 2,368. On such a disk both servers wait for it and
+        the ratio closes to nothing. Each run now records the processor and
+        `pg_test_fsync`'s rate in `facts.txt`, and the table's footnote
+        prints them; compare two runs only when those agree.
 
       **Clients moved to the client droplets the same day** (Joe: that was
       the plan for the cluster from the start). `invoke do-pg-bench` now

@@ -172,14 +172,19 @@ tar xzf pg.tgz
 rm -rf /root/repo /root/out /root/tmp && mkdir -p /root/repo /root/out /root/tmp
 tar xzf /root/harness.tgz -C /root/repo 2>/dev/null
 B=/root/{name}/secantusd-pg
-DSN="host=127.0.0.1 port=5432 dbname=postgres user=postgres"
+DSN="host=127.0.0.1 port=5432 dbname=postgres user=postgres sslmode=disable"
 {{
   echo "binary_version=$($B --version | head -1)"
   echo "binary_tree=$($B --version | sed -n 's/^tree: //p')"
   echo "postgres=$(psql "$DSN" -Atc 'show server_version')"
   echo "fsync=$(psql "$DSN" -Atc 'show fsync')"
   echo "synchronous_commit=$(psql "$DSN" -Atc 'show synchronous_commit')"
+  echo "tls=$(psql "$DSN" -Atc 'select ssl from pg_stat_ssl where pid = pg_backend_pid()')"
   echo "vcpus=$(nproc)"
+  echo "cpu=$(lscpu | sed -n 's/^Model name: *//p' | head -1)"
+  echo "fdatasync_per_s=$(/usr/lib/postgresql/16/bin/pg_test_fsync -s 2 -f /root/fsync.probe \\
+      | awk '$1 == "fdatasync" {{printf "%d", $2; exit}}')"
+  rm -f /root/fsync.probe
   echo "filesystem=$(df -T /root | tail -1 | awk '{{print $2}}')"
   echo "os=$(. /etc/os-release; echo "$PRETTY_NAME")"
 }} > /root/out/facts.txt
@@ -228,14 +233,19 @@ ln -sf /root/{name}/secantusd-pg /root/secantusd-pg
 mkdir -p /root/out
 systemctl start postgresql
 sleep 2
-DSN="host=127.0.0.1 port={WIRE_PORT} dbname=postgres user=postgres"
+DSN="host=127.0.0.1 port={WIRE_PORT} dbname=postgres user=postgres sslmode=disable"
 {{
   echo "binary_version=$(/root/secantusd-pg --version | head -1)"
   echo "binary_tree=$(/root/secantusd-pg --version | sed -n 's/^tree: //p')"
   echo "postgres=$(psql "$DSN" -Atc 'show server_version')"
   echo "fsync=$(psql "$DSN" -Atc 'show fsync')"
   echo "synchronous_commit=$(psql "$DSN" -Atc 'show synchronous_commit')"
+  echo "tls=$(psql "$DSN" -Atc 'select ssl from pg_stat_ssl where pid = pg_backend_pid()')"
   echo "vcpus=$(nproc)"
+  echo "cpu=$(lscpu | sed -n 's/^Model name: *//p' | head -1)"
+  echo "fdatasync_per_s=$(/usr/lib/postgresql/16/bin/pg_test_fsync -s 2 -f /root/fsync.probe \\
+      | awk '$1 == "fdatasync" {{printf "%d", $2; exit}}')"
+  rm -f /root/fsync.probe
   echo "filesystem=$(df -T /root | tail -1 | awk '{{print $2}}')"
   echo "os=$(. /etc/os-release; echo "$PRETTY_NAME")"
   echo "private=$(hostname -I | tr ' ' '\\n' | grep '^10\\.' | tail -1)"
@@ -327,7 +337,7 @@ def _measure_remote(
         check=True,
     )
     private = _facts(into)["private"]
-    dsn = f"host={private} port={WIRE_PORT} dbname=postgres user=postgres"
+    dsn = f"host={private} port={WIRE_PORT} dbname=postgres user=postgres sslmode=disable"
     prepare = (
         "cd /root/repo && /root/venv/bin/python -c "
         + shlex.quote(
@@ -438,8 +448,16 @@ def render(results: Path) -> str:
             f"{facts.get('binary_version', '?')} (tree {facts.get('binary_tree', '?')[:12]}), "
             f"PostgreSQL {facts.get('postgres', '?')} (fsync {facts.get('fsync', '?')}, "
             f"synchronous_commit {facts.get('synchronous_commit', '?')}), "
-            f"{facts.get('vcpus', '?')} vCPUs, {facts.get('filesystem', '?')}, "
-            f"{facts.get('os', '?')}."
+            + ("no TLS on either server, " if facts.get("tls") == "f" else "")
+            + f"{facts.get('vcpus', '?')} vCPUs"
+            + (f" ({facts['cpu']})" if facts.get("cpu") else "")
+            + f", {facts.get('filesystem', '?')}"
+            + (
+                f" ({int(facts['fdatasync_per_s']):,} fdatasync calls a second by pg_test_fsync)"
+                if facts.get("fdatasync_per_s")
+                else ""
+            )
+            + f", {facts.get('os', '?')}."
         )
     return "\n".join(lines)
 
@@ -486,6 +504,12 @@ def _main_remote(args: argparse.Namespace, version: str) -> int:
         args.seconds,
         args.repeat,
     )
+    if _facts(into).get("tls") != "f":
+        raise SystemExit(
+            "the facts connection to PostgreSQL was not in the clear "
+            f"(pg_stat_ssl.ssl = {_facts(into).get('tls')!r}); the two servers must be "
+            "measured alike"
+        )
     built_from, tagged = _facts(into).get("binary_tree"), _tag_tree(version)
     if tagged and built_from != tagged:
         raise SystemExit(
@@ -538,6 +562,12 @@ def main(argv: list[str] | None = None) -> int:
     stamp = datetime.date.today().isoformat()
     into = RESULTS / f"{stamp}-{version}"
     _fetch(host, args.ssh_key, into)
+    if _facts(into).get("tls") != "f":
+        raise SystemExit(
+            "the facts connection to PostgreSQL was not in the clear "
+            f"(pg_stat_ssl.ssl = {_facts(into).get('tls')!r}); the two servers must be "
+            "measured alike"
+        )
     built_from, tagged = _facts(into).get("binary_tree"), _tag_tree(version)
     if tagged and built_from != tagged:
         raise SystemExit(

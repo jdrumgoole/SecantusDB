@@ -47,6 +47,10 @@ default = ["bin", "mimalloc"]
 # Builds the `secantusd-pg` binary (signal handling). Off, the crate is the
 # library alone -- what a dev-dependency or the Python handle wants.
 bin = ["dep:ctrlc", "dep:libc"]
+# Only for the instrumented stage of the release build
+# (`scripts/build_pg_release.sh`): the binary writes its own profile to
+# `SECANTUS_PGO_OUT` as it stops. It links only under `-Cprofile-generate`.
+pgo-instrument = []
 
 [dependencies]
 # Anonymous files for an external sort's runs (`external_sort`).
@@ -126,3 +130,14 @@ tempfile = "3"
 name = "secantusd-pg"
 path = "src/main.rs"
 required-features = ["bin"]
+
+# Link-time optimisation across the whole program. Measured 2026-10-13 on a
+# 16-vCPU droplet: one client's selects by primary key went from 12,052 a
+# second to 14,402, and `lto = "thin"` gained nothing
+# (`bench/results/pg-droplet/2026-10-13-single-connection-cost/`). The price
+# is the release build: about seven minutes on those 16 vCPUs. A debug build,
+# which is what the tests and the gauges run, is untouched. The released
+# binaries add a profile on top (`scripts/build_pg_release.sh`).
+[profile.release]
+lto = "fat"
+codegen-units = 1
