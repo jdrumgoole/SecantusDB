@@ -3476,12 +3476,16 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "inprog": inprog, "ok": 1.0 })
 }
 
-/// `validate` — mongod's collection consistency check. SecantusDB stores
-/// documents as opaque BSON and maintains index entries transactionally, so
-/// there's nothing to repair: report a clean, mongod-shaped result with real
-/// record / index counts. `full` / `background` / `scandata` are accepted and
-/// ignored (they only affect how mongod scans, not the verdict). Ports
-/// `commands.py::_validate`.
+/// `validate` — a collection checked against its indexes.
+///
+/// The store reads every document and compares each index with the entries
+/// its documents should have, both ways, and the `_id` index with the
+/// documents (`Storage::check_collection`). `valid` is false, with the
+/// counts in `errors`, when a document cannot be read, an entry is missing
+/// or an entry belongs to no document. Until 2026-10-13 this answered
+/// `valid: true` without looking and reported one key per document for
+/// every index. `full` and `background` change how mongod scans and not the
+/// verdict, so they are taken and change nothing here; nothing is repaired.
 pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = match doc.get("validate") {
         Some(Bson::String(s)) => s.clone(),
@@ -3555,6 +3559,40 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .count_matching(&ctx.db_name, &coll, &Document::new())
             .map_err(command_error)? as i64,
     };
+    // The check itself: every document read, and each index compared with
+    // the entries its documents should have. A store that cannot check
+    // itself (a test double) reports what it is told.
+    let check = storage
+        .check_collection(&ctx.db_name, &coll)
+        .map_err(command_error)?;
+    let checked: std::collections::HashMap<String, Document> = check
+        .as_ref()
+        .and_then(|c| c.get_array("indexes").ok())
+        .into_iter()
+        .flatten()
+        .filter_map(Bson::as_document)
+        .filter_map(|ix| Some((ix.get_str("name").ok()?.to_string(), ix.clone())))
+        .collect();
+    let count = |ix: &Document, field: &str| ix.get_i64(field).unwrap_or(0);
+    let undecodable = check.as_ref().map_or(0, |c| count(c, "undecodable"));
+    let missing: i64 = checked.values().map(|ix| count(ix, "missing")).sum();
+    let extra: i64 = checked.values().map(|ix| count(ix, "extra")).sum();
+    let mut errors: Vec<Bson> = Vec::new();
+    if undecodable > 0 {
+        errors.push(Bson::String(format!(
+            "Detected {undecodable} documents that could not be read."
+        )));
+    }
+    if missing > 0 {
+        errors.push(Bson::String(format!(
+            "Detected {missing} missing index entries."
+        )));
+    }
+    if extra > 0 {
+        errors.push(Bson::String(format!(
+            "Detected {extra} extra index entries."
+        )));
+    }
     let indexes = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?;
@@ -3586,8 +3624,17 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 spec.insert(option.clone(), value.clone());
             }
         }
-        keys_per_index.insert(name, int_bson(nrecords));
-        index_details.insert(name, doc! { "valid": true, "spec": spec });
+        // The keys mongod holds for these documents (an array gives one
+        // per element), and whether the index holds what it should. A
+        // time-series collection's are shown as they lie on its buckets.
+        let found = checked.get(name);
+        let keys = match (found, &layout) {
+            (Some(ix), None) => count(ix, "keys"),
+            _ => nrecords,
+        };
+        let sound = found.is_none_or(|ix| count(ix, "missing") == 0 && count(ix, "extra") == 0);
+        keys_per_index.insert(name, int_bson(keys));
+        index_details.insert(name, doc! { "valid": sound, "spec": spec });
         n_indexes += 1;
     }
     let ns = match &layout {
@@ -3600,7 +3647,7 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     };
     // mongod's field order (measured 8.2.11).
     let mut reply = doc! {
-        "valid": true,
+        "valid": errors.is_empty(),
         "repaired": false,
         "repairMode": "None",
         "ns": ns,
@@ -3619,10 +3666,10 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     reply.extend(doc! {
         "warnings": Bson::Array(vec![]),
-        "errors": Bson::Array(vec![]),
+        "errors": errors,
         "extraIndexEntries": Bson::Array(vec![]),
         "missingIndexEntries": Bson::Array(vec![]),
-        "nInvalidDocuments": 0_i32,
+        "nInvalidDocuments": int_bson(undecodable),
         "nNonCompliantDocuments": 0_i32,
         "nrecords": int_bson(nrecords),
         "corruptRecords": Bson::Array(vec![]),

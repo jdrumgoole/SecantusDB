@@ -2730,6 +2730,60 @@ fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
     key_spec.keys().any(|f| index_field_values(doc, f).1)
 }
 
+/// Whether the path `parts` passes through an array one of whose elements
+/// does not reach the leaf: not a document, or a document without the field.
+fn element_lacks_leaf(value: &Bson, parts: &[&str], in_array: bool) -> bool {
+    let Some((first, rest)) = parts.split_first() else {
+        return false;
+    };
+    match value {
+        Bson::Document(d) => match d.get(*first) {
+            Some(next) => element_lacks_leaf(next, rest, in_array),
+            None => in_array,
+        },
+        Bson::Array(items) => items.iter().any(|item| match item {
+            Bson::Document(_) => element_lacks_leaf(item, parts, true),
+            _ => true,
+        }),
+        _ => in_array,
+    }
+}
+
+/// How many keys mongod holds for `doc` in an index on `key_spec`: for each
+/// field, one per distinct value (an array's elements, or one for an empty
+/// array or a missing field), and their product across the fields. The
+/// whole-array entry this store also keeps is not one of mongod's keys.
+fn reference_key_count(doc: &Document, key_spec: &Document, coll: Option<&Collation>) -> i64 {
+    key_spec
+        .keys()
+        .map(|field| {
+            let (values, _) = get_path_values(doc, field);
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let mut unencodable = 0i64;
+            let mut note = |v: &Bson| match enc_dir_c(v, 1, coll) {
+                Ok(key) => {
+                    seen.insert(key);
+                }
+                Err(_) => unencodable += 1,
+            };
+            for value in values {
+                match value {
+                    Bson::Array(items) if items.is_empty() => note(&Bson::Undefined),
+                    Bson::Array(items) => items.iter().for_each(&mut note),
+                    other => note(other),
+                }
+            }
+            // An element of an array on the way that has no such leaf is a
+            // null key to mongod (this store holds no entry for it).
+            let parts: Vec<&str> = field.split('.').collect();
+            if element_lacks_leaf(&Bson::Document(doc.clone()), &parts, false) {
+                note(&Bson::Null);
+            }
+            (seen.len() as i64 + unencodable).max(1)
+        })
+        .product()
+}
+
 /// All byte-keys `doc` contributes to an index under `key_spec`. Scalars give
 /// one key; arrays give one key per (deduped) element *plus* the whole-array
 /// key (the multikey layout); compound indexes take the cartesian product
@@ -13225,6 +13279,118 @@ impl Storage {
         Ok(out)
     }
 
+    /// Check a collection against its indexes: what `validate` reports.
+    ///
+    /// Every stored document is read and decoded. The entries each index
+    /// SHOULD hold for it are computed by the function the writes use
+    /// (`packed_entry_keys`) and compared with the entries the index DOES
+    /// hold, both ways; and the `_id` index is checked to lead from each
+    /// document's key to that document and to no document that is gone.
+    /// Writers are held off for the length of the check, so what it compares
+    /// is one state of the collection.
+    ///
+    /// The answer is a document, `{records, undecodable, indexes: [{name,
+    /// keys, missing, extra}]}`, `_id_` first. `keys` is the number of keys
+    /// mongod holds for the documents (an array gives one per distinct
+    /// element; this store also keeps the whole array as an entry, which is
+    /// not counted). `missing` are entries a document should have and the
+    /// index lacks; `extra` are entries that belong to no document.
+    pub fn check_collection(&self, db: &str, coll: &str) -> Result<Document> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let ns_lock = self.coll_lock(db, coll);
+        let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let descs: Vec<IndexDesc> = self
+            .index_descs(&session, db, coll)?
+            .into_iter()
+            .filter(|d| !d.id_claim && d.name != ID_INDEX_NAME)
+            .collect();
+        let mut expected: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+        let mut keys: HashMap<String, i64> = HashMap::new();
+        let mut ids: HashSet<Vec<u8>> = HashSet::new();
+        let (mut records, mut undecodable, mut id_missing) = (0i64, 0i64, 0i64);
+        for (recordid, id_key, blob) in self.scan_docs(&session, db, coll)? {
+            records += 1;
+            if self.doc_recordid(&session, db, coll, &id_key)? != Some(recordid) {
+                id_missing += 1;
+            }
+            ids.insert(id_key);
+            let Ok(doc) = secantus_core::bsondoc::from_bytes(&blob) else {
+                undecodable += 1;
+                continue;
+            };
+            for desc in &descs {
+                let packed = self.packed_entry_keys(&doc, desc, recordid)?;
+                let held = if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
+                    packed.len() as i64
+                } else if packed.is_empty() {
+                    0
+                } else {
+                    reference_key_count(&doc, &desc.key_spec, desc.collation.as_ref())
+                };
+                *keys.entry(desc.name.clone()).or_default() += held;
+                expected
+                    .entry(desc.name.clone())
+                    .or_default()
+                    .extend(packed);
+            }
+        }
+        let mut actual: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+        for (name, packed) in self.collect_entry_rows(&session, db, coll)? {
+            actual.entry(name).or_default().insert(packed);
+        }
+        // The `_id` index: an entry whose document is gone.
+        let mut id_extra = 0i64;
+        let nat = session.open_cursor(NAT_SEQ_TABLE, None)?;
+        nat.set_key_ssu(db, coll, b"");
+        let mut more = match nat.search_near() {
+            Ok(cmp) if cmp < 0 => nat.next()?,
+            Ok(_) => true,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, id_key) = nat.get_key_ssu()?;
+            if d != db || c != coll {
+                break;
+            }
+            if !ids.contains(&id_key) {
+                id_extra += 1;
+            }
+            more = nat.next()?;
+        }
+        let mut indexes = vec![Bson::Document(bson::doc! {
+            "name": ID_INDEX_NAME,
+            "keys": records,
+            "missing": id_missing,
+            "extra": id_extra,
+        })];
+        let empty = HashSet::new();
+        for desc in &descs {
+            let want = expected.get(&desc.name).unwrap_or(&empty);
+            let have = actual.remove(&desc.name).unwrap_or_default();
+            indexes.push(Bson::Document(bson::doc! {
+                "name": desc.name.clone(),
+                "keys": keys.get(&desc.name).copied().unwrap_or(0),
+                "missing": want.difference(&have).count() as i64,
+                "extra": have.difference(want).count() as i64,
+            }));
+        }
+        // Entries filed under a name no index has.
+        let mut orphaned: Vec<(String, HashSet<Vec<u8>>)> = actual.into_iter().collect();
+        orphaned.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, have) in orphaned {
+            indexes.push(Bson::Document(bson::doc! {
+                "name": name,
+                "keys": 0_i64,
+                "missing": 0_i64,
+                "extra": have.len() as i64,
+                "unknown": true,
+            }));
+        }
+        Ok(bson::doc! { "records": records, "undecodable": undecodable, "indexes": indexes })
+    }
+
     /// Introspection: the entries of index `name` as `(escaped_kb, id_key)`
     /// pairs in WiredTiger (sorted) order. Primarily for tests and explain-style
     /// inspection; the lookup paths in later slices read entries directly.
@@ -19079,6 +19245,118 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "{f:?}");
         }
+    }
+
+    fn index_check(check: &Document, name: &str) -> (i64, i64, i64) {
+        let found = check
+            .get_array("indexes")
+            .unwrap()
+            .iter()
+            .filter_map(Bson::as_document)
+            .find(|ix| ix.get_str("name") == Ok(name))
+            .unwrap_or_else(|| panic!("{name} in {check}"));
+        (
+            found.get_i64("keys").unwrap(),
+            found.get_i64("missing").unwrap(),
+            found.get_i64("extra").unwrap(),
+        )
+    }
+
+    /// A collection the server wrote is sound under every kind of index, and
+    /// the keys counted are mongod's: 4 for `5`, `"x"` and `[1, 2]`.
+    #[test]
+    fn check_collection_finds_a_written_collection_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "v": 5i32, "w": "a", "loc": [1.0, 1.0]}).unwrap(),
+                encode_doc(&doc! {"_id": 2i32, "v": "x", "w": "A"}).unwrap(),
+                encode_doc(&doc! {"_id": 3i32, "v": [1i32, 2i32], "p": [{"q": 1i32}, {}]}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        for (name, key, options) in [
+            ("v_1", doc! {"v": 1i32}, doc! {}),
+            ("v_w", doc! {"v": 1i32, "w": -1i32}, doc! {}),
+            ("w_sparse", doc! {"w": 1i32}, doc! {"sparse": true}),
+            (
+                "v_partial",
+                doc! {"v": 1i32},
+                doc! {"partialFilterExpression": {"w": "a"}},
+            ),
+            (
+                "w_ci",
+                doc! {"w": 1i32},
+                doc! {"collation": {"locale": "en", "strength": 2i32}},
+            ),
+            ("pq", doc! {"p.q": 1i32}, doc! {}),
+            ("geo", doc! {"loc": "2dsphere"}, doc! {}),
+        ] {
+            s.create_index("app", "t", name, &key, &options).unwrap();
+        }
+        let check = s.check_collection("app", "t").unwrap();
+        assert_eq!(check.get_i64("records"), Ok(3));
+        assert_eq!(check.get_i64("undecodable"), Ok(0));
+        assert_eq!(index_check(&check, "_id_"), (3, 0, 0));
+        assert_eq!(index_check(&check, "v_1"), (4, 0, 0));
+        assert_eq!(index_check(&check, "v_w"), (4, 0, 0));
+        assert_eq!(index_check(&check, "w_sparse"), (2, 0, 0));
+        assert_eq!(index_check(&check, "v_partial"), (1, 0, 0));
+        assert_eq!(index_check(&check, "pq"), (4, 0, 0));
+        for name in ["w_ci", "geo"] {
+            let (_, missing, extra) = index_check(&check, name);
+            assert_eq!((missing, extra), (0, 0), "{name}");
+        }
+        // And after the documents change.
+        s.delete_matching("app", "t", &doc! {"_id": 2i32}, 0, &doc! {}, None)
+            .unwrap();
+        let check = s.check_collection("app", "t").unwrap();
+        assert_eq!(index_check(&check, "v_1"), (3, 0, 0));
+        assert_eq!(index_check(&check, "_id_"), (2, 0, 0));
+    }
+
+    /// The check sees what a write never leaves: an entry gone, an entry
+    /// for no document, and a document the `_id` index does not lead to.
+    #[test]
+    fn check_collection_reports_a_damaged_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        s.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": 1i32, "v": 5i32}).unwrap(),
+                encode_doc(&doc! {"_id": 2i32, "v": 7i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        s.create_index("app", "t", "v_1", &doc! {"v": 1i32}, &doc! {})
+            .unwrap();
+        {
+            let session = s.conn.open_session().unwrap();
+            let rows = s.collect_entry_rows(&session, "app", "t").unwrap();
+            let (name, packed) = rows.first().unwrap().clone();
+            let entries = session.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
+            entries.set_key_sssu("app", "t", &name, &packed);
+            entries.remove().unwrap();
+            entries.reset().unwrap();
+            let stray = pack_entry(&enc_dir_c(&Bson::Int32(99), 1, None).unwrap(), 12345);
+            entries.set_key_sssu("app", "t", "v_1", &stray);
+            entries.set_value_u(b"");
+            entries.insert().unwrap();
+            let id_key = sortkey::encode_value(&Bson::Int32(2), None).unwrap();
+            let ids = session.open_cursor(NAT_SEQ_TABLE, None).unwrap();
+            ids.set_key_ssu("app", "t", &id_key);
+            ids.remove().unwrap();
+        }
+        let check = s.check_collection("app", "t").unwrap();
+        assert_eq!(index_check(&check, "v_1"), (2, 1, 1));
+        assert_eq!(index_check(&check, "_id_"), (2, 1, 0));
     }
 
     #[test]

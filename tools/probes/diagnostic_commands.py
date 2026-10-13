@@ -962,6 +962,42 @@ scenario(
     seed=True,
 )
 scenario(
+    "validate: the keys each index holds",
+    {
+        "insert": "k",
+        "documents": [
+            {"_id": 1, "v": 5, "w": "a"},
+            {"_id": 2, "v": "x", "w": "A"},
+            {"_id": 3, "v": [1, 2, 2], "p": [{"q": 1}, {}]},
+            {"_id": 4, "v": [], "p": [{"q": [7, 8]}, 3]},
+            {"_id": 5, "p": {"q": None}},
+            {"_id": 6, "v": [[1, 2], 3], "w": None},
+            {"_id": 7, "v": 5, "w": "a"},
+        ],
+    },
+    {
+        "createIndexes": "k",
+        "indexes": [
+            {"key": {"v": 1}, "name": "v_1"},
+            {"key": {"v": 1, "w": -1}, "name": "v_w"},
+            {"key": {"w": 1}, "name": "w_sparse", "sparse": True},
+            {"key": {"v": -1}, "name": "v_partial", "partialFilterExpression": {"w": "a"}},
+            {"key": {"p.q": 1}, "name": "pq"},
+            {"key": {"w": 1, "p.q": 1}, "name": "w_pq"},
+            {
+                "key": {"w": 1, "_id": 1},
+                "name": "w_ci",
+                "collation": {"locale": "en", "strength": 2},
+            },
+        ],
+    },
+    {"validate": "k", "pick": ["nrecords", "nIndexes", "keysPerIndex", "valid", "errors"]},
+    {"update": "k", "updates": [{"q": {"_id": 3}, "u": {"$set": {"v": [9, 10, 11]}}}]},
+    {"delete": "k", "deletes": [{"q": {"_id": 1}, "limit": 1}]},
+    {"validate": "k", "pick": ["nrecords", "nIndexes", "keysPerIndex", "valid", "errors"]},
+    {"validate": "k", "full": True, "pick": ["nrecords", "keysPerIndex", "valid"]},
+)
+scenario(
     "listDatabases",
     (A, {"listDatabases": 1, "filter": {"name": "@db"}}),
     (A, {"listDatabases": 1, "filter": {"name": "@db"}, "nameOnly": True}),
