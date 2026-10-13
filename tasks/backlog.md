@@ -3173,10 +3173,14 @@ These work end-to-end but cut corners.
         (`bench/results/mdb-droplet/2026-10-13-periodic-checkpoint/`).
         Released in `secantus-mdb` 0.5.3-beta.191 and `secantus-pg`
         0.1.0-beta.15.
-      - [ ] **The Python servers have the same gap.** `storage.py`
-            checkpoints at close, in a backup and in `fsync`, and nowhere
-            else, so a long-running `secantusd-py` or `secantusd-py-pg`
-            keeps every log file. Not measured.
+      - **The Python servers had the same gap; fixed 2026-10-13.** A
+        durable store now opens with WiredTiger's own checkpoint thread
+        (`checkpoint=(wait=N)`, from `SECANTUS_CHECKPOINT_SECONDS` or the
+        `checkpoint_seconds` argument, default 60, 0 for never).
+        `tests/test_storage_log_trim.py` fills four log files and sees
+        them removed, and with the interval at 0 sees them stay, which is
+        what every durable store did before. Throughput and restart time
+        were not measured on the Python servers.
       - **A `c-16` is not one machine.** The droplet of 2026-10-13 had a
         Xeon Platinum 8168 and a disk that completed 1,653 `fdatasync`
         calls a second; one client's inserts ran at 613 a second on
