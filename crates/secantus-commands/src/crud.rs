@@ -1133,15 +1133,38 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // nothing else and refuses the whole command before any statement
         // runs (`write_command_problem`).
         let limit = delete_limit(spec.get("limit"))?;
-        match storage.delete_matching_hinted(
-            &ctx.db_name,
-            &coll,
-            &filter,
-            limit,
-            &let_vars,
-            collation.as_ref(),
-            argtypes::given_hint(spec),
-        ) {
+        // A delete of ONE document removes the first its query matches in
+        // the order mongod reads them.
+        let first = if limit == 1 {
+            crate::explain::order::write_candidates(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 0,
+                },
+            )
+            .unwrap_or(None)
+        } else {
+            None
+        };
+        let deleted = crate::explain::order::pinned(storage, first, || {
+            storage.delete_matching_hinted(
+                &ctx.db_name,
+                &coll,
+                &filter,
+                limit,
+                &let_vars,
+                collation.as_ref(),
+                argtypes::given_hint(spec),
+            )
+        });
+        match deleted {
             Ok(deleted) => {
                 n += deleted as i32;
                 if deleted > 0 {
@@ -1703,14 +1726,18 @@ pub(crate) fn update_in(
             // Nothing matched -> leave the filter alone, so an upsert still
             // upserts.
             let sorted = Ok::<_, CommandError>(storage).and_then(|st| {
-                st.find_collated(
-                    db_name,
-                    &coll,
-                    &q,
-                    Some(sort),
-                    None,
-                    collation.as_ref(),
-                    &Document::new(),
+                crate::explain::order::find(
+                    st,
+                    &crate::explain::order::Ask {
+                        db: db_name,
+                        coll: &coll,
+                        filter: &q,
+                        sort: Some(sort),
+                        hint: None,
+                        collation: collation.as_ref(),
+                        vars: &Document::new(),
+                        limit: 1,
+                    },
                 )
                 .map_err(|_| CommandError::new(2, "BadValue", "sort resolution failed"))
             });
@@ -1799,6 +1826,26 @@ pub(crate) fn update_in(
         let absent = !upsert && !storage.collection_exists(db_name, &coll).unwrap_or(true);
 
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
+        // An update of ONE document changes the first its query matches in
+        // the order mongod reads them.
+        let first = if multi || absent {
+            None
+        } else {
+            crate::explain::order::write_candidates(
+                storage,
+                &crate::explain::order::Ask {
+                    db: db_name,
+                    coll: &coll,
+                    filter: &q,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &stmt_vars,
+                    limit: 0,
+                },
+            )
+            .unwrap_or(None)
+        };
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
             // Validate the shape up-front — real mongod returns a command-level
             // error for a malformed/unknown stage, not a per-op writeError.
@@ -1863,19 +1910,21 @@ pub(crate) fn update_in(
             if absent {
                 continue;
             }
-            storage.update_matching_pipeline(
-                db_name,
-                &coll,
-                &q,
-                stages,
-                multi,
-                upsert && supplied.is_none(),
-                &stmt_vars,
-                collation.as_ref(),
-                validator.as_ref(),
-                validator_moderate,
-                false,
-            )
+            crate::explain::order::pinned(storage, first, || {
+                storage.update_matching_pipeline(
+                    db_name,
+                    &coll,
+                    &q,
+                    stages,
+                    multi,
+                    upsert && supplied.is_none(),
+                    &stmt_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                    validator_moderate,
+                    false,
+                )
+            })
         } else {
             let mut u = doc_field(spec, "u");
             if is_replacement_doc {
@@ -1912,20 +1961,22 @@ pub(crate) fn update_in(
             if absent {
                 continue;
             }
-            storage.update_matching_array_filters(
-                db_name,
-                &coll,
-                &q,
-                &u,
-                multi,
-                upsert,
-                &array_filters,
-                &stmt_vars,
-                collation.as_ref(),
-                validator.as_ref(),
-                validator_moderate,
-                false,
-            )
+            crate::explain::order::pinned(storage, first, || {
+                storage.update_matching_array_filters(
+                    db_name,
+                    &coll,
+                    &q,
+                    &u,
+                    multi,
+                    upsert,
+                    &array_filters,
+                    &stmt_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                    validator_moderate,
+                    false,
+                )
+            })
         };
 
         match outcome {

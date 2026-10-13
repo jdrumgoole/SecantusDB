@@ -15,6 +15,7 @@
 mod bounds;
 mod exec;
 mod node;
+pub(crate) mod order;
 mod parsed;
 mod plan;
 mod shape;
@@ -202,8 +203,25 @@ fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
         )
         .map_err(command_error)?;
     let docs = decode_docs(raw)?;
+    let catalog = catalog(storage, db, coll, Some(&docs)).map_err(command_error)?;
+    Ok(Target {
+        exists,
+        docs,
+        catalog,
+    })
+}
+
+/// What the planner knows about each index of a collection. The multikey
+/// paths are read from `docs` when the caller holds the whole collection,
+/// and from the store's own record of them when it does not.
+fn catalog(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    docs: Option<&[Document]>,
+) -> Result<Vec<Rc<IndexInfo>>, crate::storage::StorageError> {
     let mut catalog = Vec::new();
-    for spec in storage.list_indexes(db, coll).map_err(command_error)? {
+    for spec in storage.list_indexes(db, coll)? {
         let Ok(key) = spec.get_document("key") else {
             continue;
         };
@@ -214,16 +232,20 @@ fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
         let name = spec.get_str("name").unwrap_or("").to_string();
         let plain = key.values().all(|v| matches!(as_i64(v), Some(1 | -1)))
             && !key.values().any(|v| matches!(v, Bson::String(_)));
-        let multikey = storage.index_is_multikey(db, coll, &name);
+        let multikey_paths = if !storage.index_is_multikey(db, coll, &name) {
+            vec![vec![]; key.len()]
+        } else if let Some(docs) = docs {
+            exec::multikey_paths(docs, key)
+        } else {
+            let mut paths = storage.index_multikey_paths(db, coll, &name)?;
+            paths.resize(key.len(), vec![]);
+            paths
+        };
         catalog.push(Rc::new(IndexInfo {
             unique: name == "_id_" || spec.get_bool("unique").unwrap_or(false),
             sparse: spec.get_bool("sparse").unwrap_or(false),
             partial: spec.get_document("partialFilterExpression").ok().cloned(),
-            multikey_paths: if multikey {
-                exec::multikey_paths(&docs, key)
-            } else {
-                vec![vec![]; key.len()]
-            },
+            multikey_paths,
             version: spec.get("v").and_then(as_i64).unwrap_or(2) as i32,
             collation: spec
                 .get_document("collation")
@@ -234,11 +256,7 @@ fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
             name,
         }));
     }
-    Ok(Target {
-        exists,
-        docs,
-        catalog,
-    })
+    Ok(catalog)
 }
 
 /// The plan for one command over one collection.
@@ -289,7 +307,15 @@ fn plan_for(
             ));
         }
     }
-    let or_branches = parsed::or_branches(&s.filter);
+    let trial = exec::Env {
+        docs: &t.docs,
+        collation,
+        skip: 0,
+        limit: 0,
+        multi: true,
+        upsert: false,
+        returns: false,
+    };
     let q = Query {
         canonical,
         sort: s.sort.as_ref(),
@@ -303,9 +329,9 @@ fn plan_for(
         show_record_id: s.show_record_id,
         batch_size: s.batch_size,
         keys_only: false,
-        or_branches: or_branches.as_deref(),
         wanted: None,
         implies: &implies,
+        trial: Some(&trial),
     };
     Ok(match &s.kind {
         Kind::Find => plan::plan(&q, &t.catalog),

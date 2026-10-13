@@ -37,12 +37,21 @@ pub(crate) struct Ctx {
     pub sparse: bool,
     /// The query's collation is not the index's: a string cannot be bounded.
     pub collated: bool,
+    /// The index holds plain string keys (it has no collation of its own).
+    pub plain_strings: bool,
     /// `count` reads no documents, so an equality to null needs no recheck.
     pub keys_only: bool,
 }
 
 /// The byte-sortable key of a value, for ordering interval ends.
 pub(crate) fn sort_key(v: &Bson) -> Vec<u8> {
+    // An index holds `undefined` for an empty array, between MinKey and
+    // null; the sort-key encoder has no key for it.
+    if matches!(v, Bson::Undefined) {
+        let mut key = encode_value(&Bson::MinKey, None).unwrap_or_default();
+        key.push(0x80);
+        return key;
+    }
     encode_value(v, None).unwrap_or_default()
 }
 
@@ -119,7 +128,7 @@ pub(crate) fn intersect(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
 }
 
 /// Sort ascending and merge what overlaps.
-fn union(mut list: Vec<Interval>) -> Vec<Interval> {
+pub(crate) fn union(mut list: Vec<Interval>) -> Vec<Interval> {
     list.retain(|i| !i.is_empty());
     list.sort_by(|a, b| cmp(&a.lo, &b.lo).then(b.lo_incl.cmp(&a.lo_incl)));
     let mut out: Vec<Interval> = Vec::new();
@@ -315,7 +324,9 @@ fn regex_prefix(pattern: &str, options: &str) -> (String, bool) {
 }
 
 fn regex_bounds(pattern: &str, options: &str, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
-    if ctx.collated {
+    // A regex matches the string as it is stored, whatever the query's
+    // collation, so an index of plain strings still bounds it.
+    if ctx.collated && !ctx.plain_strings {
         return None;
     }
     let (prefix, exact) = regex_prefix(pattern, options);

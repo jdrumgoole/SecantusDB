@@ -579,6 +579,58 @@ impl CmdStorage for StorageAdapter {
         self.inner.index_is_multikey(db, coll, name)
     }
 
+    fn matching_rows(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        hint: Option<RawHint<'_>>,
+        collation: Option<&Collation>,
+        let_vars: &Document,
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
+        let resolved = hint.map(to_hint);
+        self.inner
+            .matching_rows(db, coll, filter, resolved.as_ref(), collation, let_vars)
+            .map_err(map_err)
+    }
+
+    fn collection_at_most(
+        &self,
+        db: &str,
+        coll: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
+        self.inner
+            .collection_at_most(db, coll, cap)
+            .map_err(map_err)
+    }
+
+    fn sort_permutation(
+        &self,
+        blobs: &[&[u8]],
+        sort: &Document,
+        collation: Option<&Collation>,
+    ) -> Result<Vec<usize>, StorageError> {
+        self.inner
+            .sort_permutation(blobs, sort, collation)
+            .map_err(map_err)
+    }
+
+    fn index_multikey_paths(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<Vec<String>>, StorageError> {
+        self.inner
+            .index_multikey_paths(db, coll, name)
+            .map_err(map_err)
+    }
+
+    fn with_candidate_order(&self, order: Vec<i64>, f: &mut dyn FnMut()) {
+        secantus_storage::with_candidate_order(order, f)
+    }
+
     fn query_implies_partial(&self, query: &Document, partial: &Document) -> bool {
         secantus_storage::query_implies_partial(query, partial)
     }

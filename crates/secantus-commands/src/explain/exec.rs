@@ -29,7 +29,7 @@ pub(crate) struct Env<'a> {
 }
 
 impl Env<'_> {
-    fn matches(&self, row: usize, filter: &Option<Document>) -> bool {
+    pub(crate) fn matches(&self, row: usize, filter: &Option<Document>) -> bool {
         match filter {
             None => true,
             Some(f) => {
@@ -58,7 +58,13 @@ pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) 
             }
             for item in items {
                 if matches!(item, Bson::Document(_)) {
+                    // An element that does not have the rest of the path is
+                    // indexed as null.
+                    let before = out.len();
                     walk_doc(item, parts, at, out, arrays);
+                    if out.len() == before {
+                        out.push(Bson::Null);
+                    }
                 }
             }
             return;
@@ -115,18 +121,39 @@ pub(crate) fn multikey_paths(docs: &[Document], key: &Document) -> Vec<Vec<Strin
 /// One index entry: the key per field in SCAN order, and the document.
 type Entry = (Vec<Vec<u8>>, usize);
 
-fn directed(v: &Bson, reversed: bool) -> Vec<u8> {
-    let bytes = sort_key(v);
-    if reversed {
-        bytes.iter().map(|b| !b).collect()
-    } else {
-        bytes
+/// One value's key in an index field, in SCAN order: under the index's
+/// collation, and for a field read against its direction a key that sorts
+/// the other way.
+///
+/// Inverting the bytes alone does not reverse two keys when one is the start
+/// of the other (`"a"` and `"ab"`, `""` and anything), so a reversed key is
+/// first made one no other key starts with: its zero bytes escaped and a
+/// terminator added, as the entries table joins the parts of a compound key.
+fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) -> Vec<u8> {
+    let bytes = match (v, collation) {
+        (Bson::String(_), Some(_)) => {
+            secantus_core::sortkey::encode_sort_value(v, collation).unwrap_or_default()
+        }
+        _ => sort_key(v),
+    };
+    if !reversed {
+        return bytes;
     }
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    for b in bytes {
+        out.push(!b);
+        if b == 0 {
+            out.push(0x00);
+        }
+    }
+    out.extend([0xFF, 0xFF]);
+    out
 }
 
 /// The index's entries in the order the scan meets them.
 fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
     let fields = index.fields();
+    let collation = index.collation.as_ref();
     let mut out: Vec<Entry> = Vec::new();
     for (row, doc) in env.docs.iter().enumerate() {
         if let Some(partial) = &index.partial {
@@ -145,9 +172,12 @@ fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
         for (values, (_, dir)) in per_field.iter().zip(&fields) {
             let reversed = (*dir < 0) != backward;
             let mut encoded: Vec<Vec<u8>> = if values.is_empty() {
-                vec![directed(&Bson::Null, reversed)]
+                vec![directed(&Bson::Null, reversed, collation)]
             } else {
-                values.iter().map(|v| directed(v, reversed)).collect()
+                values
+                    .iter()
+                    .map(|v| directed(v, reversed, collation))
+                    .collect()
             };
             encoded.sort();
             encoded.dedup();
@@ -164,29 +194,45 @@ fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
         }
         out.extend(keys.into_iter().map(|k| (k, row)));
     }
-    out.sort();
+    // Entries with one key are in RecordId order, and a backward scan meets
+    // them last first.
+    if backward {
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    } else {
+        out.sort();
+    }
+    out
+}
+
+/// The documents an index scan returns, in the order it returns them.
+pub(crate) fn scan_rows(ix: &IxScan, env: &Env) -> Vec<usize> {
+    let mut scan = Scan::new(ix, env);
+    let mut out = Vec::new();
+    while let Some(row) = scan.next(env) {
+        out.push(row);
+    }
     out
 }
 
 /// One field's intervals in scan order: `(low, inclusive, high, inclusive)`.
 type Ranges = Vec<(Vec<u8>, bool, Vec<u8>, bool)>;
 
-fn ranges(list: &[Interval], reversed: bool) -> Ranges {
+fn ranges(list: &[Interval], reversed: bool, collation: Option<&Collation>) -> Ranges {
     let mut out: Ranges = list
         .iter()
         .map(|i| {
             if reversed {
                 (
-                    directed(&i.hi, true),
+                    directed(&i.hi, true, collation),
                     i.hi_incl,
-                    directed(&i.lo, true),
+                    directed(&i.lo, true, collation),
                     i.lo_incl,
                 )
             } else {
                 (
-                    directed(&i.lo, false),
+                    directed(&i.lo, false, collation),
                     i.lo_incl,
-                    directed(&i.hi, false),
+                    directed(&i.hi, false, collation),
                     i.hi_incl,
                 )
             }
@@ -227,7 +273,9 @@ impl Scan {
             ix.bounds
                 .iter()
                 .zip(&fields)
-                .map(|(list, (_, dir))| ranges(list, (*dir < 0) != ix.backward))
+                .map(|(list, (_, dir))| {
+                    ranges(list, (*dir < 0) != ix.backward, ix.index.collation.as_ref())
+                })
                 .collect()
         };
         // Points, then one interval, then everything: a single run of keys.

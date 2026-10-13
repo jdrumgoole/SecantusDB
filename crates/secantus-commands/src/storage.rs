@@ -486,6 +486,63 @@ pub trait Storage: Send + Sync {
         false
     }
 
+    /// The documents matching `filter`, each with its RecordId, in insertion
+    /// order: the matched set, for a caller that orders it itself
+    /// (`crate::order`). `None` when the store does not offer it or the
+    /// collection reads in an order of its own; the caller then reads through
+    /// `find_collated`.
+    #[allow(clippy::type_complexity)]
+    fn matching_rows(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _filter: &Document,
+        _hint: Option<RawHint<'_>>,
+        _collation: Option<&Collation>,
+        _let_vars: &Document,
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
+        Ok(None)
+    }
+
+    /// Every document of the collection in insertion order, when it holds
+    /// no more than `cap`; `None` when it holds more or the store cannot say.
+    fn collection_at_most(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _cap: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>, StorageError> {
+        Ok(None)
+    }
+
+    /// The order `sort` puts `blobs` in, as indexes into it; equal documents
+    /// stay in the order given.
+    fn sort_permutation(
+        &self,
+        blobs: &[&[u8]],
+        _sort: &Document,
+        _collation: Option<&Collation>,
+    ) -> Result<Vec<usize>, StorageError> {
+        Ok((0..blobs.len()).collect())
+    }
+
+    /// Per key field of an index, the path components that hold an array in
+    /// some document (mongod's `multiKeyPaths`).
+    fn index_multikey_paths(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+    ) -> Result<Vec<Vec<String>>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Run `f` with the write it makes testing the rows `order` names, in
+    /// that order, in place of the candidates the store would pick.
+    fn with_candidate_order(&self, _order: Vec<i64>, f: &mut dyn FnMut()) {
+        f()
+    }
+
     /// Whether every document `query` matches also matches `partial`, as far
     /// as the index router can prove it (it answers `false` when unsure).
     fn query_implies_partial(&self, _query: &Document, _partial: &Document) -> bool {

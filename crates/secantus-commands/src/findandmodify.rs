@@ -385,17 +385,22 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             }
         }
         // Find the target (first match in sort order).
-        let candidates = storage
-            .find_collated(
-                &ctx.db_name,
-                &coll,
-                &query,
+        let candidates = crate::explain::order::find(
+            storage,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &query,
                 sort,
-                natural_hint.as_ref(),
-                collation.as_ref(),
-                &let_vars,
-            )
-            .map_err(command_error)?;
+                // The hint says which index is read, and so which
+                // matching document comes first.
+                hint: natural_hint.as_ref().or(argtypes::given_hint(doc)),
+                collation: collation.as_ref(),
+                vars: &let_vars,
+                limit: 1,
+            },
+        )
+        .map_err(command_error)?;
         let matched = candidates.into_iter().next();
 
         // No match.

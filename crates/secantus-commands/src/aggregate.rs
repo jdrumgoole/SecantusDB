@@ -431,17 +431,35 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     Some(cand) => (cand, pipeline),
                     None => lift_leading_match(&pipeline),
                 };
-                let bytes = storage
-                    .find_collated(
-                        &ctx.db_name,
-                        c,
-                        &filter,
-                        None,
-                        hint,
-                        collation.as_ref(),
-                        &vars,
+                // A `$sort` at the front is still run by the pipeline, which
+                // keeps equal documents in the order they arrive: reading them
+                // in the order mongod's plan returns them is what puts its
+                // ties in mongod's order. mongod moves a `$match` that follows
+                // the `$sort` ahead of it, so that filter is read here too.
+                let lead = leading_sort(&rest, filter.is_empty());
+                let read = |sort: Option<&Document>, limit: i64| {
+                    let moved = lead.filter.as_ref().filter(|_| sort.is_some());
+                    crate::explain::order::find(
+                        storage,
+                        &crate::explain::order::Ask {
+                            db: &ctx.db_name,
+                            coll: c,
+                            filter: moved.unwrap_or(&filter),
+                            sort,
+                            hint,
+                            collation: collation.as_ref(),
+                            vars: &vars,
+                            limit,
+                        },
                     )
-                    .map_err(command_error)?;
+                };
+                let bytes = match lead.sort.as_ref() {
+                    // A sort or filter the read refuses is the pipeline's
+                    // to report: read as if neither had been moved.
+                    Some(sort) => read(Some(sort), lead.limit).or_else(|_| read(None, 0)),
+                    None => read(None, 0),
+                }
+                .map_err(command_error)?;
                 // A time-series collection scans bucket by bucket.
                 let bytes = crate::ts_buckets::as_read(storage, &ctx.db_name, c, bytes, false)?;
                 // Reduce the leading $skip/$limit/$match prefix over raw BSON so
@@ -3374,6 +3392,56 @@ fn first_stage_has(pipeline: &[Bson], key: &str) -> bool {
 /// Whether the first pipeline stage has any of `keys`.
 fn first_stage_has_any(pipeline: &[Bson], keys: &[&str]) -> bool {
     matches!(pipeline.first(), Some(Bson::Document(d)) if keys.iter().any(|k| d.contains_key(*k)))
+}
+
+/// What the front of a pipeline, past its lifted `$match`, asks of the read.
+#[derive(Default)]
+struct LeadingSort {
+    /// A plain `$sort` (every key a field, every value 1 or -1).
+    sort: Option<Document>,
+    /// The `$match` right after that `$sort`, when nothing was lifted.
+    filter: Option<Document>,
+    /// How many documents the stages after the `$sort` take; 0 is all.
+    limit: i64,
+}
+
+fn leading_sort(rest: &[Bson], nothing_lifted: bool) -> LeadingSort {
+    let stage = |i: usize, name: &str| {
+        rest.get(i)
+            .and_then(Bson::as_document)
+            .filter(|d| d.len() == 1)
+            .and_then(|d| d.get(name))
+    };
+    let Some(Bson::Document(spec)) = stage(0, "$sort") else {
+        return LeadingSort::default();
+    };
+    let plain = !spec.is_empty()
+        && spec
+            .iter()
+            .all(|(k, v)| !k.starts_with('$') && matches!(as_i64(v), Some(1 | -1)));
+    if !plain {
+        return LeadingSort::default();
+    }
+    let mut out = LeadingSort {
+        sort: Some(spec.clone()),
+        ..LeadingSort::default()
+    };
+    let mut at = 1;
+    if nothing_lifted {
+        if let Some(Bson::Document(m)) = stage(1, "$match") {
+            out.filter = Some(m.clone());
+            at = 2;
+        }
+    }
+    let whole = |v: &Bson| as_i64(v).filter(|n| *n >= 0);
+    let skip = stage(at, "$skip").and_then(whole);
+    if skip.is_some() {
+        at += 1;
+    }
+    if let Some(limit) = stage(at, "$limit").and_then(whole).filter(|n| *n > 0) {
+        out.limit = limit + skip.unwrap_or(0);
+    }
+    out
 }
 
 /// If the pipeline starts with `{$match: {...}}`, return its filter and the

@@ -603,19 +603,20 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
 
-    let docs = storage
-        .find_collated(
-            &ctx.db_name,
-            &coll,
-            &filter,
+    let docs = crate::explain::order::find(
+        storage,
+        &crate::explain::order::Ask {
+            db: &ctx.db_name,
+            coll: &coll,
+            filter: &filter,
             sort,
             hint,
-            collation.as_ref(),
-            &let_vars,
-        )
-        .map_err(|e| {
-            crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll))
-        })?;
+            collation: collation.as_ref(),
+            vars: &let_vars,
+            limit: if limit > 0 { (skip + limit) as i64 } else { 0 },
+        },
+    )
+    .map_err(|e| crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll)))?;
 
     // A time-series collection scans bucket by bucket, and returns each
     // measurement with its time and meta fields first.

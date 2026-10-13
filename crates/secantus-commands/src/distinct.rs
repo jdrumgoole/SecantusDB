@@ -149,17 +149,20 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             collation.as_ref(),
         )?
     } else {
-        let bytes = storage
-            .find_collated(
-                &ctx.db_name,
-                &coll,
-                &filter,
-                None,
+        let bytes = crate::explain::order::find(
+            storage,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &filter,
+                sort: None,
                 hint,
-                collation.as_ref(),
-                &Document::new(),
-            )
-            .map_err(command_error)?;
+                collation: collation.as_ref(),
+                vars: &Document::new(),
+                limit: 0,
+            },
+        )
+        .map_err(command_error)?;
         let mut decoded = Vec::with_capacity(bytes.len());
         for b in bytes {
             decoded.push(

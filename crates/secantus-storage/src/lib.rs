@@ -2560,6 +2560,64 @@ fn sparse_index_usable(key_spec: &Document, filter: &Document) -> bool {
 /// True if any field of `key_spec` is array-valued in `doc` — either an array
 /// leaf or a dotted path descending through an array. That's the signal that
 /// marks an index multikey. Mirrors `storage._doc_makes_multikey`.
+/// One index's multikey paths: the DDL generation they were read under,
+/// whether the collection has been scanned for them yet, and per key field
+/// the path components that hold an array.
+#[derive(Clone, Debug, Default)]
+struct MultikeyPaths {
+    generation: u64,
+    scanned: bool,
+    paths: Vec<Vec<String>>,
+}
+
+/// Add to `out` the components of `path` at which `doc` holds an array:
+/// `a.b` over `{a: [{b: [1]}]}` gives `a` and `a.b`.
+fn array_components(doc: &Document, path: &str, out: &mut Vec<String>) {
+    fn in_doc(d: &Document, parts: &[&str], at: usize, out: &mut Vec<String>) {
+        if at == parts.len() {
+            return;
+        }
+        match d.get(parts[at]) {
+            Some(Bson::Array(items)) => {
+                let prefix = parts[..=at].join(".");
+                if !out.contains(&prefix) {
+                    out.push(prefix);
+                }
+                for item in items {
+                    if let Bson::Document(inner) = item {
+                        in_doc(inner, parts, at + 1, out);
+                    }
+                }
+            }
+            Some(Bson::Document(inner)) => in_doc(inner, parts, at + 1, out),
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    in_doc(doc, &parts, 0, out);
+}
+
+thread_local! {
+    /// The rows a write on this thread tests, in the order it tests them
+    /// (`with_candidate_order`). `None`: the router's own candidates.
+    static CANDIDATE_ORDER: RefCell<Option<Vec<i64>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with the next write's candidates fixed to the rows `order` names,
+/// in that order. A write that changes ONE document changes the first one
+/// its query matches, so the caller that knows the order mongod reads in
+/// names the rows here. Restored on return, panic included.
+pub fn with_candidate_order<T>(order: Vec<i64>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Vec<i64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CANDIDATE_ORDER.with(|o| *o.borrow_mut() = self.0.take());
+        }
+    }
+    let _r = Restore(CANDIDATE_ORDER.with(|o| o.replace(Some(order))));
+    f()
+}
+
 fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
     key_spec.keys().any(|f| index_field_values(doc, f).1)
 }
@@ -3412,6 +3470,14 @@ pub struct Storage {
     /// because every DDL's row writes commit in ONE statement transaction, a
     /// re-run whose generation held still is a consistent point-in-time answer.
     ddl_generation: AtomicU64,
+    /// Per `(db, collection, index)`: which components of each key field hold
+    /// an array in some document -- mongod's multikey paths, which its planner
+    /// reads to decide how far an index's bounds can be narrowed. Computed by
+    /// one scan the first time a query asks, kept current by every write
+    /// (`note_multikey_paths`), and dropped when the DDL generation moves.
+    /// Only ever grows between those, as mongod's does. It orders results and
+    /// never decides which documents match.
+    multikey_paths: Mutex<HashMap<(String, String, String), MultikeyPaths>>,
     /// Dirty budget for one multi-document transaction: ~15% of the cache
     /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
     /// `TransactionTooLargeForCache` threshold). A transaction's dirty
@@ -5310,6 +5376,7 @@ impl Storage {
             coll_locks: Mutex::new(HashMap::new()),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
+            multikey_paths: Mutex::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             oplog_shards_created,
             ttl: TtlMonitor::default(),
@@ -11748,6 +11815,7 @@ impl Storage {
             if !doc_makes_multikey(doc, &desc.key_spec) {
                 continue;
             }
+            self.note_multikey_paths(db, coll, name, doc, &desc.key_spec);
             let cur = session.open_cursor(IDX_TABLE, None)?;
             cur.set_key_sss(db, coll, name);
             match cur.search() {
@@ -13563,6 +13631,11 @@ impl Storage {
         filter: &Document,
         force_scan: bool,
     ) -> Result<Vec<ScannedDoc>> {
+        // A caller that fixed the order (`with_candidate_order`) named the
+        // rows: they are read as they are now, and still tested by the write.
+        if let Some(order) = CANDIDATE_ORDER.with(|o| o.borrow().clone()) {
+            return self.rows_by_recordids(session, db, coll, order);
+        }
         // `force_scan` (a collation is active) bypasses the collation-naive
         // indexes for a full collection scan + in-memory collation matching.
         if filter.is_empty() || force_scan {
@@ -13572,43 +13645,383 @@ impl Storage {
             Some(r) => Some(r),
             None => self.try_residual_index_id_keys(session, db, coll, filter)?,
         };
-        if let Some(recordids) = routed {
-            // Index entries carry the RecordId (step 2), so this reads the doc row
-            // directly — no `id_key -> _id index -> RecordId` hop. The doc's own
-            // id_key comes back from the framed value, which is what the callers
-            // (delete / update maintenance) need it for.
-            // Lazy shards: an absent shard holds no documents. Without this a
-            // count or delete by `_id` on a collection that was never written
-            // failed with WiredTiger's ENOENT where it should find nothing.
-            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+        match routed {
+            Some(recordids) => self.rows_by_recordids(session, db, coll, recordids),
+            None => self.scan_docs(session, db, coll),
+        }
+    }
+
+    /// Whether `desc`'s entries answer `filter` where a MISSING value would.
+    ///
+    /// A dotted key over an array of documents (`p.q` over
+    /// `{p: [{q: 1}, {r: 1}]}`) holds an entry for each element that has the
+    /// leaf and none for one that does not, where mongod indexes that
+    /// element as null and matches `{"p.q": null}` on it. So a predicate a
+    /// missing value satisfies, on such a field of a multikey index, is not
+    /// read from the entries: `find({"p.q": null})` left that document out.
+    fn holds_missing_leaves(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        desc: &IndexDesc,
+        filter: &Document,
+    ) -> Result<bool> {
+        let at_risk = desc.key_spec.keys().any(|field| {
+            field.contains('.')
+                && filter.contains_key(field)
+                && predicate_may_match_missing(filter.get(field))
+        });
+        Ok(!at_risk || !self.flagged_multikey(session, db, coll, &desc.name)?)
+    }
+
+    /// Whether some document gave index `name` an array to index. Over such
+    /// an index two range bounds on one field are met by DIFFERENT elements
+    /// of one array (`{$gt: 1, $lt: 9}` matches `[1, 9]`), so a scan may
+    /// keep one bound and never both: entries between the two would leave
+    /// that document out.
+    fn flagged_multikey(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .any(|(n, _, opts)| n == name && opts.get_bool("multikey").unwrap_or(false)))
+    }
+
+    /// The rows `recordids` name, in that order, each once: the RecordId, the
+    /// `_id` key and the document. A row that is gone is left out.
+    fn rows_by_recordids(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        recordids: Vec<i64>,
+    ) -> Result<Vec<ScannedDoc>> {
+        // Index entries carry the RecordId (step 2), so this reads the doc row
+        // directly — no `id_key -> _id index -> RecordId` hop. The doc's own
+        // id_key comes back from the framed value, which is what the callers
+        // (delete / update maintenance) need it for.
+        // Lazy shards: an absent shard holds no documents. Without this a
+        // count or delete by `_id` on a collection that was never written
+        // failed with WiredTiger's ENOENT where it should find nothing.
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut out = Vec::new();
+        for recordid in recordids {
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            if !seen.insert(recordid) {
+                continue;
+            }
+            cur.reset()?;
+            cur.set_key_ssq(db, coll, recordid);
+            match cur.search() {
+                Ok(()) => {
+                    let value = cur.get_value_u()?;
+                    let (idk, blob) = unframe_doc_value(&value)?;
+                    out.push((recordid, idk.to_vec(), blob.to_vec()));
+                }
+                Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
-            };
-            let mut seen: HashSet<i64> = HashSet::new();
-            let mut out = Vec::new();
-            for recordid in recordids {
-                if deadline::check().is_err() {
-                    return Err(StorageError::MaxTimeExpired);
-                }
-                if !seen.insert(recordid) {
-                    continue;
-                }
-                cur.reset()?;
-                cur.set_key_ssq(db, coll, recordid);
-                match cur.search() {
-                    Ok(()) => {
-                        let value = cur.get_value_u()?;
-                        let (idk, blob) = unframe_doc_value(&value)?;
-                        out.push((recordid, idk.to_vec(), blob.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The documents matching `filter`, each with its RecordId, in RecordId
+    /// (insertion) order -- the matched SET, for a caller that orders it
+    /// itself. With a `hint` naming a sparse or partial index, only the
+    /// documents that index holds. `None` for a collection whose read order
+    /// is its own (the oplog view, time-series, clustered) and under a read
+    /// overlay: the caller reads those through `find_matching_with`.
+    pub fn matching_rows(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        hint: Option<&Hint>,
+        coll_opt: Option<&Collation>,
+        vars: &Document,
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>> {
+        if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
+            return Ok(None);
+        }
+        self.with_ddl_generation_check(|| {
+            self.matching_rows_inner(db, coll, filter, hint, coll_opt, vars)
+        })
+    }
+
+    fn matching_rows_inner(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        hint: Option<&Hint>,
+        coll_opt: Option<&Collation>,
+        vars: &Document,
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>> {
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        let session = self.op_session()?;
+        if self.is_timeseries(&session, db, coll)? || is_clustered(&session, db, coll)? {
+            return Ok(None);
+        }
+        // A hinted index that leaves documents out: `(key, sparse, partial)`.
+        let mut held: Option<(Document, bool, Option<Document>)> = None;
+        if let Some(h) = hint {
+            if let ResolvedHint::Named(name) = self.resolve_hint(&session, db, coll, h)? {
+                let found = self
+                    .visible_indexes(&session, db, coll)?
+                    .into_iter()
+                    .find(|(n, _, _)| n == &name);
+                if let Some((_, key_spec, opts)) = found {
+                    // A geo, text or hashed index reads through its own walk.
+                    if !key_spec
+                        .values()
+                        .all(|d| matches!(direction_of(d), Some(1 | -1)))
+                    {
+                        return Ok(None);
                     }
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
+                    let sparse = opts.get_bool("sparse").unwrap_or(false);
+                    let partial = opts
+                        .get_document("partialFilterExpression")
+                        .ok()
+                        .filter(|d| !d.is_empty())
+                        .cloned();
+                    if sparse || partial.is_some() {
+                        held = Some((key_spec, sparse, partial));
+                    }
                 }
             }
-            Ok(out)
+        }
+        let rows = if filter.is_empty() || coll_opt.is_some() || hint.is_some() {
+            self.scan_docs(&session, db, coll)?
         } else {
-            self.scan_docs(session, db, coll)
+            let routed = match self.try_index_id_keys(&session, db, coll, filter)? {
+                Some(ids) => Some(ids),
+                None => match self.try_residual_index_id_keys(&session, db, coll, filter)? {
+                    Some(ids) => Some(ids),
+                    None => self.try_or_index_id_keys(&session, db, coll, filter)?,
+                },
+            };
+            match routed {
+                Some(ids) => self.rows_by_recordids(&session, db, coll, ids)?,
+                None => self.scan_docs(&session, db, coll)?,
+            }
+        };
+        let mut out: Vec<(i64, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for (recordid, _id_k, blob) in rows {
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
+            if !filter.is_empty() {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
+                    .map_err(query_fault)?
+                {
+                    continue;
+                }
+            }
+            if let Some((key_spec, sparse, partial)) = &held {
+                let d = decode_doc(&blob)?;
+                if *sparse && !sparse_covers(&d, key_spec) {
+                    continue;
+                }
+                if let Some(pf) = partial {
+                    if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
+                        continue;
+                    }
+                }
+            }
+            out.push((recordid, blob));
+        }
+        out.sort_unstable_by_key(|(recordid, _)| *recordid);
+        Ok(Some(out))
+    }
+
+    /// Every document of the collection in insertion order, when it holds
+    /// no more than `cap` of them; `None` when it holds more, having read
+    /// `cap + 1`. For a caller that needs the whole of a SMALL collection.
+    pub fn collection_at_most(
+        &self,
+        db: &str,
+        coll: &str,
+        cap: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
+            return Ok(None);
+        }
+        let session = self.op_session()?;
+        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(Some(Vec::new())),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        cur.set_key_ssq(db, coll, i64::MIN);
+        let mut more = match cur.search_near() {
+            Ok(cmp) => {
+                if cmp < 0 {
+                    cur.next()?
+                } else {
+                    true
+                }
+            }
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, _recordid) = cur.get_key_ssq()?;
+            if d != db || c != coll {
+                break;
+            }
+            if out.len() == cap {
+                return Ok(None);
+            }
+            let value = cur.get_value_u()?;
+            let (_idk, blob) = unframe_doc_value(&value)?;
+            out.push(blob.to_vec());
+            more = cur.next()?;
+        }
+        Ok(Some(out))
+    }
+
+    /// The order `sort` puts `blobs` in, as indexes into it; documents that
+    /// compare equal stay in the order given. The same comparison
+    /// `find_matching_with` sorts by. A sort it does not read is no reorder.
+    pub fn sort_permutation(
+        &self,
+        blobs: &[&[u8]],
+        sort: &Document,
+        coll_opt: Option<&Collation>,
+    ) -> Result<Vec<usize>> {
+        let Some(spec) = multi_sort_spec(Some(sort)) else {
+            return Ok((0..blobs.len()).collect());
+        };
+        let mut keyed: Vec<(Vec<SortPart>, usize)> = Vec::with_capacity(blobs.len());
+        for (at, blob) in blobs.iter().enumerate() {
+            let d = decode_doc(blob)?;
+            keyed.push((sort_key(&d, &spec, coll_opt)?, at));
+        }
+        keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
+        Ok(keyed.into_iter().map(|(_, at)| at).collect())
+    }
+
+    /// Per key field of index `name`, the path components that hold an array
+    /// in some document (mongod's `multiKeyPaths`). Empty lists for an index
+    /// that is not multikey; an empty answer for one that does not exist.
+    pub fn index_multikey_paths(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<Vec<String>>> {
+        let session = self.op_session()?;
+        let found = self
+            .iter_indexes(&session, db, coll)?
+            .into_iter()
+            .find(|(n, _, _)| n == name);
+        let Some((_, key_spec, opts)) = found else {
+            return Ok(Vec::new());
+        };
+        if !opts.get_bool("multikey").unwrap_or(false) {
+            return Ok(vec![Vec::new(); key_spec.len()]);
+        }
+        let generation = self.ddl_generation.load(Ordering::Acquire);
+        let cache_key = (db.to_string(), coll.to_string(), name.to_string());
+        {
+            let mut cache = self
+                .multikey_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match cache.get(&cache_key) {
+                Some(entry) if entry.generation == generation && entry.scanned => {
+                    return Ok(entry.paths.clone());
+                }
+                Some(entry) if entry.generation == generation => {}
+                // Present from now on, so a write during the scan below adds
+                // what its document holds.
+                _ => {
+                    cache.insert(
+                        cache_key.clone(),
+                        MultikeyPaths {
+                            generation,
+                            scanned: false,
+                            paths: vec![Vec::new(); key_spec.len()],
+                        },
+                    );
+                }
+            }
+        }
+        let mut found: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
+        for (_recordid, _id_k, blob) in self.scan_docs(&session, db, coll)? {
+            let d = decode_doc(&blob)?;
+            for (field, parts) in key_spec.keys().zip(found.iter_mut()) {
+                array_components(&d, field, parts);
+            }
+        }
+        let mut cache = self
+            .multikey_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = cache.entry(cache_key).or_default();
+        if entry.generation != generation || entry.paths.len() != found.len() {
+            *entry = MultikeyPaths {
+                generation,
+                scanned: false,
+                paths: vec![Vec::new(); found.len()],
+            };
+        }
+        for (have, new) in entry.paths.iter_mut().zip(found) {
+            for part in new {
+                if !have.contains(&part) {
+                    have.push(part);
+                }
+            }
+            have.sort();
+        }
+        entry.scanned = true;
+        Ok(entry.paths.clone())
+    }
+
+    /// A write of `doc` adds what it holds to the index's cached multikey
+    /// paths, when there are any cached.
+    fn note_multikey_paths(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+        doc: &Document,
+        key_spec: &Document,
+    ) {
+        let mut cache = self
+            .multikey_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.is_empty() {
+            return;
+        }
+        let cache_key = (db.to_string(), coll.to_string(), name.to_string());
+        let Some(entry) = cache.get_mut(&cache_key) else {
+            return;
+        };
+        if entry.paths.len() != key_spec.len() {
+            return;
+        }
+        for (field, parts) in key_spec.keys().zip(entry.paths.iter_mut()) {
+            array_components(doc, field, parts);
+            parts.sort();
         }
     }
 
@@ -14754,6 +15167,11 @@ impl Storage {
         let Some(hint) = hint else {
             return self.candidate_docs(session, db, coll, filter, force_scan);
         };
+        if CANDIDATE_ORDER.with(|o| o.borrow().is_some()) {
+            // The hint has to be one the collection has, order fixed or not.
+            self.resolve_hint(session, db, coll, hint)?;
+            return self.candidate_docs(session, db, coll, filter, force_scan);
+        }
         if self.is_timeseries(session, db, coll)? {
             return self.candidate_docs(session, db, coll, filter, force_scan);
         }
@@ -15864,6 +16282,9 @@ impl Storage {
             if desc.sparse && !sparse_index_usable(&desc.key_spec, query) {
                 continue;
             }
+            if !self.holds_missing_leaves(session, db, coll, &desc, query)? {
+                continue;
+            }
             let n_fields = desc.key_spec.len();
             let leads = desc
                 .key_spec
@@ -16060,6 +16481,9 @@ impl Storage {
                 "$lte" => (upper, upper_incl) = (Some(kb), true),
                 _ => {}
             }
+        }
+        if lower.is_some() && upper.is_some() && self.flagged_multikey(session, db, coll, name)? {
+            upper = None;
         }
         if is_compound {
             // Walk the compound index using its leading field only; boundary
@@ -16501,6 +16925,9 @@ impl Storage {
             if desc.sparse && !sparse_index_usable(&desc.key_spec, filter) {
                 continue;
             }
+            if !self.holds_missing_leaves(session, db, coll, &desc, filter)? {
+                continue;
+            }
             let eff_fields: HashSet<&str> = match &desc.partial {
                 Some(pf) => {
                     if !query_implies_partial(filter, pf) {
@@ -16625,6 +17052,9 @@ impl Storage {
         let mut best: Option<(String, Document)> = None;
         for desc in self.planner_descs(session, db, coll)? {
             if desc.sparse && !sparse_index_usable(&desc.key_spec, filter) {
+                continue;
+            }
+            if !self.holds_missing_leaves(session, db, coll, &desc, filter)? {
                 continue;
             }
             if let Some(pf) = &desc.partial {
@@ -16762,6 +17192,9 @@ impl Storage {
                 "$lte" => (upper, upper_incl) = (Some(full), true),
                 _ => return Ok(None),
             }
+        }
+        if lower.is_some() && upper.is_some() && self.flagged_multikey(session, db, coll, &name)? {
+            upper = None;
         }
         Ok(Some(self.range_scan_index(
             session,

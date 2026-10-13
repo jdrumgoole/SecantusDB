@@ -97,8 +97,12 @@ pub fn sort_path_values<'a>(doc: &'a Document, path: &str) -> Vec<(&'a Bson, boo
                         }
                         for elem in arr {
                             if let Bson::Document(d) = elem {
-                                if let Some(v) = d.get(part) {
-                                    next.push((v, false));
+                                match d.get(part) {
+                                    Some(v) => next.push((v, false)),
+                                    // An element without the field sorts as
+                                    // null, as it is indexed: `p.q` over
+                                    // `[{q: 3}, {r: 1}]` is null ascending.
+                                    None => next.push((&MISSING_IN_ELEMENT, false)),
                                 }
                             }
                         }
@@ -111,6 +115,9 @@ pub fn sort_path_values<'a>(doc: &'a Document, path: &str) -> Vec<(&'a Bson, boo
     }
     current
 }
+
+/// What an array element that lacks the next path component stands for.
+static MISSING_IN_ELEMENT: Bson = Bson::Null;
 
 /// The `(component, array)` mongod refuses to sort by, or `None`.
 ///
