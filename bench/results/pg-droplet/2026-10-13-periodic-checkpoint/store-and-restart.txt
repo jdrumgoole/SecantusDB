@@ -1,0 +1,4 @@
+base: 132 log files, 2.1G
+base restart after kill -9: 36.829117682 s
+fix: 4 log files, 69M
+fix restart after kill -9: 1.439445677 s

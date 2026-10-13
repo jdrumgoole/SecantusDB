@@ -26,7 +26,7 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--oplog-async` | Persist oplog entries via a background drainer pool instead of inside each write's commit (higher write throughput; change-stream events surface once drained) | off, or `SECANTUS_OPLOG_ASYNC` |
 | `--oplog-nonlogged` | Create oplog tables `log=(enabled=false)` — checkpoint-durable only; a crash can lose the oplog tail | off, or `SECANTUS_OPLOG_NONLOGGED` |
 | `--data-nonlogged` | mongod's split: WAL-log only the oplog; data tables recover by oplog replay from the last stable checkpoint (see [Recovery](recovery.md)) | off, or `SECANTUS_DATA_NONLOGGED` |
-| `--checkpoint-seconds N` | Stable-checkpoint cadence for `--data-nonlogged` | `60`, or `SECANTUS_CHECKPOINT_SECONDS` |
+| `--checkpoint-seconds N` | Seconds between checkpoints. A checkpoint is what trims the log, and under `--data-nonlogged` what makes the data durable | `60`, or `SECANTUS_CHECKPOINT_SECONDS` |
 | `--auth` | Require SCRAM authentication on every non-handshake command | off |
 | `--standalone` | Advertise a plain standalone `hello` instead of the single-node replica-set persona (disables change-stream topology, matters for drivers that gate on `isReplicaSet`) | off |
 | `--noop-heartbeat-seconds N` | Periodic oplog no-op so cluster time advances while idle (mongod default is 10s) | `0` (disabled) |

@@ -3155,24 +3155,22 @@ These work end-to-end but cut corners.
         benchmark now records the disk's flush time and the server's CPU a
         statement for every trial, and prints an unsteady row trial by
         trial with them, so the next one says which it was.
-      - [ ] **Neither Rust server checkpoints while it runs, so the log is
-            never trimmed.** Found by watching the store during those
-            trials. WiredTiger removes a log file only after a checkpoint,
-            and in the default (logged) mode the only checkpoints are at
-            close, in a backup and in `fsync`; the periodic thread
-            (`spawn_stable_checkpoint_thread`) runs only for a
-            `SECANTUS_DATA_NONLOGGED` store. Measured on `secantusd-pg`
-            0.1.0-beta.13 at 13,000 updates a second: 2.0 GB and 125 log
-            files after 12 minutes, for tables of a few kilobytes; a
-            restart after SIGKILL then took 38 s to listen, and left the
-            files in place; a clean stop left one file and 19 MB. So a
-            server that runs for days under writes fills its disk, and its
-            crash recovery grows with its uptime. `secantusd-rs` opens the
-            store the same way and has not been measured. The fix is a
-            periodic plain checkpoint for a logged store (the nonlogged
-            thread also writes a stable marker, which a logged store must
-            not get), with its cost on throughput measured, and off under
-            `SECANTUS_TEST_FAST_STORAGE`.
+      - **Neither Rust server checkpointed while it ran, so its log was
+        never trimmed; fixed 2026-10-13.** Found by watching the store
+        during those trials. WiredTiger removes a log file only after a
+        checkpoint, and a logged store's only checkpoints were at close,
+        in a backup and in `fsync`. A durable, logged store now runs the
+        checkpoint thread too (`spawn_checkpoint_thread(false)`, every
+        `SECANTUS_CHECKPOINT_SECONDS`, default 60), with no stable marker.
+        Measured on `secantusd-pg`, forty trials of eight clients updating,
+        before and after: 13,815 and 13,864 statements a second; the store
+        2.1 GB and 69 MB; a restart after SIGKILL 36.8 s and 1.4 s
+        (`bench/results/pg-droplet/2026-10-13-periodic-checkpoint/`).
+        `secantusd-rs` gets it from the same code and was not measured.
+      - [ ] **The Python servers have the same gap.** `storage.py`
+            checkpoints at close, in a backup and in `fsync`, and nowhere
+            else, so a long-running `secantusd-py` or `secantusd-py-pg`
+            keeps every log file. Not measured.
       - **A `c-16` is not one machine.** The droplet of 2026-10-13 had a
         Xeon Platinum 8168 and a disk that completed 1,653 `fdatasync`
         calls a second; one client's inserts ran at 613 a second on
