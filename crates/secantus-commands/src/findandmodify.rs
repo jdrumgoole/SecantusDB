@@ -398,6 +398,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 collation: collation.as_ref(),
                 vars: &let_vars,
                 limit: 1,
+                asked: Default::default(),
             },
         )
         .map_err(command_error)?;

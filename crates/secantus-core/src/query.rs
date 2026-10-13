@@ -658,6 +658,15 @@ fn field_matches_descend(
                 }
                 regex_options_ok(opts)?;
             }
+            // A `$near` has the condition document to itself: its distance
+            // bounds are siblings, and nothing else may be.
+            if let Some(near) = crate::geoshape::near_condition(d)? {
+                return Ok(values
+                    .iter()
+                    .filter_map(|c| c.value)
+                    .filter_map(|v| near.distance(v))
+                    .any(|dist| near.admits(dist)));
+            }
             for (op, arg) in d.iter() {
                 match op.as_str() {
                     // `$options` is a sibling modifier of `$regex`, validated above.

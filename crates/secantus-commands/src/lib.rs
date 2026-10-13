@@ -44,6 +44,7 @@ pub mod changestream;
 pub mod crud;
 pub mod cursors;
 mod ddl_checks;
+mod near;
 pub mod diagnostics;
 pub mod distinct;
 mod explain;

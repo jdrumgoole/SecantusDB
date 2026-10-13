@@ -160,6 +160,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 collation: collation.as_ref(),
                 vars: &Document::new(),
                 limit: 0,
+                asked: Default::default(),
             },
         )
         .map_err(command_error)?;

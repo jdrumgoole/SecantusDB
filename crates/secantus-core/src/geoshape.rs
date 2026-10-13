@@ -423,6 +423,162 @@ pub fn stored(v: &Bson) -> Vec<Geom> {
     }
 }
 
+// ----------------------------------------------------------------- $near
+
+/// mongod's radius of the Earth, in metres.
+pub const EARTH_RADIUS_METERS: f64 = 6_378_100.0;
+
+/// A `$near` / `$nearSphere` query.
+#[derive(Clone, Debug)]
+pub struct Near {
+    pub centre: P,
+    /// Distances are along the sphere, in metres; otherwise in the plane, in
+    /// the units of the coordinates.
+    pub spherical: bool,
+    /// The centre was given as GeoJSON, which only a `2dsphere` index reads.
+    pub geojson: bool,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+fn bound(v: &Bson, name: &str, codes: (i32, i32)) -> Parsed<f64> {
+    match num(v) {
+        None => Err(Fallback::mongo(codes.0, format!("{name} must be a number"))),
+        Some(n) if n < 0.0 => Err(Fallback::mongo(
+            codes.1,
+            format!("{name} must be non-negative"),
+        )),
+        Some(n) => Ok(n),
+    }
+}
+
+/// The `$near` query a condition document holds (`{$near: ..., $maxDistance:
+/// ...}`), or `None` when it holds none. Nothing else may share the document.
+pub fn near_condition(cond: &Document) -> Parsed<Option<Near>> {
+    let is_near = |k: &str| matches!(k, "$near" | "$nearSphere" | "$geoNear");
+    if !cond.keys().any(|k| is_near(k)) {
+        return Ok(None);
+    }
+    let whole = || bson_value_repr(&Bson::Document(cond.clone()));
+    let Some((op, arg)) = cond.iter().next().filter(|(k, _)| is_near(k)) else {
+        return bad(format!("near must be first in: {}", whole()));
+    };
+    let mut spherical = op == "$nearSphere" || cond.contains_key("$nearSphere");
+    let (mut min, mut max) = (None, None);
+    let geometry = match arg {
+        Bson::Document(d) => d.get("$geometry"),
+        _ => None,
+    };
+    let (centre, geojson) = if let (Bson::Document(d), Some(g)) = (arg, geometry) {
+        let shown = bson_value_repr(g);
+        let wrong = |why: String| {
+            Fallback::mongo(
+                2,
+                format!("invalid point in geo near query $geometry argument: {shown}  {why}"),
+            )
+        };
+        let reason = |f: Fallback| match f {
+            Fallback::Mongo { message, .. } => wrong(message),
+            other => other,
+        };
+        let centre = match g {
+            Bson::Document(gd) => match gd.get_str("type") {
+                Ok("Point") | Err(_) => {
+                    in_bounds(flat_point(gd.get("coordinates")).map_err(reason)?).map_err(reason)?
+                }
+                Ok(other) => {
+                    return Err(wrong(format!(
+                        "Expected geojson geometry with type Point, but got type {other}"
+                    )))
+                }
+            },
+            other => in_bounds(flat_point(Some(other)).map_err(reason)?).map_err(reason)?,
+        };
+        for (k, v) in d {
+            match k.as_str() {
+                "$geometry" => {}
+                "$maxDistance" => max = Some(bound(v, "$maxDistance", (2, 2))?),
+                "$minDistance" => min = Some(bound(v, "$minDistance", (2, 2))?),
+                other => return bad(format!("invalid argument in geo near query: {other}")),
+            }
+        }
+        spherical = true;
+        (centre, true)
+    } else {
+        let Some(parts) = members(arg) else {
+            return bad(format!("near must be first in: {}", whole()));
+        };
+        if parts.is_empty() {
+            return bad("$geometry is required for geo near query");
+        }
+        let (Some(x), Some(y)) = (
+            parts.first().and_then(|v| num(v)),
+            parts.get(1).and_then(|v| num(v)),
+        ) else {
+            return bad("invalid argument in geo near query: 0");
+        };
+        if let Some(third) = parts.get(2).and_then(|v| num(v)) {
+            max = Some(third);
+        }
+        ((x, y), false)
+    };
+    for (k, v) in cond.iter().skip(1) {
+        match k.as_str() {
+            "$maxDistance" => max = Some(bound(v, "$maxDistance", (16895, 16896))?),
+            "$minDistance" => min = Some(bound(v, "$minDistance", (16897, 16898))?),
+            "$near" | "$nearSphere" | "$geoNear" | "$uniqueDocs" => {}
+            other => {
+                return Err(Fallback::mongo(
+                    34413,
+                    format!("invalid argument in geo near query: {other}"),
+                ))
+            }
+        }
+    }
+    if spherical && !geojson {
+        if in_bounds(centre).is_err() {
+            return bad("Legacy point is out of bounds for spherical query");
+        }
+        // A legacy point on the sphere measures in radians.
+        min = min.map(|r| r * EARTH_RADIUS_METERS);
+        max = max.map(|r| r * EARTH_RADIUS_METERS);
+    }
+    Ok(Some(Near {
+        centre,
+        spherical,
+        geojson,
+        min,
+        max,
+    }))
+}
+
+impl Near {
+    /// How far a stored value is from the centre: the least over the
+    /// geometries it holds. `None` when it holds none this query measures.
+    pub fn distance(&self, v: &Bson) -> Option<f64> {
+        stored(v)
+            .iter()
+            .filter_map(|g| {
+                if self.spherical {
+                    Some(sphere::distance(g, self.centre) * EARTH_RADIUS_METERS)
+                } else {
+                    match g {
+                        Geom::Point(p) => {
+                            Some((p.0 - self.centre.0).hypot(p.1 - self.centre.1))
+                        }
+                        _ => None,
+                    }
+                }
+            })
+            .min_by(f64::total_cmp)
+    }
+
+    /// Whether a distance is inside the query's bounds.
+    pub fn admits(&self, d: f64) -> bool {
+        self.min.is_none_or(|lo| d >= lo) && self.max.is_none_or(|hi| d <= hi)
+    }
+}
+
 // ----------------------------------------------------------------- the plane
 
 mod plane {
@@ -692,6 +848,28 @@ pub(crate) mod sphere {
                     _ => false,
                 })
             })
+    }
+
+    /// The angle from `centre` to the nearest point of the geometry: nothing
+    /// for a point on it or in it. A line is never at nothing, as mongod
+    /// measures it: `$maxDistance: 0` leaves out a line that starts at the
+    /// centre.
+    pub fn distance(g: &Geom, centre: P) -> f64 {
+        let mut pieces = Vec::new();
+        parts(g, &mut pieces);
+        let c = unit(centre);
+        pieces
+            .iter()
+            .map(|piece| match piece {
+                Part::Point(p) => angle(*p, c),
+                Part::Polygon(loops) if in_polygon(c, loops) => 0.0,
+                other => part_edges(other)
+                    .iter()
+                    .map(|(a, b)| to_arc(c, *a, *b))
+                    .fold(f64::INFINITY, f64::min)
+                    .max(f64::MIN_POSITIVE),
+            })
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// Whether every vertex of the geometry is within `radius` of `centre`.

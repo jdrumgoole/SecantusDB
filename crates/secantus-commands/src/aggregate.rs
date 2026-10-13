@@ -436,6 +436,18 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // in the order mongod's plan returns them is what puts its
                 // ties in mongod's order. mongod moves a `$match` that follows
                 // the `$sort` ahead of it, so that filter is read here too.
+                if crate::near::find_near(&filter).map_err(command_error)?.is_some() {
+                    return Err(CommandError::new(
+                        5626500,
+                        "Location5626500",
+                        "$geoNear, $near, and $nearSphere are not allowed in this context, as \
+                         these operators require sorting geospatial data. If you do not need \
+                         sort, consider using $geoWithin instead. Check out \
+                         https://dochub.mongodb.org/core/near-sort-operation and \
+                         https://dochub.mongodb.org/core/nearSphere-sort-operationfor more \
+                         details.",
+                    ));
+                }
                 let lead = leading_sort(&rest, filter.is_empty());
                 let read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
@@ -450,6 +462,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             collation: collation.as_ref(),
                             vars: &vars,
                             limit,
+                            asked: Default::default(),
                         },
                     )
                 };
