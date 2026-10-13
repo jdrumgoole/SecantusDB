@@ -1,0 +1,12 @@
+ 00:35:08 up 53 min,  1 user,  load average: 0.76, 1.83, 2.19
+pass 1 done
+pass 2 done
+pass 3 done
+pass 4 done
+                                                    select                update                insert
+postgres, TLS as psycopg defaults         16,988 ( 6.2%)         5,766 (17.7%)         6,347 ( 6.9%)  
+postgres, no TLS                          22,159 ( 2.2%)         6,644 ( 8.1%)         7,140 ( 6.9%)  
+released                                  12,052 ( 3.8%)         3,075 (17.9%)         3,992 ( 6.0%)  
+fat                                       14,402 ( 3.6%)         3,577 ( 7.4%)         4,441 (12.3%)  
+fat+pgo                                   17,855 ( 3.4%)         4,472 (12.6%)         5,418 (15.5%)  
+pass 5 done

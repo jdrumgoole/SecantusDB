@@ -1,0 +1,17 @@
+EV=task-clock,cycles,instructions,branches,branch-misses,L1-icache-load-misses,iTLB-load-misses,dTLB-load-misses,L1-dcache-load-misses,LLC-load-misses
+meas() { # name dsn kind
+  /root/venv/bin/python /root/loop.py "$2" 8 > /root/loop.out &
+  lp=$!
+  until grep -q READY /root/loop.out; do sleep 0.2; done
+  bpid=$(sed -n 's/^READY [0-9]* //p' /root/loop.out)
+  if [ "$3" = pg ]; then tgt="-p $bpid"; else pid=$(pgrep -x secantusd-pg); tid=$(for t in /proc/$pid/task/*; do echo "$(cut -d' ' -f1 $t/schedstat) ${t##*/}"; done | sort -n | tail -1 | cut -d' ' -f2); tgt="-p $pid"; fi
+  sleep 2
+  echo "== $1"
+  perf stat $tgt -e $EV -- sleep 4 2>&1 | grep -v "^$\|Performance\|elapsed"
+  perf stat $tgt -e cycles:u,instructions:u,cycles:k,instructions:k -- sleep 1 2>&1 | grep -v "^$\|Performance\|elapsed"
+  wait $lp; grep CLIENT /root/loop.out
+}
+rm -rf /root/st; setsid nohup /root/secantusd-pg /root/st 127.0.0.1:5544 >/dev/null 2>&1 </dev/null &
+sleep 2
+meas "secantusd-pg" "host=127.0.0.1 port=5544 dbname=postgres user=postgres" sd
+pkill -x secantusd-pg

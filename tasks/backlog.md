@@ -3083,13 +3083,67 @@ These work end-to-end but cut corners.
         The guest reports 16 one-thread cores, so which vCPUs share a
         physical core cannot be seen, and no pair behaved like siblings.
         **Unpinned costs this server 15% to 25% of its pinned rate and
-        PostgreSQL 2% to 6%**: its statement crosses more threads. That is
-        a real cost to a single connection and worth a look of its own.
+        PostgreSQL 2% to 6%**. The reason first written here, that its
+        statement crosses more threads, was a guess and is wrong: see the
+        2026-10-13 entry below.
       - **The disk.** With servers on vCPUs 0-7 and clients on 8-15, the
         select rows tighten (1 client: 5.5% and 1.8%) and the update rows
         do not (9% to 12%). An 8 KiB write and `fdatasync` in a loop, no
         database, gave 2,873 to 3,249 a second over seven 10 s windows:
         12.7% spread. One client's write rate is the disk's sync rate.
+
+      **The single-connection cost, investigated 2026-10-13** on a fourth
+      `c-16` (Xeon Platinum 8280, kernel 6.8), the released 0.1.0-beta.13
+      binary, one psycopg client selecting by primary key over loopback.
+      Data and scripts in
+      `bench/results/pg-droplet/2026-10-13-single-connection-cost/`.
+      - **There is no thread hand-off.** One server thread sleeps and wakes
+        once a statement (1.00, from `/proc/<pid>/task/*/status`), as a
+        PostgreSQL backend does, and makes three system calls where
+        PostgreSQL makes five. No other thread of the process runs.
+      - **It is CPU time on that thread: 61 us a statement against
+        PostgreSQL's 22** (`perf sched timehist`). In user mode it runs
+        about 97,000 instructions a statement to PostgreSQL's 35,000, at
+        0.54 instructions a cycle to 0.91, with 684 branch mispredictions
+        to 89 and 2.4 times the instruction-cache misses. The symbolised
+        profile is flat: nothing above 3%, the allocator first. The
+        earlier macOS profiles put the same statement near 17 us, so this
+        processor punishes the shape of the code far more than an M-series
+        one does.
+      - **Placement follows from that.** Linux keeps a PostgreSQL backend
+        and its client on ONE vCPU, each running while the other sleeps;
+        this server's longer run makes it spread the two over two vCPUs,
+        which then idle and wake in turn. That is the placement
+        sensitivity measured on 2026-10-12.
+      - [ ] **RUST PG server: the release binary is built with no
+            link-time or profile-guided optimisation**, and the MongoDB
+            server's has both. Measured with the crate rebuilt on the
+            droplet, server and client pinned to separate vCPUs, medians
+            of five 4 s trials, statements a second for select / update /
+            insert by one client: released 12,052 / 3,075 / 3,992; fat LTO
+            with one codegen unit 14,402 / 3,577 / 4,441; that plus a
+            profile from a 40 s psycopg workload **17,855 / 4,472 /
+            5,418** (PostgreSQL without TLS 22,159 / 6,644 / 7,140). Thin
+            LTO measured no gain. At eight clients, a table each, unpinned:
+            released 44,713 / 15,227 / 16,848, with the profile 64,908 /
+            17,157 / 17,996 (PostgreSQL 85,187 / 24,043 / 25,813). The
+            work is a `[profile.release]` for `crates/secantus-pg`, a
+            PostgreSQL-side workload script (`bench/pgo_workload.py` is
+            MongoDB-only) and the two-stage build in
+            `release-pg-binaries.yml`. A fat build took 6 to 7 minutes on
+            16 vCPUs. A `cargo install` from crates.io can have the LTO
+            and not the profile.
+      - [ ] **The published PostgreSQL droplet table compares PostgreSQL
+            over TLS with this server in the clear.** Ubuntu's
+            PostgreSQL has `ssl = on` and psycopg's default `sslmode` is
+            `prefer`, so every `invoke do-pg-bench` run so far encrypted
+            PostgreSQL's connections (the `strace` shows TLS records) and
+            not this server's. One client selecting by primary key:
+            16,988 a second with TLS and 22,159 with `sslmode=disable`.
+            The table on the site therefore understates PostgreSQL's
+            lead, most on reads. `bench/do_pg_bench.py` should put
+            `sslmode=disable` in both DSNs and the table be measured
+            again; until then the site's ratios are too kind to us.
 
       **Clients moved to the client droplets the same day** (Joe: that was
       the plan for the cluster from the start). `invoke do-pg-bench` now

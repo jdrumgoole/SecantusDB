@@ -1,0 +1,41 @@
+Model name:                              Intel(R) Xeon(R) Platinum 8280 CPU @ 2.70GHz
+BIOS Model name:                         pc-i440fx-6.1  CPU @ 2.0GHz
+has 1G pages
+L1i cache:                               512 KiB (16 instances)
+L2 cache:                                64 MiB (16 instances)
+always [madvise] never
+-rwxr-xr-x 2 1001 1001 43593104 Oct 12 18:14 /root/secantusd-pg-0.1.0-beta.13-x86_64-unknown-linux-gnu/secantusd-pg
+/root/pmu.sh: line 16: size: command not found
+/root/pmu.sh: line 16: size: command not found
+== postgres (no TLS)
+           2846.66 msec task-clock                       #    0.711 CPUs utilized             
+        4115552178      cycles                           #    1.446 GHz                         (59.42%)
+        3212473767      instructions                     #    0.78  insn per cycle              (73.50%)
+         518498801      branches                         #  182.143 M/sec                       (74.58%)
+           6000430      branch-misses                    #    1.16% of all branches             (75.94%)
+         441747123      L1-icache-load-misses                                                   (76.01%)
+           3883773      iTLB-load-misses                                                        (76.35%)
+            500725      dTLB-load-misses                                                        (49.41%)
+          64254658      L1-dcache-load-misses                                                   (47.71%)
+   <not supported>      LLC-load-misses                                                       
+         641043376      cycles:u                                                              
+         583600093      instructions:u                   #    0.91  insn per cycle            
+         587204780      cycles:k                                                              
+         352301218      instructions:k                   #    0.60  insn per cycle            
+CLIENT 16,884/s  sleeps/stmt 0.988  preempt/stmt 0.0117  user 17.7us sys 12.0us
+== secantusd-pg
+     <not counted> msec task-clock                                                            
+     <not counted>      cycles                                                                
+     <not counted>      instructions                                                          
+     <not counted>      branches                                                              
+     <not counted>      branch-misses                                                         
+     <not counted>      L1-icache-load-misses                                                 
+     <not counted>      iTLB-load-misses                                                      
+     <not counted>      dTLB-load-misses                                                      
+     <not counted>      L1-dcache-load-misses                                                 
+   <not supported>      LLC-load-misses                                                       
+     <not counted>      cycles:u                                                              
+     <not counted>      instructions:u                                                        
+     <not counted>      cycles:k                                                              
+     <not counted>      instructions:k                                                        
+CLIENT 11,556/s  sleeps/stmt 1.000  preempt/stmt 0.0000  user 18.1us sys 12.1us

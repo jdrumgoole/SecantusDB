@@ -1,0 +1,46 @@
+cat > /root/loop.py <<'PY'
+import sys, time, psycopg, os, resource
+dsn, secs = sys.argv[1], float(sys.argv[2])
+with psycopg.connect(dsn, autocommit=True) as c, c.cursor() as cur:
+    c.execute("create table if not exists exp_t (k bigint primary key, v bigint)")
+    c.execute("insert into exp_t values (1, 0) on conflict do nothing")
+    for _ in range(3000):
+        cur.execute("select v from exp_t where k = %s", (1,)); cur.fetchone()
+    print("READY", os.getpid(), c.info.backend_pid, flush=True)
+    time.sleep(1.0)
+    a = resource.getrusage(resource.RUSAGE_SELF); n = 0; end = time.monotonic() + secs
+    while time.monotonic() < end:
+        cur.execute("select v from exp_t where k = %s", (1,)); cur.fetchone(); n += 1
+    b = resource.getrusage(resource.RUSAGE_SELF)
+print(f"CLIENT {n / secs:,.0f}/s  sleeps/stmt {(b.ru_nvcsw - a.ru_nvcsw) / n:.3f}  preempt/stmt {(b.ru_nivcsw - a.ru_nivcsw) / n:.4f}  "
+      f"user {1e6 * (b.ru_utime - a.ru_utime) / n:.1f}us sys {1e6 * (b.ru_stime - a.ru_stime) / n:.1f}us", flush=True)
+PY
+stat() { cat /proc/$1/task/$2/schedstat; }
+one() { # name dsn kind [perf]
+  : > /root/loop.out
+  /root/venv/bin/python /root/loop.py "$2" 6 > /root/loop.out &
+  lp=$!
+  until grep -q READY /root/loop.out; do sleep 0.2; done
+  set -- "$@" $(sed -n 's/^READY //p' /root/loop.out)
+  cpid=$5; bpid=$6
+  if [ "$3" = pg ]; then pid=$bpid; tid=$bpid; else pid=$(pgrep -x secantusd-pg); tid=$(for t in /proc/$pid/task/*; do echo "$(cut -d' ' -f1 $t/schedstat) ${t##*/}"; done | sort -n | tail -1 | cut -d' ' -f2); fi
+  sleep 1.5
+  a=$(stat $pid $tid); sleep 4; b=$(stat $pid $tid)
+  if [ -n "$4" ]; then perf sched record -a -o /root/$4.data -- sleep 0.3 >/dev/null 2>&1; fi
+  wait $lp
+  n=$(sed -n 's/^CLIENT \([0-9,]*\).*/\1/p' /root/loop.out | tr -d ,)
+  echo "== $1"; grep CLIENT /root/loop.out
+  echo "$a $b $n" | awk '{printf "SERVER thread: on-cpu %.1f us/stmt, waited runnable %.2f us/stmt, %.2f runs/stmt\n", ($4-$1)/1000/(4*$7), ($5-$2)/1000/(4*$7), ($6-$3)/(4*$7)}'
+  if [ -n "$4" ]; then
+    perf sched timehist -i /root/$4.data -w 2>/dev/null | grep -v "swapper\|^ *$" | sed -n '400,440p' | cut -c1-150
+  fi
+}
+PG="host=127.0.0.1 port=5432 dbname=postgres user=postgres"
+one "postgres, TLS (psycopg default)" "$PG" pg
+one "postgres, sslmode=disable" "$PG sslmode=disable" pg pgsched
+rm -rf /root/st; setsid nohup /root/secantusd-pg /root/st 127.0.0.1:5544 >/dev/null 2>&1 </dev/null &
+sleep 2
+SD="host=127.0.0.1 port=5544 dbname=postgres user=postgres"
+one "secantusd-pg" "$SD" sd
+one "secantusd-pg again" "$SD" sd sdsched
+pkill -x secantusd-pg
