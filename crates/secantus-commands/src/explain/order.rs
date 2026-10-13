@@ -32,7 +32,6 @@ use super::node::Node;
 use super::plan::{self, Query};
 use super::{catalog, parsed, resolve_hint};
 use crate::storage::{RawHint, Storage, StorageError};
-use crate::util::as_i64;
 use bson::{Bson, Document};
 use secantus_core::collation::Collation;
 use std::cell::OnceCell;
@@ -283,15 +282,28 @@ fn placed(rows: Rows, order: Vec<usize>) -> Rows {
         .collect()
 }
 
+/// Whether a sort is one the planner reads: every key a field, every value
+/// exactly 1 or -1. mongod takes `-1.5` for a descending sort and then does
+/// not read it from an index.
+pub(crate) fn plain_sort(sort: &Document) -> bool {
+    !sort.is_empty()
+        && sort.iter().all(|(k, v)| {
+            !k.starts_with('$')
+                && match v {
+                    Bson::Int32(n) => n.abs() == 1,
+                    Bson::Int64(n) => n.abs() == 1,
+                    Bson::Double(d) => d.abs() == 1.0,
+                    _ => false,
+                }
+        })
+}
+
 /// The documents `ask` matches with their RecordIds, in mongod's order.
 /// `None`: the store does not offer the matched set for this collection, or
 /// the sort is one this does not read; the caller reads as it did before.
 pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Rows>, StorageError> {
     if let Some(sort) = ask.sort {
-        let plain = sort
-            .iter()
-            .all(|(k, v)| !k.starts_with('$') && matches!(as_i64(v), Some(1 | -1)));
-        if !plain {
+        if !plain_sort(sort) {
             return Ok(None);
         }
     }

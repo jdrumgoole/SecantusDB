@@ -3415,11 +3415,7 @@ fn leading_sort(rest: &[Bson], nothing_lifted: bool) -> LeadingSort {
     let Some(Bson::Document(spec)) = stage(0, "$sort") else {
         return LeadingSort::default();
     };
-    let plain = !spec.is_empty()
-        && spec
-            .iter()
-            .all(|(k, v)| !k.starts_with('$') && matches!(as_i64(v), Some(1 | -1)));
-    if !plain {
+    if !crate::explain::order::plain_sort(spec) {
         return LeadingSort::default();
     }
     let mut out = LeadingSort {
