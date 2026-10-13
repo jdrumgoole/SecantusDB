@@ -285,6 +285,9 @@ fn validate_checks_the_collection_and_counts_its_keys() {
         assert_eq!((number(keys, "_id_"), number(keys, "v_1")), (3, 4));
         assert_eq!(reply.get_array("errors").map(Vec::len), Ok(0));
         let details = reply.get_document("indexDetails").unwrap();
-        assert_eq!(details.get_document("v_1").unwrap().get_bool("valid"), Ok(true));
+        assert_eq!(
+            details.get_document("v_1").unwrap().get_bool("valid"),
+            Ok(true)
+        );
     });
 }

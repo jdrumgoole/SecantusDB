@@ -921,7 +921,10 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn check_collection(&self, db: &str, coll: &str) -> Result<Option<Document>, StorageError> {
-        self.inner.check_collection(db, coll).map(Some).map_err(map_err)
+        self.inner
+            .check_collection(db, coll)
+            .map(Some)
+            .map_err(map_err)
     }
 
     fn add_user(

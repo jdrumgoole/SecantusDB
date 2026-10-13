@@ -9223,7 +9223,8 @@ server turned out to be the Java gauge's own parallelism).
 ### 7.082 Handshake, diagnostic and session commands -- 2026-10-13
 
 `tools/probes/diagnostic_commands.py`, mongod 8.2.11 (a replica-set member):
-56 scenarios, 1,141 replies over a raw connection. The commands about the
+57 scenarios, 1,148 replies over a raw connection (56 and 1,141 when
+first run). The commands about the
 server and the connection: `hello` and its older names, `ping`, `buildInfo`,
 `connectionStatus`, `getParameter`, `serverStatus`, the statistics commands,
 the session commands, the fields every command takes, and the commands this
