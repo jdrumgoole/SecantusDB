@@ -312,7 +312,7 @@ one request path:
     the gauge's macOS list), measured 2026-10-12 on macOS with psycopg 3.3.4
     against the tree of PR #1901 (released as 0.1.0-beta.13), in 1,024 s. On
     2026-10-13 the RELEASED 0.1.0-beta.14 macOS binary, copied to the path
-    the gauge reads, had the same counts in 270 s: that is the release build
+    the gauge reads, had the same counts in 270 s, and the released 0.1.0-beta.15 one in 316 s: that is the release build
     against the debug build every other run here used, not a stale run. The
     run before the 1,024 s one, on PR #1891's tree (0.1.0-beta.12), had the same counts in
     1,129 s, and the one before that, on PR #1884's tree (0.1.0-beta.11), had the same counts in
