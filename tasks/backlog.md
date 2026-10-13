@@ -9108,6 +9108,63 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.079 `$out` and `$merge` -- 2026-10-13
+
+`tools/probes/out_and_merge.py`, mongod 8.2.11: 16 scenarios, 376 replies
+over a raw connection. Each case compares the reply AND what the source
+and the target hold afterwards: documents in order, indexes, options. The
+Rust server differed on 191 of the first 327 replies and differs on 5 of
+376. Pinned by `crates/secantus-storage-adapter/tests/out_and_merge_wt.rs`.
+
+`$merge` is now written with the `update` command, one statement a
+document, as mongod writes it (`aggregate::apply_merge`): `merge` is
+`{$set: doc}`, `replace` a replacement, `keepExisting` `{$setOnInsert:
+doc}`, a pipeline a pipeline update with `c: {new: doc}`, `fail` an
+insert. What that changed, all of it wrong before:
+
+- **`whenMatched: "merge"` merged sub-documents field by field.** mongod
+  sets each top-level field whole. `{o: {p: 1}}` over `{o: {q: 2}}` stored
+  `{o: {q: 2, p: 1}}`; mongod stores `{o: {p: 1}}`. **The Python server
+  still merges field by field** (`aggregate._deep_merge_docs`).
+- **A writing stage inside `$facet`, `$lookup` or `$unionWith` ran**, and
+  wrote to its target.
+- The first refused write stopped the stage. mongod attempts every write
+  of the batch and reports the first failure.
+- Every document was checked against the target's validator before any
+  was written, and none was written if one failed.
+- A `whenMatched` pipeline inserted an unmatched document the validator
+  refuses.
+- `whenMatched: "delete"` was accepted; mongod has no such mode.
+- A `let` was ignored, the `on` fields' index could be partial or of
+  another collation, and about forty spec errors had other codes.
+
+Found on the way, in code `$merge` does not own:
+
+- `$$var.path` that leads nowhere wrote `null` where a field is set to
+  it; mongod removes the field. Everywhere a stage sets a field.
+- A replacement could change the `_id` `"a"` to `"A"` under a collation
+  that holds them equal.
+- `{$set: {$c: 2}}` over a document whose `$c` is already 2 was refused.
+- `{$literal: {$x: 1}}` was read for unknown operators.
+- `listIndexes` left `expireAfterSeconds` off a clustered index.
+- A duplicate key reported at the command level had no `keyPattern` or
+  `keyValue`.
+
+Still different, all 5:
+
+- `cursor: {batchSize: 0}` (2): mongod does not run the stage until the
+  first `getMore`. The lazy-cursor decision.
+- A `$merge` whose first write fails to parse its query (1): mongod has
+  already created the target.
+- The collation key in a duplicate-key message under a collation (1):
+  ICU's bytes.
+- `$out` into a collection with a `2dsphere` index (1): the probe's setup
+  differs; not looked at.
+
+Not measured: the order of several `on` fields in a document `$merge`
+inserts (the upsert seed order of 7.077); `$merge` into another database;
+`$out` and `$merge` in a transaction.
+
 ### 7.078 `insert`, `delete`, `count` and `distinct` -- 2026-10-12
 
 `tools/probes/insert_delete_count_distinct.py`, mongod 8.2.11: 38
