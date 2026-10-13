@@ -89,6 +89,14 @@ pub struct ConnectionAuth {
     /// The driver `client` metadata document sent in the handshake (`hello`'s
     /// `client` field), surfaced by `currentOp` as `clientMetadata`.
     pub client_metadata: Option<Document>,
+    /// Whether this connection has had a `hello` answered: the driver's
+    /// `client` metadata may come only with the first.
+    pub hello_seen: bool,
+    /// The address the client connected from (`whatsmyuri`), set by the
+    /// accept loop.
+    pub peer_address: Option<String>,
+    /// What `connectionStatus` calls this connection, for as long as it lasts.
+    pub client_uuid: [u8; 16],
     /// Whether the peer is a loopback address -- the precondition of mongod's
     /// LOCALHOST EXCEPTION (see `lib.rs::localhost_exception`). Set by the
     /// accept loop; `false` wherever the peer is unknown.
@@ -103,6 +111,9 @@ impl ConnectionAuth {
             authenticated: Vec::new(),
             effective_roles: Vec::new(),
             client_metadata: None,
+            hello_seen: false,
+            peer_address: None,
+            client_uuid: rand::random(),
             peer_loopback: false,
         }
     }
@@ -640,6 +651,17 @@ pub fn drop_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .retain(|(d, u)| !(d == &db_name && u == &username));
     }
     Ok(doc! { "ok": 1.0 })
+}
+
+/// `logout`: drop the users this connection authenticated as on the
+/// command's database, and the roles they brought.
+pub(crate) fn forget_database(ctx: &CommandContext) {
+    if let Some(auth) = &ctx.conn_auth {
+        if let Ok(mut auth) = auth.lock() {
+            auth.authenticated.retain(|(db, _)| db != &ctx.db_name);
+        }
+    }
+    refresh_effective_roles(ctx);
 }
 
 /// Rebuild the calling connection's effective roles from its authenticated

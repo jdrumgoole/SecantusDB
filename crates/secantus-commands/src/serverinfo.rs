@@ -1,0 +1,549 @@
+//! Commands that say what the server and the connection are.
+//!
+//! `listCommands`, `logout`, `getDefaultRWConcern`, `replSetGetConfig`,
+//! `shardingState`, `fsyncUnlock`, `connectionStatus`, `whatsmyuri`,
+//! `killOp`, `getLog` and `getParameter`, each as mongod 8.2.11 answers it
+//! (`tools/probes/diagnostic_commands.py`, 2026-10-13). Before that probe
+//! five of these answered `CommandNotFound`, `whatsmyuri` said port 0 to
+//! every client, and `getParameter` answered `ok: 1` and nothing else for a
+//! parameter it did not have.
+
+use bson::spec::BinarySubtype;
+use bson::{doc, Binary, Bson, Document};
+use secantus_core::query::bson_type_name;
+
+use crate::mongod_commands::{self, ADMIN_ONLY, API_V1, REQUIRES_AUTH, SECONDARY_OK};
+use crate::{CommandContext, CommandError, HandlerResult};
+
+fn wrong_type(path: &str, value: &Bson, expected: &str) -> CommandError {
+    CommandError::new(
+        14,
+        "TypeMismatch",
+        format!(
+            "BSON field '{path}' is the wrong type '{}', expected {expected}",
+            bson_type_name(value)
+        ),
+    )
+}
+
+/// A field where mongod takes a bool or any number: how it reads, `false`
+/// when absent or null, and mongod's refusal of any other type.
+pub(crate) fn flag(doc: &Document, command: &str, field: &str) -> Result<bool, CommandError> {
+    match doc.get(field) {
+        None | Some(Bson::Null) => Ok(false),
+        Some(v) => crate::util::truthy_number_or_bool(v).ok_or_else(|| {
+            wrong_type(
+                &format!("{command}.{field}"),
+                v,
+                "types '[bool, long, int, decimal, double]'",
+            )
+        }),
+    }
+}
+
+/// `listCommands`: the commands THIS server has, each with mongod's own row
+/// for it. A command of this server's own that mongod lacks is listed with
+/// what is true of it.
+pub fn list_commands(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    let mut commands = Document::new();
+    let entry = |help: &str, flags: u8| {
+        let mut row = doc! {
+            "help": help,
+            "requiresAuth": flags & REQUIRES_AUTH != 0,
+            "secondaryOk": flags & SECONDARY_OK != 0,
+            "adminOnly": flags & ADMIN_ONLY != 0,
+        };
+        if flags & mongod_commands::SECONDARY_OVERRIDE_OK != 0 {
+            row.insert("secondaryOverrideOk", true);
+        }
+        let versions: Vec<Bson> = if flags & API_V1 != 0 {
+            vec![Bson::String("1".into())]
+        } else {
+            Vec::new()
+        };
+        row.insert("apiVersions", versions);
+        row.insert("deprecatedApiVersions", Vec::<Bson>::new());
+        row
+    };
+    for (name, flags, help) in mongod_commands::COMMANDS {
+        if crate::lookup(name).is_some() {
+            commands.insert(*name, entry(help, *flags));
+        }
+    }
+    for name in crate::OWN_COMMANDS {
+        commands.insert(
+            *name,
+            entry("A SecantusDB administration command.", REQUIRES_AUTH),
+        );
+    }
+    Ok(doc! { "commands": commands, "ok": 1.0 })
+}
+
+/// `logout`: the connection stops being the users it authenticated as on
+/// this database. Always `ok: 1`, authenticated or not.
+pub fn logout(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    crate::auth::forget_database(ctx);
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `getDefaultRWConcern`: nothing has been set, so mongod's implicit
+/// defaults, which are also how this server reads and acknowledges.
+pub fn get_default_rw_concern(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    let in_memory = match doc.get("inMemory") {
+        None | Some(Bson::Null) => None,
+        Some(Bson::Boolean(b)) => Some(*b),
+        Some(v) => return Err(wrong_type("getDefaultRWConcern.inMemory", v, "type 'bool'")),
+    };
+    let mut reply = doc! {
+        "defaultReadConcern": {"level": "local"},
+        "defaultWriteConcern": {"w": "majority", "wtimeout": 0_i32},
+        "defaultWriteConcernSource": "implicit",
+        "defaultReadConcernSource": "implicit",
+    };
+    if let Some(asked) = in_memory {
+        reply.insert("inMemory", asked);
+    }
+    reply.insert("localUpdateWallClockTime", bson::DateTime::now());
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// `replSetGetConfig`: the one-member set `hello` describes, in the shape
+/// of a configuration nobody has changed. A server run without a set name
+/// answers as a standalone does.
+pub fn repl_set_get_config(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let commitment = match doc.get("commitmentStatus") {
+        None => None,
+        Some(v) => Some(crate::util::truthy_number_or_bool(v).ok_or_else(|| {
+            CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "Expected boolean or number type for field \"commitmentStatus\", found {}",
+                    bson_type_name(v)
+                ),
+            )
+        })?),
+    };
+    let (Some(set_name), Some((host, port))) =
+        (ctx.replica_set_name.as_ref(), ctx.server_address.as_ref())
+    else {
+        return Err(CommandError::new(
+            76,
+            "NoReplicationEnabled",
+            "not running with --replSet",
+        ));
+    };
+    let mut reply = doc! {
+        "config": {
+            "_id": set_name.clone(),
+            "version": 1_i32,
+            "term": 1_i32,
+            "members": [{
+                "_id": 0_i32,
+                "host": format!("{host}:{port}"),
+                "arbiterOnly": false,
+                "buildIndexes": true,
+                "hidden": false,
+                "priority": 1.0,
+                "tags": {},
+                "secondaryDelaySecs": 0_i64,
+                "votes": 1_i32,
+            }],
+            "protocolVersion": 1_i64,
+            "writeConcernMajorityJournalDefault": true,
+            "settings": {
+                "chainingAllowed": true,
+                "heartbeatIntervalMillis": 2000_i32,
+                "heartbeatTimeoutSecs": 10_i32,
+                "electionTimeoutMillis": 10000_i32,
+                "catchUpTimeoutMillis": -1_i32,
+                "catchUpTakeoverDelayMillis": 30000_i32,
+                "getLastErrorModes": {},
+                "getLastErrorDefaults": {"w": 1_i32, "wtimeout": 0_i32},
+                // The set has no stored configuration to take an id from;
+                // the process's own id is fixed for as long as it runs.
+                "replicaSetId": crate::handshake::hello_process_id(),
+            },
+        },
+    };
+    if commitment == Some(true) {
+        reply.insert("commitmentStatus", true);
+    }
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// `shardingState`: this is not a shard.
+pub fn sharding_state(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    Ok(doc! { "enabled": false, "ok": 1.0 })
+}
+
+/// `fsyncUnlock`: `fsync` never takes the lock here, so there is never one
+/// to release, and mongod's answer to that is this refusal.
+pub fn fsync_unlock(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    Err(CommandError::new(
+        20,
+        "IllegalOperation",
+        "fsyncUnlock called when not locked",
+    ))
+}
+
+/// `connectionStatus`: who this connection has authenticated as. The
+/// privileges are listed only when asked for, and `uuid` names the
+/// connection for as long as it lasts.
+pub fn connection_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let privileges = flag(doc, "connectionStatus", "showPrivileges")?;
+    let mut users = Vec::new();
+    let mut roles = Vec::new();
+    let mut uuid = [0_u8; 16];
+    if let Some(auth) = ctx.conn_auth.as_ref().and_then(|a| a.lock().ok()) {
+        for (db, user) in &auth.authenticated {
+            users.push(Bson::Document(doc! {"user": user.clone(), "db": db.clone()}));
+        }
+        for (role, db) in &auth.effective_roles {
+            roles.push(Bson::Document(doc! {"role": role.clone(), "db": db.clone()}));
+        }
+        uuid = auth.client_uuid;
+    }
+    let mut info = doc! {
+        "authenticatedUsers": users,
+        "authenticatedUserRoles": roles,
+    };
+    if privileges {
+        info.insert("authenticatedUserPrivileges", Vec::<Bson>::new());
+    }
+    Ok(doc! {
+        "authInfo": info,
+        "uuid": Bson::Binary(Binary { subtype: BinarySubtype::Uuid, bytes: uuid.to_vec() }),
+        "ok": 1.0,
+    })
+}
+
+/// `whatsmyuri`: the address the client connected from.
+pub fn whatsmyuri(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let peer = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok())
+        .and_then(|a| a.peer_address.clone())
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+    Ok(doc! { "you": peer, "ok": 1.0 })
+}
+
+/// `killOp` — close a client connection by its `op` (our per-connection
+/// `conn_id`; we model one in-flight op per connection, so the opid a caller
+/// reads off `hello`'s `connectionId` / `currentOp` is directly killable). Real
+/// mongod signals a per-op interrupt flag long-running paths poll; SecantusDB's
+/// faithful analogue is "close the socket" — the connection thread's next read
+/// returns 0, the loop exits, and the connection unregisters.
+///
+/// `op` is any number that is a whole 32-bit value, and the answer does not
+/// say whether an operation had that id: mongod says "attempting to kill op"
+/// to an id nobody holds.
+pub fn kill_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let op_id = match doc.get("op") {
+        None => {
+            return Err(CommandError::new(4, "NoSuchKey", "Missing expected field \"op\""));
+        }
+        Some(Bson::Int32(n)) => i64::from(*n),
+        Some(Bson::Int64(n)) => *n,
+        Some(v @ (Bson::Double(_) | Bson::Decimal128(_))) => {
+            let number = match v {
+                Bson::Double(d) => *d,
+                other => other.to_string().parse::<f64>().unwrap_or(f64::NAN),
+            };
+            if number.fract() != 0.0 || !number.is_finite() {
+                return Err(CommandError::new(
+                    2,
+                    "BadValue",
+                    format!(
+                        "Expected field \"op\" to have a value exactly representable as a \
+                         64-bit integer, but found op: {v}"
+                    ),
+                ));
+            }
+            number as i64
+        }
+        Some(v) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "Expected field \"op\" to have numeric type, but found {}",
+                    bson_type_name(v)
+                ),
+            ));
+        }
+    };
+    if i32::try_from(op_id).is_err() {
+        return Err(CommandError::new(
+            26823,
+            "Location26823",
+            format!("invalid op : {op_id}. Op ID cannot be represented with 32 bits"),
+        ));
+    }
+    if let Some(killer) = &ctx.conn_killer {
+        killer.kill(op_id);
+    }
+    Ok(doc! { "info": "attempting to kill op", "ok": 1.0 })
+}
+
+/// `getLog` — the server's in-memory log ring buffer. mongod returns the log as
+/// a list of pre-formatted strings (`"<ts> <level> <component> <msg>"`); we
+/// mirror that format so tooling that grep-parses the response keeps working.
+/// Without a buffer wired in (unit tests), reports an empty log.
+///
+/// `"*"` lists the logs there are; `startupWarnings` is the warnings among
+/// the lines kept; any other name is refused.
+pub fn get_log(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let which = match doc.get("getLog") {
+        Some(Bson::String(name)) => name.as_str(),
+        None | Some(Bson::Null) => {
+            return Err(CommandError::new(
+                40414,
+                "IDLFailedToParse",
+                "BSON field 'getLog.getLog' is missing but a required field",
+            ));
+        }
+        Some(v) => return Err(wrong_type("getLog.getLog", v, "type 'string'")),
+    };
+    let warnings_only = match which {
+        "*" => {
+            return Ok(doc! { "names": ["global", "startupWarnings"], "ok": 1.0 });
+        }
+        "global" => false,
+        "startupWarnings" => true,
+        other => {
+            return Err(CommandError::new(
+                96,
+                "OperationFailed",
+                format!("No log named '{other}'"),
+            ));
+        }
+    };
+    let entries = ctx.logs.as_ref().map(|l| l.tail(None)).unwrap_or_default();
+    let formatted: Vec<Bson> = entries
+        .iter()
+        .filter(|e| !warnings_only || e.level == "W")
+        .map(|e| {
+            let ts = e.ts.try_to_rfc3339_string().unwrap_or_default();
+            Bson::String(format!("{ts} {} {} {}", e.level, e.component, e.msg))
+        })
+        .collect();
+    Ok(doc! {
+        "totalLinesWritten": formatted.len() as i32,
+        "log": formatted,
+        "ok": 1.0,
+    })
+}
+
+/// A server parameter this server reports: its name, whether mongod lets it
+/// be given at startup, and its value when nobody has changed it.
+///
+/// Only what is TRUE of this server is listed. Each value here is a limit or
+/// a setting the server really has (the cursor and transaction lifetimes,
+/// the SCRAM iteration counts it stores, the session timeout `hello` gives);
+/// a mongod parameter with nothing behind it is not reported, so a client
+/// cannot read a setting that changes nothing.
+fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
+    let version = crate::SERVER_VERSION_ARRAY;
+    vec![
+        (
+            "authenticationMechanisms",
+            true,
+            Bson::Array(vec![
+                Bson::String("MONGODB-X509".into()),
+                Bson::String("SCRAM-SHA-1".into()),
+                Bson::String("SCRAM-SHA-256".into()),
+            ]),
+        ),
+        (
+            "cursorTimeoutMillis",
+            true,
+            Bson::Int64((crate::cursors::DEFAULT_IDLE_TTL_SECONDS * 1000.0) as i64),
+        ),
+        ("enableLocalhostAuthBypass", true, Bson::Boolean(true)),
+        // The REAL value, not a constant. Drivers gate on this: while it said
+        // false, pymongo's harness skipped ~1,080 unified-spec failpoint tests
+        // (measured 2026-09-25). But hardcoding `true` would have made a server
+        // that refuses `configureFailPoint` claim to accept it, so the two now
+        // come from the same fact -- whether a FailPointRegistry was wired.
+        ("enableTestCommands", true, Bson::Boolean(test_commands)),
+        // `<major>.<minor>` of the version this server says it is; a literal
+        // here once read "7.0" beside a `buildInfo` of 8.2.11.
+        (
+            "featureCompatibilityVersion",
+            false,
+            Bson::Document(doc! {"version": format!("{}.{}", version[0], version[1])}),
+        ),
+        ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
+        ("logLevel", true, Bson::Int32(0)),
+        ("quiet", true, Bson::Boolean(false)),
+        ("scramIterationCount", true, Bson::Int32(10_000)),
+        (
+            "scramSHA256IterationCount",
+            true,
+            Bson::Int32(secantus_auth::DEFAULT_ITERATIONS as i32),
+        ),
+        ("transactionLifetimeLimitSeconds", true, Bson::Int32(60)),
+        ("ttlMonitorEnabled", true, Bson::Boolean(true)),
+        ("ttlMonitorSleepSecs", true, Bson::Int32(60)),
+    ]
+}
+
+/// The parameters and their defaults, as one document (`setParameter` reads
+/// the previous value from it).
+pub(crate) fn known_params(test_commands: bool) -> Document {
+    parameters(test_commands)
+        .into_iter()
+        .map(|(name, _, value)| (name.to_string(), value))
+        .collect()
+}
+
+/// `getParameter`, as mongod answers it (8.2.11):
+///
+/// - the parameters asked for come back in NAME order, whatever order they
+///   were asked in and whatever value was put beside each name;
+/// - a name the server does not have is left out, and a request that names
+///   nothing the server has is `72 no option found to get`;
+/// - `"*"` or `{allParameters: true}` is every parameter;
+/// - `{showDetails: true}` wraps each value with whether it can be set at
+///   runtime and at startup, and `{setAt: ...}` keeps only those that can.
+pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let mut details = false;
+    let mut everything = false;
+    let mut set_at: Option<&str> = None;
+    match doc.get("getParameter") {
+        Some(Bson::String(s)) if s == "*" => everything = true,
+        Some(Bson::Document(options)) => {
+            for (key, value) in options {
+                match (key.as_str(), value) {
+                    ("showDetails", _) => details = flag(options, "getParameter", key)?,
+                    ("allParameters", _) => everything = flag(options, "getParameter", key)?,
+                    ("setAt", Bson::String(when)) if when == "startup" || when == "runtime" => {
+                        set_at = Some(when);
+                    }
+                    ("setAt", Bson::String(when)) => {
+                        return Err(CommandError::new(
+                            2,
+                            "BadValue",
+                            format!(
+                                "Enumeration value '{when}' for field 'getParameter.setAt' is \
+                                 not a valid value."
+                            ),
+                        ));
+                    }
+                    ("setAt", v) => {
+                        return Err(wrong_type("getParameter.setAt", v, "type 'string'"))
+                    }
+                    _ => {
+                        return Err(CommandError::new(
+                            40415,
+                            "IDLUnknownField",
+                            format!("BSON field 'getParameter.{key}' is an unknown field."),
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let current = ctx.server_params.clone();
+    let mut out = Document::new();
+    for (name, at_startup, default) in parameters(ctx.failpoints.is_some()) {
+        if !everything && !doc.contains_key(name) {
+            continue;
+        }
+        let at_runtime = crate::params::settable(name);
+        match set_at {
+            Some("startup") if !at_startup => continue,
+            Some("runtime") if !at_runtime => continue,
+            _ => {}
+        }
+        // A value `setParameter` changed wins over the default, so the two
+        // commands cannot disagree about what the server holds.
+        let value = current.as_ref().and_then(|s| s.get(name)).unwrap_or(default);
+        if details {
+            out.insert(
+                name,
+                doc! {
+                    "value": value,
+                    "settableAtRuntime": at_runtime,
+                    "settableAtStartup": at_startup,
+                },
+            );
+        } else {
+            out.insert(name, value);
+        }
+    }
+    if out.is_empty() {
+        return Err(CommandError::new(72, "InvalidOptions", "no option found to get"));
+    }
+    out.insert("ok", 1.0);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> CommandContext {
+        let mut ctx = CommandContext::new(1);
+        ctx.db_name = "admin".to_string();
+        ctx
+    }
+
+    #[test]
+    fn get_parameter_answers_in_name_order_and_refuses_when_it_has_none() {
+        let reply =
+            get_parameter(&doc! {"getParameter": 1, "quiet": 1, "logLevel": 0}, &mut ctx()).unwrap();
+        assert_eq!(
+            reply.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["logLevel", "quiet", "ok"]
+        );
+        for request in [doc! {"getParameter": 1}, doc! {"getParameter": 1, "bogus": 1}] {
+            let e = get_parameter(&request, &mut ctx()).unwrap_err();
+            assert_eq!((e.code, e.errmsg.as_str()), (72, "no option found to get"));
+        }
+        let all = get_parameter(&doc! {"getParameter": "*"}, &mut ctx()).unwrap();
+        assert!(all.contains_key("featureCompatibilityVersion"));
+    }
+
+    #[test]
+    fn show_details_says_when_a_parameter_can_be_set() {
+        let request = doc! {
+            "getParameter": {"showDetails": true},
+            "quiet": 1,
+            "featureCompatibilityVersion": 1,
+        };
+        let reply = get_parameter(&request, &mut ctx()).unwrap();
+        let quiet = reply.get_document("quiet").unwrap();
+        assert_eq!(quiet, &doc! {"value": false, "settableAtRuntime": true, "settableAtStartup": true});
+        let fcv = reply.get_document("featureCompatibilityVersion").unwrap();
+        assert_eq!(fcv.get_bool("settableAtStartup"), Ok(false));
+        let runtime = doc! {"getParameter": {"setAt": "runtime"}, "enableTestCommands": 1};
+        assert_eq!(get_parameter(&runtime, &mut ctx()).unwrap_err().code, 72);
+    }
+
+    #[test]
+    fn kill_op_reads_any_whole_number_and_never_says_what_it_found() {
+        for op in [Bson::Int32(7), Bson::Double(7.0), Bson::Int64(-1)] {
+            let reply = kill_op(&doc! {"killOp": 1, "op": op}, &mut ctx()).unwrap();
+            assert_eq!(reply.get_str("info"), Ok("attempting to kill op"));
+        }
+        let code = |op: Bson| kill_op(&doc! {"killOp": 1, "op": op}, &mut ctx()).unwrap_err().code;
+        assert_eq!(code(Bson::String("x".into())), 14);
+        assert_eq!(code(Bson::Double(2.5)), 2);
+        assert_eq!(code(Bson::Int64(1 << 40)), 26823);
+        assert_eq!(kill_op(&doc! {"killOp": 1}, &mut ctx()).unwrap_err().code, 4);
+    }
+
+    #[test]
+    fn get_log_names_its_logs_and_refuses_another() {
+        let names = get_log(&doc! {"getLog": "*"}, &mut ctx()).unwrap();
+        assert_eq!(names.get_array("names").unwrap().len(), 2);
+        assert_eq!(get_log(&doc! {"getLog": "bogus"}, &mut ctx()).unwrap_err().code, 96);
+        assert_eq!(get_log(&doc! {"getLog": 1}, &mut ctx()).unwrap_err().code, 14);
+    }
+}

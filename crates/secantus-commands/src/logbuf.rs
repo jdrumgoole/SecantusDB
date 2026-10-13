@@ -4,7 +4,7 @@
 //! Real `mongod` keeps a bounded in-memory log accessible via
 //! `db.adminCommand({getLog: "global"})`. The Rust server's `getLog` used to
 //! return an empty array; this gives it a backing store the server appends to
-//! (connection accepts, …) and [`crate::diagnostics::get_log`] reads. Pure
+//! (connection accepts, …) and [`crate::serverinfo::get_log`] reads. Pure
 //! module — no I/O outside the in-memory deque.
 
 use std::collections::VecDeque;

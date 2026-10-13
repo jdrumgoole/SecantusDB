@@ -47,16 +47,20 @@ mod ddl_checks;
 pub mod diagnostics;
 pub mod distinct;
 mod explain;
+mod generic;
+pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 pub mod logbuf;
 pub mod mapreduce;
+mod mongod_commands;
 pub mod mongod_codes;
 mod near;
 pub mod params;
 pub mod rbac;
+pub mod serverinfo;
 pub mod roles;
 mod session;
 pub mod slowop;
@@ -492,6 +496,15 @@ pub fn is_test_only_command(name: &str) -> bool {
     matches!(name, "configureFailPoint")
 }
 
+/// The commands of this server's own, which mongod does not have.
+pub(crate) const OWN_COMMANDS: &[&str] = &[
+    "secantusAdmin.archiveBaseSnapshot",
+    "secantusAdmin.backupArchive",
+    "secantusAdmin.pruneOplog",
+    "secantusAdmin.pruneTtl",
+    "secantusAdmin.restoreArchive",
+];
+
 fn lookup(name: &str) -> Option<Handler> {
     Some(match name {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
@@ -534,14 +547,14 @@ fn lookup(name: &str) -> Option<Handler> {
         "dropIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
-        "collStats" => stats_admin::coll_stats,
-        "dataSize" => stats_admin::data_size,
+        "collStats" | "collstats" => stats_admin::coll_stats,
+        "dataSize" | "datasize" => stats_admin::data_size,
         // mongod accepts the lowercase `dbstats` spelling too (the C driver's
         // command_fully_qualified test sends it over the legacy OP_QUERY path).
         "dbStats" | "dbstats" => stats_admin::db_stats,
         "serverStatus" => admin::server_status,
         "currentOp" => admin::current_op,
-        "killOp" => diagnostics::kill_op,
+        "killOp" => serverinfo::kill_op,
         "validate" => admin::validate,
         "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
@@ -570,16 +583,22 @@ fn lookup(name: &str) -> Option<Handler> {
         "grantRolesToRole" => roles::grant_roles_to_role,
         "revokeRolesFromRole" => roles::revoke_roles_from_role,
         "rolesInfo" => roles::roles_info,
-        "getParameter" => diagnostics::get_parameter,
+        "getParameter" => serverinfo::get_parameter,
         "setParameter" => params::set_parameter,
         "replSetStepDown" => stepdown::replset_step_down,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
-        "connectionStatus" => diagnostics::connection_status,
-        "whatsmyuri" => diagnostics::whatsmyuri,
+        "connectionStatus" => serverinfo::connection_status,
+        "whatsmyuri" => serverinfo::whatsmyuri,
+        "listCommands" => serverinfo::list_commands,
+        "logout" => serverinfo::logout,
+        "getDefaultRWConcern" => serverinfo::get_default_rw_concern,
+        "replSetGetConfig" => serverinfo::repl_set_get_config,
+        "shardingState" => serverinfo::sharding_state,
+        "fsyncUnlock" => serverinfo::fsync_unlock,
         "fsync" => diagnostics::fsync,
         "hostInfo" => diagnostics::host_info,
         "top" => diagnostics::top,
-        "getLog" => diagnostics::get_log,
+        "getLog" => serverinfo::get_log,
         "configureFailPoint" => configure_fail_point,
         _ => return None,
     })
@@ -1051,6 +1070,12 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
         }
     }
 
+    // An unknown command says so before anything about its fields.
+    if lookup(name).is_some() {
+        if let Err(e) = generic::check(doc, name) {
+            return e.into_reply();
+        }
+    }
     if let Err(e) = validate_read_concern(doc, name, ctx) {
         return e.into_reply();
     }
@@ -1075,6 +1100,31 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
     // duplicating a flag down here.
     if is_test_only_command(name) && ctx.failpoints.is_none() {
         return CommandError::command_not_found(name).into_reply();
+    }
+    // A command mongod runs only against `admin` says so from any other
+    // database before it reads its arguments (`{killOp: 1}` with no `op`
+    // answers this, not the missing field), and whether or not this server
+    // has the command. The ones excepted parse first or carry their own
+    // refusal.
+    if ctx.db_name != "admin"
+        && mongod_commands::admin_only(name)
+        && !matches!(
+            name,
+            "renameCollection"
+                | "bulkWrite"
+                | "setParameter"
+                | "top"
+                | "listDatabases"
+                | "abortTransaction"
+                | "commitTransaction"
+        )
+    {
+        return CommandError::new(
+            13,
+            "Unauthorized",
+            format!("{name} may only be run against the admin database."),
+        )
+        .into_reply();
     }
     match lookup(name) {
         Some(handler) => {
@@ -2428,7 +2478,7 @@ fn refuse_write_concern(doc: &Document, name: &str) -> Result<(), CommandError> 
 /// a command outside API Version 1 is `APIStrictError` (323). The `apiStrict`
 /// aggregation-stage gate lands with the aggregate family.
 fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
-    if let Some(av) = doc.get("apiVersion") {
+    if let Some(av) = doc.get("apiVersion").filter(|v| !matches!(v, Bson::Null)) {
         if av.as_str() != Some("1") {
             // mongod's two wordings (measured 8.2.11, 2026-10-12): version
             // "2" is named, and anything else is told what is accepted.
@@ -2452,6 +2502,19 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
         // CommandNotFound below. This replaced a `name == "distinct"` canary
         // whose message ("Provided command ... is not in API Version 1") was
         // not mongod's either.
+        // An older spelling of a command is refused by name, whatever the
+        // command it stands for.
+        let modern = generic::struct_name(name);
+        if modern != name && name != "find" {
+            return Err(CommandError::new(
+                323,
+                "APIStrictError",
+                format!(
+                    "Command invocation with name '{name}' is not allowed in 'apiStrict' \
+                     mode, use '{modern}' instead"
+                ),
+            ));
+        }
         if !api_v1_command(name) && (lookup(name).is_some() || non_v1_mongod_command(name)) {
             return Err(CommandError::new(
                 323,
@@ -2462,6 +2525,20 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
                      API Version 1 can be found at \
                      https://dochub.mongodb.org/core/manual-versioned-api."
                 ),
+            ));
+        }
+        // The fields of a v1 command that are not themselves in v1, each
+        // sent alone to mongod 8.2.11.
+        let outside: &[&str] = match name {
+            "find" => &["tailable", "awaitData", "min", "max", "oplogReplay"],
+            "aggregate" => &["explain"],
+            _ => &[],
+        };
+        if let Some(field) = doc.keys().find(|k| outside.contains(&k.as_str())) {
+            return Err(CommandError::new(
+                323,
+                "APIStrictError",
+                format!("BSON field '{field}' is not allowed with apiStrict:true."),
             ));
         }
         // An aggregate whose pipeline uses a stage outside API Version 1 (e.g.
@@ -2488,63 +2565,17 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Commands inside MongoDB's **Stable API Version 1**, measured by sending each
-/// command the Python server implements to a real `mongod` 8.2.11 under
-/// `apiStrict: true` and recording which it refused with 323 (2026-09-27).
-/// Mirrors `commands.py::_API_V1_COMMANDS`. The surprises are why it was
-/// measured and not copied: `distinct`, `buildInfo`, `isMaster` and
-/// `serverStatus` are OUTSIDE v1, while `hello` and `count` are inside it.
+/// Whether `name` is in MongoDB's **Stable API Version 1**: mongod's own
+/// answer, from the `apiVersions` of its `listCommands` (8.2.11).
+///
+/// A list kept by hand stood here, measured by sending each command under
+/// `apiStrict: true` and recording which were refused. Ten of its names were
+/// wrong, because a command whose arguments did not parse answered the parse
+/// error first and was counted as accepted (`createUser`, `grantRolesToUser`
+/// and the like), and `collStats` was simply mistaken. An older spelling
+/// (`findandmodify`) is not in the table and gets its own refusal below.
 fn api_v1_command(name: &str) -> bool {
-    matches!(
-        name,
-        "abortTransaction"
-            | "aggregate"
-            | "authenticate"
-            | "bulkWrite"
-            | "collMod"
-            | "collStats"
-            | "commitTransaction"
-            | "count"
-            | "create"
-            | "createIndexes"
-            | "createRole"
-            | "createSearchIndexes"
-            | "createUser"
-            | "delete"
-            | "drop"
-            | "dropDatabase"
-            | "dropIndexes"
-            | "dropRole"
-            | "dropSearchIndex"
-            | "dropUser"
-            | "endSessions"
-            | "explain"
-            | "find"
-            | "findAndModify"
-            | "findandmodify"
-            | "getMore"
-            | "grantPrivilegesToRole"
-            | "grantRolesToRole"
-            | "grantRolesToUser"
-            | "hello"
-            | "insert"
-            | "killCursors"
-            | "listCollections"
-            | "listDatabases"
-            | "listIndexes"
-            | "ping"
-            | "refreshSessions"
-            | "renameCollection"
-            | "revokePrivilegesFromRole"
-            | "revokeRolesFromRole"
-            | "revokeRolesFromUser"
-            | "saslContinue"
-            | "saslStart"
-            | "update"
-            | "updateRole"
-            | "updateSearchIndex"
-            | "updateUser"
-    )
+    mongod_commands::api_v1(name)
 }
 
 /// Commands a real `mongod` HAS but this server does not implement, which sit
@@ -2553,6 +2584,7 @@ fn api_v1_command(name: &str) -> bool {
 /// outside the API. Mirrors `commands.py::_NON_V1_MONGOD_COMMANDS`.
 fn non_v1_mongod_command(name: &str) -> bool {
     matches!(name, "testVersion2" | "testDeprecationInVersion2")
+        || mongod_commands::row(name).is_some()
 }
 
 /// Aggregation stages inside API Version 1 (`commands.py::_API_V1_AGG_STAGES`).

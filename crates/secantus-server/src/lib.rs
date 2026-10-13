@@ -506,6 +506,7 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     // principals persist for the connection's lifetime.
     let mut auth_state = ConnectionAuth::new();
     auth_state.peer_loopback = tcp.peer_addr().is_ok_and(|a| a.ip().is_loopback());
+    auth_state.peer_address = tcp.peer_addr().ok().map(|a| a.to_string());
     let conn_auth = Arc::new(Mutex::new(auth_state));
 
     match shared.tls.clone() {
@@ -602,14 +603,21 @@ fn serve<S: Read + Write>(
                         continue;
                     }
                 };
-                let (reply, close_conn, pending) = run_dispatch(
-                    &request,
-                    raw_insert_docs,
-                    conn_id,
-                    shared,
-                    conn_auth,
-                    &peer_cert_dn,
-                );
+                // An OP_MSG names its database in `$db`; one without it, or
+                // with something that is not a string there, is refused the
+                // way mongod's parser refuses it.
+                let (reply, close_conn, pending) =
+                    match secantus_commands::db_field_problem(&request) {
+                        Some(refused) => (refused, false, None),
+                        None => run_dispatch(
+                            &request,
+                            raw_insert_docs,
+                            conn_id,
+                            shared,
+                            conn_auth,
+                            &peer_cert_dn,
+                        ),
+                    };
                 // A `closeConnection` failpoint drops the socket without replying,
                 // so the driver observes a network error.
                 if close_conn {

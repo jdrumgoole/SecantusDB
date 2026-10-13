@@ -1,6 +1,6 @@
 //! `setParameter` — the runtime-settable half of the server parameters.
 //!
-//! [`get_parameter`](crate::diagnostics::get_parameter) reports the parameters
+//! [`get_parameter`](crate::serverinfo::get_parameter) reports the parameters
 //! this server has; this module is what lets a client CHANGE the ones mongod
 //! lets you change at runtime, and refuse the rest the way mongod refuses them.
 //!
@@ -67,7 +67,7 @@ pub(crate) fn is_generic_arg(key: &str) -> bool {
 
 /// Parameters a client may change at runtime, with the type each accepts.
 ///
-/// Keep this in lockstep with `diagnostics::known_params`: a name that is
+/// Keep this in lockstep with `serverinfo::parameters`: a name that is
 /// settable here must be reported there, or `getParameter` will not show the
 /// value a client just set.
 ///
@@ -105,15 +105,6 @@ const SETTABLE: &[(&str, ParamKind)] = &[
 
 /// mongod's highest log level; `setParameter` clamps rather than refusing.
 const MAX_LOG_LEVEL: i32 = 5;
-
-/// Parameters this server reports but mongod refuses to change at runtime.
-/// Answering 20 rather than 72 matters: 72 claims the parameter does not
-/// exist, and `getParameter` would immediately contradict that.
-const STARTUP_ONLY: &[&str] = &[
-    "enableTestCommands",
-    "featureCompatibilityVersion",
-    "authenticationMechanisms",
-];
 
 /// Server-wide store for the settable parameters' current values.
 ///
@@ -166,6 +157,11 @@ impl ServerParams {
             }
         }
     }
+}
+
+/// Whether a client may change `name` while the server runs.
+pub(crate) fn settable(name: &str) -> bool {
+    kind_of(name).is_some()
 }
 
 fn kind_of(name: &str) -> Option<ParamKind> {
@@ -301,10 +297,16 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         ));
     }
 
+    let defaults = crate::serverinfo::known_params(ctx.failpoints.is_some());
     // mongod validates every named parameter BEFORE applying any of them, so a
     // batch that names one bad parameter changes nothing.
     for (name, value) in &requested {
-        if STARTUP_ONLY.contains(&name.as_str()) {
+        // A parameter this server reports and does not let a client change.
+        // Answering 20 and not 72 matters: 72 claims the parameter does not
+        // exist, and `getParameter` would immediately contradict that. (mongod
+        // lets some of these be changed while it runs; this server does not,
+        // and says so in mongod's words for a parameter it will not change.)
+        if !settable(name) && defaults.contains_key(name.as_str()) {
             return Err(CommandError::new(
                 20,
                 "IllegalOperation",
@@ -324,7 +326,6 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     }
 
     let store = ctx.server_params.clone();
-    let defaults = crate::diagnostics::known_params(ctx.failpoints.is_some());
     let mut out = Document::new();
     for (i, (name, value)) in requested.iter().enumerate() {
         let previous = store
@@ -613,7 +614,7 @@ mod tests {
     fn overlay_shows_the_changed_value_to_get_parameter() {
         let mut c = ctx();
         set_parameter(&doc! {"setParameter": 1, "quiet": true}, &mut c).unwrap();
-        let mut params = crate::diagnostics::known_params(false);
+        let mut params = crate::serverinfo::known_params(false);
         c.server_params.as_ref().unwrap().overlay(&mut params);
         assert!(params.get_bool("quiet").unwrap());
     }
