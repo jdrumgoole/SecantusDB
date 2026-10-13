@@ -164,23 +164,6 @@ pub(crate) fn parsed_query(filter: &Document) -> Document {
     }
 }
 
-/// The parsed branches of a filter that is only an `$or`, in the order the
-/// query gave them. (The parsed query itself lists them sorted.)
-pub(crate) fn or_branches(filter: &Document) -> Option<Vec<Document>> {
-    let filter = normalize_or(filter.clone());
-    if filter.len() != 1 {
-        return None;
-    }
-    let branches = filter.get_array("$or").ok()?;
-    Some(
-        branches
-            .iter()
-            .filter_map(Bson::as_document)
-            .map(parsed_query)
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

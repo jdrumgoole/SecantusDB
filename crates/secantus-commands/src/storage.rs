@@ -24,6 +24,17 @@ pub use secantus_core::collation::Collation;
 /// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
 pub type RawHint<'a> = &'a Bson;
 
+/// The documents a query matches, for a caller that orders them itself
+/// (`Storage::matching_rows`).
+#[derive(Debug, Default)]
+pub struct MatchedRows {
+    /// `(RecordId, document)`.
+    pub rows: Vec<(i64, Vec<u8>)>,
+    /// The one index whose entries gave the rows their order; `None` when
+    /// they are in insertion order.
+    pub via: Option<String>,
+}
+
 /// `(id_key, bson)` document rows, as returned by the collection scans the
 /// tailable-find producer polls (`scan_docs_after_id_key`).
 pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -484,6 +495,85 @@ pub trait Storage: Send + Sync {
     /// Whether some document gives the index an array to index.
     fn index_is_multikey(&self, _db: &str, _coll: &str, _name: &str) -> bool {
         false
+    }
+
+    /// The documents matching `filter`, each with its RecordId, in insertion
+    /// order: the matched set, for a caller that orders it itself
+    /// (`crate::order`). `None` when the store does not offer it or the
+    /// collection reads in an order of its own; the caller then reads through
+    /// `find_collated`.
+    fn matching_rows(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _filter: &Document,
+        _hint: Option<RawHint<'_>>,
+        _collation: Option<&Collation>,
+        _let_vars: &Document,
+    ) -> Result<Option<MatchedRows>, StorageError> {
+        Ok(None)
+    }
+
+    /// How many documents the collection holds, when no more than `cap`.
+    fn collection_count_at_most(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _cap: usize,
+    ) -> Result<Option<usize>, StorageError> {
+        Ok(None)
+    }
+
+    /// Every document of the collection with its RecordId, in insertion
+    /// order, when it holds no more than `cap`; `None` when it holds more or the store cannot say.
+    #[allow(clippy::type_complexity)]
+    fn collection_at_most(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _cap: usize,
+    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
+        Ok(None)
+    }
+
+    /// The order `sort` puts `blobs` in, as indexes into it, and for each
+    /// place in it whether the document compares equal to the one before;
+    /// equal documents stay in the order given.
+    fn sort_permutation(
+        &self,
+        blobs: &[&[u8]],
+        _sort: &Document,
+        _collation: Option<&Collation>,
+    ) -> Result<(Vec<usize>, Vec<bool>), StorageError> {
+        Ok(((0..blobs.len()).collect(), vec![true; blobs.len()]))
+    }
+
+    /// Every index as `list_indexes` gives it, each with its multikey paths,
+    /// from one read of the catalog. `None`: the store does not offer it.
+    #[allow(clippy::type_complexity)]
+    fn planner_indexes(
+        &self,
+        _db: &str,
+        _coll: &str,
+    ) -> Result<Option<Vec<(Document, Vec<Vec<String>>)>>, StorageError> {
+        Ok(None)
+    }
+
+    /// Per key field of an index, the path components that hold an array in
+    /// some document (mongod's `multiKeyPaths`).
+    fn index_multikey_paths(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+    ) -> Result<Vec<Vec<String>>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Run `f` with the write it makes testing the rows `order` names, in
+    /// that order, in place of the candidates the store would pick.
+    fn with_candidate_order(&self, _order: Vec<i64>, f: &mut dyn FnMut()) {
+        f()
     }
 
     /// Whether every document `query` matches also matches `partial`, as far

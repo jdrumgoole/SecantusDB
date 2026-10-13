@@ -95,11 +95,22 @@ pub fn sort_path_values<'a>(doc: &'a Document, path: &str) -> Vec<(&'a Bson, boo
                                 next.push((v, true));
                             }
                         }
+                        // An element that does not have the field sorts as
+                        // null, as it is indexed: one without the key, and
+                        // one that is not a document at all. `p.q` over
+                        // `[{q: 3}, {r: 1}]` and over `[5, {q: 3}]` is null
+                        // ascending. A numeric component is an index first,
+                        // and adds no null for the elements it passes over.
+                        let named = !is_digits(part);
                         for elem in arr {
-                            if let Bson::Document(d) = elem {
-                                if let Some(v) = d.get(part) {
-                                    next.push((v, false));
-                                }
+                            match elem {
+                                Bson::Document(d) => match d.get(part) {
+                                    Some(v) => next.push((v, false)),
+                                    None if named => next.push((&MISSING_IN_ELEMENT, false)),
+                                    None => {}
+                                },
+                                _ if named => next.push((&MISSING_IN_ELEMENT, false)),
+                                _ => {}
                             }
                         }
                     }
@@ -111,6 +122,9 @@ pub fn sort_path_values<'a>(doc: &'a Document, path: &str) -> Vec<(&'a Bson, boo
     }
     current
 }
+
+/// What an array element that lacks the next path component stands for.
+static MISSING_IN_ELEMENT: Bson = Bson::Null;
 
 /// The `(component, array)` mongod refuses to sort by, or `None`.
 ///

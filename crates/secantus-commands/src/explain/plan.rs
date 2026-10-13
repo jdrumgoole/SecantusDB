@@ -7,7 +7,8 @@
 //! of preference, which agrees with mongod on the common shapes and is not
 //! claimed to agree on the rest (`tasks/backlog.md`).
 
-use super::bounds::{intersect, leaf_bounds, Ctx, Interval, Tight};
+use super::bounds::{intersect, leaf_bounds, union, Ctx, Interval, Tight};
+use super::exec::{self, Env};
 use super::node::{IndexInfo, IxScan, Node};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
@@ -39,12 +40,29 @@ pub(crate) struct Query<'a> {
     pub batch_size: bool,
     /// The command reads index keys only (`count`).
     pub keys_only: bool,
-    /// The branches of a filter that is only an `$or`, in the order given.
-    pub or_branches: Option<&'a [Document]>,
     /// A field the command wants from the index itself (`distinct`'s key).
     pub wanted: Option<&'a str>,
     /// Whether the query implies an index's partial filter.
     pub implies: &'a dyn Fn(&Document) -> bool,
+    /// What the caller can say of the collection: mongod runs its candidate
+    /// plans against the data and keeps the one that finishes first, and
+    /// with this the planner can count what each would read.
+    pub trial: Option<&'a Trial<'a>>,
+}
+
+/// The collection, for counting what a candidate plan reads.
+pub(crate) struct Trial<'a> {
+    /// How many documents it holds.
+    pub total: usize,
+    /// How many of them the query matches, when the caller knows.
+    pub matched: Option<usize>,
+    /// The documents themselves, read only when a count needs them.
+    pub whole: &'a dyn Whole,
+}
+
+/// A collection's documents, for a plan to be run over.
+pub(crate) trait Whole {
+    fn env(&self) -> Option<Env<'_>>;
 }
 
 /// The scan a query reads through, before sort, paging and projection.
@@ -167,6 +185,7 @@ fn use_index(index: &Rc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Que
             multikey,
             sparse: index.sparse,
             collated,
+            plain_strings: index.collation.is_none(),
             keys_only: q.keys_only,
         };
         let mut list: Option<Vec<Interval>> = None;
@@ -245,6 +264,15 @@ fn serves_sort(index: &IndexInfo, bounds: &[Vec<Interval>], sort: &Document) -> 
     let mut backward: Option<bool> = None;
     for (name, dir) in sort {
         let dir = crate::util::as_i64(dir)?;
+        // A field that holds arrays sorts by its least or greatest element,
+        // and a scan meets a document at the first key inside its bounds:
+        // the two agree only when the bounds leave no key out.
+        if let Some(at) = index.position(name) {
+            let whole = matches!(bounds[at].as_slice(), [one] if one.is_all());
+            if !index.multikey_paths[at].is_empty() && !whole {
+                return None;
+            }
+        }
         // Sorting on a field every result shares is no sort at all.
         if index.position(name).is_some_and(pinned) {
             continue;
@@ -359,7 +387,10 @@ fn index_access(parts: &[Document], q: &Query, catalog: &[Rc<IndexInfo>]) -> Opt
         }
         // The fixed order of preference among several usable indexes.
         let score = |u: &IndexUse| {
-            let sorts = sort.is_some_and(|s| serves_sort(&u.index, &u.bounds, s).is_some());
+            let sorts = sort.is_some_and(|s| {
+                !collation_differs(&u.index, q.collation)
+                    && serves_sort(&u.index, &u.bounds, s).is_some()
+            });
             let covers = q
                 .projection
                 .is_some_and(|p| residual(u, parts).is_none() && covers(&u.index, p));
@@ -397,7 +428,8 @@ fn index_access(parts: &[Document], q: &Query, catalog: &[Rc<IndexInfo>]) -> Opt
             subplan: false,
         });
     }
-    if let Some(s) = sort {
+    // An index keyed by another collation holds strings in another order.
+    if let Some(s) = sort.filter(|_| !collation_differs(&index, q.collation)) {
         if let Some(backward) = serves_sort(&index, &chosen.bounds, s) {
             return Some(Access {
                 scan: Node::IxScan(scan_of(&chosen, parts, backward)),
@@ -429,24 +461,101 @@ fn index_access(parts: &[Document], q: &Query, catalog: &[Rc<IndexInfo>]) -> Opt
     })
 }
 
-/// An `$or` whose every branch has an index: one scan per branch.
-fn or_access(branches: &[Bson], q: &Query, catalog: &[Rc<IndexInfo>]) -> Option<Node> {
+/// An `$or` whose every branch has an index, and the filter its fetch
+/// rechecks when the whole `$or` is one scan.
+///
+/// mongod sorts the branches by the index each reads. Branches that are one
+/// predicate on an index's leading field share ONE scan of that index, their
+/// bounds joined; a branch of several predicates keeps a scan of its own.
+/// The scans come out index by index, except that the last index's shared
+/// scan follows every branch that has its own.
+fn or_access(
+    branches: &[Bson],
+    q: &Query,
+    catalog: &[Rc<IndexInfo>],
+) -> Option<(Node, Option<Document>)> {
     let plain = Query {
         sort: None,
         projection: None,
         hint: Hint::None,
         ..q.clone()
     };
-    let mut inputs = Vec::new();
+    // Per index, in catalog order: the single-predicate branches reading it,
+    // each its scan, whether its bounds decide it, and the branch.
+    type Branch = (IxScan, bool, Document);
+    let mut shared: Vec<(usize, Vec<Branch>)> = Vec::new();
+    let mut own = Vec::new();
     for branch in branches {
-        let parts = clauses(branch.as_document()?);
+        let doc = branch.as_document()?;
+        let parts = clauses(doc);
         let access = index_access(&parts, &plain, catalog)?;
-        inputs.push(match access.fetch_filter {
-            Some(f) => Node::fetch(Some(f), access.scan),
-            None => access.scan,
-        });
+        let at = access
+            .index
+            .as_ref()
+            .and_then(|ix| catalog.iter().position(|c| Rc::ptr_eq(c, ix)));
+        match (access.scan, at) {
+            (Node::IxScan(ix), Some(at))
+                if parts.len() == 1
+                    && ix
+                        .bounds
+                        .iter()
+                        .skip(1)
+                        .all(|l| l.len() == 1 && l[0].is_all()) =>
+            {
+                let exact = access.fetch_filter.is_none() && ix.filter.is_none();
+                match shared.iter_mut().find(|(i, _)| *i == at) {
+                    Some((_, list)) => list.push((ix, exact, doc.clone())),
+                    None => shared.push((at, vec![(ix, exact, doc.clone())])),
+                }
+            }
+            (scan, _) => own.push(match access.fetch_filter {
+                Some(f) => Node::fetch(Some(f), scan),
+                None => scan,
+            }),
+        }
     }
-    Some(Node::Or(inputs))
+    shared.sort_by_key(|(at, _)| *at);
+    let mut scans: Vec<(Node, Option<Document>)> = shared
+        .into_iter()
+        .map(|(_, list)| {
+            let inexact: Vec<Bson> = list
+                .iter()
+                .filter(|(_, exact, _)| !exact)
+                .map(|(_, _, doc)| Bson::Document(doc.clone()))
+                .collect();
+            let filter = (!inexact.is_empty()).then(|| {
+                let all: Vec<Bson> = list
+                    .iter()
+                    .map(|(_, _, doc)| Bson::Document(doc.clone()))
+                    .collect();
+                match all.as_slice() {
+                    [Bson::Document(one)] => one.clone(),
+                    _ => doc! { "$or": all },
+                }
+            });
+            let mut list = list.into_iter().map(|(ix, _, _)| ix);
+            let mut scan = list.next().expect("a group holds a scan");
+            for other in list {
+                let mut joined = std::mem::take(&mut scan.bounds[0]);
+                joined.extend(other.bounds[0].iter().cloned());
+                scan.bounds[0] = union(joined);
+            }
+            scan.filter = None;
+            (Node::IxScan(scan), filter)
+        })
+        .collect();
+    if own.is_empty() && scans.len() == 1 {
+        return scans.pop();
+    }
+    let fetched = |(scan, filter): (Node, Option<Document>)| match filter {
+        Some(f) => Node::fetch(Some(f), scan),
+        None => scan,
+    };
+    let last = scans.pop().map(fetched);
+    let mut inputs: Vec<Node> = scans.into_iter().map(fetched).collect();
+    inputs.extend(own);
+    inputs.extend(last);
+    Some((Node::Or(inputs), None))
 }
 
 fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
@@ -467,33 +576,37 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
         return collscan(false, backward);
     }
     let parts = clauses(q.canonical);
+    let mut only_or = false;
     // A filter that is only an `$or` is planned branch by branch.
     if let [only] = parts.as_slice() {
         if let Ok(parsed) = only.get_array("$or") {
             if q.hint == Hint::None {
-                // The scans come in the order the branches were written.
-                let given: Vec<Bson> = match q.or_branches {
-                    Some(list) if list.len() == parsed.len() => {
-                        list.iter().cloned().map(Bson::Document).collect()
-                    }
-                    _ => parsed.clone(),
-                };
-                let branches = &given;
-                return match or_access(branches, q, catalog) {
-                    Some(scan) => Access {
+                if let Some((scan, fetch_filter)) = or_access(parsed, q, catalog) {
+                    return Access {
                         scan,
-                        fetch_filter: None,
+                        fetch_filter,
                         indexed: true,
                         index: None,
                         sorted: false,
                         subplan: true,
-                    },
-                    None => collscan(true, false),
-                };
+                    };
+                }
+                // A branch has no index: the whole `$or` is one filter.
+                only_or = true;
             }
         }
     }
     if let Some(found) = index_access(&parts, q, catalog) {
+        // The predicate's index leaves a sort to do, and another index (or
+        // this one, read whole) returns the order: mongod tries both.
+        let single = matches!(found.scan, Node::IxScan(_)) && q.hint == Hint::None;
+        if let (true, false, Some(trial)) = (single, found.sorted, q.trial) {
+            if let Some(walk) = sort_provider(q, catalog, whole(), false) {
+                if walk_finishes_first(&found, &walk, q, trial) {
+                    return walk;
+                }
+            }
+        }
         return found;
     }
     // An `$or` beside other clauses: the branches' indexes, the rest rechecked.
@@ -501,13 +614,14 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
         let Ok(branches) = clause.get_array("$or") else {
             continue;
         };
-        if let Some(scan) = or_access(branches, q, catalog) {
-            let rest = parts
+        if let Some((scan, recheck)) = or_access(branches, q, catalog) {
+            let mut rest: Vec<Document> = parts
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| *j != i)
                 .map(|(_, c)| c.clone())
                 .collect();
+            rest.extend(recheck);
             return Access {
                 scan,
                 fetch_filter: assemble(rest),
@@ -519,31 +633,104 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
         }
     }
     // No predicate has an index: one that returns the sort order still helps.
-    if let Some(sort) = sort_of(q) {
-        let full = |ix: &Rc<IndexInfo>| vec![vec![Interval::all()]; ix.key.len()];
-        let found = catalog.iter().find_map(|ix| {
-            let usable = eligible(ix, q)
-                && !ix.sparse
-                && ix.partial.is_none()
-                && !collation_differs(ix, q.collation);
-            let backward = usable.then(|| serves_sort(ix, &full(ix), sort)).flatten()?;
-            Some((ix.clone(), backward))
-        });
-        if let Some((index, backward)) = found {
-            return Access {
-                scan: Node::IxScan(IxScan {
-                    backward,
-                    ..IxScan::full(index.clone())
-                }),
-                fetch_filter: whole(),
-                indexed: true,
-                index: Some(index),
-                sorted: true,
-                subplan: false,
-            };
-        }
+    if let Some(found) = sort_provider(q, catalog, whole(), only_or) {
+        return found;
     }
-    collscan(false, false)
+    collscan(only_or, false)
+}
+
+/// A walk of a whole index that returns the documents in the sort order,
+/// each one checked against the query.
+fn sort_provider(
+    q: &Query,
+    catalog: &[Rc<IndexInfo>],
+    filter: Option<Document>,
+    subplan: bool,
+) -> Option<Access> {
+    let sort = sort_of(q)?;
+    let full = |ix: &Rc<IndexInfo>| vec![vec![Interval::all()]; ix.key.len()];
+    let (index, backward) = catalog.iter().find_map(|ix| {
+        let usable = eligible(ix, q) && !ix.sparse && !collation_differs(ix, q.collation);
+        let backward = usable.then(|| serves_sort(ix, &full(ix), sort)).flatten()?;
+        Some((ix.clone(), backward))
+    })?;
+    Some(Access {
+        scan: Node::IxScan(IxScan {
+            backward,
+            ..IxScan::full(index.clone())
+        }),
+        fetch_filter: filter,
+        indexed: true,
+        index: Some(index),
+        sorted: true,
+        subplan,
+    })
+}
+
+/// Whether mongod keeps the walk of the sort's index over `found`, the scan
+/// of the predicate's index that then has to sort.
+///
+/// It works every candidate plan one step at a time, and stops when one has
+/// handed over the documents the query asked for (its `limit`, or 101) or
+/// has nothing left. The plan that got there is kept, and the walk when both
+/// did, since it does not sort.
+///
+/// The steps, as mongod 8.2.11 counts them (`allPlansExecution`): a scan
+/// takes one per key and one more to find it is over. The sort takes those,
+/// then one per document it hands over. Either plan takes a last step to
+/// report that it is done, when it runs out before the query has enough.
+fn walk_finishes_first(found: &Access, walk: &Access, q: &Query, trial: &Trial) -> bool {
+    let need = q.skip + if q.limit > 0 { q.limit } else { 101 };
+    // Counted without the documents. A scan of one run of keys in an index
+    // that holds a document once, with nothing left to recheck, reads a key
+    // for each document the query matches; a walk of such an index reads a
+    // key for each document of the collection.
+    let once = |a: &Access| matches!(&a.scan, Node::IxScan(ix) if !ix.index.is_multikey() && ix.filter.is_none());
+    let one_run = matches!(&found.scan, Node::IxScan(ix) if {
+        let mut open = false;
+        ix.bounds.iter().all(|list| match list.as_slice() {
+            [one] => {
+                let fits = !open || one.is_all();
+                open |= !one.is_point();
+                fits
+            }
+            _ => false,
+        })
+    });
+    let whole = walk
+        .index
+        .as_ref()
+        .is_some_and(|ix| !ix.sparse && ix.partial.is_none());
+    let counted = once(found) && once(walk) && one_run && whole && found.fetch_filter.is_none();
+    if let Some(matched) = trial
+        .matched
+        .map(|m| m as i64)
+        .filter(|m| counted && *m < need)
+    {
+        // The walk's steps against the sort's: see below.
+        let (walk_works, sort_works) = (trial.total as i64 + 1, 2 * matched + 2);
+        return walk_works <= sort_works;
+    }
+    let Some(env) = trial.whole.env() else {
+        return false;
+    };
+    let env = &env;
+    let fetched = |a: &Access| Node::fetch(a.fetch_filter.clone(), a.scan.clone());
+    let sorting = exec::run(&fetched(found), env);
+    let matched = sorting.n_returned;
+    let (sort_works, walk_works) = if matched >= need {
+        let limited = Node::Limit(need, Box::new(fetched(walk)));
+        (
+            sorting.totals().0 + 1 + need,
+            exec::run(&limited, env).totals().0,
+        )
+    } else {
+        (
+            sorting.totals().0 + 1 + matched + 1,
+            exec::run(&fetched(walk), env).totals().0 + 1,
+        )
+    };
+    walk_works <= sort_works
 }
 
 fn truthy(v: &Bson) -> bool {

@@ -603,8 +603,15 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_reply());
     }
 
-    let docs = storage
-        .find_collated(
+    // `min` and `max` cut the hinted index's scan at a key and fix its
+    // direction: that read keeps the order the store gives it. So does a
+    // sort by a value that is not 1 or -1 (`-1.5`): mongod sorts by it and
+    // does not read it from an index, and by here it has been made -1.
+    let bounded = doc.contains_key("min") || doc.contains_key("max");
+    let inexact = matches!(doc.get("sort"), Some(Bson::Document(given))
+        if !given.is_empty() && !crate::explain::order::plain_sort(given));
+    let docs = if bounded || inexact {
+        storage.find_collated(
             &ctx.db_name,
             &coll,
             &filter,
@@ -613,9 +620,22 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             collation.as_ref(),
             &let_vars,
         )
-        .map_err(|e| {
-            crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll))
-        })?;
+    } else {
+        crate::explain::order::find(
+            storage,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &filter,
+                sort,
+                hint,
+                collation: collation.as_ref(),
+                vars: &let_vars,
+                limit: if limit > 0 { (skip + limit) as i64 } else { 0 },
+            },
+        )
+    }
+    .map_err(|e| crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll)))?;
 
     // A time-series collection scans bucket by bucket, and returns each
     // measurement with its time and meta fields first.

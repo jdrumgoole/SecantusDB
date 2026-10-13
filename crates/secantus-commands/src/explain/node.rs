@@ -14,7 +14,7 @@ pub(crate) fn num(n: i64) -> Bson {
 }
 
 /// What the planner knows about one index.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct IndexInfo {
     pub name: String,
     pub key: Document,
