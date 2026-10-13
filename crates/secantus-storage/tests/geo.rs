@@ -95,16 +95,20 @@ fn two_d_index_is_point_only() {
         make_2d(st);
         st.insert_one("app", "c", &enc(&doc! {"_id": 1, "loc": pt(5.0, 5.0)}))
             .unwrap();
-        // A non-point (Polygon) geometry contributes no 2d entry.
-        st.insert_one(
+        // A GeoJSON geometry is not a legacy pair: mongod 8.2.11 refuses the
+        // insert (16804), where this used to store it with no entry.
+        let refused = st.insert_one(
             "app",
             "c",
             &enc(&doc! {"_id": 2, "loc": {
                 "type": "Polygon",
                 "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
             }}),
-        )
-        .unwrap();
+        );
+        assert!(
+            format!("{refused:?}").contains("16804"),
+            "a 2d index holds legacy pairs only: {refused:?}"
+        );
         // A doc with no loc field: also no entry.
         st.insert_one("app", "c", &enc(&doc! {"_id": 3, "x": 1}))
             .unwrap();
@@ -255,9 +259,15 @@ fn two_dsphere_covers_polygon_docs() {
         // A doc with no loc field contributes no entries.
         st.insert_one("app", "c", &enc(&doc! {"_id": 3, "x": 1}))
             .unwrap();
-        // A box that fully contains both geometries finds both.
-        let q = doc! {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}};
+        // A polygon that fully contains both geometries finds both. (A `$box`
+        // would find the point alone: mongod's flat shapes hold points only.)
+        let q = doc! {"loc": {"$geoWithin": {"$geometry": {
+            "type": "Polygon",
+            "coordinates": [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+        }}}};
         assert_eq!(found_ids(st, q), vec![1, 2]);
+        let q = doc! {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}};
+        assert_eq!(found_ids(st, q), vec![1]);
     });
 }
 

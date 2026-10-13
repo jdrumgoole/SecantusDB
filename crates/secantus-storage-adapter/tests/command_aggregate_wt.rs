@@ -185,6 +185,12 @@ fn geo_near_sorts_by_distance_and_attaches_field() {
                 doc! {"_id": 3, "loc": [1.0, 0.0]},
             ],
         );
+        // A legacy `near` reads a `2d` index: without one mongod refuses the
+        // stage (291).
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"loc": "2d"}, "name": "loc_2d"}]},
+            c,
+        );
         let reply = dispatch(
             &doc! {"aggregate": "c", "pipeline": [
                 {"$geoNear": {"near": [0.0, 0.0], "key": "loc", "distanceField": "d"}}
@@ -209,6 +215,10 @@ fn geo_near_max_distance_and_multiplier() {
                 doc! {"_id": 1, "loc": [0.0, 0.0]},
                 doc! {"_id": 2, "loc": [3.0, 4.0]},
             ],
+        );
+        dispatch(
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"loc": "2d"}, "name": "loc_2d"}]},
+            c,
         );
         let reply = dispatch(
             &doc! {"aggregate": "c", "pipeline": [
