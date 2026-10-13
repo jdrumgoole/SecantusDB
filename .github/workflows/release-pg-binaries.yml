@@ -22,8 +22,8 @@
 #     git tag secantusd-pg-v0.1.0-beta.0 && git push origin secantusd-pg-v0.1.0-beta.0
 #
 # SCOPE: two targets to start — x86_64 glibc Linux and arm64 macOS, the pair
-# whose static-WiredTiger build this repo exercises most. Windows and PGO are
-# follow-ons at the bottom with their blockers; shipping correct beats shipping
+# whose static-WiredTiger build this repo exercises most. Windows is a
+# follow-on at the bottom with its blocker; shipping correct beats shipping
 # everywhere, and an unverified target in a release matrix is a red run at tag
 # time rather than a caught mistake.
 
@@ -127,6 +127,8 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
         with:
           targets: ${{ matrix.target }}
+          # llvm-profdata, which merges the profile the two-stage build collects.
+          components: llvm-tools-preview
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
@@ -198,10 +200,11 @@ jobs:
             exit 1
           fi
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
-          target=${{ matrix.target }}
-          cargo build --release --locked --target "$target" \
-            --manifest-path crates/secantus-pg/Cargo.toml
-          bin="crates/secantus-pg/target/$target/release/secantusd-pg"
+          # Link-time optimisation and a profile collected from this very
+          # binary on this runner; the script has the measurements and the
+          # stages. Its last line is the path of the finished binary.
+          bin=$(scripts/build_pg_release.sh "${{ matrix.target }}" | tail -1)
+          [ -x "$bin" ] || { echo "::error::no binary at '$bin'"; exit 1; }
           strip "$bin" || true
           echo "BIN=$bin" >> "$GITHUB_ENV"
           # Also the first check that the artifact runs at all. `--version` used
@@ -288,12 +291,6 @@ jobs:
 #       plus an explicit LIBCLANG_PATH for bindgen. Left out here only because
 #       nothing has yet built THIS binary on Windows; copy that target's matrix
 #       entry and toolchain steps once a run proves it.
-#   - PGO (two-stage, on-target)
-#       The MongoDB binary gets ~12-19% on write/aggregate paths from it, driven
-#       by `bench/pgo_workload.py`. There is no PostgreSQL-side equivalent
-#       workload script, so the profile would have nothing representative to
-#       collect. Write that first; PGO is a hint, so its absence costs speed and
-#       nothing else.
 #   - musl-static / aarch64 Linux
 #       Same blockers and the same appeal as for the MongoDB binary.
 # ---------------------------------------------------------------------------

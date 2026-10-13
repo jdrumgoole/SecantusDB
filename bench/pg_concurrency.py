@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--repeat", type=int, default=3, help="trials per client count; median wins")
     ap.add_argument("--json", type=Path, default=None, help="also write the raw trials here")
-    ap.add_argument("--pg-dsn", default="host=127.0.0.1 port=5432 dbname=postgres")
+    ap.add_argument("--pg-dsn", default="host=127.0.0.1 port=5432 dbname=postgres sslmode=disable")
     args = ap.parse_args(argv)
     counts = [int(c) for c in args.clients.split(",")]
 
@@ -250,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
                 stderr=subprocess.DEVNULL,
             )
             _wait_for_listener("127.0.0.1", port)
-            dsn = f"host=127.0.0.1 port={port} dbname=postgres user=postgres"
+            dsn = f"host=127.0.0.1 port={port} dbname=postgres user=postgres sslmode=disable"
             collected["rust"] = _sweep(
                 "secantusd-pg",
                 dsn,
