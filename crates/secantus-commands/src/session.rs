@@ -224,6 +224,15 @@ pub(crate) fn run(
     ctx: &mut CommandContext,
 ) -> Document {
     let env = match parse(name, doc) {
+        Ok(env) => {
+            if let (Some(id), Some(server)) = (&env.lsid, &ctx.server_params) {
+                server.note_session(id);
+            }
+            Ok(env)
+        }
+        other => other,
+    };
+    let env = match env {
         Ok(env) => env,
         Err(e) => return e.into_reply(),
     };

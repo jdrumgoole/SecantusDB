@@ -137,8 +137,11 @@ fn aggregate_unrecognized_stage_is_location_40324() {
 #[test]
 fn aggregate_list_local_sessions_source_stage() {
     with_wt(|c| {
-        // The stage lists the session the command came in, which is how a
-        // driver's test finds one row; outside a session there is none.
+        // The stage lists the sessions commands have come in, which is how
+        // a driver's test finds one row; before any, there is none.
+        c.server_params = Some(std::sync::Arc::new(
+            secantus_commands::params::ServerParams::new(),
+        ));
         let pipeline = vec![
             doc! {"$listLocalSessions": {}},
             doc! {"$limit": 1},

@@ -183,6 +183,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = source_stage_problem(&pipeline, &ctx.db_name, coll.as_deref()) {
         return Ok(e.into_reply());
     }
+    let seen = ctx
+        .server_params
+        .as_ref()
+        .map(|p| p.sessions())
+        .unwrap_or_default();
+    SESSIONS.with(|sessions| *sessions.borrow_mut() = seen);
     // `$where` in a `$match` is refused with the aggregation-context code on
     // every mongod, script engine or not -- and it must be refused before the
     // leading-`$match` lift hands the filter to the query matcher.
@@ -713,29 +719,39 @@ fn source_stage_problem(
     Ok(())
 }
 
-/// What the session stages list: the session the command itself came in,
-/// as mongod shows one (`{_id: {id, uid}, lastUse}`). No other session is
-/// kept to list, and a command sent outside a session lists none. (An
-/// operation's row once stood in for this.)
-fn own_session(cmd_doc: &Document) -> Vec<Document> {
+thread_local! {
+    /// The sessions the server has seen, for the pipeline this thread runs.
+    static SESSIONS: std::cell::RefCell<Vec<(Vec<u8>, bson::DateTime)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What the session stages list: the sessions commands have come in and
+/// that have not timed out, as mongod shows one
+/// (`{_id: {id, uid}, lastUse}`). (An operation's row once stood in for
+/// this.)
+fn known_sessions() -> Vec<Document> {
     use sha2::Digest;
-    let Some(id) = cmd_doc
-        .get_document("lsid")
-        .ok()
-        .and_then(|lsid| lsid.get("id"))
-    else {
-        return Vec::new();
-    };
-    vec![doc! {
-        "_id": {
-            "id": id.clone(),
-            "uid": bson::Binary {
-                subtype: bson::spec::BinarySubtype::Generic,
-                bytes: sha2::Sha256::digest(b"").to_vec(),
-            },
-        },
-        "lastUse": bson::DateTime::now(),
-    }]
+    SESSIONS.with(|sessions| {
+        sessions
+            .borrow()
+            .iter()
+            .map(|(id, used)| {
+                doc! {
+                    "_id": {
+                        "id": bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Uuid,
+                            bytes: id.clone(),
+                        },
+                        "uid": bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: sha2::Sha256::digest(b"").to_vec(),
+                        },
+                    },
+                    "lastUse": *used,
+                }
+            })
+            .collect()
+    })
 }
 
 /// Source stages that ignore their input and emit a synthetic row, mirroring
@@ -1352,7 +1368,7 @@ fn run_segmented(
             docs = if name == "$currentOp" {
                 apply_source_stage(name, db, coll, cmd_doc, client_metadata)
             } else {
-                own_session(cmd_doc)
+                known_sessions()
             };
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {

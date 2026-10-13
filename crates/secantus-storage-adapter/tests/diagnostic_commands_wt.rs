@@ -224,7 +224,7 @@ fn a_collectionless_aggregate_needs_a_stage_that_reads_no_collection() {
             let reply = aggregate(c, one(), pipeline.clone());
             assert_eq!(reply.get_i32("code"), Ok(code), "{pipeline:?}: {reply}");
         }
-        // Outside a session there is none to list.
+        // No command has come in a session, so there is none to list.
         let local = aggregate(c, one(), vec![doc! { "$listLocalSessions": {} }]);
         let batch = local
             .get_document("cursor")

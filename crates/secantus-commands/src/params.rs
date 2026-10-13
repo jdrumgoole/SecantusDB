@@ -118,6 +118,10 @@ pub struct ServerParams {
     /// exists -- deleting every user does not reopen it until a restart
     /// (measured 8.2.11, 2026-09-30).
     users_seen: std::sync::atomic::AtomicBool,
+    /// The sessions commands have come in, each with when it was last used:
+    /// what `$listLocalSessions` lists. One unused for the session timeout
+    /// (30 minutes) is forgotten.
+    sessions: Mutex<BTreeMap<Vec<u8>, bson::DateTime>>,
 }
 
 impl ServerParams {
@@ -129,6 +133,31 @@ impl ServerParams {
     pub fn mark_users_seen(&self) {
         self.users_seen
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A command came in the session `id`.
+    pub fn note_session(&self, id: &[u8]) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            let now = bson::DateTime::now();
+            let oldest = now.timestamp_millis() - 30 * 60 * 1000;
+            sessions.retain(|_, used| used.timestamp_millis() >= oldest);
+            sessions.insert(id.to_vec(), now);
+        }
+    }
+
+    /// The sessions seen and not timed out, with when each was last used.
+    pub fn sessions(&self) -> Vec<(Vec<u8>, bson::DateTime)> {
+        let oldest = bson::DateTime::now().timestamp_millis() - 30 * 60 * 1000;
+        self.sessions.lock().map_or_else(
+            |_| Vec::new(),
+            |sessions| {
+                sessions
+                    .iter()
+                    .filter(|(_, used)| used.timestamp_millis() >= oldest)
+                    .map(|(id, used)| (id.clone(), *used))
+                    .collect()
+            },
+        )
     }
 
     /// Whether a user has existed since the server started.
