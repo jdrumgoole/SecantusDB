@@ -1779,6 +1779,7 @@ const KNOWN_FIELD_OPS: &[&str] = &[
     "$bitsAllClear",
     "$bitsAnyClear",
     "$geoWithin",
+    "$within",
     "$geoIntersects",
     "$near",
     "$nearSphere",

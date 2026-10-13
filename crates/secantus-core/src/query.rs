@@ -551,6 +551,7 @@ const KNOWN_FIELD_OPS: &[&str] = &[
     "$bitsAllClear",
     "$bitsAnyClear",
     "$geoWithin",
+    "$within",
     "$geoIntersects",
     "$near",
     "$nearSphere",
@@ -881,7 +882,7 @@ fn op_matches(
         "$bitsAnySet" => op_bits(values, arg, |b| b, false, op, field, descend),
         "$bitsAllClear" => op_bits(values, arg, |b| !b, true, op, field, descend),
         "$bitsAnyClear" => op_bits(values, arg, |b| !b, false, op, field, descend),
-        "$geoWithin" => crate::geo::op_geo_within(values, arg),
+        "$geoWithin" | "$within" => crate::geo::op_geo_within(values, arg, op),
         "$geoIntersects" => crate::geo::op_geo_intersects(values, arg),
         // The legacy 2d *sibling* `$maxDistance`/`$minDistance` form is handled in
         // `field_matches` (it needs the parent condition dict); here (e.g. under
@@ -2749,7 +2750,7 @@ pub(crate) fn coerce_int64_argument(value: &Bson, label: &str) -> Option<Result<
 /// Every field-level operator `op_matches` dispatches, plus the sibling
 /// modifiers that tune one. `$not` validates its inner document against this.
 /// Mirrors `query._KNOWN_FIELD_OPERATORS`.
-const KNOWN_FIELD_OPERATORS: [&str; 28] = [
+const KNOWN_FIELD_OPERATORS: [&str; 29] = [
     "$eq",
     "$ne",
     "$gt",
@@ -2772,6 +2773,7 @@ const KNOWN_FIELD_OPERATORS: [&str; 28] = [
     "$bitsAllClear",
     "$bitsAnyClear",
     "$geoWithin",
+    "$within",
     "$geoIntersects",
     "$near",
     "$nearSphere",

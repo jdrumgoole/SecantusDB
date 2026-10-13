@@ -28,6 +28,7 @@ pub mod diff;
 pub mod expressions;
 pub mod fallback;
 pub mod geo;
+pub mod geoshape;
 pub mod projection;
 pub mod query;
 pub mod sortkey;

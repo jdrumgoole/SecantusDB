@@ -249,40 +249,27 @@ fn within(doc: &Geometry<f64>, q: &QGeom) -> bool {
     }
 }
 
-/// `$geoWithin` field operator. `Fallback` for malformed / `$center` /
-/// non-document args (Python raises the proper `QueryError`).
-pub fn op_geo_within(values: &[crate::query::Cand], arg: &Bson) -> R {
-    let arg = arg.as_document().ok_or(Fallback::Defer)?;
-    let q = parse_query_geometry(arg).ok_or(Fallback::Defer)?;
-    for v in values.iter().filter_map(|c| c.value) {
-        if let Some(g) = parse_doc_geometry(v) {
-            if within(&g, &q) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+/// `$geoWithin` (and its old name `$within`): whether some value of the
+/// field is a geometry inside the query's shape. The shape is parsed, and
+/// refused as mongod refuses it, whether or not there is a value to test.
+pub fn op_geo_within(values: &[crate::query::Cand], arg: &Bson, op: &str) -> R {
+    let shape = crate::geoshape::within_shape(op, arg)?;
+    Ok(values
+        .iter()
+        .filter_map(|c| c.value)
+        .flat_map(crate::geoshape::stored)
+        .any(|g| crate::geoshape::is_within(&g, &shape)))
 }
 
-/// `$geoIntersects` field operator — `$geometry` (planar) only, mirroring
-/// mongod / `geo.py`. `Fallback` otherwise.
+/// `$geoIntersects`: whether some value of the field is a geometry with a
+/// point in common with the query's.
 pub fn op_geo_intersects(values: &[crate::query::Cand], arg: &Bson) -> R {
-    let arg = arg.as_document().ok_or(Fallback::Defer)?;
-    if !arg.contains_key("$geometry") {
-        return Err(Fallback::Defer);
-    }
-    let q = match parse_query_geometry(arg).ok_or(Fallback::Defer)? {
-        QGeom::Planar(g) => g,
-        QGeom::Sphere { .. } | QGeom::Disk { .. } => return Err(Fallback::Defer),
-    };
-    for v in values.iter().filter_map(|c| c.value) {
-        if let Some(g) = parse_doc_geometry(v) {
-            if g.relate(&q).is_intersects() {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    let query = crate::geoshape::intersects_shape("$geoIntersects", arg)?;
+    Ok(values
+        .iter()
+        .filter_map(|c| c.value)
+        .flat_map(crate::geoshape::stored)
+        .any(|g| crate::geoshape::is_intersecting(&g, &query)))
 }
 
 /// `(center, max, min, spherical, legacy)` for a `$near` arg, or `Fallback` on a
