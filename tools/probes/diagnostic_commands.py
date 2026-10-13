@@ -535,7 +535,7 @@ scenario(
     {"top": 1},
     shape((A, {"listCommands": 1}), 1),
     shape({"listCommands": 1}, 1),
-    {"listCommands": 1, "bogus": 1},
+    {"listCommands": 1, "bogus": 1, "pick": ["ok"]},
     shape((A, {"getDefaultRWConcern": 1}), 2),
     {"getDefaultRWConcern": 1},
     (A, {"getDefaultRWConcern": 1, "inMemory": "x"}),

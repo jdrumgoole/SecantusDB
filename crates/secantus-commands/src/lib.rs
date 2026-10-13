@@ -55,13 +55,13 @@ pub mod findandmodify;
 pub mod handshake;
 pub mod logbuf;
 pub mod mapreduce;
-mod mongod_commands;
 pub mod mongod_codes;
+mod mongod_commands;
 mod near;
 pub mod params;
 pub mod rbac;
-pub mod serverinfo;
 pub mod roles;
+pub mod serverinfo;
 mod session;
 pub mod slowop;
 mod stats_admin;
@@ -636,6 +636,10 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// `commands.py::dispatch` runs first. Always returns a reply document (errors
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
+    handshake::process_started();
+    if let Some(stats) = &ctx.top_stats {
+        stats.count_op(doc);
+    }
     let mut reply = dispatch_inner(doc, ctx);
     unacknowledged_write_reply(doc, &mut reply);
     attach_write_concern_error(doc, &mut reply);
@@ -848,14 +852,8 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
             ));
         }
     };
-    const WRITE_CONCERN_FIELDS: [&str; 6] = [
-        "w",
-        "j",
-        "wtimeout",
-        "fsync",
-        "getLastError",
-        "provenance",
-    ];
+    const WRITE_CONCERN_FIELDS: [&str; 6] =
+        ["w", "j", "wtimeout", "fsync", "getLastError", "provenance"];
     if let Some(unknown) = wc
         .keys()
         .find(|k| !WRITE_CONCERN_FIELDS.contains(&k.as_str()))
@@ -2434,7 +2432,9 @@ fn validate_read_concern(
     let invalid = |message: String| CommandError::new(72, "InvalidOptions", message);
     if let Some(Bson::Timestamp(after)) = rc.get("afterClusterTime") {
         if after.time == 0 && after.increment == 0 {
-            return Err(invalid("afterClusterTime cannot be a null timestamp".into()));
+            return Err(invalid(
+                "afterClusterTime cannot be a null timestamp".into(),
+            ));
         }
         if let Some(now) = ctx.storage.as_ref().map(|s| s.current_cluster_time()) {
             if (after.time, after.increment) > (now.time, now.increment) {
@@ -2991,14 +2991,15 @@ mod tests {
         let reply = dispatch(&doc! {"hello": 1}, &mut ctx());
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
         assert!(reply.get_bool("isWritablePrimary").unwrap());
-        assert!(reply.get_bool("ismaster").unwrap());
+        // `hello` answers the modern name only, as mongod does.
+        assert!(!reply.contains_key("ismaster"));
         assert_eq!(reply.get_i32("maxWireVersion").unwrap(), WIRE_VERSION);
         assert_eq!(
             reply.get_i32("maxBsonObjectSize").unwrap(),
             MAX_BSON_OBJECT_SIZE
         );
-        // connectionId and topologyVersion.counter must be int64 on the wire.
-        assert!(matches!(reply.get("connectionId"), Some(Bson::Int64(7))));
+        // mongod's widths: an int32 connectionId, an int64 counter.
+        assert!(matches!(reply.get("connectionId"), Some(Bson::Int32(7))));
         let tv = reply.get_document("topologyVersion").unwrap();
         assert!(matches!(tv.get("counter"), Some(Bson::Int64(0))));
         // No replica-set fields without a configured set name.
@@ -3144,8 +3145,10 @@ mod tests {
     fn ismaster_alias_routes_to_hello() {
         let reply = dispatch(&doc! {"isMaster": 1}, &mut ctx());
         assert!(reply.get_bool("ismaster").unwrap());
+        // The older names answer `ismaster` and not the modern flag.
         let reply2 = dispatch(&doc! {"ismaster": 1}, &mut ctx());
-        assert!(reply2.get_bool("isWritablePrimary").unwrap());
+        assert!(reply2.get_bool("ismaster").unwrap());
+        assert!(!reply2.contains_key("isWritablePrimary"));
     }
 
     #[test]

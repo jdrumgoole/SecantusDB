@@ -266,7 +266,7 @@ pub(crate) fn storage_stats(
 
 /// `dataSize`: the bytes and documents of one namespace.
 pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let ns = match doc.get("dataSize") {
+    let ns = match doc.values().next() {
         Some(Bson::String(ns)) => ns.clone(),
         None | Some(Bson::Null) => {
             return Err(err(
@@ -320,7 +320,11 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         (Some(min), Some(max)) => Some((min, max)),
         (None, None) => None,
         (Some(_), None) => {
-            return Err(err(2, "BadValue", "Max must be set if min is set.".to_string()))
+            return Err(err(
+                2,
+                "BadValue",
+                "Max must be set if min is set.".to_string(),
+            ))
         }
         (None, Some(_)) => {
             return Err(err(
@@ -413,7 +417,9 @@ fn bounded_size(
                 format!(
                     "field names of bound {} do not match those of keyPattern {}",
                     secantus_core::query::bson_value_repr(&Bson::Document(bound.clone())),
-                    secantus_core::query::bson_value_repr(&Bson::Document(pattern.unwrap_or(min).clone())),
+                    secantus_core::query::bson_value_repr(&Bson::Document(
+                        pattern.unwrap_or(min).clone()
+                    )),
                 ),
             ));
         }
@@ -422,9 +428,7 @@ fn bounded_size(
         fields
             .iter()
             .map(|name| {
-                let value = source.get(*name)
-                    .cloned()
-                    .unwrap_or(Bson::Null);
+                let value = source.get(*name).cloned().unwrap_or(Bson::Null);
                 secantus_core::sortkey::encode_value(&value, None).unwrap_or_default()
             })
             .collect()

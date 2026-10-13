@@ -94,11 +94,65 @@ pub struct Slot {
 #[derive(Debug, Default)]
 pub struct TopStats {
     inner: Mutex<HashMap<String, HashMap<&'static str, Slot>>>,
+    /// `serverStatus.opcounters`, in mongod's order: insert, query, update,
+    /// delete, getmore, command.
+    ops: [std::sync::atomic::AtomicI64; 6],
+    /// `serverStatus.network`: requests read, bytes read, bytes written.
+    net: [std::sync::atomic::AtomicI64; 3],
 }
+
+/// The names of `serverStatus.opcounters`, in mongod's order.
+pub const OPCOUNTERS: [&str; 6] = ["insert", "query", "update", "delete", "getmore", "command"];
 
 impl TopStats {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Count a command for `serverStatus.opcounters` the way mongod counts
+    /// it (measured 8.2.11): an insert by its documents, an update or delete
+    /// by its statements, `find` and `aggregate` as queries, and every other
+    /// command as a command.
+    pub fn count_op(&self, request: &bson::Document) {
+        let Some((name, _)) = request.iter().next() else {
+            return;
+        };
+        let listed = |field: &str| {
+            request
+                .get_array(field)
+                .map_or(1, |items| items.len().max(1) as i64)
+        };
+        let (slot, by) = match name.as_str() {
+            "insert" => (0, listed("documents")),
+            "find" | "aggregate" => (1, 1),
+            "update" => (2, listed("updates")),
+            "delete" => (3, listed("deletes")),
+            "getMore" => (4, 1),
+            _ => (5, 1),
+        };
+        self.ops[slot].fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One message read off a connection, of `bytes` with its header.
+    pub fn count_request(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.net[0].fetch_add(1, Relaxed);
+        self.net[1].fetch_add(bytes as i64, Relaxed);
+    }
+
+    /// One message written to a connection.
+    pub fn count_reply(&self, bytes: usize) {
+        self.net[2].fetch_add(bytes as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Requests read, bytes read and bytes written since the server started.
+    pub fn network(&self) -> [i64; 3] {
+        std::array::from_fn(|i| self.net[i].load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The six counters, in `OPCOUNTERS` order.
+    pub fn opcounters(&self) -> [i64; 6] {
+        std::array::from_fn(|i| self.ops[i].load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Accumulate one operation against `namespace` (`db.collection`).

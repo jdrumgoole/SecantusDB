@@ -2765,10 +2765,8 @@ fn coll_stats_spec(spec: Option<&Bson>) -> Result<Document, CommandError> {
     let spec = match spec {
         Some(Bson::Document(spec)) => spec,
         other => {
-            let shown = other.map_or_else(
-                || "null".to_string(),
-                secantus_core::query::bson_value_repr,
-            );
+            let shown =
+                other.map_or_else(|| "null".to_string(), secantus_core::query::bson_value_repr);
             return Err(CommandError::new(
                 5447000,
                 "Location5447000",
@@ -2782,7 +2780,11 @@ fn coll_stats_spec(spec: Option<&Bson>) -> Result<Document, CommandError> {
             (
                 "latencyStats" | "storageStats" | "count" | "queryExecStats" | "operationStats",
                 Bson::Document(section),
-            ) => match (key.as_str(), section.get("scale"), section.get("histograms")) {
+            ) => match (
+                key.as_str(),
+                section.get("scale"),
+                section.get("histograms"),
+            ) {
                 ("storageStats", Some(scale), _) if !matches!(scale, Bson::Null) => {
                     let Some(n) = crate::util::as_i64(scale).filter(|_| {
                         matches!(

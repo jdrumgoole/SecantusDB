@@ -106,7 +106,11 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // flip together with the write refusal -- a server that keeps claiming to be
     // primary while rejecting every write is worse than either alone.
     let stepped_down = ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down());
-    let primary_flag = if legacy { "ismaster" } else { "isWritablePrimary" };
+    let primary_flag = if legacy {
+        "ismaster"
+    } else {
+        "isWritablePrimary"
+    };
     // The counter moves when the TOPOLOGY moves, which for a single-node
     // surrogate means a `replSetStepDown`. A driver ignores a "not primary"
     // error whose topologyVersion is not NEWER than the one it already has,
@@ -465,14 +469,36 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
 /// so drivers enable the right feature flags; `secantusVersion` marks the actual
 /// build (the crate version here; `commands.py` reads `secantus.__version__`).
 pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    // mongod's keys in mongod's order (8.2.11), each saying what is true of
+    // THIS build: no source modules, no script engine, a Rust compiler, and
+    // WiredTiger as the one storage engine. `maxBsonObjectSize` is an int64
+    // here and an int32 in `hello`, as on mongod.
     Ok(doc! {
         "version": SERVER_VERSION,
         "secantusVersion": env!("CARGO_PKG_VERSION"),
-        "gitVersion": "0".repeat(40),
         "versionArray": SERVER_VERSION_ARRAY.iter().map(|n| Bson::Int32(*n)).collect::<Vec<_>>(),
+        "gitVersion": "0".repeat(40),
+        "modules": Vec::<Bson>::new(),
+        "allocator": "mimalloc",
+        "javascriptEngine": "none",
+        "sysinfo": "deprecated",
+        "openssl": {"running": "rustls"},
+        "buildEnvironment": {
+            "distmod": "",
+            "distarch": std::env::consts::ARCH,
+            "cc": "rustc",
+            "ccflags": "",
+            "cxx": "",
+            "cxxflags": "",
+            "linkflags": "",
+            "target_arch": std::env::consts::ARCH,
+            "target_os": std::env::consts::OS,
+            "cppdefines": "",
+        },
         "bits": 64_i32,
-        "debug": false,
-        "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
+        "debug": cfg!(debug_assertions),
+        "maxBsonObjectSize": Bson::Int64(i64::from(MAX_BSON_OBJECT_SIZE)),
+        "storageEngines": ["wiredTiger"],
         "ok": 1.0,
     })
 }

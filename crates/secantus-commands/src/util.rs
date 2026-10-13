@@ -576,13 +576,11 @@ pub(crate) fn truthy(v: &Bson) -> bool {
 pub(crate) fn truthy_number_or_bool(v: &Bson) -> Option<bool> {
     match v {
         Bson::Boolean(b) => Some(*b),
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
-            Some(match v {
-                Bson::Double(d) => *d != 0.0,
-                Bson::Decimal128(d) => d.to_string().parse::<f64>().is_ok_and(|f| f != 0.0),
-                other => as_i64(other).is_some_and(|n| n != 0),
-            })
-        }
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => Some(match v {
+            Bson::Double(d) => *d != 0.0,
+            Bson::Decimal128(d) => d.to_string().parse::<f64>().is_ok_and(|f| f != 0.0),
+            other => as_i64(other).is_some_and(|n| n != 0),
+        }),
         _ => None,
     }
 }

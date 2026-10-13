@@ -3339,14 +3339,40 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             },
         );
     }
+    // The process's own numbers: its id, and how long since it first
+    // answered a command. Each was a constant 0 before.
+    let now = bson::DateTime::now();
+    let up_millis =
+        (now.timestamp_millis() - crate::handshake::process_started().timestamp_millis()).max(0);
+    let host = match ctx.server_address.as_ref() {
+        Some((host, port)) => format!("{host}:{port}"),
+        None => "secantus".to_string(),
+    };
+    // Counted per command as mongod counts them; int64, as mongod sends them.
+    let counted = ctx
+        .top_stats
+        .as_ref()
+        .map(|s| s.opcounters())
+        .unwrap_or_default();
+    let opcounters: Document = crate::topstats::OPCOUNTERS
+        .iter()
+        .zip(counted)
+        .map(|(name, n)| (name.to_string(), Bson::Int64(n)))
+        .collect();
+    let network = ctx
+        .top_stats
+        .as_ref()
+        .map(|s| s.network())
+        .unwrap_or_default();
     Ok(doc! {
-        "host": "secantus",
+        "host": host,
         "version": crate::SERVER_VERSION,
         "process": "mongod",
-        "pid": Bson::Int64(0),
-        "uptime": 0.0,
-        "uptimeMillis": Bson::Int64(0),
-        "localTime": bson::DateTime::now(),
+        "pid": Bson::Int64(i64::from(std::process::id())),
+        "uptime": (up_millis / 1000) as f64,
+        "uptimeMillis": Bson::Int64(up_millis),
+        "uptimeEstimate": Bson::Int64(up_millis / 1000),
+        "localTime": now,
         "metrics": metrics,
         // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
         // `connections.totalCreated` off serverStatus to check the connection
@@ -3363,9 +3389,12 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "available": 0i32,
             "totalCreated": conns.total_created as i32,
         },
-        "opcounters": {
-            "insert": 0i32, "query": 0i32, "update": 0i32,
-            "delete": 0i32, "getmore": 0i32, "command": 0i32,
+        "opcounters": opcounters,
+        // What the server has read and written, counted off the sockets.
+        "network": {
+            "bytesIn": Bson::Int64(network[1]),
+            "bytesOut": Bson::Int64(network[2]),
+            "numRequests": Bson::Int64(network[0]),
         },
         // Storage-engine identity. Drivers gate real behaviour on this:
         // mongo-php-library's `skipIfTransactionsNotSupported` reads
@@ -3384,7 +3413,6 @@ pub fn server_status(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "persistent": persistent,
             "backupCursorOpen": false,
         },
-        "network": { "numRequests": 0i32, "bytesIn": 0i32, "bytesOut": 0i32 },
         // Categorical self-identification: real mongod never has this key.
         // Tooling (the conformance-gauge tripwire, ad-hoc smoke scripts)
         // checks it to prove it's talking to SecantusDB rather than an
@@ -3427,10 +3455,25 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         op.insert("clientMetadata", meta);
     }
 
-    Ok(doc! {
-        "inprog": vec![Bson::Document(op)],
-        "ok": 1.0,
-    })
+    // Every field that is not the command's own is a filter over the
+    // operations (`{currentOp: 1, op: "query"}`).
+    let filter: Document = doc
+        .iter()
+        .skip(1)
+        .filter(|(key, _)| {
+            !matches!(key.as_str(), "$all" | "$ownOps" | "$truncateOps")
+                && !crate::params::is_generic_arg(key)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let shown = filter.is_empty()
+        || secantus_core::query::matches(&op, &filter, &Document::new(), None).unwrap_or(false);
+    let inprog: Vec<Bson> = if shown {
+        vec![Bson::Document(op)]
+    } else {
+        Vec::new()
+    };
+    Ok(doc! { "inprog": inprog, "ok": 1.0 })
 }
 
 /// `validate` — mongod's collection consistency check. SecantusDB stores
@@ -3467,9 +3510,7 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // An option is on for any value but null, false and zero (a string too).
     let on = |option: &str| match doc.get(option) {
         None | Some(Bson::Null) | Some(Bson::Boolean(false)) => false,
-        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => {
-            crate::util::truthy(v)
-        }
+        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => crate::util::truthy(v),
         Some(_) => true,
     };
     if on("repair") && ctx.replica_set_name.is_some() {

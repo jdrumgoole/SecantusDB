@@ -291,6 +291,7 @@ mod top_counter_tests {
 mod tests {
     use super::*;
     use crate::dispatch;
+    use crate::SERVER_VERSION_ARRAY;
 
     fn ctx() -> CommandContext {
         CommandContext::new(1)
@@ -330,7 +331,7 @@ mod tests {
     fn kill_op_without_registry_reports_no_registry() {
         let reply = dispatch(&doc! {"killOp": 1, "op": 7_i32}, &mut ctx());
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
-        assert_eq!(reply.get_str("info").unwrap(), "no connection registry");
+        assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
     #[test]
@@ -341,7 +342,7 @@ mod tests {
         });
         let mut c = ctx().with_conn_killer(killer.clone());
         let reply = dispatch(&doc! {"killOp": 1, "op": 42_i64}, &mut c);
-        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
+        assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
         assert_eq!(
             *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
             vec![42]
@@ -356,25 +357,25 @@ mod tests {
         });
         let mut c = ctx().with_conn_killer(killer);
         let reply = dispatch(&doc! {"killOp": 1, "op": 99_i32}, &mut c);
-        assert_eq!(
-            reply.get_str("info").unwrap(),
-            "no operation with that opid"
-        );
+        assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
+    /// mongod takes a number and nothing else: a string of digits is a
+    /// type error, and nothing is closed for it.
     #[test]
-    fn kill_op_accepts_a_numeric_string_op() {
+    fn kill_op_refuses_a_numeric_string_op() {
         let killer = std::sync::Arc::new(FakeKiller {
             found: true,
             killed: Default::default(),
         });
         let mut c = ctx().with_conn_killer(killer.clone());
         let reply = dispatch(&doc! {"killOp": 1, "op": "7"}, &mut c);
-        assert_eq!(reply.get_str("info").unwrap(), "operation killed");
-        assert_eq!(
-            *killer.killed.lock().unwrap_or_else(|e| e.into_inner()),
-            vec![7]
-        );
+        assert_eq!(reply.get_i32("code").unwrap(), 14);
+        assert!(killer
+            .killed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     #[test]

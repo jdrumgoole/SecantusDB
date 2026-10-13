@@ -41,6 +41,65 @@ pub(crate) fn flag(doc: &Document, command: &str, field: &str) -> Result<bool, C
     }
 }
 
+/// The argument of `usersInfo` / `rolesInfo`, checked as mongod checks it
+/// (8.2.11): `1` for all of the database's, a name, a `{user|role, db}`
+/// document, a list of those, or `{forAllDBs: true}`. `kind` is `UserName`
+/// or `RoleName` and `field` the name's own field. Returns whether the
+/// request names its principals exactly, which the detail options need.
+pub(crate) fn principal_argument(
+    arg: Option<&Bson>,
+    kind: &str,
+    field: &str,
+) -> Result<bool, CommandError> {
+    let bad = |message: String| CommandError::new(2, "BadValue", message);
+    let one = |value: &Bson| -> Result<(), CommandError> {
+        match value {
+            Bson::String(_) => Ok(()),
+            Bson::Document(name) => {
+                for required in [field, "db"] {
+                    if let Some(unknown) = name
+                        .keys()
+                        .find(|k| k.as_str() != field && k.as_str() != "db")
+                    {
+                        // mongod's own message closes no quote.
+                        return Err(bad(format!(
+                            "{kind} contains an unknown field named: '{unknown}"
+                        )));
+                    }
+                    match name.get(required) {
+                        Some(Bson::String(_)) => {}
+                        None => {
+                            return Err(bad(format!(
+                                "{kind} must contain a field named: {required}"
+                            )))
+                        }
+                        Some(other) => {
+                            return Err(bad(format!(
+                                "{kind} must contain a string field named: {required}. But, \
+                                 has type {}",
+                                bson_type_name(other)
+                            )))
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(bad(format!("{kind} must be either a string or an object"))),
+        }
+    };
+    match arg {
+        Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => Ok(false),
+        Some(Bson::Double(d)) if *d == 1.0 => Ok(false),
+        Some(Bson::Document(all)) if all.contains_key("forAllDBs") => Ok(false),
+        Some(Bson::Array(items)) => {
+            items.iter().try_for_each(one)?;
+            Ok(true)
+        }
+        Some(other) => one(other).map(|()| true),
+        None => Err(bad(format!("{kind} must be either a string or an object"))),
+    }
+}
+
 /// `listCommands`: the commands THIS server has, each with mongod's own row
 /// for it. A command of this server's own that mongod lacks is listed with
 /// what is true of it.
@@ -199,10 +258,14 @@ pub fn connection_status(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     let mut uuid = [0_u8; 16];
     if let Some(auth) = ctx.conn_auth.as_ref().and_then(|a| a.lock().ok()) {
         for (db, user) in &auth.authenticated {
-            users.push(Bson::Document(doc! {"user": user.clone(), "db": db.clone()}));
+            users.push(Bson::Document(
+                doc! {"user": user.clone(), "db": db.clone()},
+            ));
         }
         for (role, db) in &auth.effective_roles {
-            roles.push(Bson::Document(doc! {"role": role.clone(), "db": db.clone()}));
+            roles.push(Bson::Document(
+                doc! {"role": role.clone(), "db": db.clone()},
+            ));
         }
         uuid = auth.client_uuid;
     }
@@ -244,7 +307,11 @@ pub fn whatsmyuri(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 pub fn kill_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let op_id = match doc.get("op") {
         None => {
-            return Err(CommandError::new(4, "NoSuchKey", "Missing expected field \"op\""));
+            return Err(CommandError::new(
+                4,
+                "NoSuchKey",
+                "Missing expected field \"op\"",
+            ));
         }
         Some(Bson::Int32(n)) => i64::from(*n),
         Some(Bson::Int64(n)) => *n,
@@ -463,7 +530,10 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         }
         // A value `setParameter` changed wins over the default, so the two
         // commands cannot disagree about what the server holds.
-        let value = current.as_ref().and_then(|s| s.get(name)).unwrap_or(default);
+        let value = current
+            .as_ref()
+            .and_then(|s| s.get(name))
+            .unwrap_or(default);
         if details {
             out.insert(
                 name,
@@ -478,7 +548,11 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         }
     }
     if out.is_empty() {
-        return Err(CommandError::new(72, "InvalidOptions", "no option found to get"));
+        return Err(CommandError::new(
+            72,
+            "InvalidOptions",
+            "no option found to get",
+        ));
     }
     out.insert("ok", 1.0);
     Ok(out)
@@ -496,13 +570,19 @@ mod tests {
 
     #[test]
     fn get_parameter_answers_in_name_order_and_refuses_when_it_has_none() {
-        let reply =
-            get_parameter(&doc! {"getParameter": 1, "quiet": 1, "logLevel": 0}, &mut ctx()).unwrap();
+        let reply = get_parameter(
+            &doc! {"getParameter": 1, "quiet": 1, "logLevel": 0},
+            &mut ctx(),
+        )
+        .unwrap();
         assert_eq!(
             reply.keys().map(String::as_str).collect::<Vec<_>>(),
             ["logLevel", "quiet", "ok"]
         );
-        for request in [doc! {"getParameter": 1}, doc! {"getParameter": 1, "bogus": 1}] {
+        for request in [
+            doc! {"getParameter": 1},
+            doc! {"getParameter": 1, "bogus": 1},
+        ] {
             let e = get_parameter(&request, &mut ctx()).unwrap_err();
             assert_eq!((e.code, e.errmsg.as_str()), (72, "no option found to get"));
         }
@@ -519,7 +599,10 @@ mod tests {
         };
         let reply = get_parameter(&request, &mut ctx()).unwrap();
         let quiet = reply.get_document("quiet").unwrap();
-        assert_eq!(quiet, &doc! {"value": false, "settableAtRuntime": true, "settableAtStartup": true});
+        assert_eq!(
+            quiet,
+            &doc! {"value": false, "settableAtRuntime": true, "settableAtStartup": true}
+        );
         let fcv = reply.get_document("featureCompatibilityVersion").unwrap();
         assert_eq!(fcv.get_bool("settableAtStartup"), Ok(false));
         let runtime = doc! {"getParameter": {"setAt": "runtime"}, "enableTestCommands": 1};
@@ -532,18 +615,33 @@ mod tests {
             let reply = kill_op(&doc! {"killOp": 1, "op": op}, &mut ctx()).unwrap();
             assert_eq!(reply.get_str("info"), Ok("attempting to kill op"));
         }
-        let code = |op: Bson| kill_op(&doc! {"killOp": 1, "op": op}, &mut ctx()).unwrap_err().code;
+        let code = |op: Bson| {
+            kill_op(&doc! {"killOp": 1, "op": op}, &mut ctx())
+                .unwrap_err()
+                .code
+        };
         assert_eq!(code(Bson::String("x".into())), 14);
         assert_eq!(code(Bson::Double(2.5)), 2);
         assert_eq!(code(Bson::Int64(1 << 40)), 26823);
-        assert_eq!(kill_op(&doc! {"killOp": 1}, &mut ctx()).unwrap_err().code, 4);
+        assert_eq!(
+            kill_op(&doc! {"killOp": 1}, &mut ctx()).unwrap_err().code,
+            4
+        );
     }
 
     #[test]
     fn get_log_names_its_logs_and_refuses_another() {
         let names = get_log(&doc! {"getLog": "*"}, &mut ctx()).unwrap();
         assert_eq!(names.get_array("names").unwrap().len(), 2);
-        assert_eq!(get_log(&doc! {"getLog": "bogus"}, &mut ctx()).unwrap_err().code, 96);
-        assert_eq!(get_log(&doc! {"getLog": 1}, &mut ctx()).unwrap_err().code, 14);
+        assert_eq!(
+            get_log(&doc! {"getLog": "bogus"}, &mut ctx())
+                .unwrap_err()
+                .code,
+            96
+        );
+        assert_eq!(
+            get_log(&doc! {"getLog": 1}, &mut ctx()).unwrap_err().code,
+            14
+        );
     }
 }

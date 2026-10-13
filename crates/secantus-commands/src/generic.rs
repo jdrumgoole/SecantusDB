@@ -334,13 +334,7 @@ fn read_preference(pref: &Document) -> Result<(), CommandError> {
             ("tags", v) => return Err(wrong_type(&path, v, "type 'array'")),
             ("maxStalenessSeconds", v) => match crate::util::as_i64(v) {
                 Some(seconds) => staleness = Some(seconds),
-                None => {
-                    return Err(wrong_type(
-                        &path,
-                        v,
-                        "types '[double, int, long, decimal]'",
-                    ))
-                }
+                None => return Err(wrong_type(&path, v, "types '[double, int, long, decimal]'")),
             },
             ("hedge", Bson::Document(_)) => {}
             ("hedge", v) => return Err(wrong_type(&path, v, "type 'object'")),
@@ -422,7 +416,11 @@ mod tests {
             "BSON field 'ping.apiStrict' is the wrong type 'int', expected type 'bool'"
         );
         assert_eq!(refusal(doc! {"ping": 1, "apiStrict": false}).0, 4886600);
-        assert!(check(&doc! {"ping": 1, "apiVersion": null, "apiStrict": null}, "ping").is_ok());
+        assert!(check(
+            &doc! {"ping": 1, "apiVersion": null, "apiStrict": null},
+            "ping"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -431,8 +429,14 @@ mod tests {
         assert_eq!(with(doc! {}).0, 40414);
         assert_eq!(with(doc! {"mode": "bogus"}).0, 2);
         assert_eq!(with(doc! {"mode": "primary", "tags": [{"a": "b"}]}).0, 2);
-        assert_eq!(with(doc! {"mode": "secondary", "maxStalenessSeconds": 1}).0, 160);
-        assert_eq!(with(doc! {"mode": "primary", "maxStalenessSeconds": 90}).0, 2);
+        assert_eq!(
+            with(doc! {"mode": "secondary", "maxStalenessSeconds": 1}).0,
+            160
+        );
+        assert_eq!(
+            with(doc! {"mode": "primary", "maxStalenessSeconds": 90}).0,
+            2
+        );
         let fine = doc! {"find": "c", "$readPreference": {"mode": "secondary", "tags": [{}]}};
         assert!(check(&fine, "find").is_ok());
         assert_eq!(

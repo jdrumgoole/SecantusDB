@@ -277,8 +277,39 @@ fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bs
     record.get_array("roles").ok().cloned()
 }
 
+/// A field mongod's parser requires and types (8.2.11): absent or null is
+/// 40414, another type is 14.
+fn required_field(
+    doc: &Document,
+    command: &str,
+    field: &str,
+    expected: &str,
+    fits: fn(&Bson) -> bool,
+) -> Result<(), CommandError> {
+    match doc.get(field) {
+        None | Some(Bson::Null) => Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            format!("BSON field '{command}.{field}' is missing but a required field"),
+        )),
+        Some(value) if fits(value) => Ok(()),
+        Some(value) => Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{command}.{field}' is the wrong type '{}', expected type \
+                 '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )),
+    }
+}
+
 /// `saslStart` — begin a SCRAM-SHA-1 / SCRAM-SHA-256 conversation.
 pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    required_field(doc, "saslStart", "mechanism", "string", |v| {
+        matches!(v, Bson::String(_))
+    })?;
     let mechanism = doc.get_str("mechanism").unwrap_or("");
     if mechanism == MONGODB_X509 {
         return sasl_start_x509(doc, ctx);
@@ -318,6 +349,9 @@ pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// `saslContinue` — verify the client proof and finish the conversation.
 pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    required_field(doc, "saslContinue", "conversationId", "int", |v| {
+        matches!(v, Bson::Int32(_))
+    })?;
     let payload = payload_bytes(doc.get("payload"));
     let incoming_id = doc.get_i32("conversationId").ok();
 
@@ -466,12 +500,14 @@ fn sasl_start_x509(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// MONGODB-X509 (a one-shot, no challenge/response). Only X509 is supported on
 /// this path (SCRAM goes through `saslStart`).
 pub fn authenticate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    required_field(doc, "authenticate", "mechanism", "string", |v| {
+        matches!(v, Bson::String(_))
+    })?;
     let mechanism = doc.get_str("mechanism").unwrap_or(SCRAM_SHA_256);
     if mechanism != MONGODB_X509 {
-        return Err(bad_value(format!(
-            "authenticate: only '{MONGODB_X509}' is supported on this command path; \
-             use saslStart for '{SCRAM_SHA_256}'"
-        )));
+        // mongod's whole answer to a mechanism this command does not run
+        // (the SCRAM mechanisms go through `saslStart`).
+        return Err(auth_failure("Authentication failed."));
     }
     let claimed = doc.get_str("user").ok().map(String::from);
     let (db_name, dn) = verify_x509(ctx, claimed)?;
@@ -909,6 +945,34 @@ pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -
 
 /// `usersInfo` — list user records (optionally with credentials).
 pub fn users_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let exact = crate::serverinfo::principal_argument(doc.get("usersInfo"), "UserName", "user")?;
+    let mut detail = false;
+    for option in ["showCredentials", "showCustomData"] {
+        crate::serverinfo::flag(doc, "usersInfo", option)?;
+    }
+    for option in ["showPrivileges", "showAuthenticationRestrictions"] {
+        detail |= crate::serverinfo::flag(doc, "usersInfo", option)?;
+    }
+    if detail && !exact {
+        return Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            "Privilege or restriction details require exact-match usersInfo queries",
+        ));
+    }
+    if let Some(filter) = doc.get("filter") {
+        if !matches!(filter, Bson::Document(_) | Bson::Null) {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'usersInfo.filter' is the wrong type '{}', expected type \
+                     'object'",
+                    secantus_core::query::bson_type_name(filter)
+                ),
+            ));
+        }
+    }
     let db_name = if ctx.db_name.is_empty() {
         "admin".to_string()
     } else {
