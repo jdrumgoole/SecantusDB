@@ -268,12 +268,6 @@ def test_host_info_system_fields(rust_mongo: Any) -> None:
 
 
 @pytest.mark.backlog("RM-040")
-def test_build_info_has_no_secantus_version(rust_mongo: Any) -> None:
-    """mongod 8.2.11's `buildInfo` has no `secantusVersion`."""
-    assert "secantusVersion" not in rust_mongo.admin.command("buildInfo")
-
-
-@pytest.mark.backlog("RM-040")
 def test_coll_stats_wiredtiger_and_index_details(rust_mongo: Any) -> None:
     """mongod 8.2.11's `collStats` has `wiredTiger` and `indexDetails`."""
     db = _fresh(rust_mongo, "rm040cs")

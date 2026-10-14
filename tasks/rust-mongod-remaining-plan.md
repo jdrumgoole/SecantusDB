@@ -163,8 +163,7 @@ Size: two batches; 1a is the larger one.
       `local.oplog.rs`, `local.system.replset`, `admin.system.version`;
       `electionCandidateMetrics`. (`replSetReconfig` is RM-143.)
 - [x] Commands not there: `lockInfo`, `features`, `getClusterParameter`,
-      the plan-cache commands. `$listCatalog` is RM-040: it reports a
-      durable catalog this store does not have.
+      the plan-cache commands. (`$listCatalog` is below.)
 - [ ] `serverStatus` sections (about 30), each only with numbers this server
       really has; a section with nothing true to say stays absent (RM-034).
 - [ ] `listDatabases` lists `config` (it needs `config.system.sessions`,
@@ -172,7 +171,15 @@ Size: two batches; 1a is the larger one.
       `$indexStats` use counts; `collStats` `wiredTiger` (RM-040). Done:
       `admin`, `hostInfo` `system`, `dbStats` view definitions.
 - [x] Runtime-settable parameters `cursorTimeoutMillis`,
-      `transactionLifetimeLimitSeconds`. `notablescan` waits on Joe (RM-035).
+      `transactionLifetimeLimitSeconds`.
+- [ ] `notablescan` (RM-035), decided 2026-10-15: refuse with 291 a query
+      the `explain` planner answers with a collection scan; an empty filter
+      runs; mongod's code and closing words, not its query-tree text.
+- [ ] `$listCatalog` (RM-040), decided 2026-10-15: build it from this
+      server's catalog; `ident` is the shard table holding the collection,
+      `idxIdent` the shared index table, no `multikeyPaths`.
+- Decided 2026-10-15: `buildInfo.secantusVersion` and `serverStatus.secantus`
+  stay (a scope decision in 7.082).
 - [ ] The profiler (RM-038) and `OP_COMPRESSED` (RM-039).
 
   **Batch 1 done 2026-10-15** (branch `rust-admin-diag`). Found on the way
@@ -289,7 +296,6 @@ Each unblocks rows that otherwise stay open.
 | The privileges for this server's own `secantusAdmin` commands, which were chosen, not measured (7.084) | |
 | `explain`: mongod's plan or this server's access path | |
 | Stored time-series buckets instead of derived | |
-| `notablescan` | 3 |
 | The profiler `filter`; `system.profile` | 6 |
 | Wire compression (`OP_COMPRESSED`) | 2 |
 | Server-side JavaScript (`$where`) | 3 Go leaves, several probe rows |

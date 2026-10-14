@@ -736,8 +736,10 @@ Still different:
       `setParameter` changes six (`cursorTimeoutMillis` and
       `transactionLifetimeLimitSeconds` among them, each applied to its
       registry); the others mongod changes at runtime are 20 here.
-      `notablescan` is not there to set, so a scan is never refused: whether
-      to add it waits on Joe (`tasks/rust-mongod-remaining-plan.md`).
+      `notablescan` is not there to set, so a scan is never refused. Decided
+      2026-10-15: add it, refusing with 291 a query the `explain` planner
+      would answer with a collection scan (an empty filter still runs), with
+      mongod's code and closing words but not its query-tree text.
       Backlog-ID: RM-035
       Verify: tests/backlog/test_rm_029_056.py::test_notablescan_parameter
 - [ ] **Commands answered only as far as this server honours them.**
@@ -759,13 +761,17 @@ Still different:
       `system.profile` would claim a profiler there is not: this needs one.
       Backlog-ID: RM-038
       Verify: tests/backlog/test_rm_029_056.py::test_profile_filter_is_stored,tests/backlog/test_rm_029_056.py::test_profile_level_creates_system_profile
+- **Scope decision — `buildInfo.secantusVersion` and `serverStatus.secantus`
+  stay** (Joe, 2026-10-15). Each names this build beside mongod's own
+  fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
+  `docs/servers.md`), and how the admin UI tells this server from mongod;
+  no driver compares a whole `buildInfo` reply.
 - [ ] **`hello` names no compressor.** `OP_COMPRESSED` is not spoken, so a
       `compression` list is checked and not answered (2).
       Backlog-ID: RM-039
       Verify: tests/backlog/test_rm_029_056.py::test_hello_names_compressors
-- [ ] `buildInfo` has no per-OS block and carries `secantusVersion`
-      (documented in `CLAUDE.md` as this server's own field: removing it is
-      Joe's call); `collStats` has no `wiredTiger` or `indexDetails`;
+- [ ] `buildInfo` has no per-OS block; `collStats` has no `wiredTiger` or
+      `indexDetails`;
       `$indexStats` counts no use of an index and `latencyStats` is zeros;
       `listDatabases` lists no `config` (mongod writes its sessions to
       `config.system.sessions`; here they are kept in memory), so `dbHash`
@@ -773,11 +779,12 @@ Still different:
       random signing keys there, a digest no server could match);
       `connectionStatus` lists no privileges for a user who has some;
       `$listCatalog`
-      is unknown (it reports mongod's durable catalog, WiredTiger idents and
-      all, and this store is laid out differently); `hostInfo.extra` is
-      empty on Linux.
+      is unknown (decided 2026-10-15: build it from this server's own
+      catalog, `ident` naming the shard table that holds the collection and
+      `idxIdent` the shared index table, with no `multikeyPaths`);
+      `hostInfo.extra` is empty on Linux.
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_build_info_has_no_secantus_version,tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_index_stats_counts_use,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config,tests/backlog/test_rm_029_056.py::test_list_catalog_stage
+      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_index_stats_counts_use,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config,tests/backlog/test_rm_029_056.py::test_list_catalog_stage
 
 ### 7.081 Geo queries -- 2026-10-13
 
