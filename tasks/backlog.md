@@ -5147,11 +5147,6 @@ These are explicit non-goals. Don't add them without a reason.
       - **Encodings other than UTF8, LATIN1 and SQL_ASCII convert only
         their ASCII range**; anything above it is 0A000. A conversion
         table per encoding is what PostgreSQL has.
-      - **`age(xid)` of a normal transaction id is 0A000.** This server's
-        xids are not PostgreSQL's 32-bit counter, so there is nothing to
-        measure the age against; `age(datfrozenxid)` in a monitoring
-        query fails. The special xids 0-2 answer INT_MAX, as in
-        PostgreSQL.
       - **A set-returning function inside an expression**
         (`pg_typeof(json_each(j))`), and two of them in one select list,
         are refused.
@@ -5172,9 +5167,13 @@ These are explicit non-goals. Don't add them without a reason.
         name). The selection of the words shown is not `mark_hl_words`:
         a document over 35 words is cut by a rule of this server's own,
         and has not been compared with PostgreSQL.
-      - **A column of a composite type cannot be taken apart**: `(v).*`
-        and `(v).f` are 0A000 `this field selection is not supported
-        yet`.
+      - **A record out of a subquery has its fields described as
+        `text`**: `select (x).n from (select f() as x) s` answers the
+        right value under the wrong column type, because the subquery's
+        column is `record` and its field types do not travel with it. A
+        named composite (`row(...)::t`) is typed. (`(v).f`, `(v).*` and
+        `SET v.f = ...` over a composite column work since 2026-10-14,
+        `pg_corpora/composite_fields.sql`.)
       - **Only `line <-> point` measures with `pg_hypot`.** Every other
         distance in `geom.rs` uses Rust's `f64::hypot`, which can differ
         from PostgreSQL in the last digit; no corpus line has shown one.

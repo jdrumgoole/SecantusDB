@@ -154,6 +154,20 @@ concurrency work to `crates/`.
   A deliberate divergence from the exemplar is Joe's call, and stays as narrow
   as what he actually authorised — a decision about last-digit rounding does not
   license returning a different answer.
+- **When the real product answers from state a server does not keep, model
+  the real product's mechanism -- never a stand-in of our own** (Joe,
+  2026-10-14: "We always choose the Postgres model"). Build that state the
+  way PostgreSQL (or `mongod`) keeps it: what it persists, what survives a
+  restart, what moves it. A value that is merely consistent with itself is
+  not the model. The case that set the rule: `age(xid)`. This server had no
+  32-bit xid counter, and the first version froze the catalog at each run's
+  first xid, so `age(datfrozenxid)` counted from startup and reset on every
+  restart. It was replaced before merging by PostgreSQL's own model: one
+  persisted counter that runs on across restarts, and `datfrozenxid` fixed
+  at 722 where `initdb` leaves it (`crates/secantus-pg/src/xids.rs`). When
+  the real mechanism is out of reach, refuse by name (0A000) and put it in
+  the backlog; a plausible stand-in is a decision for Joe, never the
+  default.
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
 - **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
 
@@ -666,9 +680,9 @@ one request path:
     is left is the function surface, and it is measured two ways.
 
     **The corpora are nearly clean, and that says less than it looks.**
-    Measured 2026-10-12, all 261 corpora under `pg_corpora/`, one at a
-    time (`tools/probes/pg_corpora_sweep.py`): 13 divergences in 9,737
-    checks. An earlier version of this paragraph named `fts`,
+    Measured 2026-10-14, all 262 corpora under `pg_corpora/`, one at a
+    time (`tools/probes/pg_corpora_sweep.py`): 7 divergences in 9,870
+    checks (13 in 9,737 on 2026-10-12). An earlier version of this paragraph named `fts`,
     `datetimes` and `char_padding` as the corpora with the most divergences;
     each was at none when measured. A corpus holds the statements somebody
     thought to write, so a clean corpus is silent about the rest.

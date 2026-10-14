@@ -43,6 +43,9 @@ pub enum XidOp {
     IfAssigned,
     /// The current snapshot's text (`xmin:xmax:xip,...`).
     Snapshot,
+    /// `GetStableLatestTransactionId`: the transaction's xid if it has one,
+    /// else the next xid to be assigned. What `age(xid)` measures from.
+    Stable,
 }
 
 /// `(session pid, what) -> the answer`.
@@ -67,6 +70,20 @@ pub fn set_session_pid(pid: i32) {
 fn ask(op: XidOp) -> Option<String> {
     let hook = XID_HOOK.get()?;
     hook(SESSION_PID.with(std::cell::Cell::get), op)
+}
+
+/// `xid_age`: how many transactions before the current one `xid` is, by
+/// 32-bit wrapping arithmetic. A special xid (0, 1, 2) is INT_MAX old.
+/// Without a hook the current xid is the first normal one.
+pub fn xid_age(xid: u32) -> i32 {
+    if xid < 3 {
+        return i32::MAX;
+    }
+    let now = ask(XidOp::Stable)
+        .and_then(|x| x.parse::<u64>().ok())
+        .unwrap_or(3);
+    // An xid8 is `epoch << 32 | xid`; the xid is its low half.
+    (now as u32).wrapping_sub(xid) as i32
 }
 
 /// The set-returning ones.

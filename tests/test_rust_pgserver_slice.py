@@ -20963,3 +20963,82 @@ def test_a_pg_hba_conf_the_server_cannot_apply_stops_it_starting(
         )
         assert done.returncode != 0, args
         assert expected in done.stdout + done.stderr, (args, done.stdout, done.stderr)
+
+
+def test_composite_fields_are_selected_expanded_and_assigned(home: Path) -> None:
+    """`(v).f`, `(v).*` and `(t.v).*` over a composite column, nested ones,
+    and `SET v.a = ...` / `INSERT (v.a, ...)` that assign a field. Each
+    answer is PostgreSQL 15.19's (`pg_corpora/composite_fields.sql`); the
+    expansion and both assignments were refused with 0A000 / 42804."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("create type cf_c as (a int, b text)")
+        cur.execute("create type cf_n_t as (inner_b cf_c, c int)")
+        cur.execute("create table cf_t (id int primary key, v cf_c)")
+        cur.execute("create table cf_n (id int primary key, w cf_n_t)")
+        cur.execute("insert into cf_t values (1, row(1, 'x')), (2, null), (3, row(null, 'y'))")
+        cur.execute("insert into cf_n values (1, row(row(2, 'p'), 3)), (2, null)")
+        cur.execute("select id, (v).* from cf_t order by id")
+        assert [d.name for d in cur.description] == ["id", "a", "b"]
+        assert cur.fetchall() == [(1, 1, "x"), (2, None, None), (3, None, "y")]
+        cur.execute("select (t.v).* from cf_t t order by t.id")
+        assert cur.fetchall() == [(1, "x"), (None, None), (None, "y")]
+        cur.execute("select ((n.w).inner_b).*, (n.w).c from cf_n n order by id")
+        assert cur.fetchall() == [(2, "p", 3), (None, None, None)]
+        cur.execute("update cf_t set v.b = 'm', v.a = 8 where id = 3 returning (v).*")
+        assert cur.fetchall() == [(8, "m")]
+        cur.execute("update cf_t set v.b = 'n' where id = 2 returning v")
+        assert cur.fetchall() == [("(,n)",)]
+        cur.execute("insert into cf_t (id, v.b) values (10, 'w') returning (v).a, (v).b")
+        assert cur.fetchall() == [(None, "w")]
+        with pytest.raises(psycopg.errors.UndefinedColumn) as exc:
+            cur.execute("update cf_t set v.nope = 1")
+        assert str(exc.value).startswith(
+            'cannot assign to field "nope" of column "v" because there is no such column'
+        )
+        with pytest.raises(psycopg.errors.DatatypeMismatch):
+            cur.execute("update cf_t set id.a = 1")
+
+
+def test_a_predicate_over_a_column_is_described_as_a_boolean(home: Path) -> None:
+    """`x BETWEEN a AND b` over a table column was described as its left
+    operand's type, so a binary client read a boolean as an int4."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        cur = conn.cursor(binary=True)
+        cur.execute("create table pb_t (id int primary key, n int)")
+        cur.execute("insert into pb_t values (1, 3), (2, 9)")
+        cur.execute("select n between 0 and 5, id in (1), n::text like '9%' from pb_t order by id")
+        assert cur.fetchall() == [(True, True, False), (False, False, True)]
+
+
+def test_transaction_ids_run_on_across_a_restart_as_on_postgresql(home: Path) -> None:
+    """PostgreSQL's model: one counter for the cluster that a restart does
+    not reset, a store that starts where `initdb` leaves one (frozen at 722,
+    next 723), and `age(xid)` as `xid_age` computes it -- so
+    `age(datfrozenxid)` grows over the store's life, restarts included."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("select age('0'::xid), age('2'::xid)")
+        assert cur.fetchone() == (2147483647, 2147483647)
+        cur.execute("select datfrozenxid::text from pg_database where datname = current_database()")
+        assert cur.fetchone() == ("722",)
+        cur.execute("select txid_current()")
+        (first,) = cur.fetchone()
+        assert first == 723
+        cur.execute("select age(datfrozenxid) from pg_database where datname = current_database()")
+        assert cur.fetchone() == (2,)
+        with conn.transaction():
+            cur.execute("select age(pg_current_xact_id()::xid)")
+            assert cur.fetchone() == (0,)
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("select txid_current()")
+        (after,) = cur.fetchone()
+        assert after > first + 1
+        cur.execute("select age(datfrozenxid) from pg_database where datname = current_database()")
+        (age,) = cur.fetchone()
+        assert age == after + 1 - 722

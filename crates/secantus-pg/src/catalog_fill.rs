@@ -838,10 +838,13 @@ impl PgHandler {
                             "relisshared" => Bson::Boolean(false),
                             "relpages" | "relallvisible" => Bson::Int32(0),
                             // PostgreSQL 15 freezes a relation with storage at
-                            // the cluster's xid; one without has 0.
+                            // the cluster's xid; one without has 0. Here that
+                            // xid is this run's first (`xids::frozen_xid`).
                             "relfrozenxid" | "relminmxid" => {
                                 Bson::Int64(match (kind.as_str(), c) {
-                                    ("r" | "m" | "t", "relfrozenxid") => 722,
+                                    ("r" | "m" | "t", "relfrozenxid") => {
+                                        i64::from(crate::xids::frozen_xid())
+                                    }
                                     ("r" | "m" | "t", _) => 1,
                                     _ => 0,
                                 })

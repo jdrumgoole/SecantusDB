@@ -8804,6 +8804,85 @@ fn plan_on_conflict(
     })
 }
 
+/// An INSERT whose column list names fields of a composite column, with
+/// each VALUES row's field values gathered into the column's `ROW(...)`
+/// (`composite_field_targets`). `None` when no column names a field.
+fn insert_composite_fields(
+    i: &pg_query::protobuf::InsertStmt,
+    def: &TableDef,
+    table: &str,
+) -> Result<Option<pg_query::protobuf::InsertStmt>> {
+    let names_field = i
+        .cols
+        .iter()
+        .any(|c| matches!(c.node.as_ref(), Some(N::ResTarget(rt)) if !rt.indirection.is_empty()));
+    if !names_field {
+        return Ok(None);
+    }
+    let values = match i.select_stmt.as_deref().and_then(|n| n.node.as_ref()) {
+        Some(N::SelectStmt(sel)) if !sel.values_lists.is_empty() => sel,
+        _ => {
+            return Err(Error::Unsupported(
+                "an INSERT into fields of a composite column from anything but VALUES".into(),
+            ))
+        }
+    };
+    let mut cols: Option<Vec<pg_query::protobuf::Node>> = None;
+    let mut rows = Vec::with_capacity(values.values_lists.len());
+    for vl in &values.values_lists {
+        let Some(N::List(l)) = vl.node.as_ref() else {
+            return Err(Error::Unsupported("this VALUES form".into()));
+        };
+        if l.items.len() != i.cols.len() {
+            return Err(Error::Parse(
+                if l.items.len() > i.cols.len() {
+                    "INSERT has more expressions than target columns"
+                } else {
+                    "INSERT has more target columns than expressions"
+                }
+                .into(),
+            ));
+        }
+        let targets: Vec<pg_query::protobuf::Node> = i
+            .cols
+            .iter()
+            .zip(&l.items)
+            .map(|(c, item)| {
+                let mut c = c.clone();
+                if let Some(N::ResTarget(rt)) = c.node.as_mut() {
+                    rt.val = Some(Box::new(item.clone()));
+                }
+                c
+            })
+            .collect();
+        let gathered = composite_field_targets(&targets, def, table, false)?.unwrap_or(targets);
+        let mut names = Vec::with_capacity(gathered.len());
+        let mut items = Vec::with_capacity(gathered.len());
+        for t in gathered {
+            let Some(N::ResTarget(mut rt)) = t.node else {
+                continue;
+            };
+            items.push(*rt.val.take().unwrap_or_default());
+            names.push(pg_query::protobuf::Node {
+                node: Some(N::ResTarget(rt)),
+            });
+        }
+        cols.get_or_insert(names);
+        rows.push(pg_query::protobuf::Node {
+            node: Some(N::List(pg_query::protobuf::List { items })),
+        });
+    }
+    let mut select = (**values).clone();
+    select.values_lists = rows;
+    Ok(Some(pg_query::protobuf::InsertStmt {
+        cols: cols.unwrap_or_default(),
+        select_stmt: Some(Box::new(pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(select))),
+        })),
+        ..i.clone()
+    }))
+}
+
 fn plan_insert(
     i: &pg_query::protobuf::InsertStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -8815,6 +8894,16 @@ fn plan_insert(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("INSERT without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "INSERT into"))?;
+    // `INSERT INTO t (v.a, v.b) VALUES ...` fills fields of a composite
+    // column: each row's `v` is `ROW(...)::type`, the other fields NULL.
+    let field_insert;
+    let i = match insert_composite_fields(i, &def, &table)? {
+        Some(rewritten) => {
+            field_insert = rewritten;
+            &field_insert
+        }
+        None => i,
+    };
 
     // Explicit column list, else every column in declared order.
     let targets: Vec<String> = if i.cols.is_empty() {
@@ -12785,6 +12874,16 @@ fn plan_table_targets(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<TableTargets> {
+    // `RETURNING (v).*` over a composite column, one column per field.
+    let column_type = |c: &pg_query::protobuf::ColumnRef| -> Option<String> {
+        let name = match c.fields.last()?.node.as_ref()? {
+            N::String(s) => s.sval.clone(),
+            _ => return None,
+        };
+        def.column(&name).map(|col| col.pg_type.clone())
+    };
+    let expanded = expand_composite_targets(target_list, &column_type);
+    let target_list = expanded.as_deref().unwrap_or(target_list);
     let mut columns: Vec<(String, String)> = Vec::new();
     let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
     for t in target_list {
@@ -18374,7 +18473,7 @@ fn plan_select(
     if let Some(rewritten) = whole_row_rewrite(s, lookup, params)? {
         return plan_select(&rewritten, lookup, params);
     }
-    if let Some(rewritten) = expand_composite_star(s) {
+    if let Some(rewritten) = expand_composite_star(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
     if let Some(rewritten) = expand_star_in_grouped(s, lookup) {
@@ -18515,7 +18614,88 @@ thread_local! {
 /// evaluates `expr` once per field). `None` when there is none to expand.
 fn expand_composite_star(
     s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<pg_query::protobuf::SelectStmt> {
+    // The tables in FROM, by the name a qualifier would use, so a column of
+    // a composite type (`(v).*`, `(t.v).*`) has a type to expand by.
+    let tables: Vec<(String, TableDef)> = s
+        .from_clause
+        .iter()
+        .filter_map(|f| match f.node.as_ref() {
+            Some(N::RangeVar(r)) => {
+                let def = lookup(&r.relname)?;
+                let alias = r
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| r.relname.clone());
+                Some((alias, def))
+            }
+            _ => None,
+        })
+        .collect();
+    let column_type = |c: &pg_query::protobuf::ColumnRef| -> Option<String> {
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .filter_map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (qualifier, column) = match names.as_slice() {
+            [c] => (None, *c),
+            [q, c] => (Some(*q), *c),
+            _ => return None,
+        };
+        let mut found = tables
+            .iter()
+            .filter(|(alias, _)| qualifier.is_none_or(|q| q == alias))
+            .filter_map(|(_, def)| def.columns.iter().find(|col| col.name == column));
+        let col = found.next()?;
+        // Two tables with that column: ambiguous, which planning reports.
+        found.next().is_none().then(|| col.pg_type.clone())
+    };
+    let targets = expand_composite_targets(&s.target_list, &column_type)?;
+    let mut out = s.clone();
+    out.target_list = targets;
+    Some(out)
+}
+
+/// The composite type an expression has: a column's declared type, a field
+/// of a composite's, or what the expression says of itself.
+fn composite_type(
+    node: &pg_query::protobuf::Node,
+    column_type: &dyn Fn(&pg_query::protobuf::ColumnRef) -> Option<String>,
+) -> Option<String> {
+    match node.node.as_ref()? {
+        N::ColumnRef(c) => column_type(c),
+        N::AIndirection(ind) => {
+            let [field] = ind.indirection.as_slice() else {
+                return None;
+            };
+            let Some(N::String(f)) = field.node.as_ref() else {
+                return None;
+            };
+            let outer = composite_type(ind.arg.as_deref()?, column_type)?;
+            let (_, fields) = user_composite(&outer)?;
+            fields
+                .into_iter()
+                .find(|(n, _)| *n == f.sval)
+                .map(|(_, t)| t)
+        }
+        _ => Some(static_type(node, &Bson::Null)),
+    }
+}
+
+/// A target list with each `(expr).*` over a composite expanded into
+/// `(expr).field AS field` per field, as PostgreSQL's parse analysis does.
+/// `None` when there is none to expand.
+fn expand_composite_targets(
+    target_list: &[pg_query::protobuf::Node],
+    column_type: &dyn Fn(&pg_query::protobuf::ColumnRef) -> Option<String>,
+) -> Option<Vec<pg_query::protobuf::Node>> {
     let fields_of = |rt: &pg_query::protobuf::ResTarget| {
         let Some(N::AIndirection(ind)) = rt.val.as_ref()?.node.as_ref() else {
             return None;
@@ -18527,15 +18707,12 @@ fn expand_composite_star(
             return None;
         }
         let arg = ind.arg.as_deref()?;
-        if matches!(arg.node.as_ref(), Some(N::ColumnRef(_))) {
-            return None;
-        }
-        let (_, fields) = user_composite(&static_type(arg, &Bson::Null))?;
+        let (_, fields) = user_composite(&composite_type(arg, column_type)?)?;
         Some((arg.clone(), fields))
     };
     let mut changed = false;
-    let mut targets = Vec::with_capacity(s.target_list.len());
-    for t in &s.target_list {
+    let mut targets = Vec::with_capacity(target_list.len());
+    for t in target_list {
         match t.node.as_ref() {
             Some(N::ResTarget(rt)) => match fields_of(rt) {
                 Some((arg, fields)) => {
@@ -18567,11 +18744,7 @@ fn expand_composite_star(
             _ => targets.push(t.clone()),
         }
     }
-    changed.then(|| {
-        let mut out = s.clone();
-        out.target_list = targets;
-        out
-    })
+    changed.then_some(targets)
 }
 
 /// `SELECT <aggs> FROM r WHERE p ...` as `SELECT <aggs> FROM (SELECT * FROM
@@ -21604,6 +21777,24 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     (Some(l), _) => static_type(l, value),
                     _ => inferred_type(value).to_string(),
                 };
+            }
+            // The predicate forms answer a boolean whatever their operands:
+            // `x BETWEEN a AND b` was typed by its left side, so a column
+            // expression over a table described its boolean as an int4.
+            if matches!(
+                AExprKind::try_from(e.kind),
+                Ok(AExprKind::AexprBetween
+                    | AExprKind::AexprNotBetween
+                    | AExprKind::AexprBetweenSym
+                    | AExprKind::AexprNotBetweenSym
+                    | AExprKind::AexprIn
+                    | AExprKind::AexprDistinct
+                    | AExprKind::AexprNotDistinct
+                    | AExprKind::AexprLike
+                    | AExprKind::AexprIlike
+                    | AExprKind::AexprSimilar)
+            ) {
+                return "bool".to_string();
             }
             let op = operator_name(e).unwrap_or("");
             // Each operand is typed ONCE per node. The arms below all ask, and
@@ -31704,6 +31895,138 @@ fn no_column_of(column: &str, table: &str) -> Error {
     )
 }
 
+/// Targets that assign a FIELD of a composite column (`SET v.a = 1` in an
+/// UPDATE, `(v.a, v.b)` in an INSERT's column list) gathered into one
+/// target per column whose value is `ROW(...)::type`. A field not assigned
+/// is the column's own (`(v).f`) in an UPDATE and NULL in an INSERT, which
+/// is how PostgreSQL's `transformAssignmentIndirection` fills them. In an
+/// INSERT the targets carry no value; the caller builds each row's.
+/// `None` when no target names a field.
+fn composite_field_targets(
+    targets: &[pg_query::protobuf::Node],
+    def: &TableDef,
+    table: &str,
+    update: bool,
+) -> Result<Option<Vec<pg_query::protobuf::Node>>> {
+    let field_of = |rt: &pg_query::protobuf::ResTarget| -> Option<String> {
+        let [one] = rt.indirection.as_slice() else {
+            return None;
+        };
+        match one.node.as_ref() {
+            Some(N::String(f)) => Some(f.sval.clone()),
+            _ => None,
+        }
+    };
+    if !targets
+        .iter()
+        .any(|t| matches!(t.node.as_ref(), Some(N::ResTarget(rt)) if field_of(rt).is_some()))
+    {
+        return Ok(None);
+    }
+    // Each composite column once, at its first target's place, with the
+    // fields assigned to it.
+    let mut out: Vec<pg_query::protobuf::Node> = Vec::new();
+    // (where it goes, the column, each field with its value)
+    type FieldValues = Vec<(String, Option<pg_query::protobuf::Node>)>;
+    let mut assigned: Vec<(usize, String, FieldValues)> = Vec::new();
+    for t in targets {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            out.push(t.clone());
+            continue;
+        };
+        let Some(field) = field_of(rt) else {
+            out.push(t.clone());
+            continue;
+        };
+        let column = def
+            .column(&rt.name)
+            .ok_or_else(|| no_column_of(&rt.name, table))?;
+        let Some((_, fields)) = user_composite(&column.pg_type) else {
+            return Err(Error::DatatypeMismatch(format!(
+                "cannot assign to field \"{field}\" of column \"{}\" because its type {} is not a composite type",
+                rt.name,
+                display_type(&column.pg_type)
+            )));
+        };
+        if !fields.iter().any(|(n, _)| *n == field) {
+            return Err(Error::Sqlstate(
+                "42703",
+                format!(
+                "cannot assign to field \"{field}\" of column \"{}\" because there is no such column in data type {}",
+                rt.name, column.pg_type
+            ),
+            ));
+        }
+        let value = rt.val.as_deref().cloned();
+        match assigned.iter_mut().find(|(_, c, _)| *c == rt.name) {
+            Some((_, _, list)) => list.push((field, value)),
+            None => {
+                assigned.push((out.len(), rt.name.clone(), vec![(field, value)]));
+                // A placeholder, replaced below.
+                out.push(t.clone());
+            }
+        }
+    }
+    for (at, column, list) in assigned {
+        let ty = def
+            .column(&column)
+            .map(|c| c.pg_type.clone())
+            .unwrap_or_default();
+        let (_, fields) = user_composite(&ty).unwrap_or_default();
+        let args = fields
+            .iter()
+            .map(
+                |(name, _)| match list.iter().rev().find(|(f, _)| f == name) {
+                    Some((_, Some(v))) => v.clone(),
+                    _ if update => pg_query::protobuf::Node {
+                        node: Some(N::AIndirection(Box::new(
+                            pg_query::protobuf::AIndirection {
+                                arg: Some(Box::new(pg_query::protobuf::Node {
+                                    node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                                        fields: vec![string_node(&column)],
+                                        location: -1,
+                                    })),
+                                })),
+                                indirection: vec![string_node(name)],
+                            },
+                        ))),
+                    },
+                    _ => pg_query::protobuf::Node {
+                        node: Some(N::AConst(pg_query::protobuf::AConst {
+                            isnull: true,
+                            location: -1,
+                            ..Default::default()
+                        })),
+                    },
+                },
+            )
+            .collect();
+        let row = pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                        args,
+                        row_format: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                })),
+                type_name: Some(type_name_node(&ty)),
+                location: -1,
+            }))),
+        };
+        out[at] = pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                name: column,
+                val: Some(Box::new(row)),
+                location: -1,
+                ..Default::default()
+            }))),
+        };
+    }
+    Ok(Some(out))
+}
+
 fn plan_update(
     u: &pg_query::protobuf::UpdateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -31715,6 +32038,19 @@ fn plan_update(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("UPDATE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "UPDATE of"))?;
+    // `SET v.a = x, v.b = y` assigns fields of a composite column: one
+    // `SET v = ROW(x, y, (v).c)::type`, the fields not named read back.
+    let field_set;
+    let u = match composite_field_targets(&u.target_list, &def, &table, true)? {
+        Some(targets) => {
+            field_set = pg_query::protobuf::UpdateStmt {
+                target_list: targets,
+                ..u.clone()
+            };
+            &field_set
+        }
+        None => u,
+    };
 
     let mut set = Document::new();
     let mut unset: Vec<String> = Vec::new();

@@ -4019,6 +4019,7 @@ impl PgHandler {
         secantus_pgplan::snapshots::set_session_pid(
             self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
         );
+        crate::xids::set_current(&self.storage);
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
@@ -15436,7 +15437,10 @@ impl PgHandler {
                         d.insert(field("datistemplate"), info.is_template);
                         d.insert(field("datallowconn"), info.allow_conn);
                         d.insert(field("datconnlimit"), Bson::Int32(-1));
-                        d.insert(field("datfrozenxid"), Bson::Int64(722));
+                        d.insert(
+                            field("datfrozenxid"),
+                            Bson::Int64(i64::from(crate::xids::frozen_xid())),
+                        );
                         d.insert(field("datminmxid"), Bson::Int64(1));
                         d.insert(field("dattablespace"), Bson::Int64(1663));
                         d.insert(field("datcollate"), "C.UTF-8");
@@ -18561,7 +18565,7 @@ impl Drop for PgHandler {
         advisory::release_session(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
-        xids::end(pid);
+        xids::end(&self.storage, pid);
         if pid != 0 {
             backend_registry()
                 .lock()
@@ -18856,7 +18860,7 @@ impl PgHandler {
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
-        xids::end(pid);
+        xids::end(&self.storage, pid);
     }
 
     /// `FETCH` and `MOVE`, which differ only in whether the rows are returned.
@@ -21387,13 +21391,13 @@ impl PgHandler {
             advisory::release_xact(pid);
             table_locks::release(pid);
             row_waits::forget(pid);
-            xids::end(pid);
+            xids::end(&self.storage, pid);
             return out;
         }
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
-        xids::end(pid);
+        xids::end(&self.storage, pid);
         self.end_txn_gucs(false);
         self.lo_close_all();
         self.settle_notifies(false);
@@ -21596,7 +21600,10 @@ impl PgHandler {
                 .implicit_extended
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            xids::end(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+            xids::end(
+                &self.storage,
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
         // Outside a block the statement was its own transaction: its NOTIFYs
         // go out now, or nowhere if it failed. Inside a block (or an
@@ -22000,7 +22007,7 @@ impl PgHandler {
                         advisory::release_xact(pid);
                         table_locks::release(pid);
                         row_waits::forget(pid);
-                        xids::end(pid);
+                        xids::end(&self.storage, pid);
                     }
                     out
                 }
@@ -22659,7 +22666,7 @@ impl PgHandler {
             .rollback_user_transaction(&mut handle)
             .map_err(|re| eprintln!("secantusd-pg: rolling back a failed statement: {re}"));
         row_waits::forget(pid);
-        xids::end(pid);
+        xids::end(&self.storage, pid);
         out
     }
 
@@ -23836,7 +23843,7 @@ impl PgHandler {
         advisory::release_xact(pid);
         table_locks::release(pid);
         row_waits::forget(pid);
-        xids::end(pid);
+        xids::end(&self.storage, pid);
         bump_catalog_version();
         let handle = self.open_transaction_handle()?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);

@@ -418,18 +418,8 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
         // `to_ascii(text)` reads the text in the database's encoding, UTF8;
         // the encoding given by name is 42704 when PostgreSQL has none of
         // that name, and by number when no encoding has that number.
-        // `xid_age`: a transaction id that is not a normal one (0, 1 and 2)
-        // is INT_MAX old. A normal one is measured against the 32-bit
-        // counter PostgreSQL keeps, which this server's xids do not run on.
-        "age" => {
-            let xid = xid_arg(&args[0])?;
-            if xid < 3 {
-                return Ok(Bson::Int32(i32::MAX));
-            }
-            Err(Error::Unsupported(
-                "age() of a normal transaction id".into(),
-            ))
-        }
+        // `xid_age`: transactions since `xid`, as the server counts them.
+        "age" => Ok(Bson::Int32(crate::snapshots::xid_age(xid_arg(&args[0])?))),
         // `mxid_age`: against the next multixact id, which is 1 here for
         // good -- this server makes no multixacts. 0 is not a valid one.
         "mxid_age" => {
