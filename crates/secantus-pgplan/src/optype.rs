@@ -221,12 +221,47 @@ impl<'p> Scope<'p> {
         ctes: &[Cte],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) {
-        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 || !q.values_lists.is_empty()
-        {
+        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
             self.complete = false;
             return;
         }
         let inner = Scope::new(&q.from_clause, ctes, lookup, None);
+        let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        };
+        // `(VALUES ...) v(a, b)`: column k is the rows' common type at k
+        // (`select_common_type`), named by the alias list or `columnK`.
+        if !q.values_lists.is_empty() {
+            let rows: Vec<&[pg_query::protobuf::Node]> = q
+                .values_lists
+                .iter()
+                .filter_map(|r| match r.node.as_ref() {
+                    Some(N::List(l)) => Some(l.items.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            let width = rows.first().map_or(0, |r| r.len());
+            if rows.len() != q.values_lists.len() || rows.iter().any(|r| r.len() != width) {
+                self.complete = false;
+                return;
+            }
+            let columns = (0..width)
+                .map(|k| {
+                    let name = colnames
+                        .get(k)
+                        .and_then(named)
+                        .unwrap_or_else(|| format!("column{}", k + 1));
+                    let parts: Vec<&pg_query::protobuf::Node> =
+                        rows.iter().map(|r| &r[k]).collect();
+                    let ty = common_type(&parts, &inner).unwrap_or_default();
+                    Column::new(&name, &ty, true)
+                })
+                .collect();
+            self.tables
+                .push((alias.clone(), TableDef::new(&alias, columns)));
+            return;
+        }
         let mut columns = Vec::new();
         for (i, t) in q.target_list.iter().enumerate() {
             let Some(N::ResTarget(rt)) = t.node.as_ref() else {
@@ -244,10 +279,6 @@ impl<'p> Scope<'p> {
                     return;
                 }
             }
-            let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
-                Some(N::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            };
             let name = colnames
                 .get(i)
                 .and_then(named)
@@ -1032,6 +1063,21 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
     Ok(())
 }
 
+/// A CTE's query with its column list (`WITH w(x) AS (...)`) applied, so
+/// it is typed under the names the statement uses.
+fn cte_named(
+    q: &pg_query::protobuf::SelectStmt,
+    names: &[pg_query::protobuf::Node],
+) -> pg_query::protobuf::SelectStmt {
+    let mut q = q.clone();
+    for (t, n) in q.target_list.iter_mut().zip(names) {
+        if let (Some(N::ResTarget(rt)), Some(N::String(s))) = (t.node.as_mut(), n.node.as_ref()) {
+            rt.name = s.sval.clone();
+        }
+    }
+    q
+}
+
 fn check_select(
     s: &pg_query::protobuf::SelectStmt,
     outer_ctes: &[Cte],
@@ -1043,7 +1089,7 @@ fn check_select(
         for c in &w.ctes {
             if let Some(N::CommonTableExpr(c)) = c.node.as_ref() {
                 let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
-                    Some(N::SelectStmt(q)) if !w.recursive => Some((**q).clone()),
+                    Some(N::SelectStmt(q)) if !w.recursive => Some(cte_named(q, &c.aliascolnames)),
                     _ => None,
                 };
                 ctes.push((c.ctename.clone(), query));
@@ -1334,6 +1380,52 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The argument types of a built-in call, for choosing its overload: an
+/// untyped string literal is `""` (unknown), and an argument that is itself
+/// a built-in call takes the result type of the overload it resolves to
+/// (`abs(length('ab'))` calls `abs(int4)`). Kept out of `operand_type`, so
+/// the operator check is not moved by it.
+fn call_arg_types(f: &pg_query::protobuf::FuncCall, scope: &Scope) -> Option<Vec<String>> {
+    f.args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                Some(String::new())
+            }
+            Some(N::FuncCall(inner))
+                if inner.agg_order.is_empty()
+                    && inner.over.is_none()
+                    && !inner.agg_star
+                    && !inner.func_variadic =>
+            {
+                operand_type(a, scope).or_else(|| {
+                    let name = func_name(inner)?;
+                    if correlated::user_function_named(&name)
+                        || inner.funcname.len() > 2
+                        || !crate::funcsig::is_builtin_function_name(&name)
+                    {
+                        return None;
+                    }
+                    let args = call_arg_types(inner, scope)?;
+                    if args.iter().any(String::is_empty) {
+                        // An untyped literal: `func_select_candidate`'s
+                        // unknown-argument rules (`length('ab')` is text's).
+                        let args: Vec<String> = args
+                            .into_iter()
+                            .map(|a| if a.is_empty() { "unknown".into() } else { a })
+                            .collect();
+                        return crate::funcsig::resolved_result_type(&name, &args);
+                    }
+                    crate::funcsig::selected_result_type(&name, &args)
+                })
+            }
+            _ => operand_type(a, scope),
+        })
+        .collect()
+}
+
 fn record_builtin_call(f: &pg_query::protobuf::FuncCall, scope: &Scope) {
     if BUILTIN_CALLS.with(|c| c.borrow().is_none()) {
         return;
@@ -1347,19 +1439,7 @@ fn record_builtin_call(f: &pg_query::protobuf::FuncCall, scope: &Scope) {
     {
         return;
     }
-    let args: Option<Vec<String>> = f
-        .args
-        .iter()
-        .map(|a| match a.node.as_ref() {
-            Some(N::AConst(c))
-                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
-            {
-                Some(String::new())
-            }
-            _ => operand_type(a, scope),
-        })
-        .collect();
-    let chosen = args.and_then(|a| crate::funcsig::selected_args(&name, &a));
+    let chosen = call_arg_types(f, scope).and_then(|a| crate::funcsig::selected_args(&name, &a));
     BUILTIN_CALLS.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
             v.push((name, chosen));

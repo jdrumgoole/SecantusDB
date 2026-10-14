@@ -62,32 +62,64 @@ def test_backslash_quote_off_refuses_backslash_quote(pg: Any) -> None:
 
 @pytest.fixture(scope="module")
 def _revoked_abs(rust_pg: Any) -> str:
-    """A role with no EXECUTE on `abs(int)`, and a view, a DEFAULT and a SQL
-    function that call it. Returns the role's name."""
+    """A role with no EXECUTE on `abs(int)`, and a view, a DEFAULT and a
+    rule that call it. Returns the role's name."""
     with rust_pg.connect() as conn:
         for sql in (
             "create role rp004_r",
             "revoke execute on function abs(int) from public",
             "create table rp004_t (a int default abs(-1), b int)",
             "create view rp004_v as select abs(-1) as x",
+            "create table rp004_log (a int)",
+            "create table rp004_ruled (a int)",
+            "create rule rp004_rule as on insert to rp004_ruled"
+            " do also insert into rp004_log values (abs(-1))",
             "grant select, insert on rp004_t to rp004_r",
             "grant select on rp004_v to rp004_r",
+            "grant insert on rp004_ruled, rp004_log to rp004_r",
         ):
             conn.execute(sql)
     return "rp004_r"
 
 
-@pytest.mark.backlog("RP-004")
+@pytest.mark.backlog_fixed("RP-004")
 @pytest.mark.parametrize(
     "sql",
-    ["select x from rp004_v", "insert into rp004_t (b) values (1)"],
-    ids=["view", "column-default"],
+    [
+        "select x from rp004_v",
+        "insert into rp004_t (b) values (1)",
+        "insert into rp004_t (b) values (default)",
+        "insert into rp004_t default values",
+        "insert into rp004_ruled values (1)",
+        "select abs(length('ab'::text))",
+    ],
+    ids=["view", "column-default", "values-default", "default-values", "rule", "nested-call"],
 )
 def test_revoked_builtin_refused_through_view_and_default(
     pg: Any, _revoked_abs: str, sql: str
 ) -> None:
-    """PostgreSQL 15.19 (measured in a rolled-back transaction): both are
+    """PostgreSQL 15.19 (measured in a rolled-back transaction): each is
     42501 `permission denied for function abs` for the restricted role."""
+    pg.execute(f"set role {_revoked_abs}")
+    assert pg_answer(pg, sql) == ("err", "42501", "permission denied for function abs")
+
+
+@pytest.mark.backlog_fixed("RP-004")
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select abs(x) from (values (-1)) v(x)",
+        "with w(x) as (select -1) select abs(x) from w",
+        "select abs(length('ab'))",
+    ],
+    ids=["values-column", "cte-column", "untyped-literal-argument"],
+)
+def test_revoked_builtin_refused_where_the_overload_is_unanalysed(
+    pg: Any, _revoked_abs: str, sql: str
+) -> None:
+    """PostgreSQL 15.19 (measured in a rolled-back transaction): each calls
+    `abs(int4)` and is 42501 for the restricted role: the overload is
+    chosen from a VALUES column, a CTE column and an untyped literal."""
     pg.execute(f"set role {_revoked_abs}")
     assert pg_answer(pg, sql) == ("err", "42501", "permission denied for function abs")
 

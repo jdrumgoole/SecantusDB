@@ -92,17 +92,6 @@ one beside it.
   `secantus-storage` or a stored-name escape, the second an on-disk format
   change both PG servers share. Not justified by a name SQLAlchemy's suite
   uses only to prove quoting works.
-- [ ] **RUST pgserver: EXECUTE on a BUILT-IN function is not checked in
-  every place.** A `REVOKE EXECUTE ON FUNCTION abs(int) FROM PUBLIC` is
-  checked at the call by the overload `func_select_candidate` picks (corpus
-  `b45_builtin_execute`), but not for a call whose overload the type analysis
-  cannot determine (an argument of an unanalysed shape, a polymorphic
-  overload), and not for a call inside a view, a rule, a user function's body
-  or a DEFAULT expression. Reproduce: revoke EXECUTE on `abs(int)`, then call
-  `abs(-1)` from a view or a column DEFAULT as the restricted role; PostgreSQL
-  15 refuses with 42501.
-  Backlog-ID: RP-004
-  Verify: tests/backlog/test_rp_triage.py::test_revoked_builtin_refused_through_view_and_default
 - **Scope decision — pgjdbc `BlobTransactionTest`** needs `CREATE FUNCTION
   lo_manage() ... LANGUAGE C` (the `lo` contrib trigger). `LANGUAGE C` loads
   a shared library into the server process, which a server written in Rust
