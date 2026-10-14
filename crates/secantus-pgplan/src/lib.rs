@@ -27,6 +27,14 @@ mod builtin_alias;
 mod builtins;
 mod builtins_regex;
 mod builtins_text;
+mod sbcs;
+
+/// The upper half of a single-byte encoding as PostgreSQL 15 converts it to
+/// Unicode (entry `i` is byte `0x80 + i`, 0 where it has none), for the
+/// encodings other than LATIN1 that have one.
+pub fn single_byte_table(canonical: &str) -> Option<&'static [u16; 128]> {
+    sbcs::table(canonical)
+}
 pub mod bytea;
 pub mod catalog_stmts;
 pub mod correlated;
@@ -3756,8 +3764,83 @@ fn parse_one(sql: &str) -> Result<N> {
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
     func_cast::rewrite(&mut node);
+    pattern_ops(&mut node);
     schemas::qualify(&mut node)?;
     Ok(node)
+}
+
+/// The text pattern comparisons `~<~` / `~<=~` / `~>=~` / `~>~` (the
+/// `text_pattern_ops` operators, and `bpchar`'s) compare the strings
+/// byte by byte -- which is `<` / `<=` / `>=` / `>` under `COLLATE "C"`,
+/// what they are planned as (a `bpchar`'s trailing blanks still not
+/// counting). A user operator of one of those names is left
+/// alone.
+fn pattern_ops(node: &mut N) {
+    let plain = |op: &str| match op {
+        "~<~" => Some("<"),
+        "~<=~" => Some("<="),
+        "~>=~" => Some(">="),
+        "~>~" => Some(">"),
+        _ => None,
+    };
+    let op_of = |e: &pg_query::protobuf::AExpr| -> Option<String> {
+        match e.name.last()?.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        }
+    };
+    let wanted = node.nodes().iter().any(|(n, _, _, _)| {
+        matches!(n, pg_query::NodeRef::AExpr(e)
+            if op_of(e).as_deref().and_then(plain).is_some())
+    });
+    if !wanted {
+        return;
+    }
+    let collate = |arg: Option<Box<pg_query::protobuf::Node>>| {
+        arg.map(|a| {
+            Box::new(pg_query::protobuf::Node {
+                node: Some(N::CollateClause(Box::new(
+                    pg_query::protobuf::CollateClause {
+                        arg: Some(a),
+                        collname: vec![string_node("C")],
+                        location: -1,
+                    },
+                ))),
+            })
+        })
+    };
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives the loop; each AExpr is changed in place, never replaced.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            if let pg_query::NodeMut::AExpr(e) = n {
+                let e = &mut *e;
+                let Some(op) = op_of(e) else {
+                    continue;
+                };
+                let Some(to) = plain(op.as_str()) else {
+                    continue;
+                };
+                if user_ops::defines(&op) {
+                    continue;
+                }
+                // One side is enough to collate the comparison: not an
+                // untyped literal, which then takes the other side's type
+                // (a `char(n)` column's, blanks and all).
+                let literal = |x: &Option<Box<pg_query::protobuf::Node>>| {
+                    matches!(x.as_deref().and_then(|n| n.node.as_ref()),
+                        Some(N::AConst(c)) if matches!(c.val,
+                            Some(pg_query::protobuf::a_const::Val::Sval(_))))
+                };
+                e.name = vec![string_node(to)];
+                if literal(&e.rexpr) && !literal(&e.lexpr) {
+                    e.lexpr = collate(e.lexpr.take());
+                } else {
+                    e.rexpr = collate(e.rexpr.take());
+                }
+            }
+        }
+    }
 }
 
 /// `parse_one` for a statement as its client wrote it: a bare name the
@@ -21319,6 +21402,13 @@ fn builtin_by_type(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Option<
 }
 
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // `x COLLATE c` is `x`'s type: a collation changes the comparison, not
+    // the type, so a `bpchar` operand still ignores its trailing blanks.
+    if let Some(N::CollateClause(cc)) = node.node.as_ref() {
+        if let Some(arg) = cc.arg.as_deref() {
+            return static_type(arg, value);
+        }
+    }
     // A built-in picked by its argument types says its own result type.
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if let Some(t) = builtin_call_types(f, &[])
@@ -22407,6 +22497,7 @@ fn datetime_arith_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
             ("date", "int") | ("int", "date") => Some("date"),
             ("date", "interval") | ("interval", "date") => Some("timestamp"),
             ("date", "time") | ("time", "date") => Some("timestamp"),
+            ("date", "timetz") | ("timetz", "date") => Some("timestamptz"),
             ("timestamp", "interval") | ("interval", "timestamp") => Some("timestamp"),
             ("timestamptz", "interval") | ("interval", "timestamptz") => Some("timestamptz"),
             ("time", "interval") | ("interval", "time") => Some("time"),
@@ -30662,6 +30753,20 @@ fn array_concat(lhs: Bson, rhs: Bson) -> Result<Bson> {
 }
 
 /// Is `v` a `time` value's text (`HH:MM[:SS[.ffffff]]`)?
+/// A `timetz`'s text: a time of day followed by its UTC offset
+/// (`01:00:00+02`, `23:59-05:30`).
+fn is_timetz_text(v: &Bson) -> bool {
+    let Bson::String(s) = v else { return false };
+    let s = s.trim();
+    let Some(at) = s.rfind(['+', '-']).filter(|&i| i >= 4) else {
+        return false;
+    };
+    let offset = &s[at + 1..];
+    !offset.is_empty()
+        && offset.chars().all(|c| c.is_ascii_digit() || c == ':')
+        && is_time_text(&Bson::String(s[..at].to_string()))
+}
+
 fn is_time_text(v: &Bson) -> bool {
     let Bson::String(s) = v else { return false };
     let parts: Vec<&str> = s.trim().split(':').collect();
@@ -30820,6 +30925,21 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             if let (Some(date), Some(time)) = (date, time) {
                 let since_midnight = cast_value(time.clone(), "interval")?;
                 return eval_binary("+", date.clone(), since_midnight);
+            }
+            // `date + timetz` is the instant at that time of that day in the
+            // time's own offset (`datetimetz_timestamptz`).
+            let (date, time) = if as_ymd(&lhs).is_some() && is_timetz_text(&rhs) {
+                (Some(&lhs), Some(&rhs))
+            } else if as_ymd(&rhs).is_some() && is_timetz_text(&lhs) {
+                (Some(&rhs), Some(&lhs))
+            } else {
+                (None, None)
+            };
+            if let (Some(date), Some(time)) = (date, time) {
+                return cast_value(
+                    Bson::String(format!("{} {}", value_text(date), value_text(time))),
+                    "timestamptz",
+                );
             }
         }
         if let (Some(d), Some(n)) = (as_ymd(&lhs), as_int(&rhs)) {
@@ -33093,6 +33213,17 @@ fn smallint_in_range(node: &pg_query::protobuf::Node, value: Bson) -> Result<Bso
     Ok(value)
 }
 
+/// The targets `jsonb` has a cast to besides text: `Some(true)` for
+/// boolean, `Some(false)` for the numeric types.
+fn jsonb_scalar_target(t: &str) -> Option<bool> {
+    match t {
+        "bool" | "boolean" => Some(true),
+        "int2" | "smallint" | "int4" | "int" | "integer" | "int8" | "bigint" | "float4"
+        | "real" | "float8" | "double precision" | "numeric" | "decimal" => Some(false),
+        _ => None,
+    }
+}
+
 /// A cast whose answer depends on the SOURCE type, for the types in
 /// `systypes`: a `pg_lsn` (stored as its position) to a string type is
 /// `pg_lsn_out`; a `macaddr8` to `macaddr` drops the `ff:fe` middle (and
@@ -33102,6 +33233,32 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
         return None;
     }
     match (source?, target) {
+        // `jsonb` to a number or a boolean (`jsonb_int4`, `jsonb_bool`, ...):
+        // only from a scalar of that kind, else PostgreSQL's 22023 naming the
+        // kind it is. A number to an integer then rounds, as `numeric` does.
+        ("jsonb", t) if jsonb_scalar_target(t).is_some() => {
+            let want_bool = jsonb_scalar_target(t) == Some(true);
+            let parsed = json::parse(&value_text(v)).ok()?;
+            let kind = match &parsed {
+                json::Json::Null => "null",
+                json::Json::Bool(_) => "boolean",
+                json::Json::Number(_) => "numeric",
+                json::Json::Str(_) => "string",
+                json::Json::Array(_) => "array",
+                json::Json::Object(_) => "object",
+            };
+            match (&parsed, want_bool) {
+                (json::Json::Bool(b), true) => Some(Ok(Bson::Boolean(*b))),
+                (json::Json::Number(n), false) => Some(
+                    cast_value(Bson::String(n.clone()), "numeric")
+                        .and_then(|num| cast_value(num, t)),
+                ),
+                _ => Some(Err(Error::Sqlstate(
+                    "22023",
+                    format!("cannot cast jsonb {kind} to type {}", display_type(t)),
+                ))),
+            }
+        }
         ("pg_lsn", t) if is_string_type(t) => {
             Some(cast_value(Bson::String(systypes::render_lsn_value(v)), t))
         }

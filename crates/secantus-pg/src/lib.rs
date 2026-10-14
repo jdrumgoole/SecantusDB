@@ -18607,7 +18607,8 @@ impl SimpleQueryHandler for PgHandler {
     where
         C: ClientInfo,
     {
-        Ok(encoding::decode(self.client_encoding(), &query.query_raw))
+        let enc = self.client_encoding();
+        encoding::decode(enc, &query.query_raw).map_err(|b| encoding::undecodable(enc, b))
     }
 
     async fn do_query<C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -33682,12 +33683,8 @@ fn untranslatable_char(ch: char, cenc: ClientEncoding) -> PgWireError {
         .iter()
         .map(|b| format!("0x{b:02x}"))
         .collect();
-    let target = match cenc {
-        ClientEncoding::Latin1 => "LATIN1",
-        ClientEncoding::Latin9 => "LATIN9",
-        // Only the transcoding encodings ever reach here.
-        _ => "UTF8",
-    };
+    // Only the transcoding encodings ever reach here.
+    let target = cenc.name();
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".into(),
         "22P05".into(), // untranslatable_character
@@ -36741,11 +36738,7 @@ fn decode_parameter(
             "22021".into(),
             format!(
                 "invalid byte sequence for encoding \"{}\": 0x00",
-                match cenc {
-                    ClientEncoding::Latin1 => "LATIN1",
-                    ClientEncoding::Latin9 => "LATIN9",
-                    ClientEncoding::Utf8 | ClientEncoding::Passthrough => "UTF8",
-                }
+                cenc.name()
             ),
         ))));
     }
@@ -36829,7 +36822,9 @@ fn decode_parameter(
                         "invalid byte sequence for encoding \"UTF8\": 0x00".to_owned(),
                     ))));
                 }
-                Ok(Bson::String(encoding::decode(cenc, bytes)))
+                Ok(Bson::String(
+                    encoding::decode(cenc, bytes).map_err(|b| encoding::undecodable(cenc, b))?,
+                ))
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
             Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
@@ -36970,13 +36965,19 @@ fn decode_parameter(
                     None => binary_range(bytes, &type_name, tz, cenc),
                 }
             }
-            Some(114) => secantus_pgplan::cast_text_to(&encoding::decode(cenc, bytes), "json", tz)
-                .map_err(|e| PgHandler::err(&e)),
+            Some(114) => secantus_pgplan::cast_text_to(
+                &encoding::decode(cenc, bytes).map_err(|b| encoding::undecodable(cenc, b))?,
+                "json",
+                tz,
+            )
+            .map_err(|e| PgHandler::err(&e)),
             Some(3802) => match bytes.split_first() {
-                Some((1, rest)) => {
-                    secantus_pgplan::cast_text_to(&encoding::decode(cenc, rest), "jsonb", tz)
-                        .map_err(|e| PgHandler::err(&e))
-                }
+                Some((1, rest)) => secantus_pgplan::cast_text_to(
+                    &encoding::decode(cenc, rest).map_err(|b| encoding::undecodable(cenc, b))?,
+                    "jsonb",
+                    tz,
+                )
+                .map_err(|e| PgHandler::err(&e)),
                 _ => Err(unsupported_binary_oid(Some(3802))),
             },
             Some(1114) if bytes.len() == 8 => Ok(Bson::String(
@@ -37026,7 +37027,10 @@ fn decode_parameter(
             // both cases take this arm.)
             other => {
                 if cenc.transcodes() {
-                    Ok(Bson::String(encoding::decode(cenc, bytes)))
+                    Ok(Bson::String(
+                        encoding::decode(cenc, bytes)
+                            .map_err(|b| encoding::undecodable(cenc, b))?,
+                    ))
                 } else {
                     match std::str::from_utf8(bytes) {
                         Ok(text) => Ok(Bson::String(text.to_string())),
@@ -37037,7 +37041,9 @@ fn decode_parameter(
         };
     }
 
-    let text: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(encoding::decode(cenc, bytes));
+    let text: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(
+        encoding::decode(cenc, bytes).map_err(|b| encoding::undecodable(cenc, b))?,
+    );
     match ty.map(|t| t.oid()) {
         Some(23) | Some(21) => text
             .parse::<i32>()
@@ -37952,7 +37958,8 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo,
     {
-        Ok(encoding::decode(self.client_encoding(), &parse.query_raw))
+        let enc = self.client_encoding();
+        encoding::decode(enc, &parse.query_raw).map_err(|b| encoding::undecodable(enc, b))
     }
 
     /// The default `Parse` handling, plus the `pg_prepared_statements` row a

@@ -269,7 +269,23 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 return Some(sql.trim_end().chars().count() + 1);
             }
             let near = quoted_between(m, "syntax error at or near ")?;
-            pos(toks.iter().find(|t| t.text == near)?.start)
+            // The parser stops at the first token it cannot take, and every
+            // token before it was taken. So of the tokens spelled `near`, it
+            // is the first whose prefix -- up to and including it -- still
+            // fails AT it rather than running out of input: an earlier `,`
+            // that was fine leaves its prefix merely unfinished.
+            let mut candidates = toks.iter().filter(|t| t.text == near);
+            let first = candidates.next()?;
+            let fails_here = |t: &Tok| {
+                let prefix = sql.get(..t.start + t.text.len()).unwrap_or(sql);
+                matches!(pg_query::parse(prefix), Err(e)
+                    if !e.to_string().contains("at end of input"))
+            };
+            let at = std::iter::once(first)
+                .chain(candidates)
+                .find(|t| fails_here(t))
+                .unwrap_or(first);
+            pos(at.start)
         }
         "42804" => {
             // `argument of WHERE must be type boolean`: the clause's first
