@@ -1175,6 +1175,34 @@ written up as divergences.
 
 After every push (to a feature branch via PR — the default — or to `main`), check the corresponding GitHub Actions run and **resolve any failures before moving on**. CI is the source of truth — it catches cold-cache races, cross-platform / cross-Python drift, and missing-CI-extra gaps that local-only testing misses. Procedure (`gh run list`/`watch`/`view --log-failed`), the docs-only `paths-ignore` exception (markdown / LICENSE / `docs/**` commits skip CI by design), and the recurring-failure-pattern catalog (xdist install-state races, per-platform sysconf, `pytest-subtests` outcome accounting) all live in `/ci-check`. Add new patterns to that skill as they show up. **Watch the PR's CI run, not `main`'s** — with the branch+PR flow (see "Conventions" below) each branch is its own CI lane, so a parallel session's push can no longer cancel your run; a `cancelled` conclusion now means *you* superseded it with a newer push to the same branch.
 
+## Parallel sessions and subagents: a machine-wide budget
+
+This Mac has **12 cores and 32 GB**, and Joe runs **two sessions at once**.
+The limit is the machine, not the session, so it is shared:
+
+- **At most 4 agents that build or test, across both sessions: 2 per
+  session.** Each compiles its own worktree (a WiredTiger-linked
+  `cargo build` is several minutes and about 1.3 GB of `target/` for the
+  server binary alone, more as the other crates build).
+- **Every one of them sets `CARGO_BUILD_JOBS=3`** (and `cargo test --
+  --test-threads=4`). Cargo's default is one job per core, so each agent
+  alone would take the whole machine: 4 agents x 3 jobs = 12, one job per
+  core.
+- **Agents that only read, search or probe a running server** (no cargo, no
+  pytest) are cheap: one or two more per session on top of the four.
+- Count what is ALREADY running before spawning: the other session's agents
+  are invisible to you, so ask, or read `uptime`. A load average well above
+  12 means the budget is spent.
+
+Measured 2026-10-15: eight agents building at once (five in one session,
+three in the other), each at cargo's default 12 jobs, held the load average
+at **66 on 12 cores** with the memory compressor engaged. Builds that take
+minutes alone took several times longer, and a timing-sensitive test fails
+under that contention for no reason of its own.
+
+The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
+(Tooling, above): do not run a gauge sweep beside building agents at all.
+
 ## Conventions for changes here
 
 - **Never commit build output or any other generated binary.** No cargo
