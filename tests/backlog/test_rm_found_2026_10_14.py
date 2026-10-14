@@ -49,3 +49,21 @@ def test_sasl_start_for_an_unknown_user_fails(rust_mongo: Any) -> None:
         ]
     )
     assert got == ("err", 18, "Authentication failed.")
+
+
+@pytest.mark.backlog("RM-142")
+def test_exact_duplicate_id_under_a_default_collation_names_the_collation(
+    rust_mongo: Any,
+) -> None:
+    """mongod 8.2.11 reports a second `_id: "a"` in a collection whose default
+    collation is `{locale: "en", strength: 2}` under the collated index:
+    `index: _id_ collation: { locale: "en", ... } dup key: ...`. The Rust
+    server reported it from the plain index, `index: _id_ dup key: { _id: "a" }`,
+    as it does not for a second spelling."""
+    db = rust_mongo["rm_found"]
+    db.drop_collection("collated_id")
+    db.create_collection("collated_id", collation={"locale": "en", "strength": 2})
+    db.collated_id.insert_one({"_id": "a"})
+    got = mongo_answer(lambda: db.collated_id.insert_one({"_id": "a"}))
+    assert got[:2] == ("err", 11000)
+    assert ' index: _id_ collation: { locale: "en"' in got[2]

@@ -153,7 +153,7 @@ def test_transaction_change_event_carries_txn_number_and_lsid(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-086")
+@pytest.mark.backlog_fixed("RM-086")
 def test_two_transactions_creating_one_collection_conflict_at_commit(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:

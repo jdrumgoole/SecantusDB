@@ -15,6 +15,8 @@ in a transaction is unchanged.
 
 #### Fixed
 
+- Fixes RM-086 (`tests/backlog/test_rm_085_112.py::test_two_transactions_creating_one_collection_conflict_at_commit`,
+  now a `backlog_fixed` regression test).
 - `crates/secantus-storage`: `UserTransactionHandle::set_defer_collection_creates`,
   the transaction's own view of a collection it created (`deferred_row`),
   and the write at commit (`flush_deferred_creates`). The adapter turns it
@@ -26,4 +28,5 @@ in a transaction is unchanged.
 - `tools/probes/transactions.py` has ten scenarios for it, `_id` reads and
   writes inside the transaction among them. Nine match mongod; the tenth,
   with a default collation, behaves the same and differs only in the text
-  of a duplicate-key message, which it does outside a transaction too.
+  of a duplicate-key message, which it does outside a transaction too
+  (filed as RM-142).
