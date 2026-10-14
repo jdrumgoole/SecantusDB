@@ -252,7 +252,9 @@ struct Inner {
 /// Per-server thread-safe map of cursor id → pending documents.
 pub struct CursorRegistry {
     inner: Mutex<Inner>,
-    idle_ttl_seconds: f64,
+    /// The idle timeout, as `f64` bits: `cursorTimeoutMillis` changes it
+    /// while the server runs.
+    idle_ttl_seconds: std::sync::atomic::AtomicU64,
     tailable_idle_ttl_seconds: f64,
     max_cursors: usize,
     clock: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -288,7 +290,7 @@ impl CursorRegistry {
                 cursors: HashMap::new(),
                 last_prune: f64::NEG_INFINITY,
             }),
-            idle_ttl_seconds,
+            idle_ttl_seconds: std::sync::atomic::AtomicU64::new(idle_ttl_seconds.to_bits()),
             tailable_idle_ttl_seconds,
             max_cursors,
             clock,
@@ -710,10 +712,36 @@ impl CursorRegistry {
         out
     }
 
+    /// How long an ordinary cursor may sit idle, in seconds (0 or less:
+    /// for ever).
+    pub fn idle_ttl_seconds(&self) -> f64 {
+        f64::from_bits(
+            self.idle_ttl_seconds
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// `setParameter cursorTimeoutMillis`: mongod times a cursor out once it
+    /// has sat idle longer than this, and at 0 or less, at once. The next
+    /// prune is made due, so a shorter timeout applies at the next use of
+    /// the registry.
+    pub fn set_cursor_timeout_millis(&self, millis: i64) {
+        let seconds = if millis <= 0 {
+            f64::MIN_POSITIVE
+        } else {
+            millis as f64 / 1000.0
+        };
+        self.idle_ttl_seconds
+            .store(seconds.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.last_prune = f64::NEG_INFINITY;
+        }
+    }
+
     /// The prune cadence — capped at 60s and a tenth of the TTL so a cursor
     /// can't outlive its TTL by more than ~10% (`cursors.py::_prune_interval`).
     fn prune_interval(&self) -> f64 {
-        let ttl = self.idle_ttl_seconds;
+        let ttl = self.idle_ttl_seconds();
         if ttl <= 0.0 {
             return f64::INFINITY;
         }
@@ -726,7 +754,7 @@ impl CursorRegistry {
         if now - inner.last_prune < self.prune_interval() {
             return;
         }
-        let idle = self.idle_ttl_seconds;
+        let idle = self.idle_ttl_seconds();
         let tailable_idle = self.tailable_idle_ttl_seconds;
         inner.cursors.retain(|_cid, e| {
             if e.no_cursor_timeout {

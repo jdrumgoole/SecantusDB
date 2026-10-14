@@ -157,7 +157,7 @@ pub(crate) fn check(
         | "saslContinue" | "authenticate" | "logout" | "connectionStatus" | "whatsmyuri"
         | "listCommands" | "startSession" | "endSessions" | "refreshSessions" | "getMore"
         | "killCursors" | "commitTransaction" | "abortTransaction" | "configureFailPoint"
-        | "listDatabases" => {}
+        | "listDatabases" | "features" => {}
         "killSessions" => {
             // Its own sessions need nothing; another user's need the cluster.
             let own = ctx.conn_auth.as_ref().map(|a| {
@@ -348,6 +348,13 @@ pub(crate) fn check(
         "setFeatureCompatibilityVersion" => c.cluster("setFeatureCompatibilityVersion"),
         "logRotate" => c.cluster("logRotate"),
         "connPoolStats" => c.cluster("connPoolStats"),
+        "replSetInitiate" => c.cluster("replSetConfigure"),
+        "replSetResizeOplog" => c.cluster("replSetResizeOplog"),
+        "appendOplogNote" => c.cluster("appendOplogNote"),
+        "lockInfo" => c.cluster("serverStatus"),
+        "getClusterParameter" => c.cluster("getClusterParameter"),
+        "planCacheClear" | "planCacheClearFilters" => c.on_collection(doc, name, &["planCacheWrite"]),
+        "planCacheListFilters" => c.on_collection(doc, name, &["planCacheRead"]),
         "dbHash" | "dbhash" => c.on_database(&["dbHash"]),
         "shardingState" => c.cluster("shardingState"),
         "killOp" => c.cluster("killop"),

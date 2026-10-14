@@ -1388,6 +1388,15 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
     let mut names = storage
         .list_collections(&ctx.db_name)
         .map_err(command_error)?;
+    // A set member's oplog is `local.oplog.rs`. Here it is the oplog table,
+    // with no catalog entry, so it is added by name.
+    if ctx.db_name == "local"
+        && ctx.replica_set_name.is_some()
+        && !names.iter().any(|n| n == "oplog.rs")
+    {
+        names.push("oplog.rs".to_string());
+        names.sort();
+    }
     // `authorizedCollections` lists only the collections the user has any
     // action on, which leaves out a system collection unless the user has
     // `anyResource` or that collection's name (measured 8.2.11: `read` on
@@ -1492,7 +1501,12 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // right type.
         let mut info = doc! { "readOnly": is_view };
         // A view is a definition, not a collection: it has no uuid.
-        if let (false, Ok(uuid)) = (is_view, storage.collection_uuid(&ctx.db_name, n)) {
+        let uuid = if ctx.db_name == "local" && n == "oplog.rs" {
+            Ok(crate::serverinfo::oplog_uuid(storage))
+        } else {
+            storage.collection_uuid(&ctx.db_name, n)
+        };
+        if let (false, Ok(uuid)) = (is_view, uuid) {
             if uuid.len() == 16 {
                 info.insert(
                     "uuid",
@@ -1504,7 +1518,9 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             }
         }
         // Captured before `options` is moved into the entry below.
-        let is_clustered = options.contains_key("clusteredIndex");
+        // An oplog has no `_id` index either (`autoIndexId: false`).
+        let is_clustered = options.contains_key("clusteredIndex")
+            || options.get("autoIndexId") == Some(&Bson::Boolean(false));
         let mut entry = doc! {
             "name": n,
             "type": coll_type,
@@ -1662,8 +1678,10 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A collection that exists always has at least the synthesised `_id_` index, so
     // an empty result means the namespace doesn't exist — mongod errors
     // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
-    // exist`). Mirrors commands.py's `if not indexes`.
-    if indexes.is_empty() {
+    // exist`). Mirrors commands.py's `if not indexes`. A set member's oplog
+    // exists and has no index at all.
+    let oplog = ctx.db_name == "local" && coll == "oplog.rs" && ctx.replica_set_name.is_some();
+    if indexes.is_empty() && !oplog {
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
@@ -3536,10 +3554,19 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     let storage = ctx.storage()?;
-    if !storage
+    // `system.views` is what mongod keeps its view definitions in. Here they
+    // are in the catalog, and it is validated as `find` and `listCollections`
+    // show it: one record a definition, under its `_id` index.
+    let exists = storage
         .collection_exists(&ctx.db_name, &coll)
-        .map_err(command_error)?
-    {
+        .map_err(command_error)?;
+    let view_definitions = if coll == "system.views" && !exists {
+        Some(crate::ts_buckets::view_definitions(storage, &ctx.db_name)?)
+            .filter(|definitions| !definitions.is_empty())
+    } else {
+        None
+    };
+    if !exists && view_definitions.is_none() {
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
@@ -3585,6 +3612,30 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
              not supported.",
         )
         .into_reply());
+    }
+    if let Some(definitions) = view_definitions {
+        let n = int_bson(definitions.len() as i64);
+        return Ok(doc! {
+            "valid": true,
+            "repaired": false,
+            "repairMode": "None",
+            "ns": format!("{}.system.views", ctx.db_name),
+            "uuid": crate::ts_buckets::derived_uuid(ctx.db_name.as_bytes(), 2),
+            "warnings": Bson::Array(vec![]),
+            "errors": Bson::Array(vec![]),
+            "extraIndexEntries": Bson::Array(vec![]),
+            "missingIndexEntries": Bson::Array(vec![]),
+            "nInvalidDocuments": 0_i32,
+            "nNonCompliantDocuments": 0_i32,
+            "nrecords": n.clone(),
+            "corruptRecords": Bson::Array(vec![]),
+            "nIndexes": 1_i32,
+            "keysPerIndex": {"_id_": n},
+            "indexDetails": {
+                "_id_": {"valid": true, "spec": {"v": 2, "key": {"_id": 1}, "name": "_id_"}},
+            },
+            "ok": 1.0,
+        });
     }
     // A time-series collection is validated as its buckets: mongod counts
     // them, names their namespace and shows each index as it lies on them.

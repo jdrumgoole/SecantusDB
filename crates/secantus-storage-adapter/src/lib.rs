@@ -830,6 +830,15 @@ impl CmdStorage for StorageAdapter {
         self.inner.prune_oplog(None).map_err(map_err)
     }
 
+    fn append_oplog_note(&self, data: bson::Document) -> Result<(), StorageError> {
+        self.inner.append_oplog_note(data).map(|_| ()).map_err(map_err)
+    }
+
+    fn set_oplog_max_entries(&self, n: usize) -> Result<(), StorageError> {
+        self.inner.set_oplog_max_entries(n);
+        Ok(())
+    }
+
     fn ttl_monitor(&self) -> Option<(i64, bool, u64, u64)> {
         let m = self.inner.ttl_monitor();
         Some((m.sleep_secs, m.enabled, m.passes, m.deleted))

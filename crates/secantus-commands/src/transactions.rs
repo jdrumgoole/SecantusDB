@@ -396,7 +396,9 @@ pub struct TransactionRegistry {
     inner: Mutex<Inner>,
     commit: CommitFn,
     rollback: TxnFn,
-    lifetime: f64,
+    /// Seconds, as `f64` bits: `transactionLifetimeLimitSeconds` changes it
+    /// while the server runs.
+    lifetime: std::sync::atomic::AtomicU64,
     clock: Clock,
 }
 
@@ -411,9 +413,20 @@ impl TransactionRegistry {
             }),
             commit,
             rollback,
-            lifetime: lifetime_seconds,
+            lifetime: std::sync::atomic::AtomicU64::new(lifetime_seconds.to_bits()),
             clock,
         }
+    }
+
+    /// How long a transaction may sit idle before it is aborted, in seconds.
+    pub fn lifetime_seconds(&self) -> f64 {
+        f64::from_bits(self.lifetime.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `setParameter transactionLifetimeLimitSeconds`.
+    pub fn set_lifetime_seconds(&self, seconds: f64) {
+        self.lifetime
+            .store(seconds.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn locked(&self) -> (std::sync::MutexGuard<'_, Inner>, f64) {
@@ -716,7 +729,7 @@ impl TransactionRegistry {
     /// Abort transactions idle past their lifetime, and, once a minute, forget
     /// sessions idle past theirs. Runs on every access and from `reap`.
     fn prune_locked(&self, inner: &mut Inner, now: f64) {
-        let cutoff = now - self.lifetime;
+        let cutoff = now - self.lifetime_seconds();
         for session in inner.sessions.values() {
             if let Kind::Txn(c) = &session.kind {
                 // A transaction running a statement is locked, and is not

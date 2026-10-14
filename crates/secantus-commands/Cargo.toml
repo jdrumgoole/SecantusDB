@@ -39,6 +39,9 @@ sha2 = "0.10"
 # `dbHash` is MD5 by definition: a client compares its hashes with mongod's.
 md-5 = "0.10"
 
+# A SASL payload sent as a base64 string, which mongod decodes.
+base64 = "0.22"
+
 # `dbHash` names the machine as mongod does (`hostname:port`).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -49,4 +52,3 @@ libc = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 pbkdf2 = "0.12"
-base64 = "0.22"

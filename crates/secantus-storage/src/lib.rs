@@ -543,6 +543,16 @@ const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// dirty trigger while bounding the number of commits for a large drop.
 const PURGE_CHUNK_MAX_ROWS: usize = 4000;
 
+/// Whether an oplog entry is for the `local` database, which mongod does not
+/// replicate and so does not log.
+fn oplog_entry_is_local(e: &OplogEntry) -> bool {
+    let ns = match e {
+        OplogEntry::Doc(d) => d.get_str("ns").ok(),
+        OplogEntry::Raw(buf) => buf.get_str("ns").ok(),
+    };
+    ns.is_some_and(|ns| ns == "local" || ns.starts_with("local."))
+}
+
 /// Approximate encoded size of an oplog entry, for the user-transaction
 /// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
 /// encode.
@@ -5672,9 +5682,15 @@ impl Storage {
     }
 
     /// Set the oplog hard entry cap (default 100_000). Mirrors
-    /// `oplog_max_entries`.
-    pub fn set_oplog_max_entries(&mut self, n: usize) {
+    /// `oplog_max_entries`. Takes `&self` because `replSetResizeOplog`
+    /// changes it while the server runs; the next sweep applies it.
+    pub fn set_oplog_max_entries(&self, n: usize) {
         self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
+    }
+
+    /// Whether this store keeps an oplog at all.
+    pub fn oplog_enabled(&self) -> bool {
+        self.enable_oplog
     }
 
     // --- locking (per-collection write locks + write-conflict retry) ---
@@ -6107,6 +6123,21 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        // The `local` database is not replicated: mongod writes no oplog entry
+        // for a write to it, so a change stream never sees one.
+        let (entries, pre_images) = if entries.iter().any(oplog_entry_is_local) {
+            let (entries, pre_images): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .zip(pre_images)
+                .filter(|(e, _)| !oplog_entry_is_local(e))
+                .unzip();
+            if entries.is_empty() {
+                return Ok(0);
+            }
+            (entries, pre_images)
+        } else {
+            (entries, pre_images)
+        };
         // A transaction statement's writes name the transaction, as mongod's
         // do. Stamped here, on the statement's thread, whichever thread later
         // writes the entries.
@@ -7523,6 +7554,18 @@ impl Storage {
         entry.insert("op", "n");
         entry.insert("ns", "");
         entry.insert("o", Bson::Document(o));
+        self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
+    /// Append `appendOplogNote`'s no-op entry, `{op: "n", ns: "", o: data}`,
+    /// as mongod writes it, and return its seq.
+    pub fn append_oplog_note(&self, data: Document) -> Result<i64> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let mut entry = Document::new();
+        entry.insert("op", "n");
+        entry.insert("ns", "");
+        entry.insert("o", Bson::Document(data));
         self.emit_oplog(&session, vec![entry], vec![None])
     }
 
@@ -10622,9 +10665,12 @@ impl Storage {
         if self.enable_oplog && db == "local" && coll == "oplog.rs" {
             let mut o = Document::new();
             o.insert("capped", true);
+            // mongod's options for its oplog: capped to a size in bytes, and
+            // no `_id` index. The cap here is counted in entries, at 16 KiB
+            // an entry.
             let max_entries = self.prune_ctx.max_entries.load(Ordering::Relaxed) as i64;
             o.insert("size", max_entries * 16 * 1024);
-            o.insert("max", max_entries);
+            o.insert("autoIndexId", false);
             return Ok(o);
         }
         // Lock-free read (see the `lock` field's invariants), on the

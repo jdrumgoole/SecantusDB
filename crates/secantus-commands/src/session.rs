@@ -313,6 +313,12 @@ fn run_checked(
         if !is_retryable_write(name) {
             return not_a_retryable_write(name).into_reply();
         }
+        if ctx.db_name == "local" && name != "bulkWrite" {
+            if let Some(reply) = unreplicated_retryable_write(name, doc, ctx) {
+                return reply;
+            }
+            return crate::run_handler(handler, doc, ctx);
+        }
         let Some(registry) = ctx.transactions.clone() else {
             return crate::run_handler(handler, doc, ctx);
         };
@@ -938,6 +944,81 @@ fn push_entry(reply: &mut Document, field: &str, entry: Document) {
             reply.insert(field, vec![Bson::Document(entry)]);
         }
     }
+}
+
+/// A retryable write to `local`, which mongod does not replicate and so
+/// cannot retry: every statement that would write fails with 20
+/// (`IllegalOperation`), and one that would not runs as it always does
+/// (measured 8.2.11, 2026-10-15). An insert always writes; an update or a
+/// delete writes when its filter matches, an upsert always. `None` when no
+/// statement writes, and the command runs as usual.
+fn unreplicated_retryable_write(
+    name: &str,
+    doc: &Document,
+    ctx: &mut CommandContext,
+) -> Option<Document> {
+    let coll = doc.get_str(name).ok()?.to_string();
+    let ns = format!("local.{coll}");
+    let refused = format!("retryable writes is not supported for unreplicated ns: {ns}");
+    let storage = ctx.storage.clone()?;
+    let matches = |filter: Option<&Bson>| match filter {
+        Some(Bson::Document(q)) => storage
+            .count_matching("local", &coll, q)
+            .map_or(false, |n| n > 0),
+        _ => false,
+    };
+    let ordered = doc.get_bool("ordered").unwrap_or(true);
+    let (statements, verb) = match name {
+        "insert" => (doc.get_array("documents").ok()?, None),
+        "update" => (doc.get_array("updates").ok()?, Some("update")),
+        "delete" => (doc.get_array("deletes").ok()?, Some("delete")),
+        _ => {
+            let writes = truthy_field(doc, "upsert") || matches(doc.get("query"));
+            return writes.then(|| {
+                CommandError::new(
+                    20,
+                    "IllegalOperation",
+                    format!("Plan executor error during findAndModify :: caused by :: {refused}"),
+                )
+                .into_reply()
+            });
+        }
+    };
+    let message = match verb {
+        Some(verb) => format!("Plan executor error during {verb} :: caused by :: {refused}"),
+        None => refused,
+    };
+    let mut errors = Vec::new();
+    for (index, statement) in statements.iter().enumerate() {
+        let writes = match (verb, statement.as_document()) {
+            (None, _) => true,
+            (Some(_), Some(s)) => truthy_field(s, "upsert") || matches(s.get("q")),
+            (Some(_), None) => false,
+        };
+        if writes {
+            errors.push(Bson::Document(doc! {
+                "index": index as i32,
+                "code": 20_i32,
+                "errmsg": message.clone(),
+            }));
+            if ordered {
+                break;
+            }
+        }
+    }
+    if errors.is_empty() {
+        return None;
+    }
+    let mut reply = doc! {"n": 0_i32, "writeErrors": errors};
+    if name == "update" {
+        reply.insert("nModified", 0_i32);
+    }
+    reply.insert("ok", 1.0);
+    Some(reply)
+}
+
+fn truthy_field(doc: &Document, field: &str) -> bool {
+    doc.get(field).is_some_and(crate::util::truthy)
 }
 
 fn retryable_write(

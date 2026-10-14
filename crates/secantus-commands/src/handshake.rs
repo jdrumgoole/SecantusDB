@@ -417,6 +417,31 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
     });
     let now = bson::DateTime::now();
     let optime = doc! { "ts": ts.clone(), "t": 1_i64 };
+    // A one-member set elects itself as it starts: this server's election
+    // is its start, the term it began is 1, and the opTime it had then is
+    // the start's, in no term yet (`t: -1`). mongod's keys, types and order
+    // (8.2.11, 2026-10-15).
+    let elected = process_started();
+    let at_election = doc! {
+        "ts": Bson::Timestamp(bson::Timestamp {
+            time: (elected.timestamp_millis() / 1000) as u32,
+            increment: 1,
+        }),
+        "t": -1_i64,
+    };
+    let election_metrics = doc! {
+        "lastElectionReason": "electionTimeout",
+        "lastElectionDate": elected,
+        "electionTerm": 1_i64,
+        "lastCommittedOpTimeAtElection": at_election.clone(),
+        "lastSeenWrittenOpTimeAtElection": at_election.clone(),
+        "lastSeenOpTimeAtElection": at_election,
+        "numVotesNeeded": 1_i32,
+        "priorityAtElection": 1.0,
+        "electionTimeoutMillis": 10_000_i64,
+        "newTermStartDate": elected,
+        "wMajorityWriteAvailabilityDate": elected,
+    };
     Ok(doc! {
         "set": set_name.clone(),
         "date": now,
@@ -439,6 +464,7 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
             "lastDurableWallTime": now,
         },
         "lastStableRecoveryTimestamp": ts,
+        "electionCandidateMetrics": election_metrics,
         "members": [
             {
                 "_id": 0_i32,

@@ -90,6 +90,12 @@ pub enum ParamKind {
     Bool,
     /// A whole number of seconds greater than zero (`ttlMonitorSleepSecs`).
     PositiveInt,
+    /// Any 64-bit whole number (`cursorTimeoutMillis`): a bool or a number,
+    /// truncated toward zero.
+    Int64,
+    /// A 32-bit whole number of at least 1
+    /// (`transactionLifetimeLimitSeconds`).
+    Int32AtLeastOne,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -101,6 +107,11 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // without waiting a minute.
     ("ttlMonitorEnabled", ParamKind::Bool),
     ("ttlMonitorSleepSecs", ParamKind::PositiveInt),
+    // The two registries' limits: `cursorTimeoutMillis` for an idle cursor,
+    // `transactionLifetimeLimitSeconds` for an idle transaction. Each is
+    // changed in the registry as well as stored here.
+    ("cursorTimeoutMillis", ParamKind::Int64),
+    ("transactionLifetimeLimitSeconds", ParamKind::Int32AtLeastOne),
 ];
 
 /// mongod's highest log level; `setParameter` clamps rather than refusing.
@@ -261,6 +272,11 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
                 (truncated as i64).min(MAX_LOG_LEVEL as i64) as i32
             ))
         }
+        ParamKind::Int64 => integral(value, false).ok().map(Bson::Int64),
+        ParamKind::Int32AtLeastOne => match integral(value, true) {
+            Ok(n) if n >= 1 => Some(Bson::Int32(n as i32)),
+            _ => None,
+        },
         ParamKind::PositiveInt => match whole(value) {
             Some(n) if n > 0 => Some(Bson::Int32(n.min(i64::from(i32::MAX)) as i32)),
             _ => None,
@@ -285,8 +301,49 @@ fn whole(value: &Bson) -> Option<i64> {
     }
 }
 
+/// A value as mongod coerces it to a whole number for a parameter: a bool
+/// is 0 or 1, a number is truncated toward zero, and each failure has its
+/// own words (measured 8.2.11, 2026-10-15).
+fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
+    let n = match value {
+        Bson::Boolean(b) => return Ok(i64::from(*b)),
+        Bson::Int32(i) => return Ok(i64::from(*i)),
+        Bson::Int64(i) if int32 && i32::try_from(*i).is_err() => {
+            return Err("Out of bounds coercing to integral value")
+        }
+        Bson::Int64(i) => return Ok(*i),
+        Bson::Double(d) => *d,
+        Bson::Decimal128(d) => d
+            .to_string()
+            .parse::<f64>()
+            .map_err(|_| "Unable to coerce value to integral type")?,
+        _ => return Err("Unable to coerce value to integral type"),
+    };
+    if !n.is_finite() {
+        return Err("Unable to coerce NaN/Inf to integral type");
+    }
+    let n = n.trunc();
+    let (low, high) = if int32 {
+        (f64::from(i32::MIN), f64::from(i32::MAX))
+    } else {
+        (i64::MIN as f64, i64::MAX as f64)
+    };
+    if n < low || n >= high + 1.0 {
+        return Err("Out of bounds coercing to integral value");
+    }
+    Ok(n as i64)
+}
+
 /// mongod's words for a value `coerce` refused (measured 8.2.11).
 fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
+    if matches!(kind, ParamKind::Int64 | ParamKind::Int32AtLeastOne) {
+        return match integral(value, kind == ParamKind::Int32AtLeastOne) {
+            Err(why) => format!("Failed validating {name}: {why}"),
+            Ok(n) => format!(
+                "Invalid value for parameter {name}: {n} is not greater than or equal to 1"
+            ),
+        };
+    }
     match (kind, whole(value)) {
         (ParamKind::PositiveInt, Some(n)) => {
             format!("Invalid value for parameter {name}: {n} is not greater than 0")
@@ -414,6 +471,19 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                         }
                         _ => {}
                     }
+                }
+                match (name.as_str(), &coerced) {
+                    ("cursorTimeoutMillis", Bson::Int64(ms)) => {
+                        if let Ok(cursors) = ctx.cursors() {
+                            cursors.set_cursor_timeout_millis(*ms);
+                        }
+                    }
+                    ("transactionLifetimeLimitSeconds", Bson::Int32(secs)) => {
+                        if let Some(transactions) = &ctx.transactions {
+                            transactions.set_lifetime_seconds(f64::from(*secs));
+                        }
+                    }
+                    _ => {}
                 }
                 s.set(name, coerced);
             }
