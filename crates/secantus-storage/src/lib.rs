@@ -12611,7 +12611,7 @@ impl Storage {
             }
         }
         let key_spec = bson::doc! {"_id": 1};
-        let (mut claimed, mut duplicates) = (0u64, 0u64);
+        let mut duplicates = 0u64;
         for (db, coll) in &collections {
             // The RecordIds under this collection's document-typed `_id` keys.
             let mut rows: Vec<i64> = Vec::new();
@@ -12687,9 +12687,8 @@ impl Storage {
                     Ok((taken, held))
                 })();
                 match outcome {
-                    Ok((taken, held)) => {
+                    Ok((_, held)) => {
                         session.commit_transaction(None)?;
-                        claimed += taken;
                         duplicates += held;
                     }
                     Err(e) => {
@@ -12703,11 +12702,13 @@ impl Storage {
         marker.set_key_sssu("", "", DONE, b"");
         marker.set_value_q(0);
         marker.insert()?;
-        if claimed > 0 || duplicates > 0 {
+        // Quiet unless something is wrong: the walk runs again after every
+        // hand-over from the Python server, and a server's first line of
+        // output is the one a launcher waits for.
+        if duplicates > 0 {
             eprintln!(
-                "secantus-storage: claimed {claimed} document _id values stored by an earlier \
-                 version; {duplicates} more are duplicates by value of one of those, and stay \
-                 as they are"
+                "secantus-storage: {duplicates} stored document _id values are duplicates by \
+                 value of another stored _id, and stay as they are"
             );
         }
         Ok(())
@@ -12796,7 +12797,7 @@ impl Storage {
             }
         }
         let key_spec = bson::doc! {"_id": 1};
-        let (mut claimed, mut duplicates) = (0u64, 0u64);
+        let mut duplicates = 0u64;
         for (db, coll, collation) in &collections {
             let rows = self.scan_docs(&session, db, coll)?;
             for chunk in rows.chunks(CHUNK) {
@@ -12824,9 +12825,8 @@ impl Storage {
                     Ok((taken, held))
                 })();
                 match outcome {
-                    Ok((taken, held)) => {
+                    Ok((_, held)) => {
                         session.commit_transaction(None)?;
-                        claimed += taken;
                         duplicates += held;
                     }
                     Err(e) => {
@@ -12840,11 +12840,11 @@ impl Storage {
         marker.set_key_sssu("", "", DONE, b"");
         marker.set_value_q(0);
         marker.insert()?;
-        if claimed > 0 || duplicates > 0 {
+        // Quiet unless something is wrong (see `backfill_document_id_claims`).
+        if duplicates > 0 {
             eprintln!(
-                "secantus-storage: claimed {claimed} _id values under their collection's \
-                 collation that were stored without a claim; {duplicates} more are equal \
-                 under that collation to one of those, and stay as they are"
+                "secantus-storage: {duplicates} stored _id values are equal under their \
+                 collection's collation to another stored _id, and stay as they are"
             );
         }
         Ok(())
@@ -12922,10 +12922,6 @@ impl Storage {
                     )));
                 }
             }
-            eprintln!(
-                "secantus-storage: rebuilt index '{name}' on '{db}.{coll}', whose entries \
-                 were written by an earlier version or by the Python server"
-            );
         }
         Ok(())
     }
