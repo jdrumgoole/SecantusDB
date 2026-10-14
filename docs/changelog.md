@@ -19,6 +19,1833 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.7.0b3] — 2026-10-14
+
+### The per-operation benchmark measures its servers interleaved
+
+Three droplet runs of one build put the Rust server's multi-stage aggregation
+at 2.8×, 3.6× and 4.1× of `mongod`. The harness measured each server's reps
+back to back, so minutes separated the two halves of every ratio and a noisy
+neighbour on the shared-CPU droplet moved one column only.
+
+#### Changed
+
+- `bench.compare_servers` runs every server inside each rep, rotating the
+  order, and `invoke do-perf` takes fifteen reps instead of five. Two droplet
+  runs of the same build that way agreed on multi-stage aggregation to 0.24×
+  (was 1.24×) and on `delete_many` to 0.02× (was 1.02×).
+- The results file records, per workload, the lowest and highest ratio among
+  the individual passes (`rust_x_range`, `py_x_range`), so a noisy run shows
+  as one.
+- The published per-operation figures now come from that harness. Across
+  three interleaved droplet runs the Rust server is at 1.0×–3.2× of `mongod`
+  (published before as 1.0×–4.1×), the Python server at 2.0×–26.7×, and the
+  Rust server 1.9×–13.5× faster than the Python one. A third run widened the
+  agreement on multi-stage aggregation to 0.63×: better than 1.24×, and
+  still the row that moves most.
+
+### `scripts/detached_run.py`: a stopped run always reads as finished
+
+On Windows CI, `status` could crash on every call after `stop`, so a stopped
+run never reported "finished". The supervisor could be killed while writing
+its child's exit code, leaving that file empty.
+
+#### Fixed
+
+- The exit file and the state file are written beside their name and renamed
+  into place, so a kill or a concurrent reader never sees one half written.
+- A missing, empty or garbled exit file reads as exit code -1 instead of
+  raising.
+- `stop` records the run's end itself instead of leaving it to the next
+  `status`.
+
+### `detached_run.py`: an exit that came before the state file
+
+#### Fixed
+
+- A command started with `scripts/detached_run.py start` that ended at once
+  could end before its state file was written. Its exit was then recorded
+  nowhere a reader of `<name>.json` would see it, and the file said
+  `exit_code: null` until `status` or `wait` was called. `start` now records
+  an exit that is already there.
+
+### The droplet benchmark: a task for every command, and one for PostgreSQL
+
+#### Added
+
+- `invoke do-destroy` and `invoke do-ssh`, and `--server-size` /
+  `--client-size` on `invoke do-up`. Every `do-cluster` command now has a
+  task.
+- `invoke do-pg-bench` (`bench/do_pg_bench.py`): the measurement behind the
+  site's Rust PostgreSQL table, a released `secantusd-pg` against PostgreSQL
+  16 on the server droplet. It was done by hand, and so had not been
+  repeated since 0.1.0-beta.7. The raw trials are kept under
+  `bench/results/pg-droplet/`.
+- That measurement runs its clients on the two client droplets, over the
+  private network (`bench/pg_remote_client.py`). It used to run them beside
+  the server, where a lone client and the server share CPUs: one trial of
+  one or four clients then moved by up to 21%.
+
+#### Changed
+
+- `bench/pg_concurrency.py` checks that the server binary is current when
+  it starts the server, where it used to check on import.
+
+### The Java driver gauge no longer deletes its own test data
+
+The Java gauge reported 495 of 496 for the Rust MongoDB server, with a
+different test failing on each run, always a read that was missing documents
+inserted a moment earlier. That reads like lost writes. It was the gauge.
+
+The driver's test fixture drops the shared `JavaDriverTest` database when each
+test JVM exits, and the gauge overrode the driver's own one-JVM setting to run
+twelve at once against one server. A JVM that finished deleted the data under
+the ones still running. A logging proxy in front of the server showed a
+`dropDatabase` from another connection 2 ms before the failing read.
+
+#### Fixed
+
+- `invoke validate-java` runs one test JVM at a time by default, as the driver
+  itself does. `SECANTUS_GAUGE_PARALLEL_FORKS` still raises it for timing
+  experiments.
+- The Rust server's Java panel is corrected to 496 of 496.
+- `invoke validate-kotlin` does the same: its tests use the same fixture. It
+  had not shown a failure, and one JVM at a time reports the same 340 of 340
+  on both servers.
+
+### The PostgreSQL droplet benchmark refuses a slow disk and records why a trial was slow
+
+Two things went wrong in the measurement behind the Rust PostgreSQL page's
+table on 2026-10-13, and neither can now happen quietly.
+
+#### Added
+
+- `invoke do-pg-up` creates the three droplets, probes the server's disk, and
+  destroys and creates them again while it completes fewer than 5,000
+  `fdatasync` calls a second, four times at most. Two of three `c-16`
+  droplets that day completed about 1,700, where both servers wait for the
+  disk and the write rows come out near 1.0x.
+- `invoke do-pg-bench` makes the same probe first and refuses a slow disk.
+  `bench/do_pg_bench.py --check-disk` runs the probe alone, and
+  `--min-fdatasync 0` measures anywhere.
+- Every trial now stores what the server droplet did during it: the disk's
+  flushes and the time each took, and the server's CPU a statement. A row
+  whose trials differ by more than 20% of their median is printed under the
+  table trial by trial with those figures. Three trials of one row had
+  fallen by a third with nothing recorded that could say why; fifty-four
+  further trials did not repeat it.
+
+### The Rust PostgreSQL server no longer loses a cancel that arrives before execution
+
+A `CancelRequest` that reached `secantusd-pg` while a statement was still being
+parsed, bound or described was silently dropped, and the statement ran to
+completion. The server cleared its pending-cancel flag at the moment a
+statement began executing, on the reasoning that a cancel received while idle
+targets nothing. That reasoning is right for an idle backend and wrong for one
+that has already started on the client's message.
+
+Probed against PostgreSQL 15.19 with a statement that takes seconds to parse:
+PostgreSQL answered `57014` for a cancel sent anywhere from 0 to 640 ms after
+the statement, and this server ran the full sleep at every offset. This is how
+psycopg's `test_generators.py::test_cancel` ran its `pg_sleep(180)` to the end
+on the Windows gauge runner.
+
+#### Fixed
+
+- A cancel is now dropped only if it arrives before the first message of a
+  cycle (the backend is idle). One that arrives later stays pending until the
+  next cancellation point, whichever message is being processed.
+- A statement nested inside another (a `DO` block's inner statements) no
+  longer clears a cancel aimed at the statement that contains it.
+- A cancel is consumed by the statement it interrupts, so a handler that
+  catches `query_canceled` is not cancelled again by the same request.
+
+### The Rust PostgreSQL server zero-fills its log on Linux
+
+On Linux every durable commit ends in an `fdatasync` of the log, and
+WiredTiger's log file is reserved on disk but never written, so each of those
+syncs also had the filesystem record newly written blocks. The server now
+writes zeros through a new log file when it creates it, as PostgreSQL does for
+a WAL segment.
+
+#### Changed
+
+- `secantusd-pg` on Linux, when commits sync (the default; not under
+  `SECANTUS_TEST_FAST_STORAGE=1`), creates its log files zero-filled and
+  16 MB each where they were 128 MB. A store written by an earlier version
+  opens unchanged, and an earlier version opens a store written by this one.
+- macOS and the MongoDB server are unchanged.
+
+### The Rust PostgreSQL server no longer reuses a plan across a folded parameter
+
+A prepared statement whose parameter sat inside an expression the planner
+folds into a value -- `WHERE k = $1 % 100000` -- had its plan reused with the
+raw parameter substituted, so a later execution returned the wrong row. This
+was in `0.1.0-beta.3`.
+
+#### Fixed
+
+- `secantusd-pg` reuses a prepared statement's plan only when every parameter
+  stands alone where its value is used: compared with a column in the `WHERE`
+  (`k = $1`, `k IN ($1, $2)`), an item of an `INSERT`'s `VALUES`, the whole of
+  `SET v = $1`, or one operand of `SET v = v + $1`. A parameter anywhere else
+  (`k = $1 % 100000`, `k = -$1`, `$1::int2`, `BETWEEN`, `LIMIT $1`) is planned
+  on every execution.
+- The same reuse would have stored the wrong value for
+  `INSERT ... VALUES ($1 % 1000)` and `UPDATE ... SET v = $1 % 1000`; that part
+  was introduced after `0.1.0-beta.3` and never released.
+
+### The Rust PostgreSQL server reuses the plan of a prepared INSERT or UPDATE
+
+A prepared statement's plan was reused only when its parameters landed in a
+`WHERE` clause. An `INSERT` with bound values, an `UPDATE ... SET v = $1` and
+an `UPDATE ... SET v = v + 1` were planned again on every execution, which was
+a quarter to a third of the server's CPU time for those statements.
+
+#### Changed
+
+- `secantusd-pg` reuses the plan when a parameter is stored into an `int4`,
+  `int8`, `float8` or `text` column from a value of the matching kind, and when
+  a parameter is read by an expression the server evaluates per row. Server CPU
+  per statement, macOS, release build: `INSERT` 49 to 42 us, `UPDATE SET v = $1`
+  59 to 47 us, `UPDATE SET v = v + 1` 69 to 57 us, an `UPDATE` matching no row
+  45 to 29 us.
+- A column with a declared width, a narrower range, a domain, an enum or a
+  generated value is planned per execution as before, so its checks see every
+  value.
+
+#### Fixed
+
+- `secantusd-pg` holds a `smallint` to its range. `40000::smallint` answered
+  40000 and a `smallint` column stored it; both are now PostgreSQL's 22003
+  `smallint out of range`. A float outside `integer`'s range (or NaN) cast to
+  an integer is 22003 where it used to saturate, and digits too large for the
+  type (`'99999999999'::int`) are 22003 `value ... is out of range for type
+  integer` where they were 22P02.
+
+### The Rust PostgreSQL server reuses a plan that stores a small integer in a bigint column
+
+A driver sends a small integer as `int2` or `int4`. Bound for a `bigint`
+column, the planner widens it, and a prepared `INSERT` or `UPDATE ... SET`
+that did so was planned again on every execution.
+
+#### Changed
+
+- `secantusd-pg` reuses the plan when an `int2` or `int4` parameter is stored
+  in a plain `bigint` column, carrying the widening with the value.
+- The `secantusd-pg` binary allocates with mimalloc, as `secantusd-rs` does.
+  It is the default `mimalloc` feature of the `secantus-pg` crate;
+  `--no-default-features --features bin` builds without it. A program that
+  embeds `secantus_pg::PgServer` keeps its own allocator.
+
+### The Rust PostgreSQL server's release build is optimised across the whole program, and by a profile
+
+The released `secantusd-pg` binary was compiled at Cargo's defaults: no
+link-time optimisation and no profile. Measured on a 16-vCPU droplet with one
+client selecting by primary key, that binary answered 12,052 statements a
+second. Built with link-time optimisation it answered 14,402, and with a
+profile as well 17,855.
+
+#### Changed
+
+- `crates/secantus-pg` builds its release profile with `lto = "fat"` and one
+  codegen unit. `cargo install secantus-pg` gets this too. A release build
+  takes longer: about seven minutes on 16 vCPUs.
+- The released binaries are built in two stages by
+  `scripts/build_pg_release.sh`: an instrumented build runs
+  `bench/pgo_workload_pg.py`, and the build that ships uses the profile it
+  wrote. `cargo install` cannot have the profile. The two stages take 16
+  minutes on 16 vCPUs.
+
+#### Fixed
+
+- `invoke do-pg-bench` measured PostgreSQL over TLS and `secantusd-pg` in the
+  clear. Ubuntu's PostgreSQL has `ssl = on` and psycopg asks for TLS when the
+  server offers it, so PostgreSQL paid for encryption the other side did not.
+  Every DSN the benchmark uses now says `sslmode=disable`, the run records
+  `pg_stat_ssl` for its own connection, and it stops if that says TLS was on.
+- A benchmark droplet's disk decides the write rows, and one droplet of the
+  same size completed a fifth of the commits a second of the one before it.
+  The run now records the processor and `pg_test_fsync`'s rate, and the
+  table's footnote prints them.
+
+### The psycopg gauge removes its server's store
+
+#### Fixed
+
+- `psycopg_validation.runner` made the server's storage directory, and the
+  TLS run's certificate directory, with `mkdtemp` and never removed them:
+  about 100 MB of WiredTiger left in the temporary directory by every gauge
+  run. Both are removed when the runner exits.
+
+### The Python servers trim their log while they run
+
+The Python store checkpointed when it closed, in a backup and in `fsync`,
+and at no other time. WiredTiger removes a log file only after a
+checkpoint, so a long-running `secantusd-py` or `secantusd-py-pg` kept
+every log file it had written and replayed them all after a crash. The Rust
+servers had the same gap and were fixed first.
+
+#### Fixed
+
+- A durable store checkpoints every 60 seconds. `SECANTUS_CHECKPOINT_SECONDS`
+  sets the interval, as it does for the Rust servers, and `Storage` takes
+  `checkpoint_seconds`; 0 means never.
+- A store opened for tests (`SECANTUS_TEST_FAST_STORAGE=1`, or
+  `durable=False`) does not checkpoint while open, as before.
+
+### A release no longer strands its tag when `main` moves during the test run
+
+`release-prepare` pushed the release commit and the tag in one `git push`,
+which is not atomic. When another PR merged during the 30-minute test run, the
+tag was accepted and `main` was rejected, leaving a published tag on a commit
+`main` did not have. It happened on `0.7.0b1` and again on `0.7.0b2`, and the
+version bump had to be landed by hand each time.
+
+#### Fixed
+
+- `release-prepare` pushes `main` first and the tag only once `main` carries
+  the release commit. If `main` moved, it merges `origin/main` in and retries;
+  the tag stays on the commit the tests ran against.
+- A merge conflict, or any other refused push, stops before the tag is pushed,
+  so nothing is published.
+
+### `secantusd-rs` starts with a 128 MB store, not a 2 GB one
+
+WiredTiger allocates a log file in full when it creates one, and
+`secantusd-rs` asked for 2 GB files. A server that had taken no write had a
+2 GB store.
+
+#### Changed
+
+- `--log-file-max` (and `[storage] log_file_max`) defaults to `128MB`, as
+  the embedded handle already did. Pass `--log-file-max 2GB` for the old
+  behaviour. An existing store opens as before.
+- Measured on a 16-vCPU droplet with the clients on two others, half
+  inserts and half updates of 1 KiB documents: 22,701 operations a second
+  at 2 GB and 22,422 at 128 MB with 16 writers, 16,010 and 16,102 with 64.
+  The three trials of one size differ by more than that.
+
+### A partial TTL index no longer deletes what it does not hold, and three Rust MongoDB server gaps close
+
+The Python MongoDB server expired documents outside a partial TTL index's
+filter: three expired documents, one matching the filter, and all three were
+deleted. It now deletes the one, as `mongod` 8.2.11 does.
+
+The rest is the Rust MongoDB server. An `_id` is unique by the collection's
+default collation, a `$out` that fails leaves its target alone, and a
+time-series collection has its buckets.
+
+#### Fixed
+
+- **Python server: a partial TTL index deleted documents its filter leaves
+  out.** It also expired documents by a compound index that `collMod` had
+  given an `expireAfterSeconds`, and missed a date held in an array.
+  `collMod` now refuses a TTL on a compound index or on `_id`, and a
+  negative one (72).
+- **Rust server: `_id` was not unique by a collection's default
+  collation.** With `strength: 2`, `"A"` went in beside `"a"`. Insert,
+  upsert, rename and a transaction all follow the rule now. A collection
+  created with a collation before this release is not protected for the
+  documents already in it.
+- **Rust server: a `$out` that failed destroyed its target.** The target
+  was dropped before the new documents went in, so a duplicate `_id` or a
+  unique index the output broke left it empty or half-written. `$out` now
+  builds beside the target and swaps it in. A duplicate `_id` in the output
+  used to be dropped without an error; it is reported (11000).
+- **Rust server: `$merge` matched by a simple comparison**, whatever the
+  target's collation, and so inserted a second spelling of an `_id`. It
+  matches under the target's collation and refuses to change `_id` (66).
+- **Rust server: a duplicate key on a clustered collection** names no index
+  and carries `foundValue`, as on `mongod`.
+
+#### Added
+
+- **Rust server: a time-series collection's buckets.**
+  `system.buckets.<name>` and `system.views` can be read and are listed.
+  A scan returns measurements bucket by bucket with the time and meta
+  fields first. `validate`, `collStats` and `$collStats` report buckets.
+  The server still stores measurements, not buckets, and derives the
+  buckets on request; `tasks/backlog.md` section 7.071 has what that leaves
+  out.
+- **Rust server: `convertToCapped`, `cloneCollectionAsCapped`, `compact`
+  and `reIndex`.** They answered `no such command`.
+
+#### Changed
+
+- **Rust server: `validate`** reports `repairMode`, the collection's `uuid`
+  and each index's `spec`, in `mongod`'s field order.
+- **Rust server: `$out` to a capped collection is refused** (17152).
+
+### Capped collections on the Rust MongoDB server hold their bounds within one insert
+
+A capped collection on the Rust MongoDB server could grow past its cap. The
+server never evicted a document that belonged to the batch being inserted, so
+`insert_many` of five documents into a `max: 3` collection left all five, and
+forty 500-byte documents into a `size: 4096` collection left all forty.
+`mongod` 8.2.11 leaves three and seven. The server now evicts from the batch
+like any other documents and always keeps the newest one, as `mongod` does. A
+sweep of 34 capped-collection results (sizes, payloads, one batch against
+single inserts, duplicates) went from 17 different from `mongod` to none.
+
+Two changes make the same server faster. Aggregations decode fewer fields:
+the server read only the fields a `$group` needs, but only when `$group` was
+the first stage after a leading `$match`. It now works out which fields the
+leading stages read, through `$unwind`, `$sort`, `$match`, `$skip` and
+`$limit`, up to the first `$group`, `$sortByCount` or `$count`. And an insert
+opens its `_id` index cursor once per batch, not once per document.
+
+Measured on a Mac over 10,000 five-field documents, old and new binary
+interleaved: the benchmark's multi-stage pipeline went from 13.1 ms to
+10.1 ms (`mongod` 8.2.11: 4.6 ms), `$match` then `$count` from 6.2 ms to
+3.0 ms (1.4 ms), and a 10,000-document `insert_many` from 48 ms to 43 ms
+(38 ms).
+
+#### Fixed
+
+- A capped collection on the Rust MongoDB server is held to `size` and `max`
+  after every insert, including for the documents of the batch that overflows
+  it. The newest document is kept even when it alone is larger than `size`.
+
+#### Changed
+
+- `aggregate` on the Rust MongoDB server decodes only the fields read by a
+  pipeline's leading `$unwind` / `$sort` / `$match` / `$skip` / `$limit`
+  stages and the `$group`, `$sortByCount` or `$count` they lead to.
+- `insert` on the Rust MongoDB server reuses one `_id` index cursor per batch
+  and no longer collects the batch's keys.
+
+### Capped collections on the Rust MongoDB server follow mongod in six more places
+
+A probe of capped-collection behaviour against `mongod` 8.2.11
+(`tools/probes/capped_collections.py`) found the Rust MongoDB server different
+on 67 of 97 results. It now differs on none. Two of the causes lost or
+over-kept data. An upsert was never held to the cap, so a `max: 3` collection
+that received upserts grew without limit. And `max: 0`, which means "no
+document limit" on `mongod`, was read as a limit of zero: every insert
+evicted everything except the newest document.
+
+Not covered by that probe, and still different: `convertToCapped` is not
+implemented (the server answers `CommandNotFound`), and after a refused
+statement aborts a transaction the server words the follow-up error
+differently from `mongod`. The Python MongoDB server differs on 51 of the 97
+and was not changed.
+
+#### Fixed
+
+- An upsert into a capped collection (`update`, `findAndModify`, a
+  replacement, several in one command) evicts the oldest documents to stay
+  within `size` and `max`, as an insert does.
+- `max` of zero or less on a capped collection means no document limit. It is
+  stored and reported as 2147483647, as on `mongod`. A collection created
+  earlier with `max: 0` is no longer emptied on insert.
+- `create` refuses a capped `size` under 1 or over 1 PB and a `max` of 2^31 or
+  more, with `mongod`'s messages. They were stored as given, and a `max` over
+  2^31 wrapped to a negative number.
+- `size` and `max` are stored and reported as integers. pymongo sends `size`
+  as a double, and `listCollections` echoed `1000.0`.
+- `collMod` with `cappedSize` or `cappedMax` re-bounds the collection, checks
+  the same ranges, and answers `InvalidOptions` for a collection that is not
+  capped. Both options were accepted and ignored.
+- `collStats` reports `max` and `maxSize` for a capped collection.
+- A write to a capped collection inside a multi-document transaction is
+  refused and the transaction aborted: `insert` and `update` report write
+  error 263, `delete` write error 20, `findAndModify` fails with 263. They
+  used to run.
+
+### Change streams on the Rust MongoDB server, checked command by command against mongod
+
+A comparison of 115 scripted change-stream scenarios with `mongod` 8.2.11
+(`tools/probes/change_stream_commands.py`): what `$changeStream` accepts,
+every event's shape, `getMore`, invalidation, resuming, the three scopes,
+pre-images and transactions. The previous release answered 111 of them
+differently; this one answers 5 differently.
+
+#### Fixed
+
+- **A write in a transaction is reported without its transaction.** Its
+  events now lead with `txnNumber` and `lsid`, as `mongod`'s do.
+- **A resume token that is not found resumed anyway.** `mongod` re-reads
+  the token's event and refuses (280, `NonResumableChangeStreamError`)
+  when it is not the first one seen: a token from another collection, or
+  a pipeline that filters its event out. The server started after the
+  token's position whatever it named.
+- **`startAtOperationTime` in the future delivered everything**, and one
+  far in the past delivered nothing when the oplog was long.
+- **A stream on the target of `renameCollection ... dropTarget` saw
+  nothing**; it sees the rename and is invalidated. The replaced target no
+  longer gets a `drop` event of its own.
+- **A cluster-wide stream reported writes to `admin`, `config` and
+  `local`.**
+- **After a stream ended, its cursor could still be read**, and a
+  `getMore` with cursor id 0 found a cursor.
+- **An insert that created its collection produced no `create` event**
+  under `showExpandedEvents`. It does now, and so does an upsert.
+- **`collMod`'s `modify` event listed options the command did not give**
+  (`validationLevel`, `validationAction`); `createIndexes` and
+  `dropIndexes` events left an index's options (`unique`) out and had
+  `mongod`'s field order wrong.
+- **A small event carried `splitEvent: {fragment: 1, of: 1}`** under
+  `$changeStreamSplitLargeEvent`. `mongod` adds the field only to an event
+  it split.
+
+#### Changed
+
+- **The `$changeStream` spec is checked.** An unknown field (40415), a
+  wrong type (14), a bad `fullDocument` or `fullDocumentBeforeChange`
+  value (2), `resumeAfter` with `startAfter` (50865), a token whose
+  `_data` is not a string (40647) or not hex (9), `allChangesForCluster`
+  anywhere but `admin` with no collection (72), and a stream on `admin`,
+  `local`, `config` or a `system.*` collection (73) are refused with
+  `mongod`'s messages. A stage `mongod` knows but does not allow after
+  `$changeStream` is "not permitted" (20); `$changeStream` after the first
+  stage is 40602; `$changeStreamSplitLargeEvent` must be last (7182802)
+  and needs a change stream (20).
+- **The cursor document's field order is `mongod`'s**:
+  `postBatchResumeToken` before `id`, and `invalidated: true` on the batch
+  that ends a stream. A 280 error leads with its `errorLabels`.
+- **Resume tokens are upper-case hex**, as `mongod`'s are. A token from an
+  earlier release still resumes.
+
+### Rust MongoDB server: collation that orders and matches as mongod does
+
+The Rust server's collation was a hand-written approximation. Measured
+against mongod 8.2.11 over 764 scenarios it gave a different answer in 462:
+range queries compared code points, `$sort`, `$group` and every expression
+ignored the collation, a collection's default collation was never used, and
+a malformed collation document was accepted. It now compares through ICU4X,
+the Rust implementation of the algorithm and locale data mongod gets from
+ICU, and 8 scenarios differ.
+
+Three bugs found beside it are fixed too. `renameCollection` dropped the
+collection's options, so a validator stopped being enforced after a rename.
+A unique index with a collation compared bytes, so it stored `"a"` and `"A"`
+together at strength 2. And `$group`'s `$min` / `$max` kept the first of two
+equal values where mongod keeps the last.
+
+#### Added
+- Collation by ICU4X: every `strength`, `caseLevel`, `caseFirst`,
+  `numericOrdering`, `alternate`, `maxVariable` and `backwards`, and the 109
+  locales mongod accepts with their `@collation=` variants (five variants are
+  refused by name: `search`, `searchjl`, `big5han`, `gb2312han`,
+  `phonetic`).
+- A collation applies to aggregation expressions (`$eq`, `$cmp`, `$in`, the
+  set operators, `$max` / `$min`, `$sortArray`, `$switch`), to `$group`,
+  `$sortByCount`, `$bucket` and `$addToSet` keys, to the `$sort` stage,
+  `$lookup`, `$graphLookup`, window and `$fill` partitions, and to the update
+  operators `$pull`, `$pullAll`, `$addToSet`, `$push` with `$sort`, `$min`,
+  `$max` and `arrayFilters`.
+- A collection's default collation: stored in full, shown by
+  `listCollections` and on the `_id` index, inherited by its indexes and by
+  every command that names no collation. A view has its own.
+- `$alwaysTrue` and `$alwaysFalse` in a query.
+
+#### Fixed
+- `renameCollection` keeps the collection's options and UUID.
+- A unique index with a collation enforces uniqueness by that collation, on
+  insert, update and build, and its partial filter is read under it.
+- A malformed collation is refused on `find`, `aggregate`, `count`,
+  `distinct`, `findAndModify`, `update`, `delete`, `create` and
+  `createIndexes`, with mongod's code and message.
+- `{locale: "simple"}` means no collation; it was read as one.
+- `createIndexes` stores a collation spelled out as mongod does; two indexes
+  on one key may differ by collation, and `dropIndexes` by that key answers
+  181. An `_id` index with a collation other than the collection's is
+  refused. `collMod` refuses an unknown `index` field.
+- `$group` `$min` / `$max` keep the later of two equal values; `$maxN` lists
+  the later of equal values first.
+- A sort inside `$top` / `$bottom`, `$setWindowFields` and `$fill` reads an
+  array by its smallest (or largest) element, as every other sort does.
+- `$fill` with `locf` writes null where there is nothing to carry forward,
+  and emits partitions in key order.
+- `$setWindowFields` refuses an array partition key (14); `$group` refuses
+  `_id: {field: 1}` (17390).
+
+#### Changed
+- An index created with a collation holds collation sort keys and is marked
+  so in the catalog. A query with a collation still scans the collection.
+  An index with a collation built by an earlier version keeps comparing by
+  value until it is dropped and rebuilt.
+
+### Rust MongoDB server: the cursor commands checked against mongod
+
+We compared `find`'s cursor options, `getMore`, `killCursors`, tailable
+cursors, `count` and `distinct` on the Rust MongoDB server with `mongod`
+8.2.11: 85 scripts of commands. 49 differed. 5 do now.
+
+Five of the differences were wrong results. `find` with `singleBatch`
+returned every matching document whatever `batchSize` said. A tailable cursor
+applied its filter and projection to the first batch only, so every document
+inserted later came back whole. `min` and `max` compared documents where
+`mongod` compares index keys, and left out a document whose array had one
+element inside the bounds, or which lacked the field. `distinct` kept one
+value per BSON type, so 1, 1.0 and a Decimal128 1 were three values, and it
+did not look through an array of documents. `count` ignored a negative
+`limit`.
+
+#### Fixed
+
+- `find`: `singleBatch` returns one batch of `batchSize`; `batchSize: 0`
+  opens a cursor even when nothing matches (so does an `aggregate`, over a
+  missing collection too); a negative `batchSize`, an unknown field, a
+  non-boolean cursor flag, `awaitData` without `tailable` and a malformed
+  `$natural` hint are refused; an empty `hint` is no hint; `showRecordId`
+  keeps the projection.
+- `min` / `max` bound the hinted index's keys, and are refused with
+  `mongod`'s codes when no index is hinted (291), when the index does not
+  fit (51174) and when `min` is not below `max` (51175).
+- `let`: a name must start with a lower-case letter, and a value may not
+  read a field.
+- Tailable cursors: the filter and projection apply to every batch; a
+  tailable `find` on an empty capped collection or a missing one returns a
+  closed cursor; a sort other than `{$natural: 1}` and `singleBatch` are
+  refused; no `postBatchResumeToken` outside a change stream.
+- `getMore`: the cursor id is an int64; a `getMore` for another namespace is
+  13 and names both; `maxTimeMS` is refused on a cursor that is not
+  `awaitData`; a negative `batchSize` and an unknown field are refused. None
+  of these consumes the cursor.
+- A cursor whose collection is dropped or renamed, or whose database is
+  dropped, answers its next `getMore` 175 with `mongod`'s reason. It used to
+  answer `CursorNotFound`, or go on returning documents after a
+  `dropDatabase`.
+- `killCursors`: ids are int64, a null is passed over, an unknown field is
+  refused.
+- `count`: a negative `limit` counts as its size; a negative `skip`, a
+  fractional `limit` and an unknown field are refused.
+- `distinct`: values are distinct by BSON equality and come back in BSON
+  sort order; a dotted key reads through an array of documents; an unknown
+  field and a key with a NUL are refused.
+- `aggregate`, `listIndexes`, `listCollections`: an unknown field, an
+  unknown `cursor` option and a negative `batchSize` are refused.
+- A collection name that is not a string, or is empty, is 73 with
+  `mongod`'s message on every command that takes one.
+- The parser's errors 40414 and 40415 are named `IDLFailedToParse` and
+  `IDLUnknownField` everywhere.
+
+### The Rust MongoDB server holds DDL and admin commands to mongod's rules
+
+`secantusd-rs` now refuses the database names, `create` options and command
+arguments `mongod` 8.2.11 refuses, and reports what `mongod` reports from
+`listCollections`, `dbStats`, `collStats` and `listDatabases`. A comparison
+of 809 replies went from 268 different (of the first 670) to 2.
+
+Several of the differences could leave a test passing on something `mongod`
+would have stopped: any database name was accepted, `dropDatabase` dropped
+the database whatever its argument, and `collMod` with `dryRun: true`
+applied the change.
+
+#### Fixed
+
+- **Rust MongoDB server: an invalid database name is refused.** `a.b`,
+  `a b`, the empty name and names with `/`, `\` or `"` were accepted, and a
+  write created the database. A name with `$` is refused for writes, as on
+  `mongod`.
+- **`dropDatabase` takes `1`.** `0`, `2.5`, a string or null used to drop
+  the database; they are refused (5255100, 14, 40414).
+- **`renameCollection` checks both namespaces first**: an empty or dotless
+  namespace, a rename onto itself (20), onto `system.x` (20) or onto a name
+  past 255 bytes.
+- **`create` parses its options before creating anything**:
+  `validationLevel` and `validationAction` must be strings,
+  `changeStreamPreAndPostImages` a document with a boolean `enabled`,
+  `expireAfterSeconds` a number, `storageEngine` a known engine, `idIndex`
+  a `{_id: 1}` key; `autoIndexId` is unknown; a namespace past 255 bytes is
+  refused. A view keeps only what defines it.
+- **`collMod`**: `dryRun: true` no longer applies the change; a null option
+  is an option not given; `expireAfterSeconds` is refused on a collection
+  that is not clustered; an index named by both `name` and `keyPattern` is
+  refused; the reply ends with `ok`.
+- **Converting an index to unique takes mongod's two steps.** `unique:
+  true` is refused until `prepareUnique: true` has been set; the replies
+  carry `prepareUnique_old` / `prepareUnique_new` and `unique_new`;
+  `unique: false` is refused.
+- **Dropping `system.views` drops every view.** It answered ok and left
+  them in place.
+- **`listCollections`**: no `ns` on `idIndex`, no `uuid` on a view, options
+  in mongod's order, defaults left out; with `nameOnly` the filter sees the
+  name and type only; an unknown operator in the filter is refused.
+
+#### Changed
+
+- **`dbStats`, `collStats` and `listDatabases` have mongod's fields, order
+  and number types**: `views`, `avgObjSize`, `totalSize` and `scaleFactor`
+  on `dbStats`; `numOrphanDocs`, `freeStorageSize`, `indexBuilds`,
+  `totalSize` and `scaleFactor` on `collStats`; `totalSizeMb` on
+  `listDatabases`. `scale` and `freeStorage` are honoured and checked. A
+  database is `empty` when it holds no collection.
+- **`dataSize`** is a command.
+- An unknown field on `drop`, `dropDatabase`, `dbStats`, `collStats`,
+  `listDatabases` or `renameCollection` is refused (40415).
+- `listDatabases` outside `admin` is refused (13).
+
+### Rust MongoDB server: handshake, diagnostic and session commands checked against mongod
+
+The commands a driver or a tool sends about the server and the connection
+(`hello`, `buildInfo`, `serverStatus`, `getParameter`, `dataSize`,
+`$collStats`, the session commands and the fields every command takes)
+were sent to the Rust MongoDB server and to mongod 8.2.11, 1,141 of them,
+and each reply compared. 492 differed; 160 do now
+(`tasks/backlog.md` 7.082).
+
+#### Fixed
+
+- `dataSize` with `min` and `max` sizes that key range. It sized the whole
+  collection for any range.
+- The `storageStats` of a `$collStats` stage are the collection's sizes.
+  They were 0.
+- `serverStatus` reports the process id, the uptime, the operations run
+  (`opcounters`) and the bytes read and written. Each was a constant 0.
+- A wrong-typed `$readPreference`, `$clusterTime`, `apiVersion`,
+  `apiStrict`, `readConcern.afterClusterTime` or `atClusterTime` is
+  refused. Each was read as absent. A read at an `atClusterTime` more than
+  five minutes old is `SnapshotTooOld`; it was answered with the current
+  documents.
+- A command given a field it does not have is refused where mongod refuses
+  it (`{ping: 1, bogus: 1}`).
+- `hello` answers `isWritablePrimary` and the two older names answer
+  `ismaster`, in mongod's key order, with an int32 `connectionId`. The
+  `client` metadata is checked, and refused on a second `hello`.
+- Which commands are in API Version 1, and which run only against `admin`,
+  comes from mongod's own command table. `collStats`, `createUser` and
+  eight more were taken under `apiStrict: true`.
+- `whatsmyuri` gives the client's address. `killOp` takes any whole number
+  and does not say what it found. `getParameter` refuses a request that
+  names no parameter it has, and answers `showDetails`.
+- `profile`, `validate`, `endSessions`, `killSessions`,
+  `killAllSessions`, `usersInfo`, `rolesInfo`, `saslStart`,
+  `saslContinue`, `$collStats`, `$indexStats`, `$currentOp`,
+  `$listSessions` and `{aggregate: 1}` check their arguments.
+- `$listSessions` and `$listLocalSessions` list the sessions commands have
+  come in. They answered a row describing an operation.
+
+#### Added
+
+- `listCommands`, `logout`, `getDefaultRWConcern`, `replSetGetConfig`,
+  `shardingState`, `fsyncUnlock`, and the lower-case `collstats` and
+  `datasize`.
+- `tools/probes/diagnostic_commands.py`.
+
+#### Changed
+
+- A `filter` document on `profile` is refused. It was taken and ignored.
+- `killOp` no longer takes a string of digits, and `writeConcern` no
+  longer takes `wtimeoutMS`: mongod takes neither.
+- `getParameter` no longer reports `version`, which is not a parameter.
+
+### The Rust MongoDB server's `explain` follows mongod's planner
+
+`explain` on `secantusd-rs` now reports the plan `mongod` 8.2.11 reports for
+the same command: the index bounds, what the fetch rechecks, whether an
+index serves the sort or covers the projection, and the stages `count`,
+`distinct`, `update`, `delete` and `findAndModify` have of their own. A
+comparison of 786 `explain` replies went from 771 different to 72.
+
+Two defects outside `explain` turned up and are fixed. An operator the query
+language does not have was accepted over an empty or missing collection by
+every command but `find`. And `count` or `delete` by `_id` on a collection
+that was never written could answer an internal storage error.
+
+#### Changed
+
+- **Rust MongoDB server: `explain` is derived from mongod's planning
+  rules.** `indexBounds` on every index scan, in mongod's notation and for
+  every operator that bounds an index; `EXPRESS_IXSCAN` and `IDHACK` for a
+  point lookup; `PROJECTION_COVERED`; `SORT_MERGE`; `COUNT_SCAN` and
+  `RECORD_STORE_FAST_COUNT`; `DISTINCT_SCAN`; `UPDATE`, `DELETE`,
+  `BATCHED_DELETE`, `EXPRESS_UPDATE` and `EXPRESS_DELETE`; `EOF` for a
+  missing collection or a filter that matches nothing; a view explained
+  through its pipeline. The reply has mongod's envelope (`explainVersion`,
+  the planner flags, `command`, `serverParameters`).
+- **`executionStats` counts what the reported plan examines**, stage by
+  stage: a `LIMIT` stops its input, a multikey scan drops repeated
+  documents, and a scan over several intervals examines the key that ends
+  each one.
+- **`explain` checks its arguments as mongod does**: the verbosity, unknown
+  fields, `writeConcern`, commands that cannot be explained, a write batch
+  of more or fewer than one statement. With no `verbosity` it runs at
+  `allPlansExecution`.
+- `explain` describes the plan mongod runs. This server's storage layer may
+  read the same documents another way; `tasks/backlog.md` 7.075 lists where.
+  `rejectedPlans` is always empty.
+
+#### Fixed
+
+- **Rust MongoDB server: an unknown query operator is refused over an empty
+  or missing collection.** `{a: {$nope: 1}}` was accepted by `count`,
+  `distinct`, `aggregate`, `update`, `delete` and `findAndModify` when there
+  was no document to match it against, and answered as if the filter were
+  valid. `find` refused it as `unsupported query operator`. All now answer
+  `unknown operator: $nope` (2), as `mongod` does.
+- **Rust MongoDB server: `count` and `delete` by `_id` on a collection that
+  was never written** answered `WiredTiger error: No such file or
+  directory`. They find nothing, as `mongod` does.
+- An `explain` reply no longer carries `atClusterTime` under
+  `readConcern: {level: "snapshot"}`.
+
+### The Rust MongoDB server accepts `sort: {$natural: ±1}` on `find` again
+
+Since the build of 2026-10-05, every `find().sort("$natural", ...)` against
+`secantusd-rs` failed with `16410 FieldPath field names may not start with
+'$'`. A sort validator shared between `find` and the aggregation `$sort` stage
+applied the stage's rule to both, and only the stage reads `$natural` as a
+field path. The driver-gauge refresh caught it: pymongo's
+`test_to_list_tailable`, which reads the newest oplog entry this way, failed on
+the Rust server in both the sync and async suites.
+
+Measured against mongod 8.2.11 with the same commands on both servers: 38
+cases, no differences after the fix.
+
+#### Fixed
+
+- `find` with `sort: {$natural: 1}` or `{$natural: -1}` returns documents in
+  storage order, forwards or backwards, and composes with `filter`, `skip` and
+  `limit`. `explain` reports it as a `COLLSCAN` with a direction.
+- A `$natural` sort value other than exactly 1 or -1, or `$natural` beside
+  another key, answers mongod's `2 $natural sort cannot be set to a value
+  other than -1 or 1.`
+- A `hint` alongside a `$natural` sort follows mongod: the same-direction
+  `$natural` hint is accepted, the opposite direction and any index hint are
+  refused with mongod's messages.
+- `findAndModify` with `sort: {$natural: -1}` used to act on the FIRST
+  document. It now acts on the last, as mongod does.
+
+### Rust MongoDB server: documents come back in the order mongod returns them
+
+A query with no sort has no promised order, and a client still sees one:
+the order of the index the server read. That order also decides which
+document a `limit: 1` delete removes and which one an update without
+`multi` changes. The Rust MongoDB server read through its own index router
+and returned its own order, so the same write could change a different
+document from mongod's.
+
+It now takes the order from the plan mongod runs. The store says which
+documents match, and the planner behind `explain` says in what order mongod
+reads them.
+
+Found by sending 6,531 commands to the server and to mongod 8.2.11 and
+comparing the `_id`s each read returned, in order, and what each write of
+one document left behind. 1,189 differed; 97 do now (`tasks/backlog.md`
+7.080).
+
+#### Fixed
+
+- `{a: {$gt: 1, $lt: 9}}` over an index on `a` did not return `{a: [1,
+  9]}`. One element is over 1 and another under 9, and the scan read only
+  the keys between the two.
+- `{"p.q": null}` over an index on `p.q` did not return a document whose
+  array `p` has an element without `q`.
+- A sort by `p.q` ranked that document by its other elements. mongod ranks
+  it as null.
+- `find`, the front of an `aggregate` pipeline, `distinct` and
+  `findAndModify` return documents in the order mongod's plan reads them:
+  an index's order for `$ne`, `$nin`, `$exists`, `$type`, `$not`, `$mod`
+  and a regex, `_id` order under a hinted `_id` index, and equal keys last
+  first on a backward scan.
+- `delete` with `limit: 1`, `update` without `multi` and `findAndModify`
+  change the first document in that order. `findAndModify` and `update`
+  now read their `hint`.
+
+#### Changed
+
+- A read whose order the plan has to work out costs more than it did.
+  Measured against the build before, on 20,000 documents: a read through
+  the index the router also picks, a collection scan and a read by `_id`
+  cost the same; `{a: {$ne: 5}}` over an index on `a` costs about three
+  times as much, since mongod reads it in the index's order and the router
+  scans the collection for it. A sort is unchanged unless documents compare
+  equal.
+
+### Rust MongoDB server: geo queries checked against mongod
+
+The Rust MongoDB server tested every geo shape as if coordinates were a
+plane, and treated `$near` as a filter. mongod tests `$geometry` on the
+sphere, where an edge is the great-circle arc between its ends, and returns
+a `$near` nearest first from a geo index it requires.
+
+Found by sending 1,278 geo commands to the server and to mongod 8.2.11 and
+comparing each reply. 726 differed; 137 do now, about 100 of them the order
+of documents under a geo index (`tasks/backlog.md` 7.081).
+
+#### Fixed
+
+- `$geoWithin` and `$geoIntersects` with `$geometry` are tested on the
+  sphere. `[1, 1]` is not on the line from `[0, 0]` to `[2, 2]`, and a
+  polygon across the antimeridian is the small one.
+- `$box`, `$polygon` and `$center` return points only. They returned a
+  line or a polygon that lay inside them.
+- A value holding several locations (`[[1, 1], [30, 30]]`) matches through
+  any of them, and is found through a `2d` index.
+- `$near` and `$nearSphere` return documents nearest first, measure a line
+  or a polygon by its nearest point, and need a geo index on the field
+  that the form of the query can read. They are refused inside `$or`,
+  `$nor`, `$not` and `$match`.
+- `$geoNear` takes its units from `near`: metres for GeoJSON, radians for
+  a legacy point with `spherical: true`. It no longer needs
+  `distanceField`, refuses `limit` and `num`, and must be the first stage.
+- A `2dsphere` index refuses a value that is not a geometry, and a `2d`
+  index a value that is not a legacy pair: on insert, on update, and when
+  the index is built over such a document.
+- `$within` is read as `$geoWithin`.
+- About ninety argument errors have mongod's code and text.
+
+#### Changed
+
+- A `$geoNear` with a `maxDistance` reads every document of the collection.
+  It used to fetch candidates through the index.
+
+### Index management on the Rust MongoDB server follows mongod
+
+`dropIndexes` given the key `{_id: 1}` dropped the `_id` index on the Rust
+MongoDB server. `mongod` refuses, by name, by key or in a list, and so does
+the Rust server now.
+
+That came out of a probe of index management against `mongod` 8.2.11
+(`tools/probes/index_admin.py`): the Rust server differed on 68 of 87
+results and now differs on 9. Seven of the nine are `text` and `hashed`
+indexes, which it does not build, and what follows from their absence; the
+other two are below.
+
+#### Fixed
+
+- `dropIndexes` never drops the `_id` index. It accepts a list of names,
+  checks every name before dropping any, reports a missing collection, and
+  answers `non-_id indexes dropped for collection` for `"*"`.
+- `createIndexes` checks every spec before it builds anything or creates the
+  collection. Refused with `mongod`'s errors: a key value of 0 or a boolean,
+  an empty or `$`-prefixed field name, more than 32 fields, an unknown
+  option, an empty or `*` name, index version 3, `partialFilterExpression`
+  with `sparse`, a negative, oversized or compound TTL, any option on the
+  `_id` index, and an empty `indexes` list. All were accepted.
+- `unique: 1` builds a unique index. A number was read as "not unique".
+- The `createIndexes` reply has `mongod`'s fields: `commitQuorum`, the `_id`
+  index counted for a collection the build creates, `index already exists`
+  when some of the specs existed, and no `createdCollectionAutomatically`
+  when all did.
+- `collMod` with `index: {hidden: ...}` hides or shows the index and reports
+  `hidden_old` / `hidden_new`. It answered `ok` and did nothing. Hiding the
+  `_id` index is refused.
+- A hidden index is passed over by the query planner, by sorts and by hints
+  (on reads and writes), whether hidden by `collMod` or created hidden. It is
+  still maintained, and a hidden unique index still enforces uniqueness.
+- `$geoWithin` with `$box`, `$polygon` or a `$geometry` polygon includes a
+  point that lies on the boundary. It was left out, with and without an
+  index; `mongod` includes it in all 15 combinations probed.
+- `collMod` of a TTL reports both values as int64 and no old value for an
+  index that had none, and names the missing index or option in its errors.
+- `listIndexes` lists `_id_` first.
+
+### Rust MongoDB server: `insert`, `delete`, `count` and `distinct` checked against mongod
+
+The Rust MongoDB server stored two documents whose `_id` mongod holds to be
+one: after `{_id: {a: 1}}` it accepted `{_id: {a: 1.0}}`. It also lost a
+document when a `$merge` with `whenMatched: "replace"` was refused by a
+unique index, because it deleted the old document before inserting the new
+one. Both are fixed. They were found by sending 905 `insert`, `delete`,
+`count` and `distinct` commands to the server and to mongod 8.2.11 and
+comparing each reply and the documents left behind; 162 replies differed
+and 32 still do (`tasks/backlog.md` 7.078).
+
+No stored key changes. A document `_id` takes a second claim, by value,
+beside its row in the `_id` index. The first time this version opens a
+store it gives every stored document `_id` its claim, so a duplicate by
+value of an older document is refused too. Two documents an earlier
+version already stored as different both stay.
+
+#### Fixed
+
+- A document `_id` is unique by value: `{a: 1}`, `{a: 1.0}` and
+  `{a: NumberLong(1)}` are one `_id`.
+- `$merge` with `whenMatched: "replace"` replaces the document in place. A
+  replacement that fails leaves the document as it was.
+- A delete statement with no `limit` is refused. It removed every match.
+- `delete` checks every statement before it runs any.
+- A `limit: 1` delete removes the first document its `hint` reads.
+- An `$in` over an index returns documents in the index's order, for `find`
+  and for `delete`.
+- `insert` refuses a `$`-prefixed field at any depth of an `_id` document,
+  a document nested past 180 levels, and a batch holding an element that
+  is not a document; it drops a null element.
+- A duplicate-key message prints dates, documents, binary and timestamps
+  as mongod does. They were printed as Rust debug text.
+- A document that repeats both an `_id` and a unique index key is reported
+  for the `_id`.
+- `count` reads `limit` and `skip` as mongod does: a decimal `skip` is
+  rounded, a `limit` that is not a whole number is refused.
+- `insert`, `delete`, `count` and `distinct` refuse fields they do not
+  take, and `count` and `distinct` refuse a `writeConcern`, as do 38 other
+  commands measured.
+- A `readConcern` that is not a document is refused.
+- A write concern's `j` and `fsync` take any number, are refused together,
+  and `wtimeout` is accepted whatever its type.
+- An `apiVersion` other than "1" is refused in mongod's words.
+- `$expr` with an unknown operator answers 168, and `$text` with no text
+  index answers 27, on `delete`, `count` and `distinct`.
+
+### Rust MongoDB server: `$out` and `$merge` checked against mongod
+
+`$merge` on the Rust MongoDB server stored a different document from
+mongod's. With `whenMatched: "merge"`, the default, it merged sub-documents
+field by field: `{o: {p: 1}}` merged into `{o: {q: 2}}` gave `{o: {q: 2, p:
+1}}`. mongod sets each top-level field whole and stores `{o: {p: 1}}`. The
+stage is now written with the `update` command, as mongod writes it, and
+stores what mongod stores.
+
+Found by sending 376 `$out` and `$merge` pipelines to the server and to
+mongod 8.2.11 and comparing each reply and what the source and target held
+afterwards. 191 of the first 327 differed; 4 of 376 do now
+(`tasks/backlog.md` 7.079).
+
+#### Fixed
+
+- `whenMatched: "merge"` sets each top-level field whole. A field name
+  with a dot in it is a path, and new fields are stored in the order
+  `$set` stores them.
+- `$out` and `$merge` inside `$facet`, `$lookup` or `$unionWith` are
+  refused. They ran, and wrote to the target.
+- A write the target refuses no longer stops the others: every document of
+  the batch is attempted and the first failure is reported.
+- The target's validator is asked about each document as it is written.
+  One failing document used to stop all of them from being written.
+- A `whenMatched` pipeline no longer inserts a document the validator
+  refuses, and sees the stage's `let` variables.
+- `whenMatched: "delete"` is refused; mongod has no such mode. So are the
+  pairs of modes mongod does not have.
+- The `on` fields need a unique index that is not partial and has the
+  pipeline's collation.
+- A target that does not exist is not created by a pipeline that writes
+  nothing.
+- `$out` refuses a target name no collection can have, a system
+  collection, and a document an insert would refuse, and leaves the target
+  as it was.
+- A field set to `$$variable.path` that leads nowhere is removed. It was
+  set to null, in `aggregate` and in a pipeline update.
+- A replacement cannot change an `_id` to one a collation holds equal.
+- `{$set: {$c: 2}}` over a document whose `$c` is already 2 is accepted.
+- `listIndexes` shows a clustered index's `expireAfterSeconds`.
+- A duplicate key reported for a whole command carries `keyPattern` and
+  `keyValue`.
+
+### The Rust servers trim their log while they run
+
+Neither Rust server checkpointed between opening its store and closing it,
+and WiredTiger removes a log file only after a checkpoint. A server under
+writes kept every log file it had ever written, and after a crash replayed
+all of them.
+
+#### Fixed
+
+- `secantusd-rs` and `secantusd-pg` checkpoint every 60 seconds
+  (`SECANTUS_CHECKPOINT_SECONDS`, and `--checkpoint-seconds` on
+  `secantusd-rs`). Measured on `secantusd-pg` with eight clients updating for
+  13 minutes: the store was 2.1 GB before this change and 69 MB after, and a
+  restart after a SIGKILL took 36.8 s before and 1.4 s after. Throughput was
+  the same, 13,815 statements a second before and 13,864 after.
+- A store opened for tests (`SECANTUS_TEST_FAST_STORAGE=1`, or
+  `durable=false`) does not checkpoint while open, as before.
+
+### Rust PostgreSQL server: built-in functions, checked one by one
+
+A new probe calls every immutable or stable function in PostgreSQL 15's
+`pg_proc` on PostgreSQL and on the Rust PostgreSQL server, with one sample
+value for each argument type. Of the 1,935 functions it can call, 619
+answered the same before this change and 1,439 answer the same after it.
+The corpora written by hand had not reached most of what it found.
+
+#### Fixed
+
+- `sum(interval)` answered zero and `avg(interval)` answered NULL, over a
+  table and over literals. Both add the months, days and time apart, as
+  PostgreSQL does.
+- `substr`, `substring`, `overlay`, `md5`, `btrim`, `ltrim`, `rtrim` and
+  `trim` over a `bytea` ran the text function over a rendering of the
+  bytes, or were refused. They are the `bytea` functions now.
+- `bytea LIKE bytea` answered NULL. It matches bytes, with `%` and `_` as
+  the wildcards.
+- `mod(7.5, 2)` answered 1 and `div(9.9, 0.3)` was a division by zero: both
+  truncated their arguments to integers first.
+- `smallint` arithmetic answered `integer`, and never overflowed. It
+  answers `smallint`, and a result past its range is 22003. A prefix `-` or
+  `abs` of a `real` or a `smallint` keeps the type too.
+- `to_tsvector` over `json` or `jsonb` indexed the document's text, keys
+  and numbers included. It indexes the string values only.
+- `array_agg` over an array column was typed `varchar`; it is the array's
+  own type.
+- `diagonal(box)` and a `box` cast to `lseg` ran from the lower left corner
+  to the upper right. PostgreSQL's runs the other way.
+- A regular-expression function took any letter as an option. One that is
+  no option is 22023 `invalid regular expression option`, for
+  `regexp_like`, `regexp_count`, `regexp_instr`, `regexp_substr`,
+  `regexp_replace`, `regexp_matches`, `regexp_split_to_array` and
+  `regexp_split_to_table`.
+- `pg_size_bytes` of a bad size is 22023 and `ts_rank` with a short weight
+  array is 2202E, where both were other codes. A bad range bound flag,
+  `is_normalized` with an unknown form and `json_array_elements` of a
+  non-array carry PostgreSQL's text.
+
+#### Added
+
+- `regexp_match`.
+- `regexp_replace` with a start position, and with the number of the match
+  to replace.
+- `OVERLAPS`, over dates, times and timestamps, with an end or a length.
+- `bit_xor`; `bit_and` and `bit_or` over bit strings; `string_agg` over
+  `bytea`.
+- `date + time`.
+- `get_bit`, `set_bit` and `bit_count` over `bytea`, and
+  `length(bytea, encoding)`.
+- `num_nulls` and `num_nonnulls`, `parse_ident`, `convert_to` and
+  `convert` (UTF8, LATIN1 and SQL_ASCII), `multirange(range)`,
+  `trunc(macaddr)`, `trunc(macaddr8)` and `macaddr8_set7bit`.
+- A built-in called by the name of the function behind an operator:
+  `int4pl(a, b)` is `a + b`, `texteq`, `int48lt`, `textlike` and about 740
+  more, from PostgreSQL 15's `pg_operator`. Also the `*larger` /
+  `*smaller` functions behind `max` / `min`, the numeric and date `*cmp`
+  functions, and names such as `textlen`, `dexp` and `numeric_sqrt`.
+- The embedded Python handle, `_secantus_server.PgServer`, takes
+  `tls_cert_file`, `tls_key_file`, `tls_ca_file`, `tls_client_cert`,
+  `tls_require`, `refuse_unknown_users`, `hba_file` and `ident_file`, and
+  has `reload()`. It is a tool for this repository's tests; the wheel on
+  PyPI does not carry it.
+- `./inv validate-psycopg-rust [--tls]` runs psycopg's suite against the
+  Rust PostgreSQL server, and with `--tls` again over TLS. A new workflow
+  runs both on Linux each week and on a pull request that touches the
+  server's TLS code. It fails when a run stops short, or when a test fails
+  over TLS that passes in the clear.
+
+#### Changed
+
+- A statement that passed an unknown letter as a regular-expression option
+  ran before and is refused now, as on PostgreSQL.
+- `smallint` arithmetic that overflowed gave a number before and is an
+  error now.
+
+`tools/probes/pg_builtin_coverage.py` is the probe.
+`tools/probes/pg_corpora/builtin_coverage.sql` holds 153 statements over
+what changed, with PostgreSQL 15.19's answers recorded beside it, and
+`tests/test_rust_pg_builtin_coverage.py` holds the server to them in CI.
+What the probe still reports is in `tasks/backlog.md`.
+
+### Rust PostgreSQL server: `pg_hba.conf`
+
+The Rust PostgreSQL server applied one login rule to every connection, set
+by command-line options. `--hba-file` takes a `pg_hba.conf` in their place,
+read as PostgreSQL 15 reads it.
+
+#### Added
+
+- `--hba-file` (`PgBuilder::hba_file`, `ServerOptions::hba_file`). The first
+  line whose type, database, user and address match a connection decides
+  it, and a connection no line matches is refused with PostgreSQL's "no
+  pg_hba.conf entry". Read: `host`, `hostssl`, `hostnossl`; `all`,
+  `sameuser`, `samerole`, names and lists for the database; `all`, names,
+  `+role` and lists for the user; `all`, `samehost`, and an address with a
+  prefix length or a mask; the `trust`, `reject`, `scram-sha-256`, `md5`,
+  `password` and `cert` methods; `clientcert=`, `clientname=` and `map=`.
+- `--ident-file` (`PgBuilder::ident_file`), the `pg_ident.conf` a `map=` is
+  looked up in.
+- The `password` method: the password in the clear, checked against a
+  stored SCRAM verifier or md5 hash.
+- The file is read again on SIGHUP, `select pg_reload_conf()` and
+  `PgServer::reload`.
+
+#### Changed
+
+- With a `pg_hba.conf`, a role with no password cannot pass a
+  `scram-sha-256` line and a user name with no role is refused, as on
+  PostgreSQL. Without one, both still connect, as before.
+- With a `pg_hba.conf`, a login is proved before the database is looked up:
+  a wrong password for a database that is not there is a wrong password.
+- `PgServer::reload_tls` and `TlsReloader`, added earlier in this release
+  cycle and not yet released, are `PgServer::reload` and `Reloader`.
+
+A line the server cannot apply stops it from starting, with the line's
+number: a method that needs an outside service (`peer`, `ident`, `gss`,
+`sspi`, `ldap`, `radius`, `pam`, `bsd`), a host name for the address,
+`samenet`, and `@file` inclusion.
+
+Run against PostgreSQL 15.19 with the same two files: 118 of 118 scenarios
+answer the same.
+
+### Rust PostgreSQL server: the login comparisons run in CI
+
+The login rules of the Rust PostgreSQL server were measured against
+PostgreSQL 15 by scripts that lived outside the repository, so nothing
+would have failed had a later change moved them.
+
+#### Added
+
+- `tools/probes/pg_login_options.py`, `pg_login_tls_files.py` and
+  `pg_login_hba.py`: 817 logins put to a throwaway PostgreSQL 15 cluster
+  and to `secantusd-pg`, each printing how many answer the same.
+- `tests/test_rust_pg_login_differential.py` runs the three and requires
+  every scenario to match, and each probe to hold the number of scenarios
+  it is known to. It needs `SECANTUS_PG15_BIN`; CI's `pg-oracle` lane
+  installs PostgreSQL 15 and sets it.
+- `SECANTUS_GAUGE_TLS=1` runs psycopg's suite with the Rust server started
+  with a certificate and libpq told `sslmode=verify-full`. Measured on
+  2026-10-12: 5,544 pass and none fail of the 5,731 that ran, the same
+  counts as the plain run.
+
+### Rust PostgreSQL server: `--refuse-unknown-users`
+
+The Rust PostgreSQL server lets a user name it has no role for connect
+without a password. `--refuse-unknown-users` stops that. The default is
+unchanged, because test fixtures connect as roles nobody created.
+
+#### Added
+
+- `secantusd-pg --refuse-unknown-users`, `PgBuilder::refuse_unknown_users`
+  and `ServerOptions` with `bind_with` for a caller that binds the server
+  itself. A user there is no role for is asked for a password and the login
+  fails as a wrong password does, which is what PostgreSQL answers under a
+  `scram-sha-256` line. Under `--tls-client-cert cert` the certificate is
+  checked and the role is then reported missing. A role with no password
+  still connects without one.
+
+Run against PostgreSQL 15.19 in the five login configurations of the TLS
+comparison, with 65 unknown-user scenarios added: 219 of 219 answer the
+same with the flag, and 171 without it.
+
+### Rust PostgreSQL server: `public` off the `search_path` hides its tables, and grouping sets take expressions in any clause
+
+A table in `public` is stored under its bare name, so a bare name went on
+finding it after `public` was taken off the `search_path`. PostgreSQL answers
+`42P01 relation "t" does not exist` there; this server read the table, and an
+`INSERT`, `UPDATE` or `DELETE` wrote it. It is 42P01 now.
+
+Under `ROLLUP`, `CUBE` and `GROUPING SETS`, a `HAVING` term or a select-list
+expression computed over the keys was refused when it was more than a key
+compared with a constant. Those queries run now.
+
+#### Fixed
+
+- A relation in `public` named without its schema is not found while `public`
+  is off the `search_path`: a `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+  `TRUNCATE`, `COPY`, `ALTER TABLE`, `CREATE INDEX`, `COMMENT` or `DROP` of it
+  is 42P01, as PostgreSQL 15 has it. A name written with its schema
+  (`public.t`) works, and a view created over such a table keeps reading it.
+  Still found, and listed in the backlog: a name looked up from a string
+  (`nextval('s')`, `'t'::regclass`) and `DROP ... IF EXISTS`.
+- An unterminated string, quoted identifier, dollar-quoted string or comment
+  reports where it opens (`select 'abc` is position 8). The error had no
+  position.
+
+#### Added
+
+- Under `ROLLUP` / `CUBE` / `GROUPING SETS`: a `HAVING` term over a key
+  (`having g || 'x' = 'ax'`, `having coalesce(g, z) = 'a'`), an expression
+  over an expression key (`select upper(g) || 'x' ... group by rollup
+  (upper(g))`), `GROUPING()` inside an expression (`case when grouping(g) = 1
+  then 'total' else g end`), and `ORDER BY` over an expression of the keys or
+  an aggregate. Each was `0A000`.
+- `GROUP BY (a, b)` groups by `a` and `b`. It was a 42803 naming `a`.
+
+#### Tests
+
+- `tools/probes/pg_corpora/search_path_public.sql` (37 statements) and
+  `grouping_set_exprs.sql` (45, was 25) against PostgreSQL 15.19. What still
+  differs is listed at the end of each file and in `tasks/backlog.md`.
+
+### Rust PostgreSQL server: client certificates, channel binding and `pg_stat_ssl`
+
+The Rust PostgreSQL server could offer TLS, and that was all it could do
+with it. A client that required SCRAM channel binding gave up, a client
+certificate was never asked for, and nothing could make the server refuse a
+connection in the clear. It has no `pg_hba.conf`, so three options now stand
+for the lines of one that matter here.
+
+Each behaviour was measured against PostgreSQL 15.19 in the matching
+`pg_hba.conf` configuration: 154 scenarios through psycopg 3.3.4 and a
+hand-written SCRAM client, of which 150 answer the same. The four that
+differ are one known case: this server trusts a user it has never heard of.
+
+#### Added
+
+- **SCRAM channel binding.** A password login over TLS is offered
+  `SCRAM-SHA-256-PLUS` (`tls-server-end-point`), so
+  `channel_binding=require` connects. A client that says it can bind but
+  was not offered it is refused when the server did offer it, with
+  PostgreSQL's SQLSTATE, message and detail.
+- **`--tls-ca-file`** (`TlsConfig::ca_file`): a TLS client is asked for a
+  certificate, and one it sends must be signed by a CA in that file.
+- **`--tls-client-cert verify-ca | verify-full | cert`**
+  (`TlsConfig::client_cert`): a certificate must be sent; its common name
+  must also be the user name; or that, with no password asked for.
+- **`--tls-require`** (`TlsConfig::require_tls`): a connection that is not
+  TLS is refused with PostgreSQL's "no pg_hba.conf entry ... no encryption".
+- **`pg_stat_ssl`**, which answered 42P01: a row for each connection with
+  the protocol version, the cipher under OpenSSL's name, and the client
+  certificate's subject, serial number and issuer.
+- `PgBuilder::tls_config`, which takes a whole `TlsConfig`.
+- `pg_backend_pid()` inside an expression (`where pid = pg_backend_pid()`).
+  It worked only as a select-list item on its own.
+
+#### Changed
+
+- Selecting a SASL mechanism the server did not offer is 08P01 "client
+  selected an invalid SASL authentication mechanism", as PostgreSQL has it.
+  It was 28000 with other words.
+- A SCRAM client-final message whose `c=` attribute does not repeat the
+  header of the first message is refused. It was not looked at.
+- `TlsConfig` is `#[non_exhaustive]`: build it with `TlsConfig::new`.
+
+### Rust PostgreSQL server: revocation lists, user name maps and a TLS reload
+
+The Rust PostgreSQL server's TLS could not refuse a revoked client
+certificate, map a certificate to a role other than the one it names, or
+pick up a renewed certificate without a restart. It can now.
+
+#### Added
+
+- `--tls-crl-file` (`TlsConfig::crl_file`), PostgreSQL's `ssl_crl_file`. A
+  client certificate a revocation list names fails the handshake. As
+  OpenSSL requires of PostgreSQL, every certificate in the chain needs a
+  list from its issuer that is in date. A list with no extensions, which
+  `openssl ca -gencrl` writes by default, is read.
+- `--tls-ident-file` and `--tls-user-map` (`TlsConfig::user_map`), a
+  `pg_ident.conf` and `map=`. Under `--tls-client-cert cert` a certificate
+  logs in as the roles the named map gives it, by exact name or by a
+  regular expression with `\1`.
+- `--tls-client-name DN` (`TlsConfig::client_name`), `clientname=DN`: the
+  certificate's whole subject, `CN=alice,O=Example`, is what is compared
+  with the user name or handed to the map.
+- The TLS files are read again on SIGHUP, on `select pg_reload_conf()` from
+  a superuser, and on `PgServer::reload_tls` / `RunningPgServer::tls_reloader`.
+  Files that cannot be used leave the old ones serving.
+
+#### Changed
+
+- A server certificate whose signature is RSA-PSS is offered SCRAM channel
+  binding, with the hash its parameters name. It was offered none.
+- A server certificate signed with Ed25519 is offered channel binding too,
+  and a login that takes it up fails with "could not find digest for NID
+  UNDEF", as on PostgreSQL. libpq takes it up by default, so a client that
+  connected to such a server before now needs `channel_binding=disable`.
+- SIGHUP no longer stops a server that was started with TLS. It reloads.
+
+Run against PostgreSQL 15.19: 480 of 480 scenarios answer the
+same, and the 219 of the earlier login comparison still do.
+
+### The Rust PostgreSQL server offers TLS
+
+`secantusd-pg` answered every TLS request with "not supported", so a client
+set to `sslmode=require` could not connect at all. Given a certificate and its
+key, it now completes the handshake.
+
+Run against PostgreSQL 15.19 with `ssl = on` and the same certificate, psycopg
+(libpq 18) gets the same answer from both servers for `sslmode=disable`,
+`prefer`, `require`, `verify-ca` and `verify-full`, for a certificate signed by
+another CA, for a TLS 1.2 ceiling, for a SCRAM-SHA-256 login over TLS, and for
+`SHOW ssl`, `RESET ALL` and `SET ssl`.
+
+#### Added
+
+- `secantusd-pg --tls-cert-file PATH --tls-key-file PATH`: a PEM certificate
+  chain and its private key (PKCS#8, PKCS#1 or SEC1, no passphrase). A client
+  that asks for TLS gets it; one that does not is still served in the clear.
+- `PgBuilder::tls(cert_file, key_file)` and `secantus_pg::bind_tls` for the
+  embedded server, and `secantus_pg::TlsConfig`.
+- `SHOW ssl` reads `on` when the server has a certificate.
+- A TLS round trip (`sslmode=verify-full`) in the release workflow's smoke
+  test, so the published binary's TLS is exercised before it ships.
+
+#### Changed
+
+- An option `secantusd-pg` does not know (`--tls-cert`, any other `--name`)
+  is now an error. It used to be taken as the storage path, and the server
+  started over a directory of that name.
+- A server that cannot use its certificate does not start: a missing file, a
+  key that does not match, or one flag of the pair without the other.
+
+#### Not included
+
+- SCRAM channel binding (`SCRAM-SHA-256-PLUS`): a client with
+  `channel_binding=require` and a password is refused by its own library,
+  where PostgreSQL connects.
+- Client certificates (`clientcert`, `cert` authentication), `pg_stat_ssl`,
+  and a way to refuse plaintext connections.
+
+### Rust PostgreSQL server: an unprepared statement reuses a plan
+
+A statement sent with its values written into the text (`select v from t
+where k = 5`, then `... k = 6`) was a new text each time, so the server
+parsed and planned every one from the start. It now reads such a statement
+as the same statement with the values taken out, and after the second of a
+shape it reuses the plan with the new values put in, as it already did for
+a prepared statement. On the development machine a primary-key read with a
+different literal each time went from 118 to 43 microseconds, against 42 for
+PostgreSQL 15 on the same machine and 42 for the same text repeated.
+
+#### Changed
+
+- A plan is kept for the shape of an unprepared `SELECT`, `INSERT`, `UPDATE`
+  or `DELETE` whose integer and plain string literals stand where a
+  prepared statement's parameters may: compared with a column in the
+  `WHERE`, a value of an `INSERT`, the right-hand side of a `SET`. It is
+  learned the way a prepared statement's is, by planning the text twice
+  with stand-in literals and keeping the plan only if it follows them, so a
+  literal the planner reads (a `LIMIT`, a cast, arithmetic, a value for a
+  `varchar(n)` or a `date` column) is planned every time as before.
+- A plan template is learned the second time a statement is planned, not
+  the first. Learning plans the statement twice more, which a statement
+  sent once never earned back.
+- A single command is no longer parsed once to split it from its
+  neighbours and again to plan it. Its syntax error is unchanged: the
+  position counts from the start of what the client sent.
+
+#### Fixed
+
+- A string literal compared with a `bytea` column (`x = 'abc'`,
+  `x = '\x616263'`) matched no row. It is read as `bytea` now, in either
+  input format.
+- Under `GROUPING SETS`, `ROLLUP` or `CUBE`, a select-list expression with
+  no aggregate in it (a constant, `g || 'x'`) was refused. So was an
+  aggregate over such a query in `FROM`
+  (`select count(*) from (select ... group by cube (g, z)) q`), because the
+  outer query needs none of the inner columns. Both work, and a column that
+  is not a grouping key is PostgreSQL's 42803.
+
+#### Still open
+
+- Under grouping sets, a `HAVING` term over a key (`having g || 'x' =
+  'ax'`) and an expression over an expression key (`rollup (upper(g))`) are
+  still refused.
+- A decimal or exponent literal, and a negative number written against its
+  operator (`k =-5`), are not taken out of the text; such a statement is
+  planned every time.
+
+### Rust MongoDB server: sessions, transactions and retryable writes follow mongod's rules
+
+We compared the Rust MongoDB server with `mongod` 8.2.11 on 251 scripts of
+session, transaction and retryable-write commands. 189 differed. 11 do now.
+
+Two of the differences let a write through that should have been refused.
+A command whose session fields were malformed, such as `autocommit: true` or
+a `txnNumber` with no session, was run as an ordinary write. And a collection
+created inside a transaction with a validator took any document for the rest
+of that transaction. A third gave a wrong reply: a retried batch that had
+failed part-way was run again from the start, so the retry reported a
+duplicate key for the document its own first attempt had inserted.
+
+#### Fixed
+
+- The session fields (`lsid`, `txnNumber`, `autocommit`, `startTransaction`)
+  are checked on every command, with `mongod`'s codes and messages. A
+  `txnNumber` must be an int64.
+- A transaction's state errors are `mongod`'s: 225 for an older number on any
+  request, 117 for `startTransaction` at the active number, 251 naming the
+  session and its active number or saying the transaction was aborted, with
+  `TransientTransactionError` first in the reply. Transaction number 0 is
+  valid.
+- A command a transaction does not allow (`count`, `listCollections`, `ping`
+  and the rest) is refused without aborting the transaction, and as a first
+  statement starts none. A statement that fails while running still aborts.
+- `commitTransaction` and `abortTransaction` need the `admin` database and a
+  transaction (13, 125).
+- In a transaction: `$unionWith`, a tailable `find`, `create` of a view or a
+  time-series collection, `createIndexes` on an existing or non-empty
+  collection, an insert into a time-series collection, the `config` and
+  `local` databases and system collections are refused as `mongod` refuses
+  them. An unordered batch stops at its first error.
+- A collection created in a transaction is held to its validator by the
+  transaction's later statements.
+- A retryable write is remembered per statement and only if it wrote. A retry
+  answers `retriedStmtIds` (`retriedStmtId` for `findAndModify`) and runs
+  only the statements that had not been applied. `stmtId` and `stmtIds` are
+  honoured. An older number is 225, a `multi` update or a `limit: 0` delete
+  is refused, and a `txnNumber` on a command that is not a write is 50768.
+- A cursor can be read on only by the session, and the transaction, that
+  opened it (50736 to 50741). `killSessions` kills the session's cursors.
+- `endSessions` no longer aborts the session's open transaction; `mongod`
+  leaves it to the client or to the transaction lifetime.
+- A transaction idle for its lifetime (60 seconds) is aborted about a second
+  later, whatever else the server is doing. It used to be aborted only when
+  another transaction command arrived, so a writer waiting on a document an
+  abandoned transaction held could wait for ever.
+- A `commitTransaction` whose commit failed in the storage engine answered
+  `ok: 1`. It now reports the error and the transaction is aborted.
+- A malformed `readConcern` gets `mongod`'s error, and a command that is not
+  a read refuses a level above `local`.
+- A write sent with `w: 0` reports `n: 0` and no write errors.
+- An insert, update or delete reply lists `writeErrors` before `upserted`.
+- `$geoNear` with no geo index answers 27 `IndexNotFound`.
+
+### The Rust MongoDB server logs slow operations
+
+A benchmark run on a cloud machine refused a row because one writer had not
+finished an `insert_many` within ten seconds. Nothing could say whether the
+server had stalled or the machine had: the server logged nothing about it, and
+the harness had discarded the server's output and removed its store.
+
+The Rust MongoDB server now writes a `Slow query` line for every operation
+that runs for 100 ms or longer, as `mongod` does. Under heavy disk contention
+on a Mac, both servers stall an insert for seconds at a time (`mongod` up to
+4.1 s, the Rust server up to 3.3 s over two 60-second runs each); `mongod`'s
+own line attributes its stall to waiting on the WiredTiger cache. The
+ten-second stall itself was not reproduced.
+
+#### Added
+
+- `secantusd-rs` logs `Slow query` with the namespace, command, outcome and
+  duration of any operation at or over `slowms` (default 100), at `INFO` and
+  in the `getLog` buffer. Time an awaitData `getMore` spends waiting is not
+  counted.
+- The benchmark harness (`bench/concurrency.py`) keeps the server's log and
+  store when a row fails, prints where they are, and shows the end of the log.
+  It runs the Rust server at `INFO` so the slow lines are in it.
+
+#### Fixed
+
+- `profile`'s `slowms` and `sampleRate` are server-wide on the Rust MongoDB
+  server, as on `mongod` 8.2.11. They were kept per database, so a threshold
+  set through one database read back as 100 through another.
+- The Rust server's documentation gave the `--cache-size` default as `1G`. It
+  is `4G`.
+
+### Rust MongoDB server: time-series collections checked as mongod checks them, and `$out` keeps the target's validator
+
+A time-series collection on the Rust server was a plain collection with a
+label. Measured against mongod 8.2.11 over 187 scenarios, 139 answers
+differed: any `timeseries` document was accepted, a measurement with no date
+in its time field was stored, and updates were either let through or refused
+with one message for every case. 24 now differ, nearly all of them because
+mongod stores buckets in `system.buckets.<name>` and this server does not.
+
+One bug found on the way affects every collection: `$out` dropped its target
+and created it again bare, so the target's validator and indexes were gone
+after the first `$out`, and the next one wrote documents the validator
+would have refused.
+
+#### Added
+- `create` validates a `timeseries` definition (`timeField`, `metaField`,
+  `granularity`, `bucketMaxSpanSeconds` / `bucketRoundingSeconds`), refuses
+  it beside `capped`, `validator`, `viewOn`, `clusteredIndex` and
+  `changeStreamPreAndPostImages`, and stores it with its defaults, as
+  `listCollections` shows it on mongod.
+- A time-series collection with a meta field is created with the
+  `<meta>_1_<time>_1` index, and lists no `_id` index.
+- `collMod` on a time-series collection: a wider `granularity` or bucket
+  span, `expireAfterSeconds` (a number or `"off"`), and mongod's refusals
+  for the rest.
+- `$out` with `{db, coll, timeseries}` creates a time-series collection, or
+  writes into an existing one with that definition.
+
+#### Fixed
+- `$out` keeps the target collection's options and indexes.
+- An insert into a time-series collection refuses a document whose time
+  field is missing or not a date (2).
+- An update of a time-series collection follows mongod's rules, each with
+  its own message (72): multi only, no upsert, no pipeline or replacement,
+  a query on the meta field only, and changes to the meta field only.
+- `findAndModify` on a time-series collection takes an unsorted `remove`
+  and refuses everything else (72).
+- Unique and text indexes are refused on a time-series collection, and a
+  TTL index needs a partial filter on the meta field.
+- A time-series collection cannot be renamed or renamed onto, watched by a
+  change stream, read with `tailable`, `min` or `max`, or written to by
+  `$merge`.
+- `dropDatabase` answers `{ok: 1}` with no `dropped` field when the server
+  runs as a replica-set member, as mongod does.
+- `create` words an unknown field with its final full stop.
+
+### Rust MongoDB server: TTL indexes and the `bulkWrite` command, measured against mongod
+
+Two more surfaces of the Rust MongoDB server were compared with `mongod`
+8.2.11, scenario by scenario, and the differences fixed. TTL indexes had two
+that lose or hide data. A partial TTL index expired every old document in the
+collection, including the ones its filter leaves out. And an expiry was
+written nowhere: no oplog entry, so a change stream never saw the delete and
+recovery from the oplog could not replay it. Expiry is now an ordinary delete
+with the index's filter, which fixes both and also expires a document whose
+field is an array holding an old date.
+
+The `bulkWrite` command (the 8.0 server command, not a driver's helper)
+checked each operation as it reached it, so a malformed third operation left
+the first two applied. It now checks the whole command before writing
+anything, with `mongod`'s codes and messages. The probe also found four bugs
+in plain `insert` and `update`, listed below.
+
+#### Added
+
+- `setParameter` / `getParameter` take `ttlMonitorSleepSecs` and
+  `ttlMonitorEnabled`, and they act on the running monitor: a test can set
+  the sleep to 1 second instead of waiting a minute.
+- `serverStatus` reports `metrics.ttl` (`passes`, `deletedDocuments`), so a
+  test can wait for a pass instead of sleeping.
+- `update` statements take `c` (constants) and `upsertSupplied`; `bulkWrite`
+  update operations take `constants` and `upsertSupplied`.
+- `tools/probes/bulk_write_command.py` (141 scenarios) and
+  `tools/probes/ttl_indexes.py` (50).
+
+#### Fixed
+
+- A partial TTL index no longer deletes documents outside its
+  `partialFilterExpression`.
+- A TTL expiry is written to the oplog and reaches change streams.
+- A document expires when its TTL field is an array holding an expired date,
+  directly or through a dotted path.
+- Only a single-field index expires documents. `collMod` refuses to put a TTL
+  on a compound index or on `_id`, refuses a negative or non-numeric
+  `expireAfterSeconds`, and stores one past int32 as int32's largest;
+  `createIndexes` refuses NaN. `expireAfterSeconds` is stored as an int32.
+- The same index name and key with a different `expireAfterSeconds` is 85
+  `IndexOptionsConflict`, as an equivalent index, where it was 86.
+- A TTL sweep that failed on one collection reported success.
+- `create` refuses `expireAfterSeconds` without `clusteredIndex` or
+  `timeseries`.
+- `insert` refuses an array or regex `_id` (53), and so does an upsert that
+  would produce one. Both were stored.
+- An upsert onto a taken `_id` reports the collection, index and key, where
+  it answered a bare `E11000 duplicate key error`.
+- A `$`-prefixed field in an inserted `_id` document is code 52, where it
+  was 2.
+- `bulkWrite`: nothing is written when any operation, `nsInfo` entry or
+  option is malformed; an operation on a view fails with 166 where it was
+  accepted; a failed
+  operation's entry carries `errInfo` and, for an update, `nModified`; an
+  unacknowledged write returns no per-operation results; a namespace index
+  may be any numeric type.
+- `createIndexes` refuses a `partialFilterExpression` using an operator a
+  partial index cannot hold (`$ne`, `$nin`, `$not`, `$nor`, `$exists: false`,
+  `$regex`, `$mod`, `$size`, `$elemMatch`, the `$bits*` operators, `$expr`,
+  `$where`, `$text`, `$jsonSchema`).
+
+### Rust MongoDB server: `update` and `findAndModify` checked against mongod
+
+An update of a document on the Rust MongoDB server could rewrite a field it
+did not name. A stored sub-document shaped like extended JSON, such as
+`{$numberLong: "1"}` or `{$oid: "..."}`, came back from the server's BSON
+decoder as the value it would stand for, so writing the document back
+replaced the sub-document with a number or an ObjectId. Every decode now
+keeps it as the document it is.
+
+It was found by a new probe, `tools/probes/update_commands.py`, which sends
+1,295 `update` and `findAndModify` commands to the server and to `mongod`
+8.2.11 and compares each reply and the documents left behind. The server
+differed on 213 of the first 1,096 and differs on 17.
+
+#### Fixed
+
+- A stored sub-document shaped like extended JSON is no longer rewritten
+  when its document is updated or read through `aggregate`.
+- An update adds new fields in path order across its operators, as `mongod`
+  does, not in the order written.
+- The positional operator `$` names the one array position `mongod` names
+  when a query has more than one array predicate, applies to any array in
+  the update, and is refused on an upsert.
+- A pipeline update can no longer change the `_id`. An operator that writes
+  the `_id` without changing it is accepted.
+- `{$set: {$x: 1}}`, and the same in a pipeline or in `aggregate`, no
+  longer stores a top-level `$x` field.
+- `$bit` keeps a long a long. `$addToSet`, `$pull`, `$pullAll` and `$push`
+  with `$sort` store what `mongod` stores for seven shapes they got wrong.
+- A pipeline `$set` or `$addFields` of a dotted path follows the
+  aggregation rules: through a scalar, through an array, and for a nested
+  document.
+- An upsert whose query names both `a` and `a.b`, or uses `$expr`, is
+  refused.
+- An update with no `upsert` no longer creates the collection it names.
+- `Timestamp(0, 0)` at the top level of an inserted or replacement
+  document is filled with the current time.
+- A document may not nest deeper than 180 levels.
+- `findAndModify` reads `upsert: 1` as true, refuses `arrayFilters` with
+  `remove` or a pipeline, and checks a pipeline and a projection when
+  nothing matches.
+- `update` and `findAndModify` refuse unknown fields, and `update` checks
+  the type of `updates`, of each statement and of `upsert`.
+- Error messages for malformed operator arguments are `mongod`'s, where
+  the server had answered that it does not support the construct.
+
+#### Added
+
+- The expression operator `$const`.
+
+### Rust MongoDB server: user and role commands answer as mongod does
+
+The sixteen user and role management commands on the Rust MongoDB server,
+and `usersInfo` and `rolesInfo`, were compared with mongod 8.2.11 reply by
+reply. Of 399 replies 277 differed; 7 do now, each of them the order of a
+set of roles.
+
+#### Fixed
+
+- `dropRole` removes the role from every user and role that held it. It
+  was left named there.
+- A built-in role exists only in the databases mongod has it in: `root` on
+  a database other than `admin` is `RoleNotFound`, where it was accepted.
+- A role name given as `{role: "read"}` with no `db` is refused. It was
+  taken to mean the current database.
+- `createUser` refuses a mechanism it does not know, where it dropped the
+  name, and refuses an empty password, a user on `local`, and a password
+  for a user on `$external`.
+- A role on a database other than `admin` cannot be granted privileges or
+  roles of another database, and a grant that would make a role inherit
+  from itself is refused.
+- Every field of these commands is checked for its type, and an unknown
+  field is refused, with mongod's codes and messages.
+
+#### Added
+
+- `rolesInfo` answers for the built-in roles, with the privileges mongod
+  gives each, and takes `showBuiltinRoles`, `showPrivileges` (also
+  `"asUserFragment"`) and `showAuthenticationRestrictions`.
+- `usersInfo` takes `filter`, `showPrivileges`, `showCustomData` and
+  `showAuthenticationRestrictions`, and lists `userId` and `customData`.
+- `createUser` and `updateUser` store `customData` and
+  `authenticationRestrictions`; `updateUser` can change `mechanisms`; a
+  password the client digested is taken for SCRAM-SHA-1.
+- `createRole` and `updateRole` store `authenticationRestrictions`, and
+  check privileges against mongod's 170 action names.
+
+#### Changed
+
+- A plain `rolesInfo` no longer lists `privileges`; ask with
+  `showPrivileges: true`, as on mongod.
+- A role that mongod has and enforcement here does not know
+  (`hostManager`, `enableSharding`) can now be granted. It permits nothing
+  yet (`tasks/backlog.md` 7.083).
+
+### Rust MongoDB server: `validate` checks the collection
+
+`validate` on the Rust MongoDB server answered `valid: true` without
+reading anything, and reported every index as holding one key per document.
+It now reads every document, compares each index with the entries its
+documents should have, in both directions, and checks that the `_id` index
+leads to each document and to none that is gone.
+
+#### Fixed
+
+- `validate` answers `valid: false`, with the counts in `errors` and the
+  index marked in `indexDetails`, when a document cannot be read, an index
+  entry is missing, or an entry belongs to no document.
+- `keysPerIndex` is the number of keys the documents give the index, as
+  mongod 8.2.11 counts them: an array gives one per distinct element.
+
+#### Added
+
+- `Storage::check_collection`, the check itself, with tests over a
+  collection the server wrote and one damaged by hand.
+
+### An ordered insert on the Rust MongoDB server keeps the documents before a validation failure
+
+When a document in an ordered `insert` batch failed the collection's
+validator, the Rust MongoDB server inserted none of the batch and reported
+`n: 0`. `mongod` 8.2.11 inserts the documents before the failing one and
+stops there. A three-document batch whose second document fails now leaves
+the first in the collection, as on `mongod`.
+
+That was the one data difference in a probe of document validation against
+`mongod` (`tools/probes/validators.py`): the Rust server differed on 15 of 68
+results and now differs on none. Error 121's `errInfo` already matched.
+
+#### Fixed
+
+- An ordered `insert` stops at the document that fails validation (or has a
+  `$`-prefixed key in its `_id`) and keeps the documents before it. Write
+  errors are reported in batch order.
+- `create` and `collMod` refuse a `validationLevel` or `validationAction`
+  that is not one of `mongod`'s words. They were stored, and then read as the
+  default.
+- A validator holding `$where`, `$text`, `$near`, `$nearSphere` or `$geoNear`
+  is refused.
+- `collMod` of any validation option leaves `listCollections` showing both
+  `validationLevel` and `validationAction`; an empty validator removes the
+  validator and is not listed.
+- A validation failure raised by `$out` or `$merge` carries `errInfo` and
+  `mongod`'s message.
+
+### Views on the Rust MongoDB server are read-only, and read through
+
+A probe of views against `mongod` 8.2.11 (`tools/probes/views.py`) found the
+Rust MongoDB server different on 52 of 70 results. Several were wrong answers
+with no error:
+
+- an `insert`, `update` or `delete` aimed at a view was acknowledged, and
+  stored or changed rows under the view's own name;
+- `distinct` on a view returned nothing;
+- `$lookup`, `$graphLookup` and `$unionWith` from a view matched nothing;
+- `collMod` of a view's `pipeline` or `viewOn` answered `ok` and changed
+  nothing.
+
+It now differs on 2 of the 70, both the `system.views` collection, which the
+server does not expose.
+
+The same work found that `$count` over no documents returned `{n: 0}`.
+`mongod` returns no document, and so does the Rust server now. The phantom
+document also appeared in every `$lookup`, `$unionWith` and `$facet`
+sub-pipeline that counted no match.
+
+#### Fixed
+
+- A view refuses writes (`insert`, `update`, `delete`, `findAndModify`),
+  index commands, `collStats`, `validate`, `$collStats`, a change stream, a
+  rename, and `$out` / `$merge` into it, with `mongod`'s errors.
+- `distinct`, `$lookup`, `$graphLookup` and `$unionWith` read a view through
+  its pipeline.
+- `collMod` redefines a view: `pipeline` and `viewOn` each replace their own
+  half. Collection options are refused on a view, and view options on a
+  collection.
+- `create` and `collMod` check a view's definition: a pipeline that is not an
+  array, an unknown stage, `$out` / `$merge` / `$changeStream`, an empty
+  `viewOn`, and a view defined on itself are refused. They were stored.
+- `find` on a view accepts a `$natural` sort (it failed with a field-path
+  error), refuses `tailable`, and refuses a collation other than the view's.
+- Dropping a view answers `{ns, ok}` with no index count.
+- `$count` over no documents emits no document.
+
+### A Rust version bump now moves the install commands in the docs with it
+
+The README, the docs and the crate READMEs print `cargo install secantus-mdb
+--version <ver>` with the version spelled out, because every release so far is
+a pre-release and a bare `cargo install` picks the `0.0.0` placeholder. Nothing
+moved those versions when the crates moved, so the next Rust release would have
+left every page telling readers to install the previous one.
+
+#### Changed
+
+- `./inv rust-version-bump` rewrites the version in every documented `cargo
+  install secantus-mdb --version …` and `secantus-mdb = "…"` (and the
+  `secantus-pg` forms under `--line pg`), and fails if any page still names
+  another version. A version mentioned in passing is left alone.
+- A test fails when a documented install command names a version other than
+  the one the crates carry.
+
+### `./inv rust-wt-build` recovers from a build directory left by an older checkout
+
+The Rust-side WiredTiger build moved its source from `vendor/wiredtiger` to a
+patched copy on 2026-10-07. A checkout that had built before then failed at
+the CMake configure step with "the source ... does not match the source ...
+used to generate cache", and stayed broken until `build/rust-wt/wt-build` was
+deleted by hand.
+
+#### Fixed
+
+- The build now removes a WiredTiger build directory whose CMake cache names a
+  different source tree, and rebuilds.
+- The 0.7.0b0 changelog entry and its blog post gave `cargo install
+  secantus-mdb` without `--version`, which installs nothing. They now name the
+  version.
+
+### One log sync now covers every commit already written
+
+When several clients commit at once and each commit is synced (`fdatasync` on
+Linux), WiredTiger recorded a sync as covering only the commit of the thread
+that made it. The sync had flushed every commit written before it began, but
+the next thread synced again all the same. A sync is now credited with
+everything written before it started, as PostgreSQL credits a WAL flush.
+
+#### Changed
+
+- A new WiredTiger patch, `cmake/patch_wt_fsync_group.py`, applied by the
+  wheel's build and the `secantus-wiredtiger-sys` crate. It changes
+  `method=fsync` only: the Rust PostgreSQL server on Linux, and either
+  MongoDB server when it is run with a sync per commit. Measured on Linux
+  with the Rust PostgreSQL server, durable writes at eight and sixteen
+  clients are 10 to 18 percent faster; one to four clients are unchanged.
+- A commit is still acknowledged only after a sync that began after its
+  bytes were written. Checked by hard-rebooting a server under sixteen
+  remote writers six times: no acknowledged row was missing.
+
 ## [0.7.0b2] — 2026-10-08
 
 ### The `cargo install` instructions now work
