@@ -44,7 +44,7 @@ the libpq key/value form, `.url()` the `postgresql://` form.
 ## The binary
 
 ```sh
-cargo install secantus-pg --version 0.1.0-beta.15   # a pre-release: cargo needs the version
+cargo install secantus-pg --version 0.1.0-beta.16   # a pre-release: cargo needs the version
 secantusd-pg ./pg-data 127.0.0.1:5433   # storage path, bind address
 ```
 
