@@ -1740,6 +1740,8 @@ dependencies = [
  "base64",
  "bson",
  "hmac 0.12.1",
+ "libc",
+ "md-5 0.10.6",
  "pbkdf2",
  "rand 0.9.4",
  "secantus-auth",

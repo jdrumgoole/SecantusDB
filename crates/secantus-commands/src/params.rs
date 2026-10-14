@@ -125,6 +125,10 @@ pub struct ServerParams {
     /// what `$listLocalSessions` lists. One unused for the session timeout
     /// (30 minutes) is forgotten.
     sessions: Mutex<BTreeMap<Vec<u8>, bson::DateTime>>,
+    /// The `config.settings` read/write-concern defaults document, read once
+    /// and kept so a write need not look it up (`crate::rwconcern`). The
+    /// outer `None` is "not read yet"; the inner one is "no document".
+    rw_defaults: Mutex<Option<Option<Document>>>,
 }
 
 impl ServerParams {
@@ -178,6 +182,24 @@ impl ServerParams {
     /// Whether a user has existed since the server started.
     pub fn users_seen(&self) -> bool {
         self.users_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The cached read/write-concern defaults document: `None` when it has
+    /// not been read since the last change to `config.settings`.
+    pub fn rw_defaults_cached(&self) -> Option<Option<Document>> {
+        self.rw_defaults.lock().ok()?.clone()
+    }
+
+    pub fn cache_rw_defaults(&self, settings: Option<Document>) {
+        if let Ok(mut guard) = self.rw_defaults.lock() {
+            *guard = Some(settings);
+        }
+    }
+
+    pub fn forget_rw_defaults(&self) {
+        if let Ok(mut guard) = self.rw_defaults.lock() {
+            *guard = None;
+        }
     }
 
     /// The current value, or `None` when it has never been set.
