@@ -844,6 +844,32 @@ def _conflict_key_value(
     return {field: get_path(dict(doc), field, default=None) for field in fields}
 
 
+# Catalog marker on a collated or geo index this server built: the format of
+# its entries. The Rust server writes those entries differently (and marks
+# its own with ``collationKeys`` / ``geoKeys``), so each server rebuilds an
+# index without its own marker when it opens a store
+# (``Storage._reconcile_store_from_rust_server``). Not a user option:
+# ``listIndexes`` strips it.
+_PYTHON_KEYS = "pythonKeys"
+_PYTHON_KEY_FORMAT = 1
+# What either server stamps on an index at build, which a rebuild leaves out
+# of the options it builds from.
+_BUILD_STAMPS = frozenset({"entryFormat", "multikey", "collationKeys", "geoKeys", _PYTHON_KEYS})
+# The Rust server's records that it has claimed every stored ``_id``.
+_RUST_CLAIM_MARKERS = frozenset({"$document_id_claims", "$collated_id_claims"})
+
+
+def _index_keys_are_server_specific(
+    key_spec: Mapping[str, Any], options: Mapping[str, Any]
+) -> bool:
+    """Whether the two servers key this index's entries differently: a geo
+    index, or one with a collation other than ``simple``."""
+    if _geo_type_of(key_spec) is not None:
+        return True
+    spec = options.get("collation")
+    return isinstance(spec, Mapping) and bool(spec) and spec.get("locale") != "simple"
+
+
 def _parse_index_collation(spec: Any) -> Any:
     """Parse an index's stored ``collation`` option into a Collation.
 
@@ -2009,6 +2035,8 @@ class Storage:
             # resurface under a re-created name). See ``_TOMB_TABLE``.
             self._recover_pending_drops_locked()
 
+        self._reconcile_store_from_rust_server()
+
         # TTL sweeper. Real mongod runs ``ttlMonitor`` every 60s by
         # default; we mirror that. ``ttl_sweep_seconds <= 0`` disables
         # the thread entirely (tests that drive expiry deterministically
@@ -2043,6 +2071,76 @@ class Storage:
                 target=self._noop_heartbeat_loop, name="secantus-noop-heartbeat", daemon=True
             )
             self._noop_thread.start()
+
+    def _reconcile_store_from_rust_server(self) -> None:
+        """Undo what this server cannot keep up to date in a store the Rust
+        server has had, or that an older build wrote.
+
+        * The Rust server records, under two marker rows in ``_UNIQ_TABLE``,
+          that it has claimed every stored ``_id`` by value and under its
+          collection's collation. This server takes neither claim, so once it
+          has the store the records would be wrong: they are removed, and the
+          Rust server walks the documents again the next time it opens it.
+        * A collated or geo index keys its entries differently on the two
+          servers (ICU sort keys against folded strings; the Rust server's geo
+          rules since 2026-10-13). An index this server did not build itself
+          (no ``pythonKeys``) is rebuilt from the options the user gave, so a
+          lookup through it reads the keys it wrote. The Rust server does the
+          same with its own marker. No oplog entry: this is not a
+          ``createIndexes`` a change stream should see.
+        """
+        with self._lock:
+            markers = [
+                k
+                for k, _ in self._collect_prefix(_UNIQ_TABLE, ("", ""))
+                if k[2] in _RUST_CLAIM_MARKERS
+            ]
+            self._delete_keys(_UNIQ_TABLE, markers)
+            outdated = []
+            c = self._cursor(_IDX_TABLE)
+            c.reset()
+            while c.next() == 0:
+                db, coll, name = c.get_key()
+                raw = bytes(c.get_value())
+                payload = bson.decode(raw) if raw else {}
+                key = dict(payload.get("key") or {})
+                opts = dict(payload.get("options") or {})
+                if _index_keys_are_server_specific(key, opts) and opts.get(_PYTHON_KEYS) != (
+                    _PYTHON_KEY_FORMAT
+                ):
+                    outdated.append((db, coll, name, key, opts))
+            c.reset()
+        if not outdated:
+            return
+        logged, self.enable_oplog = self.enable_oplog, False
+        try:
+            for db, coll, name, key, opts in outdated:
+                options = {k: v for k, v in opts.items() if k not in _BUILD_STAMPS}
+                self.drop_index(db, coll, name)
+                try:
+                    self.create_index(db, coll, name, key, options)
+                except Exception as exc:
+                    # Not a Storage the caller will get: release the
+                    # connection and its home-directory lock, as a refused
+                    # format does above.
+                    with contextlib.suppress(Exception):
+                        self._conn.close()
+                    raise IncompatibleStorageFormatError(
+                        f"SecantusDB storage at this path has index {name!r} on "
+                        f"'{db}.{coll}', built by the Rust server or an earlier version, "
+                        "whose entries this server reads differently, and it cannot be "
+                        f"rebuilt from the documents stored: {exc}. The index has been "
+                        "dropped; create it again once the documents allow it."
+                    ) from exc
+                logging.getLogger("secantus.storage").warning(
+                    "rebuilt index %r on '%s.%s', whose entries were written by the "
+                    "Rust server or an earlier version",
+                    name,
+                    db,
+                    coll,
+                )
+        finally:
+            self.enable_oplog = logged
 
     def _load_oplog_meta(self) -> tuple[int, int, int, int]:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -7393,6 +7491,8 @@ class Storage:
                 # RecordId entries from the pre-change id_key ones (the WT
                 # key_format is SSSu either way).
                 options["entryFormat"] = _ENTRY_FORMAT
+                if _index_keys_are_server_specific(key_spec_dict, options):
+                    options[_PYTHON_KEYS] = _PYTHON_KEY_FORMAT
                 payload = bson.encode({"key": dict(key_spec), "options": options})
                 c.reset()
                 c[db, coll, name] = payload
@@ -7453,6 +7553,8 @@ class Storage:
                 # RecordId entries from the pre-change id_key ones (the WT
                 # key_format is SSSu either way).
                 options["entryFormat"] = _ENTRY_FORMAT
+                if _index_keys_are_server_specific(key_spec_dict, options):
+                    options[_PYTHON_KEYS] = _PYTHON_KEY_FORMAT
                 payload = bson.encode({"key": dict(key_spec), "options": options})
                 c.reset()
                 c[db, coll, name] = payload

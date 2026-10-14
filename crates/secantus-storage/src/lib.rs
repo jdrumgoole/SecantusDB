@@ -2312,6 +2312,40 @@ fn enc_dir_c(v: &Bson, direction: i32, coll: Option<&Collation>) -> Result<Vec<u
 /// before 2026-10-10 reads. Not a user option: `listIndexes` strips it.
 const COLLATION_KEYS: &str = "collationKeys";
 
+/// Catalog marker on a `2d` or `2dsphere` index: the rules its entries were
+/// written by. Before 2026-10-13 a value with several locations, and a point
+/// written as a document other than `{lng, lat}`, got no entry, so a query
+/// through an index built then misses those documents. An index without the
+/// marker is rebuilt when the store opens (`rebuild_outdated_indexes`). Not a
+/// user option: `listIndexes` strips it.
+const GEO_KEYS: &str = "geoKeys";
+/// The value of [`GEO_KEYS`] this build writes.
+const GEO_KEY_FORMAT: i32 = 1;
+
+/// Options only this server's catalog carries, which a rebuild leaves out of
+/// the options it builds from: `create_index_in_txn` stamps them again.
+const BUILD_STAMPS: &[&str] = &[
+    "entryFormat",
+    "multikey",
+    COLLATION_KEYS,
+    GEO_KEYS,
+    "pythonKeys",
+];
+
+/// Whether an index's entries were written by rules this build does not
+/// read them by (see `rebuild_outdated_indexes`).
+fn index_entries_outdated(key: &Document, opts: &Document) -> bool {
+    if parse_geo_2d(key, opts).is_some() || parse_geo_sphere(key).is_some() {
+        return opts.get_i32(GEO_KEYS).ok() != Some(GEO_KEY_FORMAT);
+    }
+    let collated = opts
+        .get_document("collation")
+        .ok()
+        .and_then(secantus_core::collation::parse)
+        .is_some();
+    collated && opts.get_i32(COLLATION_KEYS).ok() != Some(secantus_core::collation::KEY_FORMAT)
+}
+
 /// The collation an index's ENTRIES are keyed by, from its catalog options.
 fn index_key_collation(opts: &Document) -> Option<Collation> {
     if opts.get_i32(COLLATION_KEYS).ok()? != secantus_core::collation::KEY_FORMAT {
@@ -5581,9 +5615,12 @@ impl Storage {
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
         storage.recover_pending_drops()?;
+        // Before a revived prepared transaction can write through an index.
+        storage.rebuild_outdated_indexes()?;
         storage.revive_prepared_xacts()?;
         storage.note_existing_timeseries()?;
         storage.backfill_document_id_claims()?;
+        storage.backfill_collated_id_claims()?;
         Ok(storage)
     }
 
@@ -10961,12 +10998,15 @@ impl Storage {
         self.retry_write_conflicts("create_index", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                self.create_index_in_txn(&session, db, coll, name, key_spec, options)
+                self.create_index_in_txn(&session, db, coll, name, key_spec, options, true)
             })
         })
     }
 
     /// The body of [`create_index`], run inside its statement transaction.
+    /// `logged` is false for a rebuild at open (`rebuild_outdated_indexes`),
+    /// which is not a `createIndexes` a change stream should see.
+    #[allow(clippy::too_many_arguments)]
     fn create_index_in_txn(
         &self,
         session: &Session,
@@ -10975,6 +11015,7 @@ impl Storage {
         name: &str,
         key_spec: &Document,
         options: &Document,
+        logged: bool,
     ) -> Result<bool> {
         let geo = parse_geo_2d(key_spec, options);
         let geo_sphere = parse_geo_sphere(key_spec);
@@ -11036,6 +11077,9 @@ impl Storage {
         };
         if key_coll.is_some() {
             stored_options.insert(COLLATION_KEYS, secantus_core::collation::KEY_FORMAT);
+        }
+        if geo.is_some() || geo_sphere.is_some() {
+            stored_options.insert(GEO_KEYS, GEO_KEY_FORMAT);
         }
         let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
@@ -11188,7 +11232,7 @@ impl Storage {
         // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
         // change stream surfaces a `createIndexes` event (the projector reads
         // `o.createIndexes` + `o.indexes[].{v,key,name}`).
-        if self.enable_oplog {
+        if self.enable_oplog && logged {
             let ui = collection_uuid(session, db, coll)?;
             let mut idx = Document::new();
             idx.insert("v", 2i32);
@@ -12627,39 +12671,16 @@ impl Storage {
                             continue;
                         }
                         for kb in index_key_variants_c(&doc, &key_spec, false, None)? {
-                            let esc = escape_kb(&kb);
-                            claims.reset()?;
-                            claims.set_key_sssu(db, coll, ID_INDEX_NAME, &esc);
-                            claims.set_value_q(recordid);
-                            match claims.insert() {
-                                Ok(()) => taken += 1,
-                                Err(e) if e.is_duplicate_key() => {
-                                    owners.reset()?;
-                                    owners.set_key_sssu(db, coll, ID_INDEX_NAME, &esc);
-                                    let owner = match owners.search() {
-                                        Ok(()) => Some(owners.get_value_q()?),
-                                        Err(e) if e.is_not_found() => None,
-                                        Err(e) => return Err(e.into()),
-                                    };
-                                    match owner {
-                                        Some(id) if id == recordid => {}
-                                        Some(id)
-                                            if self
-                                                .claim_owner_exists(&session, db, coll, id)? =>
-                                        {
-                                            held += 1;
-                                        }
-                                        // Nobody's: the row it named is gone.
-                                        _ => {
-                                            owners.reset()?;
-                                            owners.set_key_sssu(db, coll, ID_INDEX_NAME, &esc);
-                                            owners.set_value_q(recordid);
-                                            owners.insert()?;
-                                            taken += 1;
-                                        }
-                                    }
-                                }
-                                Err(e) => return Err(e.into()),
+                            match self.claim_stored_id(
+                                &session,
+                                (&claims, &owners),
+                                (db, coll),
+                                &escape_kb(&kb),
+                                recordid,
+                            )? {
+                                Some(true) => taken += 1,
+                                Some(false) => held += 1,
+                                None => {}
                             }
                         }
                     }
@@ -12687,6 +12708,223 @@ impl Storage {
                 "secantus-storage: claimed {claimed} document _id values stored by an earlier \
                  version; {duplicates} more are duplicates by value of one of those, and stay \
                  as they are"
+            );
+        }
+        Ok(())
+    }
+
+    /// Claim one stored document's `_id` key `esc` for `recordid`, as a walk
+    /// over stored documents does it. `Some(true)` when the claim is taken
+    /// (or moved from a row that is gone), `Some(false)` when another stored
+    /// document already holds it, `None` when this document held it already.
+    fn claim_stored_id(
+        &self,
+        session: &Session,
+        (claims, owners): (&Cursor, &Cursor),
+        (db, coll): (&str, &str),
+        esc: &[u8],
+        recordid: i64,
+    ) -> Result<Option<bool>> {
+        claims.reset()?;
+        claims.set_key_sssu(db, coll, ID_INDEX_NAME, esc);
+        claims.set_value_q(recordid);
+        match claims.insert() {
+            Ok(()) => return Ok(Some(true)),
+            Err(e) if e.is_duplicate_key() => {}
+            Err(e) => return Err(e.into()),
+        }
+        owners.reset()?;
+        owners.set_key_sssu(db, coll, ID_INDEX_NAME, esc);
+        let owner = match owners.search() {
+            Ok(()) => Some(owners.get_value_q()?),
+            Err(e) if e.is_not_found() => None,
+            Err(e) => return Err(e.into()),
+        };
+        match owner {
+            Some(id) if id == recordid => Ok(None),
+            Some(id) if self.claim_owner_exists(session, db, coll, id)? => Ok(Some(false)),
+            // Nobody's: the row it named is gone.
+            _ => {
+                owners.reset()?;
+                owners.set_key_sssu(db, coll, ID_INDEX_NAME, esc);
+                owners.set_value_q(recordid);
+                owners.insert()?;
+                Ok(Some(true))
+            }
+        }
+    }
+
+    /// Give every stored document of a collection with a default collation
+    /// the `_id` claim a new one takes (`id_claim_desc`), once for a store.
+    ///
+    /// That claim, under the `_id`'s collation key, is what refuses a second
+    /// spelling of an `_id` the collation calls equal. It landed 2026-10-11,
+    /// and a document stored before then holds none, so `{_id: "A"}` was
+    /// still accepted beside a stored `{_id: "a"}` under strength 2. The walk
+    /// is the one `backfill_document_id_claims` makes, over every document of
+    /// such a collection rather than only those with a document `_id`, and
+    /// it is recorded the same way, under its own marker.
+    ///
+    /// The Python server takes no claims, and removes both markers when it
+    /// opens a store, so the walk runs again after it has had the store.
+    fn backfill_collated_id_claims(&self) -> Result<()> {
+        const DONE: &str = "$collated_id_claims";
+        const CHUNK: usize = 500;
+        let session = self.conn.open_session()?;
+        {
+            let marker = session.open_cursor(UNIQ_TABLE, None)?;
+            marker.set_key_sssu("", "", DONE, b"");
+            match marker.search() {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut collections: Vec<(String, String, Collation)> = Vec::new();
+        {
+            let cur = session.open_cursor(COLL_TABLE, None)?;
+            let mut more = cur.next()?;
+            while more {
+                let (db, coll) = cur.get_key_ss()?;
+                let blob = cur.get_value_u()?;
+                if !blob.is_empty() && !options_name_timeseries(&blob)? {
+                    if let Some((collation, _)) = default_collation(&session, &db, &coll)? {
+                        collections.push((db, coll, collation));
+                    }
+                }
+                more = cur.next()?;
+            }
+        }
+        let key_spec = bson::doc! {"_id": 1};
+        let (mut claimed, mut duplicates) = (0u64, 0u64);
+        for (db, coll, collation) in &collections {
+            let rows = self.scan_docs(&session, db, coll)?;
+            for chunk in rows.chunks(CHUNK) {
+                session.begin_transaction(None)?;
+                let outcome = (|| -> Result<(u64, u64)> {
+                    let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
+                    let owners = session.open_cursor(UNIQ_TABLE, None)?;
+                    let (mut taken, mut held) = (0u64, 0u64);
+                    for (recordid, _id_k, blob) in chunk {
+                        let doc = decode_doc(blob)?;
+                        for kb in index_key_variants_c(&doc, &key_spec, false, Some(collation))? {
+                            match self.claim_stored_id(
+                                &session,
+                                (&claims, &owners),
+                                (db, coll),
+                                &escape_kb(&kb),
+                                *recordid,
+                            )? {
+                                Some(true) => taken += 1,
+                                Some(false) => held += 1,
+                                None => {}
+                            }
+                        }
+                    }
+                    Ok((taken, held))
+                })();
+                match outcome {
+                    Ok((taken, held)) => {
+                        session.commit_transaction(None)?;
+                        claimed += taken;
+                        duplicates += held;
+                    }
+                    Err(e) => {
+                        let _ = session.rollback_transaction(None);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let marker = session.open_cursor(UNIQ_TABLE, None)?;
+        marker.set_key_sssu("", "", DONE, b"");
+        marker.set_value_q(0);
+        marker.insert()?;
+        if claimed > 0 || duplicates > 0 {
+            eprintln!(
+                "secantus-storage: claimed {claimed} _id values under their collection's \
+                 collation that were stored without a claim; {duplicates} more are equal \
+                 under that collation to one of those, and stay as they are"
+            );
+        }
+        Ok(())
+    }
+
+    /// Rebuild, before anything reads through it, every index whose entries
+    /// this build would not have written:
+    ///
+    /// * a `2d` or `2dsphere` index without [`GEO_KEYS`], built before
+    ///   2026-10-13 or by the Python server: it holds no entry for a value
+    ///   with several locations, or for a point written as a document other
+    ///   than `{lng, lat}`, so a query through it misses those documents;
+    /// * an index with a collation and without [`COLLATION_KEYS`], built by
+    ///   this server before 2026-10-10 (plain values) or by the Python server
+    ///   (its own folded strings): its entries do not compare by the
+    ///   collation, so a lookup through it finds the wrong documents.
+    ///
+    /// The rebuild is the build `createIndexes` runs, from the options the
+    /// user gave, in one transaction per index and with no oplog entry. One
+    /// that cannot be built from the stored documents (a unique index they
+    /// break under its collation, a geo value the index now refuses) stops the
+    /// store from opening, naming the index: answering from it would be wrong,
+    /// and dropping a user's index here would be a decision the user did not
+    /// make.
+    fn rebuild_outdated_indexes(&self) -> Result<()> {
+        let session = self.conn.open_session()?;
+        let mut outdated: Vec<(String, String, String, Document, Document)> = Vec::new();
+        {
+            let cur = match session.open_cursor(IDX_TABLE, None) {
+                Ok(c) => c,
+                Err(e) if e.is_not_found() || e.is_missing_table() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut more = cur.next()?;
+            while more {
+                let (db, coll, name) = cur.get_key_sss()?;
+                let blob = cur.get_value_u()?;
+                if !blob.is_empty() {
+                    let payload = decode_doc(&blob)?;
+                    let key = payload.get_document("key").cloned().unwrap_or_default();
+                    let opts = payload.get_document("options").cloned().unwrap_or_default();
+                    if index_entries_outdated(&key, &opts) {
+                        outdated.push((db, coll, name, key, opts));
+                    }
+                }
+                more = cur.next()?;
+            }
+        }
+        for (db, coll, name, key, opts) in &outdated {
+            let mut options = opts.clone();
+            for stamp in BUILD_STAMPS {
+                options.remove(*stamp);
+            }
+            session.begin_transaction(None)?;
+            let outcome = (|| -> Result<()> {
+                let c = session.open_cursor(IDX_TABLE, None)?;
+                c.set_key_sss(db, coll, name);
+                c.search()?;
+                c.remove()?;
+                self.delete_entries_prefix(&session, db, coll, name)?;
+                self.purge_unique_claims(&session, db, coll, Some(name))?;
+                self.create_index_in_txn(&session, db, coll, name, key, &options, false)?;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => session.commit_transaction(None)?,
+                Err(e) => {
+                    let _ = session.rollback_transaction(None);
+                    return Err(StorageError::Internal(format!(
+                        "SecantusDB storage at this path has index '{name}' on '{db}.{coll}', \
+                         built by an earlier version or by the Python server, whose entries \
+                         this build reads differently, and it cannot be rebuilt from the \
+                         documents stored: {e}. Drop the index with the build that wrote it, \
+                         or start from a fresh data directory."
+                    )));
+                }
+            }
+            eprintln!(
+                "secantus-storage: rebuilt index '{name}' on '{db}.{coll}', whose entries \
+                 were written by an earlier version or by the Python server"
             );
         }
         Ok(())
@@ -17781,7 +18019,14 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
         for (k, v) in options {
             if !matches!(
                 k.as_str(),
-                "v" | "key" | "name" | "ns" | "multikey" | "entryFormat" | "collationKeys"
+                "v" | "key"
+                    | "name"
+                    | "ns"
+                    | "multikey"
+                    | "entryFormat"
+                    | "collationKeys"
+                    | "geoKeys"
+                    | "pythonKeys"
             ) {
                 spec.insert(k.clone(), v.clone());
             }
@@ -18521,6 +18766,266 @@ mod tests {
         }
     }
 
+    /// Rewrite index `name`'s catalog options as an older build would have
+    /// left them, and remove its entries: `edit` takes the options away.
+    fn age_index(home: &str, coll: &str, name: &str, edit: impl FnOnce(&mut Document)) {
+        let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
+        let sess = conn.open_session().unwrap();
+        let c = sess.open_cursor(IDX_TABLE, None).unwrap();
+        c.set_key_sss("app", coll, name);
+        c.search().unwrap();
+        let mut d = decode_doc(&c.get_value_u().unwrap()).unwrap();
+        let mut opts = d.get_document("options").cloned().unwrap_or_default();
+        edit(&mut opts);
+        d.insert("options", Bson::Document(opts));
+        c.reset().unwrap();
+        c.set_key_sss("app", coll, name);
+        c.set_value_u(&encode_doc(&d).unwrap());
+        c.update().unwrap();
+        let scan = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
+        let del = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
+        let mut more = scan.next().unwrap();
+        while more {
+            let (d, c, n, packed) = scan.get_key_sssu().unwrap();
+            if c == coll && n == name {
+                del.set_key_sssu(&d, &c, &n, &packed);
+                del.remove().unwrap();
+            }
+            more = scan.next().unwrap();
+        }
+    }
+
+    fn index_options(s: &Storage, coll: &str, name: &str) -> Document {
+        let session = s.conn.open_session().unwrap();
+        s.iter_indexes(&session, "app", coll)
+            .unwrap()
+            .into_iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, o)| o)
+            .unwrap()
+    }
+
+    /// A geo index built before 2026-10-13 (no `geoKeys`) holds no entry for
+    /// a value with several locations or a point written as `{x, y}`. Opening
+    /// the store rebuilds it, so a query through it finds them.
+    #[test]
+    fn open_rebuilds_a_geo_index_without_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        {
+            let st = Storage::open(home).unwrap();
+            st.insert(
+                "app",
+                "g",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "loc": [1.0, 1.0]}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32, "loc": [[5.0, 5.0], [30.0, 30.0]]}).unwrap(),
+                    encode_doc(&doc! {"_id": 3i32, "loc": {"x": 2.0, "y": 2.0}}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            st.insert(
+                "app",
+                "h",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "loc": [1.0, 1.0]}).unwrap(),
+                    encode_doc(
+                        &doc! {"_id": 2i32, "loc": {"type": "MultiPoint", "coordinates": [[5.0, 5.0], [30.0, 30.0]]}},
+                    )
+                    .unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            for (coll, kind) in [("g", "2d"), ("h", "2dsphere")] {
+                st.create_index("app", coll, "geo", &doc! {"loc": kind}, &Document::new())
+                    .unwrap();
+                assert_eq!(index_options(&st, coll, "geo").get_i32(GEO_KEYS), Ok(1));
+            }
+        }
+        for coll in ["g", "h"] {
+            age_index(home, coll, "geo", |o| {
+                o.remove(GEO_KEYS);
+            });
+        }
+        let st = Storage::open(home).unwrap();
+        for coll in ["g", "h"] {
+            let check = st.check_collection("app", coll).unwrap();
+            let (entries, missing, extra) = index_check(&check, "geo");
+            assert!(entries > 0, "{coll}");
+            assert_eq!((missing, extra), (0, 0), "{coll}");
+            let opts = index_options(&st, coll, "geo");
+            assert_eq!(opts.get_i32(GEO_KEYS), Ok(GEO_KEY_FORMAT), "{coll}");
+            assert_eq!(opts.get_bool("multikey"), Ok(true), "{coll}");
+        }
+        assert_eq!(
+            index_options(&st, "h", "geo").get_i32("2dsphereIndexVersion"),
+            Ok(3)
+        );
+        let found = st
+            .find_matching(
+                "app",
+                "g",
+                &doc! {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}},
+            )
+            .unwrap();
+        assert_eq!(found.len(), 3);
+    }
+
+    /// A collated index without `collationKeys` (this server before
+    /// 2026-10-10, or the Python server) is rebuilt with collation keys when
+    /// the store opens.
+    #[test]
+    fn open_rebuilds_a_collated_index_without_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        {
+            let st = Storage::open(home).unwrap();
+            st.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "s": "a"}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32, "s": "B"}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            st.create_index(
+                "app",
+                "c",
+                "s_ci",
+                &doc! {"s": 1i32},
+                &doc! {"collation": {"locale": "en", "strength": 2i32}},
+            )
+            .unwrap();
+        }
+        age_index(home, "c", "s_ci", |o| {
+            o.remove(COLLATION_KEYS);
+        });
+        let st = Storage::open(home).unwrap();
+        let check = st.check_collection("app", "c").unwrap();
+        assert_eq!(index_check(&check, "s_ci"), (2, 0, 0));
+        let opts = index_options(&st, "c", "s_ci");
+        assert_eq!(
+            opts.get_i32(COLLATION_KEYS),
+            Ok(secantus_core::collation::KEY_FORMAT)
+        );
+        assert_eq!(opts.get_i32("entryFormat"), Ok(ENTRY_FORMAT));
+        // The rebuilt index refuses a second spelling of a stored value.
+        drop(st);
+        let st = Storage::open(home).unwrap();
+        st.drop_index("app", "c", "s_ci").unwrap();
+        st.create_index(
+            "app",
+            "c",
+            "s_ci",
+            &doc! {"s": 1i32},
+            &doc! {"collation": {"locale": "en", "strength": 2i32}, "unique": true},
+        )
+        .unwrap();
+        drop(st);
+        age_index(home, "c", "s_ci", |o| {
+            o.remove(COLLATION_KEYS);
+        });
+        let st = Storage::open(home).unwrap();
+        let (_, errors) = st
+            .insert(
+                "app",
+                "c",
+                vec![encode_doc(&doc! {"_id": 3i32, "s": "A"}).unwrap()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    /// A unique collated index that the stored documents break under its
+    /// collation cannot be rebuilt, and the store is refused, naming it.
+    #[test]
+    fn open_refuses_an_outdated_index_it_cannot_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        {
+            let st = Storage::open(home).unwrap();
+            st.insert(
+                "app",
+                "c",
+                vec![
+                    encode_doc(&doc! {"_id": 1i32, "s": "a"}).unwrap(),
+                    encode_doc(&doc! {"_id": 2i32, "s": "A"}).unwrap(),
+                ],
+                true,
+            )
+            .unwrap();
+            st.create_index("app", "c", "s_u", &doc! {"s": 1i32}, &doc! {"unique": true})
+                .unwrap();
+        }
+        // As the Python server, or this one before 2026-10-10, left it: a
+        // collation in the options, plain values in the entries.
+        age_index(home, "c", "s_u", |o| {
+            o.insert("collation", doc! {"locale": "en", "strength": 2i32});
+        });
+        match Storage::open(home) {
+            Err(StorageError::Internal(m)) => {
+                assert!(m.contains("'s_u' on 'app.c'"), "unexpected message: {m}")
+            }
+            Err(other) => panic!("expected Internal, got: {other:?}"),
+            Ok(_) => panic!("expected the open to be refused"),
+        }
+    }
+
+    /// A collection with a default collation whose documents were stored
+    /// without `_id` claims (before 2026-10-11, or by the Python server) has
+    /// them claimed when the store opens, so a second spelling is refused.
+    #[test]
+    fn open_claims_collated_ids_stored_without_a_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        {
+            let st = Storage::open(home).unwrap();
+            st.create_collection_with_options(
+                "app",
+                "k",
+                &doc! {"collation": {"locale": "en", "strength": 2i32}},
+            )
+            .unwrap();
+            st.insert(
+                "app",
+                "k",
+                vec![encode_doc(&doc! {"_id": "a"}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+        {
+            let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
+            let sess = conn.open_session().unwrap();
+            let scan = sess.open_cursor(UNIQ_TABLE, None).unwrap();
+            let del = sess.open_cursor(UNIQ_TABLE, None).unwrap();
+            let mut more = scan.next().unwrap();
+            while more {
+                let (d, c, n, k) = scan.get_key_sssu().unwrap();
+                if c == "k" || n == "$collated_id_claims" {
+                    del.set_key_sssu(&d, &c, &n, &k);
+                    del.remove().unwrap();
+                }
+                more = scan.next().unwrap();
+            }
+        }
+        let st = Storage::open(home).unwrap();
+        let (_, errors) = st
+            .insert(
+                "app",
+                "k",
+                vec![encode_doc(&doc! {"_id": "A"}).unwrap()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
     #[test]
     fn open_rejects_pre_recordid_doc_shard() {
         let dir = tempfile::tempdir().unwrap();
@@ -18643,8 +19148,9 @@ mod tests {
             let held = claims(&s);
             let of = |coll: &str| held.iter().filter(|(_, c, _)| c == coll).count();
             // Two document `_id`s in `c`; one claim for the two documents of
-            // `d`; the row that says the walk is done.
-            assert_eq!((of("c"), of("d"), of("")), (2, 1, 1), "{held:?}");
+            // `d`; the rows that say the two walks (document `_id`s, and
+            // `_id`s under a collation) are done.
+            assert_eq!((of("c"), of("d"), of("")), (2, 1, 2), "{held:?}");
             // A stored `_id` written another way is a duplicate now.
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (0, 1));
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i64}}), (0, 1));
@@ -18662,11 +19168,11 @@ mod tests {
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (1, 0));
         }
         {
-            // The walk does not run again: a claim taken away stays away.
+            // The walks do not run again: a claim taken away stays away.
             let s = open();
             assert_eq!(
                 claims(&s).iter().filter(|(_, c, _)| c.is_empty()).count(),
-                1
+                2
             );
             let session = s.conn.open_session().unwrap();
             let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();

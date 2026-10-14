@@ -9471,12 +9471,10 @@ Still different, all 137:
       candidate fetch left out a line or polygon whose nearest point is
       inside the distance and a vertex outside (`geo_near_index_filter`,
       switched off).
-- [ ] **An index built before this holds no entry for a value with
-      several locations**, or for a point written as a document other than
-      `{lng, lat}`. Drop it and build it again.
 - [ ] **PYTHON MongoDB server:** not measured by this probe. It tests
       `$geometry` in the plane (Shapely), so the differences above are
-      expected there.
+      expected there. `find(...).hint(<a 2d index>)` is an internal error
+      (`int('2d')` in `_candidates_from_hint`), found 2026-10-14.
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -9660,8 +9658,10 @@ The wrong WRITES, all fixed:
   (`backfill_document_id_claims`, once for a store; a row in `UNIQ_TABLE`
   under an empty namespace records it). Two stored documents already
   equal by value both stay, and the older holds the claim. **The Python
-  server takes no claim**, so a document it writes into a store after
-  that walk can still be duplicated by value.
+  server takes no claim**, so as the server holding a store it accepts a
+  second document equal by value to a stored one. Since 2026-10-14 it
+  removes the record that the walk is done when it opens a store, so the
+  Rust server claims again after it, keeping both and logging them.
 - **`$merge` with `whenMatched: "replace"` deleted the matched document
   and then inserted the new one.** A replacement a unique index refused
   left neither. It is one replacement now, and a replaced document keeps
@@ -10094,14 +10094,13 @@ listed first below. What is left, there and beside it:
       found in 24 locales.
 - [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left**
       (the rule itself landed 2026-10-11: a claim per document in the
-      unique-keys table under the collated key). A collection created with a
-      default collation BEFORE that has no claims for the documents already
-      in it, so a second spelling of one of THEIR `_id`s is still accepted.
-      A duplicate whose `_id` is a document shows the value as written
-      (mongod shows each string in it as raw sort-key bytes). The Python
-      server does not enforce the rule and does not release a claim when it
-      deletes a document; the Rust server treats a claim whose document is
-      gone as free.
+      unique-keys table under the collated key; documents stored before it,
+      or by the Python server, are claimed when the store opens since
+      2026-10-14). A duplicate whose `_id` is a document shows the value as
+      written (mongod shows each string in it as raw sort-key bytes). The
+      Python server does not enforce the rule itself: as the server holding
+      the store it accepts a second spelling, and the Rust server, which
+      walks the documents again after it, keeps both and logs them.
 - [ ] **RUST MongoDB server: `$out` and `$merge` after 2026-10-11.** `$out`
       builds beside the target and renames over it, and a change stream on
       the target sees `drop` then `invalidate` (mongod: `rename` then
@@ -10115,14 +10114,6 @@ listed first below. What is left, there and beside it:
       planner passes it over: a query with a collation scans. Correct, slow
       on a large collection. A hint naming such an index is accepted and
       scans.
-- [ ] **RUST and PYTHON MongoDB servers disagree on disk about a collated
-      index.** The Rust server writes ICU4X sort keys under the marker; the
-      Python server writes its own folded strings and does not know the
-      marker. A store with a collated index handed from one server to the
-      other gives wrong answers from that index. Before 2026-10-10 the Rust
-      server wrote plain values there, so the two disagreed then as well.
-      An index the Rust server built before that date has no marker and keeps
-      comparing by value until it is dropped and rebuilt.
 - [ ] **RUST MongoDB server: five collation types are refused.** `search`,
       `searchjl`, `big5han`, `gb2312han` and `phonetic` (as
       `@collation=<type>`) are not in ICU4X's bundled data; the server
