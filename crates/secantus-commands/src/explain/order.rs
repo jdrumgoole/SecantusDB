@@ -523,6 +523,55 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     Ok(Some(placed(rows, order)))
 }
 
+/// The names of the indexes the plan for `ask` reads. A cursor left open
+/// over that plan is killed when one of them is dropped, as mongod's is.
+pub(crate) fn plan_indexes(storage: &dyn Storage, ask: &Ask) -> Vec<String> {
+    let Ok(catalog) = catalog(storage, ask.db, ask.coll, None) else {
+        return Vec::new();
+    };
+    if catalog.is_empty() {
+        return Vec::new();
+    }
+    let canonical = parsed::parsed_query(ask.filter);
+    let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
+    let Ok(hint) = resolve_hint(ask.hint, &catalog) else {
+        return Vec::new();
+    };
+    let query = Query {
+        canonical: &canonical,
+        sort: ask.sort,
+        projection: None,
+        skip: 0,
+        limit: ask.limit,
+        hint,
+        collation: ask.collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        implies: &implied,
+        trial: None,
+    };
+    let mut names = Vec::new();
+    index_names(&plan::plan(&query, &catalog), &mut names);
+    names
+}
+
+/// The indexes a plan's scans read, into `out`.
+fn index_names(node: &Node, out: &mut Vec<String>) {
+    match access(node) {
+        Node::IxScan(ix) => out.push(ix.index.name.clone()),
+        Node::Express { index, .. } => out.push(index.name.clone()),
+        Node::Fetch { input, .. } | Node::Sort { input, .. } => index_names(input, out),
+        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().for_each(|n| index_names(n, out))
+        }
+        _ => {}
+    }
+}
+
 /// `Storage::find_collated`, in mongod's order.
 pub(crate) fn find(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Vec<u8>>, StorageError> {
     match ordered_rows(storage, ask)? {

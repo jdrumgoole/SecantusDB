@@ -1692,6 +1692,67 @@ def session_id(run, label):
     return Binary(uuid.uuid5(uuid.NAMESPACE_DNS, f"{SALT}/{run}/{label}").bytes, 4)
 
 
+# ------------------------------------------- phase 1b: writes (2026-10-14)
+
+BULK = {
+    "bulkWrite": 1,
+    "ops": [
+        {"insert": 0, "document": {"_id": 10}},
+        {"update": 0, "filter": {"_id": 1}, "updateMods": {"$inc": {"v": 1}}},
+    ],
+    "nsInfo": [{"ns": "@db.c"}],
+}
+
+scenario(
+    "a retried bulkWrite is replayed, not run again",
+    SEED,
+    ("a", "admin", retry("s", 1, BULK)),
+    ("a", "admin", retry("s", 1, BULK)),
+    ALL,
+)
+scenario(
+    "a retried bulkWrite on a new connection is replayed",
+    SEED,
+    ("a", "admin", retry("s", 1, BULK)),
+    ("b", "admin", retry("s", 1, BULK)),
+    ALL,
+)
+scenario(
+    "a bulkWrite under a newer txnNumber runs",
+    SEED,
+    ("a", "admin", retry("s", 1, BULK)),
+    ("a", "admin", retry("s", 2, {**BULK, "ops": BULK["ops"][1:]})),
+    ALL,
+)
+scenario(
+    "two transactions create one collection, the later one commits first",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    ("b", None, tx("t", 1, insert("n", {"_id": 2}), start=True)),
+    commit("t", 1, conn="b"),
+    commit("s", 1),
+    find("n", sort={"_id": 1}),
+)
+scenario(
+    "a collection dropped under a transaction that wrote to it",
+    SEED,
+    tx("s", 1, insert("c", {"_id": 3}), start=True),
+    tx("s", 1, update("c", {"_id": 1}, SET9)),
+    ("b", None, {"drop": "c", "maxTimeMS": 500}),
+    commit("s", 1),
+    ALL,
+    {"count": "c"},
+    ("b", None, {"listIndexes": "c"}),
+)
+scenario(
+    "a collection dropped under a transaction that only read it",
+    SEED,
+    tx("s", 1, ALL, start=True),
+    ("b", None, {"drop": "c", "maxTimeMS": 500}),
+    commit("s", 1),
+    ALL,
+)
+
+
 def resolve(value, run, db, cursors):
     if isinstance(value, Sess):
         return session_id(run, value.label)

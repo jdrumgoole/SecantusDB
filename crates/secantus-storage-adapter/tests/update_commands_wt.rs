@@ -980,3 +980,88 @@ fn an_empty_timestamp_is_filled_in_a_whole_document() {
         assert!(filled(&d, "u"), "{d}");
     });
 }
+
+/// A `$`-prefixed field inside an upserted `_id` document is mongod's 52,
+/// whichever way the upsert built the `_id` (measured 8.2.11, 2026-10-14).
+/// Each was stored.
+#[test]
+fn an_upserted_id_holds_no_dollar_field() {
+    with_wt(|c| {
+        let message = "Plan executor error during update :: caused by :: The dollar ($) \
+                       prefixed field '$b' in '_id.a.$b' is not allowed in the context of an \
+                       update's replacement document. Consider using an aggregation pipeline \
+                       with $replaceWith.";
+        for (q, u) in [
+            (
+                doc! {"_id": {"$eq": {"a": {"$b": 1}}}},
+                Bson::Document(doc! {"$set": {"v": 1}}),
+            ),
+            (
+                doc! {"x": 1},
+                Bson::Document(doc! {"_id": {"a": {"$b": 1}}, "v": 1}),
+            ),
+            (
+                doc! {"x": 1},
+                Bson::Array(vec![Bson::Document(
+                    doc! {"$set": {"_id": {"$literal": {"a": {"$b": 1}}}}},
+                )]),
+            ),
+        ] {
+            seed(c, vec![]);
+            let reply = statement(c, doc! {"q": q, "u": u, "upsert": true});
+            let error = reply.get_array("writeErrors").unwrap()[0]
+                .as_document()
+                .unwrap()
+                .clone();
+            assert_eq!(error.get_i32("code"), Ok(52), "{reply}");
+            assert_eq!(error.get_str("errmsg"), Ok(message), "{reply}");
+            assert!(stored(c).is_empty());
+        }
+        seed(c, vec![]);
+        let reply = dispatch_full(
+            &doc! {"findAndModify": "c", "query": {"x": 1},
+            "update": {"$set": {"_id": {"a": {"$b": 1}}}}, "upsert": true},
+            c,
+        );
+        assert_eq!(reply.get_i32("code"), Ok(52), "{reply}");
+        assert!(stored(c).is_empty());
+    });
+}
+
+/// `upsertSupplied` takes the `_id` the query names by equality, and refuses
+/// a supplied document that gives another (measured 8.2.11, 2026-10-14). It
+/// stored a new ObjectId.
+#[test]
+fn an_upsert_supplied_document_takes_the_query_id() {
+    with_wt(|c| {
+        let supplied = |c: &mut CommandContext, q: Document, new: Document| {
+            seed(c, vec![]);
+            statement(
+                c,
+                doc! {"q": q, "u": [{"$set": {"v": "$$new.v"}}], "upsert": true,
+                "upsertSupplied": true, "c": {"new": new}},
+            )
+        };
+        let reply = supplied(c, doc! {"_id": 1, "x": 2}, doc! {"v": 5});
+        assert_eq!(reply.get_array("upserted").unwrap().len(), 1, "{reply}");
+        assert_eq!(stored(c), vec![doc! {"_id": 1, "v": 5}]);
+        supplied(c, doc! {"_id": {"$eq": 3}}, doc! {"v": 5});
+        assert_eq!(stored(c), vec![doc! {"_id": 3, "v": 5}]);
+        supplied(c, doc! {"x": 2}, doc! {"v": 5});
+        assert!(one(c).get_object_id("_id").is_ok());
+        let reply = supplied(c, doc! {"_id": 1}, doc! {"_id": 7, "v": 5});
+        let error = reply.get_array("writeErrors").unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert_eq!(error.get_i32("code"), Ok(66), "{reply}");
+        assert_eq!(
+            error.get_str("errmsg"),
+            Ok(
+                "Plan executor error during update :: caused by :: After applying the update, \
+                the (immutable) field '_id' was found to have been altered to _id: 7"
+            ),
+        );
+        assert!(stored(c).is_empty());
+    });
+}

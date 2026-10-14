@@ -959,6 +959,7 @@ fn retryable_write(
         },
         "update" => doc.get_array("updates").map_or(0, Vec::len),
         "delete" => doc.get_array("deletes").map_or(0, Vec::len),
+        "bulkWrite" => doc.get_array("ops").map_or(0, Vec::len),
         _ => 1,
     };
     let ids = match statement_ids(name, doc, count) {
@@ -973,7 +974,9 @@ fn retryable_write(
         "insert" => retry_insert(handler, doc, ctx, &ids, &done),
         "update" | "delete" => retry_batch(name, handler, doc, ctx, &ids, &done),
         "findAndModify" | "findandmodify" => retry_find_and_modify(handler, doc, ctx, &ids, &done),
-        // `bulkWrite` takes the session's number and is not replayed.
+        "bulkWrite" => {
+            crate::bulkwrite::with_retry(&ids, &done, || crate::run_handler(handler, doc, ctx))
+        }
         _ => (crate::run_handler(handler, doc, ctx), Vec::new()),
     };
     registry.record_statements(lsid, txn_number, records);
