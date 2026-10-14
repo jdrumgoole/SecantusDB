@@ -39,16 +39,6 @@ one beside it.
 
 ## Open from the 2026-08-26 triage
 
-- [ ] **RUST pgserver: `SET TRANSACTION` outside an explicit block sends no
-  WARNING.** It is a silent no-op here (correct), where PostgreSQL also emits
-  `WARNING: SET TRANSACTION can only be used in transaction blocks`.
-  psycopg never triggers it (it only adds the modes to `BEGIN`), and the
-  `Statement::SetTransaction` arm in `crates/secantus-pg/src/lib.rs` has no
-  notice-emission seam on that path. Isolation itself is accepted and
-  reported, not enforced -- a scope decision (single node, one WiredTiger
-  snapshot level), not a deferral.
-  Backlog-ID: RP-001
-  Verify: tests/backlog/test_rp_triage.py::test_set_transaction_outside_a_block_warns
 - **Scope decision — psycopg's `test_generators.py::test_cancel` and the
   `proxy`-marked `test_cancel_safe_error` / `test_cancel_safe_timeout` fail on
   macOS in the CLIENT.** macOS libpq sends the cancel on a not-yet-connected
@@ -282,49 +272,8 @@ one beside it.
         every time;
       - the plan cache is per connection and holds 256 entries, cleared
         whole when full.
-
-      Correctness items found on the way, open:
       Backlog-ID: RP-007
       Verify: none -- Linux throughput/CPU-per-statement benchmark campaign
-      - [ ] **RUST PG server: a parenthesised step inside `ROLLUP` / `CUBE`
-            is refused with a wrong 42803.** `group by rollup ((g, z), v)`
-            answers `column "gse_t.g" must appear in the GROUP BY clause`.
-            `GroupElement::Rollup` holds single keys; a step of several
-            needs a list of lists. (`GROUP BY (a, b)` on its own works.)
-            `tools/probes/pg_corpora/grouping_set_exprs.sql`.
-            Backlog-ID: RP-008
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_rollup_with_a_parenthesised_step
-      - [ ] **RUST PG server: a grouped query's subquery cannot name the
-            outer table by its own name.** `select g, (select max(v) from t i
-            where i.g = t.g) from t group by g` is `42P01 invalid reference
-            to FROM-clause entry for table "t"`; with an alias on the outer
-            table (`from t o ... o.g`) it works. Not a grouping-set matter:
-            the plain GROUP BY above fails the same way.
-            Backlog-ID: RP-009
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_query_subquery_names_outer_table
-      - [ ] **RUST PG server: a 42803 raised from HAVING names the column
-            without its table.** PostgreSQL writes `column "t.z" must
-            appear...`; the HAVING path writes `"z"` (`having_subject` has
-            no statement to take the qualifier from).
-            Backlog-ID: RP-010
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_having_42803_names_the_table
-      - [ ] **RUST PG server: with `public` off the `search_path`, a
-            relation of `public` is still found from a STRING and by
-            `DROP ... IF EXISTS`.** `select nextval('s')` and
-            `'t'::regclass` answer where PostgreSQL 15 says 42P01, and
-            `drop table if exists t` DROPS the table where PostgreSQL
-            skips it with a notice. The check is on the statement's
-            relation references (`schemas::hidden_in_public`); these
-            three resolve the name elsewhere.
-            `tools/probes/pg_corpora/search_path_public.sql`.
-            Backlog-ID: RP-011
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_public_off_path_not_found_from_a_string,tests/backlog/test_rust_postgres_gaps.py::test_public_off_path_drop_if_exists_skips
-      - [ ] **RUST PG server: a syntax error from Parse (the extended
-            protocol) carries no position.** `selct 1` sent with
-            `prepare=True` has `P` unset; sent as a simple query it is 1.
-            Every syntax error, not only the unterminated ones.
-            Backlog-ID: RP-012
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_parse_syntax_error_carries_position
 
 - **ACCEPTED AS A LIMIT 2026-10-07 (Joe), and may be revisited — Rust
       PostgreSQL server on macOS: a READ statement costs ~1.45-1.6x
@@ -417,6 +366,19 @@ one beside it.
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password,tests/backlog/test_rust_postgres_gaps.py::test_wrong_password_checked_before_the_database
 
 ## 5. Known bugs and edge cases to watch
+
+- [ ] **RUST pgserver: an INSERT whose expressions and target columns do
+  not match in number carries no error position.** `insert into t values
+  (1, 'a', 3)` over a two-column table is 42601 `INSERT has more
+  expressions than target columns` on both servers, but PostgreSQL 15.19
+  points at the first expression past the target list (`3`), and at the
+  first unfilled target column for "more target columns than
+  expressions"; here `P` is unset, through a simple query and Parse alike.
+  The check (`insert_row_typed`) runs on values, with no statement
+  locations; the position needs the target list's width, which only the
+  table has. Found 2026-10-15 while fixing RP-012.
+  Backlog-ID: RP-021
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_insert_arity_error_carries_position
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

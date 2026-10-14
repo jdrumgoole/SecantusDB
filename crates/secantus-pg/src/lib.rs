@@ -28910,6 +28910,14 @@ impl PgHandler {
                 for name in &names {
                     if self.sequence_doc(name)?.is_none() {
                         if if_exists {
+                            self.notice(
+                                "00000",
+                                format!(
+                                    "sequence \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(name).1
+                                ),
+                                None,
+                            );
                             continue;
                         }
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -29122,7 +29130,10 @@ impl PgHandler {
                         if if_exists {
                             self.notice(
                                 "00000",
-                                format!("view \"{name}\" does not exist, skipping"),
+                                format!(
+                                    "view \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(name).1
+                                ),
                                 None,
                             );
                             continue;
@@ -29302,7 +29313,10 @@ impl PgHandler {
                         if drop.if_exists {
                             self.notice(
                                 "00000",
-                                format!("table \"{table}\" does not exist, skipping"),
+                                format!(
+                                    "table \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(table).1
+                                ),
                                 None,
                             );
                             continue;
@@ -29732,7 +29746,10 @@ impl PgHandler {
                         if if_exists {
                             self.notice(
                                 "00000",
-                                format!("materialized view \"{name}\" does not exist, skipping"),
+                                format!(
+                                    "materialized view \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(name).1
+                                ),
                                 None,
                             );
                             continue;
@@ -30623,6 +30640,13 @@ impl PgHandler {
                             if df { "on" } else { "off" }.into(),
                         );
                     }
+                } else {
+                    // A no-op outside a block, with PostgreSQL's warning
+                    // (`WarnNoTransactionBlock`; RP-001).
+                    self.warning(
+                        "25P01",
+                        "SET TRANSACTION can only be used in transaction blocks".into(),
+                    );
                 }
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
@@ -38044,8 +38068,11 @@ impl ExtendedQueryHandler for PgHandler {
         self.install_user_types();
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
-        let fields =
-            self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
+        // Positioned as the same error is from a simple query: a syntax
+        // error points at its token (RP-012).
+        let fields = self
+            .describe_fields(&target.statement.sql, param_types.len(), &param_types)
+            .map_err(|e| Self::positioned(e, &target.statement.sql))?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -38261,11 +38288,13 @@ impl ExtendedQueryHandler for PgHandler {
         self.note_result_format(&target.result_column_format);
         self.check_cached_result_type(target.statement.as_ref())?;
         let param_types = self.param_type_names(target.statement.as_ref());
-        let fields = self.describe_fields(
-            &target.statement.statement.sql,
-            param_types.len(),
-            &param_types,
-        )?;
+        let fields = self
+            .describe_fields(
+                &target.statement.statement.sql,
+                param_types.len(),
+                &param_types,
+            )
+            .map_err(|e| Self::positioned(e, &target.statement.statement.sql))?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }

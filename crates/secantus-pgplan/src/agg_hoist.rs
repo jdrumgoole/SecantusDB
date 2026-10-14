@@ -103,11 +103,12 @@ pub(crate) fn contains_sublink(n: &pg_query::protobuf::Node) -> bool {
     found
 }
 
-/// Names a subquery's own FROM exposes (tables and aliases).
+/// Names a subquery's own FROM exposes: an aliased table by its alias
+/// ONLY, so an inner `t i` does not claim the outer `t.c` (RP-009).
 fn from_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     let mut out = Vec::new();
     for item in &s.from_clause {
-        collect_from_names(item, &mut out);
+        collect_visible_names(item, &mut out);
     }
     out
 }

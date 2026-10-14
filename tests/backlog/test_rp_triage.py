@@ -11,7 +11,7 @@ import pytest
 from tests.backlog.conftest import pg_answer
 
 
-@pytest.mark.backlog("RP-001")
+@pytest.mark.backlog_fixed("RP-001")
 def test_set_transaction_outside_a_block_warns(pg: Any) -> None:
     """PostgreSQL 15.19: `WARNING: SET TRANSACTION can only be used in
     transaction blocks` (sent as a notice, the statement succeeds)."""

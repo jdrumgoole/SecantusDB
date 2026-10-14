@@ -14139,19 +14139,21 @@ fn expand_grouping_sets(elements: &[GroupElement]) -> Option<Vec<Vec<usize>>> {
         let alternatives: Vec<Vec<usize>> = match element {
             GroupElement::Key(i) => vec![vec![*i]],
             GroupElement::Sets(inner) => inner.clone(),
-            GroupElement::Rollup(keys) => {
-                (0..=keys.len()).rev().map(|n| keys[..n].to_vec()).collect()
-            }
-            GroupElement::Cube(keys) => {
+            GroupElement::Rollup(steps) => (0..=steps.len())
+                .rev()
+                .map(|n| steps[..n].concat())
+                .collect(),
+            GroupElement::Cube(steps) => {
                 // Subsets in PostgreSQL's order: the full set first, then
                 // successively fewer, which for two keys is (a,b),(a),(b),().
                 let mut out: Vec<Vec<usize>> = Vec::new();
-                for mask in (0..(1u32 << keys.len())).rev() {
+                for mask in (0..(1u32 << steps.len())).rev() {
                     out.push(
-                        keys.iter()
+                        steps
+                            .iter()
                             .enumerate()
                             .filter(|(bit, _)| mask & (1 << bit) != 0)
-                            .map(|(_, k)| *k)
+                            .flat_map(|(_, k)| k.iter().copied())
                             .collect(),
                     );
                 }
@@ -14178,8 +14180,11 @@ enum GroupElement {
     Key(usize),
     /// `GROUPING SETS (...)` — each inner set already resolved to indices.
     Sets(Vec<Vec<usize>>),
-    Rollup(Vec<usize>),
-    Cube(Vec<usize>),
+    /// `ROLLUP` / `CUBE` over STEPS: each step one key, or several written
+    /// in parentheses (`rollup ((a, b), c)`), which are added or dropped
+    /// together.
+    Rollup(Vec<Vec<usize>>),
+    Cube(Vec<Vec<usize>>),
 }
 
 /// Resolve one `GROUP BY` element to its key.
@@ -20494,6 +20499,29 @@ pub fn join_output_keys(join: &JoinSelect) -> Vec<String> {
         .collect()
 }
 
+/// A 42803 naming a bare column, as PostgreSQL writes it: qualified by the
+/// relation it belongs to (`column "t.z" must appear ...`), which the HAVING
+/// planner, resolving by name alone, does not know (RP-010).
+fn qualify_grouping_error(e: Error, s: &pg_query::protobuf::SelectStmt) -> Error {
+    let Error::Grouping(msg) = &e else {
+        return e;
+    };
+    let Some((name, rest)) = msg
+        .strip_prefix("column \"")
+        .and_then(|r| r.split_once('"'))
+    else {
+        return e;
+    };
+    if name.contains('.') || !rest.starts_with(" must appear in the GROUP BY clause") {
+        return e;
+    }
+    let c = pg_query::protobuf::ColumnRef {
+        fields: vec![string_node(name)],
+        location: -1,
+    };
+    Error::Grouping(format!("column \"{}\"{rest}", grouping_error_name(&c, s)))
+}
+
 /// The shared tail of `plan_aggregate`, over whichever SOURCE the FROM named:
 /// a table, or a joined subquery whose output columns stand in for one.
 /// How PostgreSQL names an ungrouped column in its 42803: qualified --
@@ -20597,13 +20625,22 @@ fn finish_aggregate(
             };
             match K::try_from(gs.kind) {
                 Ok(K::GroupingSetEmpty) => elements.push(GroupElement::Sets(vec![Vec::new()])),
-                Ok(K::GroupingSetRollup) => {
-                    let keys = members(&gs.content, &mut group_by, &mut group_prints)?;
-                    elements.push(GroupElement::Rollup(keys));
-                }
-                Ok(K::GroupingSetCube) => {
-                    let keys = members(&gs.content, &mut group_by, &mut group_prints)?;
-                    elements.push(GroupElement::Cube(keys));
+                Ok(kind @ (K::GroupingSetRollup | K::GroupingSetCube)) => {
+                    // A parenthesised step, `(a, b)`, parses as a RowExpr.
+                    let mut steps = Vec::new();
+                    for item in &gs.content {
+                        steps.push(match item.node.as_ref() {
+                            Some(N::RowExpr(r)) => {
+                                members(&r.args, &mut group_by, &mut group_prints)?
+                            }
+                            _ => vec![push_key(item, &mut group_by, &mut group_prints)?],
+                        });
+                    }
+                    elements.push(if kind == K::GroupingSetRollup {
+                        GroupElement::Rollup(steps)
+                    } else {
+                        GroupElement::Cube(steps)
+                    });
                 }
                 Ok(K::GroupingSetSets) => {
                     let mut sets = Vec::new();
@@ -20930,17 +20967,20 @@ fn finish_aggregate(
     // the test and never projected.
     let having = match s.having_clause.as_deref() {
         None => None,
-        Some(node) => Some(plan_having(
-            node,
-            &def,
-            &group_by,
-            &mut items,
-            params,
-            &mut GroupingsCtx {
-                groupings: &mut groupings,
-                prints: &group_prints,
-            },
-        )?),
+        Some(node) => Some(
+            plan_having(
+                node,
+                &def,
+                &group_by,
+                &mut items,
+                params,
+                &mut GroupingsCtx {
+                    groupings: &mut groupings,
+                    prints: &group_prints,
+                },
+            )
+            .map_err(|e| qualify_grouping_error(e, s))?,
+        ),
     };
 
     let (limit, offset) = limit_offset(s, params)?;
@@ -25003,6 +25043,9 @@ pub fn regclass_text(oid: i64) -> String {
             if table_is_visible(oid) == Some(true) {
                 return scalar::quote_identifier(bare);
             }
+        } else if table_is_visible(oid) == Some(false) {
+            // A relation of `public`, with `public` off the path.
+            return format!("public.{}", scalar::quote_identifier(&name));
         }
         return name
             .split('.')
@@ -31873,7 +31916,9 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             .ok_or_else(|| Error::Unsupported("this DROP target".into()))?;
         tables.push(name);
     }
-    if tables.is_empty() {
+    // IF EXISTS can be left with none: each was a name the search path does
+    // not reach, skipped with a notice while the statement was qualified.
+    if tables.is_empty() && !d.missing_ok {
         return Err(Error::Parse("DROP TABLE with no table".into()));
     }
     Ok(Statement::DropTable(DropTable {

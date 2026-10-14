@@ -432,7 +432,10 @@ impl PgHandler {
                     pending.push((definition.clone(), depth + 1));
                 }
                 // A rule's actions join the statement on the event it fires on.
-                for rule in rules.iter().filter(|r| r.table == relation && r.event == privilege) {
+                for rule in rules
+                    .iter()
+                    .filter(|r| r.table == relation && r.event == privilege)
+                {
                     for action in &rule.actions {
                         pending.push((action.clone(), depth + 1));
                     }

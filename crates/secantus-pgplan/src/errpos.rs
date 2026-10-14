@@ -138,10 +138,15 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             // `column "x" does not exist`, or `column t.x does not exist`:
             // a qualified reference points at its qualifier. And `column "x"
             // must appear in the GROUP BY clause ...`: its first mention.
-            if sqlstate == "42803" && !m.contains(" must appear in the GROUP BY clause") {
+            // And `subquery uses ungrouped column "t.x" from outer query`.
+            if sqlstate == "42803"
+                && !m.contains(" must appear in the GROUP BY clause")
+                && !m.starts_with("subquery uses ungrouped column ")
+            {
                 return None;
             }
             let name = quoted_between(m, "column ")
+                .or_else(|| quoted_between(m, "subquery uses ungrouped column "))
                 .map(str::to_string)
                 .or_else(|| {
                     m.strip_prefix("column ")?

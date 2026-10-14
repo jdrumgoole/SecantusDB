@@ -273,6 +273,13 @@ fn notice(msg: &str) {
     NOTICES.with(|n| n.borrow_mut().push(msg.to_string()));
 }
 
+/// A NOTICE raised while planning, outside text search (a DROP ... IF
+/// EXISTS skipping a name the path does not reach). The server sends these
+/// with the statement's own.
+pub(crate) fn planner_notice(msg: &str) {
+    notice(msg);
+}
+
 /// NOTICEs raised since the last call (a stop-word-only query's).
 pub(crate) fn notices_len() -> usize {
     NOTICES.with(|n| n.borrow().len())

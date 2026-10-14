@@ -22,7 +22,7 @@ def grouped(pg: Any) -> Iterator[Any]:
     pg.execute("drop table if exists rp_gs")
 
 
-@pytest.mark.backlog("RP-008")
+@pytest.mark.backlog_fixed("RP-008")
 def test_rollup_with_a_parenthesised_step(grouped: Any) -> None:
     """PostgreSQL 15.19 groups by the step `(g, z)` and then by `v`."""
     sql = "select g, z, v, count(*) from rp_gs group by rollup ((g, z), v) order by 1, 2, 3"
@@ -40,7 +40,7 @@ def test_rollup_with_a_parenthesised_step(grouped: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-009")
+@pytest.mark.backlog_fixed("RP-009")
 def test_grouped_query_subquery_names_outer_table(grouped: Any) -> None:
     """PostgreSQL 15.19: the subquery may name the unaliased outer table."""
     sql = (
@@ -50,7 +50,7 @@ def test_grouped_query_subquery_names_outer_table(grouped: Any) -> None:
     assert pg_answer(grouped, sql) == ("ok", [(1, 3), (2, 5)])
 
 
-@pytest.mark.backlog("RP-010")
+@pytest.mark.backlog_fixed("RP-010")
 def test_having_42803_names_the_table(grouped: Any) -> None:
     """PostgreSQL 15.19 qualifies the column in the HAVING error."""
     assert pg_answer(grouped, "select g from rp_gs t group by g having z > 0") == (
@@ -74,7 +74,7 @@ def public_hidden(pg: Any) -> Iterator[Any]:
     pg.execute("drop schema if exists rp011_s")
 
 
-@pytest.mark.backlog("RP-011")
+@pytest.mark.backlog_fixed("RP-011")
 @pytest.mark.parametrize(
     ("sql", "name"),
     [("select nextval('rp011_seq')", "rp011_seq"), ("select 'rp011_t'::regclass", "rp011_t")],
@@ -85,7 +85,7 @@ def test_public_off_path_not_found_from_a_string(public_hidden: Any, sql: str, n
     assert pg_answer(public_hidden, sql) == ("err", "42P01", f'relation "{name}" does not exist')
 
 
-@pytest.mark.backlog("RP-011")
+@pytest.mark.backlog_fixed("RP-011")
 def test_public_off_path_drop_if_exists_skips(public_hidden: Any) -> None:
     """PostgreSQL 15.19: `drop table if exists` skips with a notice, and
     `public.rp011_t` is still there afterwards."""
@@ -96,7 +96,7 @@ def test_public_off_path_drop_if_exists_skips(public_hidden: Any) -> None:
     assert pg_answer(public_hidden, "select count(*) from public.rp011_t") == ("ok", [(0,)])
 
 
-@pytest.mark.backlog("RP-012")
+@pytest.mark.backlog_fixed("RP-012")
 def test_parse_syntax_error_carries_position(pg: Any) -> None:
     """PostgreSQL 15.19: `selct 1` through Parse is 42601 with position 1,
     the same as through a simple query."""
@@ -227,3 +227,24 @@ def test_grant_and_revoke_take_effect_inside_a_transaction_block(pg: Any) -> Non
     and a REVOKE inside a block stops it at once. The Rust server ignored
     both until the block ended."""
     assert _privilege_in_a_block(pg, "rp020") == [("ok", [(1,)]), ("err", "42501")]
+
+
+@pytest.mark.backlog("RP-021")
+@pytest.mark.parametrize(
+    ("sql", "position"),
+    [
+        ("insert into rp021_t values (1, 'a', 3)", "37"),
+        ("insert into rp021_t (a) values (1, 2)", "36"),
+        ("insert into rp021_t (a, b) values (1)", "25"),
+        ("insert into rp021_t (a) select 1, 2", "35"),
+    ],
+    ids=["values-no-columns", "values-columns", "too-few-expressions", "select"],
+)
+def test_insert_arity_error_carries_position(pg: Any, sql: str, position: str) -> None:
+    """PostgreSQL 15.19: 42601 with the position of the first expression
+    past the target list (or of the first target column with nothing to
+    fill it)."""
+    pg.execute("create table if not exists rp021_t (a int, b text)")
+    with pytest.raises(psycopg.errors.SyntaxError) as info:
+        pg.execute(sql)
+    assert info.value.diag.statement_position == position
