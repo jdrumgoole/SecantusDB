@@ -1073,6 +1073,103 @@ scenario(
     find("n"),
 )
 scenario(
+    "two transactions create one collection: the one that commits first wins",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    ("b", None, tx("t", 1, insert("n", {"_id": 2}), start=True)),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    commit("s", 1),
+    find("n"),
+)
+scenario(
+    "two transactions create one collection by name",
+    tx("s", 1, {"create": "n"}, start=True),
+    ("b", None, tx("t", 1, {"create": "n"}, start=True)),
+    commit("s", 1),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    {"listCollections": 1, "filter": {"name": "n"}, "nameOnly": True},
+)
+scenario(
+    "a transaction creates a collection, a plain insert creates it too",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    ("b", None, {"insert": "n", "documents": [{"_id": 2}], "maxTimeMS": 500}),
+    commit("s", 1),
+    find("n"),
+)
+scenario(
+    "a transaction creates a collection, which nobody else sees until it commits",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    tx("s", 1, find("n")),
+    ("b", None, find("n")),
+    ("b", None, {"listCollections": 1, "filter": {"name": "n"}, "nameOnly": True}),
+    commit("s", 1),
+    ("b", None, find("n")),
+)
+scenario(
+    "a transaction creates a collection and aborts",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    abort("s", 1),
+    {"listCollections": 1, "filter": {"name": "n"}, "nameOnly": True},
+    insert("n", {"_id": 2}),
+    find("n"),
+)
+scenario(
+    "two transactions create one collection, one aborts",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    ("b", None, tx("t", 1, insert("n", {"_id": 2}), start=True)),
+    abort("s", 1),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    find("n"),
+)
+scenario(
+    "two transactions create one collection, with the same _id",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    ("b", None, tx("t", 1, insert("n", {"_id": 1}), start=True)),
+    commit("s", 1),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    find("n"),
+)
+scenario(
+    "a transaction creates a collection that another commits meanwhile",
+    tx("s", 1, insert("n", {"_id": 1}), start=True),
+    ("b", None, tx("t", 1, insert("n", {"_id": 2}), start=True)),
+    commit("s", 1),
+    ("b", None, tx("t", 1, insert("n", {"_id": 3}))),
+    ("b", None, tx("t", 1, find("n"))),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    find("n"),
+)
+scenario(
+    "a transaction creates a collection and works on it by _id",
+    tx("s", 1, insert("n", {"_id": 1, "v": 1}, {"_id": 2, "v": 2}), start=True),
+    tx("s", 1, insert("n", {"_id": 1})),
+    tx("s", 1, find("n", {"_id": 1})),
+    tx("s", 1, update("n", {"_id": 1}, SET9)),
+    tx("s", 1, delete("n", {"_id": 2}, 1)),
+    tx("s", 1, update("n", {"_id": 3}, SET9, upsert=True)),
+    tx("s", 1, fam("n", {"_id": 3}, update={"$inc": {"v": 1}}, new=True)),
+    tx("s", 1, find("n", sort={"_id": 1})),
+    commit("s", 1),
+    find("n", sort={"_id": 1}),
+    insert("n", {"_id": 1}),
+    insert("n", {"_id": 2}),
+)
+scenario(
+    "two transactions create one collection with a collation, one _id spelled two ways",
+    tx("s", 1, {"create": "n", "collation": {"locale": "en", "strength": 2}}, start=True),
+    tx("s", 1, insert("n", {"_id": "a"})),
+    (
+        "b",
+        None,
+        tx("t", 1, {"create": "n", "collation": {"locale": "en", "strength": 2}}, start=True),
+    ),
+    ("b", None, tx("t", 1, insert("n", {"_id": "A"}))),
+    tx("s", 1, insert("n", {"_id": "A"})),
+    commit("s", 1),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    find("n"),
+    insert("n", {"_id": "A"}),
+)
+scenario(
     "a collection dropped under a transaction",
     SEED,
     tx("s", 1, ALL, start=True),

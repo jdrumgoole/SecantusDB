@@ -1239,16 +1239,6 @@ retryable writes). The Rust server differs on 11 scenarios. What is left:
       a transaction ...".
       Backlog-ID: RM-084
       Verify: tests/backlog/test_rm_057_084.py::test_drop_waits_for_a_transaction_that_read,tests/backlog/test_rm_057_084.py::test_drop_under_a_transaction_that_wrote_honours_max_time
-- [ ] **RUST MongoDB server: two transactions that both create one
-      collection conflict at the second insert.** mongod lets both insert
-      and fails the second COMMIT with 112 (`Collection namespace ... is
-      already in use`). So when the later transaction commits first, mongod
-      keeps ITS document and fails the earlier one, and here the reverse.
-      Either way one transaction fails with `TransientTransactionError`, so a
-      driver's retry stores both. Here the collection's catalog row is
-      written at the insert; mongod's conflict is at commit.
-      Backlog-ID: RM-086
-      Verify: tests/backlog/test_rm_085_112.py::test_two_transactions_creating_one_collection_conflict_at_commit
 - [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
       does not see another session's uncommitted insert (mongod's fast count
       does: it answered 3 for 2 committed documents). A write that waits on a
@@ -1370,6 +1360,13 @@ What is left, there and beside it:
       collation, not the collection's.
       Backlog-ID: RM-096
       Verify: tests/backlog/test_rm_085_112.py::test_did_you_mean_for_a_three_letter_code,tests/backlog/test_rm_085_112.py::test_lookup_from_a_view_with_another_collation
+- [ ] **RUST MongoDB server: a duplicate `_id` spelled exactly the same in a
+      collection with a default collation** is reported from the plain `_id`
+      index (`index: _id_ dup key: { _id: "a" }`); mongod reports it under
+      the collation (`index: _id_ collation: { ... } dup key: ...`), as it
+      does for a second spelling. Message text only (found 2026-10-14).
+      Backlog-ID: RM-142
+      Verify: tests/backlog/test_rm_found_2026_10_14.py::test_exact_duplicate_id_under_a_default_collation_names_the_collation
 - [ ] **RUST MongoDB server: `$densify` with `bounds: "full"` and
       `partitionByFields` fills each partition only to its own ends.**
       mongod fills every partition across the whole collection's range, and

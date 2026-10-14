@@ -124,7 +124,7 @@ these is a silent wrong answer from data already on disk:
 - [x] A `$`-prefixed field inside an upserted `_id` document is stored
       (mongod: 52). That is a document mongod cannot make (7.068).
 - [x] A clustered collection's `expireAfterSeconds` expires nothing (7.076).
-- [ ] Two transactions creating one collection: mongod fails the second
+- [x] Two transactions creating one collection: mongod fails the second
       COMMIT with 112 (7.072).
 - [x] **Measure first:** what a transaction that WROTE to a collection
       commits after another session dropped that collection (7.072). The
@@ -132,7 +132,10 @@ these is a silent wrong answer from data already on disk:
       commit brings the writes back or leaves orphaned rows, this is a
       Phase 1 bug, not a decision.
 
-  **Done 2026-10-14**, except the two transactions creating one collection.
+  **Done 2026-10-14.** A collection a transaction creates is now held until
+  it commits, its `_id` index rows and unique claims under a name of the
+  transaction's own, so two that create one conflict at the second commit,
+  as on mongod, whatever they insert.
   `upsertSupplied` already applied the validator; what was wrong was its
   `_id` (a new ObjectId where mongod takes the query's). The measurement:
   a drop under a transaction that wrote WAITS for it here, past its own
