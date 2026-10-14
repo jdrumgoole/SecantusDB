@@ -96,6 +96,18 @@ pub fn derive_credentials_sha1(
 ) -> StoredCredentials {
     let digest = md5::Md5::digest(format!("{username}:mongo:{password}").as_bytes());
     let prepass: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    derive_credentials_sha1_digested(&prepass, iterations, salt)
+}
+
+/// Derive SCRAM-SHA-1 credentials from a password the CLIENT already
+/// digested: the `hex(MD5("<username>:mongo:<password>"))` that `createUser`
+/// / `updateUser` take as `pwd` under `digestPassword: false` (mongod 8.2.11
+/// allows that for SCRAM-SHA-1 only).
+pub fn derive_credentials_sha1_digested(
+    prepass: &str,
+    iterations: Option<u32>,
+    salt: Option<Vec<u8>>,
+) -> StoredCredentials {
     let iterations = iterations.unwrap_or(DEFAULT_ITERATIONS_SHA1);
     let salt = salt.unwrap_or_else(|| {
         let bytes: [u8; SALT_BYTES_SHA1] = rand::random();

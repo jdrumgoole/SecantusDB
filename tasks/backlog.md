@@ -9220,6 +9220,57 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.083 User and role commands -- 2026-10-14
+
+`tools/probes/user_role_commands.py`, mongod 8.2.11: 16 scenarios, 399
+replies over a raw connection, covering the sixteen user and role
+management commands and the two that list them. The Rust server differed on
+277 replies and differs on 7. `tools/probes/scram_auth.py` is at none of 26.
+Pinned by `crates/secantus-storage-adapter/tests/user_role_commands_wt.rs`
+and the unit tests of `auth.rs` and `roles.rs`. The built-in roles and the
+170 action names are a table generated from mongod
+(`tools/probes/gen_builtin_roles.py` writes `builtin_roles.rs`).
+
+What is open:
+
+- [ ] **Enforcement does not use the generated table.** `rbac.rs`, which
+      decides what an authenticated user may run, still has its own short
+      list of built-in roles. `createUser` now accepts every role mongod
+      has, so a user granted `hostManager` or `enableSharding` is created
+      and that role lets them run nothing. The dispatcher checks a
+      privilege per database, and the table has privileges on single
+      collections (`system.profile`, `system.js`), so using it as it is
+      would grant more than mongod does. A stored role with a
+      built-in's name on a database that has no such built-in (`root` on
+      `app`, which `createRole` now allows as mongod does) is read by the
+      check as the built-in bound to the wrong database, and permits
+      nothing, whatever privileges it holds.
+- [ ] **A privilege on one collection permits the action on every
+      collection of its database.** Measured 2026-10-14 under `--auth`: a
+      user whose only role has `insert` on `app.c` inserted into
+      `app.other`. The dispatcher asks `rbac::check_privilege_resolved`
+      for an action and a database, and never names the collection. This
+      is older than this entry, and no probe compares what an
+      authenticated user may run with mongod under `--auth`: write one
+      before changing the check.
+- [ ] **`rolesInfo: 1` lists stored roles by name** (2): mongod lists them
+      in the order they were created. The role table is keyed by database
+      and name and holds no sequence.
+- [ ] **The order of a set of roles** (5): a user's `roles` after
+      `grantRolesToUser`, a role's `roles` after `grantRolesToRole`, and
+      the built-in roles under `showBuiltinRoles`. mongod keeps each in a
+      hash set, and the order differs between two databases of one
+      process. This server keeps the order they were given in.
+- [ ] **A user record written before this change has no `userId`**, and
+      `usersInfo` lists none for it. Nothing rewrites the record. Such a
+      store otherwise reads and authenticates: users and a role created by
+      the released 0.5.3-beta.192 binary were read, and logged in over
+      both SCRAM mechanisms, by this build (2026-10-14).
+- [ ] **PYTHON server parity.** The user record's field order changed
+      (`userId` added, `customData` and `authenticationRestrictions`
+      stored, `credentials: {external: true}` for a `$external` user).
+      The Python server reading such a store was not measured.
+
 ### 7.082 Handshake, diagnostic and session commands -- 2026-10-13
 
 `tools/probes/diagnostic_commands.py`, mongod 8.2.11 (a replica-set member):
@@ -9232,7 +9283,7 @@ version no longer has. Most replies hold values that differ from one machine
 to the next, so a step is compared whole with the volatile keys reduced to
 their BSON type, or by its keys and types to a given depth. mongod answered
 the same on three runs against itself. The Rust server differed on 492
-replies and differs on 159. Pinned by
+replies and differs on 156. Pinned by
 `crates/secantus-storage-adapter/tests/diagnostic_commands_wt.rs` and the
 unit tests of `generic.rs`, `serverinfo.rs` and `handshake.rs`.
 
@@ -9295,9 +9346,6 @@ Still different, all 159:
       plan-cache and query-settings commands. An unknown command that
       mongod runs only against `admin` answers that refusal from another
       database, where mongod parses its arguments first.
-- [ ] **`rolesInfo` knows no built-in role** (`read`, `dbAdmin`), and
-      `usersInfo` and `rolesInfo` are otherwise unprobed: user and role
-      management is the next area to probe on its own.
 - [ ] **The profiler** (6): a `filter` document is refused (238), where
       mongod stores it; `system.profile` is not created at level 1 or 2.
 - [ ] **`hello` names no compressor.** `OP_COMPRESSED` is not spoken, so a

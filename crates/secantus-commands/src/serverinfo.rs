@@ -43,29 +43,36 @@ pub(crate) fn flag(doc: &Document, command: &str, field: &str) -> Result<bool, C
 
 /// The argument of `usersInfo` / `rolesInfo`, checked as mongod checks it
 /// (8.2.11): `1` for all of the database's, a name, a `{user|role, db}`
-/// document, a list of those, or `{forAllDBs: true}`. `kind` is `UserName`
-/// or `RoleName` and `field` the name's own field. Returns whether the
-/// request names its principals exactly, which the detail options need.
+/// document, a list of those, or -- for users only, `for_all_dbs` -- a
+/// `{forAllDBs: v}` document whose `v` is true in BSON's sense (a `0` or
+/// `false` there makes it a `UserName` with a field it does not have).
+/// `kind` is `UserName` or `RoleName` and `field` the name's own field.
+/// Returns whether the request names its principals exactly, which the
+/// detail options need.
 pub(crate) fn principal_argument(
     arg: Option<&Bson>,
     kind: &str,
     field: &str,
+    for_all_dbs: bool,
 ) -> Result<bool, CommandError> {
     let bad = |message: String| CommandError::new(2, "BadValue", message);
     let one = |value: &Bson| -> Result<(), CommandError> {
         match value {
             Bson::String(_) => Ok(()),
             Bson::Document(name) => {
+                // A `UserName` refuses a field it does not have, before it
+                // looks for the ones it needs; a `RoleName` ignores one.
+                if let Some(unknown) = name
+                    .keys()
+                    .find(|k| k.as_str() != field && k.as_str() != "db")
+                    .filter(|_| kind == "UserName")
+                {
+                    // mongod's own message closes no quote.
+                    return Err(bad(format!(
+                        "{kind} contains an unknown field named: '{unknown}"
+                    )));
+                }
                 for required in [field, "db"] {
-                    if let Some(unknown) = name
-                        .keys()
-                        .find(|k| k.as_str() != field && k.as_str() != "db")
-                    {
-                        // mongod's own message closes no quote.
-                        return Err(bad(format!(
-                            "{kind} contains an unknown field named: '{unknown}"
-                        )));
-                    }
                     match name.get(required) {
                         Some(Bson::String(_)) => {}
                         None => {
@@ -90,7 +97,15 @@ pub(crate) fn principal_argument(
     match arg {
         Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => Ok(false),
         Some(Bson::Double(d)) if *d == 1.0 => Ok(false),
-        Some(Bson::Document(all)) if all.contains_key("forAllDBs") => Ok(false),
+        Some(Bson::Document(all))
+            if for_all_dbs
+                && all.get("forAllDBs").is_some_and(|v| match v {
+                    Bson::Null | Bson::Undefined => false,
+                    v => crate::util::truthy_number_or_bool(v).unwrap_or(true),
+                }) =>
+        {
+            Ok(false)
+        }
         Some(Bson::Array(items)) => {
             items.iter().try_for_each(one)?;
             Ok(true)

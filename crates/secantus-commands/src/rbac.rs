@@ -274,8 +274,9 @@ fn built_in_role(name: &str) -> Option<RoleSpec> {
     Some(spec)
 }
 
-/// Whether `name` is a known built-in role (used by `createUser` role
-/// validation). Custom roles aren't recognised here yet.
+/// Whether `name` is a built-in role this enforcement catalogue knows.
+/// The commands ask [`crate::privileges::builtin_exists`] instead, which
+/// knows mongod's whole set and which database each belongs to.
 pub fn is_known_role(name: &str) -> bool {
     built_in_role(name).is_some()
 }

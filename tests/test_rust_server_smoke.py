@@ -343,7 +343,8 @@ def test_role_grant_revoke_and_update_user(tmp_path) -> None:
             "r",
             privileges=[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
         )
-        rec = admin.command("rolesInfo", "r")["roles"][0]
+        # mongod lists a role's privileges only when asked (8.2.11).
+        rec = admin.command("rolesInfo", "r", showPrivileges=True)["roles"][0]
         assert rec["privileges"][0]["actions"] == ["find"]
         # revoke it → privilege dropped
         admin.command(
@@ -351,7 +352,7 @@ def test_role_grant_revoke_and_update_user(tmp_path) -> None:
             "r",
             privileges=[{"resource": {"db": "app", "collection": ""}, "actions": ["find"]}],
         )
-        assert admin.command("rolesInfo", "r")["roles"][0]["privileges"] == []
+        assert admin.command("rolesInfo", "r", showPrivileges=True)["roles"][0]["privileges"] == []
 
         # updateUser rotates a password
         admin.command("createUser", "u", pwd="old", roles=[{"role": "read", "db": "app"}])
