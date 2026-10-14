@@ -558,8 +558,6 @@ pub fn bind_with(
     // connection with it. The stack is reserved, not committed, so a large
     // one costs address space only. `planning_depth_guard` refuses what even
     // this cannot hold, as PostgreSQL's 54001 does.
-    // Transaction ids start above anything an earlier run handed out.
-    crate::xids::install(&storage);
     let runtime = Builder::new_multi_thread()
         .thread_stack_size(WORKER_STACK_BYTES)
         .enable_all()
@@ -576,6 +574,8 @@ pub fn bind_with(
     let address = listener.local_addr()?;
 
     let storage = Arc::new(storage);
+    // Transaction ids run on from the store's last reservation.
+    crate::xids::install(&storage).map_err(std::io::Error::other)?;
     // Expression indexes keep a computed field on every row; rows another
     // writer left are brought up to date before any client connects.
     for info in databases.all(&storage).unwrap_or_default() {

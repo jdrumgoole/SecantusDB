@@ -45,12 +45,68 @@ fn arg_key(n: &pg_query::protobuf::Node) -> String {
 }
 
 fn column(field: &str) -> pg_query::protobuf::Node {
-    pg_query::protobuf::Node {
+    let col = pg_query::protobuf::Node {
         node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
             fields: vec![string_node("__pgx"), string_node(field)],
             location: -1,
         })),
+    };
+    if field != "n" {
+        return col;
     }
+    // The function counts `n` as an int4 (`generate_series(1, ...)`); the
+    // ordinality standing in for it is an int8.
+    pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(col)),
+            type_name: Some(type_name_node("int4")),
+            location: -1,
+        }))),
+    }
+}
+
+/// `(f(arr)).*` in a select list as its two fields, `x` and `n`.
+fn expand_star(targets: &[pg_query::protobuf::Node]) -> Vec<pg_query::protobuf::Node> {
+    let mut out = Vec::with_capacity(targets.len());
+    for t in targets {
+        let star_of = match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(N::AIndirection(ind))
+                    if matches!(ind.indirection.as_slice(), [s] if matches!(s.node, Some(N::AStar(_))))
+                        && ind
+                            .arg
+                            .as_deref()
+                            .is_some_and(|a| is_expandarray(a).is_some()) =>
+                {
+                    ind.arg.as_deref().cloned()
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(call) = star_of else {
+            out.push(t.clone());
+            continue;
+        };
+        for field in ["x", "n"] {
+            out.push(pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    name: field.into(),
+                    val: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::AIndirection(Box::new(
+                            pg_query::protobuf::AIndirection {
+                                arg: Some(Box::new(call.clone())),
+                                indirection: vec![string_node(field)],
+                            },
+                        ))),
+                    })),
+                    location: -1,
+                    ..Default::default()
+                }))),
+            });
+        }
+    }
+    out
 }
 
 /// The select with its `_pg_expandarray` targets made a LATERAL join, or
@@ -60,6 +116,7 @@ pub(crate) fn rewrite(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     let mut out = s.clone();
+    out.target_list = expand_star(&out.target_list);
     let mut arg: Option<(String, pg_query::protobuf::Node)> = None;
     let mut mixed = false;
     let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
