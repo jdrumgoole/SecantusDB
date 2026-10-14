@@ -429,15 +429,6 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **`GRANT` and `REVOKE` inside a transaction block take no effect
-  until the block ends.** In `BEGIN; GRANT SELECT ON t TO r; SET ROLE r;
-  SELECT ... FROM t` the role is refused (42501), and after `REVOKE` in a
-  block it can still read; PostgreSQL 15.19 applies both at once. A
-  privilege check that lags the block it is in. Found 2026-10-14 while
-  verifying RP-004.
-  Backlog-ID: RP-020
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grant_and_revoke_take_effect_inside_a_transaction_block
-
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
       psycopg's suite against the Rust PostgreSQL server until

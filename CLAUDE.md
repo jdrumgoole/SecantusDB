@@ -1197,6 +1197,14 @@ After every push (to a feature branch via PR — the default — or to `main`), 
   - The one binary that IS committed on purpose is the PGO profile,
     `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling). Adding
     another needs Joe's say-so.
+- **One session works on ONE Rust server: the PostgreSQL server or the
+  MongoDB server, never both** (Joe, 2026-10-14). The two share
+  `secantus-storage` and the WiredTiger build, and parallel sessions on each
+  side kept colliding in that shared code and in each other's branches. Pick
+  the side at the start of a session (`tasks/backlog-rust-postgres.md` or
+  `tasks/backlog-rust-mongodb.md`) and stay on it; an item on the other side
+  goes to a session working that side. A change the item needs in the shared
+  storage crates is fine -- say in its PR that the other server links it.
 - **Claim a backlog item before working it — the claim is a PUSHED branch.**
   This repo runs several parallel sessions against the same backlog files, and
   the same item repeatedly got picked up twice: `set` and `timetz` in the pgtest
