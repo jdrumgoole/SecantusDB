@@ -618,3 +618,126 @@ fn a_retried_bulk_write_is_replayed() {
         assert_eq!(value(c, 1), Some(Bson::Int32(2)));
     });
 }
+
+fn collections(c: &mut CommandContext) -> Vec<String> {
+    let reply = dispatch_full(&doc! {"listCollections": 1, "nameOnly": true}, c);
+    let mut names: Vec<String> = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .iter()
+        .map(|d| {
+            d.as_document()
+                .unwrap()
+                .get_str("name")
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// A collection a transaction creates is its own until it commits: another
+/// transaction may create it too, and the second COMMIT fails with 112,
+/// whichever began first; a plain insert that creates it meanwhile wins
+/// (measured 8.2.11, 2026-10-14). The second transaction failed at its
+/// first insert.
+#[test]
+fn a_collection_created_in_a_transaction_is_registered_at_commit() {
+    with_wt(|c| {
+        seed(c);
+        let in_use = |reply: &Document| {
+            assert_eq!(code(reply), Some(112), "{reply}");
+            assert_eq!(
+                reply.get_array("errorLabels").ok().map(|l| l.len()),
+                Some(1),
+                "{reply}"
+            );
+            assert!(
+                reply
+                    .get_str("errmsg")
+                    .unwrap()
+                    .contains("Collection namespace '"),
+                "{reply}"
+            );
+        };
+        // The later one commits first, and wins.
+        let r = tx(
+            c,
+            1,
+            1,
+            true,
+            doc! {"insert": "n", "documents": [{"_id": 1}]},
+        );
+        assert_eq!(r.get_f64("ok"), Ok(1.0), "{r}");
+        let r = tx(
+            c,
+            2,
+            1,
+            true,
+            doc! {"insert": "n", "documents": [{"_id": 2}]},
+        );
+        assert_eq!(r.get_f64("ok"), Ok(1.0), "{r}");
+        // Neither is seen outside its transaction.
+        assert!(!collections(c).contains(&"n".to_string()));
+        assert_eq!(ids(c, "n"), Vec::<i32>::new());
+        // Each sees its own.
+        let mine = tx(c, 2, 1, false, doc! {"find": "n"});
+        assert_eq!(
+            mine.get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(commit(c, 2, 1).get_f64("ok"), Ok(1.0));
+        in_use(&commit(c, 1, 1));
+        assert_eq!(ids(c, "n"), vec![2]);
+
+        // A plain insert that creates the collection meanwhile wins too.
+        let r = tx(
+            c,
+            3,
+            1,
+            true,
+            doc! {"insert": "m", "documents": [{"_id": 1}]},
+        );
+        assert_eq!(r.get_f64("ok"), Ok(1.0), "{r}");
+        let r = dispatch_full(&doc! {"insert": "m", "documents": [{"_id": 2}]}, c);
+        assert_eq!(r.get_i32("n"), Ok(1), "{r}");
+        in_use(&commit(c, 3, 1));
+        assert_eq!(ids(c, "m"), vec![2]);
+
+        // An abort leaves nothing behind; the other transaction commits.
+        tx(
+            c,
+            4,
+            1,
+            true,
+            doc! {"insert": "k", "documents": [{"_id": 1}]},
+        );
+        tx(
+            c,
+            5,
+            1,
+            true,
+            doc! {"insert": "k", "documents": [{"_id": 2}]},
+        );
+        dispatch_admin(
+            &doc! {"abortTransaction": 1, "lsid": lsid(4), "txnNumber": 1_i64, "autocommit": false},
+            c,
+        );
+        assert_eq!(commit(c, 5, 1).get_f64("ok"), Ok(1.0));
+        assert_eq!(ids(c, "k"), vec![2]);
+
+        // By name, too.
+        tx(c, 6, 1, true, doc! {"create": "byname"});
+        tx(c, 7, 1, true, doc! {"create": "byname"});
+        assert_eq!(commit(c, 6, 1).get_f64("ok"), Ok(1.0));
+        in_use(&commit(c, 7, 1));
+        assert!(collections(c).contains(&"byname".to_string()));
+    });
+}

@@ -65,7 +65,11 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn begin_user_transaction(&self) -> Result<Box<dyn std::any::Any + Send>, StorageError> {
-        let h = self.inner.begin_user_transaction().map_err(map_err)?;
+        let mut h = self.inner.begin_user_transaction().map_err(map_err)?;
+        // A collection a MongoDB transaction creates is registered when it
+        // commits: two that create one conflict at the second commit
+        // (measured 8.2.11, 2026-10-14).
+        h.set_defer_collection_creates(true);
         Ok(Box::new(h))
     }
 
