@@ -8,8 +8,8 @@ as an index because code comments, docs and workflows cite it.
 | --- | --- |
 | [`backlog-rust-mongodb.md`](backlog-rust-mongodb.md) | the Rust MongoDB server, and the Rust storage both Rust servers use; also CI, build and release items no one server owns |
 | [`backlog-rust-postgres.md`](backlog-rust-postgres.md) | the Rust PostgreSQL server |
-| [`backlog-python-mongodb.md`](backlog-python-mongodb.md) | the Python MongoDB server, and the admin UI |
-| [`backlog-python-postgres.md`](backlog-python-postgres.md) | the Python PostgreSQL / SQL server |
+| [`backlog-python-mongodb.md`](backlog-python-mongodb.md) | the Python MongoDB server, and the admin UI — deprecated (2026-10-14), a record only |
+| [`backlog-python-postgres.md`](backlog-python-postgres.md) | the Python PostgreSQL / SQL server — deprecated (2026-10-14), a record only |
 
 **A citation of this file by section** (`tasks/backlog.md` 7.077, §3.1,
 §5) means the section of that number in whichever of the four files the

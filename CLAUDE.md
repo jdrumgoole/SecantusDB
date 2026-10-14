@@ -7,19 +7,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 SecantusDB is a **surrogate single-node database**. It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so an application's tests can run against it instead of standing up a real `mongod` or `postgres`. "Surrogate" rather than "fake" — these really are database servers, just intentionally scoped to single-node operation.
 
 **Four servers, two wire protocols, one storage format.** The Rust pair is the
-product; the Python pair is the reference implementation they are held to.
+product. **The Python pair is DEPRECATED** (Joe, 2026-10-14: "We are focussed
+on rust servers only").
+
+**What deprecated means here:**
+- **All new work goes to the Rust servers.** Do not add features, operators,
+  SQL surface or performance work to the Python servers, and do not port a
+  Rust fix back to Python to keep them level.
+- **The Python servers are not the reference for anything.** The exemplar
+  was always the real product (`mongod`, PostgreSQL; see "Design
+  constraints"); the Python code remains readable prior art, nothing more.
+- **Keep what exists green, do not extend it.** Their tests still run in CI
+  and still have to pass; a change elsewhere that breaks one is fixed (or the
+  test retired with a written reason), not ignored. When a Rust change makes
+  an engine parity test fail, update the parity test's expectation for that
+  case rather than changing the Python engine.
+- **Removing them is a separate decision for Joe**: the PyPI package still
+  ships them, so do not delete code, packages or docs on your own.
+- `tasks/backlog-python-*.md` stay as a record; their items are not worked.
 
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
 | **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform; NOT in the PyPI wheel since 2026-10-07 |
 | **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pg`) | PostgreSQL | **the newest.** Ships as the `secantus-pg` crate (on crates.io since `0.1.0-beta.3`, 2026-10-07) and standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); NOT in the PyPI wheel since 2026-10-07; builds from its own directory |
-| Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
-| Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
+| Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | **deprecated** (2026-10-14); formerly the reference, still in the PyPI wheel |
+| Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | **deprecated** (2026-10-14); formerly the SQL reference, still in the PyPI wheel |
 
-**Reach for Rust to RUN it; reach for Python to READ it.** That is the whole
-division of labour, and it is what the marketing site now says too (the two Rust
-servers are the focus; the Python pair is presented as the reference behind
-them). Do not "restore" a Python-first framing in docs or on the site.
+**Reach for Rust.** The marketing site already leads with the two Rust servers;
+do not "restore" a Python-first framing in docs or on the site.
 
 All four share **one on-disk format**, and that contract is a compatibility
 promise rather than an accident — breaking it is silent data loss. Be precise
@@ -871,10 +886,11 @@ engines.
   is the standing cover for the index half — it compares a server against ITSELF,
   with and without the index, so it isolates the index from the sort engine and
   needs no oracle to say which side is wrong.
-- **Implication for changes:** a change to an operator's semantics must land in
-  *both* the Python module and the Rust port (or the Rust port must explicitly
-  defer that case), and the parity suite must stay green. Both servers must keep
-  the pymongo + driver gauges non-regressing. Plan / phase status / per-engine
+- **Implication for changes:** a change to an operator's semantics lands in the
+  Rust port; the Python module is deprecated and is not changed to match. Keep
+  the parity suite green by updating its expectation for the case the Rust
+  change moved (never by changing the Python engine). The Rust server's pymongo +
+  driver gauges must not regress. Plan / phase status / per-engine
   fallback lists: `tasks/rust-server-plan.md` (north star), `tasks/rust-rewrite-
   plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
   findings.md`, `tasks/backlog-rust-mongodb.md` §7. Tooling: `invoke rust-test` / `rust-build`
@@ -961,10 +977,10 @@ The backlog is the canonical list of commands that are stubbed, features with si
 | --- | --- |
 | `tasks/backlog-rust-mongodb.md` | the Rust MongoDB server, and the Rust storage both Rust servers use; also CI / build / release items no one server owns |
 | `tasks/backlog-rust-postgres.md` | the Rust PostgreSQL server |
-| `tasks/backlog-python-mongodb.md` | the Python MongoDB server and the admin UI |
-| `tasks/backlog-python-postgres.md` | the Python PostgreSQL / SQL server |
+| `tasks/backlog-python-mongodb.md` | the Python MongoDB server and the admin UI — **deprecated: a record, not worked** |
+| `tasks/backlog-python-postgres.md` | the Python PostgreSQL / SQL server — **deprecated: a record, not worked** |
 
-**Update the right file whenever you stub something, defer a slice, or discover a limitation; an item about more than one server goes in each file it concerns. When you fix an item, delete its lines** — the files hold open work only, and git history and `changelog.d/` hold what is finished (`tests/test_backlog_markers.py` fails on a ticked `- [x]` item). Future sessions should treat these files as load-bearing — they are the only honest record of where SecantusDB's behaviour diverges from the real products. A section number (`7.077`, `§3.1`) means the same section it did in the single file.
+**Update the right file whenever you stub something, defer a slice, or discover a limitation; an item about more than one server goes in each file it concerns** (do not add new items to the two deprecated Python files). When you fix an item, delete its lines** — the files hold open work only, and git history and `changelog.d/` hold what is finished (`tests/test_backlog_markers.py` fails on a ticked `- [x]` item). Future sessions should treat these files as load-bearing — they are the only honest record of where SecantusDB's behaviour diverges from the real products. A section number (`7.077`, `§3.1`) means the same section it did in the single file.
 
 ## Finding bugs: run it against the oracle, don't reason about the source
 

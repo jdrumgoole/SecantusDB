@@ -1,5 +1,10 @@
 # Backlog: the Python PostgreSQL server
 
+**This server is DEPRECATED (2026-10-14): work goes to the Rust servers
+only.** This file is kept as a record of where it diverges; its items are
+not worked and no new ones are added. See "What deprecated means here" in
+`CLAUDE.md`.
+
 A living list of where this server does not yet behave like the real
 product it stands in for: stubs, stopgaps, deferred work and known bugs.
 Update it when you stub something, defer a slice, or find a limitation, and
