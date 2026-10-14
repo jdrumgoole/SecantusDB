@@ -10,6 +10,7 @@ showPrivileges: true`).
     PROBE_MONGOD=mongodb://127.0.0.1:27017 python tools/probes/gen_builtin_roles.py \\
         > crates/secantus-commands/src/builtin_roles.rs
 """
+
 import os
 import random
 import sys
@@ -24,36 +25,178 @@ HOLDER = "gen_builtin_roles_all_actions"
 # The ActionType enum of mongodb/mongo r8.2.1 src/mongo/db/auth/action_type.idl,
 # in file order. The server is asked to confirm every name and to say in what
 # order it renders them; the file order is only the starting point.
-ACTION_CANDIDATES = """addShard advanceClusterTime listClusterCatalog allCollectionStats analyze
-analyzeShardKey anyAction appendOplogNote applicationMessage auditConfigure auditLogRotate
-authCheck authenticate authSchemaUpgrade bypassDefaultMaxTimeMS bypassDocumentValidation
-bypassWriteBlockingMode changeCustomData changePassword changeOwnPassword changeOwnCustomData
-changeStream checkFreeMonitoringStatus checkMetadataConsistency cleanupOrphaned clearJumboFlag
-cleanupStructuredEncryptionData closeAllDatabases collMod collStats configureBackgroundTask
-compact compactStructuredEncryptionData configureQueryAnalyzer connPoolStats connPoolSync
-convertToCapped cpuProfiler createCollection createDatabase createIndex createRole
-createSearchIndexes createUser dbCheck dbHash dbStats dropAllRolesFromDatabase
-dropAllUsersFromDatabase dropCollection dropConnections dropDatabase dropIndex dropRole
-dropSearchIndex dropUser emptycapped enableProfiler enableSharding exportCollection find
-flushRouterConfig forceUUID fsync fsyncUnlock getClusterParameter getDatabaseVersion
-getDefaultRWConcern getCmdLineOpts getLog getParameter getShardMap getShardVersion grantRole
-grantPrivilegesToRole grantRolesToRole grantRolesToUser hostInfo impersonate importCollection
-indexStats inprog insert internal invalidateUserCache issueDirectShardOperations killAnyCursor
-killAnySession killCursors killop listCachedAndActiveUsers listCollections listCursors
-listDatabases listIndexes listSampledQueries listSearchIndexes listSessions listShards logRotate
-updateSearchIndex moveChunk moveCollection netstat oidcListKeys oidcRefreshKeys oidReset
-planCacheIndexFilter planCacheRead planCacheWrite querySettings queryStatsRead
-queryStatsReadTransformed performRawDataOperations refineCollectionShardKey reIndex
-releaseMemoryAnyCursor remove removeShard renameCollection renameCollectionSameDB repairDatabase
-replSetConfigure replSetGetConfig replSetGetStatus replSetHeartbeat replSetReconfig
-replSetResizeOplog replSetStateChange reshardCollection resync revokeRole revokePrivilegesFromRole
-revokeRolesFromRole revokeRolesFromUser rotateCertificates runAsLessPrivilegedUser serverStatus
-setAuthenticationRestriction setClusterParameter setDefaultRWConcern setFeatureCompatibilityVersion
-setFreeMonitoring setParameter setUserWriteBlockMode shardCollection shardedDataDistribution
-shardingState shutdown splitChunk splitVector storageDetails top touch trafficRecord
-transitionFromDedicatedConfigServer transitionToDedicatedConfigServer unlock unshardCollection
-useTenant useUUID update updateRole updateUser validate viewRole viewUser applyOps
-setChangeStreamState getChangeStreamState""".split()
+ACTION_CANDIDATES = [
+    "addShard",
+    "advanceClusterTime",
+    "listClusterCatalog",
+    "allCollectionStats",
+    "analyze",
+    "analyzeShardKey",
+    "anyAction",
+    "appendOplogNote",
+    "applicationMessage",
+    "auditConfigure",
+    "auditLogRotate",
+    "authCheck",
+    "authenticate",
+    "authSchemaUpgrade",
+    "bypassDefaultMaxTimeMS",
+    "bypassDocumentValidation",
+    "bypassWriteBlockingMode",
+    "changeCustomData",
+    "changePassword",
+    "changeOwnPassword",
+    "changeOwnCustomData",
+    "changeStream",
+    "checkFreeMonitoringStatus",
+    "checkMetadataConsistency",
+    "cleanupOrphaned",
+    "clearJumboFlag",
+    "cleanupStructuredEncryptionData",
+    "closeAllDatabases",
+    "collMod",
+    "collStats",
+    "configureBackgroundTask",
+    "compact",
+    "compactStructuredEncryptionData",
+    "configureQueryAnalyzer",
+    "connPoolStats",
+    "connPoolSync",
+    "convertToCapped",
+    "cpuProfiler",
+    "createCollection",
+    "createDatabase",
+    "createIndex",
+    "createRole",
+    "createSearchIndexes",
+    "createUser",
+    "dbCheck",
+    "dbHash",
+    "dbStats",
+    "dropAllRolesFromDatabase",
+    "dropAllUsersFromDatabase",
+    "dropCollection",
+    "dropConnections",
+    "dropDatabase",
+    "dropIndex",
+    "dropRole",
+    "dropSearchIndex",
+    "dropUser",
+    "emptycapped",
+    "enableProfiler",
+    "enableSharding",
+    "exportCollection",
+    "find",
+    "flushRouterConfig",
+    "forceUUID",
+    "fsync",
+    "fsyncUnlock",
+    "getClusterParameter",
+    "getDatabaseVersion",
+    "getDefaultRWConcern",
+    "getCmdLineOpts",
+    "getLog",
+    "getParameter",
+    "getShardMap",
+    "getShardVersion",
+    "grantRole",
+    "grantPrivilegesToRole",
+    "grantRolesToRole",
+    "grantRolesToUser",
+    "hostInfo",
+    "impersonate",
+    "importCollection",
+    "indexStats",
+    "inprog",
+    "insert",
+    "internal",
+    "invalidateUserCache",
+    "issueDirectShardOperations",
+    "killAnyCursor",
+    "killAnySession",
+    "killCursors",
+    "killop",
+    "listCachedAndActiveUsers",
+    "listCollections",
+    "listCursors",
+    "listDatabases",
+    "listIndexes",
+    "listSampledQueries",
+    "listSearchIndexes",
+    "listSessions",
+    "listShards",
+    "logRotate",
+    "updateSearchIndex",
+    "moveChunk",
+    "moveCollection",
+    "netstat",
+    "oidcListKeys",
+    "oidcRefreshKeys",
+    "oidReset",
+    "planCacheIndexFilter",
+    "planCacheRead",
+    "planCacheWrite",
+    "querySettings",
+    "queryStatsRead",
+    "queryStatsReadTransformed",
+    "performRawDataOperations",
+    "refineCollectionShardKey",
+    "reIndex",
+    "releaseMemoryAnyCursor",
+    "remove",
+    "removeShard",
+    "renameCollection",
+    "renameCollectionSameDB",
+    "repairDatabase",
+    "replSetConfigure",
+    "replSetGetConfig",
+    "replSetGetStatus",
+    "replSetHeartbeat",
+    "replSetReconfig",
+    "replSetResizeOplog",
+    "replSetStateChange",
+    "reshardCollection",
+    "resync",
+    "revokeRole",
+    "revokePrivilegesFromRole",
+    "revokeRolesFromRole",
+    "revokeRolesFromUser",
+    "rotateCertificates",
+    "runAsLessPrivilegedUser",
+    "serverStatus",
+    "setAuthenticationRestriction",
+    "setClusterParameter",
+    "setDefaultRWConcern",
+    "setFeatureCompatibilityVersion",
+    "setFreeMonitoring",
+    "setParameter",
+    "setUserWriteBlockMode",
+    "shardCollection",
+    "shardedDataDistribution",
+    "shardingState",
+    "shutdown",
+    "splitChunk",
+    "splitVector",
+    "storageDetails",
+    "top",
+    "touch",
+    "trafficRecord",
+    "transitionFromDedicatedConfigServer",
+    "transitionToDedicatedConfigServer",
+    "unlock",
+    "unshardCollection",
+    "useTenant",
+    "useUUID",
+    "update",
+    "updateRole",
+    "updateUser",
+    "validate",
+    "viewRole",
+    "viewUser",
+    "applyOps",
+    "setChangeStreamState",
+    "getChangeStreamState",
+]
 
 
 def command(wire, db, cmd):
@@ -109,7 +252,9 @@ def main():
             known.append(name)
             wire.command("admin", {"dropRole": HOLDER})
         else:
-            print(f"not an action of this build, dropped: {name}: {reply['errmsg']}", file=sys.stderr)
+            print(
+                f"not an action of this build, dropped: {name}: {reply['errmsg']}", file=sys.stderr
+            )
     candidates = list(known)
     random.shuffle(candidates)
     reply = wire.command(
@@ -143,8 +288,10 @@ def main():
             return "Res::Any"
         if "system_buckets" in res:
             # A `system_buckets` resource of every database carries no `db`.
-            return f'Res::SystemBuckets({rs(res.get("db", ""), db)}, {rs(res["system_buckets"], db)})'
-        return f'Res::Ns({rs(res["db"], db)}, {rs(res["collection"], db)})'
+            return (
+                f"Res::SystemBuckets({rs(res.get('db', ''), db)}, {rs(res['system_buckets'], db)})"
+            )
+        return f"Res::Ns({rs(res['db'], db)}, {rs(res['collection'], db)})"
 
     def rs(text, db):
         if text == db:
