@@ -19,7 +19,11 @@ in a transaction is unchanged.
   the transaction's own view of a collection it created (`deferred_row`),
   and the write at commit (`flush_deferred_creates`). The adapter turns it
   on for every MongoDB transaction.
-- `tools/probes/transactions.py` has eight scenarios for it. One still
-  differs: two transactions that insert the same `_id` into the collection
-  they both create conflict at the second insert, because the `_id` index is
-  keyed by the collection's name.
+- The collection's `_id` index rows and unique claims are kept under a name
+  of the transaction's own until the commit moves them (`key_coll`), so two
+  transactions that store one `_id` in the collection they both create do
+  not conflict before the commit either.
+- `tools/probes/transactions.py` has ten scenarios for it, `_id` reads and
+  writes inside the transaction among them. Nine match mongod; the tenth,
+  with a default collation, behaves the same and differs only in the text
+  of a duplicate-key message, which it does outside a transaction too.

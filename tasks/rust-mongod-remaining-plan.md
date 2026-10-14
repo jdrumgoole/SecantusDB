@@ -133,8 +133,9 @@ these is a silent wrong answer from data already on disk:
       Phase 1 bug, not a decision.
 
   **Done 2026-10-14.** A collection a transaction creates is now held until
-  it commits, so two that create one conflict at the second commit, as on
-  mongod (one case left: both also inserting the same `_id`, backlog 7.072).
+  it commits, its `_id` index rows and unique claims under a name of the
+  transaction's own, so two that create one conflict at the second commit,
+  as on mongod, whatever they insert.
   `upsertSupplied` already applied the validator; what was wrong was its
   `_id` (a new ObjectId where mongod takes the query's). The measurement:
   a drop under a transaction that wrote WAITS for it here, past its own

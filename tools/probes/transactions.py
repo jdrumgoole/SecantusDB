@@ -1139,6 +1139,37 @@ scenario(
     find("n"),
 )
 scenario(
+    "a transaction creates a collection and works on it by _id",
+    tx("s", 1, insert("n", {"_id": 1, "v": 1}, {"_id": 2, "v": 2}), start=True),
+    tx("s", 1, insert("n", {"_id": 1})),
+    tx("s", 1, find("n", {"_id": 1})),
+    tx("s", 1, update("n", {"_id": 1}, SET9)),
+    tx("s", 1, delete("n", {"_id": 2}, 1)),
+    tx("s", 1, update("n", {"_id": 3}, SET9, upsert=True)),
+    tx("s", 1, fam("n", {"_id": 3}, update={"$inc": {"v": 1}}, new=True)),
+    tx("s", 1, find("n", sort={"_id": 1})),
+    commit("s", 1),
+    find("n", sort={"_id": 1}),
+    insert("n", {"_id": 1}),
+    insert("n", {"_id": 2}),
+)
+scenario(
+    "two transactions create one collection with a collation, one _id spelled two ways",
+    tx("s", 1, {"create": "n", "collation": {"locale": "en", "strength": 2}}, start=True),
+    tx("s", 1, insert("n", {"_id": "a"})),
+    (
+        "b",
+        None,
+        tx("t", 1, {"create": "n", "collation": {"locale": "en", "strength": 2}}, start=True),
+    ),
+    ("b", None, tx("t", 1, insert("n", {"_id": "A"}))),
+    tx("s", 1, insert("n", {"_id": "A"})),
+    commit("s", 1),
+    ("b", "admin", tx("t", 1, {"commitTransaction": 1})),
+    find("n"),
+    insert("n", {"_id": "A"}),
+)
+scenario(
     "a collection dropped under a transaction",
     SEED,
     tx("s", 1, ALL, start=True),

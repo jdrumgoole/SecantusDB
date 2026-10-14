@@ -739,5 +739,65 @@ fn a_collection_created_in_a_transaction_is_registered_at_commit() {
         assert_eq!(commit(c, 6, 1).get_f64("ok"), Ok(1.0));
         in_use(&commit(c, 7, 1));
         assert!(collections(c).contains(&"byname".to_string()));
+
+        // Both store one `_id`: neither insert conflicts, and the second
+        // commit fails. The `_id` index rows are kept under a name of the
+        // transaction's own until it commits; it used to be the second insert.
+        let r = tx(
+            c,
+            8,
+            1,
+            true,
+            doc! {"insert": "same", "documents": [{"_id": 1, "v": 8}]},
+        );
+        assert_eq!(r.get_f64("ok"), Ok(1.0), "{r}");
+        let r = tx(
+            c,
+            9,
+            1,
+            true,
+            doc! {"insert": "same", "documents": [{"_id": 1, "v": 9}]},
+        );
+        assert_eq!(r.get_f64("ok"), Ok(1.0), "{r}");
+        // Inside each, the `_id` reads and writes as usual. (A duplicate
+        // would abort the transaction, as any failed write in one does.)
+        let r = tx(
+            c,
+            9,
+            1,
+            false,
+            doc! {"update": "same",
+            "updates": [{"q": {"_id": 1}, "u": {"$inc": {"v": 1}}}]},
+        );
+        assert_eq!(r.get_i32("nModified"), Ok(1), "{r}");
+        let r = tx(c, 9, 1, false, doc! {"find": "same", "filter": {"_id": 1}});
+        let got = r
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get_i32("v");
+        assert_eq!(got, Ok(10), "{r}");
+        assert_eq!(commit(c, 9, 1).get_f64("ok"), Ok(1.0));
+        in_use(&commit(c, 8, 1));
+        let r = dispatch_full(&doc! {"find": "same"}, c);
+        let docs = r
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(docs.len(), 1, "{r}");
+        assert_eq!(docs[0].as_document().unwrap().get_i32("v"), Ok(10));
+        // The committed `_id` index is the collection's own: a plain insert
+        // of the same `_id` is a duplicate, and a delete by `_id` finds it.
+        let r = dispatch_full(&doc! {"insert": "same", "documents": [{"_id": 1}]}, c);
+        assert!(r.contains_key("writeErrors"), "{r}");
+        let r = dispatch_full(
+            &doc! {"delete": "same", "deletes": [{"q": {"_id": 1}, "limit": 1}]},
+            c,
+        );
+        assert_eq!(r.get_i32("n"), Ok(1), "{r}");
     });
 }
