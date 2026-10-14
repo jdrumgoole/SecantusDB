@@ -30,8 +30,9 @@ pub(crate) fn invalid_database_name(db: &str, doc: &Document) -> Option<CommandE
         )));
     }
     let (name, target) = doc.iter().next()?;
+    // A user or role command's first value names no collection.
     let coll = match target {
-        Bson::String(coll) => Some(coll.as_str()),
+        Bson::String(coll) if !crate::umc::is_user_or_role_command(name) => Some(coll.as_str()),
         _ => None,
     };
     if db.is_empty() || db.contains(['/', '\\', ' ', '"']) {

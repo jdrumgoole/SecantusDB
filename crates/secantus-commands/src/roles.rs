@@ -1,14 +1,15 @@
-//! Custom user-defined role management (R5b-3 / R5b-4): `createRole` /
-//! `updateRole` / `dropRole` / `dropAllRolesFromDatabase` / `rolesInfo`, plus the
-//! incremental `grant`/`revoke` quartet (`grantPrivilegesToRole` /
-//! `revokePrivilegesFromRole` / `grantRolesToRole` / `revokeRolesFromRole`).
+//! Role management: `createRole` / `updateRole` / `dropRole` /
+//! `dropAllRolesFromDatabase` / `rolesInfo`, plus the incremental quartet
+//! (`grantPrivilegesToRole` / `revokePrivilegesFromRole` / `grantRolesToRole`
+//! / `revokeRolesFromRole`). Every reply was measured on mongod 8.2.11 with
+//! `tools/probes/user_role_commands.py` (2026-10-13).
 //!
-//! A port of `commands.py`'s role handlers. Custom roles carry a `privileges`
-//! array (`[{resource, actions}]`) plus an inherited-`roles` array, stored as
-//! opaque BSON in the role table (`Storage::add_role` / `get_role` / `drop_role`
-//! / `list_roles`). The dispatcher's RBAC check expands them through
-//! [`crate::rbac::check_privilege_resolved`] (privilege match + inheritance walk
-//! with cycle detection).
+//! A custom role carries a `privileges` array (`[{resource, actions}]`,
+//! one per resource, actions in mongod's order -- see [`crate::privileges`])
+//! and the `roles` it holds, stored as opaque BSON in the role table
+//! (`Storage::add_role` / `get_role` / `drop_role` / `list_roles`). The
+//! dispatcher's RBAC check expands them through
+//! [`crate::rbac::check_privilege_resolved`].
 //!
 //! Stored record shape (identical to the Python server's, so both share the
 //! role table):
@@ -16,141 +17,210 @@
 //! ```text
 //! { _id: "<db>.<role>", role, db,
 //!   privileges: [{ resource: {...}, actions: [...] }, ...],
-//!   roles: [{ role, db }, ...] }
+//!   roles: [{ role, db }, ...],
+//!   authenticationRestrictions: [...] }       -- when given
 //! ```
+//!
+//! Three rules of mongod's worth knowing. A role of a database other than
+//! `admin` may hold only that database's namespaces and only that
+//! database's roles (`InvalidRoleModification`, 49). A built-in role exists
+//! on the databases mongod gives it to -- `root` only on `admin` -- and
+//! cannot be modified, dropped or shadowed. And `dropRole` takes the role
+//! away from every user and role that held it, while
+//! `dropAllRolesFromDatabase` takes nothing away from anyone.
 
 use bson::{doc, Bson, Document};
 
+use crate::privileges::{self, Privilege, PrivilegeSet};
+use crate::umc::{self, bad_value, Field};
 use crate::util::command_error;
-use crate::{rbac, CommandContext, CommandError, HandlerResult};
+use crate::{CommandContext, CommandError, HandlerResult};
 
 /// `RoleNotFound`.
 const ROLE_NOT_FOUND: i32 = 31;
+/// `InvalidRoleModification`.
+const INVALID_ROLE_MODIFICATION: i32 = 49;
 /// `Location51002` — a role with that name already exists.
 const ROLE_ALREADY_EXISTS: i32 = 51002;
 
-fn bad_value(msg: impl Into<String>) -> CommandError {
-    CommandError::new(2, "BadValue", msg)
+fn role_not_found(message: String) -> CommandError {
+    CommandError::new(ROLE_NOT_FOUND, "RoleNotFound", message)
 }
 
-fn role_not_found(name: &str, db: &str) -> CommandError {
+fn invalid_modification(message: String) -> CommandError {
     CommandError::new(
-        ROLE_NOT_FOUND,
-        "RoleNotFound",
-        format!("Role '{name}' not found on database '{db}'"),
+        INVALID_ROLE_MODIFICATION,
+        "InvalidRoleModification",
+        message,
     )
 }
 
-fn db_of(ctx: &CommandContext) -> String {
+/// The database a role command works on; the empty name is refused as
+/// mongod refuses it.
+fn role_db(ctx: &CommandContext) -> Result<String, CommandError> {
     if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            "Invalid database name: ''",
+        ));
+    }
+    Ok(ctx.db_name.clone())
+}
+
+/// The `privileges` argument, parsed; `[]` when it was not given.
+fn privileges_arg(doc: &Document) -> Result<Vec<Privilege>, CommandError> {
+    match umc::given(doc, "privileges").and_then(Bson::as_array) {
+        Some(items) => privileges::parse_privileges(items),
+        None => Ok(Vec::new()),
     }
 }
 
-/// Validate / normalise a `privileges` array into `[{resource, actions}]`.
-/// Returns `Err(BadValue)` on a malformed entry; an empty list is fine (a role
-/// can be a pure inheritor). Mirrors `commands.py::_normalise_privileges`.
-fn normalise_privileges(arg: Option<&Bson>) -> Result<Vec<Bson>, CommandError> {
-    let items = match arg {
-        Some(Bson::Array(items)) => items,
-        None => return Ok(Vec::new()),
-        _ => {
-            return Err(bad_value(
-                "privileges must be an array of {resource, actions}",
-            ))
-        }
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for priv_ in items {
-        let Bson::Document(p) = priv_ else {
-            return Err(bad_value(
-                "privileges must be an array of {resource, actions}",
-            ));
-        };
-        let resource = p
-            .get_document("resource")
-            .map_err(|_| bad_value("privilege.resource must be a document"))?;
-        let actions = p
-            .get_array("actions")
-            .map_err(|_| bad_value("privilege.actions must be an array"))?;
-        if !actions.iter().all(|a| matches!(a, Bson::String(_))) {
-            return Err(bad_value("privilege.actions must be an array of strings"));
-        }
-        out.push(Bson::Document(doc! {
-            "resource": resource.clone(),
-            "actions": actions.clone(),
-        }));
+/// The `roles` argument as `(role, db)` pairs; `[]` when it was not given.
+fn roles_arg(doc: &Document, db: &str) -> Result<Vec<(String, String)>, CommandError> {
+    match umc::given(doc, "roles").and_then(Bson::as_array) {
+        Some(items) => umc::parse_role_names(items, db),
+        None => Ok(Vec::new()),
     }
-    Ok(out)
 }
 
-/// Validate / normalise an inherited-`roles` array into `[{role, db}]`. Each
-/// entry is `"<name>"` (bound to `default_db`) or `{role, db}`. Mirrors
-/// `commands.py::_normalise_inherited_roles`.
-fn normalise_inherited_roles(
-    arg: Option<&Bson>,
-    default_db: &str,
-) -> Result<Vec<Bson>, CommandError> {
-    let items = match arg {
-        Some(Bson::Array(items)) => items,
-        None => return Ok(Vec::new()),
-        _ => {
-            return Err(bad_value(
-                "roles must be a list of names or {role, db} dicts",
-            ))
-        }
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for entry in items {
-        let (role, db) = match entry {
-            Bson::String(s) if !s.is_empty() => (s.clone(), default_db.to_string()),
-            Bson::Document(d) => {
-                let role = d
-                    .get_str("role")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| bad_value("inherited role needs a non-empty 'role'"))?;
-                let db = d.get_str("db").unwrap_or(default_db);
-                if db.is_empty() {
-                    return Err(bad_value("inherited role 'db' must be non-empty"));
-                }
-                (role.to_string(), db.to_string())
-            }
-            _ => {
-                return Err(bad_value(
-                    "roles must be a list of names or {role, db} dicts",
-                ))
-            }
-        };
-        out.push(Bson::Document(doc! { "role": role, "db": db }));
-    }
-    Ok(out)
-}
-
-/// `createRole` — define a custom role. Rejects built-in names (mongod refuses
-/// `createRole: "read"` etc.).
-pub fn create_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("createRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => return Err(bad_value("createRole: role name (string) required")),
-    };
-    if rbac::is_known_role(&name) {
-        return Err(bad_value(format!(
-            "Cannot create role with name '{name}': name is reserved for a built-in"
+/// What mongod checks before it looks a granted role up: a role is not
+/// granted to itself, and a role of a database other than `admin` holds
+/// only that database's roles.
+fn grantable_roles(name: &str, db: &str, roles: &[(String, String)]) -> Result<(), CommandError> {
+    if roles.iter().any(|(r, d)| r == name && d == db) {
+        return Err(invalid_modification(format!(
+            "Cannot grant role {name}@{db} to itself."
         )));
     }
-    let db_name = db_of(ctx);
-    let privileges = normalise_privileges(doc.get("privileges"))?;
-    let inherited = normalise_inherited_roles(doc.get("roles"), &db_name)?;
-    let record = doc! {
+    if db != "admin" && roles.iter().any(|(_, d)| d != db) {
+        return Err(invalid_modification(format!(
+            "Roles on the '{db}' database cannot be granted roles from other databases"
+        )));
+    }
+    Ok(())
+}
+
+/// Every granted role must exist, in the words `createRole` and its kin use.
+fn granted_roles_exist(
+    ctx: &CommandContext,
+    name: &str,
+    db: &str,
+    roles: &[(String, String)],
+) -> Result<(), CommandError> {
+    for (role, role_db) in roles {
+        if !umc::role_exists(ctx, role, role_db)? {
+            return Err(role_not_found(format!(
+                "Cannot grant roles to '{name}@{db}': Could not find role: {role}@{role_db}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Granting `roles` to `(name, db)` must not make the graph cyclic.
+fn no_cycle(
+    ctx: &CommandContext,
+    name: &str,
+    db: &str,
+    roles: &[(String, String)],
+) -> Result<(), CommandError> {
+    let reached = umc::inherit(ctx, roles)?.roles;
+    if reached.iter().any(|(r, d)| r == name && d == db) {
+        return Err(invalid_modification(format!(
+            "Granting roles to {name}@{db} would introduce a cycle in the role graph"
+        )));
+    }
+    Ok(())
+}
+
+/// A role of a database other than `admin` holds only that database's
+/// namespaces.
+fn grantable_privileges(db: &str, privileges: &[Privilege]) -> Result<(), CommandError> {
+    if db != "admin" && privileges.iter().any(|p| !p.resource.within(db)) {
+        return Err(invalid_modification(format!(
+            "Roles on the '{db}' database cannot be granted privileges that target other \
+             databases or the cluster"
+        )));
+    }
+    Ok(())
+}
+
+/// A built-in role is not modified: `read@db is a built-in role and cannot
+/// be modified`.
+fn not_builtin(name: &str, db: &str) -> Result<(), CommandError> {
+    if privileges::builtin_exists(name, db) {
+        return Err(bad_value(format!(
+            "{name}@{db} is a built-in role and cannot be modified"
+        )));
+    }
+    Ok(())
+}
+
+/// The stored record the grant / revoke commands modify, else mongod's
+/// `Role x@db not found`.
+fn stored_or_not_found(
+    ctx: &CommandContext,
+    name: &str,
+    db: &str,
+) -> Result<Document, CommandError> {
+    umc::stored_role(ctx, db, name)?
+        .ok_or_else(|| role_not_found(format!("Role {name}@{db} not found")))
+}
+
+fn role_docs(roles: &[(String, String)]) -> Vec<Bson> {
+    roles.iter().map(umc::role_name_doc).collect()
+}
+
+const CREATE_ROLE_FIELDS: &[(&str, Field, bool)] = &[
+    ("createRole", Field::Str, true),
+    ("privileges", Field::Privileges, true),
+    ("roles", Field::RoleNames, true),
+    ("authenticationRestrictions", Field::Restrictions, false),
+];
+
+/// `createRole`, in mongod's order (8.2.11): the fields' types; a
+/// non-empty name, not on `local`, not a built-in's; the privileges parsed
+/// (resource shape, actions known); the roles grantable, then existing;
+/// the privileges within the database; the restrictions; then the insert.
+pub fn create_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    umc::check_fields(doc, "createRole", CREATE_ROLE_FIELDS)?;
+    let db_name = role_db(ctx)?;
+    let name = doc.get_str("createRole").unwrap_or("").to_string();
+    if name.is_empty() {
+        return Err(bad_value("Role name must be non-empty"));
+    }
+    if db_name == "local" {
+        return Err(bad_value("Cannot create roles in the local database"));
+    }
+    if privileges::builtin_exists(&name, &db_name) {
+        return Err(bad_value(
+            "Cannot create roles with the same name as a built-in role",
+        ));
+    }
+    let privileges = privileges_arg(doc)?;
+    let roles = roles_arg(doc, &db_name)?;
+    grantable_roles(&name, &db_name, &roles)?;
+    granted_roles_exist(ctx, &name, &db_name, &roles)?;
+    grantable_privileges(&db_name, &privileges)?;
+    let restrictions = umc::given(doc, "authenticationRestrictions")
+        .and_then(Bson::as_array)
+        .cloned();
+    if let Some(r) = &restrictions {
+        umc::validate_restrictions(r)?;
+    }
+    let mut set = PrivilegeSet::default();
+    set.extend(&privileges);
+    let mut record = doc! {
         "_id": format!("{db_name}.{name}"),
         "role": &name,
         "db": &db_name,
-        "privileges": privileges,
-        "roles": inherited,
+        "privileges": set.to_bson(),
+        "roles": role_docs(&roles),
     };
+    if let Some(r) = restrictions {
+        record.insert("authenticationRestrictions", r);
+    }
     let mut bytes = Vec::new();
     record
         .to_writer(&mut bytes)
@@ -169,272 +239,235 @@ pub fn create_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
 
-/// Read + decode a stored role record for `(db, name)`.
-fn get_role_doc(
-    ctx: &CommandContext,
-    db: &str,
-    name: &str,
-) -> Result<Option<Document>, CommandError> {
-    let Some(bytes) = ctx.storage()?.get_role(db, name).map_err(command_error)? else {
-        return Ok(None);
-    };
-    secantus_core::bsondoc::from_bytes(bytes.as_slice())
-        .map(Some)
-        .map_err(|e| CommandError::new(1, "InternalError", format!("decode role record: {e}")))
-}
+const UPDATE_ROLE_FIELDS: &[(&str, Field, bool)] = &[
+    ("updateRole", Field::Str, true),
+    ("privileges", Field::Privileges, false),
+    ("roles", Field::RoleNames, false),
+    ("authenticationRestrictions", Field::Restrictions, false),
+];
 
-/// `updateRole` — replace a custom role's privileges / inherited roles in place.
-/// Either field may be supplied; omitted fields stay as-is.
+/// `updateRole` — replace a role's privileges, roles or restrictions
+/// (8.2.11): something to update; the privileges parsed; the role known to
+/// the graph (a built-in is, and fails only at the write: `Role read@db not
+/// found`); the roles grantable, existing and acyclic; the privileges
+/// within the database; the restrictions.
 pub fn update_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("updateRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => return Err(bad_value("updateRole: role name (string) required")),
-    };
-    let db_name = db_of(ctx);
-    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
-        return Err(role_not_found(&name, &db_name));
-    };
-    if doc.contains_key("privileges") {
-        let privileges = normalise_privileges(doc.get("privileges"))?;
-        record.insert("privileges", privileges);
+    umc::check_fields(doc, "updateRole", UPDATE_ROLE_FIELDS)?;
+    let db_name = role_db(ctx)?;
+    let name = doc.get_str("updateRole").unwrap_or("").to_string();
+    let given = |field: &str| umc::given(doc, field).is_some();
+    if !given("privileges") && !given("roles") && !given("authenticationRestrictions") {
+        return Err(bad_value(
+            "Must specify at least one field to update in updateRole",
+        ));
     }
-    if doc.contains_key("roles") {
-        let inherited = normalise_inherited_roles(doc.get("roles"), &db_name)?;
-        record.insert("roles", inherited);
+    let privileges = privileges_arg(doc)?;
+    if !umc::role_exists(ctx, &name, &db_name)? {
+        return Err(role_not_found(format!(
+            "Could not find role: {name}@{db_name}"
+        )));
     }
-    let mut bytes = Vec::new();
-    record
-        .to_writer(&mut bytes)
-        .map_err(|e| CommandError::new(1, "InternalError", format!("encode role record: {e}")))?;
-    ctx.storage()?
-        .add_role(&db_name, &name, &bytes, true)
-        .map_err(command_error)?;
+    let roles = roles_arg(doc, &db_name)?;
+    if given("roles") {
+        grantable_roles(&name, &db_name, &roles)?;
+        granted_roles_exist(ctx, &name, &db_name, &roles)?;
+        no_cycle(ctx, &name, &db_name, &roles)?;
+    }
+    grantable_privileges(&db_name, &privileges)?;
+    let restrictions = umc::given(doc, "authenticationRestrictions")
+        .and_then(Bson::as_array)
+        .cloned();
+    if let Some(r) = &restrictions {
+        umc::validate_restrictions(r)?;
+    }
+    let mut record = stored_or_not_found(ctx, &name, &db_name)?;
+    if given("privileges") {
+        let mut set = PrivilegeSet::default();
+        set.extend(&privileges);
+        record.insert("privileges", set.to_bson());
+    }
+    if given("roles") {
+        record.insert("roles", role_docs(&roles));
+    }
+    if let Some(r) = restrictions {
+        record.insert("authenticationRestrictions", r);
+    }
+    umc::save_role(ctx, &db_name, &name, &record)?;
+    crate::auth::refresh_effective_roles(ctx);
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `dropRole` — remove a custom role.
+/// `dropRole` — remove a custom role, and take it from every user and role
+/// holding it, on every database (8.2.11).
 pub fn drop_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("dropRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => return Err(bad_value("dropRole: role name (string) required")),
-    };
-    let db_name = db_of(ctx);
+    umc::check_fields(doc, "dropRole", &[("dropRole", Field::Str, true)])?;
+    let db_name = role_db(ctx)?;
+    let name = doc.get_str("dropRole").unwrap_or("").to_string();
+    not_builtin(&name, &db_name)?;
     if !ctx
         .storage()?
         .drop_role(&db_name, &name)
         .map_err(command_error)?
     {
-        return Err(role_not_found(&name, &db_name));
+        return Err(role_not_found(format!(
+            "Could not find role: {name}@{db_name}"
+        )));
     }
-    Ok(doc! { "ok": 1.0 })
-}
-
-/// Encode + persist a (replace) role record.
-fn save_role(
-    ctx: &CommandContext,
-    db: &str,
-    name: &str,
-    record: &Document,
-) -> Result<(), CommandError> {
-    let mut bytes = Vec::new();
-    record
-        .to_writer(&mut bytes)
-        .map_err(|e| CommandError::new(1, "InternalError", format!("encode role record: {e}")))?;
-    ctx.storage()?
-        .add_role(db, name, &bytes, true)
+    let dropped = (name.clone(), db_name.clone());
+    crate::auth::remove_role_from_users(ctx, &dropped)?;
+    let records = ctx
+        .storage()?
+        .list_roles(None, 0, 0)
         .map_err(command_error)?;
-    Ok(())
+    for bytes in records {
+        let Ok(mut record) = secantus_core::bsondoc::from_bytes(bytes.as_slice()) else {
+            continue;
+        };
+        let (Ok(db), Ok(role)) = (
+            record.get_str("db").map(String::from),
+            record.get_str("role").map(String::from),
+        ) else {
+            continue;
+        };
+        let held = umc::role_pairs(record.get_array("roles").map(Vec::as_slice).unwrap_or(&[]));
+        if held.contains(&dropped) {
+            let kept: Vec<(String, String)> = held.into_iter().filter(|p| *p != dropped).collect();
+            record.insert("roles", role_docs(&kept));
+            umc::save_role(ctx, &db, &role, &record)?;
+        }
+    }
+    crate::auth::refresh_effective_roles(ctx);
+    Ok(doc! { "ok": 1.0 })
 }
 
-/// The `actions` string list of a privilege document.
-fn priv_actions(p: &Document) -> Vec<String> {
-    p.get_array("actions")
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `grantPrivilegesToRole` — merge privileges into a custom role (by resource,
-/// deduping actions).
+/// `grantPrivilegesToRole` — merge privileges into a custom role, by
+/// resource (8.2.11): a non-empty `privileges`, parsed; not a built-in;
+/// within the database; the role stored.
 pub fn grant_privileges_to_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("grantPrivilegesToRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            return Err(bad_value(
-                "grantPrivilegesToRole: role name (string) required",
-            ))
-        }
-    };
-    let db_name = db_of(ctx);
-    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
-        return Err(role_not_found(&name, &db_name));
-    };
-    let additions = normalise_privileges(doc.get("privileges"))?;
-    let mut privs: Vec<Document> = record
-        .get_array("privileges")
-        .map(|a| a.iter().filter_map(|p| p.as_document().cloned()).collect())
-        .unwrap_or_default();
-    for add in &additions {
-        let Bson::Document(add) = add else { continue };
-        let add_resource = add.get_document("resource").ok();
-        let mut merged = false;
-        for existing in privs.iter_mut() {
-            if existing.get_document("resource").ok() == add_resource {
-                let mut actions = priv_actions(existing);
-                for a in priv_actions(add) {
-                    if !actions.contains(&a) {
-                        actions.push(a);
-                    }
-                }
-                existing.insert("actions", actions);
-                merged = true;
-                break;
-            }
-        }
-        if !merged {
-            privs.push(add.clone());
-        }
-    }
-    record.insert(
-        "privileges",
-        privs.into_iter().map(Bson::Document).collect::<Vec<_>>(),
-    );
-    save_role(ctx, &db_name, &name, &record)?;
-    Ok(doc! { "ok": 1.0 })
+    change_privileges(doc, ctx, "grantPrivilegesToRole", true)
 }
 
-/// `revokePrivilegesFromRole` — remove actions from matching-resource
-/// privileges; privileges left with no actions are dropped.
+/// `revokePrivilegesFromRole` — take actions from a role's privileges on
+/// the same resources; a privilege left with none goes.
 pub fn revoke_privileges_from_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("revokePrivilegesFromRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            return Err(bad_value(
-                "revokePrivilegesFromRole: role name (string) required",
-            ))
-        }
-    };
-    let db_name = db_of(ctx);
-    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
-        return Err(role_not_found(&name, &db_name));
-    };
-    let revocations = normalise_privileges(doc.get("privileges"))?;
-    let mut privs: Vec<Document> = record
-        .get_array("privileges")
-        .map(|a| a.iter().filter_map(|p| p.as_document().cloned()).collect())
-        .unwrap_or_default();
-    for rev in &revocations {
-        let Bson::Document(rev) = rev else { continue };
-        let rev_resource = rev.get_document("resource").ok();
-        let rev_actions = priv_actions(rev);
-        for existing in privs.iter_mut() {
-            if existing.get_document("resource").ok() == rev_resource {
-                let kept: Vec<String> = priv_actions(existing)
-                    .into_iter()
-                    .filter(|a| !rev_actions.contains(a))
-                    .collect();
-                existing.insert("actions", kept);
-            }
-        }
+    change_privileges(doc, ctx, "revokePrivilegesFromRole", false)
+}
+
+fn change_privileges(
+    doc: &Document,
+    ctx: &mut CommandContext,
+    command: &str,
+    grant: bool,
+) -> HandlerResult {
+    umc::check_fields(
+        doc,
+        command,
+        &[
+            (command, Field::Str, true),
+            ("privileges", Field::Privileges, true),
+        ],
+    )?;
+    let db_name = role_db(ctx)?;
+    let name = doc.get_str(command).unwrap_or("").to_string();
+    if doc.get_array("privileges").is_ok_and(|p| p.is_empty()) {
+        return Err(bad_value(format!(
+            "{command} command requires a non-empty \"privileges\" array"
+        )));
     }
-    privs.retain(|p| !priv_actions(p).is_empty());
-    record.insert(
-        "privileges",
-        privs.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+    let changes = privileges_arg(doc)?;
+    not_builtin(&name, &db_name)?;
+    if grant {
+        grantable_privileges(&db_name, &changes)?;
+    }
+    let mut record = stored_or_not_found(ctx, &name, &db_name)?;
+    let mut set = PrivilegeSet::from_docs(
+        record
+            .get_array("privileges")
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
     );
-    save_role(ctx, &db_name, &name, &record)?;
-    Ok(doc! { "ok": 1.0 })
-}
-
-/// The `(role, db)` pairs of an inherited-roles array.
-fn role_pairs(arr: &[Bson]) -> Vec<(String, String)> {
-    arr.iter()
-        .filter_map(|r| {
-            let d = r.as_document()?;
-            Some((
-                d.get_str("role").ok()?.to_string(),
-                d.get_str("db").ok()?.to_string(),
-            ))
-        })
-        .collect()
-}
-
-/// `grantRolesToRole` — add inherited roles (deduped).
-pub fn grant_roles_to_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("grantRolesToRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => return Err(bad_value("grantRolesToRole: role name (string) required")),
-    };
-    let db_name = db_of(ctx);
-    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
-        return Err(role_not_found(&name, &db_name));
-    };
-    let additions = normalise_inherited_roles(doc.get("roles"), &db_name)?;
-    let mut inherited: Vec<Bson> = record.get_array("roles").cloned().unwrap_or_default();
-    let mut seen: Vec<(String, String)> = role_pairs(&inherited);
-    for add in additions {
-        if let Bson::Document(d) = &add {
-            let pair = (
-                d.get_str("role").unwrap_or("").to_string(),
-                d.get_str("db").unwrap_or("").to_string(),
-            );
-            if !seen.contains(&pair) {
-                seen.push(pair);
-                inherited.push(add);
-            }
+    for change in &changes {
+        if grant {
+            set.add(change);
+        } else {
+            set.remove(change);
         }
     }
-    record.insert("roles", inherited);
-    save_role(ctx, &db_name, &name, &record)?;
+    record.insert("privileges", set.to_bson());
+    umc::save_role(ctx, &db_name, &name, &record)?;
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `revokeRolesFromRole` — remove inherited roles.
+/// `grantRolesToRole` — add roles to a custom role (8.2.11): a non-empty
+/// `roles`; grantable (not itself, not another database's); not a
+/// built-in; the roles existing; the role stored; no cycle.
+pub fn grant_roles_to_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    change_roles(doc, ctx, "grantRolesToRole", true)
+}
+
+/// `revokeRolesFromRole` — take roles from a custom role; a role it never
+/// held, or that does not exist, is no error.
 pub fn revoke_roles_from_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let name = match doc.get_str("revokeRolesFromRole") {
-        Ok(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            return Err(bad_value(
-                "revokeRolesFromRole: role name (string) required",
-            ))
+    change_roles(doc, ctx, "revokeRolesFromRole", false)
+}
+
+fn change_roles(
+    doc: &Document,
+    ctx: &mut CommandContext,
+    command: &str,
+    grant: bool,
+) -> HandlerResult {
+    umc::check_fields(
+        doc,
+        command,
+        &[
+            (command, Field::Str, true),
+            ("roles", Field::RoleNames, true),
+        ],
+    )?;
+    let db_name = role_db(ctx)?;
+    let name = doc.get_str(command).unwrap_or("").to_string();
+    if doc.get_array("roles").is_ok_and(|r| r.is_empty()) {
+        return Err(bad_value(format!(
+            "{command} command requires a non-empty \"roles\" array"
+        )));
+    }
+    let changes = roles_arg(doc, &db_name)?;
+    if grant {
+        grantable_roles(&name, &db_name, &changes)?;
+    }
+    not_builtin(&name, &db_name)?;
+    if grant {
+        granted_roles_exist(ctx, &name, &db_name, &changes)?;
+    }
+    let mut record = stored_or_not_found(ctx, &name, &db_name)?;
+    let mut held = umc::role_pairs(record.get_array("roles").map(Vec::as_slice).unwrap_or(&[]));
+    if grant {
+        no_cycle(ctx, &name, &db_name, &changes)?;
+        for pair in changes {
+            if !held.contains(&pair) {
+                held.push(pair);
+            }
         }
-    };
-    let db_name = db_of(ctx);
-    let Some(mut record) = get_role_doc(ctx, &db_name, &name)? else {
-        return Err(role_not_found(&name, &db_name));
-    };
-    let revocations = normalise_inherited_roles(doc.get("roles"), &db_name)?;
-    let drop_set = role_pairs(&revocations);
-    let kept: Vec<Bson> = record
-        .get_array("roles")
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| {
-            r.as_document()
-                .and_then(|d| {
-                    Some((
-                        d.get_str("role").ok()?.to_string(),
-                        d.get_str("db").ok()?.to_string(),
-                    ))
-                })
-                .map(|pair| !drop_set.contains(&pair))
-                .unwrap_or(true)
-        })
-        .collect();
-    record.insert("roles", kept);
-    save_role(ctx, &db_name, &name, &record)?;
+    } else {
+        held.retain(|p| !changes.contains(p));
+    }
+    record.insert("roles", role_docs(&held));
+    umc::save_role(ctx, &db_name, &name, &record)?;
+    crate::auth::refresh_effective_roles(ctx);
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `dropAllRolesFromDatabase` — drop every custom role bound to the calling db.
-/// Returns `n` = removed count. Built-in roles are never persisted, so they're
-/// unaffected.
-pub fn drop_all_roles_from_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let db_name = db_of(ctx);
+/// `dropAllRolesFromDatabase` — drop every custom role of the calling db,
+/// answering `{n, ok}`. Nothing is taken from the users or roles that held
+/// them (8.2.11).
+pub fn drop_all_roles_from_database(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    umc::check_fields(
+        doc,
+        "dropAllRolesFromDatabase",
+        &[("dropAllRolesFromDatabase", Field::Any, false)],
+    )?;
+    let db_name = role_db(ctx)?;
     let storage = ctx.storage()?;
     let mut removed = 0;
     loop {
@@ -455,82 +488,132 @@ pub fn drop_all_roles_from_database(_doc: &Document, ctx: &mut CommandContext) -
             break;
         }
     }
-    Ok(doc! { "ok": 1.0, "n": removed })
+    Ok(doc! { "n": removed, "ok": 1.0 })
 }
 
-/// `rolesInfo` — return custom-role records. Accepts `1`/`true` (all roles in
-/// this db), a name string, a `{role, db}` doc, or a list thereof.
+/// What `showPrivileges` asks `rolesInfo` for.
+enum ShowPrivileges {
+    No,
+    Yes,
+    UserFragment,
+}
+
+const ROLES_INFO_FIELDS: &[(&str, Field, bool)] = &[
+    ("rolesInfo", Field::Any, false),
+    ("showPrivileges", Field::Any, false),
+    ("showBuiltinRoles", Field::SafeBool, false),
+    ("showAuthenticationRestrictions", Field::SafeBool, false),
+];
+
+/// `rolesInfo` (8.2.11). `1` lists the database's custom roles (its
+/// built-ins first under `showBuiltinRoles`); a name, a `{role, db}` or a
+/// list of those answers each that exists, built-in or stored, in the
+/// order named; `showPrivileges: "asUserFragment"` answers what a user
+/// holding those roles would inherit. The field order of a listed role,
+/// a named role and a built-in role each differ, as mongod's do.
 pub fn roles_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    crate::serverinfo::principal_argument(doc.get("rolesInfo"), "RoleName", "role")?;
-    match doc.get("showPrivileges") {
-        None | Some(Bson::Null | Bson::Boolean(_)) => {}
-        Some(Bson::String(word)) if word == "asUserFragment" => {}
+    umc::check_fields(doc, "rolesInfo", ROLES_INFO_FIELDS)?;
+    crate::serverinfo::principal_argument(doc.get("rolesInfo"), "RoleName", "role", false)?;
+    let show_privileges = match doc.get("showPrivileges") {
+        None => ShowPrivileges::No,
+        Some(Bson::String(word)) if word == "asUserFragment" => ShowPrivileges::UserFragment,
+        Some(v) if crate::util::truthy_number_or_bool(v).is_some() => {
+            if crate::util::truthy_number_or_bool(v).unwrap_or(false) {
+                ShowPrivileges::Yes
+            } else {
+                ShowPrivileges::No
+            }
+        }
         Some(other) => {
+            return Err(bad_value(format!(
+                "Failed to parse 'showPrivileges'. 'showPrivileges' should either be a boolean \
+                 or the string 'asUserFragment', given: showPrivileges: {}",
+                secantus_core::query::bson_value_repr(other)
+            )))
+        }
+    };
+    let flag = |name: &str| {
+        umc::given(doc, name)
+            .and_then(crate::util::truthy_number_or_bool)
+            .unwrap_or(false)
+    };
+    let show_builtin = flag("showBuiltinRoles");
+    let show_restrictions = flag("showAuthenticationRestrictions");
+    let db_name = role_db(ctx)?;
+    let privileges_shown = matches!(show_privileges, ShowPrivileges::Yes);
+
+    let listing = matches!(
+        doc.get("rolesInfo"),
+        Some(Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))
+    );
+    if listing {
+        if matches!(show_privileges, ShowPrivileges::UserFragment) {
             return Err(CommandError::new(
-                2,
-                "BadValue",
-                format!(
-                    "Failed to parse 'showPrivileges'. 'showPrivileges' should either be a \
-                     boolean or the string 'asUserFragment', given: showPrivileges: {}",
-                    secantus_core::query::bson_value_repr(other)
-                ),
-            ))
+                20,
+                "IllegalOperation",
+                "Cannot get user fragment for all roles in a database",
+            ));
         }
-    }
-    for option in ["showBuiltinRoles", "showAuthenticationRestrictions"] {
-        crate::serverinfo::flag(doc, "rolesInfo", option)?;
-    }
-    let db_name = db_of(ctx);
-    let storage = ctx.storage()?;
-
-    let mut raw: Vec<Vec<u8>> = Vec::new();
-    match doc.get("rolesInfo") {
-        Some(Bson::Int32(1)) | Some(Bson::Int64(1)) | Some(Bson::Boolean(true)) => {
-            raw = storage
-                .list_roles(Some(&db_name), 0, 0)
-                .map_err(command_error)?;
-        }
-        Some(Bson::String(name)) => {
-            if let Some(r) = storage.get_role(&db_name, name).map_err(command_error)? {
-                raw.push(r);
+        let mut roles: Vec<Bson> = Vec::new();
+        if show_builtin {
+            for name in privileges::builtin_names(&db_name) {
+                roles.push(Bson::Document(umc::builtin_role_doc(
+                    name,
+                    &db_name,
+                    true,
+                    privileges_shown,
+                    show_restrictions,
+                )));
             }
         }
-        Some(Bson::Document(spec)) => {
-            if let Ok(role) = spec.get_str("role") {
-                let d = spec.get_str("db").unwrap_or(&db_name);
-                if let Some(r) = storage.get_role(d, role).map_err(command_error)? {
-                    raw.push(r);
-                }
-            }
+        let stored = ctx
+            .storage()?
+            .list_roles(Some(&db_name), 0, 0)
+            .map_err(command_error)?;
+        for bytes in stored {
+            let record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
+                CommandError::new(1, "InternalError", format!("decode role record: {e}"))
+            })?;
+            roles.push(Bson::Document(umc::role_info_doc(
+                ctx,
+                &record,
+                true,
+                privileges_shown,
+                show_restrictions,
+            )?));
         }
-        Some(Bson::Array(items)) => {
-            for item in items {
-                let rec = match item {
-                    Bson::String(name) => storage.get_role(&db_name, name),
-                    Bson::Document(spec) => match spec.get_str("role") {
-                        Ok(role) => {
-                            let d = spec.get_str("db").unwrap_or(&db_name);
-                            storage.get_role(d, role)
-                        }
-                        Err(_) => Ok(None),
-                    },
-                    _ => Ok(None),
-                }
-                .map_err(command_error)?;
-                if let Some(r) = rec {
-                    raw.push(r);
-                }
-            }
-        }
-        _ => {}
+        return Ok(doc! { "roles": roles, "ok": 1.0 });
     }
 
-    let mut roles = Vec::with_capacity(raw.len());
-    for bytes in raw {
-        let record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
-            CommandError::new(1, "InternalError", format!("decode role record: {e}"))
-        })?;
-        roles.push(Bson::Document(record));
+    let items: Vec<Bson> = match doc.get("rolesInfo") {
+        Some(Bson::Array(items)) => items.clone(),
+        Some(other) => vec![other.clone()],
+        None => Vec::new(),
+    };
+    let names = umc::parse_role_names(&items, &db_name)?;
+    if matches!(show_privileges, ShowPrivileges::UserFragment) {
+        let fragment = umc::user_fragment(ctx, &names, show_restrictions)?;
+        return Ok(doc! { "userFragment": fragment, "ok": 1.0 });
+    }
+    let mut roles: Vec<Bson> = Vec::new();
+    for (name, db) in &names {
+        if privileges::builtin_exists(name, db) {
+            roles.push(Bson::Document(umc::builtin_role_doc(
+                name,
+                db,
+                false,
+                privileges_shown,
+                show_restrictions,
+            )));
+        } else if let Some(record) = umc::stored_role(ctx, db, name)? {
+            roles.push(Bson::Document(umc::role_info_doc(
+                ctx,
+                &record,
+                false,
+                privileges_shown,
+                show_restrictions,
+            )?));
+        }
     }
     Ok(doc! { "roles": roles, "ok": 1.0 })
 }
@@ -539,6 +622,7 @@ pub fn roles_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 mod tests {
     use super::*;
     use crate::dispatch;
+    use crate::rbac;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
@@ -717,7 +801,7 @@ mod tests {
             &mut c,
         );
         assert_eq!(upd.get_f64("ok").unwrap(), 1.0);
-        let info = dispatch(&doc! {"rolesInfo": "r"}, &mut c);
+        let info = dispatch(&doc! {"rolesInfo": "r", "showPrivileges": true}, &mut c);
         let rec = info.get_array("roles").unwrap()[0]
             .as_document()
             .unwrap()
@@ -791,7 +875,7 @@ mod tests {
     }
 
     fn fetch(c: &mut CommandContext, name: &str) -> Document {
-        let info = dispatch(&doc! {"rolesInfo": name}, c);
+        let info = dispatch(&doc! {"rolesInfo": name, "showPrivileges": true}, c);
         info.get_array("roles").unwrap()[0]
             .as_document()
             .unwrap()
@@ -883,10 +967,29 @@ mod tests {
         assert!(fetch(&mut c, "r").get_array("roles").unwrap().is_empty());
     }
 
+    /// mongod 8.2.11: an empty `roles` is refused before anything is looked
+    /// up; a role that does not exist is `Role ghost@admin not found`.
     #[test]
     fn grant_to_missing_role_is_role_not_found() {
         let mut c = ctx();
-        let reply = dispatch(&doc! {"grantRolesToRole": "ghost", "roles": []}, &mut c);
+        let empty = dispatch(&doc! {"grantRolesToRole": "ghost", "roles": []}, &mut c);
+        assert_eq!(empty.get_i32("code").unwrap(), 2);
+        assert_eq!(
+            empty.get_str("errmsg").unwrap(),
+            "grantRolesToRole command requires a non-empty \"roles\" array"
+        );
+        dispatch(
+            &doc! {"createRole": "base", "privileges": [], "roles": []},
+            &mut c,
+        );
+        let reply = dispatch(
+            &doc! {"grantRolesToRole": "ghost", "roles": ["base"]},
+            &mut c,
+        );
         assert_eq!(reply.get_i32("code").unwrap(), ROLE_NOT_FOUND);
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "Role ghost@admin not found"
+        );
     }
 }

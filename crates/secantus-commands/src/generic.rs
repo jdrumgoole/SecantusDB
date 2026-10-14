@@ -23,7 +23,7 @@ use crate::CommandError;
 
 /// The fields mongod's parser takes on any command (`ping` given each name in
 /// turn, 8.2.11). `$db` is the wire's own.
-const GENERIC: &[&str] = &[
+pub(crate) const GENERIC: &[&str] = &[
     "$audit",
     "$client",
     "$clusterTime",

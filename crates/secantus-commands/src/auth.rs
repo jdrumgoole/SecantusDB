@@ -50,11 +50,12 @@ use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
 use secantus_auth::{
-    begin_scram_with, continue_scram, derive_credentials, derive_credentials_sha1, peek_username,
-    Mechanism, ScramState,
+    begin_scram_with, continue_scram, derive_credentials, derive_credentials_sha1,
+    derive_credentials_sha1_digested, peek_username, Mechanism, ScramState,
 };
 
-use crate::{rbac, CommandContext, CommandError, HandlerResult};
+use crate::umc::{self, Field};
+use crate::{CommandContext, CommandError, HandlerResult};
 
 /// The modern driver default.
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
@@ -230,43 +231,6 @@ fn lookup_creds(
         .ok()
     })();
     Ok(decoded)
-}
-
-/// The SCRAM mechanisms a user record names, in mongod's order
-/// (`["SCRAM-SHA-1", "SCRAM-SHA-256"]`), or both when it names none.
-fn scram_mechanisms_of(names: &[String]) -> Vec<Mechanism> {
-    let wanted: Vec<Mechanism> = [Mechanism::Sha1, Mechanism::Sha256]
-        .into_iter()
-        .filter(|m| names.iter().any(|n| n == m.name()))
-        .collect();
-    wanted
-}
-
-/// `credentials` entries for `mechanisms`, derived from `pwd`.
-fn scram_credentials(
-    username: &str,
-    pwd: &str,
-    mechanisms: &[Mechanism],
-    command: &str,
-) -> Result<Document, CommandError> {
-    let mut out = Document::new();
-    for mech in mechanisms {
-        let creds = match mech {
-            Mechanism::Sha1 => derive_credentials_sha1(username, pwd, None, None),
-            Mechanism::Sha256 => derive_credentials(pwd, None, None)
-                .map_err(|e| bad_value(format!("{command}: {e}")))?,
-        };
-        out.insert(
-            mech.name(),
-            doc! {
-                "iterationCount": creds.iteration_count as i32,
-                "salt": creds.salt_b64(),
-                "storedKey": creds.stored_key_b64(),
-                "serverKey": creds.server_key_b64(),
-            },
-        );
-    }
-    Ok(out)
 }
 
 /// The `roles` array (`[{role, db}, ...]`) stored on a user record, or `None`
@@ -446,9 +410,12 @@ fn verify_x509(
             "MONGODB-X509: no user found with name '{dn}' on '{db_name}'"
         )));
     };
+    // mongod's record of a `$external` user says `credentials: {external:
+    // true}`; records this server wrote before 2026-10-13 carry the
+    // mechanism's name instead.
     let has_x509 = record
         .get_document("credentials")
-        .map(|c| c.contains_key(MONGODB_X509))
+        .map(|c| c.contains_key(MONGODB_X509) || c.get_bool("external").unwrap_or(false))
         .unwrap_or(false);
     if !has_x509 {
         return Err(auth_failure(format!(
@@ -522,117 +489,214 @@ fn bad_value(msg: impl Into<String>) -> CommandError {
 /// `RoleNotFound`.
 const ROLE_NOT_FOUND: i32 = 31;
 
-/// Coerce a `roles` argument into the canonical `[{role, db}]` shape and
-/// validate each role name. Accepts the list-of-strings shorthand (each bound to
-/// `default_db`) and the list-of-docs form. A role validates if it's a built-in
-/// **or** a custom role that exists in storage (`get_role`); otherwise it's a
-/// `RoleNotFound` (31) error.
-fn normalise_roles(
-    arg: Option<&Bson>,
-    default_db: &str,
+/// The database a user command works on. mongod refuses the empty name
+/// (8.2.11) rather than reading it as `admin`.
+fn user_db(ctx: &CommandContext) -> Result<String, CommandError> {
+    if ctx.db_name.is_empty() {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            "Invalid database name: ''",
+        ));
+    }
+    Ok(ctx.db_name.clone())
+}
+
+/// `UserNotFound` in the wording the user commands share: `updateUser`
+/// (`User x@db not found`), `dropUser` (`User 'x@db' not found`) and the
+/// role grants (`Could not find user "x" for db "db"`) each have their own
+/// (8.2.11).
+fn user_not_found(message: String) -> CommandError {
+    CommandError::new(USER_NOT_FOUND, "UserNotFound", message)
+}
+
+/// Every role named must exist on its database, else mongod's
+/// `Could not find role: r@db` (31); `prefix` is what `createRole` and its
+/// kin put before that.
+fn roles_must_exist(
     ctx: &CommandContext,
-) -> Result<Vec<Bson>, CommandError> {
-    let items = match arg {
-        Some(Bson::Array(items)) => items,
-        None => return Ok(Vec::new()),
-        _ => return Err(bad_value("createUser: roles must be an array")),
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let (role, db) = match item {
-            Bson::String(role) => (role.clone(), default_db.to_string()),
-            Bson::Document(d) => {
-                let role = d
-                    .get_str("role")
-                    .map_err(|_| bad_value("createUser: role entry needs a string 'role'"))?;
-                let db = d.get_str("db").unwrap_or(default_db);
-                (role.to_string(), db.to_string())
-            }
-            _ => return Err(bad_value("createUser: roles must be strings or {role, db}")),
-        };
-        let known = rbac::is_known_role(&role)
-            || ctx
-                .storage()
-                .ok()
-                .and_then(|s| s.get_role(&db, &role).ok().flatten())
-                .is_some();
-        if !known {
+    roles: &[(String, String)],
+    prefix: &str,
+) -> Result<(), CommandError> {
+    for (role, db) in roles {
+        if !umc::role_exists(ctx, role, db)? {
             return Err(CommandError::new(
                 ROLE_NOT_FOUND,
                 "RoleNotFound",
-                format!("Role {role}@{db} not found"),
+                format!("{prefix}Could not find role: {role}@{db}"),
             ));
         }
-        out.push(Bson::Document(doc! { "role": role, "db": db }));
+    }
+    Ok(())
+}
+
+/// The SCRAM credentials `createUser` / `updateUser` build from `pwd`, in
+/// mongod's order and with mongod's refusals (8.2.11): an unknown mechanism,
+/// SCRAM-SHA-256 with a password the client digested, and an empty password
+/// (which mongod's SASLprep refuses with its UTF-8 preflight error).
+/// `requested` is the `mechanisms` field; absent means both SCRAMs.
+fn scram_credentials(
+    username: &str,
+    pwd: &str,
+    requested: Option<&[String]>,
+    digest_password: bool,
+) -> Result<Document, CommandError> {
+    let both = [SCRAM_SHA_1.to_string(), SCRAM_SHA_256.to_string()];
+    let requested = requested.unwrap_or(&both);
+    if let Some(unknown) = requested.iter().find(|m| Mechanism::from_name(m).is_none()) {
+        return Err(bad_value(format!("Unknown auth mechanism '{unknown}'")));
+    }
+    let wants_256 = requested.iter().any(|m| m == SCRAM_SHA_256);
+    if wants_256 && !digest_password {
+        return Err(bad_value(
+            "Use of SCRAM-SHA-256 requires undigested passwords",
+        ));
+    }
+    if wants_256 && pwd.is_empty() {
+        return Err(CommandError::new(
+            50687,
+            "Location50687",
+            "Error preflighting UTF-8 conversion: U_STRING_NOT_TERMINATED_WARNING",
+        ));
+    }
+    let mut out = Document::new();
+    for mech in [Mechanism::Sha1, Mechanism::Sha256] {
+        if !requested.iter().any(|m| m == mech.name()) {
+            continue;
+        }
+        let creds = match (mech, digest_password) {
+            (Mechanism::Sha1, true) => derive_credentials_sha1(username, pwd, None, None),
+            (Mechanism::Sha1, false) => derive_credentials_sha1_digested(pwd, None, None),
+            (Mechanism::Sha256, _) => {
+                derive_credentials(pwd, None, None).map_err(|e| bad_value(e.to_string()))?
+            }
+        };
+        out.insert(
+            mech.name(),
+            doc! {
+                "iterationCount": creds.iteration_count as i32,
+                "salt": creds.salt_b64(),
+                "storedKey": creds.stored_key_b64(),
+                "serverKey": creds.server_key_b64(),
+            },
+        );
     }
     Ok(out)
 }
 
-/// `createUser` — store a user record with SCRAM-SHA-256 and/or MONGODB-X509
-/// credentials. `mechanisms` selects which (default `["SCRAM-SHA-256"]`); a
-/// password is required only when a SCRAM mechanism is requested (an
-/// X509-only user authenticates by client cert, no password).
-pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let username = match doc.get_str("createUser") {
-        Ok(u) if !u.is_empty() => u.to_string(),
-        _ => return Err(bad_value("createUser: username (string) required")),
-    };
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
-    };
-    // Requested mechanisms -- by default BOTH SCRAMs, as mongod 8.2.11 creates
-    // (measured 2026-09-30); an unknown mechanism is dropped. Stored in mongod's
-    // order whatever order they were asked in.
-    let requested: Vec<String> = match doc.get_array("mechanisms") {
-        Ok(arr) if !arr.is_empty() => {
-            let asked: Vec<&str> = arr.iter().filter_map(|m| m.as_str()).collect();
-            [SCRAM_SHA_1, SCRAM_SHA_256, MONGODB_X509]
-                .into_iter()
-                .filter(|m| asked.contains(m))
-                .map(String::from)
-                .collect()
-        }
-        _ => vec![SCRAM_SHA_1.to_string(), SCRAM_SHA_256.to_string()],
-    };
-    if requested.is_empty() {
-        return Err(bad_value(format!(
-            "createUser: mechanisms must contain at least one of '{SCRAM_SHA_1}', \
-             '{SCRAM_SHA_256}', '{MONGODB_X509}'"
-        )));
-    }
-    let scram_mechs = scram_mechanisms_of(&requested);
-    let x509_requested = requested.iter().any(|m| m == MONGODB_X509);
-
-    let mut credentials = Document::new();
-    if !scram_mechs.is_empty() {
-        let pwd = match doc.get_str("pwd") {
-            Ok(p) if !p.is_empty() => p.to_string(),
-            _ => {
-                return Err(bad_value(
-                    "createUser: pwd (string) required when SCRAM mechanisms are requested",
-                ))
+/// The strings of a `mechanisms` field, deduplicated in order.
+fn mechanism_names(value: &Bson) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Bson::Array(items) = value {
+        for name in items.iter().filter_map(Bson::as_str) {
+            if !out.iter().any(|m| m == name) {
+                out.push(name.to_string());
             }
-        };
-        credentials = scram_credentials(&username, &pwd, &scram_mechs, "createUser")?;
+        }
     }
-    if x509_requested {
-        // The credential IS the cert presented at the TLS handshake; this
-        // sentinel marks the user as X509-capable (matches the Python marker).
-        credentials.insert(MONGODB_X509, "external");
-    }
+    out
+}
 
-    let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
-    let mechanisms: Vec<Bson> = requested.iter().map(|m| Bson::String(m.clone())).collect();
-    let record = doc! {
+/// A fresh `userId`: a UUID (BSON binary subtype 4), as mongod stamps on
+/// every user it creates.
+fn new_user_id() -> Bson {
+    Bson::Binary(Binary {
+        subtype: BinarySubtype::Uuid,
+        bytes: bson::Uuid::new().bytes().to_vec(),
+    })
+}
+
+/// Put `mechanisms` at the end of a record, from its credentials.
+fn restamp_mechanisms(record: &mut Document) {
+    record.remove("mechanisms");
+    record.insert("mechanisms", umc::mechanisms_of(record));
+}
+
+const CREATE_USER_FIELDS: &[(&str, Field, bool)] = &[
+    ("createUser", Field::Str, true),
+    ("pwd", Field::Str, false),
+    ("customData", Field::Obj, false),
+    ("roles", Field::RoleNames, true),
+    ("digestPassword", Field::SafeBool, false),
+    ("authenticationRestrictions", Field::Restrictions, false),
+    ("mechanisms", Field::StrArr, false),
+];
+
+/// `createUser`, checked in mongod's order (8.2.11): the fields' types, the
+/// database (`local` holds no users; `$external` users have no password,
+/// every other user must), the mechanisms and the password, the name, the
+/// restrictions, then the roles, each of which must exist on its database.
+/// The record is stored in mongod's own field order (see [`crate::umc`]).
+pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    umc::check_fields(doc, "createUser", CREATE_USER_FIELDS)?;
+    let db_name = user_db(ctx)?;
+    let username = doc.get_str("createUser").unwrap_or("").to_string();
+    if db_name == "local" {
+        return Err(bad_value("Cannot create users in the local database"));
+    }
+    let external = db_name == "$external";
+    let pwd = umc::given(doc, "pwd").and_then(Bson::as_str);
+    if external && pwd.is_some() {
+        return Err(bad_value(
+            "Cannot set the password for users defined on the '$external' database",
+        ));
+    }
+    let Some(pwd) = pwd.or(if external { Some("") } else { None }) else {
+        return Err(bad_value(
+            "Must provide a 'pwd' field for all user documents, except those with '$external' as \
+             the user's source db",
+        ));
+    };
+    let mechanisms = umc::given(doc, "mechanisms").map(mechanism_names);
+    if mechanisms.as_ref().is_some_and(|m| m.is_empty()) {
+        return Err(bad_value("mechanisms field must not be empty"));
+    }
+    let credentials = if external {
+        doc! { "external": true }
+    } else {
+        let digest = umc::given(doc, "digestPassword")
+            .and_then(crate::util::truthy_number_or_bool)
+            .unwrap_or(true);
+        scram_credentials(&username, pwd, mechanisms.as_deref(), digest)?
+    };
+    if username.is_empty() {
+        return Err(bad_value(
+            "User document needs 'user' field to be non-empty",
+        ));
+    }
+    let restrictions = umc::given(doc, "authenticationRestrictions")
+        .and_then(Bson::as_array)
+        .cloned();
+    if let Some(r) = &restrictions {
+        umc::validate_restrictions(r)?;
+    }
+    let roles = umc::parse_role_names(
+        umc::given(doc, "roles")
+            .and_then(Bson::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &db_name,
+    )?;
+    roles_must_exist(ctx, &roles, "")?;
+
+    let mut record = doc! {
         "_id": format!("{db_name}.{username}"),
+        "userId": new_user_id(),
         "user": &username,
         "db": &db_name,
         "credentials": credentials,
-        "roles": roles,
-        "mechanisms": mechanisms,
     };
+    if let Some(r) = restrictions {
+        record.insert("authenticationRestrictions", r);
+    }
+    if let Some(custom) = umc::given(doc, "customData") {
+        record.insert("customData", custom.clone());
+    }
+    record.insert(
+        "roles",
+        roles.iter().map(umc::role_name_doc).collect::<Vec<_>>(),
+    );
+    restamp_mechanisms(&mut record);
     let mut record_bytes = Vec::new();
     record
         .to_writer(&mut record_bytes)
@@ -658,25 +722,17 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// `dropUser` — remove a user record.
 pub fn drop_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let username = match doc.get_str("dropUser") {
-        Ok(u) if !u.is_empty() => u.to_string(),
-        _ => return Err(bad_value("dropUser: username (string) required")),
-    };
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
-    };
+    umc::check_fields(doc, "dropUser", &[("dropUser", Field::Str, true)])?;
+    let db_name = user_db(ctx)?;
+    let username = doc.get_str("dropUser").unwrap_or("").to_string();
     let removed = ctx
         .storage()?
         .drop_user(&db_name, &username)
         .map_err(crate::util::command_error)?;
     if !removed {
-        return Err(CommandError::new(
-            USER_NOT_FOUND,
-            "UserNotFound",
-            format!("User '{username}@{db_name}' not found"),
-        ));
+        return Err(user_not_found(format!(
+            "User '{username}@{db_name}' not found"
+        )));
     }
     // Drop any active auth state for this principal on the calling connection.
     if let Some(auth) = &ctx.conn_auth {
@@ -701,9 +757,8 @@ pub(crate) fn forget_database(ctx: &CommandContext) {
 }
 
 /// Rebuild the calling connection's effective roles from its authenticated
-/// principals' current records (after a role change). Mirrors
-/// `commands.py::_refresh_effective_roles`.
-fn refresh_effective_roles(ctx: &CommandContext) {
+/// principals' current records (after a role change).
+pub(crate) fn refresh_effective_roles(ctx: &CommandContext) {
     let Some(auth) = &ctx.conn_auth else { return };
     let Ok(mut auth) = auth.lock() else { return };
     let principals = auth.authenticated.clone();
@@ -715,102 +770,142 @@ fn refresh_effective_roles(ctx: &CommandContext) {
     }
 }
 
-/// `updateUser` — rotate the password and/or replace role bindings in place
-/// (without invalidating other connections, matching mongod). At least one of
-/// `pwd` / `roles` must be supplied.
-pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let username = match doc.get_str("updateUser") {
-        Ok(u) if !u.is_empty() => u.to_string(),
-        _ => return Err(bad_value("updateUser: username (string) required")),
-    };
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
-    };
-    let Some(bytes) = ctx
-        .storage()?
-        .get_user(&db_name, &username)
-        .map_err(crate::util::command_error)?
-    else {
-        return Err(CommandError::new(
-            USER_NOT_FOUND,
-            "UserNotFound",
-            format!("User '{username}@{db_name}' not found"),
-        ));
-    };
-    let mut record = secantus_core::bsondoc::from_bytes(bytes.as_slice())
-        .map_err(|e| CommandError::new(1, "InternalError", format!("decode user record: {e}")))?;
+const UPDATE_USER_FIELDS: &[(&str, Field, bool)] = &[
+    ("updateUser", Field::Str, true),
+    ("pwd", Field::Str, false),
+    ("customData", Field::Obj, false),
+    ("roles", Field::RoleNames, false),
+    ("digestPassword", Field::SafeBool, false),
+    ("authenticationRestrictions", Field::Restrictions, false),
+    ("mechanisms", Field::StrArr, false),
+];
 
-    let pwd = doc.get_str("pwd").ok();
-    let has_roles = doc.contains_key("roles");
-    if pwd.is_none() && !has_roles {
+/// `updateUser`, in mongod's order (8.2.11): at least one field to update;
+/// a new password rebuilds the credentials for the mechanisms named (both
+/// SCRAMs when none are); `mechanisms` alone keeps only those credentials,
+/// and must name ones the user has; the roles must exist; then the user
+/// must. A field the record lacks is added after the rest, which is where
+/// `usersInfo` then lists it. Other connections keep their sessions.
+pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    umc::check_fields(doc, "updateUser", UPDATE_USER_FIELDS)?;
+    let db_name = user_db(ctx)?;
+    let username = doc.get_str("updateUser").unwrap_or("").to_string();
+    let updates = [
+        "pwd",
+        "customData",
+        "roles",
+        "authenticationRestrictions",
+        "mechanisms",
+    ];
+    if !updates.iter().any(|f| umc::given(doc, f).is_some()) {
         return Err(bad_value(
-            "updateUser: nothing to update (supply pwd and/or roles)",
+            "Must specify at least one field to update in updateUser",
         ));
     }
+    let external = db_name == "$external";
+    let pwd = umc::given(doc, "pwd").and_then(Bson::as_str);
+    if external && pwd.is_some() {
+        return Err(bad_value(
+            "Cannot set the password for users defined on the '$external' database",
+        ));
+    }
+    let mechanisms = umc::given(doc, "mechanisms").map(mechanism_names);
+    let mut new_credentials = None;
+    let mut keep_only = None;
     if let Some(pwd) = pwd {
-        if pwd.is_empty() {
-            return Err(bad_value("updateUser: pwd must be a non-empty string"));
+        if mechanisms.as_ref().is_some_and(|m| m.is_empty()) {
+            return Err(bad_value("mechanisms field must not be empty"));
         }
-        // Re-derive for the SCRAMs the user already has (both, for a record
-        // that names none), and keep an X509 marker.
-        let names: Vec<String> = record
-            .get_array("mechanisms")
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m.as_str().map(String::from))
-                    .collect()
-            })
+        let digest = umc::given(doc, "digestPassword")
+            .and_then(crate::util::truthy_number_or_bool)
+            .unwrap_or(true);
+        new_credentials = Some(scram_credentials(
+            &username,
+            pwd,
+            mechanisms.as_deref(),
+            digest,
+        )?);
+    } else if let Some(requested) = mechanisms {
+        if requested.is_empty() {
+            return Err(bad_value("mechanisms field must not be empty"));
+        }
+        let Some(record) = lookup_user_doc(ctx, &db_name, &username) else {
+            return Err(user_not_found(format!(
+                "Could not find user \"{username}\" for db \"{db_name}\""
+            )));
+        };
+        let held = record
+            .get_document("credentials")
+            .cloned()
             .unwrap_or_default();
-        let mut mechs = scram_mechanisms_of(&names);
-        if mechs.is_empty() {
-            mechs = vec![Mechanism::Sha1, Mechanism::Sha256];
+        if requested.iter().any(|m| !held.contains_key(m)) {
+            return Err(bad_value(
+                "mechanisms field must be a subset of previously set mechanisms",
+            ));
         }
-        let mut credentials = scram_credentials(&username, pwd, &mechs, "updateUser")?;
-        if let Ok(old) = record.get_document("credentials") {
-            if let Some(x) = old.get(MONGODB_X509) {
-                credentials.insert(MONGODB_X509, x.clone());
-            }
+        if !requested.iter().any(|m| Mechanism::from_name(m).is_some()) {
+            return Err(bad_value(
+                "mechanisms field must contain at least one previously set known mechanism",
+            ));
         }
+        keep_only = Some(requested);
+    }
+    let restrictions = umc::given(doc, "authenticationRestrictions")
+        .and_then(Bson::as_array)
+        .cloned();
+    if let Some(r) = &restrictions {
+        umc::validate_restrictions(r)?;
+    }
+    let roles = match umc::given(doc, "roles").and_then(Bson::as_array) {
+        Some(items) => {
+            let roles = umc::parse_role_names(items, &db_name)?;
+            roles_must_exist(ctx, &roles, "")?;
+            Some(roles)
+        }
+        None => None,
+    };
+    let Some(mut record) = lookup_user_doc(ctx, &db_name, &username) else {
+        return Err(user_not_found(format!(
+            "User {username}@{db_name} not found"
+        )));
+    };
+
+    if let Some(credentials) = new_credentials {
         record.insert("credentials", credentials);
     }
-    if has_roles {
-        let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
-        record.insert("roles", roles);
+    if let Some(keep) = keep_only {
+        let mut held = record
+            .get_document("credentials")
+            .cloned()
+            .unwrap_or_default();
+        let dropped: Vec<String> = held.keys().filter(|k| !keep.contains(k)).cloned().collect();
+        for k in dropped {
+            held.remove(&k);
+        }
+        record.insert("credentials", held);
     }
-    let mut new_bytes = Vec::new();
-    record
-        .to_writer(&mut new_bytes)
-        .map_err(|e| CommandError::new(1, "InternalError", format!("encode user record: {e}")))?;
-    ctx.storage()?
-        .add_user(&db_name, &username, &new_bytes, true)
-        .map_err(crate::util::command_error)?;
-    if has_roles {
+    if let Some(custom) = umc::given(doc, "customData") {
+        record.insert("customData", custom.clone());
+    }
+    if let Some(roles) = &roles {
+        record.insert(
+            "roles",
+            roles.iter().map(umc::role_name_doc).collect::<Vec<_>>(),
+        );
+    }
+    if let Some(r) = restrictions {
+        if r.is_empty() {
+            record.remove("authenticationRestrictions");
+        } else {
+            record.insert("authenticationRestrictions", r);
+        }
+    }
+    restamp_mechanisms(&mut record);
+    save_user_record(ctx, &db_name, &username, &record)?;
+    if roles.is_some() {
         refresh_effective_roles(ctx);
     }
     Ok(doc! { "ok": 1.0 })
-}
-
-/// Load and decode a user record, or return `UserNotFound`.
-fn load_user_record(
-    ctx: &mut CommandContext,
-    db_name: &str,
-    username: &str,
-) -> Result<Document, CommandError> {
-    let Some(bytes) = ctx
-        .storage()?
-        .get_user(db_name, username)
-        .map_err(crate::util::command_error)?
-    else {
-        return Err(CommandError::new(
-            USER_NOT_FOUND,
-            "UserNotFound",
-            format!("User '{username}@{db_name}' not found"),
-        ));
-    };
-    secantus_core::bsondoc::from_bytes(bytes.as_slice())
-        .map_err(|e| CommandError::new(1, "InternalError", format!("decode user record: {e}")))
 }
 
 /// Re-encode a user record and persist it (overwriting the existing one).
@@ -830,86 +925,115 @@ fn save_user_record(
     Ok(())
 }
 
-/// `(role, db)` identity of a role-assignment entry, for dedup / set membership.
-fn role_pair(b: &Bson) -> Option<(String, String)> {
-    let d = b.as_document()?;
-    Some((
-        d.get_str("role").ok()?.to_string(),
-        d.get_str("db").ok()?.to_string(),
-    ))
-}
-
-/// `grantRolesToUser` — add roles to a user's assignment list (deduped by
-/// `(role, db)`), taking effect immediately on the calling connection. Mirrors
-/// the Python `grantRolesToUser` command.
-pub fn grant_roles_to_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let username = match doc.get_str("grantRolesToUser") {
-        Ok(u) if !u.is_empty() => u.to_string(),
-        _ => return Err(bad_value("grantRolesToUser: username (string) required")),
-    };
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
-    };
-    // Validate the requested roles (RoleNotFound) before touching the user.
-    let additions = normalise_roles(doc.get("roles"), &db_name, ctx)?;
-    let mut record = load_user_record(ctx, &db_name, &username)?;
-
-    let mut roles: Vec<Bson> = record.get_array("roles").cloned().unwrap_or_default();
-    let mut seen: Vec<(String, String)> = roles.iter().filter_map(role_pair).collect();
-    for add in additions {
-        if let Some(pair) = role_pair(&add) {
-            if !seen.contains(&pair) {
-                seen.push(pair);
-                roles.push(add);
-            }
+/// Pull `(role, db)` out of every user that holds it, on every database:
+/// what `dropRole` does to users (8.2.11).
+pub(crate) fn remove_role_from_users(
+    ctx: &mut CommandContext,
+    role: &(String, String),
+) -> Result<(), CommandError> {
+    let records = ctx
+        .storage()?
+        .list_users(None, 0, 0)
+        .map_err(crate::util::command_error)?;
+    for bytes in records {
+        let Ok(mut record) = secantus_core::bsondoc::from_bytes(bytes.as_slice()) else {
+            continue;
+        };
+        let (Ok(db), Ok(user)) = (
+            record.get_str("db").map(String::from),
+            record.get_str("user").map(String::from),
+        ) else {
+            continue;
+        };
+        let Ok(roles) = record.get_array("roles").cloned() else {
+            continue;
+        };
+        let kept: Vec<Bson> = roles
+            .iter()
+            .filter(|r| umc::role_pairs(std::slice::from_ref(r)).first() != Some(role))
+            .cloned()
+            .collect();
+        if kept.len() != roles.len() {
+            record.insert("roles", kept);
+            save_user_record(ctx, &db, &user, &record)?;
         }
     }
-    record.insert("roles", roles);
+    Ok(())
+}
+
+/// `grantRolesToUser` / `revokeRolesFromUser` share one parse and one
+/// order of checks (8.2.11): a non-empty `roles`, the user, then every role
+/// named must exist -- a revoke of a role the user never held is fine, of
+/// one that does not exist is not.
+fn change_user_roles(
+    doc: &Document,
+    ctx: &mut CommandContext,
+    command: &str,
+    grant: bool,
+) -> HandlerResult {
+    umc::check_fields(
+        doc,
+        command,
+        &[
+            (command, Field::Str, true),
+            ("roles", Field::RoleNames, true),
+        ],
+    )?;
+    let db_name = user_db(ctx)?;
+    let username = doc.get_str(command).unwrap_or("").to_string();
+    let items = doc.get_array("roles").cloned().unwrap_or_default();
+    if items.is_empty() {
+        return Err(bad_value(format!(
+            "{command} command requires a non-empty \"roles\" array"
+        )));
+    }
+    let changes = umc::parse_role_names(&items, &db_name)?;
+    let Some(mut record) = lookup_user_doc(ctx, &db_name, &username) else {
+        return Err(user_not_found(format!(
+            "Could not find user \"{username}\" for db \"{db_name}\""
+        )));
+    };
+    roles_must_exist(ctx, &changes, "")?;
+    let held = record.get_array("roles").cloned().unwrap_or_default();
+    let mut pairs = umc::role_pairs(&held);
+    if grant {
+        for pair in changes {
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+    } else {
+        pairs.retain(|p| !changes.contains(p));
+    }
+    record.insert(
+        "roles",
+        pairs.iter().map(umc::role_name_doc).collect::<Vec<_>>(),
+    );
     save_user_record(ctx, &db_name, &username, &record)?;
     refresh_effective_roles(ctx);
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `revokeRolesFromUser` — remove roles from a user's assignment list (matched
-/// by `(role, db)`), taking effect immediately on the calling connection.
-/// Mirrors the Python `revokeRolesFromUser` command.
+/// `grantRolesToUser` — add roles to a user, taking effect at once on the
+/// calling connection.
+pub fn grant_roles_to_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    change_user_roles(doc, ctx, "grantRolesToUser", true)
+}
+
+/// `revokeRolesFromUser` — take roles from a user.
 pub fn revoke_roles_from_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let username = match doc.get_str("revokeRolesFromUser") {
-        Ok(u) if !u.is_empty() => u.to_string(),
-        _ => return Err(bad_value("revokeRolesFromUser: username (string) required")),
-    };
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
-    };
-    let revocations = normalise_roles(doc.get("roles"), &db_name, ctx)?;
-    let mut record = load_user_record(ctx, &db_name, &username)?;
-
-    let drop_set: Vec<(String, String)> = revocations.iter().filter_map(role_pair).collect();
-    let kept: Vec<Bson> = record
-        .get_array("roles")
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| role_pair(r).map(|p| !drop_set.contains(&p)).unwrap_or(true))
-        .collect();
-    record.insert("roles", kept);
-    save_user_record(ctx, &db_name, &username, &record)?;
-    refresh_effective_roles(ctx);
-    Ok(doc! { "ok": 1.0 })
+    change_user_roles(doc, ctx, "revokeRolesFromUser", false)
 }
 
-/// `dropAllUsersFromDatabase` — drop every user bound to the calling db; returns
-/// `n` = removed count.
-pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
-    };
+/// `dropAllUsersFromDatabase` — drop every user of the calling db; answers
+/// `{n, ok}` in that order, as mongod does.
+pub fn drop_all_users_from_database(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    umc::check_fields(
+        doc,
+        "dropAllUsersFromDatabase",
+        &[("dropAllUsersFromDatabase", Field::Any, false)],
+    )?;
+    let db_name = user_db(ctx)?;
     let storage = ctx.storage()?;
     let mut removed = 0_i32;
     loop {
@@ -940,118 +1064,160 @@ pub fn drop_all_users_from_database(_doc: &Document, ctx: &mut CommandContext) -
         auth.authenticated.retain(|(d, _)| d != &db_name);
     }
     refresh_effective_roles(ctx);
-    Ok(doc! { "ok": 1.0, "n": removed })
+    Ok(doc! { "n": removed, "ok": 1.0 })
 }
 
-/// `usersInfo` — list user records (optionally with credentials).
+/// mongod's `BSONElement::trueValue`: what `{forAllDBs: v}` means.
+fn true_value(value: &Bson) -> bool {
+    match value {
+        Bson::Null | Bson::Undefined => false,
+        other => crate::util::truthy_number_or_bool(other).unwrap_or(true),
+    }
+}
+
+/// The users `usersInfo` names, looked up one by one. A name that matches
+/// nothing is skipped.
+fn named_users(
+    ctx: &CommandContext,
+    arg: &Bson,
+    db_name: &str,
+) -> Result<Vec<Document>, CommandError> {
+    let storage = ctx.storage()?;
+    let items: Vec<&Bson> = match arg {
+        Bson::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    let mut out: Vec<Document> = Vec::new();
+    for item in items {
+        let (user, db) = match item {
+            Bson::String(name) => (name.as_str(), db_name),
+            Bson::Document(spec) => match spec.get_str("user") {
+                Ok(u) => (u, spec.get_str("db").unwrap_or(db_name)),
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        if let Some(bytes) = storage
+            .get_user(db, user)
+            .map_err(crate::util::command_error)?
+        {
+            let record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
+                CommandError::new(1, "InternalError", format!("decode user record: {e}"))
+            })?;
+            if !out.iter().any(|r| r.get("_id") == record.get("_id")) {
+                out.push(record);
+            }
+        }
+    }
+    Ok(out)
+}
+
+const USERS_INFO_FIELDS: &[(&str, Field, bool)] = &[
+    ("usersInfo", Field::Any, false),
+    ("showCredentials", Field::SafeBool, false),
+    ("showCustomData", Field::SafeBool, false),
+    ("showPrivileges", Field::SafeBool, false),
+    ("showAuthenticationRestrictions", Field::SafeBool, false),
+    ("filter", Field::Obj, false),
+];
+
+/// `usersInfo` (8.2.11). Without privilege details it is a query: the
+/// users asked for, filtered by `filter`, sorted by user then database,
+/// each in its stored field order with `mechanisms` last. With
+/// `showPrivileges` or `showAuthenticationRestrictions` it is a description
+/// of each named user in the order named, which no `1`, `forAllDBs` or
+/// `filter` may ask for.
 pub fn users_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let exact = crate::serverinfo::principal_argument(doc.get("usersInfo"), "UserName", "user")?;
-    let mut detail = false;
-    for option in ["showCredentials", "showCustomData"] {
-        crate::serverinfo::flag(doc, "usersInfo", option)?;
-    }
-    for option in ["showPrivileges", "showAuthenticationRestrictions"] {
-        detail |= crate::serverinfo::flag(doc, "usersInfo", option)?;
-    }
-    if detail && !exact {
+    umc::check_fields(doc, "usersInfo", USERS_INFO_FIELDS)?;
+    let exact =
+        crate::serverinfo::principal_argument(doc.get("usersInfo"), "UserName", "user", true)?;
+    let flag = |name: &str| {
+        umc::given(doc, name)
+            .and_then(crate::util::truthy_number_or_bool)
+            .unwrap_or(false)
+    };
+    let show_credentials = flag("showCredentials");
+    let show_custom_data = umc::given(doc, "showCustomData")
+        .and_then(crate::util::truthy_number_or_bool)
+        .unwrap_or(true);
+    let detail = flag("showPrivileges") || flag("showAuthenticationRestrictions");
+    let filter = umc::given(doc, "filter").and_then(Bson::as_document);
+    if detail && (!exact || filter.is_some()) {
         return Err(CommandError::new(
             20,
             "IllegalOperation",
             "Privilege or restriction details require exact-match usersInfo queries",
         ));
     }
-    if let Some(filter) = doc.get("filter") {
-        if !matches!(filter, Bson::Document(_) | Bson::Null) {
-            return Err(CommandError::new(
-                14,
-                "TypeMismatch",
-                format!(
-                    "BSON field 'usersInfo.filter' is the wrong type '{}', expected type \
-                     'object'",
-                    secantus_core::query::bson_type_name(filter)
-                ),
-            ));
+    let db_name = user_db(ctx)?;
+    let arg = doc.get("usersInfo").cloned().unwrap_or(Bson::Int32(1));
+
+    if detail {
+        let mut users = Vec::new();
+        for record in named_users(ctx, &arg, &db_name)? {
+            users.push(Bson::Document(umc::user_detail(
+                ctx,
+                &record,
+                show_credentials,
+                show_custom_data,
+                flag("showAuthenticationRestrictions"),
+            )?));
         }
+        return Ok(doc! { "users": users, "ok": 1.0 });
     }
-    let db_name = if ctx.db_name.is_empty() {
-        "admin".to_string()
-    } else {
-        ctx.db_name.clone()
+
+    let records: Vec<Document> = match &arg {
+        Bson::Array(items) if items.is_empty() => {
+            return Err(bad_value("$or argument must be a non-empty array"));
+        }
+        Bson::Document(spec) if spec.get("forAllDBs").is_some_and(true_value) => ctx
+            .storage()?
+            .list_users(None, 0, 0)
+            .map_err(crate::util::command_error)?
+            .iter()
+            .filter_map(|bytes| secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok())
+            .collect(),
+        Bson::String(_) | Bson::Document(_) | Bson::Array(_) => named_users(ctx, &arg, &db_name)?,
+        _ => ctx
+            .storage()?
+            .list_users(Some(&db_name), 0, 0)
+            .map_err(crate::util::command_error)?
+            .iter()
+            .filter_map(|bytes| secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok())
+            .collect(),
     };
-    let show_credentials = doc.get_bool("showCredentials").unwrap_or(false);
-    let storage = ctx.storage()?;
-
-    // Resolve the requested principal records per the `usersInfo` argument form.
-    let mut raw: Vec<Vec<u8>> = Vec::new();
-    match doc.get("usersInfo") {
-        // `{usersInfo: 1}` / `{usersInfo: true}` ⇒ all users in this db.
-        Some(Bson::Int32(1))
-        | Some(Bson::Int64(1))
-        | Some(Bson::Double(_))
-        | Some(Bson::Boolean(true)) => {
-            raw = storage
-                .list_users(Some(&db_name), 0, 0)
-                .map_err(crate::util::command_error)?;
-        }
-        // `{usersInfo: "name"}` ⇒ a single named user in this db.
-        Some(Bson::String(name)) => {
-            if let Some(r) = storage
-                .get_user(&db_name, name)
-                .map_err(crate::util::command_error)?
-            {
-                raw.push(r);
+    let mut users: Vec<Document> = records
+        .iter()
+        .map(|r| umc::user_summary(r, show_credentials, show_custom_data))
+        .collect();
+    if let Some(filter) = filter {
+        let mut kept = Vec::with_capacity(users.len());
+        for user in users {
+            match secantus_core::query::matches(&user, filter, &Document::new(), None) {
+                Ok(true) => kept.push(user),
+                Ok(false) => {}
+                Err(secantus_core::fallback::Fallback::Mongo { code, message, .. }) => {
+                    return Err(CommandError::new(
+                        code,
+                        crate::util::error_code_name(code),
+                        message,
+                    ))
+                }
+                Err(_) => return Err(bad_value("usersInfo: filter is not supported")),
             }
         }
-        // `{usersInfo: {forAllDBs: true}}` ⇒ every user in every database. It
-        // fell into the principal arm below, found no `user`, and answered
-        // `[]` whatever was stored.
-        Some(Bson::Document(spec)) if spec.get_bool("forAllDBs").unwrap_or(false) => {
-            raw = storage
-                .list_users(None, 0, 0)
-                .map_err(crate::util::command_error)?;
-        }
-        // `{usersInfo: {user, db}}` ⇒ a single fully-qualified principal.
-        Some(Bson::Document(spec)) => {
-            if let Ok(u) = spec.get_str("user") {
-                let d = spec.get_str("db").unwrap_or(&db_name);
-                if let Some(r) = storage.get_user(d, u).map_err(crate::util::command_error)? {
-                    raw.push(r);
-                }
-            }
-        }
-        // `{usersInfo: [ ... ]}` ⇒ a list of names / principals.
-        Some(Bson::Array(items)) => {
-            for item in items {
-                let rec = match item {
-                    Bson::String(name) => storage.get_user(&db_name, name),
-                    Bson::Document(spec) => match spec.get_str("user") {
-                        Ok(u) => {
-                            let d = spec.get_str("db").unwrap_or(&db_name);
-                            storage.get_user(d, u)
-                        }
-                        Err(_) => Ok(None),
-                    },
-                    _ => Ok(None),
-                }
-                .map_err(crate::util::command_error)?;
-                if let Some(r) = rec {
-                    raw.push(r);
-                }
-            }
-        }
-        _ => {}
+        users = kept;
     }
-
-    let mut users = Vec::with_capacity(raw.len());
-    for bytes in raw {
-        let mut record = secantus_core::bsondoc::from_bytes(bytes.as_slice()).map_err(|e| {
-            CommandError::new(1, "InternalError", format!("decode user record: {e}"))
-        })?;
-        if !show_credentials {
-            record.remove("credentials");
-        }
-        users.push(Bson::Document(record));
-    }
+    users.sort_by(|a, b| {
+        let key = |u: &Document| {
+            (
+                u.get_str("user").unwrap_or("").to_string(),
+                u.get_str("db").unwrap_or("").to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    let users: Vec<Bson> = users.into_iter().map(Bson::Document).collect();
     Ok(doc! { "users": users, "ok": 1.0 })
 }
 
@@ -1207,11 +1373,8 @@ mod tests {
 
     /// A user's current `(role, db)` assignments, sorted, for assertions.
     fn user_role_pairs(ctx: &CommandContext, user: &str) -> Vec<(String, String)> {
-        let mut pairs: Vec<(String, String)> = lookup_roles(ctx, "admin", user)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(role_pair)
-            .collect();
+        let mut pairs: Vec<(String, String)> =
+            umc::role_pairs(&lookup_roles(ctx, "admin", user).unwrap_or_default());
         pairs.sort();
         pairs
     }
@@ -1621,40 +1784,56 @@ mod tests {
         assert_eq!(started.get_f64("ok").unwrap(), 1.0);
     }
 
+    /// mongod 8.2.11: an X509 user lives on `$external`, takes no password
+    /// there (and must have one anywhere else), and `usersInfo` says its
+    /// credentials are `{external: true}` and its mechanisms `["external"]`.
     #[test]
     fn x509_create_user_needs_no_password() {
         let (mut ctx, _auth) = ctx_with_store();
-        // X509-only user: no pwd required.
+        let on_admin = dispatch(
+            &doc! {"createUser": "CN=alice", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(
+            on_admin.get_str("errmsg").unwrap(),
+            "Must provide a 'pwd' field for all user documents, except those with '$external' \
+             as the user's source db"
+        );
+        ctx.db_name = "$external".to_string();
         let reply = dispatch(
             &doc! {
                 "createUser": "CN=alice",
                 "mechanisms": [MONGODB_X509],
                 "roles": [{"role": "readWrite", "db": "app"}],
-                "$db": "admin",
+                "$db": "$external",
             },
             &mut ctx,
         );
         assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "{reply:?}");
-        // The stored record carries the X509 credential marker.
         let info = dispatch(
-            &doc! {"usersInfo": "CN=alice", "showCredentials": true, "$db": "admin"},
+            &doc! {"usersInfo": "CN=alice", "showCredentials": true, "$db": "$external"},
             &mut ctx,
         );
-        let creds = info.get_array("users").unwrap()[0]
+        let user = info.get_array("users").unwrap()[0]
             .as_document()
             .unwrap()
-            .get_document("credentials")
-            .unwrap()
             .clone();
-        assert!(creds.contains_key(MONGODB_X509));
-        assert!(!creds.contains_key(SCRAM_SHA_256));
+        assert_eq!(
+            user.get_document("credentials").unwrap(),
+            &doc! {"external": true}
+        );
+        assert_eq!(
+            user.get_array("mechanisms").unwrap(),
+            &vec![Bson::String("external".into())]
+        );
     }
 
     #[test]
     fn x509_saslstart_authenticates_with_matching_cert() {
         let (mut ctx, _auth) = ctx_with_store();
+        ctx.db_name = "$external".to_string();
         dispatch(
-            &doc! {"createUser": "CN=bob", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &doc! {"createUser": "CN=bob", "mechanisms": [MONGODB_X509], "roles": [], "$db": "$external"},
             &mut ctx,
         );
         // No client cert → auth failure.
@@ -1690,8 +1869,9 @@ mod tests {
         assert_eq!(reply.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
 
         // Payload-claimed username mismatching the cert DN is rejected.
+        ctx.db_name = "$external".to_string();
         dispatch(
-            &doc! {"createUser": "CN=dave", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &doc! {"createUser": "CN=dave", "mechanisms": [MONGODB_X509], "roles": [], "$db": "$external"},
             &mut ctx,
         );
         ctx.peer_cert_dn = Some("CN=dave".to_string());
@@ -1705,8 +1885,9 @@ mod tests {
     #[test]
     fn x509_legacy_authenticate_command() {
         let (mut ctx, _auth) = ctx_with_store();
+        ctx.db_name = "$external".to_string();
         dispatch(
-            &doc! {"createUser": "CN=erin", "mechanisms": [MONGODB_X509], "roles": [], "$db": "admin"},
+            &doc! {"createUser": "CN=erin", "mechanisms": [MONGODB_X509], "roles": [], "$db": "$external"},
             &mut ctx,
         );
         ctx.peer_cert_dn = Some("CN=erin".to_string());
