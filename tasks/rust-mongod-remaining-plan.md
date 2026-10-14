@@ -85,12 +85,12 @@ Wording and reply-shape differences are in Phase 5.
 **1a. Stores written by an older build, or by the other server.** Each of
 these is a silent wrong answer from data already on disk:
 
-- [ ] A geo index built before 2026-10-13 holds no entry for a value with
+- [x] A geo index built before 2026-10-13 holds no entry for a value with
       several locations, or for a point written as a document other than
       `{lng, lat}`. Queries through it miss those documents (7.081).
-- [ ] A collated index the Rust server built before 2026-10-10 has no
+- [x] A collated index the Rust server built before 2026-10-10 has no
       `collationKeys` marker and keeps comparing by value (7.070).
-- [ ] Collated `_id`: a collection created before 2026-10-11 has no claims
+- [x] Collated `_id`: a collection created before 2026-10-11 has no claims
       for its existing documents, so a second spelling of one of their
       `_id`s is accepted (7.070).
 
@@ -98,7 +98,15 @@ these is a silent wrong answer from data already on disk:
   Then either refuse it, as an outdated `entryFormat` is refused, or rebuild
   it, rather than leaving the user to drop it.
 
-- [ ] **The format the two servers share.** The Rust server writes ICU4X
+  **Done 2026-10-14:** rebuilt. Each server marks the collated and geo
+  indexes it builds (`collationKeys` / `geoKeys`, `pythonKeys`) and rebuilds
+  one without its own marker at open; an index the documents no longer allow
+  refuses the open, naming it. The Rust server claims every stored `_id`
+  under its collection's collation once per store, and the Python server
+  clears that record when it opens a store, so the walk runs again after it.
+  `tests/test_rust_store_handoff.py` hands a store Rust -> Python -> Rust.
+
+- [x] **The format the two servers share.** The Rust server writes ICU4X
       sort keys into a collated index; the Python server writes its own
       folded strings and does not know the marker. A store handed from one
       server to the other gets wrong answers from that index (7.070). The

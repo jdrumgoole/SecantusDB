@@ -881,7 +881,15 @@ def _restore_savepoint_indexes(storage: Any, db: str, wanted: dict[str, list]) -
             key_spec = entry.pop("key", None)
             if not key_spec:
                 continue
-            for drop in ("v", "name", "multikey", "entryFormat"):
+            for drop in (
+                "v",
+                "name",
+                "multikey",
+                "entryFormat",
+                "collationKeys",
+                "geoKeys",
+                "pythonKeys",
+            ):
                 entry.pop(drop, None)
             with contextlib.suppress(Exception):
                 storage.create_index(db, coll, name, key_spec, entry or None)

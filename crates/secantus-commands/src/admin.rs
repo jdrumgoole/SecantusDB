@@ -1689,6 +1689,8 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ix.remove("multikey");
         ix.remove("entryFormat");
         ix.remove("collationKeys");
+        ix.remove("geoKeys");
+        ix.remove("pythonKeys");
     }
     // The `_id` index of a collection with a default collation carries it.
     if let Some(default) = crate::util::default_collation(storage, &ctx.db_name, &coll) {
@@ -2848,7 +2850,13 @@ fn equivalent_spec_text(spec: &Document) -> String {
 /// The options that make two index specs different indexes.
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
-pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &["entryFormat", "multikey", "collationKeys"];
+pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
+    "entryFormat",
+    "multikey",
+    "collationKeys",
+    "geoKeys",
+    "pythonKeys",
+];
 
 fn index_options(spec: &Document) -> Document {
     spec.iter()
