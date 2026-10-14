@@ -8,8 +8,8 @@
 //! one per resource, actions in mongod's order -- see [`crate::privileges`])
 //! and the `roles` it holds, stored as opaque BSON in the role table
 //! (`Storage::add_role` / `get_role` / `drop_role` / `list_roles`). The
-//! dispatcher's RBAC check expands them through
-//! [`crate::rbac::check_privilege_resolved`].
+//! dispatcher's privilege check expands them through [`crate::umc::inherit`]
+//! (see [`crate::rbac`]).
 //!
 //! Stored record shape (identical to the Python server's, so both share the
 //! role table):
@@ -622,7 +622,6 @@ pub fn roles_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 mod tests {
     use super::*;
     use crate::dispatch;
-    use crate::rbac;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
@@ -815,9 +814,9 @@ mod tests {
     }
 
     #[test]
-    fn custom_role_privilege_check_via_resolver() {
-        // Build a role record and verify check_privilege_resolved honours it,
-        // including inheritance.
+    fn custom_role_privileges_are_inherited() {
+        // A role's privileges, and those of the roles it holds, reach the
+        // user through the graph.
         let mut c = ctx();
         dispatch(
             &doc! {
@@ -835,35 +834,29 @@ mod tests {
             },
             &mut c,
         );
-        let storage = c.storage().unwrap();
-        let resolver = |db: &str, role: &str| -> Option<Document> {
-            let bytes = storage.get_role(db, role).ok()??;
-            secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok()
+        let app_c = crate::privileges::Resource::Ns {
+            db: "app".into(),
+            collection: "c".into(),
+        };
+        let other_c = crate::privileges::Resource::Ns {
+            db: "other".into(),
+            collection: "c".into(),
+        };
+        let holding = |role: &str| {
+            let inherited =
+                crate::umc::inherit(&c, &[(role.to_string(), "admin".to_string())]).unwrap();
+            crate::rbac::Authz {
+                principals: Vec::new(),
+                roles: Vec::new(),
+                privileges: inherited.privileges,
+            }
         };
         // direct grant
-        assert!(rbac::check_privilege_resolved(
-            &[("writer".into(), "admin".into())],
-            rbac::A_INSERT,
-            Some("app"),
-            false,
-            Some(&resolver),
-        ));
-        // inherited grant (super → writer)
-        assert!(rbac::check_privilege_resolved(
-            &[("super".into(), "admin".into())],
-            rbac::A_INSERT,
-            Some("app"),
-            false,
-            Some(&resolver),
-        ));
+        assert!(holding("writer").is_authorized(&app_c, &["insert"]));
+        // inherited grant (super -> writer)
+        assert!(holding("super").is_authorized(&app_c, &["insert"]));
         // not granted on a different db
-        assert!(!rbac::check_privilege_resolved(
-            &[("writer".into(), "admin".into())],
-            rbac::A_INSERT,
-            Some("other"),
-            false,
-            Some(&resolver),
-        ));
+        assert!(!holding("writer").is_authorized(&other_c, &["insert"]));
     }
 
     fn privileges(rec: &Document) -> Vec<Document> {

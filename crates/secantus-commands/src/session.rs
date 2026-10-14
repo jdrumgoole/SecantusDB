@@ -240,6 +240,16 @@ pub(crate) fn run(
         lsid,
         txn_number: env.txn_number.filter(|_| env.in_txn),
     });
+    let users = ctx
+        .conn_auth
+        .as_ref()
+        .map(|a| {
+            a.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .authenticated
+                .clone()
+        })
+        .unwrap_or_default();
     // A transaction statement's writes name the transaction in the oplog,
     // by the logical session as mongod records it: the id the client sent
     // and the SHA-256 of the user, which is of the empty string for none.
@@ -262,7 +272,8 @@ pub(crate) fn run(
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(txn_session);
     }
-    let reply = crate::cursors::with_owner(owner, || run_checked(name, handler, doc, ctx, &env));
+    let reply =
+        crate::cursors::with_opener(owner, users, || run_checked(name, handler, doc, ctx, &env));
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(None);
     }
@@ -494,10 +505,23 @@ fn statement_refusal(
     None
 }
 
+/// The `uid` of a logical session as mongod stamps it: the SHA-256 of
+/// `user@db` for the one authenticated user, of the empty string for none.
+pub(crate) fn user_digest(users: &[(String, String)]) -> Vec<u8> {
+    use sha2::Digest;
+    match users {
+        [(db, user)] => sha2::Sha256::digest(format!("{user}@{db}").as_bytes()).to_vec(),
+        _ => sha2::Sha256::digest(b"").to_vec(),
+    }
+}
+
 /// Why a `getMore` may not read its cursor: a cursor is read only by the
-/// session, and the transaction, that opened it.
+/// user, the session and the transaction that opened it.
 fn cursor_problem(doc: &Document, ctx: &CommandContext, env: &Envelope) -> Option<CommandError> {
     let id = doc.get("getMore").and_then(crate::util::as_i64)?;
+    if let Some(e) = crate::cursors::user_problem(id, ctx) {
+        return Some(e);
+    }
     let opened_by = ctx.cursors.as_ref()?.owner(id)?;
     let refuse = |code: i32, rest: String| {
         Some(CommandError::new(

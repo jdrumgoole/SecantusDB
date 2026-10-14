@@ -118,6 +118,9 @@ pub struct ServerParams {
     /// exists -- deleting every user does not reopen it until a restart
     /// (measured 8.2.11, 2026-09-30).
     users_seen: std::sync::atomic::AtomicBool,
+    /// Bumped by every user and role command, so that a connection's cached
+    /// effective privileges (`rbac::effective`) are recomputed after one.
+    user_cache_generation: std::sync::atomic::AtomicU64,
     /// The sessions commands have come in, each with when it was last used:
     /// what `$listLocalSessions` lists. One unused for the session timeout
     /// (30 minutes) is forgotten.
@@ -127,6 +130,18 @@ pub struct ServerParams {
 impl ServerParams {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A user or role changed: every connection recomputes its privileges
+    /// on its next command (mongod's `invalidateUserCache`).
+    pub fn invalidate_user_cache(&self) {
+        self.user_cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn user_cache_generation(&self) -> u64 {
+        self.user_cache_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record that a user exists (see `users_seen`).

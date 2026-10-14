@@ -197,6 +197,19 @@ impl PrivilegeSet {
         }
     }
 
+    /// The actions held on exactly this resource pattern, if any.
+    pub(crate) fn actions_on(&self, resource: &Resource) -> Option<&[String]> {
+        self.0
+            .iter()
+            .find(|p| &p.resource == resource)
+            .map(|p| p.actions.as_slice())
+    }
+
+    /// The resource patterns privileges are held on.
+    pub(crate) fn resources(&self) -> impl Iterator<Item = &Resource> {
+        self.0.iter().map(|p| &p.resource)
+    }
+
     pub(crate) fn to_bson(&self) -> Vec<Bson> {
         self.0.iter().map(|p| Bson::Document(p.to_bson())).collect()
     }
