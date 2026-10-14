@@ -4562,13 +4562,6 @@ These work end-to-end but cut corners.
       server. **The libpq scenarios
       (`attempt`) do not retry**; none has shown the race, and libpq
       reports the alert it read before the close.
-    - `pg_login_options.py` failed once in CI, 218 of 219 (2026-10-14,
-      `pg-oracle` on PR #1945, a MongoDB version bump): its `stat others`
-      step counts TLS sessions in `pg_stat_ssl`, and PostgreSQL 15.19
-      counted 3 where this server counted 1, because sessions the probe
-      had just closed were still listed by the reference server. It passed
-      on a rerun. The step should count only its own session, or wait for
-      the others to end.
     - The TLS gauge run has a task and a CI lane since 2026-10-12:
       `./inv validate-psycopg-rust --tls` runs the plain gauge and then the
       TLS one, and `.github/workflows/psycopg-tls.yml` does the same on
@@ -5116,29 +5109,43 @@ These are explicit non-goals. Don't add them without a reason.
       here is said of them. Re-run it before working an item: the lists
       below are from that day.
 
-      **Wrong answers the probe found and that batch did NOT fix** (each
-      is silent, so each is worth more than a refusal):
-      - `pg_lsn + numeric`, `pg_lsn - numeric` and `numeric + pg_lsn`
-        answer a `numeric` (`'0/16'::pg_lsn + 1.5` is 23.5, where
-        PostgreSQL answers `0/18`).
-      - `lseg ?# lseg` is true for two identical segments; PostgreSQL
-        answers false.
-      - `line <-> point` differs in the last digit (0.7071067811865475
-        against ...476), which is the FMA rule in `CLAUDE.md` again.
-      - `ts_headline` over `json` / `jsonb` answers the document's text as
-        `text`; PostgreSQL answers the document, of its own type, with the
-        headline applied to each string value.
-      - `"char"(int4)` and `"char"(text)` answer a `bpchar` of the whole
-        value; PostgreSQL answers one byte.
-      - `pg_relation_is_publishable` is true for a catalog relation.
-      - `array_agg` over an array column takes a NULL array, and arrays
-        of different lengths; PostgreSQL refuses the first (22004 `cannot
-        accumulate null arrays`) and the second (2202E `cannot accumulate
-        arrays of different dimensionality`).
-      - A function call PostgreSQL refuses for its argument types can
-        run: `int4pl(1.5, 2)` is `1.5 + 2` here and 42883 there
-        (`builtin_alias.rs` casts a literal the parameter would coerce and
-        leaves every other argument as it is).
+      **The eight wrong answers that list named were fixed on 2026-10-14**,
+      each measured against PostgreSQL 15.19 and recorded in
+      `pg_corpora/builtin_coverage.sql`: `pg_lsn` arithmetic, `lseg ?#
+      lseg`, `line <-> point`, `ts_headline` over a document, `"char"`
+      from and to an integer, `pg_relation_is_publishable`, `array_agg`
+      over arrays, and an alias call with a literal PostgreSQL would not
+      coerce. Measuring them found more, fixed in the same batch: a
+      `pg_lsn` column compared with a literal (`where l = '0/16'`) matched
+      NOTHING, `set l = l + 1` failed, `ts_headline` ignored its options
+      entirely and marked up a document's KEYS, and a composite primary
+      key whose columns are named like extended JSON (`"$date"`,
+      `"$regex"`) read back NULL, failed every read, or was updated not at
+      all, because rows were decoded through serde and found again by a
+      bare `{_id: key}` filter (`tests/test_rust_pg_dollar_names.py`).
+      What that work left:
+      - **`ts_headline` refuses `MaxWords`, `MinWords`, `ShortWord`,
+        `MaxFragments` above 0 and a true `HighlightAll`** (0A000, by
+        name). The selection of the words shown is not `mark_hl_words`:
+        a document over 35 words is cut by a rule of this server's own,
+        and has not been compared with PostgreSQL.
+      - **A column of a composite type cannot be taken apart**: `(v).*`
+        and `(v).f` are 0A000 `this field selection is not supported
+        yet`.
+      - **Only `line <-> point` measures with `pg_hypot`.** Every other
+        distance in `geom.rs` uses Rust's `f64::hypot`, which can differ
+        from PostgreSQL in the last digit; no corpus line has shown one.
+      - **A `"char"` with the high bit set is carried as its `\ooo` text**,
+        so it orders by that text and not by the byte. Not measured.
+      - **An alias call with a COLUMN of the wrong type still runs**
+        (`int4pl(numeric_col, 2)`): the rewrite sees no column types.
+      - **`pg_relation_is_publishable` is true for an unlogged table**:
+        this server keeps no persistence apart from temporary.
+      - **`65::int2::"char"` answers `A`**; PostgreSQL has no `int2` cast to
+        `"char"` (42846). `"char"(x)` is planned as a cast, and as a call
+        PostgreSQL promotes the `int2`, so the two cannot be told apart
+        until `"char"` is a function here. `"char"(65::int8)` is 42846
+        where PostgreSQL says 42883.
 
       **Refused where PostgreSQL answers, called by name** (57
       signatures): `unnest` of a multirange and of a tsvector;
@@ -9731,11 +9738,9 @@ The wrong WRITES, all fixed:
 
 What is left, on the RUST MongoDB server:
 
-- [ ] **The seven `Document::from_reader` / `bson::from_slice` calls in the
-      PostgreSQL crates** (`secantus-pg` 5, `secantus-pgwire` 2) were not
-      changed here. Whether a `jsonb` value shaped like extended JSON is
-      rewritten by them has not been measured. `secantus-core-py`, the
-      parity binding, has 36 and was left too.
+- [ ] **`secantus-core-py`, the parity binding, still decodes through
+      serde** (36 calls). The PostgreSQL crates' five were replaced on
+      2026-10-14 (see the Rust PG server's built-in functions entry).
 - [ ] **The field order of a document upserted from two or more
       equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
       `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`

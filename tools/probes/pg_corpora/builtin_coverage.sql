@@ -175,3 +175,62 @@ SELECT ts_rank('{1.5,2.5}'::float4[], 'a b'::tsvector, 'a & b'::tsquery)
 SELECT json_array_elements('{"a":1}'::json)
 SELECT jsonb_array_elements('{"a":1}'::jsonb)
 SELECT json_array_elements_text('5'::json)
+# pg_lsn plus or minus a numeric is a pg_lsn (pg_lsn_pli / pg_lsn_mii): the
+# sum rounded half away from zero, then range-checked. It was a numeric.
+SELECT '0/16'::pg_lsn + 1.5, '0/16'::pg_lsn - 1.5, 1.5 + '0/16'::pg_lsn, '0/16'::pg_lsn + 10, '0/16'::pg_lsn + 2::int8, '0/16'::pg_lsn - 22.4, '0/16'::pg_lsn + NULL::numeric
+SELECT pg_typeof('0/16'::pg_lsn + 1.5), pg_typeof('0/16'::pg_lsn - '0/1'::pg_lsn), '0/16'::pg_lsn - '0/1'::pg_lsn
+SELECT '0/16'::pg_lsn - 100
+SELECT '0/16'::pg_lsn - 22.5
+SELECT 'FFFFFFFF/FFFFFFFF'::pg_lsn + 1
+SELECT '0/16'::pg_lsn + 'NaN'::numeric
+SELECT '0/16'::pg_lsn - 'NaN'::numeric
+SELECT '0/16'::pg_lsn + 'Infinity'::numeric
+SELECT '0/16'::pg_lsn + 1.5::float8
+SELECT 3 - '0/16'::pg_lsn
+SELECT '0/16'::pg_lsn * 2
+# An untyped literal beside a pg_lsn: an offset after +, a pg_lsn otherwise.
+SELECT '0/16'::pg_lsn + '1', pg_typeof('0/16'::pg_lsn + '1'), '0/16'::pg_lsn = '0/16', '0/16'::pg_lsn < '0/17', '0/16'::pg_lsn - '0/1'
+SELECT '0/16'::pg_lsn - '1'
+SELECT '0/16'::pg_lsn = '22'
+SELECT id FROM bc_lsn WHERE l = '0/16'
+SELECT id FROM bc_lsn WHERE l > '0/16' ORDER BY id
+SELECT id, l + 1, l - 1.5, l - '0/1' FROM bc_lsn ORDER BY id
+SELECT id FROM bc_lsn WHERE l + 10 > '0/20' ORDER BY id
+# Two segments on one line have no intersection point (line_interpt_line
+# refuses parallel lines), and line <-> point is pg_hypot's, FMA and all.
+SELECT lseg '[(0,0),(1,1)]' ?# lseg '[(0,0),(1,1)]', lseg '[(0,0),(2,2)]' ?# lseg '[(1,1),(3,3)]', lseg '[(0,0),(1,1)]' ?# lseg '[(0,1),(1,0)]', lseg '[(0,0),(1,0)]' ?# lseg '[(1,0),(1,1)]', lseg '[(0,0),(1,0)]' ?# lseg '[(2,0),(2,1)]'
+SELECT lseg '[(0,0),(2,2)]' # lseg '[(0,2),(2,0)]', lseg '[(0,0),(2,2)]' # lseg '[(0,0),(2,2)]', lseg '[(0,0),(1,0)]' # lseg '[(1,0),(1,1)]', lseg '[(0,0),(3,1)]' # lseg '[(1,-1),(2,2)]'
+SELECT line '{1,-1,0}' <-> point '(1,0)', point '(1,0)' <-> line '{1,-1,0}', line '{0,1,-2}' <-> point '(3,5)', line '{1,0,-2}' <-> point '(3,5)', line '{2,3,-7}' <-> point '(-1.5,4.25)'
+# ts_headline over json / jsonb marks up the string values only and answers
+# the document, of its own type; json comes back with no whitespace.
+SELECT ts_headline('{"a":  "the fat cat" , "b":1}'::json, to_tsquery('cat'))::text, ts_headline('{"a":  "the fat cat" , "b":1}'::jsonb, to_tsquery('cat'))::text, ts_headline('{"cat": "dog"}'::jsonb, to_tsquery('cat'))::text
+SELECT ts_headline('[1, "cat", null, true, 2.50, ""]'::json, to_tsquery('cat'))::text, pg_typeof(ts_headline('{"a":"cat"}'::json, to_tsquery('cat'))), pg_typeof(ts_headline('english', '{"a":"cat"}'::jsonb, to_tsquery('cat')))
+SELECT id, ts_headline(d, to_tsquery('cat'))::text, ts_headline(j, to_tsquery('cat'), 'StartSel=*,StopSel=*')::text FROM bc_hl ORDER BY id
+# Its options: the selectors, read by deserialize_deflist's rules.
+SELECT ts_headline('the fat cat', to_tsquery('cat'), 'StartSel=<, StopSel=>'), ts_headline('english', 'the fat cat', to_tsquery('cat'), 'StartSel = "[[" , StopSel = '']]'''), ts_headline('the fat cat', to_tsquery('cat'), 'startsel=007,stopsel=x'), ts_headline('the fat cat', to_tsquery('cat'), '')
+SELECT ts_headline('the fat cat', to_tsquery('cat'), 'StartSel=<, Bogus=1')
+SELECT ts_headline('the fat cat', to_tsquery('cat'), 'StartSel')
+# "char" is one byte: from an integer i4tochar's, to one chartoi4's.
+SELECT "char"(65), "char"(0), "char"(-56), 65::"char", 'é'::"char", '\310'::"char", ''::"char"::int4, int4('A'::"char"), int4((-56)::"char"), pg_typeof("char"(65))
+SELECT "char"(200)
+SELECT 65::int8::"char"
+SELECT 'A'::"char"::int8
+SELECT "char"(65::int2), "char"('hello'::text)
+# pg_relation_is_publishable: an ordinary user table only.
+SELECT pg_relation_is_publishable('pg_class'::regclass), pg_relation_is_publishable('bc_lsn'::regclass), pg_relation_is_publishable('bc_lsn_pkey'::regclass), pg_relation_is_publishable(999999)
+# array_agg over arrays (accumArrayResultArr): no NULL, no empty first
+# array, and every array the first one's shape.
+SELECT array_agg(a ORDER BY id) FROM bc_arr WHERE id IN (1, 3)
+SELECT array_agg(a ORDER BY id) FROM bc_arr
+SELECT array_agg(a ORDER BY id) FROM bc_arr WHERE a IS NOT NULL
+SELECT array_agg(a) FROM (VALUES ('{}'::int[]), ('{}')) v(a)
+SELECT array_agg(a) FROM (VALUES ('[0:1]={1,2}'::int[]), ('{3,4}')) v(a)
+SELECT array_agg(a) FILTER (WHERE a IS NOT NULL) FROM bc_arr WHERE id < 3
+# A built-in called by its operator's name takes only arguments PostgreSQL
+# would coerce: a literal that will not is 42883, as for any function.
+SELECT int4pl(1.5, 2)
+SELECT int4pl(true, 2)
+SELECT int4pl(5000000000, 1)
+SELECT textlen(1.5)
+SELECT dexp(true)
+SELECT int8pl(5000000000, 1), float8pl(1.5, 2), int4pl('1', 2), int4pl(NULL, 2), numeric_add(99999999999999999999, 1), int4inc(1.5)

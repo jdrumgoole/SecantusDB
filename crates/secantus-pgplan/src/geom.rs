@@ -842,6 +842,9 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
     use Geo::*;
     let r = |g: Result<Geo>| Some(g.map(|g| to_bson(&g)));
     match (op, lhs, rhs) {
+        ("<->", Line(a, bb, c), Point(p)) | ("<->", Point(p), Line(a, bb, c)) => {
+            Some(Ok(d(line_closept_dist((*a, *bb, *c), *p))))
+        }
         ("<->", _, _) => distance(lhs, rhs).map(|v| Ok(d(v))),
         ("@>", _, _) => contains(lhs, rhs).map(|v| Ok(b(v))),
         ("<@", _, _) => contains(rhs, lhs).map(|v| Ok(b(v))),
@@ -945,7 +948,9 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
                 _ => fp_ge(l1, l2),
             })))
         }
-        ("?#", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(b(segs_intersect(*a1, *a2, *b1, *b2)))),
+        ("?#", Lseg(a1, a2), Lseg(b1, b2)) => {
+            Some(Ok(b(lseg_interpt_lseg(*a1, *a2, *b1, *b2).is_some())))
+        }
         // `inter_sb`: an endpoint inside the box, or the segment crossing
         // one of its edges.
         ("?#", Lseg(a1, a2), Box(h, l)) => {
@@ -956,10 +961,12 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
                     segs_intersect(*a1, *a2, corners[i], corners[(i + 1) % 4])
                 }))))
         }
-        ("#", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(match seg_intersection(*a1, *a2, *b1, *b2) {
-            Some(p) => to_bson(&Point(p)),
-            None => Bson::Null,
-        })),
+        ("#", Lseg(a1, a2), Lseg(b1, b2)) => {
+            Some(Ok(match lseg_interpt_lseg(*a1, *a2, *b1, *b2) {
+                Some(p) => to_bson(&Point(p)),
+                None => Bson::Null,
+            }))
+        }
         ("?-|", Lseg(a1, a2), Lseg(b1, b2)) => {
             let dot = (a2.x - a1.x) * (b2.x - b1.x) + (a2.y - a1.y) * (b2.y - b1.y);
             Some(Ok(b(fp_eq(dot, 0.0))))
@@ -1018,19 +1025,136 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
     }
 }
 
-fn seg_intersection(a: P, b: P, c: P, d: P) -> Option<P> {
-    if !segs_intersect(a, b, c, d) {
+// What `lseg ?# lseg`, `lseg # lseg` and `line <-> point` compute,
+// transcribed from PostgreSQL 15's `geo_ops.c`. Two segments on one line
+// have no intersection point there (`line_interpt_line` refuses parallel
+// lines), so `?#` is false even for identical segments.
+
+/// `pg_hypot`. clang fuses `1.0 + yx * yx` on arm64, which moves the last
+/// digit (`line <-> point`'s 0.7071067811865476, not ...475).
+fn pg_hypot(x: f64, y: f64) -> f64 {
+    if x.is_infinite() || y.is_infinite() {
+        return f64::INFINITY;
+    }
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    let (mut x, mut y) = (x.abs(), y.abs());
+    if x < y {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if y == 0.0 {
+        return x;
+    }
+    let yx = y / x;
+    x * yx.mul_add(yx, 1.0).sqrt()
+}
+
+/// `point_dt`.
+fn point_dt(a: P, b: P) -> f64 {
+    pg_hypot(a.x - b.x, a.y - b.y)
+}
+
+/// `point_eq_point`.
+fn point_eq_point(a: P, b: P) -> bool {
+    if a.x.is_nan() || a.y.is_nan() || b.x.is_nan() || b.y.is_nan() {
+        return a.x == b.x && a.y == b.y;
+    }
+    fp_eq(a.x, b.x) && fp_eq(a.y, b.y)
+}
+
+/// `point_sl`: infinite for a vertical pair (and for one point twice).
+fn point_sl(a: P, b: P) -> f64 {
+    if fp_eq(a.x, b.x) {
+        return f64::INFINITY;
+    }
+    if fp_eq(a.y, b.y) {
+        return 0.0;
+    }
+    (a.y - b.y) / (a.x - b.x)
+}
+
+/// `line_construct`: the line through `pt` with slope `m`, as `(A, B, C)`.
+fn line_construct(pt: P, m: f64) -> (f64, f64, f64) {
+    if m.is_infinite() {
+        (-1.0, 0.0, pt.x)
+    } else if m == 0.0 {
+        (0.0, -1.0, pt.y)
+    } else {
+        let c = pt.y - m * pt.x;
+        (m, -1.0, if c == 0.0 { 0.0 } else { c })
+    }
+}
+
+/// `line_invsl`.
+fn line_invsl((a, b, _): (f64, f64, f64)) -> f64 {
+    if a.abs() <= EPSILON {
+        return f64::INFINITY;
+    }
+    if b.abs() <= EPSILON {
+        return 0.0;
+    }
+    b / a
+}
+
+/// `line_interpt_line`: `None` for parallel lines (and for two lines that
+/// are the same line).
+fn line_interpt_line(l1: (f64, f64, f64), l2: (f64, f64, f64)) -> Option<P> {
+    let ((a1, b1, c1), (a2, b2, c2)) = (l1, l2);
+    let (x, y);
+    if b1.abs() > EPSILON {
+        if fp_eq(a2, a1 * (b2 / b1)) {
+            return None;
+        }
+        x = (b1 * c2 - b2 * c1) / (a1 * b2 - a2 * b1);
+        y = -(a1 * x + c1) / b1;
+    } else if b2.abs() > EPSILON {
+        if fp_eq(a1, a2 * (b1 / b2)) {
+            return None;
+        }
+        x = (b2 * c1 - b1 * c2) / (a2 * b1 - a1 * b2);
+        y = -(a2 * x + c2) / b2;
+    } else {
         return None;
     }
-    let den = (a.x - b.x) * (c.y - d.y) - (a.y - b.y) * (c.x - d.x);
-    if den == 0.0 {
-        return None;
-    }
-    let t = ((a.x - c.x) * (c.y - d.y) - (a.y - c.y) * (c.x - d.x)) / den;
     Some(P {
-        x: a.x + t * (b.x - a.x),
-        y: a.y + t * (b.y - a.y),
+        x: if x == 0.0 { 0.0 } else { x },
+        y: if y == 0.0 { 0.0 } else { y },
     })
+}
+
+/// `lseg_contain_point`: by the triangle inequality.
+fn lseg_contain_point(p0: P, p1: P, pt: P) -> bool {
+    fp_eq(point_dt(pt, p0) + point_dt(pt, p1), point_dt(p0, p1))
+}
+
+/// `lseg_interpt_line`, with its snap to a matching endpoint.
+fn lseg_interpt_line(p0: P, p1: P, line: (f64, f64, f64)) -> Option<P> {
+    let pt = line_interpt_line(line_construct(p0, point_sl(p0, p1)), line)?;
+    if !lseg_contain_point(p0, p1, pt) {
+        return None;
+    }
+    Some(if point_eq_point(p0, pt) {
+        p0
+    } else if point_eq_point(p1, pt) {
+        p1
+    } else {
+        pt
+    })
+}
+
+/// `lseg_interpt_lseg`: the point two segments meet at, if they do.
+fn lseg_interpt_lseg(a0: P, a1: P, b0: P, b1: P) -> Option<P> {
+    let pt = lseg_interpt_line(a0, a1, line_construct(b0, point_sl(b0, b1)))?;
+    lseg_contain_point(b0, b1, pt).then_some(pt)
+}
+
+/// `line_closept_point`'s distance: a perpendicular dropped from `pt`.
+fn line_closept_dist(line: (f64, f64, f64), pt: P) -> f64 {
+    match line_interpt_line(line_construct(pt, line_invsl(line)), line) {
+        Some(close) => point_dt(close, pt),
+        None => f64::NAN,
+    }
 }
 
 /// A prefix operator on a geometric value.

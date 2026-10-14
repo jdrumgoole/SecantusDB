@@ -315,8 +315,16 @@ def scenarios(port, config):
             **pw,
             **ALICE,
         )
+        # Count only this session's TLS row: sessions an earlier step closed
+        # can still be listed by PostgreSQL while their backends exit, which
+        # made the count 3 against 1 once in CI.
         out["stat others"] = attempt(
-            port, query="select count(*) >= 1, count(*) filter (where ssl) from pg_stat_ssl", **tls
+            port,
+            query=(
+                "select count(*) >= 1, count(*) filter (where ssl and pid = pg_backend_pid())"
+                " from pg_stat_ssl"
+            ),
+            **tls,
         )
         out["raw offered tls"] = raw_scram(port, None, "")
         out["raw plus right"] = raw_scram(port, "SCRAM-SHA-256-PLUS", "p=tls-server-end-point,,")

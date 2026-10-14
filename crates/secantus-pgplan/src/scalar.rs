@@ -1780,10 +1780,18 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 crate::value_text(other).trim().parse().unwrap_or(-1),
             )),
         }),
-        "pg_relation_is_publishable" => Ok(match args.first() {
-            None | Some(Bson::Null) => Bson::Null,
-            Some(_) => Bson::Boolean(true),
-        }),
+        "pg_relation_is_publishable" => Ok(
+            match args.first().and_then(|a| match a {
+                Bson::Null => None,
+                Bson::Int32(i) => Some(i64::from(*i)),
+                Bson::Int64(i) => Some(*i),
+                other => crate::regclass_oid(other)
+                    .or_else(|| crate::value_text(other).trim().parse().ok()),
+            }) {
+                None => Bson::Null,
+                Some(oid) => crate::relation_is_publishable(oid).map_or(Bson::Null, Bson::Boolean),
+            },
+        ),
         "pg_table_is_visible" => Ok(
             match args.first().and_then(|a| match a {
                 Bson::Null => None,

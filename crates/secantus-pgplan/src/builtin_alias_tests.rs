@@ -41,10 +41,19 @@ fn a_literal_takes_the_declared_type_where_postgresql_would_coerce_it() {
         rewritten("int8pl(1, 2)").as_deref(),
         Some("SELECT 1::bigint + 2::bigint")
     );
-    // A numeric literal has no implicit cast to an integer.
+    // A numeric literal has no implicit cast to an integer, so `int4pl` does
+    // not exist for it: the call is left for the planner to refuse (42883),
+    // where it used to run as `1.5 + a`.
+    assert_eq!(rewritten("int4pl(1.5, a)"), None);
+    assert_eq!(rewritten("textlen(1.5)"), None);
+    assert_eq!(rewritten("dexp(true)"), None);
+    // A whole number past int4 is a bigint: int8pl takes it, int4pl not.
+    assert!(rewritten("int8pl(5000000000, 1)").is_some());
+    assert_eq!(rewritten("int4pl(5000000000, 1)"), None);
+    // A column's type is not known here, so a column argument is rewritten.
     assert_eq!(
-        rewritten("int4pl(1.5, a)").as_deref(),
-        Some("SELECT 1.5 + a")
+        rewritten("int4pl(a, 2)").as_deref(),
+        Some("SELECT a + 2::int")
     );
 }
 

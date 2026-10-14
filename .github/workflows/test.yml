@@ -2305,6 +2305,9 @@ jobs:
           # (it needs the binary and no PostgreSQL). Same reasoning: it skips
           # wherever the binary is not built, so it is named where it is.
           files="$files tests/test_rust_pg_builtin_coverage.py"
+          # Composite keys named like extended JSON (`"$date"`), pinned
+          # with PostgreSQL 15.19's answers written in. Binary only.
+          files="$files tests/test_rust_pg_dollar_names.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \

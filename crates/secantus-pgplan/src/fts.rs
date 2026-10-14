@@ -1725,12 +1725,236 @@ pub fn negate(a: &Option<Query>) -> Option<Query> {
     a.as_ref().map(|q| Query::Not(Box::new(q.clone())))
 }
 
+/// The `ts_headline` options this server applies: the selectors.
+pub struct HeadlineOptions {
+    pub start: String,
+    pub stop: String,
+}
+
+impl Default for HeadlineOptions {
+    fn default() -> Self {
+        HeadlineOptions {
+            start: "<b>".into(),
+            stop: "</b>".into(),
+        }
+    }
+}
+
+/// `deserialize_deflist` (tsearchcmds.c): `key = value, ...`, a key bare or
+/// double-quoted, a value bare, single-quoted (`E'...'` too) or
+/// double-quoted. A bare value that is an integer is that integer, which is
+/// how `defGetString` prints it (`StartSel=007` is `7`).
+fn deserialize_deflist(text: &str) -> Result<Vec<(String, String)>> {
+    #[derive(PartialEq)]
+    enum S {
+        WaitKey,
+        InKey,
+        InQKey,
+        WaitEq,
+        WaitValue,
+        InSqValue,
+        InDqValue,
+        InWValue,
+    }
+    let bad = || {
+        Error::Sqlstate(
+            "42601",
+            format!("invalid parameter list format: \"{text}\""),
+        )
+    };
+    let bare = |v: &str| match v.parse::<i32>() {
+        Ok(n) => n.to_string(),
+        Err(_) => v.to_string(),
+    };
+    let b: Vec<char> = text.chars().collect();
+    let (mut state, mut key, mut val) = (S::WaitKey, String::new(), String::new());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        match state {
+            S::WaitKey => {
+                if !(c.is_ascii_whitespace() || c == ',') {
+                    key.clear();
+                    if c == '"' {
+                        state = S::InQKey;
+                    } else {
+                        key.push(c);
+                        state = S::InKey;
+                    }
+                }
+            }
+            S::InKey => {
+                if c.is_ascii_whitespace() {
+                    state = S::WaitEq;
+                } else if c == '=' {
+                    state = S::WaitValue;
+                } else {
+                    key.push(c);
+                }
+            }
+            S::InQKey => {
+                if c == '"' {
+                    if next == Some('"') {
+                        key.push('"');
+                        i += 1;
+                    } else {
+                        state = S::WaitEq;
+                    }
+                } else {
+                    key.push(c);
+                }
+            }
+            S::WaitEq => {
+                if c == '=' {
+                    state = S::WaitValue;
+                } else if !c.is_ascii_whitespace() {
+                    return Err(bad());
+                }
+            }
+            S::WaitValue => {
+                val.clear();
+                if c == '\'' {
+                    state = S::InSqValue;
+                } else if c == 'E' && next == Some('\'') {
+                    i += 1;
+                    state = S::InSqValue;
+                } else if c == '"' {
+                    state = S::InDqValue;
+                } else if !c.is_ascii_whitespace() {
+                    val.push(c);
+                    state = S::InWValue;
+                }
+            }
+            S::InSqValue => {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        val.push('\'');
+                        i += 1;
+                    } else {
+                        out.push((key.clone(), val.clone()));
+                        state = S::WaitKey;
+                    }
+                } else if c == '\\' && next == Some('\\') {
+                    val.push('\\');
+                    i += 1;
+                } else {
+                    val.push(c);
+                }
+            }
+            S::InDqValue => {
+                if c == '"' {
+                    if next == Some('"') {
+                        val.push('"');
+                        i += 1;
+                    } else {
+                        out.push((key.clone(), val.clone()));
+                        state = S::WaitKey;
+                    }
+                } else {
+                    val.push(c);
+                }
+            }
+            S::InWValue => {
+                if c == ',' || c.is_ascii_whitespace() {
+                    out.push((key.clone(), bare(&val)));
+                    state = S::WaitKey;
+                } else {
+                    val.push(c);
+                }
+            }
+        }
+        i += 1;
+    }
+    match state {
+        S::InWValue => out.push((key, bare(&val))),
+        S::WaitKey => {}
+        _ => return Err(bad()),
+    }
+    Ok(out)
+}
+
+/// `prsd_headline`'s option names. The selectors are applied; options that
+/// change which words are shown are refused by name rather than ignored,
+/// because the fragment selection here is not `mark_hl_words`. A value that
+/// leaves the default selection (`MaxFragments=0`, a false `HighlightAll`)
+/// is accepted, and `FragmentDelimiter` is used only with fragments.
+pub fn headline_options(text: &str) -> Result<HeadlineOptions> {
+    let mut opts = HeadlineOptions::default();
+    let truthy = |v: &str| {
+        ["1", "on", "true", "t", "y", "yes"]
+            .iter()
+            .any(|t| v.eq_ignore_ascii_case(t))
+    };
+    for (name, value) in deserialize_deflist(text)? {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "startsel" => opts.start = value,
+            "stopsel" => opts.stop = value,
+            "fragmentdelimiter" => {}
+            "maxfragments" if value.trim() == "0" => {}
+            "highlightall" if !truthy(&value) => {}
+            "maxwords" | "minwords" | "shortword" | "maxfragments" | "highlightall" => {
+                return Err(Error::FeatureNotSupported(format!(
+                    "ts_headline option \"{name}\" is not supported yet"
+                )));
+            }
+            _ => {
+                return Err(Error::InvalidParameter(format!(
+                    "unrecognized headline parameter: \"{name}\""
+                )));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+/// `ts_headline([config,] json | jsonb, query [, options])`: the headline of
+/// each STRING value, keys and other values left alone, and the document
+/// written back -- `jsonb` in its own form, `json` with no whitespace, as
+/// `transform_json_string_values` writes it. `doc_at` is the document's
+/// argument position (1 after a configuration).
+pub(crate) fn json_headline(args: &[Bson], doc_at: usize, jsonb: bool) -> Result<Bson> {
+    let cfg = if doc_at == 1 {
+        config(&text_of(&args[0]))?
+    } else {
+        DEFAULT_CONFIG
+    };
+    let (Some(doc), Some(q)) = (args.get(doc_at), args.get(doc_at + 1)) else {
+        return Err(wrong("ts_headline"));
+    };
+    let opts = match args.get(doc_at + 2) {
+        Some(o) => headline_options(&text_of(o))?,
+        None => HeadlineOptions::default(),
+    };
+    let query = query_arg(q)?;
+    let mut json = crate::json::parse(&text_of(doc))
+        .map_err(|_| Error::InvalidText("invalid input syntax for type json".into()))?;
+    fn walk(v: &mut crate::json::Json, f: &dyn Fn(&str) -> String) {
+        match v {
+            crate::json::Json::Str(s) => *s = f(s),
+            crate::json::Json::Array(items) => items.iter_mut().for_each(|i| walk(i, f)),
+            crate::json::Json::Object(members) => {
+                members.iter_mut().for_each(|(_, m)| walk(m, f));
+            }
+            _ => {}
+        }
+    }
+    walk(&mut json, &|s| headline(cfg, s, &query, &opts));
+    Ok(Bson::String(if jsonb {
+        crate::json::render_jsonb(&json)
+    } else {
+        crate::json::render_json_compact(&json)
+    }))
+}
+
 /// `ts_headline(config, document, query)` with the default options:
 /// `StartSel=<b>, StopSel=</b>, MaxWords=35, MinWords=15`. A document of
 /// at most `MaxWords` words is returned whole with each matching word
 /// wrapped; a longer one is cut to the first window of `MaxWords` words
 /// that holds a match.
-pub fn headline(cfg: Config, doc: &str, q: &Option<Query>) -> String {
+pub fn headline(cfg: Config, doc: &str, q: &Option<Query>, opts: &HeadlineOptions) -> String {
     let mut wanted: Vec<(String, bool)> = Vec::new();
     fn collect(q: &Query, out: &mut Vec<(String, bool)>) {
         match q {
@@ -1790,9 +2014,9 @@ pub fn headline(cfg: Config, doc: &str, q: &Option<Query>) -> String {
     let mut out = String::new();
     for (t, w) in &pieces[from..to] {
         if *w && hit(t) {
-            out.push_str("<b>");
+            out.push_str(&opts.start);
             out.push_str(t);
-            out.push_str("</b>");
+            out.push_str(&opts.stop);
         } else {
             out.push_str(t);
         }
@@ -2399,19 +2623,29 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
         }
         "ts_headline" => {
             // ([config,] document, query [, options])
-            let (cfg, rest) = match args.len() {
-                4 => (config(&text_of(&args[0]))?, &args[1..3]),
+            let (cfg, rest, options) = match args.len() {
+                4 => (config(&text_of(&args[0]))?, &args[1..3], args.get(3)),
                 3 if parse_query(&text_of(&args[2])).is_ok()
                     && config(&text_of(&args[0])).is_ok() =>
                 {
-                    (config(&text_of(&args[0]))?, &args[1..3])
+                    (config(&text_of(&args[0]))?, &args[1..3], None)
                 }
-                _ => (DEFAULT_CONFIG, &args[..2]),
+                3 => (DEFAULT_CONFIG, &args[..2], args.get(2)),
+                _ => (DEFAULT_CONFIG, &args[..2], None),
             };
             let [doc, q] = rest else {
                 return Err(wrong(name));
             };
-            Ok(Bson::String(headline(cfg, &text_of(doc), &query_arg(q)?)))
+            let opts = match options {
+                Some(o) => headline_options(&text_of(o))?,
+                None => HeadlineOptions::default(),
+            };
+            Ok(Bson::String(headline(
+                cfg,
+                &text_of(doc),
+                &query_arg(q)?,
+                &opts,
+            )))
         }
         "get_current_ts_config" => Ok(Bson::String("english".into())),
         "ts_rank" => rank_call(args, false),
