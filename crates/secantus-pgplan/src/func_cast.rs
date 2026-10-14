@@ -142,7 +142,24 @@ fn cast_target(f: &pg_query::protobuf::FuncCall) -> Option<pg_query::protobuf::T
         [n] | ["pg_catalog", n] => *n,
         _ => return None,
     };
-    if scalar::is_scalar(name)
+    // `pg_lsn(numeric)` is a FUNCTION, and PostgreSQL picks it for a number
+    // (an integer promotes to numeric); a string is still the cast.
+    let string_arg = match f.args[0].node.as_ref() {
+        Some(N::AConst(c)) => !matches!(
+            c.val,
+            Some(
+                pg_query::protobuf::a_const::Val::Ival(_)
+                    | pg_query::protobuf::a_const::Val::Fval(_)
+            )
+        ),
+        Some(N::TypeCast(tc)) => tc
+            .type_name
+            .as_ref()
+            .is_some_and(|t| is_string_type(&type_name_of(t))),
+        _ => true,
+    };
+    if (name == "pg_lsn" && !string_arg)
+        || scalar::is_scalar(name)
         || correlated::user_function_named(name)
         || aggregate_func(name, false).is_some()
         || !column_type_exists(name)

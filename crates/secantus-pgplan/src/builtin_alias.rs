@@ -57,6 +57,8 @@ const TEMPLATES: &[(&str, usize, &str)] = &[
     ("float4abs", 1, "abs($1::float4)"),
     ("float8abs", 1, "abs($1::float8)"),
     ("getpgusername", 0, "current_user"),
+    // `pg_catalog."session_user"()`: the function behind the keyword.
+    ("session_user", 0, "session_user"),
     ("like", 2, "$1 LIKE $2"),
     ("notlike", 2, "$1 NOT LIKE $2"),
     (

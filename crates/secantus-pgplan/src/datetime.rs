@@ -22,7 +22,7 @@ use crate::{Error, Interval, Result};
 const USECS_PER_SEC: i64 = 1_000_000;
 const USECS_PER_MINUTE: i64 = 60 * USECS_PER_SEC;
 const USECS_PER_HOUR: i64 = 60 * USECS_PER_MINUTE;
-const USECS_PER_DAY: i64 = 24 * USECS_PER_HOUR;
+pub(crate) const USECS_PER_DAY: i64 = 24 * USECS_PER_HOUR;
 const DAYS_PER_MONTH: i32 = 30;
 
 /// The broken-down time PostgreSQL's `pg_tm` holds. `year` is astronomical
@@ -938,7 +938,7 @@ pub fn time_diff(a: &Bson, b: &Bson) -> Result<Bson> {
     .to_bson())
 }
 
-fn render_time(micros: i64) -> String {
+pub(crate) fn render_time(micros: i64) -> String {
     let (h, m, s, f) = (
         micros / USECS_PER_HOUR,
         micros % USECS_PER_HOUR / USECS_PER_MINUTE,
@@ -1049,6 +1049,9 @@ pub fn make(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
             } else {
                 let utc = match args.get(6) {
                     Some(z) => {
+                        // A zone PostgreSQL does not know is 22023 here, as in
+                        // `AT TIME ZONE`, not the session default.
+                        zone_of(z)?;
                         let zone = crate::TimeZoneSetting::parse(&crate::value_text(z));
                         let guess = local
                             - i64::from(zone.offset_at(local).local_minus_utc()) * USECS_PER_SEC;
