@@ -24,6 +24,13 @@ used, kept so the code comments that cite them still resolve.
 headline must not read as finished: if completed context belongs in it,
 lead with `**OPEN —` (`tests/test_backlog_markers.py`).
 
+**Every item carries `Backlog-ID:` and `Verify:` lines.** `Verify:` names a
+gap test under `tests/backlog/` that asserts the real product's answer and so
+fails while the item is open, or says why none can (`none -- ...`).
+`python tools/backlog.py verify` runs them all; the `backlog` skill
+(`.claude/skills/backlog/SKILL.md`) is the protocol for filing, working and
+closing an item.
+
 **Reproduce an item before working it** -- a probe, the failing test, the
 query -- and size it from that, not from the text. Entries here have
 described work as missing that was done, and understated bugs by naming one
@@ -40,6 +47,8 @@ one beside it.
   notice-emission seam on that path. Isolation itself is accepted and
   reported, not enforced -- a scope decision (single node, one WiredTiger
   snapshot level), not a deferral.
+  Backlog-ID: RP-001
+  Verify: tests/backlog/test_rp_triage.py::test_set_transaction_outside_a_block_warns
 - **Scope decision — psycopg's `test_generators.py::test_cancel` and the
   `proxy`-marked `test_cancel_safe_error` / `test_cancel_safe_timeout` fail on
   macOS in the CLIENT.** macOS libpq sends the cancel on a not-yet-connected
@@ -58,12 +67,14 @@ one beside it.
   needs a hook in the vendored `secantus-pgwire` at the point a message's
   first byte is read. Probe: send `select pg_sleep(3), 1 in (0..200000)` with
   `send_query_params`, then a blocking `PQcancel` at a chosen offset.
+  Backlog-ID: RP-002
 - [ ] RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
   pass (`secantus-pgplan/src/escape_strings.rs`) that rewrites each plain
   literal to the `E'...'` it means before pg_query (which has the setting
   hard-wired on) sees it, with the `escape_string_warning` notices. Left:
   `N'...'` literals are not rewritten (they keep the conforming reading), and
   `backslash_quote` is not a setting (2026-09-09).
+  Backlog-ID: RP-003
 - **Scope decision — a `LANGUAGE internal` wrapper over a C function with no
   SQL form** (an I/O function such as `int4out`, an aggregate transition
   function) is a catalog row that answers 42883 when called. PostgreSQL calls
@@ -88,6 +99,7 @@ one beside it.
   or a DEFAULT expression. Reproduce: revoke EXECUTE on `abs(int)`, then call
   `abs(-1)` from a view or a column DEFAULT as the restricted role; PostgreSQL
   15 refuses with 42501.
+  Backlog-ID: RP-004
 - **Scope decision — pgjdbc `BlobTransactionTest`** needs `CREATE FUNCTION
   lo_manage() ... LANGUAGE C` (the `lo` contrib trigger). `LANGUAGE C` loads
   a shared library into the server process, which a server written in Rust
@@ -140,6 +152,7 @@ one beside it.
   `select collname from pg_collation where collprovider = 'i'` on both
   servers; PostgreSQL 15 lists hundreds (`de-x-icu`, `sv-x-icu`, ...). Check
   first that each listed locale orders as PostgreSQL does.
+  Backlog-ID: RP-005
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
   against GnuPG, because both reference servers' OpenSSL 3 builds refuse
   those ciphers. Do not "fix" them to agree with a PG error.
@@ -198,6 +211,7 @@ one beside it.
       followed the runner rather than its pytest child).
       **If it recurs, capture the exception text and errno before theorising** —
       that names the failure and distinguishes the remaining possibilities.
+      Backlog-ID: RP-006
 
 - [ ] **OPEN — Rust PostgreSQL server on LINUX: durable writes are
       1.2-1.4x slower than PostgreSQL at eight clients and reads ~1.1x
@@ -276,22 +290,26 @@ one beside it.
         whole when full.
 
       Correctness items found on the way, open:
+      Backlog-ID: RP-007
       - [ ] **RUST PG server: a parenthesised step inside `ROLLUP` / `CUBE`
             is refused with a wrong 42803.** `group by rollup ((g, z), v)`
             answers `column "gse_t.g" must appear in the GROUP BY clause`.
             `GroupElement::Rollup` holds single keys; a step of several
             needs a list of lists. (`GROUP BY (a, b)` on its own works.)
             `tools/probes/pg_corpora/grouping_set_exprs.sql`.
+            Backlog-ID: RP-008
       - [ ] **RUST PG server: a grouped query's subquery cannot name the
             outer table by its own name.** `select g, (select max(v) from t i
             where i.g = t.g) from t group by g` is `42P01 invalid reference
             to FROM-clause entry for table "t"`; with an alias on the outer
             table (`from t o ... o.g`) it works. Not a grouping-set matter:
             the plain GROUP BY above fails the same way.
+            Backlog-ID: RP-009
       - [ ] **RUST PG server: a 42803 raised from HAVING names the column
             without its table.** PostgreSQL writes `column "t.z" must
             appear...`; the HAVING path writes `"z"` (`having_subject` has
             no statement to take the qualifier from).
+            Backlog-ID: RP-010
       - [ ] **RUST PG server: with `public` off the `search_path`, a
             relation of `public` is still found from a STRING and by
             `DROP ... IF EXISTS`.** `select nextval('s')` and
@@ -301,10 +319,12 @@ one beside it.
             relation references (`schemas::hidden_in_public`); these
             three resolve the name elsewhere.
             `tools/probes/pg_corpora/search_path_public.sql`.
+            Backlog-ID: RP-011
       - [ ] **RUST PG server: a syntax error from Parse (the extended
             protocol) carries no position.** `selct 1` sent with
             `prepare=True` has `P` unset; sent as a simple query it is 1.
             Every syntax error, not only the unterminated ones.
+            Backlog-ID: RP-012
 
 - **ACCEPTED AS A LIMIT 2026-10-07 (Joe), and may be revisited — Rust
       PostgreSQL server on macOS: a READ statement costs ~1.45-1.6x
@@ -393,6 +413,7 @@ one beside it.
   - The embedded Python handle (`_secantus_server.PgServer`) **does not
     take a revocation list, a user name map or `clientname=DN` as
     options**; a `pg_hba.conf` passed as `hba_file` can say the last two.
+  Backlog-ID: RP-013
 
 ## 5. Known bugs and edge cases to watch
 
@@ -448,6 +469,7 @@ one beside it.
       once in two tries; `./inv validate-psycopg-rust --tls` on a
       developer's machine holds every test to one run. Nothing gates the
       plain number on Linux.
+      Backlog-ID: RP-014
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
       (2026-10-14).** The probe calls every immutable or stable function in
@@ -548,6 +570,7 @@ one beside it.
       boolean is 22P02 `invalid input syntax` here and 22023 `cannot cast
       jsonb object to type integer` there. `ts_headline` with options
       that do not parse answers where PostgreSQL refuses.
+      Backlog-ID: RP-015
 
 - [ ] **OPEN — a backend-cancel test asserts a fixed 1 s bound on a shared
       runner.** `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
@@ -563,6 +586,7 @@ one beside it.
       workflow (it answers "run ... cannot be rerun; its workflow file may be
       broken"), so a single-lane re-run is not a diagnostic you can reach
       for. Re-triggering means a push, and therefore a full matrix.
+      Backlog-ID: RP-016
 
 ## Open from the 2026-09-30 batch
 
@@ -573,6 +597,7 @@ one beside it.
       correct for a `timestamptz`, but a wide or BC `timestamptz` is not
       rendered with the session zone's offset. Reproduce with `SET timezone`
       to a non-UTC zone and select such a value against PostgreSQL.
+      Backlog-ID: RP-017
 - [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is
       the size of what the block writes.** WiredTiger has no savepoint, so
       one here is a set of pre-images: the first write to a table after a
@@ -581,6 +606,7 @@ one beside it.
       table into memory. Lazy capture is what keeps the common case free (a
       savepoint nobody writes through costs nothing), and a per-row undo log
       would be the fix if the cost ever bites.
+      Backlog-ID: RP-018
 - [ ] **Rust PG server: what the general JOIN planner does not push into
       its table leaves.** A WHERE conjunct that reads ONE alias's columns
       (qualified), built of operators, casts, constants and parameters, is
@@ -589,6 +615,7 @@ one beside it.
       unqualified column, a function call (it may be volatile), a subquery,
       or one over two aliases. Each such conjunct is filtered only after the
       join, so the leaf cannot use an index for it.
+      Backlog-ID: RP-019
 
 ## Warning-class RUSTSEC advisories (surfaced by cargo-audit, not gated) (2026-07-20)
 

@@ -982,6 +982,8 @@ The backlog is the canonical list of commands that are stubbed, features with si
 
 **Update the right file whenever you stub something, defer a slice, or discover a limitation; an item about more than one server goes in each file it concerns** (do not add new items to the two deprecated Python files). When you fix an item, delete its lines** — the files hold open work only, and git history and `changelog.d/` hold what is finished (`tests/test_backlog_markers.py` fails on a ticked `- [x]` item). Future sessions should treat these files as load-bearing — they are the only honest record of where SecantusDB's behaviour diverges from the real products. A section number (`7.077`, `§3.1`) means the same section it did in the single file.
 
+**Every Rust item is a failing test with prose attached.** Each carries a permanent `Backlog-ID:` (`RM-nnn` / `RP-nnn`) and a `Verify:` line naming a gap test under `tests/backlog/` -- asserting the real product's answer, so it fails while the item is open -- and `python tools/backlog.py verify` runs them all (OPEN / FIXED? / BROKEN / UNCHECKED). A fix turns its gap test into the regression test and the `changelog.d/` fragment names both (`Fixes RM-142 (tests/...::test_x)`), so every fix stays traceable to the test that proves it. **The `backlog` skill is the protocol: read it before filing, working or closing an item.**
+
 ## Finding bugs: run it against the oracle, don't reason about the source
 
 Every bug found in the 2026-08 sweeps came from **executing behaviour and

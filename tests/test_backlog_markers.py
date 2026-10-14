@@ -97,3 +97,23 @@ def test_no_open_item_claims_to_be_finished() -> None:
             f"  tasks/{name}:{lineno}  {headline[:110]}" for name, lineno, headline in offenders
         )
     )
+
+
+def test_every_rust_item_has_an_id_and_a_check() -> None:
+    """Each open item in a Rust server's backlog carries `Backlog-ID:` and
+    `Verify:` lines, and no two items share an ID (the `backlog` skill)."""
+    import sys
+
+    sys.path.insert(0, str(TASKS.parent))
+    from tools import backlog
+
+    missing, seen, dupes = [], set(), []
+    for name in backlog.FILES:
+        for item in backlog.parse(name):
+            if not item.id or not item.verify:
+                missing.append(f"{name}:{item.line}")
+            if item.id in seen:
+                dupes.append(item.id)
+            seen.add(item.id)
+    assert not missing, "items without Backlog-ID / Verify: " + ", ".join(missing)
+    assert not dupes, "duplicate Backlog-IDs: " + ", ".join(dupes)
