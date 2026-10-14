@@ -674,7 +674,7 @@ fn extract_key_format(cfg: &str) -> Option<&str> {
 }
 
 /// Refuse to open a store whose document shards were written by a build BEFORE
-/// the RecordId doc-table change (see `tasks/backlog.md` §7.8). Those tables are
+/// the RecordId doc-table change (see `tasks/backlog-rust-mongodb.md` §7.8). Those tables are
 /// keyed `SSu` (`(db, coll, id_key)`) with unframed blob values; this build keys
 /// them `SSq` (`(db, coll, RecordId)`) with framed values (see [`frame_doc_value`]).
 /// WiredTiger fixes a table's `key_format` at CREATE time and preserves it across
@@ -1748,7 +1748,7 @@ pub fn wt_config(
 // data, +15% / -88% on compressible** — winning on both axes in both regimes,
 // at 1.9x / 1.14x the disk. mongod defaults to snappy for the same reason;
 // snappy and zstd measured close to lz4 and stay opt-in build flags rather
-// than two more link dependencies. See tasks/backlog.md.
+// than two more link dependencies. See tasks/backlog-rust-mongodb.md.
 //
 // **zlib remains linked and must stay that way.** `block_compressor` is
 // recorded per table at create time, so a store created before this switch has
@@ -18727,7 +18727,7 @@ mod tests {
     }
 
     /// New tables are created with lz4 — the compressor sweep measured it at
-    /// +86% throughput and -97% p99.9 against zlib (tasks/backlog.md).
+    /// +86% throughput and -97% p99.9 against zlib (tasks/backlog-rust-mongodb.md).
     #[test]
     fn value_heavy_tables_default_to_lz4() {
         for cfg in [DOC_TABLE_CFG, QU_COMPRESSED_CFG] {
@@ -18772,7 +18772,7 @@ mod tests {
     /// A store whose document shards were written before the RecordId keying
     /// change (keyed `SSu`, unframed values) must be REFUSED at open, not
     /// silently mis-read with `SSq` cursor ops. There is no in-place migration
-    /// (pre-1.0 beta) — see `tasks/backlog.md` §7.8.
+    /// (pre-1.0 beta) — see `tasks/backlog-rust-mongodb.md` §7.8.
     /// A store whose index entries predate the RecordId entry format must be
     /// REFUSED at open. Unlike the doc-table change this is invisible to WT's
     /// `key_format`, so the catalog's `entryFormat` marker is the only signal —

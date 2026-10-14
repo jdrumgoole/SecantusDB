@@ -7,7 +7,7 @@ empty because ``"time zone"`` was not among the GUC aliases. A client that
 configured its zone that way silently stayed on the default.
 
 Note this only makes the SETTING stick. Converting a ``timestamptz`` into that
-zone is a separate, larger piece of work — see tasks/backlog.md.
+zone is a separate, larger piece of work — see tasks/backlog-python-postgres.md.
 """
 
 from __future__ import annotations

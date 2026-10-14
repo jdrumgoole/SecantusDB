@@ -97,7 +97,7 @@ class TestLikeDanglingEscape:
     as a LITERAL in the SQL text is instead a plan-time error there ("LIKE
     pattern must not end with escape character"); we do not distinguish the two
     paths and implement the bound semantics, which is what a client relies on --
-    pgjdbc's getTables binds the pattern. Recorded in tasks/backlog.md.
+    pgjdbc's getTables binds the pattern. Recorded in tasks/backlog-python-postgres.md.
 
     Every case builds its SQL with chr(92) rather than a source-level escape.
     Writing these as literals silently lost backslashes across the Python-source

@@ -1783,7 +1783,7 @@ mod transcendental_tests {
     /// correctly rounded on 231 -- it carries Intel RDFP's approximation error
     /// in the last digit on the rest -- so six expectations here differ from
     /// 8.2.11 by one unit in the last place. That divergence is deliberate and
-    /// was asked for; see `tasks/backlog.md`.
+    /// was asked for; see `tasks/backlog-rust-mongodb.md`.
     #[test]
     fn ln_is_correctly_rounded() {
         for (input, want) in [

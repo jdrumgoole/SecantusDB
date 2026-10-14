@@ -101,7 +101,7 @@ pub fn db_hash(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .map_err(crate::util::command_error)?;
         // A view is a definition in `system.views`, not documents; a
         // time-series collection is one too, over `system.buckets.<name>`,
-        // and its buckets are not hashed here (`tasks/backlog.md` 7.084).
+        // and its buckets are not hashed here (`tasks/backlog-rust-mongodb.md` 7.084).
         if options.contains_key("viewOn") || options.contains_key("timeseries") {
             derived_views = true;
             continue;

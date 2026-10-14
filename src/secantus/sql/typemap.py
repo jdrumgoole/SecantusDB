@@ -862,7 +862,7 @@ def sort_key_value(value: Any) -> Any:
     Still unnormalised, and so still an internal error: `jsonb` and the range
     types, both of which ride as subdocuments. Postgres has a documented total
     order over each, and reproducing it is a slice of its own rather than a
-    coercion — see `tasks/backlog.md`."""
+    coercion — see `tasks/backlog-python-postgres.md`."""
     d = _numeric.to_decimal(value) if not isinstance(value, Decimal) else value
     if d is not None:
         # A plain Decimal (callers such as percentile_cont use the result as the
@@ -1678,7 +1678,7 @@ def _render_json(value: Any, compact: bool = False) -> str:
     plain ``json`` columns: PG preserves a json value's input text verbatim,
     and machine-written JSON is compact, so compact re-rendering reproduces
     the typical input byte-for-byte (a hand-spaced literal still normalises —
-    the parsed storage shape can't be fully verbatim; tasks/backlog.md)."""
+    the parsed storage shape can't be fully verbatim; tasks/backlog-python-postgres.md)."""
     isep, ksep = (",", ":") if compact else (", ", ": ")
     if isinstance(value, bson.Decimal128):
         return str(value.to_decimal())
@@ -1818,7 +1818,7 @@ CATALOG_ONLY_TYPES: tuple[tuple[int, str, int], ...] = (
     # `json` (114) is a REAL type this server folds onto the `jsonb` tag, so a
     # `json` column still reports atttypid 3802. The row is correct on its own
     # terms — PostgreSQL has both — but the fold is a separate divergence,
-    # recorded in tasks/backlog.md.
+    # recorded in tasks/backlog-python-postgres.md.
     (114, "json", 199),
     (3220, "pg_lsn", 3221),
     (2970, "txid_snapshot", 2949),

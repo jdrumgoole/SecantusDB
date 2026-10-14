@@ -2778,7 +2778,7 @@ def test_a_table_created_in_a_transaction_is_visible_to_it(home: Path) -> None:
 
     Note what this does NOT claim: that the rollback undoes the CREATE. It does
     not — DDL is not transactional on this server, which is a real divergence
-    from PostgreSQL and is recorded in `tasks/backlog.md`.
+    from PostgreSQL and is recorded in `tasks/backlog-rust-postgres.md`.
     """
     with _Server(home) as server, server.connect() as conn:
         conn.autocommit = False

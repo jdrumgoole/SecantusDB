@@ -59,7 +59,8 @@ session is still alive is not yours either, however old it looks.
 ## 3. Read the record, then distrust it enough to check
 
 - `tasks/remaining-work-plan.md` — phases and what is claimed done.
-- `tasks/backlog.md` — the honest list of divergences; the top of it says why.
+- `tasks/backlog-*.md` — the honest list of divergences, one file per server
+  (`tasks/backlog.md` is the index); each file's header says why.
 - `git log --oneline -20` — what landed while you were away, which is often the
   answer to "is this still open?".
 

@@ -1107,7 +1107,7 @@ def _result_value(
 #: a fresh feature-ON CI round on healthy runners is green, and the losing
 #: rounds all fell in the same degraded-runner window as the disk-reclaim
 #: infra failures. The underlying degradation-triggered race in the SIMPLE
-#: protocol path pre-exists on main and is tracked in tasks/backlog.md.
+#: protocol path pre-exists on main and is tracked in tasks/backlog-python-postgres.md.
 _PIPELINE_TXN_ENABLED = os.environ.get("SECANTUS_PIPELINE_TXN", "1") != "0"
 
 #: Process-wide diagnostics for the lost-update hunt: the racing tests run

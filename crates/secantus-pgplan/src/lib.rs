@@ -24067,7 +24067,7 @@ fn special_timestamp_text(t: &str) -> Option<String> {
 /// PostgreSQL keeps the (wide/BC) date as given but always renders the time as
 /// `HH:MM:SS` (seconds appended, `00:00:00` when absent), then re-attaches the
 /// ` BC` era. The tz-offset a *timestamptz* would carry is deliberately not
-/// computed here (see tasks/backlog.md) -- this is the no-offset form.
+/// computed here (see tasks/backlog-rust-postgres.md) -- this is the no-offset form.
 fn canonical_wide_timestamp(t: &str) -> String {
     let trimmed = t.trim();
     let (body, bc) = match trimmed

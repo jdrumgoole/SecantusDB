@@ -199,11 +199,9 @@ Size: two batches without the aggregate `explain`, three or more with it.
 
 ## Phase 5 -- smaller tails
 
-- [ ] Moved here from Phase 1, as wording or reply shape rather than a
-      wrong answer: the 251 message after a server-side abort (7.065);
+- [ ] Moved here from Phase 1, as reply shape rather than a wrong answer:
       transaction change events lack `txnNumber` / `lsid`, and `lsid.uid`
-      is not the user's hash (7.072, 7.074); no `system.views` collection
-      (7.066).
+      is not the user's hash (7.072, 7.074).
 - [ ] Capped eviction rescans the collection on every insert (7.065).
       This is a performance item: keep a running size and count.
 - [ ] Views (7.066): a `hint` on a view is ignored (mongod: 2);

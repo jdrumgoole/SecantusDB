@@ -1374,7 +1374,7 @@ def _commit_batch_transaction(session: Any, sync: bool) -> None:
 # until the transaction commits or aborts, which we approximate with a
 # backoff loop bounded by this deadline (the transaction lifetime cap
 # is 60s, but a multi-second stall already covers the overwhelmingly
-# common test patterns; see tasks/backlog.md for the divergence note).
+# common test patterns; see tasks/backlog-python-mongodb.md for the divergence note).
 # mongod's per-document BSON cap (16 MiB). Duplicated from wire.py on
 # purpose: storage must not import the wire layer, and both values pin
 # the same protocol constant.

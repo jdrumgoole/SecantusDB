@@ -73,7 +73,7 @@ class TestFieldSelection:
         ``(7,1)`` composite text, because field access has to still work a
         level up — pgjdbc selects the record into a subquery column and then
         reads ``(result.keys).x`` from the outer query. Selecting the whole
-        record straight to a client is a known gap (tasks/backlog.md): it is
+        record straight to a client is a known gap (tasks/backlog-python-postgres.md): it is
         typed from its element and renders as JSON rather than ``(7,1)``.
         """
         assert q("SELECT information_schema._pg_expandarray(ARRAY[7, 8]) FROM src") == [

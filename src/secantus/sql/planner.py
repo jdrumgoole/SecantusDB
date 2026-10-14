@@ -793,7 +793,7 @@ def _like_to_regex(pattern: str, escape: Any = _ESCAPE_UNSET) -> str:
     # instead a plan-time error there, `LIKE pattern must not end with escape
     # character`; we do not distinguish the two paths, and the bound semantics
     # are what a client actually relies on — pgjdbc's getTables binds the
-    # pattern. The literal difference is recorded in tasks/backlog.md.)
+    # pattern. The literal difference is recorded in tasks/backlog-python-postgres.md.)
     out = ["^"]
     i = 0
     while i < len(pattern):
@@ -2030,7 +2030,7 @@ def _pad_bpchar_match_operands(stmt: exp.Expression, table: TableDef) -> None:
 #: form — but is deliberately excluded: the aggregate planner takes a column,
 #: not an expression, so wrapping it raised `0A000 unsupported aggregate
 #: argument: RPAD(c, 5)`. Refusing the query is worse than the unpadded value,
-#: so it keeps the old answer. Recorded in `tasks/backlog.md`.
+#: so it keeps the old answer. Recorded in `tasks/backlog-python-postgres.md`.
 _BPCHAR_OUTPUT_FORM_FUNCS = frozenset(
     {"octet_length", "concat", "concat_ws", "format", "to_json", "to_jsonb"}
 )
@@ -2211,7 +2211,7 @@ def plan_create_table(stmt: exp.Create) -> CreateTablePlan:
             # the pgtest copy corpus creates one on an expression). The table
             # is created without the secondary index — inline index elements
             # are an optimization hint here, not a constraint (see
-            # tasks/backlog.md).
+            # tasks/backlog-python-postgres.md).
             continue
         if not isinstance(coldef, exp.ColumnDef):
             raise errors.feature_not_supported(f"unsupported table element: {coldef.sql()}")

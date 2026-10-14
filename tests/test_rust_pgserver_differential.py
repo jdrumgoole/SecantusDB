@@ -575,7 +575,7 @@ QUERIES = [
     "SELECT ('1 mon'::interval - '1 day'::interval)::text",
     # Beside an interval, a bare UNKNOWN literal coerces to an INTERVAL — not
     # to a timestamp — so this is 22007 rather than date arithmetic. A typed
-    # operand keeps datetime arithmetic. `tasks/backlog.md` recorded this rule
+    # operand keeps datetime arithmetic. `tasks/backlog-rust-postgres.md` recorded this rule
     # from the Python server; the Rust one reproduced the same bug until it did.
     "SELECT ('1 day' + interval '1 day')::text",
     "SELECT (interval '1 day' - '2 hours')::text",
@@ -1141,7 +1141,7 @@ def test_error_sqlstate_matches_postgres(
 #
 # Only the types this server can render exactly in PostgreSQL's binary layout
 # are here: a column outside that set is deliberately described as text even
-# when the client asked for binary (`tasks/backlog.md`), so putting a timestamp
+# when the client asked for binary (`tasks/backlog-rust-postgres.md`), so putting a timestamp
 # in this list would assert the divergence rather than the contract.
 BINARY_RESULT_QUERIES = [
     "SELECT 1::int2",
@@ -1241,7 +1241,7 @@ PARAM_TYPE_QUERIES: list[tuple[str, tuple]] = [
 # BOTH formats, because a boolean answer is a boolean in either. The
 # `pg_typeof` cases above are text-only: its result type is `regtype`, which
 # renders as the type NAME in text and as the four-byte oid in binary, and this
-# server answers `text` (see `tasks/backlog.md`).
+# server answers `text` (see `tasks/backlog-rust-postgres.md`).
 PARAM_RANGE_QUERIES: list[tuple[str, tuple]] = [
     ("SELECT int4range(10, 20, '[]') = %s", (Range(10, 20, "[]"),)),
     ("SELECT %s = int4range(10, 21, '[)')", (Range(10, 20, "[]"),)),
