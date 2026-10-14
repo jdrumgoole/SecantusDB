@@ -1,6 +1,6 @@
 //! Commands that say what the server and the connection are.
 //!
-//! `listCommands`, `logout`, `getDefaultRWConcern`, `replSetGetConfig`,
+//! `listCommands`, `logout`, `replSetGetConfig`,
 //! `shardingState`, `fsyncUnlock`, `connectionStatus`, `whatsmyuri`,
 //! `killOp`, `getLog` and `getParameter`, each as mongod 8.2.11 answers it
 //! (`tools/probes/diagnostic_commands.py`, 2026-10-13). Before that probe
@@ -158,28 +158,6 @@ pub fn list_commands(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
 pub fn logout(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     crate::auth::forget_database(ctx);
     Ok(doc! { "ok": 1.0 })
-}
-
-/// `getDefaultRWConcern`: nothing has been set, so mongod's implicit
-/// defaults, which are also how this server reads and acknowledges.
-pub fn get_default_rw_concern(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    let in_memory = match doc.get("inMemory") {
-        None | Some(Bson::Null) => None,
-        Some(Bson::Boolean(b)) => Some(*b),
-        Some(v) => return Err(wrong_type("getDefaultRWConcern.inMemory", v, "type 'bool'")),
-    };
-    let mut reply = doc! {
-        "defaultReadConcern": {"level": "local"},
-        "defaultWriteConcern": {"w": "majority", "wtimeout": 0_i32},
-        "defaultWriteConcernSource": "implicit",
-        "defaultReadConcernSource": "implicit",
-    };
-    if let Some(asked) = in_memory {
-        reply.insert("inMemory", asked);
-    }
-    reply.insert("localUpdateWallClockTime", bson::DateTime::now());
-    reply.insert("ok", 1.0);
-    Ok(reply)
 }
 
 /// `replSetGetConfig`: the one-member set `hello` describes, in the shape
@@ -549,6 +527,13 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             .as_ref()
             .and_then(|s| s.get(name))
             .unwrap_or(default);
+        // The FCV is what `setFeatureCompatibilityVersion` recorded, when
+        // it recorded one.
+        let value = if name == "featureCompatibilityVersion" {
+            Bson::Document(doc! {"version": crate::cluster_admin::current_fcv(ctx)})
+        } else {
+            value.clone()
+        };
         if details {
             out.insert(
                 name,

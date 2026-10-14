@@ -1237,6 +1237,8 @@ name = "secantus-commands"
 version = "0.5.3-beta.194"
 dependencies = [
  "bson",
+ "libc",
+ "md-5",
  "rand",
  "secantus-auth",
  "secantus-core",

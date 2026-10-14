@@ -9247,15 +9247,24 @@ differs on 388, none of them about who may run a command. Pinned by
 
 What is open:
 
-- [ ] **Five commands the server does not have** (324): `dbHash`,
-      `logRotate`, `connPoolStats`, `setDefaultRWConcern`,
-      `setFeatureCompatibilityVersion`. Each answers 59 to everyone, where
-      mongod refuses most users with 13.
+Re-measured 2026-10-14 after the five missing commands landed (`dbHash`,
+`logRotate`, `connPoolStats`, `setDefaultRWConcern`,
+`setFeatureCompatibilityVersion`; `tools/probes/admin_commands.py`, 279 of
+281 replies match mongod): **61 of 12,053 differ**, none of them about who
+may run a command.
+
 - [ ] **The probe's mongod is a standalone** and the Rust server says it is
       a replica-set member, so `$changeStream`, `replSetGetStatus`,
-      `replSetGetConfig` and `getDefaultRWConcern` differ for the users both
-      allow (37). Running the probe against a one-member replica set needs
-      the set initiated before the localhost exception is used.
+      `replSetGetConfig`, `getDefaultRWConcern` and `setDefaultRWConcern`
+      (mongod: 51300) differ for the users both allow (32). Running the
+      probe against a one-member replica set needs the set initiated before
+      the localhost exception is used.
+- [ ] **`setFeatureCompatibilityVersion` records the version and gates
+      nothing.** mongod at FCV 8.0 refuses the features 8.1 and 8.2 added;
+      this server has no such gates. `getParameter` reports the stored
+      version.
+- [ ] **`dbHash` leaves out a time-series collection** and hashes none of
+      its buckets; mongod hashes `system.buckets.<name>`. Not measured.
 - [ ] **`mapReduce` with `out`** (18), **`compact` and `reIndex`** (8),
       and **`setParameter notablescan`** (3) answer an error here where
       mongod runs them; the users allowed are the same.
@@ -9361,14 +9370,19 @@ Still different, all 159:
       runs, and here each is 20 "not allowed to change at runtime".
       `notablescan` is not there to set, so a scan is never refused.
 - [ ] **Replica-set commands** (about 25): `replSetInitiate`,
-      `replSetReconfig`, `replSetResizeOplog`, `appendOplogNote`,
-      `setFeatureCompatibilityVersion` and the like are unknown commands
-      here, and `local.oplog.rs`, `local.system.replset`,
-      `admin.system.version` and `config.system.sessions` are not listed
-      as collections. `replSetGetStatus` has no `electionCandidateMetrics`.
-- [ ] **Commands not there** (about 30): `dbHash`, `features`,
-      `connPoolStats`, `lockInfo`, `getClusterParameter`, `logRotate`, the
-      plan-cache and query-settings commands. An unknown command that
+      `replSetReconfig`, `replSetResizeOplog`, `appendOplogNote` and the
+      like are unknown commands here, and `local.oplog.rs`,
+      `local.system.replset`, `config.system.sessions` and the other
+      internal collections are not listed. `admin.system.version` exists
+      only once `setFeatureCompatibilityVersion` has written to it. So
+      `dbHash` on `admin` or `config` differs from mongod's
+      (`tools/probes/admin_commands.py`, 2 of 281). `admin.system.keys`
+      holds random signing keys, so that one digest could never match.
+      `replSetGetStatus` has no `electionCandidateMetrics`.
+- [ ] **Commands not there** (about 25): `features`, `lockInfo`,
+      `getClusterParameter`, the plan-cache and query-settings commands.
+      (`dbHash`, `logRotate`, `connPoolStats`, `setDefaultRWConcern` and
+      `setFeatureCompatibilityVersion` landed 2026-10-14.) An unknown command that
       mongod runs only against `admin` answers that refusal from another
       database, where mongod parses its arguments first.
 - [ ] **The profiler** (6): a `filter` document is refused (238), where

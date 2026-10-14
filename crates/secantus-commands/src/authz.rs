@@ -344,6 +344,11 @@ pub(crate) fn check(
         "replSetGetConfig" => c.cluster("replSetGetConfig"),
         "replSetStepDown" => c.cluster("replSetStateChange"),
         "getDefaultRWConcern" => c.cluster("getDefaultRWConcern"),
+        "setDefaultRWConcern" => c.cluster("setDefaultRWConcern"),
+        "setFeatureCompatibilityVersion" => c.cluster("setFeatureCompatibilityVersion"),
+        "logRotate" => c.cluster("logRotate"),
+        "connPoolStats" => c.cluster("connPoolStats"),
+        "dbHash" | "dbhash" => c.on_database(&["dbHash"]),
         "shardingState" => c.cluster("shardingState"),
         "killOp" => c.cluster("killop"),
         "currentOp" => {

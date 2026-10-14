@@ -44,8 +44,10 @@ mod builtin_roles;
 mod bulkwrite;
 mod capped_admin;
 pub mod changestream;
+mod cluster_admin;
 pub mod crud;
 pub mod cursors;
+mod dbhash;
 mod ddl_checks;
 pub mod diagnostics;
 pub mod distinct;
@@ -65,6 +67,7 @@ pub mod params;
 mod privileges;
 pub mod rbac;
 pub mod roles;
+mod rwconcern;
 pub mod serverinfo;
 mod session;
 pub mod slowop;
@@ -596,7 +599,12 @@ fn lookup(name: &str) -> Option<Handler> {
         "whatsmyuri" => serverinfo::whatsmyuri,
         "listCommands" => serverinfo::list_commands,
         "logout" => serverinfo::logout,
-        "getDefaultRWConcern" => serverinfo::get_default_rw_concern,
+        "getDefaultRWConcern" => rwconcern::get_default_rw_concern,
+        "setDefaultRWConcern" => rwconcern::set_default_rw_concern,
+        "logRotate" => cluster_admin::log_rotate,
+        "connPoolStats" => cluster_admin::conn_pool_stats,
+        "setFeatureCompatibilityVersion" => cluster_admin::set_feature_compatibility_version,
+        "dbHash" | "dbhash" => dbhash::db_hash,
         "replSetGetConfig" => serverinfo::repl_set_get_config,
         "shardingState" => serverinfo::sharding_state,
         "fsyncUnlock" => serverinfo::fsync_unlock,
@@ -645,17 +653,47 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     if let Some(stats) = &ctx.top_stats {
         stats.count_op(doc);
     }
+    let name = command_name(doc);
+    // The write concern a write with none of its own is held to: the stored
+    // default, read BEFORE the command runs, so `setDefaultRWConcern`'s own
+    // write answers for the default it replaces (mongod's order).
+    let client_wc = doc.get("writeConcern").and_then(Bson::as_document);
+    let default_wc = if client_wc.is_none() && takes_default_write_concern(name, doc) {
+        rwconcern::default_write_concern(ctx)
+    } else {
+        None
+    };
+    let dropping = if default_wc.is_some() && name == "dropDatabase" {
+        ctx.storage
+            .as_ref()
+            .and_then(|s| s.list_collections(&ctx.db_name).ok())
+            .map_or(0, |names| names.len())
+    } else {
+        0
+    };
     let mut reply = dispatch_inner(doc, ctx);
     // A user or role may have changed: every connection's effective
     // privileges are recomputed on its next command (`rbac::effective`).
-    let name = command_name(doc);
     if umc::is_user_or_role_command(name) || name == "secantusAdmin.restoreArchive" {
         if let Some(p) = &ctx.server_params {
             p.invalidate_user_cache();
         }
     }
     unacknowledged_write_reply(doc, &mut reply);
-    attach_write_concern_error(doc, &mut reply);
+    if let Some(wc) = client_wc {
+        attach_write_concern_error(wc, "clientSupplied", &mut reply);
+    } else if let Some(wc) = &default_wc {
+        attach_write_concern_error(wc, "customDefault", &mut reply);
+    }
+    if name == "setDefaultRWConcern" {
+        fail_on_write_concern_error(&mut reply);
+    } else if name == "dropDatabase" {
+        let db = ctx.db_name.clone();
+        fail_drop_database_on_write_concern_error(&mut reply, &db, dropping, ctx);
+    }
+    if may_have_written_settings(name, ctx) {
+        rwconcern::forget_cached(ctx);
+    }
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
     reply
@@ -710,13 +748,10 @@ fn unacknowledged_write_reply(doc: &Document, reply: &mut Document) {
 ///   `w`, its `j` if given, `wtimeout` (0 when absent) and
 ///   `provenance: "clientSupplied"`, in that order;
 /// - it sits immediately BEFORE `ok`, not after it.
-fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
+fn attach_write_concern_error(wc: &Document, provenance: &str, reply: &mut Document) {
     if reply.get_f64("ok").unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
         return;
     }
-    let Some(wc) = doc.get("writeConcern").and_then(bson::Bson::as_document) else {
-        return;
-    };
     // A null `w` is the empty tag; a tag set echoes its counts as longs.
     let w = match wc.get("w") {
         Some(bson::Bson::Null) => Some(bson::Bson::String(String::new())),
@@ -782,7 +817,7 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
                 i32::try_from(n).map_or(bson::Bson::Int64(n), bson::Bson::Int32)
             }),
     );
-    echoed.insert("provenance", "clientSupplied");
+    echoed.insert("provenance", provenance);
     let mut wce = Document::new();
     wce.insert("code", code);
     wce.insert("codeName", code_name);
@@ -796,9 +831,151 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     }
 }
 
+/// The commands a stored default write concern applies to when the client
+/// sends none: measured on mongod 8.2.11 with a default of `w: 3` on a
+/// one-member set (2026-10-14), each of these answered with the
+/// `customDefault` write-concern error and a read did not.
+fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
+    match name {
+        "insert"
+        | "update"
+        | "delete"
+        | "findAndModify"
+        | "findandmodify"
+        | "bulkWrite"
+        | "create"
+        | "createIndexes"
+        | "dropIndexes"
+        | "drop"
+        | "dropDatabase"
+        | "renameCollection"
+        | "collMod"
+        | "collmod"
+        | "convertToCapped"
+        | "cloneCollectionAsCapped"
+        | "setFeatureCompatibilityVersion"
+        | "setDefaultRWConcern" => true,
+        "aggregate" => doc
+            .get_array("pipeline")
+            .ok()
+            .and_then(|p| p.last())
+            .and_then(Bson::as_document)
+            .is_some_and(|stage| stage.contains_key("$out") || stage.contains_key("$merge")),
+        n => umc::is_user_or_role_command(n),
+    }
+}
+
+/// Whether `name` could have changed `config.settings` other than through
+/// `setDefaultRWConcern`, so the cached defaults are read again.
+fn may_have_written_settings(name: &str, ctx: &CommandContext) -> bool {
+    matches!(
+        name,
+        "secantusAdmin.restoreArchive" | "renameCollection" | "bulkWrite"
+    ) || (ctx.db_name == rwconcern::SETTINGS_DB
+        && matches!(
+            name,
+            "insert"
+                | "update"
+                | "delete"
+                | "findAndModify"
+                | "findandmodify"
+                | "drop"
+                | "dropDatabase"
+                | "aggregate"
+        ))
+}
+
+/// `setDefaultRWConcern` FAILS when its own write cannot satisfy the write
+/// concern, where another write reports the error beside its result: the
+/// write-concern error becomes the reply's own, with mongod's `Error
+/// details` rendering of the concern (measured 8.2.11, 2026-10-14).
+fn fail_on_write_concern_error(reply: &mut Document) {
+    let Ok(wce) = reply.get_document("writeConcernError").cloned() else {
+        return;
+    };
+    if reply.get_f64("ok") != Ok(1.0) {
+        return;
+    }
+    let details = wce
+        .get_document("errInfo")
+        .map(mongod_tostring)
+        .unwrap_or_default();
+    let errmsg = wce.get_str("errmsg").unwrap_or_default();
+    let code = wce.get_i32("code").unwrap_or(8);
+    *reply = doc! {
+        "writeConcernError": wce.clone(),
+        "ok": 0.0,
+        "errmsg": format!("{errmsg}; Error details: {details}"),
+        "code": code,
+        "codeName": util::error_code_name(code),
+    };
+}
+
+/// `dropDatabase` under a default write concern no node can satisfy FAILS
+/// too, saying how many collection drops it waited for and the opTime of
+/// the last (measured 8.2.11, 2026-10-14). `dropped` is how many
+/// collections the database had; with none there was nothing to wait for.
+fn fail_drop_database_on_write_concern_error(
+    reply: &mut Document,
+    db: &str,
+    dropped: usize,
+    ctx: &CommandContext,
+) {
+    let Ok(wce) = reply.get_document("writeConcernError").cloned() else {
+        return;
+    };
+    if reply.get_f64("ok") != Ok(1.0) || dropped == 0 {
+        return;
+    }
+    let at = ctx.storage.as_ref().map_or(
+        bson::Timestamp {
+            time: 0,
+            increment: 0,
+        },
+        |s| s.peek_cluster_time(),
+    );
+    let errmsg = wce.get_str("errmsg").unwrap_or_default();
+    let code = wce.get_i32("code").unwrap_or(8);
+    *reply = doc! {
+        "writeConcernError": wce.clone(),
+        "ok": 0.0,
+        "errmsg": format!(
+            "dropDatabase {db} failed waiting for {dropped} collection drop(s) (most recent \
+             drop optime: {{ ts: Timestamp({}, {}), t: 1 }}) to replicate. :: caused by :: \
+             {errmsg}",
+            at.time, at.increment
+        ),
+        "code": code,
+        "codeName": util::error_code_name(code),
+    };
+}
+
+/// A document as mongod's `BSONObj::toString` prints it inside a message.
+fn mongod_tostring(doc: &Document) -> String {
+    fn value(v: &Bson) -> String {
+        match v {
+            Bson::String(s) => format!("\"{s}\""),
+            Bson::Document(d) => mongod_tostring(d),
+            Bson::Boolean(b) => b.to_string(),
+            Bson::Int32(n) => n.to_string(),
+            Bson::Int64(n) => n.to_string(),
+            Bson::Double(d) => format!("{d:?}"),
+            other => other.to_string(),
+        }
+    }
+    if doc.is_empty() {
+        return "{}".to_string();
+    }
+    let fields: Vec<String> = doc
+        .iter()
+        .map(|(k, v)| format!("{k}: {}", value(v)))
+        .collect();
+    format!("{{ {} }}", fields.join(", "))
+}
+
 /// A numeric `w` as mongod reads it: `safeNumberLong` (truncated toward
 /// zero, NaN as 0, saturating).
-fn write_concern_w_number(w: &bson::Bson) -> i64 {
+pub(crate) fn write_concern_w_number(w: &bson::Bson) -> i64 {
     match w {
         bson::Bson::Int32(n) => i64::from(*n),
         bson::Bson::Int64(n) => *n,
@@ -2346,6 +2523,12 @@ const NO_WRITE_CONCERN: &[&str] = &[
     "compact",
     "reIndex",
     "mapReduce",
+    // Measured 2026-10-14 (`tools/probes/admin_commands.py`).
+    "logRotate",
+    "connPoolStats",
+    "dbHash",
+    "dbhash",
+    "getDefaultRWConcern",
 ];
 
 fn refuse_write_concern(doc: &Document, name: &str) -> Result<(), CommandError> {
@@ -2704,7 +2887,7 @@ mod tests {
         let refused = dispatch(&doc! {"ping": 1, "writeConcern": {"w": 2}}, &mut ctx());
         assert_eq!(refused.get_i32("code").unwrap(), 72);
         let mut reply = doc! {"n": 1, "ok": 1.0};
-        attach_write_concern_error(&doc! {"insert": "c", "writeConcern": {"w": 2}}, &mut reply);
+        attach_write_concern_error(&doc! {"w": 2}, "clientSupplied", &mut reply);
         let wce = reply.get_document("writeConcernError").unwrap();
         assert_eq!(wce.get_i32("code").unwrap(), 100);
         assert_eq!(
