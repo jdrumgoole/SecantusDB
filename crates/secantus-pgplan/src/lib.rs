@@ -5480,7 +5480,10 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
         // A BARE `char` can only have been written `"char"`: the grammar turns
         // an unquoted `char` into `pg_catalog.bpchar`. It is the one-byte
         // internal type (oid 18), not `character`.
-        ["char"] => QUOTED_CHAR.to_string(),
+        // So is a QUALIFIED `char`: the grammar's `character` is
+        // `pg_catalog.bpchar`, and `pg_catalog.char` only comes from
+        // `pg_catalog."char"` as written.
+        ["char"] | ["pg_catalog", "char"] => QUOTED_CHAR.to_string(),
         [n] | ["pg_catalog" | "public", n] => (*n).to_string(),
         [schema, n] => canonical_type_ref(&format!("{schema}.{n}")),
         other => other.join("."),
@@ -10515,9 +10518,17 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         names[0] = alias.clone();
     }
     // A function whose one column is a named OUT parameter keeps that name
-    // in FROM, whatever the alias: `pg_partition_ancestors(...)` is `relid`.
-    if colnames.is_empty() && names.len() == 1 && name == "pg_partition_ancestors" {
-        names[0] = "relid".into();
+    // in FROM, whatever the alias: `pg_partition_ancestors(...)` is `relid`,
+    // and `json_array_elements(...)` is `value`.
+    if colnames.is_empty() && names.len() == 1 {
+        match name.as_str() {
+            "pg_partition_ancestors" => names[0] = "relid".into(),
+            "json_array_elements"
+            | "json_array_elements_text"
+            | "jsonb_array_elements"
+            | "jsonb_array_elements_text" => names[0] = "value".into(),
+            _ => {}
+        }
     }
     let plan = Statement::ValuesConstant(ValuesConstant {
         names: names.clone(),
@@ -10591,7 +10602,7 @@ fn json_record_rows(
     ) {
         return Ok(None);
     }
-    let cols: Vec<(String, String)> = coldefs
+    let mut cols: Vec<(String, String)> = coldefs
         .iter()
         .filter_map(|c| match c.node.as_ref() {
             Some(N::ColumnDef(cd)) => Some((
@@ -10601,6 +10612,27 @@ fn json_record_rows(
             _ => None,
         })
         .collect();
+    // A populate function's columns are its base argument's row type, and
+    // the base record's fields stand in for the keys the JSON lacks.
+    let mut base_fields: Vec<Bson> = Vec::new();
+    if populate && cols.is_empty() {
+        let base = call
+            .args
+            .first()
+            .ok_or_else(|| Error::UndefinedFunction(format!("function {name} does not exist")))?;
+        let base_value = const_value(base, params)?;
+        let base_type = static_type(base, &base_value);
+        let Some((_, fields)) = user_composite(&base_type) else {
+            return Err(Error::Sqlstate(
+                "42804",
+                format!("first argument of {name} must be a row type"),
+            ));
+        };
+        cols = fields;
+        if let Some(values) = record_values(&base_value) {
+            base_fields = values.clone();
+        }
+    }
     if cols.is_empty() {
         return Err(Error::Sqlstate(
             "42601",
@@ -10623,19 +10655,31 @@ fn json_record_rows(
     let text = value_text(&value);
     let parsed = json::parse(&text)
         .map_err(|_| Error::InvalidText(format!("invalid input syntax for type json: {text}")))?;
+    // PostgreSQL's errors name the shape found: a record function is
+    // `populate_composite`, a recordset one names itself.
+    let shape = |j: &json::Json| match j {
+        json::Json::Array(_) => "an array",
+        json::Json::Object(_) => "an object",
+        _ => "a scalar",
+    };
     let objects: Vec<json::Json> = match (set, parsed) {
         (false, j @ json::Json::Object(_)) => vec![j],
         (true, json::Json::Array(items)) => items,
-        (false, _) => {
+        (false, other) => {
             return Err(Error::Sqlstate(
                 "22023",
-                "cannot call function with a non-object argument".into(),
+                format!("cannot call populate_composite on {}", shape(&other)),
             ))
         }
-        (true, _) => {
+        // jsonb says only that it is not an array.
+        (true, other) => {
             return Err(Error::Sqlstate(
                 "22023",
-                "cannot call function on a non-array".into(),
+                if name.starts_with("jsonb") {
+                    format!("cannot call {name} on a non-array")
+                } else {
+                    format!("cannot call {name} on {}", shape(&other))
+                },
             ))
         }
     };
@@ -10644,13 +10688,14 @@ fn json_record_rows(
         if !matches!(obj, json::Json::Object(_)) {
             return Err(Error::Sqlstate(
                 "22023",
-                "argument of json_populate_recordset must be an array of objects".into(),
+                format!("argument of {name} must be an array of objects"),
             ));
         }
         let mut row = Vec::with_capacity(cols.len());
-        for (col, ty) in &cols {
+        for (i, (col, ty)) in cols.iter().enumerate() {
             let cell = match json::member(obj, col) {
-                None | Some(json::Json::Null) => Bson::Null,
+                None => base_fields.get(i).cloned().unwrap_or(Bson::Null),
+                Some(json::Json::Null) => Bson::Null,
                 Some(v) => json_to_sql(v, ty)?,
             };
             row.push(cell);
@@ -10662,6 +10707,70 @@ fn json_record_rows(
         cols.iter().map(|(_, t)| t.clone()).collect(),
         rows,
     )))
+}
+
+/// `json[b]_populate_record(base, json)` as a VALUE: the composite of the
+/// base's type, each field its key's value or, for a key the object lacks,
+/// the base's field. Named, so `(...).a` and `row_to_json` see the names.
+pub(crate) fn populate_composite(
+    name: &str,
+    base: &Bson,
+    base_type: &str,
+    doc: &Bson,
+) -> Result<Bson> {
+    let Some((_, fields)) = user_composite(base_type) else {
+        return Err(Error::Sqlstate(
+            "42804",
+            format!("first argument of {name} must be a row type"),
+        ));
+    };
+    let base_fields = record_values(base).cloned().unwrap_or_default();
+    // A NULL document is the base itself, NULL or not.
+    if *doc == Bson::Null {
+        return Ok(base.clone());
+    }
+    let values: Vec<Bson> = match doc {
+        Bson::Null => unreachable!(),
+        other => {
+            let text = value_text(other);
+            let parsed = json::parse(&text).map_err(json_parse_error)?;
+            if !matches!(parsed, json::Json::Object(_)) {
+                return Err(Error::Sqlstate(
+                    "22023",
+                    format!(
+                        "cannot call populate_composite on {}",
+                        if matches!(parsed, json::Json::Array(_)) {
+                            "an array"
+                        } else {
+                            "a scalar"
+                        }
+                    ),
+                ));
+            }
+            fields
+                .iter()
+                .enumerate()
+                .map(|(i, (col, ty))| match json::member(&parsed, col) {
+                    None => Ok(base_fields.get(i).cloned().unwrap_or(Bson::Null)),
+                    Some(json::Json::Null) => Ok(Bson::Null),
+                    Some(v) => json_to_sql(v, ty),
+                })
+                .collect::<Result<_>>()?
+        }
+    };
+    let mut record = typed_record_value(values, fields.iter().map(|(_, t)| t.clone()).collect());
+    if let Bson::Document(d) = &mut record {
+        d.insert(
+            RECORD_NAMES_KEY,
+            Bson::Array(
+                fields
+                    .iter()
+                    .map(|(n, _)| Bson::String(n.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Ok(record)
 }
 
 /// An integer `generate_series(start, stop [, step])` as rows -- the lazy
@@ -10903,6 +11012,31 @@ fn srf_rows(
             ))),
         }
     };
+    // A `json` argument's members or elements as its own text: the value
+    // each row answers is the input's span for it, spacing and all.
+    let raw_rows = |as_text: bool| -> Result<Vec<Vec<Bson>>> {
+        let text = match args(1)?.into_iter().next() {
+            Some(Bson::String(t)) => t,
+            _ => return Ok(Vec::new()),
+        };
+        let raw = json::parse_raw(&text)
+            .ok_or_else(|| Error::InvalidText("invalid input syntax for type json".into()))?;
+        let cell = |v: &json::Raw| {
+            if as_text {
+                v.sql_text().map_or(Bson::Null, Bson::String)
+            } else {
+                Bson::String(v.text.to_string())
+            }
+        };
+        Ok(match &raw.kind {
+            json::RawKind::Array(items) => items.iter().map(|v| vec![cell(v)]).collect(),
+            json::RawKind::Object(members) => members
+                .iter()
+                .map(|(k, v)| vec![Bson::String(k.clone()), cell(v)])
+                .collect(),
+            _ => Vec::new(),
+        })
+    };
     let render = |j: &json::Json, jsonb: bool| {
         if jsonb {
             json::render_jsonb(j)
@@ -10931,6 +11065,7 @@ fn srf_rows(
             let col = "value";
             let rows = match json_arg()? {
                 None => Vec::new(),
+                Some((json::Json::Array(_), false)) => raw_rows(as_text)?,
                 Some((json::Json::Array(items), jsonb)) => items
                     .iter()
                     .map(|v| {
@@ -10972,13 +11107,18 @@ fn srf_rows(
             };
             let rows = match json_arg()? {
                 None => Vec::new(),
+                Some((json::Json::Object(_), false)) => raw_rows(as_text)?,
                 Some((json::Json::Object(members), jsonb)) => {
                     // jsonb reports its members in its normalised (sorted)
                     // order; json keeps the input's.
                     let mut members = members.clone();
                     if jsonb {
+                        // The sort is stable, so of a key given twice the
+                        // LAST is kept, as jsonb's own input keeps it.
                         members.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+                        members.reverse();
                         members.dedup_by(|a, b| a.0 == b.0);
+                        members.reverse();
                     }
                     members
                         .iter()
@@ -11124,6 +11264,54 @@ fn srf_rows(
             // no static type (a correlated reference's parameter) names it
             // by what it holds -- and a NULL holds no rows at all.
             let arg_type = static_type(&call.args[0], &value);
+            // `unnest(tsvector)`: a row per lexeme, with its positions and
+            // their weights (NULL when it has none), in the vector's order.
+            if arg_type == "tsvector" {
+                let rows = match &value {
+                    Bson::Null => Vec::new(),
+                    v => fts::parse_vector(&value_text(v))?
+                        .0
+                        .into_iter()
+                        .map(|(lexeme, positions)| {
+                            let (pos, weights) = if positions.is_empty() {
+                                (Bson::Null, Bson::Null)
+                            } else {
+                                (
+                                    Bson::Array(
+                                        positions
+                                            .iter()
+                                            .map(|p| Bson::Int32(i32::from(p.0)))
+                                            .collect(),
+                                    ),
+                                    Bson::Array(
+                                        positions
+                                            .iter()
+                                            .map(|p| Bson::String(fts::weight_name(p.1).into()))
+                                            .collect(),
+                                    ),
+                                )
+                            };
+                            vec![Bson::String(lexeme), pos, weights]
+                        })
+                        .collect(),
+                };
+                return Ok(Some((
+                    vec!["lexeme".into(), "positions".into(), "weights".into()],
+                    vec!["text".into(), "int2[]".into(), "text[]".into()],
+                    rows,
+                )));
+            }
+            // `unnest(multirange)`: its ranges, in order.
+            if let Some(member) = range::multirange_member(&arg_type) {
+                let values = match &value {
+                    Bson::Null => Vec::new(),
+                    v => range::multirange_from_text(&value_text(v), &arg_type)?
+                        .iter()
+                        .map(|r| Bson::String(range::render(r)))
+                        .collect(),
+                };
+                return Ok(Some(one(values, &member)));
+            }
             let element = match arg_type.strip_suffix("[]") {
                 Some(e) => e.to_owned(),
                 // `int2vector` / `oidvector` (`pg_index.indkey`) are arrays
@@ -11178,8 +11366,158 @@ fn srf_rows(
                 rows,
             )));
         }
+        // `pg_get_keywords()`: PostgreSQL 15's `kwlist.h`, in its order.
+        "pg_get_keywords" => {
+            args(0)?;
+            let rows = include_str!("pg_keywords.tsv")
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.split('\t');
+                    let (word, cat, bare) = (it.next()?, it.next()?, it.next()? == "t");
+                    let catdesc = match cat {
+                        "U" => "unreserved",
+                        "C" => "unreserved (cannot be function or type name)",
+                        "T" => "reserved (can be function or type name)",
+                        _ => "reserved",
+                    };
+                    Some(vec![
+                        Bson::String(word.into()),
+                        Bson::String(cat.into()),
+                        Bson::Boolean(bare),
+                        Bson::String(catdesc.into()),
+                        Bson::String(
+                            if bare {
+                                "can be bare label"
+                            } else {
+                                "requires AS"
+                            }
+                            .into(),
+                        ),
+                    ])
+                })
+                .collect();
+            return Ok(Some((
+                ["word", "catcode", "barelabel", "catdesc", "baredesc"]
+                    .map(String::from)
+                    .to_vec(),
+                ["text", QUOTED_CHAR, "bool", "text", "text"]
+                    .map(String::from)
+                    .to_vec(),
+                rows,
+            )));
+        }
+        // `pg_options_to_table(text[])`: each `name=value` split at its
+        // first `=`; an option with none has a NULL value.
+        "pg_options_to_table" => {
+            let a = args(1)?;
+            let rows = match arrays::strip(&a[0]) {
+                Bson::Array(items) if items.contains(&Bson::Null) => {
+                    return Err(Error::Sqlstate(
+                        "22004",
+                        "null array element not allowed in this context".into(),
+                    ))
+                }
+                Bson::Array(items) => items
+                    .iter()
+                    .map(|o| {
+                        let o = value_text(o);
+                        match o.split_once('=') {
+                            Some((k, v)) => vec![Bson::String(k.into()), Bson::String(v.into())],
+                            None => vec![Bson::String(o), Bson::Null],
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            return Ok(Some((
+                vec!["option_name".into(), "option_value".into()],
+                vec!["text".into(), "text".into()],
+                rows,
+            )));
+        }
+        // `ts_token_type(parser)`: the default parser's 23 token types
+        // (`wparser_def.c`'s `tok_alias` / `lex_descr`), the only parser
+        // there is, named or by oid (3722).
+        "ts_token_type" => {
+            let a = args(1)?;
+            let names = vec!["tokid".into(), "alias".into(), "description".into()];
+            let types = vec!["int4".into(), "text".into(), "text".into()];
+            match &a[0] {
+                Bson::Null => return Ok(Some((names, types, Vec::new()))),
+                Bson::Int32(_) | Bson::Int64(_) => {
+                    let oid = match &a[0] {
+                        Bson::Int32(i) => i64::from(*i),
+                        Bson::Int64(i) => *i,
+                        _ => 0,
+                    };
+                    if oid != 3722 {
+                        return Err(Error::Internal(format!(
+                            "cache lookup failed for text search parser {oid}"
+                        )));
+                    }
+                }
+                other => {
+                    let n = value_text(other);
+                    if !matches!(n.as_str(), "default" | "pg_catalog.default") {
+                        return Err(Error::Sqlstate(
+                            "42704",
+                            format!("text search parser \"{n}\" does not exist"),
+                        ));
+                    }
+                }
+            }
+            const TOKENS: [(&str, &str); 23] = [
+                ("asciiword", "Word, all ASCII"),
+                ("word", "Word, all letters"),
+                ("numword", "Word, letters and digits"),
+                ("email", "Email address"),
+                ("url", "URL"),
+                ("host", "Host"),
+                ("sfloat", "Scientific notation"),
+                ("version", "Version number"),
+                ("hword_numpart", "Hyphenated word part, letters and digits"),
+                ("hword_part", "Hyphenated word part, all letters"),
+                ("hword_asciipart", "Hyphenated word part, all ASCII"),
+                ("blank", "Space symbols"),
+                ("tag", "XML tag"),
+                ("protocol", "Protocol head"),
+                ("numhword", "Hyphenated word, letters and digits"),
+                ("asciihword", "Hyphenated word, all ASCII"),
+                ("hword", "Hyphenated word, all letters"),
+                ("url_path", "URL path"),
+                ("file", "File or path name"),
+                ("float", "Decimal notation"),
+                ("int", "Signed integer"),
+                ("uint", "Unsigned integer"),
+                ("entity", "XML entity"),
+            ];
+            let rows = TOKENS
+                .iter()
+                .enumerate()
+                .map(|(i, (alias, descr))| {
+                    vec![
+                        Bson::Int32(i as i32 + 1),
+                        Bson::String((*alias).into()),
+                        Bson::String((*descr).into()),
+                    ]
+                })
+                .collect();
+            return Ok(Some((names, types, rows)));
+        }
         "generate_subscripts" => {
-            let a = args(2)?;
+            // `(array, dim [, reverse])`: with `reverse` true the subscripts
+            // count down. Strict, so a NULL `reverse` is no rows.
+            let a = if call.args.len() == 3 {
+                args(3)?
+            } else {
+                args(2)?
+            };
+            let reverse = match a.get(2) {
+                None => false,
+                Some(Bson::Boolean(b)) => *b,
+                Some(Bson::Null) => return Ok(Some(one(Vec::new(), "int4"))),
+                Some(other) => value_text(other) == "true",
+            };
             let lower = arrays::lower_bounds(&a[0]);
             let dims = arrays::dim_lengths(&arrays::strip(&a[0]));
             let dim = match &a[1] {
@@ -11195,6 +11533,11 @@ fn srf_rows(
                         .collect()
                 }
                 _ => Vec::new(),
+            };
+            let values = if reverse {
+                values.into_iter().rev().collect()
+            } else {
+                values
             };
             one(values, "int4")
         }
@@ -13285,6 +13628,17 @@ fn plan_aggregate_item(
         return Ok(item);
     }
     if f.args.len() != nargs {
+        // `count()`: PostgreSQL's own message, with the name as written.
+        if func == AggFunc::Count && f.args.is_empty() && !f.agg_star {
+            let qualified = f.funcname.len() == 2;
+            return Err(Error::Sqlstate(
+                "42809",
+                format!(
+                    "{}count(*) must be used to call a parameterless aggregate function",
+                    if qualified { "pg_catalog." } else { "" }
+                ),
+            ));
+        }
         if func == AggFunc::StringAgg {
             return Err(Error::Unsupported(
                 "string_agg takes a value and a separator".into(),
@@ -16261,10 +16615,8 @@ fn call_arg_types(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Vec<Stri
         .collect()
 }
 
-/// A function the PostgreSQL this server reports (15) does not have, or
-/// refuses in a UTF8 database, answered as PostgreSQL answers it: 42883
-/// naming the argument types, and `to_ascii` cannot convert from UTF8
-/// (0A000).
+/// A function the PostgreSQL this server reports (15) does not have,
+/// answered as PostgreSQL answers it: 42883 naming the argument types.
 fn function_absent_in_reference(
     f: &pg_query::protobuf::FuncCall,
     params: &[Bson],
@@ -16289,11 +16641,6 @@ fn function_absent_in_reference(
             "function {name}({}) does not exist",
             types.join(", ")
         )));
-    }
-    if name == "to_ascii" {
-        return Some(Error::FeatureNotSupported(
-            "encoding conversion from UTF8 to ASCII not supported".into(),
-        ));
     }
     // `json_scalar` / `json_serialize` and friends parse (the grammar is
     // PostgreSQL 17's) but are PostgreSQL 16+: this server reports 15.
@@ -22242,20 +22589,59 @@ fn plan_select_unnest(
         return Ok(None);
     };
     let name = func_name(f).unwrap_or_default();
-    let Some((names, types, rows)) = srf_rows(&name, f, params, false)? else {
+    // A populate_recordset function names its row type by its first
+    // argument; each row is a record of that type. The single-record
+    // populate functions are scalar (`populate_composite`).
+    let populated = name.contains("populate_recordset");
+    let rows_of = if populated {
+        json_record_rows(&name, f, &[], params)?
+    } else {
+        srf_rows(&name, f, params, false)?
+    };
+    let Some((names, types, rows)) = rows_of else {
         return Ok(None);
     };
     // A clause needs a source to apply to, and this shape has none. Refused by
     // name rather than silently ignored -- dropping a WHERE would return rows
     // the client asked not to see.
-    if s.where_clause.is_some()
-        || !s.sort_clause.is_empty()
-        || s.limit_count.is_some()
-        || s.limit_offset.is_some()
-    {
+    if s.where_clause.is_some() || !s.sort_clause.is_empty() {
         return Err(Error::Unsupported(format!(
             "a clause over a set-returning {name}()"
         )));
+    }
+    // LIMIT and OFFSET are constants here, and cut the rows as they come.
+    let (limit, offset) = limit_offset(s, params)?;
+    let rows: Vec<Vec<Bson>> = rows
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(0))
+        .take(limit.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(0)))
+        .collect();
+    // A function of several OUT columns (`json_each`) is ONE `record` column
+    // in a select list, named after the function: `select json_each(j)` is
+    // `(a,1)`, not the two columns its FROM form gives.
+    if names.len() > 1 || populated {
+        // A populate function's record is of its base argument's type.
+        let record_type = match f.args.first().filter(|_| populated) {
+            Some(base) => {
+                let v = correlated::without_side_effects(|| const_value(base, params))
+                    .unwrap_or(Bson::Null);
+                static_type(base, &v)
+            }
+            None => "record".to_string(),
+        };
+        let rows = rows
+            .into_iter()
+            .map(|row| vec![typed_record_value(row, types.clone())])
+            .collect();
+        return Ok(Some(Statement::ValuesConstant(ValuesConstant {
+            names: vec![if rt.name.is_empty() {
+                name
+            } else {
+                rt.name.clone()
+            }],
+            types: vec![record_type],
+            rows,
+        })));
     }
     let names = vec![if rt.name.is_empty() {
         names.into_iter().next().unwrap_or(name)
@@ -29326,6 +29712,21 @@ fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson>
             json::contains(&other, &parsed)
         }));
     }
+    // Over `json`, what comes back is the input's own text for the value
+    // found, and a key given twice finds its last value.
+    if target == "json" && matches!(op, "->" | "#>" | "->>" | "#>>") {
+        let raw = json::parse_raw(&text)
+            .ok_or_else(|| Error::InvalidText("invalid input syntax for type json".into()))?;
+        let mut current = Some(&raw);
+        for step in &steps {
+            current = current.and_then(|v| v.member(step));
+        }
+        return Ok(match current {
+            None => Bson::Null,
+            Some(found) if op == "->" || op == "#>" => Bson::String(found.text.to_string()),
+            Some(found) => found.sql_text().map_or(Bson::Null, Bson::String),
+        });
+    }
     let mut current = Some(&parsed);
     for step in &steps {
         current = current.and_then(|v| json::member(v, step));
@@ -32352,6 +32753,20 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
         ("macaddr8", "macaddr") => {
             Some(systypes::macaddr8_to_macaddr(&value_text(v)).map(Bson::String))
         }
+        // `inet_to_cidr`: the host bits cleared, where a cidr LITERAL with
+        // host bits set is an error.
+        ("inet", "cidr") => Some(net::call(
+            "network",
+            std::slice::from_ref(v),
+            &["inet".into()],
+        )),
+        // `interval_time`: the interval's time part, wrapped into one day;
+        // its days and months are dropped.
+        ("interval", "time") => Interval::from_bson(v).map(|iv| {
+            Ok(Bson::String(datetime::render_time(
+                iv.micros.rem_euclid(datetime::USECS_PER_DAY),
+            )))
+        }),
         _ => None,
     }
 }

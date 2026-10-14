@@ -25,6 +25,17 @@ struct Sig {
     retset: bool,
 }
 
+/// The catalog's name for a type as the planner spells it: `pg_proc` calls
+/// the one-byte type `char` (the SQL `character` is `bpchar` there), which
+/// is `"char"` everywhere else in this crate.
+fn planner_type(t: &str) -> String {
+    match t {
+        "char" => crate::QUOTED_CHAR.to_string(),
+        "char[]" => format!("{}[]", crate::QUOTED_CHAR),
+        other => other.to_string(),
+    }
+}
+
 fn sigs() -> &'static HashMap<String, Vec<Sig>> {
     static S: OnceLock<HashMap<String, Vec<Sig>>> = OnceLock::new();
     S.get_or_init(|| {
@@ -45,11 +56,11 @@ fn sigs() -> &'static HashMap<String, Vec<Sig>> {
                 args: if args.is_empty() {
                     Vec::new()
                 } else {
-                    args.split(',').map(str::to_string).collect()
+                    args.split(',').map(planner_type).collect()
                 },
                 variadic: v == "1",
                 defaults: d.parse().unwrap_or(0),
-                ret: ret.to_string(),
+                ret: planner_type(ret),
                 retset: set == "1",
             });
         }
@@ -64,7 +75,7 @@ fn casts() -> &'static HashSet<(String, String)> {
             .lines()
             .filter_map(|l| {
                 let (a, b) = l.split_once('\t')?;
-                Some((a.to_string(), b.to_string()))
+                Some((planner_type(a), planner_type(b)))
             })
             .collect()
     })
@@ -162,7 +173,7 @@ fn categories() -> &'static HashMap<String, (char, bool)> {
                 let name = it.next()?;
                 let cat = it.next()?.chars().next()?;
                 let preferred = it.next()? == "1";
-                Some((name.to_string(), (cat, preferred)))
+                Some((planner_type(name), (cat, preferred)))
             })
             .collect()
     })

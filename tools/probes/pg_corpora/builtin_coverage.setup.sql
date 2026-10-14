@@ -13,3 +13,5 @@ INSERT INTO bc_arr VALUES (1, '{1,2}'), (2, NULL), (3, '{5,6}'), (4, '{7}')
 DROP TABLE IF EXISTS bc_hl
 CREATE TABLE bc_hl (id int PRIMARY KEY, d jsonb, j json)
 INSERT INTO bc_hl VALUES (1, '{"cat": "a cat"}', '{"x":  "cat"}'), (2, '["dog"]', '[ "dog", "cat" ]')
+DROP TYPE IF EXISTS bc_comp CASCADE
+CREATE TYPE bc_comp AS (a int, b text)

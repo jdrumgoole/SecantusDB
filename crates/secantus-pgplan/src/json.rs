@@ -518,6 +518,158 @@ pub fn render_json_compact(v: &Json) -> String {
     out
 }
 
+/// A `json` value as its SOURCE text, with the structure needed to walk it.
+///
+/// `json` keeps its input exactly, and what its operators and functions hand
+/// back of it is the input's own text: `'{"a": [1,  2]}'::json -> 'a'` is
+/// `[1,  2]`, spacing and all. A [`Json`] tree cannot give that back, so the
+/// `json` (not `jsonb`) extractions walk this instead.
+pub struct Raw<'a> {
+    /// The value's text, from its first character to its last.
+    pub text: &'a str,
+    pub kind: RawKind<'a>,
+}
+
+pub enum RawKind<'a> {
+    Null,
+    /// A string, unescaped.
+    Str(String),
+    /// A number or a boolean.
+    Other,
+    Array(Vec<Raw<'a>>),
+    /// In input order, duplicates kept.
+    Object(Vec<(String, Raw<'a>)>),
+}
+
+/// Walk valid JSON text into [`Raw`] spans. `None` when the text is not
+/// JSON; callers [`parse`] it first, for the error.
+pub fn parse_raw(text: &str) -> Option<Raw<'_>> {
+    fn ws(b: &[u8], i: &mut usize) {
+        while matches!(b.get(*i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            *i += 1;
+        }
+    }
+    fn string(s: &str, i: &mut usize) -> Option<String> {
+        let b = s.as_bytes();
+        let start = *i;
+        if b.get(*i) != Some(&b'"') {
+            return None;
+        }
+        *i += 1;
+        loop {
+            match b.get(*i)? {
+                b'\\' => *i += 2,
+                b'"' => break,
+                _ => *i += 1,
+            }
+        }
+        *i += 1;
+        match parse(&s[start..*i]).ok()? {
+            Json::Str(v) => Some(v),
+            _ => None,
+        }
+    }
+    fn value<'a>(s: &'a str, i: &mut usize) -> Option<Raw<'a>> {
+        let b = s.as_bytes();
+        ws(b, i);
+        let start = *i;
+        let kind = match *b.get(*i)? {
+            b'"' => RawKind::Str(string(s, i)?),
+            open @ (b'[' | b'{') => {
+                let close = if open == b'[' { b']' } else { b'}' };
+                *i += 1;
+                let mut items = Vec::new();
+                let mut members = Vec::new();
+                ws(b, i);
+                if b.get(*i) == Some(&close) {
+                    *i += 1;
+                } else {
+                    loop {
+                        if open == b'{' {
+                            ws(b, i);
+                            let key = string(s, i)?;
+                            ws(b, i);
+                            if b.get(*i) != Some(&b':') {
+                                return None;
+                            }
+                            *i += 1;
+                            members.push((key, value(s, i)?));
+                        } else {
+                            items.push(value(s, i)?);
+                        }
+                        ws(b, i);
+                        match b.get(*i)? {
+                            b',' => *i += 1,
+                            c if *c == close => {
+                                *i += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                if open == b'[' {
+                    RawKind::Array(items)
+                } else {
+                    RawKind::Object(members)
+                }
+            }
+            _ => {
+                while !matches!(
+                    b.get(*i),
+                    None | Some(b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+                ) {
+                    *i += 1;
+                }
+                if &s[start..*i] == "null" {
+                    RawKind::Null
+                } else {
+                    RawKind::Other
+                }
+            }
+        };
+        Some(Raw {
+            text: &s[start..*i],
+            kind,
+        })
+    }
+    let mut i = 0;
+    let v = value(text, &mut i)?;
+    ws(text.as_bytes(), &mut i);
+    (i == text.len()).then_some(v)
+}
+
+impl<'a> Raw<'a> {
+    /// One step of `->` / `#>` over `json`: as [`member`], except that a
+    /// key given twice answers its LAST value, as `json`'s field lookup does
+    /// (`'{"a":1,"a":2}'::json -> 'a'` is `2`).
+    pub fn member(&self, key: &str) -> Option<&Raw<'a>> {
+        match &self.kind {
+            RawKind::Object(pairs) => pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
+            RawKind::Array(items) => {
+                let index: i64 = key.parse().ok()?;
+                let index = if index < 0 {
+                    items.len().checked_sub(index.unsigned_abs() as usize)?
+                } else {
+                    index as usize
+                };
+                items.get(index)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `->>` reading: a string's content, NULL for null, and otherwise
+    /// the value's own text.
+    pub fn sql_text(&self) -> Option<String> {
+        match &self.kind {
+            RawKind::Null => None,
+            RawKind::Str(s) => Some(s.clone()),
+            _ => Some(self.text.to_string()),
+        }
+    }
+}
+
 /// One step of `->` / `#>`: a member by NAME, or an array element by INDEX.
 ///
 /// A negative index counts from the end (`-1` is the last element), which is

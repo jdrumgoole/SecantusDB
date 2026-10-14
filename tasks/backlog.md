@@ -5098,32 +5098,75 @@ These are explicit non-goals. Don't add them without a reason.
       plain number on Linux.
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
-      (2026-10-12).** The probe calls every immutable or stable function in
+      (2026-10-14).** The probe calls every immutable or stable function in
       PostgreSQL 15.19's `pg_proc` on both servers with one sample value
       for each argument type. Of the 1,935 it can call, 619 answered the
-      same before the batch of 2026-10-12 and 1,439 after it; 428 are still
-      refused (42883 or 0A000) and 68 differ some other way. 325 more
-      read the server's own state and are not called, and 722 take a type
-      the probe has no sample for (`internal`, `cstring`, `record`,
-      `aclitem`, `regproc`, `xml`, `refcursor` and others), so nothing
-      here is said of them. Re-run it before working an item: the lists
-      below are from that day.
+      same before the batch of 2026-10-12, 1,439 after it, 1,451 after the
+      first batch of 2026-10-14 and 1,503 after the second. 325 more read
+      the server's own state and are not called, and 722 take a type the
+      probe has no sample for (`internal`, `cstring`, `record`, `aclitem`,
+      `regproc`, `xml`, `refcursor` and others), so nothing here is said
+      of them. Re-run it before working an item: the lists below are from
+      that day.
 
-      **The eight wrong answers that list named were fixed on 2026-10-14**,
-      each measured against PostgreSQL 15.19 and recorded in
-      `pg_corpora/builtin_coverage.sql`: `pg_lsn` arithmetic, `lseg ?#
-      lseg`, `line <-> point`, `ts_headline` over a document, `"char"`
-      from and to an integer, `pg_relation_is_publishable`, `array_agg`
-      over arrays, and an alias call with a literal PostgreSQL would not
-      coerce. Measuring them found more, fixed in the same batch: a
-      `pg_lsn` column compared with a literal (`where l = '0/16'`) matched
-      NOTHING, `set l = l + 1` failed, `ts_headline` ignored its options
-      entirely and marked up a document's KEYS, and a composite primary
-      key whose columns are named like extended JSON (`"$date"`,
-      `"$regex"`) read back NULL, failed every read, or was updated not at
-      all, because rows were decoded through serde and found again by a
-      bare `{_id: key}` filter (`tests/test_rust_pg_dollar_names.py`).
-      What that work left:
+      **Fixed on 2026-10-14, each recorded with PostgreSQL 15.19's answer
+      in `pg_corpora/builtin_coverage.sql`.** The first batch: `pg_lsn`
+      arithmetic and filters, `lseg ?# lseg`, `line <-> point`,
+      `ts_headline` over a document and its options, `"char"` from and to
+      an integer, `pg_relation_is_publishable`, `array_agg` over arrays,
+      an alias call with a literal PostgreSQL would not coerce, and
+      composite keys named like extended JSON. The second batch fixed
+      these wrong answers:
+      - every `json` extraction (`->`, `->>`, `#>`, `#>>`,
+        `json_extract_path`, `json_each`, `json_array_elements`) answered
+        a re-rendering, where PostgreSQL answers the input's own text,
+        spacing and all; and a key given twice found its FIRST value
+        where `json` finds its last;
+      - `jsonb_each` of a key given twice answered its first value;
+      - `to_tsvector(json)` left a position empty after a value that was
+        all stop words;
+      - `convert_from(bytes, 'LATIN2')` (and every LATIN but 1) read the
+        bytes as LATIN1;
+      - `pg_catalog."char"(x)` was a cast to `character`;
+      - `make_timestamptz` with an unknown zone, and `substring(s, p, e)`
+        with a long escape, answered where PostgreSQL refuses.
+
+      It also stopped refusing `json[b]_each` in a select list (an
+      internal error, XX000), `unnest` of a tsvector and of a multirange,
+      `setweight` / `ts_filter` with `"char"` arguments, `ts_token_type`,
+      `json[b]_to_tsvector` with a filter, the populate functions over a
+      composite type in every position, `range_merge`, the `*_canonical`
+      and `*_subdiff` range functions, `like_escape`, `to_ascii`,
+      `inet::cidr`, `interval::time`, `pg_lsn(numeric)`,
+      `timestamp(date, time)`, `pg_get_keywords`, `pg_options_to_table`,
+      `session_user()`, `generate_subscripts(a, d, reverse)`, `int8_sum`,
+      every encoding name PostgreSQL accepts, and `LIMIT` / `OFFSET` over
+      a select-list set-returning function.
+
+      What is left:
+      - **Encodings other than UTF8, LATIN1 and SQL_ASCII convert only
+        their ASCII range**; anything above it is 0A000. A conversion
+        table per encoding is what PostgreSQL has.
+      - **`age(xid)` of a normal transaction id is 0A000.** This server's
+        xids are not PostgreSQL's 32-bit counter, so there is nothing to
+        measure the age against; `age(datfrozenxid)` in a monitoring
+        query fails. The special xids 0-2 answer INT_MAX, as in
+        PostgreSQL.
+      - **A set-returning function inside an expression**
+        (`pg_typeof(json_each(j))`), and two of them in one select list,
+        are refused.
+      - **`ts_parse`, `ts_debug` and `ts_rewrite` are refused.** The first
+        two need `wparser_def.c`'s parser, which reports 23 token types
+        where this server's tokenizer tells two apart; `ts_rewrite` needs
+        `tsquery_rewrite.c`.
+      - **`aclexplode`, `acldefault` and `makeaclitem`** need role oids;
+        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`** and
+        **`pg_settings_get_flags`** need catalog or GUC state the planner
+        does not see; `table_to_xml` and the other XML exports, and the
+        `fmgr_*` / `postgresql_fdw_validator` validators, are not
+        written.
+      - **The `tid` type does not exist here**, so its six comparisons and
+        `min` / `max` over it are 42704.
       - **`ts_headline` refuses `MaxWords`, `MinWords`, `ShortWord`,
         `MaxFragments` above 0 and a true `HighlightAll`** (0A000, by
         name). The selection of the words shown is not `mark_hl_words`:
@@ -5147,20 +5190,6 @@ These are explicit non-goals. Don't add them without a reason.
         until `"char"` is a function here. `"char"(65::int8)` is 42846
         where PostgreSQL says 42883.
 
-      **Refused where PostgreSQL answers, called by name** (57
-      signatures): `unnest` of a multirange and of a tsvector;
-      `setweight(tsvector, "char")` and `ts_filter` with a `"char"`
-      argument typed as such; `ts_rewrite` with three queries;
-      `json[b]_to_tsvector` with a filter; `ts_debug`, `ts_parse`,
-      `ts_token_type`; `json[b]_populate_record[set]` in a select list;
-      `range_merge` of a multirange; the `*_canonical` and `*_subdiff`
-      range functions; `like_escape`; `table_to_xml`, `schema_to_xml`,
-      `database_to_xml` and their schema forms; `pg_relation_is_updatable`,
-      `pg_is_other_temp_schema`, `pg_settings_get_flags`, `acldefault`,
-      `makeaclitem`, `mxid_age`. `json[b]_each[_text]` in a select list is
-      XX000 `a result row has more columns than its description`, an
-      internal error where PostgreSQL answers a record.
-
       **Refused OPERATORS the probe reached through their functions** (82
       signatures; each is `0A000` or `operator does not exist`):
       - multirange `-|-`, `<<`, `>>`, `&<`, `&>` and its ordering
@@ -5178,21 +5207,18 @@ These are explicit non-goals. Don't add them without a reason.
       - `json[b]_extract_path[_text]` and `jsonb_delete` given their
         path as `VARIADIC array`.
 
-      **Casts by function name** (12): `time(interval)`, `cidr(inet)`,
-      `int4("char")`, `pg_lsn(numeric)`, and the length-coercion forms
-      (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`,
+      **Casts by function name**: `int4("char")` and the length-coercion
+      forms (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`,
       `timestamp(timestamp, int4)` and the like) are refused or wrong.
 
       **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
       `byteacmp` answer what the C library's `memcmp` returns, which is
-      14 for `bttextcmp('b', 'a')` on macOS and 1 elsewhere; the `tid`
-      type does not exist here, so its six comparisons and `min` / `max`
-      over it are 42704; the type input and output functions (117), the
-      index support functions (103) and the aggregates' own transition
-      functions (57) take or return `cstring` and `internal` and are not
-      called by a statement.
+      14 for `bttextcmp('b', 'a')` on macOS and 1 elsewhere; the type
+      input and output functions (117), the index support functions (102)
+      and the aggregates' own transition functions (57) take or return
+      `cstring` and `internal` and are not called by a statement.
 
-      **Error texts** (30): PostgreSQL 15 reworded `date_part` /
+      **Error texts** (28): PostgreSQL 15 reworded `date_part` /
       `date_trunc` / `extract` of an unknown unit to `unit "x" not
       recognized for type timestamp with time zone`; this server still
       says 14's `timestamp with time zone units "x" not recognized`. The
@@ -5202,10 +5228,8 @@ These are explicit non-goals. Don't add them without a reason.
       `extract` of a `timetz` with an unknown unit are 22007 here, a
       different error. A `jsonb` object or array cast to a number or a
       boolean is 22P02 `invalid input syntax` here and 22023 `cannot cast
-      jsonb object to type integer` there. `make_timestamptz` with a zone
-      name that is none, `substring(s, pattern, escape)` with an escape
-      longer than one character, and `ts_headline` with options that do
-      not parse all answer where PostgreSQL refuses.
+      jsonb object to type integer` there. `ts_headline` with options
+      that do not parse answers where PostgreSQL refuses.
 
 - [ ] **OPEN — the Go gauge's 7 remaining failures, triaged (2026-09-29,
       re-measured 2026-09-30).** These were invisible until the truncation fix:

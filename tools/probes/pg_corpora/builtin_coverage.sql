@@ -234,3 +234,69 @@ SELECT int4pl(5000000000, 1)
 SELECT textlen(1.5)
 SELECT dexp(true)
 SELECT int8pl(5000000000, 1), float8pl(1.5, 2), int4pl('1', 2), int4pl(NULL, 2), numeric_add(99999999999999999999, 1), int4inc(1.5)
+#
+# The second coverage batch. A json value extracted is the input's own text,
+# and a key given twice finds its last value.
+SELECT '{"a":1,"a": [2 ,3]}'::json -> 'a', '{"a":{"b" : [1,  2]}}'::json ->> 'a', '{"a":{"b" : [1,  2]}}'::json #> '{a,b}', '{"a":{"b" : [1,  2]}}'::json #>> '{a,b}', '[1, [2,  3]]'::json -> -1
+SELECT json_extract_path('{"a":{"b" : [1,  2]}}', 'a'), json_extract_path_text('{"a":{"b" : [1,  2]}}', 'a', 'b'), '{"a":"x\ny"}'::json ->> 'a', '{"a":null}'::json -> 'a'
+SELECT * FROM json_each('{"a":[1,  2], "b" : {"c":  1}, "a": 3}')
+SELECT * FROM json_each_text('{"a":{"b" : [1,  2]}, "c": "x\\ny", "d": null}')
+SELECT * FROM json_array_elements('[ {"x" :1},  2 , "s", null]')
+SELECT * FROM json_array_elements_text('[ [1,  2], "q", null ]')
+SELECT * FROM jsonb_each('{"a":[1,  2], "a": 3}')
+SELECT id, j -> 0, j ->> 1 FROM bc_hl ORDER BY id
+# A function of several columns in a select list is one record.
+SELECT json_each('{"a":[1,2]}'::json)
+SELECT jsonb_each('{"b":null}'::jsonb)
+SELECT json_each_text('{"a":1,"b":2}'::json) LIMIT 1 OFFSET 1
+SELECT unnest('a:1A b c:2,3B'::tsvector)
+# Encodings: PostgreSQL's names for them, and no guessing past ASCII.
+SELECT pg_char_to_encoding('abc'), pg_char_to_encoding('Windows-1251'), pg_char_to_encoding('nope'), pg_char_to_encoding('utf-8')
+SELECT convert('\x616263'::bytea, 'abc', 'abc'), convert('\xb1'::bytea, 'LATIN2', 'LATIN2'), convert_from('\x616263'::bytea, 'WIN1251'), convert_to('abc', 'tcvn'), length('\x616263'::bytea, 'EUC_JP')
+SELECT convert_from('abc'::bytea, 'nope')
+SELECT to_ascii('abc', 'LATIN1'), to_ascii('Ab-c', 'win1250')
+SELECT to_ascii('abc')
+SELECT to_ascii('abc', 'nope')
+SELECT to_ascii('abc', 99)
+# Type-named calls and casts.
+SELECT pg_catalog."char"(2::int4)::text = E'\x02', pg_catalog."char"('abc'::text), pg_typeof(pg_catalog."char"('abc'::text))
+SELECT '192.168.1.5/24'::inet::cidr, cidr('10.1.2.3'::inet), '-1 day -02:03:04'::interval::time, '3 mons 25:00:01.5'::interval::time
+SELECT '192.168.1.5/24'::cidr
+SELECT pg_lsn(1.5), pg_lsn(5), pg_lsn('0/16'), pg_typeof(pg_lsn(2.4))
+SELECT pg_lsn(-1)
+SELECT pg_lsn('NaN'::numeric)
+SELECT 1.5::pg_lsn
+SELECT timestamp('2020-02-03'::date, '04:05:06'::time), timestamptz('2020-02-03'::date, '04:05:06+02'::timetz)
+SELECT make_timestamptz(2020, 1, 1, 0, 0, 0, 'abc')
+SELECT substring('abc', 'b', 'abc')
+SELECT substring('abc', '%#"b#"%', '#'), substring('abcdef', 'b_d', '#'), substring('abc', 'b', '')
+SELECT like_escape('a%b\c', ''), like_escape('a#%b\c#\', '#'), like_escape('a%b', '\'), like_escape('\x61255c'::bytea, '\x25'::bytea)
+SELECT like_escape('abc', 'ab')
+SELECT age('2'::xid), mxid_age('0'), int8_sum(1.5, 5), int8_sum(NULL, 5)
+SELECT * FROM generate_subscripts('{{1,2},{3,4}}'::int[], 2, true)
+# Ranges and multiranges.
+SELECT * FROM unnest('{[1,5), [7,9)}'::int4multirange)
+SELECT int4range_canonical('[1,5]'::int4range), daterange_canonical('[2020-01-01,2020-01-05]'::daterange), range_merge('{[1,5), [7,9)}'::int4multirange), range_merge('{}'::int4multirange)
+SELECT range_merge('(1,2)'::numrange, '[1,1.5]'::numrange), range_merge('(,2)'::int4range, '[5,6)'::int4range)
+SELECT int4range_subdiff(2, 7), numrange_subdiff(1.5, 0.25), daterange_subdiff('2020-03-01', '2020-02-01'), tsrange_subdiff('2020-01-02 00:00:01', '2020-01-01')
+# Full-text search.
+SELECT setweight('a b'::tsvector, 'a'::"char"), ts_filter('a:1A b:2B c:3'::tsvector, '{a,c}'::"char"[])
+SELECT * FROM ts_token_type('default') WHERE tokid IN (1, 12, 23)
+SELECT * FROM ts_token_type('nope')
+SELECT json_to_tsvector('{"a":"cats", "b": 5, "c": true}'::json, '"all"'), jsonb_to_tsvector('english', '{"kitten":"cats", "b": [1.50, false]}'::jsonb, '["key","boolean","numeric"]')
+SELECT json_to_tsvector('{"a":"x"}'::json, '{"a":1}')
+SELECT json_to_tsvector('{"a":"x"}'::json, '["nope"]')
+SELECT to_tsvector('{"a":"the", "b":"cats"}'::json), to_tsvector('["the", "", "cats", "a b"]'::jsonb)
+# json_populate_record and friends over a composite type.
+SELECT * FROM json_populate_record(row(5,'z')::bc_comp, '{"a":1}')
+SELECT json_populate_record(NULL::bc_comp, '{"a":1,"b":"x"}'), pg_typeof(json_populate_record(NULL::bc_comp, '{}')), (json_populate_record(NULL::bc_comp, '{"a":3}')).a, row_to_json(json_populate_record(NULL::bc_comp, '{"a":2}'))
+SELECT json_populate_record(row(1,'a')::bc_comp, NULL)
+SELECT * FROM jsonb_populate_recordset(row(9,'q')::bc_comp, '[{"a":1},{"b":"y"}]')
+SELECT json_populate_record(2, '{}'::json, true)
+SELECT * FROM json_populate_record(NULL::bc_comp, '[1]')
+SELECT * FROM jsonb_to_recordset('{"a":1}') AS x(a int)
+# Host tables.
+SELECT * FROM pg_options_to_table(ARRAY['a=1=2', '=x', 'b'])
+SELECT count(*), count(*) FILTER (WHERE catcode = 'C'), max(word) FROM pg_get_keywords()
+SELECT pg_catalog.session_user() = current_user
+SELECT pg_catalog.count() FROM (VALUES (1)) v

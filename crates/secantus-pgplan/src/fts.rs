@@ -690,6 +690,16 @@ impl TsVector {
     }
 }
 
+/// A weight's letter as `unnest(tsvector)` shows it, `D` included.
+pub(crate) fn weight_name(w: Weight) -> &'static str {
+    match w {
+        3 => "A",
+        2 => "B",
+        1 => "C",
+        _ => "D",
+    }
+}
+
 fn weight_letter(w: Weight) -> Option<char> {
     match w {
         3 => Some('A'),
@@ -855,6 +865,13 @@ pub fn to_tsvector(cfg: Config, text: &str) -> TsVector {
     TsVector(map).normalise()
 }
 
+/// Which of a JSON document's values `json[b]_to_tsvector` indexes
+/// (`parse_jsonb_index_flags`'s `jti*` bits).
+const JTI_KEY: u8 = 1;
+const JTI_STRING: u8 = 2;
+const JTI_NUMERIC: u8 = 4;
+const JTI_BOOL: u8 = 8;
+
 /// `to_tsvector([config,] json | jsonb)`: the document's STRING values, in
 /// the order they are written, each parsed as text. Keys, numbers, booleans
 /// and nulls are not indexed, and one position is left empty between two
@@ -864,34 +881,93 @@ pub(crate) fn json_to_tsvector(args: &[Bson]) -> Result<Bson> {
     let [doc] = rest else {
         return Err(wrong("to_tsvector"));
     };
+    json_values_vector(cfg, doc, JTI_STRING)
+}
+
+/// `json[b]_to_tsvector([config,] document, filter)`: the values `filter`
+/// names -- `"string"`, `"numeric"`, `"boolean"`, `"key"` or `"all"`, alone
+/// or in an array -- in document order, a key just before its value.
+pub(crate) fn json_filter_tsvector(args: &[Bson]) -> Result<Bson> {
+    let (cfg, rest) = split_config(args, 2)?;
+    let [doc, filter] = rest else {
+        return Err(wrong("json_to_tsvector"));
+    };
+    let filter = crate::json::parse(&text_of(filter))
+        .map_err(|_| Error::InvalidText("invalid input syntax for type json".into()))?;
+    let items = match filter {
+        crate::json::Json::Array(items) => items,
+        crate::json::Json::Object(_) => {
+            return Err(Error::InvalidParameter(
+                "wrong flag type, only arrays and scalars are allowed".into(),
+            ))
+        }
+        scalar => vec![scalar],
+    };
+    let mut flags = 0;
+    for item in items {
+        let crate::json::Json::Str(name) = item else {
+            return Err(Error::InvalidParameter(
+                "flag array element is not a string".into(),
+            ));
+        };
+        flags |= match name.to_ascii_lowercase().as_str() {
+            "all" => JTI_KEY | JTI_STRING | JTI_NUMERIC | JTI_BOOL,
+            "key" => JTI_KEY,
+            "string" => JTI_STRING,
+            "numeric" => JTI_NUMERIC,
+            "boolean" => JTI_BOOL,
+            _ => {
+                return Err(Error::InvalidParameter(format!(
+                    "wrong flag in flag array: \"{name}\""
+                )))
+            }
+        };
+    }
+    json_values_vector(cfg, doc, flags)
+}
+
+fn json_values_vector(cfg: Config, doc: &Bson, flags: u8) -> Result<Bson> {
     let json = crate::json::parse(&text_of(doc))
         .map_err(|_| Error::InvalidText("invalid input syntax for type json".into()))?;
-    fn strings<'a>(v: &'a crate::json::Json, out: &mut Vec<&'a str>) {
+    fn walk(v: &crate::json::Json, flags: u8, out: &mut Vec<String>) {
+        use crate::json::Json;
         match v {
-            // An empty string is not a value to parse: it leaves no gap.
-            crate::json::Json::Str(s) if s.is_empty() => {}
-            crate::json::Json::Str(s) => out.push(s),
-            crate::json::Json::Array(items) => items.iter().for_each(|i| strings(i, out)),
-            crate::json::Json::Object(members) => members.iter().for_each(|(_, m)| strings(m, out)),
+            Json::Str(s) if flags & JTI_STRING != 0 => out.push(s.clone()),
+            Json::Number(n) if flags & JTI_NUMERIC != 0 => out.push(n.clone()),
+            Json::Bool(b) if flags & JTI_BOOL != 0 => out.push(b.to_string()),
+            Json::Array(items) => items.iter().for_each(|i| walk(i, flags, out)),
+            Json::Object(members) => members.iter().for_each(|(k, m)| {
+                if flags & JTI_KEY != 0 {
+                    out.push(k.clone());
+                }
+                walk(m, flags, out)
+            }),
             _ => {}
         }
     }
     let mut values = Vec::new();
-    strings(&json, &mut values);
+    walk(&json, flags, &mut values);
+    // An empty value is not one to parse: it leaves no gap.
+    values.retain(|v| !v.is_empty());
+    // `add_to_tsvector`: one position count runs through every value, a
+    // stop word taking its place in it; a value that added words leaves one
+    // position empty after it, so a phrase cannot match across two values.
     let mut map: BTreeMap<String, Vec<(u16, Weight)>> = BTreeMap::new();
-    let mut last: u32 = 0;
-    for (i, value) in values.iter().enumerate() {
-        let base = if i == 0 { 0 } else { last + 1 };
-        last = base;
+    let mut offset: u32 = 0;
+    for value in &values {
+        let mut last = 0;
+        let mut added = false;
         for (pos, lex) in parse_document(value, cfg) {
-            let at = base + u32::from(pos);
-            last = last.max(at);
+            let at = offset + u32::from(pos);
+            last = last.max(u32::from(pos));
             if let Some(lex) = lex {
+                added = true;
                 map.entry(lex)
                     .or_default()
                     .push((u16::try_from(at.min(16383)).unwrap_or(16383), 0));
             }
         }
+        offset += last + u32::from(added);
     }
     Ok(vector_out(&TsVector(map).normalise()))
 }

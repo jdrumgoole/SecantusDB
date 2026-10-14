@@ -416,6 +416,25 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         _ => {
             // The extract_path family: the rest of the arguments are the path.
             let j = parse(&arg(0))?;
+            // Over `json`, the value's own text, a twice-given key's last.
+            if !name.starts_with("jsonb") {
+                let text = crate::value_text(&arg(0));
+                let raw = json::parse_raw(&text).ok_or_else(|| {
+                    Error::InvalidText("invalid input syntax for type json".into())
+                })?;
+                let mut current = Some(&raw);
+                for step in &args[1..] {
+                    let step = crate::value_text(step);
+                    current = current.and_then(|v| v.member(&step));
+                }
+                return Ok(match current {
+                    None => Bson::Null,
+                    Some(found) if name.ends_with("_text") => {
+                        found.sql_text().map_or(Bson::Null, Bson::String)
+                    }
+                    Some(found) => Bson::String(found.text.to_string()),
+                });
+            }
             let mut current = Some(&j);
             for step in &args[1..] {
                 let step = crate::value_text(step);

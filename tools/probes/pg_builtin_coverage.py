@@ -163,6 +163,7 @@ STATE: list[tuple[str, str]] = [
     (r"^pg_backend_pid$|^pg_my_temp_schema$|^pg_postmaster_start_time$", "process identity"),
     (r"^pg_conf_load_time$|^pg_current_logfile$|^pg_is_in_recovery$", "process state"),
     (r"^txid_|^pg_current_xact_id|^pg_current_snapshot|^pg_snapshot_|^pg_xact_", "live xids"),
+    (r"^mxid_age$", "the next multixact id, which differs per cluster"),
     (r"^pg_last_|^pg_wal|^pg_walfile|^pg_current_wal|^pg_is_wal", "the WAL, which is absent"),
     (r"^inet_client_|^inet_server_", "the connection's addresses"),
     (r"^now$|^transaction_timestamp$|^statement_timestamp$|^current_", "the clock or session"),

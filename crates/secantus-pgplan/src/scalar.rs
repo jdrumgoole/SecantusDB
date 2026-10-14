@@ -547,7 +547,9 @@ fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
 fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Result<Bson> {
     let source = match escape.as_deref() {
         None => pattern.to_string(),
-        Some(esc) => sql_substring_to_regex(pattern, esc)?,
+        // `substring(s similar p escape e)` is `textregexsubstr` over
+        // `similar_escape(p, e)`: an empty escape is none, a longer one 22025.
+        Some(esc) => similar_escape(pattern, Some(esc))?,
     };
     let re = regex::Regex::new(&pg_regex_source(&source))
         .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
@@ -562,41 +564,6 @@ fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Re
         Some(m) => Bson::String(m.as_str().to_string()),
         None => Bson::Null,
     })
-}
-
-/// The SQL-standard `substring ... for <escape>` pattern as a regex.
-///
-/// `%` is `.*`, `_` is `.`, `<esc>"` opens and closes the returned part, and
-/// `<esc><char>` is that character literally. Everything else is escaped, so a
-/// pattern cannot smuggle regex syntax through.
-fn sql_substring_to_regex(pattern: &str, escape: &str) -> Result<String> {
-    let esc = escape
-        .chars()
-        .next()
-        .ok_or_else(|| Error::InvalidText("invalid escape string".to_string()))?;
-    let mut out = String::from("^");
-    let mut chars = pattern.chars().peekable();
-    let mut groups = 0;
-    while let Some(c) = chars.next() {
-        if c == esc {
-            match chars.next() {
-                Some('"') => {
-                    out.push_str(if groups == 0 { "(" } else { ")" });
-                    groups += 1;
-                }
-                Some(other) => out.push_str(&regex::escape(&other.to_string())),
-                None => return Err(Error::InvalidText("invalid escape string".to_string())),
-            }
-            continue;
-        }
-        match c {
-            '%' => out.push_str(".*"),
-            '_' => out.push('.'),
-            other => out.push_str(&regex::escape(&other.to_string())),
-        }
-    }
-    out.push('$');
-    Ok(out)
 }
 
 /// `quote_literal(x)` -- the text as a SQL string literal.
@@ -1307,17 +1274,11 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         }
         "pg_char_to_encoding" => {
             need(1)?;
-            let norm = |s: &str| -> String {
-                s.chars()
-                    .filter(|c| c.is_ascii_alphanumeric())
-                    .map(|c| c.to_ascii_uppercase())
-                    .collect()
-            };
-            let wanted = norm(&crate::value_text(&arg(0)));
+            // Any of PostgreSQL's names for an encoding (`abc` is WIN1258).
+            let wanted = crate::builtins_text::encoding_by_name(&crate::value_text(&arg(0)));
             Ok(Bson::Int32(
-                PG_ENCODINGS
-                    .iter()
-                    .position(|n| norm(n) == wanted)
+                wanted
+                    .and_then(|w| PG_ENCODINGS.iter().position(|n| *n == w))
                     .map_or(-1, |i| i as i32),
             ))
         }
@@ -1484,19 +1445,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 Bson::Binary(b) => b.bytes,
                 other => text(&other).into_bytes(),
             };
-            let encoding = s(1).to_ascii_uppercase().replace(['-', '_'], "");
-            match encoding.as_str() {
-                "UTF8" | "UNICODE" => String::from_utf8(bytes).map(Bson::String).map_err(|_| {
-                    Error::InvalidText("invalid byte sequence for encoding \"UTF8\"".into())
-                }),
-                // The LATIN family is single-byte: each octet IS its codepoint.
-                e if e.starts_with("LATIN") || e == "SQLASCII" => {
-                    Ok(Bson::String(bytes.iter().map(|b| *b as char).collect()))
-                }
-                other => Err(Error::InvalidText(format!(
-                    "invalid encoding name \"{other}\""
-                ))),
-            }
+            // Only LATIN1's octets are their own code points: LATIN2's 0xB1
+            // is `ą`, which this used to answer as LATIN1's `±`.
+            let (encoding, _) = crate::builtins_text::encoding(&s(1), "source ")?;
+            crate::builtins_text::decode(&bytes, &encoding).map(Bson::String)
         }
         // --- numeric -------------------------------------------------------
         // `abs` gives back the type it was handed, so an exact numeric stays
@@ -2735,7 +2687,7 @@ fn column_size(v: &Bson) -> Bson {
 }
 
 /// PostgreSQL's encoding ids (`pg_enc`), in id order.
-const PG_ENCODINGS: &[&str] = &[
+pub(crate) const PG_ENCODINGS: &[&str] = &[
     "SQL_ASCII",
     "EUC_JP",
     "EUC_CN",
