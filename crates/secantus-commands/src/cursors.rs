@@ -132,6 +132,9 @@ struct Entry {
     time_limited: bool,
     /// The session, and the transaction of it, that opened the cursor.
     owner: Option<CursorOwner>,
+    /// The `(db, user)` principals authenticated when the cursor was
+    /// opened: only a session of the same users may read or kill it.
+    users: Vec<(String, String)>,
 }
 
 /// The session a cursor was opened in, and the transaction number when it was
@@ -143,23 +146,75 @@ pub struct CursorOwner {
     pub txn_number: Option<i64>,
 }
 
+/// The session and the authenticated users of a running command.
+#[derive(Default)]
+struct Opener {
+    owner: Option<CursorOwner>,
+    users: Vec<(String, String)>,
+}
+
 thread_local! {
-    /// The session of the command running on this thread; a cursor it
+    /// The opener of the command running on this thread; a cursor it
     /// registers is stamped with it.
-    static OWNER: std::cell::RefCell<Option<CursorOwner>> =
-        const { std::cell::RefCell::new(None) };
+    static OWNER: std::cell::RefCell<Opener> = const {
+        std::cell::RefCell::new(Opener {
+            owner: None,
+            users: Vec::new(),
+        })
+    };
 }
 
 /// Run `f` as the command of `owner`'s session.
 pub fn with_owner<R>(owner: Option<CursorOwner>, f: impl FnOnce() -> R) -> R {
-    let outer = OWNER.with(|o| o.replace(owner));
+    with_opener(owner, Vec::new(), f)
+}
+
+/// Run `f` as the command of `owner`'s session, authenticated as `users`.
+pub fn with_opener<R>(
+    owner: Option<CursorOwner>,
+    users: Vec<(String, String)>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let outer = OWNER.with(|o| o.replace(Opener { owner, users }));
     let result = f();
     OWNER.with(|o| o.replace(outer));
     result
 }
 
 fn current_owner() -> Option<CursorOwner> {
-    OWNER.with(|o| o.borrow().clone())
+    OWNER.with(|o| o.borrow().owner.clone())
+}
+
+fn current_users() -> Vec<(String, String)> {
+    OWNER.with(|o| o.borrow().users.clone())
+}
+
+/// Why the calling connection may not read cursor `id`: it was opened by
+/// another user (mongod: 13, before any check of the session). `None` when
+/// access control is off, the cursor is unknown, or it is the user's own.
+pub(crate) fn user_problem(id: i64, ctx: &crate::CommandContext) -> Option<CommandError> {
+    if !ctx.require_auth {
+        return None;
+    }
+    let opened_by = ctx.cursors.as_ref()?.users_of(id)?;
+    let now = ctx
+        .conn_auth
+        .as_ref()
+        .map(|a| {
+            a.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .authenticated
+                .clone()
+        })
+        .unwrap_or_default();
+    if crate::rbac::coauthorized(&opened_by, &now) {
+        return None;
+    }
+    Some(CommandError::new(
+        13,
+        "Unauthorized",
+        format!("cursor id {id} was not created by the authenticated user"),
+    ))
 }
 
 /// A read-only snapshot of a cursor's routing state, so the getMore handler can
@@ -278,6 +333,7 @@ impl CursorRegistry {
                 fatal_error: None,
                 time_limited: false,
                 owner: current_owner(),
+                users: current_users(),
             },
         );
         Ok(id)
@@ -319,6 +375,7 @@ impl CursorRegistry {
                 fatal_error: None,
                 time_limited: false,
                 owner: current_owner(),
+                users: current_users(),
             },
         );
         Ok(id)
@@ -539,6 +596,13 @@ impl CursorRegistry {
     pub fn owner(&self, cursor_id: i64) -> Option<Option<CursorOwner>> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.cursors.get(&cursor_id).map(|e| e.owner.clone())
+    }
+
+    /// The users authenticated when a live cursor was opened; `None` when
+    /// there is no such cursor.
+    pub fn users_of(&self, cursor_id: i64) -> Option<Vec<(String, String)>> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.get(&cursor_id).map(|e| e.users.clone())
     }
 
     /// Kill every cursor a session opened (`killSessions`).
@@ -956,6 +1020,28 @@ pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // or storageless context just skips it).
     let storage = ctx.storage.clone();
     let cursors = ctx.cursors()?;
+    // A user kills its own cursors; another user's take `killAnyCursor` on
+    // the cluster (measured 8.2.11: `killCursors` on the collection does not
+    // do it). A cursor that does not exist is reported, not refused.
+    if let Some(az) = crate::rbac::enforced(ctx)? {
+        if !az.is_authorized(&crate::privileges::Resource::Cluster, &["killAnyCursor"]) {
+            for &cid in &cursor_ids {
+                if let Some(opened_by) = cursors.users_of(cid) {
+                    if !crate::rbac::coauthorized(&opened_by, &az.principals) {
+                        return Err(CommandError::new(
+                            13,
+                            "Unauthorized",
+                            format!(
+                                "not authorized to kill cursor on {}.{}",
+                                ctx.db_name,
+                                doc.get_str("killCursors").unwrap_or("")
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Invalidate + remove first so the woken getMore re-polls and sees the
     // cursor gone (CursorNotFound) or invalidated, rather than reporting it
     // still alive after the client killed it.

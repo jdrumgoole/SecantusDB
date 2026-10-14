@@ -507,9 +507,29 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         return Err(err(code, &crate::util::error_code_name(code), msg));
     }
     let storage = ctx.storage()?;
+    // A user without `listDatabases` on the cluster, or one asking for
+    // `authorizedDatabases`, sees the databases it has any action in
+    // (measured 8.2.11: `read` on `ae` lists `ae` alone, `readAnyDatabase`
+    // every database but not through its cluster privilege alone).
+    let authorized_only = crate::util::bool_field(doc, "authorizedDatabases", false);
+    let visible = match crate::rbac::enforced(ctx)? {
+        Some(az)
+            if authorized_only
+                || !az.is_authorized(&crate::privileges::Resource::Cluster, &["listDatabases"]) =>
+        {
+            Some(az)
+        }
+        _ => None,
+    };
     let mut listed: Vec<Document> = Vec::new();
     let mut total: i64 = 0;
     for name in storage.list_databases().map_err(command_error)? {
+        if visible
+            .as_ref()
+            .is_some_and(|az| !az.any_action_in_db(&name))
+        {
+            continue;
+        }
         let entry = if name_only {
             doc! { "name": name }
         } else {
