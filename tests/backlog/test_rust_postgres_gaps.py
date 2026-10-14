@@ -221,7 +221,7 @@ def _privilege_in_a_block(pg: Any, name: str) -> list:
     return out
 
 
-@pytest.mark.backlog("RP-020")
+@pytest.mark.backlog_fixed("RP-020")
 def test_grant_and_revoke_take_effect_inside_a_transaction_block(pg: Any) -> None:
     """PostgreSQL 15.19: a GRANT inside a block lets the role read at once,
     and a REVOKE inside a block stops it at once. The Rust server ignored

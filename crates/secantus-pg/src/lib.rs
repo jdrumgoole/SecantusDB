@@ -20885,7 +20885,7 @@ impl PgHandler {
             return self.has_role_call(args);
         }
         if name == "has_table_privilege" {
-            return self.has_table_privilege_call(args);
+            return self.within_block(|| self.has_table_privilege_call(args));
         }
         if name == "pg_sleep" {
             let secs = match args.first() {
@@ -21838,7 +21838,7 @@ impl PgHandler {
         // uncorrelated subqueries and data-modifying CTEs, so it must not
         // start before the check. An aborted block answers 25P02 instead.
         if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
-            self.check_sql_privileges(sql)?;
+            self.within_block(|| self.check_sql_privileges(sql))?;
             self.wait_for_table_locks(sql)?;
             self.isolate_for_planning(sql)?;
         }
@@ -23095,6 +23095,31 @@ impl PgHandler {
                 Ok(Bson::Boolean(armed))
             }
         }
+    }
+
+    /// Run `f` inside the open transaction block, if there is one, so the
+    /// catalog reads it makes see the block's own uncommitted writes. A
+    /// privilege check runs before the statement is bound to the block, and
+    /// read committed state: a GRANT or REVOKE made in the block took no
+    /// effect until COMMIT (RP-020). Already bound, outside a block, or with
+    /// the handle busy (the statement is executing), `f` runs as it is.
+    fn within_block<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.storage.in_user_txn() {
+            return f();
+        }
+        let mut f = Some(f);
+        if let Ok(mut guard) = self.txn.try_lock() {
+            if let Some(handle) = guard.as_mut() {
+                if let Ok(out) = self
+                    .storage
+                    .with_user_transaction(handle, || (f.take().expect("called once"))())
+                {
+                    return out;
+                }
+            }
+        }
+        // A closed handle: nothing of the block to see.
+        (f.take().expect("not yet called"))()
     }
 
     /// Run `f` inside the open user transaction, if there is one.
@@ -30402,7 +30427,7 @@ impl PgHandler {
                     .iter()
                     .map(|t| Some(t.clone()).filter(|t| !t.is_empty()))
                     .collect();
-                self.check_sql_privileges(&query)?;
+                self.within_block(|| self.check_sql_privileges(&query))?;
                 let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
                     self.subquery_rows(stmt)
                 };
