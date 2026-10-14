@@ -208,6 +208,88 @@ pub fn render_lsn_value(v: &Bson) -> String {
     lsn_of(v).map_or_else(|| crate::value_text(v), render_lsn)
 }
 
+/// Whether `t` is an operand `pg_lsn_pli` / `pg_lsn_mii` take: a numeric,
+/// an integer (implicitly cast to one), or an untyped literal.
+fn lsn_offset_type(t: &str) -> bool {
+    matches!(
+        t,
+        "numeric" | "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "unknown"
+    )
+}
+
+/// The type `pg_lsn op x` yields (`pg_lsn.c`): `pg_lsn + numeric`,
+/// `numeric + pg_lsn` and `pg_lsn - numeric` are a `pg_lsn`, and
+/// `pg_lsn - pg_lsn` is a `numeric`. `None` for any other pairing.
+pub fn lsn_arith_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
+    match (op, lt, rt) {
+        // An untyped operand of `-` is resolved as a second pg_lsn.
+        ("-", "pg_lsn", "pg_lsn" | "unknown") => Some("numeric"),
+        ("+", "pg_lsn", t) | ("+", t, "pg_lsn") | ("-", "pg_lsn", t) if lsn_offset_type(t) => {
+            Some("pg_lsn")
+        }
+        _ => None,
+    }
+}
+
+/// `pg_lsn_pli` / `pg_lsn_mii`: the position plus or minus a numeric, as a
+/// `pg_lsn`. `None` unless [`lsn_arith_type`] says the result is one.
+/// The sum is rounded half away from zero and THEN range-checked, as
+/// `numeric_pg_lsn` does, so `'0/16' - 22.4` is `0/0` and `- 22.5` is out
+/// of range.
+pub fn lsn_arith(op: &str, l: &Bson, lt: &str, r: &Bson, rt: &str) -> Option<Result<Bson>> {
+    match lsn_arith_type(op, lt, rt) {
+        Some("pg_lsn") => {}
+        // `pg_lsn - pg_lsn`: the numeric difference the caller computes.
+        Some(_) => return None,
+        // Any other arithmetic with a pg_lsn has no operator in PostgreSQL;
+        // computed on the stored position it answered a number.
+        None if (lt == "pg_lsn" || rt == "pg_lsn") && matches!(op, "+" | "-" | "*" | "/" | "%") => {
+            return Some(Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {op} {}",
+                crate::display_type(lt),
+                crate::display_type(rt)
+            ))));
+        }
+        None => return None,
+    }
+    let (lsn, offset) = if lt == "pg_lsn" { (l, r) } else { (r, l) };
+    if *lsn == Bson::Null || *offset == Bson::Null {
+        return Some(Ok(Bson::Null));
+    }
+    Some((|| {
+        let pos = lsn_of(lsn).ok_or_else(|| {
+            Error::DataException(format!("not a pg_lsn: {}", crate::value_text(lsn)))
+        })?;
+        let text = match offset {
+            Bson::String(s) => numeric::canonical_numeric_text(s)?,
+            other => numeric::numeric_operand_text(other)
+                .ok_or_else(|| Error::DataException("not a numeric".into()))?,
+        };
+        if text == "NaN" {
+            return Err(Error::FeatureNotSupported(
+                if op == "+" {
+                    "cannot add NaN to pg_lsn"
+                } else {
+                    "cannot subtract NaN from pg_lsn"
+                }
+                .into(),
+            ));
+        }
+        let sum = numeric::decimal_arith(op, &pos.to_string(), &text)
+            .ok_or_else(|| Error::DataException("numeric arithmetic failed".into()))??;
+        let sum = numeric::numeric_text(&sum).unwrap_or_else(|| crate::value_text(&sum));
+        if sum.ends_with("Infinity") {
+            return Err(Error::FeatureNotSupported(
+                "cannot convert infinity to pg_lsn".into(),
+            ));
+        }
+        numeric::numeric_text_to_integer(&sum)
+            .and_then(|n| u64::try_from(n).ok())
+            .map(lsn_bson)
+            .ok_or_else(|| Error::InvalidParameter("pg_lsn out of range".into()))
+    })())
+}
+
 /// `cast(x AS pg_lsn)`: from its text.
 pub fn cast_lsn(value: &Bson) -> Result<Bson> {
     match value {

@@ -21401,6 +21401,19 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     {
                         return "interval".to_string();
                     }
+                    // An untyped operand beside a pg_lsn is a numeric offset
+                    // (`lsn + '1'` is `pg_lsn_pli`), except `lsn - 'x'`,
+                    // where PostgreSQL resolves it to a pg_lsn and answers
+                    // a numeric.
+                    if matches!(op, "+" | "-") {
+                        let lsn = |t: Option<&String>| t.is_some_and(|t| t == "pg_lsn");
+                        if lsn(lt()) && unknown_operand(e.rexpr.as_deref()) {
+                            return if op == "+" { "pg_lsn" } else { "numeric" }.to_string();
+                        }
+                        if op == "+" && lsn(rt()) && unknown_operand(e.lexpr.as_deref()) {
+                            return "pg_lsn".to_string();
+                        }
+                    }
                     // A prefix operator over a number keeps the number's
                     // type: `-x` of a `real` is `real`, of a `smallint`
                     // `smallint`. The value alone is a double, or an int4.
@@ -21441,6 +21454,9 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                             return t.to_string();
                         }
                         if let Some(t) = money::arith_type(op, &lt, &rt) {
+                            return t.to_string();
+                        }
+                        if let Some(t) = systypes::lsn_arith_type(op, &lt, &rt) {
                             return t.to_string();
                         }
                         // Numeric arithmetic types from the operands too:
@@ -24239,6 +24255,28 @@ thread_local! {
     /// the RowDescription's `ftable` carry.
     static PLAN_USER_RELATIONS: std::cell::RefCell<Vec<(String, i64, bool)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// The oids `pg_relation_is_publishable` answers true for, installed
+    /// with the relations.
+    static PUBLISHABLE_RELATIONS: std::cell::RefCell<Vec<i64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The relations a publication could hold (see [`relation_is_publishable`]).
+pub fn set_publishable_relations(oids: Vec<i64>) {
+    PUBLISHABLE_RELATIONS.with(|t| *t.borrow_mut() = oids);
+}
+
+/// `pg_relation_is_publishable(oid)`: true for a user table that is not
+/// temporary, false for any other relation (a catalog, a view, an index, a
+/// sequence), NULL for an oid that names no relation.
+pub fn relation_is_publishable(oid: i64) -> Option<bool> {
+    if PUBLISHABLE_RELATIONS.with(|t| t.borrow().contains(&oid)) {
+        return Some(true);
+    }
+    table_is_visible(oid).map(|_| false)
 }
 
 /// Relations: `(name, oid, temp)`.
@@ -27689,6 +27727,35 @@ fn fit_int2(v: Bson, target: &str) -> Result<Bson> {
     }
 }
 
+/// `charin`: a four-character `\ooo` is that octal byte, anything else its
+/// first byte (`'é'` is `\303`), and the empty string 0.
+pub(crate) fn char_in(text: &str) -> u8 {
+    let b = text.as_bytes();
+    let octal = |c: u8| (b'0'..=b'7').contains(&c);
+    if b.len() == 4 && b[0] == b'\\' && b[1..].iter().all(|c| octal(*c)) {
+        let v =
+            (u32::from(b[1] - b'0') << 6) | (u32::from(b[2] - b'0') << 3) | u32::from(b[3] - b'0');
+        return (v & 0xff) as u8;
+    }
+    b.first().copied().unwrap_or(0)
+}
+
+/// `charout`: nothing for 0, `\ooo` for a byte with the high bit set.
+pub(crate) fn char_out(b: u8) -> String {
+    match b {
+        0 => String::new(),
+        b if b & 0x80 != 0 => format!("\\{b:03o}"),
+        b => (b as char).to_string(),
+    }
+}
+
+/// `i4tochar`.
+fn char_from_int(i: i64) -> Result<Bson> {
+    i8::try_from(i)
+        .map(|v| Bson::String(char_out(v as u8)))
+        .map_err(|_| Error::NumericOutOfRange("\"char\" out of range".into()))
+}
+
 fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes -- but the
     // type must exist: `null::no_such_type` is 42704, as any value's cast.
@@ -27735,15 +27802,15 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             ))),
         };
     }
-    // `"char"` keeps the first BYTE of the text (`charin`); an empty string
-    // is the empty "char".
+    // `"char"` is one byte, carried as the text `charout` prints for it. From
+    // text it is `charin`'s byte; from an integer `i4tochar`'s, which took
+    // the first DIGIT when it went through the text (`65::"char"` was `6`).
     if target == QUOTED_CHAR {
-        let text = value_text(&value);
-        return Ok(Bson::String(match text.as_bytes().first() {
-            Some(b) if b.is_ascii() => (*b as char).to_string(),
-            Some(_) => text.chars().next().map(String::from).unwrap_or_default(),
-            None => String::new(),
-        }));
+        return match value {
+            Bson::Int32(i) => char_from_int(i64::from(i)),
+            Bson::Int64(i) => char_from_int(i),
+            other => Ok(Bson::String(char_out(char_in(&value_text(&other))))),
+        };
     }
     // A cast to a user BASE type (`'hello'::"a-b"`). The value is carried as
     // the text its input function would have read -- every base type this
@@ -29810,6 +29877,22 @@ fn coerce_unknown_operand(
             (coerced, rhs)
         });
     }
+    // A pg_lsn is stored as its position, a numeric, so the value arm below
+    // would read `'0/16'` as a numeric. Beside a pg_lsn an unknown IS a
+    // pg_lsn (`=`, `<`, `lsn - '0/1'`), except as the offset of `+`, which
+    // is `pg_lsn_pli`'s numeric.
+    if op != "||" && typed_node.is_some_and(|n| static_type(n, typed) == "pg_lsn") {
+        let coerced = if op == "+" {
+            cast_value(Bson::String(text.clone()), "numeric")?
+        } else {
+            systypes::cast_lsn(&Bson::String(text.clone()))?
+        };
+        return Ok(if r_bare {
+            (lhs, coerced)
+        } else {
+            (coerced, rhs)
+        });
+    }
     let coerced = match typed {
         // Beside an interval or a timestamp an unknown is that type -- except
         // for `||`, where it is text (`'a' || ts` is `textanycat`).
@@ -31448,6 +31531,11 @@ fn assign_value(value: Bson, source: &str, target: &str) -> Result<Bson> {
     if source == "timestamptz[]" && target == "timestamptz[]" && matches!(value, Bson::Array(_)) {
         return Ok(value);
     }
+    // A pg_lsn is carried as its position, a numeric, and there is no
+    // numeric -> pg_lsn cast: `set l = l + 1` assigns a pg_lsn.
+    if let Some(out) = systypes_cast(Some(source), target, &value) {
+        return out;
+    }
     cast_value(value, target)
 }
 
@@ -32236,6 +32324,21 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
             Some(cast_value(Bson::String(systypes::render_lsn_value(v)), t))
         }
         ("pg_lsn", "pg_lsn") => Some(Ok(v.clone())),
+        // Only int4 has a cast to and from "char" (`i4tochar` / `chartoi4`).
+        // An int2 source is let through: `"char"(x)` reaches here as a cast,
+        // and as a FUNCTION call PostgreSQL promotes an int2 to int4, so
+        // refusing it broke `"char"(65::int2)` to fix `65::int2::"char"`.
+        ("int8", QUOTED_CHAR) | (QUOTED_CHAR, "int2" | "int8") => {
+            Some(Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to {}",
+                display_type(source?),
+                display_type(target)
+            ))))
+        }
+        // `chartoi4`: the byte, signed.
+        (QUOTED_CHAR, "int4" | "integer") => {
+            Some(Ok(Bson::Int32(i32::from(char_in(&value_text(v)) as i8))))
+        }
         ("pg_lsn[]", t) if is_string_type(t) => {
             fn out(v: &Bson) -> Bson {
                 match v {
@@ -34106,6 +34209,36 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             if let Some(out) = money::arith(&op, &lhs, &lt, &rhs, &rt) {
                 return out;
             }
+            // `pg_lsn` is stored as a numeric; adding one answers a position
+            // (`pg_lsn.c`), and an untyped literal beside it is a numeric.
+            {
+                let lsn_side = |t: &str, other: Option<&pg_query::protobuf::Node>| {
+                    if unknown_operand(other) {
+                        "unknown".to_string()
+                    } else {
+                        t.to_string()
+                    }
+                };
+                let (llt, rrt) = if lt == "pg_lsn" || rt == "pg_lsn" {
+                    (
+                        if lt == "pg_lsn" {
+                            lt.clone()
+                        } else {
+                            lsn_side(&lt, Some(l))
+                        },
+                        if rt == "pg_lsn" {
+                            rt.clone()
+                        } else {
+                            lsn_side(&rt, Some(r))
+                        },
+                    )
+                } else {
+                    (lt.clone(), rt.clone())
+                };
+                if let Some(out) = systypes::lsn_arith(&op, &lhs, &llt, &rhs, &rrt) {
+                    return out;
+                }
+            }
             // An untyped operand beside an interval IS an interval
             // (`$1 + $2::interval`, `'1 day' - i`): PostgreSQL resolves the
             // unknown to the other operand's type, and `interval op
@@ -34490,6 +34623,9 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         // A date is stored as its text, but the literal is read AS a date
         // first: `d < '2020-01-01 10:00'` compares with `2020-01-01`.
         Some("date") => cast_value(value, "date"),
+        // A pg_lsn is stored as its position: `l = '0/16'` compared the text
+        // with a number and matched nothing.
+        Some("pg_lsn") => systypes::cast_lsn(&value),
         // An array column: the literal is that array type, bounds and all --
         // `a = '[0:1]={5,6}'` must compare the lower bound too.
         Some(ty) if ty.ends_with("[]") => cast_value(value, ty),

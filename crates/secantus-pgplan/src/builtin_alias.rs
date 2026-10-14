@@ -17,8 +17,10 @@
 //! first step, where the operator's right side is the whole path.
 //!
 //! A literal argument is given the function's declared type where PostgreSQL
-//! would coerce it (`int8pl(1, 2)` is a `bigint`). Any other argument is left
-//! as it is, so `int4pl(1.5, 2)` is `1.5 + 2` here and 42883 on PostgreSQL.
+//! would coerce it (`int8pl(1, 2)` is a `bigint`), and a literal it would NOT
+//! coerce leaves the call unrewritten, to be refused as PostgreSQL refuses it
+//! (`int4pl(1.5, 2)`, 42883). Any other argument is left as it is: a column's
+//! type is not known here, so `int4pl(numeric_col, 2)` still runs.
 
 use super::*;
 use std::collections::HashMap;
@@ -319,6 +321,93 @@ fn literal_takes(n: &pg_query::protobuf::Node, ty: &str) -> bool {
     }
 }
 
+/// Is the literal `n` one PostgreSQL would NOT pass to a parameter of type
+/// `ty`? Then the function does not exist for these arguments (42883), and
+/// the call is left for the planner to refuse with the argument types -- the
+/// rewrite used to run it anyway (`int4pl(1.5, 2)` answered 3.5). An
+/// untyped string or a NULL takes any type; a whole number past int4 is a
+/// `bigint` (pg_query reads it as a float); a polymorphic or unknown `ty`
+/// refuses nothing.
+fn literal_refused(n: &pg_query::protobuf::Node, ty: &str) -> bool {
+    use pg_query::protobuf::a_const::Val;
+    if ty.is_empty() || ty.starts_with("any") || ty.starts_with('_') {
+        return false;
+    }
+    let Some(N::AConst(c)) = n.node.as_ref() else {
+        return false;
+    };
+    if c.isnull {
+        return false;
+    }
+    match &c.val {
+        Some(Val::Sval(_)) => false,
+        Some(Val::Ival(_)) => !literal_takes(n, ty),
+        Some(Val::Fval(f)) if f.fval.bytes().all(|b| b.is_ascii_digit() || b == b'-') => {
+            let wide = if f.fval.parse::<i64>().is_ok() {
+                "int8"
+            } else {
+                "numeric"
+            };
+            !matches!(ty, "float4" | "float8" | "numeric") && !(wide == "int8" && ty == "int8")
+        }
+        Some(Val::Fval(_)) => !literal_takes(n, ty),
+        Some(Val::Boolval(_)) => !matches!(ty, "bool" | "boolean"),
+        _ => false,
+    }
+}
+
+/// The type each `$n` of a template is cast to (`length($1::text)`), or
+/// "" where the template leaves it uncast.
+fn template_param_types(template: &pg_query::protobuf::Node, nargs: usize) -> Vec<String> {
+    fn walk(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+        match n.node.as_ref() {
+            Some(N::TypeCast(t)) => {
+                if let (Some(N::ParamRef(p)), Some(tn)) = (
+                    t.arg.as_deref().and_then(|a| a.node.as_ref()),
+                    t.type_name.as_ref(),
+                ) {
+                    let i = usize::try_from(p.number - 1).unwrap_or(usize::MAX);
+                    if let (Some(slot), Some(Some(N::String(name)))) =
+                        (out.get_mut(i), tn.names.last().map(|n| n.node.as_ref()))
+                    {
+                        *slot = name.sval.clone();
+                    }
+                }
+                if let Some(a) = t.arg.as_deref() {
+                    walk(a, out);
+                }
+            }
+            Some(N::AExpr(e)) => {
+                e.lexpr
+                    .as_deref()
+                    .into_iter()
+                    .chain(e.rexpr.as_deref())
+                    .for_each(|n| walk(n, out));
+            }
+            Some(N::FuncCall(f)) => f.args.iter().for_each(|n| walk(n, out)),
+            Some(N::CaseExpr(c)) => {
+                c.arg
+                    .as_deref()
+                    .into_iter()
+                    .chain(c.defresult.as_deref())
+                    .for_each(|n| walk(n, out));
+                c.args.iter().for_each(|n| walk(n, out));
+            }
+            Some(N::CaseWhen(w)) => {
+                w.expr
+                    .as_deref()
+                    .into_iter()
+                    .chain(w.result.as_deref())
+                    .for_each(|n| walk(n, out));
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![String::new(); nargs];
+    walk(template, &mut out);
+    out
+}
+
 fn string(s: &str) -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::String(pg_query::protobuf::String { sval: s.into() })),
@@ -405,14 +494,29 @@ pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::prot
     };
     let (name, args) = plain_call(f)?;
     if let Some(template) = templates().get(&(name.as_str(), args.len())) {
+        let types = template_param_types(template, args.len());
+        if args.iter().zip(&types).any(|(a, t)| literal_refused(a, t)) {
+            return None;
+        }
         return Some(substitute(template, args));
     }
     if let Some(template) = family_template(&name, args.len()) {
         let (left, right) = family_types(&name);
+        if literal_refused(&args[0], left) || literal_refused(&args[1], right) {
+            return None;
+        }
         let args = [typed(&args[0], left), typed(&args[1], right)];
         return Some(substitute(template, &args));
     }
     let op = operators().get(&(name, args.len()))?;
+    let refused = match args {
+        [l, r] => literal_refused(l, &op.left) || literal_refused(r, &op.right),
+        [r] => literal_refused(r, &op.right),
+        _ => false,
+    };
+    if refused {
+        return None;
+    }
     let (lexpr, rexpr) = match args {
         [l, r] => (
             Some(Box::new(typed(l, &op.left))),

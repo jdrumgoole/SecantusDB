@@ -52,6 +52,13 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
         ("macaddr8_set7bit", 1) => "macaddr8",
         ("overlaps", 4) if types.iter().all(|t| period_type(t)) => "bool",
         ("to_tsvector", 1 | 2) if matches!(t(types.len() - 1), "json" | "jsonb") => "tsvector",
+        // `ts_headline` over a document answers the document, of its type.
+        ("ts_headline", 2..=4) if matches!(t(0), "json" | "jsonb") => {
+            return Some(t(0).to_string())
+        }
+        ("ts_headline", 3 | 4) if matches!(t(1), "json" | "jsonb") => {
+            return Some(t(1).to_string())
+        }
         ("multirange", 1) if crate::range::is_range_type(t(0)) => {
             return Some(crate::range::multirange_name_for(t(0)));
         }
@@ -353,6 +360,13 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
         }
         "overlaps" => overlaps(args, types),
         "to_tsvector" => crate::fts::json_to_tsvector(args),
+        "ts_headline" => {
+            let at = usize::from(!matches!(
+                types.first().map(String::as_str),
+                Some("json" | "jsonb")
+            ));
+            crate::fts::json_headline(args, at, types.get(at).is_some_and(|t| t == "jsonb"))
+        }
         "multirange" => {
             let range_type = types.first().map_or("", String::as_str);
             let range = crate::range::from_text(&text(&args[0]), range_type)?;

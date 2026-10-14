@@ -194,7 +194,12 @@ impl PgHandler {
             let Some(id) = old.get("_id") else {
                 continue;
             };
-            self.update_rows_raw(table, &bson::doc! { "_id": id.clone() }, &set, &unset)?;
+            self.update_rows_raw(
+                table,
+                &bson::doc! { "_id": { "$eq": id.clone() } },
+                &set,
+                &unset,
+            )?;
         }
         Ok(())
     }

@@ -568,8 +568,8 @@ type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
 /// `_id.<name>` keys at the same position -- a composite primary key's
 /// layout (see `Column::field_override`). Every other document, catalog rows
 /// included, has a scalar or string `_id` and comes back unchanged.
-fn decode_doc(bytes: &[u8]) -> Result<Document, bson::de::Error> {
-    let d: Document = bson::from_slice(bytes)?;
+fn decode_doc(bytes: &[u8]) -> Result<Document, bson::raw::Error> {
+    let d = secantus_core::bsondoc::from_bytes(bytes)?;
     // A VALUE can be a document too -- a numeric wider than Decimal128 is
     // `{__numeric, __numkey}` -- and one of those as a single-column key must
     // stay whole. Internal value documents are the ones keyed `__...`; a
@@ -638,6 +638,29 @@ fn row_id(d: &Document) -> Bson {
     nest_key(d)
         .and_then(|n| n.get("_id").cloned())
         .unwrap_or(Bson::Null)
+}
+
+/// Add `field = value` to a filter built from stored field names. A column
+/// named `"$x"` or `"dot.s"` is one top-level key that a filter cannot name
+/// (MQL reads `$x` as an operator and `dot.s` as a path), so it is matched
+/// through `$getField` (a composite key's `_id.a` is a real path, and is
+/// not); and the value goes in `$eq`, because a document value
+/// such as `{"$regex": ...}` beside a bare name is read as operators too.
+fn insert_key_eq(def: &TableDef, filter: &mut Document, field: &str, value: &Bson) {
+    if secantus_pgplan::is_literal_only_column_field(def, field) {
+        let clause = bson::doc! { "$expr": { "$eq": [
+            { "$getField": { "field": { "$literal": field }, "input": "$$ROOT" } },
+            { "$literal": value.clone() },
+        ] } };
+        match filter.get_mut("$and") {
+            Some(Bson::Array(all)) => all.push(Bson::Document(clause)),
+            _ => {
+                filter.insert("$and", vec![Bson::Document(clause)]);
+            }
+        }
+    } else {
+        filter.insert(field, bson::doc! { "$eq": value.clone() });
+    }
 }
 
 thread_local! {
@@ -4367,6 +4390,29 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_user_relations(self.relations());
+        // `pg_relation_is_publishable`: an ordinary or partitioned table that
+        // is not temporary (`is_publishable_class`). This server keeps no
+        // unlogged tables apart, and its own relations are below 16384.
+        {
+            let matviews: Vec<String> = self
+                .matviews()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(n, _, _)| n)
+                .collect();
+            secantus_pgplan::set_publishable_relations(
+                self.all_table_defs()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|t| {
+                        !t.temp
+                            && !matviews.contains(&t.name)
+                            && !secantus_pgplan::fdw::is_foreign(t)
+                    })
+                    .filter_map(|t| self.relation_oid(&t.name))
+                    .collect(),
+            );
+        }
         secantus_pgplan::schemas::set_relation_keys(
             self.all_table_defs()
                 .unwrap_or_default()
@@ -9509,7 +9555,7 @@ impl PgHandler {
             let index = Self::expression_index_doc(name, &options);
             let mut seen: Vec<(Vec<Bson>, String)> = Vec::new();
             for raw in rows {
-                let row = bson::from_slice::<Document>(&raw)
+                let row = secantus_core::bsondoc::from_bytes(&raw)
                     .map_err(|e| Self::storage_err("could not decode a row", e))?;
                 if let Some((key, text)) = self.expression_key(def, &index, &row)? {
                     // The row it collides with is the one shown: identical to
@@ -9678,7 +9724,7 @@ impl PgHandler {
             .find_matching(self.db(), &def.name, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?
             .into_iter()
-            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
+            .filter_map(|raw| secantus_core::bsondoc::from_bytes(&raw).ok())
             .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
             .collect();
         let key = |row: &Document, cols: &[String]| -> PgWireResult<Option<Vec<Bson>>> {
@@ -9817,7 +9863,7 @@ impl PgHandler {
             .find_matching(self.db(), &def.name, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?
             .into_iter()
-            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
+            .filter_map(|raw| secantus_core::bsondoc::from_bytes(&raw).ok())
             .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
             .collect();
         for c in excl {
@@ -16282,7 +16328,8 @@ impl PgHandler {
                 self.check_referencing_updates(def, &pair)?;
                 written += self.move_rekeyed_rows(table, def, &pair)?;
             } else {
-                written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
+                written +=
+                    self.update_rows(table, &bson::doc! {"_id": {"$eq": id}}, &set, &unset)?;
             }
             affected.push(after);
         }
@@ -30982,8 +31029,12 @@ impl PgHandler {
                             .map_err(|e| self.relabel_partition_error(def, &moved, e))?;
                     }
                     for (id, set, unset) in writes {
-                        matched +=
-                            self.update_rows(&upd.table, &bson::doc! {"_id": id}, &set, &unset)?;
+                        matched += self.update_rows(
+                            &upd.table,
+                            &bson::doc! {"_id": {"$eq": id}},
+                            &set,
+                            &unset,
+                        )?;
                     }
                     returned = new_rows;
                     matched
@@ -31068,7 +31119,7 @@ impl PgHandler {
                             .delete_matching(
                                 self.db(),
                                 &del.table,
-                                &bson::doc! {"_id": row_id(row)},
+                                &bson::doc! {"_id": {"$eq": row_id(row)}},
                                 1,
                                 &Document::new(),
                                 None,
@@ -31574,7 +31625,7 @@ impl PgHandler {
             let id = row_id(new);
             let stored = !self
                 .storage
-                .find_matching(self.db(), table, &bson::doc! {"_id": id.clone()})
+                .find_matching(self.db(), table, &bson::doc! {"_id": { "$eq": id.clone() }})
                 .map_err(|e| Self::storage_err("could not read", e))?
                 .is_empty();
             if added.contains(&key(&id)) || (stored && !removed.contains(&key(&id))) {
@@ -31604,7 +31655,7 @@ impl PgHandler {
                 .delete_matching(
                     self.db(),
                     table,
-                    &bson::doc! {"_id": row_id(old)},
+                    &bson::doc! {"_id": {"$eq": row_id(old)}},
                     1,
                     &Document::new(),
                     None,
@@ -31750,7 +31801,7 @@ impl PgHandler {
         }
         let mut filter = Document::new();
         for (f, v) in ref_fields.iter().zip(values) {
-            filter.insert(f.clone(), v.clone());
+            insert_key_eq(parent, &mut filter, f, v);
         }
         let found = self
             .storage
@@ -32034,7 +32085,7 @@ impl PgHandler {
                 // its own parent; only rows that STAY count.
                 let mut child_filter = Document::new();
                 for (f, v) in fields.iter().zip(&key) {
-                    child_filter.insert(f.clone(), v.clone());
+                    insert_key_eq(&child, &mut child_filter, f, v);
                 }
                 if child.name == def.name {
                     let going_ids: Vec<Bson> = going.iter().map(row_id).collect();
@@ -32197,7 +32248,7 @@ impl PgHandler {
                 }
                 let mut child_filter = Document::new();
                 for (f, v) in fields.iter().zip(&old) {
-                    child_filter.insert(f.clone(), v.clone());
+                    insert_key_eq(&child, &mut child_filter, f, v);
                 }
                 self.apply_referential_action(
                     def,
@@ -34169,6 +34220,48 @@ thread_local! {
     static FLOAT_SUM_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// What `array_agg` over arrays refused; read with the float overflow.
+    static ARRAY_AGG_ERROR: std::cell::RefCell<Option<PlanError>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `accumArrayResultArr`'s checks on `array_agg`'s array inputs, in input
+/// order: a NULL array is 22004, an empty first array 2202E, and every later
+/// array must have the first one's dimensions and lower bounds (2202E).
+/// True, with the error recorded, when the inputs cannot be accumulated;
+/// before this a NULL failed later as a binary-encoding error and arrays of
+/// different lengths came back as a ragged array.
+fn array_agg_refuses(values: impl Iterator<Item = Bson>) -> bool {
+    use secantus_pgplan::arrays;
+    let refuse = |code: &'static str, message: &str| {
+        ARRAY_AGG_ERROR.with(|e| *e.borrow_mut() = Some(PlanError::Sqlstate(code, message.into())));
+        true
+    };
+    let mut first: Option<(Vec<usize>, Vec<i64>)> = None;
+    for v in values {
+        if v == Bson::Null {
+            return refuse("22004", "cannot accumulate null arrays");
+        }
+        let shape = (
+            arrays::dim_lengths(&arrays::strip(&v)),
+            arrays::lower_bounds(&v),
+        );
+        match &first {
+            None if shape.0.is_empty() => return refuse("2202E", "cannot accumulate empty arrays"),
+            None => first = Some(shape),
+            Some(f) if *f != shape => {
+                return refuse(
+                    "2202E",
+                    "cannot accumulate arrays of different dimensionality",
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    false
+}
+
 /// The float8 sum of `values` in order, as `sum` / `avg` of a
 /// `double precision` add them -- or `None`, with `FLOAT_SUM_OVERFLOW` set,
 /// when an addition of two finite values overflows: PostgreSQL's `float8pl`
@@ -34210,9 +34303,13 @@ fn real_sum(values: impl Iterator<Item = f32>) -> Option<f32> {
     Some(total)
 }
 
-/// The 22003 a float `sum` / `avg` overflow raised, if one did since the
-/// last call.
-fn take_float_sum_overflow() -> Option<PlanError> {
+/// The error an aggregate raised since the last call, if any: the 22003 of
+/// a float `sum` / `avg` overflow, or what `array_agg` over arrays refused.
+fn take_aggregate_error() -> Option<PlanError> {
+    if let Some(e) = ARRAY_AGG_ERROR.with(|e| e.borrow_mut().take()) {
+        FLOAT_SUM_OVERFLOW.with(|c| c.set(false));
+        return Some(e);
+    }
     FLOAT_SUM_OVERFLOW
         .with(|c| c.replace(false))
         .then(|| PlanError::NumericOutOfRange("value out of range: overflow".into()))
@@ -34223,9 +34320,9 @@ fn take_float_sum_overflow() -> Option<PlanError> {
 /// ordering, exactly as the basic ones do.
 fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
     if !aggregates::is_extended(item.func) {
-        take_float_sum_overflow();
+        take_aggregate_error();
         let v = compute_basic_aggregate(item, rows);
-        if let Some(e) = take_float_sum_overflow() {
+        if let Some(e) = take_aggregate_error() {
             return Err(PgHandler::err(&e));
         }
         return Ok(v);
@@ -34432,6 +34529,18 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // `array_agg` is no exception, DISTINCT or not -- PostgreSQL 14.24
         // answers NULL where this answered an empty ARRAY.
         AggFunc::ArrayAgg if rows.is_empty() => Bson::Null,
+        AggFunc::ArrayAgg
+            if item
+                .source_type
+                .as_deref()
+                .is_some_and(|t| t.ends_with("[]"))
+                && array_agg_refuses(
+                    rows.iter()
+                        .map(|d| d.get(field).cloned().unwrap_or(Bson::Null)),
+                ) =>
+        {
+            Bson::Null
+        }
         AggFunc::ArrayAgg if item.distinct => {
             let mut seen = distinct_set::DistinctSet::<Option<Bson>>::new();
             let mut kept: Vec<Bson> = Vec::new();
@@ -34990,9 +35099,9 @@ fn window_value(
             None => Bson::Null,
         },
         _ => {
-            take_float_sum_overflow();
+            take_aggregate_error();
             let v = window_aggregate(w, &frame);
-            if let Some(e) = take_float_sum_overflow() {
+            if let Some(e) = take_aggregate_error() {
                 return Err(e);
             }
             v

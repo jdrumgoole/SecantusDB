@@ -482,6 +482,42 @@ fn write_json(v: &Json, out: &mut String) {
     }
 }
 
+/// Render a `json` value with no whitespace, as `transform_json_string_values`
+/// writes one (`ts_headline` over `json`): key order, duplicates and each
+/// number's text kept.
+pub fn render_json_compact(v: &Json) -> String {
+    fn write(v: &Json, out: &mut String) {
+        match v {
+            Json::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            Json::Object(pairs) => {
+                out.push('{');
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_json_string(k, out);
+                    out.push(':');
+                    write(v, out);
+                }
+                out.push('}');
+            }
+            scalar => write_json(scalar, out),
+        }
+    }
+    let mut out = String::new();
+    write(v, &mut out);
+    out
+}
+
 /// One step of `->` / `#>`: a member by NAME, or an array element by INDEX.
 ///
 /// A negative index counts from the end (`-1` is the last element), which is

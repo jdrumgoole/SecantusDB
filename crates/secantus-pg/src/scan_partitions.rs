@@ -164,7 +164,7 @@ pub(crate) fn rows_matching(
     let mut out = Vec::new();
     for &i in part.buckets.get(&want).map_or(&[][..], Vec::as_slice) {
         let raw = &part.rows[i];
-        let doc: Document = bson::from_slice(raw).ok()?;
+        let doc = secantus_core::bsondoc::from_bytes(raw).ok()?;
         // Any error is the storage scan's to raise, as it always did.
         if secantus_core::query::matches(&doc, filter, &empty, None).ok()? {
             out.push(raw.clone());
