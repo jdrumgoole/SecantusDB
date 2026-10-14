@@ -9240,7 +9240,11 @@ What is open:
       and that role lets them run nothing. The dispatcher checks a
       privilege per database, and the table has privileges on single
       collections (`system.profile`, `system.js`), so using it as it is
-      would grant more than mongod does.
+      would grant more than mongod does. A stored role with a
+      built-in's name on a database that has no such built-in (`root` on
+      `app`, which `createRole` now allows as mongod does) is read by the
+      check as the built-in bound to the wrong database, and permits
+      nothing, whatever privileges it holds.
 - [ ] **A privilege on one collection permits the action on every
       collection of its database.** Measured 2026-10-14 under `--auth`: a
       user whose only role has `insert` on `app.c` inserted into
