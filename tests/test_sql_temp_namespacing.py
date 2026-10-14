@@ -4,7 +4,7 @@ Postgres gives every backend its own ``pg_temp_<n>`` schema, so two
 concurrently-open sessions can each ``CREATE TEMPORARY TABLE bar`` without
 colliding, and each session's ``bar`` shadows a permanent ``bar``. We shared
 one namespace: the second concurrent create failed 42P07 (the confirmed gap
-in tasks/backlog.md's pgx survey). Temp tables now live under a per-session
+in tasks/backlog-python-postgres.md's pgx survey). Temp tables now live under a per-session
 ``pg_temp_<n>.`` catalog prefix, allocated lazily and resolved implicitly
 ahead of ``public`` — matching real PG's search order.
 """
@@ -167,7 +167,7 @@ def dsn(server):
 
 class TestWireConcurrency:
     def test_two_open_connections_create_same_temp_table(self, dsn):
-        # The confirmed gap from tasks/backlog.md: the second concurrent
+        # The confirmed gap from tasks/backlog-python-postgres.md: the second concurrent
         # CREATE TEMPORARY TABLE failed 42P07; Postgres allows both.
         with (
             psycopg.connect(dsn, autocommit=True) as c1,

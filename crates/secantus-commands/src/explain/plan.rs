@@ -5,7 +5,7 @@
 //! covers the projection. It does not reproduce mongod's trial runs. When
 //! several indexes could serve one query the choice below is a fixed order
 //! of preference, which agrees with mongod on the common shapes and is not
-//! claimed to agree on the rest (`tasks/backlog.md`).
+//! claimed to agree on the rest (`tasks/backlog-rust-mongodb.md`).
 
 use super::bounds::{intersect, leaf_bounds, union, Ctx, Interval, Tight};
 use super::exec::{self, Env};

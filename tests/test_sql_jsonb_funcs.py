@@ -133,7 +133,7 @@ class TestJsonbConcat:
     The mixed shapes (array||array, object||array, array||scalar) are a
     *separate, still-open* problem: their values are right but the result is
     typed as a PG array, so it renders ``{1,2,3}`` where PG renders the jsonb
-    ``[1, 2, 3]``. See tasks/backlog.md — not asserted here so this class does
+    ``[1, 2, 3]``. See tasks/backlog-python-postgres.md — not asserted here so this class does
     not pin the wrong shape.
     """
 
@@ -169,7 +169,7 @@ class TestJsonbDelete:
 
     Array results are correct in *value* but are still typed as a PG array, so
     they render `{1,3}` where PG renders the jsonb `[1, 3]` — the same open
-    typing issue as `||`'s mixed shapes, tracked in tasks/backlog.md. These
+    typing issue as `||`'s mixed shapes, tracked in tasks/backlog-python-postgres.md. These
     assertions therefore check the decoded value, not the rendered text.
     """
 

@@ -14,7 +14,7 @@ Every expectation here was measured against PostgreSQL 14.13.
 Still divergent, deliberately: arithmetic inside a **WHERE** clause. It lowers
 to a Mongo `$expr` and is evaluated by `secantus/expressions.py`, the operator
 engine the MongoDB server shares — teaching it PostgreSQL's integer widths
-would break the layer boundary. See `tasks/backlog.md`.
+would break the layer boundary. See `tasks/backlog-python-postgres.md`.
 """
 
 from __future__ import annotations

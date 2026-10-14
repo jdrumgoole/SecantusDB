@@ -433,7 +433,7 @@ OPTIONS:
                                  queue OUTSIDE it. 0 = unlimited (default).
                                  Bounds the p99.9 tail under write saturation,
                                  which unbounded concurrency does not — see
-                                 tasks/backlog.md. Start near the core count.
+                                 tasks/backlog-rust-mongodb.md. Start near the core count.
     --sync-on-commit             Fsync the WT log on every transaction commit
                                  (closes the writeConcern j:true durability gap
                                  at a throughput cost; off by default)

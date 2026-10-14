@@ -5,7 +5,7 @@
 //! tailorings) in Rust. Measured against `mongod` 8.2.11 on 2026-10-10 over
 //! 157 strings and 40 collations (every option, 24 locales), the two put the
 //! strings in the same order and the same equivalence classes, with one
-//! exception recorded in `tasks/backlog.md`: ICU4X always treats canonically
+//! exception recorded in `tasks/backlog-rust-mongodb.md`: ICU4X always treats canonically
 //! equivalent strings as equal, where `mongod` with `normalization: false`
 //! (the default) tells `"ö\u{323}"` from `"o\u{323}\u{308}"`.
 //!

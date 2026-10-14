@@ -7,11 +7,10 @@
 //! `fancy-regex`. Only a non-string pattern/options, a pattern over the length
 //! cap, or one neither engine compiles signals defer (`Err(())`).
 //!
-//! `is_match` (Python `re.search` truthiness) works on both engines. Positional
-//! find (`find_first` / `find_all`, backing `$regexFind` / `$regexFindAll`) is
-//! served **only** by the linear engine — its leftmost-first match + capture
-//! semantics align with Python `re`, whereas the backtracking engine's capture
-//! behaviour is a parity risk, so a fancy-only pattern defers those two.
+//! `is_match` (Python `re.search` truthiness) and positional find
+//! (`find_first` / `find_all`, backing `$regexFind` / `$regexFindAll`) work on
+//! both engines; a backtracking engine's captures are converted by
+//! `to_match_fancy`, and only its backtrack-limit error defers.
 
 use bson::Bson;
 use regex::{Regex as LinearRegex, RegexBuilder};

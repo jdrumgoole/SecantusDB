@@ -4,7 +4,7 @@
 //! faster than eviction can clear it. Once it crosses the eviction trigger,
 //! application threads are conscripted into eviction work — and because every
 //! connection thread dives straight into the engine, they are conscripted *all
-//! at once*. That is the p99.9 convoy measured in `tasks/backlog.md`: the
+//! at once*. That is the p99.9 convoy measured in `tasks/backlog-rust-mongodb.md`: the
 //! median stays flat while the tail explodes, every worker stalling in the
 //! same millisecond.
 //!

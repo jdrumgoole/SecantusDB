@@ -1,4 +1,8 @@
-"""`tasks/backlog.md` markers must not contradict their own headlines.
+"""The backlog files' markers must not contradict their own headlines.
+
+The backlog is four files, one per server (`tasks/backlog-*.md`; the
+single `tasks/backlog.md` they were split from on 2026-10-14 is now their
+index).
 
 The backlog is load-bearing — CLAUDE.md calls it "the only honest record of where
 SecantusDB's behaviour diverges from real MongoDB" — and it rotted badly: an audit
@@ -10,8 +14,9 @@ shipped months earlier, which is how the same thing gets built twice.
 This test pins the convention the file's own header states, so the rot cannot
 silently come back:
 
-* `- [x]` is a finished record, kept for its detail. Anything goes in the text.
-* `- [ ]` is open work. Its headline may still *mention* completed context — most
+* `- [ ]` is open work, and every item is open: a finished item is deleted
+  (git history and `changelog.d/` hold it), not ticked.
+* An open item's headline may still *mention* completed context — most
   real items do, e.g. "X landed, Y still missing" — but it must then lead with
   `OPEN —` so a reader scanning headlines is not told the item is done.
 """
@@ -21,7 +26,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-BACKLOG = Path(__file__).resolve().parent.parent / "tasks" / "backlog.md"
+TASKS = Path(__file__).resolve().parent.parent / "tasks"
+BACKLOGS = [
+    TASKS / f"backlog-{server}.md"
+    for server in ("rust-mongodb", "rust-postgres", "python-mongodb", "python-postgres")
+]
 
 # An item's headline: the bold title plus roughly the first sentence after it.
 HEADLINE_CHARS = 260
@@ -38,23 +47,35 @@ DONE_WORDS = re.compile(
 LEADS_WITH_OPEN = re.compile(r"^\*\*OPEN\b", re.IGNORECASE)
 
 
-def open_items() -> list[tuple[int, str]]:
-    """(line number, headline) for every `- [ ]` item in the backlog."""
+def open_items(backlog: Path) -> list[tuple[int, str]]:
+    """(line number, headline) for every `- [ ]` item in one backlog file."""
     items = []
     # Explicit UTF-8: the backlog is full of em dashes and "×", and Windows
     # defaults `read_text()` to cp1252, which dies on them with a
     # UnicodeDecodeError. Caught by the Windows CI lane, not locally.
-    for lineno, line in enumerate(BACKLOG.read_text(encoding="utf-8").splitlines(), 1):
+    for lineno, line in enumerate(backlog.read_text(encoding="utf-8").splitlines(), 1):
         m = OPEN_ITEM.match(line)
         if m:
             items.append((lineno, m.group("body")[:HEADLINE_CHARS]))
     return items
 
 
-def test_backlog_exists_and_has_open_items() -> None:
+def test_backlogs_exist_and_have_open_items() -> None:
     """Guard against the parser silently matching nothing."""
-    assert BACKLOG.is_file(), f"{BACKLOG} missing"
-    assert open_items(), "no open items parsed — the item pattern probably drifted"
+    for backlog in BACKLOGS:
+        assert backlog.is_file(), f"{backlog} missing"
+        assert open_items(backlog), f"no open items parsed in {backlog.name}"
+
+
+def test_no_item_is_ticked() -> None:
+    """A finished item is deleted, not ticked: the files hold open work."""
+    ticked = [
+        f"{backlog.name}:{lineno}"
+        for backlog in BACKLOGS
+        for lineno, line in enumerate(backlog.read_text(encoding="utf-8").splitlines(), 1)
+        if re.match(r"^\s*- \[x\] ", line)
+    ]
+    assert not ticked, "ticked items in the backlog (delete them instead): " + ", ".join(ticked)
 
 
 def test_no_open_item_claims_to_be_finished() -> None:
@@ -65,13 +86,34 @@ def test_no_open_item_claims_to_be_finished() -> None:
     headline ("OPEN — jsonb operator surface landed (one gap …)").
     """
     offenders = [
-        (lineno, headline)
-        for lineno, headline in open_items()
+        (backlog.name, lineno, headline)
+        for backlog in BACKLOGS
+        for lineno, headline in open_items(backlog)
         if DONE_WORDS.search(headline) and not LEADS_WITH_OPEN.match(headline.strip())
     ]
     assert not offenders, (
         "open-marked backlog items whose headline claims completion:\n"
         + "\n".join(
-            f"  tasks/backlog.md:{lineno}  {headline[:110]}" for lineno, headline in offenders
+            f"  tasks/{name}:{lineno}  {headline[:110]}" for name, lineno, headline in offenders
         )
     )
+
+
+def test_every_rust_item_has_an_id_and_a_check() -> None:
+    """Each open item in a Rust server's backlog carries `Backlog-ID:` and
+    `Verify:` lines, and no two items share an ID (the `backlog` skill)."""
+    import sys
+
+    sys.path.insert(0, str(TASKS.parent))
+    from tools import backlog
+
+    missing, seen, dupes = [], set(), []
+    for name in backlog.FILES:
+        for item in backlog.parse(name):
+            if not item.id or not item.verify:
+                missing.append(f"{name}:{item.line}")
+            if item.id in seen:
+                dupes.append(item.id)
+            seen.add(item.id)
+    assert not missing, "items without Backlog-ID / Verify: " + ", ".join(missing)
+    assert not dupes, "duplicate Backlog-IDs: " + ", ".join(dupes)

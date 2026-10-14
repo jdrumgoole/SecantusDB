@@ -53,6 +53,6 @@ checks.
 
 #### Still open
 
-`tasks/backlog.md` has the rest: `age(xid)` of a normal transaction id,
+`tasks/backlog-rust-postgres.md` has the rest: `age(xid)` of a normal transaction id,
 `ts_parse` / `ts_debug` / `ts_rewrite`, the `tid` type, the ACL and XML
 functions, and a set-returning function inside an expression.

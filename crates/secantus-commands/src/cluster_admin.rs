@@ -151,7 +151,7 @@ pub(crate) fn current_fcv(ctx: &CommandContext) -> String {
 ///
 /// What this does NOT do is change behaviour: mongod at FCV 8.0 refuses the
 /// features 8.1 and 8.2 added, and this server has no such gates
-/// (`tasks/backlog.md` 7.084).
+/// (`tasks/backlog-rust-mongodb.md` 7.084).
 pub fn set_feature_compatibility_version(
     doc: &Document,
     ctx: &mut CommandContext,

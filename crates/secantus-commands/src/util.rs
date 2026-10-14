@@ -218,7 +218,7 @@ pub(crate) fn validate_write_hint(
     }
     // mongod renders its whole query plan here; we name the hint. The CODE
     // matches, the text does not — a deliberate difference, see
-    // `tasks/backlog.md` (8.2.11 returns a planner diagnostic, and the project
+    // `tasks/backlog-rust-mongodb.md` (8.2.11 returns a planner diagnostic, and the project
     // asserts the rejection rather than the text).
     //
     // `{hint:?}` was Rust's `Debug` on a `Bson`, which leaked the RUST TYPE

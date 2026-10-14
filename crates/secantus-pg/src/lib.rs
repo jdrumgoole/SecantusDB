@@ -24798,7 +24798,7 @@ impl PgHandler {
                 format!("prepared transaction with identifier \"{gid}\" does not exist"),
             )),
             // A transaction recovered from disk holds no row locks (see
-            // `tasks/backlog.md`), so a write since the restart can have
+            // `tasks/backlog-rust-postgres.md`), so a write since the restart can have
             // taken a key its replay needs. PostgreSQL cannot reach this
             // state; the refusal is the unique violation it would have
             // given the OTHER writer, and the record stays for a ROLLBACK
@@ -32494,7 +32494,7 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// A column outside this list stays TEXT even when the client asked for
 /// binary. The format travels per column in the `RowDescription`, so the
 /// client still decodes it correctly -- but PostgreSQL honours the request for
-/// every type, and the gap is recorded in `tasks/backlog.md` rather than
+/// every type, and the gap is recorded in `tasks/backlog-rust-postgres.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
     const OK: [Type; 70] = [

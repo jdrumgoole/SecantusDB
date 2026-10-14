@@ -339,7 +339,7 @@ class PreparedXactRegistry:
 
     In-memory only: prepared transactions do NOT survive a server restart (real
     Postgres persists them to ``pg_twophase`` so they outlive a crash). This is a
-    documented surrogate limitation — see ``tasks/backlog.md``."""
+    documented surrogate limitation — see ``tasks/backlog-python-postgres.md``."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

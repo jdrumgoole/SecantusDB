@@ -122,7 +122,7 @@ fn collection(inner: &Document, name: &str, db: &str) -> Result<String, CommandE
 }
 
 /// An unknown hint, in the words every command on this server uses for it
-/// (mongod prints its parse of the query here; `tasks/backlog.md`).
+/// (mongod prints its parse of the query here; `tasks/backlog-rust-mongodb.md`).
 fn bad_hint(hint: &Bson) -> CommandError {
     let rendered = match hint {
         Bson::String(s) => format!("\"{s}\""),

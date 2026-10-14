@@ -4568,7 +4568,7 @@ def _blank_pad_record_field(expr: exp.Expression, value: Any) -> Any:
 
     Only the CAST form is recognised; a ``char(n)`` COLUMN inside a record
     needs the catalog, which this layer does not have (recorded in
-    `tasks/backlog.md`)."""
+    `tasks/backlog-python-postgres.md`)."""
     if not isinstance(value, str):
         return value
     inner = expr

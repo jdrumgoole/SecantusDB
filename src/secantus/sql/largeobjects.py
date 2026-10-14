@@ -15,7 +15,7 @@ Object bytes live in a per-database ``__sql_largeobjects__`` collection, one
 document per object: ``{_id: <oid int>, data: <Binary>}``. Descriptors are
 per-session (``Session.lo_descriptors``), carrying ``(oid, position, mode)``
 — PG closes them at transaction end; we close them at session end (noted in
-``tasks/backlog.md``; no gauge test distinguishes the two). Reads and writes
+``tasks/backlog-python-postgres.md``; no gauge test distinguishes the two). Reads and writes
 route through the session's open transaction when one is active, so a
 ``ROLLBACK`` discards ``lowrite`` data exactly as PG's transactional large
 objects do.

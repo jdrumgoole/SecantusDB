@@ -12,7 +12,7 @@
 #
 # Version is kept in lockstep with the SecantusDB release it accelerates (the
 # `secantus[rust]` extra pins it exactly), so the release process must bump and
-# publish both together — see tasks/rust-rewrite-plan.md and tasks/backlog.md.
+# publish both together — see tasks/rust-rewrite-plan.md and tasks/backlog-rust-mongodb.md.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"

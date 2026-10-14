@@ -70,7 +70,7 @@ _RECORD_SRFS = frozenset(
         # CALL SITES pgjdbc emits are not recognised yet — a schema-qualified
         # name in FROM position, and the composite-value form
         # ``(_pg_expandarray(x)).n`` — so this is not reachable from those
-        # queries. See tasks/backlog.md.
+        # queries. See tasks/backlog-python-postgres.md.
         "_pg_expandarray",
         # pg_get_keywords() -> (word, catcode, barelabel, catdesc, baredesc):
         # the server's keyword list; pgjdbc's getSQLKeywords string_aggs it.

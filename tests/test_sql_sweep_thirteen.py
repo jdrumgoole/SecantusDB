@@ -205,5 +205,5 @@ def test_char_field_of_a_record_keeps_its_padding(conn, sql):
 
     Asserted on the FIELD rather than on `record::text`, because that cast
     still renders a record as JSON instead of PostgreSQL's `(a,"d ")` — a
-    separate bug, recorded in `tasks/backlog.md`."""
+    separate bug, recorded in `tasks/backlog-python-postgres.md`."""
     assert "d " in one(conn, sql)

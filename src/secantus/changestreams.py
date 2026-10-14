@@ -289,7 +289,7 @@ def _attach_full_document(
         # ``updateLookup`` does a live point-in-time-less lookup. With
         # images enabled we approximate the post-image with the live
         # lookup — exact on a single node unless later writes already
-        # changed the doc (recorded divergence, tasks/backlog.md).
+        # changed the doc (recorded divergence, tasks/backlog-python-mongodb.md).
         if full_document_mode in (
             FULL_DOC_REQUIRED,
             FULL_DOC_WHEN_AVAILABLE,

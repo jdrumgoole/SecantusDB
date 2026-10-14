@@ -7,7 +7,7 @@ description: Find real bugs in SecantusDB by running operations against a live m
 
 **Every bug found in the 2026-08 sweeps came from executing behaviour and
 comparing against a real server.** None was accurately described in
-`tasks/backlog.md` beforehand; several entries described work as remaining that
+the server's backlog file (`tasks/backlog-<server>.md`) beforehand; several entries described work as remaining that
 was already done, or missing that already existed. Reading is for *fixing*, not
 for *finding* and not for *sizing*.
 
@@ -192,7 +192,7 @@ retargeted the error surface and `PROBED_MONGOD_VERSION` with it. Source
 comments across ~11 files still cite 6.0.16 and were explicitly not
 re-verified, so a citation is evidence of when it was measured, not of what the
 server does now. If you introduce a version-dependent difference, record every
-version you measured in `tasks/backlog.md` rather than silently picking one.
+version you measured in the server's backlog file (`tasks/backlog-<server>.md`) rather than silently picking one.
 
 **A finding that appears only on the newer server is a normalisation bug until
 proven otherwise.** Probing change streams against 8.3.4 produced three extra
@@ -356,5 +356,5 @@ real product; a count against the sibling server is not evidence.**
 - Keep a wrong estimate in the record with the correction; the error is more
   reusable than the fix.
 - Divergences you decline to fix (deliberate hardening, version-dependent
-  behaviour, cosmetic ordering) go in `tasks/backlog.md` **with the reason**,
+  behaviour, cosmetic ordering) go in the server's backlog file (`tasks/backlog-<server>.md`) **with the reason**,
   so the next session reads a decision rather than an oversight.

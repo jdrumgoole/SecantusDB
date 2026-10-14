@@ -539,7 +539,7 @@ def _dispatch(
     # ``transaction_read_only`` GUC already resolves through the session
     # default outside a block, so one check covers ``BEGIN READ ONLY``,
     # ``SET TRANSACTION READ ONLY``, and the session characteristic. PG
-    # exempts temporary tables; we don't (noted in tasks/backlog.md) — no
+    # exempts temporary tables; we don't (noted in tasks/backlog-python-postgres.md) — no
     # gauge exercises a temp-table write under read-only.
     if session.get_setting("transaction_read_only") == "on":
         verb = _write_statement_verb(stmt)
@@ -646,7 +646,7 @@ def _write_statement_verb(stmt: exp.Expression) -> str | None:
     Matches PG's classification: DML and DDL are writes; SELECT, SHOW, SET,
     EXPLAIN, and cursor traffic are not. (``SELECT … FOR UPDATE`` and
     ``nextval()`` are also writes in PG; neither is gated here — noted in
-    tasks/backlog.md.)"""
+    tasks/backlog-python-postgres.md.)"""
     if isinstance(stmt, exp.Insert):
         return "INSERT"
     if isinstance(stmt, exp.Update):
@@ -2026,7 +2026,7 @@ def _describe_statement(
         # with FORMAT (json -> 114, xml -> 142); we answer 25 for JSON too,
         # because Execute does, and a Describe that disagrees with its own
         # Execute is a worse bug than the one it would fix. Recorded in
-        # `tasks/backlog.md`.
+        # `tasks/backlog-python-postgres.md`.
         return [ColumnDesc(name="QUERY PLAN", type_tag="text", pg_oid=25)]
     if isinstance(stmt, exp.Command) and str(stmt.this).upper() == "CALL":
         # A CALL portal describes as its procedure's OUT/INOUT params (a single

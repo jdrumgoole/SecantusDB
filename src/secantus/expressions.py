@@ -2282,7 +2282,7 @@ def _dec_asinh(d: _decimal.Decimal) -> _decimal.Decimal:
 
     Correct rounding here is a DELIBERATE divergence from mongod, which carries
     Intel RDFP's own last-digit error (it answers ``…334E-11`` above): asked
-    for and recorded in `tasks/backlog.md`. The rest of the table keeps its
+    for and recorded in `tasks/backlog-python-mongodb.md`. The rest of the table keeps its
     34-digit arithmetic, which reproduces mongod more closely.
     """
     # mongod's own implementation UNDERFLOWS below ``1E-4966`` and answers a

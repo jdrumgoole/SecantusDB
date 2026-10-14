@@ -15,8 +15,7 @@
 //! `type: "view"` (readOnly, no `_id` index).
 //!
 //! **Deferred (documented so parity is honest):**
-//! * `create` unknown-field validation (`Location40415`); capped-size
-//!   enforcement; `collMod`'s TTL-index `index: {expireAfterSeconds}` modify.
+//! * capped-size enforcement.
 //! * `validator` enforcement on `findAndModify` (insert / `update` / replace are
 //!   enforced — the command layer reads the validator and the storage update
 //!   checks the post-apply doc; code 121, bypassable via
@@ -38,8 +37,8 @@ use crate::{CommandContext, CommandError, HandlerResult, StorageError, DEFAULT_B
 /// Collection-option keys (from `create` / `collMod`) the Rust server persists.
 /// `validator` + `validationLevel`/`validationAction` drive document validation;
 /// `changeStreamPreAndPostImages` drives pre-image capture; `capped`/`size`/`max`
-/// are reported in stats. (TTL-index `expireAfterSeconds` modification via
-/// `collMod`'s `index` option is deferred.)
+/// are reported in stats. (`collMod`'s `index` option, which modifies an
+/// index's `expireAfterSeconds` and the rest, is handled in `coll_mod_inner`.)
 const STORED_COLL_OPTIONS: [&str; 11] = [
     "validator",
     "validationLevel",

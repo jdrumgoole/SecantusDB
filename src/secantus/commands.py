@@ -57,7 +57,7 @@ from secantus.expressions import ExpressionError, UnknownExpressionOperatorError
 # a probe taken against the OLD target and NOT re-verified against the new one.
 # They are not known to be wrong -- most of the surface is version-stable -- but
 # they are not evidence for current behaviour either. Re-probe before relying on
-# one, and update it to name 8.2.1 when you do. See tasks/backlog.md.
+# one, and update it to name 8.2.1 when you do. See tasks/backlog-python-mongodb.md.
 from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_code
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
@@ -501,7 +501,7 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     than one naming the requested ``w``. ``tests/test_crud.py`` asserted
     the old name, so the test was pinning our bug rather than mongod.
 
-    Still divergent, filed in ``tasks/backlog.md``: mongod also carries
+    Still divergent, filed in ``tasks/backlog-python-mongodb.md``: mongod also carries
     an ``errInfo.writeConcern`` sub-document recording the effective
     write concern and its ``provenance``; we send none.
     """
@@ -4559,7 +4559,7 @@ def _require_collation_spec(spec: Any) -> dict[str, Any] | None:
     locale (mongod answers ``2 Field 'locale' is invalid in: { locale: "xx_YY" }``,
     sometimes with a "Did you mean" suffix). Enumerating ICU's locales without
     ICU would mean guessing, and wrongly rejecting a locale mongod accepts is
-    worse than accepting one it rejects. Recorded in `tasks/backlog.md`.
+    worse than accepting one it rejects. Recorded in `tasks/backlog-python-mongodb.md`.
 
     Applied to ``find`` / ``aggregate`` / ``count`` / ``distinct`` /
     ``findAndModify`` only. ``update`` and ``delete`` accept ANY spec contents
@@ -5596,7 +5596,7 @@ def _find_and_modify_impl(doc: dict[str, Any], ctx: CommandContext) -> dict[str,
         except BadHint as exc:
             # Same shape ``find`` and ``count`` already return for a hint that
             # names no index. (mongod prefixes this with a dump of the parsed
-            # plan; we emit the causal sentence only -- see tasks/backlog.md.)
+            # plan; we emit the causal sentence only -- see tasks/backlog-python-mongodb.md.)
             return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
 
         if not candidates:
@@ -10637,7 +10637,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # sessions). We advertise such a topology, so those commands
         # accept it too — accept-and-record: the reply carries
         # ``atClusterTime`` for session pinning but reads are not
-        # actually timestamp-pinned (single node; tasks/backlog.md).
+        # actually timestamp-pinned (single node; tasks/backlog-python-mongodb.md).
         # Everything else keeps mongod's rejection. When the
         # replica-set persona is off we reject like a real standalone
         # (the snapshot-sessions-not-supported unified specs pin that
@@ -11103,7 +11103,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # (client_session.py _update_read_concern) — and sends it back
         # as ``readConcern.atClusterTime`` on subsequent reads. Reads
         # are NOT actually pinned (single node, accept-and-record; see
-        # tasks/backlog.md), but the wire contract is satisfied.
+        # tasks/backlog-python-mongodb.md), but the wire contract is satisfied.
         rc = doc.get("readConcern")
         if bool(result.get("ok")) and isinstance(rc, Mapping) and rc.get("level") == "snapshot":
             cursor_part = result.get("cursor")
