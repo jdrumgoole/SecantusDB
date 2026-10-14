@@ -13,8 +13,8 @@ which this server does not have.
 MD5 of its documents' BSON in `_id` order under its default collation, a
 capped collection in insertion order, the database the MD5 of the
 collections' digests in name order. Views are left out and `system.views`
-is hashed; so are `system.profile` and everything in `local`, which mongod
-does not replicate. `setDefaultRWConcern` stores the defaults in
+is hashed. `system.profile` and everything in `local` are left out too,
+because mongod does not replicate them. `setDefaultRWConcern` stores the defaults in
 `config.settings` as mongod does, so they survive a restart and
 `getDefaultRWConcern` reports where they came from and when they were set;
 a write that sends no write concern of its own is held to the stored

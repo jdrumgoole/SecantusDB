@@ -98,7 +98,10 @@ scenario(
 # ------------------------------------------------------------------ dbHash
 
 HASH_SEED = [
-    {"insert": "a", "documents": [{"_id": 3, "x": "c"}, {"_id": 1, "x": "a"}, {"_id": 2, "x": "b"}]},
+    {
+        "insert": "a",
+        "documents": [{"_id": 3, "x": "c"}, {"_id": 1, "x": "a"}, {"_id": 2, "x": "b"}],
+    },
     {"insert": "b", "documents": [{"y": 1, "_id": "later"}]},
     {"insert": "b", "documents": [{"_id": {"k": 1}, "n": [1, 2.0, Int64(3)]}]},
     {"update": "b", "updates": [{"q": {"_id": "later"}, "u": {"$set": {"z": 2}}}]},

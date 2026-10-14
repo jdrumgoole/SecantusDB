@@ -129,7 +129,10 @@ fn conn_pool_stats_has_mongod_shape_with_no_pools() {
             assert_eq!(reply.get("totalCreated"), Some(&Bson::Int32(0)));
             let waits = reply.get_document("acquisitionWaitTimes").unwrap();
             assert_eq!(waits.len(), 23);
-            assert_eq!(waits.keys().next().map(String::as_str), Some("(-inf, 0 ms)"));
+            assert_eq!(
+                waits.keys().next().map(String::as_str),
+                Some("(-inf, 0 ms)")
+            );
             assert_eq!(
                 waits.get_document("[950 ms, 1000 ms)").unwrap(),
                 &doc! {"count": 0_i64}
@@ -159,7 +162,10 @@ fn seed_hashdb(c: &mut CommandContext) {
         c,
         doc! {"insert": "a", "documents": [{"_id": 3, "x": "c"}, {"_id": 1, "x": "a"}, {"_id": 2, "x": "b"}]},
     );
-    h(c, doc! {"insert": "b", "documents": [{"y": 1, "_id": "later"}]});
+    h(
+        c,
+        doc! {"insert": "b", "documents": [{"y": 1, "_id": "later"}]},
+    );
     h(
         c,
         doc! {"insert": "b", "documents": [{"_id": {"k": 1}, "n": [1, 2.0, 3_i64]}]},
@@ -169,7 +175,10 @@ fn seed_hashdb(c: &mut CommandContext) {
         doc! {"update": "b", "updates": [{"q": {"_id": "later"}, "u": {"$set": {"z": 2}}}]},
     );
     h(c, doc! {"create": "cap", "capped": true, "size": 4096});
-    h(c, doc! {"insert": "cap", "documents": [{"_id": 2}, {"_id": 1}]});
+    h(
+        c,
+        doc! {"insert": "cap", "documents": [{"_id": 2}, {"_id": 1}]},
+    );
     h(c, doc! {"create": "v", "viewOn": "a", "pipeline": []});
     h(
         c,
@@ -196,7 +205,10 @@ fn seed_hashdb(c: &mut CommandContext) {
         ]},
     );
     h(c, doc! {"insert": "empty", "documents": [{"_id": 1}]});
-    h(c, doc! {"delete": "empty", "deletes": [{"q": {}, "limit": 0}]});
+    h(
+        c,
+        doc! {"delete": "empty", "deletes": [{"q": {}, "limit": 0}]},
+    );
     h(c, doc! {"create": "emptyc"});
     h(c, doc! {"profile": 2});
     h(c, doc! {"find": "a", "filter": {"_id": 1}});
@@ -215,7 +227,15 @@ fn db_hash_digests_are_mongods() {
         assert_eq!(code(&reply), None, "{reply}");
         assert_eq!(
             keys(&reply),
-            ["host", "collections", "capped", "uuids", "md5", "timeMillis", "ok"]
+            [
+                "host",
+                "collections",
+                "capped",
+                "uuids",
+                "md5",
+                "timeMillis",
+                "ok"
+            ]
         );
         let collections = reply.get_document("collections").unwrap();
         // Each digest is mongod's for the same documents: `_id` order, a
@@ -235,9 +255,15 @@ fn db_hash_digests_are_mongods() {
                 "system.views": "aad469306a8b657db4298afca12705c0",
             }
         );
-        assert_eq!(reply.get_array("capped").unwrap(), &vec![Bson::String("cap".into())]);
+        assert_eq!(
+            reply.get_array("capped").unwrap(),
+            &vec![Bson::String("cap".into())]
+        );
         let uuids = reply.get_document("uuids").unwrap();
-        assert_eq!(uuids.keys().collect::<Vec<_>>(), collections.keys().collect::<Vec<_>>());
+        assert_eq!(
+            uuids.keys().collect::<Vec<_>>(),
+            collections.keys().collect::<Vec<_>>()
+        );
         for (_, uuid) in uuids {
             assert!(matches!(
                 uuid,
@@ -250,10 +276,17 @@ fn db_hash_digests_are_mongods() {
         // The whole: the digests' hex, in name order.
         let reply = on(c, HASHDB, doc! {"dbHash": 1, "collections": ["b", "a"]});
         assert_eq!(
-            reply.get_document("collections").unwrap().keys().collect::<Vec<_>>(),
+            reply
+                .get_document("collections")
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
             ["a", "b"]
         );
-        assert_eq!(reply.get_str("md5").unwrap(), "ca2989b379c9c52940db33c1dd0802bb");
+        assert_eq!(
+            reply.get_str("md5").unwrap(),
+            "ca2989b379c9c52940db33c1dd0802bb"
+        );
         assert_eq!(reply.get_array("capped").unwrap(), &Vec::<Bson>::new());
         let reply = on(
             c,
@@ -261,10 +294,17 @@ fn db_hash_digests_are_mongods() {
             doc! {"dbHash": 1, "collections": ["a", "nosuch", "v", "system.views", "system.profile"]},
         );
         assert_eq!(
-            reply.get_document("collections").unwrap().keys().collect::<Vec<_>>(),
+            reply
+                .get_document("collections")
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
             ["a", "system.views"]
         );
-        assert_eq!(reply.get_str("md5").unwrap(), "4b4c2532dbd2ebc4759c5c3daf613cc3");
+        assert_eq!(
+            reply.get_str("md5").unwrap(),
+            "4b4c2532dbd2ebc4759c5c3daf613cc3"
+        );
     });
 }
 
@@ -296,18 +336,31 @@ fn db_hash_arguments_and_system_databases() {
 
         // A database with nothing, and `local`, whose collections mongod
         // does not replicate and so does not hash.
-        on(c, "local", doc! {"insert": "stuff", "documents": [{"_id": 1}]});
+        on(
+            c,
+            "local",
+            doc! {"insert": "stuff", "documents": [{"_id": 1}]},
+        );
         for db in ["nosuchdb_zz", "local"] {
             let reply = on(c, db, doc! {"dbHash": 1});
             assert_eq!(reply.get_document("collections").unwrap(), &Document::new());
-            assert_eq!(reply.get_str("md5").unwrap(), "d41d8cd98f00b204e9800998ecf8427e");
+            assert_eq!(
+                reply.get_str("md5").unwrap(),
+                "d41d8cd98f00b204e9800998ecf8427e"
+            );
         }
         // After `setFeatureCompatibilityVersion`, `admin.system.version`
         // holds mongod's own document and hashes as mongod's does.
-        admin(c, doc! {"setFeatureCompatibilityVersion": "8.2", "confirm": true});
+        admin(
+            c,
+            doc! {"setFeatureCompatibilityVersion": "8.2", "confirm": true},
+        );
         let reply = admin(c, doc! {"dbHash": 1});
         assert_eq!(
-            reply.get_document("collections").unwrap().get_str("system.version"),
+            reply
+                .get_document("collections")
+                .unwrap()
+                .get_str("system.version"),
             Ok("dfa15704aeebc24e910e8ee0e1061af8")
         );
     });
@@ -334,7 +387,10 @@ fn default_rw_concern_implicit_until_set() {
                 "ok": 1.0,
             }
         );
-        assert!(matches!(reply.get("localUpdateWallClockTime"), Some(Bson::DateTime(_))));
+        assert!(matches!(
+            reply.get("localUpdateWallClockTime"),
+            Some(Bson::DateTime(_))
+        ));
         let reply = admin(c, doc! {"getDefaultRWConcern": 1, "inMemory": true});
         assert_eq!(reply.get("inMemory"), Some(&Bson::Boolean(true)));
         let reply = admin(c, doc! {"getDefaultRWConcern": 1, "inMemory": false});
@@ -421,7 +477,10 @@ fn set_default_rw_concern_stores_and_reads_back() {
         let reply = admin(c, doc! {SET: 1, WC: {}});
         assert_eq!(code(&reply), None, "{reply}");
         assert_eq!(reply.get_str("defaultWriteConcernSource"), Ok("implicit"));
-        assert!(matches!(reply.get("updateOpTime"), Some(Bson::Timestamp(_))));
+        assert!(matches!(
+            reply.get("updateOpTime"),
+            Some(Bson::Timestamp(_))
+        ));
 
         let reply = admin(c, doc! {SET: 1, RC: {"level": "available"}});
         assert_eq!(
@@ -437,7 +496,10 @@ fn set_default_rw_concern_stores_and_reads_back() {
                 "ok"
             ]
         );
-        assert_eq!(reply.get_document(RC).unwrap(), &doc! {"level": "available"});
+        assert_eq!(
+            reply.get_document(RC).unwrap(),
+            &doc! {"level": "available"}
+        );
         assert_eq!(
             reply.get_document(WC).unwrap(),
             &doc! {"w": "majority", "wtimeout": 0_i32}
@@ -446,26 +508,59 @@ fn set_default_rw_concern_stores_and_reads_back() {
         assert_eq!(reply.get_str("defaultReadConcernSource"), Ok("global"));
         let again = admin(c, doc! {"getDefaultRWConcern": 1});
         assert_eq!(again.get("updateOpTime"), reply.get("updateOpTime"));
-        assert_eq!(again.get("updateWallClockTime"), reply.get("updateWallClockTime"));
+        assert_eq!(
+            again.get("updateWallClockTime"),
+            reply.get("updateWallClockTime")
+        );
 
         // The write concern as mongod stores it: `w` an int, `j` only when
         // given, `wtimeout` an int (0 when not a number), `fsync` when true.
         let stored: Vec<(Document, Document)> = vec![
-            (doc! {"w": 1, "wtimeout": "x"}, doc! {"w": 1_i32, "wtimeout": 0_i32}),
+            (
+                doc! {"w": 1, "wtimeout": "x"},
+                doc! {"w": 1_i32, "wtimeout": 0_i32},
+            ),
             (doc! {"w": 1.5}, doc! {"w": 1_i32, "wtimeout": 0_i32}),
-            (doc! {"w": "majority", "wtimeout": 500, "j": false}, doc! {"w": "majority", "j": false, "wtimeout": 500_i32}),
-            (doc! {"w": 1, "j": 1}, doc! {"w": 1_i32, "j": true, "wtimeout": 0_i32}),
-            (doc! {"w": 1, "wtimeout": 2.7}, doc! {"w": 1_i32, "wtimeout": 2_i32}),
-            (doc! {"w": 1, "wtimeout": -5}, doc! {"w": 1_i32, "wtimeout": -5_i32}),
+            (
+                doc! {"w": "majority", "wtimeout": 500, "j": false},
+                doc! {"w": "majority", "j": false, "wtimeout": 500_i32},
+            ),
+            (
+                doc! {"w": 1, "j": 1},
+                doc! {"w": 1_i32, "j": true, "wtimeout": 0_i32},
+            ),
+            (
+                doc! {"w": 1, "wtimeout": 2.7},
+                doc! {"w": 1_i32, "wtimeout": 2_i32},
+            ),
+            (
+                doc! {"w": 1, "wtimeout": -5},
+                doc! {"w": 1_i32, "wtimeout": -5_i32},
+            ),
             (doc! {"w": 1_i64}, doc! {"w": 1_i32, "wtimeout": 0_i32}),
-            (doc! {"w": 1, "fsync": true}, doc! {"w": 1_i32, "wtimeout": 0_i32, "fsync": true}),
-            (doc! {"w": 1, "fsync": false}, doc! {"w": 1_i32, "wtimeout": 0_i32}),
-            (doc! {"w": 1, "getLastError": 1}, doc! {"w": 1_i32, "wtimeout": 0_i32}),
-            (doc! {"w": {"dc": 1}}, doc! {"w": {"dc": 1_i64}, "wtimeout": 0_i32}),
+            (
+                doc! {"w": 1, "fsync": true},
+                doc! {"w": 1_i32, "wtimeout": 0_i32, "fsync": true},
+            ),
+            (
+                doc! {"w": 1, "fsync": false},
+                doc! {"w": 1_i32, "wtimeout": 0_i32},
+            ),
+            (
+                doc! {"w": 1, "getLastError": 1},
+                doc! {"w": 1_i32, "wtimeout": 0_i32},
+            ),
+            (
+                doc! {"w": {"dc": 1}},
+                doc! {"w": {"dc": 1_i64}, "wtimeout": 0_i32},
+            ),
             (doc! {"w": 50}, doc! {"w": 50_i32, "wtimeout": 0_i32}),
         ];
         for (given, want) in stored {
-            let reply = admin(c, doc! {SET: 1, WC: given.clone(), "writeConcern": {"w": 1}});
+            let reply = admin(
+                c,
+                doc! {SET: 1, WC: given.clone(), "writeConcern": {"w": 1}},
+            );
             assert_eq!(code(&reply), None, "{given}: {reply}");
             assert_eq!(reply.get_document(WC).unwrap(), &want, "{given}");
             assert_eq!(reply.get_str("defaultWriteConcernSource"), Ok("global"));
@@ -473,11 +568,17 @@ fn set_default_rw_concern_stores_and_reads_back() {
         // The read concern keeps its level through a write-only set, and
         // is unset by an empty document or a null level.
         let reply = admin(c, doc! {SET: 1, WC: {"w": 1}, "writeConcern": {"w": 1}});
-        assert_eq!(reply.get_document(RC).unwrap(), &doc! {"level": "available"});
+        assert_eq!(
+            reply.get_document(RC).unwrap(),
+            &doc! {"level": "available"}
+        );
         let reply = admin(c, doc! {SET: 1, RC: {}});
         assert_eq!(reply.get_document(RC).unwrap(), &doc! {"level": "local"});
         assert_eq!(reply.get_str("defaultReadConcernSource"), Ok("implicit"));
-        assert_eq!(reply.get_document(WC).unwrap(), &doc! {"w": 1_i32, "wtimeout": 0_i32});
+        assert_eq!(
+            reply.get_document(WC).unwrap(),
+            &doc! {"w": 1_i32, "wtimeout": 0_i32}
+        );
         // A write concern once set cannot be unset.
         for command in [doc! {SET: 1, WC: {}}, doc! {SET: 1, RC: {}, WC: {}}] {
             let reply = admin(c, command.clone());
@@ -489,11 +590,20 @@ fn set_default_rw_concern_stores_and_reads_back() {
         }
         // What `config.settings` holds is mongod's document.
         let reply = on(c, "config", doc! {"find": "settings"});
-        let batch = reply.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        let batch = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
         let settings = batch[0].as_document().unwrap();
         assert_eq!(
             keys(settings),
-            ["_id", "defaultWriteConcern", "updateOpTime", "updateWallClockTime"]
+            [
+                "_id",
+                "defaultWriteConcern",
+                "updateOpTime",
+                "updateWallClockTime"
+            ]
         );
         assert_eq!(settings.get_str("_id"), Ok("ReadWriteConcernDefaults"));
     });
@@ -526,7 +636,10 @@ fn default_rw_concern_survives_a_restart() {
         );
         assert_eq!(code(&reply), None, "{reply}");
         set_at = reply.get("updateWallClockTime").cloned();
-        admin(&mut c, doc! {"setFeatureCompatibilityVersion": "8.0", "confirm": true});
+        admin(
+            &mut c,
+            doc! {"setFeatureCompatibilityVersion": "8.0", "confirm": true},
+        );
         drop(c);
     }
     {
@@ -539,7 +652,10 @@ fn default_rw_concern_survives_a_restart() {
         );
         assert_eq!(reply.get_str("defaultWriteConcernSource"), Ok("global"));
         assert_eq!(reply.get("updateWallClockTime"), set_at.as_ref());
-        let reply = admin(&mut c, doc! {"getParameter": 1, "featureCompatibilityVersion": 1});
+        let reply = admin(
+            &mut c,
+            doc! {"getParameter": 1, "featureCompatibilityVersion": 1},
+        );
         assert_eq!(
             reply.get_document("featureCompatibilityVersion").unwrap(),
             &doc! {"version": "8.0"}
@@ -586,9 +702,16 @@ fn a_default_write_concern_no_node_satisfies() {
         ] {
             let reply = on(c, "t", command.clone());
             assert_eq!(code(&reply), None, "{command}: {reply}");
-            assert!(reply.contains_key("writeConcernError"), "{command}: {reply}");
+            assert!(
+                reply.contains_key("writeConcernError"),
+                "{command}: {reply}"
+            );
         }
-        let reply = on(c, "t", doc! {"aggregate": "c", "pipeline": [], "cursor": {}});
+        let reply = on(
+            c,
+            "t",
+            doc! {"aggregate": "c", "pipeline": [], "cursor": {}},
+        );
         assert!(!reply.contains_key("writeConcernError"));
         let reply = admin(c, doc! {"ping": 1});
         assert!(!reply.contains_key("writeConcernError"));
@@ -612,7 +735,10 @@ fn a_default_write_concern_no_node_satisfies() {
         let reply = on(c, "t", doc! {"insert": "c", "documents": [{"_id": 4}]});
         let wce = reply.get_document("writeConcernError").unwrap();
         assert_eq!(wce.get_i32("code"), Ok(4));
-        assert_eq!(wce.get_str("errmsg"), Ok("No replica set tag key dc in config"));
+        assert_eq!(
+            wce.get_str("errmsg"),
+            Ok("No replica set tag key dc in config")
+        );
         let reply = admin(c, doc! {SET: 1, WC: {"w": 1}});
         assert_eq!(code(&reply), Some(4));
         assert_eq!(
@@ -628,7 +754,9 @@ fn a_default_write_concern_no_node_satisfies() {
         assert!(
             msg.starts_with("dropDatabase t failed waiting for ")
                 && msg.contains(" collection drop(s) (most recent drop optime: { ts: Timestamp(")
-                && msg.ends_with("), t: 1 }) to replicate. :: caused by :: Not enough data-bearing nodes"),
+                && msg.ends_with(
+                    "), t: 1 }) to replicate. :: caused by :: Not enough data-bearing nodes"
+                ),
             "{msg}"
         );
     });
@@ -701,12 +829,15 @@ fn set_feature_compatibility_version_arguments() {
 fn set_feature_compatibility_version_transitions() {
     with_wt(|c| {
         let fcv = |c: &mut CommandContext| {
-            admin(c, doc! {"getParameter": 1, "featureCompatibilityVersion": 1})
-                .get_document("featureCompatibilityVersion")
-                .unwrap()
-                .get_str("version")
-                .unwrap()
-                .to_string()
+            admin(
+                c,
+                doc! {"getParameter": 1, "featureCompatibilityVersion": 1},
+            )
+            .get_document("featureCompatibilityVersion")
+            .unwrap()
+            .get_str("version")
+            .unwrap()
+            .to_string()
         };
         assert_eq!(fcv(c), "8.2");
         // 8.1, the last continuous version, is reachable from neither.
@@ -748,10 +879,16 @@ fn set_feature_compatibility_version_transitions() {
             c,
             doc! {"find": "system.version", "filter": {"_id": "featureCompatibilityVersion"}},
         );
-        let batch = reply.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        let batch = reply
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
         assert_eq!(
             batch,
-            &vec![Bson::Document(doc! {"_id": "featureCompatibilityVersion", "version": "8.2"})]
+            &vec![Bson::Document(
+                doc! {"_id": "featureCompatibilityVersion", "version": "8.2"}
+            )]
         );
     });
 }
@@ -784,7 +921,11 @@ fn who_may_run_them() {
             ("reader", "read"),
             ("rw", "readWrite"),
         ] {
-            let db = if role == "read" || role == "readWrite" { "t" } else { "admin" };
+            let db = if role == "read" || role == "readWrite" {
+                "t"
+            } else {
+                "admin"
+            };
             let reply = admin(
                 c,
                 doc! {"createUser": name, "pwd": "pw", "roles": [{"role": role, "db": db}]},
@@ -800,13 +941,33 @@ fn who_may_run_them() {
         let table: Vec<(&str, &str, Document, Option<i32>)> = vec![
             ("monitor", "admin", doc! {"connPoolStats": 1}, None),
             ("monitor", "admin", doc! {"logRotate": 1}, Some(13)),
-            ("monitor", "admin", doc! {SET: 1, RC: {"level": "local"}}, Some(13)),
-            ("monitor", "admin", doc! {FCV: "8.2", "confirm": true}, Some(13)),
+            (
+                "monitor",
+                "admin",
+                doc! {SET: 1, RC: {"level": "local"}},
+                Some(13),
+            ),
+            (
+                "monitor",
+                "admin",
+                doc! {FCV: "8.2", "confirm": true},
+                Some(13),
+            ),
             ("monitor", "t", doc! {"dbHash": 1}, Some(13)),
             ("host", "admin", doc! {"logRotate": 1}, None),
             ("host", "admin", doc! {"connPoolStats": 1}, Some(13)),
-            ("host", "admin", doc! {SET: 1, RC: {"level": "local"}}, Some(13)),
-            ("manager", "admin", doc! {SET: 1, RC: {"level": "local"}}, None),
+            (
+                "host",
+                "admin",
+                doc! {SET: 1, RC: {"level": "local"}},
+                Some(13),
+            ),
+            (
+                "manager",
+                "admin",
+                doc! {SET: 1, RC: {"level": "local"}},
+                None,
+            ),
             ("manager", "admin", doc! {FCV: "8.2", "confirm": true}, None),
             ("manager", "admin", doc! {"logRotate": 1}, Some(13)),
             ("manager", "admin", doc! {"connPoolStats": 1}, Some(13)),
