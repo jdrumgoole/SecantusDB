@@ -235,7 +235,7 @@ fn unused_array_filter(filters: &[Document], update: &Document) -> Option<String
 
 /// mongod's spaced shell rendering of a value, as its update-parse messages
 /// quote an update (`{ $set: { a.0: 2 } }`).
-fn render_shell(v: &Bson) -> String {
+pub fn render_shell(v: &Bson) -> String {
     match v {
         Bson::String(s) => format!("\"{s}\""),
         Bson::Document(d) if d.is_empty() => "{}".to_string(),

@@ -3129,6 +3129,23 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply())
         }
     }
+    // A cursor whose plan reads a dropped index ends with it.
+    if let Ok(cursors) = ctx.cursors() {
+        let now: Vec<String> = storage
+            .list_indexes(&ctx.db_name, &coll)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ix| ix.get_str("name").ok().map(str::to_string))
+            .collect();
+        let ns = format!("{}.{coll}", ctx.db_name);
+        for gone in listed
+            .iter()
+            .filter_map(|ix| ix.get_str("name").ok())
+            .filter(|name| !now.iter().any(|n| n == name))
+        {
+            cursors.kill_index(&ns, gone);
+        }
+    }
     reply.insert("ok", 1.0);
     Ok(reply)
 }

@@ -9836,8 +9836,6 @@ What is left, on the RUST MongoDB server:
       index build order under 7.071.
 - [ ] **`dbStats` reports `fsUsedSize` and `fsTotalSize` as 0.** The
       filesystem's numbers are not read.
-- [ ] **A clustered collection's `expireAfterSeconds` is stored and listed,
-      and nothing expires.** No TTL pass reads it.
 - [ ] **PYTHON MongoDB server:** not measured by this probe. Whether it
       accepts invalid database names or a `dropDatabase: 0` was not checked.
 
@@ -9981,9 +9979,10 @@ What is left:
       answers in the order the indexes were built (`_id_` first on both).
       The catalog keeps no build order, so this needs a field on disk, which
       the Python server would then have to carry too. One scenario.
-- [ ] **RUST MongoDB server: a cursor outlives the index it was reading.**
-      After `dropIndexes`, mongod answers the cursor's next `getMore` 175
-      (`query plan killed :: index 'v_1' dropped`). One scenario.
+- [ ] **RUST MongoDB server: an `aggregate` cursor outlives the index it
+      reads.** A `find` cursor is killed when its index is dropped (175,
+      since 2026-10-14); an `aggregate` whose `$match` reads one is not.
+      Not measured against mongod.
 - [ ] **RUST MongoDB server: smaller cursor differences.** A projection of
       `{$meta: "recordId"}` or `{$meta: "indexKey"}` adds nothing (mongod:
       the record id, the index key). A `$`-prefixed field `find` does not
@@ -10007,11 +10006,15 @@ a command mongod merely refuses, replayed a retryable write by whole command
 and not by statement, and let any session read any cursor. What is left:
 
 - [ ] **RUST MongoDB server: a schema change does not wait for an open
-      transaction.** With a transaction holding a collection, mongod makes
-      `drop` and `createIndexes` on it wait (until `maxTimeMS`, or the
-      transaction ends); here both run at once (2 of the 11). What a
-      transaction that had WRITTEN to the dropped collection then commits
-      was not measured.
+      transaction the way mongod's does.** With a transaction holding a
+      collection, mongod makes `drop` and `createIndexes` on it wait (until
+      `maxTimeMS`, or the transaction ends). Measured 2026-10-14: under a
+      transaction that only READ, the drop here runs at once. Under one that
+      WROTE, it waits, ignores its own `maxTimeMS`, and drops once the
+      transaction commits: mongod answers 50 at the `maxTimeMS` and keeps the
+      collection. The commit itself is correct in both (its writes are not
+      brought back, and nothing is left behind). `tools/probes/transactions.py`,
+      "a collection dropped under a transaction ...".
 - [ ] **RUST MongoDB server: change events of a transaction carry no
       `txnNumber` and `lsid`.** mongod puts both first in every event a
       transaction produced (2 of the 11). The oplog entries here do not
@@ -10019,7 +10022,11 @@ and not by statement, and let any session read any cursor. What is left:
 - [ ] **RUST MongoDB server: two transactions that both create one
       collection conflict at the second insert.** mongod lets both insert
       and fails the second COMMIT with 112 (`Collection namespace ... is
-      already in use`) (1 of the 11).
+      already in use`). So when the later transaction commits first, mongod
+      keeps ITS document and fails the earlier one, and here the reverse.
+      Either way one transaction fails with `TransientTransactionError`, so a
+      driver's retry stores both. Here the collection's catalog row is
+      written at the insert; mongod's conflict is at commit.
 - [ ] **RUST MongoDB server: smaller differences.** A `count` with no query
       does not see another session's uncommitted insert (mongod's fast count
       does: it answered 3 for 2 committed documents). A write that waits on a
@@ -10033,9 +10040,6 @@ and not by statement, and let any session read any cursor. What is left:
       conflict on an insert has an empty cause where mongod names its index
       table. `find` accepts a field it does not know (mongod: 40415); the
       other session errors are worded for a session with no user.
-- [ ] **RUST MongoDB server: `bulkWrite` as a retryable write is not
-      replayed.** It takes the session's number and runs again on a retry.
-      Not measured against mongod.
 - [ ] **PYTHON MongoDB server: not measured on this probe**, which needs a
       server URI and was run against the Rust server only. Its registry
       (`src/secantus/transactions.py`) has the rules the Rust one had before:
@@ -10254,12 +10258,13 @@ to 3. What is left, and what the same probes say about the Python server:
       answers 53.** `mongod` answers 54 (`... the (immutable) field '_id' was
       found to be an array or array descendant`), as it does for a
       replacement, which the Rust server matches. The storage path cannot
-      tell a pipeline from an operator update. Also not refused there: a
-      `$`-prefixed field inside an upserted `_id` document (`mongod`: 52).
+      tell a pipeline from an operator update. (A `$`-prefixed field inside
+      an upserted `_id` document is refused with 52 since 2026-10-14.)
 - [ ] **RUST MongoDB server: `upsertSupplied` is two steps.** The update runs
       without the upsert, and when nothing matched `c.new` is inserted: not
-      one atomic statement, and the inserted document skips the collection's
-      validator.
+      one atomic statement, so a concurrent insert between the two can make
+      it a duplicate-key error. (The validator is applied, and the `_id` is
+      the query's, re-measured 2026-10-14.)
 - [ ] **RUST MongoDB server: `getParameter ttlMonitorSleepSecs` reads 60 until
       a client sets it**, whatever cadence the server was started with, and a
       server started with the sweep off (`ttl_sweep_seconds = 0`) has no
@@ -10309,12 +10314,6 @@ results different to 2. What is left, there and beside it:
       returns `{_id: "db.view", viewOn, pipeline[, collation]}` per view. The
       Rust server keeps a view's definition in the view's own collection
       options, so both are empty. These are the 2 of 70.
-- [ ] **RUST MongoDB server: no view depth limit.** `mongod` refuses a chain
-      of views past 20 (`165 ViewDepthLimitExceeded`, `View depth limit
-      exceeded; maximum depth is 20` on create, `View depth too deep or view
-      cycle detected; maximum depth is 20` on read). Its two limits are not
-      the same: `ch19`, twenty views deep, was created and then could not be
-      read. The exact create boundary was not measured.
 - [ ] **RUST MongoDB server: smaller view differences.** A `hint` naming an
       index on a view is ignored (`mongod`: 2, `hint provided does not
       correspond to an existing index`); `$indexStats` on a view answers

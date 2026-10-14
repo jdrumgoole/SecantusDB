@@ -17,7 +17,80 @@
 
 use bson::{doc, Bson, Document};
 
+use crate::transactions::{Applied, StmtRecord};
 use crate::{crud, CommandContext, CommandError, HandlerResult};
+
+/// A `bulkWrite` running as a retryable write: each op's statement id, what
+/// the ops that already ran did, and (filled in as it runs) what the ops of
+/// this attempt wrote.
+struct Retry {
+    ids: Vec<i32>,
+    done: Applied,
+    wrote: Vec<(i32, StmtRecord)>,
+}
+
+thread_local! {
+    static RETRY: std::cell::RefCell<Option<Retry>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, which runs `bulkWrite`, as the retryable write whose ops have
+/// statement ids `ids` and of which `done` already ran. Returns its reply and
+/// what the ops of this attempt wrote, for the session to remember.
+///
+/// mongod replays an op that already wrote and runs the rest (measured
+/// 8.2.11, 2026-10-14): the replayed op's entry is rebuilt from what it did,
+/// its counts are added, and its id is listed in `retriedStmtIds`. An op that
+/// matched or changed nothing was not recorded and runs again. A `multi` op
+/// cannot be retried and is refused where it stands. Here a retry used to run
+/// every op again.
+pub fn with_retry(
+    ids: &[i32],
+    done: &Applied,
+    f: impl FnOnce() -> Document,
+) -> (Document, Vec<(i32, StmtRecord)>) {
+    RETRY.with(|r| {
+        *r.borrow_mut() = Some(Retry {
+            ids: ids.to_vec(),
+            done: done.clone(),
+            wrote: Vec::new(),
+        })
+    });
+    let reply = f();
+    let wrote = RETRY
+        .with(|r| r.borrow_mut().take())
+        .map(|r| r.wrote)
+        .unwrap_or_default();
+    (reply, wrote)
+}
+
+/// The entry, and the counts, an op that already ran answers on a retry.
+fn replayed(idx: usize, record: &StmtRecord, counts: &mut Counts) -> Document {
+    let mut entry = doc! { "ok": 1.0, "idx": idx as i32, "n": 1i32 };
+    match record {
+        StmtRecord::Insert { .. } => counts.inserted += 1,
+        StmtRecord::Update { upserted: Some(id) } => {
+            entry.insert("nModified", 0i32);
+            entry.insert("upserted", doc! { "_id": id.clone() });
+            counts.upserted += 1;
+        }
+        StmtRecord::Update { upserted: None } => {
+            entry.insert("nModified", 1i32);
+            counts.matched += 1;
+            counts.modified += 1;
+        }
+        StmtRecord::Delete | StmtRecord::FindAndModify { .. } => counts.deleted += 1,
+    }
+    entry
+}
+
+#[derive(Default)]
+struct Counts {
+    inserted: i32,
+    matched: i32,
+    modified: i32,
+    upserted: i32,
+    deleted: i32,
+}
 
 /// How many results fit the first batch: a COUNT limit and a SIZE limit.
 ///
@@ -72,6 +145,9 @@ const KNOWN_FIELDS: &[&str] = &[
     "writeConcern",
     "lsid",
     "txnNumber",
+    // A retryable write's statement ids (measured 8.2.11, 2026-10-14).
+    "stmtId",
+    "stmtIds",
     "autocommit",
     "startTransaction",
     // Stable API envelope. Omitting these rejected the fields pymongo appends
@@ -480,9 +556,12 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(w) if whole_number(w) == Some(0)
     );
     let mut results: Vec<Document> = Vec::new();
-    let (mut n_inserted, mut n_matched, mut n_modified, mut n_upserted, mut n_deleted) =
-        (0i32, 0i32, 0i32, 0i32, 0i32);
+    let mut counts = Counts::default();
     let mut n_errors = 0i32;
+    // As a retryable write: the ops of an earlier attempt that wrote are
+    // replayed, not run (see `with_retry`).
+    let mut retry = RETRY.with(|r| r.borrow_mut().take());
+    let mut retried: Vec<i32> = Vec::new();
 
     let outer_db = ctx.db_name.clone();
     for (idx, raw) in ops.iter().enumerate() {
@@ -490,6 +569,31 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let kind = kinds[idx];
         let (db_name, coll) = namespaces[targets[idx]].clone();
         let is_update = kind == "update";
+        let stmt_id = retry.as_ref().and_then(|r| r.ids.get(idx).copied());
+        if let (Some(r), Some(id)) = (&retry, stmt_id) {
+            if let Some(record) = r.done.get(id) {
+                let entry = replayed(idx, &record, &mut counts);
+                if !errors_only {
+                    results.push(entry);
+                }
+                retried.push(id);
+                continue;
+            }
+            if op.get_bool("multi").unwrap_or(false) {
+                results.push(op_error(
+                    idx,
+                    72,
+                    "Cannot use retryable writes with multi=true",
+                    None,
+                    is_update,
+                ));
+                n_errors += 1;
+                if ordered {
+                    break;
+                }
+                continue;
+            }
+        }
 
         // A view takes no writes: this op fails, and the batch goes on or
         // stops by `ordered` like any other failed op. The single-write
@@ -612,8 +716,22 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
         let n = reply.get_i32("n").unwrap_or(0);
         let mut entry_out = doc! { "ok": 1.0, "idx": idx as i32, "n": n };
+        // What this op wrote, for a retry of it to be replayed. An op that
+        // wrote nothing is not kept: it runs again, as on mongod.
+        let mut wrote: Option<StmtRecord> = None;
         match kind {
-            "insert" => n_inserted += n,
+            "insert" => {
+                counts.inserted += n;
+                if n > 0 {
+                    wrote = Some(StmtRecord::Insert {
+                        id: op
+                            .get_document("document")
+                            .ok()
+                            .and_then(|d| d.get("_id"))
+                            .cloned(),
+                    });
+                }
+            }
             "update" => {
                 let modified = reply.get_i32("nModified").unwrap_or(0);
                 entry_out.insert("nModified", modified);
@@ -623,16 +741,30 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     .cloned()
                     .unwrap_or_default();
                 if let Some(first) = upserted.first().and_then(|b| b.as_document()) {
-                    n_upserted += upserted.len() as i32;
+                    counts.upserted += upserted.len() as i32;
                     if let Some(id) = first.get("_id") {
                         entry_out.insert("upserted", doc! { "_id": id.clone() });
+                        wrote = Some(StmtRecord::Update {
+                            upserted: Some(id.clone()),
+                        });
                     }
                 } else {
-                    n_matched += n;
+                    counts.matched += n;
+                    if modified > 0 {
+                        wrote = Some(StmtRecord::Update { upserted: None });
+                    }
                 }
-                n_modified += modified;
+                counts.modified += modified;
             }
-            _ => n_deleted += n,
+            _ => {
+                counts.deleted += n;
+                if n > 0 {
+                    wrote = Some(StmtRecord::Delete);
+                }
+            }
+        }
+        if let (Some(r), Some(id), Some(record)) = (retry.as_mut(), stmt_id, wrote) {
+            r.wrote.push((id, record));
         }
         if !errors_only {
             results.push(entry_out);
@@ -640,6 +772,10 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     if unacknowledged {
         results.clear();
+    }
+    // Hand back what this attempt wrote before anything below can fail.
+    if let Some(r) = retry {
+        RETRY.with(|slot| *slot.borrow_mut() = Some(r));
     }
 
     // The results are a real CURSOR when they do not fit the requested batch,
@@ -675,19 +811,24 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         true,
     )?;
 
-    // Field order is mongod's: the cursor first, then the counters, then `ok`.
-    Ok(doc! {
+    // Field order is mongod's: the cursor first, then the counters, then
+    // `retriedStmtIds` on a retry, then `ok`.
+    let mut reply = doc! {
         "cursor": doc! {
             "id": cursor_id,
             "firstBatch": first_batch,
             "ns": BULK_WRITE_NS,
         },
         "nErrors": n_errors,
-        "nInserted": n_inserted,
-        "nMatched": n_matched,
-        "nModified": n_modified,
-        "nUpserted": n_upserted,
-        "nDeleted": n_deleted,
-        "ok": 1.0,
-    })
+        "nInserted": counts.inserted,
+        "nMatched": counts.matched,
+        "nModified": counts.modified,
+        "nUpserted": counts.upserted,
+        "nDeleted": counts.deleted,
+    };
+    if !retried.is_empty() {
+        reply.insert("retriedStmtIds", retried);
+    }
+    reply.insert("ok", 1.0);
+    Ok(reply)
 }

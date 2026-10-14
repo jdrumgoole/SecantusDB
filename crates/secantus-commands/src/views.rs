@@ -222,5 +222,17 @@ pub(crate) fn definition_problem(
             None => break,
         }
     }
+    // The views in the chain: every entry but the collection it ends on.
+    // mongod refuses one longer than its limit (measured 8.2.11, 2026-10-14).
+    if chain.len() - 1 > MAX_VIEW_DEPTH {
+        return Some(CommandError::new(
+            165,
+            "ViewDepthLimitExceeded",
+            format!("View depth limit exceeded; maximum depth is {MAX_VIEW_DEPTH}"),
+        ));
+    }
     None
 }
+
+/// mongod's limit on a chain of views.
+pub(crate) const MAX_VIEW_DEPTH: usize = 20;

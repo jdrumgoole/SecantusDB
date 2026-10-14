@@ -339,3 +339,75 @@ fn distinct_values_are_distinct_by_value_and_sorted() {
         assert_eq!(code(&reply), Some(40415), "{reply}");
     });
 }
+
+/// Dropping the index a cursor's plan reads kills the cursor: its next
+/// `getMore` is 175 naming the index (measured 8.2.11, 2026-10-14). A cursor
+/// on a scan of the collection is not touched. It kept returning documents.
+#[test]
+fn dropping_an_index_kills_the_cursors_that_read_it() {
+    with_wt(|c| {
+        seed(c);
+        let open = |c: &mut CommandContext, find: Document| -> i64 {
+            let reply = dispatch_full(&find, c);
+            reply.get_document("cursor").unwrap().get_i64("id").unwrap()
+        };
+        let hinted = open(
+            c,
+            doc! {"find": "c", "filter": {"v": {"$gte": 0}}, "hint": "v_1", "batchSize": 1},
+        );
+        let planned = open(
+            c,
+            doc! {"find": "c", "filter": {"v": {"$gte": 0}}, "batchSize": 1},
+        );
+        let scan = open(c, doc! {"find": "c", "filter": {}, "batchSize": 1});
+        assert!(hinted != 0 && planned != 0 && scan != 0);
+        dispatch(&doc! {"dropIndexes": "c", "index": "v_1"}, c);
+        for id in [hinted, planned] {
+            let reply = dispatch_full(&doc! {"getMore": id, "collection": "c"}, c);
+            assert_eq!(reply.get_i32("code"), Ok(175), "{reply}");
+            assert_eq!(
+                reply.get_str("errmsg"),
+                Ok("query plan killed :: index 'v_1' dropped")
+            );
+        }
+        let reply = dispatch_full(&doc! {"getMore": scan, "collection": "c"}, c);
+        assert_eq!(reply.get_f64("ok"), Ok(1.0), "{reply}");
+    });
+}
+
+/// A chain of views is at most 20 long, and one of 20 does not resolve
+/// (measured 8.2.11, 2026-10-14). There was no limit.
+#[test]
+fn a_chain_of_views_is_limited() {
+    with_wt(|c| {
+        seed(c);
+        dispatch(&doc! {"create": "v0", "viewOn": "c", "pipeline": []}, c);
+        for i in 1..20 {
+            let reply = dispatch_full(
+                &doc! {"create": format!("v{i}"), "viewOn": format!("v{}", i - 1), "pipeline": []},
+                c,
+            );
+            assert_eq!(reply.get_f64("ok"), Ok(1.0), "v{i}: {reply}");
+        }
+        let reply = dispatch_full(&doc! {"create": "v20", "viewOn": "v19", "pipeline": []}, c);
+        assert_eq!(reply.get_i32("code"), Ok(165), "{reply}");
+        assert_eq!(
+            reply.get_str("errmsg"),
+            Ok("View depth limit exceeded; maximum depth is 20")
+        );
+        let ok = dispatch_full(&doc! {"find": "v18", "limit": 1}, c);
+        assert_eq!(ok.get_f64("ok"), Ok(1.0), "{ok}");
+        for cmd in [
+            doc! {"find": "v19"},
+            doc! {"aggregate": "v19", "pipeline": [], "cursor": {}},
+            doc! {"count": "v19"},
+        ] {
+            let reply = dispatch_full(&cmd, c);
+            assert_eq!(reply.get_i32("code"), Ok(165), "{cmd}: {reply}");
+            assert_eq!(
+                reply.get_str("errmsg"),
+                Ok("View depth too deep or view cycle detected; maximum depth is 20")
+            );
+        }
+    });
+}

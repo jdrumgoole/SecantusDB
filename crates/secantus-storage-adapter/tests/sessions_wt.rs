@@ -541,3 +541,80 @@ fn an_unacknowledged_write_reports_nothing() {
         assert_eq!(ids(c, "c"), vec![1, 2, 3]);
     });
 }
+
+/// A retried `bulkWrite` replays the ops that wrote and runs the rest
+/// (measured 8.2.11, 2026-10-14). It ran every op again: a `$inc` counted
+/// twice, an insert failed as a duplicate.
+#[test]
+fn a_retried_bulk_write_is_replayed() {
+    with_wt(|c| {
+        seed(c);
+        let ops = || {
+            vec![
+                Bson::Document(doc! {"insert": 0, "document": {"_id": 10}}),
+                Bson::Document(
+                    doc! {"update": 0, "filter": {"_id": 1}, "updateMods": {"$inc": {"v": 1}}},
+                ),
+                Bson::Document(doc! {"delete": 0, "filter": {"_id": 2}}),
+            ]
+        };
+        let ns = format!("{}.c", c.db_name);
+        let bulk = |c: &mut CommandContext, ops: Vec<Bson>, number: i64| {
+            let mut cmd = doc! {"bulkWrite": 1, "ops": ops, "nsInfo": [{"ns": &ns}]};
+            cmd.insert("lsid", lsid(9));
+            cmd.insert("txnNumber", number);
+            dispatch_admin(&cmd, c)
+        };
+        let first = bulk(c, ops(), 1);
+        assert!(!first.contains_key("retriedStmtIds"), "{first}");
+        let again = bulk(c, ops(), 1);
+        assert_eq!(
+            again.get_array("retriedStmtIds").unwrap(),
+            &vec![Bson::Int32(0), Bson::Int32(1), Bson::Int32(2)]
+        );
+        for (field, n) in [
+            ("nInserted", 1),
+            ("nMatched", 1),
+            ("nModified", 1),
+            ("nDeleted", 1),
+        ] {
+            assert_eq!(again.get_i32(field), Ok(n), "{field}: {again}");
+        }
+        assert_eq!(
+            again
+                .get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch"),
+            first
+                .get_document("cursor")
+                .unwrap()
+                .get_array("firstBatch"),
+        );
+        assert_eq!(ids(c, "c"), vec![1, 10]);
+        assert_eq!(value(c, 1), Some(Bson::Int32(2)));
+        // A new op in the retry runs; the old one is replayed.
+        let mut more = ops();
+        more.push(Bson::Document(doc! {"insert": 0, "document": {"_id": 11}}));
+        let partial = bulk(c, more, 1);
+        assert_eq!(partial.get_i32("nInserted"), Ok(2), "{partial}");
+        assert_eq!(ids(c, "c"), vec![1, 10, 11]);
+        // A multi op cannot be retried.
+        let multi = bulk(
+            c,
+            vec![Bson::Document(
+                doc! {"update": 0, "filter": {}, "updateMods": {"$inc": {"v": 1}}, "multi": true},
+            )],
+            2,
+        );
+        let entry = multi
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert_eq!(entry.get_i32("code"), Ok(72), "{multi}");
+        assert_eq!(value(c, 1), Some(Bson::Int32(2)));
+    });
+}

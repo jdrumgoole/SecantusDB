@@ -117,25 +117,39 @@ these is a silent wrong answer from data already on disk:
 
 **1b. Writes.**
 
-- [ ] `bulkWrite` as a retryable write is not replayed: a driver retry runs
+- [x] `bulkWrite` as a retryable write is not replayed: a driver retry runs
       it twice (7.072).
-- [ ] `upsertSupplied` is two steps, and the inserted document skips the
+- [x] `upsertSupplied` is two steps, and the inserted document skips the
       validator (7.068).
-- [ ] A `$`-prefixed field inside an upserted `_id` document is stored
+- [x] A `$`-prefixed field inside an upserted `_id` document is stored
       (mongod: 52). That is a document mongod cannot make (7.068).
-- [ ] A clustered collection's `expireAfterSeconds` expires nothing (7.076).
+- [x] A clustered collection's `expireAfterSeconds` expires nothing (7.076).
 - [ ] Two transactions creating one collection: mongod fails the second
       COMMIT with 112 (7.072).
-- [ ] **Measure first:** what a transaction that WROTE to a collection
+- [x] **Measure first:** what a transaction that WROTE to a collection
       commits after another session dropped that collection (7.072). The
       "schema change waits" decision below depends on the answer. If the
       commit brings the writes back or leaves orphaned rows, this is a
       Phase 1 bug, not a decision.
 
+  **Done 2026-10-14**, except the two transactions creating one collection.
+  `upsertSupplied` already applied the validator; what was wrong was its
+  `_id` (a new ObjectId where mongod takes the query's). The measurement:
+  a drop under a transaction that wrote WAITS for it here, past its own
+  `maxTimeMS`, and then drops; the commit brings nothing back and leaves no
+  rows. Not a Phase 1 bug: it goes to the "schema change waits" decision
+  (backlog 7.072).
+
 **1c. Reads.**
 
-- [ ] A cursor outlives a dropped index: mongod answers 175 (7.073).
-- [ ] No view depth limit (165) (7.066).
+- [x] A cursor outlives a dropped index: mongod answers 175 (7.073).
+- [x] No view depth limit (165) (7.066).
+
+  **Done 2026-10-14.** A `find` cursor records the indexes its plan reads,
+  and `dropIndexes` kills those cursors with mongod's 175. A chain of more
+  than 20 views is refused at `create` and `collMod`, and one of 20 at read
+  (both measured). An `aggregate` cursor over a dropped index is still open
+  (backlog 7.073).
 
 Size: two batches; 1a is the larger one.
 

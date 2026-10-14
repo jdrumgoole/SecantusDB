@@ -110,6 +110,9 @@ struct Entry {
     /// Tombstoned by `kill_namespace`: the collection was dropped out from
     /// under a plain tailable cursor, and the next getMore must say so.
     dropped: Option<String>,
+    /// The indexes the plan behind this cursor reads (`set_plan_indexes`).
+    /// Dropping one kills the cursor, as it kills mongod's plan.
+    plan_indexes: Vec<String>,
     // The tailable fields below are written by `register_tailable` but only read
     // by the change-stream getMore slice (deferred), so they're allow(dead_code)
     // until that lands.
@@ -322,6 +325,7 @@ impl CursorRegistry {
                 bounded,
                 change_stream: false,
                 dropped: None,
+                plan_indexes: Vec::new(),
                 await_data: false,
                 no_cursor_timeout: false,
                 producer: None,
@@ -364,6 +368,7 @@ impl CursorRegistry {
                 bounded: false,
                 change_stream: opts.change_stream,
                 dropped: None,
+                plan_indexes: Vec::new(),
                 await_data: opts.await_data,
                 no_cursor_timeout: opts.no_cursor_timeout,
                 producer: Some(producer),
@@ -536,6 +541,32 @@ impl CursorRegistry {
             }
         }
         (killed, not_found)
+    }
+
+    /// Record the indexes the plan behind cursor `cursor_id` reads.
+    pub fn set_plan_indexes(&self, cursor_id: i64, indexes: Vec<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            e.plan_indexes = indexes;
+        }
+    }
+
+    /// Kill every cursor on `namespace` whose plan reads index `index`, which
+    /// was dropped: the next `getMore` is mongod's `175 query plan killed ::
+    /// index '<name>' dropped` (measured 8.2.11, 2026-10-14). A cursor on a
+    /// scan of the collection, or on another index, is not touched. These
+    /// cursors kept returning documents.
+    pub fn kill_index(&self, namespace: &str, index: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut affected = 0;
+        for e in inner.cursors.values_mut() {
+            if e.namespace == namespace && e.plan_indexes.iter().any(|i| i == index) {
+                e.dropped = Some(format!("query plan killed :: index '{index}' dropped"));
+                e.remaining.clear();
+                affected += 1;
+            }
+        }
+        affected
     }
 
     /// Kill every cursor open on `namespace` (a `db.coll` string), returning the

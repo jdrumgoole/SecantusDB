@@ -434,7 +434,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // (recursively for a view-on-a-view). The reply ns keeps the queried
             // (view) name; only the fetch reads the base collection. Mirrors
             // commands._resolve_view.
-            let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline);
+            let (base_coll, pipeline) = resolve_view(storage, &ctx.db_name, c, pipeline)?;
             let c = base_coll.as_str();
             // Stages that generate / read their own input start from no docs.
             if first_stage_has_any(
@@ -2206,18 +2206,32 @@ fn bson_f64(b: &Bson) -> Option<f64> {
 /// Resolve a view namespace to its base collection + combined pipeline, following
 /// a `viewOn` chain (a view may be defined on another view) and prepending each
 /// view's stored `viewPipeline` ahead of the caller's pipeline until a base
-/// (non-view) collection is reached. A cycle is broken defensively. Returns the
-/// inputs unchanged when `coll` isn't a view. Mirrors `commands._resolve_view`.
+/// (non-view) collection is reached. Returns the inputs unchanged when `coll`
+/// isn't a view. Mirrors `commands._resolve_view`.
+///
+/// A chain of [`crate::views::MAX_VIEW_DEPTH`] views or more, or a cycle, is
+/// mongod's 165 (measured 8.2.11, 2026-10-14: a chain of 19 views resolves
+/// and one of 20 does not, though 20 can be created). There was no limit.
 pub(crate) fn resolve_view(
     storage: &dyn crate::storage::Storage,
     db: &str,
     coll: &str,
     pipeline: Vec<Bson>,
-) -> (String, Vec<Bson>) {
+) -> Result<(String, Vec<Bson>), CommandError> {
     let mut coll = coll.to_string();
     let mut combined = pipeline;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    while seen.insert(coll.clone()) {
+    loop {
+        if !seen.insert(coll.clone()) || seen.len() > crate::views::MAX_VIEW_DEPTH {
+            return Err(CommandError::new(
+                165,
+                "ViewDepthLimitExceeded",
+                format!(
+                    "View depth too deep or view cycle detected; maximum depth is {}",
+                    crate::views::MAX_VIEW_DEPTH
+                ),
+            ));
+        }
         let Ok(opts) = storage.get_collection_options(db, &coll) else {
             break;
         };
@@ -2230,9 +2244,16 @@ pub(crate) fn resolve_view(
             .unwrap_or_default();
         prepended.extend(combined);
         combined = prepended;
+        // A namespace read as a view of itself is a derived source
+        // (`system.views`, a time-series collection's buckets): its stage
+        // produces the documents, and it is where the chain ends. A user's
+        // view cannot be defined on itself: `create` refuses the cycle.
+        if view_on == coll {
+            break;
+        }
         coll = view_on.to_string();
     }
-    (coll, combined)
+    Ok((coll, combined))
 }
 
 /// The documents of `db.coll` matching `filter` -- a collection's own, or a
@@ -2257,7 +2278,7 @@ pub(crate) fn collection_documents(
     if !filter.is_empty() {
         tail.push(Bson::Document(doc! { "$match": filter.clone() }));
     }
-    let (base, pipeline) = resolve_view(storage, db, coll, tail);
+    let (base, pipeline) = resolve_view(storage, db, coll, tail)?;
     let input = decode_docs(
         storage
             .find(db, &base, &Document::new(), None, None)

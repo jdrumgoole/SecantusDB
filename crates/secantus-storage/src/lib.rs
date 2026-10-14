@@ -9535,8 +9535,32 @@ impl Storage {
     /// 8.2.11, 2026-10-10.
     pub fn prune_ttl(&self, db: &str, coll: &str, now: bson::DateTime) -> Result<usize> {
         let mut filters: Vec<Document> = Vec::new();
+        let cutoff_of = |secs: f64| {
+            bson::DateTime::from_millis(
+                now.timestamp_millis()
+                    .saturating_sub((secs * 1000.0) as i64),
+            )
+        };
         {
             let session = self.conn.open_session()?;
+            // A clustered collection's own `expireAfterSeconds` expires a
+            // document by its `_id`, when that is a date: there is no index
+            // to carry the option (measured 8.2.11, 2026-10-14: an `_id`
+            // dated 2000 went, a future one and `_id: 5` stayed). It was
+            // stored and listed, and nothing expired.
+            if let Some(opts) = coll_options(&session, db, coll)? {
+                if opts.contains_key("clusteredIndex") {
+                    let secs = match opts.get("expireAfterSeconds") {
+                        Some(Bson::Int32(i)) => Some(f64::from(*i)),
+                        Some(Bson::Int64(i)) => Some(*i as f64),
+                        Some(Bson::Double(d)) => Some(*d),
+                        _ => None,
+                    };
+                    if let Some(secs) = secs.filter(|s| !s.is_nan() && *s >= 0.0) {
+                        filters.push(bson::doc! {"_id": {"$lt": cutoff_of(secs)}});
+                    }
+                }
+            }
             for (_name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
                 let secs = match opts.get("expireAfterSeconds") {
                     Some(Bson::Int32(i)) => f64::from(*i),
@@ -9555,11 +9579,8 @@ impl Storage {
                 if field == "_id" || direction_of(direction).is_none() {
                     continue;
                 }
-                let cutoff = now
-                    .timestamp_millis()
-                    .saturating_sub((secs * 1000.0) as i64);
                 let mut expired = Document::new();
-                expired.insert("$lt", bson::DateTime::from_millis(cutoff));
+                expired.insert("$lt", cutoff_of(secs));
                 let mut filter = Document::new();
                 filter.insert(field.clone(), Bson::Document(expired));
                 if let Ok(partial) = opts.get_document("partialFilterExpression") {
@@ -15778,6 +15799,25 @@ impl Storage {
                                 exec: true,
                             });
                         }
+                        // A `$`-prefixed field at any depth inside a document
+                        // `_id`, whichever way the upsert built it: from the
+                        // query, a replacement, a pipeline or `findAndModify`
+                        // (measured 8.2.11, 2026-10-14). Stored, it was a
+                        // document mongod cannot make.
+                        Some(id @ Bson::Document(_)) => {
+                            if let Some((field, path)) = dollar_field_in(id, "_id") {
+                                return Err(StorageError::QueryError {
+                                    code: 52,
+                                    errmsg: format!(
+                                        "The dollar ($) prefixed field '{field}' in '{path}' is \
+                                         not allowed in the context of an update's replacement \
+                                         document. Consider using an aggregation pipeline with \
+                                         $replaceWith."
+                                    ),
+                                    exec: true,
+                                });
+                            }
+                        }
                         _ => {}
                     }
                     // mongod's field order for an upserted document -- see
@@ -18448,6 +18488,26 @@ fn implied_equality(value: &Bson) -> Option<Bson> {
     None
 }
 
+/// The first `$`-prefixed field name inside `value`, at any depth, with its
+/// dotted path from `path`. Arrays are walked by index, as mongod names them.
+fn dollar_field_in(value: &Bson, path: &str) -> Option<(String, String)> {
+    match value {
+        Bson::Document(d) => d.iter().find_map(|(k, v)| {
+            let here = format!("{path}.{k}");
+            if k.starts_with('$') {
+                Some((k.clone(), here))
+            } else {
+                dollar_field_in(v, &here)
+            }
+        }),
+        Bson::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| dollar_field_in(v, &format!("{path}.{i}"))),
+        _ => None,
+    }
+}
+
 /// Walk `query` and record every equality it implies.
 ///
 /// `$and` recurses into every branch and `$or` into a SINGLE branch -- with two
@@ -19020,6 +19080,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    /// A clustered collection's own `expireAfterSeconds` expires a document
+    /// whose `_id` is a date older than the cutoff, and nothing else
+    /// (measured 8.2.11, 2026-10-14). Nothing expired.
+    #[test]
+    fn a_clustered_collection_expires_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        st.create_collection_with_options(
+            "app",
+            "t",
+            &doc! {"clusteredIndex": {"key": {"_id": 1}, "unique": true}, "expireAfterSeconds": 60i32},
+        )
+        .unwrap();
+        let now = bson::DateTime::from_millis(1_000_000_000_000);
+        let at = |ms: i64| Bson::DateTime(bson::DateTime::from_millis(ms));
+        st.insert(
+            "app",
+            "t",
+            vec![
+                encode_doc(&doc! {"_id": at(1_000_000_000_000 - 61_000)}).unwrap(),
+                encode_doc(&doc! {"_id": at(1_000_000_000_000 - 59_000)}).unwrap(),
+                encode_doc(&doc! {"_id": 5i32}).unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(st.prune_ttl("app", "t", now).unwrap(), 1);
+        assert_eq!(st.find_matching("app", "t", &doc! {}).unwrap().len(), 2);
+        // An ordinary collection's `expireAfterSeconds` option is not a TTL.
+        st.insert(
+            "app",
+            "plain",
+            vec![encode_doc(&doc! {"_id": at(0)}).unwrap()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(st.prune_ttl("app", "plain", now).unwrap(), 0);
     }
 
     #[test]
