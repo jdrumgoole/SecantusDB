@@ -233,6 +233,26 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **`$dateFromParts` accepts an out-of-range `month` and answers a
+  wrong date.** `{$dateFromParts: {year: 2017, month: 40000}}` returns
+  5350-04-01 here; mongod 8.2.11 refuses it with 31034 (`'month' must
+  evaluate to a value in the range [-32768, 32767]`). The other fields'
+  ranges have not been checked. Found 2026-10-14.
+  Backlog-ID: RM-139
+  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_date_from_parts_month_out_of_range_is_refused
+- [ ] **`profile` refuses a negative `slowms`.** `{profile: 0, slowms: -1}`
+  (and level 1) answers 2 `slowms must be non-negative`; mongod 8.2.11
+  accepts it and reads `slowms: -1` back. Found 2026-10-14.
+  Backlog-ID: RM-140
+  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_profile_accepts_a_negative_slowms
+- [ ] **`saslStart` for a user that does not exist continues the
+  conversation.** mongod 8.2.11 fails the first step with 18
+  `Authentication failed.`; this server answers `ok: 1, done: false` and
+  fails later. Whether the later failure is complete was not checked.
+  Found 2026-10-14.
+  Backlog-ID: RM-141
+  Verify: tests/backlog/test_rm_found_2026_10_14.py::test_sasl_start_for_an_unknown_user_fails
+
 - [ ] **OPEN — the Go gauge's remaining failures, triaged (2026-09-29; 6
       leaves as of the 2026-10-09 run).** The gauge completes 659 of 659 and
       reads 598 / 12 / 49 = 98.0% (`docs/validation-report-go-rust-server.md`,
@@ -1206,16 +1226,17 @@ fields written out (the transaction state rules, what a transaction refuses,
 conflicts, collections made in a transaction, cursors, the session commands,
 retryable writes). The Rust server differs on 11 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a schema change does not wait for an open
-      transaction the way mongod's does.** With a transaction holding a
-      collection, mongod makes `drop` and `createIndexes` on it wait (until
-      `maxTimeMS`, or the transaction ends). Measured 2026-10-14: under a
-      transaction that only READ, the drop here runs at once. Under one that
-      WROTE, it waits, ignores its own `maxTimeMS`, and drops once the
-      transaction commits: mongod answers 50 at the `maxTimeMS` and keeps the
-      collection. The commit itself is correct in both (its writes are not
-      brought back, and nothing is left behind). `tools/probes/transactions.py`,
-      "a collection dropped under a transaction ...".
+- [ ] **RUST MongoDB server: `drop` removes a collection an open
+      transaction holds.** With a transaction holding a collection, mongod
+      8.2.11 makes `drop` (and `createIndexes`) wait until `maxTimeMS`,
+      answers 50, and keeps the collection. Here the drop answers ok within
+      half a second and the collection is gone while the transaction is
+      still open -- after a transaction that only READ, and (re-measured by
+      the gap tests on 2026-10-14) after one that WROTE, where an earlier
+      probe had seen it wait for the commit. What the open transaction then
+      sees or commits has not been measured, and is the data-integrity
+      question. `tools/probes/transactions.py`, "a collection dropped under
+      a transaction ...".
       Backlog-ID: RM-084
       Verify: tests/backlog/test_rm_057_084.py::test_drop_waits_for_a_transaction_that_read,tests/backlog/test_rm_057_084.py::test_drop_under_a_transaction_that_wrote_honours_max_time
 - [ ] **RUST MongoDB server: two transactions that both create one

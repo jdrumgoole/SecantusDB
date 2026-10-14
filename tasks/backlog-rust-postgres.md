@@ -429,6 +429,15 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **`GRANT` and `REVOKE` inside a transaction block take no effect
+  until the block ends.** In `BEGIN; GRANT SELECT ON t TO r; SET ROLE r;
+  SELECT ... FROM t` the role is refused (42501), and after `REVOKE` in a
+  block it can still read; PostgreSQL 15.19 applies both at once. A
+  privilege check that lags the block it is in. Found 2026-10-14 while
+  verifying RP-004.
+  Backlog-ID: RP-020
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grant_and_revoke_take_effect_inside_a_transaction_block
+
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
       psycopg's suite against the Rust PostgreSQL server until
@@ -500,11 +509,6 @@ one beside it.
       - **Encodings other than UTF8, LATIN1 and SQL_ASCII convert only
         their ASCII range**; anything above it is 0A000. A conversion
         table per encoding is what PostgreSQL has.
-      - **`age(xid)` of a normal transaction id is 0A000.** This server's
-        xids are not PostgreSQL's 32-bit counter, so there is nothing to
-        measure the age against; `age(datfrozenxid)` in a monitoring
-        query fails. The special xids 0-2 answer INT_MAX, as in
-        PostgreSQL.
       - **A set-returning function inside an expression**
         (`pg_typeof(json_each(j))`), and two of them in one select list,
         are refused.
@@ -525,9 +529,11 @@ one beside it.
         name). The selection of the words shown is not `mark_hl_words`:
         a document over 35 words is cut by a rule of this server's own,
         and has not been compared with PostgreSQL.
-      - **A column of a composite type cannot be taken apart**: `(v).*`
-        and `(v).f` are 0A000 `this field selection is not supported
-        yet`.
+      - **A record out of a subquery has its fields described as
+        `text`**: `select (x).n from (select f() as x) s` answers the
+        right value under the wrong column type, because the subquery's
+        column is `record` and its field types do not travel with it. A
+        named composite (`row(...)::t`) is typed.
       - **Only `line <-> point` measures with `pg_hypot`.** Every other
         distance in `geom.rs` uses Rust's `f64::hypot`, which can differ
         from PostgreSQL in the last digit; no corpus line has shown one.
@@ -584,7 +590,7 @@ one beside it.
       jsonb object to type integer` there. `ts_headline` with options
       that do not parse answers where PostgreSQL refuses.
       Backlog-ID: RP-015
-      Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue,tests/backlog/test_rust_postgres_gaps.py::test_composite_column_star_expansion
+      Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
 
 - [ ] **OPEN — a backend-cancel test asserts a fixed 1 s bound on a shared
       runner.** `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`

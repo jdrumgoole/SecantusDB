@@ -159,7 +159,7 @@ def test_builtin_coverage_residue(pg: Any, pg15: Any, sql: str) -> None:
     assert pg_answer(pg, sql) == pg_answer(pg15, sql)
 
 
-@pytest.mark.backlog("RP-015")
+@pytest.mark.backlog_fixed("RP-015")
 def test_composite_column_star_expansion(pg: Any) -> None:
     """PostgreSQL 15.19: `(v).*` over a composite column expands its fields."""
     pg.execute("drop table if exists rp015_ct_t")
@@ -194,3 +194,36 @@ def test_wide_and_bc_timestamptz_take_the_session_offset(pg: Any) -> None:
             ("infinity", "infinity"),
         ],
     )
+
+
+def _privilege_in_a_block(pg: Any, name: str) -> list:
+    """GRANT, then REVOKE, each followed by a read as the role, inside one
+    transaction block apiece."""
+    out = []
+    for stmt in ("DROP TABLE IF EXISTS {t}", "DROP ROLE IF EXISTS {r}"):
+        pg_answer(pg, stmt.format(t=f"{name}_t", r=f"{name}_u"))
+    pg_answer(pg, f"CREATE ROLE {name}_u")
+    pg_answer(pg, f"CREATE TABLE {name}_t (a int)")
+    pg_answer(pg, f"INSERT INTO {name}_t VALUES (1)")
+    for change in (
+        f"GRANT SELECT ON {name}_t TO {name}_u",
+        f"REVOKE SELECT ON {name}_t FROM {name}_u",
+    ):
+        pg_answer(pg, "BEGIN")
+        pg_answer(pg, change)
+        pg_answer(pg, f"SET ROLE {name}_u")
+        got = pg_answer(pg, f"SELECT count(*) FROM {name}_t")
+        out.append(got[:2] if got[0] == "err" else got)
+        pg_answer(pg, "ROLLBACK")
+        pg_answer(pg, change)  # keep the effect for the next step, outside a block
+    pg_answer(pg, f"DROP TABLE {name}_t")
+    pg_answer(pg, f"DROP ROLE {name}_u")
+    return out
+
+
+@pytest.mark.backlog("RP-020")
+def test_grant_and_revoke_take_effect_inside_a_transaction_block(pg: Any) -> None:
+    """PostgreSQL 15.19: a GRANT inside a block lets the role read at once,
+    and a REVOKE inside a block stops it at once. The Rust server ignored
+    both until the block ended."""
+    assert _privilege_in_a_block(pg, "rp020") == [("ok", [(1,)]), ("err", "42501")]
