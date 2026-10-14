@@ -68,6 +68,7 @@ one beside it.
   first byte is read. Probe: send `select pg_sleep(3), 1 in (0..200000)` with
   `send_query_params`, then a blocking `PQcancel` at a chosen offset.
   Backlog-ID: RP-002
+  Verify: tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once
 - [ ] RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
   pass (`secantus-pgplan/src/escape_strings.rs`) that rewrites each plain
   literal to the `E'...'` it means before pg_query (which has the setting
@@ -75,6 +76,7 @@ one beside it.
   `N'...'` literals are not rewritten (they keep the conforming reading), and
   `backslash_quote` is not a setting (2026-09-09).
   Backlog-ID: RP-003
+  Verify: tests/backlog/test_rp_triage.py::test_national_literal_under_nonconforming_strings,tests/backlog/test_rp_triage.py::test_backslash_quote_off_refuses_backslash_quote
 - **Scope decision — a `LANGUAGE internal` wrapper over a C function with no
   SQL form** (an I/O function such as `int4out`, an aggregate transition
   function) is a catalog row that answers 42883 when called. PostgreSQL calls
@@ -100,6 +102,7 @@ one beside it.
   `abs(-1)` from a view or a column DEFAULT as the restricted role; PostgreSQL
   15 refuses with 42501.
   Backlog-ID: RP-004
+  Verify: tests/backlog/test_rp_triage.py::test_revoked_builtin_refused_through_view_and_default
 - **Scope decision — pgjdbc `BlobTransactionTest`** needs `CREATE FUNCTION
   lo_manage() ... LANGUAGE C` (the `lo` contrib trigger). `LANGUAGE C` loads
   a shared library into the server process, which a server written in Rust
@@ -153,6 +156,7 @@ one beside it.
   servers; PostgreSQL 15 lists hundreds (`de-x-icu`, `sv-x-icu`, ...). Check
   first that each listed locale orders as PostgreSQL does.
   Backlog-ID: RP-005
+  Verify: tests/backlog/test_rp_triage.py::test_pg_collation_lists_locale_icu_collations
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
   against GnuPG, because both reference servers' OpenSSL 3 builds refuse
   those ciphers. Do not "fix" them to agree with a PG error.
@@ -212,6 +216,7 @@ one beside it.
       **If it recurs, capture the exception text and errno before theorising** —
       that names the failure and distinguishes the remaining possibilities.
       Backlog-ID: RP-006
+      Verify: none -- client-side psycopg test flake connecting to reserved addresses; never touches the server
 
 - [ ] **OPEN — Rust PostgreSQL server on LINUX: durable writes are
       1.2-1.4x slower than PostgreSQL at eight clients and reads ~1.1x
@@ -291,6 +296,7 @@ one beside it.
 
       Correctness items found on the way, open:
       Backlog-ID: RP-007
+      Verify: none -- Linux throughput/CPU-per-statement benchmark campaign
       - [ ] **RUST PG server: a parenthesised step inside `ROLLUP` / `CUBE`
             is refused with a wrong 42803.** `group by rollup ((g, z), v)`
             answers `column "gse_t.g" must appear in the GROUP BY clause`.
@@ -298,6 +304,7 @@ one beside it.
             needs a list of lists. (`GROUP BY (a, b)` on its own works.)
             `tools/probes/pg_corpora/grouping_set_exprs.sql`.
             Backlog-ID: RP-008
+            Verify: tests/backlog/test_rust_postgres_gaps.py::test_rollup_with_a_parenthesised_step
       - [ ] **RUST PG server: a grouped query's subquery cannot name the
             outer table by its own name.** `select g, (select max(v) from t i
             where i.g = t.g) from t group by g` is `42P01 invalid reference
@@ -305,11 +312,13 @@ one beside it.
             table (`from t o ... o.g`) it works. Not a grouping-set matter:
             the plain GROUP BY above fails the same way.
             Backlog-ID: RP-009
+            Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_query_subquery_names_outer_table
       - [ ] **RUST PG server: a 42803 raised from HAVING names the column
             without its table.** PostgreSQL writes `column "t.z" must
             appear...`; the HAVING path writes `"z"` (`having_subject` has
             no statement to take the qualifier from).
             Backlog-ID: RP-010
+            Verify: tests/backlog/test_rust_postgres_gaps.py::test_having_42803_names_the_table
       - [ ] **RUST PG server: with `public` off the `search_path`, a
             relation of `public` is still found from a STRING and by
             `DROP ... IF EXISTS`.** `select nextval('s')` and
@@ -320,11 +329,13 @@ one beside it.
             three resolve the name elsewhere.
             `tools/probes/pg_corpora/search_path_public.sql`.
             Backlog-ID: RP-011
+            Verify: tests/backlog/test_rust_postgres_gaps.py::test_public_off_path_not_found_from_a_string,tests/backlog/test_rust_postgres_gaps.py::test_public_off_path_drop_if_exists_skips
       - [ ] **RUST PG server: a syntax error from Parse (the extended
             protocol) carries no position.** `selct 1` sent with
             `prepare=True` has `P` unset; sent as a simple query it is 1.
             Every syntax error, not only the unterminated ones.
             Backlog-ID: RP-012
+            Verify: tests/backlog/test_rust_postgres_gaps.py::test_parse_syntax_error_carries_position
 
 - **ACCEPTED AS A LIMIT 2026-10-07 (Joe), and may be revisited — Rust
       PostgreSQL server on macOS: a READ statement costs ~1.45-1.6x
@@ -414,6 +425,7 @@ one beside it.
     take a revocation list, a user name map or `clientname=DN` as
     options**; a `pg_hba.conf` passed as `hba_file` can say the last two.
   Backlog-ID: RP-013
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password,tests/backlog/test_rust_postgres_gaps.py::test_wrong_password_checked_before_the_database
 
 ## 5. Known bugs and edge cases to watch
 
@@ -470,6 +482,7 @@ one beside it.
       developer's machine holds every test to one run. Nothing gates the
       plain number on Linux.
       Backlog-ID: RP-014
+      Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
       (2026-10-14).** The probe calls every immutable or stable function in
@@ -571,6 +584,7 @@ one beside it.
       jsonb object to type integer` there. `ts_headline` with options
       that do not parse answers where PostgreSQL refuses.
       Backlog-ID: RP-015
+      Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue,tests/backlog/test_rust_postgres_gaps.py::test_composite_column_star_expansion
 
 - [ ] **OPEN — a backend-cancel test asserts a fixed 1 s bound on a shared
       runner.** `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
@@ -587,17 +601,10 @@ one beside it.
       broken"), so a single-lane re-run is not a diagnostic you can reach
       for. Re-triggering means a push, and therefore a full matrix.
       Backlog-ID: RP-016
+      Verify: none -- a flaky fixed-time bound in a repo test on a shared CI runner
 
 ## Open from the 2026-09-30 batch
 
-- [ ] **Rust PG server: a wide-year or BC `timestamptz` is not rendered with
-      its session-tz offset.** Dates and plain timestamps take `'infinity'` /
-      `'-infinity'`, BC-era and wide-year (> 9999) values and `'epoch'`
-      (#1348, stored as canonical text and passed through); `infinity` is
-      correct for a `timestamptz`, but a wide or BC `timestamptz` is not
-      rendered with the session zone's offset. Reproduce with `SET timezone`
-      to a non-UTC zone and select such a value against PostgreSQL.
-      Backlog-ID: RP-017
 - [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is
       the size of what the block writes.** WiredTiger has no savepoint, so
       one here is a set of pre-images: the first write to a table after a
@@ -607,6 +614,7 @@ one beside it.
       savepoint nobody writes through costs nothing), and a per-row undo log
       would be the fix if the cost ever bites.
       Backlog-ID: RP-018
+      Verify: none -- savepoint memory cost design; no answer differs
 - [ ] **Rust PG server: what the general JOIN planner does not push into
       its table leaves.** A WHERE conjunct that reads ONE alias's columns
       (qualified), built of operators, casts, constants and parameters, is
@@ -616,6 +624,7 @@ one beside it.
       or one over two aliases. Each such conjunct is filtered only after the
       join, so the leaf cannot use an index for it.
       Backlog-ID: RP-019
+      Verify: none -- predicate pushdown/index use only; answers identical, EXPLAIN costs are a scope decision
 
 ## Warning-class RUSTSEC advisories (surfaced by cargo-audit, not gated) (2026-07-20)
 

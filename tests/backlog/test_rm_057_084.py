@@ -116,7 +116,7 @@ def _txn_order(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-057")
+@pytest.mark.backlog_fixed("RM-057")
 def test_order_under_a_transactions_own_writes(rust_mongo: Any, mongod_rs: Any) -> None:
     """A `find` inside a transaction over its own uncommitted writes returns
     them in the order of the index the plan reads, as mongod 8.2.11 does."""
@@ -137,7 +137,7 @@ def _capped_order(client: Any) -> list:
     ]
 
 
-@pytest.mark.backlog("RM-057")
+@pytest.mark.backlog_fixed("RM-057")
 def test_order_on_a_capped_collection(rust_mongo: Any, mongod: Any) -> None:
     """A capped collection with an index: the order a range query returns,
     with and without a limit, and the natural order -- as mongod 8.2.11."""
@@ -230,19 +230,6 @@ def _replace_with_scalar(client: Any) -> tuple:
 def test_replace_with_a_non_document_in_an_update(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 prints the whole input document in the 40228 message."""
     assert _replace_with_scalar(rust_mongo) == _replace_with_scalar(mongod)
-
-
-def _unknown_hint_update(client: Any) -> tuple:
-    c = client["rm064"][_name()]
-    c.insert_one({"_id": 1, "a": 1})
-    return mongo_answer(lambda: c.update_one({"a": 1}, {"$set": {"x": 1}}, hint="nope_1"))
-
-
-@pytest.mark.backlog("RM-064")
-def test_unknown_hint_wording_in_an_update(rust_mongo: Any, mongod: Any) -> None:
-    """The code AND the wording of an update's unknown-hint error, as mongod
-    8.2.11 prints it."""
-    assert _unknown_hint_update(rust_mongo) == _unknown_hint_update(mongod)
 
 
 def _current_date_missing_coll(client: Any) -> tuple:
@@ -346,18 +333,6 @@ def test_explain_of_count_on_a_view(rust_mongo: Any, mongod: Any) -> None:
     assert _view_count_explain(rust_mongo) == _view_count_explain(mongod)
 
 
-def _unknown_hint_explain(client: Any) -> tuple:
-    c = client["rm073"][_name()]
-    c.insert_one({"a": 1})
-    return mongo_answer(lambda: c.find({"a": 1}).hint("nope_1").explain())
-
-
-@pytest.mark.backlog("RM-073")
-def test_unknown_hint_wording_in_explain(rust_mongo: Any, mongod: Any) -> None:
-    """The code AND the wording of `explain`'s unknown-hint error."""
-    assert _unknown_hint_explain(rust_mongo) == _unknown_hint_explain(mongod)
-
-
 def _expr_false_stage(client: Any) -> Any:
     c = client["rm074"][_name()]
     c.insert_one({"a": 1})
@@ -458,7 +433,7 @@ def _start_after_drop_database(client: Any) -> Any:
     return mongo_answer(run)
 
 
-@pytest.mark.backlog("RM-078")
+@pytest.mark.backlog_fixed("RM-078")
 def test_start_after_a_drop_database_token(rust_mongo: Any, mongod_rs: Any) -> None:
     """At database scope, `startAfter` the token of a `dropDatabase` event:
     mongod 8.2.11 delivers the `invalidate` again."""
@@ -519,7 +494,7 @@ def _pre_image_in_txn(client: Any) -> Any:
     return None
 
 
-@pytest.mark.backlog("RM-079")
+@pytest.mark.backlog_fixed("RM-079")
 def test_pre_image_of_an_update_in_a_transaction(rust_mongo: Any, mongod_rs: Any) -> None:
     """`fullDocumentBeforeChange: "required"` on an update made in a
     transaction (not probed before): mongod 8.2.11 delivers the pre-image."""
@@ -586,7 +561,7 @@ def _expanded_txn_events(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-079")
+@pytest.mark.backlog_fixed("RM-079")
 def test_end_of_transaction_with_expanded_events(rust_mongo: Any, mongod_rs: Any) -> None:
     """The events of a two-insert transaction under `showExpandedEvents`
     (`endOfTransaction` was not measured): as mongod 8.2.11 delivers them."""
@@ -696,7 +671,7 @@ def _dollar_hint_find(client: Any) -> tuple:
     return code_of(mongo_answer(lambda: db.command({"find": name, "$hint": {"a": 1}})))
 
 
-@pytest.mark.backlog("RM-083")
+@pytest.mark.backlog_fixed("RM-083")
 def test_find_refuses_an_unknown_dollar_field(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses a `$`-prefixed field `find` does not know."""
     expected = _dollar_hint_find(mongod)

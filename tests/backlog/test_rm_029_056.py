@@ -532,7 +532,7 @@ SPHERE = [
 ]
 
 
-@pytest.mark.backlog("RM-046")
+@pytest.mark.backlog_fixed("RM-046")
 def test_center_sphere_over_pi_with_2dsphere_index(rust_mongo: Any) -> None:
     """mongod 8.2.11, documents of `tools/probes/geo_queries.py`: a
     `$centerSphere` of radius 4 over a `2dsphere` index returns every

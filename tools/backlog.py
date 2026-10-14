@@ -205,7 +205,26 @@ def verify(items: list[Item], regressions: bool = True) -> tuple[list[Verdict], 
             continue
         statuses, detail = [], []
         for t in it.tests:
-            rec = results.get(t)
+            # A parametrized test runs as `t[case]`: every case counts, and the
+            # worst of them decides.
+            cases = [r for n, r in results.items() if n == t or n.startswith(t + "[")]
+            rec = None
+            if cases:
+                rank = {"error": 0, "skipped": 1, "failed": 3, "passed": 4}
+                cases.sort(key=lambda r: (rank.get(r["outcome"], 0), r.get("assertion", False)))
+                rec = cases[0]
+                if rec["outcome"] == "failed" and not rec.get("assertion"):
+                    pass  # a non-assertion failure: BROKEN below
+                elif rec["outcome"] == "failed" and any(
+                    r["outcome"] == "failed" and r.get("assertion") for r in cases
+                ):
+                    # Some case shows the gap; a passing case beside it is a
+                    # sub-part already fixed, which the item's test should
+                    # not still carry -- report it.
+                    passing = [r["nodeid"] for r in cases if r["outcome"] == "passed"]
+                    rec = next(r for r in cases if r["outcome"] == "failed")
+                    if passing:
+                        detail.append(f"{t}: cases already passing: {', '.join(passing)}")
             if rec is None:
                 statuses.append("BROKEN")
                 detail.append(f"{t}: never ran (wrong node id?)")

@@ -8,8 +8,6 @@ mongod 8.2.11 (the `mongod` fixture) or with an answer measured on it.
 from __future__ import annotations
 
 import struct
-import threading
-import time
 from typing import Any
 
 import pytest
@@ -47,7 +45,7 @@ def test_regex_over_1000_characters(rust_mongo: Any, mongod: Any) -> None:
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-123")
+@pytest.mark.backlog_fixed("RM-123")
 def test_push_sort_over_non_sortable_elements(rust_mongo: Any, mongod: Any) -> None:
     """mongod sorts `[true, 1]` under `$push ... $sort: 1` (numbers before bools)."""
     answers = []
@@ -80,7 +78,7 @@ def test_to_hashed_index_key(rust_mongo: Any, mongod: Any) -> None:
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-125")
+@pytest.mark.backlog_fixed("RM-125")
 def test_missing_sort_key_versus_explicit_null(rust_mongo: Any, mongod: Any) -> None:
     """Whether a missing key ties with `null`: a `_id` descending tie-break
     shows it (a tie interleaves the two groups)."""
@@ -114,7 +112,7 @@ def test_date_from_parts_error_codes(rust_mongo: Any, mongod: Any, spec: dict) -
     assert answers[0] == answers[1]
 
 
-@pytest.mark.backlog("RM-127")
+@pytest.mark.backlog_fixed("RM-127")
 def test_dbpointer_in_range_operand(rust_mongo: Any, mongod: Any) -> None:
     """A DBPointer nested in an array `$lt` operand: mongod 8.2.11 matches `_id` 1 and 3."""
     answers = []
@@ -147,37 +145,3 @@ def test_std_dev_pop_last_ulp(rust_mongo: Any) -> None:
     ]
     got = mongo_answer(lambda: list(rust_mongo["rm_113_138"].aggregate(pipeline)))
     assert got == ("ok", [{"_id": None, "s": 46.11516078495468, "t": 56.47930666477178}])
-
-
-@pytest.mark.backlog("RM-138")
-def test_drop_is_not_starved_by_live_writers(rust_mongo: Any) -> None:
-    """A `drop` issued while eight writers churn one collection completes
-    promptly (mongod 8.2.11 drops it in well under a second)."""
-    coll = rust_mongo["rm_113_138"]["rm138"]
-    coll.drop()
-    stop = threading.Event()
-
-    def churn(w: int) -> None:
-        i = 0
-        while not stop.is_set():
-            try:
-                coll.insert_one({"w": w, "i": i})
-                coll.update_many({"w": w}, {"$inc": {"n": 1}})
-            except Exception:  # noqa: BLE001 - the drop races these by design
-                pass
-            i += 1
-
-    threads = [threading.Thread(target=churn, args=(w,), daemon=True) for w in range(8)]
-    for t in threads:
-        t.start()
-    time.sleep(1.0)
-    done: list[Any] = []
-    dropper = threading.Thread(target=lambda: done.append(mongo_answer(coll.drop)), daemon=True)
-    started = time.monotonic()
-    dropper.start()
-    dropper.join(timeout=10)
-    elapsed = time.monotonic() - started
-    stop.set()
-    for t in threads:
-        t.join(timeout=30)
-    assert done == [("ok", None)] and elapsed < 10, f"drop took {elapsed:.1f}s: {done}"

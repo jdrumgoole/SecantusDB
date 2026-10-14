@@ -170,7 +170,7 @@ def test_composite_column_star_expansion(pg: Any) -> None:
     assert pg_answer(pg, "select (v).* from rp015_ct_t") == ("ok", [(1, "x")])
 
 
-@pytest.mark.backlog("RP-017")
+@pytest.mark.backlog_fixed("RP-017")
 def test_wide_and_bc_timestamptz_take_the_session_offset(pg: Any) -> None:
     """PostgreSQL 15.19, stored under UTC and read under America/New_York, in
     the text format: `20000-01-01 07:00:00-05` and `0044-03-15 07:03:58-04:56:02

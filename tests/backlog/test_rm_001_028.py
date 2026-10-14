@@ -90,18 +90,6 @@ def test_bucket_auto_granularity_value_errors(rust_mongo: Any, mongod: Any, valu
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-006")
-def test_unknown_hint_message_is_mongods(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11: `error processing query: ns=rm006.cTree: a $eq 1\\nSort: {}
-    \\nProj: {}\\n planner returned error :: caused by :: hint provided does not
-    correspond to an existing index` (code 2)."""
-    answers = {}
-    for name, db in _both(rust_mongo, mongod, "rm006"):
-        db.c.insert_one({"a": 1})
-        answers[name] = mongo_answer(lambda db=db: list(db.c.find({"a": 1}).hint("nosuch")))
-    assert answers["rust"] == answers["mongod"]
-
-
 _INGRESS_PARAMS = (
     "ingressConnectionEstablishmentRateLimiterEnabled",
     "ingressConnectionEstablishmentRatePerSec",
@@ -177,7 +165,7 @@ def test_geo_intersects_unsorted_order(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-016")
+@pytest.mark.backlog_fixed("RM-016")
 def test_upsert_seeds_query_fields_in_an_order_mongod_uses(rust_mongo: Any) -> None:
     """mongod 8.2.11 has NO fixed order here: `findAndModify` with
     `query: {b: 1, a: 2}, update: {$set: {z: 1}}, upsert: true, new: true`

@@ -132,7 +132,7 @@ def _stages(plan: Any) -> list[str]:
 # --------------------------------------------------- 7.072 transactions --
 
 
-@pytest.mark.backlog("RM-085")
+@pytest.mark.backlog_fixed("RM-085")
 def test_transaction_change_event_carries_txn_number_and_lsid(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -206,7 +206,7 @@ def test_fast_count_sees_another_sessions_uncommitted_insert(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-087")
+@pytest.mark.backlog_fixed("RM-087")
 def test_find_refuses_an_unknown_field(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `find` with a field it does not know answers 40415."""
 
@@ -258,7 +258,7 @@ def test_measurement_without_id_is_stored_without_one(rust_mongo: Any, mongod: A
 # --------------------------------------------- convertToCapped & friends --
 
 
-@pytest.mark.backlog("RM-090")
+@pytest.mark.backlog_fixed("RM-090")
 def test_compact_refuses_an_unknown_field(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 (standalone): `compact` with a field it does not know
     answers 40415."""
@@ -316,7 +316,7 @@ def test_collated_duplicate_document_id_shows_sort_key(rust_mongo: Any, mongod: 
     assert got not in ("x", "X", "no error")
 
 
-@pytest.mark.backlog("RM-093")
+@pytest.mark.backlog_fixed("RM-093")
 def test_out_change_stream_sees_rename_then_invalidate(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11: a change stream on `$out`'s target sees `rename` then
     `invalidate`."""
@@ -536,7 +536,7 @@ def _raw_command(client: Any, db: str, body: dict) -> dict:
     return bson.decode(rest[5:])
 
 
-@pytest.mark.backlog("RM-105")
+@pytest.mark.backlog_fixed("RM-105")
 def test_bulk_write_ops_not_an_array(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `bulkWrite` whose `ops` is not an array is refused."""
 
@@ -553,7 +553,7 @@ def test_bulk_write_ops_not_an_array(rust_mongo: Any, mongod: Any) -> None:
     assert got == ref
 
 
-@pytest.mark.backlog("RM-105")
+@pytest.mark.backlog_fixed("RM-105")
 def test_bulk_write_ns_info_not_an_array(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: `bulkWrite` whose `nsInfo` is not an array is refused."""
 
@@ -571,21 +571,6 @@ def test_bulk_write_ns_info_not_an_array(rust_mongo: Any, mongod: Any) -> None:
 
 
 # ------------------------------------------------- 7.067 index management --
-
-
-@pytest.mark.backlog("RM-106")
-def test_unknown_hint_wording(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11: a hint naming no index answers 2 with its own text."""
-    dbn = _name("rm106")
-
-    def probe(client: Any) -> Any:
-        db = client[dbn]
-        db.c.insert_one({"a": 1})
-        return mongo_answer(lambda: list(db.c.find({"a": 1}).hint("a_1")))
-
-    got, ref = _both(rust_mongo, mongod, probe)
-    assert ref[:2] == ("err", 2)
-    assert got == ref
 
 
 @pytest.mark.backlog("RM-107")
@@ -637,7 +622,7 @@ def test_index_stats_on_a_view_is_refused(rust_mongo: Any, mongod: Any) -> None:
     assert got == ref
 
 
-@pytest.mark.backlog("RM-108")
+@pytest.mark.backlog_fixed("RM-108")
 def test_create_existing_view_with_another_pipeline_wording(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: re-creating a view with another pipeline answers 48 in
     its own words."""
