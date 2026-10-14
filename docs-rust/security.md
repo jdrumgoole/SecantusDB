@@ -27,13 +27,40 @@ users, restart with `--auth` on the same `--storage-path`.
 ## Authorization (RBAC)
 
 With auth on, every command is checked against the connection's effective
-roles; a miss returns mongod's `not authorized on <db> to execute command`
-error. The built-in role set mirrors mongod (`read`, `readWrite`,
-`dbAdmin`, `userAdmin`, `dbOwner`, the `AnyDatabase` variants,
-`clusterMonitor`, `clusterAdmin`, `backup`, `restore`, `root`), and custom
-roles work through `createRole` / `updateRole` / `dropRole` / `rolesInfo`
-plus the grant/revoke command quartet. Role documents nest; resolution
-walks the closure.
+privileges, which are the union of every role it holds and every role those
+inherit. A miss returns mongod's `not authorized on <db> to execute command`
+error.
+
+The check is mongod's.
+
+- **Resources match by mongod's rules.** A privilege on one collection
+  covers that collection only.
+- **Every command needs the actions mongod asks for, and its arguments
+  count.** An upsert also needs `insert`. A pipeline needs what each stage
+  needs. `explain` needs what it explains. `bulkWrite` is checked one
+  operation at a time.
+- **A command the server cannot check is refused.**
+- **A cursor belongs to the user that opened it.** Another user cannot read
+  from it or kill it.
+- **Two listings are filtered rather than refused.** `listDatabases` lists
+  only the databases a user has a privilege on. `listCollections` with
+  `authorizedCollections: true` lists only the collections a user can
+  reach.
+
+The built-in roles are mongod's, with the privileges mongod gives each
+(`read`, `readWrite`, `dbAdmin`, `userAdmin`, `dbOwner`, the `AnyDatabase`
+variants, the cluster roles, `backup`, `restore`, `root` and the rest).
+Custom roles work through `createRole` / `updateRole` / `dropRole` /
+`rolesInfo` and the grant and revoke commands.
+
+The server's own commands have no mongod rule, so the server sets one:
+
+| command | privilege it needs |
+| --- | --- |
+| `backupArchive`, `archiveBaseSnapshot` | the cluster privilege `readBackupFile` |
+| `restoreArchive` | `applyOps` |
+| `pruneOplog` | `replSetResizeOplog` |
+| `pruneTtl` | `compact` |
 
 ## TLS and mTLS
 
