@@ -71,7 +71,11 @@ pub fn repl_set_initiate(_doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             "This node was not started with replication enabled.",
         ));
     }
-    Err(CommandError::new(23, "AlreadyInitialized", "already initialized"))
+    Err(CommandError::new(
+        23,
+        "AlreadyInitialized",
+        "already initialized",
+    ))
 }
 
 /// `appendOplogNote`: a no-op oplog entry, `{op: "n", ns: "", o: data}`.
@@ -171,7 +175,11 @@ fn out_of_range(field: &str, relation: &str, bound: f64, value: f64) -> CommandE
 /// `replSetResizeOplog`: `size` in megabytes, 990 to 1 PB.
 pub fn repl_set_resize_oplog(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if ctx.replica_set_name.is_none() {
-        return Err(CommandError::new(26, "NamespaceNotFound", "oplog does not exist"));
+        return Err(CommandError::new(
+            26,
+            "NamespaceNotFound",
+            "oplog does not exist",
+        ));
     }
     only_fields(doc, "replSetResizeOplog", &["size", "minRetentionHours"])?;
     let size = resize_number(doc, "size")?;
@@ -338,7 +346,11 @@ pub fn get_cluster_parameter(doc: &Document, ctx: &mut CommandContext) -> Handle
 /// The collection a plan-cache command names, checked as mongod checks it:
 /// a non-string is 73, a view is 166, a collection that does not exist is
 /// fine.
-fn plan_cache_target(doc: &Document, command: &str, ctx: &mut CommandContext) -> Result<(), CommandError> {
+fn plan_cache_target(
+    doc: &Document,
+    command: &str,
+    ctx: &mut CommandContext,
+) -> Result<(), CommandError> {
     let coll = match doc.get(command) {
         Some(Bson::String(s)) => s.clone(),
         Some(other) => {

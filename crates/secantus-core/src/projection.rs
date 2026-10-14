@@ -1067,7 +1067,10 @@ mod tests {
         let b = raw_of(&d);
         let raw = RawDocument::from_bytes(&b).unwrap();
         for (spec, want) in [
-            (doc! {"_id": 0, "op": 1, "ns": 1, "o": 1}, vec!["op", "ns", "o"]),
+            (
+                doc! {"_id": 0, "op": 1, "ns": 1, "o": 1},
+                vec!["op", "ns", "o"],
+            ),
             (doc! {"_id": 0, "a": 1, "b": 1}, vec!["b", "a"]),
             (doc! {"a": 1, "op": 1}, vec!["_id", "op", "a"]),
         ] {

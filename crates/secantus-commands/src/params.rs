@@ -111,7 +111,10 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // `transactionLifetimeLimitSeconds` for an idle transaction. Each is
     // changed in the registry as well as stored here.
     ("cursorTimeoutMillis", ParamKind::Int64),
-    ("transactionLifetimeLimitSeconds", ParamKind::Int32AtLeastOne),
+    (
+        "transactionLifetimeLimitSeconds",
+        ParamKind::Int32AtLeastOne,
+    ),
 ];
 
 /// mongod's highest log level; `setParameter` clamps rather than refusing.
@@ -339,9 +342,9 @@ fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
     if matches!(kind, ParamKind::Int64 | ParamKind::Int32AtLeastOne) {
         return match integral(value, kind == ParamKind::Int32AtLeastOne) {
             Err(why) => format!("Failed validating {name}: {why}"),
-            Ok(n) => format!(
-                "Invalid value for parameter {name}: {n} is not greater than or equal to 1"
-            ),
+            Ok(n) => {
+                format!("Invalid value for parameter {name}: {n} is not greater than or equal to 1")
+            }
         };
     }
     match (kind, whole(value)) {
@@ -456,35 +459,36 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             .and_then(|s| s.get(name))
             .or_else(|| defaults.get(name.as_str()).cloned())
             .unwrap_or(Bson::Null);
-        if let Some(s) = store.as_ref() {
-            // Store what mongod would store, not what the client sent, so
-            // `getParameter` reports the coerced value (`logLevel: 99` reads
-            // back as 5, `quiet: "yes"` as true).
-            if let Some(coerced) = coerce(kind_of(name).expect("validated above"), value) {
-                if let Ok(storage) = ctx.storage() {
-                    match (name.as_str(), &coerced) {
-                        ("ttlMonitorSleepSecs", Bson::Int32(n)) => {
-                            storage.set_ttl_monitor(Some(i64::from(*n)), None)
-                        }
-                        ("ttlMonitorEnabled", Bson::Boolean(on)) => {
-                            storage.set_ttl_monitor(None, Some(*on))
-                        }
-                        _ => {}
-                    }
-                }
+        // Store what mongod would store, not what the client sent, so
+        // `getParameter` reports the coerced value (`logLevel: 99` reads back
+        // as 5, `quiet: "yes"` as true). The setting takes effect whether or
+        // not there is a store to remember it in.
+        if let Some(coerced) = coerce(kind_of(name).expect("validated above"), value) {
+            if let Ok(storage) = ctx.storage() {
                 match (name.as_str(), &coerced) {
-                    ("cursorTimeoutMillis", Bson::Int64(ms)) => {
-                        if let Ok(cursors) = ctx.cursors() {
-                            cursors.set_cursor_timeout_millis(*ms);
-                        }
+                    ("ttlMonitorSleepSecs", Bson::Int32(n)) => {
+                        storage.set_ttl_monitor(Some(i64::from(*n)), None)
                     }
-                    ("transactionLifetimeLimitSeconds", Bson::Int32(secs)) => {
-                        if let Some(transactions) = &ctx.transactions {
-                            transactions.set_lifetime_seconds(f64::from(*secs));
-                        }
+                    ("ttlMonitorEnabled", Bson::Boolean(on)) => {
+                        storage.set_ttl_monitor(None, Some(*on))
                     }
                     _ => {}
                 }
+            }
+            match (name.as_str(), &coerced) {
+                ("cursorTimeoutMillis", Bson::Int64(ms)) => {
+                    if let Ok(cursors) = ctx.cursors() {
+                        cursors.set_cursor_timeout_millis(*ms);
+                    }
+                }
+                ("transactionLifetimeLimitSeconds", Bson::Int32(secs)) => {
+                    if let Some(transactions) = &ctx.transactions {
+                        transactions.set_lifetime_seconds(f64::from(*secs));
+                    }
+                }
+                _ => {}
+            }
+            if let Some(s) = store.as_ref() {
                 s.set(name, coerced);
             }
         }

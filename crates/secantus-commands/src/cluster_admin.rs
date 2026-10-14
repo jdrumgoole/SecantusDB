@@ -130,7 +130,9 @@ const FCV_ID: &str = "featureCompatibilityVersion";
 /// `{_id: "featureCompatibilityVersion", version: "8.2"}` in
 /// `admin.system.version`. That document is why mongod always lists the
 /// `admin` database. A stored FCV is left as it is.
-pub fn record_initial_fcv(storage: &dyn crate::storage::Storage) -> Result<(), crate::storage::StorageError> {
+pub fn record_initial_fcv(
+    storage: &dyn crate::storage::Storage,
+) -> Result<(), crate::storage::StorageError> {
     let stored = storage.find(FCV_DB, FCV_COLL, &doc! {"_id": FCV_ID}, None, None)?;
     if stored.is_empty() {
         let bytes = bson::to_vec(&doc! {"_id": FCV_ID, "version": FCV_LATEST})

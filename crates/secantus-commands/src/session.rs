@@ -964,7 +964,7 @@ fn unreplicated_retryable_write(
     let matches = |filter: Option<&Bson>| match filter {
         Some(Bson::Document(q)) => storage
             .count_matching("local", &coll, q)
-            .map_or(false, |n| n > 0),
+            .is_ok_and(|n| n > 0),
         _ => false,
     };
     let ordered = doc.get_bool("ordered").unwrap_or(true);

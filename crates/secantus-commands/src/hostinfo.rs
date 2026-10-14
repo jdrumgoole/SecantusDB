@@ -51,11 +51,25 @@ mod platform {
         // SAFETY: a null buffer asks for the length; the second call fills
         // a buffer of that length.
         unsafe {
-            if libc::sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            if libc::sysctlbyname(
+                cname.as_ptr(),
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+            {
                 return None;
             }
             let mut buf = vec![0u8; len];
-            if libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) != 0 {
+            if libc::sysctlbyname(
+                cname.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+            {
                 return None;
             }
             buf.truncate(len);
@@ -178,7 +192,11 @@ mod platform {
             machine,
             mem_size_mb: mem,
             mem_limit_mb: mem,
-            logical_cores: if online > 0 { online as i32 } else { available_cores() },
+            logical_cores: if online > 0 {
+                online as i32
+            } else {
+                available_cores()
+            },
             available_cores: available_cores(),
             physical_cores: physical,
             sockets,

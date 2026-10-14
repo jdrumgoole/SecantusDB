@@ -20813,7 +20813,7 @@ mod tests {
         // long-running server bounds its oplog from writes alone — with NO
         // explicit prune_oplog call and NO noop-heartbeat sweeper (the default).
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
         s.set_oplog_max_entries(10);
         let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
         let total = OPLOG_PRUNE_INTERVAL as i32 + 1; // cross the threshold once

@@ -162,7 +162,11 @@ pub fn logout(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// The one-member set's configuration, in mongod's shape for a
 /// configuration nobody has changed.
-fn replset_config(set_name: &str, host_port: &str, replica_set_id: bson::oid::ObjectId) -> Document {
+fn replset_config(
+    set_name: &str,
+    host_port: &str,
+    replica_set_id: bson::oid::ObjectId,
+) -> Document {
     doc! {
         "_id": set_name,
         "version": 1_i32,
@@ -195,9 +199,18 @@ fn replset_config(set_name: &str, host_port: &str, replica_set_id: bson::oid::Ob
 }
 
 /// The configuration stored in `local.system.replset` for `set_name`.
-fn stored_replset_config(storage: &dyn crate::storage::Storage, set_name: &str) -> Option<Document> {
+fn stored_replset_config(
+    storage: &dyn crate::storage::Storage,
+    set_name: &str,
+) -> Option<Document> {
     let rows = storage
-        .find("local", "system.replset", &doc! {"_id": set_name}, None, None)
+        .find(
+            "local",
+            "system.replset",
+            &doc! {"_id": set_name},
+            None,
+            None,
+        )
         .ok()?;
     let bytes = rows.first()?;
     secantus_core::bsondoc::from_bytes(bytes).ok()
@@ -219,7 +232,8 @@ pub(crate) fn oplog_uuid(storage: &dyn crate::storage::Storage) -> Vec<u8> {
                 .and_then(|s| s.get_object_id("replicaSetId").ok())
         })
         .unwrap_or_else(crate::handshake::hello_process_id);
-    let mut bytes = sha2::Sha256::digest([b"local.oplog.rs".as_slice(), &id.bytes()].concat())[..16].to_vec();
+    let mut bytes =
+        sha2::Sha256::digest([b"local.oplog.rs".as_slice(), &id.bytes()].concat())[..16].to_vec();
     // A version-4 (random) UUID's version and variant bits.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;

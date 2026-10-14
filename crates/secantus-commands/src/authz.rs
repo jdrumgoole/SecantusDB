@@ -353,7 +353,9 @@ pub(crate) fn check(
         "appendOplogNote" => c.cluster("appendOplogNote"),
         "lockInfo" => c.cluster("serverStatus"),
         "getClusterParameter" => c.cluster("getClusterParameter"),
-        "planCacheClear" | "planCacheClearFilters" => c.on_collection(doc, name, &["planCacheWrite"]),
+        "planCacheClear" | "planCacheClearFilters" => {
+            c.on_collection(doc, name, &["planCacheWrite"])
+        }
         "planCacheListFilters" => c.on_collection(doc, name, &["planCacheRead"]),
         "dbHash" | "dbhash" => c.on_database(&["dbHash"]),
         "shardingState" => c.cluster("shardingState"),

@@ -831,7 +831,10 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn append_oplog_note(&self, data: bson::Document) -> Result<(), StorageError> {
-        self.inner.append_oplog_note(data).map(|_| ()).map_err(map_err)
+        self.inner
+            .append_oplog_note(data)
+            .map(|_| ())
+            .map_err(map_err)
     }
 
     fn set_oplog_max_entries(&self, n: usize) -> Result<(), StorageError> {

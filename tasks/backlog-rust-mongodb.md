@@ -712,70 +712,72 @@ unit tests of `generic.rs`, `serverinfo.rs` and `handshake.rs`.
 
 Still different:
 
-- [ ] **`validate` on `system.views`, and `background: true`** (3).
-      mongod validates `system.views` as the collection it is, and refuses
-      a background validation of a collection no checkpoint holds yet.
+- [ ] **`validate` with `background: true` reads the live collection.**
+      mongod validates the last checkpoint, so a collection created since
+      then is 26 ("does not exist to validate") and one written since is
+      validated as it was. Here it validates what is there now. Modelling
+      it means reading WiredTiger's checkpoint, not the live table.
       (`validate` itself reads the store: `Storage::check_collection`
       compares every document with each index's entries, both ways, and
       with the `_id` index. Its key counts match mongod over seven index
       shapes. It repairs nothing, and it does not check a time-series
       collection's buckets or a unique index's claims.)
       Backlog-ID: RM-033
-      Verify: tests/backlog/test_rm_029_056.py::test_validate_system_views,tests/backlog/test_rm_029_056.py::test_background_validate_of_an_uncheckpointed_collection
+      Verify: tests/backlog/test_rm_029_056.py::test_background_validate_of_an_uncheckpointed_collection
 - [ ] **`serverStatus` sections** (about 30): `asserts`, `mem`,
       `globalLock`, `transactions`, `repl`, `metrics` beyond the two this
       server keeps, `wiredTiger` and the rest are absent. None is reported
       as zeros.
       Backlog-ID: RM-034
       Verify: tests/backlog/test_rm_029_056.py::test_server_status_sections,tests/backlog/test_rm_029_056.py::test_server_status_metrics
-- [ ] **Server parameters** (about 35). `getParameter` reports the
+- [ ] **Server parameters** (about 30). `getParameter` reports the
       thirteen parameters that are true of this server
       (`serverinfo::parameters`) and mongod has several hundred.
-      `setParameter` changes four; mongod lets `cursorTimeoutMillis`,
-      `transactionLifetimeLimitSeconds` and others be changed while it
-      runs, and here each is 20 "not allowed to change at runtime".
-      `notablescan` is not there to set, so a scan is never refused.
+      `setParameter` changes six (`cursorTimeoutMillis` and
+      `transactionLifetimeLimitSeconds` among them, each applied to its
+      registry); the others mongod changes at runtime are 20 here.
+      `notablescan` is not there to set, so a scan is never refused: whether
+      to add it waits on Joe (`tasks/rust-mongod-remaining-plan.md`).
       Backlog-ID: RM-035
-      Verify: tests/backlog/test_rm_029_056.py::test_set_parameter_at_runtime,tests/backlog/test_rm_029_056.py::test_notablescan_parameter
-- [ ] **Replica-set commands** (about 25): `replSetInitiate`,
-      `replSetReconfig`, `replSetResizeOplog`, `appendOplogNote` and the
-      like are unknown commands here, and `local.oplog.rs`,
-      `local.system.replset`, `config.system.sessions` and the other
-      internal collections are not listed. `admin.system.version` exists
-      only once `setFeatureCompatibilityVersion` has written to it. So
-      `dbHash` on `admin` or `config` differs from mongod's
-      (`tools/probes/admin_commands.py`, 2 of 281). `admin.system.keys`
-      holds random signing keys, so that one digest could never match.
-      `replSetGetStatus` has no `electionCandidateMetrics`.
-      Backlog-ID: RM-036
-      Verify: tests/backlog/test_rm_029_056.py::test_replica_set_commands,tests/backlog/test_rm_029_056.py::test_replica_set_internal_collections
-- [ ] **Commands not there** (about 25): `features`, `lockInfo`,
-      `getClusterParameter`, the plan-cache and query-settings commands.
-      An unknown command that mongod runs only against `admin` answers
-      that refusal from another database, where mongod parses its
-      arguments first.
-      Backlog-ID: RM-037
-      Verify: tests/backlog/test_rm_029_056.py::test_commands_not_there,tests/backlog/test_rm_029_056.py::test_admin_only_command_parses_its_argument_first
-- [ ] **The profiler** (6): a `filter` document is refused (238), where
-      mongod stores it; `system.profile` is not created at level 1 or 2.
+      Verify: tests/backlog/test_rm_029_056.py::test_notablescan_parameter
+- [ ] **Commands answered only as far as this server honours them.**
+      `features` has no `js` block (there is no script engine) and refuses
+      `oidReset`; `getClusterParameter` has six of mongod's fifteen
+      parameters, the ones whose default is a fact here (no shards, no
+      default `maxTimeMS`, pre-images that go with the oplog), and answers 4
+      for the rest; `planCacheSetFilter` is not a command, because no filter
+      would be applied; `replSetResizeOplog` refuses a `minRetentionHours`
+      above 0, because this oplog drops an entry older than its retention
+      window whatever its size; `replSetReconfig` is not a command. Each
+      is a feature to build, not a reply to change.
+      Backlog-ID: RM-143
+      Verify: tests/backlog/test_rm_029_056.py::test_features_reports_the_script_engine,tests/backlog/test_rm_029_056.py::test_features_oid_reset,tests/backlog/test_rm_029_056.py::test_plan_cache_set_filter,tests/backlog/test_rm_029_056.py::test_resize_oplog_min_retention_hours,tests/backlog/test_rm_029_056.py::test_every_cluster_parameter
+- [ ] **The profiler** (6): nothing is profiled. A level is recorded and
+      no operation is written to `system.profile`, which is not created
+      (mongod creates it, capped, at level 1 or 2), and a `filter` document
+      is refused (238) where mongod stores it. Creating an empty
+      `system.profile` would claim a profiler there is not: this needs one.
       Backlog-ID: RM-038
       Verify: tests/backlog/test_rm_029_056.py::test_profile_filter_is_stored,tests/backlog/test_rm_029_056.py::test_profile_level_creates_system_profile
 - [ ] **`hello` names no compressor.** `OP_COMPRESSED` is not spoken, so a
       `compression` list is checked and not answered (2).
       Backlog-ID: RM-039
       Verify: tests/backlog/test_rm_029_056.py::test_hello_names_compressors
-- [ ] `hostInfo` has four of mongod's twelve `system` fields and
-      `memSizeMB: 0`; `buildInfo` has no per-OS block and carries
-      `secantusVersion`; `collStats` has no `wiredTiger` or
-      `indexDetails`; `$indexStats` counts no use of an index and
-      `latencyStats` is zeros; `dbStats` leaves the view definitions out of
-      `avgObjSize`; `listDatabases` lists no `admin` or `config`;
+- [ ] `buildInfo` has no per-OS block and carries `secantusVersion`
+      (documented in `CLAUDE.md` as this server's own field: removing it is
+      Joe's call); `collStats` has no `wiredTiger` or `indexDetails`;
+      `$indexStats` counts no use of an index and `latencyStats` is zeros;
+      `listDatabases` lists no `config` (mongod writes its sessions to
+      `config.system.sessions`; here they are kept in memory), so `dbHash`
+      on `config` differs, as on `admin` does (`admin.system.keys` holds
+      random signing keys there, a digest no server could match);
       `connectionStatus` lists no privileges for a user who has some;
-      `$listCatalog` is unknown; `authenticate` over X.509 without a
-      certificate says why, where mongod says only "Authentication
-      failed."; a base64 `saslStart` payload is not decoded.
+      `$listCatalog`
+      is unknown (it reports mongod's durable catalog, WiredTiger idents and
+      all, and this store is laid out differently); `hostInfo.extra` is
+      empty on Linux.
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_host_info_system_fields,tests/backlog/test_rm_029_056.py::test_build_info_has_no_secantus_version,tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_index_stats_counts_use,tests/backlog/test_rm_029_056.py::test_db_stats_counts_view_definitions,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config,tests/backlog/test_rm_029_056.py::test_list_catalog_stage,tests/backlog/test_rm_029_056.py::test_x509_without_a_certificate,tests/backlog/test_rm_029_056.py::test_sasl_start_base64_payload
+      Verify: tests/backlog/test_rm_029_056.py::test_build_info_has_no_secantus_version,tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details,tests/backlog/test_rm_029_056.py::test_index_stats_counts_use,tests/backlog/test_rm_029_056.py::test_list_databases_lists_admin_and_config,tests/backlog/test_rm_029_056.py::test_list_catalog_stage
 
 ### 7.081 Geo queries -- 2026-10-13
 

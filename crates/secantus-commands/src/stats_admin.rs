@@ -91,12 +91,30 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
         t.index_size += sizes.values().filter_map(as_i64).sum::<i64>();
     }
     // The views are documents in `system.views`, a collection with an `_id` index.
+    // Their bytes are the definitions' (measured 8.2.11, 2026-10-15: a view
+    // over five `$match` stages adds the 238 bytes of its definition).
     if t.views > 0 {
         t.collections += 1;
         t.objects += t.views;
         t.indexes += 1;
+        for definition in crate::ts_buckets::view_definitions(storage, db)? {
+            if definition.contains_key("viewOn") && !is_timeseries_definition(&definition) {
+                t.data_size += bson::to_vec(&definition).map_or(0, |b| b.len() as i64);
+            }
+        }
     }
     Ok(t)
+}
+
+/// Whether a `system.views` definition is a time-series collection's, which
+/// `totals` does not count as a view.
+fn is_timeseries_definition(definition: &Document) -> bool {
+    definition
+        .get_array("pipeline")
+        .ok()
+        .and_then(|p| p.first())
+        .and_then(Bson::as_document)
+        .is_some_and(|stage| stage.contains_key("$_internalUnpackBucket"))
 }
 
 /// `dbStats`.
