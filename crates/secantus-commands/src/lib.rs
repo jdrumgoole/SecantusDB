@@ -38,6 +38,8 @@ pub mod admin;
 pub mod aggregate;
 pub mod argtypes;
 pub mod auth;
+mod authz;
+mod authz_pipeline;
 mod builtin_roles;
 mod bulkwrite;
 mod capped_admin;
@@ -644,6 +646,14 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
         stats.count_op(doc);
     }
     let mut reply = dispatch_inner(doc, ctx);
+    // A user or role may have changed: every connection's effective
+    // privileges are recomputed on its next command (`rbac::effective`).
+    let name = command_name(doc);
+    if umc::is_user_or_role_command(name) || name == "secantusAdmin.restoreArchive" {
+        if let Some(p) = &ctx.server_params {
+            p.invalidate_user_cache();
+        }
+    }
     unacknowledged_write_reply(doc, &mut reply);
     attach_write_concern_error(doc, &mut reply);
     attach_cluster_time_gossip(doc, &mut reply, ctx);
@@ -2032,12 +2042,12 @@ fn localhost_exception(name: &str, ctx: &CommandContext) -> bool {
     none_stored
 }
 
-/// `--auth` gating + RBAC privilege check (`commands.py::dispatch`). A no-op when
-/// `require_auth` is off (default-allow). When on: any command outside
-/// [`is_pre_auth_command`] requires an authenticated principal (`Unauthorized`,
-/// 13); an authenticated principal must then hold the command's action grant
-/// (also `Unauthorized`). Pre-auth and explicitly exempt commands
-/// ([`is_no_privilege_command`]) bypass the privilege check.
+/// `--auth` gating and the privilege check. A no-op when `require_auth` is
+/// off. When on: any command outside [`is_pre_auth_command`] needs an
+/// authenticated user (`Unauthorized`, 13, or the localhost exception), and
+/// an authenticated user needs what mongod checks for the command
+/// ([`authz::check`]), over the privileges of every role it holds
+/// ([`rbac::effective`]).
 fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), CommandError> {
     if !ctx.require_auth {
         return Ok(());
@@ -2052,8 +2062,8 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
         })
         .unwrap_or(false);
 
-    if !is_pre_auth_command(name) && !authenticated {
-        if localhost_exception(name, ctx) {
+    if !authenticated {
+        if is_pre_auth_command(name) || localhost_exception(name, ctx) {
             return Ok(());
         }
         return Err(CommandError::new(
@@ -2063,76 +2073,12 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
             format!("Command {name} requires authentication"),
         ));
     }
-
-    if authenticated && !is_pre_auth_command(name) && !is_no_privilege_command(name) {
-        if let Some((action, scope)) = command_action(name) {
-            let (target_db, cluster) = resource_for_command(name, doc, scope, &ctx.db_name);
-            let roles = ctx
-                .conn_auth
-                .as_ref()
-                .map(|a| {
-                    a.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .effective_roles
-                        .clone()
-                })
-                .unwrap_or_default();
-            // Custom roles are expanded through a storage-backed resolver
-            // (`Storage::get_role`); built-in roles short-circuit without it.
-            let storage = ctx.storage.as_deref();
-            let resolver = |db: &str, role: &str| -> Option<Document> {
-                let bytes = storage?.get_role(db, role).ok()??;
-                secantus_core::bsondoc::from_bytes(bytes.as_slice()).ok()
-            };
-            if !rbac::check_privilege_resolved(
-                &roles,
-                action,
-                target_db.as_deref(),
-                cluster,
-                Some(&resolver),
-            ) {
-                return Err(CommandError::new(
-                    13,
-                    "Unauthorized",
-                    format!(
-                        "not authorized on {} to execute command (action: {action})",
-                        target_db.as_deref().unwrap_or("cluster")
-                    ),
-                ));
-            }
-            // A pipeline's secondary namespaces carry their own privilege
-            // requirements ($out/$merge write, $lookup-family read) — the
-            // primary (find, primary-collection) grant alone must not
-            // authorize writes to or reads from other namespaces. Mirrors
-            // commands.py's _pipeline_secondary_requirements check.
-            if name == "aggregate" {
-                for (extra_action, extra_db) in pipeline_secondary_requirements(doc, &ctx.db_name) {
-                    if !rbac::check_privilege_resolved(
-                        &roles,
-                        extra_action,
-                        Some(&extra_db),
-                        false,
-                        Some(&resolver),
-                    ) {
-                        return Err(CommandError::new(
-                            13,
-                            "Unauthorized",
-                            format!(
-                                "not authorized on {extra_db} to execute \
-                                 aggregation stage (action: {extra_action})"
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    let az = rbac::effective(ctx)?;
+    authz::check(name, doc, &ctx.db_name, ctx, &az)
 }
 
 /// Commands a connection may invoke before authenticating (`--auth` on): the
-/// driver handshake plus the SCRAM round-trip itself. Mirrors
-/// `commands.py::_PRE_AUTH_COMMANDS`.
+/// driver handshake plus the SCRAM round-trip itself.
 fn is_pre_auth_command(name: &str) -> bool {
     matches!(
         name,
@@ -2148,188 +2094,6 @@ fn is_pre_auth_command(name: &str) -> bool {
             | "endSessions"
             | "whatsmyuri"
     )
-}
-
-/// Commands that skip the RBAC privilege check even when authenticated: cursor
-/// continuation (authorized at find/aggregate time), session administrivia, and
-/// metadata the driver depends on. Mirrors `commands.py::_NO_PRIVILEGE_COMMANDS`.
-fn is_no_privilege_command(name: &str) -> bool {
-    matches!(
-        name,
-        "getMore"
-            | "endSessions"
-            | "startSession"
-            | "refreshSessions"
-            | "ping"
-            | "ismaster"
-            | "isMaster"
-            | "hello"
-            | "buildInfo"
-            | "buildinfo"
-            | "whatsmyuri"
-            | "saslStart"
-            | "saslContinue"
-            | "authenticate"
-            | "connectionStatus"
-            | "abortTransaction"
-            | "commitTransaction"
-            | "replSetGetStatus"
-    )
-}
-
-/// The `(action, scope)` a command needs, or `None` for "no privilege required"
-/// (a permissive default — an authenticated user with any role can invoke it).
-/// Mirrors `commands.py::_COMMAND_ACTIONS`.
-fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
-    use rbac::*;
-    Some(match name {
-        "find" | "count" | "distinct" | "aggregate" | "mapReduce" | "mapreduce" => {
-            (A_FIND, SCOPE_COLLECTION)
-        }
-        "insert" => (A_INSERT, SCOPE_COLLECTION),
-        "update" => (A_UPDATE, SCOPE_COLLECTION),
-        "delete" => (A_REMOVE, SCOPE_COLLECTION),
-        "findAndModify" | "findandmodify" => (A_UPDATE, SCOPE_COLLECTION),
-        "killCursors" => (A_KILL_CURSORS, SCOPE_COLLECTION),
-        "listIndexes" => (A_LIST_INDEXES, SCOPE_COLLECTION),
-        "createIndexes" => (A_CREATE_INDEX, SCOPE_COLLECTION),
-        "dropIndexes" => (A_DROP_INDEX, SCOPE_COLLECTION),
-        "create" => (A_CREATE_COLLECTION, SCOPE_DATABASE),
-        "drop" => (A_DROP_COLLECTION, SCOPE_COLLECTION),
-        "dropDatabase" => (A_DROP_DATABASE, SCOPE_DATABASE),
-        "renameCollection" => (A_RENAME_COLL_SAME_DB, SCOPE_COLLECTION),
-        "listCollections" => (A_LIST_COLLECTIONS, SCOPE_DATABASE),
-        "listDatabases" => (A_LIST_DATABASES, SCOPE_CLUSTER),
-        "dbStats" | "dbstats" => (A_DB_STATS, SCOPE_DATABASE),
-        "collStats" => (A_COLL_STATS, SCOPE_COLLECTION),
-        "createUser" => (A_CREATE_USER, SCOPE_DATABASE),
-        "updateUser" => (A_CHANGE_PASSWORD, SCOPE_DATABASE),
-        "dropUser" => (A_DROP_USER, SCOPE_DATABASE),
-        "grantRolesToUser" => (A_GRANT_ROLE, SCOPE_DATABASE),
-        "revokeRolesFromUser" => (A_REVOKE_ROLE, SCOPE_DATABASE),
-        "dropAllUsersFromDatabase" => (A_DROP_USER, SCOPE_DATABASE),
-        "usersInfo" => (A_VIEW_USER, SCOPE_DATABASE),
-        "createRole" => (A_CREATE_ROLE, SCOPE_DATABASE),
-        "updateRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
-        "dropRole" => (A_DROP_ROLE, SCOPE_DATABASE),
-        "dropAllRolesFromDatabase" => (A_DROP_ROLE, SCOPE_DATABASE),
-        "grantPrivilegesToRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
-        "revokePrivilegesFromRole" => (A_REVOKE_ROLE, SCOPE_DATABASE),
-        "grantRolesToRole" => (A_GRANT_ROLE, SCOPE_DATABASE),
-        "revokeRolesFromRole" => (A_REVOKE_ROLE, SCOPE_DATABASE),
-        "rolesInfo" => (A_VIEW_ROLE, SCOPE_DATABASE),
-        "serverStatus" => (A_SERVER_STATUS, SCOPE_CLUSTER),
-        "currentOp" => (A_INPROG, SCOPE_CLUSTER),
-        "killOp" => (A_KILLOP, SCOPE_CLUSTER),
-        "hostInfo" => (A_HOST_INFO, SCOPE_CLUSTER),
-        "top" => (A_TOP, SCOPE_CLUSTER),
-        "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
-        "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
-        "setParameter" => (A_SET_PARAMETER, SCOPE_CLUSTER),
-        "getLog" => (A_GET_LOG, SCOPE_CLUSTER),
-        // Fault injection is a server-wide DoS lever (e.g. closeConnection on
-        // every find); require an explicit cluster-admin grant under --auth.
-        "configureFailPoint" => (A_CONFIGURE_FAIL_POINT, SCOPE_CLUSTER),
-        _ => return None,
-    })
-}
-
-/// The `(action, db)` grants a pipeline needs beyond the primary `find`:
-/// `$out` insert+remove on its target, `$merge` insert+update, and the
-/// read-side stages (`$lookup` / `$graphLookup` / `$unionWith`) find on the
-/// foreign namespace. Sub-pipelines (`$lookup.pipeline`,
-/// `$unionWith.pipeline`, `$facet` branches) are walked recursively. RBAC is
-/// db-granular, so requirements resolve to `(action, db)` pairs. Mirrors
-/// `commands.py::_pipeline_secondary_requirements`.
-fn pipeline_secondary_requirements(
-    doc: &Document,
-    default_db: &str,
-) -> Vec<(&'static str, String)> {
-    let mut reqs: Vec<(&'static str, String)> = Vec::new();
-
-    fn walk(pipeline: &Bson, default_db: &str, reqs: &mut Vec<(&'static str, String)>) {
-        use rbac::{A_FIND, A_INSERT, A_REMOVE, A_UPDATE};
-        let Bson::Array(stages) = pipeline else {
-            return;
-        };
-        for stage in stages {
-            let Bson::Document(stage) = stage else {
-                continue;
-            };
-            for (op, spec) in stage.iter() {
-                match op.as_str() {
-                    "$out" => {
-                        let db = match spec {
-                            Bson::Document(d) => d.get_str("db").unwrap_or(default_db).to_string(),
-                            _ => default_db.to_string(),
-                        };
-                        reqs.push((A_INSERT, db.clone()));
-                        reqs.push((A_REMOVE, db));
-                    }
-                    "$merge" => {
-                        let into = match spec {
-                            Bson::Document(d) => d.get("into"),
-                            _ => None,
-                        };
-                        let db = match into {
-                            Some(Bson::Document(d)) => {
-                                d.get_str("db").unwrap_or(default_db).to_string()
-                            }
-                            _ => default_db.to_string(),
-                        };
-                        reqs.push((A_INSERT, db.clone()));
-                        reqs.push((A_UPDATE, db));
-                    }
-                    "$lookup" | "$graphLookup" | "$unionWith" => {
-                        reqs.push((A_FIND, default_db.to_string()));
-                        if let Bson::Document(d) = spec {
-                            if let Some(sub) = d.get("pipeline") {
-                                walk(sub, default_db, reqs);
-                            }
-                        }
-                    }
-                    "$facet" => {
-                        if let Bson::Document(d) = spec {
-                            for (_, sub) in d.iter() {
-                                walk(sub, default_db, reqs);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    if let Some(pipeline) = doc.get("pipeline") {
-        walk(pipeline, default_db, &mut reqs);
-    }
-    reqs.sort();
-    reqs.dedup();
-    reqs
-}
-
-/// Resolve the `(target_db, cluster_flag)` an action operates on. Cluster-scoped
-/// commands return `(None, true)`; collection/database commands use the
-/// connection's `$db`, except `renameCollection` whose source db is its
-/// namespace prefix. Mirrors `commands.py::_resource_for_command`.
-fn resource_for_command(
-    name: &str,
-    doc: &Document,
-    scope: &str,
-    default_db: &str,
-) -> (Option<String>, bool) {
-    if scope == rbac::SCOPE_CLUSTER {
-        return (None, true);
-    }
-    if name == "renameCollection" {
-        if let Ok(ns) = doc.get_str("renameCollection") {
-            if let Some((db, _)) = ns.split_once('.') {
-                return (Some(db.to_string()), false);
-            }
-        }
-    }
-    (Some(default_db.to_string()), false)
 }
 
 /// `readConcern.level` validation (`commands.py::dispatch`): an invalid level is
@@ -2829,42 +2593,6 @@ mod tests {
     fn command_name_is_first_key() {
         assert_eq!(command_name(&doc! {"ping": 1, "$db": "admin"}), "ping");
         assert_eq!(command_name(&Document::new()), "");
-    }
-
-    #[test]
-    fn pipeline_secondary_requirements_walks_all_stage_shapes() {
-        let doc = doc! {"aggregate": "orders", "pipeline": [
-            {"$match": {"v": 1}},
-            {"$out": {"db": "warehouse", "coll": "t"}},
-            {"$merge": {"into": "t2"}},
-            {"$unionWith": {"coll": "c2", "pipeline": [
-                {"$merge": {"into": {"db": "x", "coll": "y"}}},
-            ]}},
-            {"$facet": {"branch": [
-                {"$lookup": {"from": "f", "localField": "a", "foreignField": "b", "as": "z"}},
-            ]}},
-        ]};
-        let reqs = pipeline_secondary_requirements(&doc, "shop");
-        for want in [
-            (rbac::A_INSERT, "warehouse"),
-            (rbac::A_REMOVE, "warehouse"),
-            (rbac::A_INSERT, "shop"),
-            (rbac::A_UPDATE, "shop"),
-            (rbac::A_INSERT, "x"),
-            (rbac::A_UPDATE, "x"),
-            (rbac::A_FIND, "shop"),
-        ] {
-            assert!(
-                reqs.contains(&(want.0, want.1.to_string())),
-                "missing {want:?} in {reqs:?}"
-            );
-        }
-        // A plain read pipeline demands nothing extra.
-        assert!(pipeline_secondary_requirements(
-            &doc! {"aggregate": "orders", "pipeline": [{"$match": {}}]},
-            "shop"
-        )
-        .is_empty());
     }
 
     #[test]

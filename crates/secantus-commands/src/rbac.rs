@@ -1,497 +1,372 @@
-//! Role-based access control (R5b-2): built-in roles, the action catalogue, and
-//! the privilege check the dispatcher runs when `--auth` is on.
+//! What an authenticated user may do, decided as mongod decides it: the
+//! union of the privileges of every role the user holds and every role those
+//! inherit, matched against the resource a command works on.
 //!
-//! A pure port of `src/secantus/rbac.py` — no I/O, no storage. The dispatcher
-//! resolves a command to an `(action, scope)` pair, computes the target db /
-//! cluster flag, and asks [`check_privilege`] whether the connection's effective
-//! role bindings grant it.
+//! Every rule here was measured on mongod 8.2.11 with
+//! `tools/probes/auth_enforcement.py` (2026-10-14): 62 users holding one
+//! role each -- every built-in role and stored roles naming one collection,
+//! one database, a collection name on every database, every database, the
+//! cluster and any resource -- each running 150 commands.
 //!
-//! **Scope:** the built-in role catalogue (`read` / `readWrite` / `dbAdmin` /
-//! `userAdmin` / `dbOwner`, the `*AnyDatabase` variants, the cluster bundles, and
-//! `root`). **Custom user-defined roles** (the `createRole` family + the
-//! inheritance-graph resolver Python threads through `check_privilege`) are
-//! deferred to a later slice — the resolver hook isn't wired here, so an unknown
-//! role name grants nothing, exactly as mongod treats a role it can't see.
+//! A privilege's resource is a PATTERN, and a check asks whether the user's
+//! privileges on the patterns that cover the target carry the actions the
+//! command needs. The patterns that cover a target (mongod's
+//! `buildResourceSearchList`):
+//!
+//! - a namespace `db.coll`: its own exact pattern; `{db: "", collection:
+//!   "coll"}`; `anyResource`; and, when `coll` is not a system collection,
+//!   `{db, collection: ""}` and -- unless `db` is `local` or `config` --
+//!   `{db: "", collection: ""}`. So a `read` on `ae` finds `ae.c1` and not
+//!   `ae.system.profile`, and `readAnyDatabase` finds `ae.c1` and not
+//!   `local.oplog.rs`;
+//! - a database: its own pattern, `anyResource`, and `{db: "", collection:
+//!   ""}` unless it is `local` or `config`;
+//! - the cluster: `cluster` and `anyResource`.
+//!
+//! The set is computed from the user records and the role graph, and cached
+//! on the connection until a user or role command changes anything
+//! ([`crate::params::ServerParams::invalidate_user_cache`]).
 
-use std::collections::HashSet;
+use std::sync::Arc;
 
-use bson::{Bson, Document};
+use crate::privileges::{PrivilegeSet, Resource};
+use crate::{CommandContext, CommandError};
 
-// --- Action constants (mirror rbac.py) ----------------------------------
-
-pub const A_FIND: &str = "find";
-pub const A_LIST_COLLECTIONS: &str = "listCollections";
-pub const A_LIST_INDEXES: &str = "listIndexes";
-pub const A_LIST_DATABASES: &str = "listDatabases";
-pub const A_DB_STATS: &str = "dbStats";
-pub const A_COLL_STATS: &str = "collStats";
-pub const A_KILL_CURSORS: &str = "killCursors";
-pub const A_CHANGE_STREAM: &str = "changeStream";
-
-pub const A_INSERT: &str = "insert";
-pub const A_UPDATE: &str = "update";
-pub const A_REMOVE: &str = "remove";
-pub const A_BYPASS_DOC_VALIDATION: &str = "bypassDocumentValidation";
-
-pub const A_CREATE_COLLECTION: &str = "createCollection";
-pub const A_DROP_COLLECTION: &str = "dropCollection";
-pub const A_DROP_DATABASE: &str = "dropDatabase";
-pub const A_CREATE_INDEX: &str = "createIndex";
-pub const A_DROP_INDEX: &str = "dropIndex";
-pub const A_RENAME_COLL_SAME_DB: &str = "renameCollectionSameDB";
-pub const A_COLL_MOD: &str = "collMod";
-
-pub const A_CREATE_USER: &str = "createUser";
-pub const A_DROP_USER: &str = "dropUser";
-pub const A_GRANT_ROLE: &str = "grantRole";
-pub const A_REVOKE_ROLE: &str = "revokeRole";
-pub const A_VIEW_USER: &str = "viewUser";
-pub const A_VIEW_ROLE: &str = "viewRole";
-pub const A_CHANGE_PASSWORD: &str = "changeOwnPassword";
-pub const A_CREATE_ROLE: &str = "createRole";
-pub const A_DROP_ROLE: &str = "dropRole";
-
-pub const A_SERVER_STATUS: &str = "serverStatus";
-pub const A_HOST_INFO: &str = "hostInfo";
-pub const A_TOP: &str = "top";
-pub const A_GET_CMD_LINE_OPTS: &str = "getCmdLineOpts";
-pub const A_GET_LOG: &str = "getLog";
-pub const A_INPROG: &str = "inprog";
-pub const A_KILLOP: &str = "killop";
-pub const A_FSYNC: &str = "fsync";
-pub const A_ENABLE_PROFILER: &str = "enableProfiler";
-// configureFailPoint arms server-wide fault injection (a DoS lever), so it
-// needs an explicit cluster-admin grant — mongod gates the same command
-// behind enableTestCommands AND a privileged role.
-pub const A_CONFIGURE_FAIL_POINT: &str = "configureFailPoint";
-/// mongod grants `setParameter` to `hostManager`, which `clusterAdmin`
-/// includes; we hang it off the same cluster-admin bundle as the other
-/// server-wide levers.
-pub const A_SET_PARAMETER: &str = "setParameter";
-
-// --- Resource scopes -----------------------------------------------------
-
-pub const SCOPE_COLLECTION: &str = "collection";
-pub const SCOPE_DATABASE: &str = "database";
-pub const SCOPE_CLUSTER: &str = "cluster";
-
-// --- Built-in role action sets -------------------------------------------
-
-const READ_ACTIONS: &[&str] = &[
-    A_FIND,
-    A_LIST_COLLECTIONS,
-    A_LIST_INDEXES,
-    A_DB_STATS,
-    A_COLL_STATS,
-    A_KILL_CURSORS,
-    A_CHANGE_STREAM,
-];
-
-const READWRITE_EXTRA: &[&str] = &[
-    A_INSERT,
-    A_UPDATE,
-    A_REMOVE,
-    A_CREATE_COLLECTION,
-    A_DROP_COLLECTION,
-    A_CREATE_INDEX,
-    A_DROP_INDEX,
-    A_RENAME_COLL_SAME_DB,
-    A_COLL_MOD,
-    A_BYPASS_DOC_VALIDATION,
-];
-
-const DBADMIN_ACTIONS: &[&str] = &[
-    A_LIST_COLLECTIONS,
-    A_LIST_INDEXES,
-    A_DB_STATS,
-    A_COLL_STATS,
-    A_KILL_CURSORS,
-    A_CREATE_COLLECTION,
-    A_DROP_COLLECTION,
-    A_DROP_DATABASE,
-    A_CREATE_INDEX,
-    A_DROP_INDEX,
-    A_RENAME_COLL_SAME_DB,
-    A_COLL_MOD,
-    A_VIEW_ROLE,
-    A_ENABLE_PROFILER,
-];
-
-const USERADMIN_ACTIONS: &[&str] = &[
-    A_CREATE_USER,
-    A_DROP_USER,
-    A_GRANT_ROLE,
-    A_REVOKE_ROLE,
-    A_VIEW_USER,
-    A_VIEW_ROLE,
-    A_CHANGE_PASSWORD,
-    A_CREATE_ROLE,
-    A_DROP_ROLE,
-];
-
-const CLUSTER_MONITOR_ACTIONS: &[&str] = &[
-    A_LIST_DATABASES,
-    A_SERVER_STATUS,
-    A_HOST_INFO,
-    A_TOP,
-    A_GET_CMD_LINE_OPTS,
-    A_GET_LOG,
-    A_INPROG,
-];
-
-const CLUSTER_ADMIN_EXTRA: &[&str] = &[
-    A_FSYNC,
-    A_DROP_DATABASE,
-    A_KILLOP,
-    A_CONFIGURE_FAIL_POINT,
-    A_SET_PARAMETER,
-];
-
-/// Actions + scope flags for a built-in role. Mirrors `rbac.py::_RoleSpec`.
-struct RoleSpec {
-    actions: Vec<&'static str>,
-    any_db: bool,
-    cluster: bool,
-    admin_only: bool,
+/// The effective privileges of a connection's authenticated users.
+#[derive(Debug, Default)]
+pub(crate) struct Authz {
+    /// The `(db, user)` principals authenticated on the connection.
+    pub(crate) principals: Vec<(String, String)>,
+    /// The roles those users hold directly, as `(role, db)`.
+    pub(crate) roles: Vec<(String, String)>,
+    pub(crate) privileges: PrivilegeSet,
 }
 
-fn concat(parts: &[&[&'static str]]) -> Vec<&'static str> {
-    let mut v = Vec::new();
-    for p in parts {
-        v.extend_from_slice(p);
-    }
-    v
+/// A computed [`Authz`], good until the server's user cache changes.
+#[derive(Debug)]
+pub(crate) struct CachedAuthz {
+    pub(crate) generation: u64,
+    pub(crate) authz: Arc<Authz>,
 }
 
-/// The built-in role spec for `name`, or `None` if not a built-in role.
-fn built_in_role(name: &str) -> Option<RoleSpec> {
-    let spec = match name {
-        "read" => RoleSpec {
-            actions: READ_ACTIONS.to_vec(),
-            any_db: false,
-            cluster: false,
-            admin_only: false,
-        },
-        "readWrite" => RoleSpec {
-            actions: concat(&[READ_ACTIONS, READWRITE_EXTRA]),
-            any_db: false,
-            cluster: false,
-            admin_only: false,
-        },
-        "dbAdmin" => RoleSpec {
-            actions: DBADMIN_ACTIONS.to_vec(),
-            any_db: false,
-            cluster: false,
-            admin_only: false,
-        },
-        "userAdmin" => RoleSpec {
-            actions: USERADMIN_ACTIONS.to_vec(),
-            any_db: false,
-            cluster: false,
-            admin_only: false,
-        },
-        "dbOwner" => RoleSpec {
-            actions: concat(&[
-                READ_ACTIONS,
-                READWRITE_EXTRA,
-                DBADMIN_ACTIONS,
-                USERADMIN_ACTIONS,
-            ]),
-            any_db: false,
-            cluster: false,
-            admin_only: false,
-        },
-        "readAnyDatabase" => RoleSpec {
-            actions: READ_ACTIONS.to_vec(),
-            any_db: true,
-            cluster: false,
-            admin_only: true,
-        },
-        "readWriteAnyDatabase" => RoleSpec {
-            actions: concat(&[READ_ACTIONS, READWRITE_EXTRA]),
-            any_db: true,
-            cluster: false,
-            admin_only: true,
-        },
-        "dbAdminAnyDatabase" => RoleSpec {
-            actions: DBADMIN_ACTIONS.to_vec(),
-            any_db: true,
-            cluster: false,
-            admin_only: true,
-        },
-        "userAdminAnyDatabase" => RoleSpec {
-            actions: USERADMIN_ACTIONS.to_vec(),
-            any_db: true,
-            cluster: false,
-            admin_only: true,
-        },
-        "clusterMonitor" => RoleSpec {
-            actions: CLUSTER_MONITOR_ACTIONS.to_vec(),
-            any_db: true,
-            cluster: true,
-            admin_only: true,
-        },
-        "clusterAdmin" => RoleSpec {
-            actions: concat(&[CLUSTER_MONITOR_ACTIONS, CLUSTER_ADMIN_EXTRA]),
-            any_db: true,
-            cluster: true,
-            admin_only: true,
-        },
-        "backup" => RoleSpec {
-            actions: concat(&[READ_ACTIONS, CLUSTER_MONITOR_ACTIONS]),
-            any_db: true,
-            cluster: true,
-            admin_only: true,
-        },
-        "restore" => RoleSpec {
-            actions: concat(&[
-                READ_ACTIONS,
-                READWRITE_EXTRA,
-                DBADMIN_ACTIONS,
-                USERADMIN_ACTIONS,
-                CLUSTER_MONITOR_ACTIONS,
-                &[A_DROP_DATABASE],
-            ]),
-            any_db: true,
-            cluster: true,
-            admin_only: true,
-        },
-        "root" => RoleSpec {
-            actions: concat(&[
-                READ_ACTIONS,
-                READWRITE_EXTRA,
-                DBADMIN_ACTIONS,
-                USERADMIN_ACTIONS,
-                CLUSTER_MONITOR_ACTIONS,
-                CLUSTER_ADMIN_EXTRA,
-            ]),
-            any_db: true,
-            cluster: true,
-            admin_only: true,
-        },
-        _ => return None,
-    };
-    Some(spec)
+fn is_system(collection: &str) -> bool {
+    collection.starts_with("system.")
 }
 
-/// Whether `name` is a built-in role this enforcement catalogue knows.
-/// The commands ask [`crate::privileges::builtin_exists`] instead, which
-/// knows mongod's whole set and which database each belongs to.
-pub fn is_known_role(name: &str) -> bool {
-    built_in_role(name).is_some()
+fn is_special_db(db: &str) -> bool {
+    db == "local" || db == "config"
 }
 
-/// Does the bound role `(role_name @ role_db)` grant `action` on the target?
-/// Mirrors `rbac.py::role_grants_action`.
-fn role_grants_action(
-    role_name: &str,
-    role_db: &str,
-    action: &str,
-    target_db: Option<&str>,
-    cluster: bool,
-) -> bool {
-    let Some(spec) = built_in_role(role_name) else {
-        return false;
-    };
-    if spec.admin_only && role_db != "admin" {
-        return false; // invalid binding; never grants anything
-    }
-    if cluster {
-        return spec.cluster && spec.actions.contains(&action);
-    }
-    if !spec.actions.contains(&action) {
-        return false;
-    }
-    if spec.any_db {
-        return true;
-    }
-    Some(role_db) == target_db
-}
-
-/// A custom-role resolver: `(db, role_name) -> the stored role record`
-/// (its `privileges` + inherited `roles`). The dispatcher backs this with
-/// `Storage::get_role`; passing `None` restricts the check to built-in roles.
-pub type RoleResolver<'a> = &'a dyn Fn(&str, &str) -> Option<Document>;
-
-/// True iff any role binding in `roles` (each `(role_name, role_db)`) grants
-/// `action` on the resource, considering built-in roles only.
-pub fn check_privilege(
-    roles: &[(String, String)],
-    action: &str,
-    target_db: Option<&str>,
-    cluster: bool,
-) -> bool {
-    check_privilege_resolved(roles, action, target_db, cluster, None)
-}
-
-/// As [`check_privilege`], but expands custom user-defined roles via `resolver`:
-/// a role that isn't built-in is looked up, its `privileges` matched directly,
-/// and its inherited `roles` walked recursively with cycle detection. Mirrors
-/// `rbac.py::check_privilege`.
-pub fn check_privilege_resolved(
-    roles: &[(String, String)],
-    action: &str,
-    target_db: Option<&str>,
-    cluster: bool,
-    resolver: Option<RoleResolver<'_>>,
-) -> bool {
-    let mut pending: Vec<(String, String)> = roles.to_vec();
-    let mut visited: HashSet<(String, String)> = HashSet::new();
-    while let Some((name, db)) = pending.pop() {
-        if !visited.insert((name.clone(), db.clone())) {
-            continue;
+/// The patterns a privilege may carry to cover `target`.
+pub(crate) fn search_list(target: &Resource) -> Vec<Resource> {
+    let mut out = Vec::with_capacity(5);
+    match target {
+        Resource::Ns { db, collection } if !collection.is_empty() => {
+            if !is_system(collection) {
+                if !is_special_db(db) {
+                    out.push(Resource::Ns {
+                        db: String::new(),
+                        collection: String::new(),
+                    });
+                }
+                out.push(Resource::Ns {
+                    db: db.clone(),
+                    collection: String::new(),
+                });
+            }
+            out.push(Resource::Ns {
+                db: String::new(),
+                collection: collection.clone(),
+            });
         }
-        // Built-in roles win the lookup race (mongod refuses createRole for a
-        // built-in name, so the names can't collide).
-        if built_in_role(&name).is_some() {
-            if role_grants_action(&name, &db, action, target_db, cluster) {
+        Resource::Ns { db, .. } => {
+            if !is_special_db(db) {
+                out.push(Resource::Ns {
+                    db: String::new(),
+                    collection: String::new(),
+                });
+            }
+        }
+        Resource::SystemBuckets { db, bucket } => {
+            if !bucket.is_empty() {
+                out.push(Resource::SystemBuckets {
+                    db: db.clone(),
+                    bucket: String::new(),
+                });
+            }
+            if !db.is_empty() {
+                out.push(Resource::SystemBuckets {
+                    db: String::new(),
+                    bucket: String::new(),
+                });
+            }
+        }
+        Resource::Cluster | Resource::Any => {}
+    }
+    out.push(Resource::Any);
+    out.push(target.clone());
+    out
+}
+
+impl Authz {
+    /// Whether the privileges carry every one of `actions` on `target`.
+    pub(crate) fn is_authorized(&self, target: &Resource, actions: &[&str]) -> bool {
+        let mut unmet: Vec<&str> = actions.to_vec();
+        for pattern in search_list(target) {
+            if let Some(held) = self.privileges.actions_on(&pattern) {
+                unmet.retain(|a| !held.iter().any(|h| h == a));
+            }
+            if unmet.is_empty() {
                 return true;
             }
-            continue;
         }
-        let Some(resolver) = resolver else { continue };
-        let Some(record) = resolver(&db, &name) else {
-            continue;
-        };
-        if custom_role_grants(&record, action, target_db, cluster) {
-            return true;
-        }
-        // Walk inherited roles (`record.roles` = [{role, db}, ...]).
-        if let Ok(inherited) = record.get_array("roles") {
-            for r in inherited {
-                if let Bson::Document(d) = r {
-                    if let (Ok(rn), Ok(rd)) = (d.get_str("role"), d.get_str("db")) {
-                        pending.push((rn.to_string(), rd.to_string()));
-                    }
+        unmet.is_empty()
+    }
+
+    /// Whether the privileges carry any action at all on `target`
+    /// (mongod's `isAuthorizedForAnyActionOnResource`), which is what
+    /// `listCollections` with `authorizedCollections` lists by.
+    pub(crate) fn any_action_on(&self, target: &Resource) -> bool {
+        search_list(target)
+            .iter()
+            .any(|pattern| self.privileges.actions_on(pattern).is_some())
+    }
+
+    /// Whether the privileges carry any action on any resource of `db`
+    /// (mongod's `isAuthorizedForAnyActionOnAnyResourceInDB`): what
+    /// `listDatabases` lists by, and what lets `listCollections` with
+    /// `nameOnly` and `authorizedCollections` run at all.
+    pub(crate) fn any_action_in_db(&self, db: &str) -> bool {
+        self.privileges.resources().any(|r| match r {
+            Resource::Any => true,
+            Resource::Cluster => false,
+            Resource::Ns {
+                db: pattern_db,
+                collection,
+            } => {
+                if pattern_db.is_empty() {
+                    // Every collection name on every database; every
+                    // normal collection of every normal database.
+                    !collection.is_empty() || !is_special_db(db)
+                } else {
+                    pattern_db == db
                 }
             }
-        }
+            Resource::SystemBuckets { db: pattern_db, .. } => {
+                pattern_db.is_empty() || pattern_db == db
+            }
+        })
     }
-    false
+
+    /// Whether `(db, user)` is one of the connection's authenticated users:
+    /// mongod lets a user view and change its own record, and read and kill
+    /// its own cursors.
+    pub(crate) fn is_self(&self, db: &str, user: &str) -> bool {
+        self.principals.iter().any(|(d, u)| d == db && u == user)
+    }
+
+    /// Whether the connection's users hold `(role, db)` directly, which is
+    /// what lets `rolesInfo` describe a role the user has.
+    pub(crate) fn holds_role(&self, role: &str, db: &str) -> bool {
+        self.roles.iter().any(|(r, d)| r == role && d == db)
+    }
 }
 
-/// Does a custom-role record's `privileges` array grant `action` on the
-/// resource? Pure shape match (no graph walking). Mirrors
-/// `rbac.py::_custom_role_grants`.
-fn custom_role_grants(
-    record: &Document,
-    action: &str,
-    target_db: Option<&str>,
-    cluster: bool,
-) -> bool {
-    let Ok(privs) = record.get_array("privileges") else {
-        return false;
+/// Whether the cursor opened by `opened_by` may be read on or killed by a
+/// session whose users are `now` (mongod's `isCoauthorizedWith`): the same
+/// users, or none on either side.
+pub(crate) fn coauthorized(opened_by: &[(String, String)], now: &[(String, String)]) -> bool {
+    let mut a = opened_by.to_vec();
+    let mut b = now.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
+
+/// The effective privileges of the calling connection, computed from its
+/// authenticated users' records and the role graph, and cached until a user
+/// or role changes. A connection with no authenticated user has none.
+pub(crate) fn effective(ctx: &CommandContext) -> Result<Arc<Authz>, CommandError> {
+    let Some(conn) = ctx.conn_auth.as_ref() else {
+        return Ok(Arc::new(Authz::default()));
     };
-    for priv_ in privs {
-        let Bson::Document(p) = priv_ else { continue };
-        let Ok(actions) = p.get_array("actions") else {
-            continue;
-        };
-        if !actions.iter().any(|a| a.as_str() == Some(action)) {
-            continue;
-        }
-        let Ok(resource) = p.get_document("resource") else {
-            continue;
-        };
-        // `{anyResource: true}` matches anything.
-        if resource.get_bool("anyResource").unwrap_or(false) {
-            return true;
-        }
-        if cluster {
-            if resource.get_bool("cluster").unwrap_or(false) {
-                return true;
+    let generation = ctx
+        .server_params
+        .as_ref()
+        .map(|p| p.user_cache_generation());
+    let principals = {
+        let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(generation), Some(cached)) = (generation, &guard.privileges) {
+            if cached.generation == generation && cached.authz.principals == guard.authenticated {
+                return Ok(cached.authz.clone());
             }
-            continue;
         }
-        // `{db: "X", collection: ""}` matches any collection in db X;
-        // `{db: "", ...}` is mongod's "all databases" sentinel.
-        if let Ok(res_db) = resource.get_str("db") {
-            if res_db.is_empty() || target_db == Some(res_db) {
-                return true;
+        guard.authenticated.clone()
+    };
+    let mut roles: Vec<(String, String)> = Vec::new();
+    for (db, user) in &principals {
+        for pair in crate::auth::lookup_roles(ctx, db, user)
+            .map(|r| crate::umc::role_pairs(&r))
+            .unwrap_or_default()
+        {
+            if !roles.contains(&pair) {
+                roles.push(pair);
             }
         }
     }
-    false
+    let inherited = crate::umc::inherit(ctx, &roles)?;
+    let authz = Arc::new(Authz {
+        principals,
+        roles: roles.clone(),
+        privileges: inherited.privileges,
+    });
+    let mut guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+    guard.effective_roles = roles;
+    guard.privileges = generation.map(|generation| CachedAuthz {
+        generation,
+        authz: authz.clone(),
+    });
+    Ok(authz)
+}
+
+/// The calling connection's privileges when access control is on and a
+/// user is authenticated; `None` when every command is allowed.
+pub(crate) fn enforced(ctx: &CommandContext) -> Result<Option<Arc<Authz>>, CommandError> {
+    if !ctx.require_auth {
+        return Ok(None);
+    }
+    let authenticated = ctx.conn_auth.as_ref().is_some_and(|a| {
+        a.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_authenticated()
+    });
+    if !authenticated {
+        return Ok(None);
+    }
+    effective(ctx).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privileges::Privilege;
 
-    fn roles(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(r, d)| (r.to_string(), d.to_string()))
-            .collect()
+    fn ns(db: &str, collection: &str) -> Resource {
+        Resource::Ns {
+            db: db.into(),
+            collection: collection.into(),
+        }
+    }
+
+    fn with(privileges: &[(Resource, &[&str])]) -> Authz {
+        let mut set = PrivilegeSet::default();
+        for (resource, actions) in privileges {
+            set.add(&Privilege {
+                resource: resource.clone(),
+                actions: actions.iter().map(|a| a.to_string()).collect(),
+            });
+        }
+        Authz {
+            principals: vec![("admin".into(), "u".into())],
+            roles: Vec::new(),
+            privileges: set,
+        }
+    }
+
+    /// `{db: "ae", collection: ""}` covers the normal collections of `ae`
+    /// and none of its system collections (user `c_dbFind`).
+    #[test]
+    fn database_pattern_skips_system_collections() {
+        let az = with(&[(ns("ae", ""), &["find"])]);
+        assert!(az.is_authorized(&ns("ae", "c1"), &["find"]));
+        assert!(az.is_authorized(&ns("ae", "nope"), &["find"]));
+        assert!(!az.is_authorized(&ns("ae", "system.js"), &["find"]));
+        assert!(!az.is_authorized(&ns("ae2", "c1"), &["find"]));
+        assert!(!az.is_authorized(&ns("ae", "c1"), &["find", "insert"]));
+    }
+
+    /// `{db: "", collection: ""}` covers every normal collection of every
+    /// database but `local` and `config` (user `c_everyFind`).
+    #[test]
+    fn any_normal_pattern_skips_local_and_config() {
+        let az = with(&[(ns("", ""), &["find"])]);
+        assert!(az.is_authorized(&ns("ae", "c1"), &["find"]));
+        assert!(az.is_authorized(&ns("admin", "c1"), &["find"]));
+        assert!(!az.is_authorized(&ns("local", "oplog.rs"), &["find"]));
+        assert!(!az.is_authorized(&ns("config", "settings"), &["find"]));
+        assert!(!az.is_authorized(&ns("ae", "system.profile"), &["find"]));
+        assert!(az.is_authorized(&ns("ae", ""), &["find"]));
+        assert!(!az.is_authorized(&ns("local", ""), &["find"]));
+    }
+
+    /// `{db: "", collection: "c1"}` covers that name on every database,
+    /// `local` and `config` included, and a system collection's name too
+    /// (users `c_nameFind`, `c_nameSysJs`).
+    #[test]
+    fn collection_name_pattern_covers_every_database() {
+        let az = with(&[(ns("", "c1"), &["find"]), (ns("", "system.js"), &["find"])]);
+        assert!(az.is_authorized(&ns("ae", "c1"), &["find"]));
+        assert!(az.is_authorized(&ns("local", "c1"), &["find"]));
+        assert!(!az.is_authorized(&ns("ae", "c2"), &["find"]));
+        assert!(az.is_authorized(&ns("ae", "system.js"), &["find"]));
+        assert!(!az.is_authorized(&ns("ae", ""), &["find"]));
+    }
+
+    /// Actions on one target may come from several patterns together.
+    #[test]
+    fn actions_join_across_patterns() {
+        let az = with(&[(ns("ae", "c1"), &["find"]), (ns("ae", ""), &["insert"])]);
+        assert!(az.is_authorized(&ns("ae", "c1"), &["find", "insert"]));
+        assert!(!az.is_authorized(&ns("ae", "c2"), &["find", "insert"]));
+    }
+
+    /// `anyResource` covers the cluster and `cluster` covers only it.
+    #[test]
+    fn cluster_is_covered_by_cluster_and_any() {
+        let any = with(&[(Resource::Any, &["find", "serverStatus"])]);
+        assert!(any.is_authorized(&Resource::Cluster, &["serverStatus"]));
+        assert!(any.is_authorized(&ns("local", "system.replset"), &["find"]));
+        let cluster = with(&[(Resource::Cluster, &["serverStatus"])]);
+        assert!(cluster.is_authorized(&Resource::Cluster, &["serverStatus"]));
+        assert!(!cluster.is_authorized(&ns("ae", "c1"), &["serverStatus"]));
+        assert!(!cluster.any_action_in_db("ae"));
+    }
+
+    /// What `listDatabases` lists for a user without `listDatabases` on the
+    /// cluster: the databases the user has any action in.
+    #[test]
+    fn any_action_in_db_follows_the_patterns() {
+        assert!(with(&[(ns("", ""), &["find"])]).any_action_in_db("ae"));
+        assert!(!with(&[(ns("", ""), &["find"])]).any_action_in_db("local"));
+        assert!(with(&[(ns("", "c1"), &["find"])]).any_action_in_db("config"));
+        assert!(with(&[(ns("ae", "c1"), &["insert"])]).any_action_in_db("ae"));
+        assert!(!with(&[(ns("ae", "c1"), &["insert"])]).any_action_in_db("ae2"));
+        assert!(with(&[(ns("local", ""), &["find"])]).any_action_in_db("local"));
+        assert!(with(&[(Resource::Any, &["find"])]).any_action_in_db("local"));
+    }
+
+    /// What `listCollections` with `authorizedCollections` lists: a
+    /// collection the user has any action on, which for a system collection
+    /// takes `anyResource` or its name.
+    #[test]
+    fn any_action_on_a_namespace() {
+        let az = with(&[(ns("ae", ""), &["listCollections"])]);
+        assert!(az.any_action_on(&ns("ae", "c1")));
+        assert!(!az.any_action_on(&ns("ae", "system.views")));
+        assert!(
+            with(&[(Resource::Any, &["listCollections"])]).any_action_on(&ns("ae", "system.views"))
+        );
+        assert!(with(&[(ns("ae", "c1"), &["insert"])]).any_action_on(&ns("ae", "c1")));
+        assert!(!with(&[(ns("ae", "c1"), &["insert"])]).any_action_on(&ns("ae", "c2")));
     }
 
     #[test]
-    fn read_grants_find_on_bound_db_only() {
-        let r = roles(&[("read", "app")]);
-        assert!(check_privilege(&r, A_FIND, Some("app"), false));
-        assert!(!check_privilege(&r, A_FIND, Some("other"), false));
-        // read does NOT grant writes
-        assert!(!check_privilege(&r, A_INSERT, Some("app"), false));
-    }
-
-    #[test]
-    fn readwrite_grants_writes() {
-        let r = roles(&[("readWrite", "app")]);
-        assert!(check_privilege(&r, A_INSERT, Some("app"), false));
-        assert!(check_privilege(&r, A_UPDATE, Some("app"), false));
-        assert!(check_privilege(&r, A_FIND, Some("app"), false));
-    }
-
-    #[test]
-    fn any_database_spans_all_dbs_but_admin_bound() {
-        let ok = roles(&[("readAnyDatabase", "admin")]);
-        assert!(check_privilege(&ok, A_FIND, Some("anything"), false));
-        // bound to a non-admin db ⇒ invalid binding, grants nothing
-        let bad = roles(&[("readAnyDatabase", "app")]);
-        assert!(!check_privilege(&bad, A_FIND, Some("anything"), false));
-    }
-
-    #[test]
-    fn cluster_monitor_grants_cluster_actions() {
-        let r = roles(&[("clusterMonitor", "admin")]);
-        assert!(check_privilege(&r, A_SERVER_STATUS, None, true));
-        assert!(check_privilege(&r, A_HOST_INFO, None, true));
-        // but not cluster writes
-        assert!(!check_privilege(&r, A_FSYNC, None, true));
-    }
-
-    #[test]
-    fn root_grants_everything() {
-        let r = roles(&[("root", "admin")]);
-        assert!(check_privilege(&r, A_FIND, Some("x"), false));
-        assert!(check_privilege(&r, A_INSERT, Some("x"), false));
-        assert!(check_privilege(&r, A_CREATE_USER, Some("x"), false));
-        assert!(check_privilege(&r, A_SERVER_STATUS, None, true));
-        assert!(check_privilege(&r, A_FSYNC, None, true));
-    }
-
-    #[test]
-    fn useradmin_grants_user_management() {
-        let r = roles(&[("userAdmin", "app")]);
-        assert!(check_privilege(&r, A_CREATE_USER, Some("app"), false));
-        assert!(check_privilege(&r, A_DROP_USER, Some("app"), false));
-        // but not data reads
-        assert!(!check_privilege(&r, A_FIND, Some("app"), false));
-    }
-
-    #[test]
-    fn unknown_role_grants_nothing() {
-        let r = roles(&[("madeUpRole", "app")]);
-        assert!(!check_privilege(&r, A_FIND, Some("app"), false));
-        assert!(!is_known_role("madeUpRole"));
-        assert!(is_known_role("readWrite"));
-    }
-
-    #[test]
-    fn dbowner_is_union_of_rw_dbadmin_useradmin() {
-        let r = roles(&[("dbOwner", "app")]);
-        assert!(check_privilege(&r, A_INSERT, Some("app"), false)); // readWrite
-        assert!(check_privilege(&r, A_DROP_DATABASE, Some("app"), false)); // dbAdmin
-        assert!(check_privilege(&r, A_CREATE_USER, Some("app"), false)); // userAdmin
+    fn coauthorized_is_the_same_users() {
+        let a = vec![("admin".to_string(), "u".to_string())];
+        let b = vec![("admin".to_string(), "v".to_string())];
+        assert!(coauthorized(&a, &a));
+        assert!(!coauthorized(&a, &b));
+        assert!(!coauthorized(&a, &[]));
+        assert!(coauthorized(&[], &[]));
     }
 }

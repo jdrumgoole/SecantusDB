@@ -1386,9 +1386,24 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
     let name_only = bool_field(doc, "nameOnly", false);
-    let names = storage
+    let mut names = storage
         .list_collections(&ctx.db_name)
         .map_err(command_error)?;
+    // `authorizedCollections` lists only the collections the user has any
+    // action on, which leaves out a system collection unless the user has
+    // `anyResource` or that collection's name (measured 8.2.11: `read` on
+    // the database lists `c1` and `c2` and not `system.views`).
+    if bool_field(doc, "authorizedCollections", false) {
+        if let Some(az) = crate::rbac::enforced(ctx)? {
+            let db = ctx.db_name.clone();
+            names.retain(|n| {
+                az.any_action_on(&crate::privileges::Resource::Ns {
+                    db: db.clone(),
+                    collection: n.clone(),
+                })
+            });
+        }
+    }
     let mut entries: Vec<Document> = Vec::with_capacity(names.len());
     for n in &names {
         let mut options = storage

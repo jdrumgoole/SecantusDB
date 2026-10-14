@@ -4562,6 +4562,13 @@ These work end-to-end but cut corners.
       server. **The libpq scenarios
       (`attempt`) do not retry**; none has shown the race, and libpq
       reports the alert it read before the close.
+    - `pg_login_options.py` failed once in CI, 218 of 219 (2026-10-14,
+      `pg-oracle` on PR #1945, a MongoDB version bump): its `stat others`
+      step counts TLS sessions in `pg_stat_ssl`, and PostgreSQL 15.19
+      counted 3 where this server counted 1, because sessions the probe
+      had just closed were still listed by the reference server. It passed
+      on a rerun. The step should count only its own session, or wait for
+      the others to end.
     - The TLS gauge run has a task and a CI lane since 2026-10-12:
       `./inv validate-psycopg-rust --tls` runs the plain gauge and then the
       TLS one, and `.github/workflows/psycopg-tls.yml` does the same on
@@ -9220,6 +9227,37 @@ server turned out to be the Java gauge's own parallelism).
       Also not on the line: `planSummary`, `keysExamined`, `docsExamined`,
       `nreturned`, `reslen`, and the command document.
 
+### 7.084 What an authenticated user may run -- 2026-10-14
+
+`tools/probes/auth_enforcement.py` starts mongod 8.2.11 and the Rust server
+with `--auth` on empty stores, gives 66 users one role each (every built-in
+role, and stored roles naming one collection, one database, a collection
+name on every database, the cluster, another role, any resource), and has
+each run about 180 commands. It compares whether the command ran and, if
+not, the code. 0.5.3-beta.192 differed on 3,869 of 12,053; the server
+differs on 388, none of them about who may run a command. Pinned by
+`crates/secantus-storage-adapter/tests/auth_enforcement_wt.rs`.
+
+What is open:
+
+- [ ] **Five commands the server does not have** (324): `dbHash`,
+      `logRotate`, `connPoolStats`, `setDefaultRWConcern`,
+      `setFeatureCompatibilityVersion`. Each answers 59 to everyone, where
+      mongod refuses most users with 13.
+- [ ] **The probe's mongod is a standalone** and the Rust server says it is
+      a replica-set member, so `$changeStream`, `replSetGetStatus`,
+      `replSetGetConfig` and `getDefaultRWConcern` differ for the users both
+      allow (37). Running the probe against a one-member replica set needs
+      the set initiated before the localhost exception is used.
+- [ ] **`mapReduce` with `out`** (18), **`compact` and `reIndex`** (8),
+      and **`setParameter notablescan`** (3) answer an error here where
+      mongod runs them; the users allowed are the same.
+- [ ] **The server's own commands have no mongod rule.**
+      `secantusAdmin.backupArchive` and `archiveBaseSnapshot` need cluster
+      `readBackupFile` (the `backup` role), `restoreArchive` cluster
+      `applyOps` (`restore`), `pruneOplog` cluster `replSetResizeOplog`, and
+      `pruneTtl` cluster `compact`. These were chosen, not measured.
+
 ### 7.083 User and role commands -- 2026-10-14
 
 `tools/probes/user_role_commands.py`, mongod 8.2.11: 16 scenarios, 399
@@ -9233,26 +9271,6 @@ and the unit tests of `auth.rs` and `roles.rs`. The built-in roles and the
 
 What is open:
 
-- [ ] **Enforcement does not use the generated table.** `rbac.rs`, which
-      decides what an authenticated user may run, still has its own short
-      list of built-in roles. `createUser` now accepts every role mongod
-      has, so a user granted `hostManager` or `enableSharding` is created
-      and that role lets them run nothing. The dispatcher checks a
-      privilege per database, and the table has privileges on single
-      collections (`system.profile`, `system.js`), so using it as it is
-      would grant more than mongod does. A stored role with a
-      built-in's name on a database that has no such built-in (`root` on
-      `app`, which `createRole` now allows as mongod does) is read by the
-      check as the built-in bound to the wrong database, and permits
-      nothing, whatever privileges it holds.
-- [ ] **A privilege on one collection permits the action on every
-      collection of its database.** Measured 2026-10-14 under `--auth`: a
-      user whose only role has `insert` on `app.c` inserted into
-      `app.other`. The dispatcher asks `rbac::check_privilege_resolved`
-      for an action and a database, and never names the collection. This
-      is older than this entry, and no probe compares what an
-      authenticated user may run with mongod under `--auth`: write one
-      before changing the check.
 - [ ] **`rolesInfo: 1` lists stored roles by name** (2): mongod lists them
       in the order they were created. The role table is keyed by database
       and name and holds no sequence.

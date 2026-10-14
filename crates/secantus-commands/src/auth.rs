@@ -102,6 +102,9 @@ pub struct ConnectionAuth {
     /// LOCALHOST EXCEPTION (see `lib.rs::localhost_exception`). Set by the
     /// accept loop; `false` wherever the peer is unknown.
     pub peer_loopback: bool,
+    /// The effective privileges last computed for `authenticated`, kept
+    /// until a user or role changes (`rbac::effective`).
+    pub(crate) privileges: Option<crate::rbac::CachedAuthz>,
 }
 
 impl ConnectionAuth {
@@ -116,6 +119,7 @@ impl ConnectionAuth {
             peer_address: None,
             client_uuid: rand::random(),
             peer_loopback: false,
+            privileges: None,
         }
     }
 
@@ -235,7 +239,7 @@ fn lookup_creds(
 
 /// The `roles` array (`[{role, db}, ...]`) stored on a user record, or `None`
 /// if the user / roles can't be read.
-fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bson>> {
+pub(crate) fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bson>> {
     let record_bytes = ctx.storage().ok()?.get_user(db, username).ok()??;
     let record = secantus_core::bsondoc::from_bytes(record_bytes.as_slice()).ok()?;
     record.get_array("roles").ok().cloned()
@@ -763,6 +767,7 @@ pub(crate) fn refresh_effective_roles(ctx: &CommandContext) {
     let Ok(mut auth) = auth.lock() else { return };
     let principals = auth.authenticated.clone();
     auth.effective_roles.clear();
+    auth.privileges = None;
     for (db, user) in principals {
         if let Some(roles) = lookup_roles(ctx, &db, &user) {
             auth.add_principal_roles(&roles);
