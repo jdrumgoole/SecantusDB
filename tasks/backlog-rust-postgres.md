@@ -466,10 +466,11 @@ one beside it.
         PostgreSQL is 22023 `ts_rewrite query must return two tsquery
         columns`. The checker would need the SELECT's described column
         types, which `correlated::run_sql` does not return.
-      - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
-        is 0A000, and an aclitem naming a role oid no role has cannot be
-        read back (items are carried as text, PostgreSQL's as oids).
-      - **Not written**: the XML schema exports (`query_to_xmlschema`,
+      - **An aclitem naming a role oid no role has** cannot be read back
+        (items are carried as text, PostgreSQL's as oids).
+      - **Not written**: `ts_stat` (0A000), `pg_timezone_names` /
+        `pg_timezone_abbrevs` (the functions and the views: a client
+        listing time zones gets 42P01), the XML schema exports (`query_to_xmlschema`,
         `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`
         and the schema / database forms, and the `fmgr_*` /
         `postgresql_fdw_validator` validators (`query_to_xml` /

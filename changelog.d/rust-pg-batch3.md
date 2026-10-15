@@ -40,6 +40,12 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   exists kept the NOTICEs its probe raised. Part of RP-015
   (`::test_null_tsquery_sends_no_notice`).
 
+- A built-in `setof record` function in a select list reads its fields:
+  `(aclexplode(acl)).privilege_type`, `(pg_options_to_table(o)).*`,
+  `(ts_parse('default', t)).token`, and `ts_token_type`, `ts_debug`,
+  `pg_get_keywords` alike, where each was 0A000. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[record-srf-field]`).
+
 #### Added
 
-- Corpora `domain_typeof`, `record_arrays` and `operator_function_calls`.
+- Corpora `domain_typeof`, `record_arrays`, `operator_function_calls` and `record_srf_fields`.

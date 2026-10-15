@@ -49,6 +49,34 @@ const JSON_EACH: &[&str] = &[
     "jsonb_each_text",
 ];
 
+/// Built-in functions returning `setof record` through OUT parameters, with
+/// those parameters' names (PostgreSQL 15.19's `pg_proc.proargnames`), for
+/// the ones this server runs in a FROM clause.
+const BUILTIN_RECORD_SRFS: &[(&str, &[&str])] = &[
+    (
+        "aclexplode",
+        &["grantor", "grantee", "privilege_type", "is_grantable"],
+    ),
+    ("pg_options_to_table", &["option_name", "option_value"]),
+    ("ts_parse", &["tokid", "token"]),
+    ("ts_token_type", &["tokid", "alias", "description"]),
+    (
+        "ts_debug",
+        &[
+            "alias",
+            "description",
+            "token",
+            "dictionaries",
+            "dictionary",
+            "lexemes",
+        ],
+    ),
+    (
+        "pg_get_keywords",
+        &["word", "catcode", "barelabel", "catdesc", "baredesc"],
+    ),
+];
+
 fn srf_kind(n: &Node) -> Option<Kind> {
     let Some(N::FuncCall(f)) = n.node.as_ref() else {
         return None;
@@ -57,6 +85,14 @@ fn srf_kind(n: &Node) -> Option<Kind> {
         return None;
     }
     let name = func_name(f)?;
+    if !correlated::user_function_named(&name) {
+        if let Some((_, fields)) = BUILTIN_RECORD_SRFS.iter().find(|(n, _)| *n == name) {
+            return Some(Kind::Record {
+                fields: fields.iter().map(|f| (*f).to_string()).collect(),
+                rowtype: None,
+            });
+        }
+    }
     if JSON_EACH.contains(&name.as_str()) {
         return Some(Kind::Record {
             fields: vec!["key".into(), "value".into()],
