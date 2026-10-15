@@ -39,7 +39,7 @@ pub const OP_REPLY: i32 = 1;
 pub const OP_QUERY: i32 = 2004;
 /// `OP_GET_MORE` — legacy getMore opcode (not parsed; pymongo uses `OP_MSG`).
 pub const OP_GET_MORE: i32 = 2005;
-/// `OP_COMPRESSED` — compressed-message wrapper (not supported).
+/// `OP_COMPRESSED` — the compressed-message wrapper (see [`compression`]).
 pub const OP_COMPRESSED: i32 = 2012;
 /// `OP_MSG` — the modern opcode; everything after the handshake.
 pub const OP_MSG: i32 = 2013;
@@ -60,6 +60,9 @@ pub const MAX_BSON_OBJECT_SIZE: i32 = 16 * 1024 * 1024;
 
 /// Minimum BSON document length: a 4-byte length prefix + a 1-byte terminator.
 const MIN_BSON_DOC_LEN: i32 = 5;
+
+pub mod compression;
+pub use compression::{compress_frame, parse_op_compressed, Compressor, OpCompressed};
 
 /// A wire-protocol parse failure, split into recoverable and fatal (see the
 /// module docs). `Display` text is internal; the connection loop shapes the

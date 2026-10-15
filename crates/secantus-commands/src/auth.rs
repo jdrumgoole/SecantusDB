@@ -93,6 +93,9 @@ pub struct ConnectionAuth {
     /// Whether this connection has had a `hello` answered: the driver's
     /// `client` metadata may come only with the first.
     pub hello_seen: bool,
+    /// The compressors the last `hello` that named any settled on, in the
+    /// client's order; answered again by every `hello` that names none.
+    pub compressors: Vec<String>,
     /// The address the client connected from (`whatsmyuri`), set by the
     /// accept loop.
     pub peer_address: Option<String>,
@@ -116,6 +119,7 @@ impl ConnectionAuth {
             effective_roles: Vec::new(),
             client_metadata: None,
             hello_seen: false,
+            compressors: Vec::new(),
             peer_address: None,
             client_uuid: rand::random(),
             peer_loopback: false,

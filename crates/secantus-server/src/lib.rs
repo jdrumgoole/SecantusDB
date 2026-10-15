@@ -38,7 +38,8 @@ use secantus_commands::{
     Storage,
 };
 use secantus_wire::{
-    build_op_msg_reply, build_op_reply, Header, Op, OpMsg, WireError, HEADER_SIZE,
+    build_op_msg_reply, build_op_reply, compress_frame, parse_op_compressed, Compressor, Header,
+    Op, OpMsg, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE, OP_COMPRESSED,
     OP_MSG_FLAG_EXHAUST_ALLOWED, OP_MSG_FLAG_MORE_TO_COME,
 };
 
@@ -611,6 +612,36 @@ fn serve<S: Read + Write>(
             ReadOutcome::Closed => return Ok(()),
         }
 
+        // OP_COMPRESSED: unwrap it, and answer under the same compressor. The
+        // declared size is bounded before anything is allocated for it, and
+        // any fault in the wrapper drops the connection, as mongod does.
+        let mut req = Inbound {
+            request_id: header.request_id,
+            compressor: None,
+        };
+        let _inflated_budget;
+        let (header, body) = if header.op_code == OP_COMPRESSED {
+            let wrapped = match parse_op_compressed(&body) {
+                Ok(w) => w,
+                Err(_) => return Ok(()),
+            };
+            // A size out of bounds is refused by `decompress` before it
+            // allocates; only a size it may honour is reserved.
+            if (1..=MAX_MESSAGE_SIZE).contains(&wrapped.uncompressed_size) {
+                _inflated_budget = shared
+                    .alloc_budget
+                    .acquire(wrapped.uncompressed_size as usize);
+            }
+            let (compressor, inflated) = match wrapped.decompress() {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            };
+            req.compressor = Some(compressor);
+            (wrapped.original_header(&header), inflated)
+        } else {
+            (header, body)
+        };
+
         match secantus_wire::parse_body(header.op_code, &body) {
             Ok(Op::Msg(msg)) => {
                 let more_to_come = msg.flags & OP_MSG_FLAG_MORE_TO_COME != 0;
@@ -619,7 +650,7 @@ fn serve<S: Read + Write>(
                     Ok(d) => d,
                     Err(e) => {
                         // A kind-0/kind-1 doc failed BSON validation — recoverable.
-                        send_bad_value(stream, &header, shared, &e)?;
+                        send_bad_value(stream, &req, shared, &e)?;
                         continue;
                     }
                 };
@@ -659,7 +690,7 @@ fn serve<S: Read + Write>(
                     // wire per frame — no decode→re-encode of the batch.
                     if !stream_exhaust_getmore(
                         stream,
-                        &header,
+                        &req,
                         shared,
                         &request,
                         conn_id,
@@ -682,7 +713,7 @@ fn serve<S: Read + Write>(
                     // unexpectedly" on teardown.
                     if !stream_awaitable_hello(
                         stream,
-                        &header,
+                        &req,
                         shared,
                         &request,
                         conn_id,
@@ -727,9 +758,9 @@ fn serve<S: Read + Write>(
                     } else {
                         reply
                     };
-                    write_op_msg(stream, &header, shared, &reply, None)?;
+                    write_op_msg(stream, &req, shared, &reply, None)?;
                 } else {
-                    write_op_msg(stream, &header, shared, &reply, pending.as_ref())?;
+                    write_op_msg(stream, &req, shared, &reply, pending.as_ref())?;
                 }
             }
             Ok(Op::Query(query)) => {
@@ -740,7 +771,7 @@ fn serve<S: Read + Write>(
                     Err(e) => {
                         send_bad_value(
                             stream,
-                            &header,
+                            &req,
                             shared,
                             &WireError::MalformedBody(e.to_string()),
                         )?;
@@ -759,10 +790,10 @@ fn serve<S: Read + Write>(
                 if ctx.close_connection {
                     return Ok(());
                 }
-                write_op_reply(stream, &header, shared, &reply)?;
+                write_op_reply(stream, &req, shared, &reply)?;
             }
             Err(e) if e.is_recoverable() => {
-                send_bad_value(stream, &header, shared, &e)?;
+                send_bad_value(stream, &req, shared, &e)?;
             }
             // Fatal protocol fault (unsupported op_code, etc.) — drop.
             Err(_) => return Ok(()),
@@ -1054,21 +1085,50 @@ fn db_from_namespace(ns: &str) -> String {
     }
 }
 
+/// The request a reply answers: its id, and the compressor it arrived under.
+/// mongod answers a compressed request compressed, by the same compressor, on
+/// every frame it sends for it -- an exhaust stream's too.
+#[derive(Debug, Clone, Copy)]
+struct Inbound {
+    request_id: i32,
+    compressor: Option<Compressor>,
+}
+
+/// Write one reply frame, compressed when the request was.
+fn send_frame<S: Write>(
+    stream: &mut S,
+    req: &Inbound,
+    shared: &Arc<Shared>,
+    frame: &[u8],
+) -> io::Result<()> {
+    match req.compressor {
+        None => {
+            shared.top_stats.count_reply(frame.len());
+            stream.write_all(frame)
+        }
+        Some(compressor) => {
+            let wrapped = compress_frame(frame, compressor)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            shared.top_stats.count_reply(wrapped.len());
+            stream.write_all(&wrapped)
+        }
+    }
+}
+
 fn next_reply_id(shared: &Arc<Shared>) -> i32 {
     shared.next_reply_id.fetch_add(1, Ordering::SeqCst) as i32
 }
 
 fn write_op_msg<S: Write>(
     stream: &mut S,
-    header: &Header,
+    req: &Inbound,
     shared: &Arc<Shared>,
     reply: &Document,
     batch: Option<&PendingBatch>,
 ) -> io::Result<()> {
     let body_bytes = cursor_or_plain_body(reply, batch)?;
-    let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, 0);
-    shared.top_stats.count_reply(frame.len());
-    stream.write_all(&frame)
+    let frame = build_op_msg_reply(req.request_id, next_reply_id(shared), &body_bytes, 0);
+    send_frame(stream, req, shared, &frame)
 }
 
 /// The reply body bytes: when a `PendingBatch` is present the batch blobs are
@@ -1094,7 +1154,7 @@ fn cursor_or_plain_body(reply: &Document, batch: Option<&PendingBatch>) -> io::R
 /// exhaust-stream batch).
 fn write_op_msg_flags<S: Write>(
     stream: &mut S,
-    header: &Header,
+    req: &Inbound,
     shared: &Arc<Shared>,
     reply: &Document,
     flags: u32,
@@ -1103,9 +1163,8 @@ fn write_op_msg_flags<S: Write>(
     reply
         .to_writer(&mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body_bytes, flags);
-    shared.top_stats.count_reply(frame.len());
-    stream.write_all(&frame)
+    let frame = build_op_msg_reply(req.request_id, next_reply_id(shared), &body_bytes, flags);
+    send_frame(stream, req, shared, &frame)
 }
 
 /// Stream the rest of an exhaust cursor over one socket. Called when a getMore
@@ -1120,7 +1179,7 @@ fn write_op_msg_flags<S: Write>(
 #[allow(clippy::too_many_arguments)]
 fn stream_exhaust_getmore<S: Write>(
     stream: &mut S,
-    header: &Header,
+    req: &Inbound,
     shared: &Arc<Shared>,
     request: &Document,
     conn_id: i64,
@@ -1151,9 +1210,8 @@ fn stream_exhaust_getmore<S: Write>(
      -> io::Result<bool> {
         let flags = if more { OP_MSG_FLAG_MORE_TO_COME } else { 0 };
         let body = cursor_or_plain_body(doc, pending)?;
-        let frame = build_op_msg_reply(header.request_id, next_reply_id(shared), &body, flags);
-        shared.top_stats.count_reply(frame.len());
-        match stream.write_all(&frame) {
+        let frame = build_op_msg_reply(req.request_id, next_reply_id(shared), &body, flags);
+        match send_frame(stream, req, shared, &frame) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -1314,7 +1372,7 @@ fn await_hello_reply(shared: &Arc<Shared>, request: &Document, counter_at_entry:
 #[allow(clippy::too_many_arguments)]
 fn stream_awaitable_hello<S: Read + Write>(
     stream: &mut S,
-    header: &Header,
+    req: &Inbound,
     shared: &Arc<Shared>,
     request: &Document,
     conn_id: i64,
@@ -1339,14 +1397,7 @@ fn stream_awaitable_hello<S: Read + Write>(
     if !secantus_commands::handshake::awaitable_topology_is_current(
         request,
         topology_counter_at_send,
-    ) && write_op_msg_flags(
-        stream,
-        header,
-        shared,
-        &first_reply,
-        OP_MSG_FLAG_MORE_TO_COME,
-    )
-    .is_err()
+    ) && write_op_msg_flags(stream, req, shared, &first_reply, OP_MSG_FLAG_MORE_TO_COME).is_err()
     {
         return Ok(false);
     }
@@ -1360,7 +1411,7 @@ fn stream_awaitable_hello<S: Read + Write>(
         let deadline = Instant::now() + Duration::from_millis(max_await_ms);
         loop {
             if shared.stop.load(Ordering::SeqCst) {
-                let _ = write_op_msg_flags(stream, header, shared, &first_reply, 0);
+                let _ = write_op_msg_flags(stream, req, shared, &first_reply, 0);
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -1399,7 +1450,7 @@ fn stream_awaitable_hello<S: Read + Write>(
             return Ok(false);
         }
         topology_counter_at_send = shared.step_down.topology_counter();
-        if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
+        if write_op_msg_flags(stream, req, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
             return Ok(false);
         }
     }
@@ -1407,7 +1458,7 @@ fn stream_awaitable_hello<S: Read + Write>(
 
 fn write_op_reply<S: Write>(
     stream: &mut S,
-    header: &Header,
+    req: &Inbound,
     shared: &Arc<Shared>,
     reply: &Document,
 ) -> io::Result<()> {
@@ -1416,15 +1467,14 @@ fn write_op_reply<S: Write>(
         .to_writer(&mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_reply(
-        header.request_id,
+        req.request_id,
         next_reply_id(shared),
         &[&body_bytes],
         0,
         0,
         0,
     );
-    shared.top_stats.count_reply(frame.len());
-    stream.write_all(&frame)
+    send_frame(stream, req, shared, &frame)
 }
 
 /// Reply to a malformed-body request with `{ok:0, code:2 BadValue}` so the
@@ -1432,7 +1482,7 @@ fn write_op_reply<S: Write>(
 /// carries "invalid BSON" to match what `tests/test_wire_malformed.py` asserts.
 fn send_bad_value<S: Write>(
     stream: &mut S,
-    header: &Header,
+    req: &Inbound,
     shared: &Arc<Shared>,
     err: &WireError,
 ) -> io::Result<()> {
@@ -1442,7 +1492,7 @@ fn send_bad_value<S: Write>(
         "code": 2,
         "codeName": "BadValue",
     };
-    write_op_msg(stream, header, shared, &reply, None)
+    write_op_msg(stream, req, shared, &reply, None)
 }
 
 enum ReadOutcome {

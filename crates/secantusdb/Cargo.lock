@@ -307,6 +307,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "556e016178bb5662a08681bbe0f00f8e17631781a4dfc8c45e466e4b185ec27f"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1496,6 +1498,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.2",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1734,6 +1746,7 @@ dependencies = [
  "bson",
  "derive-where",
  "derive_more",
+ "flate2",
  "futures-core",
  "futures-io",
  "futures-util",
@@ -1756,6 +1769,7 @@ dependencies = [
  "serde_with",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "snap",
  "socket2",
  "stringprep",
  "strsim",
@@ -1767,6 +1781,7 @@ dependencies = [
  "typed-builder",
  "uuid",
  "webpki-roots",
+ "zstd",
 ]
 
 [[package]]
@@ -2367,6 +2382,7 @@ dependencies = [
  "secantus-server",
  "secantus-storage",
  "secantus-storage-adapter",
+ "secantus-wire",
  "tokio",
 ]
 
@@ -2413,6 +2429,9 @@ name = "secantus-wire"
 version = "0.5.3-beta.195"
 dependencies = [
  "bson",
+ "flate2",
+ "snap",
+ "zstd",
 ]
 
 [[package]]
@@ -2621,6 +2640,12 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "socket2"
@@ -3673,3 +3698,31 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.1+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

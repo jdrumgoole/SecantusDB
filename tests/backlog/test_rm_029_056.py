@@ -238,7 +238,7 @@ def test_profile_level_creates_system_profile(rust_mongo: Any) -> None:
     assert got == [(True, ("ok", True))] * 2
 
 
-@pytest.mark.backlog("RM-039")
+@pytest.mark.backlog_fixed("RM-039")
 def test_hello_names_compressors(rust_mongo: Any) -> None:
     """mongod 8.2.11 answers a `compression` list with the ones it speaks."""
     reply = rust_mongo.admin.command("hello", compression=["zlib", "snappy", "zstd"])
