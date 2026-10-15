@@ -628,6 +628,27 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
     if catalog.is_empty() {
         return;
     }
+    // `{_id: <value>}` with no hint or sort is a lookup in the `_id` index
+    // for every command (mongod's express and IDHACK plans), when the value
+    // is one no collation compares differently.
+    if ask.hint.is_none()
+        && ask.sort.is_none_or(|s| s.is_empty())
+        && ask.filter.len() == 1
+        && ask.filter.get("_id").is_some_and(|v| {
+            !matches!(
+                v,
+                Bson::Document(_)
+                    | Bson::Array(_)
+                    | Bson::String(_)
+                    | Bson::Symbol(_)
+                    | Bson::RegularExpression(_)
+            )
+        })
+        && catalog.iter().any(|ix| ix.name == "_id_")
+    {
+        storage.record_index_use(ask.db, ask.coll, &["_id_".to_string()]);
+        return;
+    }
     let canonical = parsed::parsed_query(ask.filter);
     let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
     let Ok(hint) = resolve_hint(ask.hint, &catalog) else {

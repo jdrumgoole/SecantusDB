@@ -570,3 +570,164 @@ fn index_stats_restart_from_nothing() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The planner's catalog is cached between reads; a new index is counted by
+/// the next read that uses it, and a dropped one is not.
+#[test]
+fn index_use_follows_index_creation_and_drop() {
+    with_wt(|c| {
+        on(
+            "t",
+            &doc! {"insert": "c", "documents": [{"_id": 1, "a": 1, "b": 1}]},
+            c,
+        );
+        // Fill the cache with a catalog that has only `_id_`.
+        on("t", &doc! {"find": "c", "filter": {"a": 1}}, c);
+        on("t", &doc! {"find": "c", "filter": {"a": 1}}, c);
+        on(
+            "t",
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"a": 1}, "name": "a_1"}]},
+            c,
+        );
+        on("t", &doc! {"find": "c", "filter": {"a": 1}}, c);
+        let ops = |c: &mut CommandContext| -> Vec<(String, i64)> {
+            let mut got: Vec<(String, i64)> = batch(&on(
+                "t",
+                &doc! {"aggregate": "c", "pipeline": [{"$indexStats": {}}], "cursor": {}},
+                c,
+            ))
+            .iter()
+            .map(|s| {
+                (
+                    s.get_str("name").unwrap().to_string(),
+                    s.get_document("accesses").unwrap().get_i64("ops").unwrap(),
+                )
+            })
+            .collect();
+            got.sort();
+            got
+        };
+        assert_eq!(ops(c), [("_id_".into(), 0), ("a_1".into(), 1)]);
+
+        on("t", &doc! {"dropIndexes": "c", "index": "a_1"}, c);
+        on(
+            "t",
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"b": 1}, "name": "b_1"}]},
+            c,
+        );
+        on("t", &doc! {"find": "c", "filter": {"a": 1}}, c);
+        on("t", &doc! {"find": "c", "filter": {"b": 1}}, c);
+        // `a_1` is gone and nothing reads it; `b_1` is read once.
+        assert_eq!(ops(c), [("_id_".into(), 0), ("b_1".into(), 1)]);
+        // A lookup by `_id` reads the `_id` index.
+        on("t", &doc! {"find": "c", "filter": {"_id": 1}}, c);
+        on(
+            "t",
+            &doc! {"delete": "c", "deletes": [{"q": {"_id": 7}, "limit": 1}]},
+            c,
+        );
+        assert_eq!(ops(c), [("_id_".into(), 2), ("b_1".into(), 1)]);
+    });
+}
+
+/// An insert that makes an index multikey is not DDL, and the cached
+/// catalog follows it: the multikey paths the planner reads are the ones
+/// `explain` (which reads the documents themselves) reports.
+#[test]
+fn planner_catalog_follows_an_index_turning_multikey() {
+    with_wt(|c| {
+        on(
+            "t",
+            &doc! {"insert": "c", "documents": [{"_id": 1, "a": 1, "b": 1}]},
+            c,
+        );
+        on(
+            "t",
+            &doc! {"createIndexes": "c", "indexes": [{"key": {"a": 1, "b": 1}, "name": "ab"}]},
+            c,
+        );
+        let cached_paths = |c: &mut CommandContext| -> Vec<Vec<String>> {
+            let storage = c.storage.clone().unwrap();
+            storage
+                .planner_indexes("t", "c")
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .find(|(spec, _)| spec.get_str("name") == Ok("ab"))
+                .unwrap()
+                .1
+        };
+        let explained = |c: &mut CommandContext| -> (bool, Document) {
+            let reply = on(
+                "t",
+                &doc! {"explain": {"find": "c", "filter": {"a": 1, "b": 1}}},
+                c,
+            );
+            let mut stage = reply
+                .get_document("queryPlanner")
+                .unwrap()
+                .get_document("winningPlan")
+                .unwrap()
+                .clone();
+            while stage.get_str("stage") != Ok("IXSCAN") {
+                stage = stage.get_document("inputStage").unwrap().clone();
+            }
+            (
+                stage.get_bool("isMultiKey").unwrap(),
+                stage.get_document("multiKeyPaths").unwrap().clone(),
+            )
+        };
+        // Read (and cache) the catalog before the change.
+        on("t", &doc! {"find": "c", "filter": {"a": 1, "b": 1}}, c);
+        assert_eq!(cached_paths(c), vec![Vec::<String>::new(), vec![]]);
+        assert_eq!(explained(c), (false, doc! {"a": [], "b": []}));
+
+        on(
+            "t",
+            &doc! {"insert": "c", "documents": [{"_id": 2, "a": 1, "b": [1, 2]}]},
+            c,
+        );
+        on("t", &doc! {"find": "c", "filter": {"a": 1, "b": 1}}, c);
+        assert_eq!(cached_paths(c), vec![vec![], vec!["b".to_string()]]);
+        assert_eq!(explained(c), (true, doc! {"a": [], "b": ["b"]}));
+
+        // A path that becomes an array later, with the flag already set.
+        on(
+            "t",
+            &doc! {"insert": "c", "documents": [{"_id": 3, "a": [5, 6], "b": 1}]},
+            c,
+        );
+        assert_eq!(
+            cached_paths(c),
+            vec![vec!["a".to_string()], vec!["b".to_string()]]
+        );
+        assert_eq!(explained(c), (true, doc! {"a": ["a"], "b": ["b"]}));
+    });
+}
+
+/// Every write of what the planner reads is released once it is visible,
+/// so the cache is used again: after DDL, a multikey insert, a transaction
+/// and its rollback, the generation settles. (Other tests in this binary
+/// write too, so it is waited for, not read once.)
+#[test]
+fn planner_generation_settles() {
+    with_wt(|c| {
+        seed(c);
+        on(
+            "t",
+            &doc! {"insert": "c", "documents": [{"_id": 50, "b": [1]}]},
+            c,
+        );
+        on("t", &doc! {"dropIndexes": "c", "index": "b_1"}, c);
+        on("t", &doc! {"drop": "v"}, c);
+        on("t", &doc! {"renameCollection": "t.c", "to": "t.d"}, c);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while secantus_storage::planner_generation().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a planner write was never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
