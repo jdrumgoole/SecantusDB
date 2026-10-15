@@ -324,9 +324,25 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             pos(toks.iter().find(|t| t.text == lit)?.start)
         }
         "42704" => {
-            let name = quoted_between(m, "type ")?;
-            let name = name.rsplit('.').next()?;
-            pos(toks[ident_at(name)?].start)
+            let full = quoted_between(m, "type ")?;
+            let name = full.rsplit('.').next()?;
+            // A type read from a string (`'nosuch'::regtype`): at the
+            // literal.
+            let lit = format!("'{}'", full.replace('\'', "''"));
+            if let Some(i) = toks.windows(3).position(|w| {
+                w[0].text == lit && w[1].text == "::" && w[2].text.eq_ignore_ascii_case("regtype")
+            }) {
+                return pos(toks[i].start);
+            }
+            let i = ident_at(name)?;
+            // A qualified name (`public.nosuch`): at its first part, as
+            // PostgreSQL places it.
+            let i = if i >= 2 && toks[i - 1].text == "." {
+                i - 2
+            } else {
+                i
+            };
+            pos(toks[i].start)
         }
         // A procedure called in an expression: at its name.
         "42809" if m.ends_with(" is a procedure") => {

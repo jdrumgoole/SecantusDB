@@ -34,6 +34,11 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   (`pgtypes::user_type_key`). Fixes RP-038
   (`tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int`).
 
+- A 42704 for an unknown type is placed at a qualified name's first part
+  (`'a'::public.nosuch` at 13) and at the literal a `regtype` reads
+  (`'nosuch'::regtype` at 8), as PostgreSQL places them. Part of RP-041
+  (`tests/backlog/test_rust_postgres_gaps.py::test_unknown_type_error_position`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,

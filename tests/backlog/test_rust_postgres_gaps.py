@@ -757,7 +757,7 @@ def test_enum_comparison_reads_its_literal_at_plan_time(pg: Any) -> None:
     assert got[:2] == ("err", "22P02")
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 @pytest.mark.parametrize(
     ("sql", "expected"),
     [
