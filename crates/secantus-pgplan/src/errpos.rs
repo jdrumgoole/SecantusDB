@@ -450,6 +450,7 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             };
             if toks.get(i + 1).is_some_and(|t| t.text == "::")
                 && toks.get(i + 2).is_some_and(|t| string_type(t.text))
+                && !toks.get(i + 3).is_some_and(|t| t.text.starts_with('['))
             {
                 return None;
             }

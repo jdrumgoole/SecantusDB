@@ -382,17 +382,6 @@ one beside it.
   Backlog-ID: RP-038
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
 
-- [ ] **RUST pgserver: two untyped array literals PostgreSQL reads
-  otherwise (2026-10-15).** Each measured on 15.19:
-  - `2 = any('{1,x}')` is 42883 `operator does not exist: int4 = text`;
-    PostgreSQL resolves the untyped literal to `int[]` from the other
-    operand and reads it, 22P02 `invalid input syntax for type integer:
-    "x"` at the literal.
-  - `'{1,{2,x}}'::int[]` is 22P02 for the element `x`; PostgreSQL checks
-    the dimensions first, 22P02 `malformed array literal: "{1,{2,x}}"`.
-  Backlog-ID: RP-039
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_untyped_array_literals
-
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
   aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's

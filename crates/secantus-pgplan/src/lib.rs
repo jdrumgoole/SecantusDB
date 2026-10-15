@@ -29267,6 +29267,16 @@ fn array_rectangular(items: &[Bson]) -> bool {
 const STRUCTURAL: &str = "unexpected";
 
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
+    // `array_in` checks the literal's structure before it reads an element
+    // (`'{1,{2,x}}'::int[]` is `malformed array literal`, not `"x"`): the
+    // same parse with text elements, which only the structure can fail.
+    if !matches!(element_type, "text" | "varchar" | "bpchar" | "name") {
+        if let Err(e @ Error::InvalidText(_)) = parse_array(text, "text") {
+            if e.to_string().starts_with("malformed array literal") {
+                return Err(e);
+            }
+        }
+    }
     let malformed = || Error::InvalidText(format!("malformed array literal: \"{text}\""));
     let mut p = ArrayParser {
         chars: text.chars().collect(),
@@ -38182,15 +38192,16 @@ fn lower_distinct(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document
 /// without a type, so it arrives as the array literal TEXT `{a,b}`; parse it
 /// into a real array using the scalar side's element type. A non-`{...}` value
 /// (a properly typed array, or a genuine scalar) is returned unchanged.
-fn coerce_any_array(rhs: Bson, element_type: &str) -> Bson {
+/// An untyped array literal on the right of `x op ANY / ALL`, read as an
+/// array of `x`'s type -- PostgreSQL resolves it so, and reports an element
+/// that does not read (`2 = any('{1,x}')` is 22P02 for `"x"`, 15.19).
+fn coerce_any_array(rhs: Bson, element_type: &str) -> Result<Bson> {
     if let Bson::String(s) = &rhs {
         if s.starts_with('{') {
-            if let Ok(arr) = parse_array(s, element_type) {
-                return arrays::strip(&arr);
-            }
+            return parse_array(s, element_type).map(|arr| arrays::strip(&arr));
         }
     }
-    rhs
+    Ok(rhs)
 }
 
 /// The MQL comparison operator for a SQL scalar comparison operator.
@@ -38223,7 +38234,7 @@ fn eval_scalar_array_const(op: &str, lhs: Bson, rhs: Bson, is_any: bool) -> Resu
         }
         return Ok(Bson::Null);
     }
-    let rhs = coerce_any_array(rhs, inferred_type(&lhs));
+    let rhs = coerce_any_array(rhs, inferred_type(&lhs))?;
     let elems = match rhs {
         Bson::Array(v) => v,
         Bson::Null => return Ok(Bson::Null),
@@ -38285,7 +38296,7 @@ fn lower_scalar_array(
     if elem_type == "jsonb" || field_type(def, &field) == Some("jsonb") {
         return Err(Error::Unsupported("a jsonb comparison".into()));
     }
-    let rhs = coerce_any_array(rhs, elem_type);
+    let rhs = coerce_any_array(rhs, elem_type)?;
     let elems = match rhs {
         Bson::Array(v) => v,
         // A NULL array (a genuine NULL operand, or an unbound parameter at

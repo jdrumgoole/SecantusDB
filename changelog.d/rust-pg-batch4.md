@@ -26,6 +26,14 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[array-element-position]`,
   `[record-input]`).
 
+- An untyped array literal under `x op ANY / ALL` is read as an array of
+  `x`'s type and an element that does not read is 22P02 at the literal
+  (`2 = any('{1,x}')`), where it had fallen back to text and answered
+  42883 `operator does not exist: int4 = text`. A literal's structure is
+  checked before its elements (`'{1,{2,x}}'::int[]` is `malformed array
+  literal`). Fixes RP-039
+  (`tests/backlog/test_rust_postgres_gaps.py::test_untyped_array_literals`).
+
 #### Added
 
 - `pg_timezone_names` and `pg_timezone_abbrevs`, as the views and as the
@@ -37,4 +45,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   2026-10-15). Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[timezone-names]`,
   `[timezone-abbrevs]`).
-- Corpora `timezone_views`, `row_type_fields` and `literal_element_positions`.
+- Corpora `timezone_views`, `row_type_fields`, `literal_element_positions` and `array_literal_resolution`.

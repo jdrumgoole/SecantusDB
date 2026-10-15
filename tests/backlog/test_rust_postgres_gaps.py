@@ -722,7 +722,7 @@ def test_null_tsquery_sends_no_notice(pg: Any) -> None:
     assert notices == []
 
 
-@pytest.mark.backlog("RP-039")
+@pytest.mark.backlog_fixed("RP-039")
 @pytest.mark.parametrize(
     "sql",
     ["select 1 where 2 = any('{1,x}')", "select '{1,{2,x}}'::int[]"],
