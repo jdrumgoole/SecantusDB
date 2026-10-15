@@ -492,6 +492,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // is kept (it re-applies the exact distance filter, so the output
                 // is identical; only the fetched set shrinks). Mirrors the Python
                 // `_geo_near_index_filter` lift.
+                // A hint must name an index the leading `$geoNear` reads.
+                if let (Some(spec), Some(hint)) = (
+                    pipeline
+                        .first()
+                        .and_then(Bson::as_document)
+                        .and_then(|d| d.get("$geoNear")),
+                    hint,
+                ) {
+                    check_geo_near_hint(spec, hint, &ctx.db_name, c, storage)?;
+                }
                 let geonear_candidate = pipeline
                     .first()
                     .and_then(Bson::as_document)
@@ -2429,33 +2439,30 @@ pub(crate) fn collection_documents(
     )
 }
 
-/// Conservative `$geoWithin` candidate filter for a leading bounded `$geoNear`
-/// (Rust mirror of `aggregate._geo_near_index_filter`): `Some(filter)` when the
-/// stage has a numeric `maxDistance` and a matching `2d`/`2dsphere` index on
-/// `key`, else `None` (fall back to the full scan). The radius is inflated by a
-/// tiny epsilon so the candidate set is a strict superset of the exact
-/// within-`maxDistance` set — the `$geoNear` stage then re-applies the exact
-/// filter, so the output is byte-for-byte identical, only the fetched set shrinks.
-/// The candidate shape (`$centerSphere`/`$center`) must match the index type.
+/// The candidate fetch for a leading bounded `$geoNear`: `Some(filter)`
+/// holding every document the stage can return (it re-applies the exact
+/// distance bounds, so the output is the same; only the documents read
+/// shrink), when the stage has a numeric `maxDistance` and a `2d` or
+/// `2dsphere` index on `key` of the kind its point reads; else `None` (every
+/// document is read).
+///
+/// The stage measures a line or a polygon by its nearest point, so on the
+/// sphere the candidates are what INTERSECTS the disc of the distance, not
+/// what lies within it: a `$geoIntersects` with a polygon drawn around the
+/// disc, its edges tangent to a slightly larger circle. In the plane a `2d`
+/// index holds points only, and a `$center` holds every point inside.
 fn geo_near_index_filter(
     spec: &Bson,
     db: &str,
     coll: Option<&str>,
     storage: &dyn crate::storage::Storage,
 ) -> Option<Document> {
-    const EARTH_RADIUS_METERS: f64 = 6_378_100.0; // matches secantus_core::geo
-                                                  // The stage measures a line or a polygon by its nearest point, and a
-                                                  // `$centerSphere` holds one only when every vertex is inside: the
-                                                  // candidates would leave out documents the stage returns. Every document
-                                                  // is read until there is a candidate shape that covers them.
-    if spec.as_document().is_some() {
-        return None;
-    }
+    const EARTH_RADIUS_METERS: f64 = secantus_core::geoshape::EARTH_RADIUS_METERS;
     let spec = spec.as_document()?;
     let max_distance = match spec.get("maxDistance") {
         Some(Bson::Int32(n)) => *n as f64,
         Some(Bson::Int64(n)) => *n as f64,
-        Some(Bson::Double(d)) => *d,
+        Some(Bson::Double(d)) if d.is_finite() && *d >= 0.0 => *d,
         _ => return None, // no numeric maxDistance -> no optimization
     };
     let coll = coll?;
@@ -2485,18 +2492,24 @@ fn geo_near_index_filter(
         .iter()
         .find(|(f, _)| *f == key)
         .map(|(_, t)| t.as_str())?;
-    // Parse `near` -> (spherical, cx, cy).
-    let (spherical, cx, cy) = match spec.get("near") {
+    // Parse `near` -> (spherical, the distance in radians on the sphere, cx, cy).
+    let (spherical, radians, cx, cy) = match spec.get("near") {
         Some(Bson::Document(d)) if d.get_str("type").ok() == Some("Point") => {
             let coords = d.get_array("coordinates").ok()?;
             if coords.len() != 2 {
                 return None;
             }
-            (true, bson_f64(&coords[0])?, bson_f64(&coords[1])?)
+            (
+                true,
+                max_distance / EARTH_RADIUS_METERS,
+                bson_f64(&coords[0])?,
+                bson_f64(&coords[1])?,
+            )
         }
         Some(Bson::Array(a)) if a.len() == 2 => {
+            // A legacy point on the sphere gives its distance in radians.
             let sph = spec.get_bool("spherical").unwrap_or(false);
-            (sph, bson_f64(&a[0])?, bson_f64(&a[1])?)
+            (sph, max_distance, bson_f64(&a[0])?, bson_f64(&a[1])?)
         }
         _ => return None,
     };
@@ -2507,16 +2520,57 @@ fn geo_near_index_filter(
     if !spherical && idx_type != "2d" {
         return None;
     }
-    let radius = max_distance * (1.0 + 1e-9); // inflate -> guaranteed superset
-    let center = Bson::Array(vec![Bson::Double(cx), Bson::Double(cy)]);
     let inner = if spherical {
-        doc! { "$centerSphere": Bson::Array(vec![center, Bson::Double(radius / EARTH_RADIUS_METERS)]) }
+        let ring = disc_polygon(cx, cy, radians)?;
+        doc! { "$geoIntersects": { "$geometry": { "type": "Polygon", "coordinates": [ring] } } }
     } else {
-        doc! { "$center": Bson::Array(vec![center, Bson::Double(radius)]) }
+        let radius = max_distance * (1.0 + 1e-9); // inflate -> guaranteed superset
+        let center = Bson::Array(vec![Bson::Double(cx), Bson::Double(cy)]);
+        doc! { "$geoWithin": { "$center": Bson::Array(vec![center, Bson::Double(radius)]) } }
     };
     let mut filter = Document::new();
-    filter.insert(key, doc! { "$geoWithin": inner });
+    filter.insert(key, inner);
     Some(filter)
+}
+
+/// A closed ring (`[lng, lat]` pairs) around the disc of `radians` about
+/// `(lng, lat)`: a regular polygon whose edges (great circles) stay outside
+/// a circle a little larger than the disc. `None` when the disc is too large
+/// for a polygon smaller than a hemisphere to hold it.
+fn disc_polygon(lng: f64, lat: f64, radians: f64) -> Option<Vec<Bson>> {
+    const SIDES: usize = 16;
+    // Room for rounding, and for a disc of no size at all.
+    let r = (radians * (1.0 + 1e-6)).max(1e-6) + 1e-9;
+    // A regular polygon whose sides are tangent to the circle of radius r
+    // has its vertices at R with tan(R) = tan(r) / cos(pi / n).
+    let tan_vertex = r.tan() / (std::f64::consts::PI / SIDES as f64).cos();
+    if !(r < 1.2 && tan_vertex.is_finite() && tan_vertex > 0.0) {
+        return None;
+    }
+    let d = tan_vertex.atan();
+    let (lat1, lng1) = (lat.to_radians(), lng.to_radians());
+    let mut ring = Vec::with_capacity(SIDES + 1);
+    for i in 0..SIDES {
+        let bearing = 2.0 * std::f64::consts::PI * i as f64 / SIDES as f64;
+        let lat2 = (lat1.sin() * d.cos() + lat1.cos() * d.sin() * bearing.cos())
+            .clamp(-1.0, 1.0)
+            .asin();
+        let lng2 =
+            lng1 + (bearing.sin() * d.sin() * lat1.cos()).atan2(d.cos() - lat1.sin() * lat2.sin());
+        let mut lng_deg = lng2.to_degrees();
+        while lng_deg > 180.0 {
+            lng_deg -= 360.0;
+        }
+        while lng_deg < -180.0 {
+            lng_deg += 360.0;
+        }
+        ring.push(Bson::Array(vec![
+            Bson::Double(lng_deg),
+            Bson::Double(lat2.to_degrees().clamp(-90.0, 90.0)),
+        ]));
+    }
+    ring.push(ring[0].clone());
+    Some(ring)
 }
 
 /// One `$geoNear` stage as mongod reads it.
@@ -2756,24 +2810,16 @@ fn apply_geo_near(
                 .is_some_and(readable)
         });
     if !indexed {
-        let max = match spec.get("maxDistance").and_then(bson_f64) {
-            Some(m) => crate::crud::fmt_g(m),
-            None => "1.79769e+308".to_string(),
-        };
         return Err(CommandError::new(
             291,
             "NoQueryExecutionPlans",
-            format!(
-                "error processing query: ns={db}.{coll}Tree: {}\nSort: {{}}\nProj: {{}}\nCollation: \
-                 {{ locale: \"simple\" }}\n planner returned error :: caused by :: unable to find \
-                 index for $geoNear query",
-                crate::near::tree(
-                    stage.query,
-                    &format!(
-                        "GEONEAR  field={key} maxdist={max} isNearSphere={}",
-                        i32::from(stage.asked_spherical)
-                    )
-                )
+            geo_near_unplannable(
+                &stage,
+                spec,
+                &key,
+                db,
+                coll,
+                "unable to find index for $geoNear query",
             ),
         ));
     }
@@ -2816,7 +2862,161 @@ fn apply_geo_near(
         scored.push((d, shaped, out));
     }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // mongod's own order: its ring search over the index, which leaves
+    // documents at one distance as its queue does.
+    if let Some(rank) = geo_near_ranks(&stage, &key, db, coll, storage)? {
+        let at = |d: &Document| {
+            d.get("_id")
+                .and_then(|id| secantus_core::sortkey::encode_value(id, None).ok())
+                .and_then(|id| rank.get(&id).copied())
+                .unwrap_or(usize::MAX)
+        };
+        scored.sort_by_key(|(_, _, d)| at(d));
+    }
     Ok(scored.into_iter().map(|(_, _, d)| d).collect())
+}
+
+/// mongod's message for a `$geoNear` it could not plan, for `reason`.
+fn geo_near_unplannable(
+    stage: &GeoNearStage<'_>,
+    spec: &Document,
+    key: &str,
+    db: &str,
+    coll: &str,
+    reason: &str,
+) -> String {
+    let max = match spec.get("maxDistance").and_then(bson_f64) {
+        Some(m) => crate::crud::fmt_g(m),
+        None => "1.79769e+308".to_string(),
+    };
+    format!(
+        "error processing query: ns={db}.{coll}Tree: {}\nSort: {{}}\nProj: {{}}\nCollation: \
+         {{ locale: \"simple\" }}\n planner returned error :: caused by :: {reason}",
+        crate::near::tree(
+            stage.query,
+            &format!(
+                "GEONEAR  field={key} maxdist={max} isNearSphere={}",
+                i32::from(stage.asked_spherical)
+            )
+        )
+    )
+}
+
+/// mongod's refusals of a leading `$geoNear` under the command's `hint`
+/// (measured, 8.2.11): a `$natural` hint is 2, a hint naming no index is 2
+/// with the query, a hint to an index that cannot answer the stage 291.
+fn check_geo_near_hint(
+    spec: &Bson,
+    hint: &Bson,
+    db: &str,
+    coll: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Result<(), CommandError> {
+    let Some(spec) = spec.as_document() else {
+        return Ok(());
+    };
+    if matches!(hint, Bson::Document(d) if d.is_empty()) {
+        return Ok(());
+    }
+    let stage = geo_near_stage(spec)?;
+    let key: String = match stage.key {
+        Some(k) => k.to_string(),
+        None => infer_geo_near_key(db, Some(coll), storage)?,
+    };
+    if matches!(hint, Bson::Document(d) if d.contains_key("$natural")) {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            "geoNear expression not allowed with $natural hint",
+        ));
+    }
+    let specs = storage.list_indexes(db, coll).map_err(command_error)?;
+    let named = specs.iter().find(|s| match hint {
+        Bson::String(name) => s.get_str("name") == Ok(name),
+        Bson::Document(k) => s.get_document("key").is_ok_and(|key| key == k),
+        _ => false,
+    });
+    let Some(named) = named else {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            geo_near_unplannable(
+                &stage,
+                spec,
+                &key,
+                db,
+                coll,
+                "hint provided does not correspond to an existing index",
+            ),
+        ));
+    };
+    let readable = named
+        .get_document("key")
+        .ok()
+        .and_then(|k| k.get_str(&key).ok())
+        .is_some_and(|kind| match kind {
+            "2dsphere" => stage.near.spherical,
+            "2d" => !stage.near.geojson,
+            _ => false,
+        });
+    if readable {
+        return Ok(());
+    }
+    Err(CommandError::new(
+        291,
+        "NoQueryExecutionPlans",
+        geo_near_unplannable(
+            &stage,
+            spec,
+            &key,
+            db,
+            coll,
+            "unable to find index for $geoNear query",
+        ),
+    ))
+}
+
+/// Where each document of the collection comes in mongod's `$geoNear`, by
+/// its `_id`, or `None` when the search is not replayed here.
+fn geo_near_ranks(
+    stage: &GeoNearStage<'_>,
+    key: &str,
+    db: &str,
+    coll: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Result<Option<std::collections::HashMap<Vec<u8>, usize>>, CommandError> {
+    let Some(index) = crate::explain::geo::near_index(storage, db, coll, key, &stage.near)
+        .map_err(command_error)?
+    else {
+        return Ok(None);
+    };
+    let Some(all) = storage
+        .collection_at_most(db, coll, 2000)
+        .map_err(command_error)?
+    else {
+        return Ok(None);
+    };
+    let docs: Option<Vec<Document>> = all
+        .iter()
+        .map(|(_, blob)| secantus_core::bsondoc::from_bytes(blob).ok())
+        .collect();
+    let Some(docs) = docs else {
+        return Ok(None);
+    };
+    let Some(order) = crate::explain::geo::geo_near_order(&index, &stage.near, stage.query, &docs)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        order
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, i)| {
+                let id = docs[i].get("_id")?;
+                Some((secantus_core::sortkey::encode_value(id, None).ok()?, rank))
+            })
+            .collect(),
+    ))
 }
 
 /// The field `$geoNear` measures when the stage names none: that of the
@@ -4322,5 +4522,63 @@ mod malformed_pipeline_tests {
             Bson::Document(doc! {"$count": "n"}),
         ])
         .expect("a valid pipeline must not be rejected");
+    }
+}
+
+#[cfg(test)]
+mod geo_near_candidate_tests {
+    use super::*;
+
+    fn unit(lng: f64, lat: f64) -> [f64; 3] {
+        let (lng, lat) = (lng.to_radians(), lat.to_radians());
+        [lat.cos() * lng.cos(), lat.cos() * lng.sin(), lat.sin()]
+    }
+
+    fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    /// The angle from `p` to the great circle through `a` and `b`.
+    fn to_great_circle(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+        let n = cross(a, b);
+        (dot(p, n).abs() / dot(n, n).sqrt()).asin()
+    }
+
+    /// Every side of the candidate polygon passes outside the disc, so a
+    /// shape that reaches into the disc meets the polygon.
+    #[test]
+    fn the_candidate_polygon_holds_the_disc() {
+        for (lng, lat, r) in [
+            (0.0, 0.0, 0.0157),
+            (179.9, 10.0, 0.3),
+            (-73.9, 40.7, 1e-7),
+            (20.0, 89.0, 0.05),
+            (0.0, -60.0, 1.0),
+        ] {
+            let ring = disc_polygon(lng, lat, r).expect("a polygon");
+            assert_eq!(ring.len(), 17);
+            let centre = unit(lng, lat);
+            let pts: Vec<[f64; 3]> = ring
+                .iter()
+                .map(|p| {
+                    let p = p.as_array().unwrap();
+                    unit(bson_f64(&p[0]).unwrap(), bson_f64(&p[1]).unwrap())
+                })
+                .collect();
+            for w in pts.windows(2) {
+                let d = to_great_circle(centre, w[0], w[1]);
+                assert!(d > r, "a side at {d} from a disc of {r}");
+            }
+        }
+        // Too large for a polygon smaller than a hemisphere.
+        assert!(disc_polygon(0.0, 0.0, 1.3).is_none());
     }
 }

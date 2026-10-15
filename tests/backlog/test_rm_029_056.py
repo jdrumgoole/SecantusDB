@@ -396,7 +396,7 @@ def test_every_cluster_parameter(rust_mongo: Any) -> None:
 POINTS = [(10, 10), (-50, 20), (100, -30), (0.5, 0.5), (-120, 45), (30, -60), (170, 5)]
 
 
-@pytest.mark.backlog("RM-041")
+@pytest.mark.backlog_fixed("RM-041")
 def test_geo_within_in_2dsphere_scan_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod returns a `$geoWithin` over a `2dsphere` index in S2 cell
     order."""
@@ -411,7 +411,7 @@ def test_geo_within_in_2dsphere_scan_order(rust_mongo: Any, mongod: Any) -> None
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-041")
+@pytest.mark.backlog_fixed("RM-041")
 def test_geo_within_in_2d_scan_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod returns a `$geoWithin` over a `2d` index in geohash order."""
     docs = [{"_id": i, "loc": list(p)} for i, p in enumerate(POINTS)]
@@ -423,7 +423,7 @@ def test_geo_within_in_2d_scan_order(rust_mongo: Any, mongod: Any) -> None:
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-041")
+@pytest.mark.backlog_fixed("RM-041")
 def test_near_ties_in_scan_order(rust_mongo: Any, mongod: Any) -> None:
     """Four points at one distance from a `$near`: mongod returns them in its
     scan's order."""
@@ -487,14 +487,14 @@ def _hinted_geo(client: Any) -> Any:
     )
 
 
-@pytest.mark.backlog("RM-044")
+@pytest.mark.backlog_fixed("RM-044")
 def test_hinted_2dsphere_index_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod returns what a hinted `2dsphere` index holds, in its order."""
     command = {"find": "c", "filter": {}, "hint": "g"}
     assert _ids(_hinted_geo(rust_mongo), command) == _ids(_hinted_geo(mongod), command)
 
 
-@pytest.mark.backlog("RM-044")
+@pytest.mark.backlog_fixed("RM-044")
 def test_near_hinted_to_another_index(rust_mongo: Any) -> None:
     """mongod 8.2.11 refuses a `$near` hinted to a non-geo index (291)."""
     near = {"loc": {"$near": {"$geometry": {"type": "Point", "coordinates": [0, 0]}}}}
