@@ -349,3 +349,158 @@ pub(crate) fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
         _ => Err(internal(format!("{name} called in non-aggregate context"))),
     })
 }
+
+/// `in_range(val, base, offset, sub, less)`: a window frame's
+/// `offset PRECEDING` / `FOLLOWING` test, whether `val` lies on the near
+/// side of `base -/+ offset` (`in_range_int4_int4`, `in_range_float8_float8`,
+/// `in_range_numeric_numeric`, `in_range_time_interval`, ...).
+pub(crate) fn in_range(args: &[Bson], types: &[String]) -> Option<Result<Bson>> {
+    if args.len() != 5 {
+        return None;
+    }
+    if args.contains(&Bson::Null) {
+        return Some(Ok(Bson::Null));
+    }
+    let t = |i: usize| types.get(i).map_or("", String::as_str);
+    let bad_size = || {
+        Error::Sqlstate(
+            "22013",
+            "invalid preceding or following size in window function".into(),
+        )
+    };
+    let (sub, less) = match (&args[3], &args[4]) {
+        (Bson::Boolean(s), Bson::Boolean(l)) => (*s, *l),
+        _ => return None,
+    };
+    let near = |val: f64, sum: f64| if less { val <= sum } else { val >= sum };
+    Some((|| -> Result<Bson> {
+        Ok(Bson::Boolean(match (t(0), t(2)) {
+            ("int2" | "int4" | "int8", "int2" | "int4" | "int8") => {
+                let n = |v: &Bson| -> Result<i128> {
+                    value_text(v)
+                        .trim()
+                        .parse()
+                        .map_err(|_| Error::Internal("in_range".into()))
+                };
+                let (val, base, offset) = (n(&args[0])?, n(&args[1])?, n(&args[2])?);
+                if offset < 0 {
+                    return Err(bad_size());
+                }
+                let sum = if sub { base - offset } else { base + offset };
+                if less {
+                    val <= sum
+                } else {
+                    val >= sum
+                }
+            }
+            ("float4" | "float8", "float8") => {
+                let f = |v: &Bson| number(v).ok_or_else(|| Error::Internal("in_range".into()));
+                let (val, base, offset) = (f(&args[0])?, f(&args[1])?, f(&args[2])?);
+                if offset.is_nan() || offset < 0.0 {
+                    return Err(bad_size());
+                }
+                if val.is_nan() {
+                    base.is_nan() || !less
+                } else if base.is_nan() {
+                    less
+                } else if offset.is_infinite()
+                    && base.is_infinite()
+                    && (if sub { base > 0.0 } else { base < 0.0 })
+                {
+                    true
+                } else {
+                    near(val, if sub { base - offset } else { base + offset })
+                }
+            }
+            ("numeric", "numeric") => {
+                let text = |v: &Bson| value_text(v).trim().to_string();
+                let (val, base, offset) = (text(&args[0]), text(&args[1]), text(&args[2]));
+                let negative = matches!(
+                    eval("$1::numeric < 0", &[args[2].clone()])?,
+                    Bson::Boolean(true)
+                );
+                if offset == "NaN" || negative {
+                    return Err(bad_size());
+                }
+                let infinite = |s: &str| s.ends_with("Infinity");
+                if val == "NaN" {
+                    base == "NaN" || !less
+                } else if base == "NaN" {
+                    less
+                } else if infinite(&offset)
+                    && infinite(&base)
+                    && (if sub {
+                        !base.starts_with('-')
+                    } else {
+                        base.starts_with('-')
+                    })
+                {
+                    true
+                } else {
+                    let op = if sub { "-" } else { "+" };
+                    let cmp = if less { "<=" } else { ">=" };
+                    matches!(
+                        eval(
+                            &format!("$1::numeric {cmp} ($2::numeric {op} $3::numeric)"),
+                            &[args[0].clone(), args[1].clone(), args[2].clone()]
+                        )?,
+                        Bson::Boolean(true)
+                    )
+                }
+            }
+            (
+                ty @ ("date" | "timestamp" | "timestamptz" | "interval" | "time" | "timetz"),
+                "interval",
+            ) => {
+                let offset = Interval::from_bson(&cast_value(args[2].clone(), "interval")?)
+                    .ok_or_else(|| Error::Internal("in_range".into()))?;
+                let negative = if matches!(ty, "time" | "timetz") {
+                    offset.micros < 0
+                } else {
+                    offset.comparable_micros() < 0
+                };
+                if negative {
+                    return Err(bad_size());
+                }
+                // `time` / `timetz` add the offset's time part only, and do
+                // not wrap round midnight.
+                if ty == "time" {
+                    let val = crate::hashfn::time_micros(&args[0])?;
+                    let base = crate::hashfn::time_micros(&args[1])?;
+                    let sum = if sub {
+                        base - offset.micros
+                    } else {
+                        base + offset.micros
+                    };
+                    return Ok(Bson::Boolean(if less { val <= sum } else { val >= sum }));
+                }
+                if ty == "timetz" {
+                    // `timetz_cmp`: by the instant, then by the zone.
+                    let (vt, vz) = crate::hashfn::timetz_parts(&args[0])?;
+                    let (bt, bz) = crate::hashfn::timetz_parts(&args[1])?;
+                    let st = if sub {
+                        bt - offset.micros
+                    } else {
+                        bt + offset.micros
+                    };
+                    let key = |t: i64, z: i32| (t + i64::from(z) * 1_000_000, z);
+                    let (v, s) = (key(vt, vz), key(st, bz));
+                    return Ok(Bson::Boolean(if less { v <= s } else { v >= s }));
+                }
+                let op = if sub { "-" } else { "+" };
+                let cmp = if less { "<=" } else { ">=" };
+                let sql = match ty {
+                    "date" => {
+                        format!("$1::date::timestamp {cmp} ($2::date::timestamp {op} $3::interval)")
+                    }
+                    _ => format!("$1::{ty} {cmp} ($2::{ty} {op} $3::interval)"),
+                };
+                matches!(
+                    eval(&sql, &[args[0].clone(), args[1].clone(), args[2].clone()])?,
+                    Bson::Boolean(true)
+                )
+            }
+            _ => return Err(Error::Unsupported(format!("in_range({}, ...)", t(0)))),
+        }))
+    })())
+}

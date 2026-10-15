@@ -417,6 +417,8 @@ const STEPS: &[(&str, usize, &str)] = &[
         1,
         "CASE WHEN $1::oid IS NOT NULL THEN true END",
     ),
+    // The SP-GiST quad tree keys a polygon by its bounding box.
+    ("spg_poly_quad_compress", 1, "box($1::polygon)"),
 ];
 
 /// The two argument types a `FAMILIES` function declares, read off its

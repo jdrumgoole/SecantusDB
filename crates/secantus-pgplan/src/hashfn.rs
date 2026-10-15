@@ -206,6 +206,26 @@ fn clock_micros(s: &str) -> Result<i64> {
     Ok(((h * 60 + m) * 60 + s) * 1_000_000 + frac)
 }
 
+/// A `time` as microseconds since midnight.
+pub(crate) fn time_micros(v: &Bson) -> Result<i64> {
+    clock_micros(&text_of(v, "time")?)
+}
+
+/// A `timetz` as PostgreSQL holds it: microseconds since midnight in its
+/// own zone, and the zone in seconds WEST of Greenwich.
+pub(crate) fn timetz_parts(v: &Bson) -> Result<(i64, i32)> {
+    let t = text_of(v, "timetz")?;
+    let at = t.rfind(['+', '-']).unwrap_or(t.len());
+    let (clock, zone) = t.split_at(at);
+    let micros = clock_micros(clock)?;
+    let sign = if zone.starts_with('-') { 1 } else { -1 };
+    let mut parts = zone[1.min(zone.len())..].split(':');
+    let hh: i32 = parse(parts.next().unwrap_or("0"), "timetz")?;
+    let mm: i32 = parse(parts.next().unwrap_or("0"), "timetz")?;
+    let ss: i32 = parse(parts.next().unwrap_or("0"), "timetz")?;
+    Ok((micros, sign * (hh * 3600 + mm * 60 + ss)))
+}
+
 /// PostgreSQL's timestamp: microseconds since 2000-01-01 00:00.
 fn timestamp_micros(v: &Bson) -> Result<i64> {
     let text = text_of(v, "timestamp")?;
@@ -328,26 +348,15 @@ fn hash_value(v: &Bson, ty: &str, h: H) -> Result<u64> {
         }
         // `pg_lsn_hash` is `hashint8` of the position.
         "pg_lsn" => {
-            let lsn = systypes::lsn_of(&cast_value(v.clone(), "pg_lsn")?)
+            let lsn = systypes::lsn_of(v)
+                .or_else(|| systypes::lsn_of(&cast_value(v.clone(), "pg_lsn").ok()?))
                 .ok_or_else(|| Error::Internal("hash of this pg_lsn".into()))?;
             Ok(h.int8(lsn as i64))
         }
-        "time" => Ok(h.int8(clock_micros(&text_of(v, "time")?)?)),
+        "time" => Ok(h.int8(time_micros(v)?)),
         "timestamp" => Ok(h.int8(timestamp_micros(v)?)),
         "timetz" => {
-            let t = text_of(v, "timetz")?;
-            let at = t.rfind(['+', '-']).unwrap_or(t.len());
-            let (clock, zone) = t.split_at(at);
-            let micros = clock_micros(clock)?;
-            // The zone is held as seconds WEST of Greenwich.
-            let zone_secs = {
-                let sign = if zone.starts_with('-') { 1 } else { -1 };
-                let mut parts = zone[1.min(zone.len())..].split(':');
-                let hh: i32 = parse(parts.next().unwrap_or("0"), "timetz")?;
-                let mm: i32 = parse(parts.next().unwrap_or("0"), "timetz")?;
-                let ss: i32 = parse(parts.next().unwrap_or("0"), "timetz")?;
-                sign * (hh * 3600 + mm * 60 + ss)
-            };
+            let (micros, zone_secs) = timetz_parts(v)?;
             Ok(h.int8(micros) ^ h.uint32(zone_secs as u32))
         }
         "interval" => {

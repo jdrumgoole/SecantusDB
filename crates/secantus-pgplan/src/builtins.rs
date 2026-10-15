@@ -84,6 +84,8 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
             | "anycompatiblenonarray_out",
             1,
         ) => "cstring",
+        ("in_range", 5) => "bool",
+        ("btvarstrequalimage", 1) => "bool",
         // A type's modifier as a declaration writes it (`(3)`).
         (
             "bittypmodout"
@@ -407,6 +409,18 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
     let bytes = |i: usize| bytea::parse(&args[i]);
     if let Some(out) = crate::agg_support::call(name, args) {
         return out;
+    }
+    if name == "in_range" {
+        if let Some(out) = crate::agg_support::in_range(args, types) {
+            return out;
+        }
+    }
+    // Called with no index to say which collation: PostgreSQL cannot tell.
+    if name == "btvarstrequalimage" {
+        return Err(Error::Sqlstate(
+            "42P22",
+            "could not determine which collation to use for string comparison".into(),
+        ));
     }
     if let Some(out) = crate::hashfn::call(name, args, types.first().map_or("", String::as_str)) {
         return out;

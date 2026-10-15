@@ -32934,6 +32934,16 @@ pub fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     compare_constants(a, b)
 }
 
+/// `1` for `infinity`, `-1` for `-infinity`, as an infinite timestamp is
+/// carried.
+fn infinite_instant(v: &Bson) -> Option<i8> {
+    match v {
+        Bson::String(s) if s == "infinity" => Some(1),
+        Bson::String(s) if s == "-infinity" => Some(-1),
+        _ => None,
+    }
+}
+
 pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
@@ -33013,6 +33023,15 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
         // `tsrange` has to order its own bounds to canonicalise.
         (a2, b2) if instant_micros(a2).is_some() && instant_micros(b2).is_some() => {
             Some(instant_micros(a2)?.cmp(&instant_micros(b2)?))
+        }
+        // An infinite timestamp is carried as its text: `infinity` follows
+        // every instant and `-infinity` precedes every one (15.19).
+        (a2, b2)
+            if (infinite_instant(a2).is_some() && instant_micros(b2).is_some())
+                || (instant_micros(a2).is_some() && infinite_instant(b2).is_some()) =>
+        {
+            let rank = |v: &Bson| infinite_instant(v).unwrap_or(0);
+            Some(rank(a2).cmp(&rank(b2)))
         }
         // Intervals compare FLATTENED -- 30-day months, 24-hour days -- even
         // though they are stored as three independent parts for arithmetic.
