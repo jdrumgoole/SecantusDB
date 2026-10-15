@@ -319,3 +319,26 @@ def test_order_by_ties_as_postgres_quicksort_leaves_them(pg: Any) -> None:
     )
     got = pg_answer(pg, "select id from rp028_t order by v")
     assert got == ("ok", [(i,) for i in [7, 10, 3, 4, 5, 9, 1, 8, 6, 2]])
+
+
+@pytest.mark.backlog("RP-029")
+@pytest.mark.parametrize(
+    ("target", "source", "message"),
+    [
+        ("b", "i", 'column "b" is of type boolean but expression is of type integer'),
+        ("n", "t", 'column "n" is of type integer but expression is of type text'),
+    ],
+    ids=["int-into-bool", "text-into-int"],
+)
+def test_insert_select_checks_assignment_types(
+    pg: Any, target: str, source: str, message: str
+) -> None:
+    """PostgreSQL 15.19: an INSERT ... SELECT whose column has no assignment
+    cast from the selected type is 42804 when the statement is analysed;
+    here the int is stored into the bool column, and the text fails per row."""
+    pg.execute("drop table if exists rp029_s, rp029_t")
+    pg.execute("create table rp029_s (i int, t text)")
+    pg.execute("insert into rp029_s values (1, 'x')")
+    pg.execute("create table rp029_t (b bool, n int)")
+    got = pg_answer(pg, f"insert into rp029_t ({target}) select {source} from rp029_s")
+    assert got == ("err", "42804", message)

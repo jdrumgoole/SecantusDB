@@ -367,6 +367,18 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: INSERT ... SELECT does not check the selected
+  types against the target columns.** `insert into t (b) select i from s`
+  (an int into a bool column) STORES the rows here; PostgreSQL 15.19 says
+  42804 `column "b" is of type boolean but expression is of type integer`
+  at analysis time, with the hint `You will need to rewrite or cast the
+  expression.` A text into an int column fails per row here with 22P02
+  rather than at analysis with 42804. INSERT ... VALUES does check
+  (`check_assignment_type`); the SELECT source never reaches it. Found
+  2026-10-15 by the `"char"` cast slice of RP-015.
+  Backlog-ID: RP-029
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_insert_select_checks_assignment_types
+
 - [ ] **RUST pgserver: rows that tie under ORDER BY come out in a
   different order from PostgreSQL's.** The sort here is stable;
   PostgreSQL's quicksort (`sort_template.h`) is not, from 7 rows up: six
@@ -453,10 +465,6 @@ one beside it.
         a `client_encoding` (passed through as UTF-8). The single-byte ones
         are done from tables measured on PostgreSQL (`sbcs.rs`); these need
         PostgreSQL's mapping tables, which are large.
-      - **`65::int2::"char"` answers `A`**; PostgreSQL has no `int2` cast to
-        `"char"` (42846). `"char"(x)` is planned as a cast, and as a call
-        PostgreSQL promotes the `int2`, so the two cannot be told apart
-        until `"char"` is a function here.
       - **Text search**: a `regconfig` / `regdictionary` by oid
         (`3748::regconfig`) and `pg_ts_config` do not exist; `null::tsquery`
         sends a spurious "doesn't contain lexemes" NOTICE; a bad
