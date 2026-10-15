@@ -315,7 +315,17 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         {
             let name = m.split_once('"')?.1.split_once('"')?.0;
             let lit = format!("'{}'", name.replace('\'', "''"));
-            pos(toks.iter().find(|t| t.text == lit)?.start)
+            let i = toks.iter().position(|t| t.text == lit)?;
+            // `schema_to_xml('nope', ...)` takes a `name`, not a
+            // regnamespace: the lookup is the function's own, with no
+            // position (15.19).
+            if i >= 2
+                && toks[i - 1].text == "("
+                && unquote_ident(toks[i - 2].text).starts_with("schema_to_xml")
+            {
+                return None;
+            }
+            pos(toks[i].start)
         }
         "42704" => {
             let name = quoted_between(m, "type ")?;

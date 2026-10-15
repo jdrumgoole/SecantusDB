@@ -87,6 +87,27 @@ pub(crate) fn run_sql(sql: &str) -> Result<Vec<Vec<Bson>>> {
     run_direct(sql, &[])
 }
 
+/// The prefix that asks the runner for a query's result COLUMNS rather than
+/// its rows: one row of `[name, type oid, domain name or NULL]` per column.
+/// A unit separator keeps it out of any SQL a user can write.
+pub const DESCRIBE_QUERY: &str = "\u{1f}describe\u{1f}";
+
+/// The prefix that asks the runner for an open cursor's next rows:
+/// `<prefix><count><unit separator><cursor name>`.
+pub const FETCH_CURSOR: &str = "\u{1f}fetch\u{1f}";
+
+/// The next `count` rows of the cursor `name`, as `SPI_cursor_fetch` reads
+/// them (34000 when no cursor has that name).
+pub(crate) fn fetch_cursor(name: &str, count: i64) -> Result<Vec<Vec<Bson>>> {
+    run_direct(&format!("{FETCH_CURSOR}{count}\u{1f}{name}"), &[])
+}
+
+/// A query's result columns, which SPI reads from a prepared plan's tuple
+/// descriptor whether or not the query returns any rows.
+pub(crate) fn describe_sql(sql: &str) -> Result<Vec<Vec<Bson>>> {
+    run_direct(&format!("{DESCRIBE_QUERY}{sql}"), &[])
+}
+
 fn int_const(v: i32) -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::AConst(pg_query::protobuf::AConst {

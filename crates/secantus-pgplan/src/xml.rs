@@ -732,7 +732,24 @@ const FUNCTIONS: &[&str] = &[
     "xml_is_well_formed_content",
     "query_to_xml",
     "table_to_xml",
+    "cursor_to_xml",
+    "schema_to_xml",
+    "database_to_xml",
+    "query_to_xmlschema",
+    "table_to_xmlschema",
+    "cursor_to_xmlschema",
+    "schema_to_xmlschema",
+    "database_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml_and_xmlschema",
 ];
+
+/// The SQL/XML mappings of a query, table, cursor, schema or database.
+fn is_mapping(name: &str) -> bool {
+    name.ends_with("_to_xml") || name.ends_with("_to_xmlschema") || name.ends_with("_and_xmlschema")
+}
 
 pub fn is_function(name: &str) -> bool {
     FUNCTIONS.contains(&name)
@@ -740,7 +757,8 @@ pub fn is_function(name: &str) -> bool {
 
 pub fn result_type(name: &str) -> Option<&'static str> {
     Some(match name {
-        "xmlcomment" | "query_to_xml" | "table_to_xml" => "xml",
+        "xmlcomment" => "xml",
+        _ if is_function(name) && is_mapping(name) => "xml",
         "xpath" => "xml[]",
         "xpath_exists" | "xmlexists" => "bool",
         "xml_is_well_formed" | "xml_is_well_formed_document" | "xml_is_well_formed_content" => {
@@ -759,7 +777,7 @@ pub fn call(name: &str, args: &[bson::Bson]) -> Option<Result<bson::Bson>> {
     if matches!(name, "xpath" | "xpath_exists" | "xmlexists") {
         return Some(xpath_call(name, args));
     }
-    if matches!(name, "query_to_xml" | "table_to_xml") {
+    if is_mapping(name) {
         return Some(crate::xml_export::call(name, args));
     }
     if args.len() != 1 {

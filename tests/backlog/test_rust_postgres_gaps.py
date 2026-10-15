@@ -139,7 +139,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
     "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
 }
 
@@ -196,6 +195,21 @@ _RP015_FIXED = {
     "width-bucket-dates": (
         "select width_bucket('2020-01-02'::date, array['2020-01-01'::date, '2020-02-01'])"
     ),
+    "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
+    "query-to-xmlschema-types": (
+        "select query_to_xmlschema('select 1::int2 as a, 2::int8 as b, 1.5::numeric as c,"
+        " ''x''::varchar as d, now() as e, current_date as f, ''01:00''::time as g,"
+        " ''01:00+01''::timetz as h, true as i, ''\\x01''::bytea as j, ''<a/>''::xml as k,"
+        " array[1] as l, ''x''::name as \"xml:m\" where false', false, true, 'urn:t')"
+    ),
+    "query-to-xml-and-xmlschema": (
+        "select query_to_xml_and_xmlschema('select 1 as a, null::text as b', true, false, 'urn:q')"
+    ),
+    "query-to-xmlschema-not-a-cursor": (
+        "select query_to_xmlschema('delete from pg_class', true, false, '')"
+    ),
+    "cursor-to-xml-missing": "select cursor_to_xml('rp015_nope', 1, true, false, '')",
+    "schema-to-xml-missing": "select schema_to_xml('rp015_nope', true, false, '')",
 }
 
 
