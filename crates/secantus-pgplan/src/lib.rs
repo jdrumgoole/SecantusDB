@@ -50,6 +50,9 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+mod ts_debug;
+mod ts_rewrite;
+pub mod wparser;
 pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
@@ -11607,74 +11610,11 @@ fn srf_rows(
                 rows,
             )));
         }
-        // `ts_token_type(parser)`: the default parser's 23 token types
-        // (`wparser_def.c`'s `tok_alias` / `lex_descr`), the only parser
-        // there is, named or by oid (3722).
-        "ts_token_type" => {
-            let a = args(1)?;
-            let names = vec!["tokid".into(), "alias".into(), "description".into()];
-            let types = vec!["int4".into(), "text".into(), "text".into()];
-            match &a[0] {
-                Bson::Null => return Ok(Some((names, types, Vec::new()))),
-                Bson::Int32(_) | Bson::Int64(_) => {
-                    let oid = match &a[0] {
-                        Bson::Int32(i) => i64::from(*i),
-                        Bson::Int64(i) => *i,
-                        _ => 0,
-                    };
-                    if oid != 3722 {
-                        return Err(Error::Internal(format!(
-                            "cache lookup failed for text search parser {oid}"
-                        )));
-                    }
-                }
-                other => {
-                    let n = value_text(other);
-                    if !matches!(n.as_str(), "default" | "pg_catalog.default") {
-                        return Err(Error::Sqlstate(
-                            "42704",
-                            format!("text search parser \"{n}\" does not exist"),
-                        ));
-                    }
-                }
-            }
-            const TOKENS: [(&str, &str); 23] = [
-                ("asciiword", "Word, all ASCII"),
-                ("word", "Word, all letters"),
-                ("numword", "Word, letters and digits"),
-                ("email", "Email address"),
-                ("url", "URL"),
-                ("host", "Host"),
-                ("sfloat", "Scientific notation"),
-                ("version", "Version number"),
-                ("hword_numpart", "Hyphenated word part, letters and digits"),
-                ("hword_part", "Hyphenated word part, all letters"),
-                ("hword_asciipart", "Hyphenated word part, all ASCII"),
-                ("blank", "Space symbols"),
-                ("tag", "XML tag"),
-                ("protocol", "Protocol head"),
-                ("numhword", "Hyphenated word, letters and digits"),
-                ("asciihword", "Hyphenated word, all ASCII"),
-                ("hword", "Hyphenated word, all letters"),
-                ("url_path", "URL path"),
-                ("file", "File or path name"),
-                ("float", "Decimal notation"),
-                ("int", "Signed integer"),
-                ("uint", "Unsigned integer"),
-                ("entity", "XML entity"),
-            ];
-            let rows = TOKENS
-                .iter()
-                .enumerate()
-                .map(|(i, (alias, descr))| {
-                    vec![
-                        Bson::Int32(i as i32 + 1),
-                        Bson::String((*alias).into()),
-                        Bson::String((*descr).into()),
-                    ]
-                })
-                .collect();
-            return Ok(Some((names, types, rows)));
+        // The default text-search parser's functions (`ts_debug.rs`).
+        "ts_token_type" => return ts_debug::token_type(&args(1)?).map(Some),
+        "ts_parse" => return ts_debug::parse(&args(2)?).map(Some),
+        "ts_debug" if matches!(call.args.len(), 1 | 2) => {
+            return ts_debug::debug(&args(call.args.len())?).map(Some)
         }
         "generate_subscripts" => {
             // `(array, dim [, reverse])`: with `reverse` true the subscripts
@@ -25168,7 +25108,7 @@ pub fn regclass_text(oid: i64) -> String {
 /// one), and anything else -- an empty name, a bare dot, an unquoted part
 /// with a space inside, an unterminated quote -- is 42602 `invalid name
 /// syntax` (measured 16: `'a b'`, `'.t1'`, `'t1.'`, `'  '`).
-fn split_relation_name(text: &str) -> Result<Vec<String>> {
+pub(crate) fn split_relation_name(text: &str) -> Result<Vec<String>> {
     let invalid = || Error::InvalidName("invalid name syntax".into());
     let mut parts = Vec::new();
     let mut chars = text.trim().chars().peekable();

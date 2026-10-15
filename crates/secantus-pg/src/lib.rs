@@ -17452,6 +17452,9 @@ fn wire_type(pg_type: &str) -> Type {
         "tsvector" => Type::TS_VECTOR,
         "tsquery" => Type::TSQUERY,
         "regconfig" => Type::REGCONFIG,
+        // `ts_debug`'s `dictionary` / `dictionaries` columns.
+        "regdictionary" => Type::REGDICTIONARY,
+        "regdictionary[]" => Type::REGDICTIONARY_ARRAY,
         "jsonpath" => Type::JSONPATH,
         // Stored as canonical TEXT but reported with their real oids: a client
         // reading 1082/1083 parses the value into a date/time object, whereas
