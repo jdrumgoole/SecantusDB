@@ -112,6 +112,8 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   (`3748::regconfig` is `simple`); and `ts_lexize`. Part of RP-015
   (tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed).
 - `pg_sequences`.
+- `pg_relation_is_updatable`, `pg_column_is_updatable` and
+  `pg_is_other_temp_schema`. Part of RP-015.
 - `acldefault`, `makeaclitem` and `aclexplode`, as PostgreSQL 15's acl.c
   answers them. Part of RP-015.
 - The length-coercion functions by name, `pg_catalog."numeric"(x,
@@ -123,4 +125,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
-  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals` and `acl_functions`.
+  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions` and `relation_updatable`.

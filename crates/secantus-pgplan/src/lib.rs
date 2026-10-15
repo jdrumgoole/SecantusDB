@@ -7762,7 +7762,7 @@ pub fn set_views(views: Vec<(String, String)>) {
     PLAN_VIEWS.with(|v| *v.borrow_mut() = views);
 }
 
-fn view_definition(name: &str) -> Option<String> {
+pub(crate) fn view_definition(name: &str) -> Option<String> {
     PLAN_VIEWS.with(|v| {
         v.borrow()
             .iter()

@@ -84,6 +84,10 @@ const CATALOG_NAMES: &[&str] = &[
     "pg_get_expr",
     "pg_table_is_visible",
     "pg_relation_is_publishable",
+    "pg_relation_is_updatable",
+    "pg_column_is_updatable",
+    "pg_is_other_temp_schema",
+    "pg_settings_get_flags",
     "pg_get_userbyid",
     "pg_get_function_sqlbody",
     "pg_type_is_visible",
@@ -1778,6 +1782,77 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 crate::value_text(other).trim().parse().unwrap_or(-1),
             )),
         }),
+        // `pg_relation_is_updatable(rel, include_triggers)`: the events a
+        // relation takes, as a mask (insert 8, update 4, delete 16 -- 28 for
+        // all three): a table (a catalog too, measured on 15.19) takes all,
+        // a view all when it is automatically updatable and none otherwise,
+        // an oid naming nothing none. `pg_column_is_updatable` follows it.
+        "pg_relation_is_updatable" | "pg_column_is_updatable" => {
+            if args.contains(&Bson::Null) {
+                return Ok(Bson::Null);
+            }
+            let oid = args
+                .first()
+                .and_then(|v| crate::regclass_oid(v).or_else(|| as_i64(v)))
+                .unwrap_or(0);
+            let relation = crate::regclass_text(oid);
+            let mask = if oid == 0 || relation == oid.to_string() {
+                0
+            } else {
+                let bare = relation.trim_matches('"');
+                match crate::view_definition(bare).or_else(|| crate::view_definition(&relation)) {
+                    Some(sql) if !crate::view_dml::is_updatable(&sql) => 0,
+                    _ => 28,
+                }
+            };
+            Ok(if name == "pg_relation_is_updatable" {
+                Bson::Int32(mask)
+            } else {
+                Bson::Boolean(mask & 4 == 4)
+            })
+        }
+        // `pg_settings_get_flags(name)`: a setting's flags, from PostgreSQL
+        // 15.19's own (`pg_settings_flags.tsv`); the name is matched without
+        // case, and one no setting has is NULL.
+        "pg_settings_get_flags" => {
+            const FLAGS: &str = include_str!("pg_settings_flags.tsv");
+            let v = arg(0);
+            if v == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let wanted = text(&v).to_ascii_lowercase();
+            Ok(FLAGS
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.split_once('\t'))
+                .find(|(n, _)| n.to_ascii_lowercase() == wanted)
+                .map_or(Bson::Null, |(_, flags)| {
+                    Bson::Array(
+                        flags
+                            .split(',')
+                            .filter(|f| !f.is_empty())
+                            .map(|f| Bson::String(f.to_string()))
+                            .collect(),
+                    )
+                }))
+        }
+        // `pg_is_other_temp_schema(oid)`: another session's `pg_temp_N`.
+        "pg_is_other_temp_schema" => {
+            let v = arg(0);
+            if v == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let oid = crate::regobj::from_bson(&v)
+                .map(|(_, o)| o)
+                .or_else(|| as_i64(&v));
+            let name = oid
+                .map(|o| crate::regobj::text("regnamespace", o))
+                .unwrap_or_default();
+            let own = crate::schemas::temp_schema();
+            Ok(Bson::Boolean(
+                name.starts_with("pg_temp_") && own.as_deref() != Some(name.as_str()),
+            ))
+        }
         "pg_relation_is_publishable" => Ok(
             match args.first().and_then(|a| match a {
                 Bson::Null => None,
@@ -2571,7 +2646,11 @@ pub fn static_result_type(name: &str) -> &'static str {
         "numeric_send" => "bytea",
         "starts_with" => "bool",
         n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
-        "pg_relation_is_publishable" => "bool",
+        "pg_relation_is_publishable" | "pg_column_is_updatable" | "pg_is_other_temp_schema" => {
+            "bool"
+        }
+        "pg_relation_is_updatable" => "int4",
+        "pg_settings_get_flags" => "text[]",
         "pg_get_userbyid" | "getdatabaseencoding" | "pg_encoding_to_char" => "name",
         "pg_char_to_encoding" => "int4",
         "pg_get_function_sqlbody" => "text",

@@ -511,9 +511,7 @@ one beside it.
       - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
         is refused, and an aclitem naming a role oid no role has cannot be
         read back (items are carried as text, PostgreSQL's as oids);
-        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`**,
-        **`pg_settings_get_flags`** need catalog or GUC state the planner
-        does not see; `table_to_xml` and the other XML exports, and the
+        **`pg_settings_get_flags`** is not written; `table_to_xml` and the other XML exports, and the
         `fmgr_*` / `postgresql_fdw_validator` validators, are not written.
       - **An untyped literal beside a typed argument** is resolved only
         for a polymorphic overload that is the one candidate (`unknown_args`,
