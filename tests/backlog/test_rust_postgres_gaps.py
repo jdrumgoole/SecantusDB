@@ -305,3 +305,17 @@ def test_window_rows_come_out_in_window_sort_order(pg: Any) -> None:
     pg.execute("insert into rp024_t values (1), (2), (3)")
     sql = "select a, row_number() over (order by a desc) from rp024_t"
     assert pg_answer(pg, sql) == ("ok", [(3, 1), (2, 2), (1, 3)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_order_by_ties_as_postgres_quicksort_leaves_them(pg: Any) -> None:
+    """PostgreSQL 15.19: tied rows land where its quicksort (not stable from
+    7 rows up) leaves them -- `7, 10, 3, 4, 5, 9` for the six rows at v = 1;
+    a stable sort keeps them in insertion order."""
+    pg.execute("drop table if exists rp028_t")
+    pg.execute("create table rp028_t (id int, v int)")
+    pg.execute(
+        "insert into rp028_t values (1,2),(2,null),(3,1),(4,1),(5,1),(6,3),(7,1),(8,2),(9,1),(10,1)"
+    )
+    got = pg_answer(pg, "select id from rp028_t order by v")
+    assert got == ("ok", [(i,) for i in [7, 10, 3, 4, 5, 9, 1, 8, 6, 2]])
