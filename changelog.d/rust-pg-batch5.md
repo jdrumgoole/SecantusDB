@@ -104,6 +104,24 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   (`::test_builtin_coverage_fixed[query-to-xmlschema]` and the cases
   beside it; corpus `xml_schema_export`).
 
+- A schema created inside a transaction block can hold a table in the same
+  block: `create schema s; create table s.t (...)` had been 3F000, the
+  schema not noted for the rest of the transaction as every other CREATE
+  is.
+- `has_schema_privilege` takes a schema's oid (and a `regnamespace`), and
+  is NULL for an oid naming none, where the oid was read as a name.
+- `DECLARE ... CURSOR WITH HOLD` is taken outside a transaction block, as
+  PostgreSQL takes it (only a cursor without HOLD needs one), and `CLOSE
+  ALL` is tagged `CLOSE CURSOR ALL`.
+- A column of an enum in another schema (`s.e`) is listed in
+  `pg_attribute`, described with the enum's oid where it went out as
+  varchar, and named by its schema in `information_schema.columns`
+  (`udt_schema`, `udt_name`) for a table and a view.
+  These four were found beside RP-015's XML work, filed as RP-042 and fixed
+  in this change (`tests/backlog/test_rust_postgres_gaps.py::test_schema_created_in_a_block_holds_a_table`,
+  `::test_has_schema_privilege_by_oid`, `::test_declare_with_hold_outside_a_block`,
+  `::test_enum_outside_public_is_a_column_type`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,

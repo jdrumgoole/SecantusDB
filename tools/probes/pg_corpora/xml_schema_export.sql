@@ -78,3 +78,8 @@ select query_to_xml('select e from xse5_t order by a', false, true, '')
 select replace(query_to_xmlschema('select e from xse5_t', false, true, 'urn:x')::text, current_database(), 'DB')
 select replace(table_to_xml_and_xmlschema('xse5_t', true, false, '')::text, current_database(), 'DB')
 RESET xmlbinary
+DROP TABLE xse5_t
+DROP DOMAIN xse5_d
+DROP SCHEMA xse5_empty
+DROP SCHEMA "Xse5:odd" CASCADE
+DROP SCHEMA xse5 CASCADE

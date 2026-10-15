@@ -880,3 +880,70 @@ def test_restricted_builtin_needs_a_grant(pg: Any) -> None:
         pg.execute("revoke execute on function pg_reload_conf() from rp013_rl")
         pg.execute("drop role rp013_rl")
     assert denied[:2] == ("err", "42501") and granted == ("ok", [(True,)])
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_schema_created_in_a_block_holds_a_table(pg: Any) -> None:
+    """PostgreSQL 15.19: `create schema s; create table s.t (...)` in one
+    transaction block works; here the table was 3F000 `schema "s" does not
+    exist`, the schema not yet visible to planning."""
+    pg.execute("begin")
+    try:
+        pg.execute("create schema rp042_s")
+        got = pg_answer(pg, "create table rp042_s.t (a int)")
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", "CREATE TABLE")
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_has_schema_privilege_by_oid(pg: Any) -> None:
+    """PostgreSQL 15.19: `has_schema_privilege(2200, 'USAGE')` (public's oid)
+    is true, and NULL for an oid naming no schema; here the oid was read as
+    a schema NAME (3F000 `schema "2200" does not exist`)."""
+    got = pg_answer(
+        pg,
+        "select has_schema_privilege(2200, 'USAGE'), has_schema_privilege(12345678, 'USAGE')",
+    )
+    assert got == ("ok", [(True, None)])
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_declare_with_hold_outside_a_block(pg: Any) -> None:
+    """PostgreSQL 15.19 takes `DECLARE c CURSOR WITH HOLD` outside a
+    transaction block (only a cursor without HOLD needs one), and `CLOSE ALL`
+    is tagged `CLOSE CURSOR ALL`; here the DECLARE was 25P01."""
+    declared = pg_answer(pg, "declare rp042_c cursor with hold for select 1")
+    fetched = pg_answer(pg, "fetch all from rp042_c")
+    closed = pg_answer(pg, "close all")
+    assert (declared, fetched, closed) == (
+        ("ok", "DECLARE CURSOR"),
+        ("ok", [(1,)]),
+        ("ok", "CLOSE CURSOR ALL"),
+    )
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_enum_outside_public_is_a_column_type(pg: Any) -> None:
+    """PostgreSQL 15.19: a column of `s.e` (an enum in another schema) is in
+    `pg_attribute`, is described with the enum's oid, and its
+    `information_schema.columns` row names schema `s`; here the column was
+    missing, described as varchar, and named `public`."""
+    pg.execute("begin")
+    try:
+        pg.execute("create schema rp042_q")
+        pg.execute("create type rp042_q.e as enum ('a')")
+        pg.execute("create table rp042_q.z (id int, m rp042_q.e)")
+        attnames = pg.execute(
+            "select attname from pg_attribute where attrelid = 'rp042_q.z'::regclass"
+            " and attnum > 0 order by attnum"
+        ).fetchall()
+        enum_oid = pg.execute("select 'rp042_q.e'::regtype::oid").fetchone()[0]
+        described = pg.execute("select m from rp042_q.z").description[0].type_code
+        udt = pg.execute(
+            "select udt_schema, udt_name from information_schema.columns"
+            " where table_schema = 'rp042_q' and column_name = 'm'"
+        ).fetchall()
+    finally:
+        pg.execute("rollback")
+    assert (attnames, described, udt) == ([("id",), ("m",)], enum_oid, [("rp042_q", "e")])

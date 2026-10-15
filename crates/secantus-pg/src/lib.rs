@@ -1205,6 +1205,7 @@ fn non_volatile_refusal(sql: &str, plan: &dyn Fn() -> Option<&'static str>) -> O
                 "FETCH"
             }
         }
+        N::ClosePortalStmt(c) if c.portalname.is_empty() => "CLOSE CURSOR ALL",
         N::ClosePortalStmt(_) => "CLOSE CURSOR",
         _ => match plan() {
             Some(verb) => verb,
@@ -4584,6 +4585,21 @@ impl PgHandler {
                 "public".to_string(),
             ));
         }
+        // An enum outside `public`, by its qualified name (`s.e`), which went
+        // out as varchar.
+        if let Some((schema, name, oid, _)) = self
+            .enums_with_schema()
+            .ok()?
+            .into_iter()
+            .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == pg_type)
+        {
+            return Some(Type::new(
+                name,
+                u32::try_from(oid).ok()?,
+                postgres_types::Kind::Enum(Vec::new()),
+                schema,
+            ));
+        }
         // A custom range (`create type testrange as range (...)`), its
         // auto-created multirange, or an ARRAY of either: its own oid, so a
         // client that ran `register_range` / `register_multirange` fires its
@@ -7592,6 +7608,32 @@ impl PgHandler {
         if let Ok(bs) = self.base_types() {
             if let Some(b) = bs.iter().find(|b| b.name == name) {
                 return Some(b.oid);
+            }
+        }
+        // A type outside `public`, by its qualified name (`s.e`): a column of
+        // one was missing from `pg_attribute`.
+        if let Ok(es) = self.enums_with_schema() {
+            if let Some((_, _, oid, _)) = es
+                .iter()
+                .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == name)
+            {
+                return Some(*oid);
+            }
+        }
+        if let Ok(cs) = self.composites_with_schema() {
+            if let Some((_, _, oid, _)) = cs
+                .iter()
+                .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == name)
+            {
+                return Some(*oid);
+            }
+        }
+        if let Ok(rs) = self.ranges_with_schema() {
+            if let Some((_, _, oid, _)) = rs
+                .iter()
+                .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == name)
+            {
+                return Some(*oid);
             }
         }
         // A user composite's / enum's ARRAY (`custom[]`): its typarray, the
@@ -13674,10 +13716,18 @@ impl PgHandler {
                                 })
                                 .map_or(Bson::Null, Bson::String),
                         );
-                        let udt_schema = if data_type == "USER-DEFINED" {
-                            "public"
-                        } else {
-                            "pg_catalog"
+                        // A user type outside `public` is named by its own
+                        // schema (`s.e` is schema `s`, name `e`).
+                        let qualified = (data_type == "USER-DEFINED")
+                            .then(|| c.pg_type.split_once('.'))
+                            .flatten();
+                        if let Some((_, bare)) = qualified {
+                            d.insert(f("udt_name"), bare);
+                        }
+                        let udt_schema = match qualified {
+                            Some((schema, _)) => schema,
+                            None if data_type == "USER-DEFINED" => "public",
+                            None => "pg_catalog",
                         };
                         info_columns::fill(
                             &mut d,
@@ -13747,12 +13797,19 @@ impl PgHandler {
                         ] {
                             d.insert(f(k), Bson::Null);
                         }
-                        let udt_schema = if data_type == "USER-DEFINED" {
-                            "public"
-                        } else {
-                            "pg_catalog"
+                        // A user type outside `public` by its own schema.
+                        let qualified = (data_type == "USER-DEFINED")
+                            .then(|| ty.split_once('.'))
+                            .flatten();
+                        let udt_schema = match qualified {
+                            Some((schema, _)) => schema,
+                            None if data_type == "USER-DEFINED" => "public",
+                            None => "pg_catalog",
                         };
-                        d.insert(f("udt_name"), udt_name);
+                        match qualified {
+                            Some((_, bare)) => d.insert(f("udt_name"), bare),
+                            None => d.insert(f("udt_name"), udt_name),
+                        };
                         d.insert(f("is_identity"), "NO");
                         d.insert(f("is_generated"), "NEVER");
                         info_columns::fill(&mut d, &def, &ty, -1, i + 1, udt_schema, &db);
@@ -22858,10 +22915,13 @@ impl PgHandler {
         } = stmt
         {
             // The BLOCK, not the handle: an extended-protocol statement group
-            // holds a handle too, and PostgreSQL refuses a cursor there.
-            if !self
-                .in_transaction
-                .load(std::sync::atomic::Ordering::Relaxed)
+            // holds a handle too, and PostgreSQL refuses a cursor there. A
+            // WITH HOLD cursor outlives its transaction, so PostgreSQL takes
+            // one outside a block too (15.19).
+            if !holdable
+                && !self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
             {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
@@ -28604,13 +28664,11 @@ impl PgHandler {
                 }
                 let doc =
                     bson::doc! {"_id": &name, "schema": &name, "owner": self.current_role_name()};
-                let bytes = encode_doc(&doc)
-                    .map_err(|e| Self::storage_err("could not encode the schema", e))?;
-                self.insert_checked(
-                    Self::SCHEMA_COLLECTION,
-                    vec![bytes],
-                    "could not record the schema",
-                )?;
+                // Noted for the rest of the transaction, as every other
+                // CREATE is: planning reads the catalog outside it, and a
+                // `create table s.t` after `create schema s` in one block
+                // was 3F000.
+                self.insert_type_doc(Self::SCHEMA_COLLECTION, &name, doc)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
             }
 
@@ -31436,9 +31494,10 @@ impl PgHandler {
                         format!("cursor \"{name}\" does not exist"),
                     ))));
                 }
-                // `CLOSE ALL` carries an empty name.
+                // `CLOSE ALL` carries an empty name, and its own tag.
                 if name.is_empty() {
                     cursors.clear();
+                    return Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR ALL"))]);
                 }
                 Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR"))])
             }

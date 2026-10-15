@@ -742,7 +742,30 @@ impl PgHandler {
         };
         let answer = match name {
             "has_schema_privilege" => {
-                let schema = text(&rest[0]);
+                // By oid (`has_schema_privilege(2200, 'USAGE')`): the schema
+                // with that oid, and NULL for an oid naming none (15.19).
+                let by_oid = match &rest[0] {
+                    Bson::Int32(o) => Some(i64::from(*o)),
+                    Bson::Int64(o) => Some(*o),
+                    other => secantus_pgplan::regobj::from_bson(other)
+                        .map(|(_, o)| o)
+                        .or_else(|| {
+                            // A `regnamespace` reaches here as its oid's digits.
+                            let t = text(other);
+                            (!t.is_empty()
+                                && t.bytes().all(|b| b.is_ascii_digit())
+                                && !secantus_pgplan::schemas::schema_exists(&t))
+                            .then(|| t.parse().ok())
+                            .flatten()
+                        }),
+                };
+                let schema = match by_oid {
+                    Some(oid) => match self.namespaces().into_iter().find(|(_, o)| *o == oid) {
+                        Some((n, _)) => n,
+                        None => return Ok(Bson::Null),
+                    },
+                    None => text(&rest[0]),
+                };
                 if !secantus_pgplan::schemas::schema_exists(&schema) {
                     return Err(Self::user_error(
                         "3F000",
