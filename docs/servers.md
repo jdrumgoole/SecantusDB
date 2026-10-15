@@ -131,11 +131,12 @@ A client that asks for TLS then gets it (`sslmode=require`, `verify-ca`,
 the pair the server answers a TLS request with "not supported", as PostgreSQL
 does with `ssl = off`. These two options are in 0.1.0-beta.9 and later.
 
-An encrypted PKCS#8 key (`-----BEGIN ENCRYPTED PRIVATE KEY-----`) needs
-`--tls-key-passphrase-command CMD`, PostgreSQL's `ssl_passphrase_command`:
-the first line the shell command prints is the passphrase, `%p` in it is
-the prompt and `%%` a `%`. It runs again on each reload. A key encrypted in
-the legacy OpenSSL PEM form is refused; `openssl pkcs8 -topk8` converts it.
+An encrypted key -- PKCS#8 (`-----BEGIN ENCRYPTED PRIVATE KEY-----`), or
+OpenSSL's legacy form (`Proc-Type: 4,ENCRYPTED`, AES or DES-EDE3 in CBC
+mode) -- needs `--tls-key-passphrase-command CMD`, PostgreSQL's
+`ssl_passphrase_command`: the first line the shell command prints is the
+passphrase, `%p` in it is the prompt and `%%` a `%`. It runs again on each
+reload.
 
 A password login over TLS is offered SCRAM channel binding
 (`SCRAM-SHA-256-PLUS`), so a client with `channel_binding=require` connects.

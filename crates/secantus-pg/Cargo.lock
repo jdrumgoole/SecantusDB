@@ -2307,13 +2307,17 @@ dependencies = [
 name = "secantus-pg"
 version = "0.1.0-beta.16"
 dependencies = [
+ "aes",
  "async-trait",
  "base64 0.22.1",
  "bson",
  "bytes",
+ "cbc",
  "ctrlc",
+ "des",
  "futures",
  "libc",
+ "md-5 0.10.6",
  "mimalloc",
  "pg_query",
  "pkcs8",

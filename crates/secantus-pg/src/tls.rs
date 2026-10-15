@@ -469,14 +469,8 @@ fn read_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
 
 fn read_key(path: &Path, passphrase_command: Option<&str>) -> io::Result<PrivateKeyDer<'static>> {
     let text = std::fs::read_to_string(path).map_err(|e| invalid(path, &e))?;
-    if !text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
-        if text.contains("Proc-Type: 4,ENCRYPTED") {
-            return Err(invalid_data(format!(
-                "TLS key file {} is encrypted in the legacy PEM form; \
-                 convert it to PKCS#8 (`openssl pkcs8 -topk8`)",
-                path.display()
-            )));
-        }
+    let legacy = text.contains("Proc-Type: 4,ENCRYPTED");
+    if !legacy && !text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
         return PrivateKeyDer::from_pem_file(path).map_err(|e| invalid(path, &e));
     }
     let Some(command) = passphrase_command else {
@@ -486,6 +480,10 @@ fn read_key(path: &Path, passphrase_command: Option<&str>) -> io::Result<Private
         )));
     };
     let passphrase = run_passphrase_command(command)?;
+    if legacy {
+        return legacy_pem_key(&text, passphrase.as_bytes())
+            .map_err(|e| invalid_data(format!("TLS key file {}: {e}", path.display())));
+    }
     let (_, document) = pkcs8::SecretDocument::from_pem(&text).map_err(|e| invalid(path, &e))?;
     let encrypted = pkcs8::EncryptedPrivateKeyInfo::try_from(document.as_bytes())
         .map_err(|e| invalid(path, &e))?;
@@ -496,6 +494,106 @@ fn read_key(path: &Path, passphrase_command: Option<&str>) -> io::Result<Private
         ))
     })?;
     Ok(PrivateKeyDer::Pkcs8(decrypted.as_bytes().to_vec().into()))
+}
+
+/// A key in OpenSSL's legacy encrypted PEM form, as `PEM_read_bio_PrivateKey`
+/// reads it: `DEK-Info: <cipher>,<iv>`, the key from `EVP_BytesToKey(MD5,
+/// salt = the IV's first 8 bytes, one round)`, the body CBC-decrypted with
+/// PKCS#7 padding. An `RSA PRIVATE KEY` is PKCS#1, an `EC PRIVATE KEY` SEC1.
+fn legacy_pem_key(text: &str, passphrase: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
+    use base64::Engine;
+    use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use md5::Digest;
+    let begin = text
+        .lines()
+        .position(|l| l.starts_with("-----BEGIN ") && l.ends_with("PRIVATE KEY-----"))
+        .ok_or("no private key in it")?;
+    let lines: Vec<&str> = text.lines().skip(begin).collect();
+    let label = lines[0]
+        .trim_start_matches("-----BEGIN ")
+        .trim_end_matches("-----")
+        .to_string();
+    let mut dek = None;
+    let mut body = String::new();
+    let mut in_headers = true;
+    for line in &lines[1..] {
+        if line.starts_with("-----END ") {
+            break;
+        }
+        if in_headers {
+            if let Some(info) = line.strip_prefix("DEK-Info:") {
+                dek = Some(info.trim().to_string());
+                continue;
+            }
+            if line.contains(':') {
+                continue;
+            }
+            if line.trim().is_empty() {
+                in_headers = false;
+                continue;
+            }
+            in_headers = false;
+        }
+        body.push_str(line.trim());
+    }
+    let dek = dek.ok_or("an encrypted key with no DEK-Info header")?;
+    let (cipher, iv_hex) = dek.split_once(',').ok_or("a DEK-Info header with no IV")?;
+    let iv: Vec<u8> = (0..iv_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(iv_hex.get(i..i + 2).unwrap_or("zz"), 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| "a DEK-Info IV that is not hex")?;
+    let key_len = match cipher {
+        "AES-128-CBC" => 16,
+        "AES-192-CBC" | "DES-EDE3-CBC" => 24,
+        "AES-256-CBC" => 32,
+        "DES-CBC" => 8,
+        other => return Err(format!("the cipher {other} is not supported")),
+    };
+    let salt = iv.get(..8).ok_or("a DEK-Info IV that is too short")?;
+    // EVP_BytesToKey: D_i = MD5(D_{i-1} || passphrase || salt).
+    let mut key = Vec::new();
+    let mut previous: Vec<u8> = Vec::new();
+    while key.len() < key_len {
+        let mut h = md5::Md5::new();
+        h.update(&previous);
+        h.update(passphrase);
+        h.update(salt);
+        previous = h.finalize().to_vec();
+        key.extend_from_slice(&previous);
+    }
+    key.truncate(key_len);
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|_| "a body that is not base64")?;
+    let bad = || "could not decrypt it with the passphrase given".to_string();
+    let plain = match cipher {
+        "AES-128-CBC" => cbc::Decryptor::<aes::Aes128>::new_from_slices(&key, &iv)
+            .map_err(|_| bad())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&data),
+        "AES-192-CBC" => cbc::Decryptor::<aes::Aes192>::new_from_slices(&key, &iv)
+            .map_err(|_| bad())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&data),
+        "AES-256-CBC" => cbc::Decryptor::<aes::Aes256>::new_from_slices(&key, &iv)
+            .map_err(|_| bad())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&data),
+        "DES-EDE3-CBC" => cbc::Decryptor::<des::TdesEde3>::new_from_slices(&key, &iv)
+            .map_err(|_| bad())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&data),
+        _ => cbc::Decryptor::<des::Des>::new_from_slices(&key, &iv)
+            .map_err(|_| bad())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&data),
+    }
+    .map_err(|_| bad())?;
+    // A wrong passphrase can still unpad: what decrypted must be DER.
+    if plain.first() != Some(&0x30) {
+        return Err(bad());
+    }
+    Ok(match label.as_str() {
+        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(plain.into()),
+        "EC PRIVATE KEY" => PrivateKeyDer::Sec1(plain.into()),
+        _ => PrivateKeyDer::Pkcs8(plain.into()),
+    })
 }
 
 /// The first line `ssl_passphrase_command` prints: `%p` is the prompt,

@@ -72,6 +72,12 @@ rustls-pki-types = { version = "1.10", features = ["std"] }
 # An encrypted PKCS#8 key, decrypted with what `--tls-key-passphrase-command`
 # prints (PostgreSQL's `ssl_passphrase_command`).
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }
+# A key encrypted in OpenSSL's legacy PEM form (`Proc-Type: 4,ENCRYPTED`):
+# `EVP_BytesToKey` over MD5, then AES or DES-EDE3 in CBC mode.
+md-5 = "0.10"
+aes = "0.8"
+des = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 # The hash of the server certificate a SCRAM channel binding carries
 # (src/x509.rs), and the base64 it travels in (src/scram_binding.rs). Both
 # are the versions `secantus-auth` already builds.

@@ -5,7 +5,7 @@ Revocation lists (current, empty, expired, dated in the future, from another
 CA, forged, with and without extensions, through an intermediate CA), user
 name maps by exact name and by pattern, ``clientname=DN``, server
 certificates whose signature is RSA-PSS or Ed25519, and what a reload picks
-up. 544 scenarios. Arguments after the binary name the groups to run; with
+up. 547 scenarios. Arguments after the binary name the groups to run; with
 none, all of them.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -207,6 +207,16 @@ open(f"{d}/senc.key", "wb").write(
     )
 )
 os.chmod(f"{d}/senc.key", 0o600)
+# And in OpenSSL's legacy encrypted PEM form (`Proc-Type: 4,ENCRYPTED`).
+shutil.copy(f"{d}/s.crt", f"{d}/sleg.crt")
+open(f"{d}/sleg.key", "wb").write(
+    serialization.load_pem_private_key(open(f"{d}/s.key", "rb").read(), None).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.BestAvailableEncryption(b"pw"),
+    )
+)
+os.chmod(f"{d}/sleg.key", 0o600)
 PGCERT = ca.issue("pguser", cn("postgres"))
 ALICE = ca.issue("alice", cn("alice"))
 REVOKED = ca.issue("revoked", cn("postgres"))
@@ -700,6 +710,13 @@ GROUPS = {
         ["--tls-key-passphrase-command", "echo pw"],
         passphrase_scenarios,
         "senc",
+    ),
+    "passphrase, legacy PEM": (
+        "ssl_passphrase_command = 'echo pw'",
+        OPEN,
+        ["--tls-key-passphrase-command", "echo pw"],
+        passphrase_scenarios,
+        "sleg",
     ),
     "no crl, chain": ("", OPEN, [], chain_scenarios, "s"),
     "crl-cert": (

@@ -154,6 +154,7 @@ impl Hba {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn parse(text: &str) -> Result<Hba, (usize, String)> {
         Hba::parse_in(text, None)
     }
