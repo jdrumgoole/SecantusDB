@@ -340,6 +340,11 @@ one beside it.
   where the planner puts the sort: `select * from t join u on t.a = u.a
   order by t.a` merge-joins in key order and cannot scroll, `select * from
   t, u order by u.c` sorts on top and can. Here both scroll.
+  **Decision needed (2026-10-16):** the answer is the PLANNER's -- which
+  join or aggregation method its cost model picks and, for a hash
+  aggregate, the table size it sizes from its row estimates. Nothing
+  in the statement fixes it, so an answer short of PostgreSQL's cost
+  model is a stand-in, which CLAUDE.md makes Joe's call.
   Backlog-ID: RP-043
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
@@ -353,6 +358,11 @@ one beside it.
   (0,6)` where PostgreSQL 15.19 gives `(0,6), (1,6)`. DISTINCT ON needs a
   planner flag (a citext DISTINCT is planned as one). Sorts that spill to
   disk runs are not PostgreSQL's merge.
+  **Decision needed (2026-10-16):** the answer is the PLANNER's -- which
+  join or aggregation method its cost model picks and, for a hash
+  aggregate, the table size it sizes from its row estimates. Nothing
+  in the statement fixes it, so an answer short of PostgreSQL's cost
+  model is a stand-in, which CLAUDE.md makes Joe's call.
   Backlog-ID: RP-028
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_output_ties_as_postgres_leaves_them
 
