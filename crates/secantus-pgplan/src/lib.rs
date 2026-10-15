@@ -37496,6 +37496,24 @@ fn is_timestamp_field(def: &TableDef, field: &str) -> bool {
 /// than their text; a text-stored type (date, time, uuid) compares correctly
 /// as a string already and is left alone.
 fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
+    // PostgreSQL resolves `float8 = numeric` (either way round) as `float8 =
+    // float8`, casting the numeric side. A numeric constant against a
+    // floating column is cast here, so the filter compares a double with a
+    // double; a floating constant against a numeric column would need the
+    // COLUMN cast, which a filter cannot do, so it is evaluated per row.
+    // (Compared as BSON, a double and a Decimal128 meet exactly: `0.1` is
+    // not `Decimal128("0.1")`.)
+    match (&value, field_type(def, field)) {
+        // To float8 against a float4 column too: PostgreSQL has no `float4 =
+        // numeric`, and resolves `r = 0.1` as `float4 = float8`.
+        (Bson::Decimal128(_), Some("float4" | "float8")) => return cast_value(value, "float8"),
+        (Bson::Double(_), Some("numeric")) => {
+            return Err(Error::Unsupported(
+                "a numeric column against a float".into(),
+            ))
+        }
+        _ => {}
+    }
     let Bson::String(_) = &value else {
         return Ok(value);
     };
@@ -38304,6 +38322,17 @@ fn lower_scalar_array(
         Bson::Null => return Ok(match_nothing()),
         _ => return Err(Error::Unsupported("this ANY/ALL operand".into())),
     };
+    // Each element meets the column as a single comparison does
+    // (`coerce_to_column`): a numeric element against a float column as a
+    // float8, a float element against a numeric column per row.
+    let elems = elems
+        .into_iter()
+        .map(|el| match el {
+            Bson::Null => Ok(el),
+            el @ (Bson::Decimal128(_) | Bson::Double(_)) => coerce_to_column(def, &field, el),
+            el => Ok(el),
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut nonnull = Vec::new();
     let mut saw_null = false;
     for el in elems {

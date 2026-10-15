@@ -34,6 +34,18 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   literal`). Fixes RP-039
   (`tests/backlog/test_rust_postgres_gaps.py::test_untyped_array_literals`).
 
+- A comparison of a float column with a numeric value, or of a numeric
+  column with a float, is resolved as PostgreSQL does, `float8 = float8`:
+  a numeric constant is cast to float8 before the filter is built, and a
+  float against a numeric column is evaluated per row. The answers were
+  right before, but only because the shared matcher compared a double with
+  a Decimal128 by the double's shortest decimal; with exact comparison
+  (mongod's, RM-152) `where f = 0.1` would have matched nothing. Fixes
+  RP-040, filed and closed in this change (the
+  `float8_against_numeric_lowers_as_float8` unit test in
+  `crates/secantus-pgplan/src/tests.rs`, and corpus `float_numeric_compare`,
+  checked against a build with RM-152).
+
 #### Added
 
 - `pg_timezone_names` and `pg_timezone_abbrevs`, as the views and as the
@@ -45,4 +57,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   2026-10-15). Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[timezone-names]`,
   `[timezone-abbrevs]`).
-- Corpora `timezone_views`, `row_type_fields`, `literal_element_positions` and `array_literal_resolution`.
+- Corpora `timezone_views`, `row_type_fields`, `literal_element_positions`, `array_literal_resolution` and `float_numeric_compare`.

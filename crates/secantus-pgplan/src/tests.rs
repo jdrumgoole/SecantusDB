@@ -3519,3 +3519,56 @@ fn an_unterminated_literal_is_positioned_where_it_opens() {
         None
     );
 }
+
+/// RP-040: PostgreSQL resolves `float8 = numeric`, either way round, as
+/// `float8 = float8` (15.19). A filter that met a stored double with a
+/// Decimal128 matched it only while the matcher compared the two by the
+/// double's shortest decimal; compared exactly (mongod 8.2.11, RM-152),
+/// `0.1` is not `Decimal128("0.1")`. So no lowered filter over a floating
+/// column may hold a Decimal128, and a float against a numeric column, which
+/// needs the column cast, is evaluated per row.
+#[test]
+fn float8_against_numeric_lowers_as_float8() {
+    let def = || {
+        TableDef::new(
+            "p",
+            vec![
+                Column::new("id", "int4", true),
+                Column::new("f", "float8", false),
+                Column::new("n", "numeric", false),
+                Column::new("r", "float4", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "p").then(def);
+    fn has_decimal(v: &Bson) -> bool {
+        match v {
+            Bson::Decimal128(_) => true,
+            Bson::Document(d) => d.values().any(has_decimal),
+            Bson::Array(a) => a.iter().any(has_decimal),
+            _ => false,
+        }
+    }
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (Bson::Document(s.filter), s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select id from p where f = 0.1",
+        "select id from p where f = 0.1::numeric",
+        "select id from p where f in (0.1, 5)",
+        "select id from p where f = any(array[0.1])",
+        "select id from p where f between 0.05 and 0.2",
+        "select id from p where r = 0.1",
+    ] {
+        let (filter, _) = lowered(sql);
+        assert!(!has_decimal(&filter), "{sql}: {filter:?}");
+    }
+    for sql in [
+        "select id from p where n = 0.1::float8",
+        "select id from p where n = any(array[0.1::float8])",
+    ] {
+        let (_, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row");
+    }
+}
