@@ -607,7 +607,6 @@ def test_untyped_record_array_compare(pg: Any, pg15: Any) -> None:
 
 # RP-038: divergences the 2026-10-15 batch saw beside its items.
 _RP038 = {
-    "xmlagg": "select xmlagg(null::xml)",
     "operator-function-typed": "select int4pl(a, b) from (values ('x'::text, 1)) v(a, b)",
 }
 
@@ -615,6 +614,7 @@ _RP038 = {
 _RP038_FIXED = {
     "limit-text": "select 1 limit 'x'",
     "mode-unknown": "select mode() within group (order by NULL)",
+    "xmlagg": "select xmlagg(null::xml)",
 }
 
 

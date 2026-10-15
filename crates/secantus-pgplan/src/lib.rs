@@ -19053,6 +19053,10 @@ fn plan_select(
     if let Some(rewritten) = ungrouped_having(s)? {
         return plan_select(&rewritten, lookup, params);
     }
+    // `xmlagg(x)` is the concatenation of its non-NULL inputs, with or without a FROM.
+    if let Some(rewritten) = rewrite_xmlagg(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     if s.from_clause.is_empty() {
         // An aggregate with no FROM aggregates the ONE row a FROM-less
         // select has (`select sum(1)` is 1, `select count(*) having false`
@@ -19065,10 +19069,6 @@ fn plan_select(
     // `FROM t TABLESAMPLE method (p)` is `t` with each row kept with
     // probability p% (see `rewrite_tablesample`).
     if let Some(rewritten) = rewrite_tablesample(s, params)? {
-        return plan_select(&rewritten, lookup, params);
-    }
-    // `xmlagg(x)` is the concatenation of its non-NULL inputs.
-    if let Some(rewritten) = rewrite_xmlagg(s)? {
         return plan_select(&rewritten, lookup, params);
     }
     // `ORDER BY 1` / `ORDER BY alias` over a COMPUTED output column sorts by

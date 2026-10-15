@@ -15,3 +15,8 @@ select query_to_xml('select ''x''::text as t, '2020-01-01'::date as d, 1.5::nume
 select query_to_xml('select e''a\rb'' as t', true, false, '')
 select table_to_xml('nosuch', true, false, '')
 select table_to_xml('public.xmlexp_t', false, true, '')
+select xmlagg(null::xml)
+select xmlagg('<a/>'::xml)::text
+select xmlagg(x::xml order by x desc)::text from (values ('<a/>'),('<b/>')) v(x)
+select xmlagg(x::xml)::text from (values ('<a/>'),('<b/>')) v(x) where false
+select xmlagg(null::xml) filter (where false)

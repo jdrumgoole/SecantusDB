@@ -375,7 +375,6 @@ one beside it.
 
 - [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
   Each measured on PostgreSQL 15.19:
-  - `xmlagg(null::xml)` is 0A000 (over a column it works).
   - An operator's function called over typed columns it does not take
     (`int4pl(text_col, int_col)`) is 42883 at the right place, worded
     `operator does not exist: text + integer`; PostgreSQL names the
