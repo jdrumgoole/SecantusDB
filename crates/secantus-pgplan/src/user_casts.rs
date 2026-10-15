@@ -106,6 +106,18 @@ pub fn assign(value: &Bson, source_oid: i64, target: &str) -> Result<Option<Bson
     cast.map(|c| apply(&c, value.clone())).transpose()
 }
 
+/// Is there an `AS ASSIGNMENT` / `AS IMPLICIT` user cast between these type
+/// oids? Such a cast makes an assignment legal that the built-ins refuse.
+pub fn assignment_exists(source_oid: i64, target_oid: i64) -> bool {
+    USER_CASTS.with(|c| {
+        c.borrow().iter().any(|u| {
+            u.source_oid == source_oid
+                && u.target_oid == target_oid
+                && matches!(u.context, 'a' | 'i')
+        })
+    })
+}
+
 /// A user cast usable in an ASSIGNMENT (`AS ASSIGNMENT` / `AS IMPLICIT`).
 pub(crate) fn find_assignment(source: &str, target: &str) -> Option<UserCast> {
     find(source, target).filter(|c| matches!(c.context, 'a' | 'i'))
