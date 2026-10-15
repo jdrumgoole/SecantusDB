@@ -140,10 +140,12 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
     "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
+    "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
+    "query-to-xml": "select query_to_xml('select 1 as a, null::text as \"_xb\", array[1,null] as r', true, true, 'urn:x')",
     "tid-type": "select '(0,1)'::tid::text",
     "date-part-unit-text": "select date_part('foo', '2000-01-01'::timestamptz)",
     "jsonb-object-to-int": """select '{"a":1}'::jsonb::int""",

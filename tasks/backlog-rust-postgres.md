@@ -479,8 +479,10 @@ one beside it.
       - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
         is refused, and an aclitem naming a role oid no role has cannot be
         read back (items are carried as text, PostgreSQL's as oids);
-         `table_to_xml` and the other XML exports, and the
-        `fmgr_*` / `postgresql_fdw_validator` validators, are not written.
+        the XML schema exports (`query_to_xmlschema`, `table_to_xmlschema`,
+        the `*_and_xmlschema` forms), `cursor_to_xml` and the schema /
+        database forms, and the `fmgr_*` / `postgresql_fdw_validator`
+        validators, are not written (`query_to_xml` / `table_to_xml` are).
       - **An untyped literal beside a typed argument** is resolved only
         for a polymorphic overload that is the one candidate (`unknown_args`,
         `funcsig::polymorphic_args`); `func_select_candidate`'s other steps

@@ -144,6 +144,11 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 
 #### Added
 
+- `query_to_xml` and `table_to_xml`, in PostgreSQL 15's SQL/XML mapping:
+  escaped names (`_x0078_mlfoo`), values by type (`xsd:dateTime`
+  timestamps, base64 `bytea`, arrays as `<element>` lists), `xsi:nil`
+  NULLs, table forests and a target namespace. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[query-to-xml]`).
 - The text-search catalogs `pg_ts_config`, `pg_ts_dict`, `pg_ts_parser`,
   `pg_ts_template` and `pg_ts_config_map`, with PostgreSQL 15.19's rows;
   `regconfig` and a new `regdictionary` resolve by name or oid
@@ -197,4 +202,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
   `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
   `string_syntax_settings`, `record_fields_using`, `fetch_ties_settings`
-  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops`, `range_order`, `geometric_closest` and `builtin_small`.
+  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops`, `range_order`, `geometric_closest`, `xml_export` and `builtin_small`.

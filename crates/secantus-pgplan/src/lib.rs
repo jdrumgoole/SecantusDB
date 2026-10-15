@@ -88,6 +88,7 @@ mod funcsig;
 mod ts_debug;
 mod ts_rewrite;
 pub mod wparser;
+mod xml_export;
 pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
