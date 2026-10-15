@@ -22792,6 +22792,20 @@ fn box_operator(op: &str, a: &[f64; 4], b: &[f64; 4]) -> Result<Bson> {
     let le = |x: f64, y: f64| x - y <= EPS;
     let gt = |x: f64, y: f64| x - y > EPS;
     let ge = |x: f64, y: f64| y - x <= EPS;
+    // `box_intersect`: the overlap, NULL when there is none.
+    if op == "#" {
+        let overlap = le(a[2], b[0]) && le(b[2], a[0]) && le(a[3], b[1]) && le(b[3], a[1]);
+        return Ok(if overlap {
+            geo::box_value([
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ])
+        } else {
+            Bson::Null
+        });
+    }
     let area = |c: &[f64; 4]| (c[0] - c[2]) * (c[1] - c[3]);
     let (aa, ab) = (area(a), area(b));
     let v = match op {
@@ -22812,6 +22826,9 @@ fn box_operator(op: &str, a: &[f64; 4], b: &[f64; 4]) -> Result<Bson> {
         "|>>" => gt(a[3], b[1]),
         "&<|" => le(a[1], b[1]),
         "|&>" => ge(a[3], b[3]),
+        // `box_below` / `box_above`: high y at or under the other's low y.
+        "<^" => le(a[1], b[3]),
+        ">^" => ge(a[3], b[1]),
         other => {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: box {other} box"

@@ -496,15 +496,14 @@ one beside it.
         an unlogged table.
       - **Refused operators** the probe reached through their functions:
         multirange `-|-` / `<<` / `>>` / `&<` / `&>` and its ordering
-        comparisons; `macaddr` / `macaddr8` `&` `|` `~`; geometric `box #
-        box`, `<^` / `>^`, circle `&<` `&>` `&<|` `|&>`, `##` for six pairs,
-        `<->` between a line or box and a segment, `line # line`, `?#`,
-        the `path` count comparisons, `point <> point`; `tsquery @>` / `<@`
-        by function name; `json[b]_extract_path[_text]` / `jsonb_delete`
-        given `VARIADIC array`. Casts by function name: `int4("char")`, a
-        length-coercion function with a modifier that is not a constant,
-        and the string / bit-string forms with `isExplicit` false (an
-        assignment, which refuses an overlong value with 22001).
+        comparisons; `macaddr` / `macaddr8` `&` `|` `~`; `##` (closest
+        point) for six pairs, `<->` between a line or box and a segment,
+        the `path` count comparisons; `tsquery @>` / `<@` by function name;
+        `json[b]_extract_path[_text]` / `jsonb_delete` given `VARIADIC
+        array`. Casts by function name: `int4("char")`, a length-coercion
+        function with a modifier that is not a constant, and the string /
+        bit-string forms with `isExplicit` false (an assignment, which
+        refuses an overlong value with 22001).
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

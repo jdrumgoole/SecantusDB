@@ -973,6 +973,28 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
                     segs_intersect(*a1, *a2, corners[i], corners[(i + 1) % 4])
                 }))))
         }
+        // geo_ops.c, PostgreSQL 15.19: `point_ne`, the circle position
+        // tests, `line_interpt` / `line_intersect` and `lseg_intersect`. The
+        // box operators are `box_operator`'s (lib.rs).
+        ("<>", Point(a), Point(q)) => Some(Ok(b(!point_eq_point(*a, *q)))),
+        ("&<", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_le(c1.x + r1, c2.x + r2)))),
+        ("&>", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_ge(c1.x - r1, c2.x - r2)))),
+        ("&<|", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_le(c1.y + r1, c2.y + r2)))),
+        ("|&>", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_ge(c1.y - r1, c2.y - r2)))),
+        ("#", Line(a1, b1, c1), Line(a2, b2, c2)) => Some(Ok(
+            match line_interpt_line((*a1, *b1, *c1), (*a2, *b2, *c2)) {
+                Some(p) => to_bson(&Point(p)),
+                None => Bson::Null,
+            },
+        )),
+        ("?#", Line(a1, b1, c1), Line(a2, b2, c2)) => {
+            Some(Ok(b(
+                line_interpt_line((*a1, *b1, *c1), (*a2, *b2, *c2)).is_some()
+            )))
+        }
+        ("?#", Lseg(a1, a2), Lseg(b1, b2)) => {
+            Some(Ok(b(lseg_interpt_lseg(*a1, *a2, *b1, *b2).is_some())))
+        }
         ("#", Lseg(a1, a2), Lseg(b1, b2)) => {
             Some(Ok(match lseg_interpt_lseg(*a1, *a2, *b1, *b2) {
                 Some(p) => to_bson(&Point(p)),
@@ -1466,6 +1488,7 @@ pub fn operator_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
             _ => return None,
         },
         "#" if lt == "lseg" || lt == "line" => "point",
+        "#" if lt == "box" => "box",
         _ => "bool",
     })
 }
