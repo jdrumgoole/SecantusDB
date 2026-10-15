@@ -911,6 +911,34 @@ pub trait Storage: Send + Sync {
         Ok(Document::new())
     }
 
+    /// The WiredTiger table that holds the collection's documents, for
+    /// `$listCatalog`'s `ident`. `None` from a store that has no such table.
+    fn collection_ident(&self, _db: &str, _coll: &str) -> Option<String> {
+        None
+    }
+
+    /// The WiredTiger table that holds index `name`'s entries, for
+    /// `$listCatalog`'s `idxIdent`.
+    fn index_ident(&self, _db: &str, _coll: &str, _name: &str) -> Option<String> {
+        None
+    }
+
+    /// Count one use of each of `names`, the indexes a plan just read
+    /// (`$indexStats`' `accesses.ops`).
+    fn record_index_use(&self, _db: &str, _coll: &str, _names: &[String]) {}
+
+    /// How many times index `name` has been used, and since when: the
+    /// moment it was created, or (`None`) since this process began. `None`
+    /// altogether when nothing is known of it.
+    fn index_use(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _name: &str,
+    ) -> Option<(i64, Option<bson::DateTime>)> {
+        None
+    }
+
     // --- users (R5 auth) ----------------------------------------------------
 
     /// Store a user record (opaque BSON). Returns `false` if the user already

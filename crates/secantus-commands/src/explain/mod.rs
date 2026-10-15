@@ -80,7 +80,7 @@ fn validate(
     inner: &Document,
     ctx: &mut CommandContext,
 ) -> Result<(), CommandError> {
-    let reply = handler(inner, ctx)?;
+    let reply = order::uncounted(|| handler(inner, ctx))?;
     if let Ok(cursor) = reply.get_document("cursor") {
         if let Some(id) = cursor.get("id").and_then(as_i64).filter(|id| *id != 0) {
             if let Ok(cursors) = ctx.cursors() {
@@ -491,7 +491,7 @@ fn count_through(
     if let Some(c) = options.get("collation") {
         cmd.insert("collation", c.clone());
     }
-    let Ok(reply) = crate::aggregate::aggregate(&cmd, ctx) else {
+    let Ok(reply) = order::uncounted(|| crate::aggregate::aggregate(&cmd, ctx)) else {
         return 0;
     };
     let Ok(cursor) = reply.get_document("cursor") else {

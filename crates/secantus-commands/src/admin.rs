@@ -1385,18 +1385,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
     let name_only = bool_field(doc, "nameOnly", false);
-    let mut names = storage
-        .list_collections(&ctx.db_name)
-        .map_err(command_error)?;
-    // A set member's oplog is `local.oplog.rs`. Here it is the oplog table,
-    // with no catalog entry, so it is added by name.
-    if ctx.db_name == "local"
-        && ctx.replica_set_name.is_some()
-        && !names.iter().any(|n| n == "oplog.rs")
-    {
-        names.push("oplog.rs".to_string());
-        names.sort();
-    }
+    let mut names = listed_collection_names(storage, &ctx.db_name, ctx.replica_set_name.is_some())?;
     // `authorizedCollections` lists only the collections the user has any
     // action on, which leaves out a system collection unless the user has
     // `anyResource` or that collection's name (measured 8.2.11: `read` on
@@ -1412,10 +1401,50 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             });
         }
     }
+    let mut entries = collection_entries(storage, &ctx.db_name, &names)?;
+    // With `nameOnly` the filter sees what is returned, the name and the
+    // type: `{"options.capped": true}` then matches nothing (mongod 8.2.11).
+    if name_only {
+        for e in &mut entries {
+            let name = e.get_str("name").unwrap_or("").to_string();
+            let ty = e.get_str("type").unwrap_or("collection").to_string();
+            *e = doc! { "name": name, "type": ty };
+        }
+    }
+    if let Some(f) = filter {
+        entries.retain(|e| {
+            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
+        });
+    }
+    let ns = format!("{}.$cmd.listCollections", ctx.db_name);
+    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
+    // gets a real getMore (drivers' "listCollections getMore is monitored"
+    // tests force this); absent ⇒ the wire default.
+    let batch_size = doc
+        .get("cursor")
+        .and_then(Bson::as_document)
+        .and_then(|c| c.get("batchSize"))
+        .and_then(as_i64)
+        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
+    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors, true)?;
+    Ok(doc! {
+        "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
+        "ok": 1.0,
+    })
+}
+
+/// `listCollections`' entry for each of `names` in `db`, followed by those
+/// of what mongod keeps beside them and this server derives: a
+/// `system.buckets.<name>` per time-series collection, and `system.views`.
+pub(crate) fn collection_entries(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    names: &[String],
+) -> Result<Vec<Document>, CommandError> {
     let mut entries: Vec<Document> = Vec::with_capacity(names.len());
-    for n in &names {
+    for n in names {
         let mut options = storage
-            .get_collection_options(&ctx.db_name, n)
+            .get_collection_options(db, n)
             .map_err(command_error)?;
         // A `viewOn` collection is a read-only view: type "view", readOnly true,
         // no `_id` index, and the stored `viewPipeline` surfaces as `pipeline`.
@@ -1501,10 +1530,10 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         // right type.
         let mut info = doc! { "readOnly": is_view };
         // A view is a definition, not a collection: it has no uuid.
-        let uuid = if ctx.db_name == "local" && n == "oplog.rs" {
+        let uuid = if db == "local" && n == "oplog.rs" {
             Ok(crate::serverinfo::oplog_uuid(storage))
         } else {
-            storage.collection_uuid(&ctx.db_name, n)
+            storage.collection_uuid(db, n)
         };
         if let (false, Ok(uuid)) = (is_view, uuid) {
             if uuid.len() == 16 {
@@ -1562,7 +1591,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
         };
         let time = definition.get_str("timeField").unwrap_or_default();
         let mut info = doc! { "readOnly": false };
-        if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, name) {
+        if let Ok(uuid) = storage.collection_uuid(db, name) {
             info.insert("uuid", crate::ts_buckets::derived_uuid(&uuid, 1));
         }
         derived.push(doc! {
@@ -1586,7 +1615,7 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             "options": {},
             "info": {
                 "readOnly": false,
-                "uuid": crate::ts_buckets::derived_uuid(ctx.db_name.as_bytes(), 2),
+                "uuid": crate::ts_buckets::derived_uuid(db.as_bytes(), 2),
             },
             "idIndex": { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
         });
@@ -1604,35 +1633,24 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             None => entries.push(entry),
         }
     }
-    // With `nameOnly` the filter sees what is returned, the name and the
-    // type: `{"options.capped": true}` then matches nothing (mongod 8.2.11).
-    if name_only {
-        for e in &mut entries {
-            let name = e.get_str("name").unwrap_or("").to_string();
-            let ty = e.get_str("type").unwrap_or("collection").to_string();
-            *e = doc! { "name": name, "type": ty };
-        }
+    Ok(entries)
+}
+
+/// The collections `listCollections` names in `db`. `set_member`: this
+/// server is a replica-set member, whose oplog is `local.oplog.rs`.
+pub(crate) fn listed_collection_names(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    set_member: bool,
+) -> Result<Vec<String>, CommandError> {
+    let mut names = storage.list_collections(db).map_err(command_error)?;
+    // A set member's oplog is `local.oplog.rs`. Here it is the oplog table,
+    // with no catalog entry, so it is added by name.
+    if db == "local" && set_member && !names.iter().any(|n| n == "oplog.rs") {
+        names.push("oplog.rs".to_string());
+        names.sort();
     }
-    if let Some(f) = filter {
-        entries.retain(|e| {
-            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
-        });
-    }
-    let ns = format!("{}.$cmd.listCollections", ctx.db_name);
-    // Honour `cursor: {batchSize: N}` so a client that asks for a small batch
-    // gets a real getMore (drivers' "listCollections getMore is monitored"
-    // tests force this); absent ⇒ the wire default.
-    let batch_size = doc
-        .get("cursor")
-        .and_then(Bson::as_document)
-        .and_then(|c| c.get("batchSize"))
-        .and_then(as_i64)
-        .unwrap_or(DEFAULT_BATCH_SIZE as i64);
-    let (first, cid) = split_into_cursor(encode_docs(entries)?, batch_size, &ns, cursors, true)?;
-    Ok(doc! {
-        "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
-        "ok": 1.0,
-    })
+    Ok(names)
 }
 
 /// `listIndexes` — a cursor over the indexes of a collection.
@@ -1658,95 +1676,19 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
-    let mut indexes = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map_err(command_error)?;
-    // `_id_` is always listed first, as on mongod. The rest come back in name
-    // order here (mongod: creation order), which put an index named `$**_1`
-    // or `A_1` ahead of it.
-    indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
-    // `hidden` is listed only on an index that is hidden.
-    for ix in &mut indexes {
-        if ix.get_bool("hidden") == Ok(false) {
-            ix.remove("hidden");
-        }
-        // Listed only while it is armed: a unique index has nothing to prepare.
-        if ix.get_bool("prepareUnique") == Ok(false) || ix.get_bool("unique") == Ok(true) {
-            ix.remove("prepareUnique");
-        }
-    }
-    // A collection that exists always has at least the synthesised `_id_` index, so
-    // an empty result means the namespace doesn't exist — mongod errors
-    // NamespaceNotFound (mongo-ruby-driver `Index::View#each ... collection does not
-    // exist`). Mirrors commands.py's `if not indexes`. A set member's oplog
-    // exists and has no index at all.
     let oplog = ctx.db_name == "local" && coll == "oplog.rs" && ctx.replica_set_name.is_some();
-    if indexes.is_empty() && !oplog {
+    let Some(indexes) = listed_indexes(storage, &ctx.db_name, &coll, oplog)? else {
+        // A collection that exists always has at least the synthesised `_id_`
+        // index, so none at all means the namespace doesn't exist — mongod
+        // errors NamespaceNotFound (mongo-ruby-driver `Index::View#each ...
+        // collection does not exist`). Mirrors commands.py's `if not indexes`.
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
             format!("ns does not exist: {}.{}", ctx.db_name, coll),
         )
         .into_reply());
-    }
-    // A time-series collection has no `_id` index to list.
-    if storage
-        .get_collection_options(&ctx.db_name, &coll)
-        .is_ok_and(|o| o.contains_key("timeseries"))
-    {
-        indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
-    }
-    // `multikey` is SecantusDB's internal catalog flag. mongod keeps the
-    // equivalent in the durable catalog and never echoes it from `listIndexes`
-    // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
-    // off the wire. Mirrors commands.py.
-    // `entryFormat` is likewise internal — the on-disk index-entry layout
-    // version (see `ENTRY_FORMAT_RECORDID`). mongod has no such field.
-    for ix in &mut indexes {
-        ix.remove("multikey");
-        ix.remove("entryFormat");
-        ix.remove("collationKeys");
-        ix.remove("geoKeys");
-        ix.remove("pythonKeys");
-    }
-    // The `_id` index of a collection with a default collation carries it.
-    if let Some(default) = crate::util::default_collation(storage, &ctx.db_name, &coll) {
-        for ix in &mut indexes {
-            if ix.get_str("name") == Ok("_id_") {
-                ix.insert("collation", default.spec().clone());
-            }
-        }
-    }
-    // A clustered collection's clustering key IS its index: mongod reports a
-    // single entry carrying `clustered: true` (with the user's name) in place of
-    // the synthesised `_id_`. Mirrors commands.py.
-    let options = storage
-        .get_collection_options(&ctx.db_name, &coll)
-        .unwrap_or_default();
-    if let Ok(ci) = options.get_document("clusteredIndex") {
-        let mut clustered = doc! {
-            "v": ci.get_i32("v").unwrap_or(2),
-            "key": { "_id": 1i32 },
-            "name": ci.get_str("name").unwrap_or("_id_").to_string(),
-            "unique": true,
-        };
-        // The collection's own expiry is its clustered index's (measured
-        // 8.2.11, 2026-10-13); it was left out.
-        if let Some(seconds) = options.get("expireAfterSeconds") {
-            // As an int where it fits one, which is how mongod lists it.
-            let listed = match crate::util::as_i64(seconds).map(i32::try_from) {
-                Some(Ok(n)) => Bson::Int32(n),
-                _ => seconds.clone(),
-            };
-            clustered.insert("expireAfterSeconds", listed);
-        }
-        clustered.insert("clustered", true);
-        let mut rest: Vec<Document> = indexes
-            .into_iter()
-            .filter(|ix| ix.get_str("name") != Ok("_id_"))
-            .collect();
-        indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
-    }
+    };
     // mongod reports a listIndexes cursor under the PLAIN collection namespace
     // (`db.coll`), not a `$cmd.` pseudo-namespace -- probed on 8.3.4. That is
     // also what drivers put in the follow-up getMore's `collection` field, so a
@@ -1785,6 +1727,92 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "cursor": { "id": Bson::Int64(cid), "ns": ns, "firstBatch": docs_to_bson(first)? },
         "ok": 1.0,
     })
+}
+
+/// The indexes of `db.coll` as `listIndexes` lists them, `None` when the
+/// collection does not exist. `oplog`: the collection is a set member's
+/// oplog, which exists and has no index at all.
+pub(crate) fn listed_indexes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    oplog: bool,
+) -> Result<Option<Vec<Document>>, CommandError> {
+    let mut indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    if indexes.is_empty() && !oplog {
+        return Ok(None);
+    }
+    // `_id_` is always listed first, as on mongod. The rest come back in name
+    // order here (mongod: creation order), which put an index named `$**_1`
+    // or `A_1` ahead of it.
+    indexes.sort_by_key(|ix| ix.get_str("name") != Ok("_id_"));
+    // `hidden` is listed only on an index that is hidden.
+    for ix in &mut indexes {
+        if ix.get_bool("hidden") == Ok(false) {
+            ix.remove("hidden");
+        }
+        // Listed only while it is armed: a unique index has nothing to prepare.
+        if ix.get_bool("prepareUnique") == Ok(false) || ix.get_bool("unique") == Ok(true) {
+            ix.remove("prepareUnique");
+        }
+    }
+    // A time-series collection has no `_id` index to list.
+    if storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
+    }
+    // `multikey` is SecantusDB's internal catalog flag. mongod keeps the
+    // equivalent in the durable catalog and never echoes it from `listIndexes`
+    // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
+    // off the wire. Mirrors commands.py.
+    // `entryFormat` is likewise internal — the on-disk index-entry layout
+    // version (see `ENTRY_FORMAT_RECORDID`). mongod has no such field.
+    for ix in &mut indexes {
+        ix.remove("multikey");
+        ix.remove("entryFormat");
+        ix.remove("collationKeys");
+        ix.remove("geoKeys");
+        ix.remove("pythonKeys");
+    }
+    // The `_id` index of a collection with a default collation carries it.
+    if let Some(default) = crate::util::default_collation(storage, db, coll) {
+        for ix in &mut indexes {
+            if ix.get_str("name") == Ok("_id_") {
+                ix.insert("collation", default.spec().clone());
+            }
+        }
+    }
+    // A clustered collection's clustering key IS its index: mongod reports a
+    // single entry carrying `clustered: true` (with the user's name) in place of
+    // the synthesised `_id_`. Mirrors commands.py.
+    let options = storage.get_collection_options(db, coll).unwrap_or_default();
+    if let Ok(ci) = options.get_document("clusteredIndex") {
+        let mut clustered = doc! {
+            "v": ci.get_i32("v").unwrap_or(2),
+            "key": { "_id": 1i32 },
+            "name": ci.get_str("name").unwrap_or("_id_").to_string(),
+            "unique": true,
+        };
+        // The collection's own expiry is its clustered index's (measured
+        // 8.2.11, 2026-10-13); it was left out.
+        if let Some(seconds) = options.get("expireAfterSeconds") {
+            // As an int where it fits one, which is how mongod lists it.
+            let listed = match crate::util::as_i64(seconds).map(i32::try_from) {
+                Some(Ok(n)) => Bson::Int32(n),
+                _ => seconds.clone(),
+            };
+            clustered.insert("expireAfterSeconds", listed);
+        }
+        clustered.insert("clustered", true);
+        let mut rest: Vec<Document> = indexes
+            .into_iter()
+            .filter(|ix| ix.get_str("name") != Ok("_id_"))
+            .collect();
+        indexes = std::iter::once(clustered).chain(rest.drain(..)).collect();
+    }
+    Ok(Some(indexes))
 }
 
 /// `createIndexes` — create one or more indexes (auto-creating the collection).

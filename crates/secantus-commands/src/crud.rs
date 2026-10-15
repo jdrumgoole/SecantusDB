@@ -1165,6 +1165,28 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 argtypes::given_hint(spec),
             )
         });
+        if deleted.is_ok() {
+            crate::explain::order::count_index_use(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                crate::explain::order::Uses::Write {
+                    delete: true,
+                    multi: limit != 1,
+                    upsert: false,
+                    returns: false,
+                },
+            );
+        }
         match deleted {
             Ok(deleted) => {
                 n += deleted as i32;
@@ -1352,6 +1374,23 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
             .map_err(command_error)? as i64
     };
+    if view_on.is_none() {
+        crate::explain::order::count_index_use(
+            ctx.storage()?,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: argtypes::given_hint(doc),
+                collation: collation.as_ref(),
+                vars: &Document::new(),
+                limit: 0,
+                asked: Default::default(),
+            },
+            crate::explain::order::Uses::Count,
+        );
+    }
     if skip > 0 {
         n = n.saturating_sub(skip).max(0);
     }
@@ -1987,6 +2026,29 @@ pub(crate) fn update_in(
             })
         };
 
+        if outcome.is_ok() {
+            // The statement's own query: a sort has pinned `q` to a document.
+            crate::explain::order::count_index_use(
+                storage,
+                &crate::explain::order::Ask {
+                    db: db_name,
+                    coll: &coll,
+                    filter: &doc_field(spec, "q"),
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &stmt_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                crate::explain::order::Uses::Write {
+                    delete: false,
+                    multi,
+                    upsert,
+                    returns: false,
+                },
+            );
+        }
         match outcome {
             Ok(outcome) => {
                 n += outcome.matched as i32;

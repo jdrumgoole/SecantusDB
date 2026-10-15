@@ -512,6 +512,27 @@ fn doc_table_for(db: &str, coll: &str) -> String {
     doc_shard_name(doc_shard_hash(db, coll) % DOC_SHARDS)
 }
 
+/// The WiredTiger table that holds `(db, coll)`'s documents (`$listCatalog`'s
+/// `ident`): one of the shared shard tables.
+pub fn collection_table(db: &str, coll: &str) -> String {
+    doc_table_for(db, coll)
+}
+
+/// The WiredTiger table that holds index `name`'s entries (`$listCatalog`'s
+/// `idxIdent`): the `_id` index is the `_id -> RecordId` map, every other
+/// index is in the one shared entries table.
+pub fn index_table(name: &str) -> &'static str {
+    if name == ID_INDEX_NAME {
+        NAT_SEQ_TABLE
+    } else {
+        IDX_ENTRIES_TABLE
+    }
+}
+
+/// The WiredTiger table of the collection registry, which is where a
+/// database's view definitions are kept.
+pub const CATALOG_TABLE: &str = COLL_TABLE;
+
 /// A scanned document row: `(RecordId, id_key, blob)`. The RecordId is the
 /// doc-table key; the id_key and blob are unframed from the value (see
 /// [`frame_doc_value`]).

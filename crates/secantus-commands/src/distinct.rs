@@ -149,21 +149,23 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             collation.as_ref(),
         )?
     } else {
-        let bytes = crate::explain::order::find(
+        let ask = crate::explain::order::Ask {
+            db: &ctx.db_name,
+            coll: &coll,
+            filter: &filter,
+            sort: None,
+            hint,
+            collation: collation.as_ref(),
+            vars: &Document::new(),
+            limit: 0,
+            asked: Default::default(),
+        };
+        let bytes = crate::explain::order::find(storage, &ask).map_err(command_error)?;
+        crate::explain::order::count_index_use(
             storage,
-            &crate::explain::order::Ask {
-                db: &ctx.db_name,
-                coll: &coll,
-                filter: &filter,
-                sort: None,
-                hint,
-                collation: collation.as_ref(),
-                vars: &Document::new(),
-                limit: 0,
-                asked: Default::default(),
-            },
-        )
-        .map_err(command_error)?;
+            &ask,
+            crate::explain::order::Uses::Distinct(&key),
+        );
         let mut decoded = Vec::with_capacity(bytes.len());
         for b in bytes {
             decoded.push(

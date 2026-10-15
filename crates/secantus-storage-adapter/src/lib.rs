@@ -16,7 +16,8 @@
 //!   hints / unsupported query constructs become a `BadValue` (2) write error,
 //!   and engine/IO faults become `Internal`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use bson::{Bson, Document};
 use secantus_commands::storage::{
@@ -33,11 +34,81 @@ use secantus_storage::{
 /// resulting `Arc<dyn secantus_commands::Storage>` to `secantus_server::bind`.
 pub struct StorageAdapter {
     inner: Arc<WtStorage>,
+    /// Per `(db, collection, index)`: how many plans have read the index, and
+    /// since when (`None`: since this process began). In memory, as mongod
+    /// keeps its own, so a restart starts every count again.
+    index_use: Mutex<HashMap<(String, String, String), IndexUse>>,
+}
+
+/// The table a namespace is kept in.
+enum Stored {
+    /// The collection registry.
+    Catalog,
+    /// The documents of the named collection.
+    Collection(String),
+}
+
+/// One index's `$indexStats` accesses.
+struct IndexUse {
+    ops: i64,
+    since: Option<bson::DateTime>,
 }
 
 impl StorageAdapter {
     pub fn new(inner: Arc<WtStorage>) -> Self {
-        StorageAdapter { inner }
+        StorageAdapter {
+            inner,
+            index_use: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn index_use_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String, String), IndexUse>> {
+        self.index_use.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// An index made now: its count starts at nothing, from now.
+    fn index_created(&self, db: &str, coll: &str, name: &str) {
+        self.index_use_map().insert(
+            (db.to_string(), coll.to_string(), name.to_string()),
+            IndexUse {
+                ops: 0,
+                since: Some(bson::DateTime::now()),
+            },
+        );
+    }
+
+    /// Where the namespace `db.coll` is kept. `None`: in no one table (a
+    /// set member's oplog is spread over the oplog's shard tables).
+    fn stored_as(&self, db: &str, coll: &str) -> Option<Stored> {
+        if (db, coll) == ("local", "oplog.rs") {
+            return None;
+        }
+        // `system.views` is not stored: a database's view definitions are
+        // rows of the collection registry.
+        if coll == "system.views" && !self.inner.collection_exists(db, coll).unwrap_or(false) {
+            return Some(Stored::Catalog);
+        }
+        // `system.buckets.<name>` is not stored either: the buckets are
+        // derived from the time-series collection's own documents.
+        if let Some(base) = coll.strip_prefix(secantus_commands::BUCKETS_PREFIX) {
+            let derived = self
+                .inner
+                .get_collection_options(db, base)
+                .is_ok_and(|o| o.contains_key("timeseries"))
+                && !self.inner.collection_exists(db, coll).unwrap_or(false);
+            if derived {
+                return Some(Stored::Collection(base.to_string()));
+            }
+        }
+        Some(Stored::Collection(coll.to_string()))
+    }
+
+    /// Forget the counts of the indexes `gone` picks out.
+    fn indexes_gone(&self, gone: impl Fn(&str, &str, &str) -> bool) {
+        self.index_use_map()
+            .retain(|(db, coll, name), _| !gone(db, coll, name));
     }
 }
 
@@ -523,7 +594,12 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn create_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
-        self.inner.create_collection(db, coll).map_err(map_err)
+        let created = self.inner.create_collection(db, coll).map_err(map_err)?;
+        if created {
+            self.indexes_gone(|d, c, _| (d, c) == (db, coll));
+            self.index_created(db, coll, "_id_");
+        }
+        Ok(created)
     }
 
     fn create_collection_with_options(
@@ -532,9 +608,15 @@ impl CmdStorage for StorageAdapter {
         coll: &str,
         options: &Document,
     ) -> Result<bool, StorageError> {
-        self.inner
+        let created = self
+            .inner
             .create_collection_with_options(db, coll, options)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        if created {
+            self.indexes_gone(|d, c, _| (d, c) == (db, coll));
+            self.index_created(db, coll, "_id_");
+        }
+        Ok(created)
     }
 
     fn get_collection_options(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
@@ -737,7 +819,9 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
-        self.inner.drop_collection(db, coll).map_err(map_err)
+        let dropped = self.inner.drop_collection(db, coll).map_err(map_err)?;
+        self.indexes_gone(|d, c, _| (d, c) == (db, coll));
+        Ok(dropped)
     }
 
     fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>, StorageError> {
@@ -772,17 +856,26 @@ impl CmdStorage for StorageAdapter {
         key: &Document,
         options: &Document,
     ) -> Result<bool, StorageError> {
-        self.inner
+        let created = self
+            .inner
             .create_index(db, coll, name, key, options)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        if created {
+            self.index_created(db, coll, name);
+        }
+        Ok(created)
     }
 
     fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool, StorageError> {
-        self.inner.drop_index(db, coll, name).map_err(map_err)
+        let dropped = self.inner.drop_index(db, coll, name).map_err(map_err)?;
+        self.indexes_gone(|d, c, n| (d, c, n) == (db, coll, name));
+        Ok(dropped)
     }
 
     fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize, StorageError> {
-        self.inner.drop_all_indexes(db, coll).map_err(map_err)
+        let dropped = self.inner.drop_all_indexes(db, coll).map_err(map_err)?;
+        self.indexes_gone(|d, c, n| (d, c) == (db, coll) && n != "_id_");
+        Ok(dropped)
     }
 
     fn set_index_options(
@@ -809,7 +902,9 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn drop_database(&self, db: &str) -> Result<(), StorageError> {
-        self.inner.drop_database(db).map_err(map_err)
+        self.inner.drop_database(db).map_err(map_err)?;
+        self.indexes_gone(|d, _, _| d == db);
+        Ok(())
     }
 
     fn create_archive(&self, output_path: &str) -> Result<(String, u64), StorageError> {
@@ -877,9 +972,24 @@ impl CmdStorage for StorageAdapter {
         dst_coll: &str,
         drop_target: bool,
     ) -> Result<(bool, Option<String>), StorageError> {
-        self.inner
+        let renamed = self
+            .inner
             .rename_collection(src_db, src_coll, dst_db, dst_coll, drop_target)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        // The collection keeps its indexes, and they their counts.
+        let mut uses = self.index_use_map();
+        uses.retain(|(d, c, _), _| (d.as_str(), c.as_str()) != (dst_db, dst_coll));
+        let moved: Vec<_> = uses
+            .keys()
+            .filter(|(d, c, _)| (d.as_str(), c.as_str()) == (src_db, src_coll))
+            .cloned()
+            .collect();
+        for key in moved {
+            if let Some(entry) = uses.remove(&key) {
+                uses.insert((dst_db.to_string(), dst_coll.to_string(), key.2), entry);
+            }
+        }
+        Ok(renamed)
     }
 
     fn collection_is_capped(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
@@ -934,6 +1044,41 @@ impl CmdStorage for StorageAdapter {
 
     fn index_sizes(&self, db: &str, coll: &str) -> Result<Document, StorageError> {
         self.inner.index_sizes(db, coll).map_err(map_err)
+    }
+
+    fn collection_ident(&self, db: &str, coll: &str) -> Option<String> {
+        Some(match self.stored_as(db, coll)? {
+            Stored::Catalog => secantus_storage::CATALOG_TABLE.to_string(),
+            Stored::Collection(name) => secantus_storage::collection_table(db, &name),
+        })
+    }
+
+    fn index_ident(&self, db: &str, coll: &str, name: &str) -> Option<String> {
+        Some(match self.stored_as(db, coll)? {
+            Stored::Catalog => secantus_storage::CATALOG_TABLE.to_string(),
+            Stored::Collection(_) => secantus_storage::index_table(name).to_string(),
+        })
+    }
+
+    fn record_index_use(&self, db: &str, coll: &str, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut uses = self.index_use_map();
+        for name in names {
+            uses.entry((db.to_string(), coll.to_string(), name.clone()))
+                .or_insert(IndexUse {
+                    ops: 0,
+                    since: None,
+                })
+                .ops += 1;
+        }
+    }
+
+    fn index_use(&self, db: &str, coll: &str, name: &str) -> Option<(i64, Option<bson::DateTime>)> {
+        self.index_use_map()
+            .get(&(db.to_string(), coll.to_string(), name.to_string()))
+            .map(|u| (u.ops, u.since))
     }
 
     fn check_collection(&self, db: &str, coll: &str) -> Result<Option<Document>, StorageError> {

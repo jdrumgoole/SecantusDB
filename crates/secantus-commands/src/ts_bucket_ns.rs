@@ -41,24 +41,10 @@ pub(crate) fn intercept(name: &str, doc: &Document, ctx: &mut CommandContext) ->
         "insert" => Some(insert(doc, ctx, &layout)),
         "update" | "delete" | "findAndModify" | "findandmodify" => Some(no_bucket_writes(&ns)),
         "listIndexes" => {
-            let indexes = match storage.list_indexes(&db, &base) {
-                Ok(indexes) => indexes,
-                Err(e) => return Some(crate::util::command_error(e).into_reply()),
+            let listed: Vec<Bson> = match bucket_indexes(storage.as_ref(), &db, &base, &layout) {
+                Ok(indexes) => indexes.into_iter().map(Bson::Document).collect(),
+                Err(e) => return Some(e.into_reply()),
             };
-            let listed: Vec<Bson> = indexes
-                .into_iter()
-                .filter(|ix| ix.get_str("name") != Ok("_id_"))
-                .map(|mut ix| {
-                    if let Ok(key) = ix.get_document("key") {
-                        let key = ts_buckets::bucket_key(key, &layout);
-                        ix.insert("key", key);
-                    }
-                    for internal in crate::admin::INDEX_CATALOG_ONLY {
-                        ix.remove(*internal);
-                    }
-                    Bson::Document(ix)
-                })
-                .collect();
             Some(doc! {
                 "cursor": { "id": 0_i64, "ns": ns, "firstBatch": listed },
                 "ok": 1.0,
@@ -114,6 +100,34 @@ pub(crate) fn intercept(name: &str, doc: &Document, ctx: &mut CommandContext) ->
             Some(doc! { "nIndexesWas": indexes as i32, "ok": 1.0 })
         }
     }
+}
+
+/// The indexes of `system.buckets.<base>` as `listIndexes` lists them: the
+/// time-series collection's own, each keyed as mongod keys it on the
+/// buckets, and no `_id` index.
+pub(crate) fn bucket_indexes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    base: &str,
+    layout: &Layout,
+) -> Result<Vec<Document>, CommandError> {
+    let indexes = storage
+        .list_indexes(db, base)
+        .map_err(crate::util::command_error)?;
+    Ok(indexes
+        .into_iter()
+        .filter(|ix| ix.get_str("name") != Ok("_id_"))
+        .map(|mut ix| {
+            if let Ok(key) = ix.get_document("key") {
+                let key = ts_buckets::bucket_key(key, layout);
+                ix.insert("key", key);
+            }
+            for internal in crate::admin::INDEX_CATALOG_ONLY {
+                ix.remove(*internal);
+            }
+            ix
+        })
+        .collect())
 }
 
 /// `mongod` takes an update or delete of a bucket document. This server has

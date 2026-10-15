@@ -290,28 +290,30 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .ok()
         .and_then(|c| c.get_i64("id").ok())
         .filter(|id| *id != 0);
-    if let (Some(id), Ok(coll), Ok(storage)) = (open, coll_arg(doc, "find"), ctx.storage()) {
+    if let (Ok(coll), Ok(storage)) = (coll_arg(doc, "find"), ctx.storage()) {
         let filter = doc_field(doc, "filter");
         let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)
             .ok()
             .flatten();
-        let indexes = crate::explain::order::plan_indexes(
-            storage,
-            &crate::explain::order::Ask {
-                db: &ctx.db_name,
-                coll: &coll,
-                filter: &filter,
-                sort: doc.get_document("sort").ok(),
-                hint: argtypes::given_hint(doc),
-                collation: collation.as_ref(),
-                vars: &Document::new(),
-                limit: 0,
-                asked: Default::default(),
-            },
-        );
-        if !indexes.is_empty() {
-            if let Ok(cursors) = ctx.cursors() {
-                cursors.set_plan_indexes(id, indexes);
+        let ask = crate::explain::order::Ask {
+            db: &ctx.db_name,
+            coll: &coll,
+            filter: &filter,
+            sort: doc.get_document("sort").ok(),
+            hint: argtypes::given_hint(doc),
+            collation: collation.as_ref(),
+            vars: &Document::new(),
+            limit: 0,
+            asked: Default::default(),
+        };
+        // The plan ran once: each index it read is used once more.
+        crate::explain::order::count_index_use(storage, &ask, crate::explain::order::Uses::Find);
+        if let Some(id) = open {
+            let indexes = crate::explain::order::plan_indexes(storage, &ask);
+            if !indexes.is_empty() {
+                if let Ok(cursors) = ctx.cursors() {
+                    cursors.set_plan_indexes(id, indexes);
+                }
             }
         }
     }

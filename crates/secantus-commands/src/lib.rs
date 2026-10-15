@@ -59,6 +59,7 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 mod hostinfo;
+mod list_catalog;
 pub mod logbuf;
 pub mod mapreduce;
 pub mod mongod_codes;

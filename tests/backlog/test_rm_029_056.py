@@ -276,7 +276,7 @@ def test_coll_stats_wiredtiger_and_index_details(rust_mongo: Any) -> None:
     assert ("wiredTiger" in stats, "indexDetails" in stats) == (True, True)
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_index_stats_counts_use(rust_mongo: Any) -> None:
     """mongod 8.2.11: two finds through `a_1` count two accesses."""
     db = _fresh(rust_mongo, "rm040ix")
@@ -309,7 +309,7 @@ def test_list_databases_lists_admin_and_config(rust_mongo: Any) -> None:
     assert {"admin", "config", "local"} - names == set()
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_list_catalog_stage(rust_mongo: Any) -> None:
     """mongod 8.2.11 has `$listCatalog`."""
     got = mongo_answer(lambda: len(list(rust_mongo.admin.aggregate([{"$listCatalog": {}}]))) > 0)
