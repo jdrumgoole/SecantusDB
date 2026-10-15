@@ -605,6 +605,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .as_ref()
         .and_then(|a| a.lock().ok())
         .and_then(|g| g.client_metadata.clone());
+    let _command = InCommand::enter(&ns);
     let result = run_segmented(
         input,
         &working_pipeline,
@@ -1626,6 +1627,57 @@ fn nested_write_stage(pipeline: &[Bson]) -> Option<CommandError> {
     None
 }
 
+/// The kind of stage a sub-pipeline runs under.
+#[derive(Clone, Copy, PartialEq)]
+enum SubPipeline {
+    Lookup,
+    UnionWith,
+}
+
+thread_local! {
+    /// The sub-pipelines being run on this thread, innermost last, each with
+    /// the namespace of the `aggregate` command that holds it.
+    static SUB_PIPELINE: std::cell::RefCell<Vec<(SubPipeline, Option<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The namespace of the `aggregate` command running on this thread.
+    static COMMAND_NS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, a sub-pipeline of `kind` is running.
+struct InSubPipeline;
+
+impl InSubPipeline {
+    fn enter(kind: SubPipeline) -> Self {
+        let ns = COMMAND_NS.with(|n| n.borrow().clone());
+        SUB_PIPELINE.with(|s| s.borrow_mut().push((kind, ns)));
+        InSubPipeline
+    }
+}
+
+impl Drop for InSubPipeline {
+    fn drop(&mut self) {
+        SUB_PIPELINE.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// While alive, the `aggregate` command on `ns` is running.
+struct InCommand(Option<String>);
+
+impl InCommand {
+    fn enter(ns: &str) -> Self {
+        InCommand(COMMAND_NS.with(|n| n.borrow_mut().replace(ns.to_string())))
+    }
+}
+
+impl Drop for InCommand {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        COMMAND_NS.with(|n| *n.borrow_mut() = before);
+    }
+}
+
 /// mongod's two wrappers for an error raised inside a pipeline: a
 /// constant-folded expression fails at optimization time and says so, while a
 /// document-dependent one fails per document under the executor prefix.
@@ -1814,6 +1866,7 @@ fn apply_lookup(
                 }
                 _ => foreign.clone(),
             };
+            let _sub = InSubPipeline::enter(SubPipeline::Lookup);
             run_segmented(
                 candidates,
                 sub,
@@ -2148,6 +2201,7 @@ fn apply_union_with(
     let mut foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
     if let Some(sub) = sub_pipeline {
+        let _sub = InSubPipeline::enter(SubPipeline::UnionWith);
         foreign = run_segmented(
             foreign,
             sub,
@@ -2730,10 +2784,42 @@ fn apply_geo_near(
     vars: &Document,
     storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
+    let within = SUB_PIPELINE.with(|s| s.borrow().last().cloned());
+    near_stage(spec, docs, db, coll, vars, storage, within.as_ref()).map_err(|mut e| {
+        // Run for each document of the outer pipeline, the stage fails under
+        // the outer command's executor prefix (measured 8.2.11, 2026-10-15).
+        if let Some((_, Some(ns))) = &within {
+            if !e.errmsg.starts_with("Executor error during") {
+                e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(ns));
+            }
+        }
+        e
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn near_stage(
+    spec: Option<&Bson>,
+    docs: Vec<Document>,
+    db: &str,
+    coll: Option<&str>,
+    vars: &Document,
+    storage: &dyn crate::storage::Storage,
+    within: Option<&(SubPipeline, Option<String>)>,
+) -> Result<Vec<Document>, CommandError> {
     let spec = spec
         .and_then(Bson::as_document)
         .ok_or_else(|| bad_value("$geoNear requires a document spec"))?;
     let stage = geo_near_stage(spec)?;
+    if let Some(c) = coll {
+        if !storage.collection_exists(db, c).map_err(command_error)? {
+            return Err(CommandError::new(
+                26,
+                "NamespaceNotFound",
+                format!("$geoNear requires a geo index to run, but {db}.{c} does not exist"),
+            ));
+        }
+    }
     let key: String = match stage.key {
         Some(k) => k.to_string(),
         None => infer_geo_near_key(db, coll, storage)?,
@@ -2745,17 +2831,34 @@ fn apply_geo_near(
         "2d" => !stage.near.geojson,
         _ => false,
     };
-    let indexed = storage
-        .list_indexes(db, coll)
-        .map_err(command_error)?
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let usable: Vec<(&Document, String)> = indexes
         .iter()
-        .any(|ix| {
-            ix.get_document("key")
-                .ok()
-                .and_then(|k| k.get_str(&key).ok())
-                .is_some_and(readable)
-        });
-    if !indexed {
+        .filter_map(|ix| {
+            let kind = ix.get_document("key").ok()?.get_str(&key).ok()?;
+            readable(kind).then(|| (ix, kind.to_string()))
+        })
+        .collect();
+    if !usable.is_empty() {
+        // A `2d` index hashes the centre before it reads anything. Inside a
+        // `$lookup` mongod meets that while it tries plans, whatever their
+        // number.
+        let tried = matches!(within, Some((SubPipeline::Lookup, _)));
+        crate::near::centre_hashes(&usable, stage.near.centre).map_err(|e| match e {
+            crate::storage::StorageError::WriteError { code, errmsg, .. } => {
+                let errmsg = if tried && !errmsg.starts_with(crate::near::MULTIPLANNER) {
+                    format!("{}{errmsg}", crate::near::MULTIPLANNER)
+                } else if errmsg.starts_with(crate::near::MULTIPLANNER) || within.is_some() {
+                    errmsg
+                } else {
+                    wrap_pipeline_error(errmsg, false, Some(&format!("{db}.{coll}")))
+                };
+                CommandError::new(code, crate::util::error_code_name(code), errmsg)
+            }
+            other => command_error(other),
+        })?;
+    }
+    if usable.is_empty() {
         let max = match spec.get("maxDistance").and_then(bson_f64) {
             Some(m) => crate::crud::fmt_g(m),
             None => "1.79769e+308".to_string(),

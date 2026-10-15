@@ -1157,6 +1157,13 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             continue;
         }
+        if let Some(e) = near_refusal(storage, &ctx.db_name, &coll, &filter, index, "delete") {
+            write_errors.push(Bson::Document(e));
+            if ordered {
+                break;
+            }
+            continue;
+        }
         let statement_started = std::time::Instant::now();
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
@@ -1409,7 +1416,22 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // A `$near` needs its index whether or not the order matters.
         if let Some(near) = crate::near::find_near(&filter).map_err(command_error)? {
             near.check_index(storage, &ctx.db_name, &coll, Default::default())
-                .map_err(command_error)?;
+                .map_err(|e| match e {
+                    StorageError::WriteError {
+                        code,
+                        errmsg,
+                        exec: true,
+                    } => CommandError::new(
+                        code,
+                        crate::util::error_code_name(code),
+                        format!(
+                            "Executor error during count command on namespace: {}.{coll} :: \
+                             caused by :: {errmsg}",
+                            ctx.db_name
+                        ),
+                    ),
+                    other => command_error(other),
+                })?;
         }
         crate::notablescan::check(
             ctx,
@@ -1960,6 +1982,20 @@ pub(crate) fn update_in(
         // collection was then listed).
         // The statement is still read first: a malformed one is refused.
         let absent = !upsert && !storage.collection_exists(db_name, &coll).unwrap_or(true);
+        if let Some(e) = near_refusal(
+            storage,
+            db_name,
+            &coll,
+            &doc_field(spec, "q"),
+            index,
+            "update",
+        ) {
+            write_errors.push(Bson::Document(e));
+            if ordered {
+                break;
+            }
+            continue;
+        }
 
         let statement_started = std::time::Instant::now();
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
@@ -2327,4 +2363,26 @@ fn query_id_equality(q: &Document) -> Option<Bson> {
         }
         v => Some(v.clone()),
     }
+}
+
+/// A write statement whose `$near` cannot run, as its `writeErrors` entry:
+/// no geo index it could read (291), or a centre its `2d` index cannot hash
+/// (16433, under the executor prefix). Measured 8.2.11, 2026-10-15: both
+/// writes changed documents here instead.
+fn near_refusal(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    index: usize,
+    command: &str,
+) -> Option<Document> {
+    let near = match crate::near::find_near(filter) {
+        Ok(Some(near)) => near,
+        Ok(None) => return None,
+        Err(e) => return Some(crate::util::write_error(index, e, command)),
+    };
+    near.check_index(storage, db, coll, Default::default())
+        .err()
+        .map(|e| crate::util::write_error(index, e, command))
 }

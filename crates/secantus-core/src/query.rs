@@ -2402,7 +2402,7 @@ fn type_spec_valid(spec: &Bson) -> Result<(), Fallback> {
 /// A double in C++'s `ostream <<` default form -- six significant digits. Used
 /// by the `$type` numeric-code message, which does NOT use the round-trip form
 /// its neighbours do.
-fn format_g(d: f64) -> String {
+pub fn format_g(d: f64) -> String {
     // `{:.5e}` of a non-finite emits no exponent, so the `split_once('e')`
     // below panicked -- `{v: {$type: NaN}}` answered `1 internal server error`.
     if d.is_nan() {

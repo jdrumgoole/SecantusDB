@@ -155,16 +155,24 @@ impl Found {
         coll: &str,
         asked: Asked,
     ) -> Result<(), StorageError> {
-        let usable = storage.list_indexes(db, coll)?.iter().any(|spec| {
-            !spec.get_bool("hidden").unwrap_or(false)
-                && spec
-                    .get_document("key")
-                    .ok()
-                    .and_then(|key| key.get_str(&self.field).ok())
-                    .is_some_and(|kind| self.reads(kind))
-        });
-        if usable {
+        // A collection that does not exist is read as nothing, with no plan
+        // to make (measured 8.2.11, 2026-10-15: `find` and `count` answer
+        // empty, and `explain` reads its dry run that way).
+        if !storage.collection_exists(db, coll)? {
             return Ok(());
+        }
+        let indexes = storage.list_indexes(db, coll)?;
+        let kind_of = |spec: &Document| -> Option<String> {
+            let kind = spec.get_document("key").ok()?.get_str(&self.field).ok()?;
+            (!spec.get_bool("hidden").unwrap_or(false) && self.reads(kind))
+                .then(|| kind.to_string())
+        };
+        let usable: Vec<(&Document, String)> = indexes
+            .iter()
+            .filter_map(|spec| kind_of(spec).map(|kind| (spec, kind)))
+            .collect();
+        if !usable.is_empty() {
+            return centre_hashes(&usable, self.near.centre);
         }
         // The bound as given: metres for GeoJSON, radians for a legacy point
         // on the sphere, the coordinates' own units in the plane.
@@ -229,6 +237,39 @@ impl Found {
         keyed.into_iter().map(|(_, _, row)| row).collect()
     }
 }
+
+/// A `2d` index the query may read hashes the centre first, and refuses one
+/// outside its range (16433, measured 8.2.11, 2026-10-15). Read as the one
+/// plan, that is an execution error; beside another index, mongod's trial
+/// of the two plans is what meets it.
+pub(crate) fn centre_hashes(
+    usable: &[(&Document, String)],
+    centre: secantus_core::geoshape::P,
+) -> Result<(), StorageError> {
+    for (spec, kind) in usable {
+        if kind != "2d" {
+            continue;
+        }
+        let Ok(index) = secantus_core::geoshape::flat_index(spec) else {
+            continue;
+        };
+        if let Some(why) = secantus_core::geoshape::flat_centre_problem(&index, centre) {
+            if usable.len() > 1 {
+                return Err(refuse(16433, format!("{MULTIPLANNER}{why}")));
+            }
+            return Err(StorageError::WriteError {
+                code: 16433,
+                errmsg: why,
+                exec: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// mongod's prefix on an error met while it tries candidate plans.
+pub(crate) const MULTIPLANNER: &str =
+    "error while multiplanner was selecting best plan :: caused by :: ";
 
 /// The value at a dotted path of a stored document.
 fn at_path(raw: &bson::RawDocument, path: &str) -> Option<Bson> {

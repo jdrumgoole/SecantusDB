@@ -18,7 +18,7 @@
 //! (`tools/probes/geo_queries.py`).
 
 use crate::fallback::Fallback;
-use crate::query::{bson_type_name, bson_value_repr};
+use crate::query::{bson_type_name, bson_value_repr, format_g};
 use bson::{Bson, Document};
 
 /// `(x, y)`: longitude and latitude in degrees for a shape on the sphere.
@@ -31,6 +31,10 @@ pub enum Geom {
     Line(Vec<P>),
     /// The outer loop, then the holes. Each loop without its closing vertex.
     Polygon(Vec<Vec<P>>),
+    /// A polygon under the `strictwinding` crs: one loop, its inside on the
+    /// left of its edges whatever its size (mongod's `BigSimplePolygon`).
+    /// Only a query holds one.
+    BigPolygon(Vec<P>),
     /// `MultiPoint`, `MultiLineString`, `MultiPolygon`, `GeometryCollection`.
     Multi(Vec<Geom>),
 }
@@ -153,6 +157,12 @@ fn degrees(p: P) -> String {
 
 /// One loop of a GeoJSON polygon, without its closing vertex.
 fn polygon_loop(v: &Bson) -> Parsed<Vec<P>> {
+    loop_quoting(v, v)
+}
+
+/// [`polygon_loop`], quoting `shown` where mongod quotes more than the loop
+/// (a big polygon's errors quote all its coordinates).
+fn loop_quoting(v: &Bson, shown: &Bson) -> Parsed<Vec<P>> {
     let mut points = vertices(v)?;
     if points.len() < 2 || points.first() != points.last() {
         return bad(format!(
@@ -171,7 +181,7 @@ fn polygon_loop(v: &Bson) -> Parsed<Vec<P>> {
         return bad(format!(
             "Loop must have at least 3 different vertices, {} unique vertices were provided: {}",
             unique.len(),
-            coordinates(v)
+            coordinates(shown)
         ));
     }
     let n = points.len();
@@ -191,7 +201,7 @@ fn polygon_loop(v: &Bson) -> Parsed<Vec<P>> {
                 return bad(format!(
                     "Loop is not valid: {} Edges {i} and {j} cross. Edge locations in degrees: \
                      {}-{} and {}-{}",
-                    coordinates(v),
+                    coordinates(shown),
                     degrees(a),
                     degrees(b),
                     degrees(c),
@@ -216,6 +226,73 @@ fn polygon(v: Option<&Bson>) -> Parsed<Geom> {
     Ok(Geom::Polygon(
         loops.iter().map(polygon_loop).collect::<Parsed<_>>()?,
     ))
+}
+
+/// A polygon under the `strictwinding` crs (`parseBigSimplePolygonCoordinates`).
+fn big_polygon(v: Option<&Bson>) -> Parsed<Geom> {
+    let Some(whole @ Bson::Array(loops)) = v else {
+        return bad(format!(
+            "Coordinates of polygon must be an array, instead got type {}",
+            type_of(v)
+        ));
+    };
+    if loops.len() != 1 {
+        return bad(format!(
+            "Only one simple loop is allowed in a big polygon, instead provided {} loops: {}",
+            loops.len(),
+            coordinates(whole)
+        ));
+    }
+    Ok(Geom::BigPolygon(loop_quoting(&loops[0], whole)?))
+}
+
+/// The crs mongod reads a big polygon by.
+const STRICT_WINDING: &str = "urn:x-mongodb:crs:strictwinding:EPSG:4326";
+
+/// A GeoJSON object's `crs` (`parseGeoJSONCRS`, r8.2): whether it is the
+/// `strictwinding` one, which only a polygon may name. Absent, it is the
+/// sphere.
+fn strict_winding(d: &Document, polygon: bool) -> Parsed<bool> {
+    let Some(crs) = d.get("crs") else {
+        return Ok(false);
+    };
+    let Bson::Document(crs) = crs else {
+        return bad(format!(
+            "GeoJSON CRS must be an object, instead got type {}",
+            bson_type_name(crs)
+        ));
+    };
+    if crs.get_str("type") != Ok("name") {
+        return bad("GeoJSON CRS must have field \"type\": \"name\"");
+    }
+    let properties = crs.get("properties");
+    let Some(Bson::Document(properties)) = properties else {
+        return bad(format!(
+            "CRS must have field \"properties\" which is an object, instead got type {}",
+            type_of(properties)
+        ));
+    };
+    let name = properties.get("name");
+    let Some(Bson::String(name)) = name else {
+        return bad(format!(
+            "In CRS, \"properties.name\" must be a string, instead got type {}",
+            type_of(name)
+        ));
+    };
+    match name.as_str() {
+        "urn:ogc:def:crs:OGC:1.3:CRS84" | "EPSG:4326" => Ok(false),
+        STRICT_WINDING if polygon => Ok(true),
+        STRICT_WINDING => bad("Strict winding order CRS is only supported by polygon"),
+        other => bad(format!("Unknown CRS name: {other}")),
+    }
+}
+
+/// Why a GeoJSON point cannot be read for its `crs`.
+pub fn point_crs_problem(d: &Document) -> Option<String> {
+    match strict_winding(d, false) {
+        Err(Fallback::Mongo { message, .. }) => Some(message),
+        _ => None,
+    }
 }
 
 fn line(v: Option<&Bson>) -> Parsed<Geom> {
@@ -248,7 +325,15 @@ fn each<'a>(v: Option<&'a Bson>, what: &str) -> Parsed<&'a Vec<Bson>> {
 /// A GeoJSON object.
 pub fn geojson(d: &Document) -> Parsed<Geom> {
     let coords = d.get("coordinates");
-    match d.get_str("type") {
+    let kind = d.get_str("type");
+    if matches!(
+        kind,
+        Ok("Point" | "LineString" | "Polygon" | "MultiPoint" | "MultiLineString" | "MultiPolygon")
+    ) && strict_winding(d, kind == Ok("Polygon"))?
+    {
+        return big_polygon(coords);
+    }
+    match kind {
         Ok("Point") => Ok(Geom::Point(in_bounds(flat_point(coords)?)?)),
         Ok("LineString") => line(coords),
         Ok("Polygon") => polygon(coords),
@@ -371,7 +456,7 @@ pub fn within_shape(op: &str, arg: &Bson) -> Parsed<Shape> {
     };
     // Only something with an inside can have a document within it.
     let area = |g: &Geom| match g {
-        Geom::Polygon(_) => true,
+        Geom::Polygon(_) | Geom::BigPolygon(_) => true,
         Geom::Multi(parts) => {
             !parts.is_empty() && parts.iter().all(|p| matches!(p, Geom::Polygon(_)))
         }
@@ -419,8 +504,12 @@ pub fn intersects_shape(op: &str, arg: &Bson) -> Parsed<Geom> {
 /// a value mongod could not index is simply not matched.
 pub fn stored(v: &Bson) -> Vec<Geom> {
     let one = |v: &Bson| match v {
+        // A document's polygon under the `strictwinding` crs is matched by
+        // nothing (measured 8.2.11, 2026-10-15), and no index holds one.
         Bson::Document(d) if d.get("type").is_some_and(|t| matches!(t, Bson::String(_))) => {
-            geojson(d).ok()
+            geojson(d)
+                .ok()
+                .filter(|g| !matches!(g, Geom::BigPolygon(_)))
         }
         Bson::Document(_) | Bson::Array(_) => flat_point(Some(v)).ok().map(Geom::Point),
         _ => None,
@@ -439,6 +528,7 @@ fn all_points(g: &Geom, out: &mut Vec<P>) {
         Geom::Point(p) => out.push(*p),
         Geom::Line(l) => out.extend(l),
         Geom::Polygon(loops) => out.extend(loops.iter().flatten()),
+        Geom::BigPolygon(ring) => out.extend(ring),
         Geom::Multi(parts) => parts.iter().for_each(|g| all_points(g, out)),
     }
 }
@@ -503,7 +593,13 @@ pub fn sphere_key_problem(field: &str, v: Option<&Bson>) -> Option<String> {
         v @ Bson::Document(d) => {
             let numbers = d.values().take(2).filter(|x| num(x).is_some()).count();
             if d.contains_key("type") {
-                geojson(d).err().map(reason)
+                match geojson(d) {
+                    Err(f) => Some(reason(f)),
+                    Ok(Geom::BigPolygon(_)) => {
+                        Some("can't index geometry with strict winding order".to_string())
+                    }
+                    Ok(_) => None,
+                }
             } else if numbers == 2 {
                 legacy(v)
             } else {
@@ -546,7 +642,11 @@ pub fn flat_key_problem(v: Option<&Bson>, lo: f64, hi: f64) -> Option<(i32, Stri
         if [x, y].iter().any(|c| *c < lo || *c > hi) {
             return Some((
                 13027,
-                format!("point not in interval of [ {lo}, {hi} ]"),
+                format!(
+                    "point not in interval of [ {}, {} ]",
+                    format_g(lo),
+                    format_g(hi)
+                ),
                 true,
             ));
         }
@@ -564,6 +664,94 @@ pub fn flat_key_problem(v: Option<&Bson>, lo: f64, hi: f64) -> Option<(i32, Stri
         }),
         Some(_) => pair(v, matches!(v, Bson::Array(_))),
     }
+}
+
+/// What a `2d` index reads its points with: mongod's `GeoHashConverter`
+/// parameters, `bits` of precision over the square `[min, max]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlatIndex {
+    pub bits: u32,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// A number option as mongod's `FieldParser::extractNumber` reads it into an
+/// `int`: a double (or a decimal, through one) truncated and saturated, NaN
+/// as 0.
+fn option_int(v: &Bson) -> Option<i32> {
+    match v {
+        Bson::Int32(n) => Some(*n),
+        Bson::Int64(n) => Some((*n).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32),
+        other => num(other).map(|d| d as i32),
+    }
+}
+
+/// The `2d` index a spec builds, or mongod's refusal of its options:
+/// `GeoHashConverter::createFromDoc` and the converter's own check of the
+/// error it computes (`hash.cpp`, r8.2). `bits` defaults to 26 and the range
+/// to `[-180, 180]`; a value of the wrong type was refused when the spec was
+/// parsed, so it is read as absent here. Measured on 8.2.11 (2026-10-15):
+/// each message, `bits` truncated (2.5 is 2, NaN is 0, 2^40 is 2147483647),
+/// and a range so wide its cell size overflows refused by 4799400.
+pub fn flat_index(spec: &Document) -> Result<FlatIndex, (i32, String)> {
+    let bits = spec.get("bits").and_then(option_int).unwrap_or(26);
+    let min = spec.get("min").and_then(num).unwrap_or(-180.0);
+    let max = spec.get("max").and_then(num).unwrap_or(180.0);
+    if !(1..=32).contains(&bits) {
+        return Err((
+            72,
+            format!("bits for hash must be > 0 and <= 32, but {bits} bits were specified"),
+        ));
+    }
+    let range = format!("[{}, {}]", format_g(min), format_g(max));
+    // NaN compares false either way: written as mongod writes it.
+    let ordered = min < max;
+    if !ordered || min.is_infinite() || max.is_infinite() {
+        return Err((
+            72,
+            format!(
+                "region for hash must be valid and have positive area, but {range} was specified"
+            ),
+        ));
+    }
+    let scaling = 4.0 * 1024.0 * 1024.0 * 1024.0 / (max - min);
+    let positive = scaling > 0.0;
+    if !positive || scaling.is_infinite() {
+        return Err((72, format!("range {range} is too small.")));
+    }
+    // The distance between the corners of two neighbouring cells, as the
+    // converter unhashes them, plus a hundredth of a cell.
+    let cell = (1u64 << (32 - bits)) as f64;
+    let (a, b) = (0.0 / scaling + min, cell / scaling + min);
+    let d = b - a;
+    let error = (d * d + d * d).sqrt() + 0.001 / scaling;
+    let enough = max - min >= error / 2.0;
+    if !enough {
+        return Err((4799400, "Invalid GeoHashConverter parameters".to_string()));
+    }
+    Ok(FlatIndex {
+        bits: bits as u32,
+        min,
+        max,
+    })
+}
+
+/// mongod's refusal of a `$near` or `$geoNear` centre a `2d` index cannot
+/// hash: one outside its range (16433, measured 8.2.11).
+pub fn flat_centre_problem(index: &FlatIndex, centre: P) -> Option<String> {
+    let (x, y) = centre;
+    if (index.min..=index.max).contains(&x) && (index.min..=index.max).contains(&y) {
+        return None;
+    }
+    let mut at = Document::new();
+    at.insert("0", x);
+    at.insert("1", y);
+    Some(format!(
+        "point not in interval of [ {}, {} ] :: caused by :: {}",
+        format_g(index.min),
+        format_g(index.max),
+        bson_value_repr(&Bson::Document(at))
+    ))
 }
 
 // ----------------------------------------------------------------- $near
@@ -627,6 +815,9 @@ pub fn near_condition(cond: &Document) -> Parsed<Option<Near>> {
         let centre = match g {
             Bson::Document(gd) => match gd.get_str("type") {
                 Ok("Point") | Err(_) => {
+                    if let Some(why) = point_crs_problem(gd) {
+                        return Err(wrong(why));
+                    }
                     in_bounds(flat_point(gd.get("coordinates")).map_err(reason)?).map_err(reason)?
                 }
                 Ok(other) => {
@@ -765,6 +956,11 @@ mod plane {
 // ---------------------------------------------------------------- the sphere
 
 pub(crate) mod sphere {
+    //! Geometry on the sphere as mongod's S2 library tests it (`s2loop.cc`,
+    //! `s2cell.cc`, `s2cap.cc`, `s2polyline.cc` in mongod's `third_party`,
+    //! and `geometry_container.cpp`, r8.2): an edge is the great-circle arc
+    //! between its ends, a loop's inside is on the left of its edges, and a
+    //! point is tested as the leaf cell it falls in.
     use super::{Geom, P};
 
     pub type V = [f64; 3];
@@ -773,8 +969,9 @@ pub(crate) mod sphere {
     /// nothing, but 6.42567661e-12 metres of it.
     const ON_A_LINE: f64 = 1.007_459_37e-18;
 
-    /// What counts as touching: about a centimetre on the ground, the width
-    /// of the leaf cell mongod tests a point as.
+    /// What counts as two lines touching, or a line touching a loop: about
+    /// a centimetre on the ground, the width of a leaf cell. (Only a point
+    /// is tested as its leaf cell itself.)
     const NEAR: f64 = 1.5e-9;
 
     pub fn unit(p: P) -> V {
@@ -800,6 +997,23 @@ pub(crate) mod sphere {
 
     fn scaled(a: V, k: f64) -> V {
         [a[0] * k, a[1] * k, a[2] * k]
+    }
+
+    fn sum(a: V, b: V) -> V {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    }
+
+    fn normalized(a: V) -> V {
+        let n = norm(a);
+        if n == 0.0 {
+            a
+        } else {
+            scaled(a, 1.0 / n)
+        }
+    }
+
+    fn neg(a: V) -> V {
+        [-a[0], -a[1], -a[2]]
     }
 
     /// The angle between two points, in radians.
@@ -855,43 +1069,345 @@ pub(crate) mod sphere {
         inner(x) || inner(scaled(x, -1.0))
     }
 
-    /// Whether `p` is strictly inside the loop: it winds once around `p`, and
-    /// `p` is on the loop's own side of the sphere (a loop winds around the
-    /// point opposite its inside as well).
-    fn winds_around(p: V, ring: &[V]) -> bool {
-        let n = ring.len();
-        let mut total = 0.0;
-        let mut centre = [0.0; 3];
-        for i in 0..n {
-            let (a, b) = (ring[i], ring[(i + 1) % n]);
-            total += dot(p, cross(a, b)).atan2(dot(cross(a, p), cross(b, p)));
-            centre = [centre[0] + a[0], centre[1] + a[1], centre[2] + a[2]];
+    /// `a` x `b`, written as S2's `RobustCrossProd` writes it, `(b + a) x
+    /// (b - a)`, twice as long and exact enough for two points a leaf cell
+    /// apart, where the plain product is all rounding.
+    fn robust_cross(a: V, b: V) -> V {
+        cross(sum(b, a), [b[0] - a[0], b[1] - a[1], b[2] - a[2]])
+    }
+
+    /// S2's `SimpleCrossing`: the arcs cross at a point inside both. Arcs
+    /// that share an end do not (S2's `RobustCrossing` is 0 for them).
+    fn crosses(a: V, b: V, c: V, d: V) -> bool {
+        if a == c || a == d || b == c || b == d {
+            return false;
         }
-        total.abs() > std::f64::consts::PI && dot(p, centre) > 0.0
+        let ab = robust_cross(a, b);
+        let acb = -dot(ab, c);
+        let bda = dot(ab, d);
+        if acb * bda <= 0.0 {
+            return false;
+        }
+        let cd = robust_cross(c, d);
+        let cbd = -dot(cd, b);
+        let dac = dot(cd, a);
+        acb * cbd > 0.0 && acb * dac > 0.0
     }
 
-    fn on_ring(p: V, ring: &[V]) -> bool {
-        let n = ring.len();
-        (0..n).any(|i| on_arc(p, ring[i], ring[(i + 1) % n]))
+    // ------------------------------------------------------------- loops
+
+    /// A loop with its inside on the left of its edges, and points just
+    /// inside it to count edge crossings from.
+    pub struct Ring {
+        v: Vec<V>,
+        inside: Vec<V>,
     }
 
-    fn rings(loops: &[Vec<P>]) -> Vec<Vec<V>> {
+    /// The angle a path turns through at `b`, left positive.
+    fn turn(a: V, b: V, c: V) -> f64 {
+        let (x, y) = (cross(a, b), cross(b, c));
+        let angle = norm(cross(x, y)).atan2(dot(x, y));
+        if dot(cross(a, b), c) > 0.0 {
+            angle
+        } else {
+            -angle
+        }
+    }
+
+    impl Ring {
+        /// A loop as given: its inside on the left, whatever its size.
+        fn as_given(v: Vec<V>) -> Ring {
+            let n = v.len();
+            let mut inside: Vec<(f64, V)> = Vec::new();
+            for i in 0..n {
+                let (a, b) = (v[i], v[(i + 1) % n]);
+                let mid = sum(a, b);
+                let left = cross(a, b);
+                if norm(mid) == 0.0 || norm(left) == 0.0 {
+                    continue;
+                }
+                let mid = normalized(mid);
+                // Off the middle of an edge, towards its left, by less than
+                // the way to any other edge.
+                let room = (0..n)
+                    .filter(|j| *j != i)
+                    .map(|j| to_arc(mid, v[j], v[(j + 1) % n]))
+                    .fold(angle(a, b) / 2.0, f64::min);
+                if room <= 0.0 {
+                    continue;
+                }
+                let q = normalized(sum(mid, scaled(normalized(left), room / 4.0)));
+                inside.push((room, q));
+            }
+            inside.sort_by(|x, y| y.0.total_cmp(&x.0));
+            Ring {
+                v,
+                inside: inside.into_iter().map(|(_, q)| q).collect(),
+            }
+        }
+
+        /// A loop of a GeoJSON polygon: the side no larger than a hemisphere
+        /// (`S2Loop::Normalize`).
+        fn smaller_side(mut v: Vec<V>) -> Ring {
+            let n = v.len();
+            let turning: f64 = (0..n)
+                .map(|i| turn(v[(i + n - 1) % n], v[i], v[(i + 1) % n]))
+                .sum();
+            if turning < -1e-14 {
+                v.reverse();
+            }
+            Ring::as_given(v)
+        }
+
+        fn edges(&self) -> impl Iterator<Item = (V, V)> + '_ {
+            let n = self.v.len();
+            (0..n).map(move |i| (self.v[i], self.v[(i + 1) % n]))
+        }
+
+        /// Whether `p` is inside the loop (its boundary aside): an even number
+        /// of edges between it and a point known to be inside.
+        fn contains(&self, p: V) -> bool {
+            for q in &self.inside {
+                if angle(*q, p) > std::f64::consts::PI - 1e-6 {
+                    continue;
+                }
+                // A path through a vertex would count its two edges as
+                // one crossing or none: take another.
+                let path = cross(*q, p);
+                if self.v.iter().any(|v| dot(path, *v) == 0.0) {
+                    continue;
+                }
+                let crossings = self.edges().filter(|(a, b)| crosses(*q, p, *a, *b)).count();
+                return crossings % 2 == 0;
+            }
+            false
+        }
+
+        fn on_boundary(&self, p: V) -> bool {
+            self.edges().any(|(a, b)| on_arc(p, a, b))
+        }
+    }
+
+    // --------------------------------------------------------- leaf cells
+
+    /// The leaf cell a point falls in, as S2 numbers them (the quadratic
+    /// projection, level 30): its cube face and its range on the face.
+    #[derive(PartialEq)]
+    struct Leaf {
+        face: usize,
+        u: [f64; 2],
+        v: [f64; 2],
+    }
+
+    /// S2's `FaceXYZtoUV`, `None` when `p` is not on the face's side.
+    fn face_uv(face: usize, p: V) -> Option<(f64, f64)> {
+        let axis = face % 3;
+        if (face < 3 && p[axis] <= 0.0) || (face >= 3 && p[axis] >= 0.0) {
+            return None;
+        }
+        Some(match face {
+            0 => (p[1] / p[0], p[2] / p[0]),
+            1 => (-p[0] / p[1], p[2] / p[1]),
+            2 => (-p[0] / p[2], -p[1] / p[2]),
+            3 => (p[2] / p[0], p[1] / p[0]),
+            4 => (p[2] / p[1], -p[0] / p[1]),
+            _ => (-p[1] / p[2], -p[0] / p[2]),
+        })
+    }
+
+    fn face_xyz(face: usize, u: f64, v: f64) -> V {
+        match face {
+            0 => [1.0, u, v],
+            1 => [-u, 1.0, v],
+            2 => [-u, -v, 1.0],
+            3 => [-1.0, -v, -u],
+            4 => [v, -1.0, -u],
+            _ => [v, u, -1.0],
+        }
+    }
+
+    fn uv_to_st(u: f64) -> f64 {
+        if u >= 0.0 {
+            0.5 * (1.0 + 3.0 * u).sqrt()
+        } else {
+            1.0 - 0.5 * (1.0 - 3.0 * u).sqrt()
+        }
+    }
+
+    fn st_to_uv(s: f64) -> f64 {
+        if s >= 0.5 {
+            (1.0 / 3.0) * (4.0 * s * s - 1.0)
+        } else {
+            (1.0 / 3.0) * (1.0 - 4.0 * (1.0 - s) * (1.0 - s))
+        }
+    }
+
+    impl Leaf {
+        fn of(p: V) -> Leaf {
+            let a = [p[0].abs(), p[1].abs(), p[2].abs()];
+            let axis = if a[0] > a[1] {
+                if a[0] > a[2] {
+                    0
+                } else {
+                    2
+                }
+            } else if a[1] > a[2] {
+                1
+            } else {
+                2
+            };
+            let face = if p[axis] < 0.0 { axis + 3 } else { axis };
+            let (u, v) = face_uv(face, p).unwrap_or((0.0, 0.0));
+            const SIZE: f64 = (1u64 << 30) as f64;
+            let range = |x: f64| {
+                let ij = (SIZE * uv_to_st(x)).floor().clamp(0.0, SIZE - 1.0);
+                [st_to_uv(ij / SIZE), st_to_uv((ij + 1.0) / SIZE)]
+            };
+            Leaf {
+                face,
+                u: range(u),
+                v: range(v),
+            }
+        }
+
+        fn corners(&self) -> [V; 4] {
+            let (u, v) = (self.u, self.v);
+            [
+                normalized(face_xyz(self.face, u[0], v[0])),
+                normalized(face_xyz(self.face, u[1], v[0])),
+                normalized(face_xyz(self.face, u[1], v[1])),
+                normalized(face_xyz(self.face, u[0], v[1])),
+            ]
+        }
+
+        fn edges(&self) -> [(V, V); 4] {
+            let c = self.corners();
+            [(c[0], c[1]), (c[1], c[2]), (c[2], c[3]), (c[3], c[0])]
+        }
+
+        fn contains(&self, p: V) -> bool {
+            face_uv(self.face, p).is_some_and(|(u, v)| {
+                (self.u[0]..=self.u[1]).contains(&u) && (self.v[0]..=self.v[1]).contains(&v)
+            })
+        }
+
+        /// Whether a line may meet the cell (`S2Polyline::MayIntersect`).
+        fn meets_line(&self, line: &[V]) -> bool {
+            line.iter().any(|p| self.contains(*p))
+                || line.windows(2).any(|e| {
+                    self.edges()
+                        .iter()
+                        .any(|(c, d)| crosses(e[0], e[1], *c, *d))
+                })
+        }
+
+        /// Whether a polygon may meet the cell (`S2Polygon::MayIntersect`).
+        fn meets_polygon(&self, rings: &[Ring]) -> bool {
+            self.corners().iter().any(|c| polygon_contains(rings, *c))
+                || rings.iter().any(|ring| {
+                    ring.v.iter().any(|p| self.contains(*p))
+                        || ring
+                            .edges()
+                            .any(|(a, b)| self.edges().iter().any(|(c, d)| crosses(a, b, *c, *d)))
+                })
+        }
+
+        /// The normal of edge `k`, pointing into the cell (`S2Cell::GetEdgeRaw`).
+        fn edge_normal(&self, k: usize) -> V {
+            let (f, u, v) = (self.face, self.u, self.v);
+            let u_norm = |u: f64| match f {
+                0 => [u, -1.0, 0.0],
+                1 => [1.0, u, 0.0],
+                2 => [1.0, 0.0, u],
+                3 => [-u, 0.0, 1.0],
+                4 => [0.0, -u, 1.0],
+                _ => [0.0, -1.0, -u],
+            };
+            let v_norm = |v: f64| match f {
+                0 => [-v, 0.0, 1.0],
+                1 => [0.0, -v, 1.0],
+                2 => [0.0, -1.0, -v],
+                3 => [v, -1.0, 0.0],
+                4 => [1.0, v, 0.0],
+                _ => [1.0, 0.0, v],
+            };
+            match k {
+                0 => v_norm(v[0]),
+                1 => u_norm(u[1]),
+                2 => neg(v_norm(v[1])),
+                _ => neg(u_norm(u[0])),
+            }
+        }
+
+        /// Whether a cap may meet the cell (`S2Cap::MayIntersect`).
+        fn meets_cap(&self, axis: V, radius: f64) -> bool {
+            let height = cap_height(radius);
+            let corners = self.corners();
+            if corners.iter().any(|c| {
+                let d = diff(axis, *c);
+                dot(d, d) <= 2.0 * height
+            }) {
+                return true;
+            }
+            // A hemisphere or more holds a corner of any cell it meets.
+            if height >= 1.0 {
+                return false;
+            }
+            if self.contains(axis) {
+                return true;
+            }
+            // Otherwise the cap can only meet the inside of an edge.
+            let sin2 = height * (2.0 - height);
+            for k in 0..4 {
+                let edge = self.edge_normal(k);
+                let d = dot(axis, edge);
+                if d > 0.0 {
+                    continue;
+                }
+                if d * d > sin2 * dot(edge, edge) {
+                    return false;
+                }
+                let dir = cross(edge, axis);
+                if dot(dir, corners[k]) < 0.0 && dot(dir, corners[(k + 1) & 3]) > 0.0 {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    /// The height of the cap of a radius (`S2Cap::FromAxisAngle`): a radius
+    /// of pi or more is the whole sphere.
+    fn cap_height(radius: f64) -> f64 {
+        if radius >= std::f64::consts::PI {
+            2.0
+        } else {
+            let d = (0.5 * radius).sin();
+            2.0 * d * d
+        }
+    }
+
+    // ------------------------------------------------------------ polygons
+
+    fn rings(loops: &[Vec<P>]) -> Vec<Ring> {
         loops
             .iter()
-            .map(|l| l.iter().map(|p| unit(*p)).collect())
+            .map(|l| Ring::smaller_side(l.iter().map(|p| unit(*p)).collect()))
             .collect()
+    }
+
+    /// Inside the polygon, its boundary aside.
+    fn polygon_contains(rings: &[Ring], p: V) -> bool {
+        let Some((outer, holes)) = rings.split_first() else {
+            return false;
+        };
+        outer.contains(p) && !holes.iter().any(|hole| hole.contains(p))
     }
 
     /// Inside the polygon or on its boundary; a hole's boundary is the
     /// polygon's too.
-    pub fn in_polygon(p: V, loops: &[Vec<V>]) -> bool {
-        let Some((outer, holes)) = loops.split_first() else {
-            return false;
-        };
-        if loops.iter().any(|ring| on_ring(p, ring)) {
-            return true;
-        }
-        winds_around(p, outer) && !holes.iter().any(|hole| winds_around(p, hole))
+    fn in_polygon(p: V, rings: &[Ring]) -> bool {
+        rings.iter().any(|ring| ring.on_boundary(p)) || polygon_contains(rings, p)
     }
 
     fn edges(ring: &[V], closed: bool) -> Vec<(V, V)> {
@@ -904,7 +1420,7 @@ pub(crate) mod sphere {
     enum Part {
         Point(V),
         Line(Vec<V>),
-        Polygon(Vec<Vec<V>>),
+        Polygon(Vec<Ring>),
     }
 
     fn parts(g: &Geom, out: &mut Vec<Part>) {
@@ -912,6 +1428,9 @@ pub(crate) mod sphere {
             Geom::Point(p) => out.push(Part::Point(unit(*p))),
             Geom::Line(l) => out.push(Part::Line(l.iter().map(|p| unit(*p)).collect())),
             Geom::Polygon(loops) => out.push(Part::Polygon(rings(loops))),
+            Geom::BigPolygon(ring) => out.push(Part::Polygon(vec![Ring::as_given(
+                ring.iter().map(|p| unit(*p)).collect(),
+            )])),
             Geom::Multi(list) => list.iter().for_each(|g| parts(g, out)),
         }
     }
@@ -920,7 +1439,7 @@ pub(crate) mod sphere {
         match part {
             Part::Point(_) => Vec::new(),
             Part::Line(l) => edges(l, false),
-            Part::Polygon(loops) => loops.iter().flat_map(|r| edges(r, true)).collect(),
+            Part::Polygon(rings) => rings.iter().flat_map(|r| r.edges()).collect(),
         }
     }
 
@@ -928,7 +1447,7 @@ pub(crate) mod sphere {
         match part {
             Part::Point(p) => vec![*p],
             Part::Line(l) => l.clone(),
-            Part::Polygon(loops) => loops.iter().flatten().copied().collect(),
+            Part::Polygon(rings) => rings.iter().flat_map(|r| r.v.iter().copied()).collect(),
         }
     }
 
@@ -936,19 +1455,90 @@ pub(crate) mod sphere {
         match part {
             Part::Point(q) => angle(p, *q) <= NEAR,
             Part::Line(l) => edges(l, false).iter().any(|(a, b)| on_arc(p, *a, *b)),
-            Part::Polygon(loops) => in_polygon(p, loops),
+            Part::Polygon(rings) => in_polygon(p, rings),
         }
     }
 
     fn parts_meet(x: &Part, y: &Part) -> bool {
-        if part_points(x).iter().any(|p| covers(y, *p))
-            || part_points(y).iter().any(|p| covers(x, *p))
-        {
-            return true;
+        match (x, y) {
+            // A point is its leaf cell (`GeometryContainer::intersects`).
+            (Part::Point(p), Part::Point(q)) => Leaf::of(*p) == Leaf::of(*q),
+            (Part::Point(p), Part::Line(l)) | (Part::Line(l), Part::Point(p)) => {
+                Leaf::of(*p).meets_line(l)
+            }
+            (Part::Point(p), Part::Polygon(rings)) | (Part::Polygon(rings), Part::Point(p)) => {
+                Leaf::of(*p).meets_polygon(rings)
+            }
+            (Part::Line(l), Part::Polygon(rings)) | (Part::Polygon(rings), Part::Line(l)) => {
+                line_meets_polygon(l, rings)
+            }
+            (Part::Polygon(x), Part::Polygon(y)) => polygons_meet(x, y),
+            _ => {
+                if part_points(x).iter().any(|p| covers(y, *p))
+                    || part_points(y).iter().any(|p| covers(x, *p))
+                {
+                    return true;
+                }
+                let (ex, ey) = (part_edges(x), part_edges(y));
+                ex.iter()
+                    .any(|(a, b)| ey.iter().any(|(c, d)| arcs_touch(*a, *b, *c, *d)))
+            }
         }
-        let (ex, ey) = (part_edges(x), part_edges(y));
-        ex.iter()
-            .any(|(a, b)| ey.iter().any(|(c, d)| arcs_touch(*a, *b, *c, *d)))
+    }
+
+    /// Strictly inside the polygon: in it, and not on its boundary.
+    fn well_inside(rings: &[Ring], p: V) -> bool {
+        polygon_contains(rings, p) && !rings.iter().any(|ring| ring.on_boundary(p))
+    }
+
+    /// Whether some of a line is inside a polygon, as mongod clips the line
+    /// to the polygon (`polygonLineIntersection`): a line along the
+    /// boundary, or touching it from outside, has nothing inside, unless an
+    /// edge of it is an edge of the loop taken the loop's way, whose inside
+    /// is on its left (measured 8.2.11, 2026-10-15).
+    fn line_meets_polygon(line: &[V], rings: &[Ring]) -> bool {
+        let boundary: Vec<(V, V)> = rings.iter().flat_map(|r| r.edges()).collect();
+        line.windows(2).any(|e| {
+            let (a, b) = (e[0], e[1]);
+            if boundary.iter().any(|(c, d)| *c == a && *d == b) {
+                return true;
+            }
+            // Cut the edge where it crosses the boundary, and look at the
+            // middle of each piece.
+            let mut cuts: Vec<(f64, V)> = vec![(0.0, a), (angle(a, b), b)];
+            for (c, d) in &boundary {
+                if crosses(a, b, *c, *d) {
+                    let mut x = normalized(cross(robust_cross(a, b), robust_cross(*c, *d)));
+                    if dot(x, sum(a, b)) < 0.0 {
+                        x = neg(x);
+                    }
+                    cuts.push((angle(a, x), x));
+                }
+            }
+            cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+            cuts.windows(2).any(|w| {
+                let mid = sum(w[0].1, w[1].1);
+                norm(mid) > 0.0 && well_inside(rings, normalized(mid))
+            })
+        })
+    }
+
+    /// Whether the insides of two polygons overlap (`S2Polygon::Intersects`):
+    /// sharing a boundary is not enough, unless an edge is shared the same
+    /// way round, with both insides on its left.
+    fn polygons_meet(x: &[Ring], y: &[Ring]) -> bool {
+        let ex: Vec<(V, V)> = x.iter().flat_map(|r| r.edges()).collect();
+        let ey: Vec<(V, V)> = y.iter().flat_map(|r| r.edges()).collect();
+        x.iter()
+            .flat_map(|r| r.v.iter())
+            .any(|p| well_inside(y, *p))
+            || y.iter()
+                .flat_map(|r| r.v.iter())
+                .any(|p| well_inside(x, *p))
+            || ex.iter().any(|(a, b)| {
+                ey.iter()
+                    .any(|(c, d)| (a, b) == (c, d) || crosses(*a, *b, *c, *d))
+            })
     }
 
     /// Whether two geometries have a point in common.
@@ -960,26 +1550,32 @@ pub(crate) mod sphere {
     }
 
     /// Whether one piece lies wholly in a polygon: every vertex in it, and no
-    /// edge leaving through its boundary.
-    fn part_in_polygon(part: &Part, loops: &[Vec<V>]) -> bool {
-        if !part_points(part).iter().all(|p| in_polygon(*p, loops)) {
+    /// edge leaving through its boundary. A point is in it when the polygon
+    /// holds it or may meet its leaf cell.
+    fn part_in_polygon(part: &Part, rings: &[Ring]) -> bool {
+        if let Part::Point(p) = part {
+            return polygon_contains(rings, *p) || Leaf::of(*p).meets_polygon(rings);
+        }
+        if !part_points(part).iter().all(|p| in_polygon(*p, rings)) {
             return false;
         }
         // A polygon that has one of the area's holes inside it is not in
         // the area, though every vertex of it is.
         if let Part::Polygon(own) = part {
-            let swallowed = |hole: &Vec<V>| {
-                hole.iter()
-                    .any(|p| own.first().is_some_and(|outer| winds_around(*p, outer)))
+            let swallowed = |hole: &Ring| {
+                hole.v
+                    .iter()
+                    .any(|p| own.first().is_some_and(|outer| outer.contains(*p)))
                     || hole
+                        .v
                         .iter()
-                        .all(|p| own.iter().any(|ring| on_ring(*p, ring)))
+                        .all(|p| own.iter().any(|ring| ring.on_boundary(*p)))
             };
-            if loops.iter().skip(1).any(swallowed) {
+            if rings.iter().skip(1).any(swallowed) {
                 return false;
             }
         }
-        let boundary: Vec<(V, V)> = loops.iter().flat_map(|r| edges(r, true)).collect();
+        let boundary: Vec<(V, V)> = rings.iter().flat_map(|r| r.edges()).collect();
         !part_edges(part)
             .iter()
             .any(|(a, b)| boundary.iter().any(|(c, d)| arcs_cross(*a, *b, *c, *d)))
@@ -993,7 +1589,7 @@ pub(crate) mod sphere {
         !pieces.is_empty()
             && pieces.iter().all(|piece| {
                 polygons.iter().any(|polygon| match polygon {
-                    Part::Polygon(loops) => part_in_polygon(piece, loops),
+                    Part::Polygon(rings) => part_in_polygon(piece, rings),
                     _ => false,
                 })
             })
@@ -1011,7 +1607,7 @@ pub(crate) mod sphere {
             .iter()
             .map(|piece| match piece {
                 Part::Point(p) => angle(*p, c),
-                Part::Polygon(loops) if in_polygon(c, loops) => 0.0,
+                Part::Polygon(rings) if in_polygon(c, rings) => 0.0,
                 other => part_edges(other)
                     .iter()
                     .map(|(a, b)| to_arc(c, *a, *b))
@@ -1021,15 +1617,266 @@ pub(crate) mod sphere {
             .fold(f64::INFINITY, f64::min)
     }
 
-    /// Whether every vertex of the geometry is within `radius` of `centre`.
+    /// S2's `SimpleCCW`: `a`, `b`, `c` turn counter-clockwise.
+    fn simple_ccw(a: V, b: V, c: V) -> bool {
+        dot(cross(c, a), b) > 0.0
+    }
+
+    fn diff(a: V, b: V) -> V {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    /// S2's `RobustCrossProd`, with its fallback for equal or opposite
+    /// points.
+    fn s2_robust_cross(a: V, b: V) -> V {
+        let x = cross(sum(b, a), diff(b, a));
+        if x != [0.0; 3] {
+            return x;
+        }
+        // `S2Point::Ortho`.
+        let k = {
+            let m = [a[0].abs(), a[1].abs(), a[2].abs()];
+            let largest = if m[0] > m[1] {
+                if m[0] > m[2] {
+                    0
+                } else {
+                    2
+                }
+            } else if m[1] > m[2] {
+                1
+            } else {
+                2
+            };
+            (largest + 2) % 3
+        };
+        let mut t = [0.012, 0.0053, 0.00457];
+        t[k] = 1.0;
+        let o = cross(a, t);
+        let n = dot(o, o).sqrt();
+        scaled(o, if n != 0.0 { 1.0 / n } else { n })
+    }
+
+    /// S2's `S2EdgeUtil::GetDistance`, which picks the edge `Project` uses.
+    fn s2_edge_distance(x: V, a: V, b: V) -> f64 {
+        let n = s2_robust_cross(a, b);
+        if simple_ccw(n, a, x) && simple_ccw(x, b, n) {
+            let sin_dist = dot(x, n).abs() / dot(n, n).sqrt();
+            return sin_dist.min(1.0).asin();
+        }
+        let linear = dot(diff(x, a), diff(x, a)).min(dot(diff(x, b), diff(x, b)));
+        2.0 * (0.5 * linear.sqrt()).min(1.0).asin()
+    }
+
+    /// S2's `S2EdgeUtil::GetClosestPoint`, its arithmetic kept: for a point
+    /// almost at the pole of the edge's great circle the projection is
+    /// rounding, and so is where mongod puts the closest point.
+    fn s2_closest_point(x: V, a: V, b: V) -> V {
+        let n = s2_robust_cross(a, b);
+        if simple_ccw(n, a, x) && simple_ccw(x, b, n) {
+            let k = dot(x, n) / dot(n, n);
+            let p = [x[0] - k * n[0], x[1] - k * n[1], x[2] - k * n[2]];
+            let len = dot(p, p).sqrt();
+            return scaled(p, if len != 0.0 { 1.0 / len } else { len });
+        }
+        if dot(diff(x, a), diff(x, a)) <= dot(diff(x, b), diff(x, b)) {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// `S2Distance::minDistanceRad(point, polyline)`: the angle to the point
+    /// `S2Polyline::Project` finds, on the first nearest edge.
+    fn s2_line_distance(x: V, line: &[(V, V)]) -> f64 {
+        let mut best: Option<(f64, V, V)> = None;
+        for (a, b) in line {
+            let d = s2_edge_distance(x, *a, *b);
+            if best.is_none_or(|(m, _, _)| d < m) {
+                best = Some((d, *a, *b));
+            }
+        }
+        match best {
+            Some((_, a, b)) => angle(x, s2_closest_point(x, a, b)),
+            None => f64::INFINITY,
+        }
+    }
+
+    const NORTH: V = [0.0, 0.0, 1.0];
+    const SOUTH: V = [0.0, 0.0, -1.0];
+
+    /// Latitude and longitude, in degrees, of a point.
+    fn lat_lng(p: V) -> (f64, f64) {
+        (
+            p[2].atan2((p[0] * p[0] + p[1] * p[1]).sqrt()).to_degrees(),
+            p[1].atan2(p[0]).to_degrees(),
+        )
+    }
+
+    /// A box of latitudes and longitudes holding every point of the area:
+    /// `(lng lo, lat lo, lng hi, lat hi)` in degrees, the longitudes wrapping
+    /// through 180 when lo is above hi (an S1 interval). The latitudes reach
+    /// as far as the edges do, which is past their ends when an edge bows
+    /// towards a pole.
+    pub fn rect_bound(g: &Geom) -> (f64, f64, f64, f64) {
+        let mut pieces = Vec::new();
+        parts(g, &mut pieces);
+        let (mut lat_lo, mut lat_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        // Each edge covers the short way between its ends' longitudes.
+        let mut spans: Vec<(f64, f64)> = Vec::new();
+        let (mut north, mut south) = (false, false);
+        for piece in &pieces {
+            if let Part::Polygon(rings) = piece {
+                north |= in_polygon(NORTH, rings);
+                south |= in_polygon(SOUTH, rings);
+            }
+            for p in part_points(piece) {
+                let (lat, lng) = lat_lng(p);
+                lat_lo = lat_lo.min(lat);
+                lat_hi = lat_hi.max(lat);
+                spans.push((lng, lng));
+            }
+            for (a, b) in part_edges(piece) {
+                let n = normalized(cross(a, b));
+                // The points of the edge's great circle nearest the poles.
+                for (pole, high) in [(NORTH, true), (SOUTH, false)] {
+                    let top = normalized(diff(pole, scaled(n, dot(pole, n))));
+                    if norm(top) > 0.0 && between(top, a, b) {
+                        let lat = lat_lng(top).0;
+                        if high {
+                            lat_hi = lat_hi.max(lat);
+                        } else {
+                            lat_lo = lat_lo.min(lat);
+                        }
+                    }
+                }
+                let ((_, x), (_, y)) = (lat_lng(a), lat_lng(b));
+                let mut d = y - x;
+                if d > 180.0 {
+                    d -= 360.0;
+                } else if d < -180.0 {
+                    d += 360.0;
+                }
+                spans.push(if d >= 0.0 { (x, x + d) } else { (x + d, x) });
+            }
+        }
+        if north {
+            lat_hi = 90.0;
+        }
+        if south {
+            lat_lo = -90.0;
+        }
+        if north || south || spans.is_empty() {
+            return (-180.0, lat_lo.max(-90.0), 180.0, lat_hi.min(90.0));
+        }
+        // The longitudes: everything but the widest stretch no edge covers.
+        let wrap = |x: f64| {
+            if x > 180.0 {
+                x - 360.0
+            } else if x < -180.0 {
+                x + 360.0
+            } else {
+                x
+            }
+        };
+        let covered = |x: f64| {
+            spans.iter().any(|(lo, hi)| {
+                let (lo, hi) = (wrap(*lo), wrap(*hi));
+                if lo <= hi {
+                    (lo..=hi).contains(&x)
+                } else {
+                    x >= lo || x <= hi
+                }
+            })
+        };
+        let mut ends: Vec<f64> = spans
+            .iter()
+            .flat_map(|(lo, hi)| [wrap(*lo), wrap(*hi)])
+            .collect();
+        ends.sort_by(f64::total_cmp);
+        ends.dedup();
+        let mut widest: Option<(f64, f64, f64)> = None;
+        for (i, lo) in ends.iter().enumerate() {
+            let hi = if i + 1 < ends.len() {
+                ends[i + 1]
+            } else {
+                ends[0] + 360.0
+            };
+            if hi - lo <= 0.0 || covered(wrap((lo + hi) / 2.0)) {
+                continue;
+            }
+            if widest.is_none_or(|(w, _, _)| hi - lo > w) {
+                widest = Some((hi - lo, *lo, hi));
+            }
+        }
+        match widest {
+            None => (-180.0, lat_lo, 180.0, lat_hi),
+            Some((_, gap_lo, gap_hi)) => (wrap(gap_hi), lat_lo, gap_lo, lat_hi),
+        }
+    }
+
+    /// The box around a cap (`S2Cap::GetRectBound`), as [`rect_bound`] gives
+    /// one.
+    pub fn cap_bound(centre: P, radius: f64) -> (f64, f64, f64, f64) {
+        if radius >= std::f64::consts::PI {
+            return (-180.0, -90.0, 180.0, 90.0);
+        }
+        let (lng, lat) = (centre.0.to_radians(), centre.1.to_radians());
+        let half = std::f64::consts::FRAC_PI_2;
+        let (mut lo, mut hi) = (lat - radius, lat + radius);
+        let mut all = false;
+        if lo <= -half {
+            lo = -half;
+            all = true;
+        }
+        if hi >= half {
+            hi = half;
+            all = true;
+        }
+        let (mut lng_lo, mut lng_hi) = (-std::f64::consts::PI, std::f64::consts::PI);
+        if !all {
+            let (sin_a, sin_c) = (radius.sin(), lat.cos());
+            if sin_a <= sin_c {
+                let a = (sin_a / sin_c).asin();
+                let tau = 2.0 * std::f64::consts::PI;
+                let rem = |x: f64| x - tau * (x / tau).round();
+                lng_lo = rem(lng - a);
+                lng_hi = rem(lng + a);
+            }
+        }
+        (
+            lng_lo.to_degrees(),
+            lo.to_degrees(),
+            lng_hi.to_degrees(),
+            hi.to_degrees(),
+        )
+    }
+
+    /// Whether the geometry is within the cap of `radius` around `centre`
+    /// (`GeometryContainer::contains` for a `$centerSphere`): a point when
+    /// the cap may meet its leaf cell; a line or a polygon when it keeps out
+    /// of the complement of the cap, which an edge bulging out of the cap
+    /// does not, though both its ends are inside.
     pub fn in_cap(g: &Geom, centre: P, radius: f64) -> bool {
         let mut pieces = Vec::new();
         parts(g, &mut pieces);
         let c = unit(centre);
+        let height = cap_height(radius);
+        // The complement: around the antipode, with what is left of the
+        // sphere (`S2Cap::Complement`, whose angle is -1 when empty).
+        let far = neg(c);
+        let far_angle = if height >= 2.0 {
+            -1.0
+        } else {
+            2.0 * (0.5 * (2.0 - height)).sqrt().asin()
+        };
         !pieces.is_empty()
-            && pieces
-                .iter()
-                .all(|piece| part_points(piece).iter().all(|p| angle(*p, c) <= radius))
+            && pieces.iter().all(|piece| match piece {
+                Part::Point(p) => Leaf::of(*p).meets_cap(c, radius),
+                Part::Polygon(rings) if polygon_contains(rings, far) => 0.0 >= far_angle,
+                // `S2Polyline::Project` and `S2Polygon::Project` both take the
+                // closest point of the first nearest edge.
+                other => s2_line_distance(far, &part_edges(other)) >= far_angle,
+            })
     }
 }
 
@@ -1049,6 +1896,20 @@ pub fn is_within(doc: &Geom, shape: &Shape) -> bool {
 /// Whether a stored geometry and a query geometry have a point in common.
 pub fn is_intersecting(doc: &Geom, query: &Geom) -> bool {
     sphere::intersects(doc, query)
+}
+
+/// A box of longitudes and latitudes holding every document a `2dsphere`
+/// `$geoWithin` can match, for its index lookup: `(lng lo, lat lo, lng hi,
+/// lat hi)`, wrapping through 180 when lo is above hi. `None` for a flat
+/// shape, whose own box is the bound.
+pub fn sphere_within_bound(arg: &Document) -> Option<(f64, f64, f64, f64)> {
+    match within_shape("$geoWithin", &Bson::Document(arg.clone())).ok()? {
+        Shape::Cap(c, r) => Some(sphere::cap_bound(c, r)),
+        // A big polygon can be most of the sphere; the box says nothing.
+        Shape::Geo(Geom::BigPolygon(_)) => Some((-180.0, -90.0, 180.0, 90.0)),
+        Shape::Geo(g) => Some(sphere::rect_bound(&g)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1106,6 +1967,86 @@ mod tests {
         assert!(is_within(&Geom::Point((179.9, 0.0)), &area));
         assert!(is_within(&Geom::Point((-179.9, 0.0)), &area));
         assert!(!is_within(&Geom::Point((0.0, 0.0)), &area));
+    }
+
+    #[test]
+    fn a_2d_index_is_read_as_mongods_converter_reads_it() {
+        let got = |spec: Document| flat_index(&spec);
+        assert_eq!(
+            got(doc! {}),
+            Ok(FlatIndex {
+                bits: 26,
+                min: -180.0,
+                max: 180.0
+            })
+        );
+        assert_eq!(got(doc! { "bits": 2.5 }).map(|f| f.bits), Ok(2));
+        assert_eq!(
+            got(doc! { "bits": f64::INFINITY }).unwrap_err().1,
+            "bits for hash must be > 0 and <= 32, but 2147483647 bits were specified"
+        );
+        assert_eq!(
+            got(doc! { "min": 0.1, "max": 0.1000000001 }).map(|f| f.max),
+            Ok(0.1000000001)
+        );
+        assert_eq!(
+            got(doc! { "min": f64::NAN }).unwrap_err().1,
+            "region for hash must be valid and have positive area, but [nan, 180] was specified"
+        );
+        let index = got(doc! { "min": -10, "max": 10 }).unwrap();
+        assert_eq!(flat_centre_problem(&index, (10.0, -10.0)), None);
+        assert_eq!(
+            flat_centre_problem(&index, (20.5, 1.25)).as_deref(),
+            Some("point not in interval of [ -10, 10 ] :: caused by :: { 0: 20.5, 1: 1.25 }")
+        );
+    }
+
+    #[test]
+    fn a_polygon_is_the_smaller_side_of_its_loop() {
+        // The same ring both ways round is the same square.
+        let ccw = vec![(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (0.0, 3.0)];
+        let mut cw = ccw.clone();
+        cw.reverse();
+        for ring in [ccw, cw.clone()] {
+            let area = Shape::Geo(Geom::Polygon(vec![ring]));
+            assert!(is_within(&Geom::Point((1.0, 1.0)), &area));
+            assert!(!is_within(&Geom::Point((100.0, 50.0)), &area));
+        }
+        // Taken as given, the clockwise ring is the rest of the sphere.
+        let big = Shape::Geo(Geom::BigPolygon(cw));
+        assert!(!is_within(&Geom::Point((1.0, 1.0)), &big));
+        assert!(is_within(&Geom::Point((100.0, 50.0)), &big));
+    }
+
+    #[test]
+    fn a_cap_holds_a_line_only_when_its_arc_stays_inside() {
+        let line = Geom::Line(vec![(-80.0, 20.0), (80.0, 20.0)]);
+        assert!(!is_within(&line, &Shape::Cap((0.0, -90.0), 2.0)));
+        assert!(is_within(
+            &Geom::Point((0.0, 20.0)),
+            &Shape::Cap((0.0, -90.0), 2.0)
+        ));
+        // The arc reaches 64.5 degrees north; this cap, 70.4.
+        assert!(is_within(&line, &Shape::Cap((0.0, -90.0), 2.8)));
+    }
+
+    #[test]
+    fn a_bound_reaches_as_far_as_the_edges_do() {
+        let bowed = Shape::Geo(Geom::Polygon(vec![vec![
+            (-80.0, 20.0),
+            (80.0, 20.0),
+            (80.0, 30.0),
+            (-80.0, 30.0),
+        ]]));
+        let Shape::Geo(g) = bowed else { unreachable!() };
+        let (lng_lo, lat_lo, lng_hi, lat_hi) = sphere::rect_bound(&g);
+        assert_eq!((lng_lo, lng_hi), (-80.0, 80.0));
+        assert!(
+            (lat_lo - 20.0).abs() < 1e-9 && lat_hi > 70.0,
+            "{lat_lo} {lat_hi}"
+        );
+        // A cap over a pole holds every longitude.
+        assert_eq!(sphere::cap_bound((0.0, -80.0), 0.5).0, -180.0);
     }
 
     #[test]
