@@ -528,7 +528,7 @@ mod tests {
             attribute(&[0x55, 0x04, 0x0a], 0x0c, b"Acme, Inc."),
             attribute(&[0x55, 0x04, 0x03], 0x13, b" alice "),
             attribute(&[0x55, 0x04, 0x03], 0x0c, "zo\u{eb}".as_bytes()),
-            attribute(&[0x2b, 0x06, 0x01], 0x0c, b"x"),
+            attribute(&[0x2a, 0x03, 0x04, 0x05, 0x06, 0x07], 0x0c, b"x"),
             attribute(&[0x55, 0x04, 0x0b], 0x02, &[0x05]),
         ]
         .concat();
@@ -541,7 +541,7 @@ mod tests {
         // DER, and a byte outside ASCII escaped.
         assert_eq!(
             rfc2253(&der).as_deref(),
-            Some("OU=#020105,1.3.6.1=#0C0178,CN=zo\\C3\\AB,CN=\\ alice\\ ,O=Acme\\, Inc.")
+            Some("OU=#020105,1.2.3.4.5.6.7=#0C0178,CN=zo\\C3\\AB,CN=\\ alice\\ ,O=Acme\\, Inc.")
         );
         // A multi-valued RDN's attributes are joined by `+`.
         let two = tlv(
