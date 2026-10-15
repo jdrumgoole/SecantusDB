@@ -56,3 +56,7 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   It was refused at startup. Part of RP-013, pinned by
   `tools/probes/pg_login_hba.py` (128 of 128) and `hba.rs`'s
   `an_at_file_holds_more_tokens`.
+- A password past its `VALID UNTIL` runs the SCRAM exchange and fails it,
+  as PostgreSQL 15.19 does, where without a `pg_hba.conf` it was refused
+  before the exchange. Part of RP-013, pinned by
+  `tools/probes/pg_login_options.py` (234 of 234).

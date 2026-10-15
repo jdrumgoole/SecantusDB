@@ -301,9 +301,6 @@ one beside it.
     - **A `map=` on a method other than `cert` is refused**; PostgreSQL
       takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
       read here.
-    - A password past its `VALID UNTIL` runs the exchange and fails it,
-      where the path without a file fails at once. PostgreSQL does the
-      first; not probed here.
   - **TLS files:**
     - **A revocation list's issuing distribution point named relative to
       its issuer is refused at startup** (`crl.rs`); one with a full name,

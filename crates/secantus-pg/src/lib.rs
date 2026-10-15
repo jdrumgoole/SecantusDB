@@ -18308,16 +18308,13 @@ impl StartupHandler for PgHandler {
                 .is_some_and(|policy| policy.client_cert == ClientCert::Cert);
             let verifier = role.password.as_deref().filter(|_| !by_certificate);
             if let Some(verifier) = verifier {
-                // A password past its VALID UNTIL cannot log in; PostgreSQL
-                // says only that authentication failed.
+                // A password past its VALID UNTIL cannot log in, but the
+                // exchange runs first, as for a user with no role:
+                // PostgreSQL's `get_role_password` answers nothing for it and
+                // `CheckPWChallengeAuth` runs a doomed SCRAM exchange
+                // (measured on 15.19). It says only that authentication failed.
                 if Self::password_expired(&role.valid_until) {
-                    return self
-                        .fail_login(
-                            client,
-                            "28P01",
-                            format!("password authentication failed for user \"{user}\""),
-                        )
-                        .await;
+                    return self.refuse_unknown_user(client, user).await;
                 }
                 let Some(creds) = scram_credentials(verifier) else {
                     // An md5 hash: the md5 challenge, as PostgreSQL's `md5`
