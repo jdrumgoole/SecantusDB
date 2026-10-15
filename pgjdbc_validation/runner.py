@@ -146,11 +146,20 @@ def _ensure_test_database(host: str, port: int) -> None:
     has them (or accepts any database name) is left alone."""
     import psycopg
 
+    # A server that serves any database name (the Python server) lets the
+    # suite in without one, and has no CREATE DATABASE: try it first. Every
+    # weekly run against it died at this step from 2026-10-02 until this.
+    try:
+        psycopg.connect(
+            host=host, port=port, dbname="test", user="postgres", autocommit=True
+        ).close()
+        serves_test = True
+    except psycopg.OperationalError:
+        serves_test = False
     with psycopg.connect(
         host=host, port=port, dbname="postgres", user="postgres", autocommit=True
     ) as conn:
-        exists = conn.execute("select 1 from pg_database where datname = 'test'").fetchone()
-        if exists is None:
+        if not serves_test:
             conn.execute("create database test")
         # ... and the `test` role it connects as, which owns what the suite
         # creates (getTablePrivileges reports the owner's privileges by its

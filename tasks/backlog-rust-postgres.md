@@ -349,18 +349,6 @@ one beside it.
   Backlog-ID: RP-043
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
-- [ ] **RUST pgserver: a quoted mixed-case type name is folded where it is
-  looked up.** The planner hands a type name on as a plain string, so a
-  quoted `"Dom"` and an unquoted `dom` arrive the same, and the user-type
-  lookups (`user_domain`, `user_enum`, `user_composite_widths`, ...) fold
-  both sides to match them. On PostgreSQL 15.19 a domain `"Dom"` is reached
-  by `5::"Dom"` (here 42704) and an enum `"MyType"` is NOT reached by
-  `'y'::"mytype"` (here it is). Names have to keep their case from the
-  parse to the lookup, with only a type name read from TEXT folded (as
-  `'MyDom'::regtype` is); a built-in already refuses a capital (2026-10-15).
-  Backlog-ID: RP-041
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_mixed_case_type_is_found_only_as_written
-
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
   aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's

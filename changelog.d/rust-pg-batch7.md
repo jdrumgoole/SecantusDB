@@ -3,6 +3,20 @@
 More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
 15.19.
 
+#### Fixed
+
+- A type name keeps its case from the parse to the lookup: a domain or type
+  created as `"Dom"` / `"MyType"` is reached by `"Dom"` / `"MyType"` and
+  not by `dom` / `mytype`, and a type named in TEXT (`'MyType'::regtype`,
+  `to_regtype(...)`) is read through the grammar as PostgreSQL's
+  `parseTypeString` reads it. A record cast to an unknown type is 42704.
+  Fixes RP-041
+  (`tests/backlog/test_rust_postgres_gaps.py::test_mixed_case_type_is_found_only_as_written`).
+- The weekly pgjdbc gauge against the Python server died at its own setup
+  from 2026-10-02 on (`create database test`, which that server has no
+  statement for, though it serves the name): the runner now tries the
+  database first.
+
 #### Added
 
 - `pg_hba.conf`'s `samehost` and `samenet` match by this host's interface

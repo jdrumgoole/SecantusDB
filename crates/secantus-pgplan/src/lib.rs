@@ -27637,25 +27637,22 @@ pub fn set_user_composite_widths(widths: std::collections::HashMap<String, Vec<O
 /// A composite's field widths, found as `user_composite` finds the type.
 fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
     let target = canonical_type_ref(name);
-    let fold = !name.trim().contains('"');
     PLAN_COMPOSITE_WIDTHS.with(|t| {
         t.borrow()
             .iter()
-            .find(|(n, _)| **n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .find(|(n, _)| **n == target)
             .map(|(_, w)| w.clone())
     })
 }
 
-/// A composite type's `(oid, fields)` by name, folded exactly as `user_enum`:
-/// a quoted name keeps its case, a bare one folds to lower.
+/// A composite type's `(oid, fields)` by name, compared as `user_enum`
+/// compares it.
 fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
     let target = canonical_type_ref(name);
-    let trimmed = name.trim();
-    let fold = !(trimmed.starts_with('"') || trimmed.contains('"'));
     PLAN_USER_COMPOSITES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(n, _, _)| *n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .find(|(n, _, _)| *n == target)
             .map(|(_, oid, fields)| (*oid, fields.clone()))
     })
 }
@@ -27771,18 +27768,14 @@ pub fn extension_canonical(ty: ExtensionType, text: &str) -> Result<String> {
     }
 }
 
-/// A base type's `(registered name, oid, defined)` by name, folded exactly as
-/// `user_composite`: a quoted name keeps its case, a bare one folds to lower.
-/// The registered name is the one to print -- the fold has lowercased the
-/// caller's spelling.
+/// A base type's `(registered name, oid, defined)` by name, compared as
+/// `user_composite` compares it.
 fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
     let target = canonical_type_ref(name);
-    let trimmed = name.trim();
-    let fold = !(trimmed.starts_with('"') || trimmed.contains('"'));
     PLAN_USER_BASE_TYPES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(n, _, _)| *n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .find(|(n, _, _)| *n == target)
             .map(|(n, oid, defined)| (n.clone(), *oid, *defined))
     })
 }
@@ -27879,15 +27872,16 @@ fn user_range_oid(name: &str) -> Option<i64> {
     })
 }
 
-/// A user type's oid by name, quoted or bare -- the bare form FOLDS, exactly
-/// as `oid_of_name` does for builtins.
 /// One identifier part of a possibly-qualified type reference: a quoted part
-/// keeps its case, an unquoted part folds to lower (PostgreSQL's rule).
+/// unquoted, an unquoted one as it is. A name reaches here from the parser,
+/// which has already folded what was unquoted, or from text read through
+/// the grammar (`text_type_oid`); folding again would make a quoted
+/// `"MyType"` and a bare `mytype` the same type.
 fn normalize_ident_part(part: &str) -> String {
     let p = part.trim();
     match p.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
         Some(inner) => inner.replace("\"\"", "\""),
-        None => p.to_ascii_lowercase(),
+        None => p.to_string(),
     }
 }
 
@@ -27940,6 +27934,29 @@ pub const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
 /// spelling PostgreSQL accepts for an array type (`to_regtype('_rt1')` renders
 /// `rt1[]`). Composites (a table's row type included) resolve through their own
 /// registry because they are not in `PLAN_USER_TYPES`.
+/// A type's oid from a name written in TEXT (`'mytype'::regtype`,
+/// `to_regtype('x')`), read through the grammar as `parseTypeString` reads
+/// it: an unquoted part folds to lower case, a quoted one keeps its case.
+fn text_type_oid(name: &str) -> Option<i64> {
+    if let Some(oid) = pgtypes::oid_of_name(name) {
+        return Some(oid);
+    }
+    let Some((parts, array)) = parsed_type_name(name) else {
+        return user_type_or_array_oid(name);
+    };
+    let base = match parts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [one] | ["public", one] => pgtypes::user_type_key(one),
+        _ => parts.join("."),
+    };
+    let key = if array { format!("{base}[]") } else { base };
+    user_type_or_array_oid(&key)
+}
+
 fn user_type_or_array_oid(name: &str) -> Option<i64> {
     let trimmed = name.trim();
     let element = if let Some(e) = trimmed.strip_suffix("[]") {
@@ -27992,26 +28009,24 @@ fn column_type_exists(name: &str) -> bool {
         || user_base_type(element).is_some()
 }
 
-/// A user ENUM's `(oid, labels)` by name, same folding rule.
+/// A user ENUM's `(oid, labels)` by name, compared exactly.
 fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
     let trimmed = name.trim();
     // A type named like grammar is registered under its quoted spelling
     // (`pgtypes::user_type_name`), which is the whole key.
-    let (target, fold) = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        _ if pgtypes::is_quoted_grammar_name(trimmed) => (trimmed.to_string(), false),
-        Some(inner) => (inner.to_string(), false),
-        None => (trimmed.to_ascii_lowercase(), true),
+    // A name the parser produced keeps its case (a capital survives only
+    // from a quoted identifier), so it is compared as it is: a stored
+    // `"MyType"` is not `mytype` (15.19). Text is read through the grammar
+    // first (`text_type_oid`), which is where an unquoted name folds.
+    let target = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        _ if pgtypes::is_quoted_grammar_name(trimmed) => trimmed.to_string(),
+        Some(inner) => inner.to_string(),
+        None => trimmed.to_string(),
     };
     PLAN_USER_TYPES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(n, _, _)| {
-                if fold {
-                    n.to_ascii_lowercase() == target
-                } else {
-                    *n == target
-                }
-            })
+            .find(|(n, _, _)| *n == target)
             .map(|(_, oid, labels)| (*oid, labels.clone()))
     })
 }
@@ -30109,6 +30124,16 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 &record_field_types(&value).unwrap_or_default(),
             ))),
             "record" => Ok(value.clone()),
+            // A name no catalog knows is 42704, as for any other cast.
+            _ if pgtypes::oid_of_name(target.trim_end_matches("[]")).is_none()
+                && user_type_oid(target.trim_end_matches("[]")).is_none()
+                && user_composite(target.trim_end_matches("[]")).is_none() =>
+            {
+                Err(Error::UndefinedObject(format!(
+                    "type \"{}\" does not exist",
+                    pgtypes::user_type_catalog_name(target)
+                )))
+            }
             _ => Err(Error::Unsupported(format!("a record cast to {target}"))),
         };
     }
@@ -30207,7 +30232,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                         format!("syntax error at or near \"{word}\""),
                     ));
                 }
-                match pgtypes::oid_of_name(&name).or_else(|| user_type_or_array_oid(&name)) {
+                match text_type_oid(&name) {
                     Some(oid) => Ok(regtype_value(oid)),
                     None => Err(match shell_type_named(&name) {
                         Some(shell) => {
@@ -36426,12 +36451,10 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 ));
             }
             return Ok(match const_value(&f.args[0], params)? {
-                Bson::String(name) => {
-                    match pgtypes::oid_of_name(&name).or_else(|| user_type_or_array_oid(&name)) {
-                        Some(oid) => regtype_value(oid),
-                        None => Bson::Null,
-                    }
-                }
+                Bson::String(name) => match text_type_oid(&name) {
+                    Some(oid) => regtype_value(oid),
+                    None => Bson::Null,
+                },
                 _ => Bson::Null,
             });
         }

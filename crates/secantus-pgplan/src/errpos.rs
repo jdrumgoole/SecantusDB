@@ -563,5 +563,11 @@ fn regtype_literal_names(tok: &str, full: &str) -> bool {
     let Some(inner) = tok.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) else {
         return false;
     };
-    inner.replace("''", "'").replace('"', "") == full
+    // Unquoted, the grammar folds it: `'MyType'` names `mytype`.
+    let text = inner.replace("''", "'");
+    if text.contains('"') {
+        text.replace('"', "") == full
+    } else {
+        text.to_ascii_lowercase() == full
+    }
 }

@@ -1035,7 +1035,7 @@ def test_join_cursor_ordered_by_its_key_cannot_scroll(pg: Any) -> None:
     assert answer[:2] == ("err", "55000")
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 def test_mixed_case_type_is_found_only_as_written(pg: Any) -> None:
     """PostgreSQL 15.19: a domain named `"Dom"` is reached by `5::"Dom"`
     (5), and an enum `"MyType"` is not reached by `"mytype"` (42704); here
