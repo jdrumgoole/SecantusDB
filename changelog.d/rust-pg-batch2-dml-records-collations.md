@@ -103,6 +103,17 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   operation; an operator that is no ordering operator is 42809, one the
   type lacks 42883. Part of RP-025
   (tests/backlog/test_rust_postgres_gaps.py::test_typed_value_open).
+- `ORDER BY` an expression over a `generate_series` source sorts by the
+  expression (`order by x % 2` had come back in series order, a silent
+  wrong answer).
+- `FETCH FIRST n ROWS WITH TIES` returns the ties (it returned exactly n
+  rows), in plain, grouped, set-operation, subquery and join queries, with
+  PostgreSQL's 2201W for a NULL count.
+- `SET x TO DEFAULT` / `SET x = DEFAULT` (and `SET LOCAL`) reset the setting,
+  as RESET does; they had stored an empty value.
+- `pg_settings.enumvals` lists each enum setting's values (it was NULL).
+- With `standard_conforming_strings = off`, a typed literal (`int4'1'`,
+  `date'2020-01-02'`) reads as one; it had failed with 42704.
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.
@@ -149,4 +160,5 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
   `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
-  `string_syntax_settings` and `record_fields_using`.
+  `string_syntax_settings`, `record_fields_using`, `fetch_ties_settings`
+  and `series_order_exprs`.

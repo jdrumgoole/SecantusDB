@@ -9336,11 +9336,12 @@ fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
 /// source expression, with the hint the mapping adds.
 pub fn assignment_mismatch(column: &Column, source_type: &str, location: i32) -> Error {
     set_error_location(location);
-    let typmod = (column.typmod >= 0).then_some(column.typmod);
+    // `format_type_be`: the column's type without its modifier
+    // (`bit`, not `bit(4)`; `numeric`, not `numeric(4,1)`).
     Error::DatatypeMismatch(format!(
         "column \"{}\" is of type {} but expression is of type {}",
         column.name,
-        scalar::format_type_text(&column.pg_type, typmod),
+        scalar::format_type_text(&column.pg_type, None),
         display_type(source_type)
     ))
 }
@@ -12282,6 +12283,51 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
 /// rather than ignored: the filter language here is built against stored
 /// columns, and quietly dropping a predicate would answer with rows the client
 /// asked to exclude.
+/// Whether a select over `generate_series` sorts by something other than
+/// the series column itself -- a bare column reference, or an ordinal or
+/// output name for a bare column. Anything else needs the rows planned as
+/// a source, as a table's are.
+fn series_sort_needs_rows(s: &pg_query::protobuf::SelectStmt) -> bool {
+    let bare = |n: Option<&pg_query::protobuf::Node>| {
+        matches!(
+            n.and_then(|n| n.node.as_ref()),
+            Some(N::ColumnRef(c)) if c.fields.len() == 1
+        )
+    };
+    let target = |i: usize| match s.target_list.get(i).and_then(|t| t.node.as_ref()) {
+        Some(N::ResTarget(rt)) => Some(rt),
+        _ => None,
+    };
+    s.sort_clause.iter().any(|item| {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return true;
+        };
+        let key = sb.node.as_deref();
+        match key.and_then(|k| k.node.as_ref()) {
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+                // An output name of an expression (`x * 10 as y ... order by
+                // y`) is that expression.
+                let name = match c.fields[0].node.as_ref() {
+                    Some(N::String(sv)) => sv.sval.as_str(),
+                    _ => return false,
+                };
+                s.target_list.iter().any(|t| match t.node.as_ref() {
+                    Some(N::ResTarget(rt)) => rt.name == name && !bare(rt.val.as_deref()),
+                    _ => false,
+                })
+            }
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Ival(i)) => usize::try_from(i.ival - 1)
+                    .ok()
+                    .and_then(target)
+                    .is_some_and(|rt| !bare(rt.val.as_deref())),
+                _ => true,
+            },
+            _ => true,
+        }
+    })
+}
+
 fn plan_series_select(
     s: &pg_query::protobuf::SelectStmt,
     series: Series,
@@ -19532,7 +19578,9 @@ fn plan_select_rest(
     // A window over `generate_series`: the series keeps a lazy path of its
     // own, but a window needs every row at once anyway, so it is materialised
     // into a source here and the query planned over that.
-    if has_window(s) && s.from_clause.len() == 1 {
+    // So is one ordered by anything but its own column (`order by x % 2`):
+    // the lazy path sorts only by the series value.
+    if s.from_clause.len() == 1 && (has_window(s) || series_sort_needs_rows(s)) {
         if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
             let fits = |v: i64| i32::try_from(v).is_ok();
             let wide = !fits(series.start) || !fits(series.stop);
