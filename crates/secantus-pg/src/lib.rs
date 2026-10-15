@@ -2568,6 +2568,28 @@ impl PgHandler {
     }
 
     /// Is `role` `other`, or a member of it?
+    /// `is_member_of_role_nosuper`: is `role` `other`, or a member of it
+    /// through any chain of grants? A superuser is a member only of what it
+    /// was granted -- what `pg_hba.conf`'s `+role` and `samerole` ask.
+    fn role_is_member_nosuper(&self, role: &str, other: &str) -> bool {
+        if role == other {
+            return true;
+        }
+        let edges = self.role_memberships();
+        let mut reached = vec![role.to_string()];
+        let mut i = 0;
+        while i < reached.len() {
+            let current = reached[i].clone();
+            for (r, m, _) in &edges {
+                if *m == current && !reached.contains(r) {
+                    reached.push(r.clone());
+                }
+            }
+            i += 1;
+        }
+        reached.iter().any(|r| r == other)
+    }
+
     fn role_is_member(&self, role: &str, other: &str) -> bool {
         other == role
             || self
@@ -18493,7 +18515,7 @@ impl PgHandler {
         // that is not sent.
         let database = client.metadata().get("database").unwrap_or(&user).clone();
         let host = client.socket_addr().ip().to_canonical();
-        let member_of = |user: &str, role: &str| self.role_is_member(user, role);
+        let member_of = |user: &str, role: &str| self.role_is_member_nosuper(user, role);
         let connection = hba::Connection {
             tls,
             address: host,

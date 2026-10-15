@@ -47,3 +47,7 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   closed as PostgreSQL 15.19 closes it, the client seeing "unexpected eof";
   it was accepted. Part of RP-013, pinned by the `direct tls` group in
   `tools/probes/pg_login_tls_files.py`.
+- `pg_hba.conf`'s `+role` and `samerole` ask about membership as
+  PostgreSQL's `is_member_of_role_nosuper` does: a superuser is a member of
+  only the roles it was granted, where it counted as a member of all. Part
+  of RP-013, pinned by `tools/probes/pg_login_hba.py` (122 of 122).

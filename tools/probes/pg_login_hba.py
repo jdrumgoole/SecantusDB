@@ -5,7 +5,7 @@ Two files, the second delivered by a reload. Between them: every line type,
 method, database form and user form the server reads, an address that does
 not match, ``clientcert=``, ``map=``, md5-stored passwords under ``md5``,
 ``scram-sha-256`` and ``password`` lines, a role with no password, a user
-with no role, and a database that is not there. 118 scenarios.
+with no role, and a database that is not there. 122 scenarios.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
 script creates and against ``secantusd-pg``, through psycopg and through a
@@ -256,6 +256,7 @@ def setup(port, connect):
             "appuser",
             "md5user",
             "nopw",
+            "boss",
         ):
             c.execute(f"drop role if exists {role}")
         for db in ("appdb", "alice", "team"):
@@ -269,6 +270,9 @@ def setup(port, connect):
         c.execute("create role nopw login")
         c.execute("create role team")
         c.execute("create role member login in role team")
+        # A superuser in no role: `+team` and `samerole` ask about membership
+        # itself, which a superuser does not have of everything.
+        c.execute("create role boss login superuser password 'pw'")
         c.execute("create role appuser login password 'pw'")
         for role in ("md5user", "md5scram", "md5plain"):
             c.execute(f"drop role if exists {role}")
@@ -326,6 +330,8 @@ def scenarios(port):
     both("erin no pw", user="erin")
     both("frank in db team (samerole: not a member)", user="frank", database="team", password="pw")
     both("member in db team", user="member", database="team")
+    both("boss (superuser, in no role) by +team", user="boss", password="pw")
+    both("boss in db team (samerole)", user="boss", database="team", password="pw")
     both(
         "alice in db alice (sameuser is erin's line)", user="alice", database="alice", password="pw"
     )

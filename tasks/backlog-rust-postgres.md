@@ -298,9 +298,6 @@ one beside it.
       outside service (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`,
       `pam`, `bsd`), a host NAME for the address, `@file` inclusion, and
       `include` directives (PostgreSQL 16's).
-    - **`+role` and `samerole` go through `pg_has_role`'s membership**,
-      where PostgreSQL uses the form that does not count a superuser as a
-      member of everything. Not probed with a superuser that has no line.
     - **A `map=` on a method other than `cert` is refused**; PostgreSQL
       takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
       read here.
