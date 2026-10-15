@@ -3208,7 +3208,7 @@ fn apply_out(
 }
 
 /// Resolve `$out`'s target. Accepts `"coll"` or `{db, coll}`.
-fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), CommandError> {
+pub(crate) fn out_target(spec: Option<&Bson>, db: &str) -> Result<(String, String), CommandError> {
     match spec {
         // An EMPTY collection name is not a namespace. It used to be accepted
         // and the stage wrote to a nameless collection, reporting success --

@@ -176,6 +176,8 @@ struct Shared {
     top_stats: Arc<secantus_commands::topstats::TopStats>,
     /// The server-wide slow-operation threshold, set by `profile`.
     slow_ops: Arc<secantus_commands::slowop::SlowOpSettings>,
+    /// Every database's profiling level and filter, set by `profile`.
+    profiler: Arc<secantus_commands::profiler::Profiler>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -411,6 +413,7 @@ pub fn bind(
         step_down: Arc::new(secantus_commands::stepdown::StepDownState::new()),
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         slow_ops: Arc::new(secantus_commands::slowop::SlowOpSettings::new()),
+        profiler: Arc::new(secantus_commands::profiler::Profiler::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -746,6 +749,7 @@ fn serve<S: Read + Write>(
                 };
                 let mut ctx = make_context(conn_id, shared, conn_auth, &peer_cert_dn);
                 ctx.db_name = db_from_namespace(query.full_collection_name);
+                ctx.op_query = true;
                 let reply = dispatch(&request, &mut ctx);
                 // A `closeConnection` failpoint drops the socket without
                 // replying -- on the legacy handshake too, which is where the
@@ -978,11 +982,18 @@ fn run_dispatch(
     // operation that ran for `slowms` or longer, at any profiling level. It is
     // the only record of WHERE a stall was -- a client sees one slow call and
     // nothing else. Time an awaitData `getMore` spent blocked is not work.
+    // A database with a profile filter logs what the filter matches,
+    // whatever `slowms` says (mongod 8.2.11).
     let total = started.elapsed();
     let worked = total.saturating_sub(ctx.awaited.get());
-    if worked.as_millis() >= shared.slow_ops.slow_ms().max(0) as u128
-        && shared.slow_ops.should_log(worked, rand::random::<f64>())
-    {
+    let slow = match ctx.slow_log {
+        Some(matched) => matched,
+        None => {
+            worked.as_millis() >= shared.slow_ops.slow_ms().max(0) as u128
+                && shared.slow_ops.should_log(worked, rand::random::<f64>())
+        }
+    };
+    if slow {
         let attr = secantus_commands::slowop::attributes(
             request,
             &reply,
@@ -1020,6 +1031,7 @@ fn make_context(
         .with_logs(shared.logs.clone())
         .with_top_stats(shared.top_stats.clone())
         .with_slow_ops(shared.slow_ops.clone())
+        .with_profiler(shared.profiler.clone())
         // `next_conn_id` starts at 1 and is bumped per accepted connection, so
         // it is the lifetime total plus one; `conns` holds the live sockets.
         .with_conn_stats(secantus_commands::ConnStats {

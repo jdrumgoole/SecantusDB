@@ -67,6 +67,7 @@ mod mongod_commands;
 mod near;
 pub mod params;
 mod privileges;
+pub mod profiler;
 pub mod rbac;
 mod replset_admin;
 pub mod roles;
@@ -207,6 +208,16 @@ pub struct CommandContext {
     /// `profile`. `None` off-server (unit tests) ⇒ `profile` keeps the values
     /// with the database's profiling level, as it always did.
     pub slow_ops: Option<Arc<slowop::SlowOpSettings>>,
+    /// Every database's profiling level and filter, shared server-wide. A
+    /// context without one gets its own on the first `profile` command.
+    pub profiler: Option<Arc<profiler::Profiler>>,
+    /// The operation `dispatch` is profiling, from its start to its end.
+    pub(crate) profiling: Option<profiler::Pending>,
+    /// The request came as a legacy `OP_QUERY`, and is answered `OP_REPLY`.
+    pub op_query: bool,
+    /// Set when the database has a profile filter: whether the filter
+    /// matched, which decides the slow-query log line in place of `slowms`.
+    pub slow_log: Option<bool>,
     /// Time this request spent WAITING for data rather than working: an
     /// awaitData `getMore` blocked on the oplog. Left out of the time the
     /// slow-operation log measures, or every idle change stream would log a
@@ -269,6 +280,10 @@ impl CommandContext {
             conn_stats: None,
             top_stats: None,
             slow_ops: None,
+            profiler: None,
+            profiling: None,
+            op_query: false,
+            slow_log: None,
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             raw_insert_documents: None,
@@ -321,6 +336,12 @@ impl CommandContext {
     /// Attach the server-wide slow-operation settings (builder-style).
     pub fn with_slow_ops(mut self, settings: Arc<slowop::SlowOpSettings>) -> Self {
         self.slow_ops = Some(settings);
+        self
+    }
+
+    /// Attach the server-wide profiler settings (builder-style).
+    pub fn with_profiler(mut self, profiler: Arc<profiler::Profiler>) -> Self {
+        self.profiler = Some(profiler);
         self
     }
 
@@ -682,7 +703,22 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     } else {
         0
     };
+    ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
+    // An unacknowledged write's reply is zeroed below; its profile entry
+    // records what it did.
+    let inner_n = ctx.profiling.as_ref().and_then(|_| match reply.get("n") {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n),
+        _ => None,
+    });
+    // `dropDatabase` resets the database's profiling settings (measured
+    // 8.2.11: the level and filter are gone afterwards).
+    if name == "dropDatabase" && reply.get_f64("ok").unwrap_or(0.0) == 1.0 {
+        if let Some(p) = &ctx.profiler {
+            p.forget(&ctx.db_name);
+        }
+    }
     // A user or role may have changed: every connection's effective
     // privileges are recomputed on its next command (`rbac::effective`).
     if umc::is_user_or_role_command(name) || name == "secantusAdmin.restoreArchive" {
@@ -707,6 +743,7 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
+    profiler::finish(name, doc, inner_n, &reply, ctx);
     reply
 }
 
@@ -1434,8 +1471,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if let Some(e) = reject_synthetic_view_write(name, doc, &ctx.db_name) {
                 return e.into_reply();
             }
-            // Time profile-eligible commands so dispatch can record a
-            // `system.profile` entry when the per-database level requires it.
+            // A time-series bucket namespace and a view answer here.
             // (A statement of a transaction is refused inside it, in
             // `session`, because the refusal aborts the transaction.)
             if doc.get("autocommit") != Some(&Bson::Boolean(false)) {
@@ -1447,7 +1483,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     return reply;
                 }
             }
-            let start = profile_eligible(name, doc).then(std::time::Instant::now);
+            profiler::mark_reached(ctx);
             let mut reply = session::run(name, handler, doc, ctx);
             // A failpoint-configured writeConcernError attaches to a successful reply,
             // AND so do the failpoint's errorLabels. The labels are what make the
@@ -1474,9 +1510,6 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         }
                     }
                 }
-            }
-            if let Some(start) = start {
-                maybe_record_profile(name, doc, &reply, start, ctx);
             }
             reply
         }
@@ -1637,112 +1670,6 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             Some(reply) => Ok(reply),
         },
         _ => Ok(doc! { "ok": 1.0 }),
-    }
-}
-
-/// Commands dispatch never profiles (handshake / auth / session / cursor
-/// framing + `profile` itself), mirroring `commands.py::_PROFILE_SKIP_COMMANDS`.
-fn profile_skip_command(name: &str) -> bool {
-    matches!(
-        name,
-        "hello"
-            | "isMaster"
-            | "ismaster"
-            | "ping"
-            | "buildInfo"
-            | "buildinfo"
-            | "whatsmyuri"
-            | "saslStart"
-            | "saslContinue"
-            | "logout"
-            | "connectionStatus"
-            | "startSession"
-            | "endSessions"
-            | "refreshSessions"
-            | "getMore"
-            | "killCursors"
-            | "profile"
-    )
-}
-
-/// Whether dispatch should time + maybe record this command in `system.profile`.
-/// Excludes framing commands and any op against `system.profile` itself (a
-/// recursion / unbounded-growth guard). Mirrors `_profile_eligible_command`.
-fn profile_eligible(name: &str, doc: &Document) -> bool {
-    if profile_skip_command(name) {
-        return false;
-    }
-    !matches!(doc.get(name), Some(Bson::String(s)) if s == "system.profile")
-}
-
-/// mongod's profiler `op` bucket for a command (`find` → `query`, writes →
-/// `insert`/`update`/`remove`, everything else → `command`).
-fn profile_op_label(name: &str) -> &'static str {
-    match name {
-        "find" => "query",
-        "insert" => "insert",
-        "update" => "update",
-        "delete" => "remove",
-        _ => "command",
-    }
-}
-
-/// The mongod-shaped `system.profile` entry for a finished command, recorded
-/// when the per-database profiling level requires it. Ports
-/// `commands.py::_maybe_record_profile` (sample-rate skipping omitted — the
-/// gauge uses the default rate of 1.0). Failures are swallowed: the command
-/// already produced its reply.
-fn maybe_record_profile(
-    name: &str,
-    doc: &Document,
-    reply: &Document,
-    start: std::time::Instant,
-    ctx: &CommandContext,
-) {
-    let Some(storage) = ctx.storage.clone() else {
-        return;
-    };
-    let db = ctx.db_name.clone();
-    let Ok(settings) = storage.get_profile(&db) else {
-        return;
-    };
-    let level = settings.get_i32("level").unwrap_or(0);
-    if level == 0 {
-        return;
-    }
-    let duration_ms = start.elapsed().as_millis() as i64;
-    let slowms = settings.get_i32("slowms").unwrap_or(100) as i64;
-    if level == 1 && duration_ms < slowms {
-        return;
-    }
-    // `ns`: db.coll when the command names a collection, else db.
-    let ns = match doc.get(name) {
-        Some(Bson::String(c)) if !c.is_empty() => format!("{db}.{c}"),
-        _ => db.clone(),
-    };
-    // `command`: the request minus framing fields.
-    let mut command = doc.clone();
-    for k in ["$db", "$clusterTime", "lsid", "$readPreference"] {
-        command.remove(k);
-    }
-    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
-    let mut entry = doc! {
-        "ts": bson::DateTime::now(),
-        "op": profile_op_label(name),
-        "ns": ns,
-        "command": command,
-        "millis": duration_ms as i32,
-        "ok": if ok { 1.0 } else { 0.0 },
-        "client": "",
-    };
-    if !ok {
-        if let Ok(em) = reply.get_str("errmsg") {
-            entry.insert("errMsg", em.to_string());
-        }
-    }
-    let mut bytes = Vec::new();
-    if entry.to_writer(&mut bytes).is_ok() {
-        let _ = storage.insert(&db, "system.profile", vec![bytes], true);
     }
 }
 

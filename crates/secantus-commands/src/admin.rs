@@ -1160,6 +1160,19 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
+    // mongod keeps the profiler's collection while it writes to it.
+    if coll == crate::profiler::PROFILE_COLLECTION
+        && ctx
+            .profiler
+            .as_ref()
+            .is_some_and(|p| p.settings(&ctx.db_name).level != 0)
+    {
+        return Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            "turn off profiling before dropping system.profile collection",
+        ));
+    }
     let storage = ctx.storage()?;
     // `system.views` holds every view's definition: dropping it drops them
     // all. It used to answer ok and leave the views in place.
@@ -1194,10 +1207,12 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // for a collection with two secondary indexes, where this always said 1
     // (measured 8.2.11, 2026-09-30). A collection that does not exist lists
     // nothing, and that branch reports no count at all.
-    let n_indexes = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map(|ix| ix.len().max(1))
-        .unwrap_or(1);
+    // `system.profile` alone has no `_id` index to count.
+    let n_indexes = match storage.list_indexes(&ctx.db_name, &coll) {
+        Ok(ix) if coll == crate::profiler::PROFILE_COLLECTION => ix.len(),
+        Ok(ix) => ix.len().max(1),
+        Err(_) => 1,
+    };
     // A time-series collection has no `_id` index to count.
     let n_indexes = if storage
         .get_collection_options(&ctx.db_name, &coll)
@@ -1558,7 +1573,12 @@ pub(crate) fn collection_entries(
         };
         // A clustered collection has no separate `_id_` index (the clustering
         // key IS the index), so mongod omits `idIndex` for it — same as views.
-        if !is_view && !is_clustered && coll_type != "timeseries" {
+        // Nor has `system.profile` (mongod 8.2.11).
+        if !is_view
+            && !is_clustered
+            && coll_type != "timeseries"
+            && n.as_str() != crate::profiler::PROFILE_COLLECTION
+        {
             let mut id_index = doc! {
                 "v": 2,
                 "key": { "_id": 1 },
@@ -1739,7 +1759,11 @@ pub(crate) fn listed_indexes(
     oplog: bool,
 ) -> Result<Option<Vec<Document>>, CommandError> {
     let mut indexes = storage.list_indexes(db, coll).map_err(command_error)?;
-    if indexes.is_empty() && !oplog {
+    // `system.profile` exists and has no index at all (mongod creates it
+    // without one), like a set member's oplog.
+    let unindexed = coll == crate::profiler::PROFILE_COLLECTION
+        && storage.collection_exists(db, coll).unwrap_or(false);
+    if indexes.is_empty() && !oplog && !unindexed {
         return Ok(None);
     }
     // `_id_` is always listed first, as on mongod. The rest come back in name
@@ -3799,37 +3823,23 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
-/// `profile` — get / set per-database profiling level. `{profile: -1}` reads;
-/// `{profile: 0|1|2, slowms, sampleRate}` updates. The reply carries the
-/// PREVIOUS values under `was` / `slowms` / `sampleRate`. Ports
-/// `commands.py::_profile`. (SecantusDB records the level but does no actual
-/// slow-op profiling — `system.profile` stays a faithful stub.)
+/// `profile` -- read or change the database's profiling settings
+/// ([`crate::profiler`]). The reply carries the settings as they were:
+/// `was` (the level), the server-wide `slowms` and `sampleRate`, the
+/// `filter` when one was set, and mongod's `note` whenever a filter was set
+/// or is being given.
+///
+/// mongod's reading of the arguments (8.2.11): the level is any number,
+/// truncated; one outside 0..=2 leaves the level alone but still applies
+/// `slowms`, `sampleRate` and `filter`. `slowms` is any number, truncated and
+/// not range-checked; `sampleRate` is a number from 0 to 1; `filter` is a
+/// document or the string "unset" (null is refused). Setting level 1 or 2
+/// creates `system.profile` at once.
 pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let db = ctx.db_name.clone();
-    let storage = ctx.storage()?;
-    let prev = storage.get_profile(&db).map_err(command_error)?;
-    let prev_level = prev.get_i32("level").unwrap_or(0);
-    // `slowms` and `sampleRate` are server-wide on mongod: set through one
-    // database, read back through every other (probed on 8.2.11). Only the
-    // level is per-database.
-    let slow_ops = ctx.slow_ops.clone();
-    let (prev_slowms, prev_rate) = match &slow_ops {
-        Some(s) => (s.slow_ms(), s.sample_rate()),
-        None => (
-            prev.get_i32("slowms").unwrap_or(100),
-            prev.get_f64("sampleRate").unwrap_or(1.0),
-        ),
-    };
-    let was = doc! {
-        "was": prev_level,
-        "slowms": prev_slowms,
-        "sampleRate": prev_rate,
-        "ok": 1.0,
-    };
-    // mongod's reading of the arguments (8.2.11): the level is any number,
-    // truncated; one outside 0..=2 changes nothing and reads the settings.
-    // `slowms` is any number, truncated and not range-checked; `sampleRate`
-    // is a number from 0 to 1; `filter` is a document or the string "unset".
+    let profiler = ctx.profiler.get_or_insert_with(Default::default).clone();
+    let slow_ops = ctx.slow_ops.get_or_insert_with(Default::default).clone();
+    let prev = profiler.settings(&db);
     let number = |field: &str| -> Result<Option<f64>, CommandError> {
         match doc.get(field) {
             None => Ok(None),
@@ -3864,19 +3874,12 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "'sampleRate' must be between 0.0 and 1.0 inclusive",
         ));
     }
-    match doc.get("filter") {
-        None | Some(Bson::Null) => {}
-        Some(Bson::String(word)) if word == "unset" => {}
-        // A filter chooses what is profiled, and this profiler has none:
-        // taking one and profiling as before would be a setting that does
-        // nothing, so it is refused.
-        Some(Bson::Document(_)) => {
-            return Err(CommandError::new(
-                238,
-                "NotImplemented",
-                "a profile filter is not supported by this server",
-            ));
-        }
+    let filter = match doc.get("filter") {
+        None => None,
+        Some(Bson::String(word)) if word == "unset" => Some(None),
+        Some(Bson::Document(f)) => Some(Some(std::sync::Arc::new(
+            crate::profiler::filter::ProfileFilter::parse(f)?,
+        ))),
         Some(_) => {
             return Err(CommandError::new(
                 2,
@@ -3884,17 +3887,50 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 "Expected an object, or the string 'unset'.",
             ));
         }
+    };
+    let mut was = doc! {
+        "was": prev.level,
+        "slowms": slow_ops.slow_ms(),
+        "sampleRate": slow_ops.sample_rate(),
+    };
+    if let Some(f) = &prev.filter {
+        was.insert("filter", f.serialized().clone());
     }
-    if !(0..=2).contains(&level) {
-        return Ok(was);
+    if prev.filter.is_some() || filter.is_some() {
+        was.insert(
+            "note",
+            "When a filter expression is set, slowms and sampleRate are not used for \
+             profiling and slow-query log lines.",
+        );
     }
-    let slowms = slowms.unwrap_or(prev_slowms);
-    let rate = rate.unwrap_or(prev_rate);
-    storage
-        .set_profile(&db, level as i32, slowms, rate)
-        .map_err(command_error)?;
-    if let Some(s) = &slow_ops {
-        s.set(slowms, rate);
+    was.insert("ok", 1.0);
+    let level = (0..=2).contains(&level).then_some(level as i32);
+    if slowms.is_some() || rate.is_some() {
+        slow_ops.set(
+            slowms.unwrap_or_else(|| slow_ops.slow_ms()),
+            rate.unwrap_or_else(|| slow_ops.sample_rate()),
+        );
+    }
+    if level.is_some() || filter.is_some() {
+        profiler.set(&db, level, filter);
+    }
+    if level.is_some_and(|l| l > 0) {
+        let storage = ctx.storage()?;
+        if !storage
+            .collection_exists(&db, crate::profiler::PROFILE_COLLECTION)
+            .map_err(command_error)?
+        {
+            storage
+                .create_collection_with_options(
+                    &db,
+                    crate::profiler::PROFILE_COLLECTION,
+                    &doc! {
+                        "capped": true,
+                        "size": crate::profiler::PROFILE_COLLECTION_BYTES,
+                    },
+                )
+                .map_err(command_error)?;
+        }
     }
     Ok(was)
 }

@@ -1051,7 +1051,10 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(Bson::Document(vars)) => argtypes::let_problem(vars),
         _ => None,
     };
+    // Each statement that runs is profiled on its own.
+    let mut statements = crate::profiler::Statements::start();
     for (index, spec) in deletes.iter().copied().enumerate() {
+        statements.close(n, 0, 0, &write_errors);
         let Bson::Document(spec) = spec else { continue };
         let mut refused: Option<(i32, String)> = let_problem.clone();
         if refused.is_none() {
@@ -1133,6 +1136,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // nothing else and refuses the whole command before any statement
         // runs (`write_command_problem`).
         let limit = delete_limit(spec.get("limit"))?;
+        statements.delete(&ctx.db_name, &coll, spec, n, write_errors.len());
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
         let first = if limit == 1 {
@@ -1213,6 +1217,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    statements.close(n, 0, 0, &write_errors);
     let mut reply = doc! { "n": n, "ok": 1.0 };
     if !write_errors.is_empty() {
         reply.insert("writeErrors", write_errors);
@@ -1631,7 +1636,10 @@ pub(crate) fn update_in(
         _ => None,
     };
 
+    // Each statement that runs is profiled on its own.
+    let mut statements = crate::profiler::Statements::start();
     for (index, spec) in updates.iter().enumerate() {
+        statements.close(n, n_modified, upserted.len(), &write_errors);
         let Bson::Document(spec) = spec else { continue };
 
         argtypes::require_write_statement(spec, "update")?;
@@ -1954,6 +1962,15 @@ pub(crate) fn update_in(
                 }
                 continue;
             }
+            statements.update(
+                db_name,
+                &coll,
+                spec,
+                n,
+                n_modified,
+                upserted.len(),
+                write_errors.len(),
+            );
             if absent {
                 continue;
             }
@@ -2005,6 +2022,15 @@ pub(crate) fn update_in(
                 }
                 continue;
             }
+            statements.update(
+                db_name,
+                &coll,
+                spec,
+                n,
+                n_modified,
+                upserted.len(),
+                write_errors.len(),
+            );
             if absent {
                 continue;
             }
@@ -2161,6 +2187,7 @@ pub(crate) fn update_in(
         }
     }
 
+    statements.close(n, n_modified, upserted.len(), &write_errors);
     let mut reply = doc! { "n": n, "nModified": n_modified, "ok": 1.0 };
     if !upserted.is_empty() {
         reply.insert("upserted", upserted);

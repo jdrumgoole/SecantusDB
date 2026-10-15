@@ -564,15 +564,43 @@ const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// dirty trigger while bounding the number of commits for a large drop.
 const PURGE_CHUNK_MAX_ROWS: usize = 4000;
 
-/// Whether an oplog entry is for the `local` database, which mongod does not
-/// replicate and so does not log.
+/// Whether an oplog entry is for something mongod does not replicate, and
+/// so does not log: the `local` database, and a database's
+/// `system.profile` -- its documents, and its creation and drop (measured
+/// 8.2.11: none of them reaches the oplog).
 fn oplog_entry_is_local(e: &OplogEntry) -> bool {
-    let ns = match e {
-        OplogEntry::Doc(d) => d.get_str("ns").ok(),
-        OplogEntry::Raw(buf) => buf.get_str("ns").ok(),
+    let (ns, target) = match e {
+        OplogEntry::Doc(d) => (
+            d.get_str("ns").ok(),
+            d.get_document("o")
+                .ok()
+                .and_then(|o| o.iter().next())
+                .and_then(|(_, v)| v.as_str()),
+        ),
+        OplogEntry::Raw(buf) => (
+            buf.get_str("ns").ok(),
+            buf.get_document("o")
+                .ok()
+                .and_then(|o| o.iter().next())
+                .and_then(|el| el.ok())
+                .and_then(|(_, v)| v.as_str()),
+        ),
     };
-    ns.is_some_and(|ns| ns == "local" || ns.starts_with("local."))
+    let Some(ns) = ns else {
+        return false;
+    };
+    if ns == "local" || ns.starts_with("local.") {
+        return true;
+    }
+    if ns.ends_with(".system.profile") {
+        return true;
+    }
+    ns.ends_with(".$cmd") && target == Some(PROFILE_COLLECTION)
 }
+
+/// The collection the profiler writes. It is not replicated, and its
+/// documents have no `_id` (mongod gives it no `_id` index).
+const PROFILE_COLLECTION: &str = "system.profile";
 
 /// Approximate encoded size of an oplog entry, for the user-transaction
 /// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
@@ -9279,6 +9307,10 @@ impl Storage {
                     if assigned_id {
                         doc.insert("_id", Bson::ObjectId(ObjectId::new()));
                     }
+                    // A profile entry is stored as written, with no `_id`:
+                    // mongod's `system.profile` has no `_id` index. The id
+                    // minted above only keys the row.
+                    let unkeyed = assigned_id && coll == PROFILE_COLLECTION;
                     let id = doc.get("_id").expect("_id present").clone();
                     let mut key = id_key(&id)?;
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
@@ -9337,7 +9369,7 @@ impl Storage {
                     // reorder case encode_doc handles).
                     let id_first = doc.keys().next().map(String::as_str) == Some("_id");
                     let reencoded;
-                    let blob: &[u8] = if !assigned_id && id_first {
+                    let blob: &[u8] = if unkeyed || (!assigned_id && id_first) {
                         doc_bytes
                     } else {
                         reencoded = encode_doc(&doc)?;
@@ -11414,7 +11446,12 @@ impl Storage {
         id_idx.insert("v", 2i32);
         id_idx.insert("key", Bson::Document(id_key_spec));
         id_idx.insert("name", ID_INDEX_NAME.to_string());
-        let mut out: Vec<Document> = vec![id_idx];
+        // `system.profile` has no `_id` index (mongod 8.2.11).
+        let mut out: Vec<Document> = if coll == PROFILE_COLLECTION {
+            Vec::new()
+        } else {
+            vec![id_idx]
+        };
         for (name, key_spec, opts) in self.iter_indexes(&session, db, coll)? {
             let mut e = Document::new();
             e.insert("v", 2i32);

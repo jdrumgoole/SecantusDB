@@ -613,6 +613,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             repick_count += 1;
             continue;
         }
+        crate::profiler::note_modified(outcome.modified);
         if outcome.modified > 0 {
             crate::transactions::note_statement(0, crate::transactions::StmtRecord::Delete);
         }

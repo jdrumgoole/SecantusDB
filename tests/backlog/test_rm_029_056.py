@@ -211,7 +211,7 @@ def test_admin_only_command_parses_its_argument_first(rust_mongo: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-038")
+@pytest.mark.backlog_fixed("RM-038")
 def test_profile_filter_is_stored(rust_mongo: Any) -> None:
     """mongod 8.2.11 stores a profile `filter` and reports it, normalised."""
     db = _fresh(rust_mongo, "rm038")
@@ -223,7 +223,7 @@ def test_profile_filter_is_stored(rust_mongo: Any) -> None:
     assert mongo_answer(run) == ("ok", {"op": {"$eq": "query"}})
 
 
-@pytest.mark.backlog("RM-038")
+@pytest.mark.backlog_fixed("RM-038")
 def test_profile_level_creates_system_profile(rust_mongo: Any) -> None:
     """mongod 8.2.11: setting level 1 or 2 creates `system.profile` at once,
     capped."""
