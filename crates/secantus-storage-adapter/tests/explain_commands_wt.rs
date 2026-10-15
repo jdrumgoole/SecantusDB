@@ -814,3 +814,33 @@ fn explain_lists_the_plans_it_rejected() {
         assert_eq!(planner.get_array("rejectedPlans").unwrap().len(), 0);
     });
 }
+
+/// Several predicates on a field that holds arrays: mongod tries one plan
+/// per predicate, and intersects the point scans of one index all together.
+#[test]
+fn a_multikey_field_is_tried_once_per_predicate() {
+    with_wt(|c| {
+        seed(c);
+        let rejected = |c: &mut CommandContext, filter: Document| -> Vec<String> {
+            let reply = explain(c, doc! { "find": "c", "filter": filter }, "queryPlanner");
+            let planner = reply.get_document("queryPlanner").unwrap();
+            let mut out = vec![text(planner.get_document("winningPlan").unwrap())];
+            out.extend(
+                planner
+                    .get_array("rejectedPlans")
+                    .unwrap()
+                    .iter()
+                    .map(|p| text(p.as_document().unwrap())),
+            );
+            out
+        };
+        let range = rejected(c, doc! { "t": { "$gt": 3, "$lt": 9 } });
+        assert_eq!(range.len(), 2, "{range:?}");
+        assert!(range[0].contains("[-inf, 9)"), "{range:?}");
+        assert!(range[1].contains("(3, inf]"), "{range:?}");
+        let all = rejected(c, doc! { "t": { "$all": [3, 4, 5] } });
+        assert_eq!(all.len(), 4, "{all:?}");
+        assert!(all[3].starts_with("FETCH filtered <- AND_SORTED <- [IXSCAN t_1"));
+        assert_eq!(all[3].matches("IXSCAN t_1").count(), 3, "{all:?}");
+    });
+}

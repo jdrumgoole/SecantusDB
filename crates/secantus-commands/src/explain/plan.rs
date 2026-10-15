@@ -55,8 +55,8 @@ pub(crate) struct Query<'a> {
 
 /// The collection, for counting what a candidate plan reads.
 pub(crate) struct Trial<'a> {
-    /// How many documents it holds.
-    pub total: usize,
+    /// How many documents it holds, when the caller counted them.
+    pub total: Option<usize>,
     /// How many of them the query matches, when the caller knows.
     pub matched: Option<usize>,
     /// The documents themselves, read only when a count needs them.
@@ -92,6 +92,7 @@ struct Access {
     subplan: bool,
 }
 
+#[derive(Clone)]
 struct Leaf {
     path: String,
     pred: Document,
@@ -754,7 +755,43 @@ fn candidates(
         return Vec::new();
     }
     let leaves = leaves_of(parts);
-    let uses = candidate_uses(&leaves, parts, q, catalog);
+    // An index whose leading field holds arrays takes the bounds of one
+    // predicate on it, and mongod tries one plan per predicate (measured
+    // 8.2.11: `{t: {$gt: 3, $lt: 9}}` over a multikey `t_1` is two plans,
+    // `[-inf, 9)` and `(3, inf]`, in the order of the parsed query).
+    let mut uses: Vec<IndexUse> = Vec::new();
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    for u in candidate_uses(&leaves, parts, q, catalog) {
+        let index = u.index.clone();
+        let lead = index.fields()[0].0.to_string();
+        let ctx_multikey = !index.multikey_paths[0].is_empty();
+        let on_lead: Vec<usize> = leaves
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.path == lead && !l.derived)
+            .map(|(i, _)| i)
+            .collect();
+        if !ctx_multikey || on_lead.len() < 2 {
+            uses.push(u);
+            continue;
+        }
+        let start = uses.len();
+        for &chosen in &on_lead {
+            let kept: Vec<Leaf> = leaves
+                .iter()
+                .enumerate()
+                .filter(|(i, l)| *i == chosen || l.path != lead || l.derived)
+                .map(|(_, l)| l.clone())
+                .collect();
+            let one = use_index(&index, &kept, parts, q);
+            if one.leads {
+                uses.push(one);
+            }
+        }
+        if uses.len() - start > 1 {
+            groups.push(start..uses.len());
+        }
+    }
     let covered: Vec<BTreeSet<usize>> = uses.iter().map(|u| u.covered.clone()).collect();
     let mut out: Vec<(Access, Option<Preference>)> = uses
         .into_iter()
@@ -791,6 +828,36 @@ fn candidates(
         _ => false,
     };
     let singles = out.len();
+    // The point scans one index makes of several predicates on its arrays
+    // are intersected all together (measured 8.2.11: `{t: {$all: [3, 4,
+    // 5]}}` adds one AND_SORTED of three scans of `t_1`).
+    let points = |a: &Access| match &a.scan {
+        Node::IxScan(ix) => {
+            ix.filter.is_none()
+                && ix
+                    .bounds
+                    .iter()
+                    .all(|list| matches!(list.as_slice(), [one] if one.is_point()))
+        }
+        _ => false,
+    };
+    for group in &groups {
+        if !group.clone().all(|at| points(&out[at].0)) {
+            continue;
+        }
+        let scans = group.clone().map(|at| out[at].0.scan.clone()).collect();
+        out.push((
+            Access {
+                scan: Node::AndSorted(scans),
+                fetch_filter: assemble(parts.to_vec()),
+                indexed: true,
+                index: None,
+                sorted: false,
+                subplan: false,
+            },
+            None,
+        ));
+    }
     for x in 0..singles {
         for y in x + 1..singles {
             if !in_order(&out[x].0) || !in_order(&out[y].0) {
@@ -928,7 +995,7 @@ fn counted(found: &Access, walk: &Access, q: &Query, trial: &Trial) -> Option<bo
         .matched
         .map(|m| m as i64)
         .filter(|m| counted && *m < need)?;
-    let (walk_works, sort_works) = (trial.total as i64 + 1, 2 * matched + 2);
+    let (walk_works, sort_works) = (trial.total? as i64 + 1, 2 * matched + 2);
     Some(walk_works <= sort_works)
 }
 

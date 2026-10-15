@@ -654,3 +654,49 @@ fn a_merge_holds_the_documents_its_filter_rejects_too() {
         );
     });
 }
+
+#[test]
+fn a_write_over_one_plain_index_takes_the_first_in_its_order() {
+    with_wt(|c| {
+        // One plain index on the predicate's field: the store reads it as
+        // mongod's plan does, by key and then insertion, so the write takes
+        // the first `3` without the matches being read twice.
+        let docs = || {
+            vec![
+                doc! { "_id": 1, "a": 5 },
+                doc! { "_id": 2, "a": 3 },
+                doc! { "_id": 3, "a": 9 },
+                doc! { "_id": 4, "a": 3 },
+                doc! { "_id": 5, "a": 1 },
+                doc! { "_id": 6, "a": 3.0 },
+            ]
+        };
+        seed(c, docs(), vec![doc! { "a": 1 }]);
+        let reply = dispatch_full(
+            &doc! { "update": "c", "updates": [{ "q": { "a": { "$gt": 2 } }, "u": { "$set": { "hit": 1 } } }] },
+            c,
+        );
+        assert_eq!(reply.get_i32("nModified"), Ok(1), "{reply}");
+        assert_eq!(hit(c), [2]);
+        seed(c, docs(), vec![doc! { "a": 1 }]);
+        let reply = dispatch_full(
+            &doc! { "delete": "c", "deletes": [{ "q": { "a": { "$lt": 9, "$gte": 3 } }, "limit": 1 }] },
+            c,
+        );
+        assert_eq!(reply.get_i32("n"), Ok(1), "{reply}");
+        assert_eq!(
+            find(c, doc! {}, doc! { "sort": { "_id": 1 } }),
+            [1, 3, 4, 5, 6]
+        );
+        seed(c, docs(), vec![doc! { "a": 1 }]);
+        let reply = dispatch_full(
+            &doc! { "findAndModify": "c", "query": { "a": 3 }, "update": { "$set": { "hit": 1 } } },
+            c,
+        );
+        assert_eq!(
+            reply.get_document("value").unwrap().get_i32("_id"),
+            Ok(2),
+            "{reply}"
+        );
+    });
+}

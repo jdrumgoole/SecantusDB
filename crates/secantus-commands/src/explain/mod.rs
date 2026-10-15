@@ -463,7 +463,7 @@ fn plan_for(
         collation,
     };
     let trial = plan::Trial {
-        total: t.docs.len(),
+        total: Some(t.docs.len()),
         matched: None,
         whole: &whole,
         ranked: Default::default(),

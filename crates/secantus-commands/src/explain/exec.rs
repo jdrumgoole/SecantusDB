@@ -127,7 +127,7 @@ pub(crate) fn multikey_paths(docs: &[Document], key: &Document) -> Vec<Vec<Strin
 }
 
 /// One index entry: the key per field in SCAN order, and the document.
-type Entry = (Vec<Vec<u8>>, usize);
+pub(crate) type Entry = (Vec<Vec<u8>>, usize);
 
 /// One value's key in an index field, in SCAN order: under the index's
 /// collation, and for a field read against its direction a key that sorts
@@ -158,16 +158,15 @@ fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) -> Vec<u8> 
     out
 }
 
-/// The index's entries in the order the scan meets them.
-fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
+/// The index's entries, unordered.
+pub(crate) fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
     let fields = index.fields();
     let collation = index.collation.as_ref();
-    let mut out: Vec<Entry> = Vec::new();
+    let partial = index.partial.clone();
+    let mut out: Vec<Entry> = Vec::with_capacity(env.docs.len());
     for (row, doc) in env.docs.iter().enumerate() {
-        if let Some(partial) = &index.partial {
-            if !env.matches(row, &Some(partial.clone())) {
-                continue;
-            }
+        if partial.is_some() && !env.matches(row, &partial) {
+            continue;
         }
         let per_field: Vec<Vec<Bson>> = fields
             .iter()
@@ -176,15 +175,31 @@ fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
         if index.sparse && per_field.iter().all(Vec::is_empty) {
             continue;
         }
+        let reversed = |dir: i64| (dir < 0) != backward;
+        // One value a field: one key, built directly.
+        if per_field.iter().all(|values| values.len() <= 1) {
+            let key = per_field
+                .iter()
+                .zip(&fields)
+                .map(|(values, (_, dir))| {
+                    directed(
+                        values.first().unwrap_or(&Bson::Null),
+                        reversed(*dir),
+                        collation,
+                    )
+                })
+                .collect();
+            out.push((key, row));
+            continue;
+        }
         let mut keys: Vec<Vec<Vec<u8>>> = vec![vec![]];
         for (values, (_, dir)) in per_field.iter().zip(&fields) {
-            let reversed = (*dir < 0) != backward;
             let mut encoded: Vec<Vec<u8>> = if values.is_empty() {
-                vec![directed(&Bson::Null, reversed, collation)]
+                vec![directed(&Bson::Null, reversed(*dir), collation)]
             } else {
                 values
                     .iter()
-                    .map(|v| directed(v, reversed, collation))
+                    .map(|v| directed(v, reversed(*dir), collation))
                     .collect()
             };
             encoded.sort();
@@ -202,14 +217,17 @@ fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry> {
         }
         out.extend(keys.into_iter().map(|k| (k, row)));
     }
-    // Entries with one key are in RecordId order, and a backward scan meets
-    // them last first.
-    if backward {
-        out.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    } else {
-        out.sort();
-    }
     out
+}
+
+/// Entries in the order the scan meets them: by key, and entries with one
+/// key in RecordId order, last first for a backward scan.
+fn sort_entries(out: &mut [Entry], backward: bool) {
+    if backward {
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    } else {
+        out.sort_unstable();
+    }
 }
 
 /// The documents an index scan returns, in the order it returns them.
@@ -311,6 +329,9 @@ pub(crate) fn merge_head(pattern: &Document, env: &Env, row: usize, child: usize
 /// A scan in progress.
 pub(crate) struct Scan {
     entries: Vec<Entry>,
+    /// For a single run of keys, which keeps only its own entries: whether
+    /// the index holds a key after it.
+    after_run: Option<bool>,
     ranges: Vec<Ranges>,
     /// The bounds are one contiguous run of keys: nothing outside is examined.
     contiguous: bool,
@@ -326,6 +347,12 @@ pub(crate) struct Scan {
 
 impl Scan {
     pub(crate) fn new(ix: &IxScan, env: &Env) -> Scan {
+        Scan::over(ix, &entries(&ix.index, ix.backward, env))
+    }
+
+    /// A scan of `ix` over the index's entries, `all` (unordered), which
+    /// several scans of one index may share.
+    pub(crate) fn over(ix: &IxScan, all: &[Entry]) -> Scan {
         let fields = ix.index.fields();
         let ranges: Vec<Ranges> = if ix.no_bounds {
             vec![]
@@ -354,8 +381,32 @@ impl Scan {
                 open = true;
             }
         }
+        // A single run of keys examines none outside it, so only the run's
+        // entries are kept (and sorted); whether a key follows the run is
+        // all that is asked of the rest.
+        let mut after_run = None;
+        let mut all: Vec<Entry> = if contiguous && !ix.no_bounds {
+            let mut after = false;
+            let kept = all
+                .iter()
+                .filter(|(key, _)| match outside_of(&ranges, key) {
+                    None => true,
+                    Some((_, ahead)) => {
+                        after |= !ahead;
+                        false
+                    }
+                })
+                .cloned()
+                .collect();
+            after_run = Some(after);
+            kept
+        } else {
+            all.to_vec()
+        };
+        sort_entries(&mut all, ix.backward);
         Scan {
-            entries: entries(&ix.index, ix.backward, env),
+            entries: all,
+            after_run,
             ranges,
             contiguous,
             multikey: ix.index.is_multikey(),
@@ -372,18 +423,36 @@ impl Scan {
     /// The first field whose key is outside its bounds, and whether a later
     /// interval of that field could still be reached.
     fn outside(&self, key: &[Vec<u8>]) -> Option<(usize, bool)> {
-        for (f, (part, list)) in key.iter().zip(&self.ranges).enumerate() {
-            if list.iter().any(|r| inside(part, r)) {
-                continue;
-            }
-            let ahead = list
-                .iter()
-                .any(|r| part.as_slice() < r.0.as_slice() || (!r.1 && part == &r.0));
-            return Some((f, ahead));
-        }
-        None
+        outside_of(&self.ranges, key)
     }
 
+    /// Whether the index holds a key past the end of the bounds.
+    pub(crate) fn key_beyond(&self) -> bool {
+        if let Some(after) = self.after_run {
+            return after;
+        }
+        self.entries[self.pos.min(self.entries.len())..]
+            .iter()
+            .any(|(key, _)| self.outside(key).is_some_and(|(_, ahead)| !ahead))
+    }
+}
+
+/// The first field whose key is outside `ranges`, and whether a later
+/// interval of that field could still be reached.
+fn outside_of(ranges: &[Ranges], key: &[Vec<u8>]) -> Option<(usize, bool)> {
+    for (f, (part, list)) in key.iter().zip(ranges).enumerate() {
+        if list.iter().any(|r| inside(part, r)) {
+            continue;
+        }
+        let ahead = list
+            .iter()
+            .any(|r| part.as_slice() < r.0.as_slice() || (!r.1 && part == &r.0));
+        return Some((f, ahead));
+    }
+    None
+}
+
+impl Scan {
     /// The first seek goes straight to the low end of the first intervals:
     /// the keys before it are never examined.
     fn seek_start(&mut self) {
@@ -517,13 +586,6 @@ impl Scan {
                 return Some(row);
             }
         }
-    }
-
-    /// Whether the index holds a key past the end of the bounds.
-    pub(crate) fn key_beyond(&self) -> bool {
-        self.entries[self.pos.min(self.entries.len())..]
-            .iter()
-            .any(|(key, _)| self.outside(key).is_some_and(|(_, ahead)| !ahead))
     }
 }
 

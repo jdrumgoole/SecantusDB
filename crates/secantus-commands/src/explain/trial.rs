@@ -15,11 +15,15 @@
 //! of `PlanStage::work`, over the documents the caller holds, and what each
 //! stage counted during the trial is kept for `allPlansExecution`.
 
-use super::exec::{fixed_extra, merge_head, Env, Head, Scan, Work};
+use super::exec::{entries, fixed_extra, merge_head, Entry, Env, Head, Scan, Work};
 use super::node::{num, Node, Stats};
 use bson::Document;
 use secantus_core::heap::Heap;
+use std::collections::HashMap;
 use std::collections::{BTreeSet, VecDeque};
+
+/// Each index's entries, by name and direction.
+type Entries = HashMap<(String, bool), Vec<Entry>>;
 
 /// A stage being stepped one work at a time.
 struct Stage<'a> {
@@ -49,7 +53,7 @@ struct Stage<'a> {
 
 impl<'a> Stage<'a> {
     /// `None`: a stage the trial does not step.
-    fn new(node: &'a Node, env: &Env) -> Option<Stage<'a>> {
+    fn new(node: &'a Node, env: &Env, cache: &mut Entries) -> Option<Stage<'a>> {
         let inputs: Vec<&Node> = match node {
             Node::IxScan(_) | Node::CollScan { .. } | Node::DistinctScan(..) => vec![],
             Node::Fetch { input, .. }
@@ -65,7 +69,12 @@ impl<'a> Stage<'a> {
             _ => return None,
         };
         let scan = match node {
-            Node::IxScan(ix) | Node::DistinctScan(ix, _) => Some(Scan::new(ix, env)),
+            Node::IxScan(ix) | Node::DistinctScan(ix, _) => {
+                let all = cache
+                    .entry((ix.index.name.clone(), ix.backward))
+                    .or_insert_with(|| entries(&ix.index, ix.backward, env));
+                Some(Scan::over(ix, all))
+            }
             _ => None,
         };
         let mut extra = Document::new();
@@ -78,7 +87,7 @@ impl<'a> Stage<'a> {
             node,
             inputs: inputs
                 .into_iter()
-                .map(|n| Stage::new(n, env))
+                .map(|n| Stage::new(n, env, cache))
                 .collect::<Option<_>>()?,
             scan,
             pos: 0,
@@ -368,9 +377,11 @@ fn holds(node: &Node, pick: &dyn Fn(&Node) -> bool) -> bool {
 /// plan hands over to end the trial. `None`: a plan holds a stage this
 /// does not step.
 pub(crate) fn run(plans: &[Node], env: &Env, need: i64) -> Option<Vec<(f64, Stats)>> {
+    // An index's entries, built once for every scan of it.
+    let mut cache = Entries::new();
     let mut stages: Vec<Stage> = plans
         .iter()
-        .map(|p| Stage::new(p, env))
+        .map(|p| Stage::new(p, env, &mut cache))
         .collect::<Option<_>>()?;
     let max_works = 10_000i64.max((env.docs.len() as f64 * 0.3) as i64);
     let mut works = 0i64;

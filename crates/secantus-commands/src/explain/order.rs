@@ -512,9 +512,17 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     // Several plans could answer it, or the predicate's index leaves a sort
     // and a walk of another index returns it: which one mongod keeps depends
     // on its trial over the collection.
-    if has_sort(&plan) || plan::contested(&query(None), &catalog) {
-        let total = storage.collection_count_at_most(ask.db, ask.coll, TRIAL_COLLECTION)?;
-        if let Some(total) = total {
+    let sorts = has_sort(&plan);
+    if sorts || plan::contested(&query(None), &catalog) {
+        // The count serves only the walk against a sort, which can be
+        // decided without reading the documents; otherwise reading them
+        // finds a collection too large on its own.
+        let total = if sorts {
+            storage.collection_count_at_most(ask.db, ask.coll, TRIAL_COLLECTION)?
+        } else {
+            None
+        };
+        if total.is_some() || !sorts {
             let whole = Lazy {
                 storage,
                 ask,
@@ -906,6 +914,64 @@ pub(crate) fn pinned<T>(
     }
 }
 
+/// Whether the store, left to pick, already takes the document mongod's
+/// plan reads first, so the matches need not be read twice (RM-056).
+///
+/// That holds for one predicate, an equality or range on a plain scalar,
+/// over a field exactly one index leads, when that index is a plain
+/// single-field index holding each document once: mongod scans it, and
+/// the store's router reads the same index, both by key and then by
+/// RecordId. A null, an array, a document, a collation, a hint or a
+/// second candidate index each leaves the order to be worked out.
+fn store_order_is_the_plans(storage: &dyn Storage, ask: &Ask) -> Result<bool, StorageError> {
+    if ask.sort.is_some_and(|s| !s.is_empty()) || ask.hint.is_some() || ask.collation.is_some() {
+        return Ok(false);
+    }
+    let [(field, value)] = ask.filter.iter().collect::<Vec<_>>()[..] else {
+        return Ok(false);
+    };
+    let plain = |v: &Bson| {
+        matches!(
+            v,
+            Bson::Int32(_)
+                | Bson::Int64(_)
+                | Bson::Double(_)
+                | Bson::Decimal128(_)
+                | Bson::String(_)
+                | Bson::Boolean(_)
+                | Bson::DateTime(_)
+                | Bson::ObjectId(_)
+                | Bson::Timestamp(_)
+        ) && !matches!(v, Bson::Double(d) if d.is_nan())
+    };
+    let simple = field != "_id"
+        && !field.starts_with('$')
+        && match value {
+            Bson::Document(ops) => {
+                !ops.is_empty()
+                    && ops.iter().all(|(op, v)| {
+                        matches!(op.as_str(), "$eq" | "$gt" | "$gte" | "$lt" | "$lte") && plain(v)
+                    })
+            }
+            v => plain(v),
+        };
+    if !simple {
+        return Ok(false);
+    }
+    let catalog = catalog(storage, ask.db, ask.coll, None)?;
+    let mut leading = catalog.iter().filter(|ix| ix.position(field) == Some(0));
+    let (Some(index), None) = (leading.next(), leading.next()) else {
+        return Ok(false);
+    };
+    Ok(index.key.len() == 1
+        && index.plain
+        && !index.sparse
+        && index.partial.is_none()
+        && index.collation.is_none()
+        && !index.is_multikey()
+        && crate::util::as_i64(index.key.get(field).unwrap_or(&Bson::Null)) == Some(1))
+}
+
 /// How many rows a write that changes one document is handed. It takes the
 /// first that still matches when it runs.
 const WRITE_CANDIDATES: usize = 8;
@@ -923,6 +989,9 @@ pub(crate) fn write_candidates(
             .get("_id")
             .is_some_and(|v| !matches!(v, Bson::Document(_) | Bson::RegularExpression(_)))
     {
+        return Ok(None);
+    }
+    if store_order_is_the_plans(storage, ask)? {
         return Ok(None);
     }
     let Some(rows) = ordered_rows(storage, ask)? else {
