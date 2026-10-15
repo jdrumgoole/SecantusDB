@@ -60,3 +60,8 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   as PostgreSQL 15.19 does, where without a `pg_hba.conf` it was refused
   before the exchange. Part of RP-013, pinned by
   `tools/probes/pg_login_options.py` (234 of 234).
+- `pg_ident.conf` takes `@file` too: a field is the one value the file
+  holds (`multiple values in ident field` for more), as PostgreSQL 15's
+  `parse_ident_line` reads it. Part of RP-013, pinned by
+  `tools/probes/pg_login_tls_files.py` (541 of 541) and `ident.rs`'s
+  `an_at_file_is_the_one_value_it_holds`.

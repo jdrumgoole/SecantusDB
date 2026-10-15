@@ -309,8 +309,7 @@ one beside it.
     - **A user name map's patterns are read as the SQL `~` operator reads
       them** (the `regex` crate, through `pg_regex_source`'s POSIX-class
       translation, 2026-10-15), so they share that engine's distance from
-      PostgreSQL's advanced regular expressions; `@file` inclusion in
-      `pg_ident.conf` is refused.
+      PostgreSQL's advanced regular expressions.
   - The key must have no passphrase.
   - **The libpq scenarios (`attempt`) in the login probes do not retry**
     when the answer is the close; `raw_first` does (up to four times), after

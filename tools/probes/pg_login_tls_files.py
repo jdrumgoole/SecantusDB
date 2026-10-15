@@ -5,7 +5,7 @@ Revocation lists (current, empty, expired, dated in the future, from another
 CA, forged, with and without extensions, through an intermediate CA), user
 name maps by exact name and by pattern, ``clientname=DN``, server
 certificates whose signature is RSA-PSS or Ed25519, and what a reload picks
-up. 513 scenarios. Arguments after the binary name the groups to run; with
+up. 541 scenarios. Arguments after the binary name the groups to run; with
 none, all of them.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -534,6 +534,7 @@ def cert_scenarios(port):
         ("postgres", PGCERT),
         ("O=Example,CN=alice", ALICE_DN),
         ("C,O,OU,CN=alice", ALICE_DN3),
+        ("inc_cert (mapped through @incname)", INC_CERT),
         ("none", {}),
     ):
         for user in ("alice", "postgres", "carol", "nobody"):
@@ -589,7 +590,9 @@ OPEN = (
     "hostssl all postgres 127.0.0.1/32 trust\nhostssl all carol 127.0.0.1/32 trust\n"
     "hostssl all all 127.0.0.1/32 scram-sha-256\n"
 )
+INC_CERT = ca.issue("inc_cert", cn("inc_cert"))
 IDENT = (
+    "m @incname alice\n"
     "m alice_cert alice\n"
     "m shared alice\n"
     "m shared postgres\n"
@@ -599,6 +602,8 @@ IDENT = (
     'dn3 "CN=alice,OU=Eng,O=Ex\\, ample,C=IE" alice\n'
 )
 open(f"{d}/ident.conf", "w").write(IDENT)
+# `@incname`: a file of one value, read beside the ident file.
+open(f"{d}/incname", "w").write("inc_cert  # one value\n")
 
 # group -> (pg: conf lines, hba, ident; ours: flags; scenarios; server cert stem)
 GROUPS = {
@@ -815,6 +820,7 @@ BASECONF = open(f"{pgd}/postgresql.conf").read() + (
     "unix_socket_directories = ''\npassword_encryption = 'scram-sha-256'\n"
 )
 shutil.copy(f"{d}/ident.conf", f"{pgd}/pg_ident.conf")
+shutil.copy(f"{d}/incname", f"{pgd}/incname")
 
 
 def pg(action):
