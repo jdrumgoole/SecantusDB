@@ -632,6 +632,56 @@ fn contiguous(mask: u128, bits: u32) -> Option<u8> {
     (mask == expected).then_some(ones as u8)
 }
 
+/// This host's interfaces as `(address, netmask)`, as `pg_foreach_ifaddr`
+/// lists them (`getifaddrs`).
+#[cfg(unix)]
+pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
+    // SAFETY (both): `sa` is null or a sockaddr whose family says its type.
+    unsafe fn ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
+        if sa.is_null() {
+            return None;
+        }
+        match i32::from((*sa).sa_family) {
+            libc::AF_INET => {
+                let sin = sa.cast::<libc::sockaddr_in>();
+                Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                    (*sin).sin_addr.s_addr,
+                ))))
+            }
+            libc::AF_INET6 => {
+                let sin6 = sa.cast::<libc::sockaddr_in6>();
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                    (*sin6).sin6_addr.s6_addr,
+                )))
+            }
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list this function walks and
+    // frees.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            if let Some(addr) = ip((*cur).ifa_addr) {
+                out.push((addr, ip((*cur).ifa_netmask)));
+            }
+            cur = (*cur).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,54 +914,4 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
         assert_eq!(contiguous(u128::MAX, 128), Some(128));
         assert_eq!(contiguous(u128::MAX << 64, 128), Some(64));
     }
-}
-
-/// This host's interfaces as `(address, netmask)`, as `pg_foreach_ifaddr`
-/// lists them (`getifaddrs`).
-#[cfg(unix)]
-pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
-    // SAFETY (both): `sa` is null or a sockaddr whose family says its type.
-    unsafe fn ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
-        if sa.is_null() {
-            return None;
-        }
-        match i32::from((*sa).sa_family) {
-            libc::AF_INET => {
-                let sin = sa.cast::<libc::sockaddr_in>();
-                Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
-                    (*sin).sin_addr.s_addr,
-                ))))
-            }
-            libc::AF_INET6 => {
-                let sin6 = sa.cast::<libc::sockaddr_in6>();
-                Some(IpAddr::V6(std::net::Ipv6Addr::from(
-                    (*sin6).sin6_addr.s6_addr,
-                )))
-            }
-            _ => None,
-        }
-    }
-    let mut out = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `head` with a list this function walks and
-    // frees.
-    unsafe {
-        if libc::getifaddrs(&mut head) != 0 {
-            return out;
-        }
-        let mut cur = head;
-        while !cur.is_null() {
-            if let Some(addr) = ip((*cur).ifa_addr) {
-                out.push((addr, ip((*cur).ifa_netmask)));
-            }
-            cur = (*cur).ifa_next;
-        }
-        libc::freeifaddrs(head);
-    }
-    out
-}
-
-#[cfg(not(unix))]
-pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
-    Vec::new()
 }
