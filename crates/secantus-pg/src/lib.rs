@@ -4425,10 +4425,32 @@ impl PgHandler {
         );
     }
 
+    /// `information_schema.columns`' `data_type` and `udt_name` for a column
+    /// of `pg_type`, as the view computes them: `ARRAY` for any type with an
+    /// element and a variable length (arrays, `int2vector`, `oidvector`),
+    /// `USER-DEFINED` for a type outside `pg_catalog`, else `format_type`;
+    /// the udt is the `pg_type.typname`, `_int4` for `int4[]` (measured on
+    /// 15.19).
+    fn information_schema_type(pg_type: &str) -> (String, String) {
+        let bare = |t: &str| t.rsplit('.').next().unwrap_or(t).to_string();
+        if let Some(element) = pg_type.strip_suffix("[]") {
+            return ("ARRAY".into(), format!("_{}", bare(element)));
+        }
+        if matches!(pg_type, "int2vector" | "oidvector") {
+            return ("ARRAY".into(), pg_type.to_string());
+        }
+        if secantus_pgplan::pgtypes::is_builtin_type(pg_type) {
+            return (secantus_pgplan::display_type(pg_type), pg_type.to_string());
+        }
+        ("USER-DEFINED".into(), bare(pg_type))
+    }
+
     /// The name a user type resolves under: its bare name in `public` (on the
-    /// default search_path), else `schema.name`.
+    /// default search_path), else `schema.name`. A `public` name that a
+    /// `pg_catalog` type shares is `public.name` too: `pg_catalog` is searched
+    /// first, so the bare name is the built-in.
     fn type_resolution(schema: &str, name: &str) -> String {
-        if schema == "public" {
+        if schema == "public" && !secantus_pgplan::pgtypes::shadowed_by_catalog(name) {
             name.to_string()
         } else {
             format!("{schema}.{name}")
@@ -13334,13 +13356,14 @@ impl PgHandler {
                         // A text `YES` / `NO`, not a boolean: this is the SQL
                         // standard's view and PostgreSQL follows it.
                         d.insert(f("is_nullable"), if c.nullable { "YES" } else { "NO" });
-                        d.insert(f("data_type"), secantus_pgplan::display_type(&c.pg_type));
+                        let (data_type, udt_name) = Self::information_schema_type(&c.pg_type);
+                        d.insert(f("data_type"), data_type);
                         let (precision, scale, length) = Self::typmod_parts(c);
                         d.insert(f("character_maximum_length"), length);
                         d.insert(f("numeric_precision"), precision);
                         d.insert(f("numeric_scale"), scale);
                         d.insert(f("datetime_precision"), Bson::Null);
-                        d.insert(f("udt_name"), c.pg_type.as_str());
+                        d.insert(f("udt_name"), udt_name);
                         d.insert(
                             f("is_identity"),
                             if c.identity.is_some() { "YES" } else { "NO" },
@@ -13420,9 +13443,11 @@ impl PgHandler {
                     };
                     let defaults = v.get_document("defaults").ok();
                     for (i, fd) in fields.iter().enumerate() {
-                        let ty =
-                            secantus_pgplan::pgtypes::name_of_oid(i64::from(fd.datatype().oid()))
-                                .unwrap_or("text");
+                        let oid = fd.datatype().oid();
+                        let ty = secantus_pgplan::pgtypes::type_name_of_oid(i64::from(oid))
+                            .or_else(|| self.user_type_name_for_oid(oid))
+                            .unwrap_or_else(|| "text".to_string());
+                        let (data_type, udt_name) = Self::information_schema_type(&ty);
                         let mut d = Document::new();
                         d.insert(f("table_catalog"), db.as_str());
                         d.insert(f("table_schema"), "public");
@@ -13436,7 +13461,7 @@ impl PgHandler {
                                 .map_or(Bson::Null, |s| Bson::String(s.to_string())),
                         );
                         d.insert(f("is_nullable"), "YES");
-                        d.insert(f("data_type"), secantus_pgplan::display_type(ty));
+                        d.insert(f("data_type"), data_type);
                         for k in [
                             "character_maximum_length",
                             "numeric_precision",
@@ -13450,7 +13475,7 @@ impl PgHandler {
                         ] {
                             d.insert(f(k), Bson::Null);
                         }
-                        d.insert(f("udt_name"), ty);
+                        d.insert(f("udt_name"), udt_name);
                         d.insert(f("is_identity"), "NO");
                         d.insert(f("is_generated"), "NEVER");
                         rows.push(d);
@@ -17310,6 +17335,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             603 => "box",
             24 => "regproc",
             2202 => "regprocedure",
+            2203 => "regoper",
+            2204 => "regoperator",
             4089 => "regnamespace",
             4096 => "regrole",
             600 => "point",
@@ -17494,6 +17521,9 @@ fn wire_type(pg_type: &str) -> Type {
         "uuid" => Type::UUID,
         // An anonymous record (`ROW(...)`): oid 2249, rendered as `(...)` text.
         "record" => Type::RECORD,
+        // `array[row(1)]`: an array of anonymous records (2287), each element
+        // sent as its own record.
+        "record[]" => Type::RECORD_ARRAY,
         "interval" => Type::INTERVAL,
         "json" => Type::JSON,
         "xml" => Type::XML,
@@ -17522,6 +17552,8 @@ fn wire_type(pg_type: &str) -> Type {
         "regrole" => Type::REGROLE,
         "regproc" => Type::REGPROC,
         "regprocedure" => Type::REGPROCEDURE,
+        "regoper" => Type::REGOPER,
+        "regoperator" => Type::REGOPERATOR,
         // A real oid column type: psycopg's numeric tests read the oid back
         // and check `ftype(0) == 26`.
         "oid" => Type::OID,
@@ -17603,6 +17635,8 @@ fn wire_type(pg_type: &str) -> Type {
         "cid[]" => Type::CID_ARRAY,
         "regproc[]" => Type::REGPROC_ARRAY,
         "regprocedure[]" => Type::REGPROCEDURE_ARRAY,
+        "regoper[]" => Type::REGOPER_ARRAY,
+        "regoperator[]" => Type::REGOPERATOR_ARRAY,
         "regnamespace[]" => Type::REGNAMESPACE_ARRAY,
         "regrole[]" => Type::REGROLE_ARRAY,
         "regconfig[]" => Type::REGCONFIG_ARRAY,

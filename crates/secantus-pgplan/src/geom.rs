@@ -936,6 +936,18 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
         (">>", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_gt(c1.x - r1, c2.x + r2)))),
         ("<<|", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_lt(c1.y + r1, c2.y - r2)))),
         ("|>>", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_gt(c1.y - r1, c2.y + r2)))),
+        // Paths compare by their NUMBER OF POINTS (`path_n_eq` / `path_n_lt`
+        // ...); there is no `<>` for paths (pg_operator, 15.19).
+        ("=" | "<" | "<=" | ">" | ">=", Path { pts: p1, .. }, Path { pts: p2, .. }) => {
+            let (n1, n2) = (p1.len(), p2.len());
+            Some(Ok(b(match op {
+                "=" => n1 == n2,
+                "<" => n1 < n2,
+                "<=" => n1 <= n2,
+                ">" => n1 > n2,
+                _ => n1 >= n2,
+            })))
+        }
         // Line segments: equality by endpoints, ordering by length.
         ("=", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(b(a1.same(*b1) && a2.same(*b2)))),
         ("<>" | "!=", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(b(!(a1.same(*b1) && a2.same(*b2))))),
