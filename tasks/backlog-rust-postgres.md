@@ -387,12 +387,22 @@ one beside it.
   Backlog-ID: RP-033
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_whole_row_of_a_union_with_unnamed_columns
 
-- [ ] **RUST pgserver: a field of an anonymous record is selected by a
-  made-up name.** `((select row(1, 'a'))).f1` answers 1; PostgreSQL 15.19
-  is 42703 `could not identify column "f1" in record data type`, since an
-  anonymous record has no field names. Found 2026-10-15 by RP-031's work.
+- [ ] **RUST pgserver: field selection on a record differs from
+  PostgreSQL's.** PostgreSQL 15.19 names an anonymous `ROW()`'s fields
+  `f1`, `f2`, ... only where it can see the `ROW()` (directly, or through a
+  subquery or CTE column it can flatten); here any record answers `fN`.
+  Measured (each case in the test):
+  - `((select row(1, 'a'))).f1` answers 1; PostgreSQL is 42703 `could not
+    identify column "f1" in record data type`, as is
+    `((row(row(1, 2), 3)).f1).f2`.
+  - `(x).f1` over `(values (row(1, 'a'))) v(x)` answers; PostgreSQL is
+    42809 `record type has not been registered`.
+  - A field read through a subquery or CTE column comes back as TEXT
+    (`'1'` where PostgreSQL returns the integer 1), and a nested record
+    field prints as its text where PostgreSQL returns the record.
+  Found 2026-10-15 by RP-031's work.
   Backlog-ID: RP-035
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_field_of_an_anonymous_record_is_refused
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_field_selection
 
 - [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
   batch made values print by their type, refused the casts and operators

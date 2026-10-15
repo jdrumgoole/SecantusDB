@@ -29652,6 +29652,9 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "jsonpath" => Ok(Bson::String(jsonpath::render(&jsonpath::parse(&as_text(
             &value,
         ))?))),
+        // A NULL is no text to parse: parsing it as `''` sent `''`'s
+        // "doesn't contain lexemes" NOTICE for `null::tsquery`.
+        "tsvector" | "tsquery" if value == Bson::Null => Ok(Bson::Null),
         "tsvector" => Ok(Bson::String(fts::render_vector(&fts::parse_vector(
             &as_text(&value),
         )?))),

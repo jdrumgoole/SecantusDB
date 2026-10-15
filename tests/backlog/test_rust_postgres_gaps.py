@@ -441,13 +441,23 @@ def test_update_from_returning_target_star(pg: Any) -> None:
     assert got == ("ok", [(1, 5)]), got
 
 
+# RP-035: field selection on a record. PostgreSQL 15.19 names an anonymous
+# ROW()'s fields f1, f2, ... only where it can see the ROW() itself; a
+# selected field keeps its type.
+_RP035 = {
+    "sublink-record": "select ((select row(1, 'a'))).f1",
+    "subquery-column": "select (r).f1 from (select row(1, 'a') as r) s",
+    "values-record": "select (x).f1 from (values (row(1, 'a'))) v(x)",
+    "cte-column": "with w as (select row(1, 2) r) select (r).f2 from w",
+    "nested-record": "select (row(row(1, 2), 3)).f1",
+    "nested-field": "select ((row(row(1, 2), 3)).f1).f2",
+}
+
+
 @pytest.mark.backlog("RP-035")
-def test_field_of_an_anonymous_record_is_refused(pg: Any) -> None:
-    """PostgreSQL 15.19: `((select row(1, 'a'))).f1` is 42703 `could not
-    identify column "f1" in record data type` (an anonymous record has no
-    field names to select by); here it answers 1."""
-    got = pg_answer(pg, "select ((select row(1, 'a'))).f1")
-    assert got[:2] == ("err", "42703"), got
+@pytest.mark.parametrize("sql", list(_RP035.values()), ids=list(_RP035))
+def test_record_field_selection(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
 
 
 # Fixed from RP-025: an untyped side of `||` beside a type with a `||` of its
