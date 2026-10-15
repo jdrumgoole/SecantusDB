@@ -359,12 +359,10 @@ one beside it.
     gate is a one-line change, measured: the planner then folds the quoted
     name to `int` and the new type captures `1::int`. Type names need to
     keep their case through the planner first.
-  - `drop type e cascade` with a column of the type sends no NOTICE;
-    PostgreSQL sends `drop cascades to column c of table t`.
   - A domain over an enum is described as varchar (1043); PostgreSQL sends
     the enum's oid.
   Backlog-ID: RP-041
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_enum_comparison_reads_its_literal_at_plan_time,tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name,tests/backlog/test_rust_postgres_gaps.py::test_drop_type_cascade_names_the_column,tests/backlog/test_rust_postgres_gaps.py::test_domain_over_enum_is_described_as_the_enum
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_enum_comparison_reads_its_literal_at_plan_time,tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name,tests/backlog/test_rust_postgres_gaps.py::test_domain_over_enum_is_described_as_the_enum
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

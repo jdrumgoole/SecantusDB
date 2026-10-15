@@ -789,7 +789,7 @@ def test_quoted_mixed_case_type_name(pg: Any) -> None:
     assert got == ("ok", "CREATE TYPE")
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 def test_drop_type_cascade_names_the_column(pg: Any) -> None:
     """PostgreSQL 15.19: `drop type e cascade` with a column of the type sends
     NOTICE `drop cascades to column c of table t`; here it sends none."""
@@ -822,3 +822,23 @@ def test_domain_over_enum_is_described_as_the_enum(pg: Any) -> None:
         pg.execute("drop domain rp041_d")
         pg.execute("drop type rp041_de")
     assert described == enum_oid
+
+
+@pytest.mark.backlog_fixed("RP-041")
+def test_drop_domain_cascade_drops_every_column(pg: Any) -> None:
+    """PostgreSQL 15.19: `drop domain d cascade` over two columns of one table
+    drops both (`select *` is `(1,)`), with `drop cascades to 2 other
+    objects`; here the second column was left behind, reading NULL."""
+    pg.execute("drop table if exists rp041_v")
+    pg.execute("drop domain if exists rp041_d2")
+    pg.execute("create domain rp041_d2 as int")
+    pg.execute("create table rp041_v (id int, a rp041_d2, b rp041_d2)")
+    pg.execute("insert into rp041_v values (1, 2, 3)")
+    notices: list[str] = []
+    pg.add_notice_handler(lambda d: notices.append(d.message_primary))
+    try:
+        pg.execute("drop domain rp041_d2 cascade")
+        got = pg_answer(pg, "select * from rp041_v")
+    finally:
+        pg.execute("drop table if exists rp041_v")
+    assert (got, notices) == (("ok", [(1,)]), ["drop cascades to 2 other objects"])

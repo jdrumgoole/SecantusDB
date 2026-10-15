@@ -39,6 +39,21 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   (`'nosuch'::regtype` at 8), as PostgreSQL places them. Part of RP-041
   (`tests/backlog/test_rust_postgres_gaps.py::test_unknown_type_error_position`).
 
+- `DROP TYPE` over an enum, composite or range checks what depends on its
+  values, as PostgreSQL does: columns of the type or of its array type, a
+  domain over it and the domain's columns, and fields of composite types.
+  Without CASCADE it is 2BP01 naming each in PostgreSQL's order; with it,
+  they are dropped under one notice. The type had been dropped from under
+  its columns, which kept their values typed as a type that no longer
+  existed, and CASCADE left them. Part of RP-041
+  (`tests/backlog/test_rust_postgres_gaps.py::test_drop_type_cascade_names_the_column`).
+- `DROP DOMAIN ... CASCADE` over two columns of one table dropped only the
+  first: the second read back as NULL. It drops every column, in one
+  `ALTER` per table, and sends PostgreSQL's `drop cascades to` notice,
+  which it had not sent at all. The extension drop that removes a type's
+  columns had the same per-column loop, and is fixed with it
+  (`::test_drop_domain_cascade_drops_every_column`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
@@ -50,4 +65,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   foreign server or user mapping may set. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
   `[fdw-validator]`).
-- Corpora `row_type_char_overflow`, `fmgr_validators` and `type_named_like_grammar`.
+- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar` and `drop_type_dependents`.

@@ -11808,6 +11808,131 @@ impl PgHandler {
         self.insert_type_doc(Self::DOMAIN_COLLECTION, name, doc)
     }
 
+    /// What depends on an enum, composite or range type's VALUES, as
+    /// PostgreSQL 15.19's `reportDependentObjects` lists it: columns of its
+    /// array type, then its own columns, then each domain over it followed
+    /// by that domain's columns, then fields of composite types. RESTRICT is
+    /// 2BP01 naming them all; CASCADE drops them, with one notice.
+    fn drop_type_value_dependents(&self, name: &str, cascade: bool) -> PgWireResult<()> {
+        let array = format!("{name}[]");
+        let tables = self.all_table_defs()?;
+        let direct = |c: &secantus_pgcatalog::Column| c.extra.get_str("domain_type").is_err();
+        let mut details: Vec<String> = Vec::new();
+        let mut drops: Vec<String> = Vec::new();
+        let mut columns: Vec<(String, String)> = Vec::new();
+        for (ty, shown) in [(array.as_str(), array.as_str()), (name, name)] {
+            for def in &tables {
+                for c in def.columns.iter().filter(|c| c.pg_type == ty && direct(c)) {
+                    details.push(format!(
+                        "column {} of table {} depends on type {shown}",
+                        c.name, def.name
+                    ));
+                    drops.push(format!("column {} of table {}", c.name, def.name));
+                    columns.push((def.name.clone(), c.name.clone()));
+                }
+            }
+        }
+        let domains: Vec<String> = self
+            .domains()?
+            .into_iter()
+            .filter(|d| d.base == name)
+            .map(|d| d.name)
+            .collect();
+        for d in &domains {
+            details.push(format!("type {d} depends on type {name}"));
+            drops.push(format!("type {d}"));
+            for (t, c) in self.domain_columns(d)? {
+                details.push(format!(
+                    "column {c} of table {} depends on type {d}",
+                    t.name
+                ));
+                drops.push(format!("column {c} of table {}", t.name));
+                columns.push((t.name.clone(), c));
+            }
+        }
+        let mut fields: Vec<(String, String)> = Vec::new();
+        for (composite, _, comp_fields) in self.composites()? {
+            if composite == name || self.row_type_of_table(&composite)? {
+                continue;
+            }
+            for (f, t) in comp_fields.iter().filter(|(_, t)| t == name || *t == array) {
+                details.push(format!(
+                    "column {f} of composite type {composite} depends on type {}",
+                    if *t == array { &array } else { name }
+                ));
+                drops.push(format!("column {f} of composite type {composite}"));
+                fields.push((composite.clone(), f.clone()));
+            }
+        }
+        if details.is_empty() {
+            return Ok(());
+        }
+        if !cascade {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "2BP01".into(), // dependent_objects_still_exist
+                format!("cannot drop type {name} because other objects depend on it"),
+            );
+            info.detail = Some(details.join("\n"));
+            info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        self.cascade_notice(&drops);
+        // One ALTER per table, dropping all of its columns at once.
+        let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
+        for (table, column) in columns {
+            match by_table.iter_mut().find(|(t, _)| *t == table) {
+                Some((_, cols)) => cols.push(column),
+                None => by_table.push((table, vec![column])),
+            }
+        }
+        for (table, cols) in by_table {
+            self.execute_inner(
+                Statement::AlterTable {
+                    table,
+                    missing_ok: false,
+                    actions: cols
+                        .into_iter()
+                        .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
+                            name,
+                            if_exists: true,
+                        })
+                        .collect(),
+                },
+                0,
+            )?;
+        }
+        for d in &domains {
+            self.delete_type_doc(Self::DOMAIN_COLLECTION, d)?;
+        }
+        for (composite, field) in fields {
+            let Some(mut doc) = self
+                .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
+                .iter()
+                .find(|d| d.get_str("composite") == Ok(composite.as_str()))
+                .cloned()
+            else {
+                continue;
+            };
+            let id = doc.get_str("_id").unwrap_or(&composite).to_string();
+            if let Ok(items) = doc.get_array("fields") {
+                let keep: Vec<Bson> = items
+                    .iter()
+                    .filter(|f| {
+                        !matches!(f, Bson::Array(p)
+                            if p.first().and_then(Bson::as_str) == Some(field.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                doc.insert("fields", keep);
+            }
+            doc.remove("widths");
+            self.delete_type_doc(Self::COMPOSITE_COLLECTION, &id)?;
+            self.insert_type_doc(Self::COMPOSITE_COLLECTION, &id, doc)?;
+        }
+        Ok(())
+    }
+
     fn drop_domains(&self, names: &[String], if_exists: bool, cascade: bool) -> PgWireResult<()> {
         let existing = self.domains()?;
         for name in names {
@@ -11847,15 +11972,32 @@ impl PgHandler {
                         Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
                     return Err(PgWireError::UserError(Box::new(info)));
                 }
+                let drops: Vec<String> = dependents
+                    .iter()
+                    .map(|(t, c)| format!("column {c} of table {}", t.name))
+                    .collect();
+                self.cascade_notice(&drops);
+                // One ALTER per table: two single-column ALTERs of one table
+                // left the second column behind (read back as NULL).
+                let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
                 for (t, c) in dependents {
+                    match by_table.iter_mut().find(|(n, _)| *n == t.name) {
+                        Some((_, cols)) => cols.push(c),
+                        None => by_table.push((t.name.clone(), vec![c])),
+                    }
+                }
+                for (table, cols) in by_table {
                     self.execute_inner(
                         Statement::AlterTable {
-                            table: t.name.clone(),
+                            table,
                             missing_ok: false,
-                            actions: vec![secantus_pgplan::AlterTableAction::DropColumn {
-                                name: c,
-                                if_exists: true,
-                            }],
+                            actions: cols
+                                .into_iter()
+                                .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
+                                    name,
+                                    if_exists: true,
+                                })
+                                .collect(),
                         },
                         0,
                     )?;
@@ -29564,6 +29706,8 @@ impl PgHandler {
                         info.hint = Some(format!("You can drop table {name} instead."));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
+                    // Columns, domains and composite fields of the type.
+                    self.drop_type_value_dependents(name, cascade)?;
                     // A `public` type named after a built-in is keyed by its
                     // qualified name or its bare one, by kind.
                     let bare = name.strip_prefix("public.").unwrap_or(name);
@@ -30952,17 +31096,28 @@ impl PgHandler {
                                     ),
                                 );
                             }
+                            // One ALTER per table (see `drop_domains`).
+                            let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
                             for (table, column) in columns {
+                                match by_table.iter_mut().find(|(t, _)| *t == table) {
+                                    Some((_, cols)) => cols.push(column),
+                                    None => by_table.push((table, vec![column])),
+                                }
+                            }
+                            for (table, cols) in by_table {
                                 self.execute_inner(
                                     Statement::AlterTable {
                                         table,
                                         missing_ok: false,
-                                        actions: vec![
-                                            secantus_pgplan::AlterTableAction::DropColumn {
-                                                name: column,
-                                                if_exists: true,
-                                            },
-                                        ],
+                                        actions: cols
+                                            .into_iter()
+                                            .map(|name| {
+                                                secantus_pgplan::AlterTableAction::DropColumn {
+                                                    name,
+                                                    if_exists: true,
+                                                }
+                                            })
+                                            .collect(),
                                     },
                                     0,
                                 )?;
