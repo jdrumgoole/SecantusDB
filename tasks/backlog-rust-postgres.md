@@ -467,12 +467,6 @@ one beside it.
       before working an item.
 
       What is left:
-      - **The multi-byte encodings** (EUC_JP, EUC_CN, EUC_KR, EUC_TW,
-        SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004,
-        EUC_JIS_2004) convert only their ASCII range, in `convert*` and as
-        a `client_encoding` (passed through as UTF-8). The single-byte ones
-        are done from tables measured on PostgreSQL (`sbcs.rs`); these need
-        PostgreSQL's mapping tables, which are large.
       - **Text search**: `null::tsquery` sends a spurious "doesn't
         contain lexemes" NOTICE from a FROM-less select; `ts_headline`
         refuses its `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments`

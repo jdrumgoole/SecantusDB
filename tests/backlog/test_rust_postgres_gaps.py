@@ -139,8 +139,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "sjis-non-ascii": "select convert_to('é', 'SJIS')",
-    "euc-jp-from-bytes": "select convert_from('\\xa4a2'::bytea, 'EUC_JP')",
     "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
 }
 
@@ -160,6 +158,8 @@ _RP015_FIXED = {
     "timetz-date-part": "select date_part('timezone_h', '01:00-03:30'::timetz)",
     "int2-to-char-cast": 'select 65::int2::"char"',
     "regconfig-by-oid": "select 3748::regconfig::text",
+    "sjis-non-ascii": "select convert_to('é', 'SJIS')",
+    "euc-jp-from-bytes": "select convert_from('\\xa4a2'::bytea, 'EUC_JP')",
     "pg-ts-config": "select count(*) from pg_ts_config",
     "regdictionary": "select 'simple'::regdictionary::oid",
     "ts-lexize": "select ts_lexize('english_stem', 'cats')",
