@@ -179,6 +179,30 @@ pub fn text(kind: &str, oid: i64) -> String {
     found.unwrap_or_else(|| oid.to_string())
 }
 
+/// A schema or role name is ONE identifier: `a.b` is PostgreSQL's 42602
+/// (`stringToQualifiedNameList` gives two names).
+fn single_name(input: &str) -> Result<String> {
+    let t = input.trim();
+    let quoted = t.starts_with('"') && t.ends_with('"') && t.len() >= 2;
+    if !quoted && t.contains('.') {
+        return Err(Error::Sqlstate("42602", "invalid name syntax".into()));
+    }
+    Ok(unquote(t))
+}
+
+/// The `reg*` type a `to_reg*` function resolves to, which answers NULL
+/// where the cast would say the object does not exist.
+pub fn to_reg_kind(function: &str) -> Option<&'static str> {
+    Some(match function {
+        "to_regnamespace" => "regnamespace",
+        "to_regrole" => "regrole",
+        "to_regcollation" => "regcollation",
+        "to_regproc" => "regproc",
+        "to_regprocedure" => "regprocedure",
+        _ => return None,
+    })
+}
+
 fn unquote(name: &str) -> String {
     let t = name.trim();
     match t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
@@ -194,7 +218,7 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
     }
     match kind {
         "regnamespace" => {
-            let name = unquote(input);
+            let name = single_name(input)?;
             NAMESPACES
                 .with(|t| t.borrow().iter().find(|(n, _)| *n == name).map(|(_, o)| *o))
                 .ok_or_else(|| {
@@ -214,7 +238,7 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
                 })
         }
         "regrole" => {
-            let name = unquote(input);
+            let name = single_name(input)?;
             ROLES
                 .with(|t| t.borrow().iter().find(|(n, _)| *n == name).map(|(_, o)| *o))
                 .ok_or_else(|| Error::UndefinedObject(format!("role \"{name}\" does not exist")))
@@ -336,12 +360,11 @@ pub fn collation_names() -> Vec<(String, i64)> {
         ("C", 950),
         ("POSIX", 951),
         ("ucs_basic", 962),
-        ("und-x-icu", 12713),
-        ("en-x-icu", 12860),
     ]
     .into_iter()
     .map(|(n, o)| (n.to_string(), o))
     .collect();
+    out.extend(crate::collation::icu_collations().map(|(o, n, _)| (n.to_string(), o)));
     out.extend(
         crate::collation::user_collations()
             .into_iter()

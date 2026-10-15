@@ -3802,6 +3802,7 @@ fn parse_one(sql: &str) -> Result<N> {
     unknown_args::check_ambiguous(&node)?;
     unknown_args::rewrite(&mut node);
     srf_place::check(&node)?;
+    collation::check_clauses(&node)?;
     schemas::qualify(&mut node)?;
     Ok(node)
 }
@@ -21826,6 +21827,16 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regclass") => {
             "regclass".to_string()
         }
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
+                .and_then(regobj::to_reg_kind)
+                .is_some() =>
+        {
+            regobj::to_reg_kind(&func_name(f).unwrap_or_default())
+                .unwrap_or("text")
+                .to_string()
+        }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_typeof") => {
             "regtype".to_string()
         }
@@ -23544,6 +23555,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // what evaluates it inside a WHERE clause.
                 if name == "to_regtype"
                     || name == "to_regclass"
+                    || regobj::to_reg_kind(&name).is_some()
                     || name == "pg_get_constraintdef"
                     || name == "pg_get_viewdef"
                     || name == "pg_get_indexdef"
@@ -34855,6 +34867,28 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 Bson::String(name) => match resolve_regclass(&name) {
                     Ok(oid) => regclass_value(oid),
                     Err(Error::UndefinedTable(_)) => Bson::Null,
+                    Err(e) => return Err(e),
+                },
+                _ => Bson::Null,
+            });
+        }
+        // `to_regnamespace` / `to_regrole` / `to_regcollation` / `to_regproc`
+        // / `to_regprocedure`: the `::reg*` cast, NULL where the cast says the
+        // object does not exist (or, for `to_regproc`, names several). A
+        // malformed name still raises (42602), as on PostgreSQL 15.19.
+        if let Some(kind) = func_name(f).as_deref().and_then(regobj::to_reg_kind) {
+            let [arg] = f.args.as_slice() else {
+                return Err(Error::Parse(format!(
+                    "function {}() requires exactly one argument",
+                    func_name(f).unwrap_or_default()
+                )));
+            };
+            return Ok(match const_value(arg, params)? {
+                Bson::String(name) => match cast_value(Bson::String(name), kind) {
+                    Ok(v) => v,
+                    Err(e) if matches!(e.sqlstate(), "42704" | "42883" | "42725" | "3F000") => {
+                        Bson::Null
+                    }
                     Err(e) => return Err(e),
                 },
                 _ => Bson::Null,

@@ -17312,6 +17312,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             2202 => "regprocedure",
             4089 => "regnamespace",
             4096 => "regrole",
+            4191 => "regcollation",
             600 => "point",
             601 => "lseg",
             602 => "path",
@@ -17520,6 +17521,7 @@ fn wire_type(pg_type: &str) -> Type {
         "regclass" => Type::REGCLASS,
         "regnamespace" => Type::REGNAMESPACE,
         "regrole" => Type::REGROLE,
+        "regcollation" => Type::REGCOLLATION,
         "regproc" => Type::REGPROC,
         "regprocedure" => Type::REGPROCEDURE,
         // A real oid column type: psycopg's numeric tests read the oid back

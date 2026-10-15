@@ -125,17 +125,18 @@ one beside it.
   table refuses reads and writes with PostgreSQL's own `55000` for a
   handler-less wrapper; `postgres_fdw` / `file_fdw` are contrib modules this
   server does not ship.
-- [ ] **RUST pgserver: `pg_collation` lists only `und-x-icu` / `en-x-icu`
-  among the ICU collations.** The list was limited because ordering by a
-  locale once needed CLDR data the server did not have. `secantus-pgplan/src/
-  collation.rs` now evaluates any `<tag>-x-icu` name with ICU4X over CLDR
-  data, but `regobj::collation_names` and `secantus-pg/src/collations.rs`
-  still list only `und-x-icu` (12713) and `en-x-icu` (12860). Reproduce:
-  `select collname from pg_collation where collprovider = 'i'` on both
-  servers; PostgreSQL 15 lists hundreds (`de-x-icu`, `sv-x-icu`, ...). Check
-  first that each listed locale orders as PostgreSQL does.
+- [ ] **RUST pgserver: 27 of PostgreSQL 15.19's 907 ICU collations are
+  refused.** `pg_collation` lists the other 880 (`pg_icu_collations.tsv`),
+  each checked to ORDER BY as PostgreSQL does over a 97-string probe across
+  scripts. Left out, because ICU4X's CLDR data tailors them differently
+  (most order as the root locale): `az-Cyrl`, `haw`, `hi-Latn`, `kl`,
+  `kok-Latn`, `lkt`, `pa-Arab`, `se`, `smn`, `uz-Arab`, `uz-Cyrl`, `yi`,
+  `en-US-u-va-posix` and their regional forms; each is 42704. Related, not
+  tested: none of PostgreSQL's libc collations beyond `C` / `POSIX` exists
+  here (`COLLATE "en_US"` is 42704), and which ones a server has is the
+  host's locale list.
   Backlog-ID: RP-005
-  Verify: tests/backlog/test_rp_triage.py::test_pg_collation_lists_locale_icu_collations
+  Verify: tests/backlog/test_rp_triage.py::test_tailored_icu_collation_orders_as_postgres
 - **Scope decision — pgcrypto Blowfish and CAST5** PGP messages are verified
   against GnuPG, because both reference servers' OpenSSL 3 builds refuse
   those ciphers. Do not "fix" them to agree with a PG error.
