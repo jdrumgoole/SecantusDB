@@ -139,8 +139,16 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "tid-type": "select '(0,1)'::tid::text",
     "int2-to-char-cast": 'select 65::int2::"char"',
+    "sjis-non-ascii": "select convert_to('é', 'SJIS')",
+    "euc-jp-from-bytes": "select convert_from('\\xa4a2'::bytea, 'EUC_JP')",
+    "regconfig-by-oid": "select 3748::regconfig::text",
+    "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
+}
+
+# What the 2026-10-15 batch fixed, kept as regression tests.
+_RP015_FIXED = {
+    "tid-type": "select '(0,1)'::tid::text",
     "date-part-unit-text": "select date_part('foo', '2000-01-01'::timestamptz)",
     "jsonb-object-to-int": """select '{"a":1}'::jsonb::int""",
     "ts-parse": "select * from ts_parse('default', 'foo bar')",
@@ -148,15 +156,29 @@ _RP015 = {
     "srf-in-expression": """select pg_typeof(json_each('{"a":1}'))::text""",
     "text-pattern-op": "select 'b'::text ~>~ 'a'::text",
     "date-plus-timetz": "select (date '2000-01-01' + time with time zone '01:00+00')::text",
+    "untyped-literal-arg": "select abs('-1'), sqrt('4')",
+    "float-input-range": "select '1e400'::float8",
+    "srf-in-coalesce": "select coalesce(unnest(array[1, null]), 0)",
+    "timetz-date-part": "select date_part('timezone_h', '01:00-03:30'::timetz)",
 }
+
+
+def _same_as_reference(pg: Any, pg15: Any, sql: str) -> None:
+    for conn in (pg, pg15):
+        conn.execute("set timezone = 'UTC'")
+    assert pg_answer(pg, sql) == pg_answer(pg15, sql)
 
 
 @pytest.mark.backlog("RP-015")
 @pytest.mark.parametrize("sql", list(_RP015.values()), ids=list(_RP015))
 def test_builtin_coverage_residue(pg: Any, pg15: Any, sql: str) -> None:
-    for conn in (pg, pg15):
-        conn.execute("set timezone = 'UTC'")
-    assert pg_answer(pg, sql) == pg_answer(pg15, sql)
+    _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog_fixed("RP-015")
+@pytest.mark.parametrize("sql", list(_RP015_FIXED.values()), ids=list(_RP015_FIXED))
+def test_builtin_coverage_fixed(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
 
 
 @pytest.mark.backlog_fixed("RP-015")

@@ -435,101 +435,66 @@ one beside it.
       Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
-      (2026-10-14).** The probe calls every immutable or stable function in
-      PostgreSQL 15.19's `pg_proc` on both servers with one sample value
-      for each argument type. Of the 1,935 it can call, 1,503 answered the
-      same on 2026-10-14 (what that day's batches fixed is recorded with
-      PostgreSQL 15.19's answers in `pg_corpora/builtin_coverage.sql`). 325
-      more read the server's own state and are not called, and 722 take a
-      type the probe has no sample for (`internal`, `cstring`, `record`,
-      `aclitem`, `regproc`, `xml`, `refcursor` and others), so nothing here
-      is said of them. Re-run it before working an item: the lists below
-      are from that day.
+      (re-measured 2026-10-15).** The probe calls every immutable or stable
+      function in PostgreSQL 15.19's `pg_proc` on both servers with one
+      sample value for each argument type; 1,505 of 1,934 answered the same
+      on 2026-10-15 before that day's batch (what it fixed -- `tid`,
+      `ts_parse` / `ts_debug` / `ts_rewrite`, the single-byte encodings,
+      SRFs in expressions, untyped literal arguments -- is pinned by
+      `test_builtin_coverage_fixed` and the corpora it added). Re-run it
+      before working an item.
 
       What is left:
-      - **Encodings other than UTF8, LATIN1 and SQL_ASCII convert only
-        their ASCII range**; anything above it is 0A000. A conversion
-        table per encoding is what PostgreSQL has.
-      - **A set-returning function inside an expression**
-        (`pg_typeof(json_each(j))`), and two of them in one select list,
-        are refused.
-      - **`ts_parse`, `ts_debug` and `ts_rewrite` are refused.** The first
-        two need `wparser_def.c`'s parser, which reports 23 token types
-        where this server's tokenizer tells two apart; `ts_rewrite` needs
-        `tsquery_rewrite.c`.
-      - **`aclexplode`, `acldefault` and `makeaclitem`** need role oids;
-        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`** and
-        **`pg_settings_get_flags`** need catalog or GUC state the planner
-        does not see; `table_to_xml` and the other XML exports, and the
-        `fmgr_*` / `postgresql_fdw_validator` validators, are not
-        written.
-      - **The `tid` type does not exist here**, so its six comparisons and
-        `min` / `max` over it are 42704.
-      - **`ts_headline` refuses `MaxWords`, `MinWords`, `ShortWord`,
-        `MaxFragments` above 0 and a true `HighlightAll`** (0A000, by
-        name). The selection of the words shown is not `mark_hl_words`:
-        a document over 35 words is cut by a rule of this server's own,
-        and has not been compared with PostgreSQL.
-      - **A record out of a subquery has its fields described as
-        `text`**: `select (x).n from (select f() as x) s` answers the
-        right value under the wrong column type, because the subquery's
-        column is `record` and its field types do not travel with it. A
-        named composite (`row(...)::t`) is typed.
-      - **Only `line <-> point` measures with `pg_hypot`.** Every other
-        distance in `geom.rs` uses Rust's `f64::hypot`, which can differ
-        from PostgreSQL in the last digit; no corpus line has shown one.
-      - **A `"char"` with the high bit set is carried as its `\ooo` text**,
-        so it orders by that text and not by the byte. Not measured.
-      - **An alias call with a COLUMN of the wrong type still runs**
-        (`int4pl(numeric_col, 2)`): the rewrite sees no column types.
-      - **`pg_relation_is_publishable` is true for an unlogged table**:
-        this server keeps no persistence apart from temporary.
+      - **The multi-byte encodings** (EUC_JP, EUC_CN, EUC_KR, EUC_TW,
+        SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004,
+        EUC_JIS_2004) convert only their ASCII range, in `convert*` and as
+        a `client_encoding` (passed through as UTF-8). The single-byte ones
+        are done from tables measured on PostgreSQL (`sbcs.rs`); these need
+        PostgreSQL's mapping tables, which are large.
       - **`65::int2::"char"` answers `A`**; PostgreSQL has no `int2` cast to
         `"char"` (42846). `"char"(x)` is planned as a cast, and as a call
         PostgreSQL promotes the `int2`, so the two cannot be told apart
-        until `"char"` is a function here. `"char"(65::int8)` is 42846
-        where PostgreSQL says 42883.
-
-      **Refused OPERATORS the probe reached through their functions** (82
-      signatures; each is `0A000` or `operator does not exist`):
-      - multirange `-|-`, `<<`, `>>`, `&<`, `&>` and its ordering
-        comparisons (`<`, `<=`, `>`, `>=`), with a multirange or a range
-        on either side;
-      - `macaddr` and `macaddr8` `&`, `|`, `~`;
-      - the text pattern comparisons `~<~`, `~<=~`, `~>=~`, `~>~`;
-      - `date + timetz` and `timetz + date`;
-      - geometric: `box # box`, `box <^ box`, `box >^ box`, circle
-        `&<` / `&>` / `&<|` / `|&>`, the closest-point operator `##` for
-        six pairs of types, `<->` between a line or a box and a segment,
-        `line # line`, `line ?# box`, `lseg ?# line`, the `path` count
-        comparisons, `point <> point`;
-      - `tsquery @> tsquery` and `<@` by their function names;
-      - `json[b]_extract_path[_text]` and `jsonb_delete` given their
-        path as `VARIADIC array`.
-
-      **Casts by function name**: `int4("char")` and the length-coercion
-      forms (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`,
-      `timestamp(timestamp, int4)` and the like) are refused or wrong.
-
-      **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
-      `byteacmp` answer what the C library's `memcmp` returns, which is
-      14 for `bttextcmp('b', 'a')` on macOS and 1 elsewhere; the type
-      input and output functions (117), the index support functions (102)
-      and the aggregates' own transition functions (57) take or return
-      `cstring` and `internal` and are not called by a statement.
-
-      **Error texts** (28): PostgreSQL 15 reworded `date_part` /
-      `date_trunc` / `extract` of an unknown unit to `unit "x" not
-      recognized for type timestamp with time zone`; this server still
-      says 14's `timestamp with time zone units "x" not recognized`. The
-      corpora that pin those lines are measured against the PostgreSQL 14
-      reference, so changing the text moves them to
-      `# reference-version: 15` in the same change. `date_part` and
-      `extract` of a `timetz` with an unknown unit are 22007 here, a
-      different error. A `jsonb` object or array cast to a number or a
-      boolean is 22P02 `invalid input syntax` here and 22023 `cannot cast
-      jsonb object to type integer` there. `ts_headline` with options
-      that do not parse answers where PostgreSQL refuses.
+        until `"char"` is a function here.
+      - **Text search**: a `regconfig` / `regdictionary` by oid
+        (`3748::regconfig`) and `pg_ts_config` do not exist; `null::tsquery`
+        sends a spurious "doesn't contain lexemes" NOTICE; a bad
+        configuration name carries no position; `ts_headline` refuses its
+        `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments` options,
+        chooses its words by a rule of its own, and answers an all-untyped
+        call PostgreSQL refuses as not unique (42725); `ts_rewrite`'s
+        substitute loses its AND/OR nesting (a tsquery is carried as its
+        canonical text), its SELECT form checks the column count only on
+        rows it gets back, and a syntax error in that SQL has a position
+        PostgreSQL does not give.
+      - **`aclexplode`, `acldefault`, `makeaclitem`** need role oids;
+        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`**,
+        **`pg_settings_get_flags`** need catalog or GUC state the planner
+        does not see; `table_to_xml` and the other XML exports, and the
+        `fmgr_*` / `postgresql_fdw_validator` validators, are not written.
+      - **An untyped literal beside a typed argument** is not resolved by
+        `func_select_candidate`'s rules (only an all-constant call is,
+        `unknown_args.rs`); `abs(NULL)`'s column is described as text (its
+        `pg_typeof` is right); `array_length('{1,2,3}', 1)` is not
+        PostgreSQL's 42804 polymorphic error.
+      - **Smaller**: only `line <-> point` measures with `pg_hypot`; a
+        `"char"` with the high bit set orders by its `\ooo` text; an alias
+        call with a COLUMN of the wrong type still runs
+        (`int4pl(numeric_col, 2)`); `pg_relation_is_publishable` is true for
+        an unlogged table.
+      - **Refused operators** the probe reached through their functions:
+        multirange `-|-` / `<<` / `>>` / `&<` / `&>` and its ordering
+        comparisons; `macaddr` / `macaddr8` `&` `|` `~`; geometric `box #
+        box`, `<^` / `>^`, circle `&<` `&>` `&<|` `|&>`, `##` for six pairs,
+        `<->` between a line or box and a segment, `line # line`, `?#`,
+        the `path` count comparisons, `point <> point`; `tsquery @>` / `<@`
+        by function name; `json[b]_extract_path[_text]` / `jsonb_delete`
+        given `VARIADIC array`. Casts by function name (`int4("char")`,
+        `bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`, ...).
+      - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
+        `byteacmp` answer what the C library's `memcmp` returns (14 for
+        `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,
+        index support and aggregate transition functions take or return
+        `cstring` / `internal` and are not called by a statement.
       Backlog-ID: RP-015
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
 
