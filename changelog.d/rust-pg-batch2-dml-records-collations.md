@@ -29,6 +29,23 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   checked to sort as PostgreSQL does. A `<tag>-x-icu` name that is not one
   of them is 42704, as on PostgreSQL. Fixes most of RP-005
   (tests/backlog/test_rp_triage.py::test_pg_collation_lists_locale_icu_collations).
+- A table named after a built-in type (`create table tid (...)`) no
+  longer shadows it: a bare `tid` is the built-in and the row type is
+  `public.tid`, so `'(0,1)'::tid`, `row_to_json(x)`, `x::text` and
+  `pg_typeof(x)` all answer as on PostgreSQL. Fixes RP-030
+  (tests/backlog/test_rust_postgres_gaps.py::test_table_named_after_a_builtin_type).
+- Most of RP-025 (tests/backlog/test_rust_postgres_gaps.py::test_typed_value_residue):
+  `array[row(1)]` is a real `record[]`, and arrays of records compare;
+  `regprocedure`, `regoper` and `regoperator` cover every built-in
+  function and operator (tables dumped from PostgreSQL 15.19); a refused
+  function-style cast (`int8(true)`) is 42883; ORDER BY, GROUP BY,
+  DISTINCT, window clauses, aggregate ORDER BY / DISTINCT and set
+  operations over a type with no ordering or equality operator (`point`,
+  `json`, `xml`, ...) are refused with 42883 at PostgreSQL's position;
+  `information_schema.columns.data_type` says `ARRAY` / `USER-DEFINED`;
+  `path` compares by point count; `time` compared with `timetz` or
+  `interval` is widened first; `macaddr = macaddr8` is 42725; and input-cast
+  error positions follow PostgreSQL.
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.
@@ -49,5 +66,5 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - `to_regnamespace`, `to_regrole`, `to_regcollation`, `to_regproc` and
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
-- Corpora `multi_assign_update`, `returning_star`, `icu_collations` and
-  `to_reg_functions`.
+- Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
+  `to_reg_functions` and `typed_value_residue`.

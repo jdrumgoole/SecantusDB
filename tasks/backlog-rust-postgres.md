@@ -404,36 +404,18 @@ one beside it.
   Backlog-ID: RP-035
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_field_selection
 
-- [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
-  batch made values print by their type, refused the casts and operators
-  PostgreSQL 15's `pg_cast` / `pg_operator` have no entry for, and typed
-  untyped literals in set operations and NULLIF (corpus
-  `typed_value_render`, 634 checks). Still different:
-  - `array[row(1)]` comes back as the one string `{(1)}`, not an array.
-  - `'now()'::regprocedure` is 42883 and `regoper` does not exist.
-  - A refused function-style cast (`int8(true)`) is 42846; PostgreSQL
-    calls it a function and says 42883.
-  - ORDER BY over `point` (no ordering operator) and set operations over
-    it (no equality operator) succeed where PostgreSQL refuses.
-  - `information_schema.columns.data_type` says `tid[]` where PostgreSQL
-    says `ARRAY`; `=` over `int2vector` / `oidvector` / `path` is refused;
-    `time` compared with `timetz` / `interval` and `macaddr` with
-    `macaddr8` resolve differently; an input-cast error carries a position
-    PostgreSQL does not give.
+- [ ] **RUST pgserver: what the typed-value work left (2026-10-15).**
+  - `ORDER BY ... USING <op>` (in a query or an aggregate) is 0A000;
+    PostgreSQL resolves the operator, sorts by it, and refuses one with no
+    btree family (`point < point`) with 42883.
+  - `create type uuid as enum (...)` is 42710; PostgreSQL 15.19 creates
+    `public.uuid` beside the built-in (a TABLE named so works since RP-030).
+    The duplicate-name checks are spread over several paths.
+  - Comparing arrays of records whose fields are untyped
+    (`array[row(1, null)] = array[row(1, null)]`) stays 0A000; PostgreSQL
+    errors at execution with messages that vary by case.
   Backlog-ID: RP-025
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_typed_value_residue
-
-- [ ] **RUST pgserver: a table named after a built-in type shadows it.**
-  `create table tid (d date)` now succeeds, as on PostgreSQL 15.19 (it
-  was 42710), but then a bare `tid` in a cast resolves to the table's row
-  type (`'(0,1)'::tid` is a malformed record literal) and the table's
-  whole-row value is typed as the built-in (`row_to_json(x)` over it is
-  42883). PostgreSQL searches `pg_catalog` first, so a bare name is the
-  built-in, while the row type is `public.tid`. Composite types are found
-  by name here (`user_composite`), so this needs them told apart by schema.
-  Found 2026-10-15 merging the `tid` type.
-  Backlog-ID: RP-030
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_table_named_after_a_builtin_type
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_typed_value_open,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin
 
 - [ ] **RUST pgserver: rows that tie under ORDER BY come out in a
   different order from PostgreSQL's.** The sort here is stable;

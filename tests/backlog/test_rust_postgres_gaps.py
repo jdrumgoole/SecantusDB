@@ -344,7 +344,7 @@ def test_insert_select_checks_assignment_types(
     assert got == ("err", "42804", message)
 
 
-@pytest.mark.backlog("RP-030")
+@pytest.mark.backlog_fixed("RP-030")
 @pytest.mark.parametrize(
     ("sql", "expected"),
     [
@@ -376,7 +376,7 @@ _RP025 = {
 }
 
 
-@pytest.mark.backlog("RP-025")
+@pytest.mark.backlog_fixed("RP-025")
 @pytest.mark.parametrize("sql", list(_RP025.values()), ids=list(_RP025))
 def test_typed_value_residue(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
@@ -458,6 +458,30 @@ _RP035 = {
 @pytest.mark.parametrize("sql", list(_RP035.values()), ids=list(_RP035))
 def test_record_field_selection(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
+
+
+# RP-025's residue (PostgreSQL 15.19): ORDER BY ... USING, and CREATE TYPE
+# with a built-in type's name in public.
+_RP025_OPEN = {
+    "order-by-using": "select string_agg(x::text, ',' order by x using >) from (values (1), (3), (2)) v(x)",
+    "order-by-using-plain": "select x from (values (1), (3), (2)) v(x) order by x using >",
+}
+
+
+@pytest.mark.backlog("RP-025")
+@pytest.mark.parametrize("sql", list(_RP025_OPEN.values()), ids=list(_RP025_OPEN))
+def test_typed_value_open(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog("RP-025")
+def test_create_type_named_after_a_builtin(pg: Any) -> None:
+    """PostgreSQL 15.19: `create type uuid as enum ('a')` succeeds (it is
+    `public.uuid`); here it is 42710."""
+    pg.execute("drop type if exists public.uuid")
+    got = pg_answer(pg, "create type uuid as enum ('a')")
+    pg.execute("drop type if exists public.uuid")
+    assert got[0] == "ok", got
 
 
 # Fixed from RP-025: an untyped side of `||` beside a type with a `||` of its
