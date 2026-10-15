@@ -683,14 +683,21 @@ def test_pg_typeof_names_the_domain(pg: Any) -> None:
     assert got == ("ok", [("rp38_d",)])
 
 
-@pytest.mark.backlog("RP-038")
+@pytest.mark.backlog_fixed("RP-038")
 def test_create_type_named_int(pg: Any) -> None:
     """PostgreSQL 15.19: `create type int as enum ('a')` creates
-    `public."int"` (`int` is a grammar spelling, not a pg_type name); here
-    it is 42710."""
+    `public."int"` (`int` is a grammar spelling, not a pg_type name), which
+    `'a'::"int"` reaches and `pg_typeof` prints `"int"`, while a bare `int`
+    is still `integer`; here the CREATE was 42710."""
     got = pg_answer(pg, "create type int as enum ('a')")
-    pg.execute('drop type if exists public."int"')
+    try:
+        typed = pg_answer(
+            pg, """select 'a'::"int"::text, pg_typeof('a'::"int")::text, pg_typeof(1::int)::text"""
+        )
+    finally:
+        pg.execute('drop type if exists public."int"')
     assert got == ("ok", "CREATE TYPE")
+    assert typed == ("ok", [("a", '"int"', "integer")])
 
 
 @pytest.mark.backlog_fixed("RP-038")

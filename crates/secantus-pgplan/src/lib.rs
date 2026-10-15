@@ -4233,7 +4233,12 @@ fn plan_node(
                 .typevar
                 .as_ref()
                 .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
-            let name = typevar.relname.clone();
+            // A grammar spelling (`int`) is kept quoted (`user_type_name`).
+            let name = if matches!(typevar.schemaname.as_str(), "" | "public") {
+                pgtypes::user_type_key(&typevar.relname)
+            } else {
+                typevar.relname.clone()
+            };
             let schema = if typevar.schemaname.is_empty() {
                 None
             } else {
@@ -4686,8 +4691,8 @@ fn split_qualified_type_name(
         .collect();
     match parts.as_slice() {
         [] => Err(Error::Parse("CREATE TYPE without a name".into())),
-        [name] => Ok((None, name.clone())),
-        [schema, name] if schema == "public" => Ok((None, name.clone())),
+        [name] => Ok((None, pgtypes::user_type_key(name))),
+        [schema, name] if schema == "public" => Ok((None, pgtypes::user_type_key(name))),
         [schema, name] => Ok((Some(schema.clone()), name.clone())),
         _ => {
             let name = parts.last().expect("non-empty").clone();
@@ -5662,6 +5667,12 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
         // `pg_catalog.bpchar`, and `pg_catalog.char` only comes from
         // `pg_catalog."char"` as written.
         ["char"] | ["pg_catalog", "char"] => QUOTED_CHAR.to_string(),
+        // Likewise a bare or `public.` `int`: the grammar's `int` is
+        // `pg_catalog.int4`, so this one was written `"int"` and names a user
+        // type (`pgtypes::user_type_name`).
+        [n] | ["public", n] if pgtypes::user_type_key(n) != *n => pgtypes::user_type_key(n),
+        // `pg_catalog."int"` names no type at all (42704 on 15.19).
+        ["pg_catalog", n] if pgtypes::user_type_key(n) != *n => format!("pg_catalog.{n}"),
         [n] | ["pg_catalog", n] => (*n).to_string(),
         // `public.tid` is not the built-in `tid` (see `shadowed_by_catalog`).
         ["public", n] if !pgtypes::shadowed_by_catalog(n) => (*n).to_string(),
@@ -6656,7 +6667,10 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             (Some(rv), _) => relation_name(rv),
             (None, Some(N::List(l))) => {
                 let parts = string_list(&l.items);
+                let is_type = matches!(kind, "type" | "domain");
                 match parts.as_slice() {
+                    [bare] if is_type => pgtypes::user_type_key(bare),
+                    [schema, bare] if schema == "public" && is_type => pgtypes::user_type_key(bare),
                     [schema, bare] if schema == "public" => bare.clone(),
                     _ => parts.join("."),
                 }
@@ -6664,6 +6678,13 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             (None, Some(N::TypeName(t))) => type_name_of(t),
             _ if kind == "schema" => r.subname.clone(),
             _ => return Err(Error::Parse("RENAME without an object".into())),
+        };
+        // A type renamed to a grammar spelling is kept quoted, as one
+        // created under it is (`pgtypes::user_type_key`).
+        let to = if matches!(kind, "type" | "domain") {
+            pgtypes::user_type_key(&r.newname)
+        } else {
+            r.newname.clone()
         };
         let sub = if kind == "schema" {
             String::new()
@@ -6674,7 +6695,7 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             kind: kind.to_string(),
             target,
             sub,
-            to: r.newname.clone(),
+            to,
             missing_ok: r.missing_ok,
         });
     }
@@ -8112,7 +8133,8 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 let domain = domains::user_domain(&ty);
                 if domain.is_none() && !column_type_exists(&ty) {
                     return Err(Error::UndefinedObject(format!(
-                        "type \"{ty}\" does not exist"
+                        "type \"{}\" does not exist",
+                        pgtypes::user_type_catalog_name(&ty)
                     )));
                 }
                 let ty = domain.as_ref().map_or(ty, |d| d.base.clone());
@@ -18618,7 +18640,8 @@ fn plan_alter_enum(a: &pg_query::protobuf::AlterEnumStmt) -> Result<Statement> {
         })
         .collect();
     let name = match parts.as_slice() {
-        [schema, bare] if schema == "public" => bare.clone(),
+        [bare] => pgtypes::user_type_key(bare),
+        [schema, bare] if schema == "public" => pgtypes::user_type_key(bare),
         _ => parts.join("."),
     };
     let change = if a.old_val.is_empty() {
@@ -25910,6 +25933,10 @@ pub fn regtype_text(oid: i64) -> String {
 }
 
 fn quote_type_path(name: &str) -> String {
+    // `"int"` is kept as it prints (`pgtypes::user_type_key`).
+    if pgtypes::is_quoted_grammar_name(name) {
+        return name.to_string();
+    }
     name.split('.')
         .map(scalar::quote_identifier)
         .collect::<Vec<_>>()
@@ -27674,7 +27701,12 @@ fn canonical_type_ref(name: &str) -> String {
     let norm: Vec<String> = parts.iter().map(|p| normalize_ident_part(p)).collect();
     match norm.as_slice() {
         // `public.tid` stays qualified: the bare name is `pg_catalog`'s.
-        [schema, name] if schema == "public" && !pgtypes::shadowed_by_catalog(name) => name.clone(),
+        // A user type named like grammar (`int`) is keyed quoted
+        // (`pgtypes::user_type_name`); a builtin is resolved before this.
+        [schema, name] if schema == "public" && !pgtypes::shadowed_by_catalog(name) => {
+            pgtypes::user_type_key(name)
+        }
+        [name] => pgtypes::user_type_key(name),
         [schema, name] => format!("{schema}.{name}"),
         _ => norm.join("."),
     }
@@ -27744,7 +27776,10 @@ fn column_type_exists(name: &str) -> bool {
 /// A user ENUM's `(oid, labels)` by name, same folding rule.
 fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
     let trimmed = name.trim();
+    // A type named like grammar is registered under its quoted spelling
+    // (`pgtypes::user_type_name`), which is the whole key.
     let (target, fold) = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        _ if pgtypes::is_quoted_grammar_name(trimmed) => (trimmed.to_string(), false),
         Some(inner) => (inner.to_string(), false),
         None => (trimmed.to_ascii_lowercase(), true),
     };
@@ -29682,7 +29717,8 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         if let Err(Error::UndefinedObject(m)) = probe {
             if m.starts_with("type \"") && m.ends_with("\" does not exist") {
                 return Err(Error::UndefinedObject(format!(
-                    "type \"{target}\" does not exist"
+                    "type \"{}\" does not exist",
+                    pgtypes::user_type_catalog_name(target)
                 )));
             }
         }
@@ -29960,7 +29996,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                         }
                         None => Error::UndefinedObject(format!(
                             "type \"{}\" does not exist",
-                            name.trim()
+                            pgtypes::user_type_catalog_name(name.trim())
                         )),
                     }),
                 }
@@ -30473,7 +30509,8 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 && user_composite(base).is_none()
             {
                 return Err(Error::UndefinedObject(format!(
-                    "type \"{base}\" does not exist"
+                    "type \"{}\" does not exist",
+                    pgtypes::user_type_catalog_name(base)
                 )));
             }
             Err(Error::Unsupported(format!("a cast to {other}")))
@@ -33318,13 +33355,13 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
                 .collect();
             let name = match parts.as_slice() {
                 [] => return Err(Error::Parse("DROP TYPE without a name".into())),
-                [bare] => bare.clone(),
+                [bare] => pgtypes::user_type_key(bare),
                 // `public.uuid` (a type named after a built-in) stays
                 // qualified: its bare name is pg_catalog's.
                 [schema, bare]
                     if schema == "public" && (domain || !pgtypes::shadowed_by_catalog(bare)) =>
                 {
-                    bare.clone()
+                    pgtypes::user_type_key(bare)
                 }
                 _ => parts.join("."),
             };

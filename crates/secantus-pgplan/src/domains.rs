@@ -49,6 +49,8 @@ pub fn set_user_domains(mut domains: Vec<Domain>) {
 pub fn user_domain(name: &str) -> Option<Domain> {
     let trimmed = name.trim();
     let target = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        // `"int"` is the whole key (`pgtypes::user_type_key`).
+        Some(_) if crate::pgtypes::is_quoted_grammar_name(trimmed) => trimmed.to_string(),
         Some(inner) => inner.to_string(),
         None => trimmed.to_ascii_lowercase(),
     };
@@ -168,6 +170,8 @@ fn constraints_of(
                     .as_deref()
                     .ok_or_else(|| Error::Parse("CHECK without an expression".into()))?;
                 let name = if k.conname.is_empty() {
+                    // Named after `integer`, not the key `"integer"`.
+                    let domain = crate::pgtypes::user_type_catalog_name(domain);
                     let mut candidate = format!("{domain}_check");
                     let mut i = 0;
                     while existing.contains(&candidate)
@@ -204,7 +208,8 @@ fn domain_name(parts: &[pg_query::protobuf::Node]) -> String {
         })
         .collect();
     match names.as_slice() {
-        [schema, bare] if schema == "public" => bare.clone(),
+        [bare] => crate::pgtypes::user_type_key(bare),
+        [schema, bare] if schema == "public" => crate::pgtypes::user_type_key(bare),
         _ => names.join("."),
     }
 }

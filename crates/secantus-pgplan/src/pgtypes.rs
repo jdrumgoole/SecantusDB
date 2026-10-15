@@ -97,6 +97,61 @@ pub fn typdelim(element_type: &str) -> char {
     }
 }
 
+/// The `pg_type` name behind a type spelling the GRAMMAR has and the
+/// catalog does not: `int` and `integer` are `int4`, `boolean` is `bool`.
+/// None of these is a `pg_type` row (`select typname from pg_type where
+/// typname = 'int'` is empty on 15.19), so a user type may take the name.
+fn grammar_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "integer" | "int" => "int4",
+        "smallint" => "int2",
+        "bigint" => "int8",
+        "real" => "float4",
+        "double precision" => "float8",
+        "boolean" => "bool",
+        "character varying" => "varchar",
+        "character" => "bpchar",
+        "decimal" => "numeric",
+        "time without time zone" => "time",
+        "timestamp without time zone" => "timestamp",
+        "timestamp with time zone" => "timestamptz",
+        "time with time zone" => "timetz",
+        _ => return None,
+    })
+}
+
+/// The internal name of a USER type called `name` (as written, unquoted).
+/// A grammar spelling (`int`, `integer`, `double precision`) is no
+/// `pg_type` row, and PostgreSQL 15.19 creates `public."int"` beside the
+/// built-in `int4`; but this code reads the string `int` as `int4`
+/// everywhere, so the user type is kept under its QUOTED spelling, `"int"`,
+/// the way the one-byte `"char"` is (`QUOTED_CHAR`). That is also how
+/// `format_type` and `pg_typeof` print it, every such spelling being a
+/// keyword or holding a space. A bare `int` never collides: the grammar makes it
+/// `pg_catalog.int4`, so a single-part `int` was written quoted.
+pub fn user_type_key(name: &str) -> String {
+    if grammar_alias(name).is_some() {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
+    }
+}
+
+/// A user type's name as `pg_type.typname` holds it: `int` for the type
+/// kept as `"int"` (see `user_type_key`).
+pub fn user_type_catalog_name(name: &str) -> &str {
+    match name.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) if grammar_alias(inner).is_some() => inner,
+        _ => name,
+    }
+}
+
+/// Is `name` a user type kept under a grammar spelling's quoted form
+/// (`"int"`, see `user_type_key`)?
+pub fn is_quoted_grammar_name(name: &str) -> bool {
+    user_type_catalog_name(name) != name
+}
+
 /// The oid for a type NAME, in any spelling PostgreSQL itself accepts --
 /// `int4` and `integer`, `varchar` and `character varying`. `None` for a name
 /// this catalog does not have, which is what `to_regtype` answers NULL for.
@@ -121,22 +176,7 @@ pub fn oid_of_name(name: &str) -> Option<i64> {
             .map(|(_, _, arr)| *arr);
     }
     let n = trimmed.to_ascii_lowercase();
-    let internal = match n.as_str() {
-        "integer" | "int" => "int4",
-        "smallint" => "int2",
-        "bigint" => "int8",
-        "real" => "float4",
-        "double precision" => "float8",
-        "boolean" => "bool",
-        "character varying" => "varchar",
-        "character" => "bpchar",
-        "decimal" => "numeric",
-        "time without time zone" => "time",
-        "timestamp without time zone" => "timestamp",
-        "timestamp with time zone" => "timestamptz",
-        "time with time zone" => "timetz",
-        other => other,
-    };
+    let internal = grammar_alias(&n).unwrap_or(n.as_str());
     BUILTIN_TYPES
         .iter()
         .find(|(t, _, _)| *t == internal)
@@ -291,6 +331,9 @@ pub fn shadowed_by_catalog(name: &str) -> bool {
 pub fn is_builtin_type(name: &str) -> bool {
     let base = name.trim_end_matches("[]").trim();
     let base = base.strip_prefix("pg_catalog.").unwrap_or(base);
+    if is_quoted_grammar_name(base) {
+        return false;
+    }
     let base = base.trim_matches('"');
     CATALOG_TYPE_NAMES.contains(&base)
         || matches!(base, "bit varying" | "serial" | "bigserial" | "smallserial")
