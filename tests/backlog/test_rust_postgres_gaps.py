@@ -139,10 +139,9 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "memcmp-compare": (
-        "select bttextcmp('b', 'a'), byteacmp('\\x02'::bytea, '\\x01'::bytea),"
-        " network_cmp('10.0.0.1', '10.0.0.3'), bitcmp(B'101', B'100')"
-    ),
+    # Under the database's collation, through `strcoll`: the platform's
+    # locale data says the magnitude.
+    "strcoll-compare": "select bttextcmp('b', 'a'), bpcharcmp('b', 'a'), jsonb_cmp('\"a\"', '\"c\"')",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
@@ -205,6 +204,11 @@ _RP015_FIXED = {
         " in_range(9223372036854775807::int8, 9223372036854775807::int8, 1::int8, false, false)"
     ),
     "in-range-negative": "select in_range(1, 2, -1, true, false)",
+    "byte-compare": (
+        "select byteacmp('\\x05'::bytea, '\\x01ff'::bytea), bitcmp(B'101', B'100'),"
+        " btnamecmp('ab', 'a'), network_cmp('10.0.0.0/8', '10.0.0.0/16'),"
+        " btbpchar_pattern_cmp('ab', 'a '), gin_compare_jsonb('abc', 'ab')"
+    ),
     "infinite-timestamp-compare": (
         "select 'infinity'::timestamp > '2020-01-02'::timestamp,"
         " '-infinity'::timestamptz < '2020-01-01 00:00+00'::timestamptz"

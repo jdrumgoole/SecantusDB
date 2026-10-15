@@ -145,6 +145,7 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
             return crate::typsend::result_type(name, types.len())
                 .or_else(|| crate::agg_support::result_type(name, types.len()))
                 .or_else(|| crate::hashfn::result_type(name, types.len()))
+                .or_else(|| crate::cmpfn::result_type(name, types.len()))
                 .map(String::from)
         }
     };
@@ -408,6 +409,9 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
     }
     let bytes = |i: usize| bytea::parse(&args[i]);
     if let Some(out) = crate::agg_support::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::cmpfn::call(name, args) {
         return out;
     }
     if name == "in_range" {

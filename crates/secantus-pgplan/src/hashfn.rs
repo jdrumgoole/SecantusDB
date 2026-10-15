@@ -235,7 +235,7 @@ fn timestamp_micros(v: &Bson) -> Result<i64> {
 
 /// `inet`'s in-memory bytes: family (2 for IPv4, 3 for IPv6), the prefix
 /// length, then the address.
-fn inet_bytes(text: &str) -> Result<Vec<u8>> {
+pub(crate) fn inet_bytes(text: &str) -> Result<Vec<u8>> {
     let (addr, bits) = match text.split_once('/') {
         Some((a, b)) => (a, Some(parse::<u8>(b, "inet")?)),
         None => (text, None),

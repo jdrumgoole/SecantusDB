@@ -433,16 +433,16 @@ one beside it.
 
       What is left (re-measured 2026-10-15 against 15.19, 1,890 of 1,934
       the same; everything else the probe reports is below):
-      - **Decision needed -- the comparisons that answer a `memcmp`
-        difference** (16): `bttextcmp`, `bpcharcmp`, `byteacmp`, `bitcmp`,
-        `varbitcmp`, `btnamecmp` and its text forms, the `*_pattern_cmp`
-        pair, `network_cmp`, `jsonb_cmp`, `tsvector_cmp`, `tsquery_cmp`,
-        `gin_cmp_tslexeme`, `gin_compare_jsonb`. Each returns what the C
-        library's `memcmp` / `strcoll` does on the reference machine
-        (`bttextcmp('b', 'a')` is 14 on the macOS reference,
-        `bitcmp(B'101', B'100')` 32), and only the sign is promised.
-        Answering the reference's magnitude is one rule; answering -1 / 1 is
-        another. Which one is Joe's call, so none is answered yet.
+      - **Decision needed -- the comparisons that answer `strcoll`**
+        (`bttextcmp`, `bpcharcmp`, `jsonb_cmp`) under the database's
+        collation: the magnitude is the platform's locale data
+        (`bttextcmp('b', 'a')` is 14 on the macOS reference under
+        `en_US.UTF-8`), and only the sign is promised. And `tsvector_cmp` /
+        `tsquery_cmp`, which compare their types' internal storage layouts
+        (sizes first). Answering the reference's numbers, or -1 / 1, is
+        Joe's call. The byte comparisons (`byteacmp`, `bitcmp`,
+        `btnamecmp`, `network_cmp`, the `*_pattern_cmp` pair, ...) answer
+        PostgreSQL's numbers since 2026-10-16 (`cmpfn.rs`).
       - `table_to_xml` / `database_to_xml` over the catalog or the whole
         database differ only by what each database holds.
       Backlog-ID: RP-015

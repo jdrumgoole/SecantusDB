@@ -16,6 +16,7 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 mod agg_hoist;
 mod agg_support;
+mod cmpfn;
 mod expr_where;
 mod filter_sublink;
 mod hashfn;
