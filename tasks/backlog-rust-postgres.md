@@ -478,10 +478,6 @@ one beside it.
         literal (`array_append('{1.5}', 2)`,
         `concat(variadic $$${1}$$::int[])`) is the right 22P02 with no
         position (PostgreSQL places it at the literal).
-      - **`concat('a', variadic array['b','c'])`** answers `abc`;
-        PostgreSQL 15.19 is 42883 `function concat(unknown, text[]) does
-        not exist`, since an untyped argument does not resolve against
-        `VARIADIC "any"`.
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

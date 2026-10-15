@@ -322,6 +322,78 @@ pub(crate) fn rewrite(node: &mut N) {
 /// (`jsonb_extract_path(j, VARIADIC ARRAY['a', 'b'])`, `concat(VARIADIC
 /// ARRAY['a', 'b'])`). Only an array CONSTRUCTOR with elements is spread; any
 /// other array value keeps the VARIADIC form.
+/// `concat(VARIADIC "any")`, `concat_ws(text, VARIADIC "any")` and
+/// `format(text, VARIADIC "any")` take nothing beside the variadic array but
+/// the one fixed argument: `concat('a', VARIADIC array['b'])` is 42883 on
+/// PostgreSQL 15.19 (`function concat(unknown, text[]) does not exist`), at
+/// the call. Checked before `spread_variadic` takes the array apart, when
+/// every argument's type is known from the statement's text.
+pub(crate) fn check_variadic_arity(node: &N) -> Result<()> {
+    use pg_query::protobuf::a_const::Val;
+    fn arg_type(n: &pg_query::protobuf::Node) -> Option<String> {
+        match n.node.as_ref()? {
+            N::AConst(c) if c.isnull => Some("unknown".into()),
+            N::AConst(c) => Some(
+                match c.val.as_ref()? {
+                    Val::Sval(_) => "unknown",
+                    Val::Ival(_) => "int4",
+                    Val::Fval(_) => "numeric",
+                    Val::Boolval(_) => "bool",
+                    _ => return None,
+                }
+                .into(),
+            ),
+            N::TypeCast(tc) => {
+                let t = crate::type_name_of(tc.type_name.as_ref()?);
+                (!t.contains('(')).then_some(t)
+            }
+            // An array of untyped strings is `text[]`.
+            N::AArrayExpr(a) => {
+                let first = arg_type(a.elements.first()?)?;
+                let element = if first == "unknown" {
+                    "text".into()
+                } else {
+                    first
+                };
+                Some(format!("{element}[]"))
+            }
+            _ => None,
+        }
+    }
+    for (n, _, _, _) in node.nodes() {
+        let pg_query::NodeRef::FuncCall(f) = n else {
+            continue;
+        };
+        if !f.func_variadic || f.funcname.len() != 1 {
+            continue;
+        }
+        let Some(name) = func_name(f) else {
+            continue;
+        };
+        let fixed = match name.as_str() {
+            "concat" => 1,
+            "concat_ws" | "format" => 2,
+            _ => continue,
+        };
+        if f.args.len() == fixed || crate::correlated::user_function_named(&name) {
+            continue;
+        }
+        let Some(types) = f.args.iter().map(arg_type).collect::<Option<Vec<_>>>() else {
+            continue;
+        };
+        crate::set_error_location(f.location);
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            types
+                .iter()
+                .map(|t| crate::display_type(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn spread_variadic(node: &mut N) {
     // The json path functions and `jsonb_delete` are their operators over
     // the whole array (any array, not only a constructor): renamed to the

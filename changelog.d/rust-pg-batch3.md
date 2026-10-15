@@ -31,7 +31,10 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   `ARRAY[[1,2],[3,4]]` had spread its rows. A NULL array is NULL, and no
   arguments for `format`. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[variadic-column]`,
-  `[variadic-nested-array]`).
+  `[variadic-nested-array]`). A fixed argument `concat` / `concat_ws` /
+  `format` do not take beside the variadic array is PostgreSQL's 42883
+  (`function concat(unknown, text[]) does not exist`, at the call), where
+  it was concatenated (`[variadic-arity]`).
 - `null::tsquery` and `numnode(null)` no longer send `''::tsquery`'s
   "doesn't contain lexemes" NOTICE: a NULL cast's check that its type
   exists kept the NOTICEs its probe raised. Part of RP-015

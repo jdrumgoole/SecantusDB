@@ -3843,6 +3843,7 @@ fn parse_one(sql: &str) -> Result<N> {
         .as_ref()
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
+    func_cast::check_variadic_arity(&node)?;
     func_cast::spread_variadic(&mut node);
     func_cast::rewrite(&mut node);
     pattern_ops(&mut node);

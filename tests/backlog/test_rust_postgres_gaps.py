@@ -150,6 +150,7 @@ _RP015_FIXED = {
         " from (values (array['x', 'y'])) v(a)"
     ),
     "variadic-nested-array": "select concat(variadic array[[1, 2], [3, 4]])",
+    "variadic-arity": "select concat('a', variadic array['b', 'c'])",
     "query-to-xml": (
         "select query_to_xml('select 1 as a, null::text as \"_xb\", array[1,null] as r',"
         " true, true, 'urn:x')"
