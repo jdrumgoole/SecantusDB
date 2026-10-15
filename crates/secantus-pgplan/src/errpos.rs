@@ -72,7 +72,7 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
             _ => return false,
         };
         inner
-            .split(|c| matches!(c, ',' | '{' | '}' | '(' | ')'))
+            .split([',', '{', '}', '(', ')'])
             .any(|e| e.trim().trim_matches('"') == value)
     };
     let mut hits = toks.iter().enumerate().filter(|(_, t)| holds(t));
