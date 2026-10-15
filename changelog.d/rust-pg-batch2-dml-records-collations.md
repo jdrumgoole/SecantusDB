@@ -112,8 +112,9 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   (`3748::regconfig` is `simple`); and `ts_lexize`. Part of RP-015
   (tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed).
 - `pg_sequences`.
-- `pg_relation_is_updatable`, `pg_column_is_updatable` and
-  `pg_is_other_temp_schema`. Part of RP-015.
+- `pg_relation_is_updatable`, `pg_column_is_updatable`,
+  `pg_is_other_temp_schema` and `pg_settings_get_flags` (PostgreSQL
+  15.19's flags for every setting). Part of RP-015.
 - `acldefault`, `makeaclitem` and `aclexplode`, as PostgreSQL 15's acl.c
   answers them. Part of RP-015.
 - The length-coercion functions by name, `pg_catalog."numeric"(x,
