@@ -386,11 +386,8 @@ one beside it.
   - `create type int` / `create type integer` are 42710; PostgreSQL makes
     `public."int"`. They are grammar spellings with no pg_type row, and the
     planner folds `int` to `int4`, so the fix has to keep the two apart.
-  - COPY FROM a UTF8 client with invalid bytes says `COPY data is not
-    valid UTF-8`; PostgreSQL says `invalid byte sequence for encoding
-    "UTF8": 0x82` (22021). Other client encodings already match.
   Backlog-ID: RP-038
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int,tests/backlog/test_rust_postgres_gaps.py::test_copy_from_reports_the_bad_byte
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

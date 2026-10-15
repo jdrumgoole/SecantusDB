@@ -39500,11 +39500,25 @@ impl CopyHandler for PgHandler {
                     encoding::decode(cenc, &state.buffer)
                         .map_err(|e| encoding::undecodable(cenc, e))?
                 } else {
-                    String::from_utf8(state.buffer.clone()).map_err(|_| {
+                    String::from_utf8(state.buffer.clone()).map_err(|e| {
+                        // `report_invalid_encoding`: the bad character's
+                        // bytes, as many as its lead byte says it has.
+                        let bad = &state.buffer[e.utf8_error().valid_up_to()..];
+                        let len = match bad.first() {
+                            Some(0xc0..=0xdf) => 2,
+                            Some(0xe0..=0xef) => 3,
+                            Some(0xf0..=0xf7) => 4,
+                            _ => 1,
+                        };
+                        let shown: Vec<String> =
+                            bad.iter().take(len).map(|b| format!("0x{b:02x}")).collect();
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "22021".into(), // character_not_in_repertoire
-                            "COPY data is not valid UTF-8".into(),
+                            format!(
+                                "invalid byte sequence for encoding \"UTF8\": {}",
+                                shown.join(" ")
+                            ),
                         )))
                     })?
                 };

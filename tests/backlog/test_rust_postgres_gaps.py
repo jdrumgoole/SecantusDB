@@ -657,7 +657,7 @@ def test_create_type_named_int(pg: Any) -> None:
     assert got == ("ok", "CREATE TYPE")
 
 
-@pytest.mark.backlog("RP-038")
+@pytest.mark.backlog_fixed("RP-038")
 def test_copy_from_reports_the_bad_byte(pg: Any) -> None:
     """PostgreSQL 15.19: COPY FROM a UTF8 client with the byte 0x82 is 22021
     `invalid byte sequence for encoding "UTF8": 0x82`; here the message is
