@@ -312,6 +312,18 @@ def test_window_rows_come_out_in_window_sort_order(pg: Any) -> None:
 
 
 @pytest.mark.backlog("RP-028")
+def test_grouped_output_ties_as_postgres_leaves_them(pg: Any) -> None:
+    """PostgreSQL 15.19: groups tied under ORDER BY come out in the order its
+    HashAggregate produced them -- `(0, 6), (1, 6)` here; this server's
+    grouping hands them to the (stable) sort in another order."""
+    pg.execute("drop table if exists rp028_g")
+    pg.execute("create table rp028_g (k int, g int)")
+    pg.execute("insert into rp028_g select i, i % 2 from generate_series(1, 12) i")
+    got = pg_answer(pg, "select g, count(*) from rp028_g group by g order by count(*)")
+    assert got == ("ok", [(0, 6), (1, 6)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
 def test_order_by_ties_as_postgres_quicksort_leaves_them(pg: Any) -> None:
     """PostgreSQL 15.19: tied rows land where its quicksort (not stable from
     7 rows up) leaves them -- `7, 10, 3, 4, 5, 9` for the six rows at v = 1;
@@ -418,7 +430,7 @@ def test_record_literal_pads_char_field(pg: Any) -> None:
     assert pg_answer(pg, "select '(ab,x)'::rp032_l::text") == ("ok", [('("ab ",x)',)])
 
 
-@pytest.mark.backlog("RP-033")
+@pytest.mark.backlog_fixed("RP-033")
 def test_whole_row_of_a_union_with_unnamed_columns(pg: Any) -> None:
     """PostgreSQL 15.19: `select q from (select 1, 'a' union select 1, 'a') q`
     is `(1,a)`; here it is `(1,1)` -- both columns are named `?column?`, and
@@ -458,21 +470,20 @@ _RP035 = {
 }
 
 
-@pytest.mark.backlog("RP-035")
+@pytest.mark.backlog_fixed("RP-035")
 @pytest.mark.parametrize("sql", list(_RP035.values()), ids=list(_RP035))
 def test_record_field_selection(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-# RP-025's residue (PostgreSQL 15.19): ORDER BY ... USING, and CREATE TYPE
-# with a built-in type's name in public.
+# Fixed from RP-025: ORDER BY ... USING (2026-10-15).
 _RP025_OPEN = {
     "order-by-using": "select string_agg(x::text, ',' order by x using >) from (values (1), (3), (2)) v(x)",
     "order-by-using-plain": "select x from (values (1), (3), (2)) v(x) order by x using >",
 }
 
 
-@pytest.mark.backlog("RP-025")
+@pytest.mark.backlog_fixed("RP-025")
 @pytest.mark.parametrize("sql", list(_RP025_OPEN.values()), ids=list(_RP025_OPEN))
 def test_typed_value_open(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)

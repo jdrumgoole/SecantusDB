@@ -38,7 +38,7 @@ def test_cancel_during_parse_is_honoured_at_once(pg: Any) -> None:
     assert elapsed - delay < 0.5, f"cancel honoured {elapsed - delay:.2f} s after it was sent"
 
 
-@pytest.mark.backlog("RP-003")
+@pytest.mark.backlog_fixed("RP-003")
 def test_national_literal_under_nonconforming_strings(pg: Any) -> None:
     """PostgreSQL 15.19: with `standard_conforming_strings = off`, `N'a\\\\b'`
     reads its backslash as an escape, like a plain literal: `a\\b`."""
@@ -46,7 +46,7 @@ def test_national_literal_under_nonconforming_strings(pg: Any) -> None:
     assert pg_answer(pg, r"select N'a\\b'") == ("ok", [("a\\b",)])
 
 
-@pytest.mark.backlog("RP-003")
+@pytest.mark.backlog_fixed("RP-003")
 def test_backslash_quote_off_refuses_backslash_quote(pg: Any) -> None:
     """PostgreSQL 15.19: with `standard_conforming_strings = off` and
     `backslash_quote = off`, `'a\\'b'` is 22P06 `unsafe use of \\' in a

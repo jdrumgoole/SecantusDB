@@ -59,14 +59,6 @@ one beside it.
   `send_query_params`, then a blocking `PQcancel` at a chosen offset.
   Backlog-ID: RP-002
   Verify: tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once
-- [ ] RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
-  pass (`secantus-pgplan/src/escape_strings.rs`) that rewrites each plain
-  literal to the `E'...'` it means before pg_query (which has the setting
-  hard-wired on) sees it, with the `escape_string_warning` notices. Left:
-  `N'...'` literals are not rewritten (they keep the conforming reading), and
-  `backslash_quote` is not a setting (2026-09-09).
-  Backlog-ID: RP-003
-  Verify: tests/backlog/test_rp_triage.py::test_national_literal_under_nonconforming_strings,tests/backlog/test_rp_triage.py::test_backslash_quote_off_refuses_backslash_quote
 - **Scope decision — a `LANGUAGE internal` wrapper over a C function with no
   SQL form** (an I/O function such as `int4out`, an aggregate transition
   function) is a catalog row that answers 42883 when called. PostgreSQL calls
@@ -374,36 +366,7 @@ one beside it.
   Backlog-ID: RP-032
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_literal_pads_char_field
 
-- [ ] **RUST pgserver: the whole-row value of a subquery whose columns share a
-  name reads the wrong fields.** `select q from (select 1, 'a' union select
-  1, 'a') q` is `(1,1)`; PostgreSQL 15.19 answers `(1,a)`. Both columns are
-  named `?column?`, and `whole_row_rewrite` builds `ROW(q."?column?", ...)`
-  by name. A silent wrong answer; reading the fields by position fixes it.
-  Found 2026-10-15 by RP-031's work.
-  Backlog-ID: RP-033
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_whole_row_of_a_union_with_unnamed_columns
-
-- [ ] **RUST pgserver: field selection on a record differs from
-  PostgreSQL's.** PostgreSQL 15.19 names an anonymous `ROW()`'s fields
-  `f1`, `f2`, ... only where it can see the `ROW()` (directly, or through a
-  subquery or CTE column it can flatten); here any record answers `fN`.
-  Measured (each case in the test):
-  - `((select row(1, 'a'))).f1` answers 1; PostgreSQL is 42703 `could not
-    identify column "f1" in record data type`, as is
-    `((row(row(1, 2), 3)).f1).f2`.
-  - `(x).f1` over `(values (row(1, 'a'))) v(x)` answers; PostgreSQL is
-    42809 `record type has not been registered`.
-  - A field read through a subquery or CTE column comes back as TEXT
-    (`'1'` where PostgreSQL returns the integer 1), and a nested record
-    field prints as its text where PostgreSQL returns the record.
-  Found 2026-10-15 by RP-031's work.
-  Backlog-ID: RP-035
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_field_selection
-
 - [ ] **RUST pgserver: what the typed-value work left (2026-10-15).**
-  - `ORDER BY ... USING <op>` (in a query or an aggregate) is 0A000;
-    PostgreSQL resolves the operator, sorts by it, and refuses one with no
-    btree family (`point < point`) with 42883.
   - `create type uuid as enum (...)` is 42710; PostgreSQL 15.19 creates
     `public.uuid` beside the built-in (a TABLE named so works since RP-030).
     The duplicate-name checks are spread over several paths.
@@ -411,21 +374,20 @@ one beside it.
     (`array[row(1, null)] = array[row(1, null)]`) stays 0A000; PostgreSQL
     errors at execution with messages that vary by case.
   Backlog-ID: RP-025
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_typed_value_open,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin
 
-- [ ] **RUST pgserver: rows that tie under ORDER BY come out in a
-  different order from PostgreSQL's.** The sort here is stable;
-  PostgreSQL's quicksort (`sort_template.h`) is not, from 7 rows up: six
-  rows tied at `v = 1` come out `7, 10, 3, 4, 5, 9` there and in insertion
-  order here. SQL leaves the order unspecified, but a client sees it.
-  `window_order::pg_qsort` is a transcription of that quicksort (the
-  window path uses it since RP-024); using it for ORDER BY would change
-  every sorted query, so it wants a corpus sweep of its own. Related, not
-  covered by the test: DISTINCT and grouped queries where PostgreSQL picks
-  a HashAggregate come out in hash-table order. Found 2026-10-15 while
-  fixing RP-024.
+- [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
+  come out in another order from PostgreSQL's.** A plain ORDER BY (and an
+  aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's
+  quicksort (`tuplesort.rs`, fixed 2026-10-15). A grouped query's groups
+  and DISTINCT ON's rows still reach the sort in this server's order, not
+  the HashAggregate's or scan's PostgreSQL feeds it, so they keep a stable
+  sort: `select g, count(*) ... group by g order by count(*)` gives `(1,6),
+  (0,6)` where PostgreSQL 15.19 gives `(0,6), (1,6)`. DISTINCT ON needs a
+  planner flag (a citext DISTINCT is planned as one). Sorts that spill to
+  disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_order_by_ties_as_postgres_quicksort_leaves_them
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_output_ties_as_postgres_leaves_them
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

@@ -81,6 +81,28 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `anycompatible` family reads an all-untyped call as `text`
   (`array_cat('{1}', '{2}')`); and one that nothing fixes is PostgreSQL's
   42804 (`array_length('{1,2,3}', 1)`). Part of RP-015.
+- Rows that tie under ORDER BY come out where PostgreSQL's quicksort
+  leaves them (it is not stable from 7 rows up), including an aggregate's
+  ORDER BY, and a LIMIT keeps PostgreSQL's bounded heap of OFFSET + LIMIT
+  rows. Grouped output and DISTINCT ON keep their order for now. Fixes
+  RP-028 (tests/backlog/test_rust_postgres_gaps.py::test_order_by_ties_as_postgres_quicksort_leaves_them).
+- Under `standard_conforming_strings = off`, `N'...'` literals read their
+  escapes as PostgreSQL's scanner does, and `backslash_quote` is a setting
+  (on / off / safe_encoding) that refuses `\'` with 22P06 at the literal.
+  Fixes RP-003 (tests/backlog/test_rp_triage.py::test_national_literal_under_nonconforming_strings,
+  tests/backlog/test_rp_triage.py::test_backslash_quote_off_refuses_backslash_quote).
+- A field read off a subquery or CTE record column keeps its type, a nested
+  `ROW()` field comes back as a record, and the selections PostgreSQL
+  refuses are refused with its codes (42703, 42809). Fixes RP-035
+  (tests/backlog/test_rust_postgres_gaps.py::test_record_field_selection).
+- The whole-row value of a subquery whose columns share a name reads its
+  fields by position: `select q from (select 1, 'a' union select 1, 'a') q`
+  is `(1,a)` (it was `(1,1)`). Fixes RP-033
+  (tests/backlog/test_rust_postgres_gaps.py::test_whole_row_of_a_union_with_unnamed_columns).
+- `ORDER BY ... USING <op>` in a query, an aggregate, a window and a set
+  operation; an operator that is no ordering operator is 42809, one the
+  type lacks 42883. Part of RP-025
+  (tests/backlog/test_rust_postgres_gaps.py::test_typed_value_open).
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.
@@ -126,4 +148,5 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
-  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions` and `relation_updatable`.
+  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
+  `string_syntax_settings` and `record_fields_using`.
