@@ -739,3 +739,86 @@ def test_null_tsquery_sends_no_notice(pg: Any) -> None:
 )
 def test_untyped_array_literals(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog("RP-041")
+def test_enum_comparison_reads_its_literal_at_plan_time(pg: Any) -> None:
+    """PostgreSQL 15.19: `c = 'zz'` over an enum column is 22P02 `invalid
+    input value for enum`, even over an empty table; here it answers no rows."""
+    pg.execute("drop table if exists rp041_t")
+    pg.execute("drop type if exists rp041_e")
+    pg.execute("create type rp041_e as enum ('a', 'b')")
+    pg.execute("create table rp041_t (c rp041_e)")
+    try:
+        got = pg_answer(pg, "select c = 'zz' from rp041_t")
+    finally:
+        pg.execute("drop table rp041_t")
+        pg.execute("drop type rp041_e")
+    assert got[:2] == ("err", "22P02")
+
+
+@pytest.mark.backlog("RP-041")
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("select 'a'::public.nosuch", ("42704", "13")),
+        ("select 'nosuch'::regtype", ("42704", "8")),
+    ],
+    ids=["qualified-type", "regtype-literal"],
+)
+def test_unknown_type_error_position(pg: Any, sql: str, expected: tuple) -> None:
+    """PostgreSQL 15.19 places these 42704s at the type name (13) and at the
+    literal (8); here the first is at 20 and the second has none."""
+    assert _error_and_position(pg, [], sql) == expected
+
+
+@pytest.mark.backlog("RP-041")
+def test_qualified_unknown_type_is_named_qualified(pg: Any) -> None:
+    """PostgreSQL 15.19: `'a'::public.nosuch` is `type "public.nosuch" does
+    not exist`; here the schema is dropped from the name."""
+    got = pg_answer(pg, "select 'a'::public.nosuch")
+    assert got[:2] == ("err", "42704") and 'type "public.nosuch" does not exist' in got[2]
+
+
+@pytest.mark.backlog("RP-041")
+def test_quoted_mixed_case_type_name(pg: Any) -> None:
+    """PostgreSQL 15.19: `create type "Int" as enum ('x')` succeeds (`"Int"`
+    is not `int`); here it is 42710, the name folded to `int4`."""
+    got = pg_answer(pg, """create type "Int" as enum ('x')""")
+    pg.execute('drop type if exists "Int"')
+    assert got == ("ok", "CREATE TYPE")
+
+
+@pytest.mark.backlog("RP-041")
+def test_drop_type_cascade_names_the_column(pg: Any) -> None:
+    """PostgreSQL 15.19: `drop type e cascade` with a column of the type sends
+    NOTICE `drop cascades to column c of table t`; here it sends none."""
+    pg.execute("drop table if exists rp041_c")
+    pg.execute("drop type if exists rp041_ce")
+    pg.execute("create type rp041_ce as enum ('a')")
+    pg.execute("create table rp041_c (id int, c rp041_ce)")
+    notices: list[str] = []
+    pg.add_notice_handler(lambda d: notices.append(d.message_primary))
+    try:
+        pg.execute("drop type rp041_ce cascade")
+    finally:
+        pg.execute("drop table if exists rp041_c")
+    assert notices == ["drop cascades to column c of table rp041_c"]
+
+
+@pytest.mark.backlog("RP-041")
+def test_domain_over_enum_is_described_as_the_enum(pg: Any) -> None:
+    """PostgreSQL 15.19 describes a domain over an enum with the ENUM's oid
+    (a domain is sent as its base type); here it is varchar (1043)."""
+    pg.execute("drop domain if exists rp041_d")
+    pg.execute("drop type if exists rp041_de")
+    pg.execute("create type rp041_de as enum ('a')")
+    pg.execute("create domain rp041_d as rp041_de")
+    try:
+        enum_oid = pg.execute("select 'rp041_de'::regtype::oid").fetchone()[0]
+        cur = pg.execute("select 'a'::rp041_d")
+        described = cur.description[0].type_code
+    finally:
+        pg.execute("drop domain rp041_d")
+        pg.execute("drop type rp041_de")
+    assert described == enum_oid
