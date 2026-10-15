@@ -21,6 +21,9 @@
 //!   where PostgreSQL's `infix` does.
 
 use std::cell::RefCell;
+
+mod headline;
+pub use headline::{headline, headline_options, HeadlineOptions};
 use std::collections::BTreeMap;
 
 use crate::{Error, Result};
@@ -433,13 +436,6 @@ const ENGLISH_STOP: &[&str] = &[
 // The document parser
 // ------------------------------------------------------------------------
 
-/// A token's class, as far as the configurations tell them apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// A word (possibly a hyphenated compound or part): stemmed by `english`.
-    Word,
-}
-
 /// A letter to PostgreSQL's parser under the UTF-8 locale this server
 /// reports (`C.UTF-8`): `iswalpha`, so a Unicode letter -- or a combining
 /// mark, which stays inside its word (Devanagari's virama) -- and NOT the
@@ -454,36 +450,6 @@ fn letter_char(c: char) -> bool {
 /// A letter or an ASCII digit, by the same rule.
 fn word_char(c: char) -> bool {
     c.is_ascii_digit() || letter_char(c)
-}
-
-/// One token through the configuration's dictionary: `None` for a
-/// stop-word (which still takes a position).
-fn normalise(token: &str, kind: Kind, cfg: Config) -> Option<String> {
-    // Lower-casing follows the database's LC_CTYPE, which this server
-    // reports as `C.UTF-8`: every letter folds, by the same simple mapping
-    // `lower()` uses (`ÄBC` is `äbc`). A `C`-locale PostgreSQL folds ASCII
-    // only; the server is consistent with the locale it reports.
-    let lower: String = token.chars().map(crate::scalar::simple_lower).collect();
-    let english = |lower: String| {
-        if ENGLISH_STOP.contains(&lower.as_str()) {
-            None
-        } else {
-            Some(stem(&lower))
-        }
-    };
-    match (cfg, kind) {
-        (Config::Simple, _) => Some(lower),
-        (Config::English, Kind::Word) => english(lower),
-        // `russian` sends its ASCII words to english_stem.
-        (Config::Snowball(Lang::Russian), Kind::Word) if lower.is_ascii() => english(lower),
-        (Config::Snowball(lang), Kind::Word) => {
-            if lang.is_stop(&lower) {
-                None
-            } else {
-                Some(lang.stem(&lower))
-            }
-        }
-    }
 }
 
 /// The dictionary a built-in configuration maps a parser token type to, and
@@ -1684,21 +1650,6 @@ pub fn negate(a: &Option<Query>) -> Option<Query> {
     a.as_ref().map(|q| Query::Not(Box::new(q.clone())))
 }
 
-/// The `ts_headline` options this server applies: the selectors.
-pub struct HeadlineOptions {
-    pub start: String,
-    pub stop: String,
-}
-
-impl Default for HeadlineOptions {
-    fn default() -> Self {
-        HeadlineOptions {
-            start: "<b>".into(),
-            stop: "</b>".into(),
-        }
-    }
-}
-
 /// `deserialize_deflist` (tsearchcmds.c): `key = value, ...`, a key bare or
 /// double-quoted, a value bare, single-quoted (`E'...'` too) or
 /// double-quoted. A bare value that is an integer is that integer, which is
@@ -1834,41 +1785,6 @@ fn deserialize_deflist(text: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// `prsd_headline`'s option names. The selectors are applied; options that
-/// change which words are shown are refused by name rather than ignored,
-/// because the fragment selection here is not `mark_hl_words`. A value that
-/// leaves the default selection (`MaxFragments=0`, a false `HighlightAll`)
-/// is accepted, and `FragmentDelimiter` is used only with fragments.
-pub fn headline_options(text: &str) -> Result<HeadlineOptions> {
-    let mut opts = HeadlineOptions::default();
-    let truthy = |v: &str| {
-        ["1", "on", "true", "t", "y", "yes"]
-            .iter()
-            .any(|t| v.eq_ignore_ascii_case(t))
-    };
-    for (name, value) in deserialize_deflist(text)? {
-        let lower = name.to_ascii_lowercase();
-        match lower.as_str() {
-            "startsel" => opts.start = value,
-            "stopsel" => opts.stop = value,
-            "fragmentdelimiter" => {}
-            "maxfragments" if value.trim() == "0" => {}
-            "highlightall" if !truthy(&value) => {}
-            "maxwords" | "minwords" | "shortword" | "maxfragments" | "highlightall" => {
-                return Err(Error::FeatureNotSupported(format!(
-                    "ts_headline option \"{name}\" is not supported yet"
-                )));
-            }
-            _ => {
-                return Err(Error::InvalidParameter(format!(
-                    "unrecognized headline parameter: \"{name}\""
-                )));
-            }
-        }
-    }
-    Ok(opts)
-}
-
 /// `ts_headline([config,] json | jsonb, query [, options])`: the headline of
 /// each STRING value, keys and other values left alone, and the document
 /// written back -- `jsonb` in its own form, `json` with no whitespace, as
@@ -1906,81 +1822,6 @@ pub(crate) fn json_headline(args: &[Bson], doc_at: usize, jsonb: bool) -> Result
     } else {
         crate::json::render_json_compact(&json)
     }))
-}
-
-/// `ts_headline(config, document, query)` with the default options:
-/// `StartSel=<b>, StopSel=</b>, MaxWords=35, MinWords=15`. A document of
-/// at most `MaxWords` words is returned whole with each matching word
-/// wrapped; a longer one is cut to the first window of `MaxWords` words
-/// that holds a match.
-pub fn headline(cfg: Config, doc: &str, q: &Option<Query>, opts: &HeadlineOptions) -> String {
-    let mut wanted: Vec<(String, bool)> = Vec::new();
-    fn collect(q: &Query, out: &mut Vec<(String, bool)>) {
-        match q {
-            Query::Val { lex, prefix, .. } => out.push((lex.clone(), *prefix)),
-            Query::Not(_) | Query::Stop => {}
-            Query::And(l, r) | Query::Or(l, r) | Query::Phrase(l, r, _) => {
-                collect(l, out);
-                collect(r, out);
-            }
-        }
-    }
-    if let Some(q) = q {
-        collect(q, &mut wanted);
-    }
-    let hit = |word: &str| -> bool {
-        let Some(lex) = normalise(word, Kind::Word, cfg) else {
-            return false;
-        };
-        wanted.iter().any(|(w, prefix)| {
-            if *prefix {
-                lex.starts_with(w.as_str())
-            } else {
-                &lex == w
-            }
-        })
-    };
-    // Split into words and the separators between them, keeping both.
-    let mut pieces: Vec<(String, bool)> = Vec::new();
-    let mut cur = String::new();
-    let mut in_word = false;
-    for c in doc.chars() {
-        let w = word_char(c);
-        if w != in_word && !cur.is_empty() {
-            pieces.push((std::mem::take(&mut cur), in_word));
-        }
-        in_word = w;
-        cur.push(c);
-    }
-    if !cur.is_empty() {
-        pieces.push((cur, in_word));
-    }
-    let words = pieces.iter().filter(|p| p.1).count();
-    let (from, to) = if words <= 35 {
-        (0, pieces.len())
-    } else {
-        let first = pieces.iter().position(|(t, w)| *w && hit(t)).unwrap_or(0);
-        let mut end = first;
-        let mut count = 0;
-        while end < pieces.len() && count < 35 {
-            if pieces[end].1 {
-                count += 1;
-            }
-            end += 1;
-        }
-        (first, end)
-    };
-    let mut out = String::new();
-    for (t, w) in &pieces[from..to] {
-        if *w && hit(t) {
-            out.push_str(&opts.start);
-            out.push_str(t);
-            out.push_str(&opts.stop);
-        } else {
-            out.push_str(t);
-        }
-    }
-    out
 }
 
 // ------------------------------------------------------------------------

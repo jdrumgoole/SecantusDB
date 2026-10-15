@@ -282,25 +282,49 @@ fn factorial(args: &[Bson]) -> Result<Bson> {
 /// `width_bucket(operand, low, high, count)` and `width_bucket(operand,
 /// thresholds)`.
 fn width_bucket(args: &[Bson]) -> Result<Bson> {
-    if let [op, Bson::Array(thresholds)] = args {
-        // The number of thresholds at or below the operand (the thresholds
-        // are sorted, as PostgreSQL requires).
-        let x = f(std::slice::from_ref(op), 0, "width_bucket")?;
-        let mut n = 0;
-        for t in thresholds {
-            if t == &Bson::Null {
-                return Err(Error::Sqlstate(
-                    "22004",
-                    "thresholds array must not contain NULLs".into(),
-                ));
+    let thresholds = match args.get(1) {
+        Some(v) if args.len() == 2 && crate::arrays::is_bounded(v) => Some(crate::arrays::strip(v)),
+        Some(v @ Bson::Array(_)) if args.len() == 2 => Some(v.clone()),
+        _ => None,
+    };
+    if let (Some(op), Some(Bson::Array(thresholds))) = (args.first(), thresholds) {
+        // `width_bucket_array`: one-dimensional, no NULLs, then a binary
+        // search for the first threshold above the operand, by the type's
+        // own comparison (a date array buckets a date), the thresholds
+        // taken as sorted, as PostgreSQL takes them (measured on 15.19).
+        if thresholds.iter().any(|t| matches!(t, Bson::Array(_))) {
+            return Err(Error::Sqlstate(
+                "2202E",
+                "thresholds must be one-dimensional array".into(),
+            ));
+        }
+        if thresholds.contains(&Bson::Null) {
+            return Err(Error::Sqlstate(
+                "22004",
+                "thresholds array must not contain NULLs".into(),
+            ));
+        }
+        let below = |t: &Bson| -> Result<bool> {
+            let number = |v: &Bson| f(std::slice::from_ref(v), 0, "width_bucket").ok();
+            if let (Some(x), Some(y)) = (number(op), number(t)) {
+                return Ok(x < y);
             }
-            if f(std::slice::from_ref(t), 0, "width_bucket")? <= x {
-                n += 1;
+            crate::compare_values(op, t)
+                .map(|o| o == std::cmp::Ordering::Less)
+                .ok_or_else(|| {
+                    Error::UndefinedFunction("function width_bucket does not exist".into())
+                })
+        };
+        let (mut left, mut right) = (0usize, thresholds.len());
+        while left < right {
+            let mid = (left + right) / 2;
+            if below(&thresholds[mid])? {
+                right = mid;
             } else {
-                break;
+                left = mid + 1;
             }
         }
-        return Ok(Bson::Int32(n));
+        return Ok(Bson::Int32(left as i32));
     }
     let [_, _, _, count] = args else {
         return Err(Error::UndefinedFunction(
