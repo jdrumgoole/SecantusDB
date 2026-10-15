@@ -317,6 +317,11 @@ pub(crate) fn text(v: &Bson) -> String {
         // A boolean's text form is `t` / `f`: `concat(true)` is `t`
         // (measured), never `true`.
         Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
+        // A record prints as its output function does: `concat(t)` over a
+        // row is `("ab ",1)` (15.19).
+        other if crate::record_value_text(other).is_some() => {
+            crate::record_value_text(other).unwrap_or_default()
+        }
         other => format!("{other:?}"),
     }
 }

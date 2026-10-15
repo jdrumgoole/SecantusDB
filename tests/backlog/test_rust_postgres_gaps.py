@@ -382,7 +382,7 @@ def test_typed_value_residue(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-031")
+@pytest.mark.backlog_fixed("RP-031")
 def test_update_multi_column_assignment_from_a_subquery(pg: Any) -> None:
     """PostgreSQL 15.19: `update t set (v, t) = (select 5, 'z')` assigns both
     columns from the subquery's one row; here it is 0A000 (MultiAssignRef)."""
@@ -394,7 +394,7 @@ def test_update_multi_column_assignment_from_a_subquery(pg: Any) -> None:
     assert pg_answer(pg, "select v, t from rp031_t") == ("ok", [(5, "z")])
 
 
-@pytest.mark.backlog("RP-032")
+@pytest.mark.backlog_fixed("RP-032")
 def test_record_text_keeps_char_padding(pg: Any) -> None:
     """PostgreSQL 15.19: a record's text form prints a `char(3)` field with its
     padding, quoted: `("ab ")`; here it is `(ab)`."""
@@ -402,6 +402,52 @@ def test_record_text_keeps_char_padding(pg: Any) -> None:
     pg.execute("create table rp032_t (c char(3))")
     pg.execute("insert into rp032_t values ('ab')")
     assert pg_answer(pg, "select (t)::text from rp032_t t") == ("ok", [('("ab ")',)])
+
+
+@pytest.mark.backlog("RP-032")
+def test_record_literal_pads_char_field(pg: Any) -> None:
+    """PostgreSQL 15.19: a text literal cast to a table's row type pads its
+    `char(3)` field to the column's width, `("ab ",x)`; here it is `(ab,x)`,
+    because the row type's catalog entry does not record the width."""
+    pg.execute("drop table if exists rp032_l")
+    pg.execute("create table rp032_l (c char(3), v text)")
+    assert pg_answer(pg, "select '(ab,x)'::rp032_l::text") == ("ok", [('("ab ",x)',)])
+
+
+@pytest.mark.backlog("RP-033")
+def test_whole_row_of_a_union_with_unnamed_columns(pg: Any) -> None:
+    """PostgreSQL 15.19: `select q from (select 1, 'a' union select 1, 'a') q`
+    is `(1,a)`; here it is `(1,1)` -- both columns are named `?column?`, and
+    the whole-row value reads its fields by name."""
+    assert pg_answer(pg, "select q::text from (select 1, 'a' union select 1, 'a') q") == (
+        "ok",
+        [("(1,a)",)],
+    )
+
+
+@pytest.mark.backlog_fixed("RP-034")
+def test_update_from_returning_target_star(pg: Any) -> None:
+    """PostgreSQL 15.19: `UPDATE t ... FROM s ... RETURNING t.*` returns the
+    updated row; here it is 0A000 `this target is not supported yet`."""
+    pg.execute("drop table if exists rp034_t")
+    pg.execute("drop table if exists rp034_s")
+    pg.execute("create table rp034_t (k int, v int)")
+    pg.execute("create table rp034_s (k int)")
+    pg.execute("insert into rp034_t values (1, 0)")
+    pg.execute("insert into rp034_s values (1)")
+    got = pg_answer(
+        pg, "update rp034_t set v = 5 from rp034_s s where s.k = rp034_t.k returning rp034_t.*"
+    )
+    assert got == ("ok", [(1, 5)]), got
+
+
+@pytest.mark.backlog("RP-035")
+def test_field_of_an_anonymous_record_is_refused(pg: Any) -> None:
+    """PostgreSQL 15.19: `((select row(1, 'a'))).f1` is 42703 `could not
+    identify column "f1" in record data type` (an anonymous record has no
+    field names to select by); here it answers 1."""
+    got = pg_answer(pg, "select ((select row(1, 'a'))).f1")
+    assert got[:2] == ("err", "42703"), got
 
 
 # Fixed from RP-025: an untyped side of `||` beside a type with a `||` of its

@@ -18,6 +18,8 @@ mod agg_hoist;
 mod expr_where;
 mod filter_sublink;
 mod like_match;
+mod multi_assign;
+mod returning_star;
 pub mod schemas;
 mod srf_tlist;
 pub mod systypes;
@@ -16016,8 +16018,29 @@ fn rewrite_dml_from(
         }
     }
     // `SET (a, b) = (1, 2)` is `SET a = 1, b = 2`. The row-subquery form
-    // `SET (a, b) = (SELECT ...)` has no per-column split and stays refused.
+    // `SET (a, b) = (SELECT ...)` becomes one record subquery here, before
+    // the statement's subqueries are resolved (`multi_assign`).
+    // `RETURNING *` / `RETURNING t.*` as the columns they stand for.
+    match node.node.as_mut() {
+        Some(N::UpdateStmt(u)) => returning_star::expand(
+            &mut u.returning_list,
+            u.relation.as_ref(),
+            &u.from_clause,
+            lookup,
+            &[],
+        )?,
+        Some(N::DeleteStmt(d)) => returning_star::expand(
+            &mut d.returning_list,
+            d.relation.as_ref(),
+            &d.using_clause,
+            lookup,
+            &[],
+        )?,
+        _ => {}
+    }
     if let Some(N::UpdateStmt(u)) = node.node.as_mut() {
+        let def = u.relation.as_ref().and_then(|r| lookup(&relation_name(r)));
+        multi_assign::rewrite(u, def.as_ref())?;
         for t in &mut u.target_list {
             let Some(N::ResTarget(rt)) = t.node.as_mut() else {
                 continue;
@@ -16027,7 +16050,9 @@ fn rewrite_dml_from(
             };
             let row = match m.source.as_deref().and_then(|s| s.node.as_ref()) {
                 Some(N::RowExpr(row)) => row,
-                Some(N::SubLink(_)) => continue,
+                // A record subquery, and the columns after the first in its
+                // list (`multi_assign::rewrite`).
+                Some(N::SubLink(_)) | None => continue,
                 _ => {
                     return Err(Error::Sqlstate(
                         "0A000",
@@ -16085,13 +16110,24 @@ fn rewrite_dml_from(
                 let Some(N::ResTarget(rt)) = t.node.as_mut() else {
                     continue;
                 };
-                let Some(v) = rt.val.take() else { continue };
-                // `SET a = DEFAULT` and `SET (a, b) = ...` are not values a
-                // subquery can yield; they keep their own paths.
-                if matches!(
-                    v.node.as_ref(),
-                    Some(N::SetToDefault(_) | N::MultiAssignRef(_))
-                ) {
+                let Some(mut v) = rt.val.take() else { continue };
+                // `SET (a, b) = (SELECT ...)`: the list's record subquery
+                // (`multi_assign`) is the value read through the FROM.
+                if let Some(N::MultiAssignRef(m)) = v.node.as_mut() {
+                    if let Some(src) = m.source.take() {
+                        let at = expr_location(&src).unwrap_or(-1);
+                        m.source = Some(Box::new(sublink(
+                            SubLinkType::ExprSublink,
+                            select(*src, &from, cond.as_deref(), true),
+                            at,
+                        )));
+                    }
+                    rt.val = Some(v);
+                    continue;
+                }
+                // `SET a = DEFAULT` is not a value a subquery can yield; it
+                // keeps its own path.
+                if matches!(v.node.as_ref(), Some(N::SetToDefault(_))) {
                     rt.val = Some(v);
                     continue;
                 }
@@ -16552,6 +16588,8 @@ fn resolve_sublinks_in_expr(
         N::CoalesceExpr(c) => children.extend(c.args.iter_mut()),
         N::MinMaxExpr(m) => children.extend(m.args.iter_mut()),
         N::NullTest(t) => children.extend(t.arg.as_deref_mut()),
+        // `SET (a, b) = (SELECT ...)`'s record subquery (`multi_assign`).
+        N::MultiAssignRef(m) => children.extend(m.source.as_deref_mut()),
         N::AIndirection(a) => {
             children.extend(a.arg.as_deref_mut());
             for ind in &mut a.indirection {
@@ -17112,7 +17150,7 @@ fn resolve_one_sublink(
     // see a qualified one: the lowering resolves a column by its LAST name
     // part and ignores the qualifier, so `e.dept_id = d.id` would bind the
     // outer `d.id` to the inner table's own `id` and plan clean.
-    if foreign_qualifier(&inner).is_some() {
+    if foreign_qualifier(&inner).is_some() || correlated::fromless_outer_ref(&inner, outer) {
         let test = sl.testexpr.as_deref().cloned();
         let mut sl = sl.clone();
         if let Some(mut t) = test {
@@ -17237,6 +17275,11 @@ fn resolve_one_sublink(
                         .map(|c| c.pg_type.clone())
                         .unwrap_or_else(|| "text".into());
                     let null = located(param_node(params, Bson::Null), sl.location);
+                    // `record` is no type a cast can name: a row subquery
+                    // that returned nothing is a bare NULL.
+                    if ty == "record" {
+                        return Ok(null);
+                    }
                     Ok(pg_query::protobuf::Node {
                         node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                             arg: Some(Box::new(null)),
@@ -24809,6 +24852,26 @@ pub(crate) fn record_text(fields: &[Bson], types: &[String]) -> String {
     out
 }
 
+/// A record's fields as a comparison sees them: a `char(n)` field without
+/// its trailing blanks, which `bpchar` comparison ignores (a record keeps
+/// them for output). `None` for anything but a record.
+fn compared_fields(v: &Bson) -> Option<Vec<Bson>> {
+    let fields = record_fields(v)?;
+    let types = record_field_types(v).unwrap_or_default();
+    Some(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| match f {
+                Bson::String(t) if types.get(i).is_some_and(|t| t == "bpchar") => {
+                    Bson::String(t.trim_end_matches(' ').to_string())
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// Compare two records with PostgreSQL's rules, which DIFFER by operator AND
 /// by whether the operands are ROW CONSTRUCTORS or composite VALUES.
 ///
@@ -25097,7 +25160,15 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
     }
     let mut out = Vec::with_capacity(raw.len());
     for (v, (_, ty)) in raw.into_iter().zip(fields.iter()) {
-        out.push(cast_value(v, ty)?);
+        // A `char(n)` field keeps the blanks it arrived with: a whole-row
+        // value is padded to the column's width before it gets here, and a
+        // record prints its fields padded (`("ab ",1)` on 15.19), where
+        // `cast_value` would store the value trimmed.
+        out.push(if ty == "bpchar" {
+            cast_value_inner(v, ty)?
+        } else {
+            cast_value(v, ty)?
+        });
     }
     // A composite value knows its fields' names and types --
     // `row_to_json(row(1, 'x')::comp)` names them.
@@ -26331,6 +26402,13 @@ pub fn plan_with_session_types(
     timezone: &TimeZoneSetting,
 ) -> Result<Statement> {
     plan_with_session_types_and_subqueries(sql, lookup, params, param_types, timezone, None)
+}
+
+/// The parameter types declared for the statement being evaluated, which a
+/// correlated subquery's runner plans its inner SQL under (see
+/// `correlated::eval`).
+pub fn declared_param_types() -> Vec<Option<String>> {
+    PLAN_PARAM_TYPES.with(|t| t.borrow().clone())
 }
 
 /// `plan_with_session_types`, optionally able to run an uncorrelated
@@ -30548,6 +30626,25 @@ fn whole_row_rewrite(
             }
         }
         walk_expr(node, &mut |n| {
+            // `ROW(t.*)` is a row of t's COLUMNS (PostgreSQL expands the star
+            // inside a row constructor), not a row holding t's row.
+            if let Some(N::RowExpr(r)) = n.node.as_mut() {
+                let star = |a: &pg_query::protobuf::Node| match a.node.as_ref() {
+                    Some(N::ColumnRef(c)) => is_whole_row(c, true) && c.fields.len() == 2,
+                    _ => false,
+                };
+                if r.args.iter().any(star) {
+                    let args = std::mem::take(&mut r.args);
+                    for a in args {
+                        if star(&a) {
+                            r.args.extend(columns.iter().map(|c| column_ref_node(c)));
+                        } else {
+                            r.args.push(a);
+                        }
+                    }
+                    changed = true;
+                }
+            }
             if let Some(N::ColumnRef(c)) = n.node.as_ref() {
                 if is_whole_row(c, true) {
                     *n = row();
@@ -31510,8 +31607,8 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
         // path treats them as composite VALUES (NULLs equal): the row-constructor
         // three-valued rule is applied by const_value, which alone can tell a
         // bare `ROW(...)` from a composite value.
-        if let (Some(a), Some(b)) = (record_fields(&lhs), record_fields(&rhs)) {
-            return record_compare(op, a, b, true);
+        if let (Some(a), Some(b)) = (compared_fields(&lhs), compared_fields(&rhs)) {
+            return record_compare(op, &a, &b, true);
         }
         // A scalar compared to an ARRAY with no ANY/ALL is an operator
         // PostgreSQL does not have (`text = text[]` is 42883). Array = array is
@@ -32710,6 +32807,8 @@ fn plan_update(
     let mut unset: Vec<String> = Vec::new();
     let mut set_exprs: Vec<(String, String, i32, ColumnExpr)> = Vec::new();
     let mut set_subscripts: Vec<SubscriptAssign> = Vec::new();
+    let mut multi: Option<multi_assign::Group> = None;
+    let mut assigned: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let row_fields = || -> (Vec<RowField>, Document) {
         let fields: Vec<RowField> = def
             .columns
@@ -32732,6 +32831,21 @@ fn plan_update(
         let column = def
             .column(&rt.name)
             .ok_or_else(|| no_column_of(&rt.name, &table))?;
+        // A column may be assigned twice only through subscripts or fields
+        // (`SET a[1] = 1, a[2] = 2`); PostgreSQL's `rewriteTargetListIU`
+        // refuses any other repeat, with no position (measured 15.19).
+        let plain = rt.indirection.is_empty();
+        match assigned.get(&column.name) {
+            Some(&was_plain) if plain || was_plain => {
+                return Err(Error::Sqlstate(
+                    "42601",
+                    format!("multiple assignments to same column \"{}\"", column.name),
+                ));
+            }
+            _ => {
+                assigned.insert(column.name.clone(), plain);
+            }
+        }
         // A PRIMARY KEY column is the document's `_id`: the executor
         // re-keys a row whose key changes (a delete plus an insert, checked
         // for uniqueness first), so it is planned like any other column.
@@ -32740,6 +32854,55 @@ fn plan_update(
             .val
             .as_ref()
             .ok_or_else(|| Error::Parse("SET without a value".into()))?;
+        // `SET (a, b) = (SELECT ...)`: column `colno` of the list reads one
+        // field of the subquery's row (see `multi_assign`).
+        if let Some(N::MultiAssignRef(m)) = val.node.as_ref() {
+            if !rt.indirection.is_empty() {
+                return Err(Error::Unsupported(
+                    "a subscripted column in a multiple-column UPDATE".into(),
+                ));
+            }
+            if m.colno == 1 {
+                let Some(record) = m.source.as_deref() else {
+                    return Err(Error::Unsupported(
+                        "this multiple-column UPDATE source".into(),
+                    ));
+                };
+                multi = Some(multi_assign::Group {
+                    record: record.clone(),
+                    ncolumns: usize::try_from(m.ncolumns).unwrap_or(0),
+                    location: expr_location(record).unwrap_or(-1),
+                    value: None,
+                });
+            }
+            let Some(g) = multi.as_mut() else {
+                return Err(Error::Unsupported(
+                    "this multiple-column UPDATE source".into(),
+                ));
+            };
+            let i = usize::try_from(m.colno - 1).unwrap_or(0);
+            if references_columns(&g.record) || default_is_volatile(&g.record) {
+                let (fields, sample) = row_fields();
+                let mut row = row_column_expr(&g.record, &fields, params, &sample)?;
+                if let ColumnExpr::Row { result_type, .. } = &mut row {
+                    *result_type = multi_assign::field_marker(i, g.ncolumns, g.location);
+                    set_exprs.push((field, column.pg_type.clone(), column.typmod, row));
+                    continue;
+                }
+                return Err(Error::Unsupported(
+                    "this multiple-column UPDATE source".into(),
+                ));
+            }
+            if g.value.is_none() {
+                g.value = Some(const_value(&g.record, params)?);
+            }
+            let record = g.value.as_ref().expect("set above");
+            let value = multi_assign::field(record, i, g.ncolumns, g.location)?;
+            let source = multi_assign::field_type(record, i, &value);
+            let value = fit_to_column(assign_value(value, &source, &column.pg_type)?, column)?;
+            set_stored_value(&mut set, &mut unset, field, value);
+            continue;
+        }
         // `SET a[i] = v` -- the target is one element (or slice) of the array
         // the column holds, so the assignment reads the old value. Checked
         // BEFORE `check_assignment_type`, which would compare the element
@@ -32933,12 +33096,21 @@ fn assign_value(value: Bson, source: &str, target: &str) -> Result<Bson> {
 pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<String>)> {
     let mut set = upd.set.clone();
     let mut unset = upd.unset.clone();
+    let mut records = multi_assign::RecordMemo::default();
     for (field, pg_type, typmod, expr) in &upd.set_exprs {
-        let value = fit_length(
-            assign_value(apply_row_expr(expr, row)?, column_expr_type(expr), pg_type)?,
-            pg_type,
-            *typmod,
-        )?;
+        let (value, source) = match multi_assign::parse_marker(column_expr_type(expr)) {
+            Some((i, n, location)) => {
+                let record = records.value(expr, row)?;
+                let value = multi_assign::field(&record, i, n, location)?;
+                let source = multi_assign::field_type(&record, i, &value);
+                (value, source)
+            }
+            None => (
+                apply_row_expr(expr, row)?,
+                column_expr_type(expr).to_string(),
+            ),
+        };
+        let value = fit_length(assign_value(value, &source, pg_type)?, pg_type, *typmod)?;
         set_stored_value(&mut set, &mut unset, field.clone(), value);
     }
     for a in &upd.set_subscripts {
@@ -35537,13 +35709,13 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // else -- and only three-valued NULL logic applies when BOTH sides are
         // row constructors. `eval_binary` has no AST, so decide here.
         if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-            if let (Some(a), Some(b)) = (record_fields(&lhs), record_fields(&rhs)) {
+            if let (Some(a), Some(b)) = (compared_fields(&lhs), compared_fields(&rhs)) {
                 let is_row_ctor = |n: Option<&pg_query::protobuf::Node>| {
                     matches!(n.and_then(|n| n.node.as_ref()), Some(N::RowExpr(_)))
                 };
                 let composite =
                     !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
-                return record_compare(&op, a, b, composite);
+                return record_compare(&op, &a, &b, composite);
             }
         }
         // SQL/JSON path: `jsonb @? jsonpath` and `jsonb @@ jsonpath`, the

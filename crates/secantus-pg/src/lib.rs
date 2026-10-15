@@ -26833,12 +26833,15 @@ impl PgHandler {
                 }
                 let tz = self.session_timezone();
                 let run = |stmt: &Statement| self.subquery_rows(stmt);
+                // The types `correlated::eval` declared for the inner SQL's
+                // parameters: the statement's own, then each outer column's.
+                let types = secantus_pgplan::declared_param_types();
                 let stmt = secantus_pgplan::planning_to_execute(|| {
                     secantus_pgplan::plan_with_session_types_and_subqueries(
                         sql,
                         &|n| self.lookup(n),
                         params,
-                        &[],
+                        &types,
                         &tz,
                         Some(&run),
                     )

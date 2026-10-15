@@ -367,19 +367,31 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: `UPDATE ... SET (a, b) = (SELECT ...)` is refused.**
-  It is 0A000 `MultiAssignRef is not supported yet`; PostgreSQL 15.19
-  assigns each listed column from the subquery's one row. Found 2026-10-15
-  by RP-029's work.
-  Backlog-ID: RP-031
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_update_multi_column_assignment_from_a_subquery
-
-- [ ] **RUST pgserver: a record's text form drops a `char(n)` field's
-  padding.** `(t)::text` over a `char(3)` holding `ab` is `(ab)`;
-  PostgreSQL 15.19 prints `("ab ")` (the padded value, quoted because of
-  its blank). Found 2026-10-15 by RP-029's work.
+- [ ] **RUST pgserver: a text literal cast to a table's row type does not
+  pad its `char(n)` fields.** `'(ab,x)'::t::text` over `t (c char(3), v
+  text)` is `(ab,x)`; PostgreSQL 15.19 prints `("ab ",x)`. A whole-row
+  value keeps the padding (fixed 2026-10-15), but a row type's entry in
+  `__sql_composites__` records each field as `[name, type, null]` with no
+  width, so a literal has nothing to pad to. Recording it is a change to a
+  catalog document the Python server shares.
   Backlog-ID: RP-032
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_text_keeps_char_padding
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_literal_pads_char_field
+
+- [ ] **RUST pgserver: the whole-row value of a subquery whose columns share a
+  name reads the wrong fields.** `select q from (select 1, 'a' union select
+  1, 'a') q` is `(1,1)`; PostgreSQL 15.19 answers `(1,a)`. Both columns are
+  named `?column?`, and `whole_row_rewrite` builds `ROW(q."?column?", ...)`
+  by name. A silent wrong answer; reading the fields by position fixes it.
+  Found 2026-10-15 by RP-031's work.
+  Backlog-ID: RP-033
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_whole_row_of_a_union_with_unnamed_columns
+
+- [ ] **RUST pgserver: a field of an anonymous record is selected by a
+  made-up name.** `((select row(1, 'a'))).f1` answers 1; PostgreSQL 15.19
+  is 42703 `could not identify column "f1" in record data type`, since an
+  anonymous record has no field names. Found 2026-10-15 by RP-031's work.
+  Backlog-ID: RP-035
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_field_of_an_anonymous_record_is_refused
 
 - [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
   batch made values print by their type, refused the casts and operators
