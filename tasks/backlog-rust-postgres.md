@@ -376,6 +376,16 @@ one beside it.
   Backlog-ID: RP-025
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin
 
+- [ ] **RUST pgserver: ORDER BY a range or multirange sorts by its text.**
+  `order by r` over `int4range` values puts `empty` last and `[10,11)`
+  before `[5,7)`; PostgreSQL 15.19 sorts by `range_cmp` (empty first, then
+  the lower bound, then the upper, each with its inclusivity and
+  infinities) and multiranges by `multirange_cmp`. The comparison
+  operators are right (`range_ops.rs`); the sort needs a key per range
+  type, as enums and collations have (`enum_order.rs`). Found 2026-10-15.
+  Backlog-ID: RP-037
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_order_by_a_range
+
 - [ ] **RUST pgserver: settings and error positions the 2026-10-15 batch
   found.** `SET nosuch_param = 1` is accepted (PostgreSQL 15.19: 42704
   `unrecognized configuration parameter`). Under `standard_conforming_strings
@@ -495,8 +505,7 @@ one beside it.
         (`int4pl(numeric_col, 2)`); `pg_relation_is_publishable` is true for
         an unlogged table.
       - **Refused operators** the probe reached through their functions:
-        multirange `-|-` / `<<` / `>>` / `&<` / `&>` and its ordering
-        comparisons; `##` (closest
+        `##` (closest
         point) for six pairs, `<->` between a line or box and a segment,
         a VARIADIC argument that is neither an
         `ARRAY[...]` constructor nor a json path / `jsonb_delete` call. Casts by function name: `int4("char")`, a length-coercion

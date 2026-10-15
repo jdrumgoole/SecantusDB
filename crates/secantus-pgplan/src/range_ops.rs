@@ -508,6 +508,47 @@ fn eval(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Result<Bson> {
                 })?;
             Ok(Bson::Boolean(if op == "=" { same } else { !same }))
         }
+        // multirangetypes.c: the position tests compare the multiranges'
+        // spans (first lower bound, last upper bound); an empty one is
+        // never before, after, beside or overlapping-left of anything.
+        "<<" | ">>" | "&<" | "&>" | "-|-" => {
+            let (x, y) = (norm(ma)?, norm(mb)?);
+            let (Some(xf), Some(xl), Some(yf), Some(yl)) =
+                (x.first(), x.last(), y.first(), y.last())
+            else {
+                return Ok(Bson::Boolean(false));
+            };
+            Ok(Bson::Boolean(match op {
+                "<<" => cmp(&upper(xl), &lower(yf), &e)?.is_lt(),
+                ">>" => cmp(&lower(xf), &upper(yl), &e)?.is_gt(),
+                "&<" => cmp(&upper(xl), &upper(yl), &e)?.is_le(),
+                "&>" => cmp(&lower(xf), &lower(yf), &e)?.is_ge(),
+                _ => {
+                    bounds_adjacent(&upper(xl), &lower(yf), &e)?
+                        || bounds_adjacent(&upper(yl), &lower(xf), &e)?
+                }
+            }))
+        }
+        // `multirange_cmp`: range by range, then the shorter is smaller.
+        "<" | "<=" | ">" | ">=" => {
+            let (x, y) = (norm(ma)?, norm(mb)?);
+            let mut ord = std::cmp::Ordering::Equal;
+            for (p, q) in x.iter().zip(&y) {
+                ord = range_order(p, q, &e)?;
+                if ord.is_ne() {
+                    break;
+                }
+            }
+            if ord.is_eq() {
+                ord = x.len().cmp(&y.len());
+            }
+            Ok(Bson::Boolean(match op {
+                "<" => ord.is_lt(),
+                "<=" => ord.is_le(),
+                ">" => ord.is_gt(),
+                _ => ord.is_ge(),
+            }))
+        }
         _ => Err(Error::Unsupported(format!("multirange operator {op}"))),
     }
 }

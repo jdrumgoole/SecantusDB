@@ -559,3 +559,19 @@ def test_error_positions(pg: Any, pg15: Any, setup: list[str], sql: str) -> None
     `standard_conforming_strings = off`, 42P02 at the `$1`); here they carry
     no position."""
     assert _error_and_position(pg, setup, sql) == _error_and_position(pg15, setup, sql)
+
+
+@pytest.mark.backlog("RP-037")
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select r from (values ('[5,7)'::int4range), ('[1,3)'), ('empty'), ('[10,11)')) v(r) order by r",
+        "select r from (values ('{[5,7)}'::int4multirange), ('{[1,3),[4,5)}'), ('{}'), ('{[1,3)}')) v(r) order by r",
+    ],
+    ids=["range", "multirange"],
+)
+def test_order_by_a_range(pg: Any, pg15: Any, sql: str) -> None:
+    """PostgreSQL 15.19 sorts ranges by `range_cmp` (empty first, then by
+    lower and upper bound) and multiranges by `multirange_cmp`; here both
+    sort by their text, so `empty` is last and `[10,11)` before `[5,7)`."""
+    _same_as_reference(pg, pg15, sql)
