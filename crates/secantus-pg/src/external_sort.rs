@@ -1,14 +1,17 @@
 //! An ORDER BY for a streamed portal (`portal_stream`) with bounded memory.
 //!
 //! The rows are read in scan order and gathered into runs of at most
-//! `RUN_BYTES`; each run is sorted (`compare_rows`, the materialised path's
-//! comparison) and, when more than one is needed, written to an anonymous
-//! temporary file. The runs are then merged, ties going to the earlier run,
-//! so the result is the stable sort of the scan -- what the materialised
-//! path gives. Memory is one run plus one buffered reader per run.
+//! `RUN_BYTES`; each run is sorted as PostgreSQL's in-memory sort leaves it
+//! (`sort_rows`, `tuplesort.rs`), so a sort that fits in one run puts tied
+//! rows where PostgreSQL does, as the materialised path does. When more than
+//! one run is needed each is written to an anonymous temporary file and the
+//! runs are merged, ties going to the earlier run (PostgreSQL's external
+//! merge is not transcribed). Memory is one run plus one buffered reader
+//! per run.
 //!
-//! With a LIMIT the server keeps only the first `OFFSET + LIMIT` rows seen
-//! so far in order (a top-k), and nothing is written to disk.
+//! With a LIMIT the server sorts with PostgreSQL's bound of `OFFSET + LIMIT`
+//! rows (`TupleSort`: a heap of that many once more than twice as many have
+//! arrived), and nothing is written to disk.
 
 use super::*;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
@@ -72,6 +75,10 @@ pub(crate) fn sort_runs_with(
     // A top-k would drop rows the de-duplication has not yet seen.
     let top_k = cap.filter(|c| *c <= TOP_K_MAX && dedup.is_none());
     let mut runs = RunBuilder::new(order, top_k, batch);
+    // The de-duplication keeps the first row of each equal run: sorted
+    // stably, that is the first in scan order, which the materialised
+    // DISTINCT / DISTINCT ON keep too (what a HashAggregate keeps).
+    runs.stable = dedup.is_some();
     let mut failed: Option<String> = None;
     {
         let mut sink = |blobs: Vec<Vec<u8>>| -> bool {
@@ -95,22 +102,25 @@ pub(crate) fn sort_runs_with(
 /// `sort_runs_with`), for a caller that drives its own scan.
 pub(crate) struct RunBuilder {
     order: Vec<OrderKey>,
-    top_k: Option<usize>,
+    top_k: Option<crate::tuplesort::TupleSort<Document>>,
     batch: usize,
     chunk: Vec<Document>,
     bytes: usize,
     runs: Vec<std::fs::File>,
+    /// Sort each run stably rather than as PostgreSQL's quicksort does.
+    stable: bool,
 }
 
 impl RunBuilder {
     pub(crate) fn new(order: &[OrderKey], top_k: Option<usize>, batch: usize) -> Self {
         RunBuilder {
             order: order.to_vec(),
-            top_k,
+            top_k: top_k.map(|k| crate::tuplesort::TupleSort::new(Some(k))),
             batch,
             chunk: Vec::new(),
             bytes: 0,
             runs: Vec::new(),
+            stable: false,
         }
     }
 
@@ -130,20 +140,15 @@ impl RunBuilder {
 
     /// Add one row of about `bytes` bytes.
     pub(crate) fn push(&mut self, d: Document, bytes: usize) -> Result<(), String> {
-        self.chunk.push(d);
-        self.bytes += bytes;
         let order = &self.order;
-        if let Some(k) = self.top_k {
-            // Keep the first k in order: the earlier rows stay ahead of
-            // equal later ones, as a stable sort keeps them.
-            if self.chunk.len() >= k.max(self.batch) * 2 {
-                self.chunk.sort_by(|a, b| compare_rows(a, b, order));
-                self.chunk.truncate(k);
-            }
+        if let Some(sort) = self.top_k.as_mut() {
+            sort.put(d, &mut |a, b| compare_rows(a, b, order));
             return Ok(());
         }
+        self.chunk.push(d);
+        self.bytes += bytes;
         if self.bytes >= RUN_BYTES {
-            self.chunk.sort_by(|a, b| compare_rows(a, b, order));
+            sort_run(&mut self.chunk, order, self.stable);
             self.runs.push(spill(std::mem::take(&mut self.chunk))?);
             self.bytes = 0;
         }
@@ -163,11 +168,12 @@ impl RunBuilder {
             batch,
             mut chunk,
             runs: mut runs_in,
+            stable,
             ..
         } = self;
-        chunk.sort_by(|a, b| compare_rows(a, b, &order));
-        if let Some(k) = top_k {
-            chunk.truncate(k);
+        match top_k {
+            Some(sort) => chunk = sort.finish(&mut |a, b| compare_rows(a, b, &order)),
+            None => sort_run(&mut chunk, &order, stable),
         }
         let order: Arc<[OrderKey]> = order.into();
         let mut sorted = Sorted {
@@ -203,6 +209,15 @@ impl RunBuilder {
             }
         }
         Ok(sorted)
+    }
+}
+
+/// One run, sorted as PostgreSQL's quicksort leaves it unless `stable`.
+fn sort_run(rows: &mut [Document], order: &[OrderKey], stable: bool) {
+    if stable {
+        rows.sort_by(|a, b| compare_rows(a, b, order));
+    } else {
+        sort_rows(rows, order);
     }
 }
 
@@ -375,16 +390,34 @@ mod tests {
         got
     }
 
+    /// What PostgreSQL's in-memory sort answers: descending key, ties where
+    /// its quicksort (or, under a bound, its heap) leaves them.
     fn expected(n: usize, skip: usize, limit: Option<usize>) -> Vec<(i32, i32)> {
-        let mut all: Vec<(i32, i32)> = (0..n)
+        let all: Vec<(i32, i32)> = (0..n)
             .map(|i| (((i * 7919) % 101) as i32, i as i32))
             .collect();
-        // Stable: descending key, scan order among equals.
-        all.sort_by_key(|a| std::cmp::Reverse(a.0));
-        all.into_iter()
+        let bound = limit.map(|l| l + skip);
+        crate::tuplesort::sort(all, bound, &mut |a, b| b.0.cmp(&a.0))
+            .into_iter()
             .skip(skip)
             .take(limit.unwrap_or(usize::MAX))
             .collect()
+    }
+
+    /// A spilled sort: every row once, in descending key order.
+    fn check_spilled(got: &[(i32, i32)], n: usize, skip: usize, limit: Option<usize>) {
+        assert!(got.windows(2).all(|w| w[0].0 >= w[1].0));
+        assert!(got
+            .iter()
+            .all(|(k, i)| (*i as usize * 7919) % 101 == *k as usize));
+        let mut ids: Vec<i32> = got.iter().map(|r| r.1).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), got.len());
+        assert_eq!(
+            got.len(),
+            n.saturating_sub(skip).min(limit.unwrap_or(usize::MAX))
+        );
     }
 
     #[test]
@@ -430,7 +463,8 @@ mod tests {
                     (d.get_i32("k").unwrap(), d.get_i32("i").unwrap())
                 }));
             }
-            // The first row (in scan order) of each key.
+            // The first row (in scan order) of each key: the runs of a
+            // de-duplicating sort are sorted stably.
             let mut want: Vec<(i32, i32)> = Vec::new();
             for k in 0..101 {
                 let i = (0..120_000).find(|i| (i * 7919) % 101 == k).unwrap();
@@ -446,20 +480,22 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_spilled_and_top_k_sorts_agree_with_a_stable_sort() {
-        // 120,000 rows of ~230 bytes are ~27 MB: two runs on disk.
+    fn in_memory_and_top_k_sorts_agree_with_postgres_and_spilled_ones_sort() {
         for (n, skip, limit) in [
             (1000, 0, None),
             (1000, 5, Some(17)),
-            (120_000, 0, None),
+            (1000, 400, Some(200)),
             (120_000, 1000, Some(5000)),
-            (120_000, 3, Some(200_000)),
         ] {
             assert_eq!(
                 run(n, skip, limit),
                 expected(n, skip, limit),
                 "{n} {skip} {limit:?}"
             );
+        }
+        // 120,000 rows of ~230 bytes are ~27 MB: two runs on disk.
+        for (n, skip, limit) in [(120_000, 0, None), (120_000, 3, Some(200_000))] {
+            check_spilled(&run(n, skip, limit), n, skip, limit);
         }
     }
 }

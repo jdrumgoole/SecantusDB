@@ -79,6 +79,7 @@ mod table_locks;
 mod tls;
 mod triggers;
 mod ts_catalogs;
+mod tuplesort;
 mod txn_gucs;
 mod window_order;
 mod wire_portals;
@@ -5381,6 +5382,11 @@ impl PgHandler {
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
         // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
         // works even when `s` is not projected.
+        // Stable, not PostgreSQL's quicksort (`tuplesort.rs`): the quicksort
+        // leaves ties where PostgreSQL's do only over the same input order,
+        // and the groups do not arrive in PostgreSQL's (HashAggregate /
+        // GroupAggregate) order. Over them a stable sort matched more
+        // (b67_grouping_sets' ROLLUP rows, RP-028).
         if !agg.order.is_empty() {
             groups.sort_by(|a, b| {
                 for key in &agg.order {
@@ -6168,7 +6174,7 @@ impl PgHandler {
     }
 
     fn join_docs(&self, join: &secantus_pgplan::JoinSelect) -> PgWireResult<Vec<Document>> {
-        self.join_docs_with(join, None, None)
+        self.join_docs_with(join, None, None, None)
     }
 
     /// `join_docs` with optional pre-materialised rows for a side that is a
@@ -6414,6 +6420,7 @@ impl PgHandler {
         join: &secantus_pgplan::JoinSelect,
         left_rows: Option<Vec<Document>>,
         right_rows: Option<Vec<Document>>,
+        bound: Option<usize>,
     ) -> PgWireResult<Vec<Document>> {
         let mut left_rows = Some(match left_rows {
             Some(r) => r,
@@ -6442,7 +6449,8 @@ impl PgHandler {
             // PostgreSQL sorts NULLS LAST ascending / FIRST descending, which
             // the LEFT-JOIN misses rely on.
             let key = |d: &Document| d.get("__join_order").cloned().unwrap_or(Bson::Null);
-            out.sort_by(|a, b| {
+            // PostgreSQL's sort, as every ORDER BY here (`tuplesort.rs`).
+            out = tuplesort::sort(out, bound, &mut |a, b| {
                 let (ka, kb) = (key(a), key(b));
                 let ord = match (&ka, &kb) {
                     (Bson::Null, Bson::Null) => std::cmp::Ordering::Equal,
@@ -17186,6 +17194,29 @@ fn canonical_bool_guc(name: &str, value: &str) -> PgWireResult<String> {
     })
 }
 
+/// `backslash_quote`, an enum GUC: guc.c's `backslash_quote_options` --
+/// `safe_encoding`, `on`, `off`, and the hidden `true` / `yes` / `1` (on)
+/// and `false` / `no` / `0` (off), matched without regard to case and never
+/// by a prefix (`of` is refused; measured on PostgreSQL 15.19).
+fn canonical_backslash_quote(value: &str) -> PgWireResult<String> {
+    let v = value.to_ascii_lowercase();
+    let canonical = match v.as_str() {
+        "safe_encoding" => "safe_encoding",
+        "on" | "true" | "yes" | "1" => "on",
+        "off" | "false" | "no" | "0" => "off",
+        _ => {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                format!("invalid value for parameter \"backslash_quote\": \"{value}\""),
+            );
+            info.hint = Some("Available values: safe_encoding, on, off.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+    };
+    Ok(canonical.to_string())
+}
+
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
 fn default_settings() -> HashMap<String, String> {
@@ -22954,22 +22985,39 @@ impl PgHandler {
     /// -- the simple `Query` and the extended `Parse` -- because that is when
     /// PostgreSQL's scanner reads it: a statement prepared under one setting
     /// keeps its meaning when the setting later changes.
+    ///
+    /// `backslash_quote` is read here too, conforming or not: it refuses a
+    /// `\'` in any literal read with backslash escapes when it is `off`, or
+    /// `safe_encoding` under a client-only client encoding (scan.l's
+    /// `xeescape`, `PG_ENCODING_IS_CLIENT_ONLY`).
     fn apply_string_syntax(&self, sql: &str) -> PgWireResult<String> {
-        let (conforming, warn) = {
+        let syntax = {
             let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                settings
+            let client_only = settings.get("client_encoding").is_some_and(|e| {
+                matches!(
+                    e.as_str(),
+                    "SJIS" | "BIG5" | "GBK" | "UHC" | "GB18030" | "JOHAB" | "SHIFT_JIS_2004"
+                )
+            });
+            secantus_pgplan::escape_strings::Syntax {
+                conforming: settings
                     .get("standard_conforming_strings")
                     .is_none_or(|v| v != "off"),
-                settings
+                warn_escapes: settings
                     .get("escape_string_warning")
                     .is_none_or(|v| v != "off"),
-            )
+                refuse_backslash_quote: match settings.get("backslash_quote").map(String::as_str) {
+                    Some("off") => true,
+                    Some("on") => false,
+                    _ => client_only,
+                },
+            }
         };
-        if conforming {
+        if syntax.conforming && (!syntax.refuse_backslash_quote || !sql.contains("\\'")) {
             return Ok(sql.to_string());
         }
-        let (rewritten, warnings) = secantus_pgplan::escape_strings::rewrite(sql, warn);
+        let (rewritten, warnings, position) =
+            secantus_pgplan::escape_strings::rewrite_with(sql, syntax);
         if !warnings.is_empty() {
             let mut pending = self
                 .pending_notices
@@ -22986,7 +23034,13 @@ impl PgHandler {
                 pending.push(info);
             }
         }
-        rewritten.map_err(|e| Self::err(&e))
+        rewritten.map_err(|e| {
+            let mut out = Self::err(&e);
+            if let (PgWireError::UserError(info), Some(p)) = (&mut out, position) {
+                info.position = Some(p.to_string());
+            }
+            out
+        })
     }
 
     fn collect_planner_warnings(&self) {
@@ -23125,6 +23179,8 @@ impl PgHandler {
                         secantus_pgplan::DateStyle::parse(&text).canonical()
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &text)?
+                    } else if key == "backslash_quote" {
+                        canonical_backslash_quote(&text)?
                     } else {
                         text
                     };
@@ -25659,7 +25715,14 @@ impl PgHandler {
                     Some(stmt) => Some(self.sub_plan_rows(stmt)?),
                     None => None,
                 };
-                let docs = self.join_docs_with(join, left_rows, right_rows)?;
+                // The join's own ORDER BY is the statement's, so the LIMIT
+                // bounds its sort.
+                let bound = if sel.order.is_empty() {
+                    sort_bound(sel)
+                } else {
+                    None
+                };
+                let docs = self.join_docs_with(join, left_rows, right_rows, bound)?;
                 let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
                     .map_err(|e| Self::err(&e))?;
                 (docs, def)
@@ -25767,8 +25830,12 @@ impl PgHandler {
             }
             docs = kept;
         }
+        // The order the windows' last Sort left the rows in: PostgreSQL
+        // plans no Sort for an ORDER BY that order already satisfies.
+        let mut window_sorted: Vec<OrderKey> = Vec::new();
         if !sel.windows.is_empty() {
-            materialise_windows(&mut docs, &sel.windows, &sel.order).map_err(|e| Self::err(&e))?;
+            window_sorted = materialise_windows(&mut docs, &sel.windows, &sel.order)
+                .map_err(|e| Self::err(&e))?;
             // The synthetic `__winN` columns go into the def HERE rather than
             // only in `select_def`, because every reader of a select's schema
             // -- the row encoder, `rows_with_schema`, `COPY (query)` -- takes
@@ -25812,9 +25879,25 @@ impl PgHandler {
             docs = kept;
         }
 
-        if !sel.order.is_empty() {
+        if !sel.order.is_empty()
+            && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
+        {
             materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
-            sort_rows(&mut docs, &sel.order);
+            // A LIMIT directly over the Sort bounds it (`ExecSetTupleBound`,
+            // OFFSET + LIMIT), which changes where ties land; a Unique (any
+            // DISTINCT) or a LockRows between them passes no bound down.
+            if matches!(sel.distinct, secantus_pgplan::Distinct::On(_)) {
+                // Stable: the DISTINCT ON below keeps the first row of each
+                // key, and a DISTINCT over a nondeterministic collation
+                // (citext) is planned as one -- where PostgreSQL runs a
+                // HashAggregate, which keeps the first row in scan order.
+                // The two cannot be told apart here, so a real DISTINCT ON
+                // keeps the stable order too (RP-028 leaves it).
+                docs.sort_by(|a, b| compare_rows(a, b, &sel.order));
+            } else {
+                let bound = sort_bound(sel).filter(|_| row_lock.is_none());
+                docs = tuplesort::sort(docs, bound, &mut |a, b| compare_rows(a, b, &sel.order));
+            }
         }
         // `DISTINCT ON (keys)` keeps one row per key, the FIRST in the sort
         // order -- which is why it runs after the sort and DISTINCT does not.
@@ -30990,6 +31073,8 @@ impl PgHandler {
                                 ))))
                             }
                         }
+                    } else if key == "backslash_quote" {
+                        canonical_backslash_quote(&value)?
                     } else if key == "TimeZone" {
                         // A bare number of hours is recorded as its POSIX
                         // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
@@ -35308,7 +35393,7 @@ fn materialise_windows(
     docs: &mut [Document],
     windows: &[secantus_pgplan::WindowItem],
     query_order: &[OrderKey],
-) -> Result<(), PlanError> {
+) -> Result<Vec<OrderKey>, PlanError> {
     // A computed PARTITION BY / ORDER BY key has no stored field, so it is
     // evaluated per row into its own `__wkeyN` first and then read back
     // like any column -- one comparator rather than two. All of them before
@@ -35374,7 +35459,7 @@ fn materialise_windows(
     for (slot, d) in docs.iter_mut().zip(taken.drain(..)) {
         *slot = d;
     }
-    Ok(())
+    Ok(sorted_by)
 }
 
 /// The row indices of each partition, in the rows' original order.
@@ -36089,8 +36174,22 @@ fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<
     Ok(())
 }
 
+/// The bound a select's LIMIT passes down to the Sort beneath it
+/// (`ExecSetTupleBound`: OFFSET + LIMIT), when it reaches one: a Unique (any
+/// DISTINCT) or a LockRows in between passes none.
+fn sort_bound(sel: &secantus_pgplan::Select) -> Option<usize> {
+    if sel.distinct != secantus_pgplan::Distinct::None || !sel.lock_clauses.is_empty() {
+        return None;
+    }
+    let count = |n: i64| usize::try_from(n.max(0)).unwrap_or(usize::MAX);
+    sel.limit
+        .map(|l| count(l).saturating_add(count(sel.offset)))
+}
+
+/// PostgreSQL's in-memory sort (`tuplesort.c`'s quicksort), so rows that
+/// tie land where PostgreSQL's do -- it is not stable (`tuplesort.rs`).
 fn sort_rows(docs: &mut [Document], order: &[OrderKey]) {
-    docs.sort_by(|a, b| compare_rows(a, b, order));
+    window_order::pg_qsort(docs, &mut |a, b| compare_rows(a, b, order));
 }
 
 /// Two rows compared by a sort spec, in PostgreSQL's order.
