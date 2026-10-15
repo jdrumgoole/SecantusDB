@@ -15,8 +15,10 @@ use bson::{doc, Bson, Document};
 
 pub mod acl;
 mod agg_hoist;
+mod agg_support;
 mod expr_where;
 mod filter_sublink;
+mod hashfn;
 mod like_match;
 mod multi_assign;
 mod record_fields;

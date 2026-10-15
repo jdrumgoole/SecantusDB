@@ -81,10 +81,86 @@ pub(crate) fn call(name: &str, value: &Bson, ty: &str) -> Option<Result<Bson>> {
         bytes.extend_from_slice(value_text(&value).as_bytes());
         return Some(Ok(bytea::to_binary(bytes)));
     }
+    if let Some(bytes) = own_format(&value, &ty) {
+        return Some(bytes.map(bytea::to_binary));
+    }
     let encode = ENCODER.get()?;
     Some(
         encode(&value, &ty)
             .map(|bytes| bytea::to_binary(bytes))
             .ok_or_else(|| Error::Unsupported(format!("{name}({ty})"))),
     )
+}
+
+/// The send formats of the types the wire layer has no binary encoding for.
+fn own_format(value: &Bson, ty: &str) -> Option<Result<Vec<u8>>> {
+    let number = |what: &str| -> Result<u64> {
+        value_text(value)
+            .trim()
+            .parse()
+            .map_err(|_| Error::Internal(format!("{what}send")))
+    };
+    Some(match ty {
+        "xid" => number("xid").map(|n| (n as u32).to_be_bytes().to_vec()),
+        "xid8" => number("xid8").map(|n| n.to_be_bytes().to_vec()),
+        "regconfig" => regobj::from_bson(value)
+            .map(|(_, oid)| (oid as u32).to_be_bytes().to_vec())
+            .ok_or_else(|| Error::Internal("regconfigsend".into())),
+        // `tsvectorsend`: the lexeme count, then each lexeme (sorted), a
+        // NUL, its position count and each position as `weight << 14 | pos`.
+        "tsvector" => fts::parse_vector(&value_text(value)).map(|v| {
+            let mut out = (v.0.len() as u32).to_be_bytes().to_vec();
+            for (lex, positions) in &v.0 {
+                out.extend_from_slice(lex.as_bytes());
+                out.push(0);
+                out.extend_from_slice(&(positions.len() as u16).to_be_bytes());
+                for (p, w) in positions {
+                    out.extend_from_slice(&((u16::from(*w) << 14) | p).to_be_bytes());
+                }
+            }
+            out
+        }),
+        // `tsquerysend`: the item count, then the items as PostgreSQL
+        // stores them -- an operator, its right operand, then its left.
+        "tsquery" => fts::parse_query(&value_text(value)).map(|q| {
+            fn items(q: &fts::Query, out: &mut Vec<u8>) -> u32 {
+                use fts::Query as Q;
+                match q {
+                    Q::Val {
+                        lex,
+                        prefix,
+                        weight,
+                    } => {
+                        out.extend_from_slice(&[1, *weight, u8::from(*prefix)]);
+                        out.extend_from_slice(lex.as_bytes());
+                        out.push(0);
+                        1
+                    }
+                    Q::Stop => 0,
+                    Q::Not(a) => {
+                        out.extend_from_slice(&[2, 1]);
+                        1 + items(a, out)
+                    }
+                    Q::And(l, r) | Q::Or(l, r) | Q::Phrase(l, r, _) => {
+                        let op = match q {
+                            Q::And(..) => 2,
+                            Q::Or(..) => 3,
+                            _ => 4,
+                        };
+                        out.extend_from_slice(&[2, op]);
+                        if let Q::Phrase(_, _, distance) = q {
+                            out.extend_from_slice(&distance.to_be_bytes());
+                        }
+                        1 + items(r, out) + items(l, out)
+                    }
+                }
+            }
+            let mut body = Vec::new();
+            let n = q.as_ref().map_or(0, |q| items(q, &mut body));
+            let mut out = n.to_be_bytes().to_vec();
+            out.extend(body);
+            out
+        }),
+        _ => return None,
+    })
 }

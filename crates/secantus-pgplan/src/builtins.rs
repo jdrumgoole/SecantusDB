@@ -139,7 +139,12 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
         ("multirange", 1) if crate::range::is_range_type(t(0)) => {
             return Some(crate::range::multirange_name_for(t(0)));
         }
-        _ => return crate::typsend::result_type(name, types.len()).map(String::from),
+        _ => {
+            return crate::typsend::result_type(name, types.len())
+                .or_else(|| crate::agg_support::result_type(name, types.len()))
+                .or_else(|| crate::hashfn::result_type(name, types.len()))
+                .map(String::from)
+        }
     };
     Some(out.to_string())
 }
@@ -400,6 +405,12 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
         return Ok(Bson::Null);
     }
     let bytes = |i: usize| bytea::parse(&args[i]);
+    if let Some(out) = crate::agg_support::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::hashfn::call(name, args, types.first().map_or("", String::as_str)) {
+        return out;
+    }
     if args.len() == 1 {
         let ty = types.first().map_or("", String::as_str);
         if let Some(out) = crate::typsend::call(name, &args[0], ty) {

@@ -162,6 +162,26 @@ fn templates() -> &'static HashMap<(&'static str, usize), pg_query::protobuf::No
             .iter()
             .filter_map(|(name, n, sql)| Some(((*name, *n), parse_expression(sql)?)))
             .collect();
+        let typed = |n: &str, t: &str| {
+            if t.is_empty() {
+                format!("${n}")
+            } else {
+                format!("(${n}::{t})")
+            }
+        };
+        for (name, sql, left, right) in TYPED {
+            let sql = sql
+                .replace("$1", &typed("1", left))
+                .replace("$2", &typed("2", right));
+            if let Some(node) = parse_expression(&sql) {
+                map.entry((*name, 2)).or_insert(node);
+            }
+        }
+        for (name, n, sql) in STEPS {
+            if let Some(node) = parse_expression(sql) {
+                map.entry((*name, *n)).or_insert(node);
+            }
+        }
         for (name, sql) in output_templates() {
             if let Some(node) = parse_expression(&sql) {
                 map.entry((name, 1)).or_insert(node);
@@ -292,6 +312,111 @@ const FAMILIES: &[(&str, &str)] = &[
     ("timestamptz_cmp", COMPARE),
     ("interval_cmp", COMPARE),
     ("uuid_cmp", COMPARE),
+];
+
+/// More of the B-tree support and aggregate step functions, each with the
+/// argument types `pg_proc` declares (`$1` / `$2` are cast to them). The
+/// comparisons answer -1 / 0 / 1 as PostgreSQL 15.19's do; the ones that
+/// answer a `memcmp` difference are left out (`bitcmp`, `varbitcmp`,
+/// `btnamecmp`, `network_cmp`, `jsonb_cmp`, `tsvector_cmp`, `tsquery_cmp`).
+const TYPED: &[(&str, &str, &str, &str)] = &[
+    ("bttidcmp", COMPARE, "tid", "tid"),
+    ("cash_cmp", COMPARE, "money", "money"),
+    ("date_cmp_timestamp", COMPARE, "date", "timestamp"),
+    ("date_cmp_timestamptz", COMPARE, "date", "timestamptz"),
+    ("timestamp_cmp_date", COMPARE, "timestamp", "date"),
+    (
+        "timestamp_cmp_timestamptz",
+        COMPARE,
+        "timestamp",
+        "timestamptz",
+    ),
+    ("timestamptz_cmp_date", COMPARE, "timestamptz", "date"),
+    (
+        "timestamptz_cmp_timestamp",
+        COMPARE,
+        "timestamptz",
+        "timestamp",
+    ),
+    ("macaddr_cmp", COMPARE, "macaddr", "macaddr"),
+    ("macaddr8_cmp", COMPARE, "macaddr8", "macaddr8"),
+    ("pg_lsn_cmp", COMPARE, "pg_lsn", "pg_lsn"),
+    ("timetz_cmp", COMPARE, "timetz", "timetz"),
+    ("xid8cmp", COMPARE, "xid8", "xid8"),
+    ("range_cmp", COMPARE, "", ""),
+    ("multirange_cmp", COMPARE, "", ""),
+    ("btarraycmp", COMPARE, "", ""),
+    // `btcharcmp` is the two bytes' difference.
+    (
+        "btcharcmp",
+        "ascii($1::\"char\"::text) - ascii($2::\"char\"::text)",
+        "",
+        "",
+    ),
+    ("array_larger", LARGER, "", ""),
+    ("array_smaller", SMALLER, "", ""),
+    ("cashlarger", LARGER, "money", "money"),
+    ("cashsmaller", SMALLER, "money", "money"),
+    ("network_larger", LARGER, "inet", "inet"),
+    ("network_smaller", SMALLER, "inet", "inet"),
+    ("pg_lsn_larger", LARGER, "pg_lsn", "pg_lsn"),
+    ("pg_lsn_smaller", SMALLER, "pg_lsn", "pg_lsn"),
+    ("timetz_larger", LARGER, "timetz", "timetz"),
+    ("timetz_smaller", SMALLER, "timetz", "timetz"),
+    ("xid8_larger", LARGER, "xid8", "xid8"),
+    ("xid8_smaller", SMALLER, "xid8", "xid8"),
+    // Strict: a NULL either side answers NULL, where AND would not.
+    (
+        "booland_statefunc",
+        "CASE WHEN $1 IS NOT NULL AND $2 IS NOT NULL THEN $1 AND $2 END",
+        "bool",
+        "bool",
+    ),
+    (
+        "boolor_statefunc",
+        "CASE WHEN $1 IS NOT NULL AND $2 IS NOT NULL THEN $1 OR $2 END",
+        "bool",
+        "bool",
+    ),
+    // `int2_sum` / `int4_sum` are not strict: a NULL state is the value.
+    (
+        "int2_sum",
+        "coalesce($1 + $2, $1, $2::int8)",
+        "int8",
+        "int2",
+    ),
+    (
+        "int4_sum",
+        "coalesce($1 + $2, $1, $2::int8)",
+        "int8",
+        "int4",
+    ),
+];
+
+/// The one-argument steps of `count`, strict like the others.
+const STEPS: &[(&str, usize, &str)] = &[
+    ("int8inc", 1, "$1::int8 + 1"),
+    ("int8dec", 1, "$1::int8 - 1"),
+    (
+        "int8inc_any",
+        2,
+        "CASE WHEN $2 IS NOT NULL THEN $1::int8 + 1 END",
+    ),
+    (
+        "int8dec_any",
+        2,
+        "CASE WHEN $2 IS NOT NULL THEN $1::int8 - 1 END",
+    ),
+    (
+        "int8inc_float8_float8",
+        3,
+        "CASE WHEN $2::float8 IS NOT NULL AND $3::float8 IS NOT NULL THEN $1::int8 + 1 END",
+    ),
+    (
+        "btequalimage",
+        1,
+        "CASE WHEN $1::oid IS NOT NULL THEN true END",
+    ),
 ];
 
 /// The two argument types a `FAMILIES` function declares, read off its
@@ -470,6 +595,9 @@ fn template_param_types(template: &pg_query::protobuf::Node, nargs: usize) -> Ve
                     .chain(w.result.as_deref())
                     .for_each(|n| walk(n, out));
             }
+            Some(N::NullTest(t)) => t.arg.as_deref().into_iter().for_each(|n| walk(n, out)),
+            Some(N::BoolExpr(b)) => b.args.iter().for_each(|n| walk(n, out)),
+            Some(N::CoalesceExpr(c)) => c.args.iter().for_each(|n| walk(n, out)),
             _ => {}
         }
     }
@@ -551,6 +679,21 @@ fn substitute(
             out.expr = sub(&w.expr);
             out.result = sub(&w.result);
             N::CaseWhen(Box::new(out))
+        }
+        Some(N::NullTest(t)) => {
+            let mut out = (**t).clone();
+            out.arg = sub(&t.arg);
+            N::NullTest(Box::new(out))
+        }
+        Some(N::BoolExpr(b)) => {
+            let mut out = (**b).clone();
+            out.args = all(&b.args);
+            N::BoolExpr(Box::new(out))
+        }
+        Some(N::CoalesceExpr(c)) => {
+            let mut out = (**c).clone();
+            out.args = all(&c.args);
+            N::CoalesceExpr(Box::new(out))
         }
         _ => return template.clone(),
     };
