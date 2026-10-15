@@ -61,6 +61,11 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   (`c = d::text`) is 42883, where it had compared the label text. Part of
   RP-041 (`tests/backlog/test_rust_postgres_gaps.py::test_enum_comparison_reads_its_literal_at_plan_time`).
 
+- A domain over an enum (or over a domain over one) is described with the
+  enum's oid, as PostgreSQL sends it, where it went out as varchar (1043).
+  Part of RP-041
+  (`tests/backlog/test_rust_postgres_gaps.py::test_domain_over_enum_is_described_as_the_enum`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,

@@ -806,7 +806,7 @@ def test_drop_type_cascade_names_the_column(pg: Any) -> None:
     assert notices == ["drop cascades to column c of table rp041_c"]
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 def test_domain_over_enum_is_described_as_the_enum(pg: Any) -> None:
     """PostgreSQL 15.19 describes a domain over an enum with the ENUM's oid
     (a domain is sent as its base type); here it is varchar (1043)."""

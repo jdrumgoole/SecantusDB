@@ -4548,9 +4548,12 @@ impl PgHandler {
         ) {
             return None;
         }
-        // A domain goes out as its base type, as PostgreSQL sends it.
+        // A domain goes out as its base type, as PostgreSQL sends it -- a
+        // user type's own oid when the base is one (an enum, a composite).
         if let Some(base) = secantus_pgplan::domains::domain_base(pg_type) {
-            return Some(wire_type(&base));
+            return self
+                .user_wire_type(&base)
+                .or_else(|| Some(wire_type(&base)));
         }
         let enums = self.enums().ok()?;
         // An enum ARRAY: `inttestenum[]` reports the type's typarray oid
