@@ -5,7 +5,7 @@ Two files, the second delivered by a reload. Between them: every line type,
 method, database form and user form the server reads, an address that does
 not match, ``clientcert=``, ``map=``, md5-stored passwords under ``md5``,
 ``scram-sha-256`` and ``password`` lines, a role with no password, a user
-with no role, and a database that is not there. 128 scenarios.
+with no role, and a database that is not there. 134 scenarios.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
 script creates and against ``secantusd-pg``, through psycopg and through a
@@ -260,6 +260,9 @@ def setup(port, connect):
             "inc1",
             "inc2",
             "inc3",
+            "byname",
+            "bycase",
+            "bysuffix",
         ):
             c.execute(f"drop role if exists {role}")
         for db in ("appdb", "alice", "team"):
@@ -277,7 +280,7 @@ def setup(port, connect):
         # itself, which a superuser does not have of everything.
         c.execute("create role boss login superuser password 'pw'")
         # Named only through `@incusers`, a file beside pg_hba.conf.
-        for role in ("inc1", "inc2", "inc3"):
+        for role in ("inc1", "inc2", "inc3", "byname", "bycase", "bysuffix"):
             c.execute(f"create role {role} login")
         c.execute("create role appuser login password 'pw'")
         for role in ("md5user", "md5scram", "md5plain"):
@@ -309,6 +312,9 @@ hostssl     all        frank       all                        scram-sha-256  cli
 host        all        nopw        127.0.0.1/32               scram-sha-256
 host        "appdb"    "nobody"    127.0.0.1/32               trust
 host        all        @incusers   127.0.0.1/32               trust
+host        all        byname      localhost                  trust
+host        all        bycase      LOCALHOST                  trust
+host        all        bysuffix    .nosuch.example            trust
 """
 # `@incusers`: tokens of every line, comments dropped, read beside the file.
 INCUSERS = "inc1  # the first\ninc2,\n"
@@ -344,6 +350,9 @@ def scenarios(port):
     both("inc1 (named in @incusers)", user="inc1")
     both("inc2 (after a comma there)", user="inc2")
     both("inc3 (not in @incusers)", user="inc3")
+    both("byname (a host name line)", user="byname")
+    both("bycase (the name in capitals)", user="bycase")
+    both("bysuffix (a suffix the host lacks)", user="bysuffix")
     both(
         "alice in db alice (sameuser is erin's line)", user="alice", database="alice", password="pw"
     )

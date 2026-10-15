@@ -296,8 +296,7 @@ one beside it.
   - **With `--hba-file`:**
     - **Refused at startup, by line number**: the methods that need an
       outside service (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`,
-      `pam`, `bsd`), a host NAME for the address, and `include` directives
-      (PostgreSQL 16's).
+      `pam`, `bsd`) and `include` directives (PostgreSQL 16's).
     - **A `map=` on a method other than `cert` is refused**; PostgreSQL
       takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
       read here.

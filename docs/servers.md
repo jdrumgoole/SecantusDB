@@ -246,7 +246,8 @@ read leaves the old one in force.
 A line this server cannot apply stops it from starting, with the line's
 number, so that no rule is silently skipped: a method that needs a service
 outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`, `pam`,
-`bsd`) and a host name for the address. `@file` inclusion reads a file of
+`bsd`). A host name for the address is matched by a reverse lookup of the
+client's address confirmed forward, as PostgreSQL's is. `@file` inclusion reads a file of
 names beside the `pg_hba.conf`, as PostgreSQL 15 does. `samehost`
 and `samenet` match by this host's interface addresses and their networks,
 as PostgreSQL's do.

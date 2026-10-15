@@ -21,8 +21,8 @@
 //! What is refused when the file is read, by name, so that a rule this
 //! server cannot apply is never silently skipped: a method that needs a
 //! service outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`,
-//! `radius`, `pam`, `bsd`), a host NAME for the address (PostgreSQL resolves
-//! it; this server does not). `@file` inclusion is read as PostgreSQL 15
+//! `radius`, `pam`, `bsd`). A host name for the address is matched as
+//! PostgreSQL's `check_hostname` matches it. `@file` inclusion is read as PostgreSQL 15
 //! reads it. `local`
 //! lines are for Unix-domain sockets, which this server does not listen on:
 //! they are read and never match, as are the GSSAPI types.
@@ -77,6 +77,8 @@ enum Address {
     /// `samenet`: the network of one of this host's interfaces.
     SameNet,
     Network(IpAddr, u8),
+    /// A host name, or a `.suffix` of one (`check_hostname`).
+    Host(String),
 }
 
 /// How a connection a line matches must prove who it is.
@@ -244,6 +246,11 @@ impl Address {
                     _ => false,
                 }
             }),
+            // `check_hostname`: the client's address reverse-resolved, the
+            // name matched, and the match confirmed by resolving the name
+            // forward to the client's address.
+            Address::Host(pattern) => client_host_name(client)
+                .is_some_and(|name| hostname_match(pattern, &name) && resolves_to(&name, client)),
             Address::Network(network, prefix) => match (network, client) {
                 (IpAddr::V4(network), IpAddr::V4(client)) => {
                     let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
@@ -563,10 +570,7 @@ fn rule(fields: &[Vec<Token>], line: usize) -> Result<Rule, String> {
             .ok_or_else(|| format!("invalid IP mask \"{mask}\": not a run of leading ones"))?;
             Address::Network(ip, prefix)
         } else {
-            return Err(format!(
-                "host name \"{}\" is not supported for the address; give an IP address",
-                token.text
-            ));
+            Address::Host(token.text.clone())
         }
     };
     let method_token = single(fields.get(next), "authentication method")?;
@@ -668,6 +672,85 @@ fn contiguous(mask: u128, bits: u32) -> Option<u8> {
         (u128::MAX << (128 - ones)) >> (128 - bits)
     };
     (mask == expected).then_some(ones as u8)
+}
+
+/// `hostname_match`: a pattern starting with `.` matches a name ending in
+/// it, any other the name itself; case is not significant.
+fn hostname_match(pattern: &str, name: &str) -> bool {
+    if pattern.starts_with('.') {
+        name.len() > pattern.len()
+            && name[name.len() - pattern.len()..].eq_ignore_ascii_case(pattern)
+    } else {
+        name.eq_ignore_ascii_case(pattern)
+    }
+}
+
+/// Does `name` resolve (forward) to `client`?
+fn resolves_to(name: &str, client: IpAddr) -> bool {
+    use std::net::ToSocketAddrs;
+    (name, 0)
+        .to_socket_addrs()
+        .is_ok_and(|mut addrs| addrs.any(|a| a.ip().to_canonical() == client))
+}
+
+/// The client address's host name, from a reverse lookup that must find
+/// one (`getnameinfo` with `NI_NAMEREQD`).
+#[cfg(unix)]
+fn client_host_name(client: IpAddr) -> Option<String> {
+    let mut host = [0 as libc::c_char; 1025];
+    // SAFETY: `getnameinfo` reads the sockaddr built here and writes a
+    // NUL-terminated name into `host`, within its length.
+    let rc = unsafe {
+        match client {
+            IpAddr::V4(v4) => {
+                let mut sa: libc::sockaddr_in = std::mem::zeroed();
+                sa.sin_family = libc::AF_INET as libc::sa_family_t;
+                sa.sin_addr.s_addr = u32::from(v4).to_be();
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+                {
+                    sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                }
+                libc::getnameinfo(
+                    std::ptr::addr_of!(sa).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    host.as_mut_ptr(),
+                    host.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    libc::NI_NAMEREQD,
+                )
+            }
+            IpAddr::V6(v6) => {
+                let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+                sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sa.sin6_addr.s6_addr = v6.octets();
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+                {
+                    sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+                }
+                libc::getnameinfo(
+                    std::ptr::addr_of!(sa).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    host.as_mut_ptr(),
+                    host.len() as libc::socklen_t,
+                    std::ptr::null_mut(),
+                    0,
+                    libc::NI_NAMEREQD,
+                )
+            }
+        }
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: `getnameinfo` NUL-terminated it.
+    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
+    name.to_str().ok().map(str::to_string)
+}
+
+#[cfg(not(unix))]
+fn client_host_name(_client: IpAddr) -> Option<String> {
+    None
 }
 
 /// This host's interfaces as `(address, netmask)`, as `pg_foreach_ifaddr`
@@ -874,6 +957,15 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
     }
 
     #[test]
+    fn a_host_name_matches_whole_or_by_its_suffix() {
+        assert!(hostname_match("localhost", "LocalHost"));
+        assert!(!hostname_match("localhost", "localhost.example"));
+        assert!(hostname_match(".example.com", "db.Example.com"));
+        assert!(!hostname_match(".example.com", "example.com"));
+        assert!(!hostname_match(".example.com", "db.example.org"));
+    }
+
+    #[test]
     fn an_at_file_holds_more_tokens() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -922,7 +1014,6 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
                 "host all all 127.0.0.1/32 trusted\n",
                 "invalid authentication method",
             ),
-            ("host all all db.example.com trust\n", "host name"),
             ("host all all 127.0.0.1/33 trust\n", "invalid CIDR mask"),
             (
                 "host all all 127.0.0.1 255.0.255.0 trust\n",

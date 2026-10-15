@@ -65,3 +65,8 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   `parse_ident_line` reads it. Part of RP-013, pinned by
   `tools/probes/pg_login_tls_files.py` (541 of 541) and `ident.rs`'s
   `an_at_file_is_the_one_value_it_holds`.
+- A `pg_hba.conf` address may be a host name or a `.suffix`, matched as
+  PostgreSQL's `check_hostname` matches it: the client's address
+  reverse-resolved, compared without case, and confirmed by a forward
+  lookup. It was refused at startup. Part of RP-013, pinned by
+  `tools/probes/pg_login_hba.py` (134 of 134).

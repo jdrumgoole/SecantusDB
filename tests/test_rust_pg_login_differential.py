@@ -46,7 +46,7 @@ REFERENCE_MAJOR = 15
 CASES: dict[str, tuple[tuple[str, ...], int]] = {
     "pg_login_options.py": (("--refuse-unknown-users",), 234),
     "pg_login_tls_files.py": ((), 541),
-    "pg_login_hba.py": ((), 128),
+    "pg_login_hba.py": ((), 134),
 }
 
 
