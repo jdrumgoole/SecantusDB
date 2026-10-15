@@ -174,6 +174,14 @@ impl Found {
         if !usable.is_empty() {
             return centre_hashes(&usable, self.near.centre);
         }
+        Err(refuse(
+            291,
+            self.unplannable(db, coll, asked, "unable to find index for $geoNear query"),
+        ))
+    }
+
+    /// mongod's message for a `$near` it could not plan, for `reason`.
+    pub(crate) fn unplannable(&self, db: &str, coll: &str, asked: Asked, reason: &str) -> String {
         // The bound as given: metres for GeoJSON, radians for a legacy point
         // on the sphere, the coordinates' own units in the plane.
         let max = match self.near.max {
@@ -203,15 +211,12 @@ impl Found {
         if asked.skip > 0 {
             paging.push_str(&format!(" skip={}", asked.skip));
         }
-        Err(refuse(
-            291,
-            format!(
-                "error processing query: ns={db}.{coll}{paging}Tree: {tree}\nSort: {}\nProj: {}\n \
-                 planner returned error :: caused by :: unable to find index for $geoNear query",
-                shown(asked.sort),
-                shown(asked.projection)
-            ),
-        ))
+        format!(
+            "error processing query: ns={db}.{coll}{paging}Tree: {tree}\nSort: {}\nProj: {}\n \
+             planner returned error :: caused by :: {reason}",
+            shown(asked.sort),
+            shown(asked.projection)
+        )
     }
 
     /// `rows` nearest first. Documents at one distance keep the order given,
