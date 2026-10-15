@@ -367,26 +367,29 @@ one beside it.
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_literal_pads_char_field
 
 - [ ] **RUST pgserver: what the typed-value work left (2026-10-15).**
-  - `create type uuid as enum (...)` is 42710; PostgreSQL 15.19 creates
-    `public.uuid` beside the built-in (a TABLE named so works since RP-030).
-    The duplicate-name checks are spread over several paths.
   - Comparing arrays of records whose fields are untyped
     (`array[row(1, null)] = array[row(1, null)]`) stays 0A000; PostgreSQL
     errors at execution with messages that vary by case.
   Backlog-ID: RP-025
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_untyped_record_array_compare
 
-- [ ] **RUST pgserver: settings and error positions the 2026-10-15 batch
-  found.** `SET nosuch_param = 1` is accepted (PostgreSQL 15.19: 42704
-  `unrecognized configuration parameter`). Under `standard_conforming_strings
-  = off` every error loses its position (`select 1, 'x'::int4` is 22P02 at
-  11 on PostgreSQL), because the escape-string rewrite changes the text the
-  positions are found in. A missing parameter (`fetch first $1 rows`) is
-  42P02 with no position. Not tested: `SET transaction_isolation TO
-  DEFAULT` outside a block has no "RESET TRANSACTION can only be used in
-  transaction blocks" WARNING.
-  Backlog-ID: RP-036
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_setting_is_refused,tests/backlog/test_rust_postgres_gaps.py::test_error_positions
+- [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
+  Each measured on PostgreSQL 15.19:
+  - `limit 'x'` is 0A000 "this LIMIT is not supported yet" in every
+    query path; PostgreSQL is 22P02 at the literal.
+  - `mode() within group (order by NULL)` answers; PostgreSQL is 42804
+    (no polymorphic type from `unknown`).
+  - `xmlagg(null::xml)` is 0A000 (over a column it works).
+  - `pg_typeof` of a column of a domain type prints the base type, not
+    the domain's name (`pg_typeof(1::d)` is right).
+  - `create type int` / `create type integer` are 42710; PostgreSQL makes
+    `public."int"`. They are grammar spellings with no pg_type row, and the
+    planner folds `int` to `int4`, so the fix has to keep the two apart.
+  - COPY FROM a UTF8 client with invalid bytes says `COPY data is not
+    valid UTF-8`; PostgreSQL says `invalid byte sequence for encoding
+    "UTF8": 0x82` (22021). Other client encodings already match.
+  Backlog-ID: RP-038
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int,tests/backlog/test_rust_postgres_gaps.py::test_copy_from_reports_the_bad_byte
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

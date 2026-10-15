@@ -8,6 +8,33 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 
 #### Fixed
 
+- A SELECT with no FROM ignored LIMIT and OFFSET: `select 1 limit 0` and
+  `select 1 offset 1` returned a row (PostgreSQL returns none), and
+  `select 1 limit $1` with no parameter succeeded rather than 42P02.
+- An unknown configuration parameter is refused with 42704
+  `unrecognized configuration parameter` by SET, SET LOCAL, SET ... TO
+  DEFAULT, RESET, `set_config` and ALTER DATABASE SET; parameters the
+  server cannot change are 55P02, and `SET transaction_isolation TO
+  DEFAULT` outside a block warns 25P01. Error positions survive
+  `standard_conforming_strings = off`, and 42P02 points at its `$N`.
+  Fixes RP-036 (`tests/backlog/test_rust_postgres_gaps.py::test_unknown_setting_is_refused`,
+  `::test_error_positions`).
+- CREATE TYPE / DOMAIN / a range named after a built-in (`uuid`, `text`,
+  `int4`, `int8range`) creates `public.<name>` beside it, and a bare
+  `drop type uuid` is 2BP01; a domain named `int4` had overflowed the
+  stack. Part of RP-025
+  (`tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin`).
+- A call whose arguments are all untyped follows `func_select_candidate`'s
+  unknown-argument steps: `unnest('{1,2}')`, `sum('1')`, `array_agg(NULL)`
+  are 42725 and `json_agg('x')` 42804; a call over NULL is described by
+  the overload PostgreSQL picks (`abs(NULL)` is float8).
+- `ts_headline` is transcribed from PostgreSQL 15: every option and its
+  choice of words. `width_bucket` over an array takes any element type.
+  Part of RP-015 (`::test_builtin_coverage_fixed[ts-headline-untyped]`,
+  `[ts-headline-options]`, `[unnest-untyped]`, `[width-bucket-dates]`).
+- `pg_client_encoding()` answers the session's encoding, and `SHOW
+  is_superuser` / `SHOW session_authorization` answer from the roles.
+
 - `UPDATE ... SET (a, b) = (SELECT ...)` assigns each listed column from
   the subquery's one row: once per updated row, or once per statement when
   the subquery is uncorrelated, so a volatile subquery runs once as on
@@ -202,4 +229,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
   `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
   `string_syntax_settings`, `record_fields_using`, `fetch_ties_settings`
-  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops`, `range_order`, `geometric_closest`, `xml_export` and `builtin_small`.
+  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops`, `range_order`, `geometric_closest`, `xml_export`, `builtin_residue_2`, `settings_known` and `builtin_small`.

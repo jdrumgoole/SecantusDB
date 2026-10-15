@@ -76,6 +76,7 @@ const CATALOG_NAMES: &[&str] = &[
     "current_catalog",
     "current_setting",
     "pg_backend_pid",
+    "pg_client_encoding",
     "pg_reload_conf",
     "format_type",
     "obj_description",
@@ -1734,6 +1735,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             Ok(Bson::Array(out))
         }
         "pg_backend_pid" => Ok(Bson::Int32(BACKEND_PID.with(|p| p.get()))),
+        // The session's `client_encoding`, by its canonical name.
+        "pg_client_encoding" => Ok(Bson::String(
+            crate::session_setting("client_encoding").unwrap_or_else(|| "UTF8".into()),
+        )),
         // PostgreSQL answers true once the signal is sent, whatever the
         // reload then makes of the files.
         "pg_reload_conf" => {
@@ -2664,7 +2669,8 @@ pub fn static_result_type(name: &str) -> &'static str {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "scale" | "min_scale" => "int4",
-        "current_schema" | "current_database" | "current_user" | "session_user" => "name",
+        "current_schema" | "current_database" | "current_user" | "session_user"
+        | "pg_client_encoding" => "name",
         "current_schemas" => "name[]",
         "char" => crate::QUOTED_CHAR,
         "trim_scale" => "numeric",

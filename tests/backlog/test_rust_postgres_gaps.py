@@ -144,7 +144,10 @@ _RP015 = {
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
-    "query-to-xml": "select query_to_xml('select 1 as a, null::text as \"_xb\", array[1,null] as r', true, true, 'urn:x')",
+    "query-to-xml": (
+        "select query_to_xml('select 1 as a, null::text as \"_xb\", array[1,null] as r',"
+        " true, true, 'urn:x')"
+    ),
     "tid-type": "select '(0,1)'::tid::text",
     "date-part-unit-text": "select date_part('foo', '2000-01-01'::timestamptz)",
     "jsonb-object-to-int": """select '{"a":1}'::jsonb::int""",
@@ -490,7 +493,9 @@ def test_record_field_selection(pg: Any, pg15: Any, sql: str) -> None:
 
 # Fixed from RP-025: ORDER BY ... USING (2026-10-15).
 _RP025_OPEN = {
-    "order-by-using": "select string_agg(x::text, ',' order by x using >) from (values (1), (3), (2)) v(x)",
+    "order-by-using": (
+        "select string_agg(x::text, ',' order by x using >) from (values (1), (3), (2)) v(x)"
+    ),
     "order-by-using-plain": "select x from (values (1), (3), (2)) v(x) order by x using >",
 }
 
@@ -501,7 +506,7 @@ def test_typed_value_open(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-025")
+@pytest.mark.backlog_fixed("RP-025")
 def test_create_type_named_after_a_builtin(pg: Any) -> None:
     """PostgreSQL 15.19: `create type uuid as enum ('a')` succeeds (it is
     `public.uuid`); here it is 42710."""
@@ -549,7 +554,7 @@ def _error_and_position(conn: Any, setup: list[str], sql: str) -> tuple:
     return ("ok", None)
 
 
-@pytest.mark.backlog("RP-036")
+@pytest.mark.backlog_fixed("RP-036")
 def test_unknown_setting_is_refused(pg: Any, pg15: Any) -> None:
     """PostgreSQL 15.19: `SET nosuch_param = 1` is 42704 `unrecognized
     configuration parameter`; here it is accepted."""
@@ -557,7 +562,7 @@ def test_unknown_setting_is_refused(pg: Any, pg15: Any) -> None:
     assert pg_answer(pg, sql)[:2] == pg_answer(pg15, sql)[:2] == ("err", "42704")
 
 
-@pytest.mark.backlog("RP-036")
+@pytest.mark.backlog_fixed("RP-036")
 @pytest.mark.parametrize(
     ("setup", "sql"),
     [
@@ -577,8 +582,10 @@ def test_error_positions(pg: Any, pg15: Any, setup: list[str], sql: str) -> None
 @pytest.mark.parametrize(
     "sql",
     [
-        "select r from (values ('[5,7)'::int4range), ('[1,3)'), ('empty'), ('[10,11)')) v(r) order by r",
-        "select r from (values ('{[5,7)}'::int4multirange), ('{[1,3),[4,5)}'), ('{}'), ('{[1,3)}')) v(r) order by r",
+        "select r from (values ('[5,7)'::int4range), ('[1,3)'), ('empty'), ('[10,11)')) v(r)"
+        " order by r",
+        "select r from (values ('{[5,7)}'::int4multirange), ('{[1,3),[4,5)}'), ('{}'),"
+        " ('{[1,3)}')) v(r) order by r",
     ],
     ids=["range", "multirange"],
 )
@@ -587,3 +594,71 @@ def test_order_by_a_range(pg: Any, pg15: Any, sql: str) -> None:
     lower and upper bound) and multiranges by `multirange_cmp`; here both
     sort by their text, so `empty` is last and `[10,11)` before `[5,7)`."""
     _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog("RP-025")
+def test_untyped_record_array_compare(pg: Any, pg15: Any) -> None:
+    """PostgreSQL 15.19: comparing arrays of records with an untyped field
+    is 42883 `could not identify an equality operator for type unknown`;
+    here it is 0A000."""
+    sql = "select array[row(1, null)] = array[row(1, null)]"
+    assert pg_answer(pg, sql)[:2] == pg_answer(pg15, sql)[:2] == ("err", "42883")
+
+
+# RP-038: divergences the 2026-10-15 batch saw beside its items.
+_RP038 = {
+    "limit-text": "select 1 limit 'x'",
+    "mode-unknown": "select mode() within group (order by NULL)",
+    "xmlagg": "select xmlagg(null::xml)",
+}
+
+
+@pytest.mark.backlog("RP-038")
+@pytest.mark.parametrize("sql", list(_RP038.values()), ids=list(_RP038))
+def test_batch_residue(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog("RP-038")
+def test_pg_typeof_names_the_domain(pg: Any) -> None:
+    """PostgreSQL 15.19: `pg_typeof` of a column declared `rp38_d` is
+    `rp38_d`; here it is the domain's base type, `integer`."""
+    pg.execute("drop table if exists rp38_t")
+    pg.execute("drop domain if exists rp38_d")
+    pg.execute("create domain rp38_d as int")
+    pg.execute("create table rp38_t (c rp38_d)")
+    try:
+        pg.execute("insert into rp38_t values (1)")
+        got = pg_answer(pg, "select pg_typeof(c)::text from rp38_t")
+    finally:
+        pg.execute("drop table rp38_t")
+        pg.execute("drop domain rp38_d")
+    assert got == ("ok", [("rp38_d",)])
+
+
+@pytest.mark.backlog("RP-038")
+def test_create_type_named_int(pg: Any) -> None:
+    """PostgreSQL 15.19: `create type int as enum ('a')` creates
+    `public."int"` (`int` is a grammar spelling, not a pg_type name); here
+    it is 42710."""
+    got = pg_answer(pg, "create type int as enum ('a')")
+    pg.execute('drop type if exists public."int"')
+    assert got == ("ok", "CREATE TYPE")
+
+
+@pytest.mark.backlog("RP-038")
+def test_copy_from_reports_the_bad_byte(pg: Any) -> None:
+    """PostgreSQL 15.19: COPY FROM a UTF8 client with the byte 0x82 is 22021
+    `invalid byte sequence for encoding "UTF8": 0x82`; here the message is
+    `COPY data is not valid UTF-8`."""
+    pg.execute("drop table if exists rp38_copy")
+    pg.execute("create table rp38_copy (t text)")
+    got: tuple = ("ok",)
+    try:
+        with pg.cursor().copy("copy rp38_copy from stdin") as cp:
+            cp.write(b"\x82\n")
+    except psycopg.Error as e:
+        got = (e.sqlstate, e.diag.message_primary)
+    finally:
+        pg.execute("drop table rp38_copy")
+    assert got == ("22021", 'invalid byte sequence for encoding "UTF8": 0x82')

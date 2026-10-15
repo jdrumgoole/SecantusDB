@@ -30831,12 +30831,31 @@ impl PgHandler {
                 // Release the settings lock BEFORE building the field:
                 // `field` reads `client_encoding` from the same (non-reentrant)
                 // mutex to transcode the column name.
-                let value = self
+                let stored = self
                     .settings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&key)
-                    .cloned()
+                    .cloned();
+                // Two hidden parameters PostgreSQL derives from the roles:
+                // `is_superuser` follows the effective role (`SET ROLE`),
+                // `session_authorization` the session user.
+                let value = stored
+                    .or_else(|| match key.as_str() {
+                        "is_superuser" => {
+                            let role = self.current_role_name();
+                            Some(
+                                if self.is_superuser(&role) {
+                                    "on"
+                                } else {
+                                    "off"
+                                }
+                                .into(),
+                            )
+                        }
+                        "session_authorization" => Some(self.session_user_name()),
+                        _ => None,
+                    })
                     .ok_or_else(|| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
