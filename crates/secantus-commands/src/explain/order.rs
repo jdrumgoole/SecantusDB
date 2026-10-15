@@ -491,6 +491,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         batch_size: false,
         keys_only: false,
         wanted: None,
+        pipeline: false,
         implies: &implied,
         trial,
     };
@@ -710,6 +711,7 @@ pub(crate) fn plan_indexes(storage: &dyn Storage, ask: &Ask) -> Vec<String> {
         batch_size: false,
         keys_only: false,
         wanted: None,
+        pipeline: false,
         implies: &implied,
         trial: None,
     };
@@ -827,6 +829,7 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
         batch_size: false,
         keys_only: false,
         wanted: None,
+        pipeline: false,
         implies: &implied,
         trial: None,
     };
@@ -851,7 +854,7 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
 /// lookup by `_id` reads.
 fn used_indexes(node: &Node, out: &mut Vec<String>) {
     match node {
-        Node::IxScan(ix) | Node::CountScan(ix) | Node::DistinctScan(ix, _) => {
+        Node::IxScan(ix) | Node::CountScan(ix) | Node::DistinctScan(ix, _, _) => {
             out.push(ix.index.name.clone())
         }
         Node::Express { index, .. } | Node::ExpressWrite { index, .. } => {

@@ -626,7 +626,7 @@ impl<'a> Run<'a> {
             _ => vec![],
         };
         let scan = match node {
-            Node::IxScan(ix) | Node::CountScan(ix) | Node::DistinctScan(ix, _) => {
+            Node::IxScan(ix) | Node::CountScan(ix) | Node::DistinctScan(ix, _, _) => {
                 Some(Scan::new(ix, env))
             }
             _ => None,
@@ -699,7 +699,7 @@ impl<'a> Run<'a> {
                 }
                 row
             }
-            Node::DistinctScan(_, width) => {
+            Node::DistinctScan(_, width, _) => {
                 // One entry per distinct value of the leading `width` fields.
                 let scan = self.scan.as_mut()?;
                 loop {

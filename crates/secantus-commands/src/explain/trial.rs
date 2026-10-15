@@ -69,7 +69,7 @@ impl<'a> Stage<'a> {
             _ => return None,
         };
         let scan = match node {
-            Node::IxScan(ix) | Node::DistinctScan(ix, _) => {
+            Node::IxScan(ix) | Node::DistinctScan(ix, _, _) => {
                 let all = cache
                     .entry((ix.index.name.clone(), ix.backward))
                     .or_insert_with(|| entries(&ix.index, ix.backward, env));
@@ -143,7 +143,7 @@ impl<'a> Stage<'a> {
                 Some(scan) => scan.work(env),
                 None => Work::Eof,
             },
-            Node::DistinctScan(_, width) => {
+            Node::DistinctScan(_, width, _) => {
                 let (Some(scan), prefixes) = (self.scan.as_mut(), &mut self.prefixes) else {
                     return Work::Eof;
                 };

@@ -844,3 +844,127 @@ fn a_multikey_field_is_tried_once_per_predicate() {
         assert_eq!(all[3].matches("IXSCAN t_1").count(), 3, "{all:?}");
     });
 }
+
+/// An aggregate's explain as mongod 8.2.11 prints it: the projection the
+/// later stages need on the cursor, a `$group` answered by a DISTINCT_SCAN,
+/// stages as mongod parses them, and counts under a `$limit`.
+#[test]
+fn an_aggregate_is_explained_as_mongod_runs_it() {
+    with_wt(|c| {
+        seed(c);
+        let agg = |c: &mut CommandContext, pipeline: Vec<Document>, verbosity: &str| {
+            explain(
+                c,
+                doc! { "aggregate": "c", "pipeline": pipeline, "cursor": {} },
+                verbosity,
+            )
+        };
+        let stages = |reply: &Document| -> Vec<Document> {
+            reply
+                .get_array("stages")
+                .unwrap_or_else(|_| panic!("no stages: {reply}"))
+                .iter()
+                .map(|s| s.as_document().unwrap().clone())
+                .collect()
+        };
+        let cursor_plan = |reply: &Document| -> Document {
+            stages(reply)[0]
+                .get_document("$cursor")
+                .unwrap()
+                .get_document("queryPlanner")
+                .unwrap()
+                .get_document("winningPlan")
+                .unwrap()
+                .clone()
+        };
+
+        // The fields the stages read, projected on the cursor.
+        let reply = agg(
+            c,
+            vec![doc! { "$replaceRoot": { "newRoot": "$n" } }],
+            "queryPlanner",
+        );
+        let plan = cursor_plan(&reply);
+        assert_eq!(plan.get_str("stage"), Ok("PROJECTION_SIMPLE"), "{plan}");
+        assert_eq!(
+            plan.get_document("transformBy").unwrap(),
+            &doc! { "n": 1, "_id": 0 }
+        );
+
+        // A `$group` on an indexed field reads one key per value.
+        let reply = agg(c, vec![doc! { "$group": { "_id": "$a" } }], "queryPlanner");
+        assert!(
+            text(&cursor_plan(&reply)).starts_with("PROJECTION_COVERED <- DISTINCT_SCAN a_1"),
+            "{reply}"
+        );
+        assert_eq!(
+            stages(&reply)[1],
+            doc! { "$groupByDistinctScan": { "newRoot": { "_id": "$a" } } }
+        );
+
+        // `$count` is listed as the `$group` and `$project` it becomes.
+        let reply = agg(
+            c,
+            vec![doc! { "$unwind": "$t" }, doc! { "$count": "k" }],
+            "queryPlanner",
+        );
+        let listed = stages(&reply);
+        assert_eq!(
+            listed[2],
+            doc! { "$group": {
+                "_id": { "$const": Bson::Null },
+                "k": { "$sum": { "$const": 1 } },
+                "$willBeMerged": false,
+            } }
+        );
+        assert_eq!(listed[3], doc! { "$project": { "k": true, "_id": false } });
+
+        // A `$match` behind an `$unwind` it does not read goes ahead of it.
+        let reply = agg(
+            c,
+            vec![doc! { "$unwind": "$t" }, doc! { "$match": { "a": 2 } }],
+            "queryPlanner",
+        );
+        let cursor = stages(&reply)[0].get_document("$cursor").unwrap().clone();
+        assert_eq!(
+            cursor
+                .get_document("queryPlanner")
+                .unwrap()
+                .get_document("parsedQuery")
+                .unwrap(),
+            &doc! { "a": { "$eq": 2 } }
+        );
+        assert_eq!(stages(&reply).len(), 2);
+
+        // Under a `$limit`, the cursor and the `$unwind` hand over only
+        // what it pulls.
+        let reply = agg(
+            c,
+            vec![
+                doc! { "$match": { "a": 2 } },
+                doc! { "$unwind": "$t" },
+                doc! { "$limit": 3 },
+            ],
+            "executionStats",
+        );
+        let counts: Vec<i64> = stages(&reply)
+            .iter()
+            .map(|s| s.get_i64("nReturned").unwrap())
+            .collect();
+        assert_eq!(counts, [2, 3, 3]);
+
+        // A projection that keeps the sort's field runs below the sort.
+        let reply = agg(
+            c,
+            vec![
+                doc! { "$sort": { "x": 1 } },
+                doc! { "$project": { "x": 1 } },
+            ],
+            "queryPlanner",
+        );
+        assert!(
+            winning(&reply).starts_with("SORT <- PROJECTION_SIMPLE <- COLLSCAN"),
+            "{reply}"
+        );
+    });
+}

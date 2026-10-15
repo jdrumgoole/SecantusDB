@@ -286,43 +286,6 @@ pub(crate) fn find_and_modify(coll: &str, inner: &Document) -> Result<Shape, Com
     Ok(s)
 }
 
-/// A `$project` that only includes or only excludes plain fields, in the
-/// form mongod prints: booleans, with `_id` stated.
-fn simple_projection(spec: &Document) -> Option<Document> {
-    let mut include: Option<bool> = None;
-    let mut id: Option<bool> = None;
-    let mut out = Document::new();
-    for (field, value) in spec {
-        let on = match value {
-            Bson::Boolean(b) => *b,
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => crate::util::truthy(value),
-            _ => return None,
-        };
-        if field.contains('.') || field.starts_with('$') {
-            return None;
-        }
-        if field == "_id" {
-            id = Some(on);
-            continue;
-        }
-        if include.is_some_and(|i| i != on) {
-            return None;
-        }
-        include = Some(on);
-        out.insert(field.clone(), on);
-    }
-    let include = include?;
-    let id = id.unwrap_or(true);
-    if include && id {
-        // An implied `_id` leads; a stated one keeps its place at the end.
-        let mut with_id = doc! { "_id": true };
-        with_id.extend(out);
-        return Some(with_id);
-    }
-    out.insert("_id", id);
-    Some(out)
-}
-
 /// The leading stages of a pipeline the query planner absorbs, folded into
 /// `shape`; the stages it leaves are kept in `shape.rest`.
 pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
@@ -364,14 +327,25 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
                 let Some(n) = as_i64(n) else { break };
                 limit = Some(limit.map_or(n, |l| l.min(n)));
             }
-            ("$project", Bson::Document(p)) if i + 1 == pipeline.len() => {
-                let Some(simple) = simple_projection(p) else {
+            // The last stage's projection, as mongod prints it. One that
+            // computes or reaches into a document is left to the pipeline
+            // behind a sort (measured 8.2.11).
+            ("$project" | "$unset", _) if i + 1 == pipeline.len() => {
+                let listed = listed_stage(stage, "");
+                let Some(p) = listed
+                    .first()
+                    .filter(|_| listed.len() == 1)
+                    .and_then(|d| d.get_document("$project").ok())
+                else {
                     break;
                 };
-                shape.projection = Some(simple);
-            }
-            ("$unset", Bson::String(field)) if i + 1 == pipeline.len() && !field.contains('.') => {
-                shape.projection = Some(doc! { field.clone(): false, "_id": true });
+                let general = p
+                    .iter()
+                    .any(|(k, v)| k.contains('.') || !matches!(v, Bson::Boolean(_)));
+                if general && shape.sort.is_some() {
+                    break;
+                }
+                shape.projection = Some(p.clone());
             }
             _ => break,
         }
@@ -384,6 +358,10 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
         _ => doc! { "$and": filters.into_iter().map(Bson::Document).collect::<Vec<_>>() },
     };
     shape.rest = pipeline[taken..].to_vec();
+    // The fields the stages left over read, projected in the query.
+    if shape.projection.is_none() && !shape.rest.is_empty() {
+        shape.projection = super::deps::projection(&shape.rest);
+    }
     shape.optimized_pipeline = shape.rest.is_empty();
     shape.pipeline = true;
 }
@@ -391,13 +369,25 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
 /// An expression as mongod prints it back: every literal wrapped in `$const`.
 fn constified(v: &Bson) -> Bson {
     match v {
+        Bson::Document(d) if d.len() == 1 && d.contains_key("$literal") => {
+            Bson::Document(doc! { "$const": d.get("$literal").cloned().unwrap_or(Bson::Null) })
+        }
         Bson::String(s) if s.starts_with('$') => v.clone(),
         Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => Bson::Document(
             d.iter()
                 .map(|(op, arg)| {
                     let arg = match arg {
                         Bson::Array(items) => Bson::Array(items.iter().map(constified).collect()),
-                        other => constified(other),
+                        // `$cond`'s object form prints as its argument list.
+                        Bson::Document(form) if op == "$cond" => Bson::Array(
+                            ["if", "then", "else"]
+                                .iter()
+                                .map(|k| constified(form.get(*k).unwrap_or(&Bson::Null)))
+                                .collect(),
+                        ),
+                        // A lone argument prints as a list of one.
+                        Bson::Document(_) => constified(arg),
+                        other => Bson::Array(vec![constified(other)]),
                     };
                     (op.clone(), arg)
                 })
@@ -410,30 +400,122 @@ fn constified(v: &Bson) -> Bson {
     }
 }
 
-/// A stage the planner left in the pipeline, as `explain` lists it.
-pub(crate) fn listed_stage(stage: &Document, db: &str) -> Document {
+/// A stage the planner left in the pipeline, as `explain` lists it: the
+/// stages mongod parses it into, each printed as mongod prints it back
+/// (measured 8.2.11).
+pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
     let Some((name, arg)) = stage.iter().next() else {
-        return stage.clone();
+        return vec![stage.clone()];
     };
     let wide = |v: &Bson| as_i64(v).map_or_else(|| v.clone(), Bson::Int64);
+    let one = |d: Document| vec![d];
+    let count_of = |field: &str| {
+        doc! { field: { "$sum": { "$const": 1 } } }
+    };
     match (name.as_str(), arg) {
-        ("$unwind", Bson::String(path)) => doc! { "$unwind": { "path": path.clone() } },
-        ("$sort", Bson::Document(spec)) => doc! { "$sort": { "sortKey": spec.clone() } },
-        ("$out", Bson::String(coll)) => doc! { "$out": { "coll": coll.clone(), "db": db } },
-        ("$limit" | "$skip", n) => doc! { name.clone(): wide(n) },
+        ("$unwind", Bson::String(path)) => one(doc! { "$unwind": { "path": path.clone() } }),
+        ("$sort", Bson::Document(spec)) => one(doc! { "$sort": { "sortKey": spec.clone() } }),
+        ("$out", Bson::String(coll)) => one(doc! { "$out": { "coll": coll.clone(), "db": db } }),
+        ("$limit" | "$skip", n) => one(doc! { name.clone(): wide(n) }),
         ("$sample", Bson::Document(spec)) => {
             let mut out = spec.clone();
             if let Some(size) = spec.get("size") {
                 out.insert("size", wide(size));
             }
-            doc! { "$sample": out }
+            one(doc! { "$sample": out })
+        }
+        ("$match", Bson::Document(filter)) => {
+            one(doc! { "$match": super::parsed::parsed_query(filter) })
         }
         ("$addFields" | "$set", Bson::Document(fields)) => {
-            let listed: Document = fields
-                .iter()
-                .map(|(k, v)| (k.clone(), constified(v)))
-                .collect();
-            doc! { "$addFields": listed }
+            one(doc! { name.clone(): nested_fields(fields, &constified) })
+        }
+        ("$project", Bson::Document(spec)) => match listed_projection(spec) {
+            Some(p) => one(doc! { "$project": p }),
+            None => one(stage.clone()),
+        },
+        ("$unset", spec) => {
+            let names: Vec<String> = match spec {
+                Bson::String(f) => vec![f.clone()],
+                Bson::Array(items) => items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect(),
+                _ => return one(stage.clone()),
+            };
+            let mut out = Document::new();
+            for n in names {
+                out.insert(n, false);
+            }
+            out.insert("_id", true);
+            one(doc! { "$project": out })
+        }
+        // A collection-less source, as the stages mongod turns it into.
+        ("$documents", docs) => vec![
+            doc! { "$queue": [{}] },
+            doc! { "$project": { "_id": true, "_tempDocumentsField": constified(docs) } },
+            doc! { "$unwind": { "path": "$_tempDocumentsField" } },
+            doc! { "$replaceRoot": { "newRoot": "$_tempDocumentsField" } },
+        ],
+        ("$replaceWith", root) => one(doc! { "$replaceRoot": { "newRoot": constified(root) } }),
+        ("$replaceRoot", Bson::Document(spec)) => match spec.get("newRoot") {
+            Some(root) => one(doc! { "$replaceRoot": { "newRoot": constified(root) } }),
+            None => one(stage.clone()),
+        },
+        ("$group", Bson::Document(spec)) => match listed_group(spec) {
+            Some(g) => one(doc! { "$group": g }),
+            None => one(stage.clone()),
+        },
+        ("$count", Bson::String(field)) => {
+            let mut group = doc! { "_id": { "$const": Bson::Null } };
+            group.extend(count_of(field));
+            group.insert("$willBeMerged", false);
+            vec![
+                doc! { "$group": group },
+                doc! { "$project": { field.clone(): true, "_id": false } },
+            ]
+        }
+        ("$sortByCount", by) => {
+            let mut group = doc! { "_id": constified(by) };
+            group.extend(count_of("count"));
+            group.insert("$willBeMerged", false);
+            vec![
+                doc! { "$group": group },
+                doc! { "$sort": { "sortKey": { "count": -1 } } },
+            ]
+        }
+        ("$bucket", Bson::Document(spec)) => match listed_bucket(spec) {
+            Some(group) => vec![
+                doc! { "$group": group },
+                doc! { "$sort": { "sortKey": { "_id": 1 } } },
+            ],
+            None => one(stage.clone()),
+        },
+        ("$facet", Bson::Document(facets)) => {
+            let mut out = Document::new();
+            for (field, sub) in facets {
+                let Bson::Array(stages) = sub else {
+                    return one(stage.clone());
+                };
+                let mut listed = vec![Bson::Document(doc! { "$internalFacetTeeConsumer": {} })];
+                for s in stages.iter().filter_map(Bson::as_document) {
+                    listed.extend(listed_stage(s, db).into_iter().map(Bson::Document));
+                }
+                out.insert(field.clone(), listed);
+            }
+            one(doc! { "$facet": out })
+        }
+        ("$lookup", Bson::Document(spec))
+            if spec.contains_key("pipeline") && !spec.contains_key("let") =>
+        {
+            let mut out = Document::new();
+            for (k, v) in spec {
+                if k == "pipeline" {
+                    out.insert("let", Document::new());
+                }
+                out.insert(k.clone(), v.clone());
+            }
+            one(doc! { "$lookup": out })
         }
         ("$merge", into) => {
             let spec = match into {
@@ -446,16 +528,178 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Document {
                 _ => Document::new(),
             };
             let pick = |field: &str, default: Bson| spec.get(field).cloned().unwrap_or(default);
-            doc! { "$merge": {
+            one(doc! { "$merge": {
                 "into": target,
                 "on": pick("on", Bson::String("_id".into())),
                 "whenMatched": pick("whenMatched", Bson::String("merge".into())),
                 "whenNotMatched": pick("whenNotMatched", Bson::String("insert".into())),
                 "allowMergeOnNullishValues": true,
-            } }
+            } })
         }
-        _ => stage.clone(),
+        _ => one(stage.clone()),
     }
+}
+
+/// Fields whose dotted names mongod prints as nested documents, each value
+/// passed through `value`.
+fn nested_fields(fields: &Document, value: &dyn Fn(&Bson) -> Bson) -> Document {
+    let mut out = Document::new();
+    for (k, v) in fields {
+        let mut parts: Vec<&str> = k.split('.').collect();
+        let last = parts.pop().unwrap_or_default();
+        let mut at = &mut out;
+        for p in parts {
+            if !matches!(at.get(p), Some(Bson::Document(_))) {
+                at.insert(p, Document::new());
+            }
+            at = match at.get_mut(p) {
+                Some(Bson::Document(d)) => d,
+                _ => return fields.clone(),
+            };
+        }
+        at.insert(last, value(v));
+    }
+    out
+}
+
+/// A `$project` as mongod prints it back: an inclusion leads with `_id:
+/// true` (or ends with `_id: false`), plain fields before nested ones and
+/// expressions; an exclusion lists its fields, then `_id: true` (or leads
+/// with `_id: false`). `None`: a shape this does not print.
+fn listed_projection(spec: &Document) -> Option<Document> {
+    let on = |v: &Bson| match v {
+        Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+            Some(crate::util::truthy(v))
+        }
+        _ => None,
+    };
+    let id = spec.get("_id");
+    let id_on = id.map(on);
+    let rest: Vec<(&String, &Bson)> = spec.iter().filter(|(k, _)| *k != "_id").collect();
+    let exclusion = !rest.is_empty() && rest.iter().all(|(_, v)| on(v) == Some(false));
+    let nested = |plain: &[(&String, &Bson)], value: &dyn Fn(&Bson) -> Bson| {
+        let d: Document = plain
+            .iter()
+            .map(|(k, v)| ((*k).clone(), (*v).clone()))
+            .collect();
+        nested_fields(&d, value)
+    };
+    let mut out = Document::new();
+    if exclusion || (rest.is_empty() && id_on == Some(Some(false))) {
+        if id_on == Some(Some(false)) {
+            out.insert("_id", false);
+        }
+        out.extend(nested(&rest, &|_| Bson::Boolean(false)));
+        if id_on != Some(Some(false)) {
+            out.insert("_id", true);
+        }
+        return Some(out);
+    }
+    if rest.iter().any(|(_, v)| on(v) == Some(false)) {
+        return None;
+    }
+    let plain: Vec<(&String, &Bson)> = rest
+        .iter()
+        .filter(|(k, v)| on(v) == Some(true) && !k.contains('.'))
+        .copied()
+        .collect();
+    // A computed `_id` is printed among the other expressions.
+    let others: Vec<(&String, &Bson)> = spec
+        .iter()
+        .filter(|(k, v)| {
+            if *k == "_id" {
+                on(v).is_none()
+            } else {
+                !(on(v) == Some(true) && !k.contains('.'))
+            }
+        })
+        .collect();
+    let value = |v: &Bson| match on(v) {
+        Some(b) => Bson::Boolean(b),
+        None => match v {
+            Bson::Document(d) if !d.keys().any(|k| k.starts_with('$')) => {
+                Bson::Document(listed_projection(d).map_or_else(
+                    || d.clone(),
+                    |mut p| {
+                        p.remove("_id");
+                        p
+                    },
+                ))
+            }
+            other => constified(other),
+        },
+    };
+    let keep_id = id_on != Some(Some(false));
+    let computed_id = id.is_some_and(|v| on(v).is_none());
+    if keep_id && !computed_id {
+        out.insert("_id", true);
+    }
+    out.extend(nested(&plain, &value));
+    out.extend(nested(&others, &value));
+    if !keep_id {
+        out.insert("_id", false);
+    }
+    Some(out)
+}
+
+/// A `$group` as mongod prints it back: literals as `$const`, `$count` as a
+/// sum of ones, and `$willBeMerged`.
+fn listed_group(spec: &Document) -> Option<Document> {
+    let mut out = Document::new();
+    for (k, v) in spec {
+        if k == "_id" {
+            out.insert("_id", constified(v));
+            continue;
+        }
+        let acc = v.as_document()?;
+        let (op, arg) = acc.iter().next()?;
+        let listed = if op == "$count" {
+            doc! { "$sum": { "$const": 1 } }
+        } else {
+            doc! { op.clone(): constified(arg) }
+        };
+        out.insert(k.clone(), listed);
+    }
+    out.insert("$willBeMerged", false);
+    Some(out)
+}
+
+/// A `$bucket` as the `$group` mongod turns it into: a `$switch` over the
+/// boundaries.
+fn listed_bucket(spec: &Document) -> Option<Document> {
+    let by = constified(spec.get("groupBy")?);
+    let bounds = spec.get_array("boundaries").ok()?;
+    let branches: Vec<Bson> = bounds
+        .windows(2)
+        .map(|pair| {
+            Bson::Document(doc! {
+                "case": { "$and": [
+                    { "$gte": [by.clone(), { "$const": pair[0].clone() }] },
+                    { "$lt": [by.clone(), { "$const": pair[1].clone() }] },
+                ] },
+                "then": { "$const": pair[0].clone() },
+            })
+        })
+        .collect();
+    let mut switch = doc! { "branches": branches };
+    if let Some(d) = spec.get("default") {
+        switch.insert("default", doc! { "$const": d.clone() });
+    }
+    let mut group = doc! { "_id": { "$switch": switch } };
+    match spec.get_document("output") {
+        Ok(output) => {
+            for (k, v) in output {
+                let acc = v.as_document()?;
+                let (op, arg) = acc.iter().next()?;
+                group.insert(k.clone(), doc! { op.clone(): constified(arg) });
+            }
+        }
+        Err(_) => {
+            group.insert("count", doc! { "$sum": { "$const": 1 } });
+        }
+    }
+    group.insert("$willBeMerged", false);
+    Some(group)
 }
 
 /// Whether a stage reads something other than the collection's documents,

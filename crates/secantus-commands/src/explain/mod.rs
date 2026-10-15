@@ -16,6 +16,7 @@
 //! on one field is tried once here, where mongod tries a plan per predicate.
 
 mod bounds;
+mod deps;
 mod exec;
 pub(crate) mod geo;
 pub(crate) mod hoist;
@@ -262,6 +263,7 @@ pub(crate) fn plans_table_scan(
         batch_size: false,
         keys_only: false,
         wanted: None,
+        pipeline: false,
         implies: &implies,
         trial: None,
     };
@@ -482,6 +484,7 @@ fn plan_for(
         batch_size: s.batch_size,
         keys_only: false,
         wanted: None,
+        pipeline: s.pipeline,
         implies: &implies,
         trial: Some(&trial),
     };
@@ -538,6 +541,122 @@ fn query_planner(
     out.insert("winningPlan", winning);
     out.insert("rejectedPlans", Bson::Array(vec![]));
     out
+}
+
+/// A `$group` mongod answers from a DISTINCT_SCAN (`$groupByDistinctScan`,
+/// measured 8.2.11): its `_id` one field path (or a document of one), its
+/// accumulators `$first` / `$last` of field paths, after no sort or a sort
+/// on that field alone, over an index that serves `distinct` on the field.
+/// The scan fetches the documents when an accumulator reads another field.
+/// `None`: not such a `$group`, or no index serves it.
+fn distinct_group(
+    s: &Shape,
+    canonical: &Document,
+    collation: Option<&Collation>,
+    t: &Target,
+    ctx: &CommandContext,
+) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
+    let path = |v: &Bson| match v {
+        Bson::String(p) if p.starts_with('$') && !p.starts_with("$$") => Some(p[1..].to_string()),
+        _ => None,
+    };
+    if s.kind != Kind::Find || !s.pipeline || s.skip != 0 || s.limit != 0 {
+        return Ok(None);
+    }
+    let Some(Ok(spec)) = s.rest.first().map(|st| st.get_document("$group")) else {
+        return Ok(None);
+    };
+    let Some(id) = spec.get("_id") else {
+        return Ok(None);
+    };
+    let field = match id {
+        Bson::Document(d) if d.len() == 1 => d.values().next().and_then(path),
+        other => path(other),
+    };
+    let Some(field) = field else {
+        return Ok(None);
+    };
+    let mut root = doc! { "_id": id.clone() };
+    let mut fetching = false;
+    for (name, acc) in spec.iter().filter(|(k, _)| *k != "_id") {
+        let Some((op, arg)) = acc.as_document().and_then(|d| d.iter().next()) else {
+            return Ok(None);
+        };
+        let Some(read) = path(arg).filter(|_| op == "$first" || op == "$last") else {
+            return Ok(None);
+        };
+        fetching |= read != field;
+        root.insert(name.clone(), arg.clone());
+    }
+    let backward = match &s.sort {
+        None => false,
+        Some(sort) => match (sort.len(), sort.get(&field).and_then(as_i64)) {
+            (1, Some(dir)) => dir < 0,
+            _ => return Ok(None),
+        },
+    };
+    let mut asked = s.clone();
+    asked.kind = Kind::Distinct(field.clone());
+    asked.sort = None;
+    asked.projection = None;
+    let (node, ranked) = plan_for(&asked, canonical, collation, t, ctx)?;
+    let Node::Projection { input, .. } = node else {
+        return Ok(None);
+    };
+    let Node::DistinctScan(mut ix, width, _) = *input else {
+        return Ok(None);
+    };
+    ix.backward = backward;
+    let scan = Node::DistinctScan(ix, width, fetching);
+    let plan = if fetching {
+        scan
+    } else {
+        Node::Projection {
+            name: if field.contains('.') {
+                "PROJECTION_DEFAULT"
+            } else {
+                "PROJECTION_COVERED"
+            },
+            spec: doc! { field.clone(): 1_i32, "_id": 0_i32 },
+            input: Box::new(scan),
+        }
+    };
+    // The other plans tried read through the projection of the fields the
+    // `$group` needs.
+    let ranked: Vec<plan::Ranked> = ranked
+        .into_iter()
+        .map(|mut r| {
+            if !matches!(r.plan, Node::Projection { .. }) {
+                if let Some(p) = &s.projection {
+                    r.plan = Node::Projection {
+                        name: "PROJECTION_SIMPLE",
+                        spec: p.clone(),
+                        input: Box::new(r.plan),
+                    };
+                    r.stats = Stats {
+                        n_returned: r.stats.n_returned,
+                        children: vec![r.stats],
+                        ..Stats::default()
+                    };
+                }
+            }
+            r
+        })
+        .collect();
+    let mut ranked: Vec<plan::Ranked> = ranked;
+    if let Some(winner) = ranked.first_mut() {
+        winner.plan = plan.clone();
+        if fetching {
+            if let Some(scan) = winner.stats.children.first().cloned() {
+                winner.stats = scan;
+            }
+        }
+    }
+    let mut shape = s.clone();
+    shape.sort = None;
+    shape.projection = None;
+    shape.rest[0] = doc! { "$groupByDistinctScan": { "newRoot": root } };
+    Ok(Some((shape, plan, ranked)))
 }
 
 /// Raise each counter of `run` to what `trial` counted in the same stage.
@@ -695,6 +814,91 @@ fn count_through(
     cursor.get_array("firstBatch").map_or(0, |b| b.len() as i64)
 }
 
+/// Whether a stage hands each document on as it reads it.
+fn streams(stage: &Document) -> bool {
+    matches!(
+        stage.keys().next().map(String::as_str),
+        Some(
+            "$match"
+                | "$unwind"
+                | "$project"
+                | "$addFields"
+                | "$set"
+                | "$unset"
+                | "$replaceRoot"
+                | "$replaceWith"
+        )
+    )
+}
+
+/// mongod's per-stage counts in front of a `$limit` (measured 8.2.11): a
+/// stage that streams hands over only what the stage after it pulled, so
+/// `[$match, $unwind: "$t", $limit: 3]` returns 2 documents from the
+/// cursor and 3 from the `$unwind`. Rewrites `counts` (the stages after the
+/// cursor) and returns what the cursor handed over, when it streams into
+/// the limit.
+fn pulled_counts(
+    ctx: &mut CommandContext,
+    coll: &str,
+    pipeline: &[Document],
+    taken: usize,
+    options: &Document,
+    counts: &mut [i64],
+) -> Option<i64> {
+    let rest = &pipeline[taken..];
+    let at = rest.iter().position(|st| st.contains_key("$limit"))?;
+    let limit = rest[at].get("$limit").and_then(as_i64)?;
+    // The run of streaming stages that feeds the limit, after the last that
+    // does not stream (or after the cursor).
+    let from = rest[..at]
+        .iter()
+        .rposition(|st| !streams(st))
+        .map_or(0, |b| b + 1);
+    let full_before = |ctx: &mut CommandContext, j: usize, counts: &[i64]| -> i64 {
+        if j == 0 {
+            count_through(ctx, coll, &pipeline[..taken], options)
+        } else {
+            counts[j - 1]
+        }
+    };
+    let mut demand = limit;
+    for j in (from..at).rev() {
+        let before = full_before(ctx, j, counts);
+        // Asked for no fewer than it has: it reads everything, to the end.
+        if demand >= counts[j] {
+            demand = before;
+            continue;
+        }
+        counts[j] = demand;
+        let wanted = demand;
+        // The fewest documents stage `j` reads to hand over `wanted`.
+        let (mut lo, mut hi) = (0_i64, before);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let mut probe: Vec<Document> = pipeline[..taken + j].to_vec();
+            probe.push(doc! { "$limit": Bson::Int64(mid.max(1)) });
+            probe.push(rest[j].clone());
+            let got = if mid == 0 {
+                0
+            } else {
+                count_through(ctx, coll, &probe, options)
+            };
+            if got >= wanted {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        demand = lo;
+    }
+    if from == 0 {
+        Some(demand)
+    } else {
+        counts[from - 1] = counts[from - 1].min(demand);
+        None
+    }
+}
+
 /// One explained command, ready to plan.
 struct Request {
     shape: Shape,
@@ -711,18 +915,40 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let wanted = verbosity != Verbosity::QueryPlanner;
     // What each stage after the cursor returns: the pipeline run that far.
     let taken = r.pipeline.len() - s.rest.len();
-    let stage_counts: Vec<i64> = if wanted {
+    let mut stage_counts: Vec<i64> = if wanted {
         (0..s.rest.len())
             .map(|i| count_through(ctx, &s.coll, &r.pipeline[..taken + i + 1], &s.options))
             .collect()
     } else {
         vec![]
     };
+    // Under a `$limit`, the stages that stream into it hand over only what
+    // it pulls; `None`: the cursor's own count stands.
+    let cursor_pulled = if wanted {
+        pulled_counts(
+            ctx,
+            &s.coll,
+            &r.pipeline,
+            taken,
+            &s.options,
+            &mut stage_counts,
+        )
+    } else {
+        None
+    };
     let storage = ctx.storage()?;
     let collation = crate::util::effective_collation(storage, &db, &s.coll, &s.options)?;
     let canonical = parsed::parsed_query(&s.filter);
     let t = target(ctx, &s.coll)?;
-    let (plan, ranked) = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
+    let grouped = distinct_group(s, &canonical, collation.as_ref(), &t, ctx)?;
+    let regrouped;
+    let (s, (plan, ranked)) = match grouped {
+        Some((shape, plan, ranked)) => {
+            regrouped = shape;
+            (&regrouped, (plan, ranked))
+        }
+        None => (s, plan_for(s, &canonical, collation.as_ref(), &t, ctx)?),
+    };
     if crate::notablescan::enabled(ctx) {
         let why = resolve_hint(s.hint.as_ref(), &t.catalog)
             .ok()
@@ -797,15 +1023,16 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         };
         let mut first = doc! { "$cursor": cursor };
         if let Some(st) = &stats {
-            counted(&mut first, st.n_returned);
+            counted(&mut first, cursor_pulled.unwrap_or(st.n_returned));
         }
         let mut stages = vec![Bson::Document(first)];
         for (i, stage) in s.rest.iter().enumerate() {
-            let mut listed = shape::listed_stage(stage, &db);
-            if let Some(n) = stage_counts.get(i) {
-                counted(&mut listed, *n);
+            for mut listed in shape::listed_stage(stage, &db) {
+                if let Some(n) = stage_counts.get(i) {
+                    counted(&mut listed, *n);
+                }
+                stages.push(Bson::Document(listed));
             }
-            stages.push(Bson::Document(listed));
         }
         reply.insert("stages", stages);
         reply.insert("serverInfo", server_info(ctx));
@@ -870,8 +1097,15 @@ fn through_view(
     let mut shape = shape::find(&base, &doc! { "find": base.clone() })?;
     shape.hint = s.hint.clone();
     shape.options = s.options.clone();
-    shape::absorb(&mut shape, &pipeline);
     let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let pipeline: Vec<Document> = hoist::hoist_matches(&stages)
+        .into_iter()
+        .filter_map(|b| match b {
+            Bson::Document(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    shape::absorb(&mut shape, &pipeline);
     let mut echo = doc! {
         "aggregate": base,
         "pipeline": stages,
@@ -1141,7 +1375,8 @@ fn aggregate(
         // No collection is read through a query: the stages, as mongod lists them.
         let stages: Vec<Bson> = pipeline
             .iter()
-            .map(|s| Bson::Document(shape::listed_stage(s, &db)))
+            .flat_map(|s| shape::listed_stage(s, &db))
+            .map(Bson::Document)
             .collect();
         let mut reply = doc! { "explainVersion": "1", "stages": stages };
         reply.insert("serverInfo", server_info(ctx));
@@ -1159,6 +1394,16 @@ fn aggregate(
     let request = if crate::views::is_view(storage, &db, &coll) {
         through_view(&s, pipeline, false, ctx)?
     } else {
+        // The pipeline as mongod reorders it, which the per-stage counts
+        // run a prefix of.
+        let staged: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+        let pipeline: Vec<Document> = hoist::hoist_matches(&staged)
+            .into_iter()
+            .filter_map(|b| match b {
+                Bson::Document(d) => Some(d),
+                _ => None,
+            })
+            .collect();
         shape::absorb(&mut s, &pipeline);
         Request {
             shape: s,
