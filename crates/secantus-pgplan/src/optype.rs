@@ -687,6 +687,66 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // `tid || x` is `anynonarray || text`: the other side must be a string
+    // (or untyped). `tid || integer` has no operator.
+    if kind == Some(K::AexprOp) && op == "||" {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let other = if l == "tid" {
+                Some(&r)
+            } else if r == "tid" {
+                Some(&l)
+            } else {
+                None
+            };
+            if other.is_some_and(|t| t != "unknown" && category(t) != Some("string")) {
+                return Err(mismatch(&op, &l, &r, e.location));
+            }
+        }
+    }
+    // `tid` has the six comparisons against another tid and nothing else
+    // (`pg_operator`): `tid = integer` and `tid + 1` are 42883, where
+    // comparing or adding the numbers a tid is carried as answered.
+    if kind == Some(K::AexprOp) && op != "||" {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+        let tid = |t: &Option<String>| t.as_deref() == Some("tid");
+        if tid(&l) || tid(&r) {
+            let comparison = matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=");
+            // Beside a tid an untyped literal is a tid for a comparison and
+            // has no operator to resolve to otherwise (`tid + '1'`).
+            let untyped = |n: Option<&pg_query::protobuf::Node>| {
+                matches!(n.and_then(|n| n.node.as_ref()), Some(N::AConst(c))
+                    if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+            };
+            let (l, r) = if comparison {
+                (l, r)
+            } else {
+                let fill =
+                    |t: Option<String>, n| t.or_else(|| untyped(n).then(|| "unknown".to_string()));
+                (fill(l, e.lexpr.as_deref()), fill(r, e.rexpr.as_deref()))
+            };
+            let typed = |t: &Option<String>| {
+                t.as_deref().is_some_and(|t| t != "unknown") || !comparison && t.is_some()
+            };
+            match (e.lexpr.is_some(), &l, &r) {
+                (false, _, Some(r)) => {
+                    set_error_location(e.location);
+                    return Err(Error::UndefinedFunction(format!(
+                        "operator does not exist: {op} {}",
+                        display_type(r)
+                    )));
+                }
+                (true, Some(lt), Some(rt))
+                    if typed(&l) && typed(&r) && (!comparison || lt != rt) =>
+                {
+                    let op = if op == "!=" { "<>" } else { op.as_str() };
+                    return Err(mismatch(op, lt, rt, e.location));
+                }
+                _ => {}
+            }
+        }
+    }
     // A prefix `-` / `+` exists for the numbers and `interval` only:
     // `- text` is 42883, where the lowering answered it as `0 - text`.
     if kind == Some(K::AexprOp) && e.lexpr.is_none() && matches!(op.as_str(), "+" | "-") {

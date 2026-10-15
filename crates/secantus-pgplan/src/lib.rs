@@ -20,6 +20,7 @@ mod filter_sublink;
 mod like_match;
 pub mod schemas;
 pub mod systypes;
+pub mod tid;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -13021,8 +13022,12 @@ fn plan_table_targets(
                     (scalar::is_scalar(n) && scalar::has_static_result_type(n))
                         || n == "regexp_replace"
                 }) && single_column_call(f, params).is_some_and(|(col, _)| {
-                    def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
-                }) && !(func_name(f).as_deref() == Some("to_char")
+                    // A tid column (or argument) is a number to this path,
+                    // which would print it as one; the general path types it.
+                    def.column(&col)
+                        .is_none_or(|c| !matches!(c.pg_type.as_str(), "bpchar" | "tid"))
+                }) && !f.args.iter().any(|a| static_type(a, &Bson::Null) == "tid")
+                    && !(func_name(f).as_deref() == Some("to_char")
                     && single_column_call(f, params).is_some_and(|(c, _)| {
                         def.column(&c)
                             .is_some_and(|col| datetime::is_datetime(&col.pg_type))
@@ -21871,7 +21876,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::CaseExpr(c)) => common_type(&case_results(c)),
         Some(N::MinMaxExpr(m)) => {
             let common = common_type(&m.args.iter().collect::<Vec<_>>());
-            if wider_datetime(&common, &common).is_some() {
+            if wider_datetime(&common, &common).is_some() || common == "tid" {
                 common
             } else {
                 inferred_type(value).to_string()
@@ -22456,6 +22461,10 @@ fn to_common_type(v: Bson, ty: &str) -> Result<Bson> {
     // A date (its text) meeting a timestamp: the date's midnight.
     if matches!(ty, "timestamp" | "timestamptz") && matches!(v, Bson::String(_)) {
         return cast_value(v, ty);
+    }
+    // An untyped literal meeting a tid is a tid (`greatest(t, '(1,2)')`).
+    if ty == "tid" && matches!(v, Bson::String(_)) {
+        return tid::cast_tid(&v);
     }
     if v == Bson::Null || !matches!(ty, "int8" | "numeric" | "float4" | "float8") {
         return Ok(v);
@@ -24519,7 +24528,9 @@ pub fn record_names(v: &Bson) -> Option<Vec<String>> {
 /// A record's PostgreSQL text: `(f1,f2,...)`. A NULL field is empty; a field is
 /// double-quoted (with `"`->`""` and `\`->`\\`) when it is empty or contains
 /// a comma, parenthesis, quote, backslash or whitespace.
-pub(crate) fn record_text(fields: &[Bson]) -> String {
+/// `types` are the fields' static types where the record carries them
+/// (a `ROW(...)`): a tid, stored as a number, prints as `(b,o)`.
+pub(crate) fn record_text(fields: &[Bson], types: &[String]) -> String {
     let mut out = String::from("(");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -24532,6 +24543,7 @@ pub(crate) fn record_text(fields: &[Bson]) -> String {
         // cast: a bool prints `t`/`f` inside a record, not `true`/`false`.
         let field = match f {
             Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
+            _ if types.get(i).is_some_and(|t| t == "tid") => tid::render_tid_value(f),
             _ => render_value_text(f),
         };
         let needs_quote = field.is_empty()
@@ -28058,7 +28070,10 @@ fn render_array_element(v: &Bson) -> String {
         // A record / composite element renders as its `(...)` text; the
         // array-quoting below wraps it (it has parens and commas), so
         // `array[row('a',1)::t]` becomes `{"(a,1)"}` as PostgreSQL renders it.
-        _ if record_fields(v).is_some() => record_text(record_fields(v).expect("checked")),
+        _ if record_fields(v).is_some() => record_text(
+            record_fields(v).expect("checked"),
+            &record_field_types(v).unwrap_or_default(),
+        ),
         // A timestamp (a BSON date, or the sub-millisecond composite) and an
         // interval (its three-part document) render as the text their scalar
         // cast produces: `{"2020-01-01 00:00:00.5"}`, `{"1 day"}`. These
@@ -28390,7 +28405,7 @@ pub fn value_text(v: &Bson) -> String {
 /// The `(...)` text of an anonymous record value, or `None` for any other
 /// value -- the wire layer renders a record in the text format through this.
 pub fn record_value_text(v: &Bson) -> Option<String> {
-    record_fields(v).map(|f| record_text(f))
+    record_fields(v).map(|f| record_text(f, &record_field_types(v).unwrap_or_default()))
 }
 
 /// The ordered field values of a record / composite value, or `None` for any
@@ -28645,7 +28660,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     // a no-op. Other targets are not defined for a bare record.
     if let Some(fields) = record_fields(&value) {
         return match target {
-            "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(record_text(fields))),
+            "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(record_text(
+                fields,
+                &record_field_types(&value).unwrap_or_default(),
+            ))),
             "record" => Ok(value.clone()),
             _ => Err(Error::Unsupported(format!("a record cast to {target}"))),
         };
@@ -29175,6 +29193,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "macaddr" => Ok(Bson::String(systypes::parse_macaddr(&as_text(&value))?)),
         "macaddr8" => Ok(Bson::String(systypes::parse_macaddr8(&as_text(&value))?)),
         "pg_lsn" => systypes::cast_lsn(&value),
+        "tid" => tid::cast_tid(&value),
         "xid" | "cid" => Ok(systypes::cast_xid(&value)),
         "xid8" => Ok(systypes::cast_xid8(&value)),
         "txid_snapshot" | "pg_snapshot" => Ok(Bson::String(systypes::parse_snapshot(
@@ -30270,6 +30289,29 @@ fn star_target_node() -> pg_query::protobuf::Node {
 /// blanks, `concat` / `format` print them).
 fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) -> Vec<Bson> {
     const PADDED: &[&str] = &["octet_length", "concat", "concat_ws", "format"];
+    // The `"any"` functions that print an argument print it by its type's
+    // output function, so a tid (stored as a number) is its `(b,o)` there.
+    const PRINTED: &[&str] = &[
+        "concat",
+        "concat_ws",
+        "format",
+        "quote_literal",
+        "quote_nullable",
+    ];
+    let args: Vec<Bson> = if PRINTED.contains(&name) {
+        args.into_iter()
+            .zip(f.args.iter())
+            .map(|(v, node)| {
+                if v != Bson::Null && static_type(node, &v) == "tid" {
+                    Bson::String(tid::render_tid_value(&v))
+                } else {
+                    v
+                }
+            })
+            .collect()
+    } else {
+        args
+    };
     if PADDED.contains(&name) {
         return args;
     }
@@ -30613,6 +30655,15 @@ fn coerce_unknown_operand(
         } else {
             systypes::cast_lsn(&Bson::String(text.clone()))?
         };
+        return Ok(if r_bare {
+            (lhs, coerced)
+        } else {
+            (coerced, rhs)
+        });
+    }
+    // A tid is stored as a number too: beside one an unknown IS a tid.
+    if op != "||" && typed_node.is_some_and(|n| static_type(n, typed) == "tid") {
+        let coerced = tid::cast_tid(&Bson::String(text.clone()))?;
         return Ok(if r_bare {
             (lhs, coerced)
         } else {
@@ -33263,6 +33314,20 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
             Some(cast_value(Bson::String(systypes::render_lsn_value(v)), t))
         }
         ("pg_lsn", "pg_lsn") => Some(Ok(v.clone())),
+        ("tid", t) if is_string_type(t) => {
+            Some(cast_value(Bson::String(tid::render_tid_value(v)), t))
+        }
+        ("tid", "tid") => Some(Ok(v.clone())),
+        // A tid has no cast but the I/O ones, to and from a string type
+        // (`pg_cast` holds none for it): stored as a number, it used to cast
+        // to and from every numeric type.
+        ("tid", t) if t != "unknown" => Some(Err(Error::CannotCoerce(format!(
+            "cannot cast type tid to {}",
+            display_type(t)
+        )))),
+        (s, "tid") if !is_string_type(s) && s != "unknown" => Some(Err(Error::CannotCoerce(
+            format!("cannot cast type {} to tid", display_type(s)),
+        ))),
         // Only int4 has a cast to and from "char" (`i4tochar` / `chartoi4`).
         // An int2 source is let through: `"char"(x)` reaches here as a cast,
         // and as a FUNCTION call PostgreSQL promotes an int2 to int4, so
@@ -33284,6 +33349,16 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
                     Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
                     Bson::Null => Bson::Null,
                     other => Bson::String(systypes::render_lsn_value(other)),
+                }
+            }
+            Some(cast_value(Bson::String(value_text(&out(v))), t))
+        }
+        ("tid[]", t) if is_string_type(t) => {
+            fn out(v: &Bson) -> Bson {
+                match v {
+                    Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
+                    Bson::Null => Bson::Null,
+                    other => Bson::String(tid::render_tid_value(other)),
                 }
             }
             Some(cast_value(Bson::String(value_text(&out(v))), t))
@@ -33429,6 +33504,21 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 )
                 && pgtypes::oid_of_name(&source).is_some()
             {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to {}",
+                    display_type(&source),
+                    display_type(&target)
+                )));
+            }
+            // A tid is cast to and from the string types only (`pg_cast`
+            // has nothing for it but the I/O casts), NULL or not.
+            let to_tid = target == "tid"
+                && !matches!(source.as_str(), "unknown" | "tid" | "")
+                && !is_string_type(&source)
+                && pgtypes::oid_of_name(&source).is_some();
+            let from_tid = source == "tid" && target != "tid" && !is_string_type(&target);
+            if to_tid || from_tid {
                 set_error_location(tc.location);
                 return Err(Error::CannotCoerce(format!(
                     "cannot cast type {} to {}",
@@ -35125,6 +35215,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 let ty = node.map(|n| static_type(n, &v)).unwrap_or_default();
                 match (ty.as_str(), &v) {
                     ("float4", Bson::Double(d)) => Bson::String(geo::float4_text(*d as f32)),
+                    ("tid", v) if *v != Bson::Null => Bson::String(tid::render_tid_value(v)),
                     ("timestamptz", _) => {
                         timestamptz_value_text(&v, &session_timezone()).map_or(v, Bson::String)
                     }
@@ -35579,6 +35670,7 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         // A pg_lsn is stored as its position: `l = '0/16'` compared the text
         // with a number and matched nothing.
         Some("pg_lsn") => systypes::cast_lsn(&value),
+        Some("tid") => tid::cast_tid(&value),
         // An array column: the literal is that array type, bounds and all --
         // `a = '[0:1]={5,6}'` must compare the lower bound too.
         Some(ty) if ty.ends_with("[]") => cast_value(value, ty),

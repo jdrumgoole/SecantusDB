@@ -17281,6 +17281,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             829 => "macaddr",
             774 => "macaddr8",
             3220 => "pg_lsn",
+            27 => "tid",
             28 => "xid",
             5069 => "xid8",
             29 => "cid",
@@ -17331,6 +17332,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1040 => "macaddr[]",
             775 => "macaddr8[]",
             3221 => "pg_lsn[]",
+            1010 => "tid[]",
             651 => "cidr[]",
             1020 => "box[]",
             1017 => "point[]",
@@ -17396,7 +17398,7 @@ fn type_size(ty: &Type) -> i16 {
         | Type::TIMESTAMPTZ
         | Type::MACADDR8
         | Type::PG_LSN => 8,
-        Type::MACADDR => 6,
+        Type::MACADDR | Type::TID => 6,
         Type::TIMETZ => 12,
         Type::INTERVAL | Type::UUID => 16,
         Type::BOX | Type::LSEG => 32,
@@ -17431,6 +17433,7 @@ fn wire_type(pg_type: &str) -> Type {
         "macaddr" => Type::MACADDR,
         "macaddr8" => Type::MACADDR8,
         "pg_lsn" => Type::PG_LSN,
+        "tid" => Type::TID,
         "xid" => Type::XID,
         "xid8" => Type::XID8,
         "cid" => Type::CID,
@@ -17571,6 +17574,7 @@ fn wire_type(pg_type: &str) -> Type {
         "macaddr[]" => Type::MACADDR_ARRAY,
         "macaddr8[]" => Type::MACADDR8_ARRAY,
         "pg_lsn[]" => Type::PG_LSN_ARRAY,
+        "tid[]" => Type::TID_ARRAY,
         "txid_snapshot[]" => Type::TXID_SNAPSHOT_ARRAY,
         "pg_snapshot[]" => Type::PG_SNAPSHOT_ARRAY,
         "aclitem[]" => Type::ACLITEM_ARRAY,
@@ -32547,13 +32551,15 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog-rust-postgres.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 70] = [
+    const OK: [Type; 72] = [
         Type::MACADDR,
         Type::MACADDR8,
         Type::PG_LSN,
+        Type::TID,
         Type::MACADDR_ARRAY,
         Type::MACADDR8_ARRAY,
         Type::PG_LSN_ARRAY,
+        Type::TID_ARRAY,
         Type::VARCHAR_ARRAY,
         Type::BPCHAR_ARRAY,
         Type::NAME_ARRAY,
@@ -33102,6 +33108,16 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             &FormatOptions::default(),
         );
     }
+    // `tidsend`: the block (u32) and the offset (u16).
+    if *ty == Type::TID {
+        let wire = secantus_pgplan::tid::tid_to_wire(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field_with_type_and_format(
+            &RawEncoded(wire),
+            ty,
+            FieldFormat::Binary,
+            &FormatOptions::default(),
+        );
+    }
     if *ty == Type::PG_LSN {
         let lsn = secantus_pgplan::systypes::lsn_of(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field_with_type_and_format(
@@ -33333,6 +33349,7 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         Type::MACADDR_ARRAY => Some(Type::MACADDR),
         Type::MACADDR8_ARRAY => Some(Type::MACADDR8),
         Type::PG_LSN_ARRAY => Some(Type::PG_LSN),
+        Type::TID_ARRAY => Some(Type::TID),
         Type::INET_ARRAY => Some(Type::INET),
         Type::CIDR_ARRAY => Some(Type::CIDR),
         Type::JSON_ARRAY => Some(Type::JSON),
@@ -33796,6 +33813,13 @@ fn encode_field_value_inner(
             return enc.encode_field(&Some(out));
         }
     }
+    // A tid is stored as one number and prints as `(block,offset)`.
+    if *field.datatype() == Type::TID {
+        if let Some(v) = v.filter(|v| **v != Bson::Null) {
+            let out = secantus_pgplan::tid::render_tid_value(v);
+            return enc.encode_field(&Some(out));
+        }
+    }
     // A pg_lsn is stored as its position and prints as `%X/%X`.
     if *field.datatype() == Type::PG_LSN {
         if let Some(v) = v.filter(|v| **v != Bson::Null) {
@@ -33857,6 +33881,17 @@ fn encode_field_value_inner(
                 .map(|x| match x {
                     Bson::Null => None,
                     other => Some(secantus_pgplan::value_text(other)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
+        }
+        // A `tid[]` in text is `tidout` per element.
+        if element == "tid" {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    other => Some(secantus_pgplan::tid::render_tid_value(other)),
                 })
                 .collect();
             return enc.encode_field(&rendered);
@@ -35950,6 +35985,9 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
     if *elem == Type::PG_LSN {
         return secantus_pgplan::systypes::lsn_of(v).map(|l| l.to_be_bytes().to_vec());
     }
+    if *elem == Type::TID {
+        return secantus_pgplan::tid::tid_to_wire(v);
+    }
     // A geometric element: its type's `*_send` layout.
     if matches!(
         *elem,
@@ -36292,6 +36330,7 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1040 => "macaddr",
         775 => "macaddr8",
         3221 => "pg_lsn",
+        1010 => "tid",
         1034 => "aclitem",
         1020 => "box",
         1017 => "point",
@@ -36646,6 +36685,18 @@ fn copy_text_row(
                 secantus_pgplan::net::text_out(v, oid == 650)
             }
             Some(v) if oid == 3220 => secantus_pgplan::systypes::render_lsn_value(v),
+            Some(v) if oid == 27 => secantus_pgplan::tid::render_tid_value(v),
+            // A `tid[]` field is `array_out` over `tidout`.
+            Some(Bson::Array(items)) if oid == 1010 => {
+                fn out(v: &Bson) -> Bson {
+                    match v {
+                        Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
+                        Bson::Null => Bson::Null,
+                        other => Bson::String(secantus_pgplan::tid::render_tid_value(other)),
+                    }
+                }
+                secantus_pgplan::value_text(&out(&Bson::Array(items.clone())))
+            }
             Some(Bson::String(v)) => v.clone(),
             Some(Bson::Array(items)) if matches!(oid, 1041 | 651) => {
                 let rendered: Vec<Bson> = items
@@ -36781,6 +36832,9 @@ fn decode_parameter(
             Some(3220) if bytes.len() == 8 => Ok(secantus_pgplan::systypes::lsn_bson(
                 u64::from_be_bytes(bytes[..8].try_into().expect("checked")),
             )),
+            Some(27) if bytes.len() == 6 => {
+                Ok(secantus_pgplan::tid::tid_from_wire(bytes).expect("checked"))
+            }
             // `xid` / `cid` (4-byte) and `xid8` (8-byte) unsigned counters,
             // and a snapshot (`int32 nxip, int64 xmin, int64 xmax, int64
             // xip...` -- `pg_snapshot_send`), decoded to the text a text
@@ -37098,6 +37152,8 @@ fn decode_parameter(
         Some(603) => {
             secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
         }
+        // `tidin`, as the binary path's `tidrecv` gives the same number.
+        Some(27) => secantus_pgplan::cast_text_to(&text, "tid", tz).map_err(|e| PgHandler::err(&e)),
         Some(oid @ (600 | 601 | 602 | 604 | 628 | 718)) => {
             let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(oid)).unwrap_or("point");
             secantus_pgplan::cast_text_to(&text, ty, tz).map_err(|e| PgHandler::err(&e))
@@ -38459,6 +38515,11 @@ fn copy_field(
     if secantus_pgplan::range::is_range_type(pg_type)
         || secantus_pgplan::range::is_multirange_type(pg_type)
     {
+        return secantus_pgplan::cast_text_to(raw, pg_type, tz).map_err(|e| PgHandler::err(&e));
+    }
+    // A tid is stored as a number (`tidin`): kept as its text it sorted
+    // after every stored tid and compared equal to none.
+    if pg_type == "tid" {
         return secantus_pgplan::cast_text_to(raw, pg_type, tz).map_err(|e| PgHandler::err(&e));
     }
     // `raw` has already been backslash-unescaped by `copy_parse_text` /
