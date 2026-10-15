@@ -209,7 +209,15 @@ impl PgHandler {
     }
 
     pub(crate) fn create_cast(&self, mut cast: UserCast) -> PgWireResult<Vec<Response>> {
-        let missing = |t: &str| Self::user_error("42704", format!("type \"{t}\" does not exist"));
+        let missing = |t: &str| {
+            Self::user_error(
+                "42704",
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(t)
+                ),
+            )
+        };
         let source_oid = type_oid(&cast.source).ok_or_else(|| missing(&cast.source))?;
         let target_oid = type_oid(&cast.target).ok_or_else(|| missing(&cast.target))?;
         let invalid = |m: &str| Self::user_error("42P17", m.to_string());

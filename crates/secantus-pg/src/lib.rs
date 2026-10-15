@@ -4480,7 +4480,11 @@ impl PgHandler {
     /// the udt is the `pg_type.typname`, `_int4` for `int4[]` (measured on
     /// 15.19).
     fn information_schema_type(pg_type: &str) -> (String, String) {
-        let bare = |t: &str| t.rsplit('.').next().unwrap_or(t).to_string();
+        // `"int"` (`pgtypes::user_type_key`) is `int` in pg_type.
+        let bare = |t: &str| {
+            let t = secantus_pgplan::pgtypes::user_type_catalog_name(t);
+            t.rsplit('.').next().unwrap_or(t).to_string()
+        };
         if let Some(element) = pg_type.strip_suffix("[]") {
             return ("ARRAY".into(), format!("_{}", bare(element)));
         }
@@ -7548,6 +7552,10 @@ impl PgHandler {
             || name.ends_with("[]")
         {
             return secantus_pgplan::display_type(name);
+        }
+        if secantus_pgplan::pgtypes::is_quoted_grammar_name(name) {
+            // `"int"` is kept as it prints (`pgtypes::user_type_key`).
+            return name.to_string();
         }
         secantus_pgplan::scalar::quote_identifier(name)
     }
@@ -11388,7 +11396,10 @@ impl PgHandler {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42704".into(),
-                format!("type \"{name}\" does not exist"),
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                ),
             ))));
         };
         let not_a_label = |l: &str| {
@@ -11599,7 +11610,10 @@ impl PgHandler {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),
             "42704".into(),
-            format!("type \"{name}\" does not exist"),
+            format!(
+                "type \"{}\" does not exist",
+                secantus_pgplan::pgtypes::user_type_catalog_name(name)
+            ),
         )))
     }
 
@@ -11613,7 +11627,10 @@ impl PgHandler {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42710".into(),
-                format!("type \"{}\" already exists", d.name),
+                format!(
+                    "type \"{}\" already exists",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(&d.name)
+                ),
             ))));
         }
         let known = secantus_pgplan::pgtypes::oid_of_name(&d.base).is_some()
@@ -11773,7 +11790,10 @@ impl PgHandler {
         let Some(mut doc) = self.raw_domain_doc(name)? else {
             return Err(Self::user_error(
                 "42704",
-                format!("type \"{name}\" does not exist"),
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                ),
             ));
         };
         match comment {
@@ -11795,7 +11815,10 @@ impl PgHandler {
                 if if_exists {
                     self.notice(
                         "00000",
-                        format!("type \"{name}\" does not exist, skipping"),
+                        format!(
+                            "type \"{}\" does not exist, skipping",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                        ),
                         None,
                     );
                     continue;
@@ -14622,6 +14645,12 @@ impl PgHandler {
                 for d in &mut rows {
                     let oid = d.get_i64(f("oid")).unwrap_or(0);
                     let name = d.get_str(f("typname")).unwrap_or_default().to_string();
+                    // A user type kept as `"int"` is `int` in pg_type (and its
+                    // array `_int`), as PostgreSQL 15.19 lists it.
+                    let catalog = secantus_pgplan::pgtypes::user_type_catalog_name(&name);
+                    if catalog != name {
+                        d.insert(f("typname"), catalog.to_string());
+                    }
                     let builtin = secantus_pgplan::pgtypes::type_name_of_oid(oid).is_some()
                         || PSEUDO_TYPES.iter().any(|(_, o, a)| *o == oid || *a == oid);
                     if !d.contains_key(f("typtype")) {
@@ -27722,7 +27751,10 @@ impl PgHandler {
                     let mut info = ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(),
-                        format!("type \"{}\" already exists", def.name),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&def.name)
+                        ),
                     );
                     info.hint = Some(
                         "A relation has an associated type of the same name, so you must \
@@ -28438,7 +28470,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(),
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
@@ -28521,7 +28556,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(),
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
@@ -28562,7 +28600,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(), // duplicate_object
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
@@ -28598,7 +28639,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(),
-                            format!("type \"{name}\" already exists"),
+                            format!(
+                                "type \"{}\" already exists",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                            ),
                         ))));
                     }
                     Some(b) => b,
@@ -28607,14 +28651,20 @@ impl PgHandler {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42710".into(),
-                                format!("type \"{name}\" already exists"),
+                                format!(
+                                    "type \"{}\" already exists",
+                                    secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                                ),
                             ))));
                         }
                         // 42710 (not 42704) with a hint: measured on 16.
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(),
-                            format!("type \"{name}\" does not exist"),
+                            format!(
+                                "type \"{}\" does not exist",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                            ),
                         );
                         info.hint = Some(
                             "Create the type as a shell type, then create its I/O \
@@ -29095,7 +29145,10 @@ impl PgHandler {
                             if if_exists {
                                 self.notice(
                                     "00000",
-                                    format!("type \"{t}\" does not exist, skipping"),
+                                    format!(
+                                        "type \"{}\" does not exist, skipping",
+                                        secantus_pgplan::pgtypes::user_type_catalog_name(t)
+                                    ),
                                     None,
                                 );
                                 return tag();
@@ -29103,7 +29156,10 @@ impl PgHandler {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42704".into(),
-                                format!("type \"{t}\" does not exist"),
+                                format!(
+                                    "type \"{}\" does not exist",
+                                    secantus_pgplan::pgtypes::user_type_catalog_name(t)
+                                ),
                             ))));
                         }
                         keys.push(key);
@@ -29379,7 +29435,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(), // duplicate_object
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
@@ -29562,7 +29621,10 @@ impl PgHandler {
                         if if_exists {
                             self.notice(
                                 "00000",
-                                format!("type \"{name}\" does not exist, skipping"),
+                                format!(
+                                    "type \"{}\" does not exist, skipping",
+                                    secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                                ),
                                 None,
                             );
                             continue;
@@ -29570,7 +29632,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42704".into(), // undefined_object
-                            format!("type \"{name}\" does not exist"),
+                            format!(
+                                "type \"{}\" does not exist",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                            ),
                         ))));
                     }
                 }
@@ -30576,7 +30641,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(), // duplicate_object
-                            format!("type \"{ty}\" already exists"),
+                            format!(
+                                "type \"{}\" already exists",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(ty)
+                            ),
                         ))));
                     }
                 }
