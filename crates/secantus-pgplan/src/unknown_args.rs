@@ -54,13 +54,23 @@ fn untyped_string(n: &pg_query::protobuf::Node) -> Option<i32> {
 }
 
 /// The name and argument types of a constant built-in call with an untyped
-/// argument, when the rules here apply to it.
-fn unknown_call(f: &pg_query::protobuf::FuncCall) -> Option<(String, Vec<String>)> {
+/// argument, when the rules here apply to it. An aggregate is resolved the
+/// same way (`sum('1')` is 42725) but only `check_ambiguous` judges one.
+fn unknown_call(
+    f: &pg_query::protobuf::FuncCall,
+    aggregates: bool,
+) -> Option<(String, Vec<String>)> {
     if f.agg_star || f.func_variadic || f.over.is_some() || f.funcname.len() > 2 {
         return None;
     }
+    if !f.agg_order.is_empty() || f.agg_within_group || f.agg_filter.is_some() || f.agg_distinct {
+        return None;
+    }
     let name = func_name(f)?;
-    if correlated::user_function_named(&name) || is_aggregate_call(f) {
+    if correlated::user_function_named(&name)
+        || crate::user_agg::is_user_aggregate(&name)
+        || (!aggregates && is_aggregate_call(f))
+    {
         return None;
     }
     if !f.args.iter().any(|a| untyped_string(a).is_some()) {
@@ -72,7 +82,7 @@ fn unknown_call(f: &pg_query::protobuf::FuncCall) -> Option<(String, Vec<String>
 
 /// The parameter types for `f`'s untyped literals, when they are to be cast.
 fn resolved(f: &pg_query::protobuf::FuncCall) -> Option<Vec<String>> {
-    let (name, types) = unknown_call(f)?;
+    let (name, types) = unknown_call(f, false)?;
     funcsig::resolved_args(&name, &types).or_else(|| funcsig::polymorphic_args(&name, &types))
 }
 
@@ -83,7 +93,7 @@ pub(crate) fn check_ambiguous(node: &N) -> Result<()> {
         let pg_query::NodeRef::FuncCall(f) = n else {
             continue;
         };
-        let Some((name, types)) = unknown_call(f) else {
+        let Some((name, types)) = unknown_call(f, true) else {
             continue;
         };
         // Only a call of untyped arguments alone: beside a typed one the
@@ -96,6 +106,21 @@ pub(crate) fn check_ambiguous(node: &N) -> Result<()> {
             ));
         }
         if types.iter().all(|t| t == "unknown") && funcsig::unknown_ambiguous(&name, &types) {
+            // Named as written, schema and all: the grammar's own calls are
+            // `pg_catalog.extract`.
+            let written: Vec<&str> = f
+                .funcname
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let name = if written.len() == 2 {
+                written.join(".")
+            } else {
+                name
+            };
             set_error_location(f.location);
             return Err(Error::Sqlstate(
                 "42725",

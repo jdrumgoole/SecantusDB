@@ -14075,6 +14075,20 @@ fn plan_aggregate_item(
     item.order = plan_aggregate_order(&f.agg_order, def, params)?;
     let (field, ty, typmod, expr) = resolve(&f.args[0], format!("__agg{index}"))?;
     item.field = Some(field);
+    // An untyped literal given to the variance family reads as float8, the
+    // numeric category's preferred type (`stddev(NULL)` is double
+    // precision, measured on 15.19).
+    let untyped = matches!(f.args[0].node.as_ref(), Some(N::AConst(c))
+        if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
+    let ty = if untyped
+        && matches!(
+            func,
+            AggFunc::VarSamp | AggFunc::VarPop | AggFunc::StddevSamp | AggFunc::StddevPop
+        ) {
+        Some("float8".to_string())
+    } else {
+        ty
+    };
     item.source_type = ty;
     item.source_typmod = typmod;
     item.expr = expr;
@@ -23836,6 +23850,16 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                                 Some(n) => static_type(n, &value),
                                 None => inferred_type(&value).to_string(),
                             }
+                        } else if let Some(t) = (value == Bson::Null)
+                            .then(|| selected_call_type(f))
+                            .flatten()
+                            .filter(|t| !t.starts_with("any") && t != "record")
+                        {
+                            // A NULL from a call whose overload is known is
+                            // that overload's type: `abs(NULL)` reads its
+                            // literal as float8 (`func_select_candidate`), so
+                            // it is `double precision`, not abs's numeric.
+                            t
                         } else if value == Bson::Null
                             || declared == "timestamptz"
                             || declared == "name"
@@ -32709,7 +32733,13 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             let name = match parts.as_slice() {
                 [] => return Err(Error::Parse("DROP TYPE without a name".into())),
                 [bare] => bare.clone(),
-                [schema, bare] if schema == "public" => bare.clone(),
+                // `public.uuid` (a type named after a built-in) stays
+                // qualified: its bare name is pg_catalog's.
+                [schema, bare]
+                    if schema == "public" && (domain || !pgtypes::shadowed_by_catalog(bare)) =>
+                {
+                    bare.clone()
+                }
                 _ => parts.join("."),
             };
             names.push(name);

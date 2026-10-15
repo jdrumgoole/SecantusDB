@@ -7560,6 +7560,16 @@ impl PgHandler {
         })
     }
 
+    /// Does a built-in type name keep a new `public` type from taking it?
+    /// Only a spelling that is not itself a `pg_type` name (`int`, a
+    /// keyword's alias): a real one (`uuid`, `text`, `int4range`) is
+    /// `pg_catalog`'s, and PostgreSQL creates `public.uuid` beside it, which
+    /// a bare name never reaches (measured on 15.19).
+    fn builtin_name_taken(name: &str) -> bool {
+        secantus_pgplan::pgtypes::oid_of_name(name).is_some()
+            && !secantus_pgplan::pgtypes::shadowed_by_catalog(name)
+    }
+
     /// Is `name` taken by ANY type in the default search_path -- an enum, a
     /// composite, a range, a base type (shell or not), or a builtin? The
     /// 42710 `type "x" already exists` gate every CREATE TYPE shares.
@@ -7568,7 +7578,7 @@ impl PgHandler {
             || self.enums()?.iter().any(|(n, _, _)| n == name)
             || self.ranges()?.iter().any(|(n, _, _)| n == name)
             || self.base_types()?.iter().any(|b| b.name == name)
-            || secantus_pgplan::pgtypes::oid_of_name(name).is_some())
+            || Self::builtin_name_taken(name))
     }
 
     /// Raise a NOTICE for the statement in flight: sent at once when a
@@ -11536,7 +11546,7 @@ impl PgHandler {
         let taken = self.domains()?.iter().any(|x| x.name == d.name)
             || self.enums()?.iter().any(|(n, _, _)| *n == d.name)
             || self.composites()?.iter().any(|(n, _, _)| *n == d.name)
-            || secantus_pgplan::pgtypes::oid_of_name(&d.name).is_some();
+            || Self::builtin_name_taken(&d.name);
         if taken {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -17557,7 +17567,6 @@ fn wire_type(pg_type: &str) -> Type {
         "tsvector" => Type::TS_VECTOR,
         "tsquery" => Type::TSQUERY,
         "regconfig" => Type::REGCONFIG,
-        "regdictionary" => Type::REGDICTIONARY,
         // `ts_debug`'s `dictionary` / `dictionaries` columns.
         "regdictionary" => Type::REGDICTIONARY,
         "regdictionary[]" => Type::REGDICTIONARY_ARRAY,
@@ -28038,7 +28047,7 @@ impl PgHandler {
                 let taken = composite_dup
                     || (unqualified
                         && (self.enums()?.iter().any(|(n, _, _)| *n == name)
-                            || secantus_pgplan::pgtypes::oid_of_name(&name).is_some()));
+                            || Self::builtin_name_taken(&name)));
                 if taken {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -28107,7 +28116,7 @@ impl PgHandler {
                     || (unqualified
                         && (self.composites()?.iter().any(|(n2, _, _)| *n2 == name)
                             || self.enums()?.iter().any(|(n2, _, _)| *n2 == name)
-                            || secantus_pgplan::pgtypes::oid_of_name(&name).is_some()));
+                            || Self::builtin_name_taken(&name)));
                 if taken {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -28963,7 +28972,7 @@ impl PgHandler {
                     .any(|(s, n, _, _)| *s == schema_name && *n == name);
                 let exists = enum_dup
                     || (unqualified
-                        && (secantus_pgplan::pgtypes::oid_of_name(&name).is_some()
+                        && (Self::builtin_name_taken(&name)
                             || self.composites()?.iter().any(|(n, _, _)| *n == name)
                             || self.ranges()?.iter().any(|(n, _, _)| *n == name)));
                 if exists {
@@ -29004,6 +29013,17 @@ impl PgHandler {
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
                 for name in &names {
+                    // A bare built-in name is pg_catalog's type, even beside a
+                    // `public` one of that name (measured on 15.19).
+                    if secantus_pgplan::pgtypes::shadowed_by_catalog(name) {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!(
+                                "cannot drop type {name} because it is required by the database system"
+                            ),
+                        ))));
+                    }
                     // Functions whose signature names it, and casts naming
                     // it, depend on any other kind of type. (A base type
                     // tracks its I/O functions below.)
@@ -29085,7 +29105,10 @@ impl PgHandler {
                         info.hint = Some(format!("You can drop table {name} instead."));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
-                    let filter = bson::doc! {"_id": name};
+                    // A `public` type named after a built-in is keyed by its
+                    // qualified name or its bare one, by kind.
+                    let bare = name.strip_prefix("public.").unwrap_or(name);
+                    let filter = bson::doc! {"_id": {"$in": [name.as_str(), bare]}};
                     let from_enum = self
                         .storage
                         .delete_matching(

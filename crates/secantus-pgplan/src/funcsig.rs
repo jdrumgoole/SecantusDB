@@ -542,11 +542,16 @@ fn unknown_resolution(
         .iter()
         .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
         .collect();
-    if cands
+    // A polymorphic candidate is judged only when every argument is
+    // untyped, and only for ambiguity: its parameters' category is the
+    // pseudo-types' `P`, so `unnest('{1,2}')` (anyarray, anymultirange,
+    // tsvector) has candidates of two categories and is 42725, while one
+    // left standing would need the polymorphic rules, not modelled here.
+    let polymorphic = cands
         .iter()
         .flat_map(|s| s.args.iter())
-        .any(|p| p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring"))
-    {
+        .any(|p| p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring"));
+    if polymorphic && !args.iter().all(|a| a == "unknown") {
         return None;
     }
     let keep_best = |cands: &mut Vec<&Sig>, score: &dyn Fn(&str, &str) -> bool| {
@@ -568,39 +573,77 @@ fn unknown_resolution(
                 (Some((pc, true)), Some((ac, _))) if pc == ac
             )
     });
-    for (i, a) in args.iter().enumerate() {
-        if a != "unknown" || cands.len() < 2 {
-            continue;
-        }
-        let at = |s: &Sig| cats.get(s.args[i].as_str()).copied();
-        let mut chosen: Option<char> = None;
-        let mut conflict = false;
-        for s in &cands {
-            let (c, _) = at(s)?;
-            if c == 'S' {
-                chosen = Some('S');
-                conflict = false;
+    // The unknown positions, as `func_select_candidate` takes them: a
+    // category for EACH position over all the remaining candidates (a
+    // string category wins a conflict, any other conflict leaves the
+    // unknowns unresolved), and only then the candidates that agree at
+    // every position -- kept if any do. Deciding one position at a time
+    // let `ts_headline('english', 'a b c', 'b')` settle on one overload
+    // where PostgreSQL 15 finds none agreeing at all three (42725).
+    if cands.len() > 1 {
+        let mut slots: Vec<(usize, char, bool)> = Vec::new();
+        let mut resolved = true;
+        for (i, a) in args.iter().enumerate() {
+            if a != "unknown" {
+                continue;
+            }
+            let mut slot: Option<(char, bool)> = None;
+            let mut conflict = false;
+            for s in &cands {
+                let (c, p) = *cats.get(s.args[i].as_str())?;
+                match slot {
+                    None => slot = Some((c, p)),
+                    Some((sc, sp)) if sc == c => slot = Some((sc, sp || p)),
+                    Some(_) if c == 'S' => slot = Some((c, p)),
+                    Some(_) => conflict = true,
+                }
+            }
+            let (c, p) = slot?;
+            if conflict && c != 'S' {
+                resolved = false;
                 break;
             }
-            match chosen {
-                None => chosen = Some(c),
-                Some(x) if x != c => conflict = true,
-                _ => {}
+            slots.push((i, c, p));
+        }
+        if resolved {
+            let keep: Vec<&Sig> = cands
+                .iter()
+                .copied()
+                .filter(|s| {
+                    slots.iter().all(|&(i, c, p)| {
+                        cats.get(s.args[i].as_str())
+                            .is_some_and(|&(sc, sp)| sc == c && (!p || sp))
+                    })
+                })
+                .collect();
+            if !keep.is_empty() {
+                cands = keep;
             }
         }
-        if conflict {
-            return Some(Err(()));
-        }
-        let chosen = chosen?;
-        cands.retain(|s| at(s).is_some_and(|(c, _)| c == chosen));
-        if cands.iter().any(|s| at(s).is_some_and(|(_, p)| p)) {
-            cands.retain(|s| at(s).is_some_and(|(_, p)| p));
+    }
+    // Last gasp: the known arguments all of one type, with the unknowns
+    // taken as that type, may leave exactly one candidate.
+    if cands.len() > 1 {
+        let mut known = args.iter().filter(|a| *a != "unknown");
+        if let Some(first) = known.next() {
+            if known.all(|k| k == first) {
+                let as_known: Vec<String> = args.iter().map(|_| first.clone()).collect();
+                let fits: Vec<&Sig> = cands
+                    .iter()
+                    .copied()
+                    .filter(|s| sig_accepts(s, &as_known))
+                    .collect();
+                if let [one] = fits.as_slice() {
+                    cands = vec![*one];
+                }
+            }
         }
     }
     match cands.as_slice() {
+        [_, _, ..] => Some(Err(())),
+        _ if polymorphic => None,
         [s] => Some(Ok(*s)),
         [] => None,
-        _ => Some(Err(())),
     }
 }
 

@@ -141,7 +141,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 _RP015 = {
     "sjis-non-ascii": "select convert_to('é', 'SJIS')",
     "euc-jp-from-bytes": "select convert_from('\\xa4a2'::bytea, 'EUC_JP')",
-    "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
@@ -164,6 +163,17 @@ _RP015_FIXED = {
     "regdictionary": "select 'simple'::regdictionary::oid",
     "ts-lexize": "select ts_lexize('english_stem', 'cats')",
     "ts-config-position": "select to_tsvector('nope', 'a b')",
+    "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
+    "ts-headline-options": (
+        "select ts_headline('english', 'The quick brown fox jumps over the lazy dog. "
+        "The fox is quick.', to_tsquery('english', 'fox'), "
+        "'MaxFragments=2, MaxWords=4, MinWords=2, FragmentDelimiter=\" | \"')"
+    ),
+    "unnest-untyped": "select unnest('{1,2}')",
+    "sum-untyped": "select sum('1')",
+    "width-bucket-dates": (
+        "select width_bucket('2020-01-02'::date, array['2020-01-01'::date, '2020-02-01'])"
+    ),
 }
 
 
