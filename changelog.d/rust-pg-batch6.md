@@ -41,6 +41,15 @@ does.
 - An unrecognised interval modifier is XX000, as on PostgreSQL.
 - `close_ls` of a segment parallel to the line is NULL.
 - An infinite timestamp compared with a finite one was 0A000.
+- A missing qualified type is named as written (`type "public.nosuch"
+  does not exist`, `pg_catalog.` and `[]` kept), an unknown schema in a
+  type name is 3F000 `schema "nosuch" does not exist` at the name, and
+  `'"Nosuch"'::regtype` names the type without its quotes. Part of RP-041
+  (`tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified`).
+- `create type "Int"`, `"Text"`, `"Varchar"`: a quoted name with a capital
+  is not a built-in, so it no longer collides with `int` / `text` /
+  `varchar` (42710). Part of RP-041
+  (`tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name`).
 
 Pinned by `tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed`
 (RP-015); what RP-015 still lists -- the comparisons that answer a

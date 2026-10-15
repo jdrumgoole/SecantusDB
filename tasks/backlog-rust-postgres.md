@@ -351,21 +351,17 @@ one beside it.
   Backlog-ID: RP-043
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
-- [ ] **RUST pgserver: type-name divergences found beside RP-038
-  (2026-10-15).** Each measured on PostgreSQL 15.19:
-  - `'a'::public.nosuch` is 42704 `type "public.nosuch" does not exist`;
-    here the schema is dropped from the name (`pg_catalog.` likewise), an
-    unknown schema (`1::nosuch.t`) is this 42704 where PostgreSQL says 3F000
-    `schema "nosuch" does not exist`, and `'"nosuch"'::regtype` keeps the
-    quotes in its message. The qualifier is dropped where a type name is
-    lowered to the planner's string (`type_name_of`). (The positions were
-    fixed 2026-10-15.)
-  - `create type "Int"` / `"Int4"` are 42710; PostgreSQL creates them. The
-    gate is a one-line change, measured: the planner then folds the quoted
-    name to `int` and the new type captures `1::int`. Type names need to
-    keep their case through the planner first.
+- [ ] **RUST pgserver: a quoted mixed-case type name is folded where it is
+  looked up.** The planner hands a type name on as a plain string, so a
+  quoted `"Dom"` and an unquoted `dom` arrive the same, and the user-type
+  lookups (`user_domain`, `user_enum`, `user_composite_widths`, ...) fold
+  both sides to match them. On PostgreSQL 15.19 a domain `"Dom"` is reached
+  by `5::"Dom"` (here 42704) and an enum `"MyType"` is NOT reached by
+  `'y'::"mytype"` (here it is). Names have to keep their case from the
+  parse to the lookup, with only a type name read from TEXT folded (as
+  `'MyDom'::regtype` is); a built-in already refuses a capital (2026-10-15).
   Backlog-ID: RP-041
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_mixed_case_type_is_found_only_as_written
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

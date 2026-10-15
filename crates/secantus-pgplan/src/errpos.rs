@@ -321,6 +321,17 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         {
             let name = m.split_once('"')?.1.split_once('"')?.0;
             let lit = format!("'{}'", name.replace('\'', "''"));
+            // A schema named first in a `'s.t'::regtype` literal.
+            if m.starts_with("schema ") {
+                if let Some(i) = toks.windows(3).position(|w| {
+                    w[1].text == "::"
+                        && w[2].text.eq_ignore_ascii_case("regtype")
+                        && w[0].text.starts_with('\'')
+                        && w[0].text[1..].trim_start_matches('"').starts_with(name)
+                }) {
+                    return pos(toks[i].start);
+                }
+            }
             let i = toks.iter().position(|t| t.text == lit)?;
             // `schema_to_xml('nope', ...)` takes a `name`, not a
             // regnamespace: the lookup is the function's own, with no
@@ -335,12 +346,14 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         }
         "42704" => {
             let full = quoted_between(m, "type ")?;
-            let name = full.rsplit('.').next()?;
+            let name = full.rsplit('.').next()?.trim_end_matches("[]");
             // A type read from a string (`'nosuch'::regtype`): at the
             // literal.
             let lit = format!("'{}'", full.replace('\'', "''"));
             if let Some(i) = toks.windows(3).position(|w| {
-                w[0].text == lit && w[1].text == "::" && w[2].text.eq_ignore_ascii_case("regtype")
+                (w[0].text == lit || regtype_literal_names(w[0].text, full))
+                    && w[1].text == "::"
+                    && w[2].text.eq_ignore_ascii_case("regtype")
             }) {
                 return pos(toks[i].start);
             }
@@ -542,4 +555,13 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         }
         _ => None,
     }
+}
+
+/// Does the string literal `tok` read as the type name `full` (its quotes
+/// gone: `'"Nosuch"'` names `Nosuch`)?
+fn regtype_literal_names(tok: &str, full: &str) -> bool {
+    let Some(inner) = tok.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) else {
+        return false;
+    };
+    inner.replace("''", "'").replace('"', "") == full
 }

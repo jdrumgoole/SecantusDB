@@ -7696,7 +7696,10 @@ impl PgHandler {
     /// `pg_catalog`'s, and PostgreSQL creates `public.uuid` beside it, which
     /// a bare name never reaches (measured on 15.19).
     fn builtin_name_taken(name: &str) -> bool {
-        secantus_pgplan::pgtypes::oid_of_name(name).is_some()
+        // Every built-in's name is lower case: a name with a capital in it
+        // was written quoted (`"Int"`) and is not `int` (15.19).
+        !name.chars().any(|c| c.is_ascii_uppercase())
+            && secantus_pgplan::pgtypes::oid_of_name(name).is_some()
             && !secantus_pgplan::pgtypes::shadowed_by_catalog(name)
     }
 

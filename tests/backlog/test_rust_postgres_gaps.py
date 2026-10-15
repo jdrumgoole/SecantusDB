@@ -852,7 +852,7 @@ def test_unknown_type_error_position(pg: Any, sql: str, expected: tuple) -> None
     assert _error_and_position(pg, [], sql) == expected
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 def test_qualified_unknown_type_is_named_qualified(pg: Any) -> None:
     """PostgreSQL 15.19: `'a'::public.nosuch` is `type "public.nosuch" does
     not exist`; here the schema is dropped from the name."""
@@ -860,7 +860,7 @@ def test_qualified_unknown_type_is_named_qualified(pg: Any) -> None:
     assert got[:2] == ("err", "42704") and 'type "public.nosuch" does not exist' in got[2]
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 def test_quoted_mixed_case_type_name(pg: Any) -> None:
     """PostgreSQL 15.19: `create type "Int" as enum ('x')` succeeds (`"Int"`
     is not `int`); here it is 42710, the name folded to `int4`."""
@@ -1033,3 +1033,21 @@ def test_join_cursor_ordered_by_its_key_cannot_scroll(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert answer[:2] == ("err", "55000")
+
+
+@pytest.mark.backlog("RP-041")
+def test_mixed_case_type_is_found_only_as_written(pg: Any) -> None:
+    """PostgreSQL 15.19: a domain named `"Dom"` is reached by `5::"Dom"`
+    (5), and an enum `"MyType"` is not reached by `"mytype"` (42704); here
+    the first is 42704 and the second finds it, the names folded."""
+    pg.execute("begin")
+    try:
+        pg.execute('create domain "Rp041Dom" as int')
+        pg.execute("create type \"Rp041Type\" as enum ('y')")
+        pg.execute("savepoint s")
+        reached = pg_answer(pg, 'select 5::"Rp041Dom"')
+        pg.execute("rollback to s")
+        folded = pg_answer(pg, "select 'y'::\"rp041type\"")
+    finally:
+        pg.execute("rollback")
+    assert reached == ("ok", [(5,)]) and folded[:2] == ("err", "42704")

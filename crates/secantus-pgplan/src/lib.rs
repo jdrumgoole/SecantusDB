@@ -3869,9 +3869,112 @@ fn parse_one(sql: &str) -> Result<N> {
     Ok(node)
 }
 
+/// A qualified type name's schema must exist: `1::nosuch.t` is 3F000 at the
+/// type name, before anything looks for the type (15.19).
+/// The type names a statement writes: a cast's, a column's, and any the
+/// walk reaches on its own (it does not descend into the first two).
+fn statement_type_names(node: &N) -> Vec<pg_query::protobuf::TypeName> {
+    let mut out = Vec::new();
+    let columns = |elts: &[pg_query::protobuf::Node],
+                   out: &mut Vec<pg_query::protobuf::TypeName>| {
+        for e in elts {
+            if let Some(N::ColumnDef(cd)) = e.node.as_ref() {
+                out.extend(cd.type_name.clone());
+            }
+        }
+    };
+    match node {
+        N::CreateStmt(c) => columns(&c.table_elts, &mut out),
+        N::AlterTableStmt(a) => {
+            for cmd in &a.cmds {
+                if let Some(N::AlterTableCmd(c)) = cmd.node.as_ref() {
+                    if let Some(def) = c.def.as_deref() {
+                        columns(std::slice::from_ref(def), &mut out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    for (n, _, _, _) in node.nodes() {
+        match n {
+            pg_query::NodeRef::TypeName(tn) => out.push(tn.clone()),
+            pg_query::NodeRef::TypeCast(tc) => out.extend(tc.type_name.clone()),
+            pg_query::NodeRef::ColumnDef(cd) => out.extend(cd.type_name.clone()),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn check_type_schemas(node: &N) -> Result<()> {
+    for tn in statement_type_names(node) {
+        {
+            let parts: Vec<&str> = tn
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if let [schema, _] | [_, schema, _] = parts.as_slice() {
+                if !type_schema_exists(schema) {
+                    set_error_location(tn.location);
+                    return Err(Error::Sqlstate(
+                        "3F000",
+                        format!("schema \"{schema}\" does not exist"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A missing type is named as the statement wrote it, schema and all
+/// (`type "public.nosuch" does not exist`): the planner's own message
+/// carries the bare name its lowering kept.
+fn qualify_type_error(e: Error, node: &pg_query::protobuf::Node) -> Error {
+    let Error::UndefinedObject(m) = &e else {
+        return e;
+    };
+    let Some(name) = m
+        .strip_prefix("type \"")
+        .and_then(|r| r.strip_suffix("\" does not exist"))
+    else {
+        return e;
+    };
+    let bare = name.strip_suffix("[]").unwrap_or(name);
+    let Some(inner) = node.node.as_ref() else {
+        return e;
+    };
+    for tn in statement_type_names(inner) {
+        {
+            let parts: Vec<String> = tn
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            if parts.len() >= 2 && parts.last().map(String::as_str) == Some(bare) {
+                let array = if tn.array_bounds.is_empty() { "" } else { "[]" };
+                return Error::UndefinedObject(format!(
+                    "type \"{}{array}\" does not exist",
+                    parts.join(".")
+                ));
+            }
+        }
+    }
+    e
+}
+
 /// The analysis-time rewrites every statement passes through before it is
 /// planned.
 fn rewrite_statement(node: &mut N) -> Result<()> {
+    check_type_schemas(node)?;
     func_cast::check_variadic_arity(node)?;
     func_cast::spread_variadic(node);
     func_cast::rewrite(node);
@@ -4027,6 +4130,18 @@ pub fn plan_with_subqueries(
     let node = pg_query::protobuf::Node {
         node: Some(parse_one_as_sent(sql)?),
     };
+    let original = node.clone();
+    plan_with_subqueries_parsed(sql, node, lookup, params, run)
+        .map_err(|e| qualify_type_error(e, &original))
+}
+
+fn plan_with_subqueries_parsed(
+    sql: &str,
+    node: pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    run: SubqueryRunner<'_>,
+) -> Result<Statement> {
     // A cursor's query is a statement of its own: subqueries, views and
     // CTEs are resolved in it as in a bare SELECT.
     if let Some(N::DeclareCursorStmt(d)) = node.node.as_ref() {
@@ -30088,10 +30203,27 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                         Some(shell) => {
                             Error::UndefinedObject(format!("type \"{shell}\" is only a shell"))
                         }
-                        None => Error::UndefinedObject(format!(
-                            "type \"{}\" does not exist",
-                            pgtypes::user_type_catalog_name(name.trim())
-                        )),
+                        None => match parsed_type_name(&name) {
+                            // `TypeNameToString`: the parts as parsed, quotes
+                            // gone; an unknown schema is named first.
+                            Some((parts, _))
+                                if parts.len() == 2 && !type_schema_exists(&parts[0]) =>
+                            {
+                                Error::Sqlstate(
+                                    "3F000",
+                                    format!("schema \"{}\" does not exist", parts[0]),
+                                )
+                            }
+                            Some((parts, array)) => Error::UndefinedObject(format!(
+                                "type \"{}{}\" does not exist",
+                                pgtypes::user_type_catalog_name(&parts.join(".")),
+                                if array { "[]" } else { "" }
+                            )),
+                            None => Error::UndefinedObject(format!(
+                                "type \"{}\" does not exist",
+                                pgtypes::user_type_catalog_name(name.trim())
+                            )),
+                        },
                     }),
                 }
             }
@@ -32932,6 +33064,47 @@ fn bson_kind(v: &Bson) -> &'static str {
 /// The public door onto `compare_constants` for the wire layer's join sort.
 pub fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     compare_constants(a, b)
+}
+
+/// A type name as the grammar reads it (`public."Nosuch"[]`): its parts,
+/// quotes removed, and whether it names an array.
+fn parsed_type_name(text: &str) -> Option<(Vec<String>, bool)> {
+    let parsed = pg_query::parse(&format!("SELECT NULL::{text}")).ok()?;
+    let stmt = parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?;
+    let N::SelectStmt(s) = stmt else { return None };
+    let Some(N::ResTarget(rt)) = s.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    let Some(N::TypeCast(tc)) = rt.val.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let tn = tc.type_name.as_ref()?;
+    let parts = tn
+        .names
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    Some((parts, !tn.array_bounds.is_empty()))
+}
+
+/// Does a type name's schema exist (`pg_catalog`, `public`, a user schema)?
+pub(crate) fn type_schema_exists(schema: &str) -> bool {
+    matches!(
+        schema,
+        "pg_catalog" | "public" | "information_schema" | "pg_toast"
+    ) || schema == "pg_temp"
+        || schema.starts_with("pg_temp_")
+        || schemas::schema_exists(schema)
 }
 
 /// `1` for `infinity`, `-1` for `-infinity`, as an infinite timestamp is
