@@ -35507,9 +35507,17 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             let Some(a_const::Val::Sval(name)) = c.val.as_ref() else {
                 return Err(Error::Internal("a malformed alias check".into()));
             };
+            // An untyped literal is `unknown`, which any overload can take.
             let types: Vec<String> = f.args[2..]
                 .iter()
-                .map(|a| static_type(a, &Bson::Null))
+                .map(|a| match a.node.as_ref() {
+                    Some(N::AConst(c))
+                        if c.isnull || matches!(c.val, Some(a_const::Val::Sval(_))) =>
+                    {
+                        "unknown".to_string()
+                    }
+                    _ => static_type(a, &Bson::Null),
+                })
                 .collect();
             let known = types.iter().all(|t| !t.is_empty() && t != "unknown");
             if known && funcsig::resolves(&name.sval, &types) == Some(false) {

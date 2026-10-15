@@ -88,5 +88,4 @@ select 1 where false limit 1
 select generate_series(1, 5) limit 2
 select count(*) limit 0
 show is_superuser
-show session_authorization
 select pg_client_encoding(), pg_typeof(pg_client_encoding())
