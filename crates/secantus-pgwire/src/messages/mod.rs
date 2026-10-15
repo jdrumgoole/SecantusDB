@@ -156,10 +156,10 @@ mod codec;
 pub mod copy;
 /// Data related messages
 pub mod data;
-/// Extended query messages, including request/response for parse, bind and etc.
-pub mod extendedquery;
 /// Fastpath function call messages (SecantusDB local patch)
 pub mod fastpath;
+/// Extended query messages, including request/response for parse, bind and etc.
+pub mod extendedquery;
 /// General response messages
 pub mod response;
 /// Simple query messages, including descriptions

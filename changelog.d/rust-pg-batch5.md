@@ -25,6 +25,15 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   took a 1.2 MB scan to look for. Fixes RP-002
   (`tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once`).
 
+- `create type int` (and `integer`, `smallint`, `bigint`, `real`, `double
+  precision`, `boolean`, `character varying`, `decimal` and the other
+  grammar spellings with no `pg_type` row) creates `public."int"` beside the
+  built-in, as PostgreSQL 15.19 does, where it was 42710. A bare `int` still
+  means `int4`; `"int"` and `public."int"` reach the new type, which prints
+  `"int"`. The type is held under its quoted spelling, as `"char"` is
+  (`pgtypes::user_type_key`). Fixes RP-038
+  (`tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
@@ -36,4 +45,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   foreign server or user mapping may set. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
   `[fdw-validator]`).
-- Corpora `row_type_char_overflow` and `fmgr_validators`.
+- Corpora `row_type_char_overflow`, `fmgr_validators` and `type_named_like_grammar`.
