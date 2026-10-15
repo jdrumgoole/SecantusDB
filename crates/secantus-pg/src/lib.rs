@@ -17986,6 +17986,7 @@ fn wire_type(pg_type: &str) -> Type {
         "float8" => Type::FLOAT8,
         "bool" | "boolean" => Type::BOOL,
         "void" => Type::VOID,
+        "cstring" => Type::CSTRING,
         // `text` is oid 25, NOT varchar (1043). PostgreSQL distinguishes them
         // and clients read the oid: psycopg decodes both to `str` so a value
         // comparison never notices, but pgjdbc and pgx do.
@@ -18969,6 +18970,7 @@ impl PgHandler {
         // pgwire has assigned and already sent the BackendKeyData PID by now;
         // record it so `pg_backend_pid()` / `pg_terminate_backend()` can see
         // it, and register this connection so another backend can terminate it.
+        secantus_pgplan::typsend::set_encoder(send_bytes);
         let (pid, secret) = _c.pid_and_secret_key();
         self.backend_pid
             .store(pid, std::sync::atomic::Ordering::Relaxed);
@@ -34379,6 +34381,23 @@ fn numeric_binary(text: &str) -> Option<Vec<u8>> {
 /// `Int32` renders as `1` either way in text, but in binary it would put four
 /// bytes where the client reads eight. Text encoding is left exactly as it
 /// was.
+/// One value's binary wire format, for the planner's `*send` functions
+/// (`secantus_pgplan::typsend`): the bytes `encode_binary` puts in a field.
+fn send_bytes(v: &Bson, pg_type: &str) -> Option<Vec<u8>> {
+    let ty = wire_type(pg_type);
+    if ty == Type::VARCHAR && !matches!(pg_type, "varchar" | "character varying") {
+        // `wire_type`'s fallback: no binary format is known for this type.
+        return None;
+    }
+    let field = FieldInfo::new("v".into(), None, None, ty.clone(), FieldFormat::Binary);
+    let mut enc = DataRowEncoder::new(Arc::new(vec![field]));
+    encode_binary(&mut enc, &ty, Some(v)).ok()?;
+    let row = enc.finish().ok()?;
+    let len = i32::from_be_bytes(row.data.get(..4)?.try_into().ok()?);
+    let len = usize::try_from(len).ok()?;
+    Some(row.data.get(4..4 + len)?.to_vec())
+}
+
 fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWireResult<()> {
     let v = match v {
         None | Some(Bson::Null) => return enc.encode_field(&None::<i32>),

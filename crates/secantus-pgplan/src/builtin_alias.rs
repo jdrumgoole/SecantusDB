@@ -121,13 +121,53 @@ fn operators() -> &'static HashMap<(String, usize), Operator> {
     })
 }
 
+/// PostgreSQL 15.19's `pg_type`: `typname`, `typoutput`, `typsend`,
+/// `typmodout` for its base, range and multirange types.
+const TYPE_IO: &str = include_str!("pg_type_io.tsv");
+
+/// Each type's output function, as its value's I/O conversion to `cstring`:
+/// `int4out(x)` is `x::int4::cstring`. A function several types share
+/// (`range_out`, `array_out`) takes its argument as it comes.
+fn output_templates() -> Vec<(&'static str, String)> {
+    let rows: Vec<(&str, &str)> = TYPE_IO
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            Some((it.next()?, it.next()?))
+        })
+        .filter(|(_, out)| *out != "-")
+        .collect();
+    let shared = |out: &str| rows.iter().filter(|(_, o)| *o == out).count() > 1;
+    let mut out: Vec<(&'static str, String)> = rows
+        .iter()
+        .map(|(ty, f)| {
+            // A bare `bit` is `bit(1)` in a cast, and would cut the value.
+            let sql = if shared(f) || *ty == "bit" {
+                "$1::cstring".to_string()
+            } else {
+                format!("$1::{}::cstring", scalar::quote_identifier(ty))
+            };
+            (&*Box::leak(f.to_string().into_boxed_str()), sql)
+        })
+        .collect();
+    out.push(("array_out", "$1::cstring".to_string()));
+    out
+}
+
 fn templates() -> &'static HashMap<(&'static str, usize), pg_query::protobuf::Node> {
     static T: OnceLock<HashMap<(&'static str, usize), pg_query::protobuf::Node>> = OnceLock::new();
     T.get_or_init(|| {
-        TEMPLATES
+        let mut map: HashMap<(&'static str, usize), pg_query::protobuf::Node> = TEMPLATES
             .iter()
             .filter_map(|(name, n, sql)| Some(((*name, *n), parse_expression(sql)?)))
-            .collect()
+            .collect();
+        for (name, sql) in output_templates() {
+            if let Some(node) = parse_expression(&sql) {
+                map.entry((name, 1)).or_insert(node);
+            }
+        }
+        map
     })
 }
 

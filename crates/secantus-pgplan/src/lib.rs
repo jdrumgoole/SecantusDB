@@ -90,6 +90,7 @@ mod funcsig;
 pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
+pub mod typsend;
 pub mod validators;
 pub mod wparser;
 mod xml_catalog;
@@ -30587,6 +30588,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         )?))),
         // `record_in`: text cannot be read as an anonymous record, which
         // has no field types to read it by (15.19, at the literal).
+        "cstring" => Ok(match value {
+            Bson::Null => Bson::Null,
+            v => Bson::String(as_text(&v)),
+        }),
         "record" if matches!(value, Bson::String(_)) => Err(Error::Sqlstate(
             "0A000",
             "input of anonymous composite types is not implemented".into(),
@@ -35212,6 +35217,31 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // `cstring` is a value's output text (an I/O conversion): the text
+        // cast's, except that a `char(n)` keeps its padding (`bpcharout`).
+        if target == "cstring" {
+            if value == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            match static_type(arg, &value).as_str() {
+                "bpchar" => return Ok(Bson::String(value_text(&value))),
+                // `boolout` is `t` / `f`, where the text cast spells it out.
+                "bool" => {
+                    if let Bson::Boolean(b) = value {
+                        return Ok(Bson::String(if b { "t" } else { "f" }.into()));
+                    }
+                }
+                _ => {}
+            }
+            let mut as_text = (**tc).clone();
+            as_text.type_name = Some(type_name_node("text"));
+            return const_value_inner(
+                &pg_query::protobuf::Node {
+                    node: Some(N::TypeCast(Box::new(as_text))),
+                },
+                params,
+            );
+        }
         // A user BASE type (`CREATE TYPE t (input = ..., output = ...)`) is
         // carried as its text, but it has no cast to anything but the string
         // types and itself: `'a'::t::int` is 42846 on PostgreSQL rather than a
