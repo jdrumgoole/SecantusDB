@@ -509,7 +509,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     .and_then(|spec| geo_near_index_filter(spec, &ctx.db_name, Some(c), storage));
                 let (filter, rest) = match geonear_candidate {
                     Some(cand) => (cand, pipeline),
-                    None => lift_leading_match(&pipeline),
+                    None => lift_leading_match(&crate::explain::hoist::hoist_matches(&pipeline)),
                 };
                 // A `$sort` at the front is still run by the pipeline, which
                 // keeps equal documents in the order they arrive: reading them

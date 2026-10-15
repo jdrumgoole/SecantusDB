@@ -326,6 +326,15 @@ fn simple_projection(spec: &Document) -> Option<Document> {
 /// The leading stages of a pipeline the query planner absorbs, folded into
 /// `shape`; the stages it leaves are kept in `shape.rest`.
 pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let hoisted: Vec<Document> = super::hoist::hoist_matches(&stages)
+        .into_iter()
+        .filter_map(|s| match s {
+            Bson::Document(d) => Some(d),
+            _ => None,
+        })
+        .collect();
+    let pipeline = hoisted.as_slice();
     let mut filters: Vec<Document> = Vec::new();
     if !shape.filter.is_empty() {
         filters.push(shape.filter.clone());

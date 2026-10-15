@@ -89,6 +89,7 @@ fn has_sort(node: &Node) -> bool {
 fn has_or(node: &Node) -> bool {
     match access(node) {
         Node::Or(_) => true,
+        Node::AndSorted(_) => false,
         Node::Fetch { input, .. } | Node::Sort { input, .. } => has_or(input),
         Node::SortMerge { inputs, .. } => inputs.iter().any(has_or),
         _ => false,
@@ -104,7 +105,7 @@ fn key_fields(node: &Node, out: &mut BTreeSet<String>) {
             }
         }
         Node::Fetch { input, .. } | Node::Sort { input, .. } => key_fields(input, out),
-        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
             inputs.iter().for_each(|n| key_fields(n, out))
         }
         _ => {}
@@ -189,9 +190,74 @@ fn reached(node: &Node, env: &Env, count: usize) -> Vec<usize> {
             rows
         }
         Node::Sort { input, .. } => reached(input, env, count),
-        Node::Or(inputs) | Node::SortMerge { inputs, .. } => union(inputs),
+        Node::Or(inputs) => union(inputs),
+        and @ Node::AndSorted(_) => exec::rows(and, env),
+        merge @ Node::SortMerge { .. } => exec::rows(merge, env),
         _ => (0..count).collect(),
     }
+}
+
+/// Whether the plan merges sorted scans. Which of two equal documents a
+/// merge hands over first depends on every document it holds, so all of
+/// them are placed, not only those that compare equal.
+fn has_merge(node: &Node) -> bool {
+    match access(node) {
+        Node::SortMerge { .. } => true,
+        Node::Fetch { input, .. } | Node::Sort { input, .. } => has_merge(input),
+        Node::Or(inputs) => inputs.iter().any(has_merge),
+        _ => false,
+    }
+}
+
+/// Whether a stage of the plan runs a filter.
+fn filtered(node: &Node) -> bool {
+    match access(node) {
+        Node::IxScan(ix) => ix.filter.is_some(),
+        Node::Fetch { filter, input } => filter.is_some() || filtered(input),
+        Node::Sort { input, .. } => filtered(input),
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().any(filtered)
+        }
+        Node::CollScan { filter, .. } => filter.is_some(),
+        _ => false,
+    }
+}
+
+/// Where the plan puts each document of the whole collection it returns,
+/// by RecordId. `None`: the collection is too large to read for it, or a
+/// document does not decode.
+fn merge_ranks(
+    storage: &dyn Storage,
+    ask: &Ask,
+    plan: &Node,
+) -> Result<Option<std::collections::HashMap<i64, usize>>, StorageError> {
+    let Some(all) = storage.collection_at_most(ask.db, ask.coll, TRIAL_COLLECTION)? else {
+        return Ok(None);
+    };
+    let docs: Option<Vec<Document>> = all
+        .iter()
+        .map(|(_, blob)| secantus_core::bsondoc::from_bytes(blob.as_slice()).ok())
+        .collect();
+    let Some(docs) = docs else {
+        return Ok(None);
+    };
+    let env = Env {
+        docs: &docs,
+        collation: ask.collation,
+        skip: 0,
+        limit: 0,
+        multi: true,
+        upsert: false,
+        returns: false,
+        known: None,
+    };
+    Ok(Some(
+        reached(plan, &env, docs.len())
+            .into_iter()
+            .enumerate()
+            .map(|(rank, at)| (all[at].0, rank))
+            .collect(),
+    ))
 }
 
 /// Whether rows the router read through index `via` are in the plan's
@@ -443,26 +509,10 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         }
     }
 
-    if let Some(via) = &via {
-        if already_in_order(&plan, via) {
-            return Ok(Some(rows));
-        }
-        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
-    }
-    // A scan of the collection is the order the rows are in.
-    if sorted.is_none() {
-        if let Node::CollScan { backward, .. } = access(&plan) {
-            if *backward {
-                rows.reverse();
-            }
-            return Ok(Some(rows));
-        }
-    }
-
-    // A sort the predicate's index does not return: mongod also tries a walk
-    // of an index that does, and which one it keeps depends on how much of
-    // the collection each reads.
-    if has_sort(&plan) {
+    // Several plans could answer it, or the predicate's index leaves a sort
+    // and a walk of another index returns it: which one mongod keeps depends
+    // on its trial over the collection.
+    if has_sort(&plan) || plan::contested(&query(None), &catalog) {
         let total = storage.collection_count_at_most(ask.db, ask.coll, TRIAL_COLLECTION)?;
         if let Some(total) = total {
             let whole = Lazy {
@@ -481,8 +531,25 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
                 total,
                 matched: Some(rows.len()),
                 whole: &whole,
+                ranked: Default::default(),
             };
             plan = plan::plan(&query(Some(&trial)), &catalog);
+        }
+    }
+
+    if let Some(via) = &via {
+        if already_in_order(&plan, via) {
+            return Ok(Some(rows));
+        }
+        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+    }
+    // A scan of the collection is the order the rows are in.
+    if sorted.is_none() {
+        if let Node::CollScan { backward, .. } = access(&plan) {
+            if *backward {
+                rows.reverse();
+            }
+            return Ok(Some(rows));
         }
     }
 
@@ -500,8 +567,11 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         }
         _ => rows.len(),
     };
+    let merged = has_merge(&plan);
+    let cut = if merged { rows.len() } else { cut };
     let placing: Vec<usize> = match &sorted {
         None => (0..rows.len()).collect(),
+        Some(_) if merged => (0..rows.len()).collect(),
         Some((order, tied)) => {
             let mut some: Vec<usize> = (0..cut)
                 .filter(|&at| tied[at] || tied.get(at + 1).copied().unwrap_or(false))
@@ -511,56 +581,76 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             some
         }
     };
-    // Whole documents when an `$or` runs its branches' filters; otherwise
-    // the fields the scans are keyed on, and none at all without a scan.
-    let whole = has_or(&plan);
-    let plan = if whole { plan } else { untested(&plan) };
-    let mut fields = BTreeSet::new();
-    key_fields(&plan, &mut fields);
-    let mut docs: Vec<Document> = Vec::new();
-    if whole || !fields.is_empty() {
-        docs.reserve(placing.len());
+    // A merge whose scans admit documents a filter then rejects holds those
+    // in its heap too, and they move where equal documents come out: it is
+    // run over the whole collection, filters and all.
+    let whole_merge = if merged && filtered(&plan) {
+        merge_ranks(storage, ask, &plan)?
+    } else {
+        None
+    };
+    let rank = if let Some(ranks) = whole_merge {
+        let mut rank = vec![usize::MAX; rows.len()];
         for &row in &placing {
-            let blob = rows[row].1.as_slice();
-            let decoded = if whole {
-                secantus_core::bsondoc::from_bytes(blob).ok()
-            } else {
-                decode_fields(blob, &fields)
-            };
-            match decoded {
-                Some(d) => docs.push(d),
-                // A document that does not decode: read as before.
-                None => return Ok(None),
+            rank[row] = ranks
+                .get(&rows[row].0)
+                .copied()
+                .unwrap_or(usize::MAX / 2 + row);
+        }
+        rank
+    } else {
+        // Whole documents when an `$or` runs its branches' filters; otherwise
+        // the fields the scans are keyed on, and none at all without a scan.
+        let whole = has_or(&plan);
+        let plan = if whole { plan } else { untested(&plan) };
+        let mut fields = BTreeSet::new();
+        key_fields(&plan, &mut fields);
+        let mut docs: Vec<Document> = Vec::new();
+        if whole || !fields.is_empty() {
+            docs.reserve(placing.len());
+            for &row in &placing {
+                let blob = rows[row].1.as_slice();
+                let decoded = if whole {
+                    secantus_core::bsondoc::from_bytes(blob).ok()
+                } else {
+                    decode_fields(blob, &fields)
+                };
+                match decoded {
+                    Some(d) => docs.push(d),
+                    // A document that does not decode: read as before.
+                    None => return Ok(None),
+                }
             }
         }
-    }
-    let env = Env {
-        docs: &docs,
-        collation: ask.collation,
-        skip: 0,
-        limit: 0,
-        multi: true,
-        upsert: false,
-        returns: false,
-        known: None,
+        let env = Env {
+            docs: &docs,
+            collation: ask.collation,
+            skip: 0,
+            limit: 0,
+            multi: true,
+            upsert: false,
+            returns: false,
+            known: None,
+        };
+        // Where the plan puts each row among those it places. One it does not
+        // reach goes after the rest, in insertion order: the plan never selects.
+        let mut rank = vec![usize::MAX; rows.len()];
+        let mut next = 0;
+        for at in reached(&plan, &env, placing.len()) {
+            let row = placing[at];
+            if rank[row] == usize::MAX {
+                rank[row] = next;
+                next += 1;
+            }
+        }
+        for &row in &placing {
+            if rank[row] == usize::MAX {
+                rank[row] = next;
+                next += 1;
+            }
+        }
+        rank
     };
-    // Where the plan puts each row among those it places. One it does not
-    // reach goes after the rest, in insertion order: the plan never selects.
-    let mut rank = vec![usize::MAX; rows.len()];
-    let mut next = 0;
-    for at in reached(&plan, &env, placing.len()) {
-        let row = placing[at];
-        if rank[row] == usize::MAX {
-            rank[row] = next;
-            next += 1;
-        }
-    }
-    for &row in &placing {
-        if rank[row] == usize::MAX {
-            rank[row] = next;
-            next += 1;
-        }
-    }
     let order = match sorted {
         None => {
             let mut order = placing;
@@ -626,7 +716,7 @@ fn index_names(node: &Node, out: &mut Vec<String>) {
         Node::IxScan(ix) => out.push(ix.index.name.clone()),
         Node::Express { index, .. } => out.push(index.name.clone()),
         Node::Fetch { input, .. } | Node::Sort { input, .. } => index_names(input, out),
-        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
             inputs.iter().for_each(|n| index_names(n, out))
         }
         _ => {}
@@ -770,7 +860,7 @@ fn used_indexes(node: &Node, out: &mut Vec<String>) {
         | Node::Count(input)
         | Node::Update(input)
         | Node::Delete { input, .. } => used_indexes(input, out),
-        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
             inputs.iter().for_each(|n| used_indexes(n, out))
         }
         _ => {}

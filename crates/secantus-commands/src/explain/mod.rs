@@ -8,18 +8,23 @@
 //! command. It is a description of the plan mongod runs for the query. This
 //! server's own storage layer may read the same documents another way.
 //!
-//! Not reproduced: the rejected plans, the plan cache, and the choice
-//! mongod makes by trial when several indexes could serve one query (a
-//! fixed order of preference stands in for it, see `plan.rs`).
+//! Not reproduced: the plan cache. The choice mongod makes by trial when
+//! several plans could serve one query is counted over the collection
+//! (`trial.rs`), and the plans it tried are listed as `rejectedPlans` and
+//! `allPlansExecution`; between plans the trial scores alike a fixed order
+//! of preference decides (`plan.rs`). A multikey index with two predicates
+//! on one field is tried once here, where mongod tries a plan per predicate.
 
 mod bounds;
 mod exec;
 pub(crate) mod geo;
+pub(crate) mod hoist;
 mod node;
 pub(crate) mod order;
 mod parsed;
 mod plan;
 mod shape;
+mod trial;
 
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
@@ -198,7 +203,9 @@ fn scans_collection(plan: &Node) -> bool {
         | Node::Count(input)
         | Node::Update(input)
         | Node::Delete { input, .. } => scans_collection(input),
-        Node::Or(inputs) | Node::SortMerge { inputs, .. } => inputs.iter().any(scans_collection),
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().any(scans_collection)
+        }
         Node::IxScan(_)
         | Node::Eof(_)
         | Node::Express { .. }
@@ -407,14 +414,17 @@ fn plan_for(
     collation: Option<&Collation>,
     t: &Target,
     ctx: &CommandContext,
-) -> Result<Node, CommandError> {
+) -> Result<(Node, Vec<plan::Ranked>), CommandError> {
     let ns = format!("{}.{}", ctx.db_name, s.coll);
     if !t.exists {
         let eof = Node::Eof("nonExistentNamespace");
-        return Ok(match s.kind {
-            Kind::Count => Node::Count(Box::new(eof)),
-            _ => eof,
-        });
+        return Ok((
+            match s.kind {
+                Kind::Count => Node::Count(Box::new(eof)),
+                _ => eof,
+            },
+            Vec::new(),
+        ));
     }
     let storage = ctx.storage()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
@@ -456,6 +466,7 @@ fn plan_for(
         total: t.docs.len(),
         matched: None,
         whole: &whole,
+        ranked: Default::default(),
     };
     let q = Query {
         canonical,
@@ -474,7 +485,7 @@ fn plan_for(
         implies: &implies,
         trial: Some(&trial),
     };
-    Ok(match &s.kind {
+    let node = match &s.kind {
         Kind::Find => plan::plan(&q, &t.catalog),
         Kind::Count => plan::count(&q, &t.catalog),
         Kind::Distinct(key) => plan::distinct(&q, &t.catalog, key),
@@ -484,7 +495,9 @@ fn plan_for(
         Kind::Delete { multi, returns } => {
             plan::write(&q, &t.catalog, true, *multi, false, *returns)
         }
-    })
+    };
+    let ranked = std::mem::take(&mut *trial.ranked.borrow_mut());
+    Ok((node, ranked))
 }
 
 fn query_planner(
@@ -527,7 +540,57 @@ fn query_planner(
     out
 }
 
-fn execution_stats(plan: &Node, stats: &Stats, verbosity: Verbosity) -> Document {
+/// Raise each counter of `run` to what `trial` counted in the same stage.
+fn at_least(run: &mut Stats, trial: &Stats) {
+    run.n_returned = run.n_returned.max(trial.n_returned);
+    run.keys = run.keys.max(trial.keys);
+    run.docs = run.docs.max(trial.docs);
+    if run.children.len() == trial.children.len() {
+        for (r, t) in run.children.iter_mut().zip(&trial.children) {
+            at_least(r, t);
+        }
+    }
+}
+
+/// The plans mongod tried, as `explain` lists them (the winner first): each
+/// under the stage the command puts on top, with its score and what its
+/// stages counted during the trial.
+fn tried_plans(s: &Shape, ranked: &[plan::Ranked]) -> Vec<(Node, f64, Stats)> {
+    ranked
+        .iter()
+        .map(|r| {
+            let on_top = |node: Node, extra: Document| {
+                let stats = Stats {
+                    extra,
+                    children: vec![r.stats.clone()],
+                    ..Stats::default()
+                };
+                (node, r.score, stats)
+            };
+            match &s.kind {
+                Kind::Update { .. } => on_top(
+                    Node::Update(Box::new(r.plan.clone())),
+                    doc! { "nMatched": 0_i32, "nWouldModify": 0_i32, "nWouldUpsert": 0_i32 },
+                ),
+                Kind::Delete { multi, .. } => on_top(
+                    Node::Delete {
+                        batched: *multi,
+                        input: Box::new(r.plan.clone()),
+                    },
+                    doc! { "nWouldDelete": 0_i32 },
+                ),
+                _ => (r.plan.clone(), r.score, r.stats.clone()),
+            }
+        })
+        .collect()
+}
+
+fn execution_stats(
+    plan: &Node,
+    stats: &Stats,
+    verbosity: Verbosity,
+    tried: &[(Node, f64, Stats)],
+) -> Document {
     let (keys, docs) = stats.totals();
     let mut stages = doc! { "isCached": false };
     stages.extend(plan.to_doc(Some(stats)));
@@ -540,7 +603,32 @@ fn execution_stats(plan: &Node, stats: &Stats, verbosity: Verbosity) -> Document
         "executionStages": stages,
     };
     if verbosity == Verbosity::AllPlans {
-        out.insert("allPlansExecution", Bson::Array(vec![]));
+        let entries: Vec<Bson> = tried
+            .iter()
+            .enumerate()
+            .map(|(at, (node, score, st))| {
+                // mongod's write stage is one object, shared by every plan:
+                // the plans it rejected show the counts of the run that
+                // followed, the winner the counts it had during the trial.
+                let mut st = st.clone();
+                if at > 0 && matches!(node, Node::Update(_) | Node::Delete { .. }) {
+                    st.extra = stats.extra.clone();
+                    st.n_returned = stats.n_returned;
+                }
+                let (keys, docs) = st.totals();
+                let mut stages = doc! { "isCached": false };
+                stages.extend(node.to_doc(Some(&st)));
+                Bson::Document(doc! {
+                    "nReturned": num(st.n_returned),
+                    "executionTimeMillisEstimate": 0_i32,
+                    "totalKeysExamined": num(keys),
+                    "totalDocsExamined": num(docs),
+                    "score": *score,
+                    "executionStages": stages,
+                })
+            })
+            .collect();
+        out.insert("allPlansExecution", entries);
     }
     out
 }
@@ -634,14 +722,26 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let collation = crate::util::effective_collation(storage, &db, &s.coll, &s.options)?;
     let canonical = parsed::parsed_query(&s.filter);
     let t = target(ctx, &s.coll)?;
-    let plan = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
+    let (plan, ranked) = plan_for(s, &canonical, collation.as_ref(), &t, ctx)?;
     if crate::notablescan::enabled(ctx) {
         let why = resolve_hint(s.hint.as_ref(), &t.catalog)
             .ok()
             .and_then(|hint| table_scan(&plan, &hint));
         crate::notablescan::refuse_planned(ctx.storage()?, &db, &s.coll, &s.filter, why)?;
     }
-    let planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
+    let tried = tried_plans(s, &ranked);
+    let mut planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
+    if tried.len() > 1 {
+        let rejected: Vec<Bson> = tried[1..]
+            .iter()
+            .map(|(node, _, _)| {
+                let mut d = doc! { "isCached": false };
+                d.extend(node.to_doc(None));
+                Bson::Document(d)
+            })
+            .collect();
+        planner.insert("rejectedPlans", rejected);
+    }
     let stats = wanted.then(|| {
         let (multi, upsert, returns) = match &s.kind {
             Kind::Update {
@@ -662,13 +762,23 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             returns,
             known: None,
         };
-        exec::run(&plan, &env)
+        let mut run = exec::run(&plan, &env);
+        // The winner's stages are the ones the trial worked: what they
+        // counted then stands where the run read less (a delete of one
+        // document after a trial that read them all).
+        if let Some((_, _, trial)) = tried.first() {
+            at_least(&mut run, trial);
+        }
+        run
     });
     let mut reply = doc! { "explainVersion": "1" };
     if s.rest.is_empty() {
         reply.insert("queryPlanner", planner);
         if let Some(st) = &stats {
-            reply.insert("executionStats", execution_stats(&plan, st, verbosity));
+            reply.insert(
+                "executionStats",
+                execution_stats(&plan, st, verbosity, &tried),
+            );
         }
         reply.insert("command", r.echo.clone());
         reply.insert("serverInfo", server_info(ctx));
@@ -676,7 +786,10 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     } else {
         let mut cursor = doc! { "queryPlanner": planner };
         if let Some(st) = &stats {
-            cursor.insert("executionStats", execution_stats(&plan, st, verbosity));
+            cursor.insert(
+                "executionStats",
+                execution_stats(&plan, st, verbosity, &tried),
+            );
         }
         let counted = |stage: &mut Document, n: i64| {
             stage.insert("nReturned", Bson::Int64(n));
