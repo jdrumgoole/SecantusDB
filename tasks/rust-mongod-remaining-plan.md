@@ -60,11 +60,11 @@ measured on is not recorded. Re-run a probe, and record `secantusd-rs
 
 ## Phase 0 -- in flight at the end of 2026-10-14
 
-- [ ] **0a. The 0.5.3-beta.194 site post.** Released (binaries, crates.io);
+- [x] **0a. The 0.5.3-beta.194 site post.** (#1952) Released (binaries, crates.io);
       the post, the pinned binary tag and the rewritten authorization section
       of `docs-rust/security.md` are on branch `site-mdb-0.5.3-beta.194`.
       Needs a PR, a merge and `invoke deploy`.
-- [ ] **0b. Five commands mongod has and the server lacked** (7.084, 324
+- [x] **0b. Five commands mongod has and the server lacked** (#1954) (7.084, 324
       rows; part of 7.082's "commands not there"): `dbHash`, `logRotate`,
       `connPoolStats`, `setDefaultRWConcern`, `setFeatureCompatibilityVersion`.
       A WIP commit is on the claim branch `rust-missing-admin-commands`
@@ -273,23 +273,27 @@ Size: one or two batches.
 
 ## Phase 6 -- tooling and measurement
 
-- [ ] 7.06: the binary smoke test should run the binary the provenance check
+- [x] 7.06: the binary smoke test should run the binary the provenance check
       verified; replace `timeout` in the release skill's finalize loop.
-- [ ] Re-run every driver gauge against the Rust server and regenerate the
-      driver panels; the `-rust-server` reports are stale (7.05).
+      Done 2026-10-15: the smoke test picks a binary built from HEAD, else
+      the debug one the check covers (RM-112); the skill no longer calls
+      `timeout` (RM-113, already fixed).
+- [x] Re-run every driver gauge against the Rust server and regenerate the
+      driver panels; the `-rust-server` reports are stale (7.05). Done
+      2026-10-15 on main f301d636 (validate.yml run 38816458149): no gauge
+      lost a test; mongo-rust-driver 105/105, Go the same six leaves (RM-008).
 - [ ] Re-measure throughput against mongod on the droplets: the 0.27x write
-      figure (§3) is from 0.5.3-beta.160.
-- [ ] Backlog entries that read as stale, to verify and close: 7.065's
+      figure (§3) is from 0.5.3-beta.160. Against the beta.196 release.
+- [x] Backlog entries that read as stale, to verify and close: 7.065's
       "`convertToCapped` is not implemented" (7.071 says it landed
       2026-10-11), the Go SDAM heartbeat item, the `featureCompatibilityVersion:
-      "7.0"` note and the `Location91` codeName in §5.
-- [ ] Backlog entries that contradict each other: 7.071 says `compact` and
-      `reIndex` landed 2026-10-11 and match mongod on 51 of 51; 7.084
-      (2026-10-14) says they answer an error where mongod runs them (8).
-      Reproduce both before scheduling either. The unknown-hint wording is
-      "left open on purpose" in 7.05 and in
-      `tests/test_rust_hint_error_message.py`, but "Joe's call, not made" in
-      7.078. Make the entries agree once the decision below is confirmed.
+      "7.0"` note and the `Location91` codeName in §5. The first, third and
+      fourth were gone already; the heartbeat test passes (2026-10-15).
+- [x] Backlog entries that contradict each other: `compact` and `reIndex`.
+      Re-measured 2026-10-15: `compact` (and `setParameter notablescan`)
+      match mongod 8.2.11, `reIndex` refuses as on a replica-set primary;
+      RM-027 now holds only `mapReduce` with `out`. The unknown-hint wording
+      (RM-051) waits on the decision below; 7.078 no longer says otherwise.
 - [ ] Watch item (7.07): one writer made no progress for over 10 s in a
       droplet sweep. Not reproduced. The harness now keeps the server's log
       and store when a row fails; read them if it happens again.

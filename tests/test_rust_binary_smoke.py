@@ -28,6 +28,26 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
 
 
+def _source_tree_of(binary: pathlib.Path) -> str | None:
+    """The tree hash the binary was stamped with, or None if it carries none."""
+    out = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=60)
+    for line in out.stdout.splitlines():
+        if line.startswith("tree: "):
+            return line[len("tree: ") :].strip()
+    return None
+
+
+def _tree_at_head() -> str | None:
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD:crates"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
 def _binary_path() -> pathlib.Path | None:
     env = os.environ.get("SECANTUSDB_BIN")
     if env:
@@ -51,13 +71,31 @@ def _binary_path() -> pathlib.Path | None:
                 "the suite discover one under crates/secantusdb/target/."
             )
         return p
-    # Prefer the release binary: it is the shipped artifact and much faster than
-    # a debug build under the full parallel suite. Fall back to debug.
+    # Prefer the release binary, which is the shipped artifact and much faster
+    # than a debug build under the full parallel suite -- but only when it was
+    # built from HEAD. The provenance check in conftest verifies the DEBUG
+    # binary, so a stale release binary picked ahead of it was smoked unchecked:
+    # a 29 September beta.165 build, older than the SIGTERM fix, failed the
+    # signal tests deterministically and read as a regression (RM-112).
+    found = []
     for profile in ("release", "debug"):
         p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
         if sys.platform == "win32":
             p = p.with_suffix(".exe")
         if p.exists():
+            found.append((profile, p))
+    head = _tree_at_head()
+    if head is None:
+        # No git to judge staleness by (an unpacked sdist): keep the preference.
+        return found[0][1] if found else None
+    for _profile, p in found:
+        if _source_tree_of(p) == head:
+            return p
+    # Nothing built from HEAD. The debug binary is the one conftest's check
+    # covers (it aborts the run on a stale one unless told to measure an old
+    # build), so smoke that; a stale release binary alone is never smoked.
+    for profile, p in found:
+        if profile == "debug":
             return p
     return None
 
@@ -247,26 +285,6 @@ def test_help_exits_zero() -> None:
     res = subprocess.run([str(_BIN), "--help"], capture_output=True, text=True, timeout=30)
     assert res.returncode == 0
     assert "--storage-path" in res.stdout
-
-
-def _source_tree_of(binary: pathlib.Path) -> str | None:
-    """The tree hash the binary was stamped with, or None if it carries none."""
-    out = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=60)
-    for line in out.stdout.splitlines():
-        if line.startswith("tree: "):
-            return line[len("tree: ") :].strip()
-    return None
-
-
-def _tree_at_head() -> str | None:
-    out = subprocess.run(
-        ["git", "rev-parse", "HEAD:crates"],
-        cwd=_REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return out.stdout.strip() if out.returncode == 0 else None
 
 
 def test_binary_was_built_from_this_tree() -> None:
