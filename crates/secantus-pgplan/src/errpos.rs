@@ -77,10 +77,17 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         .iter()
         .filter_map(|t| {
             let (s, e) = (t.start as usize, t.end as usize);
-            Some(Tok {
-                start: s,
-                text: sql.get(s..e)?,
-            })
+            let text = sql.get(s..e)?;
+            // An escape literal is matched as the plain literal it spells
+            // when it has no escapes (`E'x'` is `'x'`), still positioned at
+            // its `E`: under `standard_conforming_strings = off` every
+            // plain literal reaches here rewritten as one
+            // (`escape_strings`), and the `E` maps back to its quote.
+            let text = match text.get(..2) {
+                Some("E'" | "e'") => &text[1..],
+                _ => text,
+            };
+            Some(Tok { start: s, text })
         })
         .collect();
     let pos = |start: usize| Some(sql.get(..start)?.chars().count() + 1);
@@ -174,6 +181,12 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 return None;
             }
             pos(inner.first()?.start)
+        }
+        // `there is no parameter $2`: at its first `$2` (15.19: position 22
+        // of `select 1 fetch first $1 rows only`).
+        "42P02" if m.starts_with("there is no parameter ") => {
+            let n = m.strip_prefix("there is no parameter ")?;
+            pos(toks.iter().find(|t| t.text == n)?.start)
         }
         // `ORDER BY position 5 is not in select list`: at the number.
         "42P10" if m.ends_with(" is not in select list") => {

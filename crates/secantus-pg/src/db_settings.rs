@@ -79,6 +79,11 @@ impl PgHandler {
                     .into(),
             ));
         }
+        // A value names a parameter PostgreSQL must know (42704 otherwise);
+        // RESET of an unknown name is accepted (measured on 15.19).
+        if let (Some(n), Some(_)) = (name.as_deref(), value.as_ref()) {
+            self.check_setting_known(n)?;
+        }
         let key = name.as_deref().map(canonical_setting);
         if let Some(msg) = key.as_deref().and_then(super::setting_change_refusal) {
             return Err(Self::user_error("55P02", msg));

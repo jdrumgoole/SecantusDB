@@ -3027,6 +3027,10 @@ pub struct PgHandler {
     /// `RAISE NOTICE` / `WARNING` / `INFO`), sent to the client by the query
     /// handlers before the statement's own result or error.
     pending_notices: Mutex<Vec<ErrorInfo>>,
+    /// The texts `apply_string_syntax` rewrote, newest last: (rewritten,
+    /// as sent, the map between them), so an error positioned in the
+    /// rewritten text is reported where the client wrote it.
+    string_maps: Mutex<Vec<StringMap>>,
     /// While a statement runs: a way to send notices to the client NOW,
     /// before the statement ends (see `live_notices`).
     live_notices: Mutex<Option<live_notices::SendNotices>>,
@@ -3538,6 +3542,7 @@ impl PgHandler {
             block_scans: Mutex::new(Vec::new()),
             settings: Arc::new(Mutex::new(GucMap::from(default_settings()))),
             pending_notices: Mutex::new(Vec::new()),
+            string_maps: Mutex::new(Vec::new()),
             live_notices: Mutex::new(None),
             pending_params: Mutex::new(Vec::new()),
             copy_in: Mutex::new(None),
@@ -17372,9 +17377,90 @@ pub(crate) fn is_internal_setting(key: &str) -> bool {
 /// `internal` setting never changes, a `postmaster` one only at a restart, a
 /// `sighup` one only in the configuration file, a `backend` one only at
 /// connection start. `None` for a setting a session may change.
+/// A text `apply_string_syntax` rewrote: (rewritten, as sent, the map).
+type StringMap = Arc<(String, String, secantus_pgplan::escape_strings::PositionMap)>;
+
+/// How many rewritten texts a session keeps maps for: enough for the
+/// statements a client keeps prepared at once, and no more.
+const STRING_MAPS_KEPT: usize = 64;
+
+/// PostgreSQL 15's parameters that `pg15_settings.tsv` leaves out (the
+/// machine-specific ones); each is still a parameter, refused for its
+/// context rather than as unknown.
+const UNDUMPED_SETTINGS: [&str; 7] = [
+    "config_file",
+    "data_directory",
+    "hba_file",
+    "ident_file",
+    "log_timezone",
+    "port",
+    "unix_socket_directories",
+];
+
+/// PostgreSQL 15's parameters that `pg_settings` hides (`GUC_NO_SHOW_ALL`),
+/// and so the dump lacks, beside `role` / `session_authorization` (measured
+/// on 15.19: each SHOWs, and `set is_superuser` is "cannot be changed").
+const HIDDEN_SETTINGS: [&str; 6] = [
+    "role",
+    "session_authorization",
+    "is_superuser",
+    "seed",
+    "ssl_renegotiation_limit",
+    "default_with_oids",
+];
+
+impl PgHandler {
+    /// `find_option`'s answer for a name a statement sets, resets or ALTERs:
+    /// PostgreSQL knows its own parameters and takes any dotted (custom)
+    /// name as a placeholder; anything else is 42704 `unrecognized
+    /// configuration parameter`, worded with the name as written (measured
+    /// on 15.19, `set "NoSuch" = 1` keeps the case).
+    pub(crate) fn check_setting_known(&self, name: &str) -> PgWireResult<()> {
+        let key = canonical_setting(name);
+        let known = key.contains('.')
+            || pg15_settings::pg15_setting(&key).is_some()
+            || UNDUMPED_SETTINGS.contains(&key.as_str())
+            || is_internal_setting(&key)
+            || self.server_defaults().contains_key(&key)
+            || HIDDEN_SETTINGS.contains(&key.as_str());
+        if known {
+            return Ok(());
+        }
+        Err(Self::user_error(
+            "42704",
+            format!("unrecognized configuration parameter \"{name}\""),
+        ))
+    }
+
+    /// `RESET transaction_isolation` (and `SET ... TO DEFAULT`) outside a
+    /// block: ExecSetVariableStmt's `WarnNoTransactionBlock(isTopLevel,
+    /// "RESET TRANSACTION")`.
+    fn warn_reset_transaction(&self, key: &str) {
+        if key == "transaction_isolation"
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.warning(
+                "25P01",
+                "RESET TRANSACTION can only be used in transaction blocks".into(),
+            );
+        }
+    }
+}
+
 pub(crate) fn setting_change_refusal(key: &str) -> Option<String> {
-    if is_internal_setting(key) {
+    if is_internal_setting(key) || key == "is_superuser" {
         return Some(format!("parameter \"{key}\" cannot be changed"));
+    }
+    // The undumped ones: `log_timezone` is sighup, the rest postmaster.
+    if UNDUMPED_SETTINGS.contains(&key) {
+        let why = if key == "log_timezone" {
+            "cannot be changed now"
+        } else {
+            "cannot be changed without restarting the server"
+        };
+        return Some(format!("parameter \"{key}\" {why}"));
     }
     let why = match pg15_settings::pg15_setting(key)?.context {
         "postmaster" => "cannot be changed without restarting the server",
@@ -18815,7 +18901,11 @@ impl SimpleQueryHandler for PgHandler {
                 Err(e) => {
                     self.note_failure();
                     self.flush_notices(_c).await?;
-                    return Err(Self::err_in(&e, query));
+                    let map = self.string_map(query);
+                    return Err(Self::restore_position(
+                        Self::err_in(&e, query),
+                        map.as_ref(),
+                    ));
                 }
             },
         };
@@ -18848,9 +18938,19 @@ impl SimpleQueryHandler for PgHandler {
         let out = match out {
             Err(PgWireError::UserError(info)) if lone.is_some() && info.code == "42601" => {
                 Err(match secantus_pgplan::split_statements(query) {
-                    Err(e) => Self::err_in(&e, query),
+                    Err(e) => {
+                        let map = self.string_map(query);
+                        Self::restore_position(Self::err_in(&e, query), map.as_ref())
+                    }
                     Ok(_) => PgWireError::UserError(info),
                 })
+            }
+            // Several commands: positions were counted into the whole text
+            // (`run_batch`), so they map back by it. (One command was
+            // mapped by `run`.)
+            Err(e) if stmts.len() > 1 => {
+                let map = self.string_map(query);
+                Err(Self::restore_position(e, map.as_ref()))
             }
             out => out,
         };
@@ -21968,7 +22068,9 @@ impl PgHandler {
             None,
         );
         // An error can also surface while the rows STREAM (a value that
-        // fails to evaluate on some row): it gets the same position.
+        // fails to evaluate on some row): it gets the same position. Either
+        // is reported in the text as the client sent it.
+        let map = self.string_map(query);
         result
             .map(|responses| {
                 responses
@@ -21980,15 +22082,17 @@ impl PgHandler {
                                 &mut q.data_rows,
                                 Box::pin(futures::stream::empty()),
                             );
-                            q.data_rows =
-                                Box::pin(rows.map_err(move |e| Self::positioned(e, &sql)));
+                            let map = map.clone();
+                            q.data_rows = Box::pin(rows.map_err(move |e| {
+                                Self::restore_position(Self::positioned(e, &sql), map.as_ref())
+                            }));
                             Response::Query(q)
                         }
                         other => other,
                     })
                     .collect()
             })
-            .map_err(|e| Self::positioned(e, query))
+            .map_err(|e| Self::restore_position(Self::positioned(e, query), map.as_ref()))
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -23046,8 +23150,18 @@ impl PgHandler {
         if syntax.conforming && (!syntax.refuse_backslash_quote || !sql.contains("\\'")) {
             return Ok(sql.to_string());
         }
-        let (rewritten, warnings, position) =
-            secantus_pgplan::escape_strings::rewrite_with(sql, syntax);
+        let (rewritten, warnings, position, map) =
+            secantus_pgplan::escape_strings::rewrite_mapped(sql, syntax);
+        if let Ok(text) = rewritten.as_ref() {
+            if !map.is_identity() {
+                let mut maps = self.string_maps.lock().unwrap_or_else(|e| e.into_inner());
+                maps.retain(|m| m.0 != *text);
+                if maps.len() >= STRING_MAPS_KEPT {
+                    maps.remove(0);
+                }
+                maps.push(Arc::new((text.clone(), sql.to_string(), map)));
+            }
+        }
         if !warnings.is_empty() {
             let mut pending = self
                 .pending_notices
@@ -23071,6 +23185,32 @@ impl PgHandler {
             }
             out
         })
+    }
+
+    /// The map `apply_string_syntax` kept for `rewritten`, if it rewrote it.
+    fn string_map(&self, rewritten: &str) -> Option<StringMap> {
+        self.string_maps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|m| m.0 == rewritten)
+            .cloned()
+    }
+
+    /// `e` with its position put back into the text as the client sent it,
+    /// when `map` rewrote it (`escape_strings::PositionMap`).
+    fn restore_position(mut e: PgWireError, map: Option<&StringMap>) -> PgWireError {
+        if let (PgWireError::UserError(info), Some(m)) = (&mut e, map) {
+            if let Some(p) = info
+                .position
+                .as_deref()
+                .and_then(|p| p.parse::<usize>().ok())
+            {
+                info.position = Some(m.2.original(&m.0, &m.1, p).to_string());
+            }
+        }
+        e
     }
 
     fn collect_planner_warnings(&self) {
@@ -23181,6 +23321,7 @@ impl PgHandler {
                     Bson::Null => String::new(),
                     other => format!("{other}"),
                 };
+                self.check_setting_known(name)?;
                 let key = canonical_setting(name);
                 if let Some(msg) = setting_change_refusal(&key) {
                     return Err(Self::user_error("55P02", msg));
@@ -31075,7 +31216,9 @@ impl PgHandler {
                 // (measured on 15.19: `SET LOCAL datestyle TO DEFAULT` in a
                 // block reads `ISO, MDY`, and the session's `German, DMY`
                 // is back after COMMIT).
+                self.check_setting_known(&name)?;
                 let key = canonical_setting(&name);
+                self.warn_reset_transaction(&key);
                 let value = self
                     .db_setting_defaults()
                     .into_iter()
@@ -31099,6 +31242,8 @@ impl PgHandler {
             }
             Statement::SetLocal { name, value } => {
                 if !self.set_local_allowed() {
+                    // The WARNING first, then the name is looked up.
+                    self.check_setting_known(&name)?;
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
                 }
                 let key = canonical_setting(&name);
@@ -31109,6 +31254,7 @@ impl PgHandler {
                 out
             }
             Statement::Set { name, value } => {
+                self.check_setting_known(&name)?;
                 let key = canonical_setting(&name);
                 if let Some(msg) = setting_change_refusal(&key) {
                     return Err(Self::user_error("55P02", msg));
@@ -31305,7 +31451,14 @@ impl PgHandler {
                     *settings = self.server_defaults().into();
                     settings.extend(db_defaults);
                 } else {
+                    drop(settings);
+                    self.check_setting_known(&name)?;
                     let key = canonical_setting(&name);
+                    if let Some(msg) = setting_change_refusal(&key) {
+                        return Err(Self::user_error("55P02", msg));
+                    }
+                    self.warn_reset_transaction(&key);
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     // RESET restores the DEFAULT, which is not the same as
                     // removing the setting: a client reading it back afterwards
                     // must see the default, not an error. A database's own
@@ -31320,6 +31473,12 @@ impl PgHandler {
                             let d = d.clone();
                             drop(settings);
                             self.note_reportable_guc(&key, &d);
+                        }
+                        // A custom (dotted) name RESET is a placeholder
+                        // that reads empty (15.19: `reset myapp.y; show
+                        // myapp.y` is '').
+                        None if key.contains('.') => {
+                            settings.insert(key.clone(), String::new());
                         }
                         None => {
                             settings.remove(&key);
@@ -38828,7 +38987,13 @@ impl ExtendedQueryHandler for PgHandler {
         // Positioned as from a simple query (RP-012).
         let fields = self
             .describe_fields(&target.statement.sql, param_types.len(), &param_types)
-            .map_err(|e| Self::syntax_positioned(e, &target.statement.sql))?;
+            .map_err(|e| {
+                let map = self.string_map(&target.statement.sql);
+                Self::restore_position(
+                    Self::syntax_positioned(e, &target.statement.sql),
+                    map.as_ref(),
+                )
+            })?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -39050,7 +39215,13 @@ impl ExtendedQueryHandler for PgHandler {
                 param_types.len(),
                 &param_types,
             )
-            .map_err(|e| Self::syntax_positioned(e, &target.statement.statement.sql))?;
+            .map_err(|e| {
+                let map = self.string_map(&target.statement.statement.sql);
+                Self::restore_position(
+                    Self::syntax_positioned(e, &target.statement.statement.sql),
+                    map.as_ref(),
+                )
+            })?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
