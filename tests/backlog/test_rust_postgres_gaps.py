@@ -630,7 +630,7 @@ def test_batch_residue(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-038")
+@pytest.mark.backlog_fixed("RP-038")
 def test_pg_typeof_names_the_domain(pg: Any) -> None:
     """PostgreSQL 15.19: `pg_typeof` of a column declared `rp38_d` is
     `rp38_d`; here it is the domain's base type, `integer`."""

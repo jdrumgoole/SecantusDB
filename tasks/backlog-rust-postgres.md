@@ -380,13 +380,11 @@ one beside it.
     `operator does not exist: text + integer`; PostgreSQL names the
     function, `function int4pl(text, integer) does not exist`. (Over
     constants it is worded as PostgreSQL has it.)
-  - `pg_typeof` of a column of a domain type prints the base type, not
-    the domain's name (`pg_typeof(1::d)` is right).
   - `create type int` / `create type integer` are 42710; PostgreSQL makes
     `public."int"`. They are grammar spellings with no pg_type row, and the
     planner folds `int` to `int4`, so the fix has to keep the two apart.
   Backlog-ID: RP-038
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

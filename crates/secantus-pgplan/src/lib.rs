@@ -18212,6 +18212,84 @@ fn rewrite_xmlagg(
     Ok(changed.then_some(out))
 }
 
+/// `pg_typeof(c)` over a column of a domain type names the DOMAIN, though
+/// the column is stored (and sent) as its base type: the argument is cast
+/// to the domain, which its value already satisfies. Over the one table of
+/// a single-table FROM; `None` when nothing changed.
+fn rewrite_domain_typeof(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    let [from] = s.from_clause.as_slice() else {
+        return Ok(None);
+    };
+    let Some(N::RangeVar(rv)) = from.node.as_ref() else {
+        return Ok(None);
+    };
+    let Some(def) = lookup(&relation_name(rv)) else {
+        return Ok(None);
+    };
+    let domains: std::collections::HashMap<String, String> = def
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let d = c.extra.get_str("domain_type").ok()?;
+            Some((c.name.clone(), d.to_string()))
+        })
+        .collect();
+    if domains.is_empty() {
+        return Ok(None);
+    }
+    let alias = rv
+        .alias
+        .as_ref()
+        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+    let mut out = s.clone();
+    let mut changed = false;
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        let Some(N::FuncCall(f)) = n.node.as_mut() else {
+            return Ok(());
+        };
+        if func_name(f).as_deref() != Some("pg_typeof") || f.args.len() != 1 {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = f.args[0].node.as_ref() else {
+            return Ok(());
+        };
+        let qualifier_ok = match c.fields.as_slice() {
+            [_] => true,
+            [q, _] => matches!(q.node.as_ref(), Some(N::String(q)) if q.sval == alias),
+            _ => false,
+        };
+        let Some(domain) = column_ref_name(c).and_then(|name| domains.get(&name)) else {
+            return Ok(());
+        };
+        if !qualifier_ok {
+            return Ok(());
+        }
+        let arg = f.args[0].clone();
+        f.args[0] = pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(arg)),
+                type_name: Some(type_name_node(domain)),
+                location: -1,
+            }))),
+        };
+        changed = true;
+        Ok(())
+    };
+    for t in &mut out.target_list {
+        walk_expr(t, &mut visit)?;
+    }
+    if let Some(w) = out.where_clause.as_deref_mut() {
+        walk_expr(w, &mut visit)?;
+    }
+    for o in &mut out.sort_clause {
+        walk_expr(o, &mut visit)?;
+    }
+    Ok(changed.then_some(out))
+}
+
 /// A role specification's name: `PUBLIC`, a role, or the session role
 /// spelled `CURRENT_USER` / `SESSION_USER` / `CURRENT_ROLE`.
 fn role_spec_name(r: &pg_query::protobuf::RoleSpec) -> String {
@@ -19051,6 +19129,9 @@ fn plan_select(
         return plan_select(&values_as_subquery(s), lookup, params);
     }
     if let Some(rewritten) = ungrouped_having(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = rewrite_domain_typeof(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     // `xmlagg(x)` is the concatenation of its non-NULL inputs, with or without a FROM.
