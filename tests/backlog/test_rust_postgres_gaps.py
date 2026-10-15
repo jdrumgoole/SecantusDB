@@ -141,7 +141,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 _RP015 = {
     "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
     "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
-    "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
     "timezone-names": "select count(*) > 100 from pg_timezone_names",
 }
 
@@ -153,6 +152,7 @@ _RP015_FIXED = {
     ),
     "variadic-nested-array": "select concat(variadic array[[1, 2], [3, 4]])",
     "variadic-arity": "select concat('a', variadic array['b', 'c'])",
+    "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
     "record-srf-field": (
         "select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1"
     ),

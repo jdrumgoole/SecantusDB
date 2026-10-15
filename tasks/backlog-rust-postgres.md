@@ -468,7 +468,7 @@ one beside it.
         types, which `correlated::run_sql` does not return.
       - **An aclitem naming a role oid no role has** cannot be read back
         (items are carried as text, PostgreSQL's as oids).
-      - **Not written**: `ts_stat` (0A000), `pg_timezone_names` /
+      - **Not written**: `pg_timezone_names` /
         `pg_timezone_abbrevs` (the functions and the views: a client
         listing time zones gets 42P01), the XML schema exports (`query_to_xmlschema`,
         `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`

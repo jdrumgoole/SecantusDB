@@ -60,6 +60,7 @@ const BUILTIN_RECORD_SRFS: &[(&str, &[&str])] = &[
     ("pg_options_to_table", &["option_name", "option_value"]),
     ("ts_parse", &["tokid", "token"]),
     ("ts_token_type", &["tokid", "alias", "description"]),
+    ("ts_stat", &["word", "ndoc", "nentry"]),
     (
         "ts_debug",
         &[

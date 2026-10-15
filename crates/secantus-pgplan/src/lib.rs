@@ -11886,6 +11886,88 @@ fn srf_rows(
                 rows,
             )));
         }
+        // `ts_stat(query [, weights])` (`ts_stat_sql`): per lexeme of the
+        // query's tsvectors, the documents holding it and its occurrences.
+        // A weights string (letters a-d, any case; anything else adds
+        // nothing) counts only positions of those weights, and leaves out a
+        // lexeme with none; without one a lexeme without positions counts
+        // once. Measured on PostgreSQL 15.19.
+        "ts_stat" => {
+            let (sql, weights) = match call.args.len() {
+                1 => (args(1)?.remove(0), None),
+                2 => {
+                    let mut a = args(2)?;
+                    let w = a.pop();
+                    (a.remove(0), w)
+                }
+                _ => {
+                    return Err(Error::UndefinedFunction(
+                        "function ts_stat does not exist".into(),
+                    ))
+                }
+            };
+            if sql == Bson::Null || weights.as_ref() == Some(&Bson::Null) {
+                return Ok(Some((
+                    vec!["word".into(), "ndoc".into(), "nentry".into()],
+                    vec!["text".into(), "int4".into(), "int4".into()],
+                    Vec::new(),
+                )));
+            }
+            let mask: u8 = weights.map_or(0, |w| {
+                value_text(&w).chars().fold(0, |m, c| {
+                    m | match c.to_ascii_lowercase() {
+                        'a' => 1 << 3,
+                        'b' => 1 << 2,
+                        'c' => 1 << 1,
+                        'd' => 1,
+                        _ => 0,
+                    }
+                })
+            });
+            let rows = correlated::run_sql(&format!("SELECT q FROM ({}) q", value_text(&sql)))?;
+            let mut stats: std::collections::BTreeMap<String, (i32, i32)> =
+                std::collections::BTreeMap::new();
+            for row in &rows {
+                let record = row.first().cloned().unwrap_or(Bson::Null);
+                let fields = record_values(&record).cloned().unwrap_or_default();
+                let types = record_field_types(&record).unwrap_or_default();
+                if fields.len() != 1 || types.first().is_some_and(|t| t != "tsvector") {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        "ts_stat query must return one tsvector column".into(),
+                    ));
+                }
+                if fields[0] == Bson::Null {
+                    continue;
+                }
+                let vector = fts::parse_vector(&value_text(&fields[0]))?;
+                for (lexeme, positions) in &vector.0 {
+                    let n = if mask == 0 {
+                        positions.len().max(1)
+                    } else {
+                        positions
+                            .iter()
+                            .filter(|(_, w)| mask & (1 << w) != 0)
+                            .count()
+                    };
+                    if n == 0 {
+                        continue;
+                    }
+                    let e = stats.entry(lexeme.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += i32::try_from(n).unwrap_or(i32::MAX);
+                }
+            }
+            let rows = stats
+                .into_iter()
+                .map(|(w, (d, e))| vec![Bson::String(w), Bson::Int32(d), Bson::Int32(e)])
+                .collect();
+            return Ok(Some((
+                vec!["word".into(), "ndoc".into(), "nentry".into()],
+                vec!["text".into(), "int4".into(), "int4".into()],
+                rows,
+            )));
+        }
         // `aclexplode(aclitem[])`: one row per privilege of each item.
         "aclexplode" => {
             let a = args(1)?;

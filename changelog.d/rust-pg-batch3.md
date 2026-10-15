@@ -48,4 +48,10 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
 
 #### Added
 
-- Corpora `domain_typeof`, `record_arrays`, `operator_function_calls` and `record_srf_fields`.
+- `ts_stat(query [, weights])`: each lexeme of the query's tsvectors with
+  the documents holding it and its occurrences, a weights string counting
+  only those positions, and 22023 for a query that is not one tsvector
+  column; in FROM and in a select list. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[ts-stat]`).
+
+- Corpora `domain_typeof`, `record_arrays`, `operator_function_calls`, `record_srf_fields` and `ts_stat`.
