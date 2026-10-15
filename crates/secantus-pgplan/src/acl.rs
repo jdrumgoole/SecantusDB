@@ -237,8 +237,17 @@ pub fn explode(item: &str) -> Result<Vec<(i64, i64, &'static str, bool)>> {
     let rest = rest.strip_prefix('=').unwrap_or(rest);
     let (privs, grantor) = rest.split_once('/').unwrap_or((rest, ""));
     let (grantor, _) = getid(grantor)?;
+    // An item is carried as its text, which names a role whose oid no role
+    // has by the number (`makeaclitem(12345, ...)` prints `12345=r/...`), and
+    // PUBLIC by nothing: those read back as that oid and 0.
     let oid = |n: &str| {
         crate::regobj::role_oid(n)
+            .or_else(|| n.is_empty().then_some(0))
+            .or_else(|| {
+                (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| n.parse().ok())
+                    .flatten()
+            })
             .ok_or_else(|| Error::Sqlstate("42704", format!("role \"{n}\" does not exist")))
     };
     let (grantee, grantor) = (oid(&grantee)?, oid(&grantor)?);

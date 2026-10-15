@@ -1029,6 +1029,7 @@ impl PgHandler {
                 env,
             }),
             base: 0,
+            failed: false,
         }))
     }
 

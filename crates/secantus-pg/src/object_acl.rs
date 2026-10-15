@@ -117,6 +117,20 @@ impl PgHandler {
         }
         match (kind, name) {
             ("schema", "public") => vec![("PUBLIC".into(), vec!["USAGE".into()], vec![])],
+            // A built-in PostgreSQL ships revoked from PUBLIC starts with its
+            // predefined roles' grants only (`restricted_builtins`).
+            ("function", key) if Self::restricted_builtins().iter().any(|(k, _)| k == key) => {
+                Self::restricted_builtins()
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, roles)| {
+                        roles
+                            .iter()
+                            .map(|r| (r.clone(), vec!["EXECUTE".into()], vec![]))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
             ("function", _) => vec![("PUBLIC".into(), vec!["EXECUTE".into()], vec![])],
             _ => Vec::new(),
         }
@@ -411,7 +425,7 @@ impl PgHandler {
             .iter()
             .filter_map(|b| decode_doc(b).ok())
             .any(|d| d.get_str("name").is_ok_and(|n| n.contains('(')));
-        if !has_touched {
+        if !has_touched && !Self::mentions_restricted_builtin(sql) {
             return Ok(());
         }
         let views = self.views()?;
@@ -462,6 +476,38 @@ impl PgHandler {
         Ok(())
     }
 
+    /// The built-ins PostgreSQL ships with EXECUTE revoked from PUBLIC
+    /// (`restricted_builtins.tsv`): `(signature, the predefined roles that
+    /// may call it)`. A role needs one of those, or a GRANT, as for a
+    /// built-in a REVOKE has touched.
+    fn restricted_builtins() -> &'static [(String, Vec<String>)] {
+        static T: std::sync::OnceLock<Vec<(String, Vec<String>)>> = std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            include_str!("restricted_builtins.tsv")
+                .lines()
+                .filter(|l| !l.starts_with('#') && !l.is_empty())
+                .map(|l| {
+                    let (key, roles) = l.split_once('\t').unwrap_or((l, ""));
+                    let roles = roles
+                        .split(',')
+                        .filter(|r| !r.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    (key.to_string(), roles)
+                })
+                .collect()
+        })
+    }
+
+    /// Does `sql` name one of the restricted built-ins? (A cheap screen, so
+    /// the calls are only resolved when it might.)
+    fn mentions_restricted_builtin(sql: &str) -> bool {
+        let lower = sql.to_ascii_lowercase();
+        Self::restricted_builtins()
+            .iter()
+            .any(|(k, _)| lower.contains(k.split('(').next().unwrap_or(k)))
+    }
+
     /// `check_builtin_execute` for the calls written in `sql` itself.
     fn check_builtin_calls(&self, role: &str, sql: &str) -> PgWireResult<()> {
         if self.is_superuser(role) {
@@ -480,16 +526,55 @@ impl PgHandler {
             .filter_map(|d| d.get_str("name").ok().map(str::to_string))
             .filter(|n| n.contains('('))
             .collect();
-        if touched.is_empty() {
+        if touched.is_empty() && !Self::mentions_restricted_builtin(sql) {
             return Ok(());
         }
         let lookup = |n: &str| self.lookup(n);
         for (name, chosen) in secantus_pgplan::privileges::builtin_calls(sql, &lookup) {
             let Some(args) = chosen else {
+                // The overload is not determined here; every overload of a
+                // restricted name is restricted (15.19), so the name settles
+                // it: one of their predefined roles, or a GRANT on one.
+                let prefix = format!("{name}(");
+                let overloads: Vec<&(String, Vec<String>)> = Self::restricted_builtins()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .collect();
+                if !overloads.is_empty() {
+                    let held = overloads.iter().any(|(key, roles)| {
+                        roles.iter().any(|g| self.role_is_member(role, g))
+                            || self
+                                .object_grants("function", key)
+                                .iter()
+                                .any(|(g, privs, _)| {
+                                    (g.eq_ignore_ascii_case("PUBLIC")
+                                        || self.role_is_member(role, g))
+                                        && privs.iter().any(|p| p == "EXECUTE")
+                                })
+                    });
+                    if !held {
+                        return Err(Self::user_error(
+                            "42501",
+                            format!("permission denied for function {name}"),
+                        ));
+                    }
+                }
                 continue;
             };
             let key = format!("{name}({})", args.join(","));
             if !touched.contains(&key) {
+                // Untouched, a restricted built-in is the bootstrap
+                // superuser's and its predefined roles' only (15.19).
+                if let Some((_, roles)) =
+                    Self::restricted_builtins().iter().find(|(k, _)| *k == key)
+                {
+                    if !roles.iter().any(|g| self.role_is_member(role, g)) {
+                        return Err(Self::user_error(
+                            "42501",
+                            format!("permission denied for function {name}"),
+                        ));
+                    }
+                }
                 continue;
             }
             // A built-in belongs to the bootstrap superuser, so only a grant
@@ -657,7 +742,30 @@ impl PgHandler {
         };
         let answer = match name {
             "has_schema_privilege" => {
-                let schema = text(&rest[0]);
+                // By oid (`has_schema_privilege(2200, 'USAGE')`): the schema
+                // with that oid, and NULL for an oid naming none (15.19).
+                let by_oid = match &rest[0] {
+                    Bson::Int32(o) => Some(i64::from(*o)),
+                    Bson::Int64(o) => Some(*o),
+                    other => secantus_pgplan::regobj::from_bson(other)
+                        .map(|(_, o)| o)
+                        .or_else(|| {
+                            // A `regnamespace` reaches here as its oid's digits.
+                            let t = text(other);
+                            (!t.is_empty()
+                                && t.bytes().all(|b| b.is_ascii_digit())
+                                && !secantus_pgplan::schemas::schema_exists(&t))
+                            .then(|| t.parse().ok())
+                            .flatten()
+                        }),
+                };
+                let schema = match by_oid {
+                    Some(oid) => match self.namespaces().into_iter().find(|(_, o)| *o == oid) {
+                        Some((n, _)) => n,
+                        None => return Ok(Bson::Null),
+                    },
+                    None => text(&rest[0]),
+                };
                 if !secantus_pgplan::schemas::schema_exists(&schema) {
                     return Err(Self::user_error(
                         "3F000",

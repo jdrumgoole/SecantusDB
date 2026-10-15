@@ -142,6 +142,21 @@ impl std::fmt::Debug for BackendMessageTranscoder {
     }
 }
 
+/// SecantusDB patch: a per-session hook called when a frontend message's
+/// first bytes arrive, before the whole message has been read. PostgreSQL
+/// takes a cancel that lands while a long message is still arriving (its
+/// `CancelRequest` is honoured at the next cancellation point after the
+/// read); a session that starts its message cycle here keeps such a cancel
+/// rather than clearing it as stale when the message is finally whole.
+#[derive(Clone)]
+pub struct MessageStartHook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for MessageStartHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MessageStartHook")
+    }
+}
+
 // TODO: add oauth scope and issuer
 /// Describe a client information holder
 pub trait ClientInfo {

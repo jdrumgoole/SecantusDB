@@ -837,7 +837,7 @@ fn sublink_removable(body: &pg_query::protobuf::SelectStmt) -> bool {
 }
 
 /// Does any PostgreSQL 15 built-in of this name return a set?
-fn returns_set(name: &str) -> bool {
+pub(crate) fn returns_set(name: &str) -> bool {
     static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         include_str!("pg_proc_sigs.tsv")

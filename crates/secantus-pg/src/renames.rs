@@ -455,12 +455,21 @@ impl PgHandler {
             if missing_ok {
                 self.notice(
                     "00000",
-                    format!("type \"{target}\" does not exist, skipping"),
+                    format!(
+                        "type \"{}\" does not exist, skipping",
+                        secantus_pgplan::pgtypes::user_type_catalog_name(target)
+                    ),
                     None,
                 );
                 return done(tag);
             }
-            return Err(error("42704", format!("type \"{target}\" does not exist")));
+            return Err(error(
+                "42704",
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(target)
+                ),
+            ));
         };
         let old_bare = target.rsplit('.').next().unwrap_or(target).to_string();
         let new_key = match target.rsplit_once('.') {
@@ -476,7 +485,13 @@ impl PgHandler {
             })
             || self.lookup(to).is_some();
         if taken {
-            return Err(error("42710", format!("type \"{to}\" already exists")));
+            return Err(error(
+                "42710",
+                format!(
+                    "type \"{}\" already exists",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(to)
+                ),
+            ));
         }
         doc.insert("_id", new_key.as_str());
         for key in ["enum", "composite", "range", "domain", "name", "type"] {
@@ -507,10 +522,22 @@ impl PgHandler {
             .find(|d| d.get_str("_id") == Ok(target))
             .cloned()
         else {
-            return Err(error("42704", format!("type \"{target}\" does not exist")));
+            return Err(error(
+                "42704",
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(target)
+                ),
+            ));
         };
         let Some(Bson::Array(fields)) = doc.get_mut("fields") else {
-            return Err(error("42704", format!("type \"{target}\" does not exist")));
+            return Err(error(
+                "42704",
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(target)
+                ),
+            ));
         };
         let name_of = |f: &Bson| match f {
             Bson::Array(f) => f.first().and_then(Bson::as_str).map(str::to_string),
@@ -549,7 +576,13 @@ impl PgHandler {
             .find(|d| d.get_str("_id") == Ok(domain))
             .cloned()
         else {
-            return Err(error("42704", format!("type \"{domain}\" does not exist")));
+            return Err(error(
+                "42704",
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(domain)
+                ),
+            ));
         };
         let Some(Bson::Array(checks)) = doc.get_mut("checks") else {
             return Err(error(

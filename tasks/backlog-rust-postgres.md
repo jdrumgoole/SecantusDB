@@ -46,19 +46,6 @@ one beside it.
   call sequence (7 of 10 rounds), and `pproxy` cannot start under this
   venv's uvloop on Python 3.12. `psycopg_validation/include_paths.py` keeps
   them out of the macOS gauge. Nothing to do server-side.
-- [ ] RUST pgserver: a cancel that arrives during Parse / Bind / Describe is kept
-  (fixed 2026-10-09), but two differences from PostgreSQL remain. It is
-  honoured at the first cancellation point of EXECUTION, not during the parse
-  itself: against a statement that takes 2.8 s to parse here, PostgreSQL 15
-  answers 57014 in 30 ms and this server answers it after the parse. And the
-  idle window is wider: a cancel that lands while the server is still READING
-  a large message is dropped (0-5 ms after a 1.4 MB statement in a debug
-  build), where PostgreSQL has finished reading by then. Closing the second
-  needs a hook in the vendored `secantus-pgwire` at the point a message's
-  first byte is read. Probe: send `select pg_sleep(3), 1 in (0..200000)` with
-  `send_query_params`, then a blocking `PQcancel` at a chosen offset.
-  Backlog-ID: RP-002
-  Verify: tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_at_once
 - **Scope decision — a `LANGUAGE internal` wrapper over a C function with no
   SQL form** (an I/O function such as `int4out`, an aggregate transition
   function) is a catalog row that answers 42883 when called. PostgreSQL calls
@@ -329,12 +316,8 @@ one beside it.
     - **A user name map's patterns are the `regex` crate's**, not
       PostgreSQL's advanced regular expressions; `@file` inclusion in
       `pg_ident.conf` is refused.
-    - **`pg_reload_conf()` checks superuser as of login**, not the role
-      `SET ROLE` chose, and a GRANT of EXECUTE on it is not honoured.
     - **SIGHUP reloads only on a server started with TLS**; without TLS it
       still stops the server (`ctrlc`'s termination handler).
-  - **`pg_stat_ssl` prints `UNDEF` for an attribute type outside
-    `x509::short_name`'s table**, where OpenSSL knows more names.
   - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
     PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
   - The key must have no passphrase.
@@ -356,31 +339,33 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: a `char(n)` field too long for a row type has no
-  error position.** `'(abcd,x)'::t` over `t (c char(3), v text)` is the right
-  22001 `value too long for type character(3)`, with no position;
-  PostgreSQL 15.19 places it at the literal (8). The width check runs in
-  `composite_value`, which does not know where the literal is. (The padding
-  itself, and a row type that follows `ALTER TABLE`, were fixed 2026-10-15; a
-  table created before then has no `widths` in its row type until its next
-  ALTER.)
-  Backlog-ID: RP-032
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_row_type_char_overflow_has_a_position
+- [ ] **RUST pgserver: whether a cursor declared without SCROLL scans
+  backward over a join with an ORDER BY is guessed.** PostgreSQL adds
+  `CURSOR_OPT_SCROLL` when the plan supports a backward scan
+  (`ExecSupportsBackwardScan`); `cursor_scroll.rs` reads that from the
+  statement's shape, which settles every shape measured on 15.19 except a
+  join (or IN / EXISTS semi-join) under an ORDER BY. That one depends on
+  where the planner puts the sort: `select * from t join u on t.a = u.a
+  order by t.a` merge-joins in key order and cannot scroll, `select * from
+  t, u order by u.c` sorts on top and can. Here both scroll.
+  Backlog-ID: RP-043
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
 
-- [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
-  Each measured on PostgreSQL 15.19:
-  - `create type int` / `create type integer` (and their quoted forms) are
-    42710; PostgreSQL makes `public."int"`, printed `"int"` (a keyword, not
-    hidden by `pg_catalog`, so unlike `public.uuid` it is not qualified).
-    Letting the CREATE through is a one-line gate change, measured: a
-    column or cast of `"int"` then comes back described as `int4`,
-    because the planner carries a type as a string and `int` already
-    means `int4` there at dozens of sites. A bare `int` reaches the planner
-    as `pg_catalog.int4`, so a single-part `"int"` can only have been
-    quoted; the fix is a distinct internal name for it, as `"char"` has
-    (`QUOTED_CHAR`).
-  Backlog-ID: RP-038
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
+- [ ] **RUST pgserver: type-name divergences found beside RP-038
+  (2026-10-15).** Each measured on PostgreSQL 15.19:
+  - `'a'::public.nosuch` is 42704 `type "public.nosuch" does not exist`;
+    here the schema is dropped from the name (`pg_catalog.` likewise), an
+    unknown schema (`1::nosuch.t`) is this 42704 where PostgreSQL says 3F000
+    `schema "nosuch" does not exist`, and `'"nosuch"'::regtype` keeps the
+    quotes in its message. The qualifier is dropped where a type name is
+    lowered to the planner's string (`type_name_of`). (The positions were
+    fixed 2026-10-15.)
+  - `create type "Int"` / `"Int4"` are 42710; PostgreSQL creates them. The
+    gate is a one-line change, measured: the planner then folds the quoted
+    name to `int` and the new type captures `1::int`. Type names need to
+    keep their case through the planner first.
+  Backlog-ID: RP-041
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
@@ -461,19 +446,14 @@ one beside it.
       before working an item.
 
       What is left (re-measured 2026-10-15 against 15.19):
-      - **`ts_rewrite(query, select)`** checks that its SELECT returns two
-        tsquery columns only on the rows it gets back: over none
-        (`... where false`) it answers the query unchanged, where
-        PostgreSQL is 22023 `ts_rewrite query must return two tsquery
-        columns`. The checker would need the SELECT's described column
-        types, which `correlated::run_sql` does not return.
-      - **An aclitem naming a role oid no role has** cannot be read back
-        (items are carried as text, PostgreSQL's as oids).
-      - **Not written**: the XML schema exports (`query_to_xmlschema`,
-        `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`
-        and the schema / database forms, and the `fmgr_*` /
-        `postgresql_fdw_validator` validators (`query_to_xml` /
-        `table_to_xml` are).
+      - **An aclitem naming a role oid no role has** (`makeaclitem(12345,
+        ...)`) cannot be read back once it is in an array: items are
+        carried as their TEXT (`12345=r/postgres`), and building
+        `ARRAY[...]` of them re-reads each through the aclitem input,
+        which (as PostgreSQL's) refuses an unknown role name, so
+        `aclexplode` over one is 42704 where PostgreSQL answers the oid.
+        PostgreSQL carries the item as oids; `acl::explode` already reads
+        such a text back as its oid.
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

@@ -14,6 +14,13 @@ const XSI: &str = " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"";
 /// character no XML name may hold is `_xHHHH_`, as is `:`, the `_` of a
 /// `_x`, and the first letter of a name starting `xml` in any case.
 fn xml_name(ident: &str) -> String {
+    xml_name_escaped(ident, false)
+}
+
+/// `map_sql_identifier_to_xml_name(ident, true, escape_period)`: with
+/// `escape_period`, a `.` is `_x002E_` too, as each part of a multi-part
+/// name has it.
+pub(crate) fn xml_name_escaped(ident: &str, escape_period: bool) -> String {
     let chars: Vec<char> = ident.chars().collect();
     let mut out = String::new();
     let lower = ident.to_lowercase();
@@ -21,6 +28,7 @@ fn xml_name(ident: &str) -> String {
         let escape = c == ':'
             || (c == '_' && chars.get(i + 1) == Some(&'x'))
             || (i == 0 && lower.starts_with("xml"))
+            || (escape_period && c == '.')
             || (i == 0 && !(c.is_alphabetic() || c == '_'))
             || (i > 0 && !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')));
         if escape {
@@ -47,7 +55,7 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn base64(bytes: &[u8]) -> String {
+fn to_base64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
@@ -69,7 +77,7 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// `map_sql_value_to_xml_value`: a value as XML content, by its type.
-fn xml_value(v: &Bson, ty: &str) -> String {
+fn xml_value(v: &Bson, ty: &str, base64: bool) -> String {
     if let Some(element) = ty.strip_suffix("[]") {
         fn flat(v: &Bson, out: &mut Vec<Bson>) {
             match v {
@@ -81,7 +89,10 @@ fn xml_value(v: &Bson, ty: &str) -> String {
         flat(&arrays::strip(v), &mut items);
         let mut out = String::new();
         for i in items.iter().filter(|i| **i != Bson::Null) {
-            out.push_str(&format!("<element>{}</element>", xml_value(i, element)));
+            out.push_str(&format!(
+                "<element>{}</element>",
+                xml_value(i, element, base64)
+            ));
         }
         return out;
     }
@@ -107,34 +118,110 @@ fn xml_value(v: &Bson, ty: &str) -> String {
                 _ => t,
             }
         }
+        // `xmlbinary`: base64, or upper-case hex (measured).
         "bytea" => match bytea::parse(v) {
-            Ok(bytes) => base64(&bytes),
+            Ok(bytes) if base64 => to_base64(&bytes),
+            Ok(bytes) => bytes.iter().map(|b| format!("{b:02X}")).collect(),
             Err(_) => escape(&text),
         },
+        // An xml value is content already, and goes in unescaped.
+        "xml" => text,
         _ => escape(&text),
     }
 }
 
-/// The rows of `sql` as XML, the table element named `table` and each row
-/// `row` (or, as a forest, each row named `forest_row`).
-fn rows_to_xml(
+/// `xmldata_root_element_start`: the namespace declarations only at the
+/// top level, and the schema's location when the schema is inside.
+fn root_start(name: &str, with_schema: bool, ns: &str, top_level: bool) -> String {
+    let mut out = format!("<{name}");
+    if top_level {
+        out.push_str(XSI);
+        if !ns.is_empty() {
+            out.push_str(&format!(" xmlns=\"{ns}\""));
+        }
+    }
+    if with_schema {
+        if ns.is_empty() {
+            out.push_str(" xsi:noNamespaceSchemaLocation=\"#\"");
+        } else {
+            out.push_str(&format!(" xsi:schemaLocation=\"{ns} #\""));
+        }
+    }
+    out.push_str(">\n");
+    out
+}
+
+/// What `SPI_sql_row_to_xmlelement` writes for each row.
+struct RowOpts<'a> {
+    nulls: bool,
+    forest: bool,
+    ns: &'a str,
+    top_level: bool,
+    /// The forest's row element: the table's name, or `row`.
+    row_name: &'a str,
+    base64: bool,
+}
+
+fn row_to_xml(out: &mut String, cols: &[(String, String)], values: &[Bson], o: &RowOpts) {
+    if o.forest {
+        out.push_str(&root_start(o.row_name, false, o.ns, o.top_level));
+    } else {
+        out.push_str("<row>\n");
+    }
+    for (i, v) in values.iter().enumerate() {
+        let (name, ty) = cols
+            .get(i)
+            .map_or(("", "text"), |(n, t)| (n.as_str(), t.as_str()));
+        let name = xml_name(name);
+        if *v == Bson::Null {
+            if o.nulls {
+                out.push_str(&format!("  <{name} xsi:nil=\"true\"/>\n"));
+            }
+            continue;
+        }
+        out.push_str(&format!(
+            "  <{name}>{}</{name}>\n",
+            xml_value(v, ty, o.base64)
+        ));
+    }
+    if o.forest {
+        out.push_str(&format!("</{}>\n\n", o.row_name));
+    } else {
+        out.push_str("</row>\n\n");
+    }
+}
+
+/// `query_to_xml_internal`: the rows of `sql`, under an element named for
+/// `tablename` (or `table`), with `xmlschema` first when given.
+pub(crate) fn query_to_xml_internal(
     sql: &str,
+    tablename: Option<&str>,
+    xmlschema: Option<&str>,
     nulls: bool,
     forest: bool,
     ns: &str,
-    table: &str,
-    forest_row: &str,
-) -> Result<Bson> {
+    top_level: bool,
+) -> Result<String> {
+    let xmltn = tablename.map_or_else(|| "table".to_string(), xml_name);
+    xml_catalog::check_query(sql, false)?;
     let rows = correlated::run_sql(&format!("SELECT q FROM ({sql}) q"))?;
-    let attrs = if ns.is_empty() {
-        XSI.to_string()
-    } else {
-        format!("{XSI} xmlns=\"{ns}\"")
-    };
     let mut out = String::new();
     if !forest {
-        out.push_str(&format!("<{table}{attrs}>\n\n"));
+        out.push_str(&root_start(&xmltn, xmlschema.is_some(), ns, top_level));
+        out.push('\n');
     }
+    if let Some(schema) = xmlschema {
+        out.push_str(&format!("{schema}\n\n"));
+    }
+    let row_name = tablename.map_or_else(|| "row".to_string(), xml_name);
+    let opts = RowOpts {
+        nulls,
+        forest,
+        ns,
+        top_level,
+        row_name: &row_name,
+        base64: xml_schema::binary_is_base64(),
+    };
     for row in &rows {
         let record = row.first().cloned().unwrap_or(Bson::Null);
         let values = record_values(&record).cloned().unwrap_or_default();
@@ -150,38 +237,172 @@ fn rows_to_xml(
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        let open = if forest {
-            format!("<{forest_row}{attrs}>\n")
-        } else {
-            "<row>\n".to_string()
-        };
-        out.push_str(&open);
-        for (i, v) in values.iter().enumerate() {
-            let name = xml_name(names.get(i).map_or("", String::as_str));
-            if *v == Bson::Null {
-                if nulls {
-                    out.push_str(&format!("  <{name} xsi:nil=\"true\"/>\n"));
-                }
-                continue;
-            }
-            let ty = types.get(i).map_or("text", String::as_str);
-            out.push_str(&format!("  <{name}>{}</{name}>\n", xml_value(v, ty)));
-        }
-        out.push_str(&format!(
-            "</{}>\n\n",
-            if forest { forest_row } else { "row" }
-        ));
+        let cols: Vec<(String, String)> = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, types.get(i).cloned().unwrap_or_else(|| "text".into())))
+            .collect();
+        row_to_xml(&mut out, &cols, &values, &opts);
     }
     if !forest {
-        out.push_str(&format!("</{table}>\n"));
+        out.push_str(&format!("</{xmltn}>\n"));
     }
-    Ok(Bson::String(out))
+    Ok(out)
 }
 
-/// `query_to_xml(query, nulls, tableforest, targetns)` and
-/// `table_to_xml(tbl, nulls, tableforest, targetns)`.
+/// The type name `xml_value` renders by, from a column's type oid: a
+/// domain by its base type (`getBaseType`), an array as `element[]`.
+fn value_type(oid: i64) -> String {
+    let base = xml_schema::domain_base(oid).map_or(oid, |(b, _)| b);
+    if let Some(name) = pgtypes::name_of_oid(base) {
+        return name.to_string();
+    }
+    match pgtypes::BUILTIN_TYPES
+        .iter()
+        .find(|(_, _, arr)| *arr == base)
+    {
+        Some((name, _, _)) => format!("{name}[]"),
+        None => "text".into(),
+    }
+}
+
+/// A relation argument: a regclass, or an untyped literal read as one.
+fn relation_oid(v: &Bson) -> Result<i64> {
+    match regclass_oid(v) {
+        Some(oid) => Ok(oid),
+        None => resolve_regclass(&render_value_text(v)),
+    }
+}
+
+/// `table_to_xml_internal`.
+fn table_to_xml_internal(
+    oid: i64,
+    xmlschema: Option<&str>,
+    nulls: bool,
+    forest: bool,
+    ns: &str,
+    top_level: bool,
+) -> Result<String> {
+    let (relname, _) = xml_catalog::relation(oid)?;
+    query_to_xml_internal(
+        &format!("SELECT * FROM {}", regclass_text(oid)),
+        Some(&relname),
+        xmlschema,
+        nulls,
+        forest,
+        ns,
+        top_level,
+    )
+}
+
+/// `schema_to_xml_internal`: each of the schema's tables in turn, by name.
+fn schema_to_xml_internal(
+    nspid: i64,
+    xmlschema: Option<&str>,
+    nulls: bool,
+    forest: bool,
+    ns: &str,
+    top_level: bool,
+) -> Result<String> {
+    let xmlsn = xml_name(&xml_catalog::schema_name(nspid)?);
+    let mut out = root_start(&xmlsn, xmlschema.is_some(), ns, top_level);
+    out.push('\n');
+    if let Some(schema) = xmlschema {
+        out.push_str(&format!("{schema}\n\n"));
+    }
+    for rel in xml_catalog::schema_tables(nspid)? {
+        out.push_str(&table_to_xml_internal(rel, None, nulls, forest, ns, false)?);
+        out.push('\n');
+    }
+    out.push_str(&format!("</{xmlsn}>\n"));
+    Ok(out)
+}
+
+/// `database_to_xml_internal`: each visible schema in turn, by name.
+fn database_to_xml_internal(
+    xmlschema: Option<&str>,
+    nulls: bool,
+    forest: bool,
+    ns: &str,
+) -> Result<String> {
+    let xmlcn = xml_name(&xml_catalog::database_name()?);
+    let mut out = root_start(&xmlcn, xmlschema.is_some(), ns, true);
+    out.push('\n');
+    if let Some(schema) = xmlschema {
+        out.push_str(&format!("{schema}\n\n"));
+    }
+    for nsp in xml_catalog::database_schemas()? {
+        out.push_str(&schema_to_xml_internal(
+            nsp, None, nulls, forest, ns, false,
+        )?);
+        out.push('\n');
+    }
+    out.push_str(&format!("</{xmlcn}>\n"));
+    Ok(out)
+}
+
+/// An open cursor's columns; 34000 when no cursor has that name.
+fn cursor_columns(name: &str) -> Result<Vec<xml_schema::Col>> {
+    let open = correlated::run_sql(&format!(
+        "SELECT 1 FROM pg_catalog.pg_cursors WHERE name = '{}'",
+        name.replace('\'', "''")
+    ))?;
+    if open.is_empty() {
+        return Err(Error::Sqlstate(
+            "34000",
+            format!("cursor \"{name}\" does not exist"),
+        ));
+    }
+    xml_schema::columns(&format!(
+        "FETCH FORWARD 0 FROM \"{}\"",
+        name.replace('"', "\"\"")
+    ))
+}
+
+/// `cursor_to_xml(cursor, count, nulls, tableforest, targetns)`: the next
+/// `count` rows of an open cursor.
+fn cursor_to_xml(name: &str, count: i64, nulls: bool, forest: bool, ns: &str) -> Result<String> {
+    let mut out = String::new();
+    if !forest {
+        out.push_str(&root_start("table", false, ns, true));
+        out.push('\n');
+    }
+    let cols: Vec<(String, String)> = cursor_columns(name)?
+        .iter()
+        .map(|c| (c.name.clone(), value_type(c.oid)))
+        .collect();
+    let rows = correlated::fetch_cursor(name, count)?;
+    let opts = RowOpts {
+        nulls,
+        forest,
+        ns,
+        top_level: true,
+        row_name: "row",
+        base64: xml_schema::binary_is_base64(),
+    };
+    for row in &rows {
+        row_to_xml(&mut out, &cols, row, &opts);
+    }
+    if !forest {
+        out.push_str("</table>\n");
+    }
+    Ok(out)
+}
+
+/// The arguments each mapping takes after its first.
+fn arity(name: &str) -> usize {
+    match name {
+        "cursor_to_xml" => 5,
+        "database_to_xml" | "database_to_xmlschema" | "database_to_xml_and_xmlschema" => 3,
+        _ => 4,
+    }
+}
+
+/// The SQL/XML mapping functions: `query_to_xml`, `table_to_xml`,
+/// `cursor_to_xml`, `schema_to_xml`, `database_to_xml`, each `...xmlschema`
+/// and `..._and_xmlschema` form.
 pub(crate) fn call(name: &str, args: &[Bson]) -> Result<Bson> {
-    if args.len() != 4 {
+    if args.len() != arity(name) {
         return Err(Error::UndefinedFunction(format!(
             "function {name} does not exist"
         )));
@@ -189,39 +410,70 @@ pub(crate) fn call(name: &str, args: &[Bson]) -> Result<Bson> {
     if args.contains(&Bson::Null) {
         return Ok(Bson::Null);
     }
+    // The flags and the namespace are the last three arguments.
+    let n = args.len();
     let flag = |i: usize| matches!(args[i], Bson::Boolean(true));
-    let ns = render_value_text(&args[3]);
-    match name {
-        "query_to_xml" => rows_to_xml(
-            &render_value_text(&args[0]),
-            flag(1),
-            flag(2),
-            &ns,
-            "table",
-            "row",
-        ),
-        _ => {
-            // An untyped literal is a regclass's input text.
-            let oid = match regclass_oid(&args[0]) {
-                Some(oid) => oid,
-                None => resolve_regclass(&render_value_text(&args[0]))?,
-            };
-            let relation = regclass_text(oid);
-            let element = xml_name(
-                relation
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&relation)
-                    .trim_matches('"'),
-            );
-            rows_to_xml(
-                &format!("SELECT * FROM {relation}"),
-                flag(1),
-                flag(2),
-                &ns,
-                &element,
-                &element,
-            )
+    let (nulls, forest) = (flag(n - 3), flag(n - 2));
+    let ns = render_value_text(&args[n - 1]);
+    let text0 = || render_value_text(&args[0]);
+    let out = match name {
+        "query_to_xml" => query_to_xml_internal(&text0(), None, None, nulls, forest, &ns, true)?,
+        "query_to_xmlschema" => {
+            xml_catalog::check_query(&text0(), true)?;
+            let cols = xml_schema::columns(&text0())?;
+            xml_schema::table_xmlschema(&cols, None, nulls, forest, &ns)?
         }
-    }
+        "query_to_xml_and_xmlschema" => {
+            let sql = text0();
+            xml_catalog::check_query(&sql, true)?;
+            let cols = xml_schema::columns(&sql)?;
+            let schema = xml_schema::table_xmlschema(&cols, None, nulls, forest, &ns)?;
+            query_to_xml_internal(&sql, None, Some(&schema), nulls, forest, &ns, true)?
+        }
+        "table_to_xml" | "table_to_xmlschema" | "table_to_xml_and_xmlschema" => {
+            let oid = relation_oid(&args[0])?;
+            let schema = || {
+                let rel = xml_catalog::relation(oid)?;
+                let cols = xml_schema::relation_columns(oid)?;
+                xml_schema::table_xmlschema(&cols, Some(&rel), nulls, forest, &ns)
+            };
+            match name {
+                "table_to_xml" => table_to_xml_internal(oid, None, nulls, forest, &ns, true)?,
+                "table_to_xmlschema" => schema()?,
+                _ => {
+                    let schema = schema()?;
+                    table_to_xml_internal(oid, Some(&schema), nulls, forest, &ns, true)?
+                }
+            }
+        }
+        "cursor_to_xml" => {
+            let count = match &args[1] {
+                Bson::Int32(c) => i64::from(*c),
+                Bson::Int64(c) => *c,
+                other => render_value_text(other).parse().unwrap_or(0),
+            };
+            cursor_to_xml(&text0(), count, nulls, forest, &ns)?
+        }
+        "cursor_to_xmlschema" => {
+            let cols = cursor_columns(&text0())?;
+            xml_schema::table_xmlschema(&cols, None, nulls, forest, &ns)?
+        }
+        "schema_to_xml" => {
+            let nspid = xml_catalog::schema_oid(&text0())?;
+            schema_to_xml_internal(nspid, None, nulls, forest, &ns, true)?
+        }
+        "schema_to_xmlschema" => xml_schema::schema_xmlschema(&text0(), forest, &ns)?,
+        "schema_to_xml_and_xmlschema" => {
+            let nspid = xml_catalog::schema_oid(&text0())?;
+            let schema = xml_schema::schema_xmlschema(&text0(), forest, &ns)?;
+            schema_to_xml_internal(nspid, Some(&schema), nulls, forest, &ns, true)?
+        }
+        "database_to_xml" => database_to_xml_internal(None, nulls, forest, &ns)?,
+        "database_to_xmlschema" => xml_schema::database_xmlschema(&ns)?,
+        _ => {
+            let schema = xml_schema::database_xmlschema(&ns)?;
+            database_to_xml_internal(Some(&schema), nulls, forest, &ns)?
+        }
+    };
+    Ok(Bson::String(out))
 }

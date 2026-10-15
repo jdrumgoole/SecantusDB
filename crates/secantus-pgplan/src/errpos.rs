@@ -84,6 +84,12 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
     let location = take_error_location();
+    // A cancelled or terminated statement has no position on PostgreSQL,
+    // and looking for one in a large statement would hold the cancel's
+    // answer back.
+    if matches!(sqlstate, "57014" | "57P01") {
+        return None;
+    }
     // `CREATE CAST` / `DROP CAST` resolve their types and function by name,
     // outside any expression, and PostgreSQL reports no position for them.
     let head: String = sql
@@ -315,12 +321,38 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         {
             let name = m.split_once('"')?.1.split_once('"')?.0;
             let lit = format!("'{}'", name.replace('\'', "''"));
-            pos(toks.iter().find(|t| t.text == lit)?.start)
+            let i = toks.iter().position(|t| t.text == lit)?;
+            // `schema_to_xml('nope', ...)` takes a `name`, not a
+            // regnamespace: the lookup is the function's own, with no
+            // position (15.19).
+            if i >= 2
+                && toks[i - 1].text == "("
+                && unquote_ident(toks[i - 2].text).starts_with("schema_to_xml")
+            {
+                return None;
+            }
+            pos(toks[i].start)
         }
         "42704" => {
-            let name = quoted_between(m, "type ")?;
-            let name = name.rsplit('.').next()?;
-            pos(toks[ident_at(name)?].start)
+            let full = quoted_between(m, "type ")?;
+            let name = full.rsplit('.').next()?;
+            // A type read from a string (`'nosuch'::regtype`): at the
+            // literal.
+            let lit = format!("'{}'", full.replace('\'', "''"));
+            if let Some(i) = toks.windows(3).position(|w| {
+                w[0].text == lit && w[1].text == "::" && w[2].text.eq_ignore_ascii_case("regtype")
+            }) {
+                return pos(toks[i].start);
+            }
+            let i = ident_at(name)?;
+            // A qualified name (`public.nosuch`): at its first part, as
+            // PostgreSQL places it.
+            let i = if i >= 2 && toks[i - 1].text == "." {
+                i - 2
+            } else {
+                i
+            };
+            pos(toks[i].start)
         }
         // A procedure called in an expression: at its name.
         "42809" if m.ends_with(" is a procedure") => {
@@ -415,6 +447,17 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let value = value.strip_suffix('"')?;
             let lit = format!("'{}'", value.replace('\'', "''"));
             pos(toks.iter().find(|t| t.text == lit)?.start)
+        }
+        // A `char(n)` field too long for a composite, read from a text
+        // literal cast to the type (`'(abcd,x)'::t`): at the literal. An
+        // assignment's 22001 (`insert ... values ('abcd')`) has no position.
+        "22001" if m.starts_with("value too long for type character") => {
+            let i = toks.windows(3).position(|w| {
+                w[0].text.starts_with('\'')
+                    && w[1].text == "::"
+                    && crate::user_composite_oid(w[2].text).is_some()
+            })?;
+            pos(toks[i].start)
         }
         // `'(1,x)'::record`: at the literal.
         "0A000" if m == "input of anonymous composite types is not implemented" => {

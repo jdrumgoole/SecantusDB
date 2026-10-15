@@ -21,7 +21,7 @@ def test_set_transaction_outside_a_block_warns(pg: Any) -> None:
     assert notices == ["WARNING: SET TRANSACTION can only be used in transaction blocks"]
 
 
-@pytest.mark.backlog("RP-002")
+@pytest.mark.backlog_fixed("RP-002")
 def test_cancel_during_parse_is_honoured_at_once(pg: Any) -> None:
     """PostgreSQL 15.19: a cancel sent 0.5 s into this 1.2 MB statement
     answers 57014 at 0.515 s, during the parse (it takes ~2 s to parse

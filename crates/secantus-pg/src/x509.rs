@@ -321,27 +321,21 @@ fn string_value(value: Tlv<'_>) -> Value {
 /// prints. An attribute outside this table prints as `UNDEF`, where OpenSSL
 /// knows more names than these.
 fn short_name(oid: &str) -> &'static str {
-    match oid {
-        "2.5.4.3" => "CN",
-        "2.5.4.4" => "SN",
-        "2.5.4.5" => "serialNumber",
-        "2.5.4.6" => "C",
-        "2.5.4.7" => "L",
-        "2.5.4.8" => "ST",
-        "2.5.4.9" => "street",
-        "2.5.4.10" => "O",
-        "2.5.4.11" => "OU",
-        "2.5.4.12" => "title",
-        "2.5.4.13" => "description",
-        "2.5.4.17" => "postalCode",
-        "2.5.4.42" => "GN",
-        "2.5.4.43" => "initials",
-        "2.5.4.46" => "dnQualifier",
-        "1.2.840.113549.1.9.1" => "emailAddress",
-        "0.9.2342.19200300.100.1.1" => "UID",
-        "0.9.2342.19200300.100.1.25" => "DC",
-        _ => "UNDEF",
-    }
+    // OpenSSL's `OBJ_nid2sn` for the object, `UNDEF` for one it does not
+    // know (`x509_short_names.tsv`, dumped from the OpenSSL 3 PostgreSQL
+    // 15.19 links).
+    static T: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static str>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        include_str!("x509_short_names.tsv")
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once('\t'))
+            .collect()
+    })
+    .get(oid)
+    .copied()
+    .unwrap_or("UNDEF")
 }
 
 /// A name as PostgreSQL's `X509_NAME_to_cstring` prints it: `/CN=...` for
@@ -471,6 +465,17 @@ fn integer_text(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn short_names_are_openssls() {
+        // OpenSSL 3's `OBJ_nid2sn`, which PostgreSQL 15.19 prints.
+        assert_eq!(short_name("2.5.4.3"), "CN");
+        assert_eq!(short_name("2.5.4.15"), "businessCategory");
+        assert_eq!(short_name("2.5.4.97"), "organizationIdentifier");
+        assert_eq!(short_name("1.3.6.1.4.1.311.60.2.1.1"), "jurisdictionL");
+        assert_eq!(short_name("1.2.3.4.5.6.7"), "UNDEF");
+    }
+
     use super::*;
 
     fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
@@ -523,7 +528,7 @@ mod tests {
             attribute(&[0x55, 0x04, 0x0a], 0x0c, b"Acme, Inc."),
             attribute(&[0x55, 0x04, 0x03], 0x13, b" alice "),
             attribute(&[0x55, 0x04, 0x03], 0x0c, "zo\u{eb}".as_bytes()),
-            attribute(&[0x2b, 0x06, 0x01], 0x0c, b"x"),
+            attribute(&[0x2a, 0x03, 0x04, 0x05, 0x06, 0x07], 0x0c, b"x"),
             attribute(&[0x55, 0x04, 0x0b], 0x02, &[0x05]),
         ]
         .concat();
@@ -536,7 +541,7 @@ mod tests {
         // DER, and a byte outside ASCII escaped.
         assert_eq!(
             rfc2253(&der).as_deref(),
-            Some("OU=#020105,1.3.6.1=#0C0178,CN=zo\\C3\\AB,CN=\\ alice\\ ,O=Acme\\, Inc.")
+            Some("OU=#020105,1.2.3.4.5.6.7=#0C0178,CN=zo\\C3\\AB,CN=\\ alice\\ ,O=Acme\\, Inc.")
         );
         // A multi-valued RDN's attributes are joined by `+`.
         let two = tlv(

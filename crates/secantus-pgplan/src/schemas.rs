@@ -601,7 +601,18 @@ pub fn qualify(node: &mut N) -> Result<()> {
             }
         }
         for (n, _, _) in node.nodes_mut() {
-            if let pg_query::NodeMut::RangeVar(r) = n {
+            // The walk does not descend into a TABLESAMPLE's relation.
+            let r = match n {
+                pg_query::NodeMut::RangeVar(r) => r,
+                pg_query::NodeMut::RangeTableSample(ts) => {
+                    match (*ts).relation.as_mut().and_then(|r| r.node.as_mut()) {
+                        Some(N::RangeVar(r)) => r as *mut RangeVar,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            {
                 if target.is_some_and(|t| std::ptr::eq(t, r)) {
                     continue;
                 }

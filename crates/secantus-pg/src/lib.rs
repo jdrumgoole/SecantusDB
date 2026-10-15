@@ -1205,6 +1205,7 @@ fn non_volatile_refusal(sql: &str, plan: &dyn Fn() -> Option<&'static str>) -> O
                 "FETCH"
             }
         }
+        N::ClosePortalStmt(c) if c.portalname.is_empty() => "CLOSE CURSOR ALL",
         N::ClosePortalStmt(_) => "CLOSE CURSOR",
         _ => match plan() {
             Some(verb) => verb,
@@ -3230,7 +3231,7 @@ pub struct PgHandler {
     /// Messages of one cycle are being processed: set by the first message
     /// after a `ReadyForQuery`, cleared when the next one is sent. See
     /// `begin_message_cycle`.
-    cycle_open: AtomicBool,
+    cycle_open: Arc<AtomicBool>,
     /// A statement in the open group failed: the group rolls back at `Sync`.
     group_failed: AtomicBool,
     /// NOTIFYs of the open transaction, `(channel, payload)` in first-issue
@@ -3448,6 +3449,19 @@ struct CursorState {
     /// row `base + 1`.
     tail: Option<portal_stream::CursorTail>,
     base: usize,
+    /// An error was raised while the cursor ran (PostgreSQL's
+    /// `PORTAL_FAILED`): every later read of it is refused.
+    failed: bool,
+}
+
+impl CursorState {
+    /// PortalRunFetch's state check: a failed portal cannot be run (55000).
+    fn check_runnable(&self, name: &str) -> std::result::Result<(), String> {
+        if self.failed {
+            return Err(format!("portal \"{name}\" cannot be run"));
+        }
+        Ok(())
+    }
 }
 
 /// One row of `pg_prepared_statements`.
@@ -3584,7 +3598,7 @@ impl PgHandler {
             constraint_modes: Mutex::new((None, HashMap::new())),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
-            cycle_open: AtomicBool::new(false),
+            cycle_open: Arc::new(AtomicBool::new(false)),
             group_failed: AtomicBool::new(false),
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
@@ -4077,6 +4091,9 @@ impl PgHandler {
         // the reads may differ (and then the record is cleared, so the next
         // statement installs afresh). They were a sixth of a `select 1`.
         let shareable = !self.storage.in_user_txn()
+            && !self
+                .catalog_changed_in_txn
+                .load(std::sync::atomic::Ordering::Relaxed)
             && self
                 .uncommitted
                 .lock()
@@ -4139,8 +4156,13 @@ impl PgHandler {
             ));
             let (pairs, columns) = self.inheritance();
             secantus_pgplan::inherit::set_inheritance(pairs, columns);
-            secantus_pgplan::rls::set_rls(self.rls_tables());
-            secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
+            // In the open block's transaction: a policy it created, or the
+            // RLS it enabled, restricts its own later reads.
+            let (rls, view_rls) = self
+                .in_open_transaction(|| Ok((self.rls_tables(), self.view_rls_tables())))
+                .unwrap_or_else(|_| (self.rls_tables(), self.view_rls_tables()));
+            secantus_pgplan::rls::set_rls(rls);
+            secantus_pgplan::rls::set_view_rls(view_rls);
             INSTALLED_SESSION_TABLES.with(|c| *c.borrow_mut() = shareable.then_some(session_key));
         }
         // The database and the GUCs, for `current_database()` and
@@ -4289,6 +4311,23 @@ impl PgHandler {
         secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
         catalog_meta::install_system_relations();
         let routines = self.user_function_docs().unwrap_or_default();
+        // Each routine's `pg_proc` oid and language, for the validators.
+        secantus_pgplan::validators::set_user_function_languages(
+            routines
+                .iter()
+                .map(|d| {
+                    let oid =
+                        Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                    let lang = match d.get_str("language").unwrap_or_default() {
+                        "sql" => 14i64,
+                        "plpgsql" => 14078,
+                        "c" => 13,
+                        _ => 12,
+                    };
+                    (oid, lang)
+                })
+                .collect(),
+        );
         let is_procedure = |d: &&Document| d.get_bool("is_procedure").unwrap_or(false);
         secantus_pgplan::set_user_functions(
             routines
@@ -4463,7 +4502,11 @@ impl PgHandler {
     /// the udt is the `pg_type.typname`, `_int4` for `int4[]` (measured on
     /// 15.19).
     fn information_schema_type(pg_type: &str) -> (String, String) {
-        let bare = |t: &str| t.rsplit('.').next().unwrap_or(t).to_string();
+        // `"int"` (`pgtypes::user_type_key`) is `int` in pg_type.
+        let bare = |t: &str| {
+            let t = secantus_pgplan::pgtypes::user_type_catalog_name(t);
+            t.rsplit('.').next().unwrap_or(t).to_string()
+        };
         if let Some(element) = pg_type.strip_suffix("[]") {
             return ("ARRAY".into(), format!("_{}", bare(element)));
         }
@@ -4527,9 +4570,12 @@ impl PgHandler {
         ) {
             return None;
         }
-        // A domain goes out as its base type, as PostgreSQL sends it.
+        // A domain goes out as its base type, as PostgreSQL sends it -- a
+        // user type's own oid when the base is one (an enum, a composite).
         if let Some(base) = secantus_pgplan::domains::domain_base(pg_type) {
-            return Some(wire_type(&base));
+            return self
+                .user_wire_type(&base)
+                .or_else(|| Some(wire_type(&base)));
         }
         let enums = self.enums().ok()?;
         // An enum ARRAY: `inttestenum[]` reports the type's typarray oid
@@ -4558,6 +4604,21 @@ impl PgHandler {
                 u32::try_from(*oid).ok()?,
                 postgres_types::Kind::Enum(Vec::new()),
                 "public".to_string(),
+            ));
+        }
+        // An enum outside `public`, by its qualified name (`s.e`), which went
+        // out as varchar.
+        if let Some((schema, name, oid, _)) = self
+            .enums_with_schema()
+            .ok()?
+            .into_iter()
+            .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == pg_type)
+        {
+            return Some(Type::new(
+                name,
+                u32::try_from(oid).ok()?,
+                postgres_types::Kind::Enum(Vec::new()),
+                schema,
             ));
         }
         // A custom range (`create type testrange as range (...)`), its
@@ -7532,6 +7593,10 @@ impl PgHandler {
         {
             return secantus_pgplan::display_type(name);
         }
+        if secantus_pgplan::pgtypes::is_quoted_grammar_name(name) {
+            // `"int"` is kept as it prints (`pgtypes::user_type_key`).
+            return name.to_string();
+        }
         secantus_pgplan::scalar::quote_identifier(name)
     }
 
@@ -7564,6 +7629,32 @@ impl PgHandler {
         if let Ok(bs) = self.base_types() {
             if let Some(b) = bs.iter().find(|b| b.name == name) {
                 return Some(b.oid);
+            }
+        }
+        // A type outside `public`, by its qualified name (`s.e`): a column of
+        // one was missing from `pg_attribute`.
+        if let Ok(es) = self.enums_with_schema() {
+            if let Some((_, _, oid, _)) = es
+                .iter()
+                .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == name)
+            {
+                return Some(*oid);
+            }
+        }
+        if let Ok(cs) = self.composites_with_schema() {
+            if let Some((_, _, oid, _)) = cs
+                .iter()
+                .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == name)
+            {
+                return Some(*oid);
+            }
+        }
+        if let Ok(rs) = self.ranges_with_schema() {
+            if let Some((_, _, oid, _)) = rs
+                .iter()
+                .find(|(sc, n, _, _)| Self::type_resolution(sc, n) == name)
+            {
+                return Some(*oid);
             }
         }
         // A user composite's / enum's ARRAY (`custom[]`): its typarray, the
@@ -9340,6 +9431,12 @@ impl PgHandler {
     /// Read off the SQL rather than the plan, so a view is still a view and a
     /// subquery -- correlated or not -- is still part of the statement.
     fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
+        // It parses the statement before planning does: a cancel that lands
+        // during that parse is seen there too.
+        self.with_cancel_hook(|| self.check_sql_privileges_inner(sql))
+    }
+
+    fn check_sql_privileges_inner(&self, sql: &str) -> PgWireResult<()> {
         let role = self.current_role_name();
         self.check_schema_create(&role, sql)?;
         self.check_builtin_execute(&role, sql)?;
@@ -11365,7 +11462,10 @@ impl PgHandler {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42704".into(),
-                format!("type \"{name}\" does not exist"),
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                ),
             ))));
         };
         let not_a_label = |l: &str| {
@@ -11576,7 +11676,10 @@ impl PgHandler {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),
             "42704".into(),
-            format!("type \"{name}\" does not exist"),
+            format!(
+                "type \"{}\" does not exist",
+                secantus_pgplan::pgtypes::user_type_catalog_name(name)
+            ),
         )))
     }
 
@@ -11590,7 +11693,10 @@ impl PgHandler {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42710".into(),
-                format!("type \"{}\" already exists", d.name),
+                format!(
+                    "type \"{}\" already exists",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(&d.name)
+                ),
             ))));
         }
         let known = secantus_pgplan::pgtypes::oid_of_name(&d.base).is_some()
@@ -11750,7 +11856,10 @@ impl PgHandler {
         let Some(mut doc) = self.raw_domain_doc(name)? else {
             return Err(Self::user_error(
                 "42704",
-                format!("type \"{name}\" does not exist"),
+                format!(
+                    "type \"{}\" does not exist",
+                    secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                ),
             ));
         };
         match comment {
@@ -11765,6 +11874,131 @@ impl PgHandler {
         self.insert_type_doc(Self::DOMAIN_COLLECTION, name, doc)
     }
 
+    /// What depends on an enum, composite or range type's VALUES, as
+    /// PostgreSQL 15.19's `reportDependentObjects` lists it: columns of its
+    /// array type, then its own columns, then each domain over it followed
+    /// by that domain's columns, then fields of composite types. RESTRICT is
+    /// 2BP01 naming them all; CASCADE drops them, with one notice.
+    fn drop_type_value_dependents(&self, name: &str, cascade: bool) -> PgWireResult<()> {
+        let array = format!("{name}[]");
+        let tables = self.all_table_defs()?;
+        let direct = |c: &secantus_pgcatalog::Column| c.extra.get_str("domain_type").is_err();
+        let mut details: Vec<String> = Vec::new();
+        let mut drops: Vec<String> = Vec::new();
+        let mut columns: Vec<(String, String)> = Vec::new();
+        for (ty, shown) in [(array.as_str(), array.as_str()), (name, name)] {
+            for def in &tables {
+                for c in def.columns.iter().filter(|c| c.pg_type == ty && direct(c)) {
+                    details.push(format!(
+                        "column {} of table {} depends on type {shown}",
+                        c.name, def.name
+                    ));
+                    drops.push(format!("column {} of table {}", c.name, def.name));
+                    columns.push((def.name.clone(), c.name.clone()));
+                }
+            }
+        }
+        let domains: Vec<String> = self
+            .domains()?
+            .into_iter()
+            .filter(|d| d.base == name)
+            .map(|d| d.name)
+            .collect();
+        for d in &domains {
+            details.push(format!("type {d} depends on type {name}"));
+            drops.push(format!("type {d}"));
+            for (t, c) in self.domain_columns(d)? {
+                details.push(format!(
+                    "column {c} of table {} depends on type {d}",
+                    t.name
+                ));
+                drops.push(format!("column {c} of table {}", t.name));
+                columns.push((t.name.clone(), c));
+            }
+        }
+        let mut fields: Vec<(String, String)> = Vec::new();
+        for (composite, _, comp_fields) in self.composites()? {
+            if composite == name || self.row_type_of_table(&composite)? {
+                continue;
+            }
+            for (f, t) in comp_fields.iter().filter(|(_, t)| t == name || *t == array) {
+                details.push(format!(
+                    "column {f} of composite type {composite} depends on type {}",
+                    if *t == array { &array } else { name }
+                ));
+                drops.push(format!("column {f} of composite type {composite}"));
+                fields.push((composite.clone(), f.clone()));
+            }
+        }
+        if details.is_empty() {
+            return Ok(());
+        }
+        if !cascade {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "2BP01".into(), // dependent_objects_still_exist
+                format!("cannot drop type {name} because other objects depend on it"),
+            );
+            info.detail = Some(details.join("\n"));
+            info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        self.cascade_notice(&drops);
+        // One ALTER per table, dropping all of its columns at once.
+        let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
+        for (table, column) in columns {
+            match by_table.iter_mut().find(|(t, _)| *t == table) {
+                Some((_, cols)) => cols.push(column),
+                None => by_table.push((table, vec![column])),
+            }
+        }
+        for (table, cols) in by_table {
+            self.execute_inner(
+                Statement::AlterTable {
+                    table,
+                    missing_ok: false,
+                    actions: cols
+                        .into_iter()
+                        .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
+                            name,
+                            if_exists: true,
+                        })
+                        .collect(),
+                },
+                0,
+            )?;
+        }
+        for d in &domains {
+            self.delete_type_doc(Self::DOMAIN_COLLECTION, d)?;
+        }
+        for (composite, field) in fields {
+            let Some(mut doc) = self
+                .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
+                .iter()
+                .find(|d| d.get_str("composite") == Ok(composite.as_str()))
+                .cloned()
+            else {
+                continue;
+            };
+            let id = doc.get_str("_id").unwrap_or(&composite).to_string();
+            if let Ok(items) = doc.get_array("fields") {
+                let keep: Vec<Bson> = items
+                    .iter()
+                    .filter(|f| {
+                        !matches!(f, Bson::Array(p)
+                            if p.first().and_then(Bson::as_str) == Some(field.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                doc.insert("fields", keep);
+            }
+            doc.remove("widths");
+            self.delete_type_doc(Self::COMPOSITE_COLLECTION, &id)?;
+            self.insert_type_doc(Self::COMPOSITE_COLLECTION, &id, doc)?;
+        }
+        Ok(())
+    }
+
     fn drop_domains(&self, names: &[String], if_exists: bool, cascade: bool) -> PgWireResult<()> {
         let existing = self.domains()?;
         for name in names {
@@ -11772,7 +12006,10 @@ impl PgHandler {
                 if if_exists {
                     self.notice(
                         "00000",
-                        format!("type \"{name}\" does not exist, skipping"),
+                        format!(
+                            "type \"{}\" does not exist, skipping",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                        ),
                         None,
                     );
                     continue;
@@ -11801,15 +12038,32 @@ impl PgHandler {
                         Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
                     return Err(PgWireError::UserError(Box::new(info)));
                 }
+                let drops: Vec<String> = dependents
+                    .iter()
+                    .map(|(t, c)| format!("column {c} of table {}", t.name))
+                    .collect();
+                self.cascade_notice(&drops);
+                // One ALTER per table: two single-column ALTERs of one table
+                // left the second column behind (read back as NULL).
+                let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
                 for (t, c) in dependents {
+                    match by_table.iter_mut().find(|(n, _)| *n == t.name) {
+                        Some((_, cols)) => cols.push(c),
+                        None => by_table.push((t.name.clone(), vec![c])),
+                    }
+                }
+                for (table, cols) in by_table {
                     self.execute_inner(
                         Statement::AlterTable {
-                            table: t.name.clone(),
+                            table,
                             missing_ok: false,
-                            actions: vec![secantus_pgplan::AlterTableAction::DropColumn {
-                                name: c,
-                                if_exists: true,
-                            }],
+                            actions: cols
+                                .into_iter()
+                                .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
+                                    name,
+                                    if_exists: true,
+                                })
+                                .collect(),
                         },
                         0,
                     )?;
@@ -12942,8 +13196,8 @@ impl PgHandler {
                 "pg_type",
                 vec![
                     secantus_pgcatalog::Column::new("typname", "name", false),
-                    secantus_pgcatalog::Column::new("oid", "int8", false),
-                    secantus_pgcatalog::Column::new("typarray", "int8", false),
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("typarray", "oid", false),
                     secantus_pgcatalog::Column::new(
                         "typdelim",
                         secantus_pgplan::QUOTED_CHAR,
@@ -13483,10 +13737,18 @@ impl PgHandler {
                                 })
                                 .map_or(Bson::Null, Bson::String),
                         );
-                        let udt_schema = if data_type == "USER-DEFINED" {
-                            "public"
-                        } else {
-                            "pg_catalog"
+                        // A user type outside `public` is named by its own
+                        // schema (`s.e` is schema `s`, name `e`).
+                        let qualified = (data_type == "USER-DEFINED")
+                            .then(|| c.pg_type.split_once('.'))
+                            .flatten();
+                        if let Some((_, bare)) = qualified {
+                            d.insert(f("udt_name"), bare);
+                        }
+                        let udt_schema = match qualified {
+                            Some((schema, _)) => schema,
+                            None if data_type == "USER-DEFINED" => "public",
+                            None => "pg_catalog",
                         };
                         info_columns::fill(
                             &mut d,
@@ -13556,12 +13818,19 @@ impl PgHandler {
                         ] {
                             d.insert(f(k), Bson::Null);
                         }
-                        let udt_schema = if data_type == "USER-DEFINED" {
-                            "public"
-                        } else {
-                            "pg_catalog"
+                        // A user type outside `public` by its own schema.
+                        let qualified = (data_type == "USER-DEFINED")
+                            .then(|| ty.split_once('.'))
+                            .flatten();
+                        let udt_schema = match qualified {
+                            Some((schema, _)) => schema,
+                            None if data_type == "USER-DEFINED" => "public",
+                            None => "pg_catalog",
                         };
-                        d.insert(f("udt_name"), udt_name);
+                        match qualified {
+                            Some((_, bare)) => d.insert(f("udt_name"), bare),
+                            None => d.insert(f("udt_name"), udt_name),
+                        };
                         d.insert(f("is_identity"), "NO");
                         d.insert(f("is_generated"), "NEVER");
                         info_columns::fill(&mut d, &def, &ty, -1, i + 1, udt_schema, &db);
@@ -14599,6 +14868,12 @@ impl PgHandler {
                 for d in &mut rows {
                     let oid = d.get_i64(f("oid")).unwrap_or(0);
                     let name = d.get_str(f("typname")).unwrap_or_default().to_string();
+                    // A user type kept as `"int"` is `int` in pg_type (and its
+                    // array `_int`), as PostgreSQL 15.19 lists it.
+                    let catalog = secantus_pgplan::pgtypes::user_type_catalog_name(&name);
+                    if catalog != name {
+                        d.insert(f("typname"), catalog.to_string());
+                    }
                     let builtin = secantus_pgplan::pgtypes::type_name_of_oid(oid).is_some()
                         || PSEUDO_TYPES.iter().any(|(_, o, a)| *o == oid || *a == oid);
                     if !d.contains_key(f("typtype")) {
@@ -18719,14 +18994,12 @@ impl PgHandler {
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
-        // `pg_reload_conf()` is a superuser's by default; the answer is
-        // taken at login.
-        let may_reload = self.is_superuser(&self.session_user_name());
+        // `pg_reload_conf()` is a superuser's by default: who may call it is
+        // the built-in EXECUTE check's (`restricted_builtins`), for the role
+        // in effect at the call, GRANTs included; a call that reaches here
+        // reloads.
         let reloader = self.reloader.clone();
         secantus_pgplan::scalar::set_reload_conf(Some(Box::new(move || {
-            if !may_reload {
-                return false;
-            }
             if let Some(Err(e)) = reloader.as_ref().map(live::Reloader::reload) {
                 eprintln!("secantusd-pg: configuration was not reloaded: {e}");
             }
@@ -18737,6 +19010,19 @@ impl PgHandler {
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
         // not UTF-8. The transcoder reads the setting at send time, so a later
         // SET takes effect.
+        // A message cycle opens at a message's FIRST byte, so a cancel that
+        // lands while a long statement is still arriving is kept, as
+        // PostgreSQL keeps it; one from before the message is stale and is
+        // cleared (`begin_message_cycle`).
+        let cycle = Arc::clone(&self.cycle_open);
+        let backend = Arc::clone(&self.backend);
+        _c.session_extensions()
+            .insert(pgwire::api::MessageStartHook(Arc::new(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                if !cycle.swap(true, Relaxed) {
+                    backend.cancel.store(false, Relaxed);
+                }
+            })));
         let settings = Arc::clone(&self.settings);
         _c.session_extensions()
             .insert(pgwire::api::BackendMessageTranscoder(Arc::new(move |s| {
@@ -18931,11 +19217,20 @@ impl SimpleQueryHandler for PgHandler {
         // semicolons and answers with one result each. The extended protocol
         // does not, and still refuses -- see `Error::MultipleCommands`.
         // A Query message is a cycle of its own: whatever cancel was pending
-        // when it arrived targeted nothing.
-        self.end_message_cycle();
-        self.backend
-            .cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // before its first byte arrived targeted nothing. The cycle opened
+        // then (the session's `MessageStartHook`), so a cancel that landed
+        // while the text was still arriving, or is being split or parsed, is
+        // kept; opening it here is for a session without the hook.
+        self.begin_message_cycle();
+        // ... and closes when the Query's answer is done, however it ends, so
+        // a cancel sent while the backend is idle again targets nothing.
+        struct CloseCycle<'a>(&'a PgHandler);
+        impl Drop for CloseCycle<'_> {
+            fn drop(&mut self) {
+                self.0.end_message_cycle();
+            }
+        }
+        let _close_cycle = CloseCycle(self);
         // The simple protocol carries no `Bind`, so its results are always text.
         self.binary_results
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -19214,6 +19509,9 @@ impl PgHandler {
                 format!("cursor \"{name}\" does not exist"),
             ))));
         };
+        if let Err(message) = cursor.check_runnable(name) {
+            return Err(Self::user_error("55000", message));
+        }
         // A streamed cursor reads what this FETCH reaches first.
         if cursor.tail.is_some() {
             self.fill_cursor(cursor, direction, count)?;
@@ -19259,11 +19557,13 @@ impl PgHandler {
             backward && wanted > 0
         };
         if is_backward && !cursor.is_scrollable {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            let mut info = ErrorInfo::new(
                 "ERROR".into(),
                 "55000".into(), // object_not_in_prerequisite_state
                 "cursor can only scan forward".into(),
-            ))));
+            );
+            info.hint = Some("Declare it with SCROLL option to enable backward scan.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
         }
 
         // The 0-based indices of the rows to return, in output order. Kept as
@@ -21590,6 +21890,18 @@ impl PgHandler {
 
     /// Run `f` with the executor's callbacks installed: correlated subqueries
     /// and sequence functions inside expressions both need the store.
+    /// Run `f` where the planner can see a cancel that lands while a large
+    /// statement is still parsing (`secantus_pgplan::cancel`). The flag is
+    /// only looked at there; `check_cancel` takes it.
+    fn with_cancel_hook<R>(&self, f: impl FnOnce() -> R) -> R {
+        let cancel = || {
+            self.backend
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        secantus_pgplan::cancel::with_cancel_hook(&cancel, f)
+    }
+
     fn with_executor_hooks<R>(&self, f: impl FnOnce() -> R) -> R {
         let hook = |name: &str, args: &[Bson]| -> std::result::Result<Bson, PlanError> {
             // `nextval` / `setval` write the sequence, so a READ ONLY
@@ -21663,9 +21975,13 @@ impl PgHandler {
             }
             found
         };
-        secantus_pgplan::with_function_hook(&functions, || {
-            secantus_pgplan::with_sequence_hook(&hook, || {
-                secantus_pgplan::with_expr_index_hook(&expr_indexes, || self.correlated_scope(f))
+        self.with_cancel_hook(|| {
+            secantus_pgplan::with_function_hook(&functions, || {
+                secantus_pgplan::with_sequence_hook(&hook, || {
+                    secantus_pgplan::with_expr_index_hook(&expr_indexes, || {
+                        self.correlated_scope(f)
+                    })
+                })
             })
         })
     }
@@ -22411,7 +22727,7 @@ impl PgHandler {
         // start before the check. An aborted block answers 25P02 instead.
         if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.within_block(|| self.check_sql_privileges(sql))?;
-            self.wait_for_table_locks(sql)?;
+            self.with_cancel_hook(|| self.wait_for_table_locks(sql))?;
             self.isolate_for_planning(sql)?;
         }
         // Whatever path the statement takes, a planning transaction it left
@@ -22625,16 +22941,32 @@ impl PgHandler {
         } = stmt
         {
             // The BLOCK, not the handle: an extended-protocol statement group
-            // holds a handle too, and PostgreSQL refuses a cursor there.
-            if !self
-                .in_transaction
-                .load(std::sync::atomic::Ordering::Relaxed)
+            // holds a handle too, and PostgreSQL refuses a cursor there. A
+            // WITH HOLD cursor outlives its transaction, so PostgreSQL takes
+            // one outside a block too (15.19).
+            if !holdable
+                && !self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
             {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "25P01".into(), // no_active_sql_transaction
                     "DECLARE CURSOR can only be used in transaction blocks".into(),
                 ))));
+            }
+            // PerformCursorOpen's CreatePortal: after the query is planned,
+            // before it runs (15.19).
+            if self
+                .cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&name)
+            {
+                return Err(Self::user_error(
+                    "42P03",
+                    format!("cursor \"{name}\" already exists"),
+                ));
             }
             // A cursor's rows are encoded ONCE, at DECLARE, in TEXT: the
             // DECLARE arrives over the simple-query protocol, which is always
@@ -22752,6 +23084,7 @@ impl PgHandler {
                         tz,
                         tail: None,
                         base: 0,
+                        failed: false,
                     },
                 );
             if holdable {
@@ -27412,6 +27745,22 @@ impl PgHandler {
             std::cell::RefCell::new(HashMap::new());
         let runner =
             |sql: &str, params: &[Bson]| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+                // `query_to_xmlschema` and its kin read a query's COLUMNS,
+                // which exist even when it returns no rows (SPI's tupdesc).
+                if let Some(query) = sql.strip_prefix(secantus_pgplan::DESCRIBE_QUERY) {
+                    return self.describe_columns(query);
+                }
+                // `cursor_to_xml` reads an open cursor's next rows, as SPI's
+                // `SPI_cursor_fetch` does: never from the cache, since each
+                // read moves the cursor.
+                if let Some(rest) = sql.strip_prefix(secantus_pgplan::FETCH_CURSOR) {
+                    let (count, name) = rest.split_once('\u{1f}').unwrap_or(("0", rest));
+                    let out = self.fetch_values(name, count.parse().unwrap_or(0));
+                    if out.is_err() {
+                        self.mark_cursor_failed(name);
+                    }
+                    return out;
+                }
                 let key = format!("{sql}\u{0}{params:?}");
                 if let Some(rows) = cache.borrow().get(&key) {
                     return Ok(rows.clone());
@@ -27436,6 +27785,140 @@ impl PgHandler {
                 Ok(rows)
             };
         secantus_pgplan::with_correlated_runner(&runner, f)
+    }
+
+    /// A query's result columns as rows of `[name, type oid, declared type]`,
+    /// for the SQL/XML schema mappings, which name each column's type from
+    /// the portal's tuple descriptor. The wire describes a domain column as
+    /// its BASE type, as PostgreSQL's RowDescription does, while the tuple
+    /// descriptor keeps the domain; so a column read straight from a table
+    /// column declared over a domain (or an enum, which this server's
+    /// description reports as text) carries that type's name as well.
+    fn describe_columns(&self, sql: &str) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+        let fields = self
+            .describe_fields(sql, 0, &[])
+            .map_err(Self::plan_error_of)?
+            .unwrap_or_default();
+        Ok(fields
+            .iter()
+            .map(|f| {
+                let declared = match (f.table_id(), f.column_id()) {
+                    (Some(rel), Some(att)) if rel > 0 && att > 0 => self
+                        .lookup(&secantus_pgplan::regclass_text(i64::from(rel)))
+                        .and_then(|def| {
+                            def.columns.get(usize::try_from(att - 1).ok()?).map(|c| {
+                                c.extra
+                                    .get_str("domain_type")
+                                    .or_else(|_| c.extra.get_str("enum_type"))
+                                    .unwrap_or(&c.pg_type)
+                                    .to_string()
+                            })
+                        }),
+                    _ => None,
+                };
+                vec![
+                    Bson::String(f.name().to_string()),
+                    Bson::Int64(i64::from(f.datatype().oid())),
+                    declared.map_or(Bson::Null, Bson::String),
+                ]
+            })
+            .collect())
+    }
+
+    /// Mark cursor `name` failed, after an error raised while it ran.
+    fn mark_cursor_failed(&self, name: &str) {
+        if let Some(c) = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(name)
+        {
+            c.failed = true;
+        }
+    }
+
+    /// The next `count` rows of cursor `name` as values, moving the cursor
+    /// past them: a forward FETCH, read from the values captured at DECLARE
+    /// rather than the text rows a client is sent.
+    fn fetch_values(
+        &self,
+        name: &str,
+        count: i64,
+    ) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cursor) = cursors.get_mut(name) else {
+            return Err(PlanError::Sqlstate(
+                "34000",
+                format!("cursor \"{name}\" does not exist"),
+            ));
+        };
+        if let Err(message) = cursor.check_runnable(name) {
+            return Err(PlanError::Sqlstate("55000", message));
+        }
+        // A negative count reads BACKWARD (SPI's FETCH_FORWARD with a
+        // negative count), which only a SCROLL cursor may (55000, measured
+        // on 15.19); its rows come nearest first.
+        if count < 0 && !cursor.is_scrollable {
+            return Err(PlanError::Sqlstate(
+                "55000",
+                "cursor can only scan forward\nHint: Declare it with SCROLL option to enable backward scan."
+                    .into(),
+            ));
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let backward = count < 0;
+        let wanted = count.saturating_abs();
+        if cursor.tail.is_some() {
+            let direction = if backward {
+                secantus_pgplan::FetchDirection::Backward
+            } else {
+                secantus_pgplan::FetchDirection::Forward
+            };
+            self.fill_cursor(cursor, direction, wanted)
+                .map_err(Self::plan_error_of)?;
+        }
+        let base = cursor.base;
+        let len = (base + cursor.rows.len()) as i64;
+        let positions: Vec<i64> = if backward {
+            let first = (cursor.pos - 1).min(len);
+            let last = cursor.pos.saturating_sub(wanted).max(1);
+            (last..=first).rev().collect()
+        } else {
+            let first = cursor.pos.saturating_add(1).max(1);
+            let last = cursor.pos.saturating_add(wanted).min(len);
+            (first..=last).collect()
+        };
+        let Some(typed) = cursor.typed_rows.as_ref() else {
+            return Err(PlanError::Unsupported(
+                "reading this cursor's rows as values".into(),
+            ));
+        };
+        let mut out = Vec::new();
+        for i in positions {
+            let row = usize::try_from(i - 1)
+                .ok()
+                .and_then(|i| i.checked_sub(base))
+                .and_then(|i| typed.get(i))
+                .ok_or_else(|| {
+                    PlanError::Sqlstate("XX000", format!("cursor \"{name}\" lost its place"))
+                })?;
+            out.push(
+                row.iter()
+                    .map(|v| v.clone().unwrap_or(Bson::Null))
+                    .collect(),
+            );
+        }
+        cursor.pos = if backward {
+            cursor.pos.saturating_sub(wanted).max(0)
+        } else {
+            cursor.pos.saturating_add(wanted).min(len + 1)
+        };
+        if cursor.tail.is_some() {
+            portal_stream::trim_cursor(cursor);
+        }
+        Ok(out)
     }
 
     fn execute_statement(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
@@ -27661,7 +28144,10 @@ impl PgHandler {
                     let mut info = ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(),
-                        format!("type \"{}\" already exists", def.name),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&def.name)
+                        ),
                     );
                     info.hint = Some(
                         "A relation has an associated type of the same name, so you must \
@@ -28252,13 +28738,11 @@ impl PgHandler {
                 }
                 let doc =
                     bson::doc! {"_id": &name, "schema": &name, "owner": self.current_role_name()};
-                let bytes = encode_doc(&doc)
-                    .map_err(|e| Self::storage_err("could not encode the schema", e))?;
-                self.insert_checked(
-                    Self::SCHEMA_COLLECTION,
-                    vec![bytes],
-                    "could not record the schema",
-                )?;
+                // Noted for the rest of the transaction, as every other
+                // CREATE is: planning reads the catalog outside it, and a
+                // `create table s.t` after `create schema s` in one block
+                // was 3F000.
+                self.insert_type_doc(Self::SCHEMA_COLLECTION, &name, doc)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
             }
 
@@ -28377,7 +28861,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(),
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
@@ -28460,7 +28947,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(),
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
@@ -28501,7 +28991,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(), // duplicate_object
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
@@ -28537,7 +29030,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(),
-                            format!("type \"{name}\" already exists"),
+                            format!(
+                                "type \"{}\" already exists",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                            ),
                         ))));
                     }
                     Some(b) => b,
@@ -28546,14 +29042,20 @@ impl PgHandler {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42710".into(),
-                                format!("type \"{name}\" already exists"),
+                                format!(
+                                    "type \"{}\" already exists",
+                                    secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                                ),
                             ))));
                         }
                         // 42710 (not 42704) with a hint: measured on 16.
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(),
-                            format!("type \"{name}\" does not exist"),
+                            format!(
+                                "type \"{}\" does not exist",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                            ),
                         );
                         info.hint = Some(
                             "Create the type as a shell type, then create its I/O \
@@ -29034,7 +29536,10 @@ impl PgHandler {
                             if if_exists {
                                 self.notice(
                                     "00000",
-                                    format!("type \"{t}\" does not exist, skipping"),
+                                    format!(
+                                        "type \"{}\" does not exist, skipping",
+                                        secantus_pgplan::pgtypes::user_type_catalog_name(t)
+                                    ),
                                     None,
                                 );
                                 return tag();
@@ -29042,7 +29547,10 @@ impl PgHandler {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42704".into(),
-                                format!("type \"{t}\" does not exist"),
+                                format!(
+                                    "type \"{}\" does not exist",
+                                    secantus_pgplan::pgtypes::user_type_catalog_name(t)
+                                ),
                             ))));
                         }
                         keys.push(key);
@@ -29318,7 +29826,10 @@ impl PgHandler {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42710".into(), // duplicate_object
-                        format!("type \"{name}\" already exists"),
+                        format!(
+                            "type \"{}\" already exists",
+                            secantus_pgplan::pgtypes::user_type_catalog_name(&name)
+                        ),
                     ))));
                 }
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
@@ -29444,6 +29955,8 @@ impl PgHandler {
                         info.hint = Some(format!("You can drop table {name} instead."));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
+                    // Columns, domains and composite fields of the type.
+                    self.drop_type_value_dependents(name, cascade)?;
                     // A `public` type named after a built-in is keyed by its
                     // qualified name or its bare one, by kind.
                     let bare = name.strip_prefix("public.").unwrap_or(name);
@@ -29501,7 +30014,10 @@ impl PgHandler {
                         if if_exists {
                             self.notice(
                                 "00000",
-                                format!("type \"{name}\" does not exist, skipping"),
+                                format!(
+                                    "type \"{}\" does not exist, skipping",
+                                    secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                                ),
                                 None,
                             );
                             continue;
@@ -29509,7 +30025,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42704".into(), // undefined_object
-                            format!("type \"{name}\" does not exist"),
+                            format!(
+                                "type \"{}\" does not exist",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(name)
+                            ),
                         ))));
                     }
                 }
@@ -30515,7 +31034,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42710".into(), // duplicate_object
-                            format!("type \"{ty}\" already exists"),
+                            format!(
+                                "type \"{}\" already exists",
+                                secantus_pgplan::pgtypes::user_type_catalog_name(ty)
+                            ),
                         ))));
                     }
                 }
@@ -30823,17 +31345,28 @@ impl PgHandler {
                                     ),
                                 );
                             }
+                            // One ALTER per table (see `drop_domains`).
+                            let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
                             for (table, column) in columns {
+                                match by_table.iter_mut().find(|(t, _)| *t == table) {
+                                    Some((_, cols)) => cols.push(column),
+                                    None => by_table.push((table, vec![column])),
+                                }
+                            }
+                            for (table, cols) in by_table {
                                 self.execute_inner(
                                     Statement::AlterTable {
                                         table,
                                         missing_ok: false,
-                                        actions: vec![
-                                            secantus_pgplan::AlterTableAction::DropColumn {
-                                                name: column,
-                                                if_exists: true,
-                                            },
-                                        ],
+                                        actions: cols
+                                            .into_iter()
+                                            .map(|name| {
+                                                secantus_pgplan::AlterTableAction::DropColumn {
+                                                    name,
+                                                    if_exists: true,
+                                                }
+                                            })
+                                            .collect(),
                                     },
                                     0,
                                 )?;
@@ -31024,7 +31557,13 @@ impl PgHandler {
                 direction,
                 count,
                 is_move,
-            } => self.fetch(&name, direction, count, is_move),
+            } => {
+                let out = self.fetch(&name, direction, count, is_move);
+                if out.is_err() {
+                    self.mark_cursor_failed(&name);
+                }
+                out
+            }
 
             Statement::CloseCursor(name) => {
                 let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
@@ -31035,9 +31574,10 @@ impl PgHandler {
                         format!("cursor \"{name}\" does not exist"),
                     ))));
                 }
-                // `CLOSE ALL` carries an empty name.
+                // `CLOSE ALL` carries an empty name, and its own tag.
                 if name.is_empty() {
                     cursors.clear();
+                    return Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR ALL"))]);
                 }
                 Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR"))])
             }

@@ -139,12 +139,14 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
-    "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
+    "aclitem-unknown-role": (
+        "select a.grantee from aclexplode(array[makeaclitem(12345, 10, 'SELECT', false)]) a"
+    ),
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
+    "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
     "variadic-column": (
         "select concat(variadic a), format('%s-%s', variadic a)"
         " from (values (array['x', 'y'])) v(a)"
@@ -158,6 +160,8 @@ _RP015_FIXED = {
     "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
     "array-element-position": "select array_append('{1.5}', 2)",
     "record-input": "select '(1,x)'::record",
+    "fmgr-validator": "select pg_typeof(fmgr_internal_validator('abs(int4)'::regprocedure))::text",
+    "fdw-validator": "select postgresql_fdw_validator(array['nosuch=x'], 1418)",
     "record-srf-field": (
         "select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1"
     ),
@@ -196,6 +200,21 @@ _RP015_FIXED = {
     "width-bucket-dates": (
         "select width_bucket('2020-01-02'::date, array['2020-01-01'::date, '2020-02-01'])"
     ),
+    "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
+    "query-to-xmlschema-types": (
+        "select query_to_xmlschema('select 1::int2 as a, 2::int8 as b, 1.5::numeric as c,"
+        " ''x''::varchar as d, now() as e, current_date as f, ''01:00''::time as g,"
+        " ''01:00+01''::timetz as h, true as i, ''\\x01''::bytea as j, ''<a/>''::xml as k,"
+        " array[1] as l, ''x''::name as \"xml:m\" where false', false, true, 'urn:t')"
+    ),
+    "query-to-xml-and-xmlschema": (
+        "select query_to_xml_and_xmlschema('select 1 as a, null::text as b', true, false, 'urn:q')"
+    ),
+    "query-to-xmlschema-not-a-cursor": (
+        "select query_to_xmlschema('delete from pg_class', true, false, '')"
+    ),
+    "cursor-to-xml-missing": "select cursor_to_xml('rp015_nope', 1, true, false, '')",
+    "schema-to-xml-missing": "select schema_to_xml('rp015_nope', true, false, '')",
 }
 
 
@@ -477,7 +496,7 @@ def test_row_type_follows_alter_table(pg: Any) -> None:
     assert got == ("ok", [("(1,x)",)])
 
 
-@pytest.mark.backlog("RP-032")
+@pytest.mark.backlog_fixed("RP-032")
 def test_row_type_char_overflow_has_a_position(pg: Any) -> None:
     """PostgreSQL 15.19: `'(abcd,x)'::t` over `t (c char(3), v text)` is
     22001 `value too long for type character(3)` at the literal (position
@@ -683,14 +702,21 @@ def test_pg_typeof_names_the_domain(pg: Any) -> None:
     assert got == ("ok", [("rp38_d",)])
 
 
-@pytest.mark.backlog("RP-038")
+@pytest.mark.backlog_fixed("RP-038")
 def test_create_type_named_int(pg: Any) -> None:
     """PostgreSQL 15.19: `create type int as enum ('a')` creates
-    `public."int"` (`int` is a grammar spelling, not a pg_type name); here
-    it is 42710."""
+    `public."int"` (`int` is a grammar spelling, not a pg_type name), which
+    `'a'::"int"` reaches and `pg_typeof` prints `"int"`, while a bare `int`
+    is still `integer`; here the CREATE was 42710."""
     got = pg_answer(pg, "create type int as enum ('a')")
-    pg.execute('drop type if exists public."int"')
+    try:
+        typed = pg_answer(
+            pg, """select 'a'::"int"::text, pg_typeof('a'::"int")::text, pg_typeof(1::int)::text"""
+        )
+    finally:
+        pg.execute('drop type if exists public."int"')
     assert got == ("ok", "CREATE TYPE")
+    assert typed == ("ok", [("a", '"int"', "integer")])
 
 
 @pytest.mark.backlog_fixed("RP-038")
@@ -730,3 +756,217 @@ def test_null_tsquery_sends_no_notice(pg: Any) -> None:
 )
 def test_untyped_array_literals(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog_fixed("RP-041")
+def test_enum_comparison_reads_its_literal_at_plan_time(pg: Any) -> None:
+    """PostgreSQL 15.19: `c = 'zz'` over an enum column is 22P02 `invalid
+    input value for enum`, even over an empty table; here it answers no rows."""
+    pg.execute("drop table if exists rp041_t")
+    pg.execute("drop type if exists rp041_e")
+    pg.execute("create type rp041_e as enum ('a', 'b')")
+    pg.execute("create table rp041_t (c rp041_e)")
+    try:
+        got = pg_answer(pg, "select c = 'zz' from rp041_t")
+    finally:
+        pg.execute("drop table rp041_t")
+        pg.execute("drop type rp041_e")
+    assert got[:2] == ("err", "22P02")
+
+
+@pytest.mark.backlog_fixed("RP-041")
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("select 'a'::public.nosuch", ("42704", "13")),
+        ("select 'nosuch'::regtype", ("42704", "8")),
+    ],
+    ids=["qualified-type", "regtype-literal"],
+)
+def test_unknown_type_error_position(pg: Any, sql: str, expected: tuple) -> None:
+    """PostgreSQL 15.19 places these 42704s at the type name (13) and at the
+    literal (8); here the first is at 20 and the second has none."""
+    assert _error_and_position(pg, [], sql) == expected
+
+
+@pytest.mark.backlog("RP-041")
+def test_qualified_unknown_type_is_named_qualified(pg: Any) -> None:
+    """PostgreSQL 15.19: `'a'::public.nosuch` is `type "public.nosuch" does
+    not exist`; here the schema is dropped from the name."""
+    got = pg_answer(pg, "select 'a'::public.nosuch")
+    assert got[:2] == ("err", "42704") and 'type "public.nosuch" does not exist' in got[2]
+
+
+@pytest.mark.backlog("RP-041")
+def test_quoted_mixed_case_type_name(pg: Any) -> None:
+    """PostgreSQL 15.19: `create type "Int" as enum ('x')` succeeds (`"Int"`
+    is not `int`); here it is 42710, the name folded to `int4`."""
+    got = pg_answer(pg, """create type "Int" as enum ('x')""")
+    pg.execute('drop type if exists "Int"')
+    assert got == ("ok", "CREATE TYPE")
+
+
+@pytest.mark.backlog_fixed("RP-041")
+def test_drop_type_cascade_names_the_column(pg: Any) -> None:
+    """PostgreSQL 15.19: `drop type e cascade` with a column of the type sends
+    NOTICE `drop cascades to column c of table t`; here it sends none."""
+    pg.execute("drop table if exists rp041_c")
+    pg.execute("drop type if exists rp041_ce")
+    pg.execute("create type rp041_ce as enum ('a')")
+    pg.execute("create table rp041_c (id int, c rp041_ce)")
+    notices: list[str] = []
+    pg.add_notice_handler(lambda d: notices.append(d.message_primary))
+    try:
+        pg.execute("drop type rp041_ce cascade")
+    finally:
+        pg.execute("drop table if exists rp041_c")
+    assert notices == ["drop cascades to column c of table rp041_c"]
+
+
+@pytest.mark.backlog_fixed("RP-041")
+def test_domain_over_enum_is_described_as_the_enum(pg: Any) -> None:
+    """PostgreSQL 15.19 describes a domain over an enum with the ENUM's oid
+    (a domain is sent as its base type); here it is varchar (1043)."""
+    pg.execute("drop domain if exists rp041_d")
+    pg.execute("drop type if exists rp041_de")
+    pg.execute("create type rp041_de as enum ('a')")
+    pg.execute("create domain rp041_d as rp041_de")
+    try:
+        enum_oid = pg.execute("select 'rp041_de'::regtype::oid").fetchone()[0]
+        cur = pg.execute("select 'a'::rp041_d")
+        described = cur.description[0].type_code
+    finally:
+        pg.execute("drop domain rp041_d")
+        pg.execute("drop type rp041_de")
+    assert described == enum_oid
+
+
+@pytest.mark.backlog_fixed("RP-041")
+def test_drop_domain_cascade_drops_every_column(pg: Any) -> None:
+    """PostgreSQL 15.19: `drop domain d cascade` over two columns of one table
+    drops both (`select *` is `(1,)`), with `drop cascades to 2 other
+    objects`; here the second column was left behind, reading NULL."""
+    pg.execute("drop table if exists rp041_v")
+    pg.execute("drop domain if exists rp041_d2")
+    pg.execute("create domain rp041_d2 as int")
+    pg.execute("create table rp041_v (id int, a rp041_d2, b rp041_d2)")
+    pg.execute("insert into rp041_v values (1, 2, 3)")
+    notices: list[str] = []
+    pg.add_notice_handler(lambda d: notices.append(d.message_primary))
+    try:
+        pg.execute("drop domain rp041_d2 cascade")
+        got = pg_answer(pg, "select * from rp041_v")
+    finally:
+        pg.execute("drop table if exists rp041_v")
+    assert (got, notices) == (("ok", [(1,)]), ["drop cascades to 2 other objects"])
+
+
+@pytest.mark.backlog_fixed("RP-013")
+def test_restricted_builtin_needs_a_grant(pg: Any) -> None:
+    """PostgreSQL 15.19 ships `pg_reload_conf()` (and 58 more) with EXECUTE
+    revoked from PUBLIC: a role without a GRANT gets 42501 under SET ROLE,
+    and one with a GRANT may call it. Here any role could reload."""
+    pg.execute("drop role if exists rp013_rl")
+    pg.execute("create role rp013_rl")
+    try:
+        pg.execute("set role rp013_rl")
+        denied = pg_answer(pg, "select pg_reload_conf()")
+        pg.execute("reset role")
+        pg.execute("grant execute on function pg_reload_conf() to rp013_rl")
+        pg.execute("set role rp013_rl")
+        granted = pg_answer(pg, "select pg_reload_conf()")
+    finally:
+        pg.execute("reset role")
+        pg.execute("revoke execute on function pg_reload_conf() from rp013_rl")
+        pg.execute("drop role rp013_rl")
+    assert denied[:2] == ("err", "42501") and granted == ("ok", [(True,)])
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_schema_created_in_a_block_holds_a_table(pg: Any) -> None:
+    """PostgreSQL 15.19: `create schema s; create table s.t (...)` in one
+    transaction block works; here the table was 3F000 `schema "s" does not
+    exist`, the schema not yet visible to planning."""
+    pg.execute("begin")
+    try:
+        pg.execute("create schema rp042_s")
+        got = pg_answer(pg, "create table rp042_s.t (a int)")
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", "CREATE TABLE")
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_has_schema_privilege_by_oid(pg: Any) -> None:
+    """PostgreSQL 15.19: `has_schema_privilege(2200, 'USAGE')` (public's oid)
+    is true, and NULL for an oid naming no schema; here the oid was read as
+    a schema NAME (3F000 `schema "2200" does not exist`)."""
+    got = pg_answer(
+        pg,
+        "select has_schema_privilege(2200, 'USAGE'), has_schema_privilege(12345678, 'USAGE')",
+    )
+    assert got == ("ok", [(True, None)])
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_declare_with_hold_outside_a_block(pg: Any) -> None:
+    """PostgreSQL 15.19 takes `DECLARE c CURSOR WITH HOLD` outside a
+    transaction block (only a cursor without HOLD needs one), and `CLOSE ALL`
+    is tagged `CLOSE CURSOR ALL`; here the DECLARE was 25P01."""
+    declared = pg_answer(pg, "declare rp042_c cursor with hold for select 1")
+    fetched = pg_answer(pg, "fetch all from rp042_c")
+    closed = pg_answer(pg, "close all")
+    assert (declared, fetched, closed) == (
+        ("ok", "DECLARE CURSOR"),
+        ("ok", [(1,)]),
+        ("ok", "CLOSE CURSOR ALL"),
+    )
+
+
+@pytest.mark.backlog_fixed("RP-042")
+def test_enum_outside_public_is_a_column_type(pg: Any) -> None:
+    """PostgreSQL 15.19: a column of `s.e` (an enum in another schema) is in
+    `pg_attribute`, is described with the enum's oid, and its
+    `information_schema.columns` row names schema `s`; here the column was
+    missing, described as varchar, and named `public`."""
+    pg.execute("begin")
+    try:
+        pg.execute("create schema rp042_q")
+        pg.execute("create type rp042_q.e as enum ('a')")
+        pg.execute("create table rp042_q.z (id int, m rp042_q.e)")
+        attnames = pg.execute(
+            "select attname from pg_attribute where attrelid = 'rp042_q.z'::regclass"
+            " and attnum > 0 order by attnum"
+        ).fetchall()
+        enum_oid = pg.execute("select 'rp042_q.e'::regtype::oid").fetchone()[0]
+        described = pg.execute("select m from rp042_q.z").description[0].type_code
+        udt = pg.execute(
+            "select udt_schema, udt_name from information_schema.columns"
+            " where table_schema = 'rp042_q' and column_name = 'm'"
+        ).fetchall()
+    finally:
+        pg.execute("rollback")
+    assert (attnames, described, udt) == ([("id",), ("m",)], enum_oid, [("rp042_q", "e")])
+
+
+@pytest.mark.backlog("RP-043")
+def test_join_cursor_ordered_by_its_key_cannot_scroll(pg: Any) -> None:
+    """PostgreSQL 15.19: a cursor declared without SCROLL over
+    `select * from t join u on t.a = u.a order by t.a` (a merge join in key
+    order) refuses FETCH BACKWARD with 55000; here it scrolls."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp043_t (a int primary key)")
+        pg.execute("create table rp043_u (a int primary key)")
+        pg.execute("insert into rp043_t select generate_series(1, 20)")
+        pg.execute("insert into rp043_u select generate_series(1, 20)")
+        pg.execute(
+            "declare c cursor for select * from rp043_t join rp043_u"
+            " on rp043_t.a = rp043_u.a order by rp043_t.a"
+        )
+        pg.execute("fetch 2 from c")
+        pg.execute("savepoint s")
+        answer = pg_answer(pg, "fetch backward 1 from c")
+    finally:
+        pg.execute("rollback")
+    assert answer[:2] == ("err", "55000")

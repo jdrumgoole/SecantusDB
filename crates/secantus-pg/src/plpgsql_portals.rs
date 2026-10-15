@@ -76,6 +76,7 @@ impl PgHandler {
                 tz,
                 tail: None,
                 base: 0,
+                failed: false,
             },
         );
         Ok(name)

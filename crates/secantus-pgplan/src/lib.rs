@@ -71,8 +71,10 @@ pub fn encode_multi_byte(canonical: &str, text: &str) -> std::result::Result<Vec
     mb.encode(text)
 }
 pub mod bytea;
+pub mod cancel;
 pub mod catalog_stmts;
 pub mod correlated;
+pub mod cursor_scroll;
 pub mod datetime;
 pub mod domains;
 pub mod dtparse;
@@ -88,8 +90,11 @@ mod funcsig;
 pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
+pub mod validators;
 pub mod wparser;
+mod xml_catalog;
 mod xml_export;
+mod xml_schema;
 pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
@@ -130,6 +135,7 @@ pub mod user_casts;
 pub use correlated::{is_user_procedure, set_user_functions, set_user_procedures};
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
+    DESCRIBE_QUERY, FETCH_CURSOR,
 };
 pub mod json;
 pub mod jsonfn;
@@ -3798,23 +3804,24 @@ fn parse_guarded(sql: &str) -> Result<pg_query::ParseResult> {
     if sql.len() <= DIRECT_CHARS {
         return pg_query::parse(sql).map_err(parse_error);
     }
-    let bound = nesting_bound(sql);
-    if bound <= MAX_EXPR_DEPTH as usize {
+    // Up to 64 KiB, a statement nested no deeper than PostgreSQL allows
+    // parses here, quickly enough that a cancel can wait for it. Beyond
+    // that it is parsed where a cancel can still reach it
+    // (`cancel::interruptible`), on a stack deep enough for its nesting.
+    const INTERRUPTIBLE_CHARS: usize = 64 * 1024;
+    if sql.len() <= INTERRUPTIBLE_CHARS && nesting_bound(sql) <= MAX_EXPR_DEPTH as usize {
         return pg_query::parse(sql).map_err(parse_error);
     }
-    if bound > MAX_BOUND {
-        return Err(Error::Sqlstate(
-            "54001",
-            "stack depth limit exceeded".into(),
-        ));
-    }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(BIG_STACK_BYTES)
-            .spawn_scoped(scope, || pg_query::parse(sql).map_err(parse_error))
-            .map_err(|e| Error::Sqlstate("54001", format!("stack depth limit exceeded: {e}")))?
-            .join()
-            .map_err(|_| Error::Sqlstate("XX000", "the parser thread panicked".into()))?
+    let owned = sql.to_string();
+    cancel::interruptible(BIG_STACK_BYTES, move || {
+        let bound = nesting_bound(&owned);
+        if bound > MAX_BOUND {
+            return Err(Error::Sqlstate(
+                "54001",
+                "stack depth limit exceeded".into(),
+            ));
+        }
+        pg_query::parse(&owned).map_err(parse_error)
     })
 }
 
@@ -3846,16 +3853,31 @@ fn parse_one(sql: &str) -> Result<N> {
         .as_ref()
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
-    func_cast::check_variadic_arity(&node)?;
-    func_cast::spread_variadic(&mut node);
-    func_cast::rewrite(&mut node);
-    pattern_ops(&mut node);
-    unknown_args::check_ambiguous(&node)?;
-    unknown_args::rewrite(&mut node);
-    srf_place::check(&node)?;
-    collation::check_clauses(&node)?;
-    schemas::qualify(&mut node)?;
+    // pg_query's node walk does not descend into a DECLARE's query, so the
+    // rewrites run on that query itself: without it a cursor over a temp
+    // table never reached the table's `pg_temp_N` key (42P01).
+    if let N::DeclareCursorStmt(d) = &mut node {
+        if let Some(inner) = d.query.as_mut().and_then(|q| q.node.as_mut()) {
+            rewrite_statement(inner)?;
+        }
+        return Ok(node);
+    }
+    rewrite_statement(&mut node)?;
     Ok(node)
+}
+
+/// The analysis-time rewrites every statement passes through before it is
+/// planned.
+fn rewrite_statement(node: &mut N) -> Result<()> {
+    func_cast::check_variadic_arity(node)?;
+    func_cast::spread_variadic(node);
+    func_cast::rewrite(node);
+    pattern_ops(node);
+    unknown_args::check_ambiguous(node)?;
+    unknown_args::rewrite(node);
+    srf_place::check(node)?;
+    collation::check_clauses(node)?;
+    schemas::qualify(node)
 }
 
 /// The text pattern comparisons `~<~` / `~<=~` / `~>=~` / `~>~` (the
@@ -3999,9 +4021,34 @@ pub fn plan_with_subqueries(
     params: &[Bson],
     run: SubqueryRunner<'_>,
 ) -> Result<Statement> {
-    let mut node = pg_query::protobuf::Node {
+    let node = pg_query::protobuf::Node {
         node: Some(parse_one_as_sent(sql)?),
     };
+    // A cursor's query is a statement of its own: subqueries, views and
+    // CTEs are resolved in it as in a bare SELECT.
+    if let Some(N::DeclareCursorStmt(d)) = node.node.as_ref() {
+        if let Some(N::SelectStmt(_)) = d.query.as_ref().and_then(|q| q.node.as_ref()) {
+            let inner = plan_query_node(
+                sql,
+                (**d.query.as_ref().expect("checked")).clone(),
+                lookup,
+                params,
+                run,
+            )?;
+            return Ok(declare_cursor(d, inner));
+        }
+    }
+    plan_query_node(sql, node, lookup, params, run)
+}
+
+/// [`plan_with_subqueries`] for one parsed statement.
+fn plan_query_node(
+    sql: &str,
+    mut node: pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    run: SubqueryRunner<'_>,
+) -> Result<Statement> {
     if let Some(e) = sql_json_absent(&node, sql, params) {
         return Err(e);
     }
@@ -4052,6 +4099,40 @@ pub fn plan_with_subqueries(
         lookup,
         &params,
     )
+}
+
+/// The DECLARE of `inner`, the cursor's planned query.
+fn declare_cursor(d: &pg_query::protobuf::DeclareCursorStmt, inner: Statement) -> Statement {
+    let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
+    // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
+    const CURSOR_OPT_BINARY: i32 = 0x0001;
+    const CURSOR_OPT_SCROLL: i32 = 0x0002;
+    const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
+    const CURSOR_OPT_HOLD: i32 = 0x0020;
+    // Deparse the inner query for `pg_cursors.statement`. Best-effort:
+    // an un-deparsable node leaves the column empty rather than failing
+    // the DECLARE, which no client reads that column to check.
+    let statement = inner_node
+        .and_then(|n| n.deparse().ok())
+        .unwrap_or_default();
+    Statement::DeclareCursor {
+        name: d.portalname.clone(),
+        query: Box::new(inner),
+        statement,
+        // Neither SCROLL nor NO SCROLL: whatever the plan can do.
+        scrollable: if d.options & CURSOR_OPT_SCROLL != 0 {
+            true
+        } else if d.options & CURSOR_OPT_NO_SCROLL != 0 {
+            false
+        } else {
+            match inner_node {
+                Some(N::SelectStmt(sel)) => cursor_scroll::scrolls_by_default(sel),
+                _ => true,
+            }
+        },
+        holdable: (d.options & CURSOR_OPT_HOLD) != 0,
+        binary: (d.options & CURSOR_OPT_BINARY) != 0,
+    }
 }
 
 pub(crate) fn plan_node_public(
@@ -4233,7 +4314,12 @@ fn plan_node(
                 .typevar
                 .as_ref()
                 .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
-            let name = typevar.relname.clone();
+            // A grammar spelling (`int`) is kept quoted (`user_type_name`).
+            let name = if matches!(typevar.schemaname.as_str(), "" | "public") {
+                pgtypes::user_type_key(&typevar.relname)
+            } else {
+                typevar.relname.clone()
+            };
             let schema = if typevar.schemaname.is_empty() {
                 None
             } else {
@@ -4373,30 +4459,12 @@ fn plan_node(
             if_not_exists: c.if_not_exists,
         }),
         N::DeclareCursorStmt(d) => {
-            let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
-            let inner = match inner_node {
+            let inner = match d.query.as_ref().and_then(|q| q.node.as_ref()) {
                 Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
                 Some(other) => return Err(Error::Unsupported(disc(other))),
                 None => return Err(Error::Parse("DECLARE CURSOR without a query".into())),
             };
-            // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
-            const CURSOR_OPT_BINARY: i32 = 0x0001;
-            const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
-            const CURSOR_OPT_HOLD: i32 = 0x0020;
-            // Deparse the inner query for `pg_cursors.statement`. Best-effort:
-            // an un-deparsable node leaves the column empty rather than failing
-            // the DECLARE, which no client reads that column to check.
-            let statement = inner_node
-                .and_then(|n| n.deparse().ok())
-                .unwrap_or_default();
-            Ok(Statement::DeclareCursor {
-                name: d.portalname.clone(),
-                query: Box::new(inner),
-                statement,
-                scrollable: (d.options & CURSOR_OPT_NO_SCROLL) == 0,
-                holdable: (d.options & CURSOR_OPT_HOLD) != 0,
-                binary: (d.options & CURSOR_OPT_BINARY) != 0,
-            })
+            Ok(declare_cursor(&d, inner))
         }
         N::FetchStmt(f) => {
             use pg_query::protobuf::FetchDirection as Fd;
@@ -4686,8 +4754,8 @@ fn split_qualified_type_name(
         .collect();
     match parts.as_slice() {
         [] => Err(Error::Parse("CREATE TYPE without a name".into())),
-        [name] => Ok((None, name.clone())),
-        [schema, name] if schema == "public" => Ok((None, name.clone())),
+        [name] => Ok((None, pgtypes::user_type_key(name))),
+        [schema, name] if schema == "public" => Ok((None, pgtypes::user_type_key(name))),
         [schema, name] => Ok((Some(schema.clone()), name.clone())),
         _ => {
             let name = parts.last().expect("non-empty").clone();
@@ -5662,6 +5730,12 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
         // `pg_catalog.bpchar`, and `pg_catalog.char` only comes from
         // `pg_catalog."char"` as written.
         ["char"] | ["pg_catalog", "char"] => QUOTED_CHAR.to_string(),
+        // Likewise a bare or `public.` `int`: the grammar's `int` is
+        // `pg_catalog.int4`, so this one was written `"int"` and names a user
+        // type (`pgtypes::user_type_name`).
+        [n] | ["public", n] if pgtypes::user_type_key(n) != *n => pgtypes::user_type_key(n),
+        // `pg_catalog."int"` names no type at all (42704 on 15.19).
+        ["pg_catalog", n] if pgtypes::user_type_key(n) != *n => format!("pg_catalog.{n}"),
         [n] | ["pg_catalog", n] => (*n).to_string(),
         // `public.tid` is not the built-in `tid` (see `shadowed_by_catalog`).
         ["public", n] if !pgtypes::shadowed_by_catalog(n) => (*n).to_string(),
@@ -6656,7 +6730,10 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             (Some(rv), _) => relation_name(rv),
             (None, Some(N::List(l))) => {
                 let parts = string_list(&l.items);
+                let is_type = matches!(kind, "type" | "domain");
                 match parts.as_slice() {
+                    [bare] if is_type => pgtypes::user_type_key(bare),
+                    [schema, bare] if schema == "public" && is_type => pgtypes::user_type_key(bare),
                     [schema, bare] if schema == "public" => bare.clone(),
                     _ => parts.join("."),
                 }
@@ -6664,6 +6741,13 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             (None, Some(N::TypeName(t))) => type_name_of(t),
             _ if kind == "schema" => r.subname.clone(),
             _ => return Err(Error::Parse("RENAME without an object".into())),
+        };
+        // A type renamed to a grammar spelling is kept quoted, as one
+        // created under it is (`pgtypes::user_type_key`).
+        let to = if matches!(kind, "type" | "domain") {
+            pgtypes::user_type_key(&r.newname)
+        } else {
+            r.newname.clone()
         };
         let sub = if kind == "schema" {
             String::new()
@@ -6674,7 +6758,7 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
             kind: kind.to_string(),
             target,
             sub,
-            to: r.newname.clone(),
+            to,
             missing_ok: r.missing_ok,
         });
     }
@@ -8112,7 +8196,8 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 let domain = domains::user_domain(&ty);
                 if domain.is_none() && !column_type_exists(&ty) {
                     return Err(Error::UndefinedObject(format!(
-                        "type \"{ty}\" does not exist"
+                        "type \"{}\" does not exist",
+                        pgtypes::user_type_catalog_name(&ty)
                     )));
                 }
                 let ty = domain.as_ref().map_or(ty, |d| d.base.clone());
@@ -18618,7 +18703,8 @@ fn plan_alter_enum(a: &pg_query::protobuf::AlterEnumStmt) -> Result<Statement> {
         })
         .collect();
     let name = match parts.as_slice() {
-        [schema, bare] if schema == "public" => bare.clone(),
+        [bare] => pgtypes::user_type_key(bare),
+        [schema, bare] if schema == "public" => pgtypes::user_type_key(bare),
         _ => parts.join("."),
     };
     let change = if a.old_val.is_empty() {
@@ -21784,7 +21870,7 @@ fn finish_aggregate(
 /// same expression compare equal wherever they sat in the query text --
 /// PostgreSQL's `equal()` for the purpose of matching a target to a GROUP BY
 /// key.
-fn node_print(node: &pg_query::protobuf::Node) -> String {
+pub(crate) fn node_print(node: &pg_query::protobuf::Node) -> String {
     static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     LOCATION
         .get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"))
@@ -22306,6 +22392,16 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             "regtype".to_string()
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
+                .and_then(validators::result_type)
+                .is_some() =>
+        {
+            validators::result_type(&func_name(f).unwrap_or_default())
+                .unwrap_or("void")
+                .to_string()
+        }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("current_schemas") => {
             "name[]".to_string()
         }
@@ -24261,6 +24357,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || declared.starts_with("aclitem")
                             || fts::result_type(&name).is_some()
                             || xml::result_type(&name).is_some()
+                            || validators::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
                             || mathfn::result_type(&name).is_some()
                             || snapshots::result_type(&name).is_some()
@@ -25825,10 +25922,27 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
     for (i, (v, (_, ty))) in raw.into_iter().zip(fields.iter()).enumerate() {
         let width = widths.get(i).copied().flatten();
         let v = if let (true, Some(n)) = (ty == "bpchar", width) {
-            // The column's typmod applies as on input: excess blanks are cut,
-            // anything else is 22001.
-            let n32 = i32::try_from(n).unwrap_or(i32::MAX - 4);
-            pad_bpchar(fit_length(cast_value_inner(v, ty)?, ty, n32 + 4)?, width)
+            let v = cast_value_inner(v, ty)?;
+            let v = if literal.is_some() {
+                // A text literal is INPUT: excess blanks are cut, anything
+                // else is 22001.
+                let n32 = i32::try_from(n).unwrap_or(i32::MAX - 4);
+                fit_length(v, ty, n32 + 4)?
+            } else {
+                // A record cast is an explicit cast, which truncates
+                // (`row('abcd', 'x')::t` is `(abc,x)`, 15.19).
+                match v {
+                    Bson::String(t) => Bson::String(
+                        t.chars()
+                            .take(n)
+                            .collect::<String>()
+                            .trim_end_matches(' ')
+                            .to_string(),
+                    ),
+                    other => other,
+                }
+            };
+            pad_bpchar(v, width)
         } else {
             v
         };
@@ -25910,6 +26024,10 @@ pub fn regtype_text(oid: i64) -> String {
 }
 
 fn quote_type_path(name: &str) -> String {
+    // `"int"` is kept as it prints (`pgtypes::user_type_key`).
+    if pgtypes::is_quoted_grammar_name(name) {
+        return name.to_string();
+    }
     name.split('.')
         .map(scalar::quote_identifier)
         .collect::<Vec<_>>()
@@ -27674,7 +27792,12 @@ fn canonical_type_ref(name: &str) -> String {
     let norm: Vec<String> = parts.iter().map(|p| normalize_ident_part(p)).collect();
     match norm.as_slice() {
         // `public.tid` stays qualified: the bare name is `pg_catalog`'s.
-        [schema, name] if schema == "public" && !pgtypes::shadowed_by_catalog(name) => name.clone(),
+        // A user type named like grammar (`int`) is keyed quoted
+        // (`pgtypes::user_type_name`); a builtin is resolved before this.
+        [schema, name] if schema == "public" && !pgtypes::shadowed_by_catalog(name) => {
+            pgtypes::user_type_key(name)
+        }
+        [name] => pgtypes::user_type_key(name),
         [schema, name] => format!("{schema}.{name}"),
         _ => norm.join("."),
     }
@@ -27744,7 +27867,10 @@ fn column_type_exists(name: &str) -> bool {
 /// A user ENUM's `(oid, labels)` by name, same folding rule.
 fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
     let trimmed = name.trim();
+    // A type named like grammar is registered under its quoted spelling
+    // (`pgtypes::user_type_name`), which is the whole key.
     let (target, fold) = match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        _ if pgtypes::is_quoted_grammar_name(trimmed) => (trimmed.to_string(), false),
         Some(inner) => (inner.to_string(), false),
         None => (trimmed.to_ascii_lowercase(), true),
     };
@@ -29682,7 +29808,8 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         if let Err(Error::UndefinedObject(m)) = probe {
             if m.starts_with("type \"") && m.ends_with("\" does not exist") {
                 return Err(Error::UndefinedObject(format!(
-                    "type \"{target}\" does not exist"
+                    "type \"{}\" does not exist",
+                    pgtypes::user_type_catalog_name(target)
                 )));
             }
         }
@@ -29960,7 +30087,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                         }
                         None => Error::UndefinedObject(format!(
                             "type \"{}\" does not exist",
-                            name.trim()
+                            pgtypes::user_type_catalog_name(name.trim())
                         )),
                     }),
                 }
@@ -30473,7 +30600,8 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 && user_composite(base).is_none()
             {
                 return Err(Error::UndefinedObject(format!(
-                    "type \"{base}\" does not exist"
+                    "type \"{}\" does not exist",
+                    pgtypes::user_type_catalog_name(base)
                 )));
             }
             Err(Error::Unsupported(format!("a cast to {other}")))
@@ -33318,13 +33446,13 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
                 .collect();
             let name = match parts.as_slice() {
                 [] => return Err(Error::Parse("DROP TYPE without a name".into())),
-                [bare] => bare.clone(),
+                [bare] => pgtypes::user_type_key(bare),
                 // `public.uuid` (a type named after a built-in) stays
                 // qualified: its bare name is pg_catalog's.
                 [schema, bare]
                     if schema == "public" && (domain || !pgtypes::shadowed_by_catalog(bare)) =>
                 {
-                    bare.clone()
+                    pgtypes::user_type_key(bare)
                 }
                 _ => parts.join("."),
             };
