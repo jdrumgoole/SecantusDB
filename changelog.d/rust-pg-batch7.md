@@ -51,3 +51,8 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   PostgreSQL's `is_member_of_role_nosuper` does: a superuser is a member of
   only the roles it was granted, where it counted as a member of all. Part
   of RP-013, pinned by `tools/probes/pg_login_hba.py` (122 of 122).
+- `pg_hba.conf` takes `@file` inclusion as PostgreSQL 15 does: an
+  unquoted `@name` is the tokens of the file `name` beside it, recursively.
+  It was refused at startup. Part of RP-013, pinned by
+  `tools/probes/pg_login_hba.py` (128 of 128) and `hba.rs`'s
+  `an_at_file_holds_more_tokens`.

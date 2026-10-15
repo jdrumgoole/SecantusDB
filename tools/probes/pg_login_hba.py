@@ -5,7 +5,7 @@ Two files, the second delivered by a reload. Between them: every line type,
 method, database form and user form the server reads, an address that does
 not match, ``clientcert=``, ``map=``, md5-stored passwords under ``md5``,
 ``scram-sha-256`` and ``password`` lines, a role with no password, a user
-with no role, and a database that is not there. 122 scenarios.
+with no role, and a database that is not there. 128 scenarios.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
 script creates and against ``secantusd-pg``, through psycopg and through a
@@ -257,6 +257,9 @@ def setup(port, connect):
             "md5user",
             "nopw",
             "boss",
+            "inc1",
+            "inc2",
+            "inc3",
         ):
             c.execute(f"drop role if exists {role}")
         for db in ("appdb", "alice", "team"):
@@ -273,6 +276,9 @@ def setup(port, connect):
         # A superuser in no role: `+team` and `samerole` ask about membership
         # itself, which a superuser does not have of everything.
         c.execute("create role boss login superuser password 'pw'")
+        # Named only through `@incusers`, a file beside pg_hba.conf.
+        for role in ("inc1", "inc2", "inc3"):
+            c.execute(f"create role {role} login")
         c.execute("create role appuser login password 'pw'")
         for role in ("md5user", "md5scram", "md5plain"):
             c.execute(f"drop role if exists {role}")
@@ -302,7 +308,10 @@ host        all        erin        samehost                   md5
 hostssl     all        frank       all                        scram-sha-256  clientcert=verify-ca
 host        all        nopw        127.0.0.1/32               scram-sha-256
 host        "appdb"    "nobody"    127.0.0.1/32               trust
+host        all        @incusers   127.0.0.1/32               trust
 """
+# `@incusers`: tokens of every line, comments dropped, read beside the file.
+INCUSERS = "inc1  # the first\ninc2,\n"
 
 
 def scenarios(port):
@@ -332,6 +341,9 @@ def scenarios(port):
     both("member in db team", user="member", database="team")
     both("boss (superuser, in no role) by +team", user="boss", password="pw")
     both("boss in db team (samerole)", user="boss", database="team", password="pw")
+    both("inc1 (named in @incusers)", user="inc1")
+    both("inc2 (after a comma there)", user="inc2")
+    both("inc3 (not in @incusers)", user="inc3")
     both(
         "alice in db alice (sameuser is erin's line)", user="alice", database="alice", password="pw"
     )
@@ -455,6 +467,7 @@ setup(
 with psycopg.connect(host="127.0.0.1", port=5419, dbname="postgres", user="postgres") as c:
     print("reference:", c.execute("show server_version").fetchone()[0])
 open(f"{pgd}/pg_hba.conf", "w").write(HBA)
+open(f"{pgd}/incusers", "w").write(INCUSERS)
 subprocess.run([f"{PGB}/pg_ctl", "-D", pgd, "reload"], check=True, capture_output=True)
 time.sleep(1)
 assert attempt(5419, **PLAIN) == ("ok", False), "self-check: postgres is trusted in the clear"
@@ -503,6 +516,7 @@ if BIN:
     p.send_signal(signal.SIGTERM)
     p.wait(30)
     open(f"{d}/pg_hba.conf", "w").write(HBA)
+    open(f"{d}/incusers", "w").write(INCUSERS)
     open(f"{d}/pg_ident.conf", "w").write("")
     p, port = start(["--hba-file", f"{d}/pg_hba.conf", "--ident-file", f"{d}/pg_ident.conf"])
     try:

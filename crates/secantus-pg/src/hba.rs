@@ -22,7 +22,8 @@
 //! server cannot apply is never silently skipped: a method that needs a
 //! service outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`,
 //! `radius`, `pam`, `bsd`), a host NAME for the address (PostgreSQL resolves
-//! it; this server does not) and `@file` inclusion. `local`
+//! it; this server does not). `@file` inclusion is read as PostgreSQL 15
+//! reads it. `local`
 //! lines are for Unix-domain sockets, which this server does not listen on:
 //! they are read and never match, as are the GSSAPI types.
 
@@ -143,7 +144,7 @@ impl Hba {
     pub(crate) fn read(path: &Path) -> io::Result<Hba> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
-        Hba::parse(&text).map_err(|(line, message)| {
+        Hba::parse_in(&text, path.parent()).map_err(|(line, message)| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}, line {line}: {message}", path.display()),
@@ -152,9 +153,14 @@ impl Hba {
     }
 
     pub(crate) fn parse(text: &str) -> Result<Hba, (usize, String)> {
+        Hba::parse_in(text, None)
+    }
+
+    /// [`Hba::parse`], an `@file` read relative to `dir` (the hba file's).
+    pub(crate) fn parse_in(text: &str, dir: Option<&Path>) -> Result<Hba, (usize, String)> {
         let mut rules = Vec::new();
         for (number, line) in logical_lines(text) {
-            let fields = fields(&line).map_err(|message| (number, message))?;
+            let fields = fields(&line, dir, 0).map_err(|message| (number, message))?;
             if fields.is_empty() {
                 continue;
             }
@@ -373,7 +379,7 @@ fn logical_lines(text: &str) -> Vec<(usize, String)> {
 /// One line's fields, each a comma-separated list of tokens. Blanks separate
 /// fields, a `#` outside quotes starts a comment, and double quotes keep
 /// blanks, commas and `#` in a token (`""` inside them is one quote).
-fn fields(line: &str) -> Result<Vec<Vec<Token>>, String> {
+fn fields(line: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<Vec<Token>>, String> {
     let mut out: Vec<Vec<Token>> = Vec::new();
     let mut chars = line.chars().peekable();
     loop {
@@ -414,8 +420,14 @@ fn fields(line: &str) -> Result<Vec<Vec<Token>>, String> {
             if quoted {
                 return Err("unterminated quoted string".into());
             }
-            if !was_quoted && text.starts_with('@') {
-                return Err(format!("file inclusion ({text}) is not supported"));
+            // `@file` (unquoted): the tokens that file holds, in its place
+            // (`tokenize_inc_file`), relative to the hba file's directory.
+            if !was_quoted && text.len() > 1 && text.starts_with('@') {
+                field.extend(included(&text[1..], dir, depth)?);
+                if !more {
+                    break;
+                }
+                continue;
             }
             if !text.is_empty() || was_quoted {
                 field.push(Token {
@@ -431,6 +443,32 @@ fn fields(line: &str) -> Result<Vec<Vec<Token>>, String> {
             out.push(field);
         }
     }
+}
+
+/// The tokens of an `@file`: every token of every line, comments dropped.
+fn included(name: &str, dir: Option<&Path>, depth: usize) -> Result<Vec<Token>, String> {
+    if depth >= 10 {
+        return Err(format!(
+            "could not open file \"{name}\": too many levels of inclusion"
+        ));
+    }
+    let path = match dir {
+        Some(dir) if Path::new(name).is_relative() => dir.join(name),
+        _ => Path::new(name).to_path_buf(),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "could not open secondary authentication file \"@{name}\" as \"{}\": {e}",
+            path.display()
+        )
+    })?;
+    let mut out = Vec::new();
+    for (_, line) in logical_lines(&text) {
+        for field in fields(&line, path.parent(), depth + 1)? {
+            out.extend(field);
+        }
+    }
+    Ok(out)
 }
 
 /// A field that must be one token.
@@ -835,6 +873,30 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
         assert!(net("192.0.2.200") && !net("192.0.3.1") && !net("::1"));
     }
 
+    #[test]
+    fn an_at_file_holds_more_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("admins"),
+            "alice  # a comment\nbob,carol\n@more\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("more"), "dave\n").unwrap();
+        let hba = Hba::parse_in("host all @admins all trust\n", Some(dir.path()))
+            .expect("the file parses");
+        for user in ["alice", "bob", "carol", "dave"] {
+            assert!(
+                decide_from(&hba, false, user, "x", "127.0.0.1").is_some(),
+                "{user}"
+            );
+        }
+        assert!(decide_from(&hba, false, "erin", "x", "127.0.0.1").is_none());
+        // Quoted, `@admins` is a user called @admins.
+        let quoted =
+            Hba::parse_in("host all \"@admins\" all trust\n", Some(dir.path())).expect("parses");
+        assert!(decide_from(&quoted, false, "@admins", "x", "127.0.0.1").is_some());
+    }
+
     #[cfg(unix)]
     #[test]
     fn this_hosts_addresses_are_listed() {
@@ -892,7 +954,10 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
                 "host all all all trust colour=blue\n",
                 "unrecognized authentication option",
             ),
-            ("host all @users all trust\n", "file inclusion"),
+            (
+                "host all @absent-users-file all trust\n",
+                "could not open secondary authentication file",
+            ),
             ("host all \"alice all trust\n", "unterminated"),
             (
                 "host all all 127.0.0.1/32,10.0.0.0/8 trust\n",
