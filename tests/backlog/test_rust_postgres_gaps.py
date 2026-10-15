@@ -140,10 +140,22 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
     "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
+    "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
+    "timezone-names": "select count(*) > 100 from pg_timezone_names",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
+    "variadic-column": (
+        "select concat(variadic a), format('%s-%s', variadic a)"
+        " from (values (array['x', 'y'])) v(a)"
+    ),
+    "variadic-nested-array": "select concat(variadic array[[1, 2], [3, 4]])",
+    "variadic-arity": "select concat('a', variadic array['b', 'c'])",
+    "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
+    "record-srf-field": (
+        "select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1"
+    ),
     "query-to-xml": (
         "select query_to_xml('select 1 as a, null::text as \"_xb\", array[1,null] as r',"
         " true, true, 'urn:x')"
@@ -596,7 +608,7 @@ def test_order_by_a_range(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-025")
+@pytest.mark.backlog_fixed("RP-025")
 def test_untyped_record_array_compare(pg: Any, pg15: Any) -> None:
     """PostgreSQL 15.19: comparing arrays of records with an untyped field
     is 42883 `could not identify an equality operator for type unknown`;
@@ -606,15 +618,11 @@ def test_untyped_record_array_compare(pg: Any, pg15: Any) -> None:
 
 
 # RP-038: divergences the 2026-10-15 batch saw beside its items.
-_RP038 = {
-    "operator-function-typed": "select int4pl(a, b) from (values ('x'::text, 1)) v(a, b)",
-}
-
-
 _RP038_FIXED = {
     "limit-text": "select 1 limit 'x'",
     "mode-unknown": "select mode() within group (order by NULL)",
     "xmlagg": "select xmlagg(null::xml)",
+    "operator-function-typed": "select int4pl(a, b) from (values ('x'::text, 1)) v(a, b)",
 }
 
 
@@ -624,13 +632,7 @@ def test_batch_residue_fixed(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-038")
-@pytest.mark.parametrize("sql", list(_RP038.values()), ids=list(_RP038))
-def test_batch_residue(pg: Any, pg15: Any, sql: str) -> None:
-    _same_as_reference(pg, pg15, sql)
-
-
-@pytest.mark.backlog("RP-038")
+@pytest.mark.backlog_fixed("RP-038")
 def test_pg_typeof_names_the_domain(pg: Any) -> None:
     """PostgreSQL 15.19: `pg_typeof` of a column declared `rp38_d` is
     `rp38_d`; here it is the domain's base type, `integer`."""
@@ -673,3 +675,14 @@ def test_copy_from_reports_the_bad_byte(pg: Any) -> None:
     finally:
         pg.execute("drop table rp38_copy")
     assert got == ("22021", 'invalid byte sequence for encoding "UTF8": 0x82')
+
+
+@pytest.mark.backlog_fixed("RP-015")
+def test_null_tsquery_sends_no_notice(pg: Any) -> None:
+    """PostgreSQL 15.19: `select null::tsquery` and `numnode(null)` send no
+    NOTICE (`''::tsquery` says it has no lexemes; a NULL is not parsed)."""
+    notices: list[str] = []
+    pg.add_notice_handler(lambda d: notices.append(d.message_primary))
+    for sql in ("select null::tsquery", "select numnode(null)", "select querytree(null::tsquery)"):
+        pg.execute(sql).fetchall()
+    assert notices == []

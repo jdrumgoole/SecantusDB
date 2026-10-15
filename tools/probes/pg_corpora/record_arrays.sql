@@ -1,0 +1,23 @@
+# reference-version: 15
+# Arrays of ROW(...) records compared: array_eq / array_cmp over record_eq / record_cmp, untyped fields (42883), dissimilar field types (42804), column counts, NULL elements and fields (RP-025).
+select array[row(1, null)] = array[row(1, null)]
+select array[row(1, 'a')] = array[row(1, 'a')]
+select row(1, null) = row(1, null)
+select array[row(1, 2)] = array[row(1, 2)]
+select array[row(1, null::int)] = array[row(1, null::int)]
+select array[row(1, null)] <> array[row(1, 2)]
+select array[row(1, null)] < array[row(1, null)]
+select array[row(1, null)] = array[row(2, null)]
+select array[row(2, null)] > array[row(1, null)]
+select array[row(1, null)] = array[row(1, null), row(1, null)]
+select array[row(1, null, 3)] = array[row(1, null)]
+select array[null, row(1, null)] = array[null, row(1, null)]
+select array[row('a', 1)] = array[row('a', 1)]
+select array[row(1, null)] <= array[row(1, 2)]
+select array[row(1, 2::int)] = array[row(1, 2::int, 3)]
+select array[row(1::int, null)] = array[row(2::int, null, 4)]
+select array[row(1, 'a'::text)] < array[row(1, 'b'::text)]
+select array[row(1, 2), row(3, 4)] = array[row(1, 2), row(3, 4)]
+select array[row(1, 2)] = array[row(1, 2::int8)]
+select array[row(1, row(2, 3))] = array[row(1, row(2, 3))]
+select array[row(1.5, 2)] > array[row(1, 2)]

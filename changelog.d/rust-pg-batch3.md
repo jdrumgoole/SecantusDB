@@ -1,0 +1,57 @@
+### Rust PostgreSQL server: backlog batch 3
+
+More of the Rust PostgreSQL server's backlog, each fix measured against
+PostgreSQL 15.19 and pinned by the backlog test that found it.
+
+#### Fixed
+
+- `pg_typeof` of a column of a domain type names the domain (`rp38_d`),
+  where it printed the base type (`integer`); qualified or not, in a select
+  list or a WHERE. Part of RP-038
+  (`tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain`).
+
+- Arrays of `ROW(...)` records compare as PostgreSQL's `array_eq` /
+  `array_cmp` over `record_eq` / `record_cmp` do: an untyped field reached
+  is 42883 (`could not identify an equality operator for type unknown`),
+  two field types that differ are 42804 naming the column, and records of
+  different widths are 42804 once their common columns are equal. These
+  were 0A000, and an all-typed width mismatch answered `false`. Fixes
+  RP-025 (`tests/backlog/test_rust_postgres_gaps.py::test_untyped_record_array_compare`).
+
+- An operator's function called by name over columns it does not take
+  (`int4pl(text_col, int_col)`) is 42883 `function int4pl(text, integer)
+  does not exist`, as on PostgreSQL, where it was worded as the operator
+  it is rewritten into. Part of RP-038
+  (`tests/backlog/test_rust_postgres_gaps.py::test_batch_residue_fixed[operator-function-typed]`).
+
+- `concat`, `concat_ws` and `format` with `VARIADIC` over a column or any
+  value that is not an `ARRAY[...]` constructor spread its elements when
+  they run, flattened. `concat(variadic col)` had answered the array's
+  internal debug text, and `format('%s-%s', variadic col)` 22023; a nested
+  `ARRAY[[1,2],[3,4]]` had spread its rows. A NULL array is NULL, and no
+  arguments for `format`. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[variadic-column]`,
+  `[variadic-nested-array]`). A fixed argument `concat` / `concat_ws` /
+  `format` do not take beside the variadic array is PostgreSQL's 42883
+  (`function concat(unknown, text[]) does not exist`, at the call), where
+  it was concatenated (`[variadic-arity]`).
+- `null::tsquery` and `numnode(null)` no longer send `''::tsquery`'s
+  "doesn't contain lexemes" NOTICE: a NULL cast's check that its type
+  exists kept the NOTICEs its probe raised. Part of RP-015
+  (`::test_null_tsquery_sends_no_notice`).
+
+- A built-in `setof record` function in a select list reads its fields:
+  `(aclexplode(acl)).privilege_type`, `(pg_options_to_table(o)).*`,
+  `(ts_parse('default', t)).token`, and `ts_token_type`, `ts_debug`,
+  `pg_get_keywords` alike, where each was 0A000. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[record-srf-field]`).
+
+#### Added
+
+- `ts_stat(query [, weights])`: each lexeme of the query's tsvectors with
+  the documents holding it and its occurrences, a weights string counting
+  only those positions, and 22023 for a query that is not one tsvector
+  column; in FROM and in a select list. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[ts-stat]`).
+
+- Corpora `domain_typeof`, `record_arrays`, `operator_function_calls`, `record_srf_fields` and `ts_stat`.

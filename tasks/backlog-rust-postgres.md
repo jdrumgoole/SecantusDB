@@ -366,27 +366,20 @@ one beside it.
   Backlog-ID: RP-032
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_literal_pads_char_field
 
-- [ ] **RUST pgserver: what the typed-value work left (2026-10-15).**
-  - Comparing arrays of records whose fields are untyped
-    (`array[row(1, null)] = array[row(1, null)]`) stays 0A000; PostgreSQL
-    errors at execution with messages that vary by case.
-  Backlog-ID: RP-025
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_untyped_record_array_compare
-
 - [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
   Each measured on PostgreSQL 15.19:
-  - An operator's function called over typed columns it does not take
-    (`int4pl(text_col, int_col)`) is 42883 at the right place, worded
-    `operator does not exist: text + integer`; PostgreSQL names the
-    function, `function int4pl(text, integer) does not exist`. (Over
-    constants it is worded as PostgreSQL has it.)
-  - `pg_typeof` of a column of a domain type prints the base type, not
-    the domain's name (`pg_typeof(1::d)` is right).
-  - `create type int` / `create type integer` are 42710; PostgreSQL makes
-    `public."int"`. They are grammar spellings with no pg_type row, and the
-    planner folds `int` to `int4`, so the fix has to keep the two apart.
+  - `create type int` / `create type integer` (and their quoted forms) are
+    42710; PostgreSQL makes `public."int"`, printed `"int"` (a keyword, not
+    hidden by `pg_catalog`, so unlike `public.uuid` it is not qualified).
+    Letting the CREATE through is a one-line gate change, measured: a
+    column or cast of `"int"` then comes back described as `int4`,
+    because the planner carries a type as a string and `int` already
+    means `int4` there at dozens of sites. A bare `int` reaches the planner
+    as `pg_catalog.int4`, so a single-part `"int"` can only have been
+    quoted; the fix is a distinct internal name for it, as `"char"` has
+    (`QUOTED_CHAR`).
   Backlog-ID: RP-038
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_pg_typeof_names_the_domain,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
@@ -466,33 +459,26 @@ one beside it.
       `test_builtin_coverage_fixed` and the corpora it added). Re-run it
       before working an item.
 
-      What is left:
-      - **Text search**: `null::tsquery` sends a spurious "doesn't
-        contain lexemes" NOTICE from a FROM-less select; `ts_headline`
-        refuses its `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments`
-        options, chooses its words by a rule of its own, and answers an
-        all-untyped call PostgreSQL refuses as not unique (42725);
-        `ts_rewrite`'s substitute loses its AND/OR nesting (a tsquery is
-        carried as its canonical text), its SELECT form checks the column
-        count only on rows it gets back, and a syntax error in that SQL has
-        a position PostgreSQL does not give.
-      - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
-        is refused, and an aclitem naming a role oid no role has cannot be
-        read back (items are carried as text, PostgreSQL's as oids);
-        the XML schema exports (`query_to_xmlschema`, `table_to_xmlschema`,
-        the `*_and_xmlschema` forms), `cursor_to_xml` and the schema /
-        database forms, and the `fmgr_*` / `postgresql_fdw_validator`
-        validators, are not written (`query_to_xml` / `table_to_xml` are).
-      - **An untyped literal beside a typed argument** is resolved only
-        for a polymorphic overload that is the one candidate (`unknown_args`,
-        `funcsig::polymorphic_args`); `func_select_candidate`'s other steps
-        are not followed (only an all-constant call is). `unnest('{1,2}')`
-        is not PostgreSQL's 42725 (three overloads), and a bad literal read
-        through `array_append('{1.5}', 2)` has no position. `abs(NULL)`'s
-        column is described as `numeric` (oid 1700); PostgreSQL says
-        `float8` (701), and its `pg_typeof` is right here.
-      - **A VARIADIC argument** that is neither an `ARRAY[...]` constructor
-        nor a json path / `jsonb_delete` call (`concat(VARIADIC arr_col)`).
+      What is left (re-measured 2026-10-15 against 15.19):
+      - **`ts_rewrite(query, select)`** checks that its SELECT returns two
+        tsquery columns only on the rows it gets back: over none
+        (`... where false`) it answers the query unchanged, where
+        PostgreSQL is 22023 `ts_rewrite query must return two tsquery
+        columns`. The checker would need the SELECT's described column
+        types, which `correlated::run_sql` does not return.
+      - **An aclitem naming a role oid no role has** cannot be read back
+        (items are carried as text, PostgreSQL's as oids).
+      - **Not written**: `pg_timezone_names` /
+        `pg_timezone_abbrevs` (the functions and the views: a client
+        listing time zones gets 42P01), the XML schema exports (`query_to_xmlschema`,
+        `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`
+        and the schema / database forms, and the `fmgr_*` /
+        `postgresql_fdw_validator` validators (`query_to_xml` /
+        `table_to_xml` are).
+      - **Error positions**: a bad element read through an untyped array
+        literal (`array_append('{1.5}', 2)`,
+        `concat(variadic $$${1}$$::int[])`) is the right 22P02 with no
+        position (PostgreSQL places it at the literal).
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

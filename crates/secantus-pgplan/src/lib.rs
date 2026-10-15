@@ -3843,6 +3843,7 @@ fn parse_one(sql: &str) -> Result<N> {
         .as_ref()
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
+    func_cast::check_variadic_arity(&node)?;
     func_cast::spread_variadic(&mut node);
     func_cast::rewrite(&mut node);
     pattern_ops(&mut node);
@@ -11885,6 +11886,88 @@ fn srf_rows(
                 rows,
             )));
         }
+        // `ts_stat(query [, weights])` (`ts_stat_sql`): per lexeme of the
+        // query's tsvectors, the documents holding it and its occurrences.
+        // A weights string (letters a-d, any case; anything else adds
+        // nothing) counts only positions of those weights, and leaves out a
+        // lexeme with none; without one a lexeme without positions counts
+        // once. Measured on PostgreSQL 15.19.
+        "ts_stat" => {
+            let (sql, weights) = match call.args.len() {
+                1 => (args(1)?.remove(0), None),
+                2 => {
+                    let mut a = args(2)?;
+                    let w = a.pop();
+                    (a.remove(0), w)
+                }
+                _ => {
+                    return Err(Error::UndefinedFunction(
+                        "function ts_stat does not exist".into(),
+                    ))
+                }
+            };
+            if sql == Bson::Null || weights.as_ref() == Some(&Bson::Null) {
+                return Ok(Some((
+                    vec!["word".into(), "ndoc".into(), "nentry".into()],
+                    vec!["text".into(), "int4".into(), "int4".into()],
+                    Vec::new(),
+                )));
+            }
+            let mask: u8 = weights.map_or(0, |w| {
+                value_text(&w).chars().fold(0, |m, c| {
+                    m | match c.to_ascii_lowercase() {
+                        'a' => 1 << 3,
+                        'b' => 1 << 2,
+                        'c' => 1 << 1,
+                        'd' => 1,
+                        _ => 0,
+                    }
+                })
+            });
+            let rows = correlated::run_sql(&format!("SELECT q FROM ({}) q", value_text(&sql)))?;
+            let mut stats: std::collections::BTreeMap<String, (i32, i32)> =
+                std::collections::BTreeMap::new();
+            for row in &rows {
+                let record = row.first().cloned().unwrap_or(Bson::Null);
+                let fields = record_values(&record).cloned().unwrap_or_default();
+                let types = record_field_types(&record).unwrap_or_default();
+                if fields.len() != 1 || types.first().is_some_and(|t| t != "tsvector") {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        "ts_stat query must return one tsvector column".into(),
+                    ));
+                }
+                if fields[0] == Bson::Null {
+                    continue;
+                }
+                let vector = fts::parse_vector(&value_text(&fields[0]))?;
+                for (lexeme, positions) in &vector.0 {
+                    let n = if mask == 0 {
+                        positions.len().max(1)
+                    } else {
+                        positions
+                            .iter()
+                            .filter(|(_, w)| mask & (1 << w) != 0)
+                            .count()
+                    };
+                    if n == 0 {
+                        continue;
+                    }
+                    let e = stats.entry(lexeme.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += i32::try_from(n).unwrap_or(i32::MAX);
+                }
+            }
+            let rows = stats
+                .into_iter()
+                .map(|(w, (d, e))| vec![Bson::String(w), Bson::Int32(d), Bson::Int32(e)])
+                .collect();
+            return Ok(Some((
+                vec!["word".into(), "ndoc".into(), "nentry".into()],
+                vec!["text".into(), "int4".into(), "int4".into()],
+                rows,
+            )));
+        }
         // `aclexplode(aclitem[])`: one row per privilege of each item.
         "aclexplode" => {
             let a = args(1)?;
@@ -18212,6 +18295,84 @@ fn rewrite_xmlagg(
     Ok(changed.then_some(out))
 }
 
+/// `pg_typeof(c)` over a column of a domain type names the DOMAIN, though
+/// the column is stored (and sent) as its base type: the argument is cast
+/// to the domain, which its value already satisfies. Over the one table of
+/// a single-table FROM; `None` when nothing changed.
+fn rewrite_domain_typeof(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    let [from] = s.from_clause.as_slice() else {
+        return Ok(None);
+    };
+    let Some(N::RangeVar(rv)) = from.node.as_ref() else {
+        return Ok(None);
+    };
+    let Some(def) = lookup(&relation_name(rv)) else {
+        return Ok(None);
+    };
+    let domains: std::collections::HashMap<String, String> = def
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let d = c.extra.get_str("domain_type").ok()?;
+            Some((c.name.clone(), d.to_string()))
+        })
+        .collect();
+    if domains.is_empty() {
+        return Ok(None);
+    }
+    let alias = rv
+        .alias
+        .as_ref()
+        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+    let mut out = s.clone();
+    let mut changed = false;
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        let Some(N::FuncCall(f)) = n.node.as_mut() else {
+            return Ok(());
+        };
+        if func_name(f).as_deref() != Some("pg_typeof") || f.args.len() != 1 {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = f.args[0].node.as_ref() else {
+            return Ok(());
+        };
+        let qualifier_ok = match c.fields.as_slice() {
+            [_] => true,
+            [q, _] => matches!(q.node.as_ref(), Some(N::String(q)) if q.sval == alias),
+            _ => false,
+        };
+        let Some(domain) = column_ref_name(c).and_then(|name| domains.get(&name)) else {
+            return Ok(());
+        };
+        if !qualifier_ok {
+            return Ok(());
+        }
+        let arg = f.args[0].clone();
+        f.args[0] = pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(arg)),
+                type_name: Some(type_name_node(domain)),
+                location: -1,
+            }))),
+        };
+        changed = true;
+        Ok(())
+    };
+    for t in &mut out.target_list {
+        walk_expr(t, &mut visit)?;
+    }
+    if let Some(w) = out.where_clause.as_deref_mut() {
+        walk_expr(w, &mut visit)?;
+    }
+    for o in &mut out.sort_clause {
+        walk_expr(o, &mut visit)?;
+    }
+    Ok(changed.then_some(out))
+}
+
 /// A role specification's name: `PUBLIC`, a role, or the session role
 /// spelled `CURRENT_USER` / `SESSION_USER` / `CURRENT_ROLE`.
 fn role_spec_name(r: &pg_query::protobuf::RoleSpec) -> String {
@@ -19051,6 +19212,9 @@ fn plan_select(
         return plan_select(&values_as_subquery(s), lookup, params);
     }
     if let Some(rewritten) = ungrouped_having(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = rewrite_domain_typeof(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     // `xmlagg(x)` is the concatenation of its non-NULL inputs, with or without a FROM.
@@ -25201,6 +25365,114 @@ fn compared_fields(v: &Bson) -> Option<Vec<Bson>> {
     )
 }
 
+/// `array_eq` / `array_cmp` over arrays of `ROW(...)` records
+/// (`array[row(1, null)]`), as PostgreSQL 15 runs them: element pairs in
+/// order, each through `record_eq` / `record_cmp`, which check every field
+/// pair they reach -- 42804 for two different types, 42883 for `unknown`,
+/// which has no equality operator or comparison function. A pair decided
+/// before such a field is never checked (`array[row(1, null)] =
+/// array[row(2, null)]` is false). `None` for any other comparison.
+fn record_array_compare(op: &str, l: &Bson, r: &Bson) -> Option<Result<Bson>> {
+    use std::cmp::Ordering;
+    fn flat(v: &Bson, out: &mut Vec<Bson>) {
+        match v {
+            Bson::Array(items) => items.iter().for_each(|i| flat(i, out)),
+            other => out.push(other.clone()),
+        }
+    }
+    let (Bson::Array(_), Bson::Array(_)) = (arrays::strip(l), arrays::strip(r)) else {
+        return None;
+    };
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    flat(&arrays::strip(l), &mut a);
+    flat(&arrays::strip(r), &mut b);
+    // Only records that carry their fields' types (a `ROW(...)`); a
+    // composite value is compared by the general path.
+    let typed = |v: &Bson| record_field_types(v).is_some();
+    if !a.iter().chain(b.iter()).any(typed) {
+        return None;
+    }
+    let equality = matches!(op, "=" | "<>" | "!=");
+    if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        return None;
+    }
+    // `array_eq`: arrays of different shapes are unequal, nothing compared.
+    if equality && a.len() != b.len() {
+        return Some(Ok(Bson::Boolean(op != "=")));
+    }
+    let mut ord = Ordering::Equal;
+    'pairs: for (x, y) in a.iter().zip(b.iter()) {
+        let o = match (x, y) {
+            (Bson::Null, Bson::Null) => Ordering::Equal,
+            (Bson::Null, _) => Ordering::Greater,
+            (_, Bson::Null) => Ordering::Less,
+            _ => {
+                let (Some(fx), Some(fy)) = (record_fields(x), record_fields(y)) else {
+                    return None;
+                };
+                let tx = record_field_types(x).unwrap_or_default();
+                let ty = record_field_types(y).unwrap_or_default();
+                let mut o = Ordering::Equal;
+                for (i, (vx, vy)) in fx.iter().zip(fy.iter()).enumerate() {
+                    let (Some(t1), Some(t2)) = (tx.get(i), ty.get(i)) else {
+                        return None;
+                    };
+                    if t1 != t2 {
+                        return Some(Err(Error::DatatypeMismatch(format!(
+                            "cannot compare dissimilar column types {} and {} at record column {}",
+                            display_type(t1),
+                            display_type(t2),
+                            i + 1
+                        ))));
+                    }
+                    if t1 == "unknown" {
+                        let what = if equality {
+                            "an equality operator"
+                        } else {
+                            "a comparison function"
+                        };
+                        return Some(Err(Error::UndefinedFunction(format!(
+                            "could not identify {what} for type unknown"
+                        ))));
+                    }
+                    // Two NULLs are equal and a NULL sorts after a value.
+                    o = match (vx, vy) {
+                        (Bson::Null, Bson::Null) => Ordering::Equal,
+                        (Bson::Null, _) => Ordering::Greater,
+                        (_, Bson::Null) => Ordering::Less,
+                        _ => compare_constants(vx, vy)?,
+                    };
+                    if o != Ordering::Equal {
+                        break;
+                    }
+                }
+                // Checked once the columns both have are compared equal.
+                if o == Ordering::Equal && fx.len() != fy.len() {
+                    return Some(Err(Error::DatatypeMismatch(
+                        "cannot compare record types with different numbers of columns".into(),
+                    )));
+                }
+                o
+            }
+        };
+        if o != Ordering::Equal {
+            ord = o;
+            break 'pairs;
+        }
+    }
+    if ord == Ordering::Equal {
+        ord = a.len().cmp(&b.len());
+    }
+    Some(Ok(Bson::Boolean(match op {
+        "=" => ord == Ordering::Equal,
+        "<>" | "!=" => ord != Ordering::Equal,
+        "<" => ord == Ordering::Less,
+        "<=" => ord != Ordering::Greater,
+        ">" => ord == Ordering::Greater,
+        _ => ord != Ordering::Less,
+    })))
+}
+
 /// Compare two records with PostgreSQL's rules, which DIFFER by operator AND
 /// by whether the operands are ROW CONSTRUCTORS or composite VALUES.
 ///
@@ -29297,8 +29569,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         // The cast's own arms are the list of known types: a probe value
         // that reaches the "no such type" arm is the only refusal kept.
         let base = target.strip_suffix("[]").unwrap_or(target);
-        if let Err(Error::UndefinedObject(m)) = cast_value_inner(Bson::String(String::new()), base)
-        {
+        // The probe's own NOTICEs are not the statement's: `''::tsquery`
+        // says it has no lexemes, `null::tsquery` says nothing.
+        let notices = fts::notices_len();
+        let probe = cast_value_inner(Bson::String(String::new()), base);
+        fts::truncate_notices(notices);
+        if let Err(Error::UndefinedObject(m)) = probe {
             if m.starts_with("type \"") && m.ends_with("\" does not exist") {
                 return Err(Error::UndefinedObject(format!(
                     "type \"{target}\" does not exist"
@@ -32202,6 +32478,9 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             let r = widen(rhs, &l)?;
             (l, r)
         };
+        if let Some(out) = record_array_compare(op, &lhs, &rhs) {
+            return out;
+        }
         let ord = compare_constants(&lhs, &rhs).ok_or_else(|| {
             // Name the OPERAND TYPES. "comparing these operands" was the second
             // largest failure signature on the psycopg gauge and said nothing
