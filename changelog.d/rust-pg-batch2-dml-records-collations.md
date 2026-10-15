@@ -71,6 +71,11 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `numeric_precision_radix`, `datetime_precision`, `interval_type`,
   `udt_schema`, `dtd_identifier`, the `identity_*` options and
   `is_updatable` filled as `information_schema.sql` derives them.
+- Without a `pg_hba.conf`, a login is proved before its database is looked
+  up, as PostgreSQL does: a wrong password for a database that does not
+  exist is `password authentication failed`, not `database ... does not
+  exist`. Part of RP-013
+  (tests/backlog/test_rust_postgres_gaps.py::test_wrong_password_checked_before_the_database).
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.

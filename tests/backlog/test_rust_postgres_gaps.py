@@ -124,7 +124,7 @@ def test_unknown_user_is_asked_for_a_password(rust_pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-013")
+@pytest.mark.backlog_fixed("RP-013")
 def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a scram-sha-256 cluster): a wrong password for a
     database that does not exist reads `password authentication failed`,

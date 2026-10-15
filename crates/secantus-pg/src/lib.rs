@@ -17750,22 +17750,14 @@ impl StartupHandler for PgHandler {
             .cloned()
             .unwrap_or_else(|| self.databases.default_db().to_string());
         if let Err(e) = self.select_database(&requested) {
+            // PostgreSQL proves the login first and looks the database up
+            // after (`complete_login` sends this): a wrong password for a
+            // database that is not there is a wrong password.
             let info: ErrorInfo = e.into();
-            if self.hba.is_some() {
-                // PostgreSQL proves the login first and looks the database
-                // up after: a wrong password for a database that is not
-                // there is a wrong password.
-                *self
-                    .database_error
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(info);
-            } else {
-                client
-                    .send(PgWireBackendMessage::ErrorResponse(info.into()))
-                    .await?;
-                client.close().await?;
-                return Ok(());
-            }
+            *self
+                .database_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(info);
         }
 
         // A role that HAS a password must prove it -- SCRAM-SHA-256, as

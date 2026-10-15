@@ -327,10 +327,6 @@ one beside it.
     - **A `map=` on a method other than `cert` is refused**; PostgreSQL
       takes it for `ident`, `peer`, `gss` and `sspi` too, none of which is
       read here.
-    - **Without a `pg_hba.conf` the database is still looked up before the
-      login is proved**, so a wrong password for a database that is not
-      there reads "database does not exist". With one the order is
-      PostgreSQL's.
     - A password past its `VALID UNTIL` runs the exchange and fails it,
       where the path without a file fails at once. PostgreSQL does the
       first; not probed here.
@@ -364,7 +360,7 @@ one beside it.
     take a revocation list, a user name map or `clientname=DN` as
     options**; a `pg_hba.conf` passed as `hba_file` can say the last two.
   Backlog-ID: RP-013
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password,tests/backlog/test_rust_postgres_gaps.py::test_wrong_password_checked_before_the_database
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password
 
 ## 5. Known bugs and edge cases to watch
 
