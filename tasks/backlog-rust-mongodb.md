@@ -947,24 +947,16 @@ Still different, all 77:
         partial index in key order; this server scans the collection.
       Backlog-ID: RM-155
       Verify: tests/backlog/test_rm_order_shapes.py::test_ne_null_over_a_multikey_index_scans_the_collection,tests/backlog/test_rm_order_shapes.py::test_type_object_reads_the_object_bracket,tests/backlog/test_rm_order_shapes.py::test_elem_match_ne_reads_the_index,tests/backlog/test_rm_order_shapes.py::test_type_date_reads_a_descending_index_latest_first,tests/backlog/test_rm_order_shapes.py::test_regex_with_an_alternation_reads_every_string,tests/backlog/test_rm_order_shapes.py::test_exists_over_a_partial_index_the_query_implies
-- [ ] **A double is compared with a Decimal128 or an Int64 by its
-      shortest decimal form, not its exact value.** Silent wrong answers,
-      with or without an index. mongod 8.2.11 (2026-10-15): `find({a:
-      0.1})` matches the double and not `Decimal128("0.1")` (this server:
-      both); `{a: {$lt: 0.1}}` matches `Decimal128("0.1")` (here:
-      nothing); `{a: 2.0**62}` matches `Int64(2**62)` (here: not);
-      `{a: {$gt: 2.0**62}}` matches `Int64(4611686018427387950)` (here:
-      not). `_id` uniqueness follows the same rule: mongod refuses `_id:
-      2.0**62` beside `_id: Int64(2**62)` and accepts `_id: 0.1` beside
-      `_id: Decimal128("0.1")`; this server does the opposite. The matcher
-      and the sort key (`sortkey::encode_number`, `format!("{d}")`, the
-      Python server's `Decimal(repr(value))`) share the error, so an index
-      agrees with a collection scan. The sort key is on disk in both
-      servers: a fix changes the index entries of every non-integral
-      double, so stored indexes must be rebuilt or refused.
-      Found by the p4-router agent during the Phase 4 router work.
-      Backlog-ID: RM-152
-      Verify: tests/backlog/test_rm_numeric_compare.py::test_double_compared_with_decimal_and_int64_exactly,tests/backlog/test_rm_numeric_compare.py::test_id_uniqueness_compares_numbers_exactly
+- [ ] **A build before number-key format 2 writing into a store already at
+      format 2.** An older build of either server (the PyPI wheel included)
+      that inserts a document with a numeric `_id` writes a format-1 `_id`
+      key, which the store never re-keys: a lookup by that `_id` misses the
+      document. An index such a build adds is caught, because it has no
+      `numberKeys` stamp and is rebuilt on the next open; the `_id` keys
+      have nothing to stamp. Format-1 keys are recognisable
+      (`sortkey::is_format1_number_key`), so a sweep on open would close it.
+      Backlog-ID: RM-153
+      Verify: none -- needs an older build to write the store
 - [ ] **The multikey paths are not stored.** They are read from the
       collection the first time a query needs them after the server starts
       or an index is dropped, and kept current by writes after that

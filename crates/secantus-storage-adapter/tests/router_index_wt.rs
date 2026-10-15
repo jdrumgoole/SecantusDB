@@ -190,10 +190,11 @@ fn not_of_a_range_keeps_the_bound_nan_null_and_missing() {
         same(&s, doc! {"a": {"$not": {"$lt": "sa"}}}),
         [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
     );
+    // Number-key format 2 keys every exponent in order, so the read is in
+    // the index's order (format 1 sent 1e-300 above every positive).
     assert_eq!(
         access(&s, "ix", doc! {"a": {"$not": {"$gt": 2}}}),
-        unordered("the_index"),
-        "a collapsed number was read, out of its value's place"
+        ordered("the_index")
     );
 }
 
@@ -439,15 +440,14 @@ fn an_id_range_reads_the_id_index() {
         [Bson::String("s".into())]
     );
     assert_eq!(got(doc! {"_id": {"$ne": 4}}).len(), docs.len() - 1);
-    // 1e-300 is collapsed: read, and the order not claimed.
+    // 1e-300 is keyed below 1 (format 1 collapsed it above every positive):
+    // read in `_id` order.
     load(&s, "ix", &[doc! {"_id": 1e-300, "x": 1}]);
-    let lt = got(doc! {"_id": {"$lt": 2}});
-    assert!(lt.contains(&Bson::Double(1e-300)));
-    assert_eq!(lt.len(), 3);
     assert_eq!(
-        access(&s, "ix", doc! {"_id": {"$lt": 2}}),
-        unordered("_id_")
+        got(doc! {"_id": {"$lt": 2}}),
+        [Bson::Int32(0), Bson::Double(1e-300), Bson::Int32(1)]
     );
+    assert_eq!(access(&s, "ix", doc! {"_id": {"$lt": 2}}), ordered("_id_"));
 }
 
 #[test]
@@ -562,31 +562,32 @@ fn a_walk_of_a_descending_index_orders_strings_by_value() {
 }
 
 #[test]
-fn no_index_order_is_claimed_across_collapsed_numbers() {
-    // 1e-300 and 2e-300 share one key, so their entries come in insertion
-    // order, not by value. An `$in` of the two is read without claiming the
-    // index's order. (Where they then go is the number encoding's own
-    // problem, RM-152, the same with the index or without.)
+fn numbers_beyond_exponent_127_read_in_key_order() {
+    // Number-key format 1 gave 1e-300 and 2e-300 one key, so their entries
+    // came in insertion order. Format 2 keys them by exact value: an `$in` of
+    // the two is read in the index's order, mongod's [1e-300, 2e-300]
+    // (measured 8.2.11, 2026-10-15), and a sort served by the walk agrees
+    // with the sort over no index.
     let s = store();
     let docs = vec![
         doc! {"_id": 0, "a": 2e-300},
         doc! {"_id": 1, "a": 1e-300},
         doc! {"_id": 2, "a": 5},
+        doc! {"_id": 3, "a": 3e250},
+        doc! {"_id": 4, "a": -1e-300},
     ];
     twin(&s, &docs, doc! {"a": 1}, doc! {});
     assert_eq!(same(&s, doc! {"a": {"$in": [1e-300, 2e-300]}}), [0, 1]);
     assert_eq!(
         access(&s, "ix", doc! {"a": {"$in": [1e-300, 2e-300]}}),
-        unordered("the_index")
-    );
-    assert_eq!(
-        access(&s, "ix", doc! {"a": {"$in": [5, 6]}}),
         ordered("the_index")
     );
-    // A sort served by the index walk orders them as the sort with no index
-    // does: the walk adds no order of its own.
-    assert_eq!(
-        walked(&s, "ix", Some(doc! {"a": 1}), None),
-        walked(&s, "plain", Some(doc! {"a": 1}), None)
-    );
+    let order: Vec<i32> = ids(&s, "ix", &doc! {"a": {"$in": [2e-300, 1e-300]}})
+        .iter()
+        .map(|b| b.as_i32().unwrap())
+        .collect();
+    assert_eq!(order, [1, 0]);
+    let sorted = [4, 1, 0, 2, 3];
+    assert_eq!(walked(&s, "ix", Some(doc! {"a": 1}), None), sorted);
+    assert_eq!(walked(&s, "plain", Some(doc! {"a": 1}), None), sorted);
 }

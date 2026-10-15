@@ -51,10 +51,12 @@ from secantus.projection import apply_projection_batch
 from secantus.query import matches
 from secantus.sortkey import (
     COMPOUND_SEP,
+    NUMBER_KEY_FORMAT,
     RANK_ARRAY,
     encode_id_key,
     encode_value,
     encode_value_directed,
+    is_format1_number_key,
 )
 from secantus.update import (
     UpdateError,
@@ -852,9 +854,21 @@ def _conflict_key_value(
 # ``listIndexes`` strips it.
 _PYTHON_KEYS = "pythonKeys"
 _PYTHON_KEY_FORMAT = 1
+# Catalog marker on every index, written by both servers: the number-key
+# format (``sortkey.NUMBER_KEY_FORMAT``) its entries were written with. An
+# index without it predates 2026-10-15 -- a double keyed by its shortest
+# decimal, numbers beyond exponent +-127 sharing one key -- and is rebuilt
+# when the store opens. Not a user option: ``listIndexes`` strips it.
+_NUMBER_KEYS = "numberKeys"
+# The oplog-meta row recording the number-key format of a store's ``_id`` keys
+# and claims (``Storage._upgrade_number_keys_locked``); the Rust server reads
+# and writes the same row.
+_NUMBER_KEYS_META = "numberKeys"
 # What either server stamps on an index at build, which a rebuild leaves out
 # of the options it builds from.
-_BUILD_STAMPS = frozenset({"entryFormat", "multikey", "collationKeys", "geoKeys", _PYTHON_KEYS})
+_BUILD_STAMPS = frozenset(
+    {"entryFormat", "multikey", "collationKeys", "geoKeys", _NUMBER_KEYS, _PYTHON_KEYS}
+)
 # The Rust server's records that it has claimed every stored ``_id``.
 _RUST_CLAIM_MARKERS = frozenset({"$document_id_claims", "$collated_id_claims"})
 
@@ -2096,6 +2110,16 @@ class Storage:
                 if k[2] in _RUST_CLAIM_MARKERS
             ]
             self._delete_keys(_UNIQ_TABLE, markers)
+            number_keys_current = self._stored_number_key_format() >= NUMBER_KEY_FORMAT
+            if not number_keys_current:
+                self._rekey_numeric_ids_locked()
+                # The Rust server's ``_id`` claims hold keys of the old format;
+                # it takes them again once its "done" markers (deleted above)
+                # are gone.
+                self._delete_keys(
+                    _UNIQ_TABLE,
+                    [k for k, _ in self._collect_prefix(_UNIQ_TABLE, ()) if k[2] == _ID_INDEX_NAME],
+                )
             outdated = []
             c = self._cursor(_IDX_TABLE)
             c.reset()
@@ -2105,12 +2129,15 @@ class Storage:
                 payload = bson.decode(raw) if raw else {}
                 key = dict(payload.get("key") or {})
                 opts = dict(payload.get("options") or {})
-                if _index_keys_are_server_specific(key, opts) and opts.get(_PYTHON_KEYS) != (
-                    _PYTHON_KEY_FORMAT
-                ):
+                server_specific = _index_keys_are_server_specific(key, opts) and opts.get(
+                    _PYTHON_KEYS
+                ) != (_PYTHON_KEY_FORMAT)
+                if server_specific or opts.get(_NUMBER_KEYS) != NUMBER_KEY_FORMAT:
                     outdated.append((db, coll, name, key, opts))
             c.reset()
         if not outdated:
+            if not number_keys_current:
+                self._record_number_key_format()
             return
         logged, self.enable_oplog = self.enable_oplog, False
         try:
@@ -2141,6 +2168,103 @@ class Storage:
                 )
         finally:
             self.enable_oplog = logged
+        if not number_keys_current:
+            self._record_number_key_format()
+
+    def _stored_number_key_format(self) -> int:
+        """The number-key format of this store's ``_id`` keys and claims: 1
+        when it never recorded one (every store written before 2026-10-15)."""
+        c = self._cursor(_OPLOG_META_TABLE)
+        c.set_key(_NUMBER_KEYS_META)
+        try:
+            if c.search() != 0:
+                return 1
+            blob = bytes(c.get_value())
+        finally:
+            c.reset()
+        return int(bson.decode(blob).get("format", 1)) if blob else 1
+
+    def _record_number_key_format(self) -> None:
+        with self._lock:
+            c = self._cursor(_OPLOG_META_TABLE)
+            c.set_key(_NUMBER_KEYS_META)
+            c.set_value(bson.encode({"format": NUMBER_KEY_FORMAT}))
+            c.insert()
+            c.reset()
+
+    def _rekey_numeric_ids_locked(self) -> None:
+        """Re-key every document whose ``_id`` is a number keyed by number-key
+        format 1: its ``_id``-index row and the ``_id`` key framed into its
+        document row (a time-series key keeps its 10-byte suffix). Mirrors the
+        Rust ``rekey_numeric_ids``, chunk by chunk, so an interrupted run picks
+        up where it stopped: a format-2 key never equals a format-1 one.
+
+        Format 1 gave two values one key and one value two keys, so two stored
+        ``_id``s can now be equal by exact value (the Int64 ``2**62`` and the
+        double ``2.0**62``). The one re-keyed first takes the key; the other
+        keeps its old one and stays readable by a scan. The count is logged.
+        """
+        c = self._cursor_optional(_NAT_SEQ_TABLE)
+        if c is None:
+            return
+        rows: list[tuple[str, str, bytes, int]] = []
+        c.reset()
+        while c.next() == 0:
+            db, coll, key = c.get_key()
+            key = bytes(key)
+            if is_format1_number_key(key):
+                rows.append((db, coll, key, int(c.get_value())))
+        c.reset()
+        kept = 0
+        timeseries: dict[tuple[str, str], bool] = {}
+        for at in range(0, len(rows), 500):
+            with self._batch_transaction():
+                for db, coll, old, recordid in rows[at : at + 500]:
+                    if (db, coll) not in timeseries:
+                        timeseries[(db, coll)] = self._is_timeseries(db, coll)
+                    docs = self._cursor_optional(_doc_table_for(db, coll))
+                    if docs is None:
+                        continue
+                    docs.set_key(db, coll, recordid)
+                    if docs.search() != 0:
+                        docs.reset()
+                        continue
+                    framed, blob = _unframe_doc_value(bytes(docs.get_value()))
+                    docs.reset()
+                    if framed != old:
+                        raise IncompatibleStorageFormatError(
+                            f"document {recordid} of '{db}.{coll}' holds another _id key "
+                            "than its _id index row"
+                        )
+                    new = _id_key(bson.decode(blob)["_id"])
+                    if timeseries[(db, coll)]:
+                        new += old[-10:]
+                    nat = self._cursor(_NAT_SEQ_TABLE, overwrite=False)
+                    nat.set_key(db, coll, new)
+                    nat.set_value(recordid)
+                    try:
+                        nat.insert()
+                    except wt.WiredTigerError as exc:
+                        if _is_wt_duplicate_key(exc):
+                            kept += 1
+                            continue
+                        raise
+                    finally:
+                        nat.reset()
+                    rm = self._cursor(_NAT_SEQ_TABLE)
+                    rm.set_key(db, coll, old)
+                    rm.remove()
+                    rm.reset()
+                    docs.set_key(db, coll, recordid)
+                    docs.set_value(_frame_doc_value(new, blob))
+                    docs.update()
+                    docs.reset()
+        if kept:
+            logging.getLogger("secantus.storage").warning(
+                "%d stored numeric _id values are equal to another stored _id by exact "
+                "value, and keep their earlier key",
+                kept,
+            )
 
     def _load_oplog_meta(self) -> tuple[int, int, int, int]:
         c = self._cursor(_OPLOG_META_TABLE)
@@ -7491,6 +7615,7 @@ class Storage:
                 # RecordId entries from the pre-change id_key ones (the WT
                 # key_format is SSSu either way).
                 options["entryFormat"] = _ENTRY_FORMAT
+                options[_NUMBER_KEYS] = NUMBER_KEY_FORMAT
                 if _index_keys_are_server_specific(key_spec_dict, options):
                     options[_PYTHON_KEYS] = _PYTHON_KEY_FORMAT
                 payload = bson.encode({"key": dict(key_spec), "options": options})
@@ -7553,6 +7678,7 @@ class Storage:
                 # RecordId entries from the pre-change id_key ones (the WT
                 # key_format is SSSu either way).
                 options["entryFormat"] = _ENTRY_FORMAT
+                options[_NUMBER_KEYS] = NUMBER_KEY_FORMAT
                 if _index_keys_are_server_specific(key_spec_dict, options):
                     options[_PYTHON_KEYS] = _PYTHON_KEY_FORMAT
                 payload = bson.encode({"key": dict(key_spec), "options": options})

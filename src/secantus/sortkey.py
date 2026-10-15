@@ -100,10 +100,33 @@ def _rank(value: Any) -> int:
 # Byte-sortable decimal markers within the number payload.
 _NUM_NAN = b"\x00"
 _NUM_NEG_INF = b"\x20"
-_NUM_NEG = 0x40  # prefix byte for finite negative
+# Prefix byte for a finite negative / positive. Number-key format 1 wrote
+# 0x40 / 0xC0, so a finite number's key names its format and no key of one
+# format equals a key of the other (a store is re-keyed in place without a
+# new key landing on an old one).
+_NUM_NEG = 0x41
 _NUM_ZERO = b"\x80"
-_NUM_POS = 0xC0  # prefix byte for finite positive
+_NUM_POS = 0xC1
 _NUM_POS_INF = b"\xff"
+
+#: The number-key format this encoder writes -- byte-identical to the Rust
+#: ``sortkey::NUMBER_KEY_FORMAT``. A store records it (an index's
+#: ``numberKeys``, the oplog-meta row ``numberKeys``) and rebuilds the keys of
+#: a store written with another.
+#:
+#: * 1 (no marker) -- a double keyed by ``Decimal(repr(value))``, its SHORTEST
+#:   decimal, so the double ``0.1`` and ``Decimal128("0.1")`` shared a key, and
+#:   a one-byte exponent, so every number whose exponent fell outside
+#:   -128..=127 shared ONE key per sign.
+#: * 2 -- a double keyed by its EXACT binary value (``Decimal(value)``), as
+#:   mongod compares it, and a two-byte exponent.
+NUMBER_KEY_FORMAT = 2
+
+
+def is_format1_number_key(key: bytes) -> bool:
+    """Whether ``key``, an encoded value, is a finite number keyed by
+    number-key format 1 (its prefix is the old one)."""
+    return len(key) >= 2 and key[0] == RANK_NUMBER and key[1] in (0x40, 0xC0)
 
 
 def _to_decimal(value: int | float | Decimal128) -> Decimal | None:
@@ -119,10 +142,9 @@ def _to_decimal(value: int | float | Decimal128) -> Decimal | None:
     if isinstance(value, float):
         if math.isnan(value) or math.isinf(value):
             return None
-        try:
-            return Decimal(repr(value))
-        except (InvalidOperation, ValueError):
-            return None
+        # EXACT: ``Decimal(0.1)`` is 0.1000000000000000055511151231257827...,
+        # which is the value mongod compares, where ``repr`` gives 0.1.
+        return Decimal(value)
     return Decimal(int(value))
 
 
@@ -166,26 +188,29 @@ def _encode_number(value: int | float | Decimal128) -> bytes:
     d = _to_decimal(value)
     if d is None or d.is_zero():
         return _NUM_ZERO
-    sign = 1 if d > 0 else -1
-    d = abs(d).normalize()
-    digits, exp = d.as_tuple()[1:3]
+    # The digits as they are: ``normalize()`` / ``abs()`` round to the context
+    # precision (28 digits), and an exact double has up to 767.
+    negative, digit_tuple, exp = d.as_tuple()
+    sign = -1 if negative else 1
+    digits = list(digit_tuple)
+    while digits and digits[0] == 0:
+        digits.pop(0)
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exp += 1
     sci_exp = exp + len(digits) - 1
-    bias_e = 128 + sci_exp
-    if not 0 <= bias_e <= 255:
-        # Out of single-byte exponent range — fall back to a marker that
-        # still sorts on the correct side of zero. Magnitudes within ranks
-        # collapse together; acceptable until we widen the encoding.
-        return bytes([_NUM_POS, 0xFF, 0xFF]) if sign > 0 else bytes([_NUM_NEG, 0x00, 0x00])
-    if sign < 0:
-        bias_e = 0xFF - bias_e
+    # A two-byte exponent biased by 0x8000: every double (+-324) and every
+    # Decimal128 (about +-6176) keeps its order.
+    biased = max(0, min(0xFFFF, 0x8000 + sci_exp))
+    e = 0xFFFF - biased if sign < 0 else biased
     if len(digits) % 2 == 1:
-        digits = digits + (0,)
+        digits.append(0)
     pairs = bytes(da * 10 + db + 1 for da, db in zip(digits[::2], digits[1::2], strict=True))
     if sign < 0:
         pairs = bytes(0x64 - p for p in pairs)  # invert: 100 - encoded
     prefix = _NUM_POS if sign > 0 else _NUM_NEG
     terminator = b"\x00" if sign > 0 else b"\xff"
-    return bytes([prefix, bias_e]) + pairs + terminator
+    return bytes([prefix]) + e.to_bytes(2, "big") + pairs + terminator
 
 
 COMPOUND_SEP = b"\x00\x00"

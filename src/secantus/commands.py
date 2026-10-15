@@ -6524,7 +6524,14 @@ def _list_indexes(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # keeps the equivalents in the durable catalog and never echoes them from
     # ``listIndexes`` (probed 6.0.16) — drivers see multikey only as explain's
     # ``isMultiKey``, and the entry format not at all. Keep both off the wire.
-    _INTERNAL_INDEX_FIELDS = ("multikey", "entryFormat", "collationKeys", "geoKeys", "pythonKeys")
+    _INTERNAL_INDEX_FIELDS = (
+        "multikey",
+        "entryFormat",
+        "collationKeys",
+        "geoKeys",
+        "numberKeys",
+        "pythonKeys",
+    )
     indexes = [{k: v for k, v in ix.items() if k not in _INTERNAL_INDEX_FIELDS} for ix in indexes]
     # A clustered collection has no separate ``_id_`` index — the
     # clustering key IS the index. mongod reports a single entry for it
@@ -6594,7 +6601,18 @@ _KNOWN_INDEX_PLUGINS = frozenset({"2d", "2dsphere", "text", "hashed", "2dsphere_
 
 # Catalog bookkeeping that is not part of an index's options.
 _INDEX_NOT_OPTIONS = frozenset(
-    {"v", "key", "name", "ns", "entryFormat", "multikey", "collationKeys", "geoKeys", "pythonKeys"}
+    {
+        "v",
+        "key",
+        "name",
+        "ns",
+        "entryFormat",
+        "multikey",
+        "collationKeys",
+        "geoKeys",
+        "numberKeys",
+        "pythonKeys",
+    }
 )
 
 
