@@ -97,10 +97,19 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     }
     match sqlstate {
         // `could not identify column "b" in record data type`: PostgreSQL
-        // points at the record, the `c` of `(c).b`.
-        "42703" if m.starts_with("could not identify column ") => {
+        // points at the record, the `c` of `(c).b` -- and the function name
+        // of `(json_each(j)).b` (PostgreSQL 15.19: position 9 of `select
+        // (jsonb_each('{"a":1}')).nosuch`, and of `(f()).nosuch` over a
+        // function of a composite type, `column "nosuch" not found in data
+        // type t`). Any other expression is located by its own node (a
+        // cast at its `::`), which this does not try.
+        "42703"
+            if m.starts_with("could not identify column ")
+                || (m.starts_with("column \"") && m.contains("\" not found in data type ")) =>
+        {
             let field = m
-                .strip_prefix("could not identify column \"")?
+                .strip_prefix("could not identify column \"")
+                .or_else(|| m.strip_prefix("column \""))?
                 .split('"')
                 .next()?;
             let i = toks.iter().enumerate().position(|(i, t)| {
@@ -108,9 +117,49 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                     && i >= 4
                     && toks[i - 1].text == "."
                     && toks[i - 2].text == ")"
-                    && toks[i - 4].text == "("
             })?;
-            pos(toks[i - 3].start)
+            let mut depth = 0usize;
+            let open = (0..i - 1).rev().find(|&j| {
+                match toks[j].text {
+                    ")" => depth += 1,
+                    "(" => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })?;
+            // The record expression is `toks[open + 1 .. i - 2]`.
+            let inner = &toks[open + 1..i - 2];
+            let mut depth = 0usize;
+            let mut top_cast = None;
+            let mut closes_first_call = None;
+            for (j, t) in inner.iter().enumerate() {
+                match t.text {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 && closes_first_call.is_none() {
+                            closes_first_call = Some(j);
+                        }
+                    }
+                    "::" if depth == 0 => top_cast = Some(t.start),
+                    _ => {}
+                }
+            }
+            // A cast is located at its (outermost, last) `::`.
+            if let Some(at) = top_cast {
+                return pos(at);
+            }
+            // A name (`c`, `t.c`), or a call `f(...)` filling the parentheses.
+            let name = inner
+                .iter()
+                .enumerate()
+                .all(|(j, t)| (j % 2 == 1) == (t.text == "."));
+            let call = inner.get(1).is_some_and(|t| t.text == "(")
+                && closes_first_call == Some(inner.len() - 1);
+            if !(name || call) {
+                return None;
+            }
+            pos(inner.first()?.start)
         }
         // `ORDER BY position 5 is not in select list`: at the number.
         "42P10" if m.ends_with(" is not in select list") => {

@@ -2761,9 +2761,10 @@ fn a_set_returning_function_in_the_select_list_makes_rows() {
 fn a_set_returning_function_beside_a_column_plans_and_several_run_in_lockstep() {
     plan("SELECT 1, generate_series(1,3)", &lookup).expect("srf beside a column");
     plan("SELECT unnest(ARRAY[1]), unnest(ARRAY[2])", &lookup).expect("two srfs");
-    let err = plan("SELECT unnest(ARRAY[1]) + unnest(ARRAY[2])", &lookup)
-        .expect_err("two srfs in one expression");
-    assert_eq!(err.sqlstate(), "0A000");
+    // Two in one expression run in lockstep too (PostgreSQL 15.19:
+    // `generate_series(1,2) + generate_series(1,3)` is 2, 4, NULL).
+    plan("SELECT unnest(ARRAY[1]) + unnest(ARRAY[2])", &lookup)
+        .expect("two srfs in one expression");
 }
 
 #[test]
