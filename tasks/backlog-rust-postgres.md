@@ -445,20 +445,24 @@ one beside it.
       `test_builtin_coverage_fixed` and the corpora it added). Re-run it
       before working an item.
 
-      What is left (re-measured 2026-10-15 against 15.19):
-      - **An aclitem naming a role oid no role has** (`makeaclitem(12345,
-        ...)`) cannot be read back once it is in an array: items are
-        carried as their TEXT (`12345=r/postgres`), and building
-        `ARRAY[...]` of them re-reads each through the aclitem input,
-        which (as PostgreSQL's) refuses an unknown role name, so
-        `aclexplode` over one is 42704 where PostgreSQL answers the oid.
-        PostgreSQL carries the item as oids; `acl::explode` already reads
-        such a text back as its oid.
+      What is left (re-measured 2026-10-15 against 15.19, 1,654 of 1,934
+      the same): the functions only a catalog role reaches, called here by
+      name, each pinned by one sample in `test_builtin_coverage_residue`.
+      - **Type output and send** (111): `int4out`, `date_out`, ... answer
+        the value's text typed `cstring`; `int4send`, `boolsend`, ... the
+        binary send format as `bytea`; the `*typmodout` functions the
+        modifier as written (`(3)`).
+      - **Index support** (102): the btree `*cmp` functions, `in_range`, and
+        the hash family (`hashint4`, `hashtext`, `*_extended` with a seed),
+        which answer PostgreSQL's `hash_any` values.
+      - **Aggregate support** (55): the transition and final functions
+        (`float8_accum`, `int8inc`, `int4_avg_accum`, `array_larger`, ...)
+        over their array states.
+      - `table_to_xml` / `database_to_xml` over the catalog or the whole
+        database differ only by what each database holds.
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
-        `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,
-        index support and aggregate transition functions take or return
-        `cstring` / `internal` and are not called by a statement.
+        `bttextcmp('b', 'a')` on macOS, 1 elsewhere).
       Backlog-ID: RP-015
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
 

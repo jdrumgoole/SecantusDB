@@ -736,3 +736,17 @@ xideq	2	xid	xid	=
 xideqint4	2	xid	int4	=
 xidneq	2	xid	xid	<>
 xidneqint4	2	xid	int4	<>
+box_overlap	2	box	box	&&
+dist_lp	2	line	point	<->
+dist_pl	2	point	line	<->
+inter_lb	2	line	box	?#
+inter_sl	2	lseg	line	?#
+line_distance	2	line	line	<->
+lseg_intersect	2	lseg	lseg	?#
+numeric_pl_pg_lsn	2	numeric	pg_lsn	+
+pg_lsn_mii	2	pg_lsn	numeric	-
+pg_lsn_pli	2	pg_lsn	numeric	+
+point_above	2	point	point	>^
+point_below	2	point	point	<^
+ts_match_qv	2	tsquery	tsvector	@@
+ts_match_vq	2	tsvector	tsquery	@@

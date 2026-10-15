@@ -139,13 +139,34 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "aclitem-unknown-role": (
-        "select a.grantee from aclexplode(array[makeaclitem(12345, 10, 'SELECT', false)]) a"
-    ),
+    "type-output": "select boolout(true), int4out(42), date_out('2020-01-02'::date)",
+    "typmod-output": "select varchartypmodout(7), numerictypmodout(131078)",
+    "btree-compare": "select bitcmp(B'101', B'100'), pg_lsn_cmp('0/16', '0/17')",
+    "aggregate-transition": "select float8_accum('{0,0,0}'::float8[], 2), int8inc(4)",
+    "type-send": "select int4send(1), boolsend(true)",
+    "hash": "select hashint4(1), hashtext('a')",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
+    "aclitem-unknown-role": (
+        "select a.grantee from aclexplode(array[makeaclitem(12345, 10, 'SELECT', false)]) a"
+    ),
+    "operator-functions": (
+        "select box_overlap('((0,0),(1,1))', '((0,0),(2,2))'), dist_lp('{1,-1,0}', '(1,2)'),"
+        " lseg_intersect('[(0,0),(1,1)]', '[(0,1),(1,0)]'), pg_lsn_pli('0/16', 1.5),"
+        " point_above('(1,3)', '(1,2)'), ts_match_vq('a b', 'a & b')"
+    ),
+    "line-box-intersect": "select '{1,-1,0}'::line ?# '((0,0),(1,1))'::box",
+    "lseg-line-intersect": "select '[(0,0),(1,1)]'::lseg ?# '{1,-1,1}'::line",
+    "line-distance": "select '{1,-1,0}'::line <-> '{1,-1,5}'::line",
+    "jsonb-minus-text": "select '{\"a\":[1,2]}'::jsonb - 'a'::text",
+    "close-ls-parallel": "select close_ls('{1,-1,0}'::line, '[(0,1),(1,2)]'::lseg)",
+    "timestamp-of-date-and-time": (
+        "select pg_catalog.timestamp('2020-02-03'::date, '04:05:06'::time),"
+        " pg_catalog.timestamptz('2020-02-03'::date, '04:05:06+02'::timetz)"
+    ),
+    "interval-typmod-unrecognised": "select pg_catalog.interval('1 day'::interval, 2)",
     "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
     "variadic-column": (
         "select concat(variadic a), format('%s-%s', variadic a)"

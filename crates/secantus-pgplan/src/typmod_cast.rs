@@ -23,7 +23,7 @@ use super::*;
 
 /// The interval field masks PostgreSQL's grammar can produce (`INTERVAL_MASK`
 /// combinations in `gram.y`), as `(mask, the fields as written)`.
-const INTERVAL_RANGES: &[(i32, &str)] = &[
+pub(crate) const INTERVAL_RANGES: &[(i32, &str)] = &[
     (0x7FFF, ""),
     (4, "year"),
     (2, "month"),
@@ -48,6 +48,23 @@ fn int_arg(n: &pg_query::protobuf::Node) -> Option<i32> {
         },
         N::TypeCast(t) => int_arg(t.arg.as_deref()?),
         _ => None,
+    }
+}
+
+/// Could `n` be an `int4` modifier: not a literal or a cast of another type?
+fn may_be_typmod(n: &pg_query::protobuf::Node) -> bool {
+    match n.node.as_ref() {
+        Some(N::AConst(c)) => matches!(
+            c.val,
+            Some(pg_query::protobuf::a_const::Val::Ival(_)) | None
+        ),
+        Some(N::TypeCast(t)) => t.type_name.as_ref().is_some_and(|tn| {
+            tn.names.iter().any(|n| {
+                matches!(n.node.as_ref(), Some(N::String(s))
+                    if matches!(s.sval.as_str(), "int2" | "int4" | "int8"))
+            })
+        }),
+        _ => true,
     }
 }
 
@@ -151,6 +168,11 @@ fn assignment_call(f: &pg_query::protobuf::FuncCall) -> Option<pg_query::protobu
         _ => return None,
     };
     if f.args.len() != arity {
+        return None;
+    }
+    // `timestamp(date, time)` and `timestamptz(date, time[tz])` are the
+    // date-and-time constructors, not a modifier's coercion.
+    if arity == 2 && !may_be_typmod(&f.args[1]) {
         return None;
     }
     // A cast (`isExplicit` true) with a modifier that is not constant is

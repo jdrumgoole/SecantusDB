@@ -35315,6 +35315,12 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     display_type(&source)
                 )));
             }
+            // An aclitem to itself is no conversion: re-reading its text
+            // would refuse an item naming an oid no role has, which
+            // PostgreSQL carries as the oid (`makeaclitem(12345, ...)`).
+            if source == "aclitem" && target == "aclitem" {
+                return Ok(value);
+            }
             // An aclitem casts to the string types (I/O conversion) and to
             // itself; nothing else (`'x=r/x'::aclitem::oid` is 42846).
             if source == "aclitem" && !is_string_type(&target) && target != "aclitem" {
@@ -36461,6 +36467,12 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
                 if untyped {
                     return cast_value(v, &element);
+                }
+                // An element already of the element type is not re-read: an
+                // aclitem naming an oid no role has is carried as the oid
+                // there, and its text would not read back (RP-015).
+                if static_type(n, &v) == element {
+                    return Ok(v);
                 }
                 to_common_type(v, &element)
             })

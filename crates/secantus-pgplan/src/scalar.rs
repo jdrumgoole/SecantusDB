@@ -847,6 +847,19 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             let typmod = as_i64(&arg(2))
                 .and_then(|t| i32::try_from(t).ok())
                 .ok_or_else(|| wrong_args(name))?;
+            // `AdjustIntervalForTypmod`: a field mask the grammar cannot
+            // write is refused.
+            if s(1) == "interval"
+                && typmod >= 0
+                && !crate::typmod_cast::INTERVAL_RANGES
+                    .iter()
+                    .any(|(m, _)| *m == typmod >> 16)
+            {
+                return Err(Error::Sqlstate(
+                    "XX000",
+                    format!("unrecognized interval typmod: {typmod}"),
+                ));
+            }
             crate::fit_length(arg(0), &s(1), typmod)
         }
         "__range_sortkey" => {
