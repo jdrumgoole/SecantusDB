@@ -31393,6 +31393,28 @@ fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
 /// PostgreSQL's `ts_match_tt` / `ts_match_tq` do), `||` / `&&` / `<->` on
 /// queries, `||` on vectors. `None`: not a full-text operation.
 fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bson>> {
+    // `tsquery @> tsquery` / `<@`: query containment, only between queries
+    // (the same operators belong to arrays, ranges, jsonb, ...).
+    if matches!(op, "@>" | "<@") {
+        let side = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+            n.map_or_else(String::new, |n| static_type(n, v))
+        };
+        // An untyped side beside a query is read as one (`'a & b' @>
+        // 'a'::tsquery`).
+        let query_side = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+            side(n, v) == "tsquery" || unknown_operand(n)
+        };
+        let typed = side(e.lexpr.as_deref(), lhs) == "tsquery"
+            || side(e.rexpr.as_deref(), rhs) == "tsquery";
+        if !typed || !query_side(e.lexpr.as_deref(), lhs) || !query_side(e.rexpr.as_deref(), rhs) {
+            return None;
+        }
+        if *lhs == Bson::Null || *rhs == Bson::Null {
+            return Some(Ok(Bson::Null));
+        }
+        let (query, ex) = if op == "@>" { (lhs, rhs) } else { (rhs, lhs) };
+        return Some(fts::query_contains(query, ex).map(Bson::Boolean));
+    }
     if !matches!(op, "@@" | "@@@" | "||" | "&&" | "<->") {
         return None;
     }

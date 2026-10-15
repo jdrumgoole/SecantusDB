@@ -2732,6 +2732,44 @@ pub fn operator(op: &str, left_type: &str, a: &Bson, b: &Bson) -> Result<Bson> {
     }
 }
 
+/// `tsquery @> tsquery` (`tsq_mcontains`, tsquery_op.c): every lexeme of
+/// `ex` is one of `query`'s, and `query` has at least as many nodes (its
+/// `size`, operands and operators both). `<@` is it reversed. Operators,
+/// weights and prefixes are not compared, as PostgreSQL does not.
+pub fn query_contains(query: &Bson, ex: &Bson) -> Result<bool> {
+    fn size(q: &Query) -> usize {
+        match q {
+            Query::Val { .. } | Query::Stop => 1,
+            Query::Not(a) => 1 + size(a),
+            Query::And(a, b) | Query::Or(a, b) | Query::Phrase(a, b, _) => 1 + size(a) + size(b),
+        }
+    }
+    fn values(q: &Query, out: &mut Vec<String>) {
+        match q {
+            Query::Val { lex, .. } => out.push(lex.clone()),
+            Query::Stop => {}
+            Query::Not(a) => values(a, out),
+            Query::And(a, b) | Query::Or(a, b) | Query::Phrase(a, b, _) => {
+                values(a, out);
+                values(b, out);
+            }
+        }
+    }
+    let (q, e) = (query_arg(query)?, query_arg(ex)?);
+    let (qs, es) = (q.as_ref().map_or(0, size), e.as_ref().map_or(0, size));
+    if qs < es {
+        return Ok(false);
+    }
+    let (mut qv, mut ev) = (Vec::new(), Vec::new());
+    if let Some(q) = &q {
+        values(q, &mut qv);
+    }
+    if let Some(e) = &e {
+        values(e, &mut ev);
+    }
+    Ok(ev.iter().all(|v| qv.contains(v)))
+}
+
 /// `!! tsquery`.
 pub fn not_value(q: &Bson) -> Result<Bson> {
     Ok(query_out(&negate(&query_arg(q)?)))
