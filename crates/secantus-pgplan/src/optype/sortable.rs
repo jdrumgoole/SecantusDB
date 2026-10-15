@@ -90,6 +90,53 @@ fn require(n: &pg_query::protobuf::Node, ty: Option<String>, need: Need) -> Resu
     )))
 }
 
+/// The operator an `ORDER BY ... USING op` names, without its schema.
+pub(crate) fn using_operator(b: &pg_query::protobuf::SortBy) -> Option<String> {
+    b.use_op.last().and_then(|n| match n.node.as_ref() {
+        Some(N::String(s)) => Some(s.sval.clone()),
+        _ => None,
+    })
+}
+
+/// The sort direction `USING op` stands for: the `<` / `>` members of a
+/// btree family (`text_pattern_ops`' `~<~` / `~>~` too), `true` for
+/// ascending. Any other operator -- even `<=` -- is not an ordering
+/// operator (measured on 15.19).
+pub(crate) fn using_ascending(op: &str) -> Option<bool> {
+    match op {
+        "<" | "~<~" => Some(true),
+        ">" | "~>~" => Some(false),
+        _ => None,
+    }
+}
+
+/// One sort item typed `ty`: plain, it needs an ordering operator; with
+/// `USING op`, `op` must exist for the type (42883 `operator does not
+/// exist: point < point`) and be an ordering one (42809), both at the
+/// operator.
+fn sort_item(
+    b: &pg_query::protobuf::SortBy,
+    n: &pg_query::protobuf::Node,
+    ty: Option<String>,
+) -> Result<()> {
+    let Some(op) = using_operator(b) else {
+        return require(n, ty, Need::Ordering);
+    };
+    if let Some(t) = &ty {
+        if crate::funcsig::operator_resolves(&op, t, t) == Some(false) {
+            return Err(mismatch(&op, t, t, b.location));
+        }
+    }
+    if using_ascending(&op).is_none() {
+        set_error_location(b.location);
+        return Err(Error::Sqlstate(
+            "42809",
+            format!("operator {op} is not a valid ordering operator"),
+        ));
+    }
+    Ok(())
+}
+
 fn res_target(t: &pg_query::protobuf::Node) -> Option<&pg_query::protobuf::ResTarget> {
     match t.node.as_ref() {
         Some(N::ResTarget(rt)) => Some(rt),
@@ -141,13 +188,13 @@ pub(super) fn check_clauses(s: &pg_query::protobuf::SelectStmt, scope: &Scope) -
         Some(N::SortBy(b)) => Some(b),
         _ => None,
     }) {
-        let (Some(n), true) = (b.node.as_deref(), b.use_op.is_empty()) else {
+        let Some(n) = b.node.as_deref() else {
             continue;
         };
         let ty = output_column(targets, n)
             .and_then(|v| typed(v, scope))
             .or_else(|| typed(n, scope));
-        require(n, ty, Need::Ordering)?;
+        sort_item(b, n, ty)?;
     }
     for n in &s.group_clause {
         let ordinal = matches!(n.node.as_ref(), Some(N::AConst(_)));
@@ -197,8 +244,8 @@ fn sort_items(items: &[pg_query::protobuf::Node], scope: &Scope) -> Result<()> {
         Some(N::SortBy(b)) => Some(b),
         _ => None,
     }) {
-        if let (Some(n), true) = (b.node.as_deref(), b.use_op.is_empty()) {
-            require(n, typed(n, scope), Need::Ordering)?;
+        if let Some(n) = b.node.as_deref() {
+            sort_item(b, n, typed(n, scope))?;
         }
     }
     Ok(())
@@ -281,10 +328,61 @@ pub(super) fn check_set_operation(
         Some(N::SortBy(b)) => Some(b),
         _ => None,
     }) {
-        if let (Some(n), true) = (b.node.as_deref(), b.use_op.is_empty()) {
+        if let Some(n) = b.node.as_deref() {
             let ty = output_column(&arms[0].target_list, n).and_then(|v| typed(v, &scopes[0]));
-            require(n, ty, Need::Ordering)?;
+            sort_item(b, n, ty)?;
         }
     }
     Ok(())
+}
+
+/// `ORDER BY x USING <` as `ORDER BY x ASC` (`>` as `DESC`), everywhere in
+/// the statement -- a query, an aggregate's ORDER BY, a window's -- once
+/// [`check`](super::check) has refused the operators that do not order.
+/// The NULLS default follows the direction, as it does for USING.
+pub(crate) fn using_to_direction(node: &mut N) {
+    use pg_query::protobuf::SortByDir;
+    let direct = |b: &mut pg_query::protobuf::SortBy| {
+        if let Some(asc) = using_operator(b).as_deref().and_then(using_ascending) {
+            b.sortby_dir = if asc {
+                SortByDir::SortbyAsc
+            } else {
+                SortByDir::SortbyDesc
+            } as i32;
+            b.use_op.clear();
+        }
+    };
+    let items = |list: &mut [pg_query::protobuf::Node]| {
+        for n in list {
+            if let Some(N::SortBy(b)) = n.node.as_mut() {
+                direct(b);
+            }
+        }
+    };
+    // SAFETY: only plain fields of SortBy nodes change; no node is replaced
+    // or freed, so every pointer in the list stays valid. An aggregate's
+    // ORDER BY and a window's are reached through their call / definition.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            match n {
+                pg_query::NodeMut::SortBy(b) => direct(&mut *b),
+                pg_query::NodeMut::FuncCall(f) => {
+                    let f = &mut *f;
+                    items(&mut f.agg_order);
+                    if let Some(w) = f.over.as_deref_mut() {
+                        items(&mut w.order_clause);
+                    }
+                }
+                pg_query::NodeMut::WindowDef(w) => items(&mut (*w).order_clause),
+                pg_query::NodeMut::SelectStmt(sel) => {
+                    for w in &mut (*sel).window_clause {
+                        if let Some(N::WindowDef(w)) = w.node.as_mut() {
+                            items(&mut w.order_clause);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }

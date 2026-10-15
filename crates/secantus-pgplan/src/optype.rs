@@ -17,6 +17,8 @@ use super::*;
 
 mod sortable;
 
+pub(crate) use sortable::using_to_direction;
+
 /// The type category of a built-in type, by oid; `None` for a type whose
 /// operators this does not reason about (a domain, an enum, `oid`, arrays).
 fn category(ty: &str) -> Option<&'static str> {
@@ -349,6 +351,18 @@ impl<'p> Scope<'p> {
             _ => None,
         }
     }
+}
+
+/// The static type of `expr` in the FROM scope of `sel` (a subquery's
+/// select-list expression), or `None` when it cannot be told or is
+/// `unknown`.
+pub(crate) fn type_in_select(
+    sel: &pg_query::protobuf::SelectStmt,
+    expr: &pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let scope = Scope::new(&sel.from_clause, &[], lookup, None);
+    operand_type(expr, &scope).filter(|t| !t.is_empty() && t != "unknown")
 }
 
 /// The type an operand has statically, or `None`.

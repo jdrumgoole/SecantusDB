@@ -19,6 +19,7 @@ mod expr_where;
 mod filter_sublink;
 mod like_match;
 mod multi_assign;
+mod record_fields;
 mod returning_star;
 pub mod schemas;
 mod srf_tlist;
@@ -3978,6 +3979,9 @@ pub fn plan_with_subqueries(
         if let N::SelectStmt(sel) = inner {
             order_by_ambiguity(sel)?;
         }
+    }
+    if let Some(inner) = node.node.as_mut() {
+        optype::using_to_direction(inner);
     }
     let mut params = params.to_vec();
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
@@ -16654,6 +16658,9 @@ fn resolve_sublinks_in_expr(
     run: SubqueryRunner<'_>,
     outer: &[String],
 ) -> Result<()> {
+    // A field of a scalar subquery's ROW() has no name to find, before the
+    // subquery is replaced by its value (`record_fields`).
+    record_fields::check_sublink_selection(node)?;
     if let Some(N::SubLink(_)) = node.node.as_ref() {
         let N::SubLink(sl) = node.node.clone().expect("matched above") else {
             unreachable!("matched SubLink")
@@ -18893,6 +18900,11 @@ fn plan_select(
     // A set-returning function in the select list (or ORDER BY / GROUP BY)
     // is a LATERAL source (see `srf_tlist`).
     if let Some(rewritten) = srf_tlist::rewrite(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // `(r).f1` over a subquery / CTE record column has the type of the
+    // ROW() argument it selects (see `record_fields`).
+    if let Some(rewritten) = record_fields::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     // A reference to the RELATION itself -- `row_to_json(t)`, `SELECT jr
@@ -22214,7 +22226,21 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     field.and_then(|f| fields.iter().find(|(n, _)| n == f).map(|(_, t)| t.clone()))
                 })
             });
-            field_type.unwrap_or_else(|| inferred_type(value).to_string())
+            // A ROW()'s `fN` is its Nth argument, a nested ROW() a record.
+            let row_field = || {
+                let Some(N::RowExpr(r)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+                    return None;
+                };
+                let n = field?.strip_prefix('f')?.parse::<usize>().ok()?;
+                let e = r.args.get(n.checked_sub(1)?)?;
+                Some(static_type(e, value))
+            };
+            field_type
+                .or_else(row_field)
+                .unwrap_or_else(|| match record_fields(value) {
+                    Some(_) => "record".to_string(),
+                    None => inferred_type(value).to_string(),
+                })
         }
         Some(N::CoalesceExpr(c)) => common_type(&c.args.iter().collect::<Vec<_>>()),
         Some(N::CaseExpr(c)) => common_type(&case_results(c)),
@@ -30765,6 +30791,21 @@ fn whole_row_rewrite(
     if columns.contains(&alias) {
         return Ok(None);
     }
+    // A subquery whose outputs share a name (`select 1, 'a'`, both
+    // `?column?`) cannot have its row built by name: its columns are
+    // renamed by position (the alias column list) to names of our own, the
+    // row's field names stay the outputs' own, and a reference to a shared
+    // name is PostgreSQL's 42702.
+    let shared = |c: &String| columns.iter().filter(|x| *x == c).count() > 1;
+    let renamed =
+        matches!(item.node.as_ref(), Some(N::RangeSubselect(_))) && columns.iter().any(shared);
+    let arg_names: Vec<String> = if renamed {
+        (1..=columns.len())
+            .map(|i| format!("\u{1f}wr{i}"))
+            .collect()
+    } else {
+        columns.clone()
+    };
     let is_whole_row = |c: &pg_query::protobuf::ColumnRef, allow_star: bool| -> bool {
         let names: Vec<Option<&str>> = c
             .fields
@@ -30781,7 +30822,8 @@ fn whole_row_rewrite(
             _ => false,
         }
     };
-    let row = || -> pg_query::protobuf::Node {
+    // The row is reported where the reference to it was written.
+    let row = |location: i32| -> pg_query::protobuf::Node {
         let col_node = |name: &str| pg_query::protobuf::Node {
             node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                 fields: vec![pg_query::protobuf::Node {
@@ -30795,7 +30837,7 @@ fn whole_row_rewrite(
         let row = pg_query::protobuf::Node {
             node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
                 xpr: None,
-                args: columns.iter().map(|c| col_node(c)).collect(),
+                args: arg_names.iter().map(|c| col_node(c)).collect(),
                 row_typeid: 0,
                 row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
                 colnames: columns
@@ -30804,7 +30846,7 @@ fn whole_row_rewrite(
                         node: Some(N::String(pg_query::protobuf::String { sval: c.clone() })),
                     })
                     .collect(),
-                location: 0,
+                location,
             }))),
         };
         match &rowtype {
@@ -30820,10 +30862,50 @@ fn whole_row_rewrite(
     };
     let mut out = s.clone();
     let mut changed = false;
+    // A column named by a renamed subquery's output name: its own name, or
+    // 42702 for a name more than one output has.
+    let rename = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if !renamed {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = n.node.as_mut() else {
+            return Ok(());
+        };
+        let names: Vec<Option<String>> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(sv)) => Some(sv.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        let col = match names.as_slice() {
+            [Some(col)] => col.clone(),
+            [Some(q), Some(col)] if *q == alias => col.clone(),
+            _ => return Ok(()),
+        };
+        let hits: Vec<usize> = (0..columns.len()).filter(|i| columns[*i] == col).collect();
+        match hits.as_slice() {
+            [] => Ok(()),
+            [i] => {
+                if let Some(Some(N::String(sv))) = c.fields.last_mut().map(|f| f.node.as_mut()) {
+                    sv.sval.clone_from(&arg_names[*i]);
+                }
+                Ok(())
+            }
+            _ => {
+                set_error_location(c.location);
+                Err(Error::Sqlstate(
+                    "42702",
+                    format!("column reference \"{col}\" is ambiguous"),
+                ))
+            }
+        }
+    };
     let mut rewrite = |node: &mut pg_query::protobuf::Node, top_target: bool| -> Result<()> {
         if let Some(N::ColumnRef(c)) = node.node.as_ref() {
             if is_whole_row(c, !top_target) {
-                *node = row();
+                *node = row(c.location);
                 changed = true;
                 return Ok(());
             }
@@ -30848,7 +30930,7 @@ fn whole_row_rewrite(
                     let args = std::mem::take(&mut r.args);
                     for a in args {
                         if star(&a) {
-                            r.args.extend(columns.iter().map(|c| column_ref_node(c)));
+                            r.args.extend(arg_names.iter().map(|c| column_ref_node(c)));
                         } else {
                             r.args.push(a);
                         }
@@ -30858,20 +30940,52 @@ fn whole_row_rewrite(
             }
             if let Some(N::ColumnRef(c)) = n.node.as_ref() {
                 if is_whole_row(c, true) {
-                    *n = row();
+                    *n = row(c.location);
                     changed = true;
+                    return Ok(());
                 }
             }
-            Ok(())
+            rename(n)
         })
     };
-    for t in &mut out.target_list {
+    // Over a renamed subquery, a select-list `*` / `alias.*` is its columns
+    // under their own names.
+    let star_of_source = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => match c.fields.as_slice() {
+            [f] => matches!(f.node.as_ref(), Some(N::AStar(_))),
+            [q, f] => {
+                matches!(q.node.as_ref(), Some(N::String(sv)) if sv.sval == alias)
+                    && matches!(f.node.as_ref(), Some(N::AStar(_)))
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let mut targets = Vec::with_capacity(out.target_list.len());
+    let mut expanded = false;
+    for mut t in std::mem::take(&mut out.target_list) {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+            if renamed && rt.val.as_deref().is_some_and(star_of_source) {
+                for (name, arg) in columns.iter().zip(&arg_names) {
+                    targets.push(pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            name: name.clone(),
+                            val: Some(Box::new(column_ref_node(arg))),
+                            location: rt.location,
+                            ..Default::default()
+                        }))),
+                    });
+                }
+                expanded = true;
+                continue;
+            }
             if let Some(v) = rt.val.as_deref_mut() {
                 rewrite(v, true)?;
             }
         }
+        targets.push(t);
     }
+    out.target_list = targets;
     if let Some(w) = out.where_clause.as_deref_mut() {
         rewrite(w, false)?;
     }
@@ -30882,7 +30996,28 @@ fn whole_row_rewrite(
             }
         }
     }
-    Ok(changed.then_some(out))
+    if !(changed || expanded) {
+        return Ok(None);
+    }
+    if renamed {
+        for g in &mut out.group_clause {
+            walk_expr(g, &mut |n| rename(n))?;
+        }
+        if let Some(h) = out.having_clause.as_deref_mut() {
+            walk_expr(h, &mut |n| rename(n))?;
+        }
+        if let Some(N::RangeSubselect(rs)) = out.from_clause[0].node.as_mut() {
+            if let Some(a) = rs.alias.as_mut() {
+                a.colnames = arg_names
+                    .iter()
+                    .map(|n| pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String { sval: n.clone() })),
+                    })
+                    .collect();
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// A bare `*` column reference.
@@ -34733,12 +34868,47 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 format!("column \"{field}\" not found in data type {ty}"),
             )
         } else if let Some(names) = named.filter(|n| n.contains(&field)) {
+            // Two fields of that name (a subquery's `select 1 as x, 2 as x`):
+            // PostgreSQL's 42702, at the record.
+            if names.iter().filter(|n| **n == field).count() > 1 {
+                if let Some(loc) = expr_location(arg) {
+                    set_error_location(loc);
+                }
+                return Err(Error::Sqlstate(
+                    "42702",
+                    format!("column reference \"{field}\" is ambiguous"),
+                ));
+            }
             (
                 names.iter().position(|n| *n == field),
                 format!("could not identify column \"{field}\" in record data type"),
             )
         } else {
-            // An anonymous record names its fields f1, f2, ... by position.
+            // An anonymous record names its fields f1, f2, ... by position --
+            // but only one whose ROW() PostgreSQL can see. A subquery's value
+            // (`((select row(1, 'a'))).f1`) or a record field of a record
+            // (`((row(row(1, 2), 3)).f1).f2`) has no field names at all:
+            // 42703 at the record (measured on 15.19).
+            let hidden = match arg.node.as_ref() {
+                Some(N::SubLink(_)) => true,
+                Some(N::AIndirection(inner)) => inner
+                    .indirection
+                    .iter()
+                    .all(|i| matches!(i.node.as_ref(), Some(N::String(_)))),
+                _ => false,
+            };
+            if hidden {
+                let at = match arg.node.as_ref() {
+                    Some(N::AIndirection(inner)) => inner.arg.as_deref().and_then(expr_location),
+                    _ => expr_location(arg),
+                };
+                if let Some(loc) = at {
+                    set_error_location(loc);
+                }
+                return Err(Error::UndefinedField(format!(
+                    "could not identify column \"{field}\" in record data type"
+                )));
+            }
             (
                 field
                     .strip_prefix('f')
