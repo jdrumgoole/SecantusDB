@@ -30448,6 +30448,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "tsquery" => Ok(Bson::String(fts::render_query(&fts::parse_query(
             &as_text(&value),
         )?))),
+        // `record_in`: text cannot be read as an anonymous record, which
+        // has no field types to read it by (15.19, at the literal).
+        "record" if matches!(value, Bson::String(_)) => Err(Error::Sqlstate(
+            "0A000",
+            "input of anonymous composite types is not implemented".into(),
+        )),
         // A name no catalog knows is PostgreSQL's 42704; only a REAL type
         // this server has no cast arm for is the honest 0A000.
         other => {

@@ -156,6 +156,8 @@ _RP015_FIXED = {
         "select * from pg_timezone_abbrevs() where abbrev in ('EST', 'IST') order by 1"
     ),
     "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
+    "array-element-position": "select array_append('{1.5}', 2)",
+    "record-input": "select '(1,x)'::record",
     "record-srf-field": (
         "select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1"
     ),
@@ -718,3 +720,13 @@ def test_null_tsquery_sends_no_notice(pg: Any) -> None:
     for sql in ("select null::tsquery", "select numnode(null)", "select querytree(null::tsquery)"):
         pg.execute(sql).fetchall()
     assert notices == []
+
+
+@pytest.mark.backlog("RP-039")
+@pytest.mark.parametrize(
+    "sql",
+    ["select 1 where 2 = any('{1,x}')", "select '{1,{2,x}}'::int[]"],
+    ids=["any-untyped-array", "nested-array-dimensions"],
+)
+def test_untyped_array_literals(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)

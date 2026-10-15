@@ -43,6 +43,43 @@ fn reg_literal(toks: &[Tok]) -> Option<usize> {
         .map(|w| w[0].start)
 }
 
+/// The literal an input error's value came from when it is not the whole
+/// literal: a dollar-quoted one spelled exactly so (`$$${1}$$`), or the one
+/// string literal among whose array or record elements it is
+/// (`array_append('{1.5}', 2)` is 22P02 for `"1.5"` at `'{1.5}'`). `None`
+/// when no literal, or more than one, holds it.
+fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
+    if let Some(i) = toks.iter().position(|t| {
+        t.text.starts_with('$')
+            && t.text.len() > 2
+            && t.text[1..].find('$').is_some_and(|end| {
+                let tag = &t.text[..end + 2];
+                t.text.len() >= 2 * tag.len()
+                    && t.text.ends_with(tag)
+                    && &t.text[tag.len()..t.text.len() - tag.len()] == value
+            })
+    }) {
+        return Some(i);
+    }
+    let holds = |t: &Tok| -> bool {
+        let Some(body) = t.text.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) else {
+            return false;
+        };
+        let body = body.replace("''", "'");
+        let inner = body.trim();
+        let inner = match (inner.chars().next(), inner.chars().last()) {
+            (Some('{'), Some('}')) | (Some('('), Some(')')) => &inner[1..inner.len() - 1],
+            _ => return false,
+        };
+        inner
+            .split(|c| matches!(c, ',' | '{' | '}' | '(' | ')'))
+            .any(|e| e.trim().trim_matches('"') == value)
+    };
+    let mut hits = toks.iter().enumerate().filter(|(_, t)| holds(t));
+    let (i, _) = hits.next()?;
+    hits.next().is_none().then_some(i)
+}
+
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
@@ -379,6 +416,15 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let lit = format!("'{}'", value.replace('\'', "''"));
             pos(toks.iter().find(|t| t.text == lit)?.start)
         }
+        // `'(1,x)'::record`: at the literal.
+        "0A000" if m == "input of anonymous composite types is not implemented" => {
+            let i = toks.windows(3).position(|w| {
+                w[0].text.starts_with('\'')
+                    && w[1].text == "::"
+                    && w[2].text.eq_ignore_ascii_case("record")
+            })?;
+            pos(toks[i].start)
+        }
         "22P02" => {
             if matches!(
                 m,
@@ -390,7 +436,10 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let (_, value) = m.rsplit_once(": \"")?;
             let value = value.strip_suffix('"')?;
             let lit = format!("'{}'", value.replace('\'', "''"));
-            let i = toks.iter().position(|t| t.text == lit)?;
+            let i = toks
+                .iter()
+                .position(|t| t.text == lit)
+                .or_else(|| element_literal(&toks, value))?;
             // A literal cast to a string type first is a text VALUE when the
             // target's input function reads it, at execution, where there is
             // no position (`int8('x'::text)`, measured on 15.19).

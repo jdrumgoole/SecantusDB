@@ -17,6 +17,15 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   fields the Python server reads. Part of RP-032
   (`::test_record_literal_pads_char_field`).
 
+- An input error read from inside an array or record literal is placed at
+  the literal, as PostgreSQL places it: `array_append('{1.5}', 2)` (22P02
+  for `"1.5"`), a dollar-quoted `VARIADIC` array. `'(1,x)'::record` is
+  PostgreSQL's 0A000 `input of anonymous composite types is not
+  implemented` at the literal, where it was 42704 `type "record" does not
+  exist`. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[array-element-position]`,
+  `[record-input]`).
+
 #### Added
 
 - `pg_timezone_names` and `pg_timezone_abbrevs`, as the views and as the
@@ -28,4 +37,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   2026-10-15). Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[timezone-names]`,
   `[timezone-abbrevs]`).
-- Corpora `timezone_views` and `row_type_fields`.
+- Corpora `timezone_views`, `row_type_fields` and `literal_element_positions`.
