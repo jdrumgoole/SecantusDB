@@ -496,9 +496,9 @@ one beside it.
         an unlogged table.
       - **Refused operators** the probe reached through their functions:
         multirange `-|-` / `<<` / `>>` / `&<` / `&>` and its ordering
-        comparisons; `macaddr` / `macaddr8` `&` `|` `~`; `##` (closest
+        comparisons; `##` (closest
         point) for six pairs, `<->` between a line or box and a segment,
-        the `path` count comparisons; a VARIADIC argument that is neither an
+        a VARIADIC argument that is neither an
         `ARRAY[...]` constructor nor a json path / `jsonb_delete` call. Casts by function name: `int4("char")`, a length-coercion
         function with a modifier that is not a constant, and the string /
         bit-string forms with `isExplicit` false (an assignment, which

@@ -22455,6 +22455,15 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     return "jsonb".to_string();
                 }
             }
+            // `macaddr` / `macaddr8` `&` `|` `~` answer the operand's type.
+            if matches!(op, "&" | "|" | "~") {
+                if let Some(t) = rt()
+                    .filter(|t| matches!(t.as_str(), "macaddr" | "macaddr8"))
+                    .or_else(|| lt().filter(|t| matches!(t.as_str(), "macaddr" | "macaddr8")))
+                {
+                    return t.clone();
+                }
+            }
             // Bit-string operators keep the left operand's type; `||` is varbit
             // and `~` the operand's.
             if matches!(op, "&" | "|" | "#" | "<<" | ">>" | "||" | "~") {
@@ -36175,6 +36184,12 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 {
                     return Ok(bits::not(&rhs));
                 }
+                "~" if e.rexpr.as_deref().is_some_and(|r| {
+                    matches!(static_type(r, &rhs).as_str(), "macaddr" | "macaddr8")
+                }) =>
+                {
+                    return systypes::mac_bitop("~", None, &value_text(&rhs)).map(Bson::String);
+                }
                 _ if geom::from_bson(&rhs).is_some() => {
                     let g = geom::from_bson(&rhs).expect("checked");
                     return geom::unary(op.as_str(), &g).unwrap_or_else(|| {
@@ -36339,6 +36354,24 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 f,
                 &[lhs, rhs, Bson::String("{}".into()), Bson::Boolean(true)],
             );
+        }
+        // `macaddr & macaddr` / `|` (and `macaddr8`'s): by the STATIC types,
+        // an untyped side taking the other's.
+        if matches!(op.as_str(), "&" | "|") {
+            let t = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+                n.map_or_else(String::new, |n| static_type(n, v))
+            };
+            let (lt, rt) = (t(e.lexpr.as_deref(), &lhs), t(e.rexpr.as_deref(), &rhs));
+            let mac = |t: &str| matches!(t, "macaddr" | "macaddr8");
+            if (mac(&lt) && (lt == rt || unknown_operand(e.rexpr.as_deref())))
+                || (mac(&rt) && unknown_operand(e.lexpr.as_deref()))
+            {
+                if lhs == Bson::Null || rhs == Bson::Null {
+                    return Ok(Bson::Null);
+                }
+                return systypes::mac_bitop(&op, Some(&value_text(&lhs)), &value_text(&rhs))
+                    .map(Bson::String);
+            }
         }
         // Full-text search: `@@` between a document and a query, and the
         // combining operators, told apart by the operands' STATIC types.
