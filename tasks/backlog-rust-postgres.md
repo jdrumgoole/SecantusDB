@@ -445,24 +445,20 @@ one beside it.
       `test_builtin_coverage_fixed` and the corpora it added). Re-run it
       before working an item.
 
-      What is left (re-measured 2026-10-15 against 15.19, 1,654 of 1,934
-      the same): the functions only a catalog role reaches, called here by
-      name, each pinned by one sample in `test_builtin_coverage_residue`.
-      - **Type output and send** (111): `int4out`, `date_out`, ... answer
-        the value's text typed `cstring`; `int4send`, `boolsend`, ... the
-        binary send format as `bytea`; the `*typmodout` functions the
-        modifier as written (`(3)`).
-      - **Index support** (102): the btree `*cmp` functions, `in_range`, and
-        the hash family (`hashint4`, `hashtext`, `*_extended` with a seed),
-        which answer PostgreSQL's `hash_any` values.
-      - **Aggregate support** (55): the transition and final functions
-        (`float8_accum`, `int8inc`, `int4_avg_accum`, `array_larger`, ...)
-        over their array states.
+      What is left (re-measured 2026-10-15 against 15.19, 1,890 of 1,934
+      the same; everything else the probe reports is below):
+      - **Decision needed -- the comparisons that answer a `memcmp`
+        difference** (16): `bttextcmp`, `bpcharcmp`, `byteacmp`, `bitcmp`,
+        `varbitcmp`, `btnamecmp` and its text forms, the `*_pattern_cmp`
+        pair, `network_cmp`, `jsonb_cmp`, `tsvector_cmp`, `tsquery_cmp`,
+        `gin_cmp_tslexeme`, `gin_compare_jsonb`. Each returns what the C
+        library's `memcmp` / `strcoll` does on the reference machine
+        (`bttextcmp('b', 'a')` is 14 on the macOS reference,
+        `bitcmp(B'101', B'100')` 32), and only the sign is promised.
+        Answering the reference's magnitude is one rule; answering -1 / 1 is
+        another. Which one is Joe's call, so none is answered yet.
       - `table_to_xml` / `database_to_xml` over the catalog or the whole
         database differ only by what each database holds.
-      - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
-        `byteacmp` answer what the C library's `memcmp` returns (14 for
-        `bttextcmp('b', 'a')` on macOS, 1 elsewhere).
       Backlog-ID: RP-015
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
 

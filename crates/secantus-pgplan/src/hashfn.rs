@@ -449,6 +449,101 @@ fn range_hash(r: &range::Range, element: &str, h: H) -> Result<u64> {
     })
 }
 
+/// `jsonb_hash` / `jsonb_hash_extended`: the iterator's tokens folded in --
+/// an array's or object's flag at its start, each key, value and element
+/// as `JsonbHashScalarValue` hashes it -- with object keys in jsonb's own
+/// order (by length, then bytes; the last of a duplicate kept). A raw
+/// scalar is a one-element array; an empty container hashes as 0 (the seed).
+fn jsonb_hash(text: &str, h: H) -> Result<u64> {
+    const ARRAY: u32 = 0x4000_0000;
+    const OBJECT: u32 = 0x2000_0000;
+    let j = json::parse(text).map_err(|_| Error::Internal("jsonb_hash".into()))?;
+    let empty = match &j {
+        json::Json::Array(items) => items.is_empty(),
+        json::Json::Object(pairs) => pairs.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return Ok(match h {
+            H::Plain => 0,
+            H::Seed(s) => s,
+        });
+    }
+    let flag = |f: u32| match h {
+        H::Plain => u64::from(f),
+        H::Seed(_) => (u64::from(f) << 32) | u64::from(f),
+    };
+    let rotate = |x: u64| match h {
+        H::Plain => u64::from((x as u32).rotate_left(1)),
+        H::Seed(_) => ((x << 1) & 0xffff_fffe_ffff_fffe) | ((x >> 31) & 0x0000_0001_0000_0001),
+    };
+    let scalar = |v: &json::Json, hash: &mut u64| -> Result<()> {
+        let tmp = match v {
+            json::Json::Null => match h {
+                H::Plain => 1,
+                H::Seed(s) => s.wrapping_add(1),
+            },
+            json::Json::Str(s) => h.bytes(s.as_bytes()),
+            json::Json::Number(n) => hash_numeric(&Bson::String(n.clone()), h)?,
+            json::Json::Bool(b) => match h {
+                H::Seed(s) if s != 0 => h.uint32(u32::from(*b)),
+                _ => {
+                    if *b {
+                        2
+                    } else {
+                        4
+                    }
+                }
+            },
+            _ => 0,
+        };
+        *hash = rotate(*hash) ^ tmp;
+        Ok(())
+    };
+    fn walk(
+        v: &json::Json,
+        hash: &mut u64,
+        flag: &dyn Fn(u32) -> u64,
+        scalar: &dyn Fn(&json::Json, &mut u64) -> Result<()>,
+    ) -> Result<()> {
+        match v {
+            json::Json::Array(items) => {
+                *hash ^= flag(0x4000_0000);
+                for i in items {
+                    walk(i, hash, flag, scalar)?;
+                }
+            }
+            json::Json::Object(pairs) => {
+                *hash ^= flag(0x2000_0000);
+                let mut kept: Vec<(&String, &json::Json)> = Vec::new();
+                for (k, val) in pairs {
+                    match kept.iter_mut().find(|(existing, _)| *existing == k) {
+                        Some(slot) => slot.1 = val,
+                        None => kept.push((k, val)),
+                    }
+                }
+                kept.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
+                for (k, val) in kept {
+                    scalar(&json::Json::Str(k.clone()), hash)?;
+                    walk(val, hash, flag, scalar)?;
+                }
+            }
+            other => scalar(other, hash)?,
+        }
+        Ok(())
+    }
+    let mut hash = 0u64;
+    let root_scalar = !matches!(j, json::Json::Array(_) | json::Json::Object(_));
+    if root_scalar {
+        hash ^= flag(ARRAY);
+        scalar(&j, &mut hash)?;
+    } else {
+        walk(&j, &mut hash, &flag, &scalar)?;
+    }
+    let _ = OBJECT;
+    Ok(hash)
+}
+
 /// The hash functions this module answers, as `(name, result type)`.
 pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
     let extended = name.ends_with("extended");
@@ -457,7 +552,7 @@ pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
         | "hashchar" | "hashfloat4" | "hashfloat8" | "hashinet" | "hashint2" | "hashint4"
         | "hashint8" | "hashmacaddr" | "hashmacaddr8" | "hashname" | "hashoid" | "hashtext"
         | "hashtid" | "interval_hash" | "pg_lsn_hash" | "time_hash" | "timestamp_hash"
-        | "timetz_hash" | "uuid_hash" => true,
+        | "timetz_hash" | "uuid_hash" | "jsonb_hash" => true,
         n if extended => result_type(
             n.trim_end_matches("_extended").trim_end_matches("extended"),
             1,
@@ -552,6 +647,7 @@ pub(crate) fn call(name: &str, args: &[Bson], ty: &str) -> Option<Result<Bson>> 
             }
             Ok(result)
         })(),
+        "jsonb_hash" => jsonb_hash(&value_text(&args[0]), h),
         other => {
             let d = declared(other).unwrap_or("text");
             hash_value(&args[0], d, h)
