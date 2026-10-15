@@ -57,7 +57,7 @@ EXPECTED = [
 ]
 
 
-@pytest.mark.backlog("RM-152")
+@pytest.mark.backlog_fixed("RM-152")
 @pytest.mark.parametrize("indexed", [False, True], ids=["collscan", "index"])
 def test_double_compared_with_decimal_and_int64_exactly(rust_mongo: Any, indexed: bool) -> None:
     """mongod 8.2.11: a double equals a Decimal128 or an Int64 only when
@@ -69,7 +69,7 @@ def test_double_compared_with_decimal_and_int64_exactly(rust_mongo: Any, indexed
     assert got == [(q, ("ok", ids)) for q, ids in EXPECTED]
 
 
-@pytest.mark.backlog("RM-152")
+@pytest.mark.backlog_fixed("RM-152")
 def test_id_uniqueness_compares_numbers_exactly(rust_mongo: Any) -> None:
     """mongod 8.2.11: `_id: 2**62` as a double duplicates the Int64, and
     `_id: 0.1` does not duplicate `Decimal128("0.1")`."""

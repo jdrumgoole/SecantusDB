@@ -871,7 +871,7 @@ fn op_matches(
         }
         "$type" => op_type(values, arg, field, descend),
         "$size" => op_size(values, arg),
-        "$all" => op_all(values, arg, field, descend),
+        "$all" => op_all(values, arg, coll, field, descend),
         "$elemMatch" => {
             if !matches!(arg, Bson::Document(_)) {
                 return Err(Fallback::mongo(2, "$elemMatch needs an Object"));
@@ -2492,17 +2492,24 @@ fn op_type(values: &[Cand], spec: &Bson, field: &str, descend: bool) -> R {
 
 // --- $size --------------------------------------------------------------
 
-/// `$all`: some array value contains, for every required element, a matching
-/// element. Element equality uses Python `==` (`expressions::py_eq` — numeric
-/// bridge + bool-as-int), matching `secantus.query._op_all`. Regex elements
-/// (which Python matches as patterns) defer to Python.
-fn op_all(values: &[Cand], required: &Bson, field: &str, descend: bool) -> R {
-    let field_name = field;
+/// `$all`: every listed element holds of the field -- mongod parses
+/// `{f: {$all: [x, y]}}` as `{$and: [{f: x}, {f: y}]}`, so each element is an
+/// EQUALITY with all of equality's rules: `$all: [null]` matches a missing
+/// field and a null, `$all: [[]]` an empty array, `$all: [5]` a 5 or an array
+/// holding one (measured 8.2.11, 2026-10-15). A regex element matches as a
+/// pattern, and a `{$elemMatch: ...}` element as that operator; mixing an
+/// `$elemMatch` with anything else is refused, as mongod refuses it.
+fn op_all(
+    values: &[Cand],
+    required: &Bson,
+    coll: Option<&Collation>,
+    field: &str,
+    descend: bool,
+) -> R {
     let Bson::Array(required) = required else {
         return Err(Fallback::mongo(2, "$all needs an array"));
     };
-    // `$all: []` matches nothing (mongod), not everything — the vacuous
-    // all-clauses-satisfied below would otherwise be true for every value.
+    // `$all: []` matches nothing (mongod), not everything.
     if required.is_empty() {
         return Ok(false);
     }
@@ -2516,64 +2523,19 @@ fn op_all(values: &[Cand], required: &Bson, field: &str, descend: bool) -> R {
     if required.iter().any(has_dollar) && !required.iter().all(is_elemmatch) {
         return Err(Fallback::Defer);
     }
-    // A regex element matches as a *pattern* (not by equality), mirroring
-    // `query._op_all`; a non-regex element matches by `py_eq`. A regex the
-    // engine can't compile still defers via `op_regex`. mongod treats a scalar
-    // field value like a one-element array for `$all` (only `$elemMatch`
-    // clauses require an actual array) — verified against mongod 7.0.12.
-    for c in values {
-        let Some(field) = c.value else { continue };
-        // The elements to match each required clause against: the array's own
-        // elements, or the scalar itself as a single element.
-        let elems: &[Bson] = match (descend, field) {
-            (true, Bson::Array(arr)) => arr,
-            // `descend = false`: the value IS the single element to match --
-            // inside `$elemMatch` the array step is already spent.
-            (_, scalar) => std::slice::from_ref(scalar),
+    for r in required {
+        let holds = match r {
+            Bson::Document(d) if is_elemmatch(r) => {
+                op_elem_match(values, d.get("$elemMatch").unwrap_or(&Bson::Null), field)?
+            }
+            Bson::RegularExpression(_) => op_regex(values, r, None, descend)?,
+            _ => eq_with_array(values, r, coll, descend)?,
         };
-        let is_array = matches!(field, Bson::Array(_));
-        let mut all_present = true;
-        for r in required {
-            // A `{$elemMatch: {...}}` clause requires *some* element of an actual
-            // array to match the sub-query — a scalar field never satisfies it.
-            if let Bson::Document(rd) = r {
-                if rd.len() == 1 {
-                    if let Some(sub) = rd.get("$elemMatch") {
-                        let ok = is_array && {
-                            let arr_bson = Bson::Array(elems.to_vec());
-                            // `field` is shadowed here by a local `&Bson`, so
-                            // reach past it for the name the error message wants.
-                            op_elem_match(&[Cand::plain(Some(&arr_bson))], sub, field_name)?
-                        };
-                        if !ok {
-                            all_present = false;
-                            break;
-                        }
-                        continue;
-                    }
-                }
-            }
-            let mut found = false;
-            for e in elems {
-                let matched = match r {
-                    Bson::RegularExpression(_) => op_regex(&[Cand::plain(Some(e))], r, None, true)?,
-                    _ => expressions::py_eq(e, r)?,
-                };
-                if matched {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                all_present = false;
-                break;
-            }
-        }
-        if all_present {
-            return Ok(true);
+        if !holds {
+            return Ok(false);
         }
     }
-    Ok(false)
+    Ok(true)
 }
 
 fn op_size(values: &[Cand], size: &Bson) -> R {
@@ -2679,11 +2641,18 @@ fn mod_int(val: &Bson) -> Result<Option<i64>, Fallback> {
     Ok(match val {
         Bson::Int32(n) => Some(*n as i64),
         Bson::Int64(n) => Some(*n),
+        // Truncated toward zero, and only when that fits an Int64: mongod
+        // matches neither `3e250` nor `2^63` against any remainder (measured
+        // 8.2.11, 2026-10-15), where a saturating cast read them as
+        // `i64::MAX`.
         Bson::Double(d) => {
-            if d.is_nan() || d.is_infinite() {
+            let t = d.trunc();
+            if d.is_nan()
+                || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t)
+            {
                 None
             } else {
-                Some(d.trunc() as i64)
+                Some(t as i64)
             }
         }
         // Truncated toward zero on the decimal digits, not through f64 --
@@ -3185,6 +3154,39 @@ mod tests {
 
     use super::*;
     use bson::doc;
+
+    /// mongod 8.2.11 (measured 2026-10-15): `$all` is an AND of equalities,
+    /// so `[null]` matches a missing field and `[[]]` an empty array; `$mod`
+    /// matches no number whose truncation does not fit an Int64.
+    #[test]
+    fn all_is_equalities_and_mod_needs_an_int64() {
+        assert!(m(doc! {"b": 1}, doc! {"a": {"$all": [Bson::Null]}}));
+        assert!(m(
+            doc! {"a": Bson::Null},
+            doc! {"a": {"$all": [Bson::Null, Bson::Null]}}
+        ));
+        assert!(m(
+            doc! {"a": [Bson::Null]},
+            doc! {"a": {"$all": [Bson::Null]}}
+        ));
+        assert!(!m(doc! {"a": 1}, doc! {"a": {"$all": [Bson::Null]}}));
+        assert!(m(doc! {"a": []}, doc! {"a": {"$all": [[]]}}));
+        assert!(!m(
+            doc! {"b": [{"x": 1}]},
+            doc! {"b.x": {"$all": [Bson::Null]}}
+        ));
+        assert!(m(doc! {"c": 1}, doc! {"b.x": {"$all": [Bson::Null]}}));
+        assert!(m(doc! {"a": [5, 6]}, doc! {"a": {"$all": [5, 6]}}));
+        assert!(!m(doc! {"a": [5]}, doc! {"a": {"$all": [5, 6]}}));
+        assert!(!m(doc! {"a": []}, doc! {"a": {"$all": []}}));
+        for (v, rem) in [(3e250, 1i32), (9.3e18, 1), (2f64.powi(63), 0), (-9.3e18, 0)] {
+            assert!(!m(doc! {"a": v}, doc! {"a": {"$mod": [2, rem]}}), "{v}");
+            assert!(!m(doc! {"a": v}, doc! {"a": {"$mod": [2, 0]}}), "{v}");
+        }
+        assert!(m(doc! {"a": 1e-300}, doc! {"a": {"$mod": [2, 0]}}));
+        assert!(m(doc! {"a": -9.2e18}, doc! {"a": {"$mod": [2, 0]}}));
+        assert!(m(doc! {"a": -5.5}, doc! {"a": {"$mod": [2, -1]}}));
+    }
 
     fn m(doc: Document, query: Document) -> bool {
         let owned = matches(&doc, &query, &Document::new(), None).expect("should not fall back");

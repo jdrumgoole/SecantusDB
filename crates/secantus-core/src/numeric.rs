@@ -138,8 +138,87 @@ pub fn from_f64(d: f64) -> NumVal {
     if d == 0.0 {
         return NumVal::Zero;
     }
-    // Rust's shortest Display matches Python's Decimal(repr(d)) digits.
-    from_decimal_str(&format!("{d}"))
+    let (sign, digits, exp) = exact_f64_parts(d);
+    NumVal::Finite { sign, digits, exp }
+}
+
+/// The EXACT decimal value of a finite, nonzero double: its sign, its
+/// digits and the power of ten they are scaled by (`value = digits *
+/// 10^exp`), with no leading or trailing zero digit.
+///
+/// mongod compares a double with an Int64 or a Decimal128 by the double's
+/// exact binary value (measured 8.2.11: `Decimal128("0.1")` is not equal to
+/// the double `0.1`, and is less than it). The shortest decimal that
+/// round-trips (`format!("{d}")`, Python's `repr`) is a different number:
+/// `0.1` instead of `0.1000000000000000055511151231257827021181583404541015625`.
+///
+/// A double is `m * 2^e` with `m` odd. For `e >= 0` that is the integer
+/// `m << e`; for `e < 0` it is `m * 5^-e / 10^-e`, so the digits are those of
+/// `m * 5^-e` -- which, `m` being odd, ends in no zero. Both are built in
+/// base-1e9 limbs, a few hundred multiplications for the smallest double
+/// (`5e-324` has 751 digits).
+pub fn exact_f64_parts(d: f64) -> (i8, Vec<u8>, i64) {
+    const LIMB: u64 = 1_000_000_000;
+    let bits = d.to_bits();
+    let sign: i8 = if bits >> 63 == 1 { -1 } else { 1 };
+    let raw_exp = ((bits >> 52) & 0x7FF) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (mut m, mut e) = if raw_exp == 0 {
+        (frac, -1074i64)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1075)
+    };
+    let tz = m.trailing_zeros() as i64;
+    m >>= tz;
+    e += tz;
+    // Little-endian base-1e9 limbs of `m`.
+    let mut limbs: Vec<u64> = vec![m % LIMB, (m / LIMB) % LIMB, m / (LIMB * LIMB)];
+    while limbs.len() > 1 && *limbs.last().unwrap() == 0 {
+        limbs.pop();
+    }
+    let mul = |limbs: &mut Vec<u64>, by: u64| {
+        let mut carry = 0u64;
+        for l in limbs.iter_mut() {
+            let v = *l * by + carry;
+            *l = v % LIMB;
+            carry = v / LIMB;
+        }
+        while carry > 0 {
+            limbs.push(carry % LIMB);
+            carry /= LIMB;
+        }
+    };
+    let exp10 = if e >= 0 {
+        // `m << e`, 29 bits at a time (a limb times 2^29 fits in a u64).
+        let mut left = e;
+        while left > 0 {
+            let step = left.min(29);
+            mul(&mut limbs, 1u64 << step);
+            left -= step;
+        }
+        0
+    } else {
+        // `m * 5^k`, 5^13 at a time (a limb times 5^13 fits in a u64).
+        let mut left = -e;
+        while left > 0 {
+            let step = left.min(13);
+            mul(&mut limbs, 5u64.pow(step as u32));
+            left -= step;
+        }
+        e
+    };
+    let mut digits: Vec<u8> = Vec::with_capacity(limbs.len() * 9);
+    for (at, l) in limbs.iter().rev().enumerate() {
+        let text = if at == 0 {
+            l.to_string()
+        } else {
+            format!("{l:09}")
+        };
+        digits.extend(text.bytes().map(|b| b - b'0'));
+    }
+    let mut exp = exp10;
+    normalize(&mut digits, &mut exp);
+    (sign, digits, exp)
 }
 
 /// Exact ordering of an i64-range integer against a double, without
@@ -159,11 +238,17 @@ fn cmp_i64_f64(i: i64, f: f64) -> Option<Ordering> {
     if f == f64::NEG_INFINITY {
         return Some(Ordering::Greater);
     }
-    // `as` saturates: for |f| >= 2^63 (reachable via the ungated Int32 arms)
-    // t pins to i64::MAX/MIN, which still orders correctly against any i32,
-    // and the equal/frac tie-break is unreachable there (t != i). For
-    // |f| < 2^63 the trunc converts exactly (integral doubles > 2^53 are
-    // exact; below 2^53 everything is).
+    // Outside [-2^63, 2^63) no i64 reaches the double: `as` would saturate,
+    // and `i64::MAX` would then read as EQUAL to the double 2^63.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    // Inside it the trunc converts exactly (an integral double is exact; a
+    // double above 2^53 is integral).
     let t = f.trunc() as i64;
     Some(match i.cmp(&t) {
         Ordering::Equal => {
@@ -189,27 +274,11 @@ fn cmp_i64_f64(i: i64, f: f64) -> Option<Ordering> {
 /// * `Some(None)`  — unordered (NaN involved), matching [`cmp`]'s `None`.
 /// * `Some(Some)`  — the ordering.
 ///
-/// Double↔double uses `partial_cmp` (shortest-repr digit ordering and f64
-/// ordering agree for all finite doubles: repr round-trips, and rounding is
-/// monotone, so distinct doubles keep their order and equal reprs mean equal
-/// doubles; ±0.0 both classify to `Zero` and compare equal either way;
-/// infinities and NaN match the variant handling).
-///
-/// The MIXED int↔double arm is gated to |values| ≤ 2^53. The engines'
-/// established semantic (Python parity) compares a double by the decimal
-/// value of its SHORTEST REPR, which can differ from the exact binary value
-/// above 2^53 (e.g. the double 2^63 reprs as 9223372036854776000) — an exact
-/// comparison would diverge there, so those pairs fall back to the digit
-/// form. Within ±2^53 every integer in play is exactly representable and a
-/// repr cannot cross an integer boundary, so exact and repr-decimal verdicts
-/// coincide.
+/// Double↔double uses `partial_cmp`, which is exact. Int↔double is
+/// [`cmp_i64_f64`], exact for every pair: mongod orders a double by its exact
+/// binary value, so the double 2^62 equals the Int64 2^62 and is less than
+/// the Int64 2^62 + 46 (measured 8.2.11).
 pub fn fast_cmp(a: &Bson, b: &Bson) -> Option<Option<Ordering>> {
-    // Gate on the INTEGER only: an exactly-representable i (|i| <= 2^53)
-    // rounds to itself, so it can never sit strictly between a double and
-    // that double's repr-decimal — the two verdicts coincide for any double
-    // operand. Int64 outside +/-2^53 declines to the digit form.
-    const SAFE_I: i64 = 1 << 53;
-    let mixed_ok = |i: i64| (-SAFE_I..=SAFE_I).contains(&i);
     match (a, b) {
         (Bson::Int32(x), Bson::Int32(y)) => Some(Some(x.cmp(y))),
         (Bson::Int64(x), Bson::Int64(y)) => Some(Some(x.cmp(y))),
@@ -217,13 +286,11 @@ pub fn fast_cmp(a: &Bson, b: &Bson) -> Option<Option<Ordering>> {
         (Bson::Int64(x), Bson::Int32(y)) => Some(Some(x.cmp(&(*y as i64)))),
         (Bson::Double(x), Bson::Double(y)) => Some(x.partial_cmp(y)),
         (Bson::Int32(x), Bson::Double(y)) => Some(cmp_i64_f64(*x as i64, *y)),
-        (Bson::Int64(x), Bson::Double(y)) if mixed_ok(*x) => Some(cmp_i64_f64(*x, *y)),
+        (Bson::Int64(x), Bson::Double(y)) => Some(cmp_i64_f64(*x, *y)),
         (Bson::Double(x), Bson::Int32(y)) => {
             Some(cmp_i64_f64(*y as i64, *x).map(Ordering::reverse))
         }
-        (Bson::Double(x), Bson::Int64(y)) if mixed_ok(*y) => {
-            Some(cmp_i64_f64(*y, *x).map(Ordering::reverse))
-        }
+        (Bson::Double(x), Bson::Int64(y)) => Some(cmp_i64_f64(*y, *x).map(Ordering::reverse)),
         _ => None,
     }
 }
@@ -518,6 +585,58 @@ mod fast_path_tests {
                 }
             }
         }
+    }
+
+    /// A double is compared by its exact binary value (mongod 8.2.11,
+    /// measured 2026-10-15).
+    #[test]
+    fn a_double_is_its_exact_value() {
+        let (sign, digits, exp) = exact_f64_parts(0.1);
+        let text: String = digits.iter().map(|d| char::from(b'0' + d)).collect();
+        assert_eq!(
+            (sign, text.as_str(), exp),
+            (
+                1,
+                "1000000000000000055511151231257827021181583404541015625",
+                -55
+            )
+        );
+        let (_, digits, exp) = exact_f64_parts(5e-324);
+        assert_eq!((digits.len(), exp), (751, -1074));
+        let (_, digits, exp) = exact_f64_parts(-(2f64.powi(62)));
+        let text: String = digits.iter().map(|d| char::from(b'0' + d)).collect();
+        assert_eq!((text.as_str(), exp), ("4611686018427387904", 0));
+
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let ord = |a: Bson, b: Bson| cmp(&classify(&a).unwrap(), &classify(&b).unwrap());
+        assert_eq!(ord(dec("0.1"), Bson::Double(0.1)), Some(Ordering::Less));
+        assert_eq!(
+            ord(
+                dec("0.1000000000000000055511151231257827"),
+                Bson::Double(0.1)
+            ),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            ord(Bson::Int64(1 << 62), Bson::Double(2f64.powi(62))),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            ord(
+                Bson::Int64(4611686018427387950),
+                Bson::Double(2f64.powi(62))
+            ),
+            Some(Ordering::Greater)
+        );
+        let big = Bson::Double(2f64.powi(63));
+        assert_eq!(
+            fast_cmp(&Bson::Int64(i64::MAX), &big),
+            Some(Some(Ordering::Less))
+        );
+        assert_eq!(
+            fast_cmp(&Bson::Int64(i64::MIN), &Bson::Double(-(2f64.powi(63)))),
+            Some(Some(Ordering::Equal))
+        );
     }
 
     /// Decimal128 and non-numeric operands must be declined (caller falls

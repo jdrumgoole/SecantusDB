@@ -941,6 +941,19 @@ def _rand_query(rng):
     return {field: {op: _rand_scalar(rng)}}
 
 
+def _all_with_null(query) -> bool:
+    """A KNOWN difference, excluded on purpose since 2026-10-15: mongod 8.2.11
+    reads ``$all: [..., null, ...]`` as an equality to null, which a MISSING
+    field meets; the Rust engine was moved to that (RM-152) and the deprecated
+    Python engine still skips a missing field. What this gives up: other drift
+    in a query holding such an ``$all``. The curated ``$all`` cases still pin
+    it without null."""
+    return any(
+        isinstance(cond, dict) and isinstance(cond.get("$all"), list) and None in cond["$all"]
+        for cond in query.values()
+    )
+
+
 def test_randomised_fuzz_parity():
     rng = random.Random(0x5EC0)
     handled = 0
@@ -950,8 +963,10 @@ def test_randomised_fuzz_parity():
         rust = _rust_match(doc, query)
         if rust is None:
             continue  # fallback case — shim would use pure Python
-        handled += 1
         py = _pure.matches(doc, query)
+        if _all_with_null(query) and not same(rust, py):
+            continue
+        handled += 1
         assert same(rust, py), f"divergence: rust={rust} pure={py} query={query} doc={doc}"
     assert handled > 1000, f"expected the Rust matcher to handle many cases, only {handled}"
 
@@ -984,8 +999,10 @@ def test_batch_matches_parity():
             # whole-batch fallback must mean at least one doc deferred per-doc too.
             assert any(r is None for r in per_doc) or not docs
             continue
-        handled += 1
         py = [_pure.matches(d, query) for d in docs]
+        if _all_with_null(query) and not same(rust, py):
+            continue
+        handled += 1
         assert same(rust, py), f"batch divergence: rust={rust} pure={py} query={query} docs={docs}"
     assert handled > 500, f"expected many handled batches, only {handled}"
 

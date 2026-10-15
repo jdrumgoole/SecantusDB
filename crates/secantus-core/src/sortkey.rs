@@ -40,9 +40,14 @@ const RANK_MAXKEY: u8 = 14;
 
 const NUM_NAN: u8 = 0x00;
 const NUM_NEG_INF: u8 = 0x20;
-const NUM_NEG: u8 = 0x40;
+/// A finite negative. Number-key format 1 wrote 0x40, so a key of either
+/// format says which it is, and no key of one format equals a key of the
+/// other: a store is re-keyed in place without a new key ever landing on
+/// an old one.
+const NUM_NEG: u8 = 0x41;
 const NUM_ZERO: u8 = 0x80;
-const NUM_POS: u8 = 0xC0;
+/// A finite positive (format 1: 0xC0; see [`NUM_NEG`]).
+const NUM_POS: u8 = 0xC1;
 const NUM_POS_INF: u8 = 0xFF;
 
 /// Compound-key separator (also the escape sentinel). Matches
@@ -132,17 +137,99 @@ fn parts_from_int(mut n: i128) -> Option<DecimalParts> {
     Some(DecimalParts { sign, digits, exp })
 }
 
+/// The number-key format this encoder writes. Stores record it (the Rust
+/// server's `numberKeys` marker, the Python server's `_NUMBER_KEY_FORMAT`) and
+/// rebuild the keys of a store written by another.
+///
+/// * 1 (no marker) -- a double keyed by its SHORTEST decimal (`format!("{d}")`,
+///   Python's `Decimal(repr(d))`), so the double `0.1` and `Decimal128("0.1")`
+///   shared a key, and a one-byte decimal exponent, so every number whose
+///   exponent fell outside -128..=127 shared ONE key per sign, which sorted
+///   above every other positive (below every other negative).
+/// * 2 -- a double keyed by its EXACT binary value, and a two-byte exponent,
+///   enough for every double and every Decimal128. The sign markers moved
+///   (0x40 -> 0x41, 0xC0 -> 0xC1), so a finite number's key names its format.
+pub const NUMBER_KEY_FORMAT: i32 = 2;
+
+/// Whether `key`, an encoded value, is a finite number keyed by a number-key
+/// format before 2 (its marker is the old one). NaN, the infinities and
+/// zero are keyed alike by both formats.
+pub fn is_format1_number_key(key: &[u8]) -> bool {
+    matches!(key, [RANK_NUMBER, 0x40 | 0xC0, ..])
+}
+
+/// `[sign][exponent, 2 bytes][digit pairs][terminator]`. The exponent is the
+/// scientific one (`d.ddd * 10^e`) biased by 0x8000, big-endian; the digits
+/// are packed two to a byte as `pair + 1` (1..=100), so a shorter mantissa
+/// sorts first and the terminator 0x00 sits below every pair. A negative
+/// number inverts the exponent and maps each pair to `0x64 - (pair + 1)`,
+/// with terminator 0xff, so a larger magnitude sorts first.
 fn encode_number_from_parts(p: &DecimalParts) -> Vec<u8> {
+    let sci_exp = p.exp + p.digits.len() as i64 - 1;
+    // Decimal128 reaches about +-6176, a double +-324: well inside i16.
+    let biased = (0x8000 + sci_exp).clamp(0, 0xFFFF) as u16;
+    let e = if p.sign < 0 { 0xFFFF - biased } else { biased };
+    let mut digits = p.digits.clone();
+    if digits.len() % 2 == 1 {
+        digits.push(0);
+    }
+    let mut out = Vec::with_capacity(4 + digits.len() / 2);
+    out.push(if p.sign > 0 { NUM_POS } else { NUM_NEG });
+    out.extend_from_slice(&e.to_be_bytes());
+    for pair in digits.as_chunks::<2>().0 {
+        let b = pair[0] * 10 + pair[1] + 1;
+        out.push(if p.sign < 0 { 0x64 - b } else { b });
+    }
+    out.push(if p.sign > 0 { 0x00 } else { 0xff });
+    out
+}
+
+thread_local! {
+    static FORMAT_1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's number keys written in number-key format 1, as
+/// a build before 2026-10-15 wrote them. For tests that build a store as an
+/// earlier version left it, to check it is brought up to date; nothing else
+/// may call it.
+#[doc(hidden)]
+pub fn with_number_key_format_1<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORMAT_1.with(|c| c.set(self.0));
+        }
+    }
+    let _r = Restore(FORMAT_1.with(|c| c.replace(true)));
+    f()
+}
+
+/// A finite nonzero number's key in number-key format 1: the shortest
+/// decimal of a double, a one-byte exponent, one key per sign beyond it.
+fn encode_number_format_1(b: &Bson) -> Option<Vec<u8>> {
+    let text = match b {
+        Bson::Double(d) if d.is_finite() && *d != 0.0 => format!("{d}"),
+        Bson::Int32(n) if *n != 0 => n.to_string(),
+        Bson::Int64(n) if *n != 0 => n.to_string(),
+        Bson::Decimal128(d) => {
+            let t = d.to_string();
+            let low = t.to_lowercase();
+            if low.contains("nan") || low.contains("inf") {
+                return None;
+            }
+            t
+        }
+        _ => return None,
+    };
+    let p = parse_decimal_str(&text)?;
     let sci_exp = p.exp + p.digits.len() as i64 - 1;
     let mut bias_e = 128 + sci_exp;
     if !(0..=255).contains(&bias_e) {
-        // Out of single-byte exponent range — sort on the correct side of
-        // zero, magnitudes within the rank collapse (matches Python).
-        return if p.sign > 0 {
-            vec![NUM_POS, 0xFF, 0xFF]
+        return Some(if p.sign > 0 {
+            vec![0xC0, 0xFF, 0xFF]
         } else {
-            vec![NUM_NEG, 0x00, 0x00]
-        };
+            vec![0x40, 0x00, 0x00]
+        });
     }
     if p.sign < 0 {
         bias_e = 0xFF - bias_e;
@@ -151,29 +238,21 @@ fn encode_number_from_parts(p: &DecimalParts) -> Vec<u8> {
     if digits.len() % 2 == 1 {
         digits.push(0);
     }
-    // `digits` was padded to an even length just above, so the `as_chunks`
-    // remainder (`.1`) is always empty and the pairing is exhaustive — same
-    // semantics as the `chunks_exact(2)` this replaces.
-    let mut pairs: Vec<u8> = digits
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| c[0] * 10 + c[1] + 1)
-        .collect();
-    if p.sign < 0 {
-        for b in pairs.iter_mut() {
-            *b = 0x64 - *b;
-        }
+    let mut out = vec![if p.sign > 0 { 0xC0 } else { 0x40 }, bias_e as u8];
+    for pair in digits.as_chunks::<2>().0 {
+        let b = pair[0] * 10 + pair[1] + 1;
+        out.push(if p.sign < 0 { 0x64 - b } else { b });
     }
-    let prefix = if p.sign > 0 { NUM_POS } else { NUM_NEG };
-    let terminator = if p.sign > 0 { 0x00 } else { 0xff };
-    let mut out = vec![prefix, bias_e as u8];
-    out.append(&mut pairs);
-    out.push(terminator);
-    out
+    out.push(if p.sign > 0 { 0x00 } else { 0xff });
+    Some(out)
 }
 
 fn encode_number(b: &Bson) -> Vec<u8> {
+    if FORMAT_1.with(|c| c.get()) {
+        if let Some(key) = encode_number_format_1(b) {
+            return key;
+        }
+    }
     let parts = match b {
         Bson::Int32(n) => parts_from_int(*n as i128),
         Bson::Int64(n) => parts_from_int(*n as i128),
@@ -187,9 +266,14 @@ fn encode_number(b: &Bson) -> Vec<u8> {
             if *d == 0.0 {
                 None
             } else {
-                // Python: Decimal(repr(value)); Rust's shortest Display is the
-                // equivalent round-tripping decimal for a finite f64.
-                parse_decimal_str(&format!("{d}"))
+                // The double's EXACT value, as mongod compares it: `0.1` is
+                // 0.1000000000000000055511151231257827021181583404541015625.
+                let (sign, digits, exp) = crate::numeric::exact_f64_parts(*d);
+                Some(DecimalParts {
+                    sign: sign as i32,
+                    digits,
+                    exp,
+                })
             }
         }
         Bson::Decimal128(d) => {
@@ -461,6 +545,48 @@ mod tests {
 
     fn ev(v: Bson) -> Vec<u8> {
         encode_value(&v, None).unwrap()
+    }
+
+    /// Number-key format 2: every number keyed by its exact value, in order,
+    /// whatever its exponent (mongod 8.2.11's order, measured 2026-10-15).
+    #[test]
+    fn numbers_are_keyed_by_exact_value_at_any_exponent() {
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let ascending = [
+            Bson::Double(f64::NAN),
+            Bson::Double(f64::NEG_INFINITY),
+            dec("-1E+6144"),
+            Bson::Double(-3e250),
+            Bson::Double(-1.0),
+            Bson::Double(-1e-300),
+            dec("-1E-6176"),
+            Bson::Int32(0),
+            dec("1E-6176"),
+            Bson::Double(5e-324),
+            Bson::Double(1e-300),
+            dec("0.1"),
+            dec("0.1000000000000000055511151231257827"),
+            Bson::Double(0.1),
+            Bson::Int32(5),
+            Bson::Double(2f64.powi(62)),
+            Bson::Int64(4611686018427387950),
+            Bson::Double(3e250),
+            dec("1E+400"),
+            dec("1E+6144"),
+            Bson::Double(f64::INFINITY),
+        ];
+        for pair in ascending.windows(2) {
+            assert!(
+                ev(pair[0].clone()) < ev(pair[1].clone()),
+                "{:?} should key below {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Equal values, equal keys.
+        assert_eq!(ev(Bson::Int64(1 << 62)), ev(Bson::Double(2f64.powi(62))));
+        assert_eq!(ev(Bson::Int32(5)), ev(dec("5.000")));
+        assert_eq!(ev(Bson::Double(0.5)), ev(dec("0.5")));
     }
 
     /// Entry format 4: documents and arrays keyed by VALUE. Each pair is

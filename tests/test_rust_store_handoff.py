@@ -114,3 +114,42 @@ def test_a_geo_index_finds_what_either_server_wrote(tmp_path: Path) -> None:
         db.g.insert_one({"_id": 3, "loc": [[3, 3], [40, 40]]})
         assert sorted(d["_id"] for d in db.g.find(box)) == [1, 2, 3]
         assert set(_index(db, "g", "geo")) == {"v", "key", "name"}
+
+
+def test_number_keys_are_read_alike_by_both_servers(tmp_path: Path) -> None:
+    """Both servers key a number by its exact value with a two-byte exponent
+    (number-key format 2), so each finds the other's `_id`s and index entries
+    -- a double `0.1` beside `Decimal128("0.1")`, numbers beyond exponent
+    +-127 -- and neither rebuilds the other's indexes."""
+    from bson.decimal128 import Decimal128
+
+    data = tmp_path / "store"
+    with _Rust(data) as db:
+        db.n.create_index("a", name="a_1")
+        db.n.insert_many(
+            [
+                {"_id": 0.1, "a": 1e-300},
+                {"_id": Decimal128("0.1"), "a": 3e250},
+                {"_id": 1e-300, "a": -1e-300},
+            ]
+        )
+    with _Python(data) as db:
+        # The Rust server's `_id` keys and entries.
+        assert db.n.find_one({"_id": Decimal128("0.1")})["a"] == 3e250
+        assert db.n.find_one({"_id": 1e-300})["a"] == -1e-300
+        assert sorted(d["a"] for d in db.n.find({"a": {"$gt": 1e200}})) == [3e250]
+        with pytest.raises(DuplicateKeyError):
+            db.n.insert_one({"_id": 1e-300})
+        db.n.insert_one({"_id": 3e250, "a": 2e-300})
+        assert set(_index(db, "n", "a_1")) == {"v", "key", "name"}
+    with _Rust(data) as db:
+        # The Python server's.
+        assert db.n.find_one({"_id": 3e250})["a"] == 2e-300
+        assert sorted(d["a"] for d in db.n.find({"a": {"$lt": 1}})) == [-1e-300, 1e-300, 2e-300]
+        with pytest.raises(DuplicateKeyError):
+            db.n.insert_one({"_id": 3e250})
+        assert [d["_id"] for d in db.n.find({"_id": {"$lt": 1}}).sort("_id", 1)] == [
+            1e-300,
+            Decimal128("0.1"),
+            0.1,
+        ]

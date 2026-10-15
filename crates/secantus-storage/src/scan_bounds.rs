@@ -10,12 +10,6 @@
 //! cannot be trusted to sort where its value does, a stretch is widened to
 //! its type bracket rather than cut:
 //!
-//! - A number whose decimal exponent is outside -128..=127 is keyed by ONE
-//!   collapsed key per sign (`sortkey::encode_number`), which sorts at the
-//!   top of the positives (or the bottom of the negatives) whatever the
-//!   value: `1e-300` sorts above `5`. A stretch that cuts the numbers also
-//!   reads those two keys, and a number bound that is itself collapsed is
-//!   widened to the numbers.
 //! - A string, JavaScript or regex key has no terminator, so inverting it for
 //!   a DESCENDING index does not reverse a prefix: inverted, `"s"` still
 //!   sorts before `"sa"`. A range end of those types on a descending field is
@@ -129,12 +123,6 @@ impl Stretch {
         let out = Stretch { lo, hi };
         (!out.is_empty()).then_some(out)
     }
-
-    /// Whether any key of rank `rank` can be inside.
-    fn reaches_rank(&self, rank: u8) -> bool {
-        let inside = Stretch::bracket(rank);
-        self.intersect(&inside).is_some()
-    }
 }
 
 /// What a predicate bounds an index to.
@@ -211,19 +199,6 @@ fn rank_js() -> u8 {
     rank(&Bson::JavaScriptCode(String::new()))
 }
 
-/// The two keys every number outside the encoder's exponent range shares.
-pub(crate) fn collapsed_keys() -> [Vec<u8>; 2] {
-    [
-        encode_value(&Bson::Double(1e300), None).unwrap_or_default(),
-        encode_value(&Bson::Double(-1e300), None).unwrap_or_default(),
-    ]
-}
-
-/// Whether `v` is a number keyed by one of the collapsed keys.
-pub(crate) fn is_collapsed(v: &Bson) -> bool {
-    key(v).is_some_and(|k| collapsed_keys().contains(&k))
-}
-
 /// The ranks whose keys have no terminator (see the module notes).
 pub(crate) fn open_ended_rank(r: u8) -> bool {
     r == rank_string() || r == rank_js() || r == rank_regex()
@@ -244,10 +219,7 @@ fn is_nan(v: &Bson) -> bool {
 /// Whether a key of `v` sorts where `v` does among the other values of its
 /// rank, so that it can END a range.
 fn trusted_end(v: &Bson, desc: bool) -> bool {
-    let Some(k) = key(v) else {
-        return false;
-    };
-    if collapsed_keys().contains(&k) {
+    if key(v).is_none() {
         return false;
     }
     match v {
@@ -644,17 +616,7 @@ pub(crate) fn for_predicate(pred: &Bson, multikey: bool, desc: bool) -> Option<B
         Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => return None,
         other => equality(other, desc)?,
     };
-    let mut stretches: Vec<Stretch> = stretches.into_iter().filter(|s| !s.is_empty()).collect();
-    // A stretch that cuts the numbers misses the collapsed keys.
-    let numbers = rank_number();
-    if stretches
-        .iter()
-        .any(|s| s.as_point().is_none() && s.reaches_rank(numbers))
-    {
-        for k in collapsed_keys() {
-            stretches.push(Stretch::point(k));
-        }
-    }
+    let stretches: Vec<Stretch> = stretches.into_iter().filter(|s| !s.is_empty()).collect();
     Some(Bounds { stretches, broad })
 }
 
@@ -783,20 +745,18 @@ mod tests {
             hi: Some(End::Key(two))
         }));
         assert!(b.stretches.contains(&Stretch::point(nan)));
-        for k in collapsed_keys() {
-            assert!(b.stretches.contains(&Stretch::point(k)));
-        }
     }
 
     #[test]
-    fn a_range_end_is_inclusive_and_reads_the_collapsed_numbers() {
+    fn a_range_end_is_inclusive_at_any_exponent() {
         let b = bounds(Bson::Document(doc! {"$gt": 2}));
         let two = encode_value(&Bson::Int32(2), None).unwrap();
         assert_eq!(b.stretches[0].lo, Some(End::Key(two)));
-        assert_eq!(b.stretches.len(), 3);
-        // A collapsed bound is no bound inside the numbers.
+        assert_eq!(b.stretches.len(), 1);
+        // Number-key format 2 keys every exponent in order.
+        let big = encode_value(&Bson::Double(1e200), None).unwrap();
         let b = bounds(Bson::Document(doc! {"$gt": 1e200}));
-        assert_eq!(b.stretches[0].lo, Some(End::Floor(rank_number())));
+        assert_eq!(b.stretches[0].lo, Some(End::Key(big)));
     }
 
     #[test]

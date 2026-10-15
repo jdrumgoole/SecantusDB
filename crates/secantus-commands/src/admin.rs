@@ -1798,6 +1798,7 @@ pub(crate) fn listed_indexes(
         ix.remove("entryFormat");
         ix.remove("collationKeys");
         ix.remove("geoKeys");
+        ix.remove("numberKeys");
         ix.remove("pythonKeys");
         *ix = listed_spec(std::mem::take(ix));
     }
@@ -3283,6 +3284,7 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
     "multikey",
     "collationKeys",
     "geoKeys",
+    "numberKeys",
     "pythonKeys",
 ];
 

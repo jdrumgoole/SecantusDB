@@ -2431,6 +2431,15 @@ const GEO_KEYS: &str = "geoKeys";
 /// The value of [`GEO_KEYS`] this build writes.
 const GEO_KEY_FORMAT: i32 = 2;
 
+/// Catalog marker on an index: the number-key format
+/// (`sortkey::NUMBER_KEY_FORMAT`) its entries were written with. An index
+/// without it was built before 2026-10-15, when a double was keyed by its
+/// shortest decimal rather than its exact value and every number whose
+/// exponent fell outside -128..=127 shared one key per sign; it is rebuilt
+/// when the store opens. Both servers write and read it. Not a user option:
+/// `listIndexes` strips it.
+const NUMBER_KEYS: &str = "numberKeys";
+
 /// Options only this server's catalog carries, which a rebuild leaves out of
 /// the options it builds from: `create_index_in_txn` stamps them again.
 const BUILD_STAMPS: &[&str] = &[
@@ -2438,12 +2447,16 @@ const BUILD_STAMPS: &[&str] = &[
     "multikey",
     COLLATION_KEYS,
     GEO_KEYS,
+    NUMBER_KEYS,
     "pythonKeys",
 ];
 
 /// Whether an index's entries were written by rules this build does not
 /// read them by (see `rebuild_outdated_indexes`).
 fn index_entries_outdated(key: &Document, opts: &Document) -> bool {
+    if opts.get_i32(NUMBER_KEYS).ok() != Some(sortkey::NUMBER_KEY_FORMAT) {
+        return true;
+    }
     if parse_geo_2d(key, opts).is_some() {
         return opts.get_i32(GEO_KEYS).ok() != Some(GEO_KEY_FORMAT);
     }
@@ -5157,6 +5170,29 @@ fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
     None
 }
 
+/// The oplog-meta row recording a store's number-key format (see
+/// `Storage::upgrade_number_keys`).
+const NUMBER_KEYS_META: &str = "numberKeys";
+
+/// The number-key format a store's keys are in: 1 when it never recorded
+/// one (every store written before 2026-10-15).
+fn stored_number_key_format(session: &Session) -> Result<i32> {
+    let c = match session.open_cursor(OPLOG_META_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(1),
+        Err(e) => return Err(e.into()),
+    };
+    c.set_key_s(NUMBER_KEYS_META);
+    match c.search() {
+        Ok(()) => {
+            let d = decode_doc(&c.get_value_u()?)?;
+            Ok(d.get_i32("format").unwrap_or(1))
+        }
+        Err(e) if e.is_not_found() => Ok(1),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     let c = session.open_cursor(OPLOG_META_TABLE, None)?;
     c.set_key_s("state");
@@ -5820,6 +5856,9 @@ impl Storage {
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
         };
+        // Before anything looks a key up: crash recovery below replays writes
+        // by `_id`.
+        storage.upgrade_number_keys()?;
         if storage.data_nonlogged {
             // Crash recovery: the data tables rolled back to the last stable
             // checkpoint; the (WAL-logged) oplog has everything. Replay the
@@ -11424,6 +11463,7 @@ impl Storage {
         // `multikey`), and the options-conflict check compares only the
         // enumerated user-facing options, so it never provokes a false conflict.
         stored_options.insert("entryFormat", ENTRY_FORMAT);
+        stored_options.insert(NUMBER_KEYS, sortkey::NUMBER_KEY_FORMAT);
         // An index with a collation keys its entries by collation sort keys,
         // and says so in the catalog (see `COLLATION_KEYS`).
         let key_coll: Option<Collation> = if geo.is_none() && geo_sphere.is_none() {
@@ -13311,6 +13351,213 @@ impl Storage {
         Ok(())
     }
 
+    /// Bring a store written with number-key format 1 to format 2
+    /// (`sortkey::NUMBER_KEY_FORMAT`), once, before anything reads or writes
+    /// through its keys. Format 1 keyed a double by its shortest decimal and
+    /// collapsed every number whose exponent fell outside -128..=127, so its
+    /// keys are not where this build looks for them:
+    ///
+    /// * the `_id` index row and the in-row `_id` key of every document whose
+    ///   `_id` is a number are re-keyed (`rekey_numeric_ids`);
+    /// * the `_id` claims in `UNIQ_TABLE` are dropped with their two "done"
+    ///   markers, and taken again by `backfill_document_id_claims` /
+    ///   `backfill_collated_id_claims` as the open finishes;
+    /// * every secondary index without the [`NUMBER_KEYS`] stamp is rebuilt
+    ///   (`rebuild_outdated_indexes`).
+    ///
+    /// Then the store records format 2 in the oplog-meta table under
+    /// `"numberKeys"`, which the Python server reads and writes too. The
+    /// re-keying commits in chunks and is safe to repeat: a key of format 2
+    /// never equals one of format 1 (their sign markers differ), so an
+    /// interrupted run picks up where it stopped.
+    fn upgrade_number_keys(&self) -> Result<()> {
+        let session = self.conn.open_session()?;
+        if stored_number_key_format(&session)? >= sortkey::NUMBER_KEY_FORMAT {
+            return Ok(());
+        }
+        self.rekey_numeric_ids(&session)?;
+        session.begin_transaction(None)?;
+        match self.purge_id_claims(&session) {
+            Ok(()) => session.commit_transaction(None)?,
+            Err(e) => {
+                let _ = session.rollback_transaction(None);
+                return Err(e);
+            }
+        }
+        self.rebuild_outdated_indexes()?;
+        session.begin_transaction(None)?;
+        let outcome = (|| -> Result<()> {
+            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+            cur.set_key_s(NUMBER_KEYS_META);
+            cur.set_value_u(&encode_doc(
+                &bson::doc! {"format": sortkey::NUMBER_KEY_FORMAT},
+            )?);
+            cur.insert()?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => session.commit_transaction(None)?,
+            Err(e) => {
+                let _ = session.rollback_transaction(None);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-key every document whose `_id` is a number keyed by number-key
+    /// format 1: its row in the `_id` index and the `_id` key framed into its
+    /// document row. A time-series key keeps its 10-byte suffix.
+    ///
+    /// Format 1 gave two different values one key and one value two keys, so
+    /// two stored documents can now hold `_id`s mongod calls equal (the Int64
+    /// `2^62` and the double `2^62`). The one re-keyed first takes the key;
+    /// the other keeps its old one and stays readable by a scan, and the
+    /// count is logged -- as `backfill_document_id_claims` does for document
+    /// `_id`s equal by value.
+    fn rekey_numeric_ids(&self, session: &Session) -> Result<()> {
+        const CHUNK: usize = 500;
+        // `(db, coll, old key, RecordId)` for every format-1 number key.
+        let mut rows: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
+        {
+            let cur = match session.open_cursor(NAT_SEQ_TABLE, None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut more = cur.next()?;
+            while more {
+                let (db, coll, key) = cur.get_key_ssu()?;
+                if sortkey::is_format1_number_key(&key) {
+                    let rid = cur.get_value_q()?;
+                    rows.push((db, coll, key, rid));
+                }
+                more = cur.next()?;
+            }
+        }
+        let mut kept = 0u64;
+        let mut timeseries: HashMap<(String, String), bool> = HashMap::new();
+        for chunk in rows.chunks(CHUNK) {
+            session.begin_transaction(None)?;
+            let outcome = (|| -> Result<u64> {
+                let nat = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+                let nat_del = session.open_cursor(NAT_SEQ_TABLE, None)?;
+                let mut kept = 0u64;
+                for (db, coll, old, rid) in chunk {
+                    let ts = match timeseries.get(&(db.clone(), coll.clone())) {
+                        Some(t) => *t,
+                        None => {
+                            let t = coll_meta(session, db, coll)?.timeseries;
+                            timeseries.insert((db.clone(), coll.clone()), t);
+                            t
+                        }
+                    };
+                    let docs = match session.open_cursor(&doc_table_for(db, coll), None) {
+                        Ok(c) => c,
+                        Err(e) if e.is_missing_table() => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    docs.set_key_ssq(db, coll, *rid);
+                    match docs.search() {
+                        Ok(()) => {}
+                        // An `_id` row whose document is gone: nothing to key.
+                        Err(e) if e.is_not_found() => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                    let value = docs.get_value_u()?;
+                    let (framed, blob) = unframe_doc_value(&value)?;
+                    if framed != old.as_slice() {
+                        return Err(StorageError::Internal(format!(
+                            "document {rid} of '{db}.{coll}' holds another _id key than \
+                             its _id index row"
+                        )));
+                    }
+                    let raw = bson::RawDocument::from_bytes(blob)
+                        .map_err(|e| StorageError::Bson(e.to_string()))?;
+                    let id: Bson = raw
+                        .get("_id")
+                        .map_err(|e| StorageError::Bson(e.to_string()))?
+                        .ok_or_else(|| {
+                            StorageError::Internal(format!(
+                                "document {rid} of '{db}.{coll}' has no _id"
+                            ))
+                        })?
+                        .to_raw_bson()
+                        .try_into()
+                        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+                    let mut new = id_key(&id)?;
+                    if ts {
+                        let suffix = old.len().saturating_sub(10);
+                        new.extend_from_slice(&old[suffix..]);
+                    }
+                    nat.reset()?;
+                    nat.set_key_ssu(db, coll, &new);
+                    nat.set_value_q(*rid);
+                    match nat.insert() {
+                        Ok(()) => {}
+                        Err(e) if e.is_duplicate_key() => {
+                            kept += 1;
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                    nat_del.reset()?;
+                    nat_del.set_key_ssu(db, coll, old);
+                    nat_del.remove()?;
+                    let blob = blob.to_vec();
+                    docs.reset()?;
+                    docs.set_key_ssq(db, coll, *rid);
+                    docs.set_value_u(&frame_doc_value(&new, &blob));
+                    docs.update()?;
+                }
+                Ok(kept)
+            })();
+            match outcome {
+                Ok(n) => {
+                    session.commit_transaction(None)?;
+                    kept += n;
+                }
+                Err(e) => {
+                    let _ = session.rollback_transaction(None);
+                    return Err(e);
+                }
+            }
+        }
+        if kept > 0 {
+            eprintln!(
+                "secantus-storage: {kept} stored numeric _id values are equal to another \
+                 stored _id by exact value, and keep their earlier key"
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop every `_id` claim in `UNIQ_TABLE` (the index name `_id_`) and the
+    /// two rows recording that they were all taken, so that the open takes
+    /// them again under the current keys.
+    fn purge_id_claims(&self, session: &Session) -> Result<()> {
+        let scan = session.open_cursor(UNIQ_TABLE, None)?;
+        let del = session.open_cursor(UNIQ_TABLE, None)?;
+        let mut more = scan.next()?;
+        while more {
+            let (d, c, n, k) = scan.get_key_sssu()?;
+            let marker = d.is_empty()
+                && c.is_empty()
+                && matches!(n.as_str(), "$document_id_claims" | "$collated_id_claims");
+            if n == ID_INDEX_NAME || marker {
+                del.reset()?;
+                del.set_key_sssu(&d, &c, &n, &k);
+                match del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            more = scan.next()?;
+        }
+        Ok(())
+    }
+
     /// The `id_claim` descriptor of a collection with a default collation.
     fn id_claim_desc(&self, session: &Session, db: &str, coll: &str) -> Result<Option<IndexDesc>> {
         Ok(
@@ -14494,7 +14741,8 @@ impl Storage {
                 // `sort_walk_index`); otherwise the post-sort below orders it.
                 // And only when the router read THAT index, in key order: it
                 // may have read another (`{n: {$elemMatch: {k: 1}}}` reads
-                // `n.k`), or its keys out of order (a collapsed number).
+                // `n.k`), or its keys out of order (strings on a descending
+                // column).
                 let walk = if single {
                     self.sort_walk_index(&session, db, coll, sf, filter)?
                 } else {
@@ -17975,13 +18223,12 @@ impl Storage {
                             }
                         }
                     }
-                    // Inverted, a string still sorts before its extensions;
-                    // and numbers outside the encoder's exponent range share
-                    // one key, whatever their values.
-                    if vals.iter().any(|v| {
-                        (direction == -1 && scan_bounds::open_ended_rank(scan_bounds::rank(v)))
-                            || scan_bounds::is_collapsed(v)
-                    }) {
+                    // Inverted, a string still sorts before its extensions.
+                    if direction == -1
+                        && vals
+                            .iter()
+                            .any(|v| scan_bounds::open_ended_rank(scan_bounds::rank(v)))
+                    {
                         note_unordered();
                     }
                     return Ok(Some(out));
@@ -18175,11 +18422,11 @@ impl Storage {
     /// Read index `name` over `spans` (stored bytes, from
     /// [`scan_bounds::to_spans`]) of one column, each behind `prefix` (the
     /// escaped equality columns and separator before it in a compound index;
-    /// empty for a leading column). `more` says whether columns follow it.
+    /// empty for a leading column).
     /// The RecordIds come in entry order, span after span. Also whether that
     /// is the order of the values: not once a key that does not sort where
-    /// its value does was read -- a collapsed number, or on a descending
-    /// column a string, JavaScript or regex key.
+    /// its value does was read -- on a descending column, a string,
+    /// JavaScript or regex key.
     #[allow(clippy::too_many_arguments)]
     fn scan_spans(
         &self,
@@ -18190,26 +18437,8 @@ impl Storage {
         spans: &[scan_bounds::Span],
         prefix: &[u8],
         dir: i32,
-        more: bool,
     ) -> Result<(Vec<i64>, bool)> {
         note_routed(name);
-        let sep = escape_kb(COMPOUND_SEP);
-        let collapsed: Vec<Vec<u8>> = scan_bounds::collapsed_keys()
-            .iter()
-            .map(|k| {
-                let directed: Vec<u8> = if dir == -1 {
-                    k.iter().map(|b| b ^ 0xFF).collect()
-                } else {
-                    k.clone()
-                };
-                let mut e = prefix.to_vec();
-                e.extend(escape_kb(&directed));
-                if more {
-                    e.extend_from_slice(&sep);
-                }
-                e
-            })
-            .collect();
         let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         let mut out = Vec::new();
         let mut ordered = true;
@@ -18252,16 +18481,6 @@ impl Storage {
                         return None;
                     }
                     let mut in_order = true;
-                    let hit = |ck: &Vec<u8>| {
-                        if more {
-                            row_esc.starts_with(ck)
-                        } else {
-                            row_esc == ck.as_slice()
-                        }
-                    };
-                    if ordered && collapsed.iter().any(hit) {
-                        in_order = false;
-                    }
                     if ordered && dir == -1 {
                         if let Some(b) = row_esc.get(prefix.len()) {
                             if scan_bounds::open_ended_rank(0xFF - b) {
@@ -18308,8 +18527,7 @@ impl Storage {
             return Ok(None);
         }
         let spans = scan_bounds::to_spans(&bounds, dir, escape_kb);
-        let (ids, mut ordered) =
-            self.scan_spans(session, db, coll, name, &spans, &[], dir, is_compound)?;
+        let (ids, mut ordered) = self.scan_spans(session, db, coll, name, &spans, &[], dir)?;
         // On a multikey index a document comes out where its FIRST key in the
         // stretches is, which is mongod's order only for single keys.
         if multikey && !bounds.scalar_points() {
@@ -18362,7 +18580,6 @@ impl Storage {
         bounds.widen_ranks(&legacy);
         let spans = scan_bounds::to_spans(&bounds, 1, |k| k.to_vec());
         note_routed("_id_");
-        let collapsed = scan_bounds::collapsed_keys();
         let kc = key_coll(db, coll);
         let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
         let mut out = Vec::new();
@@ -18391,7 +18608,7 @@ impl Storage {
                 if d != db || c != kc.as_ref() || idk.as_slice() >= hi.as_slice() {
                     break;
                 }
-                if idk.first().is_some_and(|r| legacy.contains(r)) || collapsed.contains(&idk) {
+                if idk.first().is_some_and(|r| legacy.contains(r)) {
                     ordered = false;
                 }
                 out.push(cur.get_value_q()?);
@@ -18803,10 +19020,7 @@ impl Storage {
                             }
                         }
                     }
-                    if vals
-                        .iter()
-                        .any(|v| desc_text(v) || scan_bounds::is_collapsed(v))
-                    {
+                    if vals.iter().any(desc_text) {
                         note_unordered();
                     }
                     return Ok(Some(out));
@@ -18833,9 +19047,8 @@ impl Storage {
         };
         let spans = scan_bounds::to_spans(&bounds, op_dir, escape_kb);
         let prefix = escape_kb(&prefix_with_sep);
-        let (ids, mut ordered) = self.scan_spans(
-            session, db, coll, &name, &spans, &prefix, op_dir, use_prefix,
-        )?;
+        let (ids, mut ordered) =
+            self.scan_spans(session, db, coll, &name, &spans, &prefix, op_dir)?;
         if multikey && !bounds.scalar_points() {
             ordered = false;
         }
@@ -18876,6 +19089,7 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "multikey"
                     | "entryFormat"
                     | "collationKeys"
+                    | "numberKeys"
                     | "geoKeys"
                     | "pythonKeys"
             ) {
@@ -19975,6 +20189,180 @@ mod tests {
             }
             more = scan.next().unwrap();
         }
+    }
+
+    /// Make a store look as a build before number-key format 2 left it: no
+    /// `numberKeys` stamp on any index and no format recorded. The keys
+    /// themselves are written by `sortkey::with_number_key_format_1`.
+    fn forget_number_key_format(home: &str) {
+        let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
+        let sess = conn.open_session().unwrap();
+        let scan = sess.open_cursor(IDX_TABLE, None).unwrap();
+        let mut rows = Vec::new();
+        let mut more = scan.next().unwrap();
+        while more {
+            let key = scan.get_key_sss().unwrap();
+            let mut d = decode_doc(&scan.get_value_u().unwrap()).unwrap();
+            let mut opts = d.get_document("options").cloned().unwrap_or_default();
+            opts.remove(NUMBER_KEYS);
+            d.insert("options", Bson::Document(opts));
+            rows.push((key, d));
+            more = scan.next().unwrap();
+        }
+        let c = sess.open_cursor(IDX_TABLE, None).unwrap();
+        for ((db, coll, name), d) in rows {
+            c.reset().unwrap();
+            c.set_key_sss(&db, &coll, &name);
+            c.set_value_u(&encode_doc(&d).unwrap());
+            c.update().unwrap();
+        }
+        let meta = sess.open_cursor(OPLOG_META_TABLE, None).unwrap();
+        meta.set_key_s(NUMBER_KEYS_META);
+        meta.remove().unwrap();
+    }
+
+    fn ids_of(st: &Storage, coll: &str, filter: Document) -> Vec<i32> {
+        let mut out: Vec<i32> = st
+            .find_matching("app", coll, &filter)
+            .unwrap()
+            .iter()
+            .map(|b| decode_doc(b).unwrap().get_i32("u").unwrap())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// A store written with number-key format 1 (a double keyed by its
+    /// shortest decimal, numbers beyond exponent +-127 collapsed) is re-keyed
+    /// when it opens -- its `_id` rows, its document `_id` claims and every
+    /// index -- and then answers as mongod 8.2.11 does (measured
+    /// 2026-10-15): the double `0.1` is not `Decimal128("0.1")`, and
+    /// `1e-300` sorts below 1.
+    #[test]
+    fn open_rekeys_a_store_written_with_number_key_format_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let docs = vec![
+            doc! {"_id": 0.1, "a": 0.1, "u": 1i32},
+            doc! {"_id": dec("0.25"), "a": dec("0.1"), "u": 2i32},
+            doc! {"_id": 1e-300, "a": 1e-300, "u": 3i32},
+            // Format 1 gave 1e-300 and 3e250 one key: only one can be an `_id`.
+            doc! {"_id": "big", "a": 3e250, "u": 4i32},
+            doc! {"_id": -1e-300, "a": -1e-300, "u": 5i32},
+            doc! {"_id": 5i32, "a": 5i32, "u": 6i32},
+            doc! {"_id": {"k": 0.1}, "a": [0.1, 2i32], "u": 7i32},
+            doc! {"_id": Bson::Int64(1 << 62), "a": Bson::Int64(1 << 62), "u": 8i32},
+            // Equal to the Int64 above by exact value; format 1 keyed it apart.
+            doc! {"_id": 2f64.powi(62), "a": 2f64.powi(62), "u": 9i32},
+            doc! {"_id": "s", "a": "s", "u": 10i32},
+        ];
+        {
+            let st = Storage::open(home).unwrap();
+            sortkey::with_number_key_format_1(|| {
+                let blobs = docs.iter().map(|d| encode_doc(d).unwrap()).collect();
+                let (n, errors) = st.insert("app", "n", blobs, true).unwrap();
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(n, docs.len());
+                st.create_index("app", "n", "a_1", &doc! {"a": 1}, &Document::new())
+                    .unwrap();
+                st.create_index("app", "n", "u_1", &doc! {"u": 1}, &doc! {"unique": true})
+                    .unwrap();
+            });
+        }
+        forget_number_key_format(home);
+
+        let st = Storage::open(home).unwrap();
+        let session = st.conn.open_session().unwrap();
+        assert_eq!(
+            stored_number_key_format(&session).unwrap(),
+            sortkey::NUMBER_KEY_FORMAT
+        );
+        for name in ["a_1", "u_1"] {
+            assert_eq!(
+                index_options(&st, "n", name).get_i32(NUMBER_KEYS),
+                Ok(sortkey::NUMBER_KEY_FORMAT)
+            );
+        }
+        let check = st.check_collection("app", "n").unwrap();
+        for name in ["a_1", "u_1"] {
+            let (entries, missing, extra) = index_check(&check, name);
+            assert!(entries > 0, "{name}");
+            assert_eq!((missing, extra), (0, 0), "{name}");
+        }
+        // Every document is still there.
+        assert_eq!(ids_of(&st, "n", doc! {}), (1..=10).collect::<Vec<_>>());
+        // Through the index, by exact value.
+        assert_eq!(ids_of(&st, "n", doc! {"a": 0.1}), [1, 7]);
+        assert_eq!(ids_of(&st, "n", doc! {"a": dec("0.1")}), [2]);
+        assert_eq!(ids_of(&st, "n", doc! {"a": {"$lt": 1}}), [1, 2, 3, 5, 7]);
+        assert_eq!(ids_of(&st, "n", doc! {"a": {"$gt": 1e200}}), [4]);
+        assert_eq!(ids_of(&st, "n", doc! {"a": Bson::Int64(1 << 62)}), [8, 9]);
+        // Through the `_id` index.
+        for (id, u) in [
+            (Bson::Double(0.1), 1),
+            (dec("0.25"), 2),
+            (Bson::Double(1e-300), 3),
+            (Bson::String("big".into()), 4),
+            (Bson::Double(-1e-300), 5),
+            (Bson::Int32(5), 6),
+        ] {
+            assert_eq!(ids_of(&st, "n", doc! {"_id": id.clone()}), [u], "{id}");
+        }
+        assert_eq!(ids_of(&st, "n", doc! {"_id": {"$lt": 1}}), [1, 2, 3, 5]);
+        // Re-keyed `_id`s are held: the same value again is a duplicate, an
+        // `_id` equal only by its shortest decimal is not (mongod accepts
+        // `Decimal128("0.1")` beside the double `0.1`).
+        let again = |d: Document| {
+            st.insert("app", "n", vec![encode_doc(&d).unwrap()], true)
+                .unwrap()
+                .1
+                .len()
+        };
+        assert_eq!(again(doc! {"_id": 0.1, "u": 11i32}), 1);
+        assert_eq!(again(doc! {"_id": {"k": 0.1}, "u": 12i32}), 1);
+        assert_eq!(again(doc! {"_id": 1e-300, "u": 13i32}), 1);
+        assert_eq!(again(doc! {"_id": dec("0.1"), "u": 14i32}), 0);
+        // The two `_id`s equal by exact value: one holds the key, both stay.
+        assert_eq!(again(doc! {"_id": Bson::Int64(1 << 62), "u": 15i32}), 1);
+        drop(session);
+        drop(st);
+        // Opening again changes nothing.
+        let st = Storage::open(home).unwrap();
+        assert_eq!(ids_of(&st, "n", doc! {"a": 0.1}), [1, 7]);
+        assert_eq!(ids_of(&st, "n", doc! {}).len(), 11);
+    }
+
+    /// A unique index whose stored values format 1 kept apart but which are
+    /// equal by exact value cannot be rebuilt: the store refuses to open and
+    /// names the index, as for any index it cannot rebuild.
+    #[test]
+    fn open_refuses_a_unique_index_format_1_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        {
+            let st = Storage::open(home).unwrap();
+            sortkey::with_number_key_format_1(|| {
+                st.insert(
+                    "app",
+                    "n",
+                    vec![
+                        encode_doc(&doc! {"_id": 1i32, "u": Bson::Int64(1 << 62)}).unwrap(),
+                        encode_doc(&doc! {"_id": 2i32, "u": 2f64.powi(62)}).unwrap(),
+                    ],
+                    true,
+                )
+                .unwrap();
+                st.create_index("app", "n", "u_1", &doc! {"u": 1}, &doc! {"unique": true})
+                    .unwrap();
+            });
+        }
+        forget_number_key_format(home);
+        let err = match Storage::open(home) {
+            Ok(_) => panic!("opened a store whose unique index cannot be rebuilt"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("u_1"), "{err}");
     }
 
     fn index_options(s: &Storage, coll: &str, name: &str) -> Document {
