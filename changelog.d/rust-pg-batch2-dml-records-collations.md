@@ -54,7 +54,7 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   (tests/backlog/test_rust_postgres_gaps.py::test_update_from_returning_target_star).
 - A record keeps a `char(n)` field's padding when it prints
   (`("ab ",1)`), in `row_to_json` and in `array_agg`, and still compares it
-  without the padding. Fixes RP-032 for whole-row values
+  without the padding. Part of RP-032, for whole-row values
   (tests/backlog/test_rust_postgres_gaps.py::test_record_text_keeps_char_padding).
 - `pg_collation` lists 880 of PostgreSQL 15.19's 907 ICU collations, each
   checked to sort as PostgreSQL does. A `<tag>-x-icu` name that is not one
