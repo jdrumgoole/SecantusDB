@@ -518,7 +518,9 @@ one beside it.
         `funcsig::polymorphic_args`); `func_select_candidate`'s other steps
         are not followed (only an all-constant call is). `unnest('{1,2}')`
         is not PostgreSQL's 42725 (three overloads), and a bad literal read
-        through `array_append('{1.5}', 2)` has no position.
+        through `array_append('{1.5}', 2)` has no position. `abs(NULL)`'s
+        column is described as `numeric` (oid 1700); PostgreSQL says
+        `float8` (701), and its `pg_typeof` is right here.
       - **Smaller**: only `line <-> point` measures with `pg_hypot`; a
         `"char"` with the high bit set orders by its `\ooo` text; an alias
         call with a COLUMN of the wrong type still runs
