@@ -343,21 +343,6 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
-  Each measured on PostgreSQL 15.19:
-  - `create type int` / `create type integer` (and their quoted forms) are
-    42710; PostgreSQL makes `public."int"`, printed `"int"` (a keyword, not
-    hidden by `pg_catalog`, so unlike `public.uuid` it is not qualified).
-    Letting the CREATE through is a one-line gate change, measured: a
-    column or cast of `"int"` then comes back described as `int4`,
-    because the planner carries a type as a string and `int` already
-    means `int4` there at dozens of sites. A bare `int` reaches the planner
-    as `pg_catalog.int4`, so a single-part `"int"` can only have been
-    quoted; the fix is a distinct internal name for it, as `"char"` has
-    (`QUOTED_CHAR`).
-  Backlog-ID: RP-038
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
-
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
   aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's
