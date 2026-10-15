@@ -391,6 +391,11 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
                     Ok(s) => s.chars().count() as i32,
                     Err(e) => return Err(invalid_utf8(&value, e.valid_up_to())),
                 },
+                // `pg_verify_mbstr_len`: the characters its verifier finds.
+                Encoding::Multi(mb) => mb
+                    .verify(&value)
+                    .map_err(|(state, msg)| Error::Sqlstate(state, msg))?
+                    .len() as i32,
                 // A multibyte encoding's characters need its own rules to
                 // count, past the ASCII range every one of them shares.
                 Encoding::Other(canonical) if !single_byte(canonical) && !value.is_ascii() => {
@@ -607,6 +612,10 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
         "convert" => {
             let (from, from_name) = encoding(&text(&args[1]), "source ")?;
             let (to, shown) = encoding(&text(&args[2]), "destination ")?;
+            if matches!(from, Encoding::Multi(_)) || matches!(to, Encoding::Multi(_)) {
+                return crate::mbcs::convert_multi(&bytes(0)?, &from, &to, &shown)
+                    .map(bytea::to_binary);
+            }
             // `pg_convert` hands back the bytes unchanged between one
             // encoding and itself, once they are checked as that encoding.
             if from_name == shown {

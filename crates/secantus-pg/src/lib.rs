@@ -39072,13 +39072,21 @@ impl CopyHandler for PgHandler {
         let rows: Vec<Vec<Option<Bson>>> = match state.format {
             CopyFormat::Binary => self.parse_binary_copy(&state.buffer, &state.types)?,
             format => {
-                let text = String::from_utf8(state.buffer.clone()).map_err(|_| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "22021".into(), // character_not_in_repertoire
-                        "COPY data is not valid UTF-8".into(),
-                    )))
-                })?;
+                // COPY's text arrives in the client encoding, and PostgreSQL
+                // converts it as it does a query's (22021 / 22P05 by name).
+                let cenc = self.client_encoding();
+                let text = if cenc.transcodes() {
+                    encoding::decode(cenc, &state.buffer)
+                        .map_err(|e| encoding::undecodable(cenc, e))?
+                } else {
+                    String::from_utf8(state.buffer.clone()).map_err(|_| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "22021".into(), // character_not_in_repertoire
+                            "COPY data is not valid UTF-8".into(),
+                        )))
+                    })?
+                };
                 let mut parsed = copy_parse_text(&text, format);
                 if state.header && !parsed.is_empty() {
                     parsed.remove(0);
