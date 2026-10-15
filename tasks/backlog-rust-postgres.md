@@ -376,6 +376,18 @@ one beside it.
   Backlog-ID: RP-025
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_after_a_builtin
 
+- [ ] **RUST pgserver: settings and error positions the 2026-10-15 batch
+  found.** `SET nosuch_param = 1` is accepted (PostgreSQL 15.19: 42704
+  `unrecognized configuration parameter`). Under `standard_conforming_strings
+  = off` every error loses its position (`select 1, 'x'::int4` is 22P02 at
+  11 on PostgreSQL), because the escape-string rewrite changes the text the
+  positions are found in. A missing parameter (`fetch first $1 rows`) is
+  42P02 with no position. Not tested: `SET transaction_isolation TO
+  DEFAULT` outside a block has no "RESET TRANSACTION can only be used in
+  transaction blocks" WARNING.
+  Backlog-ID: RP-036
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_setting_is_refused,tests/backlog/test_rust_postgres_gaps.py::test_error_positions
+
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an
   aggregate's, and a LIMIT's bounded heap) now sorts with PostgreSQL's

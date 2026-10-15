@@ -523,3 +523,39 @@ _RP025_FIXED = {
 @pytest.mark.parametrize("sql", list(_RP025_FIXED.values()), ids=list(_RP025_FIXED))
 def test_typed_value_fixed(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
+
+
+def _error_and_position(conn: Any, setup: list[str], sql: str) -> tuple:
+    for stmt in setup:
+        conn.execute(stmt)
+    try:
+        conn.execute(sql)
+    except psycopg.Error as e:
+        if not conn.autocommit:
+            conn.rollback()
+        return (e.sqlstate, e.diag.statement_position)
+    return ("ok", None)
+
+
+@pytest.mark.backlog("RP-036")
+def test_unknown_setting_is_refused(pg: Any, pg15: Any) -> None:
+    """PostgreSQL 15.19: `SET nosuch_param = 1` is 42704 `unrecognized
+    configuration parameter`; here it is accepted."""
+    sql = "set nosuch_param = 1"
+    assert pg_answer(pg, sql)[:2] == pg_answer(pg15, sql)[:2] == ("err", "42704")
+
+
+@pytest.mark.backlog("RP-036")
+@pytest.mark.parametrize(
+    ("setup", "sql"),
+    [
+        (["set standard_conforming_strings = off"], "select 1, 'x'::int4"),
+        ([], "select 1 fetch first $1 rows only"),
+    ],
+    ids=["nonconforming-strings", "missing-parameter"],
+)
+def test_error_positions(pg: Any, pg15: Any, setup: list[str], sql: str) -> None:
+    """PostgreSQL 15.19 places these errors (22P02 at the literal under
+    `standard_conforming_strings = off`, 42P02 at the `$1`); here they carry
+    no position."""
+    assert _error_and_position(pg, setup, sql) == _error_and_position(pg15, setup, sql)
