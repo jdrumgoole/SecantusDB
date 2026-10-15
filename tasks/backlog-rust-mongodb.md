@@ -936,6 +936,24 @@ Still different, all 97:
       `$in` sorts after writes that turn on the same merge.
       Backlog-ID: RM-054
       Verify: tests/backlog/test_rm_029_056.py::test_regex_under_a_collation_with_two_indexes,tests/backlog/test_rm_029_056.py::test_in_sort_after_writes
+- [ ] **A double is compared with a Decimal128 or an Int64 by its
+      shortest decimal form, not its exact value.** Silent wrong answers,
+      with or without an index. mongod 8.2.11 (2026-10-15): `find({a:
+      0.1})` matches the double and not `Decimal128("0.1")` (this server:
+      both); `{a: {$lt: 0.1}}` matches `Decimal128("0.1")` (here:
+      nothing); `{a: 2.0**62}` matches `Int64(2**62)` (here: not);
+      `{a: {$gt: 2.0**62}}` matches `Int64(4611686018427387950)` (here:
+      not). `_id` uniqueness follows the same rule: mongod refuses `_id:
+      2.0**62` beside `_id: Int64(2**62)` and accepts `_id: 0.1` beside
+      `_id: Decimal128("0.1")`; this server does the opposite. The matcher
+      and the sort key (`sortkey::encode_number`, `format!("{d}")`, the
+      Python server's `Decimal(repr(value))`) share the error, so an index
+      agrees with a collection scan. The sort key is on disk in both
+      servers: a fix changes the index entries of every non-integral
+      double, so stored indexes must be rebuilt or refused.
+      Found by the p4-router agent during the Phase 4 router work.
+      Backlog-ID: RM-152
+      Verify: tests/backlog/test_rm_numeric_compare.py::test_double_compared_with_decimal_and_int64_exactly,tests/backlog/test_rm_numeric_compare.py::test_id_uniqueness_compares_numbers_exactly
 - [ ] **The multikey paths are not stored.** They are read from the
       collection the first time a query needs them after the server starts
       or an index is dropped, and kept current by writes after that
