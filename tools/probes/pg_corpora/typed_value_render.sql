@@ -634,3 +634,80 @@ SELECT m::int8 FROM tvr_t
 SELECT k FROM tvr_t WHERE l = 1
 SELECT k FROM tvr_t WHERE m = 1.5
 SELECT k FROM tvr_t WHERE x = 5
+# An untyped side of || beside a type with a || of its own (bytea, bit, varbit, tsvector, tsquery, jsonb, an array, a NULL array) is read as that type; beside a TYPED string it is text concatenation.
+select '\x01'::bytea || 'x'
+select 'x' || '\x01'::bytea
+select '\x01'::bytea || '\x02'
+select '\x02' || '\x01'::bytea
+select pg_typeof('\x01'::bytea || 'x')
+select '\x01'::bytea || 'x'::text
+select '\x01'::bytea || null
+select null || '\x01'::bytea
+select '\x01'::bytea || '\x'
+select '\x01'::bytea || 'ab\\c'
+select '\x01'::bytea || '\xzz'
+select B'10' || '01'
+select '01' || B'10'
+select pg_typeof(B'10' || '01')
+select B'10'::varbit || '01'
+select B'10' || 'x1F'
+select B'10' || '012'
+select B'10' || ''
+select B'10' || '01'::text
+select 'a b'::tsvector || 'c'
+select 'c' || 'a b'::tsvector
+select pg_typeof('a b'::tsvector || 'c')
+select 'a b'::tsvector || 'c:1A'
+select 'a'::tsquery || 'b'
+select 'b' || 'a'::tsquery
+select pg_typeof('a'::tsquery || 'b')
+select '{"a":1}'::jsonb || '{"b":2}'
+select '{"b":2}' || '{"a":1}'::jsonb
+select '{"a":1}'::jsonb || 'x'
+select '[1]'::jsonb || '2'
+select pg_typeof('{"a":1}'::jsonb || '{"b":2}')
+select array[1,2] || '{3,4}'
+select '{3,4}' || array[1,2]
+select array[1,2] || '3'
+select array['a'] || 'b'
+select pg_typeof(array[1,2] || '{3}')
+select array[1,2] || 'x'
+select array['a','b'] || '{c}'
+select 'x' || 1
+select 1 || 'x'
+select 'x' || true
+select 'x' || '1 day'::interval
+select '{1}'::int[] || '{2}'::int[]
+select '[1,3)'::int4range || 'x'
+select 'abc'::text || 'x'
+select 'abc'::varchar || 'x'
+select 'ab'::char(3) || 'x'
+select '\x01'::bytea || '\x02'::bytea
+select '\x01'::bytea || 'x'::bytea
+select k, b || 'x', 'x' || b from bc_t order by k
+select k, v || '01', '11' || v, f || 'x1' from bc_t order by k
+select k, tv || 'c', 'c' || tv from bc_t order by k
+select k, tq || 'b', 'b' || tq from bc_t order by k
+select k, j || '{"b":2}', '[3]' || j from bc_t order by k
+select k, a || '{3}', '{0}' || a from bc_t order by k
+select k, b || 'x'::text, v || '01'::text from bc_t order by k
+select pg_typeof(b || 'x'), pg_typeof(v || '01'), pg_typeof('c' || tv), pg_typeof('b' || tq), pg_typeof(b || 'x'::text) from bc_t where k = 1
+select b || '\xzz' from bc_t where k = 1
+select v || '2' from bc_t where k = 1
+select '\x01'::bytea || '\x02' || 'x'
+select 'a' || 'b' || '\x01'::bytea
+select B'1' || '0' || '1'
+select 'x' || B'1'
+select 'x' || '\x01'::bytea || 'y'
+select '\x01'::bytea || 'x'::varchar
+select B'1' || '0'::varchar
+select 'a b'::tsvector || 'c'::text
+select '{"a":1}'::jsonb || '{"b":2}'::text
+select '\x01'::bytea || E'\\001'
+select '\x01'::bytea || 'o\\101'
+select B'10' || 'X1f'
+select B'10' || 'b01'
+select B'10' || 'o7'
+select null::int[] || '{3}'
+select '{3}' || null::int[]
+select null::text[] || '{a}'

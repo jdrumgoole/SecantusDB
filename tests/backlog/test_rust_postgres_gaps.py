@@ -371,7 +371,6 @@ def test_table_named_after_a_builtin_type(pg: Any, sql: str, expected: Any) -> N
 _RP025 = {
     "array-of-row": "select array[row(1)]",
     "regprocedure-input": "select 'now()'::regprocedure::text",
-    "bytea-concat-untyped": "select '\\x01'::bytea || 'x'",
     "function-style-refused-cast": "select int8(true)",
     "point-order-by": "select p from (values (point '(1,1)'), (point '(0,0)')) v(p) order by p",
 }
@@ -380,4 +379,30 @@ _RP025 = {
 @pytest.mark.backlog("RP-025")
 @pytest.mark.parametrize("sql", list(_RP025.values()), ids=list(_RP025))
 def test_typed_value_residue(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
+
+
+# Fixed from RP-025: an untyped side of `||` beside a type with a `||` of its
+# own is read as that type (`byteacat`, `bitcat`, `tsvector_concat`,
+# `tsquery_or`, `jsonb_concat`, array_cat); beside a TYPED string it is
+# text concatenation.
+_RP025_FIXED = {
+    "bytea-concat-untyped": "select '\\x01'::bytea || 'x'",
+    "untyped-concat-bytea": "select 'x' || '\\x01'::bytea",
+    "bytea-concat-text": "select '\\x01'::bytea || 'x'::text",
+    "bytea-concat-bad-hex": "select '\\x01'::bytea || '\\xzz'",
+    "bit-concat-hex": "select B'10' || 'x1F'",
+    "bit-concat-bad-digit": "select B'10' || '012'",
+    "untyped-concat-tsvector": "select 'c' || 'a b'::tsvector",
+    "untyped-concat-tsquery": "select 'b' || 'a'::tsquery",
+    "tsvector-concat-text": "select 'a b'::tsvector || 'c'::text",
+    "jsonb-concat-bad": """select '{"a":1}'::jsonb || 'x'""",
+    "jsonb-concat-text": """select '{"a":1}'::jsonb || '{"b":2}'::text""",
+    "null-array-concat": "select null::int[] || '{3}'",
+}
+
+
+@pytest.mark.backlog_fixed("RP-025")
+@pytest.mark.parametrize("sql", list(_RP025_FIXED.values()), ids=list(_RP025_FIXED))
+def test_typed_value_fixed(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
