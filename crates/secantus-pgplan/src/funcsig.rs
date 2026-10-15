@@ -215,6 +215,63 @@ pub(crate) fn operator_resolves(op: &str, l: &str, r: &str) -> Option<bool> {
     Some(cands.iter().any(|(a, b)| accepts(a, l) && accepts(b, r)))
 }
 
+/// Is `l op r` over two known built-in types AMBIGUOUS -- PostgreSQL's
+/// 42725 `operator is not unique`? `oper_select_candidate` narrows the
+/// operators that take the operands (exactly or by implicit cast) as
+/// `func_select_candidate` narrows functions: most exact matches, then most
+/// exact-or-preferred matches; more than one left is ambiguous (`macaddr =
+/// macaddr8`, each castable to the other, measured on 15.19). Not judged
+/// (false) for arrays, `unknown`, or a polymorphic candidate.
+pub(crate) fn operator_ambiguous(op: &str, l: &str, r: &str) -> bool {
+    let cats = categories();
+    if l == "unknown"
+        || r == "unknown"
+        || l.ends_with("[]")
+        || r.ends_with("[]")
+        || !cats.contains_key(l)
+        || !cats.contains_key(r)
+    {
+        return false;
+    }
+    let Some(all) = binary_operators().get(op) else {
+        return false;
+    };
+    let mut cands: Vec<&(String, String)> = all
+        .iter()
+        .filter(|(a, b)| accepts(a, l) && accepts(b, r))
+        .collect();
+    let args = [l, r];
+    let params = |c: &(String, String)| [c.0.clone(), c.1.clone()];
+    if cands.len() < 2
+        || cands.iter().any(|c| *c.0 == *l && *c.1 == *r)
+        || cands.iter().flat_map(|c| params(c)).any(|p| {
+            p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring")
+        })
+    {
+        return false;
+    }
+    let keep_best = |cands: &mut Vec<&(String, String)>, score: &dyn Fn(&str, &str) -> bool| {
+        let count = |c: &&(String, String)| {
+            params(c)
+                .iter()
+                .zip(args)
+                .filter(|(p, a)| score(p, a))
+                .count()
+        };
+        let best = cands.iter().map(count).max().unwrap_or(0);
+        cands.retain(|c| count(c) == best);
+    };
+    keep_best(&mut cands, &|p, a| p == a);
+    keep_best(&mut cands, &|p, a| {
+        p == a
+            || matches!(
+                (cats.get(p), cats.get(a)),
+                (Some((pc, true)), Some((ac, _))) if pc == ac
+            )
+    });
+    cands.len() > 1
+}
+
 /// `pg_type.typcategory` of a built-in type, by oid.
 pub(crate) fn category_of_oid(oid: i64) -> Option<char> {
     let name = crate::pgtypes::name_of_oid(oid)?;

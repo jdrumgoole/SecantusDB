@@ -5605,7 +5605,9 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
         // `pg_catalog.bpchar`, and `pg_catalog.char` only comes from
         // `pg_catalog."char"` as written.
         ["char"] | ["pg_catalog", "char"] => QUOTED_CHAR.to_string(),
-        [n] | ["pg_catalog" | "public", n] => (*n).to_string(),
+        [n] | ["pg_catalog", n] => (*n).to_string(),
+        // `public.tid` is not the built-in `tid` (see `shadowed_by_catalog`).
+        ["public", n] if !pgtypes::shadowed_by_catalog(n) => (*n).to_string(),
         [schema, n] => canonical_type_ref(&format!("{schema}.{n}")),
         other => other.join("."),
     }
@@ -26891,7 +26893,8 @@ fn canonical_type_ref(name: &str) -> String {
     parts.push(cur);
     let norm: Vec<String> = parts.iter().map(|p| normalize_ident_part(p)).collect();
     match norm.as_slice() {
-        [schema, name] if schema == "public" => name.clone(),
+        // `public.tid` stays qualified: the bare name is `pg_catalog`'s.
+        [schema, name] if schema == "public" && !pgtypes::shadowed_by_catalog(name) => name.clone(),
         [schema, name] => format!("{schema}.{name}"),
         _ => norm.join("."),
     }
@@ -30537,7 +30540,14 @@ fn whole_row_rewrite(
                 .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
             match lookup(&relation_name(r)) {
                 Some(def) => {
-                    rowtype = Some(relation_name(r));
+                    // A table named after a built-in type (`tid`) has the
+                    // row type `public.tid`: the bare name is pg_catalog's.
+                    let name = relation_name(r);
+                    rowtype = Some(if pgtypes::shadowed_by_catalog(&name) {
+                        format!("public.{name}")
+                    } else {
+                        name
+                    });
                     (alias, def.columns.iter().map(|c| c.name.clone()).collect())
                 }
                 None => return Ok(None),
@@ -31636,6 +31646,27 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                 inferred_type(&rhs)
             )));
         }
+        // `time` has no comparison with `timetz` or `interval` of its own:
+        // PostgreSQL resolves `time = timetz` to `timetz = timetz` and `time
+        // = interval` to `interval = interval`, each through the implicit
+        // cast of the time (measured on 15.19).
+        let (lhs, rhs) = {
+            let widen = |t: Bson, other: &Bson| -> Result<Bson> {
+                if !is_time_text(&t) {
+                    return Ok(t);
+                }
+                if is_timetz_text(other) {
+                    return cast_value(t, "timetz");
+                }
+                if Interval::from_bson(other).is_some() {
+                    return cast_value(t, "interval");
+                }
+                Ok(t)
+            };
+            let l = widen(lhs, &rhs)?;
+            let r = widen(rhs, &l)?;
+            (l, r)
+        };
         let ord = compare_constants(&lhs, &rhs).ok_or_else(|| {
             // Name the OPERAND TYPES. "comparing these operands" was the second
             // largest failure signature on the psycopg gauge and said nothing
@@ -31862,6 +31893,31 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
                     (true, false) => return Some(std::cmp::Ordering::Greater),
                     (false, true) => return Some(std::cmp::Ordering::Less),
                     (false, false) => {}
+                }
+                // Records inside an array compare as `record_cmp` does, field
+                // by field (`array[row(1)] = array[row(1)]` is true).
+                if let (Some(rx), Some(ry)) = (record_fields(ex), record_fields(ey)) {
+                    // A field still `unknown` (a bare literal or NULL in the
+                    // ROW) has no comparison there: PostgreSQL refuses at
+                    // execution, so this does not answer either.
+                    let untyped = |v: &Bson| {
+                        record_field_types(v).is_some_and(|ts| ts.iter().any(|t| t == "unknown"))
+                    };
+                    if untyped(ex) || untyped(ey) {
+                        return None;
+                    }
+                    let is = |op: &str| {
+                        record_compare(op, rx, ry, true)
+                            .ok()
+                            .map(|v| v == Bson::Boolean(true))
+                    };
+                    if is("<")? {
+                        return Some(std::cmp::Ordering::Less);
+                    }
+                    if !is("=")? {
+                        return Some(std::cmp::Ordering::Greater);
+                    }
+                    continue;
                 }
                 match compare_constants(ex, ey)? {
                     std::cmp::Ordering::Equal => continue,

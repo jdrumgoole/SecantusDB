@@ -44,6 +44,8 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("regclass", 2205, 2210),
     ("regproc", 24, 1008),
     ("regprocedure", 2202, 2207),
+    ("regoper", 2203, 2208),
+    ("regoperator", 2204, 2209),
     ("regnamespace", 4089, 4090),
     ("regrole", 4096, 4097),
     ("regcollation", 4191, 4192),
@@ -263,6 +265,15 @@ const CATALOG_TYPE_NAMES: &[&str] = &[
     "xid8",
     "xml",
 ];
+
+/// Whether a type called `name` in `public` is hidden by `pg_catalog`'s
+/// own: PostgreSQL searches `pg_catalog` first, so a bare `tid` is the
+/// built-in even when a table `tid` exists, and the table's row type is
+/// reached (and printed, by `format_type`) only as `public.tid` (measured on
+/// 15.19). Only a real `pg_type` name: `int` is grammar, not a type.
+pub fn shadowed_by_catalog(name: &str) -> bool {
+    CATALOG_TYPE_NAMES.contains(&name)
+}
 
 /// Whether `name` (an array's element name, or a scalar's) is a built-in
 /// type, in any spelling PostgreSQL accepts.

@@ -15,6 +15,8 @@
 
 use super::*;
 
+mod sortable;
+
 /// The type category of a built-in type, by oid; `None` for a type whose
 /// operators this does not reason about (a domain, an enum, `oid`, arrays).
 fn category(ty: &str) -> Option<&'static str> {
@@ -690,6 +692,17 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             if crate::funcsig::operator_resolves(name, &l, &r) == Some(false) {
                 return Err(mismatch(name, &l, &r, e.location));
             }
+            if crate::funcsig::operator_ambiguous(name, &l, &r) {
+                set_error_location(e.location);
+                return Err(Error::Sqlstate(
+                    "42725",
+                    format!(
+                        "operator is not unique: {} {name} {}",
+                        display_type(&l),
+                        display_type(&r)
+                    ),
+                ));
+            }
         }
     }
     // NULLIF and IS [NOT] DISTINCT FROM resolve `a = b` the same way; an
@@ -1096,6 +1109,30 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 // function-style cast (location -1) is a function call on
                 // PostgreSQL, resolved with implicit coercion of its
                 // argument, and is left to that.
+                // With no cast pathway at all, the call form finds no function
+                // either (`func_get_detail` takes a call as a cast only when a
+                // coercion path exists): `int8(true)` is 42883 at the call
+                // (measured on 15.19).
+                if tc.location == -1 {
+                    if let Some(source) = operand_type(arg, scope) {
+                        if crate::pg_casts::refused(&source, &target) {
+                            let name: Vec<String> = tn
+                                .names
+                                .iter()
+                                .filter_map(|n| match n.node.as_ref() {
+                                    Some(N::String(s)) => Some(s.sval.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            set_error_location(tn.location);
+                            return Err(Error::UndefinedFunction(format!(
+                                "function {}({}) does not exist",
+                                name.join("."),
+                                crate::display_type(&source)
+                            )));
+                        }
+                    }
+                }
                 if tc.location >= 0 {
                     if let Some(source) = operand_type(arg, scope) {
                         if crate::pg_casts::refused(&source, &target) {
@@ -1182,7 +1219,9 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             record_builtin_call(f, scope);
             if let Some(w) = f.over.as_deref() {
                 check_range_offset(w, scope)?;
+                sortable::check_window(w, scope)?;
             }
+            sortable::check_call(f, scope)?;
             if let (Some(name), [arg]) = (func_name(f), f.args.as_slice()) {
                 if checked_aggregate(&name)
                     && !f.agg_star
@@ -1301,6 +1340,11 @@ fn check_select(
         _ => None,
     }) {
         walk(n, &scope, &cx)?;
+    }
+    if s.op == pg_query::protobuf::SetOperation::SetopNone as i32 {
+        sortable::check_clauses(s, &scope)?;
+    } else {
+        sortable::check_set_operation(s, &cx.ctes, lookup, parent)?;
     }
     Ok(())
 }

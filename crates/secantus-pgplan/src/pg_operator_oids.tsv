@@ -1,0 +1,799 @@
+15	=	integer	bigint
+36	<>	integer	bigint
+37	<	integer	bigint
+58	<	boolean	boolean
+59	>	boolean	boolean
+76	>	integer	bigint
+80	<=	integer	bigint
+82	>=	integer	bigint
+85	<>	boolean	boolean
+91	=	boolean	boolean
+92	=	"char"	"char"
+93	=	name	name
+94	=	smallint	smallint
+95	<	smallint	smallint
+96	=	integer	integer
+97	<	integer	integer
+98	=	text	text
+254	=	name	text
+255	<	name	text
+256	<=	name	text
+257	>=	name	text
+258	>	name	text
+259	<>	name	text
+260	=	text	name
+261	<	text	name
+262	<=	text	name
+263	>=	text	name
+264	>	text	name
+265	<>	text	name
+349	||	anycompatiblearray	anycompatible
+352	=	xid	xid
+353	=	xid	integer
+374	||	anycompatible	anycompatiblearray
+375	||	anycompatiblearray	anycompatiblearray
+385	=	cid	cid
+387	=	tid	tid
+402	<>	tid	tid
+410	=	bigint	bigint
+411	<>	bigint	bigint
+412	<	bigint	bigint
+413	>	bigint	bigint
+414	<=	bigint	bigint
+415	>=	bigint	bigint
+416	=	bigint	integer
+417	<>	bigint	integer
+418	<	bigint	integer
+419	>	bigint	integer
+420	<=	bigint	integer
+430	>=	bigint	integer
+433	@>	box	point
+439	%	bigint	bigint
+473	@	NONE	bigint
+484	-	NONE	bigint
+485	<<	polygon	polygon
+486	&<	polygon	polygon
+487	&>	polygon	polygon
+488	>>	polygon	polygon
+489	<@	polygon	polygon
+490	@>	polygon	polygon
+491	~=	polygon	polygon
+492	&&	polygon	polygon
+493	<<	box	box
+494	&<	box	box
+495	&>	box	box
+496	>>	box	box
+497	<@	box	box
+498	@>	box	box
+499	~=	box	box
+500	&&	box	box
+501	>=	box	box
+502	>	box	box
+503	=	box	box
+504	<	box	box
+505	<=	box	box
+506	>^	point	point
+507	<<	point	point
+508	>>	point	point
+509	<^	point	point
+510	~=	point	point
+511	<@	point	box
+512	<@	point	path
+513	@@	NONE	box
+514	*	integer	integer
+517	<->	point	point
+518	<>	integer	integer
+519	<>	smallint	smallint
+520	>	smallint	smallint
+521	>	integer	integer
+522	<=	smallint	smallint
+523	<=	integer	integer
+524	>=	smallint	smallint
+525	>=	integer	integer
+526	*	smallint	smallint
+527	/	smallint	smallint
+528	/	integer	integer
+529	%	smallint	smallint
+530	%	integer	integer
+531	<>	text	text
+532	=	smallint	integer
+533	=	integer	smallint
+534	<	smallint	integer
+535	<	integer	smallint
+536	>	smallint	integer
+537	>	integer	smallint
+538	<>	smallint	integer
+539	<>	integer	smallint
+540	<=	smallint	integer
+541	<=	integer	smallint
+542	>=	smallint	integer
+543	>=	integer	smallint
+544	*	smallint	integer
+545	*	integer	smallint
+546	/	smallint	integer
+547	/	integer	smallint
+550	+	smallint	smallint
+551	+	integer	integer
+552	+	smallint	integer
+553	+	integer	smallint
+554	-	smallint	smallint
+555	-	integer	integer
+556	-	smallint	integer
+557	-	integer	smallint
+558	-	NONE	integer
+559	-	NONE	smallint
+584	-	NONE	real
+585	-	NONE	double precision
+586	+	real	real
+587	-	real	real
+588	/	real	real
+589	*	real	real
+590	@	NONE	real
+591	+	double precision	double precision
+592	-	double precision	double precision
+593	/	double precision	double precision
+594	*	double precision	double precision
+595	@	NONE	double precision
+596	|/	NONE	double precision
+597	||/	NONE	double precision
+606	<->	box	point
+607	=	oid	oid
+608	<>	oid	oid
+609	<	oid	oid
+610	>	oid	oid
+611	<=	oid	oid
+612	>=	oid	oid
+613	<->	point	line
+614	<->	point	lseg
+615	<->	point	box
+616	<->	lseg	line
+617	<->	lseg	box
+618	<->	point	path
+620	=	real	real
+621	<>	real	real
+622	<	real	real
+623	>	real	real
+624	<=	real	real
+625	>=	real	real
+630	<>	"char"	"char"
+631	<	"char"	"char"
+632	<=	"char"	"char"
+633	>	"char"	"char"
+634	>=	"char"	"char"
+639	~	name	text
+640	!~	name	text
+641	~	text	text
+642	!~	text	text
+643	<>	name	name
+644	<>	oidvector	oidvector
+645	<	oidvector	oidvector
+646	>	oidvector	oidvector
+647	<=	oidvector	oidvector
+648	>=	oidvector	oidvector
+649	=	oidvector	oidvector
+654	||	text	text
+660	<	name	name
+661	<=	name	name
+662	>	name	name
+663	>=	name	name
+664	<	text	text
+665	<=	text	text
+666	>	text	text
+667	>=	text	text
+670	=	double precision	double precision
+671	<>	double precision	double precision
+672	<	double precision	double precision
+673	<=	double precision	double precision
+674	>	double precision	double precision
+675	>=	double precision	double precision
+682	@	NONE	smallint
+684	+	bigint	bigint
+685	-	bigint	bigint
+686	*	bigint	bigint
+687	/	bigint	bigint
+688	+	bigint	integer
+689	-	bigint	integer
+690	*	bigint	integer
+691	/	bigint	integer
+692	+	integer	bigint
+693	-	integer	bigint
+694	*	integer	bigint
+695	/	integer	bigint
+706	<->	box	box
+707	<->	path	path
+708	<->	line	line
+709	<->	lseg	lseg
+712	<->	polygon	polygon
+713	<>	point	point
+731	+	point	point
+732	-	point	point
+733	*	point	point
+734	/	point	point
+735	+	path	path
+736	+	path	point
+737	-	path	point
+738	*	path	point
+739	/	path	point
+755	@>	path	point
+756	<@	point	polygon
+757	@>	polygon	point
+758	<@	point	circle
+759	@>	circle	point
+760	<->	line	point
+761	<->	lseg	point
+762	<->	line	lseg
+763	<->	box	lseg
+773	@	NONE	integer
+784	<->	path	point
+792	=	path	path
+793	<	path	path
+794	>	path	path
+795	<=	path	path
+796	>=	path	path
+797	#	NONE	path
+798	?#	path	path
+799	@-@	NONE	path
+800	>^	box	box
+801	<^	box	box
+802	?#	box	box
+803	#	box	box
+804	+	box	point
+805	-	box	point
+806	*	box	point
+807	/	box	point
+808	?-	point	point
+809	?|	point	point
+818	+	bigint	smallint
+819	-	bigint	smallint
+820	*	bigint	smallint
+821	/	bigint	smallint
+822	+	smallint	bigint
+823	-	smallint	bigint
+824	*	smallint	bigint
+825	/	smallint	bigint
+843	*	money	real
+844	/	money	real
+845	*	real	money
+900	=	money	money
+901	<>	money	money
+902	<	money	money
+903	>	money	money
+904	<=	money	money
+905	>=	money	money
+906	+	money	money
+907	-	money	money
+908	*	money	double precision
+909	/	money	double precision
+912	*	money	integer
+913	/	money	integer
+914	*	money	smallint
+915	/	money	smallint
+916	*	double precision	money
+917	*	integer	money
+918	*	smallint	money
+931	<<	inet	inet
+932	<<=	inet	inet
+933	>>	inet	inet
+934	>>=	inet	inet
+965	^	double precision	double precision
+966	+	aclitem[]	aclitem
+967	-	aclitem[]	aclitem
+968	@>	aclitem[]	aclitem
+969	@@	NONE	lseg
+971	@@	NONE	polygon
+974	=	aclitem	aclitem
+1038	^	numeric	numeric
+1054	=	character	character
+1055	~	character	text
+1056	!~	character	text
+1057	<>	character	character
+1058	<	character	character
+1059	<=	character	character
+1060	>	character	character
+1061	>=	character	character
+1070	=	anyarray	anyarray
+1071	<>	anyarray	anyarray
+1072	<	anyarray	anyarray
+1073	>	anyarray	anyarray
+1074	<=	anyarray	anyarray
+1075	>=	anyarray	anyarray
+1076	+	date	interval
+1077	-	date	interval
+1093	=	date	date
+1094	<>	date	date
+1095	<	date	date
+1096	<=	date	date
+1097	>	date	date
+1098	>=	date	date
+1099	-	date	date
+1100	+	date	integer
+1101	-	date	integer
+1108	=	time without time zone	time without time zone
+1109	<>	time without time zone	time without time zone
+1110	<	time without time zone	time without time zone
+1111	<=	time without time zone	time without time zone
+1112	>	time without time zone	time without time zone
+1113	>=	time without time zone	time without time zone
+1116	+	real	double precision
+1117	-	real	double precision
+1118	/	real	double precision
+1119	*	real	double precision
+1120	=	real	double precision
+1121	<>	real	double precision
+1122	<	real	double precision
+1123	>	real	double precision
+1124	<=	real	double precision
+1125	>=	real	double precision
+1126	+	double precision	real
+1127	-	double precision	real
+1128	/	double precision	real
+1129	*	double precision	real
+1130	=	double precision	real
+1131	<>	double precision	real
+1132	<	double precision	real
+1133	>	double precision	real
+1134	<=	double precision	real
+1135	>=	double precision	real
+1201	=	inet	inet
+1202	<>	inet	inet
+1203	<	inet	inet
+1204	<=	inet	inet
+1205	>	inet	inet
+1206	>=	inet	inet
+1207	~~	name	text
+1208	!~~	name	text
+1209	~~	text	text
+1210	!~~	text	text
+1211	~~	character	text
+1212	!~~	character	text
+1220	=	macaddr	macaddr
+1221	<>	macaddr	macaddr
+1222	<	macaddr	macaddr
+1223	<=	macaddr	macaddr
+1224	>	macaddr	macaddr
+1225	>=	macaddr	macaddr
+1226	~*	name	text
+1227	!~*	name	text
+1228	~*	text	text
+1229	!~*	text	text
+1234	~*	character	text
+1235	!~*	character	text
+1320	=	timestamp with time zone	timestamp with time zone
+1321	<>	timestamp with time zone	timestamp with time zone
+1322	<	timestamp with time zone	timestamp with time zone
+1323	<=	timestamp with time zone	timestamp with time zone
+1324	>	timestamp with time zone	timestamp with time zone
+1325	>=	timestamp with time zone	timestamp with time zone
+1327	+	timestamp with time zone	interval
+1328	-	timestamp with time zone	timestamp with time zone
+1329	-	timestamp with time zone	interval
+1330	=	interval	interval
+1331	<>	interval	interval
+1332	<	interval	interval
+1333	<=	interval	interval
+1334	>	interval	interval
+1335	>=	interval	interval
+1336	-	NONE	interval
+1337	+	interval	interval
+1338	-	interval	interval
+1360	+	date	time without time zone
+1361	+	date	time with time zone
+1363	+	time without time zone	date
+1366	+	time with time zone	date
+1383	<->	polygon	circle
+1399	-	time without time zone	time without time zone
+1420	@@	NONE	circle
+1500	=	circle	circle
+1501	<>	circle	circle
+1502	<	circle	circle
+1503	>	circle	circle
+1504	<=	circle	circle
+1505	>=	circle	circle
+1506	<<	circle	circle
+1507	&<	circle	circle
+1508	&>	circle	circle
+1509	>>	circle	circle
+1510	<@	circle	circle
+1511	@>	circle	circle
+1512	~=	circle	circle
+1513	&&	circle	circle
+1514	|>>	circle	circle
+1515	<<|	circle	circle
+1516	+	circle	point
+1517	-	circle	point
+1518	*	circle	point
+1519	/	circle	point
+1520	<->	circle	circle
+1521	#	NONE	polygon
+1522	<->	point	circle
+1523	<->	circle	polygon
+1525	?#	lseg	lseg
+1526	?||	lseg	lseg
+1527	?-|	lseg	lseg
+1528	?-	NONE	lseg
+1529	?|	NONE	lseg
+1535	=	lseg	lseg
+1536	#	lseg	lseg
+1537	?#	lseg	line
+1538	?#	lseg	box
+1539	?#	line	box
+1546	<@	point	line
+1547	<@	point	lseg
+1548	<@	lseg	line
+1549	<@	lseg	box
+1550	=	time with time zone	time with time zone
+1551	<>	time with time zone	time with time zone
+1552	<	time with time zone	time with time zone
+1553	<=	time with time zone	time with time zone
+1554	>	time with time zone	time with time zone
+1555	>=	time with time zone	time with time zone
+1557	##	point	line
+1558	##	point	lseg
+1559	##	point	box
+1567	##	lseg	box
+1577	##	line	lseg
+1578	##	lseg	lseg
+1583	*	interval	double precision
+1584	*	double precision	interval
+1585	/	interval	double precision
+1586	<>	lseg	lseg
+1587	<	lseg	lseg
+1588	<=	lseg	lseg
+1589	>	lseg	lseg
+1590	>=	lseg	lseg
+1591	@-@	NONE	lseg
+1611	?#	line	line
+1612	?||	line	line
+1613	?-|	line	line
+1614	?-	NONE	line
+1615	?|	NONE	line
+1616	=	line	line
+1617	#	line	line
+1625	~~*	name	text
+1626	!~~*	name	text
+1627	~~*	text	text
+1628	!~~*	text	text
+1629	~~*	character	text
+1630	!~~*	character	text
+1694	<=	boolean	boolean
+1695	>=	boolean	boolean
+1751	-	NONE	numeric
+1752	=	numeric	numeric
+1753	<>	numeric	numeric
+1754	<	numeric	numeric
+1755	<=	numeric	numeric
+1756	>	numeric	numeric
+1757	>=	numeric	numeric
+1758	+	numeric	numeric
+1759	-	numeric	numeric
+1760	*	numeric	numeric
+1761	/	numeric	numeric
+1762	%	numeric	numeric
+1763	@	NONE	numeric
+1784	=	bit	bit
+1785	<>	bit	bit
+1786	<	bit	bit
+1787	>	bit	bit
+1788	<=	bit	bit
+1789	>=	bit	bit
+1791	&	bit	bit
+1792	|	bit	bit
+1793	#	bit	bit
+1794	~	NONE	bit
+1795	<<	bit	integer
+1796	>>	bit	integer
+1797	||	bit varying	bit varying
+1800	+	time without time zone	interval
+1801	-	time without time zone	interval
+1802	+	time with time zone	interval
+1803	-	time with time zone	interval
+1804	=	bit varying	bit varying
+1805	<>	bit varying	bit varying
+1806	<	bit varying	bit varying
+1807	>	bit varying	bit varying
+1808	<=	bit varying	bit varying
+1809	>=	bit varying	bit varying
+1849	+	interval	time without time zone
+1862	=	smallint	bigint
+1863	<>	smallint	bigint
+1864	<	smallint	bigint
+1865	>	smallint	bigint
+1866	<=	smallint	bigint
+1867	>=	smallint	bigint
+1868	=	bigint	smallint
+1869	<>	bigint	smallint
+1870	<	bigint	smallint
+1871	>	bigint	smallint
+1872	<=	bigint	smallint
+1873	>=	bigint	smallint
+1874	&	smallint	smallint
+1875	|	smallint	smallint
+1876	#	smallint	smallint
+1877	~	NONE	smallint
+1878	<<	smallint	integer
+1879	>>	smallint	integer
+1880	&	integer	integer
+1881	|	integer	integer
+1882	#	integer	integer
+1883	~	NONE	integer
+1884	<<	integer	integer
+1885	>>	integer	integer
+1886	&	bigint	bigint
+1887	|	bigint	bigint
+1888	#	bigint	bigint
+1889	~	NONE	bigint
+1890	<<	bigint	integer
+1891	>>	bigint	integer
+1916	+	NONE	bigint
+1917	+	NONE	smallint
+1918	+	NONE	integer
+1919	+	NONE	real
+1920	+	NONE	double precision
+1921	+	NONE	numeric
+1955	=	bytea	bytea
+1956	<>	bytea	bytea
+1957	<	bytea	bytea
+1958	<=	bytea	bytea
+1959	>	bytea	bytea
+1960	>=	bytea	bytea
+2016	~~	bytea	bytea
+2017	!~~	bytea	bytea
+2018	||	bytea	bytea
+2060	=	timestamp without time zone	timestamp without time zone
+2061	<>	timestamp without time zone	timestamp without time zone
+2062	<	timestamp without time zone	timestamp without time zone
+2063	<=	timestamp without time zone	timestamp without time zone
+2064	>	timestamp without time zone	timestamp without time zone
+2065	>=	timestamp without time zone	timestamp without time zone
+2066	+	timestamp without time zone	interval
+2067	-	timestamp without time zone	timestamp without time zone
+2068	-	timestamp without time zone	interval
+2314	~<~	text	text
+2315	~<=~	text	text
+2317	~>=~	text	text
+2318	~>~	text	text
+2326	~<~	character	character
+2327	~<=~	character	character
+2329	~>=~	character	character
+2330	~>~	character	character
+2345	<	date	timestamp without time zone
+2346	<=	date	timestamp without time zone
+2347	=	date	timestamp without time zone
+2348	>=	date	timestamp without time zone
+2349	>	date	timestamp without time zone
+2350	<>	date	timestamp without time zone
+2358	<	date	timestamp with time zone
+2359	<=	date	timestamp with time zone
+2360	=	date	timestamp with time zone
+2361	>=	date	timestamp with time zone
+2362	>	date	timestamp with time zone
+2363	<>	date	timestamp with time zone
+2371	<	timestamp without time zone	date
+2372	<=	timestamp without time zone	date
+2373	=	timestamp without time zone	date
+2374	>=	timestamp without time zone	date
+2375	>	timestamp without time zone	date
+2376	<>	timestamp without time zone	date
+2384	<	timestamp with time zone	date
+2385	<=	timestamp with time zone	date
+2386	=	timestamp with time zone	date
+2387	>=	timestamp with time zone	date
+2388	>	timestamp with time zone	date
+2389	<>	timestamp with time zone	date
+2534	<	timestamp without time zone	timestamp with time zone
+2535	<=	timestamp without time zone	timestamp with time zone
+2536	=	timestamp without time zone	timestamp with time zone
+2537	>=	timestamp without time zone	timestamp with time zone
+2538	>	timestamp without time zone	timestamp with time zone
+2539	<>	timestamp without time zone	timestamp with time zone
+2540	<	timestamp with time zone	timestamp without time zone
+2541	<=	timestamp with time zone	timestamp without time zone
+2542	=	timestamp with time zone	timestamp without time zone
+2543	>=	timestamp with time zone	timestamp without time zone
+2544	>	timestamp with time zone	timestamp without time zone
+2545	<>	timestamp with time zone	timestamp without time zone
+2551	+	interval	date
+2552	+	interval	time with time zone
+2553	+	interval	timestamp without time zone
+2554	+	interval	timestamp with time zone
+2555	+	integer	date
+2570	<<|	box	box
+2571	&<|	box	box
+2572	|&>	box	box
+2573	|>>	box	box
+2574	<<|	polygon	polygon
+2575	&<|	polygon	polygon
+2576	|&>	polygon	polygon
+2577	|>>	polygon	polygon
+2589	&<|	circle	circle
+2590	|&>	circle	circle
+2634	~	NONE	inet
+2635	&	inet	inet
+2636	|	inet	inet
+2637	+	inet	bigint
+2638	+	bigint	inet
+2639	-	inet	bigint
+2640	-	inet	inet
+2750	&&	anyarray	anyarray
+2751	@>	anyarray	anyarray
+2752	<@	anyarray	anyarray
+2779	||	text	anynonarray
+2780	||	anynonarray	text
+2799	<	tid	tid
+2800	>	tid	tid
+2801	<=	tid	tid
+2802	>=	tid	tid
+2860	=	anymultirange	anymultirange
+2861	<>	anymultirange	anymultirange
+2862	<	anymultirange	anymultirange
+2863	<=	anymultirange	anymultirange
+2864	>=	anymultirange	anymultirange
+2865	>	anymultirange	anymultirange
+2866	&&	anyrange	anymultirange
+2867	&&	anymultirange	anyrange
+2868	&&	anymultirange	anymultirange
+2869	@>	anymultirange	anyelement
+2870	@>	anymultirange	anyrange
+2871	@>	anymultirange	anymultirange
+2872	<@	anyelement	anymultirange
+2873	<@	anyrange	anymultirange
+2874	<@	anymultirange	anymultirange
+2875	&<	anyrange	anymultirange
+2876	&<	anymultirange	anyrange
+2877	&<	anymultirange	anymultirange
+2972	=	uuid	uuid
+2973	<>	uuid	uuid
+2974	<	uuid	uuid
+2975	>	uuid	uuid
+2976	<=	uuid	uuid
+2977	>=	uuid	uuid
+2988	=	record	record
+2989	<>	record	record
+2990	<	record	record
+2991	>	record	record
+2992	<=	record	record
+2993	>=	record	record
+3147	~	NONE	macaddr
+3148	&	macaddr	macaddr
+3149	|	macaddr	macaddr
+3188	*=	record	record
+3189	*<>	record	record
+3190	*<	record	record
+3191	*>	record	record
+3192	*<=	record	record
+3193	*>=	record	record
+3206	#>>	jsonb	text[]
+3211	->	jsonb	text
+3212	->	jsonb	integer
+3213	#>	jsonb	text[]
+3222	=	pg_lsn	pg_lsn
+3223	<>	pg_lsn	pg_lsn
+3224	<	pg_lsn	pg_lsn
+3225	>	pg_lsn	pg_lsn
+3226	<=	pg_lsn	pg_lsn
+3227	>=	pg_lsn	pg_lsn
+3228	-	pg_lsn	pg_lsn
+3240	=	jsonb	jsonb
+3241	<>	jsonb	jsonb
+3242	<	jsonb	jsonb
+3243	>	jsonb	jsonb
+3244	<=	jsonb	jsonb
+3245	>=	jsonb	jsonb
+3246	@>	jsonb	jsonb
+3247	?	jsonb	text
+3248	?|	jsonb	text[]
+3249	?&	jsonb	text[]
+3250	<@	jsonb	jsonb
+3276	<->	point	polygon
+3284	||	jsonb	jsonb
+3285	-	jsonb	text
+3286	-	jsonb	integer
+3287	#-	jsonb	text[]
+3289	<->	polygon	point
+3291	<->	circle	point
+3315	<>	xid	xid
+3316	<>	xid	integer
+3346	*	money	bigint
+3347	/	money	bigint
+3349	*	bigint	money
+3362	=	macaddr8	macaddr8
+3363	<>	macaddr8	macaddr8
+3364	<	macaddr8	macaddr8
+3365	<=	macaddr8	macaddr8
+3366	>	macaddr8	macaddr8
+3367	>=	macaddr8	macaddr8
+3368	~	NONE	macaddr8
+3369	&	macaddr8	macaddr8
+3370	|	macaddr8	macaddr8
+3398	-	jsonb	text[]
+3477	->>	jsonb	text
+3481	->>	jsonb	integer
+3516	=	anyenum	anyenum
+3517	<>	anyenum	anyenum
+3518	<	anyenum	anyenum
+3519	>	anyenum	anyenum
+3520	<=	anyenum	anyenum
+3521	>=	anyenum	anyenum
+3552	&&	inet	inet
+3585	&>	anyrange	anymultirange
+3627	<	tsvector	tsvector
+3628	<=	tsvector	tsvector
+3629	=	tsvector	tsvector
+3630	<>	tsvector	tsvector
+3631	>=	tsvector	tsvector
+3632	>	tsvector	tsvector
+3633	||	tsvector	tsvector
+3636	@@	tsvector	tsquery
+3637	@@	tsquery	tsvector
+3660	@@@	tsvector	tsquery
+3661	@@@	tsquery	tsvector
+3674	<	tsquery	tsquery
+3675	<=	tsquery	tsquery
+3676	=	tsquery	tsquery
+3677	<>	tsquery	tsquery
+3678	>=	tsquery	tsquery
+3679	>	tsquery	tsquery
+3680	&&	tsquery	tsquery
+3681	||	tsquery	tsquery
+3682	!!	NONE	tsquery
+3693	@>	tsquery	tsquery
+3694	<@	tsquery	tsquery
+3762	@@	text	text
+3763	@@	text	tsquery
+3825	/	money	money
+3877	^@	text	text
+3882	=	anyrange	anyrange
+3883	<>	anyrange	anyrange
+3884	<	anyrange	anyrange
+3885	<=	anyrange	anyrange
+3886	>=	anyrange	anyrange
+3887	>	anyrange	anyrange
+3888	&&	anyrange	anyrange
+3889	@>	anyrange	anyelement
+3890	@>	anyrange	anyrange
+3891	<@	anyelement	anyrange
+3892	<@	anyrange	anyrange
+3893	<<	anyrange	anyrange
+3894	>>	anyrange	anyrange
+3895	&<	anyrange	anyrange
+3896	&>	anyrange	anyrange
+3897	-|-	anyrange	anyrange
+3898	+	anyrange	anyrange
+3899	-	anyrange	anyrange
+3900	*	anyrange	anyrange
+3962	->	json	text
+3963	->>	json	text
+3964	->	json	integer
+3965	->>	json	integer
+3966	#>	json	text[]
+3967	#>>	json	text[]
+4012	@?	jsonb	jsonpath
+4013	@@	jsonb	jsonpath
+4035	&>	anymultirange	anyrange
+4142	&>	anymultirange	anymultirange
+4161	|>>	point	point
+4162	<<|	point	point
+4179	-|-	anyrange	anymultirange
+4180	-|-	anymultirange	anyrange
+4198	-|-	anymultirange	anymultirange
+4392	+	anymultirange	anymultirange
+4393	-	anymultirange	anymultirange
+4394	*	anymultirange	anymultirange
+4395	<<	anyrange	anymultirange
+4396	<<	anymultirange	anyrange
+4397	<<	anymultirange	anymultirange
+4398	>>	anyrange	anymultirange
+4399	>>	anymultirange	anyrange
+4400	>>	anymultirange	anymultirange
+4539	@>	anyrange	anymultirange
+4540	<@	anymultirange	anyrange
+5005	<->	tsquery	tsquery
+5025	+	pg_lsn	numeric
+5026	+	numeric	pg_lsn
+5027	-	pg_lsn	numeric
+5068	=	xid8	xid8
+5072	<>	xid8	xid8
+5073	<	xid8	xid8
+5074	>	xid8	xid8
+5075	<=	xid8	xid8
+5076	>=	xid8	xid8
