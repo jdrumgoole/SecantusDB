@@ -19,6 +19,7 @@ mod expr_where;
 mod filter_sublink;
 mod like_match;
 pub mod schemas;
+mod srf_tlist;
 pub mod systypes;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
@@ -10613,6 +10614,10 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         let mut names = Vec::new();
         let mut types = Vec::new();
         let mut parts: Vec<Vec<Vec<Bson>>> = Vec::new();
+        // Each function's width is its declared column count: one that
+        // yields no rows still pads with that many NULLs, or the columns
+        // after it shift left (`ROWS FROM (jsonb_each('{}'), generate_series(1, 2))`).
+        let mut widths: Vec<usize> = Vec::new();
         for c in &calls {
             let n = func_name(c).unwrap_or_default();
             let Some((cn, ct, rows)) = (match json_record_rows(&n, c, &[], params)? {
@@ -10626,6 +10631,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
             };
             names.extend(cn);
             types.extend(ct.clone());
+            widths.push(ct.len());
             parts.push(
                 rows.into_iter()
                     .map(|r| {
@@ -10636,11 +10642,6 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
                     .collect(),
             );
         }
-        let widths: Vec<usize> = calls
-            .iter()
-            .zip(&parts)
-            .map(|(_, p)| p.first().map_or(0, Vec::len))
-            .collect();
         let depth = parts.iter().map(Vec::len).max().unwrap_or(0);
         let mut rows = Vec::with_capacity(depth);
         for i in 0..depth {
@@ -18551,9 +18552,9 @@ fn plan_select(
     enum_order::check_collate_operands(s, lookup)?;
     check_distinct_order(s)?;
     check_distinct_on_order(s)?;
-    // A set-returning function over a column in the select list is a
-    // LATERAL join (see `joins::select_list_srf`).
-    if let Some(rewritten) = joins::select_list_srf(s)? {
+    // A set-returning function in the select list (or ORDER BY / GROUP BY)
+    // is a LATERAL source (see `srf_tlist`).
+    if let Some(rewritten) = srf_tlist::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
     }
     // A reference to the RELATION itself -- `row_to_json(t)`, `SELECT jr
