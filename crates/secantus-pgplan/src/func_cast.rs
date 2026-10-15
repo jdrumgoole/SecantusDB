@@ -338,13 +338,25 @@ pub(crate) fn spread_variadic(node: &mut N) {
             && f.args.len() == 2
             && func_name(f).is_some_and(|n| AS_OPERATOR.contains(&n.as_str()))
     };
+    // A one-dimensional `ARRAY[...]` spreads into the call as written; a
+    // nested one is flattened when it runs, as any other value is.
+    let literal_array = |f: &pg_query::protobuf::FuncCall| {
+        matches!(
+            f.args.last().and_then(|a| a.node.as_ref()),
+            Some(N::AArrayExpr(a)) if !a.elements.is_empty()
+                && !a.elements.iter().any(|e| matches!(e.node, Some(N::AArrayExpr(_))))
+        )
+    };
+    // `VARIADIC x` over any other value for a `VARIADIC "any"` built-in:
+    // `\u{1f}variadic_<name>` spreads the array when it runs (`scalar`).
+    let runtime_form = |f: &pg_query::protobuf::FuncCall| {
+        f.func_variadic
+            && f.funcname.len() == 1
+            && !literal_array(f)
+            && func_name(f).is_some_and(|n| matches!(n.as_str(), "concat" | "concat_ws" | "format"))
+    };
     let spreadable = |f: &pg_query::protobuf::FuncCall| {
-        operator_form(f)
-            || f.func_variadic
-                && matches!(
-                    f.args.last().and_then(|a| a.node.as_ref()),
-                    Some(N::AArrayExpr(a)) if !a.elements.is_empty()
-                )
+        operator_form(f) || runtime_form(f) || f.func_variadic && literal_array(f)
     };
     if !node
         .nodes()
@@ -366,7 +378,7 @@ pub(crate) fn spread_variadic(node: &mut N) {
                 if !spreadable(f) {
                     continue;
                 }
-                if operator_form(f) {
+                if operator_form(f) || runtime_form(f) {
                     let name = func_name(f).unwrap_or_default();
                     f.funcname = vec![pg_query::protobuf::Node {
                         node: Some(N::String(pg_query::protobuf::String {

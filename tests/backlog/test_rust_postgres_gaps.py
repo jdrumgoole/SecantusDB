@@ -140,10 +140,16 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
     "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
+    "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
+    "variadic-column": (
+        "select concat(variadic a), format('%s-%s', variadic a)"
+        " from (values (array['x', 'y'])) v(a)"
+    ),
+    "variadic-nested-array": "select concat(variadic array[[1, 2], [3, 4]])",
     "query-to-xml": (
         "select query_to_xml('select 1 as a, null::text as \"_xb\", array[1,null] as r',"
         " true, true, 'urn:x')"
@@ -663,3 +669,14 @@ def test_copy_from_reports_the_bad_byte(pg: Any) -> None:
     finally:
         pg.execute("drop table rp38_copy")
     assert got == ("22021", 'invalid byte sequence for encoding "UTF8": 0x82')
+
+
+@pytest.mark.backlog_fixed("RP-015")
+def test_null_tsquery_sends_no_notice(pg: Any) -> None:
+    """PostgreSQL 15.19: `select null::tsquery` and `numnode(null)` send no
+    NOTICE (`''::tsquery` says it has no lexemes; a NULL is not parsed)."""
+    notices: list[str] = []
+    pg.add_notice_handler(lambda d: notices.append(d.message_primary))
+    for sql in ("select null::tsquery", "select numnode(null)", "select querytree(null::tsquery)"):
+        pg.execute(sql).fetchall()
+    assert notices == []

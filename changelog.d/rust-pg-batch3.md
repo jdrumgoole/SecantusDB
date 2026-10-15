@@ -24,6 +24,19 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   it is rewritten into. Part of RP-038
   (`tests/backlog/test_rust_postgres_gaps.py::test_batch_residue_fixed[operator-function-typed]`).
 
+- `concat`, `concat_ws` and `format` with `VARIADIC` over a column or any
+  value that is not an `ARRAY[...]` constructor spread its elements when
+  they run, flattened. `concat(variadic col)` had answered the array's
+  internal debug text, and `format('%s-%s', variadic col)` 22023; a nested
+  `ARRAY[[1,2],[3,4]]` had spread its rows. A NULL array is NULL, and no
+  arguments for `format`. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[variadic-column]`,
+  `[variadic-nested-array]`).
+- `null::tsquery` and `numnode(null)` no longer send `''::tsquery`'s
+  "doesn't contain lexemes" NOTICE: a NULL cast's check that its type
+  exists kept the NOTICEs its probe raised. Part of RP-015
+  (`::test_null_tsquery_sends_no_notice`).
+
 #### Added
 
 - Corpora `domain_typeof`, `record_arrays` and `operator_function_calls`.

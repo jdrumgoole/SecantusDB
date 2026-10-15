@@ -12,7 +12,8 @@ use bson::Bson;
 
 /// Is this a scalar built-in this server implements?
 pub fn is_scalar(name: &str) -> bool {
-    name == "secantus_hash_partition"
+    variadic_base(name).is_some()
+        || name == "secantus_hash_partition"
         || SCALAR_NAMES.contains(&name)
         || CATALOG_NAMES.contains(&name)
         || crate::arrays::is_array_function(name)
@@ -646,7 +647,41 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     Some(eval(name, args))
 }
 
+/// The `VARIADIC "any"` built-in a `\u{1f}variadic_<name>` call stands for
+/// (`func_cast::spread_variadic`): `VARIADIC x` over a value that is not an
+/// `ARRAY[...]` constructor, spread when it runs.
+fn variadic_base(name: &str) -> Option<&str> {
+    name.strip_prefix("\u{1f}variadic_")
+        .filter(|b| matches!(*b, "concat" | "concat_ws" | "format"))
+}
+
+/// The array's elements, flattened, as the call's last arguments. A NULL
+/// array is a NULL result, except for `format`, which then has no
+/// arguments beyond its format (PostgreSQL 15.19: `too few arguments`).
+fn eval_variadic(base: &str, args: &[Bson]) -> Result<Bson> {
+    fn flat(v: &Bson, out: &mut Vec<Bson>) {
+        match v {
+            Bson::Array(items) => items.iter().for_each(|i| flat(i, out)),
+            other => out.push(other.clone()),
+        }
+    }
+    let Some((last, fixed)) = args.split_last() else {
+        return eval(base, args);
+    };
+    let mut spread = fixed.to_vec();
+    match crate::arrays::strip(last) {
+        v @ Bson::Array(_) => flat(&v, &mut spread),
+        Bson::Null if base == "format" => {}
+        Bson::Null => return Ok(Bson::Null),
+        other => spread.push(other),
+    }
+    eval(base, &spread)
+}
+
 fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
+    if let Some(base) = variadic_base(name) {
+        return eval_variadic(base, args);
+    }
     // Most scalar built-ins are NULL-propagating: given a NULL argument the
     // answer is NULL, not an error. Four are not, and all four IGNORE a NULL
     // argument instead: `concat` and `concat_ws` skip them, and `greatest` /
@@ -2600,6 +2635,9 @@ pub fn md5_hex(data: &[u8]) -> String {
 /// input and fall back to text only when unknown, which is also what an
 /// untyped output column defaults to.
 pub fn static_result_type(name: &str) -> &'static str {
+    if let Some(base) = variadic_base(name) {
+        return static_result_type(base);
+    }
     if name == "secantus_hash_partition" || name == "__net_op" {
         return "bool";
     }

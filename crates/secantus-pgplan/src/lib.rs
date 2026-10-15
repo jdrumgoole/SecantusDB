@@ -29486,8 +29486,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         // The cast's own arms are the list of known types: a probe value
         // that reaches the "no such type" arm is the only refusal kept.
         let base = target.strip_suffix("[]").unwrap_or(target);
-        if let Err(Error::UndefinedObject(m)) = cast_value_inner(Bson::String(String::new()), base)
-        {
+        // The probe's own NOTICEs are not the statement's: `''::tsquery`
+        // says it has no lexemes, `null::tsquery` says nothing.
+        let notices = fts::notices_len();
+        let probe = cast_value_inner(Bson::String(String::new()), base);
+        fts::truncate_notices(notices);
+        if let Err(Error::UndefinedObject(m)) = probe {
             if m.starts_with("type \"") && m.ends_with("\" does not exist") {
                 return Err(Error::UndefinedObject(format!(
                     "type \"{target}\" does not exist"

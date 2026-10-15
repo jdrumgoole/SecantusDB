@@ -459,33 +459,29 @@ one beside it.
       `test_builtin_coverage_fixed` and the corpora it added). Re-run it
       before working an item.
 
-      What is left:
-      - **Text search**: `null::tsquery` sends a spurious "doesn't
-        contain lexemes" NOTICE from a FROM-less select; `ts_headline`
-        refuses its `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments`
-        options, chooses its words by a rule of its own, and answers an
-        all-untyped call PostgreSQL refuses as not unique (42725);
-        `ts_rewrite`'s substitute loses its AND/OR nesting (a tsquery is
-        carried as its canonical text), its SELECT form checks the column
-        count only on rows it gets back, and a syntax error in that SQL has
-        a position PostgreSQL does not give.
+      What is left (re-measured 2026-10-15 against 15.19):
+      - **`ts_rewrite(query, select)`** checks that its SELECT returns two
+        tsquery columns only on the rows it gets back: over none
+        (`... where false`) it answers the query unchanged, where
+        PostgreSQL is 22023 `ts_rewrite query must return two tsquery
+        columns`. The checker would need the SELECT's described column
+        types, which `correlated::run_sql` does not return.
       - **`aclexplode` in a select list** (`(aclexplode(a)).privilege_type`)
-        is refused, and an aclitem naming a role oid no role has cannot be
-        read back (items are carried as text, PostgreSQL's as oids);
-        the XML schema exports (`query_to_xmlschema`, `table_to_xmlschema`,
-        the `*_and_xmlschema` forms), `cursor_to_xml` and the schema /
-        database forms, and the `fmgr_*` / `postgresql_fdw_validator`
-        validators, are not written (`query_to_xml` / `table_to_xml` are).
-      - **An untyped literal beside a typed argument** is resolved only
-        for a polymorphic overload that is the one candidate (`unknown_args`,
-        `funcsig::polymorphic_args`); `func_select_candidate`'s other steps
-        are not followed (only an all-constant call is). `unnest('{1,2}')`
-        is not PostgreSQL's 42725 (three overloads), and a bad literal read
-        through `array_append('{1.5}', 2)` has no position. `abs(NULL)`'s
-        column is described as `numeric` (oid 1700); PostgreSQL says
-        `float8` (701), and its `pg_typeof` is right here.
-      - **A VARIADIC argument** that is neither an `ARRAY[...]` constructor
-        nor a json path / `jsonb_delete` call (`concat(VARIADIC arr_col)`).
+        is 0A000, and an aclitem naming a role oid no role has cannot be
+        read back (items are carried as text, PostgreSQL's as oids).
+      - **Not written**: the XML schema exports (`query_to_xmlschema`,
+        `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`
+        and the schema / database forms, and the `fmgr_*` /
+        `postgresql_fdw_validator` validators (`query_to_xml` /
+        `table_to_xml` are).
+      - **Error positions**: a bad element read through an untyped array
+        literal (`array_append('{1.5}', 2)`,
+        `concat(variadic $$${1}$$::int[])`) is the right 22P02 with no
+        position (PostgreSQL places it at the literal).
+      - **`concat('a', variadic array['b','c'])`** answers `abc`;
+        PostgreSQL 15.19 is 42883 `function concat(unknown, text[]) does
+        not exist`, since an untyped argument does not resolve against
+        `VARIADIC "any"`.
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,
