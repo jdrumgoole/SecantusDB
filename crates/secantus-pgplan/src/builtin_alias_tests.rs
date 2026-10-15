@@ -109,7 +109,19 @@ fn family_types_are_read_off_the_name() {
 
 #[test]
 fn every_template_parses() {
-    assert_eq!(templates().len(), TEMPLATES.len());
+    // Every template parses, the hand-written and the generated alike.
+    for (name, n, _) in TEMPLATES {
+        assert!(templates().contains_key(&(*name, *n)), "{name}");
+    }
+    for (name, _, _, _) in TYPED {
+        assert!(templates().contains_key(&(*name, 2)), "{name}");
+    }
+    for (name, n, _) in STEPS {
+        assert!(templates().contains_key(&(*name, *n)), "{name}");
+    }
+    for (name, _) in output_templates() {
+        assert!(templates().contains_key(&(name, 1)), "{name}");
+    }
     for (name, _) in FAMILIES {
         assert!(family_template(name, 2).is_some(), "{name}");
     }

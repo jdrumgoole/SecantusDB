@@ -34395,7 +34395,7 @@ fn send_bytes(v: &Bson, pg_type: &str) -> Option<Vec<u8>> {
     let field = FieldInfo::new("v".into(), None, None, ty.clone(), FieldFormat::Binary);
     let mut enc = DataRowEncoder::new(Arc::new(vec![field]));
     encode_binary(&mut enc, &ty, Some(v)).ok()?;
-    let row = enc.finish().ok()?;
+    let row = enc.take_row();
     let len = i32::from_be_bytes(row.data.get(..4)?.try_into().ok()?);
     let len = usize::try_from(len).ok()?;
     Some(row.data.get(4..4 + len)?.to_vec())

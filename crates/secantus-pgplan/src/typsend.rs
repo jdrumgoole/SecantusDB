@@ -87,7 +87,7 @@ pub(crate) fn call(name: &str, value: &Bson, ty: &str) -> Option<Result<Bson>> {
     let encode = ENCODER.get()?;
     Some(
         encode(&value, &ty)
-            .map(|bytes| bytea::to_binary(bytes))
+            .map(bytea::to_binary)
             .ok_or_else(|| Error::Unsupported(format!("{name}({ty})"))),
     )
 }
