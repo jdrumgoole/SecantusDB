@@ -30,6 +30,10 @@ pub enum ClientEncoding {
     /// ISO-8859-15: LATIN1 with eight positions reassigned (the euro sign and
     /// seven others).
     Latin9,
+    /// Another single-byte encoding (`LATIN2`, `WIN1251`, `KOI8R`, ...), by
+    /// the table PostgreSQL 15 converts it with (`secantus_pgplan`'s, measured
+    /// from it). A byte the table has no character for is refused.
+    Single(&'static str, &'static [u16; 128]),
     /// Bytes pass through unchanged in both directions, exactly as UTF8 does
     /// (the server's internal form is UTF-8). Covers `SQL_ASCII` and every
     /// accepted-but-not-transcoded encoding.
@@ -40,7 +44,20 @@ impl ClientEncoding {
     /// Whether outgoing / incoming text bytes must be transcoded. Only LATIN1
     /// and LATIN9 differ from the internal UTF-8 form.
     pub fn transcodes(self) -> bool {
-        matches!(self, ClientEncoding::Latin1 | ClientEncoding::Latin9)
+        matches!(
+            self,
+            ClientEncoding::Latin1 | ClientEncoding::Latin9 | ClientEncoding::Single(..)
+        )
+    }
+
+    /// The canonical name, as an error about this encoding writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ClientEncoding::Latin1 => "LATIN1",
+            ClientEncoding::Latin9 => "LATIN9",
+            ClientEncoding::Single(name, _) => name,
+            ClientEncoding::Utf8 | ClientEncoding::Passthrough => "UTF8",
+        }
     }
 }
 
@@ -162,7 +179,18 @@ pub fn client_encoding(canonical: &str) -> ClientEncoding {
         "UTF8" => ClientEncoding::Utf8,
         "LATIN1" => ClientEncoding::Latin1,
         "LATIN9" => ClientEncoding::Latin9,
-        _ => ClientEncoding::Passthrough,
+        other => match secantus_pgplan::single_byte_table(other) {
+            // The `&'static str` the table is filed under, not `other`.
+            Some(table) => ClientEncoding::Single(
+                CANONICAL
+                    .iter()
+                    .find(|n| **n == other)
+                    .copied()
+                    .unwrap_or("UTF8"),
+                table,
+            ),
+            None => ClientEncoding::Passthrough,
+        },
     }
 }
 
@@ -181,10 +209,25 @@ const LATIN9_DIFFS: &[(u8, char)] = &[
 /// Decode wire bytes in the client encoding into an internal UTF-8 string.
 ///
 /// LATIN1 and LATIN9 are single-byte encodings in which every byte is valid, so
-/// this cannot fail for them; every other encoding takes the UTF-8 path (the
+/// they cannot fail; another single-byte encoding refuses a byte its table has
+/// no character for (`Err(byte)`, PostgreSQL's 22P05), rather than store a
+/// replacement character. Every other encoding takes the UTF-8 path (the
 /// internal form), where invalid bytes are the caller's concern.
-pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> String {
-    match enc {
+pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> Result<String, u8> {
+    Ok(match enc {
+        ClientEncoding::Single(_, table) => {
+            return bytes
+                .iter()
+                .map(|&b| {
+                    if b < 0x80 {
+                        return Ok(b as char);
+                    }
+                    char::from_u32(u32::from(table[usize::from(b - 0x80)]))
+                        .filter(|c| *c != '\0')
+                        .ok_or(b)
+                })
+                .collect()
+        }
         ClientEncoding::Latin1 => bytes.iter().map(|&b| b as char).collect(),
         ClientEncoding::Latin9 => bytes
             .iter()
@@ -199,18 +242,45 @@ pub fn decode(enc: ClientEncoding, bytes: &[u8]) -> String {
         ClientEncoding::Utf8 | ClientEncoding::Passthrough => {
             String::from_utf8_lossy(bytes).into_owned()
         }
-    }
+    })
+}
+
+/// PostgreSQL's 22P05 for a byte of the client's encoding with no Unicode
+/// character (`0xa5` in LATIN3).
+pub fn undecodable(enc: ClientEncoding, byte: u8) -> pgwire::error::PgWireError {
+    pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+        "ERROR".into(),
+        "22P05".into(),
+        format!(
+            "character with byte sequence 0x{byte:02x} in encoding \"{}\" has no equivalent \
+             in encoding \"UTF8\"",
+            enc.name()
+        ),
+    )))
 }
 
 /// Transcode an internal UTF-8 byte slice to the client encoding.
 ///
 /// Returns `Err(ch)` with the first code point that has no representation in the
 /// target encoding, which the caller turns into PostgreSQL's `22P05`
-/// untranslatable-character error. Only ever called for LATIN1 / LATIN9; the
-/// other encodings emit their input unchanged and never reach here.
+/// untranslatable-character error. Only ever called for the transcoding
+/// encodings; the others emit their input unchanged and never reach here.
 pub fn encode(enc: ClientEncoding, utf8: &[u8]) -> Result<Vec<u8>, char> {
     let text = String::from_utf8_lossy(utf8);
     match enc {
+        ClientEncoding::Single(_, table) => text
+            .chars()
+            .map(|c| {
+                if c.is_ascii() {
+                    return Ok(c as u8);
+                }
+                table
+                    .iter()
+                    .position(|&u| u != 0 && u32::from(u) == u32::from(c))
+                    .and_then(|i| u8::try_from(i + 0x80).ok())
+                    .ok_or(c)
+            })
+            .collect(),
         ClientEncoding::Latin1 => text
             .chars()
             .map(|c| u8::try_from(c as u32).map_err(|_| c))
@@ -272,7 +342,7 @@ mod tests {
         assert_eq!(enc, ClientEncoding::Latin9);
         let bytes = encode(enc, "€".as_bytes()).unwrap();
         assert_eq!(bytes, vec![0xA4]);
-        assert_eq!(decode(enc, &bytes), "€");
+        assert_eq!(decode(enc, &bytes).unwrap(), "€");
     }
 
     #[test]
@@ -290,15 +360,33 @@ mod tests {
         // 0xA4 is the euro in LATIN9, so the LATIN1 currency sign U+00A4 no
         // longer has a byte there.
         assert_eq!(encode(enc, "\u{00A4}".as_bytes()), Err('\u{00A4}'));
-        assert_eq!(decode(enc, &[0xA4]), "€");
-        assert_eq!(decode(enc, &[0xA6]), "Š");
+        assert_eq!(decode(enc, &[0xA4]).unwrap(), "€");
+        assert_eq!(decode(enc, &[0xA6]).unwrap(), "Š");
+    }
+
+    #[test]
+    fn single_byte_encodings_use_their_table() {
+        let enc = client_encoding("LATIN2");
+        assert!(matches!(enc, ClientEncoding::Single("LATIN2", _)));
+        assert_eq!(encode(enc, "ą".as_bytes()).unwrap(), vec![0xB1]);
+        assert_eq!(decode(enc, &[0xB1, b'a']).unwrap(), "ąa");
+        assert_eq!(encode(enc, "€".as_bytes()), Err('€'));
+        let koi8r = client_encoding("KOI8R");
+        assert_eq!(decode(koi8r, &[0xD6]).unwrap(), "ж");
+    }
+
+    #[test]
+    fn a_byte_with_no_character_is_refused() {
+        // LATIN3 has no character at 0xA5: PostgreSQL's 22P05, not U+FFFD.
+        let enc = client_encoding("LATIN3");
+        assert_eq!(decode(enc, &[b'a', 0xA5]), Err(0xA5));
     }
 
     #[test]
     fn utf8_and_passthrough_are_identity() {
         for enc in [ClientEncoding::Utf8, ClientEncoding::Passthrough] {
             assert_eq!(encode(enc, "€".as_bytes()).unwrap(), "€".as_bytes());
-            assert_eq!(decode(enc, "€".as_bytes()), "€");
+            assert_eq!(decode(enc, "€".as_bytes()).unwrap(), "€");
             assert!(!enc.transcodes());
         }
     }

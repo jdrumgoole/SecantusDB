@@ -197,7 +197,9 @@ impl PgHandler {
             return Ok(None);
         };
         let enc = self.client_encoding();
-        Ok(crate::split_single_field(row).map(|b| encoding::decode(enc, &b)))
+        crate::split_single_field(row)
+            .map(|b| encoding::decode(enc, &b).map_err(|byte| encoding::undecodable(enc, byte)))
+            .transpose()
     }
 
     async fn do_raise(&self, raise: Raise) -> PgWireResult<()> {

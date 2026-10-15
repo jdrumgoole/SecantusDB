@@ -78,6 +78,7 @@ mod table_locks;
 mod tls;
 mod triggers;
 mod txn_gucs;
+mod window_order;
 mod wire_portals;
 mod x509;
 mod xids;
@@ -16196,6 +16197,24 @@ impl PgHandler {
         out
     }
 
+    /// `positioned`, for an error found while describing a prepared
+    /// statement: PostgreSQL positions it as it does from a simple query
+    /// (a syntax error, an unknown column or relation, a grouping error), but
+    /// not an `operator does not exist` over a bound parameter (`arr @> $1`,
+    /// measured on 15.19), which it finds only once the parameter is typed.
+    fn syntax_positioned(e: PgWireError, sql: &str) -> PgWireError {
+        match &e {
+            PgWireError::UserError(info)
+                if info.code == "42883"
+                    && info.message.starts_with("operator does not exist")
+                    && sql.contains('$') =>
+            {
+                e
+            }
+            _ => Self::positioned(e, sql),
+        }
+    }
+
     /// An error raised while RUNNING `sql` (not planning it), given the
     /// position PostgreSQL would point at when the statement names it.
     fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
@@ -17281,6 +17300,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             829 => "macaddr",
             774 => "macaddr8",
             3220 => "pg_lsn",
+            27 => "tid",
             28 => "xid",
             5069 => "xid8",
             29 => "cid",
@@ -17331,6 +17351,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1040 => "macaddr[]",
             775 => "macaddr8[]",
             3221 => "pg_lsn[]",
+            1010 => "tid[]",
             651 => "cidr[]",
             1020 => "box[]",
             1017 => "point[]",
@@ -17396,7 +17417,7 @@ fn type_size(ty: &Type) -> i16 {
         | Type::TIMESTAMPTZ
         | Type::MACADDR8
         | Type::PG_LSN => 8,
-        Type::MACADDR => 6,
+        Type::MACADDR | Type::TID => 6,
         Type::TIMETZ => 12,
         Type::INTERVAL | Type::UUID => 16,
         Type::BOX | Type::LSEG => 32,
@@ -17431,6 +17452,7 @@ fn wire_type(pg_type: &str) -> Type {
         "macaddr" => Type::MACADDR,
         "macaddr8" => Type::MACADDR8,
         "pg_lsn" => Type::PG_LSN,
+        "tid" => Type::TID,
         "xid" => Type::XID,
         "xid8" => Type::XID8,
         "cid" => Type::CID,
@@ -17452,6 +17474,9 @@ fn wire_type(pg_type: &str) -> Type {
         "tsvector" => Type::TS_VECTOR,
         "tsquery" => Type::TSQUERY,
         "regconfig" => Type::REGCONFIG,
+        // `ts_debug`'s `dictionary` / `dictionaries` columns.
+        "regdictionary" => Type::REGDICTIONARY,
+        "regdictionary[]" => Type::REGDICTIONARY_ARRAY,
         "jsonpath" => Type::JSONPATH,
         // Stored as canonical TEXT but reported with their real oids: a client
         // reading 1082/1083 parses the value into a date/time object, whereas
@@ -17571,6 +17596,23 @@ fn wire_type(pg_type: &str) -> Type {
         "macaddr[]" => Type::MACADDR_ARRAY,
         "macaddr8[]" => Type::MACADDR8_ARRAY,
         "pg_lsn[]" => Type::PG_LSN_ARRAY,
+        "tid[]" => Type::TID_ARRAY,
+        "money[]" => Type::MONEY_ARRAY,
+        "xid[]" => Type::XID_ARRAY,
+        "xid8[]" => Type::XID8_ARRAY,
+        "cid[]" => Type::CID_ARRAY,
+        "regproc[]" => Type::REGPROC_ARRAY,
+        "regprocedure[]" => Type::REGPROCEDURE_ARRAY,
+        "regnamespace[]" => Type::REGNAMESPACE_ARRAY,
+        "regrole[]" => Type::REGROLE_ARRAY,
+        "regconfig[]" => Type::REGCONFIG_ARRAY,
+        "bit[]" => Type::BIT_ARRAY,
+        "varbit[]" | "bit varying[]" => Type::VARBIT_ARRAY,
+        "tsvector[]" => Type::TS_VECTOR_ARRAY,
+        "tsquery[]" => Type::TSQUERY_ARRAY,
+        "jsonpath[]" => Type::JSONPATH_ARRAY,
+        "int2vector[]" => Type::INT2_VECTOR_ARRAY,
+        "oidvector[]" => Type::OID_VECTOR_ARRAY,
         "txid_snapshot[]" => Type::TXID_SNAPSHOT_ARRAY,
         "pg_snapshot[]" => Type::PG_SNAPSHOT_ARRAY,
         "aclitem[]" => Type::ACLITEM_ARRAY,
@@ -18607,7 +18649,8 @@ impl SimpleQueryHandler for PgHandler {
     where
         C: ClientInfo,
     {
-        Ok(encoding::decode(self.client_encoding(), &query.query_raw))
+        let enc = self.client_encoding();
+        encoding::decode(enc, &query.query_raw).map_err(|b| encoding::undecodable(enc, b))
     }
 
     async fn do_query<C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -19056,16 +19099,87 @@ impl PgHandler {
         Ok(vec![Response::Query(response)])
     }
 
+    /// `INSERT ... SELECT`: every target column needs an ASSIGNMENT cast from
+    /// the type the source query gives it, or the statement is 42804 before a
+    /// row is read -- an empty source included (`transformAssignedExpr`,
+    /// measured on PostgreSQL 15). An untyped literal or NULL takes the
+    /// column's type instead. The source is described, not run.
+    fn check_insert_select_types(
+        &self,
+        def: &TableDef,
+        ins: &secantus_pgplan::Insert,
+        source: &Statement,
+    ) -> PgWireResult<()> {
+        let Ok(fields) = self.copy_query_fields(source) else {
+            return Ok(());
+        };
+        // Expand a `*` to the columns it stands for.
+        let named = ins.source_targets.iter().filter(|t| !t.star).count();
+        let mut per_column: Vec<Option<&secantus_pgplan::SourceTarget>> = Vec::new();
+        for t in &ins.source_targets {
+            let n = if t.star {
+                fields.len().saturating_sub(named)
+            } else {
+                1
+            };
+            per_column.extend(std::iter::repeat_n(Some(t), n));
+        }
+        for (i, (field, target)) in fields.iter().zip(&ins.targets).enumerate() {
+            let entry = per_column.get(i).copied().flatten();
+            if entry.is_some_and(|t| t.untyped) {
+                continue;
+            }
+            let Some(col) = def.column(target) else {
+                continue;
+            };
+            let Some(target_oid) = secantus_pgplan::pgtypes::oid_of_name(&col.pg_type) else {
+                continue;
+            };
+            let source_oid = i64::from(field.datatype().oid());
+            if casts::assignment_path(source_oid, target_oid)
+                || secantus_pgplan::user_casts::assignment_exists(source_oid, target_oid)
+            {
+                continue;
+            }
+            // `name_of_oid` names the scalars; an array is its element's
+            // name with `[]`, and the one-byte type is `"char"` here.
+            let scalar_name = |oid: i64| {
+                secantus_pgplan::pgtypes::name_of_oid(oid).map(|n| match n {
+                    "char" => secantus_pgplan::QUOTED_CHAR.to_string(),
+                    other => other.to_string(),
+                })
+            };
+            let source_name = scalar_name(source_oid).or_else(|| {
+                secantus_pgplan::pgtypes::BUILTIN_TYPES
+                    .iter()
+                    .find(|(_, _, arr)| *arr == source_oid)
+                    .and_then(|(_, el, _)| scalar_name(*el))
+                    .map(|n| format!("{n}[]"))
+            });
+            let Some(source_name) = source_name else {
+                continue;
+            };
+            return Err(Self::err(&secantus_pgplan::assignment_mismatch(
+                col,
+                &source_name,
+                entry.map_or(-1, |t| t.location),
+            )));
+        }
+        Ok(())
+    }
+
     /// The output columns of a `COPY (query) TO STDOUT`, from the same code
     /// that describes the query anywhere else.
     fn copy_query_fields(&self, inner: &Statement) -> PgWireResult<Vec<FieldInfo>> {
         match inner {
-            // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all.
+            // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all. A
+            // user type (`row(1, 'x')::pt`) is described by its own oid.
             Statement::SelectConstant(sc) => Ok(sc
                 .columns
                 .iter()
                 .map(|(name, _, ty, _)| {
-                    FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
                 })
                 .collect()),
             Statement::ValuesConstant(vc) => Ok(vc
@@ -25494,7 +25608,7 @@ impl PgHandler {
             docs = kept;
         }
         if !sel.windows.is_empty() {
-            materialise_windows(&mut docs, &sel.windows).map_err(|e| Self::err(&e))?;
+            materialise_windows(&mut docs, &sel.windows, &sel.order).map_err(|e| Self::err(&e))?;
             // The synthetic `__winN` columns go into the def HERE rather than
             // only in `select_def`, because every reader of a select's schema
             // -- the row encoder, `rows_with_schema`, `COPY (query)` -- takes
@@ -25819,6 +25933,40 @@ impl PgHandler {
         }
     }
 
+    /// Which of a set-operation side's columns are a bare UNTYPED string
+    /// literal (`select '0/17'`). Like an untyped NULL it is `unknown` and
+    /// takes the other side's type: `select '0/16'::pg_lsn union select
+    /// '0/17'` is a pg_lsn column on PostgreSQL 15, read by pg_lsn's input
+    /// function, where typing the literal text refused every non-text type
+    /// (`UNION types pg_lsn and text cannot be matched`).
+    fn untyped_string_columns(stmt: &Statement) -> Vec<bool> {
+        match stmt {
+            Statement::SelectConstant(sc) => sc
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, (_, col, ..))| {
+                    matches!(col, secantus_pgplan::ConstCol::Value(Bson::String(_)))
+                        && sc.untyped.get(i).copied().unwrap_or(false)
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The planner's name for a built-in wire type (`pg_lsn`, `int4[]`), or
+    /// `None` for a user type.
+    fn planner_type_name(ty: &Type) -> Option<String> {
+        let oid = i64::from(ty.oid());
+        if let Some(t) = secantus_pgplan::pgtypes::name_of_oid(oid) {
+            return Some(t.to_string());
+        }
+        secantus_pgplan::pgtypes::BUILTIN_TYPES
+            .iter()
+            .find(|(_, _, arr)| *arr == oid)
+            .map(|(t, _, _)| format!("{t}[]"))
+    }
+
     /// The result type of one set-operation column, or 42804.
     ///
     /// PostgreSQL unifies the two sides within a type CATEGORY and refuses
@@ -26092,16 +26240,46 @@ impl PgHandler {
         // unified, which is also where mismatched types are refused.
         let left_nulls = Self::null_constant_columns(&set.left);
         let right_nulls = Self::null_constant_columns(&set.right);
+        let left_strs = Self::untyped_string_columns(&set.left);
+        let right_strs = Self::untyped_string_columns(&set.right);
+        let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
         let mut schema = Vec::with_capacity(left_schema.len());
+        // The columns whose untyped literal side is read as the other side's
+        // type: (column, the side holding the literal is the left, type name).
+        let mut retype: Vec<(usize, bool, String)> = Vec::new();
         for (i, (l, r)) in left_schema.iter().zip(&right_schema).enumerate() {
-            let ty = if right_nulls.get(i).copied().unwrap_or(false) {
+            let ty = if flag(&right_nulls, i) {
                 l.datatype().clone()
-            } else if left_nulls.get(i).copied().unwrap_or(false) {
+            } else if flag(&left_nulls, i) {
+                r.datatype().clone()
+            } else if flag(&right_strs, i) && !flag(&left_strs, i) {
+                if let Some(name) = Self::planner_type_name(l.datatype()) {
+                    retype.push((i, false, name));
+                }
+                l.datatype().clone()
+            } else if flag(&left_strs, i) && !flag(&right_strs, i) {
+                if let Some(name) = Self::planner_type_name(r.datatype()) {
+                    retype.push((i, true, name));
+                }
                 r.datatype().clone()
             } else {
                 Self::unify_set_op_type(op, l.datatype(), r.datatype())?
             };
             schema.push(self.field(l.name().to_string(), ty));
+        }
+        let (mut left, mut right) = (left, right);
+        if !retype.is_empty() {
+            let tz = self.session_timezone();
+            for (i, on_left, name) in &retype {
+                let rows = if *on_left { &mut left } else { &mut right };
+                for row in rows.iter_mut() {
+                    if let Some(Some(Bson::String(text))) = row.get(*i) {
+                        let v = secantus_pgplan::cast_text_to(text, name, &tz)
+                            .map_err(|e| Self::err(&e))?;
+                        row[*i] = Some(v);
+                    }
+                }
+            }
         }
         let jsonb_cols: Vec<bool> = schema
             .iter()
@@ -26867,9 +27045,11 @@ impl PgHandler {
                     ))));
                 }
                 // The table's name is also its ROW TYPE's, so it must be free
-                // as a type. Measured on 16: over a composite (which is a
-                // relation too) it is 42P07; over an enum, a range or a
-                // builtin it is 42710 with the hint.
+                // as a type IN ITS SCHEMA. Measured on 16: over a composite
+                // (which is a relation too) it is 42P07; over an enum or a
+                // range it is 42710 with the hint. A built-in type is in
+                // `pg_catalog`, so `create table int4 (...)` or `tid` is a
+                // new type in `public` and succeeds (15.19).
                 if self.composites()?.iter().any(|(n, _, _)| *n == def.name) {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -26879,7 +27059,6 @@ impl PgHandler {
                 }
                 if self.enums()?.iter().any(|(n, _, _)| *n == def.name)
                     || self.ranges()?.iter().any(|(n, _, _)| *n == def.name)
-                    || secantus_pgplan::pgtypes::oid_of_name(&def.name).is_some()
                 {
                     let mut info = ErrorInfo::new(
                         "ERROR".into(),
@@ -27148,6 +27327,7 @@ impl PgHandler {
                             on_conflict: None,
                             overriding_system: false,
                             overriding_user: false,
+                            source_targets: Vec::new(),
                         }),
                         max_rows,
                     )?;
@@ -27173,6 +27353,7 @@ impl PgHandler {
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
+                    self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
                     let (schema, rows) = if secantus_pgplan::user_casts::any() {
@@ -28910,6 +29091,14 @@ impl PgHandler {
                 for name in &names {
                     if self.sequence_doc(name)?.is_none() {
                         if if_exists {
+                            self.notice(
+                                "00000",
+                                format!(
+                                    "sequence \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(name).1
+                                ),
+                                None,
+                            );
                             continue;
                         }
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -29122,7 +29311,10 @@ impl PgHandler {
                         if if_exists {
                             self.notice(
                                 "00000",
-                                format!("view \"{name}\" does not exist, skipping"),
+                                format!(
+                                    "view \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(name).1
+                                ),
                                 None,
                             );
                             continue;
@@ -29302,7 +29494,10 @@ impl PgHandler {
                         if drop.if_exists {
                             self.notice(
                                 "00000",
-                                format!("table \"{table}\" does not exist, skipping"),
+                                format!(
+                                    "table \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(table).1
+                                ),
                                 None,
                             );
                             continue;
@@ -29732,7 +29927,10 @@ impl PgHandler {
                         if if_exists {
                             self.notice(
                                 "00000",
-                                format!("materialized view \"{name}\" does not exist, skipping"),
+                                format!(
+                                    "materialized view \"{}\" does not exist, skipping",
+                                    secantus_pgplan::schemas::split_key(name).1
+                                ),
                                 None,
                             );
                             continue;
@@ -30623,6 +30821,13 @@ impl PgHandler {
                             if df { "on" } else { "off" }.into(),
                         );
                     }
+                } else {
+                    // A no-op outside a block, with PostgreSQL's warning
+                    // (`WarnNoTransactionBlock`; RP-001).
+                    self.warning(
+                        "25P01",
+                        "SET TRANSACTION can only be used in transaction blocks".into(),
+                    );
                 }
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
@@ -32522,13 +32727,15 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog-rust-postgres.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 70] = [
+    const OK: [Type; 72] = [
         Type::MACADDR,
         Type::MACADDR8,
         Type::PG_LSN,
+        Type::TID,
         Type::MACADDR_ARRAY,
         Type::MACADDR8_ARRAY,
         Type::PG_LSN_ARRAY,
+        Type::TID_ARRAY,
         Type::VARCHAR_ARRAY,
         Type::BPCHAR_ARRAY,
         Type::NAME_ARRAY,
@@ -33077,6 +33284,16 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             &FormatOptions::default(),
         );
     }
+    // `tidsend`: the block (u32) and the offset (u16).
+    if *ty == Type::TID {
+        let wire = secantus_pgplan::tid::tid_to_wire(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field_with_type_and_format(
+            &RawEncoded(wire),
+            ty,
+            FieldFormat::Binary,
+            &FormatOptions::default(),
+        );
+    }
     if *ty == Type::PG_LSN {
         let lsn = secantus_pgplan::systypes::lsn_of(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field_with_type_and_format(
@@ -33308,6 +33525,7 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         Type::MACADDR_ARRAY => Some(Type::MACADDR),
         Type::MACADDR8_ARRAY => Some(Type::MACADDR8),
         Type::PG_LSN_ARRAY => Some(Type::PG_LSN),
+        Type::TID_ARRAY => Some(Type::TID),
         Type::INET_ARRAY => Some(Type::INET),
         Type::CIDR_ARRAY => Some(Type::CIDR),
         Type::JSON_ARRAY => Some(Type::JSON),
@@ -33658,12 +33876,8 @@ fn untranslatable_char(ch: char, cenc: ClientEncoding) -> PgWireError {
         .iter()
         .map(|b| format!("0x{b:02x}"))
         .collect();
-    let target = match cenc {
-        ClientEncoding::Latin1 => "LATIN1",
-        ClientEncoding::Latin9 => "LATIN9",
-        // Only the transcoding encodings ever reach here.
-        _ => "UTF8",
-    };
+    // Only the transcoding encodings ever reach here.
+    let target = cenc.name();
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".into(),
         "22P05".into(), // untranslatable_character
@@ -33775,11 +33989,42 @@ fn encode_field_value_inner(
             return enc.encode_field(&Some(out));
         }
     }
+    // A tid is stored as one number and prints as `(block,offset)`.
+    if *field.datatype() == Type::TID {
+        if let Some(v) = v.filter(|v| **v != Bson::Null) {
+            let out = secantus_pgplan::tid::render_tid_value(v);
+            return enc.encode_field(&Some(out));
+        }
+    }
     // A pg_lsn is stored as its position and prints as `%X/%X`.
     if *field.datatype() == Type::PG_LSN {
         if let Some(v) = v.filter(|v| **v != Bson::Null) {
             let out = secantus_pgplan::systypes::render_lsn_value(v);
             return enc.encode_field(&Some(out));
+        }
+    }
+    // An array of a type carried in another form than its text -- a money's
+    // numeric, a float4's f64 -- is `array_out` over that type's output
+    // function: `{$1.50}`, `{1.1}`, not `{1.50}` / `{1.100000023841858}`.
+    if let (Some(arr @ Bson::Array(_)), postgres_types::Kind::Array(inner)) =
+        (v, field.datatype().kind())
+    {
+        if let Some(elem @ ("money" | "float4" | "int2vector" | "oidvector")) =
+            secantus_pgplan::pgtypes::name_of_oid(i64::from(inner.oid()))
+        {
+            let ty = format!("{elem}[]");
+            if let Some(rendered) = secantus_pgplan::typeout::array_elements(arr, &ty) {
+                return enc.encode_field(&rendered);
+            }
+            // A multidimensional one is its whole text, as plain TEXT.
+            let text = secantus_pgplan::typeout::output_text(arr, &ty);
+            let options = field.format_options().clone();
+            return enc.encode_field_with_type_and_format(
+                &Some(text),
+                &Type::TEXT,
+                field.format(),
+                options.as_ref(),
+            );
         }
     }
     // A COMPOSITE / anonymous-RECORD ARRAY in TEXT format: render each element
@@ -33836,6 +34081,17 @@ fn encode_field_value_inner(
                 .map(|x| match x {
                     Bson::Null => None,
                     other => Some(secantus_pgplan::value_text(other)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
+        }
+        // A `tid[]` in text is `tidout` per element.
+        if element == "tid" {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    other => Some(secantus_pgplan::tid::render_tid_value(other)),
                 })
                 .collect();
             return enc.encode_field(&rendered);
@@ -34810,17 +35066,23 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
 /// Compute every window function into its synthetic field.
 ///
 /// Runs after the WHERE and before `DISTINCT` / `ORDER BY` / `LIMIT`, which is
-/// PostgreSQL's evaluation order. The rows are NOT reordered: a window's own
-/// ordering is internal to it, so the work is done over an index permutation
-/// and the values are written back in place.
+/// PostgreSQL's evaluation order. The windows are evaluated in the order
+/// PostgreSQL's planner stacks them, each over the rows sorted for it unless
+/// they already arrive in that order (`window_order.rs`), and the rows are
+/// left in the last sort's order: a query with no ORDER BY of its own returns
+/// them that way on PostgreSQL 15. `query_order` is that ORDER BY, which
+/// numbers its keys before any window's and so decides which window runs
+/// last.
 fn materialise_windows(
     docs: &mut [Document],
     windows: &[secantus_pgplan::WindowItem],
+    query_order: &[OrderKey],
 ) -> Result<(), PlanError> {
+    // A computed PARTITION BY / ORDER BY key has no stored field, so it is
+    // evaluated per row into its own `__wkeyN` first and then read back
+    // like any column -- one comparator rather than two. All of them before
+    // any window runs: a window's sort may be another's.
     for w in windows {
-        // A computed PARTITION BY / ORDER BY key has no stored field, so it is
-        // evaluated per row into its own `__wkeyN` first and then read back
-        // like any column -- one comparator rather than two.
         for key in w.partition_by.iter().chain(w.order_by.iter()) {
             if let Some(expr) = key.expr.as_ref() {
                 for d in docs.iter_mut() {
@@ -34829,31 +35091,57 @@ fn materialise_windows(
                 }
             }
         }
-        let values: Vec<Bson> = match w.arg.as_ref() {
-            Some(expr) => docs
-                .iter()
-                .map(|d| secantus_pgplan::apply_row_expr(expr, d))
-                .collect::<Result<_, _>>()?,
-            None => vec![Bson::Null; docs.len()],
-        };
-        // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
-        // the output: the row still gets a value, computed over the rows that
-        // did pass.
-        let included: Vec<bool> = match w.filter.as_ref() {
-            Some(expr) => docs
-                .iter()
-                .map(|d| {
-                    Ok::<bool, PlanError>(
-                        secantus_pgplan::apply_row_expr(expr, d)? == Bson::Boolean(true),
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            None => vec![true; docs.len()],
-        };
-
-        for partition in window_partitions(docs, &w.partition_by, &w.partition_jsonb) {
-            window_partition_values(docs, &partition, w, &values, &included)?;
+    }
+    let mut order: Vec<usize> = (0..docs.len()).collect();
+    let mut sorted_by: Vec<OrderKey> = Vec::new();
+    for clause in window_order::window_clauses(windows, query_order) {
+        if !window_order::presorted(&clause.sort, &sorted_by) {
+            window_order::pg_qsort(&mut order, &mut |a, b| {
+                compare_rows(&docs[*a], &docs[*b], &clause.sort)
+            });
+            sorted_by = clause.sort.clone();
         }
+        let mut rank = vec![0usize; docs.len()];
+        for (pos, row) in order.iter().enumerate() {
+            rank[*row] = pos;
+        }
+        for &wi in &clause.windows {
+            let w = &windows[wi];
+            let values: Vec<Bson> = match w.arg.as_ref() {
+                Some(expr) => docs
+                    .iter()
+                    .map(|d| secantus_pgplan::apply_row_expr(expr, d))
+                    .collect::<Result<_, _>>()?,
+                None => vec![Bson::Null; docs.len()],
+            };
+            // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
+            // the output: the row still gets a value, computed over the rows that
+            // did pass.
+            let included: Vec<bool> = match w.filter.as_ref() {
+                Some(expr) => docs
+                    .iter()
+                    .map(|d| {
+                        Ok::<bool, PlanError>(
+                            secantus_pgplan::apply_row_expr(expr, d)? == Bson::Boolean(true),
+                        )
+                    })
+                    .collect::<Result<_, _>>()?,
+                None => vec![true; docs.len()],
+            };
+            for mut partition in window_partitions(docs, &w.partition_by, &w.partition_jsonb) {
+                // In the sorted order, so rows that tie on the window's ORDER
+                // BY are taken in the order PostgreSQL's sort left them.
+                partition.sort_by_key(|r| rank[*r]);
+                window_partition_values(docs, &partition, w, &values, &included)?;
+            }
+        }
+    }
+    let mut taken: Vec<Document> = order
+        .iter()
+        .map(|i| std::mem::take(&mut docs[*i]))
+        .collect();
+    for (slot, d) in docs.iter_mut().zip(taken.drain(..)) {
+        *slot = d;
     }
     Ok(())
 }
@@ -35929,6 +36217,9 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
     if *elem == Type::PG_LSN {
         return secantus_pgplan::systypes::lsn_of(v).map(|l| l.to_be_bytes().to_vec());
     }
+    if *elem == Type::TID {
+        return secantus_pgplan::tid::tid_to_wire(v);
+    }
     // A geometric element: its type's `*_send` layout.
     if matches!(
         *elem,
@@ -36271,6 +36562,7 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1040 => "macaddr",
         775 => "macaddr8",
         3221 => "pg_lsn",
+        1010 => "tid",
         1034 => "aclitem",
         1020 => "box",
         1017 => "point",
@@ -36625,6 +36917,18 @@ fn copy_text_row(
                 secantus_pgplan::net::text_out(v, oid == 650)
             }
             Some(v) if oid == 3220 => secantus_pgplan::systypes::render_lsn_value(v),
+            Some(v) if oid == 27 => secantus_pgplan::tid::render_tid_value(v),
+            // A `tid[]` field is `array_out` over `tidout`.
+            Some(Bson::Array(items)) if oid == 1010 => {
+                fn out(v: &Bson) -> Bson {
+                    match v {
+                        Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
+                        Bson::Null => Bson::Null,
+                        other => Bson::String(secantus_pgplan::tid::render_tid_value(other)),
+                    }
+                }
+                secantus_pgplan::value_text(&out(&Bson::Array(items.clone())))
+            }
             Some(Bson::String(v)) => v.clone(),
             Some(Bson::Array(items)) if matches!(oid, 1041 | 651) => {
                 let rendered: Vec<Bson> = items
@@ -36717,11 +37021,7 @@ fn decode_parameter(
             "22021".into(),
             format!(
                 "invalid byte sequence for encoding \"{}\": 0x00",
-                match cenc {
-                    ClientEncoding::Latin1 => "LATIN1",
-                    ClientEncoding::Latin9 => "LATIN9",
-                    ClientEncoding::Utf8 | ClientEncoding::Passthrough => "UTF8",
-                }
+                cenc.name()
             ),
         ))));
     }
@@ -36764,6 +37064,9 @@ fn decode_parameter(
             Some(3220) if bytes.len() == 8 => Ok(secantus_pgplan::systypes::lsn_bson(
                 u64::from_be_bytes(bytes[..8].try_into().expect("checked")),
             )),
+            Some(27) if bytes.len() == 6 => {
+                Ok(secantus_pgplan::tid::tid_from_wire(bytes).expect("checked"))
+            }
             // `xid` / `cid` (4-byte) and `xid8` (8-byte) unsigned counters,
             // and a snapshot (`int32 nxip, int64 xmin, int64 xmax, int64
             // xip...` -- `pg_snapshot_send`), decoded to the text a text
@@ -36805,7 +37108,9 @@ fn decode_parameter(
                         "invalid byte sequence for encoding \"UTF8\": 0x00".to_owned(),
                     ))));
                 }
-                Ok(Bson::String(encoding::decode(cenc, bytes)))
+                Ok(Bson::String(
+                    encoding::decode(cenc, bytes).map_err(|b| encoding::undecodable(cenc, b))?,
+                ))
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
             Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
@@ -36946,13 +37251,19 @@ fn decode_parameter(
                     None => binary_range(bytes, &type_name, tz, cenc),
                 }
             }
-            Some(114) => secantus_pgplan::cast_text_to(&encoding::decode(cenc, bytes), "json", tz)
-                .map_err(|e| PgHandler::err(&e)),
+            Some(114) => secantus_pgplan::cast_text_to(
+                &encoding::decode(cenc, bytes).map_err(|b| encoding::undecodable(cenc, b))?,
+                "json",
+                tz,
+            )
+            .map_err(|e| PgHandler::err(&e)),
             Some(3802) => match bytes.split_first() {
-                Some((1, rest)) => {
-                    secantus_pgplan::cast_text_to(&encoding::decode(cenc, rest), "jsonb", tz)
-                        .map_err(|e| PgHandler::err(&e))
-                }
+                Some((1, rest)) => secantus_pgplan::cast_text_to(
+                    &encoding::decode(cenc, rest).map_err(|b| encoding::undecodable(cenc, b))?,
+                    "jsonb",
+                    tz,
+                )
+                .map_err(|e| PgHandler::err(&e)),
                 _ => Err(unsupported_binary_oid(Some(3802))),
             },
             Some(1114) if bytes.len() == 8 => Ok(Bson::String(
@@ -37002,7 +37313,10 @@ fn decode_parameter(
             // both cases take this arm.)
             other => {
                 if cenc.transcodes() {
-                    Ok(Bson::String(encoding::decode(cenc, bytes)))
+                    Ok(Bson::String(
+                        encoding::decode(cenc, bytes)
+                            .map_err(|b| encoding::undecodable(cenc, b))?,
+                    ))
                 } else {
                     match std::str::from_utf8(bytes) {
                         Ok(text) => Ok(Bson::String(text.to_string())),
@@ -37013,7 +37327,9 @@ fn decode_parameter(
         };
     }
 
-    let text: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(encoding::decode(cenc, bytes));
+    let text: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(
+        encoding::decode(cenc, bytes).map_err(|b| encoding::undecodable(cenc, b))?,
+    );
     match ty.map(|t| t.oid()) {
         Some(23) | Some(21) => text
             .parse::<i32>()
@@ -37068,6 +37384,8 @@ fn decode_parameter(
         Some(603) => {
             secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
         }
+        // `tidin`, as the binary path's `tidrecv` gives the same number.
+        Some(27) => secantus_pgplan::cast_text_to(&text, "tid", tz).map_err(|e| PgHandler::err(&e)),
         Some(oid @ (600 | 601 | 602 | 604 | 628 | 718)) => {
             let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(oid)).unwrap_or("point");
             secantus_pgplan::cast_text_to(&text, ty, tz).map_err(|e| PgHandler::err(&e))
@@ -37928,7 +38246,8 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo,
     {
-        Ok(encoding::decode(self.client_encoding(), &parse.query_raw))
+        let enc = self.client_encoding();
+        encoding::decode(enc, &parse.query_raw).map_err(|b| encoding::undecodable(enc, b))
     }
 
     /// The default `Parse` handling, plus the `pg_prepared_statements` row a
@@ -38044,8 +38363,10 @@ impl ExtendedQueryHandler for PgHandler {
         self.install_user_types();
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
-        let fields =
-            self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
+        // Positioned as from a simple query (RP-012).
+        let fields = self
+            .describe_fields(&target.statement.sql, param_types.len(), &param_types)
+            .map_err(|e| Self::syntax_positioned(e, &target.statement.sql))?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -38261,11 +38582,13 @@ impl ExtendedQueryHandler for PgHandler {
         self.note_result_format(&target.result_column_format);
         self.check_cached_result_type(target.statement.as_ref())?;
         let param_types = self.param_type_names(target.statement.as_ref());
-        let fields = self.describe_fields(
-            &target.statement.statement.sql,
-            param_types.len(),
-            &param_types,
-        )?;
+        let fields = self
+            .describe_fields(
+                &target.statement.statement.sql,
+                param_types.len(),
+                &param_types,
+            )
+            .map_err(|e| Self::syntax_positioned(e, &target.statement.statement.sql))?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
@@ -38455,7 +38778,17 @@ fn copy_field(
             "f" | "false" | "n" | "no" | "off" | "0" => Bson::Boolean(false),
             _ => return Err(bad("boolean")),
         },
-        _ => Bson::String(text),
+        // The string types are stored as their text.
+        "text" | "varchar" | "character varying" | "bpchar" | "char" | "character" | "name"
+        | "citext" | "\"char\"" => Bson::String(text),
+        // Every other type is read by its INPUT function, as PostgreSQL's
+        // COPY reads it -- the same cast a literal goes through. Kept as raw
+        // text, a pg_lsn / money / xid / oid / reg* / geometric / tid value
+        // was a string where the column holds its carried form: it compared
+        // equal to nothing a literal or an INSERT stored (a self-join of a
+        // COPY'd row matched only itself), and a macaddr / tsvector / jsonpath
+        // kept its input spelling.
+        _ => secantus_pgplan::cast_text_to(&text, pg_type, tz).map_err(|e| PgHandler::err(&e))?,
     })
 }
 

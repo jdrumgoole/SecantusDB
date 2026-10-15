@@ -189,6 +189,7 @@ const FAMILIES: &[(&str, &str)] = &[
     ("timestamptz_larger", LARGER),
     ("interval_larger", LARGER),
     ("oidlarger", LARGER),
+    ("tidlarger", LARGER),
     ("int2smaller", SMALLER),
     ("int4smaller", SMALLER),
     ("int8smaller", SMALLER),
@@ -203,6 +204,7 @@ const FAMILIES: &[(&str, &str)] = &[
     ("timestamptz_smaller", SMALLER),
     ("interval_smaller", SMALLER),
     ("oidsmaller", SMALLER),
+    ("tidsmaller", SMALLER),
     ("btint2cmp", COMPARE),
     ("btint4cmp", COMPARE),
     ("btint8cmp", COMPARE),
@@ -255,6 +257,7 @@ fn family_types(name: &str) -> (&'static str, &'static str) {
             "timestamptz" => "timestamptz",
             "interval" => "interval",
             "uuid" => "uuid",
+            "tid" => "tid",
             _ => "",
         }
     };

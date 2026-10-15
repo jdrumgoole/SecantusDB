@@ -13,10 +13,13 @@ use bson::Bson;
 use crate::json::{self, Json};
 use crate::{Error, Result};
 
+/// An operand's json. A text PostgreSQL's json input refuses is its 22P02,
+/// whose primary message names no token (the token goes in the DETAIL):
+/// `'{"a":1}'::jsonb || 'x'` on PostgreSQL 15.19.
 fn parse(v: &Bson) -> Result<Json> {
     let text = crate::value_text(v);
     json::parse(&text)
-        .map_err(|_| Error::InvalidText(format!("invalid input syntax for type json: \"{text}\"")))
+        .map_err(|_| Error::InvalidText("invalid input syntax for type json".to_string()))
 }
 
 fn out(j: &Json) -> Bson {

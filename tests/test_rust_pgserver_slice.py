@@ -8696,9 +8696,11 @@ def test_two_phase_commit_resolves_from_another_connection(home: Path) -> None:
         b.execute("prepare transaction 'gid-rollback'")
         b.close()
 
+        # `xid > integer` has no operator in PostgreSQL 15 (42883), so the
+        # xid is compared through its text, as a client has to.
         row = setup.execute(
-            "select gid, owner, database, transaction > 0, prepared is not null "
-            "from pg_prepared_xacts order by gid"
+            "select gid, owner, database, transaction::text::int8 > 0, "
+            "prepared is not null from pg_prepared_xacts order by gid"
         ).fetchall()
         assert row == [
             ("gid-commit", "test", "postgres", True, True),

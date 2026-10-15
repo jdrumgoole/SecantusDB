@@ -169,6 +169,7 @@ const SCALAR_NAMES: &[&str] = &[
     "format",
     "chr",
     "ascii",
+    "char",
     "split_part",
     "starts_with",
     "lpad",
@@ -1182,6 +1183,21 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     Error::InvalidText(format!("requested character too large for encoding: {n}"))
                 })?;
             Ok(Bson::String(c.to_string()))
+        }
+        // `"char"(x)` is a FUNCTION call on PostgreSQL: `char(integer)`
+        // (`i4tochar`) or `char(text)` (`text_char`), chosen by the usual
+        // overload rules, so an int2 promotes to int4 where the CAST
+        // `x::int2::"char"` has no path (42846), and an int8 resolves to
+        // neither (42883). Only those two overloads reach here.
+        "char" => {
+            need(1)?;
+            match arg(0) {
+                Bson::Int32(i) => crate::char_from_int(i64::from(i)),
+                Bson::Int64(i) => crate::char_from_int(i),
+                other => Ok(Bson::String(crate::char_out(crate::char_in(
+                    &crate::value_text(&other),
+                )))),
+            }
         }
         "ascii" => {
             need(1)?;
@@ -2482,6 +2498,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "scale" | "min_scale" => "int4",
         "current_schema" | "current_database" | "current_user" | "session_user" => "name",
         "current_schemas" => "name[]",
+        "char" => crate::QUOTED_CHAR,
         "trim_scale" => "numeric",
         "numeric_send" => "bytea",
         "starts_with" => "bool",

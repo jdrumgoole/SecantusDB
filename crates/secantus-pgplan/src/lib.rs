@@ -19,7 +19,10 @@ mod expr_where;
 mod filter_sublink;
 mod like_match;
 pub mod schemas;
+mod srf_tlist;
 pub mod systypes;
+pub mod tid;
+pub mod typeout;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -27,6 +30,16 @@ mod builtin_alias;
 mod builtins;
 mod builtins_regex;
 mod builtins_text;
+mod sbcs;
+mod srf_place;
+mod unknown_args;
+
+/// The upper half of a single-byte encoding as PostgreSQL 15 converts it to
+/// Unicode (entry `i` is byte `0x80 + i`, 0 where it has none), for the
+/// encodings other than LATIN1 that have one.
+pub fn single_byte_table(canonical: &str) -> Option<&'static [u16; 128]> {
+    sbcs::table(canonical)
+}
 pub mod bytea;
 pub mod catalog_stmts;
 pub mod correlated;
@@ -42,6 +55,9 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+mod ts_debug;
+mod ts_rewrite;
+pub mod wparser;
 pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
@@ -90,6 +106,7 @@ pub mod money;
 pub mod net;
 pub mod numeric;
 pub mod numeric_math;
+pub mod pg_casts;
 pub mod pgtypes;
 pub mod range;
 pub mod range_ops;
@@ -1127,6 +1144,22 @@ pub struct Insert {
     /// `OVERRIDING USER VALUE`: the opposite -- the value the statement gives
     /// is DISCARDED and the sequence supplies one, for either identity kind.
     pub overriding_user: bool,
+    /// `INSERT ... SELECT`: the source query's select-list entries, as the
+    /// executor needs them to check each column's assignment cast once it
+    /// knows the source's column types. Empty for a `VALUES` insert.
+    pub source_targets: Vec<SourceTarget>,
+}
+
+/// One select-list entry of an `INSERT ... SELECT` source (of its leftmost
+/// arm, for a set operation): where PostgreSQL reports a type mismatch for
+/// it (`exprLocation`), whether it is an UNTYPED literal or NULL -- which
+/// takes the target column's type rather than a type of its own -- and
+/// whether it is a `*`, which stands for however many columns it expands to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceTarget {
+    pub location: i32,
+    pub untyped: bool,
+    pub star: bool,
 }
 
 /// The projection a `RETURNING` clause applies to each written row.
@@ -2053,6 +2086,12 @@ pub struct WindowItem {
     pub filter: Option<ColumnExpr>,
     /// `WindowFunc::User`'s aggregate.
     pub user: Option<user_agg::UserAggregate>,
+    /// Where PostgreSQL's parser lists this window's definition: the named
+    /// windows of the WINDOW clause first, in that clause's order (a bare
+    /// `OVER w` IS that definition), then each inline one as it appears. The
+    /// order the definitions' keys are given sortgroup refs in, which
+    /// decides the order the windows are evaluated in.
+    pub def_order: usize,
 }
 
 /// The window functions this server computes.
@@ -2926,8 +2965,9 @@ pub struct SelectConstant {
     /// still waits), a set-returning one yields one row per result, and
     /// every `ConstCol::FromColumn` in `columns` reads that row's value.
     pub source: Option<Box<ConstCol>>,
-    /// Per column: a bare `NULL`, whose type is `unknown` -- a set
-    /// operation gives it the other side's type, where `NULL::text` is text.
+    /// Per column: a bare `NULL` or a bare string literal, whose type is
+    /// `unknown` -- a set operation gives it the other side's type, where
+    /// `NULL::text` / `'x'::text` is text.
     /// Empty when not recorded.
     pub untyped: Vec<bool>,
 }
@@ -3756,8 +3796,86 @@ fn parse_one(sql: &str) -> Result<N> {
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
     func_cast::rewrite(&mut node);
+    pattern_ops(&mut node);
+    unknown_args::check_ambiguous(&node)?;
+    unknown_args::rewrite(&mut node);
+    srf_place::check(&node)?;
     schemas::qualify(&mut node)?;
     Ok(node)
+}
+
+/// The text pattern comparisons `~<~` / `~<=~` / `~>=~` / `~>~` (the
+/// `text_pattern_ops` operators, and `bpchar`'s) compare the strings
+/// byte by byte -- which is `<` / `<=` / `>=` / `>` under `COLLATE "C"`,
+/// what they are planned as (a `bpchar`'s trailing blanks still not
+/// counting). A user operator of one of those names is left
+/// alone.
+fn pattern_ops(node: &mut N) {
+    let plain = |op: &str| match op {
+        "~<~" => Some("<"),
+        "~<=~" => Some("<="),
+        "~>=~" => Some(">="),
+        "~>~" => Some(">"),
+        _ => None,
+    };
+    let op_of = |e: &pg_query::protobuf::AExpr| -> Option<String> {
+        match e.name.last()?.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        }
+    };
+    let wanted = node.nodes().iter().any(|(n, _, _, _)| {
+        matches!(n, pg_query::NodeRef::AExpr(e)
+            if op_of(e).as_deref().and_then(plain).is_some())
+    });
+    if !wanted {
+        return;
+    }
+    let collate = |arg: Option<Box<pg_query::protobuf::Node>>| {
+        arg.map(|a| {
+            Box::new(pg_query::protobuf::Node {
+                node: Some(N::CollateClause(Box::new(
+                    pg_query::protobuf::CollateClause {
+                        arg: Some(a),
+                        collname: vec![string_node("C")],
+                        location: -1,
+                    },
+                ))),
+            })
+        })
+    };
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives the loop; each AExpr is changed in place, never replaced.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            if let pg_query::NodeMut::AExpr(e) = n {
+                let e = &mut *e;
+                let Some(op) = op_of(e) else {
+                    continue;
+                };
+                let Some(to) = plain(op.as_str()) else {
+                    continue;
+                };
+                if user_ops::defines(&op) {
+                    continue;
+                }
+                // One side is enough to collate the comparison: not an
+                // untyped literal, which then takes the other side's type
+                // (a `char(n)` column's, blanks and all).
+                let literal = |x: &Option<Box<pg_query::protobuf::Node>>| {
+                    matches!(x.as_deref().and_then(|n| n.node.as_ref()),
+                        Some(N::AConst(c)) if matches!(c.val,
+                            Some(pg_query::protobuf::a_const::Val::Sval(_))))
+                };
+                e.name = vec![string_node(to)];
+                if literal(&e.rexpr) && !literal(&e.lexpr) {
+                    e.lexpr = collate(e.lexpr.take());
+                } else {
+                    e.rexpr = collate(e.rexpr.take());
+                }
+            }
+        }
+    }
 }
 
 /// `parse_one` for a statement as its client wrote it: a bare name the
@@ -8939,6 +9057,69 @@ fn plan_insert(
     // `INSERT ... SELECT`: the query is planned whole and evaluated by the
     // executor, which has the storage. Before this it was silently treated
     // as an empty VALUES list -- `INSERT 0 0`, nothing written, no error.
+    // The number of expressions against the target list, as
+    // `transformInsertStmt` checks it, pointing at the first expression past
+    // the list or the first target column left with none (RP-021).
+    let arity = |exprs: &[&pg_query::protobuf::Node]| -> Result<()> {
+        if exprs.len() > targets.len() {
+            if let Some(loc) = exprs.get(targets.len()).and_then(|e| expr_location(e)) {
+                set_error_location(loc);
+            }
+            return Err(Error::Parse(
+                "INSERT has more expressions than target columns".into(),
+            ));
+        }
+        if exprs.len() < targets.len() && !i.cols.is_empty() {
+            if let Some(Some(N::ResTarget(rt))) = i.cols.get(exprs.len()).map(|c| c.node.as_ref()) {
+                set_error_location(rt.location);
+            }
+            return Err(Error::Parse(
+                "INSERT has more target columns than expressions".into(),
+            ));
+        }
+        Ok(())
+    };
+    if sel.values_lists.is_empty() && sel.op == pg_query::protobuf::SetOperation::SetopNone as i32 {
+        let exprs: Vec<&pg_query::protobuf::Node> = sel
+            .target_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            })
+            .collect();
+        // A `*` stands for columns not counted here.
+        let star = exprs.iter().any(|e| {
+            matches!(e.node.as_ref(), Some(N::ColumnRef(c))
+                if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))))
+        });
+        if !star {
+            arity(&exprs)?;
+        }
+    }
+    // Every VALUES list as long as the first, before the target list is
+    // counted against any of them.
+    let lists: Vec<&Vec<pg_query::protobuf::Node>> = sel
+        .values_lists
+        .iter()
+        .filter_map(|vl| match vl.node.as_ref() {
+            Some(N::List(l)) => Some(&l.items),
+            _ => None,
+        })
+        .collect();
+    if let Some(first) = lists.first() {
+        // `transformInsertStmt` counts the first row against the targets,
+        // then each later one against the first.
+        arity(&first.iter().collect::<Vec<_>>())?;
+        if let Some(odd) = lists.iter().find(|l| l.len() != first.len()) {
+            if let Some(loc) = odd.first().and_then(expr_location) {
+                set_error_location(loc);
+            }
+            return Err(Error::Parse(
+                "VALUES lists must all be the same length".into(),
+            ));
+        }
+    }
     let source = if sel.values_lists.is_empty() {
         // Every target of an INSERT ... SELECT receives a value.
         if let Some(t) = targets.iter().find(|t| {
@@ -9020,7 +9201,70 @@ fn plan_insert(
             == Ok(OverridingKind::OverridingSystemValue),
         overriding_user: OverridingKind::try_from(i.r#override)
             == Ok(OverridingKind::OverridingUserValue),
+        source_targets: if sel.values_lists.is_empty() {
+            source_targets(sel)
+        } else {
+            Vec::new()
+        },
     }))
+}
+
+/// The select-list entries of an `INSERT ... SELECT` source. A set
+/// operation's output types are its arms' resolved together and are typed
+/// (`'x' UNION 'y'` is text), but the mismatch is reported at the leftmost
+/// arm's expression, as PostgreSQL does.
+fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
+    let mut leftmost = sel;
+    let set_op = sel.op != pg_query::protobuf::SetOperation::SetopNone as i32;
+    while leftmost.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        match leftmost.larg.as_deref() {
+            Some(l) => leftmost = l,
+            None => break,
+        }
+    }
+    leftmost
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .map(|e| {
+            let star = matches!(e.node.as_ref(), Some(N::ColumnRef(c))
+                if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))));
+            // A parameter the client sent untyped (oid 0) is `unknown` too.
+            let untyped = !set_op
+                && match e.node.as_ref() {
+                    Some(N::AConst(c)) => {
+                        c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+                    }
+                    Some(N::ParamRef(p)) => usize::try_from(p.number)
+                        .ok()
+                        .and_then(declared_param_type)
+                        .is_none(),
+                    _ => false,
+                };
+            SourceTarget {
+                location: expr_location(e).unwrap_or(-1),
+                untyped,
+                star,
+            }
+        })
+        .collect()
+}
+
+/// PostgreSQL's assignment-coercion failure for one column of an
+/// `INSERT ... SELECT` (`transformAssignedExpr`): 42804, reported at the
+/// source expression, with the hint the mapping adds.
+pub fn assignment_mismatch(column: &Column, source_type: &str, location: i32) -> Error {
+    set_error_location(location);
+    let typmod = (column.typmod >= 0).then_some(column.typmod);
+    Error::DatatypeMismatch(format!(
+        "column \"{}\" is of type {} but expression is of type {}",
+        column.name,
+        scalar::format_type_text(&column.pg_type, typmod),
+        display_type(source_type)
+    ))
 }
 
 /// The type an assigned expression DECLARES, when it declares one: an
@@ -9101,7 +9345,15 @@ fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Re
 /// Where an expression starts, as PostgreSQL's `exprLocation` reports it.
 fn expr_location(node: &pg_query::protobuf::Node) -> Option<i32> {
     let loc = match node.node.as_ref()? {
-        N::TypeCast(t) => t.location,
+        // `leftmostLoc` of the cast and its operand: `65::int2` is reported
+        // at the `65`.
+        N::TypeCast(t) => {
+            let inner = t.arg.as_deref().and_then(expr_location);
+            return match inner {
+                Some(i) if t.location < 0 || i < t.location => Some(i),
+                _ => (t.location >= 0).then_some(t.location),
+            };
+        }
         N::FuncCall(f) => f.location,
         N::AExpr(e) => e.location,
         N::AConst(c) => c.location,
@@ -9110,6 +9362,7 @@ fn expr_location(node: &pg_query::protobuf::Node) -> Option<i32> {
         N::RowExpr(r) => r.location,
         N::AArrayExpr(a) => a.location,
         N::SqlvalueFunction(f) => f.location,
+        N::SubLink(s) => s.location,
         _ => return None,
     };
     (loc >= 0).then_some(loc)
@@ -9173,6 +9426,10 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
             "bool" | "boolean" => 7,
             "uuid" => 8,
             "bytea" => 9,
+            // `"char"` has only EXPLICIT casts to and from int4 (and none to
+            // any other number or boolean): `insert ... values (65)` into a
+            // `"char"` column is 42804 (measured).
+            QUOTED_CHAR => 10,
             _ => return None,
         })
     };
@@ -9198,6 +9455,9 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
         && (from_s == to_s
             || from == "unknown"
             || is_string_type(to)
+            // `text_char` is an ASSIGNMENT cast: a string stores into a
+            // `"char"` column (measured, text and varchar).
+            || (to == QUOTED_CHAR && is_string_type(&from))
             || !(is_string_type(&from)
                 || cross_family
                 || (is_boolean_type(&from) && is_integer_type(to))
@@ -9943,7 +10203,23 @@ fn plan_window_call(
         .iter()
         .map(|k| k.expr.is_none() && field_type(def, &k.field) == Some("jsonb"))
         .collect();
+    // `OVER (w)` with nothing added is `OVER w` (`transformWindowFuncCall`).
+    let reference = if !over.name.is_empty() {
+        Some(over.name.as_str())
+    } else if !over.refname.is_empty()
+        && over.partition_clause.is_empty()
+        && over.order_clause.is_empty()
+        && over.frame_options & frameopt::NONDEFAULT == 0
+    {
+        Some(over.refname.as_str())
+    } else {
+        None
+    };
+    let def_order = reference
+        .and_then(|r| named.iter().position(|w| w.name == r))
+        .unwrap_or(named.len() + windows.len());
     windows.push(WindowItem {
+        def_order,
         field: field.clone(),
         func,
         arg,
@@ -10530,6 +10806,10 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         let mut names = Vec::new();
         let mut types = Vec::new();
         let mut parts: Vec<Vec<Vec<Bson>>> = Vec::new();
+        // Each function's width is its declared column count: one that
+        // yields no rows still pads with that many NULLs, or the columns
+        // after it shift left (`ROWS FROM (jsonb_each('{}'), generate_series(1, 2))`).
+        let mut widths: Vec<usize> = Vec::new();
         for c in &calls {
             let n = func_name(c).unwrap_or_default();
             let Some((cn, ct, rows)) = (match json_record_rows(&n, c, &[], params)? {
@@ -10543,6 +10823,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
             };
             names.extend(cn);
             types.extend(ct.clone());
+            widths.push(ct.len());
             parts.push(
                 rows.into_iter()
                     .map(|r| {
@@ -10553,11 +10834,6 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
                     .collect(),
             );
         }
-        let widths: Vec<usize> = calls
-            .iter()
-            .zip(&parts)
-            .map(|(_, p)| p.first().map_or(0, Vec::len))
-            .collect();
         let depth = parts.iter().map(Vec::len).max().unwrap_or(0);
         let mut rows = Vec::with_capacity(depth);
         for i in 0..depth {
@@ -11524,74 +11800,11 @@ fn srf_rows(
                 rows,
             )));
         }
-        // `ts_token_type(parser)`: the default parser's 23 token types
-        // (`wparser_def.c`'s `tok_alias` / `lex_descr`), the only parser
-        // there is, named or by oid (3722).
-        "ts_token_type" => {
-            let a = args(1)?;
-            let names = vec!["tokid".into(), "alias".into(), "description".into()];
-            let types = vec!["int4".into(), "text".into(), "text".into()];
-            match &a[0] {
-                Bson::Null => return Ok(Some((names, types, Vec::new()))),
-                Bson::Int32(_) | Bson::Int64(_) => {
-                    let oid = match &a[0] {
-                        Bson::Int32(i) => i64::from(*i),
-                        Bson::Int64(i) => *i,
-                        _ => 0,
-                    };
-                    if oid != 3722 {
-                        return Err(Error::Internal(format!(
-                            "cache lookup failed for text search parser {oid}"
-                        )));
-                    }
-                }
-                other => {
-                    let n = value_text(other);
-                    if !matches!(n.as_str(), "default" | "pg_catalog.default") {
-                        return Err(Error::Sqlstate(
-                            "42704",
-                            format!("text search parser \"{n}\" does not exist"),
-                        ));
-                    }
-                }
-            }
-            const TOKENS: [(&str, &str); 23] = [
-                ("asciiword", "Word, all ASCII"),
-                ("word", "Word, all letters"),
-                ("numword", "Word, letters and digits"),
-                ("email", "Email address"),
-                ("url", "URL"),
-                ("host", "Host"),
-                ("sfloat", "Scientific notation"),
-                ("version", "Version number"),
-                ("hword_numpart", "Hyphenated word part, letters and digits"),
-                ("hword_part", "Hyphenated word part, all letters"),
-                ("hword_asciipart", "Hyphenated word part, all ASCII"),
-                ("blank", "Space symbols"),
-                ("tag", "XML tag"),
-                ("protocol", "Protocol head"),
-                ("numhword", "Hyphenated word, letters and digits"),
-                ("asciihword", "Hyphenated word, all ASCII"),
-                ("hword", "Hyphenated word, all letters"),
-                ("url_path", "URL path"),
-                ("file", "File or path name"),
-                ("float", "Decimal notation"),
-                ("int", "Signed integer"),
-                ("uint", "Unsigned integer"),
-                ("entity", "XML entity"),
-            ];
-            let rows = TOKENS
-                .iter()
-                .enumerate()
-                .map(|(i, (alias, descr))| {
-                    vec![
-                        Bson::Int32(i as i32 + 1),
-                        Bson::String((*alias).into()),
-                        Bson::String((*descr).into()),
-                    ]
-                })
-                .collect();
-            return Ok(Some((names, types, rows)));
+        // The default text-search parser's functions (`ts_debug.rs`).
+        "ts_token_type" => return ts_debug::token_type(&args(1)?).map(Some),
+        "ts_parse" => return ts_debug::parse(&args(2)?).map(Some),
+        "ts_debug" if matches!(call.args.len(), 1 | 2) => {
+            return ts_debug::debug(&args(call.args.len())?).map(Some)
         }
         "generate_subscripts" => {
             // `(array, dim [, reverse])`: with `reverse` true the subscripts
@@ -12938,8 +13151,16 @@ fn plan_table_targets(
                     (scalar::is_scalar(n) && scalar::has_static_result_type(n))
                         || n == "regexp_replace"
                 }) && single_column_call(f, params).is_some_and(|(col, _)| {
-                    def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
-                }) && !(func_name(f).as_deref() == Some("to_char")
+                    def.column(&col).is_none_or(|c| {
+                        c.pg_type != "bpchar"
+                            && c.pg_type != "tid"
+                            && !(printing_function(f) && typeout::needs_type(&c.pg_type))
+                    })
+                }) && !(printing_function(f)
+                    && f.args
+                        .iter()
+                        .any(|a| typeout::needs_type(&static_type(a, &Bson::Null))))
+                    && !(func_name(f).as_deref() == Some("to_char")
                     && single_column_call(f, params).is_some_and(|(c, _)| {
                         def.column(&c)
                             .is_some_and(|col| datetime::is_datetime(&col.pg_type))
@@ -14139,19 +14360,21 @@ fn expand_grouping_sets(elements: &[GroupElement]) -> Option<Vec<Vec<usize>>> {
         let alternatives: Vec<Vec<usize>> = match element {
             GroupElement::Key(i) => vec![vec![*i]],
             GroupElement::Sets(inner) => inner.clone(),
-            GroupElement::Rollup(keys) => {
-                (0..=keys.len()).rev().map(|n| keys[..n].to_vec()).collect()
-            }
-            GroupElement::Cube(keys) => {
+            GroupElement::Rollup(steps) => (0..=steps.len())
+                .rev()
+                .map(|n| steps[..n].concat())
+                .collect(),
+            GroupElement::Cube(steps) => {
                 // Subsets in PostgreSQL's order: the full set first, then
                 // successively fewer, which for two keys is (a,b),(a),(b),().
                 let mut out: Vec<Vec<usize>> = Vec::new();
-                for mask in (0..(1u32 << keys.len())).rev() {
+                for mask in (0..(1u32 << steps.len())).rev() {
                     out.push(
-                        keys.iter()
+                        steps
+                            .iter()
                             .enumerate()
                             .filter(|(bit, _)| mask & (1 << bit) != 0)
-                            .map(|(_, k)| *k)
+                            .flat_map(|(_, k)| k.iter().copied())
                             .collect(),
                     );
                 }
@@ -14178,8 +14401,11 @@ enum GroupElement {
     Key(usize),
     /// `GROUPING SETS (...)` — each inner set already resolved to indices.
     Sets(Vec<Vec<usize>>),
-    Rollup(Vec<usize>),
-    Cube(Vec<usize>),
+    /// `ROLLUP` / `CUBE` over STEPS: each step one key, or several written
+    /// in parentheses (`rollup ((a, b), c)`), which are added or dropped
+    /// together.
+    Rollup(Vec<Vec<usize>>),
+    Cube(Vec<Vec<usize>>),
 }
 
 /// Resolve one `GROUP BY` element to its key.
@@ -15591,9 +15817,12 @@ fn rewrite_dml_from(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<()> {
+    // `location`: the expression the subquery stands for, so an error about
+    // the value (a SET's 42804) points where PostgreSQL's does.
     fn sublink(
         kind: SubLinkType,
         select: pg_query::protobuf::SelectStmt,
+        location: i32,
     ) -> pg_query::protobuf::Node {
         pg_query::protobuf::Node {
             node: Some(N::SubLink(Box::new(pg_query::protobuf::SubLink {
@@ -15601,7 +15830,7 @@ fn rewrite_dml_from(
                 subselect: Some(Box::new(pg_query::protobuf::Node {
                     node: Some(N::SelectStmt(Box::new(select))),
                 })),
-                location: -1,
+                location,
                 ..Default::default()
             }))),
         }
@@ -15732,9 +15961,11 @@ fn rewrite_dml_from(
                 }
             }
             let v = rt.val.take().expect("checked");
+            let at = expr_location(&v).unwrap_or(-1);
             rt.val = Some(Box::new(sublink(
                 SubLinkType::ExprSublink,
                 select(*v, from, cond, true),
+                at,
             )));
         }
         Ok(())
@@ -15864,14 +16095,17 @@ fn rewrite_dml_from(
                     rt.val = Some(v);
                     continue;
                 }
+                let at = expr_location(&v).unwrap_or(-1);
                 rt.val = Some(Box::new(sublink(
                     SubLinkType::ExprSublink,
                     select(*v, &from, cond.as_deref(), true),
+                    at,
                 )));
             }
             u.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
                 select(one(), &from, cond.as_deref(), false),
+                -1,
             )));
         }
         Some(N::DeleteStmt(d)) if !d.using_clause.is_empty() => {
@@ -15893,6 +16127,7 @@ fn rewrite_dml_from(
             d.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
                 select(one(), &from, cond.as_deref(), false),
+                -1,
             )));
         }
         _ => {}
@@ -16931,19 +17166,61 @@ fn resolve_one_sublink(
                 // subquery column's type: an `int2vector` is an int array
                 // at run time and must still print as `2 3`.
                 Some(value) => {
-                    let node = param_node(params, value);
+                    let node = located(param_node(params, value), sl.location);
                     let ty = sub_plan_def(&plan, lookup)
                         .ok()
                         .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
                     // So must a type the value reads back as another (an
-                    // `oid` is carried as a bigint, a `name` as text).
+                    // `oid` is carried as a bigint, a `name` as text) -- and
+                    // every other built-in type, so the value is typed as the
+                    // subquery's column wherever it lands: a bare parameter
+                    // has no declared type, which made `pg_typeof((select
+                    // 1))` 42P18 and a CASE over it text (RP-023).
+                    let cast = |t: &str| {
+                        matches!(
+                            t,
+                            "int2vector"
+                                | "oidvector"
+                                | "oid"
+                                | "int2"
+                                | "float4"
+                                | "name"
+                                | "varchar"
+                                | "bpchar"
+                                | "\"char\""
+                                | "xid"
+                                | "cid"
+                                | "timestamp"
+                                | "timestamptz"
+                                | "date"
+                                | "time"
+                                | "timetz"
+                                | "interval"
+                                | "uuid"
+                        )
+                    };
+                    // Any other built-in type is DECLARED for the parameter
+                    // rather than cast to: a value carried in another form
+                    // (a `pg_lsn` as its position) would not survive a cast
+                    // of itself.
+                    if let Some(t) = ty.as_deref().filter(|t| {
+                        !cast(t)
+                            && !matches!(*t, "" | "unknown" | "record" | "text")
+                            && !t.contains('"')
+                            && pgtypes::oid_of_name(t).is_some()
+                            && user_composite(t).is_none()
+                    }) {
+                        let at = params.len() - 1;
+                        PLAN_PARAM_TYPES.with(|p| {
+                            let mut p = p.borrow_mut();
+                            if p.len() <= at {
+                                p.resize(at + 1, None);
+                            }
+                            p[at] = Some(t.to_string());
+                        });
+                    }
                     Ok(match ty.as_deref() {
-                        Some(
-                            ty @ ("int2vector" | "oidvector" | "oid" | "int2" | "float4" | "name"
-                            | "varchar" | "bpchar" | "\"char\"" | "xid" | "cid" | "timestamp"
-                            | "timestamptz" | "date" | "time" | "timetz" | "interval"
-                            | "uuid"),
-                        ) => pg_query::protobuf::Node {
+                        Some(ty) if cast(ty) => pg_query::protobuf::Node {
                             node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                                 arg: Some(Box::new(node)),
                                 type_name: Some(type_name_node(ty)),
@@ -16959,7 +17236,7 @@ fn resolve_one_sublink(
                         .first()
                         .map(|c| c.pg_type.clone())
                         .unwrap_or_else(|| "text".into());
-                    let null = param_node(params, Bson::Null);
+                    let null = located(param_node(params, Bson::Null), sl.location);
                     Ok(pg_query::protobuf::Node {
                         node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                             arg: Some(Box::new(null)),
@@ -17356,6 +17633,15 @@ fn bool_const_node(value: bool) -> pg_query::protobuf::Node {
 /// dates, numerics, arrays and NULL included. Building `A_Const` nodes instead
 /// would mean a second, narrower value encoder, and the types it did not cover
 /// would fail in a way that looked like a missing feature.
+/// A parameter standing for a subquery's value, at the subquery's location
+/// (`exprLocation` of the SubLink), so an error about the value points there.
+fn located(mut node: pg_query::protobuf::Node, location: i32) -> pg_query::protobuf::Node {
+    if let Some(N::ParamRef(p)) = node.node.as_mut() {
+        p.location = location;
+    }
+    node
+}
+
 fn param_node(params: &mut Vec<Bson>, value: Bson) -> pg_query::protobuf::Node {
     params.push(value);
     pg_query::protobuf::Node {
@@ -18463,9 +18749,9 @@ fn plan_select(
     enum_order::check_collate_operands(s, lookup)?;
     check_distinct_order(s)?;
     check_distinct_on_order(s)?;
-    // A set-returning function over a column in the select list is a
-    // LATERAL join (see `joins::select_list_srf`).
-    if let Some(rewritten) = joins::select_list_srf(s)? {
+    // A set-returning function in the select list (or ORDER BY / GROUP BY)
+    // is a LATERAL source (see `srf_tlist`).
+    if let Some(rewritten) = srf_tlist::rewrite(s)? {
         return plan_select(&rewritten, lookup, params);
     }
     // A reference to the RELATION itself -- `row_to_json(t)`, `SELECT jr
@@ -20494,6 +20780,29 @@ pub fn join_output_keys(join: &JoinSelect) -> Vec<String> {
         .collect()
 }
 
+/// A 42803 naming a bare column, as PostgreSQL writes it: qualified by the
+/// relation it belongs to (`column "t.z" must appear ...`), which the HAVING
+/// planner, resolving by name alone, does not know (RP-010).
+fn qualify_grouping_error(e: Error, s: &pg_query::protobuf::SelectStmt) -> Error {
+    let Error::Grouping(msg) = &e else {
+        return e;
+    };
+    let Some((name, rest)) = msg
+        .strip_prefix("column \"")
+        .and_then(|r| r.split_once('"'))
+    else {
+        return e;
+    };
+    if name.contains('.') || !rest.starts_with(" must appear in the GROUP BY clause") {
+        return e;
+    }
+    let c = pg_query::protobuf::ColumnRef {
+        fields: vec![string_node(name)],
+        location: -1,
+    };
+    Error::Grouping(format!("column \"{}\"{rest}", grouping_error_name(&c, s)))
+}
+
 /// The shared tail of `plan_aggregate`, over whichever SOURCE the FROM named:
 /// a table, or a joined subquery whose output columns stand in for one.
 /// How PostgreSQL names an ungrouped column in its 42803: qualified --
@@ -20597,13 +20906,22 @@ fn finish_aggregate(
             };
             match K::try_from(gs.kind) {
                 Ok(K::GroupingSetEmpty) => elements.push(GroupElement::Sets(vec![Vec::new()])),
-                Ok(K::GroupingSetRollup) => {
-                    let keys = members(&gs.content, &mut group_by, &mut group_prints)?;
-                    elements.push(GroupElement::Rollup(keys));
-                }
-                Ok(K::GroupingSetCube) => {
-                    let keys = members(&gs.content, &mut group_by, &mut group_prints)?;
-                    elements.push(GroupElement::Cube(keys));
+                Ok(kind @ (K::GroupingSetRollup | K::GroupingSetCube)) => {
+                    // A parenthesised step, `(a, b)`, parses as a RowExpr.
+                    let mut steps = Vec::new();
+                    for item in &gs.content {
+                        steps.push(match item.node.as_ref() {
+                            Some(N::RowExpr(r)) => {
+                                members(&r.args, &mut group_by, &mut group_prints)?
+                            }
+                            _ => vec![push_key(item, &mut group_by, &mut group_prints)?],
+                        });
+                    }
+                    elements.push(if kind == K::GroupingSetRollup {
+                        GroupElement::Rollup(steps)
+                    } else {
+                        GroupElement::Cube(steps)
+                    });
                 }
                 Ok(K::GroupingSetSets) => {
                     let mut sets = Vec::new();
@@ -20930,17 +21248,20 @@ fn finish_aggregate(
     // the test and never projected.
     let having = match s.having_clause.as_deref() {
         None => None,
-        Some(node) => Some(plan_having(
-            node,
-            &def,
-            &group_by,
-            &mut items,
-            params,
-            &mut GroupingsCtx {
-                groupings: &mut groupings,
-                prints: &group_prints,
-            },
-        )?),
+        Some(node) => Some(
+            plan_having(
+                node,
+                &def,
+                &group_by,
+                &mut items,
+                params,
+                &mut GroupingsCtx {
+                    groupings: &mut groupings,
+                    prints: &group_prints,
+                },
+            )
+            .map_err(|e| qualify_grouping_error(e, s))?,
+        ),
     };
 
     let (limit, offset) = limit_offset(s, params)?;
@@ -21279,6 +21600,13 @@ fn builtin_by_type(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Option<
 }
 
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // `x COLLATE c` is `x`'s type: a collation changes the comparison, not
+    // the type, so a `bpchar` operand still ignores its trailing blanks.
+    if let Some(N::CollateClause(cc)) = node.node.as_ref() {
+        if let Some(arg) = cc.arg.as_deref() {
+            return static_type(arg, value);
+        }
+    }
     // A built-in picked by its argument types says its own result type.
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if let Some(t) = builtin_call_types(f, &[])
@@ -21741,7 +22069,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::CaseExpr(c)) => common_type(&case_results(c)),
         Some(N::MinMaxExpr(m)) => {
             let common = common_type(&m.args.iter().collect::<Vec<_>>());
-            if wider_datetime(&common, &common).is_some() {
+            if common != "text" {
                 common
             } else {
                 inferred_type(value).to_string()
@@ -21770,8 +22098,14 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 // reports 23. A NULL still has a type; it just cannot tell you
                 // what it is.
                 return match (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                    // An untyped left side takes the right side's type.
-                    (Some(l), Some(r)) if matches!(l.node.as_ref(), Some(N::AConst(c)) if c.isnull) => {
+                    // An untyped left side -- a NULL or a bare string -- takes
+                    // the right side's type (`nullif('0/16', l)` is pg_lsn).
+                    (Some(l), Some(r))
+                        if matches!(l.node.as_ref(), Some(N::AConst(c)) if c.isnull
+                            || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+                            && !matches!(r.node.as_ref(), Some(N::AConst(c)) if c.isnull
+                                || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))) =>
+                    {
                         static_type(r, &Bson::Null)
                     }
                     (Some(l), _) => static_type(l, value),
@@ -21817,6 +22151,23 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     return t.to_string();
                 }
             }
+            // `x || 'a'` over a type with no `||` of its own is text
+            // concatenation (`anytextcat`), not the geometric "is parallel".
+            let spell = |t: Option<&String>, n: Option<&pg_query::protobuf::Node>| {
+                if unknown_operand(n) || null_literal(n) {
+                    Some("unknown".to_string())
+                } else {
+                    t.cloned()
+                }
+            };
+            if op == "||"
+                && textcat_operands(
+                    spell(lt(), e.lexpr.as_deref()).as_deref(),
+                    spell(rt(), e.rexpr.as_deref()).as_deref(),
+                )
+            {
+                return "text".to_string();
+            }
             if let (Some(lt), Some(rt)) = (lt(), rt()) {
                 if let Some(t) = range_ops::result_type(op, lt, rt) {
                     return t;
@@ -21834,7 +22185,12 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             // Bit-string operators keep the left operand's type; `||` is varbit
             // and `~` the operand's.
             if matches!(op, "&" | "|" | "#" | "<<" | ">>" | "||" | "~") {
-                if let Some(t) = lt().or(rt()) {
+                // `'01' || B'10'`: an untyped left side, so the bit string
+                // can be on either side.
+                let bit_side = lt()
+                    .filter(|t| bits::is_bit_type(t))
+                    .or_else(|| rt().filter(|t| bits::is_bit_type(t) && op == "||"));
+                if let Some(t) = bit_side.or(lt()).or(rt()) {
                     if bits::is_bit_type(t) {
                         return if op == "||" {
                             "varbit".to_string()
@@ -21852,7 +22208,9 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 return "tsquery".to_string();
             }
             if matches!(op, "||" | "&&" | "<->") {
-                if let Some(t) = lt() {
+                // Either side: `'c' || 'a b'::tsvector` is a tsvector.
+                let right = rt().filter(|_| unknown_operand(e.lexpr.as_deref()));
+                for t in lt().into_iter().chain(right) {
                     if t == "tsvector" || t == "tsquery" {
                         return t.clone();
                     }
@@ -22327,6 +22685,18 @@ fn to_common_type(v: Bson, ty: &str) -> Result<Bson> {
     if matches!(ty, "timestamp" | "timestamptz") && matches!(v, Bson::String(_)) {
         return cast_value(v, ty);
     }
+    // An untyped literal meeting a typed value is read as that type, by its
+    // input function: `greatest('0/16'::pg_lsn, '0/17')` compares two
+    // pg_lsns, where the literal used to stay a string and lose to the
+    // carried number.
+    if matches!(v, Bson::String(_))
+        && !is_string_type(ty)
+        && !matches!(ty, "unknown" | "\"char\"")
+        && !ty.ends_with("[]")
+        && pgtypes::oid_of_name(ty).is_some()
+    {
+        return cast_value(v, ty);
+    }
     if v == Bson::Null || !matches!(ty, "int8" | "numeric" | "float4" | "float8") {
         return Ok(v);
     }
@@ -22367,6 +22737,7 @@ fn datetime_arith_type(op: &str, lt: &str, rt: &str) -> Option<&'static str> {
             ("date", "int") | ("int", "date") => Some("date"),
             ("date", "interval") | ("interval", "date") => Some("timestamp"),
             ("date", "time") | ("time", "date") => Some("timestamp"),
+            ("date", "timetz") | ("timetz", "date") => Some("timestamptz"),
             ("timestamp", "interval") | ("interval", "timestamp") => Some("timestamp"),
             ("timestamptz", "interval") | ("interval", "timestamptz") => Some("timestamptz"),
             ("time", "interval") | ("interval", "time") => Some("time"),
@@ -22866,7 +23237,13 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             width = items.len();
             types = vec![String::new(); width];
         } else if items.len() != width {
-            return Err(Error::Unsupported("VALUES rows of differing widths".into()));
+            // PostgreSQL's `transformValuesClause`, at the odd row's first item.
+            if let Some(loc) = items.first().and_then(expr_location) {
+                set_error_location(loc);
+            }
+            return Err(Error::Parse(
+                "VALUES lists must all be the same length".into(),
+            ));
         }
         let mut row = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
@@ -23285,6 +23662,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || declared == "timestamptz"
                             || declared == "name"
                             || declared == "name[]"
+                            // A `"char"` is carried as its text.
+                            || declared == QUOTED_CHAR
                             || fts::result_type(&name).is_some()
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
@@ -23668,7 +24047,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         .map(|t| {
             matches!(t.node.as_ref(), Some(N::ResTarget(rt))
                 if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                    Some(N::AConst(c)) if c.isnull))
+                    Some(N::AConst(c)) if c.isnull
+                        || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))))
         })
         .collect();
     let untyped = if untyped.len() == columns.len() {
@@ -24388,7 +24768,9 @@ pub fn record_names(v: &Bson) -> Option<Vec<String>> {
 /// A record's PostgreSQL text: `(f1,f2,...)`. A NULL field is empty; a field is
 /// double-quoted (with `"`->`""` and `\`->`\\`) when it is empty or contains
 /// a comma, parenthesis, quote, backslash or whitespace.
-pub(crate) fn record_text(fields: &[Bson]) -> String {
+/// `types` are the fields' static types where the record carries them
+/// (a `ROW(...)`): a tid, stored as a number, prints as `(b,o)`.
+pub(crate) fn record_text(fields: &[Bson], types: &[String]) -> String {
     let mut out = String::from("(");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -24401,6 +24783,9 @@ pub(crate) fn record_text(fields: &[Bson]) -> String {
         // cast: a bool prints `t`/`f` inside a record, not `true`/`false`.
         let field = match f {
             Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
+            _ if types.get(i).is_some_and(|t| typeout::needs_type(t)) => {
+                typeout::output_text(f, &types[i])
+            }
             _ => render_value_text(f),
         };
         let needs_quote = field.is_empty()
@@ -25003,6 +25388,9 @@ pub fn regclass_text(oid: i64) -> String {
             if table_is_visible(oid) == Some(true) {
                 return scalar::quote_identifier(bare);
             }
+        } else if table_is_visible(oid) == Some(false) {
+            // A relation of `public`, with `public` off the path.
+            return format!("public.{}", scalar::quote_identifier(&name));
         }
         return name
             .split('.')
@@ -25034,7 +25422,7 @@ pub fn regclass_text(oid: i64) -> String {
 /// one), and anything else -- an empty name, a bare dot, an unquoted part
 /// with a space inside, an unterminated quote -- is 42602 `invalid name
 /// syntax` (measured 16: `'a b'`, `'.t1'`, `'t1.'`, `'  '`).
-fn split_relation_name(text: &str) -> Result<Vec<String>> {
+pub(crate) fn split_relation_name(text: &str) -> Result<Vec<String>> {
     let invalid = || Error::InvalidName("invalid name syntax".into());
     let mut parts = Vec::new();
     let mut chars = text.trim().chars().peekable();
@@ -27924,7 +28312,10 @@ fn render_array_element(v: &Bson) -> String {
         // A record / composite element renders as its `(...)` text; the
         // array-quoting below wraps it (it has parens and commas), so
         // `array[row('a',1)::t]` becomes `{"(a,1)"}` as PostgreSQL renders it.
-        _ if record_fields(v).is_some() => record_text(record_fields(v).expect("checked")),
+        _ if record_fields(v).is_some() => record_text(
+            record_fields(v).expect("checked"),
+            &record_field_types(v).unwrap_or_default(),
+        ),
         // A timestamp (a BSON date, or the sub-millisecond composite) and an
         // interval (its three-part document) render as the text their scalar
         // cast produces: `{"2020-01-01 00:00:00.5"}`, `{"1 day"}`. These
@@ -28256,7 +28647,7 @@ pub fn value_text(v: &Bson) -> String {
 /// The `(...)` text of an anonymous record value, or `None` for any other
 /// value -- the wire layer renders a record in the text format through this.
 pub fn record_value_text(v: &Bson) -> Option<String> {
-    record_fields(v).map(|f| record_text(f))
+    record_fields(v).map(|f| record_text(f, &record_field_types(v).unwrap_or_default()))
 }
 
 /// The ordered field values of a record / composite value, or `None` for any
@@ -28270,6 +28661,31 @@ pub(crate) fn render_value_text(v: &Bson) -> String {
         Ok(Bson::String(s)) => s,
         _ => String::new(),
     }
+}
+
+/// `float8in` / `float4in`'s reading of a number's text: what `strtod`
+/// takes, with PostgreSQL's 22003 for a value that overflows to infinity
+/// or underflows to zero from nonzero digits (`'1e400'`, `'1e-400'`), and
+/// 22P02 for text that is no number. `Infinity` and `NaN` are words of
+/// their own, in any case and with a sign.
+fn float_in(text: &str, type_name: &str) -> Result<f64> {
+    let t = text.trim();
+    let invalid = || {
+        Error::InvalidText(format!(
+            "invalid input syntax for type {type_name}: \"{text}\""
+        ))
+    };
+    let v = t.parse::<f64>().map_err(|_| invalid())?;
+    let word = t.trim_start_matches(['+', '-']).to_ascii_lowercase();
+    let mantissa = word.split(['e', 'E']).next().unwrap_or("");
+    let out_of_range = (v.is_infinite() && word != "inf" && word != "infinity")
+        || (v == 0.0 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)));
+    if out_of_range {
+        return Err(Error::NumericOutOfRange(format!(
+            "\"{text}\" is out of range for type {type_name}"
+        )));
+    }
+    Ok(v)
 }
 
 pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
@@ -28326,8 +28742,43 @@ pub(crate) fn char_out(b: u8) -> String {
     }
 }
 
+/// A cast to or from `"char"` that PostgreSQL 15 has no path for (42846):
+/// `pg_cast` holds `int4` <-> `"char"` (`i4tochar` / `chartoi4`) and the
+/// string types' I/O casts, and nothing for the other numbers or boolean --
+/// `65::int2::"char"` and `'A'::"char"::int8` are both refused, NULL or not
+/// (measured). The call `"char"(x)` is a function, not this cast.
+pub(crate) fn char_cast_refused(source: &str, target: &str) -> Option<Error> {
+    let other = match (source, target) {
+        (s, QUOTED_CHAR) if s != QUOTED_CHAR => s,
+        (QUOTED_CHAR, t) if t != QUOTED_CHAR => t,
+        _ => return None,
+    };
+    matches!(
+        other,
+        "int2"
+            | "smallint"
+            | "int8"
+            | "bigint"
+            | "numeric"
+            | "decimal"
+            | "float4"
+            | "real"
+            | "float8"
+            | "double precision"
+            | "bool"
+            | "boolean"
+    )
+    .then(|| {
+        Error::CannotCoerce(format!(
+            "cannot cast type {} to {}",
+            display_type(source),
+            display_type(target)
+        ))
+    })
+}
+
 /// `i4tochar`.
-fn char_from_int(i: i64) -> Result<Bson> {
+pub(crate) fn char_from_int(i: i64) -> Result<Bson> {
     i8::try_from(i)
         .map(|v| Bson::String(char_out(v as u8)))
         .map_err(|_| Error::NumericOutOfRange("\"char\" out of range".into()))
@@ -28511,7 +28962,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     // a no-op. Other targets are not defined for a bare record.
     if let Some(fields) = record_fields(&value) {
         return match target {
-            "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(record_text(fields))),
+            "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(record_text(
+                fields,
+                &record_field_types(&value).unwrap_or_default(),
+            ))),
             "record" => Ok(value.clone()),
             _ => Err(Error::Unsupported(format!("a record cast to {target}"))),
         };
@@ -28800,7 +29254,15 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "float4" | "real" => {
             // numeric -> float4 goes through float4in on the numeric's text,
             // so its range error quotes that text; float8 -> float4 does not.
-            let source_text = is_numeric(&value).then(|| numeric_text(&value)).flatten();
+            let source_text = match &value {
+                // `float4in`: the text, read as a double and refused by the
+                // name of this type if it is out of range for either.
+                Bson::String(t) => {
+                    float_in(t, "real")?;
+                    Some(t.clone())
+                }
+                v => is_numeric(v).then(|| numeric_text(v)).flatten(),
+            };
             let range = |which: &str| match &source_text {
                 Some(t) => {
                     Error::NumericOutOfRange(format!("\"{t}\" is out of range for type real"))
@@ -28832,11 +29294,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 .and_then(|t| numeric::numeric_text_to_f64(&t))
                 .map(Bson::Double)
                 .ok_or_else(|| bad("double precision", &value)),
-            Bson::String(s) => s
-                .trim()
-                .parse::<f64>()
-                .map(Bson::Double)
-                .map_err(|_| bad("double precision", &value)),
+            Bson::String(s) => float_in(s, "double precision").map(Bson::Double),
             _ => Err(bad("double precision", &value)),
         },
         "bool" | "boolean" => match &value {
@@ -29041,6 +29499,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "macaddr" => Ok(Bson::String(systypes::parse_macaddr(&as_text(&value))?)),
         "macaddr8" => Ok(Bson::String(systypes::parse_macaddr8(&as_text(&value))?)),
         "pg_lsn" => systypes::cast_lsn(&value),
+        "tid" => tid::cast_tid(&value),
         "xid" | "cid" => Ok(systypes::cast_xid(&value)),
         "xid8" => Ok(systypes::cast_xid8(&value)),
         "txid_snapshot" | "pg_snapshot" => Ok(Bson::String(systypes::parse_snapshot(
@@ -30130,12 +30589,112 @@ fn star_target_node() -> pg_query::protobuf::Node {
     }
 }
 
+/// Is `t` a type with no `||` of its own, so that `x || 'a'` is
+/// `anytextcat` -- `x::text || 'a'`? The types carried in another form than
+/// their text, the ranges and multiranges; not an array, bytea, the bit
+/// strings, jsonb or the text-search types, whose `||` is their own.
+fn textcat_type(t: &str) -> bool {
+    (typeout::needs_type(t)
+        && !t.ends_with("[]")
+        && !matches!(t, "bytea" | "int2vector" | "oidvector"))
+        || range::is_range_type(t)
+        || range::is_multirange_type(t)
+}
+
+/// Is `l || r` text concatenation of a [`textcat_type`] side with a string
+/// (or untyped) one? Or of a type with a `||` of its own -- bytea, the bit
+/// strings, jsonb, the text-search types -- with a TYPED string: there is no
+/// `bytea || text`, so it is `anytextcat` too (`'\x01'::bytea || 'x'::text`
+/// is the text `\x01x`). An UNTYPED side beside one of those is read as
+/// its type instead ([`own_concat_type`]); the caller spells such a side
+/// `unknown`.
+fn textcat_operands(l: Option<&str>, r: Option<&str>) -> bool {
+    let stringy = |t: Option<&str>| t.is_some_and(|t| is_string_type(t) || t == "unknown");
+    let typed_string = |t: Option<&str>| t.is_some_and(is_string_type);
+    let own = |t: Option<&str>| t.is_some_and(|t| own_concat_type(t).is_some());
+    (l.is_some_and(textcat_type) && stringy(r))
+        || (r.is_some_and(textcat_type) && stringy(l))
+        || (own(l) && typed_string(r))
+        || (own(r) && typed_string(l))
+}
+
+/// Is `n` a bare `NULL` (untyped, so `unknown` like a string literal)?
+fn null_literal(n: Option<&pg_query::protobuf::Node>) -> bool {
+    matches!(n.and_then(|x| x.node.as_ref()), Some(N::AConst(c)) if c.isnull)
+}
+
+/// Is `n` a TYPED string operand (`'x'::text`, a text column), as opposed
+/// to an untyped literal or parameter?
+fn typed_string_operand(n: Option<&pg_query::protobuf::Node>, v: &Bson) -> bool {
+    !unknown_operand(n) && !null_literal(n) && n.is_some_and(|n| is_string_type(&static_type(n, v)))
+}
+
+/// The type an untyped operand of `||` is read as beside `t`, when `t` has a
+/// `||` of its own (`byteacat`, `bitcat`, `tsvector_concat`, `tsquery_or`,
+/// `jsonb_concat`): `'\x01'::bytea || 'x'` is the bytea `\x0178`,
+/// `B'10' || '01'` the varbit `1001`, `'c' || 'a b'::tsvector` a tsvector.
+/// Measured on PostgreSQL 15.19.
+fn own_concat_type(t: &str) -> Option<&'static str> {
+    Some(match t {
+        "bytea" => "bytea",
+        "bit" | "varbit" | "bit varying" => "varbit",
+        "tsvector" => "tsvector",
+        "tsquery" => "tsquery",
+        "jsonb" => "jsonb",
+        _ => return None,
+    })
+}
+
+/// Is `f` one of the functions that print their arguments (`concat`,
+/// `format`, `quote_literal`, ...)? Over a value carried in another form
+/// than its text they need its type, which the one-column fast path, whose
+/// argument is just the stored value, does not have.
+fn printing_function(f: &pg_query::protobuf::FuncCall) -> bool {
+    matches!(
+        func_name(f).as_deref(),
+        Some("concat" | "concat_ws" | "format" | "quote_literal" | "quote_nullable")
+    )
+}
+
 /// A built-in's arguments with each `char(n)` one trimmed, as the
 /// bpchar-to-text cast in front of a text function trims it -- except for
 /// the functions that take the value as it is (`octet_length` counts the
 /// blanks, `concat` / `format` print them).
 fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) -> Vec<Bson> {
     const PADDED: &[&str] = &["octet_length", "concat", "concat_ws", "format"];
+    // The `"any"` functions print an argument by its type's OUTPUT function
+    // (`concat(true)` is `t`), and `quote_literal` / `quote_nullable` are
+    // `quote_*($1::text)` (`quote_literal(true)` is `'true'`). Either way a
+    // value carried in another form -- a pg_lsn's position, a money's
+    // numeric, a regclass's oid document -- is printed by its type, not as
+    // what it is carried as.
+    const PRINTED: &[&str] = &["concat", "concat_ws", "format"];
+    const CAST: &[&str] = &["quote_literal", "quote_nullable"];
+    let args: Vec<Bson> = if PRINTED.contains(&name) || CAST.contains(&name) {
+        args.into_iter()
+            .zip(f.args.iter())
+            .map(|(v, node)| {
+                if v == Bson::Null {
+                    return v;
+                }
+                let ty = static_type(node, &v);
+                // A string is its own text, except an inet, whose output drops
+                // a full host mask the stored text keeps.
+                if matches!(v, Bson::String(_)) && !matches!(ty.as_str(), "inet" | "cidr") {
+                    return v;
+                }
+                if CAST.contains(&name) {
+                    Bson::String(typeout::cast_text(&v, &ty))
+                } else if typeout::needs_type(&ty) || matches!(v, Bson::Boolean(_)) {
+                    Bson::String(typeout::output_text(&v, &ty))
+                } else {
+                    v
+                }
+            })
+            .collect()
+    } else {
+        args
+    };
     if PADDED.contains(&name) {
         return args;
     }
@@ -30255,6 +30814,8 @@ fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
         Some(N::ParamRef(p)) => {
             declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
         }
+        // `'a  ' COLLATE "C"` is still an untyped literal (RP-022).
+        Some(N::CollateClause(cc)) => unknown_operand(cc.arg.as_deref()),
         _ => false,
     }
 }
@@ -30264,6 +30825,13 @@ fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
 /// queries, `||` on vectors. `None`: not a full-text operation.
 fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bson>> {
     if !matches!(op, "@@" | "@@@" | "||" | "&&" | "<->") {
+        return None;
+    }
+    // `tsvector || text` has no operator of its own: it is `anytextcat`.
+    if op == "||"
+        && (typed_string_operand(e.lexpr.as_deref(), lhs)
+            || typed_string_operand(e.rexpr.as_deref(), rhs))
+    {
         return None;
     }
     let lt = e
@@ -30276,6 +30844,16 @@ fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bs
         .map_or_else(String::new, |n| static_type(n, rhs));
     let fts_type = |t: &str| t == "tsvector" || t == "tsquery";
     if op != "@@" && op != "@@@" {
+        // An untyped left side beside a tsvector / tsquery is read as that
+        // type (`'c' || 'a b'::tsvector` is `tsvector_concat`).
+        if !fts_type(&lt) && fts_type(&rt) && unknown_operand(e.lexpr.as_deref()) {
+            if *lhs == Bson::Null || *rhs == Bson::Null {
+                return Some(Ok(Bson::Null));
+            }
+            return Some(
+                cast_value(lhs.clone(), &rt).and_then(|l| fts::operator(op, &rt, &l, rhs)),
+            );
+        }
         if !fts_type(&lt) {
             return None;
         }
@@ -30485,6 +31063,51 @@ fn coerce_unknown_operand(
             (coerced, rhs)
         });
     }
+    // A tid is stored as a number too: beside one an unknown IS a tid.
+    if op != "||" && typed_node.is_some_and(|n| static_type(n, typed) == "tid") {
+        let coerced = tid::cast_tid(&Bson::String(text.clone()))?;
+        return Ok(if r_bare {
+            (lhs, coerced)
+        } else {
+            (coerced, rhs)
+        });
+    }
+    // Beside a NULL array an unknown is that array type: `null::int[] ||
+    // '{3}'` is array_cat's `{3}`.
+    if op == "||" && *typed == Bson::Null {
+        if let Some(ty) = typed_node
+            .map(|n| static_type(n, typed))
+            .filter(|t| t.ends_with("[]"))
+        {
+            let coerced = cast_value(Bson::String(text.clone()), &ty)?;
+            return Ok(if r_bare {
+                (lhs, coerced)
+            } else {
+                (coerced, rhs)
+            });
+        }
+    }
+    // Beside a type with a `||` of its own an unknown is that type.
+    if op == "||" {
+        if let Some(ty) = typed_node.and_then(|n| own_concat_type(&static_type(n, typed))) {
+            // A literal its type's input refuses is reported at the literal.
+            let literal = if r_bare {
+                e.rexpr.as_deref()
+            } else {
+                e.lexpr.as_deref()
+            };
+            let coerced = cast_value(Bson::String(text.clone()), ty).inspect_err(|_| {
+                if let Some(N::AConst(c)) = literal.and_then(|n| n.node.as_ref()) {
+                    set_error_location(c.location);
+                }
+            })?;
+            return Ok(if r_bare {
+                (lhs, coerced)
+            } else {
+                (coerced, rhs)
+            });
+        }
+    }
     let coerced = match typed {
         // Beside an interval or a timestamp an unknown is that type -- except
         // for `||`, where it is text (`'a' || ts` is `textanycat`).
@@ -30619,6 +31242,20 @@ fn array_concat(lhs: Bson, rhs: Bson) -> Result<Bson> {
 }
 
 /// Is `v` a `time` value's text (`HH:MM[:SS[.ffffff]]`)?
+/// A `timetz`'s text: a time of day followed by its UTC offset
+/// (`01:00:00+02`, `23:59-05:30`).
+fn is_timetz_text(v: &Bson) -> bool {
+    let Bson::String(s) = v else { return false };
+    let s = s.trim();
+    let Some(at) = s.rfind(['+', '-']).filter(|&i| i >= 4) else {
+        return false;
+    };
+    let offset = &s[at + 1..];
+    !offset.is_empty()
+        && offset.chars().all(|c| c.is_ascii_digit() || c == ':')
+        && is_time_text(&Bson::String(s[..at].to_string()))
+}
+
 fn is_time_text(v: &Bson) -> bool {
     let Bson::String(s) = v else { return false };
     let parts: Vec<&str> = s.trim().split(':').collect();
@@ -30777,6 +31414,21 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             if let (Some(date), Some(time)) = (date, time) {
                 let since_midnight = cast_value(time.clone(), "interval")?;
                 return eval_binary("+", date.clone(), since_midnight);
+            }
+            // `date + timetz` is the instant at that time of that day in the
+            // time's own offset (`datetimetz_timestamptz`).
+            let (date, time) = if as_ymd(&lhs).is_some() && is_timetz_text(&rhs) {
+                (Some(&lhs), Some(&rhs))
+            } else if as_ymd(&rhs).is_some() && is_timetz_text(&lhs) {
+                (Some(&rhs), Some(&lhs))
+            } else {
+                (None, None)
+            };
+            if let (Some(date), Some(time)) = (date, time) {
+                return cast_value(
+                    Bson::String(format!("{} {}", value_text(date), value_text(time))),
+                    "timestamptz",
+                );
             }
         }
         if let (Some(d), Some(n)) = (as_ymd(&lhs), as_int(&rhs)) {
@@ -31873,7 +32525,9 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             .ok_or_else(|| Error::Unsupported("this DROP target".into()))?;
         tables.push(name);
     }
-    if tables.is_empty() {
+    // IF EXISTS can be left with none: each was a name the search path does
+    // not reach, skipped with a notice while the statement was qualified.
+    if tables.is_empty() && !d.missing_ok {
         return Err(Error::Parse("DROP TABLE with no table".into()));
     }
     Ok(Statement::DropTable(DropTable {
@@ -33048,30 +33702,74 @@ fn smallint_in_range(node: &pg_query::protobuf::Node, value: Bson) -> Result<Bso
     Ok(value)
 }
 
+/// The targets `jsonb` has a cast to besides text: `Some(true)` for
+/// boolean, `Some(false)` for the numeric types.
+fn jsonb_scalar_target(t: &str) -> Option<bool> {
+    match t {
+        "bool" | "boolean" => Some(true),
+        "int2" | "smallint" | "int4" | "int" | "integer" | "int8" | "bigint" | "float4"
+        | "real" | "float8" | "double precision" | "numeric" | "decimal" => Some(false),
+        _ => None,
+    }
+}
+
 /// A cast whose answer depends on the SOURCE type, for the types in
 /// `systypes`: a `pg_lsn` (stored as its position) to a string type is
 /// `pg_lsn_out`; a `macaddr8` to `macaddr` drops the `ff:fe` middle (and
 /// refuses an address without it). `None` for every other cast.
 fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<Bson>> {
+    // Checked by TYPE, so a NULL is refused too.
+    if let Some(e) = source.and_then(|s| char_cast_refused(s, target)) {
+        return Some(Err(e));
+    }
     if *v == Bson::Null {
         return None;
     }
     match (source?, target) {
+        // `jsonb` to a number or a boolean (`jsonb_int4`, `jsonb_bool`, ...):
+        // only from a scalar of that kind, else PostgreSQL's 22023 naming the
+        // kind it is. A number to an integer then rounds, as `numeric` does.
+        ("jsonb", t) if jsonb_scalar_target(t).is_some() => {
+            let want_bool = jsonb_scalar_target(t) == Some(true);
+            let parsed = json::parse(&value_text(v)).ok()?;
+            let kind = match &parsed {
+                json::Json::Null => "null",
+                json::Json::Bool(_) => "boolean",
+                json::Json::Number(_) => "numeric",
+                json::Json::Str(_) => "string",
+                json::Json::Array(_) => "array",
+                json::Json::Object(_) => "object",
+            };
+            match (&parsed, want_bool) {
+                (json::Json::Bool(b), true) => Some(Ok(Bson::Boolean(*b))),
+                (json::Json::Number(n), false) => Some(
+                    cast_value(Bson::String(n.clone()), "numeric")
+                        .and_then(|num| cast_value(num, t)),
+                ),
+                _ => Some(Err(Error::Sqlstate(
+                    "22023",
+                    format!("cannot cast jsonb {kind} to type {}", display_type(t)),
+                ))),
+            }
+        }
         ("pg_lsn", t) if is_string_type(t) => {
             Some(cast_value(Bson::String(systypes::render_lsn_value(v)), t))
         }
         ("pg_lsn", "pg_lsn") => Some(Ok(v.clone())),
-        // Only int4 has a cast to and from "char" (`i4tochar` / `chartoi4`).
-        // An int2 source is let through: `"char"(x)` reaches here as a cast,
-        // and as a FUNCTION call PostgreSQL promotes an int2 to int4, so
-        // refusing it broke `"char"(65::int2)` to fix `65::int2::"char"`.
-        ("int8", QUOTED_CHAR) | (QUOTED_CHAR, "int2" | "int8") => {
-            Some(Err(Error::CannotCoerce(format!(
-                "cannot cast type {} to {}",
-                display_type(source?),
-                display_type(target)
-            ))))
+        ("tid", t) if is_string_type(t) => {
+            Some(cast_value(Bson::String(tid::render_tid_value(v)), t))
         }
+        ("tid", "tid") => Some(Ok(v.clone())),
+        // A tid has no cast but the I/O ones, to and from a string type
+        // (`pg_cast` holds none for it): stored as a number, it used to cast
+        // to and from every numeric type.
+        ("tid", t) if t != "unknown" => Some(Err(Error::CannotCoerce(format!(
+            "cannot cast type tid to {}",
+            display_type(t)
+        )))),
+        (s, "tid") if !is_string_type(s) && s != "unknown" => Some(Err(Error::CannotCoerce(
+            format!("cannot cast type {} to tid", display_type(s)),
+        ))),
         // `chartoi4`: the byte, signed.
         (QUOTED_CHAR, "int4" | "integer") => {
             Some(Ok(Bson::Int32(i32::from(char_in(&value_text(v)) as i8))))
@@ -33082,6 +33780,16 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
                     Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
                     Bson::Null => Bson::Null,
                     other => Bson::String(systypes::render_lsn_value(other)),
+                }
+            }
+            Some(cast_value(Bson::String(value_text(&out(v))), t))
+        }
+        ("tid[]", t) if is_string_type(t) => {
+            fn out(v: &Bson) -> Bson {
+                match v {
+                    Bson::Array(items) => Bson::Array(items.iter().map(out).collect()),
+                    Bson::Null => Bson::Null,
+                    other => Bson::String(tid::render_tid_value(other)),
                 }
             }
             Some(cast_value(Bson::String(value_text(&out(v))), t))
@@ -33234,6 +33942,25 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     display_type(&target)
                 )));
             }
+            if let Some(e) = char_cast_refused(&source, &target) {
+                set_error_location(tc.location);
+                return Err(e);
+            }
+            // A tid is cast to and from the string types only (`pg_cast`
+            // has nothing for it but the I/O casts), NULL or not.
+            let to_tid = target == "tid"
+                && !matches!(source.as_str(), "unknown" | "tid" | "")
+                && !is_string_type(&source)
+                && pgtypes::oid_of_name(&source).is_some();
+            let from_tid = source == "tid" && target != "tid" && !is_string_type(&target);
+            if to_tid || from_tid {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to {}",
+                    display_type(&source),
+                    display_type(&target)
+                )));
+            }
             // An `inet[]` / `cidr[]` to text is `array_out`, which prints each
             // element with `inet_out` -- a full host mask dropped
             // (`{127.0.0.1}`) -- where the scalar `text(inet)` keeps it.
@@ -33241,6 +33968,22 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 if let Bson::Array(_) = value {
                     let out = net_elements_out(&value, source == "cidr[]");
                     return cast_value(out, &target);
+                }
+            }
+            // An array of a type carried in another form than its text, to a
+            // string type, is `array_out` over the element's output function
+            // (`array['1.5'::money]::text` is `{$1.50}`).
+            if let Some(elem) = source.strip_suffix("[]") {
+                if matches!(
+                    elem,
+                    "money" | "float4" | "real" | "int2vector" | "oidvector"
+                ) && is_string_type(&target)
+                    && matches!(value, Bson::Array(_))
+                {
+                    return cast_value(
+                        Bson::String(typeout::output_text(&value, &source)),
+                        &target,
+                    );
                 }
             }
             if let Some(out) = systypes_cast(Some(source.as_str()), &target, &value) {
@@ -34398,6 +35141,37 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 Some(r) => const_value(r, params)?,
                 None => return Err(Error::Parse("NULLIF without a right operand".into())),
             };
+            // NULLIF is `=` over the two resolved to one type: an untyped
+            // string side is read as the other side's type first, so
+            // `nullif('0/16'::pg_lsn, '0/16')` is NULL as on PostgreSQL 15.
+            let (lhs, rhs) = coerce_unknown_operand(e, lhs, rhs, "=")?;
+            let bare = |n: Option<&pg_query::protobuf::Node>| {
+                matches!(n.and_then(|n| n.node.as_ref()), Some(N::AConst(c))
+                    if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+            };
+            // What that leaves a string: read it by the typed side's input
+            // function (`nullif('10:00'::time, '10:00')`).
+            let resolve = |typed: Option<&pg_query::protobuf::Node>, v: &Bson, other: Bson| {
+                let ty = typed.map(|n| static_type(n, v)).unwrap_or_default();
+                match other {
+                    Bson::String(t)
+                        if !ty.is_empty() && !is_string_type(&ty) && ty != "unknown" =>
+                    {
+                        cast_value(Bson::String(t), &ty)
+                    }
+                    other => Ok(other),
+                }
+            };
+            let (l_bare, r_bare) = (bare(e.lexpr.as_deref()), bare(e.rexpr.as_deref()));
+            let (lhs, rhs) = if r_bare && !l_bare {
+                let r = resolve(e.lexpr.as_deref(), &lhs, rhs)?;
+                (lhs, r)
+            } else if l_bare && !r_bare {
+                let l = resolve(e.rexpr.as_deref(), &rhs, lhs)?;
+                (l, rhs)
+            } else {
+                (lhs, rhs)
+            };
             return Ok(
                 if lhs != Bson::Null
                     && rhs != Bson::Null
@@ -34706,7 +35480,22 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 .as_deref()
                 .is_some_and(|n| bits::is_bit_type(&static_type(n, &rhs)))
         {
-            if let Some(out) = bits::binary(&op, &lhs, &rhs) {
+            // `B'10' || '01'` is `bitcat`: the untyped side is read by the
+            // bit-string input function (`'x1F'` is hex, `'012'` refused).
+            let read = |n: Option<&pg_query::protobuf::Node>, v: Bson| -> Result<Bson> {
+                if op == "||" && unknown_operand(n) && matches!(v, Bson::String(_)) {
+                    cast_value(v, "varbit").inspect_err(|_| {
+                        if let Some(N::AConst(c)) = n.and_then(|n| n.node.as_ref()) {
+                            set_error_location(c.location);
+                        }
+                    })
+                } else {
+                    Ok(v)
+                }
+            };
+            let bl = read(e.lexpr.as_deref(), lhs.clone())?;
+            let br = read(e.rexpr.as_deref(), rhs.clone())?;
+            if let Some(out) = bits::binary(&op, &bl, &br) {
                 return out;
             }
         }
@@ -34829,9 +35618,28 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             let r_json = static_json_type(e.rexpr.as_deref(), &rhs);
             let jsonb = l_json.as_deref() == Some("jsonb")
                 || (op == "||" && r_json.as_deref() == Some("jsonb"));
-            if jsonb {
+            // Beside a TYPED string there is no `jsonb || text`: it is
+            // `anytextcat`, text concatenation (below).
+            let beside_text = op == "||"
+                && (typed_string_operand(e.lexpr.as_deref(), &lhs)
+                    || typed_string_operand(e.rexpr.as_deref(), &rhs));
+            if jsonb && !beside_text {
                 if lhs == Bson::Null || rhs == Bson::Null {
                     return Ok(Bson::Null);
+                }
+                // An untyped side is read by jsonb's input function, so a
+                // text it refuses is reported at the literal.
+                for (n, v) in [(e.lexpr.as_deref(), &lhs), (e.rexpr.as_deref(), &rhs)] {
+                    if let (Some(N::AConst(c)), Bson::String(t)) =
+                        (n.and_then(|n| n.node.as_ref()), v)
+                    {
+                        if op == "||" && unknown_operand(n) && json::parse(t).is_err() {
+                            set_error_location(c.location);
+                            return Err(Error::InvalidText(
+                                "invalid input syntax for type json".to_string(),
+                            ));
+                        }
+                    }
                 }
                 return match op.as_str() {
                     "-" => {
@@ -34914,7 +35722,35 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         }
         // A bare UNKNOWN literal takes the type of the operand beside it,
         // which decides both the parse and the error.
-        let (lhs, rhs) = coerce_unknown_operand(e, lhs, rhs, &op)?;
+        // `x || y` where one side's type has no `||` of its own is
+        // `anytextcat` / `textanycat`: `$1::text || $2`. So that side is its
+        // `::text` and an untyped other side stays text -- read as the typed
+        // side's type, `'(1,2)'::point || 'x'` answered `false` and
+        // `int4range || 'x'` a malformed range literal.
+        let lt = e.lexpr.as_deref().map(|n| static_type(n, &lhs));
+        let rt = e.rexpr.as_deref().map(|n| static_type(n, &rhs));
+        let spell = |t: &Option<String>, n: Option<&pg_query::protobuf::Node>| {
+            if unknown_operand(n) || null_literal(n) {
+                Some("unknown".to_string())
+            } else {
+                t.clone()
+            }
+        };
+        let (lt, rt) = (
+            spell(&lt, e.lexpr.as_deref()),
+            spell(&rt, e.rexpr.as_deref()),
+        );
+        let (lhs, rhs) = if op == "||" && textcat_operands(lt.as_deref(), rt.as_deref()) {
+            let side = |t: Option<&str>, v: Bson| match t {
+                Some(t) if textcat_type(t) && v != Bson::Null => {
+                    Bson::String(typeout::cast_text(&v, t))
+                }
+                _ => v,
+            };
+            (side(lt.as_deref(), lhs), side(rt.as_deref(), rhs))
+        } else {
+            coerce_unknown_operand(e, lhs, rhs, &op)?
+        };
         // `||` over text renders each side as its `::text`, which for a
         // float4 and a timestamptz depends on the TYPE, not only the value
         // (a float4 carried as an f64; an instant shown in the session zone).
@@ -34923,6 +35759,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 let ty = node.map(|n| static_type(n, &v)).unwrap_or_default();
                 match (ty.as_str(), &v) {
                     ("float4", Bson::Double(d)) => Bson::String(geo::float4_text(*d as f32)),
+                    ("tid", v) if *v != Bson::Null => Bson::String(tid::render_tid_value(v)),
                     ("timestamptz", _) => {
                         timestamptz_value_text(&v, &session_timezone()).map_or(v, Bson::String)
                     }
@@ -35377,6 +36214,7 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         // A pg_lsn is stored as its position: `l = '0/16'` compared the text
         // with a number and matched nothing.
         Some("pg_lsn") => systypes::cast_lsn(&value),
+        Some("tid") => tid::cast_tid(&value),
         // An array column: the literal is that array type, bounds and all --
         // `a = '[0:1]={5,6}'` must compare the lower bound too.
         Some(ty) if ty.ends_with("[]") => cast_value(value, ty),

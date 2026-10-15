@@ -39,16 +39,6 @@ one beside it.
 
 ## Open from the 2026-08-26 triage
 
-- [ ] **RUST pgserver: `SET TRANSACTION` outside an explicit block sends no
-  WARNING.** It is a silent no-op here (correct), where PostgreSQL also emits
-  `WARNING: SET TRANSACTION can only be used in transaction blocks`.
-  psycopg never triggers it (it only adds the modes to `BEGIN`), and the
-  `Statement::SetTransaction` arm in `crates/secantus-pg/src/lib.rs` has no
-  notice-emission seam on that path. Isolation itself is accepted and
-  reported, not enforced -- a scope decision (single node, one WiredTiger
-  snapshot level), not a deferral.
-  Backlog-ID: RP-001
-  Verify: tests/backlog/test_rp_triage.py::test_set_transaction_outside_a_block_warns
 - **Scope decision — psycopg's `test_generators.py::test_cancel` and the
   `proxy`-marked `test_cancel_safe_error` / `test_cancel_safe_timeout` fail on
   macOS in the CLIENT.** macOS libpq sends the cancel on a not-yet-connected
@@ -92,17 +82,6 @@ one beside it.
   `secantus-storage` or a stored-name escape, the second an on-disk format
   change both PG servers share. Not justified by a name SQLAlchemy's suite
   uses only to prove quoting works.
-- [ ] **RUST pgserver: EXECUTE on a BUILT-IN function is not checked in
-  every place.** A `REVOKE EXECUTE ON FUNCTION abs(int) FROM PUBLIC` is
-  checked at the call by the overload `func_select_candidate` picks (corpus
-  `b45_builtin_execute`), but not for a call whose overload the type analysis
-  cannot determine (an argument of an unanalysed shape, a polymorphic
-  overload), and not for a call inside a view, a rule, a user function's body
-  or a DEFAULT expression. Reproduce: revoke EXECUTE on `abs(int)`, then call
-  `abs(-1)` from a view or a column DEFAULT as the restricted role; PostgreSQL
-  15 refuses with 42501.
-  Backlog-ID: RP-004
-  Verify: tests/backlog/test_rp_triage.py::test_revoked_builtin_refused_through_view_and_default
 - **Scope decision — pgjdbc `BlobTransactionTest`** needs `CREATE FUNCTION
   lo_manage() ... LANGUAGE C` (the `lo` contrib trigger). `LANGUAGE C` loads
   a shared library into the server process, which a server written in Rust
@@ -293,49 +272,8 @@ one beside it.
         every time;
       - the plan cache is per connection and holds 256 entries, cleared
         whole when full.
-
-      Correctness items found on the way, open:
       Backlog-ID: RP-007
       Verify: none -- Linux throughput/CPU-per-statement benchmark campaign
-      - [ ] **RUST PG server: a parenthesised step inside `ROLLUP` / `CUBE`
-            is refused with a wrong 42803.** `group by rollup ((g, z), v)`
-            answers `column "gse_t.g" must appear in the GROUP BY clause`.
-            `GroupElement::Rollup` holds single keys; a step of several
-            needs a list of lists. (`GROUP BY (a, b)` on its own works.)
-            `tools/probes/pg_corpora/grouping_set_exprs.sql`.
-            Backlog-ID: RP-008
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_rollup_with_a_parenthesised_step
-      - [ ] **RUST PG server: a grouped query's subquery cannot name the
-            outer table by its own name.** `select g, (select max(v) from t i
-            where i.g = t.g) from t group by g` is `42P01 invalid reference
-            to FROM-clause entry for table "t"`; with an alias on the outer
-            table (`from t o ... o.g`) it works. Not a grouping-set matter:
-            the plain GROUP BY above fails the same way.
-            Backlog-ID: RP-009
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_grouped_query_subquery_names_outer_table
-      - [ ] **RUST PG server: a 42803 raised from HAVING names the column
-            without its table.** PostgreSQL writes `column "t.z" must
-            appear...`; the HAVING path writes `"z"` (`having_subject` has
-            no statement to take the qualifier from).
-            Backlog-ID: RP-010
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_having_42803_names_the_table
-      - [ ] **RUST PG server: with `public` off the `search_path`, a
-            relation of `public` is still found from a STRING and by
-            `DROP ... IF EXISTS`.** `select nextval('s')` and
-            `'t'::regclass` answer where PostgreSQL 15 says 42P01, and
-            `drop table if exists t` DROPS the table where PostgreSQL
-            skips it with a notice. The check is on the statement's
-            relation references (`schemas::hidden_in_public`); these
-            three resolve the name elsewhere.
-            `tools/probes/pg_corpora/search_path_public.sql`.
-            Backlog-ID: RP-011
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_public_off_path_not_found_from_a_string,tests/backlog/test_rust_postgres_gaps.py::test_public_off_path_drop_if_exists_skips
-      - [ ] **RUST PG server: a syntax error from Parse (the extended
-            protocol) carries no position.** `selct 1` sent with
-            `prepare=True` has `P` unset; sent as a simple query it is 1.
-            Every syntax error, not only the unterminated ones.
-            Backlog-ID: RP-012
-            Verify: tests/backlog/test_rust_postgres_gaps.py::test_parse_syntax_error_carries_position
 
 - **ACCEPTED AS A LIMIT 2026-10-07 (Joe), and may be revisited — Rust
       PostgreSQL server on macOS: a READ statement costs ~1.45-1.6x
@@ -429,6 +367,65 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: `UPDATE ... SET (a, b) = (SELECT ...)` is refused.**
+  It is 0A000 `MultiAssignRef is not supported yet`; PostgreSQL 15.19
+  assigns each listed column from the subquery's one row. Found 2026-10-15
+  by RP-029's work.
+  Backlog-ID: RP-031
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_update_multi_column_assignment_from_a_subquery
+
+- [ ] **RUST pgserver: a record's text form drops a `char(n)` field's
+  padding.** `(t)::text` over a `char(3)` holding `ab` is `(ab)`;
+  PostgreSQL 15.19 prints `("ab ")` (the padded value, quoted because of
+  its blank). Found 2026-10-15 by RP-029's work.
+  Backlog-ID: RP-032
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_record_text_keeps_char_padding
+
+- [ ] **RUST pgserver: what the 2026-10-15 typed-value work left.** That
+  batch made values print by their type, refused the casts and operators
+  PostgreSQL 15's `pg_cast` / `pg_operator` have no entry for, and typed
+  untyped literals in set operations and NULLIF (corpus
+  `typed_value_render`, 634 checks). Still different:
+  - `array[row(1)]` comes back as the one string `{(1)}`, not an array.
+  - `'now()'::regprocedure` is 42883 and `regoper` does not exist.
+  - A refused function-style cast (`int8(true)`) is 42846; PostgreSQL
+    calls it a function and says 42883.
+  - ORDER BY over `point` (no ordering operator) and set operations over
+    it (no equality operator) succeed where PostgreSQL refuses.
+  - `information_schema.columns.data_type` says `tid[]` where PostgreSQL
+    says `ARRAY`; `=` over `int2vector` / `oidvector` / `path` is refused;
+    `time` compared with `timetz` / `interval` and `macaddr` with
+    `macaddr8` resolve differently; an input-cast error carries a position
+    PostgreSQL does not give.
+  Backlog-ID: RP-025
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_typed_value_residue
+
+- [ ] **RUST pgserver: a table named after a built-in type shadows it.**
+  `create table tid (d date)` now succeeds, as on PostgreSQL 15.19 (it
+  was 42710), but then a bare `tid` in a cast resolves to the table's row
+  type (`'(0,1)'::tid` is a malformed record literal) and the table's
+  whole-row value is typed as the built-in (`row_to_json(x)` over it is
+  42883). PostgreSQL searches `pg_catalog` first, so a bare name is the
+  built-in, while the row type is `public.tid`. Composite types are found
+  by name here (`user_composite`), so this needs them told apart by schema.
+  Found 2026-10-15 merging the `tid` type.
+  Backlog-ID: RP-030
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_table_named_after_a_builtin_type
+
+- [ ] **RUST pgserver: rows that tie under ORDER BY come out in a
+  different order from PostgreSQL's.** The sort here is stable;
+  PostgreSQL's quicksort (`sort_template.h`) is not, from 7 rows up: six
+  rows tied at `v = 1` come out `7, 10, 3, 4, 5, 9` there and in insertion
+  order here. SQL leaves the order unspecified, but a client sees it.
+  `window_order::pg_qsort` is a transcription of that quicksort (the
+  window path uses it since RP-024); using it for ORDER BY would change
+  every sorted query, so it wants a corpus sweep of its own. Related, not
+  covered by the test: DISTINCT and grouped queries where PostgreSQL picks
+  a HashAggregate come out in hash-table order. Found 2026-10-15 while
+  fixing RP-024.
+  Backlog-ID: RP-028
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_order_by_ties_as_postgres_quicksort_leaves_them
+
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
       psycopg's suite against the Rust PostgreSQL server until
@@ -485,101 +482,62 @@ one beside it.
       Verify: none -- CI-runner timing flakes in psycopg's own suite on Linux
 
 - [ ] **OPEN — RUST pgserver: what `pg_builtin_coverage.py` still reports
-      (2026-10-14).** The probe calls every immutable or stable function in
-      PostgreSQL 15.19's `pg_proc` on both servers with one sample value
-      for each argument type. Of the 1,935 it can call, 1,503 answered the
-      same on 2026-10-14 (what that day's batches fixed is recorded with
-      PostgreSQL 15.19's answers in `pg_corpora/builtin_coverage.sql`). 325
-      more read the server's own state and are not called, and 722 take a
-      type the probe has no sample for (`internal`, `cstring`, `record`,
-      `aclitem`, `regproc`, `xml`, `refcursor` and others), so nothing here
-      is said of them. Re-run it before working an item: the lists below
-      are from that day.
+      (re-measured 2026-10-15).** The probe calls every immutable or stable
+      function in PostgreSQL 15.19's `pg_proc` on both servers with one
+      sample value for each argument type; 1,505 of 1,934 answered the same
+      on 2026-10-15 before that day's batch (what it fixed -- `tid`,
+      `ts_parse` / `ts_debug` / `ts_rewrite`, the single-byte encodings,
+      SRFs in expressions, untyped literal arguments -- is pinned by
+      `test_builtin_coverage_fixed` and the corpora it added). Re-run it
+      before working an item.
 
       What is left:
-      - **Encodings other than UTF8, LATIN1 and SQL_ASCII convert only
-        their ASCII range**; anything above it is 0A000. A conversion
-        table per encoding is what PostgreSQL has.
-      - **A set-returning function inside an expression**
-        (`pg_typeof(json_each(j))`), and two of them in one select list,
-        are refused.
-      - **`ts_parse`, `ts_debug` and `ts_rewrite` are refused.** The first
-        two need `wparser_def.c`'s parser, which reports 23 token types
-        where this server's tokenizer tells two apart; `ts_rewrite` needs
-        `tsquery_rewrite.c`.
-      - **`aclexplode`, `acldefault` and `makeaclitem`** need role oids;
-        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`** and
+      - **The multi-byte encodings** (EUC_JP, EUC_CN, EUC_KR, EUC_TW,
+        SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004,
+        EUC_JIS_2004) convert only their ASCII range, in `convert*` and as
+        a `client_encoding` (passed through as UTF-8). The single-byte ones
+        are done from tables measured on PostgreSQL (`sbcs.rs`); these need
+        PostgreSQL's mapping tables, which are large.
+      - **Text search**: a `regconfig` / `regdictionary` by oid
+        (`3748::regconfig`) and `pg_ts_config` do not exist; `null::tsquery`
+        sends a spurious "doesn't contain lexemes" NOTICE; a bad
+        configuration name carries no position; `ts_headline` refuses its
+        `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments` options,
+        chooses its words by a rule of its own, and answers an all-untyped
+        call PostgreSQL refuses as not unique (42725); `ts_rewrite`'s
+        substitute loses its AND/OR nesting (a tsquery is carried as its
+        canonical text), its SELECT form checks the column count only on
+        rows it gets back, and a syntax error in that SQL has a position
+        PostgreSQL does not give.
+      - **`aclexplode`, `acldefault`, `makeaclitem`** need role oids;
+        **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`**,
         **`pg_settings_get_flags`** need catalog or GUC state the planner
         does not see; `table_to_xml` and the other XML exports, and the
-        `fmgr_*` / `postgresql_fdw_validator` validators, are not
-        written.
-      - **The `tid` type does not exist here**, so its six comparisons and
-        `min` / `max` over it are 42704.
-      - **`ts_headline` refuses `MaxWords`, `MinWords`, `ShortWord`,
-        `MaxFragments` above 0 and a true `HighlightAll`** (0A000, by
-        name). The selection of the words shown is not `mark_hl_words`:
-        a document over 35 words is cut by a rule of this server's own,
-        and has not been compared with PostgreSQL.
-      - **A record out of a subquery has its fields described as
-        `text`**: `select (x).n from (select f() as x) s` answers the
-        right value under the wrong column type, because the subquery's
-        column is `record` and its field types do not travel with it. A
-        named composite (`row(...)::t`) is typed.
-      - **Only `line <-> point` measures with `pg_hypot`.** Every other
-        distance in `geom.rs` uses Rust's `f64::hypot`, which can differ
-        from PostgreSQL in the last digit; no corpus line has shown one.
-      - **A `"char"` with the high bit set is carried as its `\ooo` text**,
-        so it orders by that text and not by the byte. Not measured.
-      - **An alias call with a COLUMN of the wrong type still runs**
-        (`int4pl(numeric_col, 2)`): the rewrite sees no column types.
-      - **`pg_relation_is_publishable` is true for an unlogged table**:
-        this server keeps no persistence apart from temporary.
-      - **`65::int2::"char"` answers `A`**; PostgreSQL has no `int2` cast to
-        `"char"` (42846). `"char"(x)` is planned as a cast, and as a call
-        PostgreSQL promotes the `int2`, so the two cannot be told apart
-        until `"char"` is a function here. `"char"(65::int8)` is 42846
-        where PostgreSQL says 42883.
-
-      **Refused OPERATORS the probe reached through their functions** (82
-      signatures; each is `0A000` or `operator does not exist`):
-      - multirange `-|-`, `<<`, `>>`, `&<`, `&>` and its ordering
-        comparisons (`<`, `<=`, `>`, `>=`), with a multirange or a range
-        on either side;
-      - `macaddr` and `macaddr8` `&`, `|`, `~`;
-      - the text pattern comparisons `~<~`, `~<=~`, `~>=~`, `~>~`;
-      - `date + timetz` and `timetz + date`;
-      - geometric: `box # box`, `box <^ box`, `box >^ box`, circle
-        `&<` / `&>` / `&<|` / `|&>`, the closest-point operator `##` for
-        six pairs of types, `<->` between a line or a box and a segment,
-        `line # line`, `line ?# box`, `lseg ?# line`, the `path` count
-        comparisons, `point <> point`;
-      - `tsquery @> tsquery` and `<@` by their function names;
-      - `json[b]_extract_path[_text]` and `jsonb_delete` given their
-        path as `VARIADIC array`.
-
-      **Casts by function name**: `int4("char")` and the length-coercion
-      forms (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`,
-      `timestamp(timestamp, int4)` and the like) are refused or wrong.
-
-      **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
-      `byteacmp` answer what the C library's `memcmp` returns, which is
-      14 for `bttextcmp('b', 'a')` on macOS and 1 elsewhere; the type
-      input and output functions (117), the index support functions (102)
-      and the aggregates' own transition functions (57) take or return
-      `cstring` and `internal` and are not called by a statement.
-
-      **Error texts** (28): PostgreSQL 15 reworded `date_part` /
-      `date_trunc` / `extract` of an unknown unit to `unit "x" not
-      recognized for type timestamp with time zone`; this server still
-      says 14's `timestamp with time zone units "x" not recognized`. The
-      corpora that pin those lines are measured against the PostgreSQL 14
-      reference, so changing the text moves them to
-      `# reference-version: 15` in the same change. `date_part` and
-      `extract` of a `timetz` with an unknown unit are 22007 here, a
-      different error. A `jsonb` object or array cast to a number or a
-      boolean is 22P02 `invalid input syntax` here and 22023 `cannot cast
-      jsonb object to type integer` there. `ts_headline` with options
-      that do not parse answers where PostgreSQL refuses.
+        `fmgr_*` / `postgresql_fdw_validator` validators, are not written.
+      - **An untyped literal beside a typed argument** is not resolved by
+        `func_select_candidate`'s rules (only an all-constant call is,
+        `unknown_args.rs`); `abs(NULL)`'s column is described as text (its
+        `pg_typeof` is right); `array_length('{1,2,3}', 1)` is not
+        PostgreSQL's 42804 polymorphic error.
+      - **Smaller**: only `line <-> point` measures with `pg_hypot`; a
+        `"char"` with the high bit set orders by its `\ooo` text; an alias
+        call with a COLUMN of the wrong type still runs
+        (`int4pl(numeric_col, 2)`); `pg_relation_is_publishable` is true for
+        an unlogged table.
+      - **Refused operators** the probe reached through their functions:
+        multirange `-|-` / `<<` / `>>` / `&<` / `&>` and its ordering
+        comparisons; `macaddr` / `macaddr8` `&` `|` `~`; geometric `box #
+        box`, `<^` / `>^`, circle `&<` `&>` `&<|` `|&>`, `##` for six pairs,
+        `<->` between a line or box and a segment, `line # line`, `?#`,
+        the `path` count comparisons, `point <> point`; `tsquery @>` / `<@`
+        by function name; `json[b]_extract_path[_text]` / `jsonb_delete`
+        given `VARIADIC array`. Casts by function name (`int4("char")`,
+        `bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`, ...).
+      - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
+        `byteacmp` answer what the C library's `memcmp` returns (14 for
+        `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,
+        index support and aggregate transition functions take or return
+        `cstring` / `internal` and are not called by a statement.
       Backlog-ID: RP-015
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_residue
 

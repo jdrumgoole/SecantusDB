@@ -33,8 +33,15 @@ SET search_path TO pg_catalog, public
 SELECT count(*) FROM sppub_t
 RESET search_path
 SELECT count(*) FROM sppub_t
-# Still different here: a name looked up from a string, and DROP ... IF EXISTS.
+# A name looked up from a string, and DROP ... IF EXISTS, are hidden too.
 SET search_path TO pg_catalog
 SELECT nextval('sppub_s')
 SELECT 'sppub_t'::regclass
+SELECT currval('sppub_s')
+SELECT 'public.sppub_t'::regclass::text
+SELECT nextval('public.sppub_s')
+DROP TABLE IF EXISTS sppub_t
+DROP SEQUENCE IF EXISTS sppub_s
+DROP VIEW IF EXISTS sppub_w
+SELECT count(*) FROM public.sppub_t
 RESET search_path

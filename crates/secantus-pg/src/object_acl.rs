@@ -391,7 +391,79 @@ impl PgHandler {
     /// built-in a GRANT / REVOKE has touched can be refused, so nothing is
     /// walked while none has; a call whose overload is not determined here
     /// is not checked.
+    ///
+    /// The calls PostgreSQL's rewriter adds to the statement are checked
+    /// too, for the same role (`ExecInitFunc` checks the CALLER even inside
+    /// a view, unlike the view's relations): each view's definition the
+    /// statement reaches, and each column DEFAULT an INSERT fills (RP-004).
     pub(crate) fn check_builtin_execute(&self, role: &str, sql: &str) -> PgWireResult<()> {
+        if self.is_superuser(role) {
+            return Ok(());
+        }
+        let has_touched = self
+            .storage
+            .find_matching(
+                self.db(),
+                OBJECT_ACL_COLLECTION,
+                &bson::doc! {"kind": "function"},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .any(|d| d.get_str("name").is_ok_and(|n| n.contains('(')));
+        if !has_touched {
+            return Ok(());
+        }
+        let views = self.views()?;
+        let rules = if self.any_rules() {
+            self.enabled_rules()
+        } else {
+            Vec::new()
+        };
+        let lookup = |n: &str| self.lookup(n);
+        let mut pending = vec![(sql.to_string(), 0usize)];
+        while let Some((text, depth)) = pending.pop() {
+            self.check_builtin_calls(role, &text)?;
+            if depth >= 16 {
+                continue;
+            }
+            for (relation, privilege) in secantus_pgplan::privileges::sql_relations(&text) {
+                if let Some((_, definition)) = views.iter().find(|(n, _)| *n == relation) {
+                    pending.push((definition.clone(), depth + 1));
+                }
+                // A rule's actions join the statement on the event it fires on.
+                for rule in rules
+                    .iter()
+                    .filter(|r| r.table == relation && r.event == privilege)
+                {
+                    for action in &rule.actions {
+                        pending.push((action.clone(), depth + 1));
+                    }
+                }
+            }
+            let columns =
+                |t: &str| lookup(t).map(|d| d.columns.iter().map(|c| c.name.clone()).collect());
+            for (table, defaulted) in
+                secantus_pgplan::privileges::insert_defaulted_columns(&text, &columns)
+            {
+                let Some(def) = lookup(&table) else {
+                    continue;
+                };
+
+                for c in def.columns.iter().filter(|c| defaulted.contains(&c.name)) {
+                    // A constant default is stored folded, beside the text
+                    // it was written as, which PostgreSQL still runs.
+                    if let Some(expr) = c.default_expr().or(c.default_sql()) {
+                        self.check_builtin_calls(role, &format!("select {expr}"))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `check_builtin_execute` for the calls written in `sql` itself.
+    fn check_builtin_calls(&self, role: &str, sql: &str) -> PgWireResult<()> {
         if self.is_superuser(role) {
             return Ok(());
         }

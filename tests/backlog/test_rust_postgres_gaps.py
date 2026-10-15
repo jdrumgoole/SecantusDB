@@ -22,7 +22,7 @@ def grouped(pg: Any) -> Iterator[Any]:
     pg.execute("drop table if exists rp_gs")
 
 
-@pytest.mark.backlog("RP-008")
+@pytest.mark.backlog_fixed("RP-008")
 def test_rollup_with_a_parenthesised_step(grouped: Any) -> None:
     """PostgreSQL 15.19 groups by the step `(g, z)` and then by `v`."""
     sql = "select g, z, v, count(*) from rp_gs group by rollup ((g, z), v) order by 1, 2, 3"
@@ -40,7 +40,7 @@ def test_rollup_with_a_parenthesised_step(grouped: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-009")
+@pytest.mark.backlog_fixed("RP-009")
 def test_grouped_query_subquery_names_outer_table(grouped: Any) -> None:
     """PostgreSQL 15.19: the subquery may name the unaliased outer table."""
     sql = (
@@ -50,7 +50,7 @@ def test_grouped_query_subquery_names_outer_table(grouped: Any) -> None:
     assert pg_answer(grouped, sql) == ("ok", [(1, 3), (2, 5)])
 
 
-@pytest.mark.backlog("RP-010")
+@pytest.mark.backlog_fixed("RP-010")
 def test_having_42803_names_the_table(grouped: Any) -> None:
     """PostgreSQL 15.19 qualifies the column in the HAVING error."""
     assert pg_answer(grouped, "select g from rp_gs t group by g having z > 0") == (
@@ -74,7 +74,7 @@ def public_hidden(pg: Any) -> Iterator[Any]:
     pg.execute("drop schema if exists rp011_s")
 
 
-@pytest.mark.backlog("RP-011")
+@pytest.mark.backlog_fixed("RP-011")
 @pytest.mark.parametrize(
     ("sql", "name"),
     [("select nextval('rp011_seq')", "rp011_seq"), ("select 'rp011_t'::regclass", "rp011_t")],
@@ -85,7 +85,7 @@ def test_public_off_path_not_found_from_a_string(public_hidden: Any, sql: str, n
     assert pg_answer(public_hidden, sql) == ("err", "42P01", f'relation "{name}" does not exist')
 
 
-@pytest.mark.backlog("RP-011")
+@pytest.mark.backlog_fixed("RP-011")
 def test_public_off_path_drop_if_exists_skips(public_hidden: Any) -> None:
     """PostgreSQL 15.19: `drop table if exists` skips with a notice, and
     `public.rp011_t` is still there afterwards."""
@@ -96,7 +96,7 @@ def test_public_off_path_drop_if_exists_skips(public_hidden: Any) -> None:
     assert pg_answer(public_hidden, "select count(*) from public.rp011_t") == ("ok", [(0,)])
 
 
-@pytest.mark.backlog("RP-012")
+@pytest.mark.backlog_fixed("RP-012")
 def test_parse_syntax_error_carries_position(pg: Any) -> None:
     """PostgreSQL 15.19: `selct 1` through Parse is 42601 with position 1,
     the same as through a simple query."""
@@ -139,8 +139,15 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
+    "sjis-non-ascii": "select convert_to('é', 'SJIS')",
+    "euc-jp-from-bytes": "select convert_from('\\xa4a2'::bytea, 'EUC_JP')",
+    "regconfig-by-oid": "select 3748::regconfig::text",
+    "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
+}
+
+# What the 2026-10-15 batch fixed, kept as regression tests.
+_RP015_FIXED = {
     "tid-type": "select '(0,1)'::tid::text",
-    "int2-to-char-cast": 'select 65::int2::"char"',
     "date-part-unit-text": "select date_part('foo', '2000-01-01'::timestamptz)",
     "jsonb-object-to-int": """select '{"a":1}'::jsonb::int""",
     "ts-parse": "select * from ts_parse('default', 'foo bar')",
@@ -148,15 +155,30 @@ _RP015 = {
     "srf-in-expression": """select pg_typeof(json_each('{"a":1}'))::text""",
     "text-pattern-op": "select 'b'::text ~>~ 'a'::text",
     "date-plus-timetz": "select (date '2000-01-01' + time with time zone '01:00+00')::text",
+    "untyped-literal-arg": "select abs('-1'), sqrt('4')",
+    "float-input-range": "select '1e400'::float8",
+    "srf-in-coalesce": "select coalesce(unnest(array[1, null]), 0)",
+    "timetz-date-part": "select date_part('timezone_h', '01:00-03:30'::timetz)",
+    "int2-to-char-cast": 'select 65::int2::"char"',
 }
+
+
+def _same_as_reference(pg: Any, pg15: Any, sql: str) -> None:
+    for conn in (pg, pg15):
+        conn.execute("set timezone = 'UTC'")
+    assert pg_answer(pg, sql) == pg_answer(pg15, sql)
 
 
 @pytest.mark.backlog("RP-015")
 @pytest.mark.parametrize("sql", list(_RP015.values()), ids=list(_RP015))
 def test_builtin_coverage_residue(pg: Any, pg15: Any, sql: str) -> None:
-    for conn in (pg, pg15):
-        conn.execute("set timezone = 'UTC'")
-    assert pg_answer(pg, sql) == pg_answer(pg15, sql)
+    _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog_fixed("RP-015")
+@pytest.mark.parametrize("sql", list(_RP015_FIXED.values()), ids=list(_RP015_FIXED))
+def test_builtin_coverage_fixed(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
 
 
 @pytest.mark.backlog_fixed("RP-015")
@@ -227,3 +249,182 @@ def test_grant_and_revoke_take_effect_inside_a_transaction_block(pg: Any) -> Non
     and a REVOKE inside a block stops it at once. The Rust server ignored
     both until the block ended."""
     assert _privilege_in_a_block(pg, "rp020") == [("ok", [(1,)]), ("err", "42501")]
+
+
+@pytest.mark.backlog_fixed("RP-021")
+@pytest.mark.parametrize(
+    ("sql", "position"),
+    [
+        ("insert into rp021_t values (1, 'a', 3)", "37"),
+        ("insert into rp021_t (a) values (1, 2)", "36"),
+        ("insert into rp021_t (a, b) values (1)", "25"),
+        ("insert into rp021_t (a) select 1, 2", "35"),
+    ],
+    ids=["values-no-columns", "values-columns", "too-few-expressions", "select"],
+)
+def test_insert_arity_error_carries_position(pg: Any, sql: str, position: str) -> None:
+    """PostgreSQL 15.19: 42601 with the position of the first expression
+    past the target list (or of the first target column with nothing to
+    fill it)."""
+    pg.execute("create table if not exists rp021_t (a int, b text)")
+    with pytest.raises(psycopg.errors.SyntaxError) as info:
+        pg.execute(sql)
+    assert info.value.diag.statement_position == position
+
+
+@pytest.mark.backlog_fixed("RP-022")
+def test_collated_literal_against_a_char_column(pg: Any) -> None:
+    """PostgreSQL 15.19: an untyped literal under COLLATE takes the
+    `char(n)` column's type, trailing blanks and all, so `'a  '` equals the
+    stored `a` in the select list as it does in WHERE."""
+    pg.execute("drop table if exists rp022_t")
+    pg.execute("create table rp022_t (c char(3))")
+    pg.execute("insert into rp022_t values ('a'), ('b')")
+    sql = "select c = 'a  ' collate \"C\", c >= ('a  ' collate \"C\") from rp022_t order by c"
+    assert pg_answer(pg, sql) == ("ok", [(True, True), (False, True)])
+
+
+@pytest.mark.backlog_fixed("RP-023")
+def test_case_over_a_scalar_subquery_keeps_its_type(pg: Any) -> None:
+    """PostgreSQL 15.19: `case when true then (select 1) end` is an integer:
+    an uncorrelated subquery's value keeps its column's type."""
+    assert pg_answer(pg, "select case when true then (select 1) end") == ("ok", [(1,)])
+    assert pg_answer(pg, "select pg_typeof(case when true then (select 1) end)::text") == (
+        "ok",
+        [("integer",)],
+    )
+
+
+@pytest.mark.backlog_fixed("RP-024")
+def test_window_rows_come_out_in_window_sort_order(pg: Any) -> None:
+    """PostgreSQL 15.19: with no ORDER BY of its own, a query with a window
+    returns its rows in the window's sort order (the WindowAgg's input is
+    sorted), which clients see and some rely on."""
+    pg.execute("drop table if exists rp024_t")
+    pg.execute("create table rp024_t (a int)")
+    pg.execute("insert into rp024_t values (1), (2), (3)")
+    sql = "select a, row_number() over (order by a desc) from rp024_t"
+    assert pg_answer(pg, sql) == ("ok", [(3, 1), (2, 2), (1, 3)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_order_by_ties_as_postgres_quicksort_leaves_them(pg: Any) -> None:
+    """PostgreSQL 15.19: tied rows land where its quicksort (not stable from
+    7 rows up) leaves them -- `7, 10, 3, 4, 5, 9` for the six rows at v = 1;
+    a stable sort keeps them in insertion order."""
+    pg.execute("drop table if exists rp028_t")
+    pg.execute("create table rp028_t (id int, v int)")
+    pg.execute(
+        "insert into rp028_t values (1,2),(2,null),(3,1),(4,1),(5,1),(6,3),(7,1),(8,2),(9,1),(10,1)"
+    )
+    got = pg_answer(pg, "select id from rp028_t order by v")
+    assert got == ("ok", [(i,) for i in [7, 10, 3, 4, 5, 9, 1, 8, 6, 2]])
+
+
+@pytest.mark.backlog_fixed("RP-029")
+@pytest.mark.parametrize(
+    ("target", "source", "message"),
+    [
+        ("b", "i", 'column "b" is of type boolean but expression is of type integer'),
+        ("n", "t", 'column "n" is of type integer but expression is of type text'),
+    ],
+    ids=["int-into-bool", "text-into-int"],
+)
+def test_insert_select_checks_assignment_types(
+    pg: Any, target: str, source: str, message: str
+) -> None:
+    """PostgreSQL 15.19: an INSERT ... SELECT whose column has no assignment
+    cast from the selected type is 42804 when the statement is analysed;
+    here the int is stored into the bool column, and the text fails per row."""
+    pg.execute("drop table if exists rp029_s, rp029_t")
+    pg.execute("create table rp029_s (i int, t text)")
+    pg.execute("insert into rp029_s values (1, 'x')")
+    pg.execute("create table rp029_t (b bool, n int)")
+    got = pg_answer(pg, f"insert into rp029_t ({target}) select {source} from rp029_s")
+    assert got == ("err", "42804", message)
+
+
+@pytest.mark.backlog("RP-030")
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("select '(0,1)'::tid::text", ("ok", [("(0,1)",)])),
+        ("select row_to_json(x)::text from tid x", ("ok", [('{"d":"2020-01-01"}',)])),
+    ],
+    ids=["builtin-still-wins", "whole-row"],
+)
+def test_table_named_after_a_builtin_type(pg: Any, sql: str, expected: Any) -> None:
+    """PostgreSQL 15.19: a table may be named `tid` (its row type is
+    `public.tid`); a bare `tid` in a cast is still `pg_catalog.tid`, searched
+    first, and the table's whole-row value is its own row type."""
+    pg.execute("drop table if exists tid")
+    pg.execute("create table tid (d date)")
+    pg.execute("insert into tid values ('2020-01-01')")
+    try:
+        assert pg_answer(pg, sql) == expected
+    finally:
+        pg.execute("drop table if exists tid")
+
+
+# RP-025: what the 2026-10-15 typed-value work left, each compared with the
+# live PostgreSQL 15 reference.
+_RP025 = {
+    "array-of-row": "select array[row(1)]",
+    "regprocedure-input": "select 'now()'::regprocedure::text",
+    "function-style-refused-cast": "select int8(true)",
+    "point-order-by": "select p from (values (point '(1,1)'), (point '(0,0)')) v(p) order by p",
+}
+
+
+@pytest.mark.backlog("RP-025")
+@pytest.mark.parametrize("sql", list(_RP025.values()), ids=list(_RP025))
+def test_typed_value_residue(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
+
+
+@pytest.mark.backlog("RP-031")
+def test_update_multi_column_assignment_from_a_subquery(pg: Any) -> None:
+    """PostgreSQL 15.19: `update t set (v, t) = (select 5, 'z')` assigns both
+    columns from the subquery's one row; here it is 0A000 (MultiAssignRef)."""
+    pg.execute("drop table if exists rp031_t")
+    pg.execute("create table rp031_t (k int, v int, t text)")
+    pg.execute("insert into rp031_t values (1, 0, 'a')")
+    got = pg_answer(pg, "update rp031_t set (v, t) = (select 5, 'z') where k = 1")
+    assert got[0] == "ok", got
+    assert pg_answer(pg, "select v, t from rp031_t") == ("ok", [(5, "z")])
+
+
+@pytest.mark.backlog("RP-032")
+def test_record_text_keeps_char_padding(pg: Any) -> None:
+    """PostgreSQL 15.19: a record's text form prints a `char(3)` field with its
+    padding, quoted: `("ab ")`; here it is `(ab)`."""
+    pg.execute("drop table if exists rp032_t")
+    pg.execute("create table rp032_t (c char(3))")
+    pg.execute("insert into rp032_t values ('ab')")
+    assert pg_answer(pg, "select (t)::text from rp032_t t") == ("ok", [('("ab ")',)])
+
+
+# Fixed from RP-025: an untyped side of `||` beside a type with a `||` of its
+# own is read as that type (`byteacat`, `bitcat`, `tsvector_concat`,
+# `tsquery_or`, `jsonb_concat`, array_cat); beside a TYPED string it is
+# text concatenation.
+_RP025_FIXED = {
+    "bytea-concat-untyped": "select '\\x01'::bytea || 'x'",
+    "untyped-concat-bytea": "select 'x' || '\\x01'::bytea",
+    "bytea-concat-text": "select '\\x01'::bytea || 'x'::text",
+    "bytea-concat-bad-hex": "select '\\x01'::bytea || '\\xzz'",
+    "bit-concat-hex": "select B'10' || 'x1F'",
+    "bit-concat-bad-digit": "select B'10' || '012'",
+    "untyped-concat-tsvector": "select 'c' || 'a b'::tsvector",
+    "untyped-concat-tsquery": "select 'b' || 'a'::tsquery",
+    "tsvector-concat-text": "select 'a b'::tsvector || 'c'::text",
+    "jsonb-concat-bad": """select '{"a":1}'::jsonb || 'x'""",
+    "jsonb-concat-text": """select '{"a":1}'::jsonb || '{"b":2}'::text""",
+    "null-array-concat": "select null::int[] || '{3}'",
+}
+
+
+@pytest.mark.backlog_fixed("RP-025")
+@pytest.mark.parametrize("sql", list(_RP025_FIXED.values()), ids=list(_RP025_FIXED))
+def test_typed_value_fixed(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)

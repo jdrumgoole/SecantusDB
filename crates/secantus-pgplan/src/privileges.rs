@@ -29,6 +29,73 @@ pub fn builtin_calls(
     out
 }
 
+/// The columns each INSERT in `sql` fills from their DEFAULT, by target
+/// table: those its column list leaves out, and those a VALUES row gives as
+/// `DEFAULT`. `columns` is a table's column list, in order. PostgreSQL's
+/// rewriter puts those defaults into the statement, so the functions they
+/// call are checked as the statement's own (`ExecInitFunc`).
+pub fn insert_defaulted_columns(
+    sql: &str,
+    columns: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Vec<(String, Vec<String>)> {
+    let Ok(parsed) = parse_tree(sql) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw in &parsed.stmts {
+        let Some(N::InsertStmt(i)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        let Some(rel) = i.relation.as_ref() else {
+            continue;
+        };
+        let table = key(rel);
+        let Some(all) = columns(&table) else {
+            continue;
+        };
+        let listed: Vec<String> = i
+            .cols
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::ResTarget(r)) => Some(r.name.clone()),
+                _ => None,
+            })
+            .collect();
+        // No column list: a query fills the columns in order, and DEFAULT
+        // VALUES (no query at all) fills none.
+        let filled: Vec<String> = match (&listed[..], &i.select_stmt) {
+            ([], None) => Vec::new(),
+            ([], Some(_)) => all.clone(),
+            _ => listed,
+        };
+        let mut defaulted: Vec<String> = all
+            .iter()
+            .filter(|c| !filled.contains(c))
+            .cloned()
+            .collect();
+        if let Some(N::SelectStmt(s)) = i.select_stmt.as_ref().and_then(|n| n.node.as_ref()) {
+            for row in &s.values_lists {
+                let Some(N::List(items)) = row.node.as_ref() else {
+                    continue;
+                };
+                for (k, item) in items.items.iter().enumerate() {
+                    if matches!(item.node, Some(N::SetToDefault(_))) {
+                        if let Some(c) = filled.get(k) {
+                            if !defaulted.contains(c) {
+                                defaulted.push(c.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !defaulted.is_empty() {
+            out.push((table, defaulted));
+        }
+    }
+    out
+}
+
 /// `(relation, privilege)` for every relation `sql` names, before view
 /// expansion. The target of an INSERT / UPDATE / DELETE takes that
 /// privilege (and SELECT too when the statement reads its rows to choose

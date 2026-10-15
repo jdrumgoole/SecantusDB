@@ -65,6 +65,25 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
         {
             "record"
         }
+        // The pseudo-types' output functions: a container's is its value's
+        // text (`array_out`, `range_out`, ...); a lone element's has none.
+        (
+            "anyarray_out"
+            | "anycompatiblearray_out"
+            | "anyrange_out"
+            | "anycompatiblerange_out"
+            | "anymultirange_out"
+            | "anycompatiblemultirange_out",
+            1,
+        ) => "cstring",
+        (
+            "any_out"
+            | "anyelement_out"
+            | "anynonarray_out"
+            | "anycompatible_out"
+            | "anycompatiblenonarray_out",
+            1,
+        ) => "cstring",
         // A discrete range type's canonical function, called by name.
         ("int4range_canonical", 1) => "int4range",
         ("int8range_canonical", 1) => "int8range",
@@ -457,6 +476,20 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
             let at = format!("{day} {}", crate::value_text(&args[1]));
             crate::cast_value(Bson::String(at), name)
         }
+        "anyarray_out"
+        | "anycompatiblearray_out"
+        | "anyrange_out"
+        | "anycompatiblerange_out"
+        | "anymultirange_out"
+        | "anycompatiblemultirange_out" => crate::cast_value(args[0].clone(), "text"),
+        "any_out"
+        | "anyelement_out"
+        | "anynonarray_out"
+        | "anycompatible_out"
+        | "anycompatiblenonarray_out" => Err(Error::FeatureNotSupported(format!(
+            "cannot display a value of type {}",
+            name.trim_end_matches("_out")
+        ))),
         "like_escape" if types.first().is_some_and(|t| t == "bytea") => Ok(bytea::to_binary(
             like_escape(&bytes(0)?, &bytes(1)?, b'\\')?,
         )),
@@ -581,6 +614,44 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
                     decode(&bytes(0)?, &from)?;
                 }
                 return Ok(bytea::to_binary(bytes(0)?));
+            }
+            // Between two encodings neither of which is UTF8 or SQL_ASCII,
+            // PostgreSQL converts only where `pg_conversion` has a default
+            // function; a pair through UTF8 alone has none.
+            let single = |n: &str| n == "LATIN1" || crate::sbcs::table(n).is_some();
+            if single(&from_name) && single(&shown) {
+                if !crate::sbcs::direct(&from_name, &shown) {
+                    return Err(Error::Sqlstate(
+                        "42883",
+                        format!(
+                            "default conversion function for encoding \"{from_name}\" to \
+                             \"{shown}\" does not exist"
+                        ),
+                    ));
+                }
+                // A direct conversion goes byte by byte, and names the
+                // first byte the other encoding cannot hold.
+                return bytes(0)?
+                    .iter()
+                    .map(|&b| {
+                        let unmapped = || {
+                            Error::Sqlstate(
+                                "22P05",
+                                format!(
+                                    "character with byte sequence 0x{b:02x} in encoding \
+                                     \"{from_name}\" has no equivalent in encoding \"{shown}\""
+                                ),
+                            )
+                        };
+                        if b < 0x80 {
+                            return Ok(vec![b]);
+                        }
+                        crate::sbcs::direct_byte(&from_name, &shown, b)
+                            .map(|v| vec![v])
+                            .ok_or_else(unmapped)
+                    })
+                    .collect::<Result<Vec<Vec<u8>>>>()
+                    .map(|parts| bytea::to_binary(parts.concat()));
             }
             Ok(bytea::to_binary(encode(
                 &decode(&bytes(0)?, &from)?,

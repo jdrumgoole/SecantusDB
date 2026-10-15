@@ -221,12 +221,47 @@ impl<'p> Scope<'p> {
         ctes: &[Cte],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) {
-        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 || !q.values_lists.is_empty()
-        {
+        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
             self.complete = false;
             return;
         }
         let inner = Scope::new(&q.from_clause, ctes, lookup, None);
+        let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        };
+        // `(VALUES ...) v(a, b)`: column k is the rows' common type at k
+        // (`select_common_type`), named by the alias list or `columnK`.
+        if !q.values_lists.is_empty() {
+            let rows: Vec<&[pg_query::protobuf::Node]> = q
+                .values_lists
+                .iter()
+                .filter_map(|r| match r.node.as_ref() {
+                    Some(N::List(l)) => Some(l.items.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            let width = rows.first().map_or(0, |r| r.len());
+            if rows.len() != q.values_lists.len() || rows.iter().any(|r| r.len() != width) {
+                self.complete = false;
+                return;
+            }
+            let columns = (0..width)
+                .map(|k| {
+                    let name = colnames
+                        .get(k)
+                        .and_then(named)
+                        .unwrap_or_else(|| format!("column{}", k + 1));
+                    let parts: Vec<&pg_query::protobuf::Node> =
+                        rows.iter().map(|r| &r[k]).collect();
+                    let ty = common_type(&parts, &inner).unwrap_or_default();
+                    Column::new(&name, &ty, true)
+                })
+                .collect();
+            self.tables
+                .push((alias.clone(), TableDef::new(&alias, columns)));
+            return;
+        }
         let mut columns = Vec::new();
         for (i, t) in q.target_list.iter().enumerate() {
             let Some(N::ResTarget(rt)) = t.node.as_ref() else {
@@ -244,10 +279,6 @@ impl<'p> Scope<'p> {
                     return;
                 }
             }
-            let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
-                Some(N::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            };
             let name = colnames
                 .get(i)
                 .and_then(named)
@@ -324,6 +355,16 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
     match n.node.as_ref()? {
         N::AConst(c) if !c.isnull => match c.val.as_ref()? {
             Val::Ival(_) => Some("int4".into()),
+            // An integer literal past int4 is a bigint (`5000000000`), one
+            // past int8 a numeric -- pg_query hands both over as a float.
+            Val::Fval(f) if f.fval.bytes().all(|b| b.is_ascii_digit()) => Some(
+                if f.fval.parse::<i64>().is_ok() {
+                    "int8"
+                } else {
+                    "numeric"
+                }
+                .into(),
+            ),
             Val::Fval(_) => Some("numeric".into()),
             Val::Boolval(_) => Some("bool".into()),
             _ => None,
@@ -636,6 +677,50 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // Any binary operator over two KNOWN built-in types is resolved against
+    // `pg_operator`, as parse analysis resolves it: no candidate that takes
+    // the two types (exactly, by an implicit cast, or polymorphically) is
+    // 42883 at the operator, where lowering it compared the carried values
+    // (`int2 = xid` answered true, `numeric = oid` false) or failed at run
+    // time with a 0A000 "comparing ... is not supported yet".
+    if kind == Some(K::AexprOp) && e.lexpr.is_some() {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let name = if op == "!=" { "<>" } else { op.as_str() };
+            if crate::funcsig::operator_resolves(name, &l, &r) == Some(false) {
+                return Err(mismatch(name, &l, &r, e.location));
+            }
+        }
+    }
+    // NULLIF and IS [NOT] DISTINCT FROM resolve `a = b` the same way; an
+    // untyped literal side is read as the other side's type, but named
+    // `unknown` when there is no `=` for it (`nullif(point, '(1,2)')`).
+    if matches!(
+        kind,
+        Some(K::AexprNullif | K::AexprDistinct | K::AexprNotDistinct)
+    ) {
+        let untyped = |n: Option<&pg_query::protobuf::Node>| {
+            matches!(n.and_then(|n| n.node.as_ref()), Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+        };
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        let (ln, rn) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+        let (l, r) = (side(ln), side(rn));
+        let refused = match (&l, &r) {
+            (Some(l), Some(r)) => crate::funcsig::operator_resolves("=", l, r) == Some(false),
+            (Some(t), None) if untyped(rn) => {
+                crate::funcsig::operator_resolves("=", t, t) == Some(false)
+            }
+            (None, Some(t)) if untyped(ln) => {
+                crate::funcsig::operator_resolves("=", t, t) == Some(false)
+            }
+            _ => false,
+        };
+        if refused {
+            let name = |t: &Option<String>| t.clone().unwrap_or_else(|| "unknown".into());
+            return Err(mismatch("=", &name(&l), &name(&r), e.location));
+        }
+    }
     // `oid` has comparison operators and nothing arithmetic: `oid + integer`,
     // `oid - oid` and a prefix `- oid` are all 42883 on PostgreSQL, where
     // evaluating them as the integers the values are carried as answered.
@@ -652,6 +737,66 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                     )));
                 }
                 (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
+                _ => {}
+            }
+        }
+    }
+    // `tid || x` is `anynonarray || text`: the other side must be a string
+    // (or untyped). `tid || integer` has no operator.
+    if kind == Some(K::AexprOp) && op == "||" {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let other = if l == "tid" {
+                Some(&r)
+            } else if r == "tid" {
+                Some(&l)
+            } else {
+                None
+            };
+            if other.is_some_and(|t| t != "unknown" && category(t) != Some("string")) {
+                return Err(mismatch(&op, &l, &r, e.location));
+            }
+        }
+    }
+    // `tid` has the six comparisons against another tid and nothing else
+    // (`pg_operator`): `tid = integer` and `tid + 1` are 42883, where
+    // comparing or adding the numbers a tid is carried as answered.
+    if kind == Some(K::AexprOp) && op != "||" {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+        let tid = |t: &Option<String>| t.as_deref() == Some("tid");
+        if tid(&l) || tid(&r) {
+            let comparison = matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=");
+            // Beside a tid an untyped literal is a tid for a comparison and
+            // has no operator to resolve to otherwise (`tid + '1'`).
+            let untyped = |n: Option<&pg_query::protobuf::Node>| {
+                matches!(n.and_then(|n| n.node.as_ref()), Some(N::AConst(c))
+                    if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+            };
+            let (l, r) = if comparison {
+                (l, r)
+            } else {
+                let fill =
+                    |t: Option<String>, n| t.or_else(|| untyped(n).then(|| "unknown".to_string()));
+                (fill(l, e.lexpr.as_deref()), fill(r, e.rexpr.as_deref()))
+            };
+            let typed = |t: &Option<String>| {
+                t.as_deref().is_some_and(|t| t != "unknown") || !comparison && t.is_some()
+            };
+            match (e.lexpr.is_some(), &l, &r) {
+                (false, _, Some(r)) => {
+                    set_error_location(e.location);
+                    return Err(Error::UndefinedFunction(format!(
+                        "operator does not exist: {op} {}",
+                        display_type(r)
+                    )));
+                }
+                (true, Some(lt), Some(rt))
+                    if typed(&l) && typed(&r) && (!comparison || lt != rt) =>
+                {
+                    let op = if op == "!=" { "<>" } else { op.as_str() };
+                    return Err(mismatch(op, lt, rt, e.location));
+                }
                 _ => {}
             }
         }
@@ -913,6 +1058,59 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 walk(a, scope, cx)?;
             }
         }
+        // A cast to or from `"char"` with no path is refused when the
+        // statement is analysed, whatever the rows (`i2::"char"` over an
+        // empty table too). The call form `int2(x)` is a function call on
+        // PostgreSQL when no cast applies, so it is a missing function
+        // instead (`func_cast` marks the casts it builds with location -1).
+        N::TypeCast(tc) => {
+            if let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) {
+                let target = type_name_of(tn);
+                if let Some(e) = operand_type(arg, scope).and_then(|source| {
+                    crate::char_cast_refused(&source, &target).map(|e| (source, e))
+                }) {
+                    let (source, e) = e;
+                    if tc.location == -1 {
+                        let name: Vec<String> = tn
+                            .names
+                            .iter()
+                            .filter_map(|n| match n.node.as_ref() {
+                                Some(N::String(s)) => Some(s.sval.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        set_error_location(tn.location);
+                        return Err(Error::UndefinedFunction(format!(
+                            "function {}({}) does not exist",
+                            name.join("."),
+                            crate::display_type(&source)
+                        )));
+                    }
+                    set_error_location(tc.location);
+                    return Err(e);
+                }
+                // Any other explicit cast between built-in types PostgreSQL
+                // has no pathway for is refused too, NULL or not:
+                // `pg_lsn::int8` is 42846 at the `::`, where it used to
+                // answer the number the pg_lsn is carried as. A
+                // function-style cast (location -1) is a function call on
+                // PostgreSQL, resolved with implicit coercion of its
+                // argument, and is left to that.
+                if tc.location >= 0 {
+                    if let Some(source) = operand_type(arg, scope) {
+                        if crate::pg_casts::refused(&source, &target) {
+                            set_error_location(tc.location);
+                            return Err(Error::CannotCoerce(format!(
+                                "cannot cast type {} to {}",
+                                display_type(&source),
+                                display_type(&target)
+                            )));
+                        }
+                    }
+                }
+                walk(arg, scope, cx)?;
+            }
+        }
         N::ResTarget(r) => {
             if let Some(v) = r.val.as_deref() {
                 walk(v, scope, cx)?;
@@ -1032,6 +1230,21 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
     Ok(())
 }
 
+/// A CTE's query with its column list (`WITH w(x) AS (...)`) applied, so
+/// it is typed under the names the statement uses.
+fn cte_named(
+    q: &pg_query::protobuf::SelectStmt,
+    names: &[pg_query::protobuf::Node],
+) -> pg_query::protobuf::SelectStmt {
+    let mut q = q.clone();
+    for (t, n) in q.target_list.iter_mut().zip(names) {
+        if let (Some(N::ResTarget(rt)), Some(N::String(s))) = (t.node.as_mut(), n.node.as_ref()) {
+            rt.name = s.sval.clone();
+        }
+    }
+    q
+}
+
 fn check_select(
     s: &pg_query::protobuf::SelectStmt,
     outer_ctes: &[Cte],
@@ -1043,7 +1256,7 @@ fn check_select(
         for c in &w.ctes {
             if let Some(N::CommonTableExpr(c)) = c.node.as_ref() {
                 let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
-                    Some(N::SelectStmt(q)) if !w.recursive => Some((**q).clone()),
+                    Some(N::SelectStmt(q)) if !w.recursive => Some(cte_named(q, &c.aliascolnames)),
                     _ => None,
                 };
                 ctes.push((c.ctename.clone(), query));
@@ -1334,6 +1547,52 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The argument types of a built-in call, for choosing its overload: an
+/// untyped string literal is `""` (unknown), and an argument that is itself
+/// a built-in call takes the result type of the overload it resolves to
+/// (`abs(length('ab'))` calls `abs(int4)`). Kept out of `operand_type`, so
+/// the operator check is not moved by it.
+fn call_arg_types(f: &pg_query::protobuf::FuncCall, scope: &Scope) -> Option<Vec<String>> {
+    f.args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                Some(String::new())
+            }
+            Some(N::FuncCall(inner))
+                if inner.agg_order.is_empty()
+                    && inner.over.is_none()
+                    && !inner.agg_star
+                    && !inner.func_variadic =>
+            {
+                operand_type(a, scope).or_else(|| {
+                    let name = func_name(inner)?;
+                    if correlated::user_function_named(&name)
+                        || inner.funcname.len() > 2
+                        || !crate::funcsig::is_builtin_function_name(&name)
+                    {
+                        return None;
+                    }
+                    let args = call_arg_types(inner, scope)?;
+                    if args.iter().any(String::is_empty) {
+                        // An untyped literal: `func_select_candidate`'s
+                        // unknown-argument rules (`length('ab')` is text's).
+                        let args: Vec<String> = args
+                            .into_iter()
+                            .map(|a| if a.is_empty() { "unknown".into() } else { a })
+                            .collect();
+                        return crate::funcsig::resolved_result_type(&name, &args);
+                    }
+                    crate::funcsig::selected_result_type(&name, &args)
+                })
+            }
+            _ => operand_type(a, scope),
+        })
+        .collect()
+}
+
 fn record_builtin_call(f: &pg_query::protobuf::FuncCall, scope: &Scope) {
     if BUILTIN_CALLS.with(|c| c.borrow().is_none()) {
         return;
@@ -1347,19 +1606,7 @@ fn record_builtin_call(f: &pg_query::protobuf::FuncCall, scope: &Scope) {
     {
         return;
     }
-    let args: Option<Vec<String>> = f
-        .args
-        .iter()
-        .map(|a| match a.node.as_ref() {
-            Some(N::AConst(c))
-                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
-            {
-                Some(String::new())
-            }
-            _ => operand_type(a, scope),
-        })
-        .collect();
-    let chosen = args.and_then(|a| crate::funcsig::selected_args(&name, &a));
+    let chosen = call_arg_types(f, scope).and_then(|a| crate::funcsig::selected_args(&name, &a));
     BUILTIN_CALLS.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
             v.push((name, chosen));

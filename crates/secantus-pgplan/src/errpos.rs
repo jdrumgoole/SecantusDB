@@ -97,10 +97,19 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     }
     match sqlstate {
         // `could not identify column "b" in record data type`: PostgreSQL
-        // points at the record, the `c` of `(c).b`.
-        "42703" if m.starts_with("could not identify column ") => {
+        // points at the record, the `c` of `(c).b` -- and the function name
+        // of `(json_each(j)).b` (PostgreSQL 15.19: position 9 of `select
+        // (jsonb_each('{"a":1}')).nosuch`, and of `(f()).nosuch` over a
+        // function of a composite type, `column "nosuch" not found in data
+        // type t`). Any other expression is located by its own node (a
+        // cast at its `::`), which this does not try.
+        "42703"
+            if m.starts_with("could not identify column ")
+                || (m.starts_with("column \"") && m.contains("\" not found in data type ")) =>
+        {
             let field = m
-                .strip_prefix("could not identify column \"")?
+                .strip_prefix("could not identify column \"")
+                .or_else(|| m.strip_prefix("column \""))?
                 .split('"')
                 .next()?;
             let i = toks.iter().enumerate().position(|(i, t)| {
@@ -108,9 +117,49 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                     && i >= 4
                     && toks[i - 1].text == "."
                     && toks[i - 2].text == ")"
-                    && toks[i - 4].text == "("
             })?;
-            pos(toks[i - 3].start)
+            let mut depth = 0usize;
+            let open = (0..i - 1).rev().find(|&j| {
+                match toks[j].text {
+                    ")" => depth += 1,
+                    "(" => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })?;
+            // The record expression is `toks[open + 1 .. i - 2]`.
+            let inner = &toks[open + 1..i - 2];
+            let mut depth = 0usize;
+            let mut top_cast = None;
+            let mut closes_first_call = None;
+            for (j, t) in inner.iter().enumerate() {
+                match t.text {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 && closes_first_call.is_none() {
+                            closes_first_call = Some(j);
+                        }
+                    }
+                    "::" if depth == 0 => top_cast = Some(t.start),
+                    _ => {}
+                }
+            }
+            // A cast is located at its (outermost, last) `::`.
+            if let Some(at) = top_cast {
+                return pos(at);
+            }
+            // A name (`c`, `t.c`), or a call `f(...)` filling the parentheses.
+            let name = inner
+                .iter()
+                .enumerate()
+                .all(|(j, t)| (j % 2 == 1) == (t.text == "."));
+            let call = inner.get(1).is_some_and(|t| t.text == "(")
+                && closes_first_call == Some(inner.len() - 1);
+            if !(name || call) {
+                return None;
+            }
+            pos(inner.first()?.start)
         }
         // `ORDER BY position 5 is not in select list`: at the number.
         "42P10" if m.ends_with(" is not in select list") => {
@@ -138,10 +187,15 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             // `column "x" does not exist`, or `column t.x does not exist`:
             // a qualified reference points at its qualifier. And `column "x"
             // must appear in the GROUP BY clause ...`: its first mention.
-            if sqlstate == "42803" && !m.contains(" must appear in the GROUP BY clause") {
+            // And `subquery uses ungrouped column "t.x" from outer query`.
+            if sqlstate == "42803"
+                && !m.contains(" must appear in the GROUP BY clause")
+                && !m.starts_with("subquery uses ungrouped column ")
+            {
                 return None;
             }
             let name = quoted_between(m, "column ")
+                .or_else(|| quoted_between(m, "subquery uses ungrouped column "))
                 .map(str::to_string)
                 .or_else(|| {
                     m.strip_prefix("column ")?
@@ -231,10 +285,16 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 }) {
                     return None;
                 }
-                let name = call.split('(').next()?.rsplit('.').next()?;
+                let full = call.split('(').next()?;
+                let name = full.rsplit('.').next()?;
                 let i = toks.iter().enumerate().position(|(i, t)| {
                     unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
                 })?;
+                // A call named with its schema (`pg_catalog.lower(1)`) is
+                // reported at the schema, where the name starts (measured).
+                if full.contains('.') && i >= 2 && toks[i - 1].text == "." {
+                    return pos(toks[i - 2].start);
+                }
                 return pos(toks[i].start);
             }
             let rest = m.strip_prefix("operator does not exist: ")?;
@@ -264,7 +324,23 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 return Some(sql.trim_end().chars().count() + 1);
             }
             let near = quoted_between(m, "syntax error at or near ")?;
-            pos(toks.iter().find(|t| t.text == near)?.start)
+            // The parser stops at the first token it cannot take, and every
+            // token before it was taken. So of the tokens spelled `near`, it
+            // is the first whose prefix -- up to and including it -- still
+            // fails AT it rather than running out of input: an earlier `,`
+            // that was fine leaves its prefix merely unfinished.
+            let mut candidates = toks.iter().filter(|t| t.text == near);
+            let first = candidates.next()?;
+            let fails_here = |t: &Tok| {
+                let prefix = sql.get(..t.start + t.text.len()).unwrap_or(sql);
+                matches!(pg_query::parse(prefix), Err(e)
+                    if !e.to_string().contains("at end of input"))
+            };
+            let at = std::iter::once(first)
+                .chain(candidates)
+                .find(|t| fails_here(t))
+                .unwrap_or(first);
+            pos(at.start)
         }
         "42804" => {
             // `argument of WHERE must be type boolean`: the clause's first

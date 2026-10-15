@@ -43,8 +43,13 @@ SELECT g FROM gse_t GROUP BY ROLLUP (upper(g))
 SELECT g, count(*) FROM gse_t GROUP BY (g, z) ORDER BY 1, 2
 SELECT g, z FROM gse_t GROUP BY (g, z), v ORDER BY 1, 2
 SELECT count(*) FROM gse_t GROUP BY ROW(g, z) ORDER BY 1
-# Still different here, and listed so the day they agree is noticed: a parenthesised step inside ROLLUP / CUBE, and an unqualified table's own name used from a subquery.
+# A parenthesised step inside ROLLUP / CUBE is added and dropped as one.
 SELECT g, z, count(*) FROM gse_t GROUP BY ROLLUP ((g, z), v) ORDER BY 1, 2, 3
+SELECT g, z, v, count(*) FROM gse_t GROUP BY CUBE ((g, z), v) ORDER BY 1, 2, 3
+SELECT g, z, v, grouping(g, z, v), count(*) FROM gse_t GROUP BY ROLLUP (g, (z, v)) ORDER BY 1, 2, 3
+SELECT g, z, count(*) FROM gse_t GROUP BY g, ROLLUP ((z, v)) ORDER BY 1, 2
+SELECT g, z, count(*) FROM gse_t GROUP BY CUBE ((g, z)) ORDER BY 1, 2
+# Still different here, and listed so the day they agree is noticed: an unqualified table's own name used from a subquery.
 SELECT g, (SELECT max(v) FROM gse_t i WHERE i.g = gse_t.g) FROM gse_t GROUP BY g ORDER BY 1
 # The same error with a different name in it: PostgreSQL writes `gse_t.z`.
 SELECT g, count(*) FROM gse_t GROUP BY ROLLUP (g) HAVING z = 'p'

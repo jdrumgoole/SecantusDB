@@ -222,6 +222,73 @@ fn hidden_in_public(name: &str, path: &[String]) -> bool {
         && resolve_unqualified(name) == name
 }
 
+/// A bare relation name in a string literal the statement turns into a
+/// `regclass`: a `::regclass` cast of one, or the first argument of the
+/// sequence functions, which take a regclass. With its location.
+///
+/// # Safety
+/// `n` must point at a live node, as `nodes_mut` hands out.
+unsafe fn regclass_literal(n: &pg_query::NodeMut) -> Option<(String, i32)> {
+    use pg_query::protobuf::a_const::Val;
+    let literal = |c: &pg_query::protobuf::Node| match c.node.as_ref() {
+        Some(N::AConst(a)) => match a.val.as_ref() {
+            Some(Val::Sval(s)) if !s.sval.contains('.') && !s.sval.contains('"') => {
+                Some((s.sval.trim().to_ascii_lowercase(), a.location))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    match n {
+        pg_query::NodeMut::TypeCast(tc) => {
+            // SAFETY: the caller's contract -- `tc` points at a live node.
+            let tc = unsafe { &**tc };
+            let names: Vec<&str> = tc
+                .type_name
+                .as_ref()?
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !matches!(names.as_slice(), ["regclass"] | ["pg_catalog", "regclass"]) {
+                return None;
+            }
+            literal(tc.arg.as_deref()?)
+        }
+        pg_query::NodeMut::FuncCall(f) => {
+            // SAFETY: as above.
+            let f = unsafe { &**f };
+            let name = match f.funcname.as_slice() {
+                [n] | [_, n] => match n.node.as_ref() {
+                    Some(N::String(s)) => s.sval.as_str(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            if !matches!(name, "nextval" | "currval" | "setval") {
+                return None;
+            }
+            literal(f.args.first()?)
+        }
+        _ => None,
+    }
+}
+
+/// The noun a DROP of `remove_type` names its object by in an error.
+fn drop_kind_noun(remove_type: i32) -> &'static str {
+    use pg_query::protobuf::ObjectType;
+    match ObjectType::try_from(remove_type) {
+        Ok(ObjectType::ObjectView) => "view",
+        Ok(ObjectType::ObjectSequence) => "sequence",
+        Ok(ObjectType::ObjectMatview) => "materialized view",
+        Ok(ObjectType::ObjectForeignTable) => "foreign table",
+        _ => "table",
+    }
+}
+
 /// PostgreSQL's answer for a relation no schema on the path holds.
 fn not_on_path(name: &str, location: i32) -> Error {
     if location >= 0 {
@@ -522,6 +589,17 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 ctes.push((*c).ctename.clone());
             }
         }
+        // A relation named in a STRING that becomes a regclass as the
+        // statement is analysed -- `'t'::regclass`, `nextval('s')` -- is
+        // looked up then, so `public` off the path hides it there too, with
+        // PostgreSQL's 42P01 at the literal (RP-011).
+        for (n, _, _) in node.nodes_mut() {
+            if let Some((name, location)) = regclass_literal(&n) {
+                if hidden_in_public(&name, &path) {
+                    return Err(not_on_path(&name, location));
+                }
+            }
+        }
         for (n, _, _) in node.nodes_mut() {
             if let pg_query::NodeMut::RangeVar(r) = n {
                 if target.is_some_and(|t| std::ptr::eq(t, r)) {
@@ -647,21 +725,34 @@ pub fn qualify(node: &mut N) -> Result<()> {
                     | ObjectType::ObjectForeignTable)
             );
             let index = ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectIndex);
+            // With IF EXISTS, such a name is skipped with PostgreSQL's
+            // notice, and is not dropped (RP-011).
+            if relation_kind && d.missing_ok {
+                let kind = drop_kind_noun(d.remove_type);
+                d.objects.retain(|o| {
+                    let Some(N::List(l)) = o.node.as_ref() else {
+                        return true;
+                    };
+                    match strings(l).as_deref() {
+                        Some([name]) if hidden_in_public(name, &path) => {
+                            crate::fts::planner_notice(&format!(
+                                "{kind} \"{name}\" does not exist, skipping"
+                            ));
+                            false
+                        }
+                        _ => true,
+                    }
+                });
+            }
             for o in &mut d.objects {
                 if let Some(N::List(l)) = o.node.as_mut() {
                     // A bare name `public` holds, with `public` off the
                     // path: PostgreSQL finds nothing to drop. (With IF
-                    // EXISTS it skips; that is not done here.)
+                    // EXISTS it skips; see below.)
                     if relation_kind && !d.missing_ok {
                         if let Some([name]) = strings(l).as_deref() {
                             if hidden_in_public(name, &path) {
-                                let kind = match ObjectType::try_from(d.remove_type) {
-                                    Ok(ObjectType::ObjectView) => "view",
-                                    Ok(ObjectType::ObjectSequence) => "sequence",
-                                    Ok(ObjectType::ObjectMatview) => "materialized view",
-                                    Ok(ObjectType::ObjectForeignTable) => "foreign table",
-                                    _ => "table",
-                                };
+                                let kind = drop_kind_noun(d.remove_type);
                                 return Err(Error::Sqlstate(
                                     "42P01",
                                     format!("{kind} \"{name}\" does not exist"),

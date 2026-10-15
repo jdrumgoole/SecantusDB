@@ -39,7 +39,11 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
     }
     let ty = ty.trim();
     if let Bson::Array(items) = v {
-        let elem = ty.strip_suffix("[]").unwrap_or("");
+        let elem = match ty {
+            "int2vector" => "int2",
+            "oidvector" => "oid",
+            t => t.strip_suffix("[]").unwrap_or(""),
+        };
         return Json::Array(items.iter().map(|x| to_json_value(x, elem)).collect());
     }
     match ty {
@@ -65,25 +69,41 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
             }
             None => Json::Str(crate::value_text(v)),
         },
+        // A float4 is its shortest float4 text, not the f64 it is carried as.
+        "float4" | "real" => match v {
+            Bson::Double(d) if d.is_finite() => Json::Number(crate::geo::float4_text(*d as f32)),
+            other => Json::Str(crate::typeout::output_text(other, ty)),
+        },
+        // The numbers are JSON numbers; every other built-in type is the
+        // string its output function prints (`to_json('0/16'::pg_lsn)` is
+        // `"0/16"`, of an oid `"5"`, of a money `"$1.50"`).
+        "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "float8"
+        | "double precision" | "numeric" | "decimal" | "" => number_or_text(v),
+        t if crate::pgtypes::oid_of_name(t).is_some() => {
+            Json::Str(crate::typeout::output_text(v, t))
+        }
         "text" | "varchar" | "bpchar" | "name" | "char" | "unknown" | "date" | "time" | "uuid" => {
             Json::Str(crate::value_text(v))
         }
-        _ => match v {
-            Bson::Int32(i) => Json::Number(i.to_string()),
-            Bson::Int64(i) => Json::Number(i.to_string()),
-            Bson::Double(d) if d.is_finite() => Json::Number(crate::geo::float8_text(*d)),
-            Bson::Double(d) => Json::Str(crate::geo::float8_text(*d)),
-            Bson::Boolean(b) => Json::Bool(*b),
-            Bson::Decimal128(_) => {
-                Json::Number(crate::numeric::numeric_text(v).unwrap_or_default())
-            }
-            Bson::Document(d) if d.contains_key(crate::WIDE_NUMERIC_KEY) => {
-                Json::Number(crate::numeric::numeric_text(v).unwrap_or_default())
-            }
-            other => Json::Str(
-                crate::interval_value_text(other).unwrap_or_else(|| crate::value_text(other)),
-            ),
-        },
+        _ => number_or_text(v),
+    }
+}
+
+/// A value of a numeric (or unknown) type as a JSON number where it is one.
+fn number_or_text(v: &Bson) -> Json {
+    match v {
+        Bson::Int32(i) => Json::Number(i.to_string()),
+        Bson::Int64(i) => Json::Number(i.to_string()),
+        Bson::Double(d) if d.is_finite() => Json::Number(crate::geo::float8_text(*d)),
+        Bson::Double(d) => Json::Str(crate::geo::float8_text(*d)),
+        Bson::Boolean(b) => Json::Bool(*b),
+        Bson::Decimal128(_) => Json::Number(crate::numeric::numeric_text(v).unwrap_or_default()),
+        Bson::Document(d) if d.contains_key(crate::WIDE_NUMERIC_KEY) => {
+            Json::Number(crate::numeric::numeric_text(v).unwrap_or_default())
+        }
+        other => {
+            Json::Str(crate::interval_value_text(other).unwrap_or_else(|| crate::value_text(other)))
+        }
     }
 }
 

@@ -194,22 +194,38 @@ fn unit(name: &str) -> Option<Unit> {
     })
 }
 
+/// The type an error about a unit names, as PostgreSQL 15's
+/// `format_type` spells it (`timestamp` is `timestamp without time zone`).
+fn unit_type_name(kind: &str) -> &str {
+    match kind.trim_matches('"') {
+        "timestamp" => "timestamp without time zone",
+        "time" => "time without time zone",
+        "timetz" | "time with time zone" => "time with time zone",
+        other => other,
+    }
+}
+
+/// PostgreSQL 15's 22023 for a unit no function knows (14 wrote
+/// `timestamp units "x" not recognized`).
 fn not_recognized(kind: &str, name: &str) -> Error {
     Error::Sqlstate(
         "22023",
         format!(
-            "{kind} units \"{}\" not recognized",
-            name.to_ascii_lowercase()
+            "unit \"{}\" not recognized for type {}",
+            name.to_ascii_lowercase(),
+            unit_type_name(kind)
         ),
     )
 }
 
+/// PostgreSQL 15's 0A000 for a unit this type has no value for.
 fn not_supported(kind: &str, name: &str) -> Error {
     Error::Sqlstate(
         "0A000",
         format!(
-            "{kind} units \"{}\" not supported",
-            name.to_ascii_lowercase()
+            "unit \"{}\" not supported for type {}",
+            name.to_ascii_lowercase(),
+            unit_type_name(kind)
         ),
     )
 }
@@ -354,6 +370,30 @@ fn julian_numeric(tm: &Tm) -> Result<Bson> {
     crate::cast_value(Bson::String(text), "numeric")
 }
 
+/// A `timetz`'s text read as (microseconds since midnight, its UTC offset in
+/// seconds east): `01:30:00.5+05:30` is (5_400_500_000, 19_800).
+fn timetz_of(v: &Bson) -> Result<(i64, i64)> {
+    let text = crate::value_text(v);
+    let t = text.trim();
+    let at = t
+        .rfind(['+', '-'])
+        .filter(|&i| i > 0)
+        .ok_or_else(|| bad("time with time zone", v))?;
+    let (clock, zone) = t.split_at(at);
+    let time = time_of(&Bson::String(clock.to_string()))?;
+    let micros = i64::from(time.num_seconds_from_midnight()) * USECS_PER_SEC
+        + i64::from(time.nanosecond() / 1000);
+    let sign = if zone.starts_with('-') { -1 } else { 1 };
+    let mut parts = zone[1..].split(':');
+    let mut field = || -> Result<i64> {
+        parts.next().map_or(Ok(0), |p| {
+            p.parse::<i64>().map_err(|_| bad("time with time zone", v))
+        })
+    };
+    let east = sign * (field()? * 3600 + field()? * 60 + field()?);
+    Ok((micros, east))
+}
+
 /// `extract` (numeric) / `date_part` (float8) over a value of static type
 /// `ty`.
 pub fn part(name: &str, v: &Bson, ty: &str, numeric: bool) -> Result<Bson> {
@@ -446,6 +486,26 @@ pub fn part(name: &str, v: &Bson, ty: &str, numeric: bool) -> Result<Bson> {
                 Unit::Hour => Part::Int(tm.hour),
                 Unit::Epoch => Part::Scaled(micros, 6),
                 _ => return Err(not_supported("\"time\"", name)),
+            };
+            out(p)
+        }
+        // `timetz_part_common`: the time-of-day fields, its zone, and an
+        // epoch that is the time of day in UTC.
+        "timetz" | "time with time zone" => {
+            let (micros, east) = timetz_of(v)?;
+            let u = unit(name).ok_or_else(|| not_recognized("timetz", name))?;
+            let sec = micros % USECS_PER_MINUTE;
+            let p = match u {
+                Unit::Microsec => Part::Int(sec),
+                Unit::Millisec => Part::Scaled(sec, 3),
+                Unit::Second => Part::Scaled(sec, 6),
+                Unit::Minute => Part::Int(micros % USECS_PER_HOUR / USECS_PER_MINUTE),
+                Unit::Hour => Part::Int(micros / USECS_PER_HOUR),
+                Unit::Tz => Part::Int(east),
+                Unit::TzMinute => Part::Int(east / 60 % 60),
+                Unit::TzHour => Part::Int(east / 3600),
+                Unit::Epoch => Part::Scaled(micros - east * USECS_PER_SEC, 6),
+                _ => return Err(not_supported("timetz", name)),
             };
             out(p)
         }
@@ -591,10 +651,27 @@ fn timestamptz_bson(micros: i64) -> Result<Bson> {
 // ------------------------------------------------------------------------
 
 /// `date_trunc(unit, value)` over a timestamp / timestamptz / interval.
+/// A `date_trunc` unit: one `date_part` alone knows (`dow`, `epoch`, ...)
+/// is not recognized here, as PostgreSQL's `DecodeUnits` table leaves it
+/// to `DecodeSpecial`.
+fn trunc_unit(name: &str, kind: &str) -> Result<Unit> {
+    match unit(name) {
+        Some(Unit::Dow | Unit::IsoDow | Unit::Doy | Unit::Julian | Unit::Epoch | Unit::IsoYear)
+        | None => Err(not_recognized(kind, name)),
+        Some(u) => Ok(u),
+    }
+}
+
 pub fn trunc(name: &str, v: &Bson, ty: &str) -> Result<Bson> {
+    // There is no `date_trunc(text, time)`: a time of day takes the
+    // interval overload, by its implicit cast.
+    if matches!(ty, "time" | "time without time zone") {
+        let iv = crate::cast_value(v.clone(), "interval")?;
+        return trunc(name, &iv, "interval");
+    }
     if ty == "interval" {
         let iv = Interval::from_bson(v).ok_or_else(|| bad("interval", v))?;
-        let u = unit(name).ok_or_else(|| not_recognized("interval", name))?;
+        let u = trunc_unit(name, "interval")?;
         let mut tm = interval2tm(&iv);
         let step = match u {
             Unit::Millennium => 0,
@@ -612,15 +689,6 @@ pub fn trunc(name: &str, v: &Bson, ty: &str) -> Result<Bson> {
                 return Ok(tm2interval(&tm).to_bson());
             }
             Unit::Microsec => return Ok(tm2interval(&tm).to_bson()),
-            Unit::Week => {
-                return Err(Error::Sqlstate(
-                    "0A000",
-                    format!(
-                        "interval units \"{}\" not supported because months usually have fractional weeks",
-                        name.to_ascii_lowercase()
-                    ),
-                ))
-            }
             _ => return Err(not_supported("interval", name)),
         };
         if step <= 0 {
@@ -655,16 +723,14 @@ pub fn trunc(name: &str, v: &Bson, ty: &str) -> Result<Bson> {
     }
     let tz = ty == "timestamptz" || ty == "timestamp with time zone";
     let utc = instant_of(v, ty)?;
-    let u = unit(name).ok_or_else(|| {
-        not_recognized(
-            if tz {
-                "timestamp with time zone"
-            } else {
-                "timestamp"
-            },
-            name,
-        )
-    })?;
+    let u = trunc_unit(
+        name,
+        if tz {
+            "timestamp with time zone"
+        } else {
+            "timestamp"
+        },
+    )?;
     let offset = if tz {
         i64::from(crate::session_timezone().offset_at(utc).local_minus_utc())
     } else {
@@ -2316,7 +2382,7 @@ pub fn result_type(name: &str, arg_types: &[String]) -> Option<String> {
             "extract" => "numeric",
             "date_part" => "float8",
             "date_trunc" => match second {
-                "interval" => "interval",
+                "interval" | "time" | "time without time zone" => "interval",
                 "timestamp" | "timestamp without time zone" => "timestamp",
                 _ => "timestamptz",
             },
@@ -2394,12 +2460,18 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Option<Result<Bson>>
             }
             let ty = match t(1) {
                 "interval" => "interval",
+                // Cast to interval in `trunc`.
+                "time" | "time without time zone" => "time",
                 "timestamp" | "timestamp without time zone" => "timestamp",
                 _ => "timestamptz",
             };
             if let Some(z) = args.get(2) {
-                // date_trunc(unit, timestamptz, zone): truncate in that zone.
-                let zone = crate::TimeZoneSetting::parse(&crate::value_text(z));
+                // date_trunc(unit, timestamptz, zone): truncate in that zone,
+                // which is read -- and refused -- before the unit.
+                let zone = match zone_of(z) {
+                    Ok(zone) => zone,
+                    Err(e) => return Some(Err(e)),
+                };
                 let prev = crate::PLAN_TIMEZONE.with(|p| p.replace(zone));
                 let out = trunc(&crate::value_text(&args[0]), &args[1], ty);
                 crate::PLAN_TIMEZONE.with(|p| *p.borrow_mut() = prev);

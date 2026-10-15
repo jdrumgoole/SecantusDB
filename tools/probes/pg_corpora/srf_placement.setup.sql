@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS srf_t CASCADE
+CREATE TABLE srf_t (a int)
+INSERT INTO srf_t VALUES (1), (2)

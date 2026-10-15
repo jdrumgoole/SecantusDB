@@ -15,6 +15,8 @@ pub(crate) enum Encoding {
     Utf8,
     Latin1,
     Ascii,
+    /// A single-byte encoding with its upper half's table (`sbcs`).
+    Single(&'static str, &'static [u16; 128]),
     Other(&'static str),
 }
 
@@ -153,9 +155,30 @@ pub(crate) fn encoding(name: &str, role: &str) -> Result<(Encoding, String)> {
         "UTF8" => Encoding::Utf8,
         "LATIN1" => Encoding::Latin1,
         "SQL_ASCII" => Encoding::Ascii,
-        other => Encoding::Other(other),
+        other => match crate::sbcs::table(other) {
+            Some(table) => Encoding::Single(other, table),
+            None => Encoding::Other(other),
+        },
     };
     Ok((enc, canonical.to_string()))
+}
+
+/// PostgreSQL's 22P05 for a character `to_name` cannot hold.
+fn no_equivalent(c: char, to_name: &str) -> Error {
+    let mut buf = [0u8; 4];
+    let shown: Vec<String> = c
+        .encode_utf8(&mut buf)
+        .bytes()
+        .map(|b| format!("0x{b:02x}"))
+        .collect();
+    Error::Sqlstate(
+        "22P05",
+        format!(
+            "character with byte sequence {} in encoding \"UTF8\" has no equivalent in \
+             encoding \"{to_name}\"",
+            shown.join(" ")
+        ),
+    )
 }
 
 /// Non-ASCII data in an encoding this server has no table for.
@@ -200,6 +223,25 @@ pub(crate) fn decode(bytes: &[u8], from: &Encoding) -> Result<String> {
         },
         Encoding::Latin1 => Ok(bytes.iter().map(|b| *b as char).collect()),
         Encoding::Ascii => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Encoding::Single(canonical, table) => bytes
+            .iter()
+            .map(|&b| {
+                if b < 0x80 {
+                    return Ok(b as char);
+                }
+                char::from_u32(u32::from(table[usize::from(b - 0x80)]))
+                    .filter(|c| *c != '\0')
+                    .ok_or_else(|| {
+                        Error::Sqlstate(
+                            "22P05",
+                            format!(
+                                "character with byte sequence 0x{b:02x} in encoding \"{canonical}\" \
+                                 has no equivalent in encoding \"UTF8\""
+                            ),
+                        )
+                    })
+            })
+            .collect(),
         Encoding::Other(_) if bytes.is_ascii() => Ok(bytes.iter().map(|b| *b as char).collect()),
         Encoding::Other(canonical) => Err(no_table(canonical)),
     }
@@ -208,28 +250,24 @@ pub(crate) fn decode(bytes: &[u8], from: &Encoding) -> Result<String> {
 pub(crate) fn encode(s: &str, to: &Encoding, to_name: &str) -> Result<Vec<u8>> {
     match to {
         Encoding::Utf8 | Encoding::Ascii => Ok(s.as_bytes().to_vec()),
+        Encoding::Single(_, table) => s
+            .chars()
+            .map(|c| {
+                if c.is_ascii() {
+                    return Ok(c as u8);
+                }
+                table
+                    .iter()
+                    .position(|&u| u != 0 && u32::from(u) == u32::from(c))
+                    .and_then(|i| u8::try_from(i + 0x80).ok())
+                    .ok_or_else(|| no_equivalent(c, to_name))
+            })
+            .collect(),
         Encoding::Other(_) if s.is_ascii() => Ok(s.as_bytes().to_vec()),
         Encoding::Other(canonical) => Err(no_table(canonical)),
         Encoding::Latin1 => s
             .chars()
-            .map(|c| {
-                u8::try_from(u32::from(c)).map_err(|_| {
-                    let mut buf = [0u8; 4];
-                    let shown: Vec<String> = c
-                        .encode_utf8(&mut buf)
-                        .bytes()
-                        .map(|b| format!("0x{b:02x}"))
-                        .collect();
-                    Error::Sqlstate(
-                        "22P05",
-                        format!(
-                            "character with byte sequence {} in encoding \"UTF8\" has no \
-                             equivalent in encoding \"{to_name}\"",
-                            shown.join(" ")
-                        ),
-                    )
-                })
-            })
+            .map(|c| u8::try_from(u32::from(c)).map_err(|_| no_equivalent(c, to_name)))
             .collect(),
     }
 }

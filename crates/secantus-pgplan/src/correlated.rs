@@ -81,6 +81,12 @@ fn run_direct(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
     }
 }
 
+/// Run a query's SQL through the executor -- what SPI does for a C
+/// function that takes one as text (`ts_rewrite(query, select)`).
+pub(crate) fn run_sql(sql: &str) -> Result<Vec<Vec<Bson>>> {
+    run_direct(sql, &[])
+}
+
 fn int_const(v: i32) -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::AConst(pg_query::protobuf::AConst {
