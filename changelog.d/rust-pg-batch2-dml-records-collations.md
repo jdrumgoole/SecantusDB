@@ -181,9 +181,10 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   answers them. Part of RP-015.
 - The length-coercion functions by name, `pg_catalog."numeric"(x,
   typmod)` and the `varchar` / `bpchar` / `bit` / `varbit` / `time` /
-  `timetz` / `timestamp` / `timestamptz` / `interval` forms, with
-  constant modifiers (the non-explicit string form stays refused). Part
-  of RP-015.
+  `timetz` / `timestamp` / `timestamptz` / `interval` forms; the
+  non-explicit string and bit-string forms refuse an overlong value as an
+  assignment does (22001 / 22026), and a modifier may be any expression.
+  Part of RP-015.
 - `to_regnamespace`, `to_regrole`, `to_regcollation`, `to_regproc` and
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.

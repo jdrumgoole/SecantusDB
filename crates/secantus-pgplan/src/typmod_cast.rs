@@ -16,7 +16,8 @@
 //!
 //! The `isExplicit` argument of the string and bit-string forms decides
 //! whether an overlong value is truncated (`true`, a cast) or refused (an
-//! assignment); only `true` is rewritten, so `false` stays refused here.
+//! assignment, `false`); the assignment form, and a modifier that is not a
+//! constant, go through `__typmod_coerce` (a column assignment's rules).
 
 use super::*;
 
@@ -126,9 +127,76 @@ fn cast_text(f: &pg_query::protobuf::FuncCall) -> Option<String> {
     })
 }
 
-/// Is `f` one of these calls with constant modifiers?
+/// One of these calls the cast rewrite cannot take -- a modifier that is
+/// not a constant, or `isExplicit` false (an assignment, which refuses an
+/// overlong string or bit string rather than truncating it) -- as
+/// `__typmod_coerce(value, 'type', typmod)`, which applies the modifier as
+/// a column assignment does (`fit_length`).
+fn assignment_call(f: &pg_query::protobuf::FuncCall) -> Option<pg_query::protobuf::Node> {
+    let parts: Vec<&str> = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let ["pg_catalog", name] = parts.as_slice() else {
+        return None;
+    };
+    let arity = match *name {
+        "varchar" | "bpchar" | "varbit" => 3,
+        "bit" if f.args.len() == 3 => 3,
+        "numeric" | "interval" | "time" | "timetz" | "timestamp" | "timestamptz" => 2,
+        _ => return None,
+    };
+    if f.args.len() != arity {
+        return None;
+    }
+    // A cast (`isExplicit` true) with a modifier that is not constant is
+    // not an assignment; only `false` (or no such argument) is taken here.
+    if arity == 3 && bool_arg(&f.args[2]) != Some(false) {
+        return None;
+    }
+    let text = |v: &str| pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            isnull: false,
+            location: -1,
+            val: Some(pg_query::protobuf::a_const::Val::Sval(
+                pg_query::protobuf::String { sval: v.into() },
+            )),
+        })),
+    };
+    let call = pg_query::protobuf::Node {
+        node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+            funcname: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String {
+                    sval: "__typmod_coerce".into(),
+                })),
+            }],
+            args: vec![f.args[0].clone(), text(name), f.args[1].clone()],
+            funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+            location: f.location,
+            ..Default::default()
+        }))),
+    };
+    // Typed as the function's result, without changing its value -- except
+    // `bit`, whose bare name means `bit(1)` and would cut it.
+    if *name == "bit" {
+        return Some(call);
+    }
+    Some(pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(call)),
+            type_name: Some(type_name_node(name)),
+            location: -1,
+        }))),
+    })
+}
+
+/// Is `f` one of these calls?
 pub(crate) fn wanted(f: &pg_query::protobuf::FuncCall) -> bool {
-    cast_text(f).is_some()
+    cast_text(f).is_some() || assignment_call(f).is_some()
 }
 
 /// The cast a call stands for: `(<value>)::<type>`, parsed from its text.
@@ -136,7 +204,9 @@ pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::prot
     let N::FuncCall(f) = n.node.as_ref()? else {
         return None;
     };
-    let text = cast_text(f)?;
+    let Some(text) = cast_text(f) else {
+        return assignment_call(f);
+    };
     let parsed = pg_query::parse(&format!("select null::{text}")).ok()?;
     let target = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
     let N::SelectStmt(s) = target.node.as_ref()? else {

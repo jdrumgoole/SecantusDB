@@ -494,12 +494,8 @@ one beside it.
         call with a COLUMN of the wrong type still runs
         (`int4pl(numeric_col, 2)`); `pg_relation_is_publishable` is true for
         an unlogged table.
-      - **Refused operators** the probe reached through their functions:
-        a VARIADIC argument that is neither an
-        `ARRAY[...]` constructor nor a json path / `jsonb_delete` call. Casts by function name: `int4("char")`, a length-coercion
-        function with a modifier that is not a constant, and the string /
-        bit-string forms with `isExplicit` false (an assignment, which
-        refuses an overlong value with 22001).
+      - **A VARIADIC argument** that is neither an `ARRAY[...]` constructor
+        nor a json path / `jsonb_delete` call (`concat(VARIADIC arr_col)`).
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

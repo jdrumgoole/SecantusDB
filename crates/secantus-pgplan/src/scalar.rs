@@ -228,6 +228,7 @@ const SCALAR_NAMES: &[&str] = &[
     // The planner's own: an inet / cidr value's order key (`enum_order`).
     "__net_sortkey",
     "__range_sortkey",
+    "__typmod_coerce",
     "__net_op",
     "__net_arith",
     "__net_diff",
@@ -788,6 +789,18 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "__net_diff" => {
             need(2)?;
             crate::net::diff(&arg(0), &arg(1))
+        }
+        // `__typmod_coerce(value, type, typmod)`: a modifier applied as a
+        // column assignment applies it (`typmod_cast`).
+        "__typmod_coerce" => {
+            need(3)?;
+            if arg(0) == Bson::Null || arg(2) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let typmod = as_i64(&arg(2))
+                .and_then(|t| i32::try_from(t).ok())
+                .ok_or_else(|| wrong_args(name))?;
+            crate::fit_length(arg(0), &s(1), typmod)
         }
         "__range_sortkey" => {
             need(2)?;

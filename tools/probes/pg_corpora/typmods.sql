@@ -23,3 +23,12 @@ SELECT table_schema, table_name, column_name, ordinal_position, column_default, 
 SELECT table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, character_octet_length, numeric_precision, numeric_precision_radix, numeric_scale, datetime_precision, interval_type, interval_precision, character_set_name, collation_schema, collation_name, domain_schema, domain_name, udt_schema, udt_name, scope_name, maximum_cardinality, dtd_identifier, is_self_referencing, is_identity, identity_generation, identity_start, identity_increment, identity_maximum, identity_minimum, identity_cycle, is_generated, generation_expression, is_updatable FROM information_schema.columns WHERE table_schema = 'pg_catalog' AND table_name = 'pg_class' AND column_name IN ('oid', 'relname', 'relacl', 'reltuples') ORDER BY ordinal_position
 INSERT INTO tm_id (v) VALUES (1), (2) RETURNING id
 INSERT INTO tm_id2 (v) VALUES (1), (2), (3) RETURNING id
+SELECT pg_catalog."int4"('a'::"char"), int4('a'::"char"), pg_catalog."char"(65), pg_catalog."text"('a'::"char")
+SELECT pg_catalog."varchar"('abcdef'::varchar, 7, false)
+SELECT pg_catalog."varchar"('abc   '::varchar, 7, false), pg_catalog."varchar"('ab'::varchar, 7, false)
+SELECT pg_catalog."bpchar"('abcdef'::bpchar, 7, false)
+SELECT pg_catalog."bpchar"('abc   '::bpchar, 7, false)::text || '|'
+SELECT pg_catalog."bit"(B'101', 2, false)
+SELECT pg_catalog."varbit"(B'101', 2, false)
+SELECT pg_catalog."bit"(B'10', 2, false), pg_catalog."varbit"(B'10', 4, false)
+SELECT pg_catalog."numeric"(1.5, n) from (values (458758)) v(n)
