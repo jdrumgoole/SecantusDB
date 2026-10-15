@@ -244,7 +244,9 @@ read leaves the old one in force.
 A line this server cannot apply stops it from starting, with the line's
 number, so that no rule is silently skipped: a method that needs a service
 outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`, `pam`,
-`bsd`), a host name for the address, `samenet`, and `@file` inclusion.
+`bsd`), a host name for the address, and `@file` inclusion. `samehost`
+and `samenet` match by this host's interface addresses and their networks,
+as PostgreSQL's do.
 `--hba-file` cannot be given with `--tls-require`, `--tls-client-cert`,
 `--tls-client-name`, `--tls-user-map` or `--refuse-unknown-users`: the file
 says what those say.

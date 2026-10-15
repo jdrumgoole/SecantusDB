@@ -22,7 +22,7 @@
 //! server cannot apply is never silently skipped: a method that needs a
 //! service outside the server (`peer`, `ident`, `gss`, `sspi`, `ldap`,
 //! `radius`, `pam`, `bsd`), a host NAME for the address (PostgreSQL resolves
-//! it; this server does not), `samenet`, and `@file` inclusion. `local`
+//! it; this server does not) and `@file` inclusion. `local`
 //! lines are for Unix-domain sockets, which this server does not listen on:
 //! they are read and never match, as are the GSSAPI types.
 
@@ -73,6 +73,8 @@ enum Address {
     All,
     /// Any of the server's own addresses.
     SameHost,
+    /// `samenet`: the network of one of this host's interfaces.
+    SameNet,
     Network(IpAddr, u8),
 }
 
@@ -123,8 +125,9 @@ pub(crate) struct Rule {
 pub(crate) struct Connection<'a> {
     pub tls: bool,
     pub address: IpAddr,
-    /// The address the connection arrived on, for `samehost`.
-    pub local: Option<IpAddr>,
+    /// This host's interfaces, as `(address, netmask)`, for `samehost` and
+    /// `samenet`.
+    pub host: Vec<(IpAddr, Option<IpAddr>)>,
     pub user: &'a str,
     pub database: &'a str,
 }
@@ -213,10 +216,28 @@ impl Address {
         let client = connection.address.to_canonical();
         match self {
             Address::All => true,
+            // `check_same_host_or_net`: any address of any of this host's
+            // interfaces, the loopback ones among them.
             Address::SameHost => {
                 client.is_loopback()
-                    || connection.local.map(|local| local.to_canonical()) == Some(client)
+                    || connection
+                        .host
+                        .iter()
+                        .any(|(a, _)| a.to_canonical() == client)
             }
+            // The client on the network of one of this host's interfaces.
+            Address::SameNet => connection.host.iter().any(|(a, mask)| {
+                let Some(mask) = mask else { return false };
+                match (a.to_canonical(), mask, client) {
+                    (IpAddr::V4(a), IpAddr::V4(m), IpAddr::V4(c)) => {
+                        u32::from(a) & u32::from(*m) == u32::from(c) & u32::from(*m)
+                    }
+                    (IpAddr::V6(a), IpAddr::V6(m), IpAddr::V6(c)) => {
+                        u128::from(a) & u128::from(*m) == u128::from(c) & u128::from(*m)
+                    }
+                    _ => false,
+                }
+            }),
             Address::Network(network, prefix) => match (network, client) {
                 (IpAddr::V4(network), IpAddr::V4(client)) => {
                     let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
@@ -477,7 +498,7 @@ fn rule(fields: &[Vec<Token>], line: usize) -> Result<Rule, String> {
         } else if token.keyword("samehost") {
             Address::SameHost
         } else if token.keyword("samenet") {
-            return Err("samenet is not supported; give the network as an address".into());
+            Address::SameNet
         } else if let Some((ip, prefix)) = token.text.split_once('/') {
             let ip: IpAddr = ip
                 .parse()
@@ -650,7 +671,7 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
             &Connection {
                 tls,
                 address: address.parse().unwrap(),
-                local: None,
+                host: Vec::new(),
                 user,
                 database,
             },
@@ -725,6 +746,53 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
         assert!(hit("d", "::ffff:10.0.0.1") && hit("d", "10.0.0.1"));
         assert!(!hit("d", "::1"), "an IPv4 line does not match IPv6");
         assert!(hit("e", "127.0.0.1") && hit("e", "::1") && !hit("e", "10.0.0.1"));
+        // `samehost` is any of this host's interface addresses, not only the
+        // loopback ones.
+        let on = |address: &str, host: &[&str]| {
+            hba.decide(
+                &Connection {
+                    tls: false,
+                    address: address.parse().unwrap(),
+                    host: host.iter().map(|a| (a.parse().unwrap(), None)).collect(),
+                    user: "e",
+                    database: "x",
+                },
+                &|_, _| false,
+            )
+            .is_some()
+        };
+        assert!(on("192.0.2.7", &["10.0.0.1", "192.0.2.7"]));
+        assert!(!on("192.0.2.8", &["10.0.0.1", "192.0.2.7"]));
+        assert!(on("::ffff:192.0.2.7", &["192.0.2.7"]));
+        // `samenet`: the client on an interface's network.
+        let hba = Hba::parse("host all all samenet trust\n").expect("samenet parses");
+        let net = |address: &str| {
+            hba.decide(
+                &Connection {
+                    tls: false,
+                    address: address.parse().unwrap(),
+                    host: vec![(
+                        "192.0.2.7".parse().unwrap(),
+                        Some("255.255.255.0".parse().unwrap()),
+                    )],
+                    user: "u",
+                    database: "x",
+                },
+                &|_, _| false,
+            )
+            .is_some()
+        };
+        assert!(net("192.0.2.200") && !net("192.0.3.1") && !net("::1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_hosts_addresses_are_listed() {
+        let addresses = host_addresses();
+        assert!(
+            addresses.iter().any(|(a, _)| a.is_loopback()),
+            "getifaddrs lists the loopback interface: {addresses:?}"
+        );
     }
 
     #[test]
@@ -743,7 +811,6 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
                 "invalid authentication method",
             ),
             ("host all all db.example.com trust\n", "host name"),
-            ("host all all samenet trust\n", "samenet"),
             ("host all all 127.0.0.1/33 trust\n", "invalid CIDR mask"),
             (
                 "host all all 127.0.0.1 255.0.255.0 trust\n",
@@ -797,4 +864,54 @@ hostssl     all        mapped      all            cert  map=m clientname=DN
         assert_eq!(contiguous(u128::MAX, 128), Some(128));
         assert_eq!(contiguous(u128::MAX << 64, 128), Some(64));
     }
+}
+
+/// This host's interfaces as `(address, netmask)`, as `pg_foreach_ifaddr`
+/// lists them (`getifaddrs`).
+#[cfg(unix)]
+pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
+    // SAFETY (both): `sa` is null or a sockaddr whose family says its type.
+    unsafe fn ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
+        if sa.is_null() {
+            return None;
+        }
+        match i32::from((*sa).sa_family) {
+            libc::AF_INET => {
+                let sin = sa.cast::<libc::sockaddr_in>();
+                Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                    (*sin).sin_addr.s_addr,
+                ))))
+            }
+            libc::AF_INET6 => {
+                let sin6 = sa.cast::<libc::sockaddr_in6>();
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                    (*sin6).sin6_addr.s6_addr,
+                )))
+            }
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list this function walks and
+    // frees.
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            if let Some(addr) = ip((*cur).ifa_addr) {
+                out.push((addr, ip((*cur).ifa_netmask)));
+            }
+            cur = (*cur).ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_addresses() -> Vec<(IpAddr, Option<IpAddr>)> {
+    Vec::new()
 }

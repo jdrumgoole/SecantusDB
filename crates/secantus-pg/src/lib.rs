@@ -18497,7 +18497,7 @@ impl PgHandler {
         let connection = hba::Connection {
             tls,
             address: host,
-            local: None,
+            host: hba::host_addresses(),
             user: &user,
             database: &database,
         };
@@ -18978,6 +18978,7 @@ impl PgHandler {
         self.backend_pid
             .store(pid, std::sync::atomic::Ordering::Relaxed);
         secantus_pgplan::scalar::set_backend_pid(pid);
+        secantus_pgplan::scalar::set_connection_addrs(_c.socket_addr(), _c.local_addr());
         let _ = self.backend.secret.set(secret.to_bytes());
         {
             let mut activity = self

@@ -22533,6 +22533,14 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         {
             "name".to_string()
         }
+        // `inet_client_addr()` / `inet_server_addr()`: an `inet` carried as
+        // its text.
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .is_some_and(|n| matches!(n.as_str(), "inet_client_addr" | "inet_server_addr")) =>
+        {
+            "inet".to_string()
+        }
         Some(N::FuncCall(f))
             if func_name(f).as_deref() == Some("pg_event_trigger_table_rewrite_oid") =>
         {
@@ -24469,6 +24477,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || declared == "timestamptz"
                             || declared == "name"
                             || declared == "name[]"
+                            // An `inet` is carried as its text.
+                            || declared == "inet"
                             // A `"char"` is carried as its text, and so is an
                             // `aclitem`.
                             || declared == QUOTED_CHAR

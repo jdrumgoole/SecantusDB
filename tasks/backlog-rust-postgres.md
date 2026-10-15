@@ -296,10 +296,8 @@ one beside it.
   - **With `--hba-file`:**
     - **Refused at startup, by line number**: the methods that need an
       outside service (`peer`, `ident`, `gss`, `sspi`, `ldap`, `radius`,
-      `pam`, `bsd`), a host NAME for the address, `samenet`, `@file`
-      inclusion, and `include` directives (PostgreSQL 16's).
-    - **`samehost` matches loopback only**: the handler is not told the
-      address a connection arrived on.
+      `pam`, `bsd`), a host NAME for the address, `@file` inclusion, and
+      `include` directives (PostgreSQL 16's).
     - **`+role` and `samerole` go through `pg_has_role`'s membership**,
       where PostgreSQL uses the form that does not count a superuser as a
       member of everything. Not probed with a superuser that has no line.

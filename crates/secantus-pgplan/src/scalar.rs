@@ -78,6 +78,10 @@ const CATALOG_NAMES: &[&str] = &[
     "current_catalog",
     "current_setting",
     "pg_backend_pid",
+    "inet_client_addr",
+    "inet_client_port",
+    "inet_server_addr",
+    "inet_server_port",
     "pg_client_encoding",
     "pg_reload_conf",
     "format_type",
@@ -272,6 +276,38 @@ thread_local! {
 /// 42501.
 pub fn set_reload_conf(hook: Option<ReloadConf>) {
     RELOAD_CONF.with(|h| *h.borrow_mut() = hook);
+}
+
+thread_local! {
+    /// The connection's `(client, server)` socket addresses, as
+    /// `inet_client_addr()` and its kin answer them (`set_connection_addrs`).
+    static CONNECTION_ADDRS: std::cell::Cell<Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install the connection's client and server addresses on this thread.
+pub fn set_connection_addrs(client: std::net::SocketAddr, server: Option<std::net::SocketAddr>) {
+    CONNECTION_ADDRS.with(|a| a.set(Some((client, server))));
+}
+
+/// `inet_client_addr()` & co.: the address (an IPv4-mapped one as IPv4) or
+/// the port; NULL where there is no TCP connection.
+fn connection_addr(name: &str) -> Bson {
+    let Some((client, server)) = CONNECTION_ADDRS.with(|a| a.get()) else {
+        return Bson::Null;
+    };
+    let addr = if name.starts_with("inet_client") {
+        Some(client)
+    } else {
+        server
+    };
+    match (addr, name.ends_with("_port")) {
+        (None, _) => Bson::Null,
+        (Some(a), true) => Bson::Int32(i32::from(a.port())),
+        // Carried as an `inet` is, its canonical `addr/masklen` text.
+        (Some(a), false) => crate::net::normalize_inet(&a.ip().to_canonical().to_string())
+            .map_or(Bson::Null, Bson::String),
+    }
 }
 
 /// Install the PID `pg_backend_pid()` answers inside an expression on this
@@ -1787,6 +1823,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             Ok(Bson::Array(out))
         }
         "pg_backend_pid" => Ok(Bson::Int32(BACKEND_PID.with(|p| p.get()))),
+        "inet_client_addr" | "inet_client_port" | "inet_server_addr" | "inet_server_port" => {
+            Ok(connection_addr(name))
+        }
         // The session's `client_encoding`, by its canonical name.
         "pg_client_encoding" => Ok(Bson::String(
             crate::session_setting("client_encoding").unwrap_or_else(|| "UTF8".into()),
@@ -2730,6 +2769,8 @@ pub fn static_result_type(name: &str) -> &'static str {
         "current_schema" | "current_database" | "current_user" | "session_user"
         | "pg_client_encoding" => "name",
         "current_schemas" => "name[]",
+        "inet_client_addr" | "inet_server_addr" => "inet",
+        "inet_client_port" | "inet_server_port" => "int4",
         "char" => crate::QUOTED_CHAR,
         "trim_scale" => "numeric",
         "numeric_send" => "bytea",

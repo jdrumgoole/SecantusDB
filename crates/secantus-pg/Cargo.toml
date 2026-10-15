@@ -46,7 +46,7 @@ path = "src/lib.rs"
 default = ["bin", "mimalloc"]
 # Builds the `secantusd-pg` binary (signal handling). Off, the crate is the
 # library alone -- what a dev-dependency or the Python handle wants.
-bin = ["dep:ctrlc", "dep:libc"]
+bin = ["dep:ctrlc"]
 # Only for the instrumented stage of the release build
 # (`scripts/build_pg_release.sh`): the binary writes its own profile to
 # `SECANTUS_PGO_OUT` as it stops. It links only under `-Cprofile-generate`.
@@ -115,7 +115,7 @@ stacker = "0.1"
 # startup: a blocked mask and an ignored disposition both survive exec, and a
 # server started under either could not be stopped by its supervisor.
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2" }
 
 [dev-dependencies]
 # A real PostgreSQL client for the embedded-server tests: the durability test

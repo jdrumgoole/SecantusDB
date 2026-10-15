@@ -159,6 +159,10 @@ impl<T: 'static, S> ClientInfo for Framed<T, PgWireMessageServerCodec<S>> {
         self.codec().client_info.socket_addr
     }
 
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.codec().client_info.local_addr
+    }
+
     fn is_secure(&self) -> bool {
         self.codec().client_info.is_secure
     }
@@ -589,9 +593,11 @@ pub async fn negotiate_tls<S>(
     tls_acceptor: Option<crate::tokio::TlsAcceptor>,
 ) -> io::Result<Option<Framed<MaybeTls, PgWireMessageServerCodec<S>>>> {
     let addr = tcp_socket.peer_addr()?;
+    let local = tcp_socket.local_addr().ok();
     tcp_socket.set_nodelay(true)?;
 
-    let client_info = DefaultClient::new(addr, false);
+    let mut client_info = DefaultClient::new(addr, false);
+    client_info.local_addr = local;
     let mut tcp_socket = Framed::new(tcp_socket, PgWireMessageServerCodec::new(client_info));
 
     // this function will process postgres ssl negotiation and consume the first
@@ -614,6 +620,7 @@ pub async fn negotiate_tls<S>(
     if let Some(tls_acceptor) = tls_acceptor {
         // mention the use of ssl
         let mut client_info = DefaultClient::new(addr, true);
+        client_info.local_addr = local;
 
         let ssl_socket = Box::new(tls_acceptor.accept(old_parts.io).await?);
 
