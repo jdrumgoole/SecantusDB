@@ -242,9 +242,17 @@ fn sql_relations_uncached(sql: &str) -> Vec<(String, &'static str)> {
         for (t, p) in targets {
             push(&mut out, &t, p);
         }
-        let Some(inner) = stmt.node.as_ref() else {
+        let Some(mut inner) = stmt.node.as_ref() else {
             continue;
         };
+        // pg_query's walk does not descend into a DECLARE's query: the
+        // cursor's reads are checked from the query itself.
+        if let N::DeclareCursorStmt(d) = inner {
+            match d.query.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(q) => inner = q,
+                None => continue,
+            }
+        }
         let nodes = inner.nodes();
         for (node, _, _, _) in &nodes {
             if let pg_query::NodeRef::CommonTableExpr(c) = node {
@@ -252,11 +260,20 @@ fn sql_relations_uncached(sql: &str) -> Vec<(String, &'static str)> {
             }
         }
         for (node, _, context, _) in &nodes {
-            if let pg_query::NodeRef::RangeVar(r) = node {
-                let catalog = matches!(r.schemaname.as_str(), "pg_catalog" | "information_schema");
-                if *context == pg_query::Context::Select && !catalog && !ctes.contains(&r.relname) {
-                    push(&mut out, &raw_key(r), "SELECT");
+            // Nor into a TABLESAMPLE's relation, which is read like any other.
+            let r = match node {
+                pg_query::NodeRef::RangeVar(r) => *r,
+                pg_query::NodeRef::RangeTableSample(ts) => {
+                    match ts.relation.as_ref().and_then(|r| r.node.as_ref()) {
+                        Some(N::RangeVar(r)) => r,
+                        _ => continue,
+                    }
                 }
+                _ => continue,
+            };
+            let catalog = matches!(r.schemaname.as_str(), "pg_catalog" | "information_schema");
+            if *context == pg_query::Context::Select && !catalog && !ctes.contains(&r.relname) {
+                push(&mut out, &raw_key(r), "SELECT");
             }
         }
     }
@@ -289,9 +306,16 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
             .collect()
     };
     for raw in &parsed.stmts {
-        let Some(stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        let Some(mut stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
             continue;
         };
+        // A DECLARE reads what its query reads (the walk does not reach it).
+        if let N::DeclareCursorStmt(d) = stmt {
+            match d.query.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(q) => stmt = q,
+                None => continue,
+            }
+        }
         match (privilege, stmt) {
             ("INSERT", N::InsertStmt(i))
                 if i.relation.as_ref().is_some_and(|r| key(r) == table) =>
@@ -326,11 +350,19 @@ pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) 
                     names.push(bare.to_string());
                 }
                 for (node, _, _, _) in stmt.nodes() {
-                    if let pg_query::NodeRef::RangeVar(r) = node {
-                        if key(r) == table {
-                            if let Some(a) = &r.alias {
-                                names.push(a.aliasname.clone());
+                    let r = match node {
+                        pg_query::NodeRef::RangeVar(r) => r,
+                        pg_query::NodeRef::RangeTableSample(ts) => {
+                            match ts.relation.as_ref().and_then(|r| r.node.as_ref()) {
+                                Some(N::RangeVar(r)) => r,
+                                _ => continue,
                             }
+                        }
+                        _ => continue,
+                    };
+                    if key(r) == table {
+                        if let Some(a) = &r.alias {
+                            names.push(a.aliasname.clone());
                         }
                     }
                 }

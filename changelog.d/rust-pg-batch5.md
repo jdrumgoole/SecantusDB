@@ -5,6 +5,29 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
 
 #### Fixed
 
+- **Privileges and row-level security were skipped for a cursor's query and
+  a TABLESAMPLE's table.** pg_query's node walk reaches neither, so
+  `DECLARE c CURSOR FOR SELECT * FROM t` and `SELECT * FROM t TABLESAMPLE
+  SYSTEM (100)` read a table the role had no SELECT on, a DECLARE read
+  columns a column GRANT did not cover, and a TABLESAMPLE's alias escaped the
+  column check. All are 42501 now, as on PostgreSQL 15.19
+  (`crates/secantus-pg/tests/declare_reads.rs`).
+- A policy created, or row-level security enabled, inside a transaction
+  block now restricts that block's own later reads; it applied only after
+  COMMIT.
+- A DECLARE's query is planned as a statement of its own: one over a temp
+  table (42P01), a TABLESAMPLE over a temp table (42P01), and one with a
+  subquery (`IN`, `EXISTS`, a scalar subquery: 0A000) all work.
+- A cursor declared with neither SCROLL nor NO SCROLL scans backward only
+  where PostgreSQL's plan can (`ExecSupportsBackwardScan`): a scan, VALUES,
+  a function scan, a subquery or CTE over one, UNION ALL, and anything
+  sorted on top. An aggregate, a window, DISTINCT, a join, a set-returning
+  target list, FOR UPDATE and a FROM-less SELECT refuse with 55000, with
+  PostgreSQL's hint. A join under an ORDER BY is still guessed (RP-043).
+- A DECLARE of a cursor name already open is 42P03; a cursor whose FETCH
+  failed answers 55000 `portal "c" cannot be run` afterwards; and
+  `cursor_to_xml` with a negative count reads backward.
+
 - A `char(n)` field too long for a row type is placed at the text literal
   it came from (`'(abcd,x)'::t`, 22001 at 8), and a RECORD cast to the type
   truncates it as an explicit cast does (`row('abcd', 'x')::t` is
@@ -133,4 +156,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   foreign server or user mapping may set. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
   `[fdw-validator]`).
-- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents`, `enum_literal_analysis`, `restricted_builtins` and `xml_schema_export`.
+- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents`, `enum_literal_analysis`, `restricted_builtins`, `xml_schema_export` and `cursor_declare_reads`.

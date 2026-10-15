@@ -947,3 +947,26 @@ def test_enum_outside_public_is_a_column_type(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert (attnames, described, udt) == ([("id",), ("m",)], enum_oid, [("rp042_q", "e")])
+
+
+@pytest.mark.backlog("RP-043")
+def test_join_cursor_ordered_by_its_key_cannot_scroll(pg: Any) -> None:
+    """PostgreSQL 15.19: a cursor declared without SCROLL over
+    `select * from t join u on t.a = u.a order by t.a` (a merge join in key
+    order) refuses FETCH BACKWARD with 55000; here it scrolls."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp043_t (a int primary key)")
+        pg.execute("create table rp043_u (a int primary key)")
+        pg.execute("insert into rp043_t select generate_series(1, 20)")
+        pg.execute("insert into rp043_u select generate_series(1, 20)")
+        pg.execute(
+            "declare c cursor for select * from rp043_t join rp043_u"
+            " on rp043_t.a = rp043_u.a order by rp043_t.a"
+        )
+        pg.execute("fetch 2 from c")
+        pg.execute("savepoint s")
+        answer = pg_answer(pg, "fetch backward 1 from c")
+    finally:
+        pg.execute("rollback")
+    assert answer[:2] == ("err", "55000")

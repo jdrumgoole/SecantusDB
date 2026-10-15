@@ -3449,6 +3449,19 @@ struct CursorState {
     /// row `base + 1`.
     tail: Option<portal_stream::CursorTail>,
     base: usize,
+    /// An error was raised while the cursor ran (PostgreSQL's
+    /// `PORTAL_FAILED`): every later read of it is refused.
+    failed: bool,
+}
+
+impl CursorState {
+    /// PortalRunFetch's state check: a failed portal cannot be run (55000).
+    fn check_runnable(&self, name: &str) -> std::result::Result<(), String> {
+        if self.failed {
+            return Err(format!("portal \"{name}\" cannot be run"));
+        }
+        Ok(())
+    }
 }
 
 /// One row of `pg_prepared_statements`.
@@ -4078,6 +4091,9 @@ impl PgHandler {
         // the reads may differ (and then the record is cleared, so the next
         // statement installs afresh). They were a sixth of a `select 1`.
         let shareable = !self.storage.in_user_txn()
+            && !self
+                .catalog_changed_in_txn
+                .load(std::sync::atomic::Ordering::Relaxed)
             && self
                 .uncommitted
                 .lock()
@@ -4140,8 +4156,13 @@ impl PgHandler {
             ));
             let (pairs, columns) = self.inheritance();
             secantus_pgplan::inherit::set_inheritance(pairs, columns);
-            secantus_pgplan::rls::set_rls(self.rls_tables());
-            secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
+            // In the open block's transaction: a policy it created, or the
+            // RLS it enabled, restricts its own later reads.
+            let (rls, view_rls) = self
+                .in_open_transaction(|| Ok((self.rls_tables(), self.view_rls_tables())))
+                .unwrap_or_else(|_| (self.rls_tables(), self.view_rls_tables()));
+            secantus_pgplan::rls::set_rls(rls);
+            secantus_pgplan::rls::set_view_rls(view_rls);
             INSTALLED_SESSION_TABLES.with(|c| *c.borrow_mut() = shareable.then_some(session_key));
         }
         // The database and the GUCs, for `current_database()` and
@@ -19488,6 +19509,9 @@ impl PgHandler {
                 format!("cursor \"{name}\" does not exist"),
             ))));
         };
+        if let Err(message) = cursor.check_runnable(name) {
+            return Err(Self::user_error("55000", message));
+        }
         // A streamed cursor reads what this FETCH reaches first.
         if cursor.tail.is_some() {
             self.fill_cursor(cursor, direction, count)?;
@@ -19533,11 +19557,13 @@ impl PgHandler {
             backward && wanted > 0
         };
         if is_backward && !cursor.is_scrollable {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            let mut info = ErrorInfo::new(
                 "ERROR".into(),
                 "55000".into(), // object_not_in_prerequisite_state
                 "cursor can only scan forward".into(),
-            ))));
+            );
+            info.hint = Some("Declare it with SCROLL option to enable backward scan.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
         }
 
         // The 0-based indices of the rows to return, in output order. Kept as
@@ -22929,6 +22955,19 @@ impl PgHandler {
                     "DECLARE CURSOR can only be used in transaction blocks".into(),
                 ))));
             }
+            // PerformCursorOpen's CreatePortal: after the query is planned,
+            // before it runs (15.19).
+            if self
+                .cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&name)
+            {
+                return Err(Self::user_error(
+                    "42P03",
+                    format!("cursor \"{name}\" already exists"),
+                ));
+            }
             // A cursor's rows are encoded ONCE, at DECLARE, in TEXT: the
             // DECLARE arrives over the simple-query protocol, which is always
             // text, and every client can read a text row whatever format it
@@ -23045,6 +23084,7 @@ impl PgHandler {
                         tz,
                         tail: None,
                         base: 0,
+                        failed: false,
                     },
                 );
             if holdable {
@@ -27715,7 +27755,11 @@ impl PgHandler {
                 // read moves the cursor.
                 if let Some(rest) = sql.strip_prefix(secantus_pgplan::FETCH_CURSOR) {
                     let (count, name) = rest.split_once('\u{1f}').unwrap_or(("0", rest));
-                    return self.fetch_values(name, count.parse().unwrap_or(0));
+                    let out = self.fetch_values(name, count.parse().unwrap_or(0));
+                    if out.is_err() {
+                        self.mark_cursor_failed(name);
+                    }
+                    return out;
                 }
                 let key = format!("{sql}\u{0}{params:?}");
                 if let Some(rows) = cache.borrow().get(&key) {
@@ -27781,6 +27825,18 @@ impl PgHandler {
             .collect())
     }
 
+    /// Mark cursor `name` failed, after an error raised while it ran.
+    fn mark_cursor_failed(&self, name: &str) {
+        if let Some(c) = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(name)
+        {
+            c.failed = true;
+        }
+    }
+
     /// The next `count` rows of cursor `name` as values, moving the cursor
     /// past them: a forward FETCH, read from the values captured at DECLARE
     /// rather than the text rows a client is sent.
@@ -27796,37 +27852,51 @@ impl PgHandler {
                 format!("cursor \"{name}\" does not exist"),
             ));
         };
-        // A negative count reads BACKWARD, which only a SCROLL cursor may
-        // (55000, measured on 15.19); none of that is done here yet.
+        if let Err(message) = cursor.check_runnable(name) {
+            return Err(PlanError::Sqlstate("55000", message));
+        }
+        // A negative count reads BACKWARD (SPI's FETCH_FORWARD with a
+        // negative count), which only a SCROLL cursor may (55000, measured
+        // on 15.19); its rows come nearest first.
         if count < 0 && !cursor.is_scrollable {
             return Err(PlanError::Sqlstate(
                 "55000",
-                "cursor can only scan forward".into(),
-            ));
-        }
-        if count < 0 {
-            return Err(PlanError::Unsupported(
-                "cursor_to_xml with a negative count".into(),
+                "cursor can only scan forward\nHint: Declare it with SCROLL option to enable backward scan."
+                    .into(),
             ));
         }
         if count == 0 {
             return Ok(Vec::new());
         }
+        let backward = count < 0;
+        let wanted = count.saturating_abs();
         if cursor.tail.is_some() {
-            self.fill_cursor(cursor, secantus_pgplan::FetchDirection::Forward, count)
+            let direction = if backward {
+                secantus_pgplan::FetchDirection::Backward
+            } else {
+                secantus_pgplan::FetchDirection::Forward
+            };
+            self.fill_cursor(cursor, direction, wanted)
                 .map_err(Self::plan_error_of)?;
         }
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
-        let first = cursor.pos.saturating_add(1).max(1);
-        let last = cursor.pos.saturating_add(count).min(len);
+        let positions: Vec<i64> = if backward {
+            let first = (cursor.pos - 1).min(len);
+            let last = cursor.pos.saturating_sub(wanted).max(1);
+            (last..=first).rev().collect()
+        } else {
+            let first = cursor.pos.saturating_add(1).max(1);
+            let last = cursor.pos.saturating_add(wanted).min(len);
+            (first..=last).collect()
+        };
         let Some(typed) = cursor.typed_rows.as_ref() else {
             return Err(PlanError::Unsupported(
                 "reading this cursor's rows as values".into(),
             ));
         };
         let mut out = Vec::new();
-        for i in first..=last {
+        for i in positions {
             let row = usize::try_from(i - 1)
                 .ok()
                 .and_then(|i| i.checked_sub(base))
@@ -27840,7 +27910,11 @@ impl PgHandler {
                     .collect(),
             );
         }
-        cursor.pos = cursor.pos.saturating_add(count).min(len + 1);
+        cursor.pos = if backward {
+            cursor.pos.saturating_sub(wanted).max(0)
+        } else {
+            cursor.pos.saturating_add(wanted).min(len + 1)
+        };
         if cursor.tail.is_some() {
             portal_stream::trim_cursor(cursor);
         }
@@ -31483,7 +31557,13 @@ impl PgHandler {
                 direction,
                 count,
                 is_move,
-            } => self.fetch(&name, direction, count, is_move),
+            } => {
+                let out = self.fetch(&name, direction, count, is_move);
+                if out.is_err() {
+                    self.mark_cursor_failed(&name);
+                }
+                out
+            }
 
             Statement::CloseCursor(name) => {
                 let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());

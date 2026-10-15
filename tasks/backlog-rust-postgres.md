@@ -339,6 +339,18 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **RUST pgserver: whether a cursor declared without SCROLL scans
+  backward over a join with an ORDER BY is guessed.** PostgreSQL adds
+  `CURSOR_OPT_SCROLL` when the plan supports a backward scan
+  (`ExecSupportsBackwardScan`); `cursor_scroll.rs` reads that from the
+  statement's shape, which settles every shape measured on 15.19 except a
+  join (or IN / EXISTS semi-join) under an ORDER BY. That one depends on
+  where the planner puts the sort: `select * from t join u on t.a = u.a
+  order by t.a` merge-joins in key order and cannot scroll, `select * from
+  t, u order by u.c` sorts on top and can. Here both scroll.
+  Backlog-ID: RP-043
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_join_cursor_ordered_by_its_key_cannot_scroll
+
 - [ ] **RUST pgserver: type-name divergences found beside RP-038
   (2026-10-15).** Each measured on PostgreSQL 15.19:
   - `'a'::public.nosuch` is 42704 `type "public.nosuch" does not exist`;

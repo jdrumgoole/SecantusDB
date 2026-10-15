@@ -74,6 +74,7 @@ pub mod bytea;
 pub mod cancel;
 pub mod catalog_stmts;
 pub mod correlated;
+pub mod cursor_scroll;
 pub mod datetime;
 pub mod domains;
 pub mod dtparse;
@@ -3852,16 +3853,31 @@ fn parse_one(sql: &str) -> Result<N> {
         .as_ref()
         .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))?;
-    func_cast::check_variadic_arity(&node)?;
-    func_cast::spread_variadic(&mut node);
-    func_cast::rewrite(&mut node);
-    pattern_ops(&mut node);
-    unknown_args::check_ambiguous(&node)?;
-    unknown_args::rewrite(&mut node);
-    srf_place::check(&node)?;
-    collation::check_clauses(&node)?;
-    schemas::qualify(&mut node)?;
+    // pg_query's node walk does not descend into a DECLARE's query, so the
+    // rewrites run on that query itself: without it a cursor over a temp
+    // table never reached the table's `pg_temp_N` key (42P01).
+    if let N::DeclareCursorStmt(d) = &mut node {
+        if let Some(inner) = d.query.as_mut().and_then(|q| q.node.as_mut()) {
+            rewrite_statement(inner)?;
+        }
+        return Ok(node);
+    }
+    rewrite_statement(&mut node)?;
     Ok(node)
+}
+
+/// The analysis-time rewrites every statement passes through before it is
+/// planned.
+fn rewrite_statement(node: &mut N) -> Result<()> {
+    func_cast::check_variadic_arity(node)?;
+    func_cast::spread_variadic(node);
+    func_cast::rewrite(node);
+    pattern_ops(node);
+    unknown_args::check_ambiguous(node)?;
+    unknown_args::rewrite(node);
+    srf_place::check(node)?;
+    collation::check_clauses(node)?;
+    schemas::qualify(node)
 }
 
 /// The text pattern comparisons `~<~` / `~<=~` / `~>=~` / `~>~` (the
@@ -4005,9 +4021,34 @@ pub fn plan_with_subqueries(
     params: &[Bson],
     run: SubqueryRunner<'_>,
 ) -> Result<Statement> {
-    let mut node = pg_query::protobuf::Node {
+    let node = pg_query::protobuf::Node {
         node: Some(parse_one_as_sent(sql)?),
     };
+    // A cursor's query is a statement of its own: subqueries, views and
+    // CTEs are resolved in it as in a bare SELECT.
+    if let Some(N::DeclareCursorStmt(d)) = node.node.as_ref() {
+        if let Some(N::SelectStmt(_)) = d.query.as_ref().and_then(|q| q.node.as_ref()) {
+            let inner = plan_query_node(
+                sql,
+                (**d.query.as_ref().expect("checked")).clone(),
+                lookup,
+                params,
+                run,
+            )?;
+            return Ok(declare_cursor(d, inner));
+        }
+    }
+    plan_query_node(sql, node, lookup, params, run)
+}
+
+/// [`plan_with_subqueries`] for one parsed statement.
+fn plan_query_node(
+    sql: &str,
+    mut node: pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    run: SubqueryRunner<'_>,
+) -> Result<Statement> {
     if let Some(e) = sql_json_absent(&node, sql, params) {
         return Err(e);
     }
@@ -4058,6 +4099,40 @@ pub fn plan_with_subqueries(
         lookup,
         &params,
     )
+}
+
+/// The DECLARE of `inner`, the cursor's planned query.
+fn declare_cursor(d: &pg_query::protobuf::DeclareCursorStmt, inner: Statement) -> Statement {
+    let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
+    // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
+    const CURSOR_OPT_BINARY: i32 = 0x0001;
+    const CURSOR_OPT_SCROLL: i32 = 0x0002;
+    const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
+    const CURSOR_OPT_HOLD: i32 = 0x0020;
+    // Deparse the inner query for `pg_cursors.statement`. Best-effort:
+    // an un-deparsable node leaves the column empty rather than failing
+    // the DECLARE, which no client reads that column to check.
+    let statement = inner_node
+        .and_then(|n| n.deparse().ok())
+        .unwrap_or_default();
+    Statement::DeclareCursor {
+        name: d.portalname.clone(),
+        query: Box::new(inner),
+        statement,
+        // Neither SCROLL nor NO SCROLL: whatever the plan can do.
+        scrollable: if d.options & CURSOR_OPT_SCROLL != 0 {
+            true
+        } else if d.options & CURSOR_OPT_NO_SCROLL != 0 {
+            false
+        } else {
+            match inner_node {
+                Some(N::SelectStmt(sel)) => cursor_scroll::scrolls_by_default(sel),
+                _ => true,
+            }
+        },
+        holdable: (d.options & CURSOR_OPT_HOLD) != 0,
+        binary: (d.options & CURSOR_OPT_BINARY) != 0,
+    }
 }
 
 pub(crate) fn plan_node_public(
@@ -4384,30 +4459,12 @@ fn plan_node(
             if_not_exists: c.if_not_exists,
         }),
         N::DeclareCursorStmt(d) => {
-            let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
-            let inner = match inner_node {
+            let inner = match d.query.as_ref().and_then(|q| q.node.as_ref()) {
                 Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
                 Some(other) => return Err(Error::Unsupported(disc(other))),
                 None => return Err(Error::Parse("DECLARE CURSOR without a query".into())),
             };
-            // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
-            const CURSOR_OPT_BINARY: i32 = 0x0001;
-            const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
-            const CURSOR_OPT_HOLD: i32 = 0x0020;
-            // Deparse the inner query for `pg_cursors.statement`. Best-effort:
-            // an un-deparsable node leaves the column empty rather than failing
-            // the DECLARE, which no client reads that column to check.
-            let statement = inner_node
-                .and_then(|n| n.deparse().ok())
-                .unwrap_or_default();
-            Ok(Statement::DeclareCursor {
-                name: d.portalname.clone(),
-                query: Box::new(inner),
-                statement,
-                scrollable: (d.options & CURSOR_OPT_NO_SCROLL) == 0,
-                holdable: (d.options & CURSOR_OPT_HOLD) != 0,
-                binary: (d.options & CURSOR_OPT_BINARY) != 0,
-            })
+            Ok(declare_cursor(&d, inner))
         }
         N::FetchStmt(f) => {
             use pg_query::protobuf::FetchDirection as Fd;
@@ -21813,7 +21870,7 @@ fn finish_aggregate(
 /// same expression compare equal wherever they sat in the query text --
 /// PostgreSQL's `equal()` for the purpose of matching a target to a GROUP BY
 /// key.
-fn node_print(node: &pg_query::protobuf::Node) -> String {
+pub(crate) fn node_print(node: &pg_query::protobuf::Node) -> String {
     static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     LOCATION
         .get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"))
