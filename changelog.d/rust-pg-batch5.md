@@ -54,6 +54,13 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   columns had the same per-column loop, and is fixed with it
   (`::test_drop_domain_cascade_drops_every_column`).
 
+- An enum compared with an untyped literal reads it as the enum when the
+  statement is analysed, as PostgreSQL does: `c = 'zz'` is 22P02 at the
+  literal even over an empty table (it had answered no rows), in `=`, `<`,
+  `IN` and `IS DISTINCT FROM`. An enum beside any other typed operand
+  (`c = d::text`) is 42883, where it had compared the label text. Part of
+  RP-041 (`tests/backlog/test_rust_postgres_gaps.py::test_enum_comparison_reads_its_literal_at_plan_time`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
@@ -65,4 +72,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   foreign server or user mapping may set. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
   `[fdw-validator]`).
-- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar` and `drop_type_dependents`.
+- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents` and `enum_literal_analysis`.

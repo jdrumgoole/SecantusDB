@@ -741,7 +741,7 @@ def test_untyped_array_literals(pg: Any, pg15: Any, sql: str) -> None:
     _same_as_reference(pg, pg15, sql)
 
 
-@pytest.mark.backlog("RP-041")
+@pytest.mark.backlog_fixed("RP-041")
 def test_enum_comparison_reads_its_literal_at_plan_time(pg: Any) -> None:
     """PostgreSQL 15.19: `c = 'zz'` over an enum column is 22P02 `invalid
     input value for enum`, even over an empty table; here it answers no rows."""

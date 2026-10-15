@@ -345,9 +345,6 @@ one beside it.
 
 - [ ] **RUST pgserver: type-name divergences found beside RP-038
   (2026-10-15).** Each measured on PostgreSQL 15.19:
-  - `c = 'zz'` over an enum column is 22P02 `invalid input value for enum`
-    even over an empty table; here it answers no rows (the literal is read
-    only against rows).
   - `'a'::public.nosuch` is 42704 `type "public.nosuch" does not exist`;
     here the schema is dropped from the name (`pg_catalog.` likewise), an
     unknown schema (`1::nosuch.t`) is this 42704 where PostgreSQL says 3F000
@@ -362,7 +359,7 @@ one beside it.
   - A domain over an enum is described as varchar (1043); PostgreSQL sends
     the enum's oid.
   Backlog-ID: RP-041
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_enum_comparison_reads_its_literal_at_plan_time,tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name,tests/backlog/test_rust_postgres_gaps.py::test_domain_over_enum_is_described_as_the_enum
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_qualified_unknown_type_is_named_qualified,tests/backlog/test_rust_postgres_gaps.py::test_quoted_mixed_case_type_name,tests/backlog/test_rust_postgres_gaps.py::test_domain_over_enum_is_described_as_the_enum
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

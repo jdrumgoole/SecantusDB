@@ -675,6 +675,63 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         return Ok(());
     }
     let kind = K::try_from(e.kind).ok();
+    // An enum compared with an untyped literal reads the literal as the enum
+    // when the statement is analysed (`c = 'zz'` is 22P02 at the literal on
+    // 15.19, even over an empty table).
+    if matches!(
+        kind,
+        Some(K::AexprOp | K::AexprDistinct | K::AexprNotDistinct)
+    ) {
+        for (col, lit) in [
+            (e.lexpr.as_deref(), e.rexpr.as_deref()),
+            (e.rexpr.as_deref(), e.lexpr.as_deref()),
+        ] {
+            let (Some(col), Some(lit)) = (col, lit) else {
+                continue;
+            };
+            let Some(N::AConst(c)) = lit.node.as_ref() else {
+                continue;
+            };
+            let Some(pg_query::protobuf::a_const::Val::Sval(label)) = c.val.as_ref() else {
+                continue;
+            };
+            if let Some(ty) = operand_type(col, scope).filter(|t| crate::user_enum(t).is_some()) {
+                crate::cast_value(Bson::String(label.sval.clone()), &ty)?;
+            }
+        }
+        // An enum has its comparison operators against itself only: beside
+        // any other TYPED operand (`c = d::text`) there is none (42883).
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let is_enum = |t: &str| crate::user_enum(t).is_some();
+            if (is_enum(&l) || is_enum(&r))
+                && l != r
+                && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+            {
+                let op = if op == "!=" { "<>" } else { op.as_str() };
+                return Err(mismatch(op, &l, &r, e.location));
+            }
+        }
+    }
+    // `c IN ('a', 'zz')` over an enum: each untyped literal is read as the
+    // enum when the statement is analysed.
+    if kind == Some(K::AexprIn) {
+        if let (Some(col), Some(N::List(items))) = (
+            e.lexpr.as_deref(),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            if let Some(ty) = operand_type(col, scope).filter(|t| crate::user_enum(t).is_some()) {
+                for item in &items.items {
+                    if let Some(N::AConst(c)) = item.node.as_ref() {
+                        if let Some(pg_query::protobuf::a_const::Val::Sval(label)) = c.val.as_ref()
+                        {
+                            crate::cast_value(Bson::String(label.sval.clone()), &ty)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // A COMPOSITE has only the record operators, and those only against the
     // same type: beside any other typed operand there is no operator at all
     // (`integer + point_t`, `point_t = integer`), and a user cast never
