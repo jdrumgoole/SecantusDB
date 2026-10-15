@@ -91,7 +91,9 @@ mod ts_debug;
 mod ts_rewrite;
 pub mod validators;
 pub mod wparser;
+mod xml_catalog;
 mod xml_export;
+mod xml_schema;
 pub use funcsig::is_builtin_function_name as is_known_function;
 mod optype;
 mod semijoin;
@@ -132,6 +134,7 @@ pub mod user_casts;
 pub use correlated::{is_user_procedure, set_user_functions, set_user_procedures};
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
+    DESCRIBE_QUERY, FETCH_CURSOR,
 };
 pub mod json;
 pub mod jsonfn;

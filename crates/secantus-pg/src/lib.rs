@@ -27645,6 +27645,18 @@ impl PgHandler {
             std::cell::RefCell::new(HashMap::new());
         let runner =
             |sql: &str, params: &[Bson]| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+                // `query_to_xmlschema` and its kin read a query's COLUMNS,
+                // which exist even when it returns no rows (SPI's tupdesc).
+                if let Some(query) = sql.strip_prefix(secantus_pgplan::DESCRIBE_QUERY) {
+                    return self.describe_columns(query);
+                }
+                // `cursor_to_xml` reads an open cursor's next rows, as SPI's
+                // `SPI_cursor_fetch` does: never from the cache, since each
+                // read moves the cursor.
+                if let Some(rest) = sql.strip_prefix(secantus_pgplan::FETCH_CURSOR) {
+                    let (count, name) = rest.split_once('\u{1f}').unwrap_or(("0", rest));
+                    return self.fetch_values(name, count.parse().unwrap_or(0));
+                }
                 let key = format!("{sql}\u{0}{params:?}");
                 if let Some(rows) = cache.borrow().get(&key) {
                     return Ok(rows.clone());
@@ -27669,6 +27681,110 @@ impl PgHandler {
                 Ok(rows)
             };
         secantus_pgplan::with_correlated_runner(&runner, f)
+    }
+
+    /// A query's result columns as rows of `[name, type oid, declared type]`,
+    /// for the SQL/XML schema mappings, which name each column's type from
+    /// the portal's tuple descriptor. The wire describes a domain column as
+    /// its BASE type, as PostgreSQL's RowDescription does, while the tuple
+    /// descriptor keeps the domain; so a column read straight from a table
+    /// column declared over a domain (or an enum, which this server's
+    /// description reports as text) carries that type's name as well.
+    fn describe_columns(&self, sql: &str) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+        let fields = self
+            .describe_fields(sql, 0, &[])
+            .map_err(Self::plan_error_of)?
+            .unwrap_or_default();
+        Ok(fields
+            .iter()
+            .map(|f| {
+                let declared = match (f.table_id(), f.column_id()) {
+                    (Some(rel), Some(att)) if rel > 0 && att > 0 => self
+                        .lookup(&secantus_pgplan::regclass_text(i64::from(rel)))
+                        .and_then(|def| {
+                            def.columns.get(usize::try_from(att - 1).ok()?).map(|c| {
+                                c.extra
+                                    .get_str("domain_type")
+                                    .or_else(|_| c.extra.get_str("enum_type"))
+                                    .unwrap_or(&c.pg_type)
+                                    .to_string()
+                            })
+                        }),
+                    _ => None,
+                };
+                vec![
+                    Bson::String(f.name().to_string()),
+                    Bson::Int64(i64::from(f.datatype().oid())),
+                    declared.map_or(Bson::Null, Bson::String),
+                ]
+            })
+            .collect())
+    }
+
+    /// The next `count` rows of cursor `name` as values, moving the cursor
+    /// past them: a forward FETCH, read from the values captured at DECLARE
+    /// rather than the text rows a client is sent.
+    fn fetch_values(
+        &self,
+        name: &str,
+        count: i64,
+    ) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cursor) = cursors.get_mut(name) else {
+            return Err(PlanError::Sqlstate(
+                "34000",
+                format!("cursor \"{name}\" does not exist"),
+            ));
+        };
+        // A negative count reads BACKWARD, which only a SCROLL cursor may
+        // (55000, measured on 15.19); none of that is done here yet.
+        if count < 0 && !cursor.is_scrollable {
+            return Err(PlanError::Sqlstate(
+                "55000",
+                "cursor can only scan forward".into(),
+            ));
+        }
+        if count < 0 {
+            return Err(PlanError::Unsupported(
+                "cursor_to_xml with a negative count".into(),
+            ));
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if cursor.tail.is_some() {
+            self.fill_cursor(cursor, secantus_pgplan::FetchDirection::Forward, count)
+                .map_err(Self::plan_error_of)?;
+        }
+        let base = cursor.base;
+        let len = (base + cursor.rows.len()) as i64;
+        let first = cursor.pos.saturating_add(1).max(1);
+        let last = cursor.pos.saturating_add(count).min(len);
+        let Some(typed) = cursor.typed_rows.as_ref() else {
+            return Err(PlanError::Unsupported(
+                "reading this cursor's rows as values".into(),
+            ));
+        };
+        let mut out = Vec::new();
+        for i in first..=last {
+            let row = usize::try_from(i - 1)
+                .ok()
+                .and_then(|i| i.checked_sub(base))
+                .and_then(|i| typed.get(i))
+                .ok_or_else(|| {
+                    PlanError::Sqlstate("XX000", format!("cursor \"{name}\" lost its place"))
+                })?;
+            out.push(
+                row.iter()
+                    .map(|v| v.clone().unwrap_or(Bson::Null))
+                    .collect(),
+            );
+        }
+        cursor.pos = cursor.pos.saturating_add(count).min(len + 1);
+        if cursor.tail.is_some() {
+            portal_stream::trim_cursor(cursor);
+        }
+        Ok(out)
     }
 
     fn execute_statement(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
