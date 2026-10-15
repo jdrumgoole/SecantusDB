@@ -386,9 +386,6 @@ one beside it.
   PostgreSQL 15's `pg_cast` / `pg_operator` have no entry for, and typed
   untyped literals in set operations and NULLIF (corpus
   `typed_value_render`, 634 checks). Still different:
-  - `'\x01'::bytea || 'x'` answers `\x01`, DROPPING the `x`; PostgreSQL
-    reads the untyped side as `bytea` (`\x0178`). The same for `bit` /
-    `varbit`.
   - `array[row(1)]` comes back as the one string `{(1)}`, not an array.
   - `'now()'::regprocedure` is 42883 and `regoper` does not exist.
   - A refused function-style cast (`int8(true)`) is 42846; PostgreSQL

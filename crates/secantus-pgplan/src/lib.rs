@@ -22153,7 +22153,19 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             }
             // `x || 'a'` over a type with no `||` of its own is text
             // concatenation (`anytextcat`), not the geometric "is parallel".
-            if op == "||" && textcat_operands(lt().map(String::as_str), rt().map(String::as_str)) {
+            let spell = |t: Option<&String>, n: Option<&pg_query::protobuf::Node>| {
+                if unknown_operand(n) || null_literal(n) {
+                    Some("unknown".to_string())
+                } else {
+                    t.cloned()
+                }
+            };
+            if op == "||"
+                && textcat_operands(
+                    spell(lt(), e.lexpr.as_deref()).as_deref(),
+                    spell(rt(), e.rexpr.as_deref()).as_deref(),
+                )
+            {
                 return "text".to_string();
             }
             if let (Some(lt), Some(rt)) = (lt(), rt()) {
@@ -22173,7 +22185,12 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             // Bit-string operators keep the left operand's type; `||` is varbit
             // and `~` the operand's.
             if matches!(op, "&" | "|" | "#" | "<<" | ">>" | "||" | "~") {
-                if let Some(t) = lt().or(rt()) {
+                // `'01' || B'10'`: an untyped left side, so the bit string
+                // can be on either side.
+                let bit_side = lt()
+                    .filter(|t| bits::is_bit_type(t))
+                    .or_else(|| rt().filter(|t| bits::is_bit_type(t) && op == "||"));
+                if let Some(t) = bit_side.or(lt()).or(rt()) {
                     if bits::is_bit_type(t) {
                         return if op == "||" {
                             "varbit".to_string()
@@ -22191,7 +22208,9 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 return "tsquery".to_string();
             }
             if matches!(op, "||" | "&&" | "<->") {
-                if let Some(t) = lt() {
+                // Either side: `'c' || 'a b'::tsvector` is a tsvector.
+                let right = rt().filter(|_| unknown_operand(e.lexpr.as_deref()));
+                for t in lt().into_iter().chain(right) {
                     if t == "tsvector" || t == "tsquery" {
                         return t.clone();
                     }
@@ -30583,10 +30602,47 @@ fn textcat_type(t: &str) -> bool {
 }
 
 /// Is `l || r` text concatenation of a [`textcat_type`] side with a string
-/// (or untyped) one?
+/// (or untyped) one? Or of a type with a `||` of its own -- bytea, the bit
+/// strings, jsonb, the text-search types -- with a TYPED string: there is no
+/// `bytea || text`, so it is `anytextcat` too (`'\x01'::bytea || 'x'::text`
+/// is the text `\x01x`). An UNTYPED side beside one of those is read as
+/// its type instead ([`own_concat_type`]); the caller spells such a side
+/// `unknown`.
 fn textcat_operands(l: Option<&str>, r: Option<&str>) -> bool {
     let stringy = |t: Option<&str>| t.is_some_and(|t| is_string_type(t) || t == "unknown");
-    (l.is_some_and(textcat_type) && stringy(r)) || (r.is_some_and(textcat_type) && stringy(l))
+    let typed_string = |t: Option<&str>| t.is_some_and(is_string_type);
+    let own = |t: Option<&str>| t.is_some_and(|t| own_concat_type(t).is_some());
+    (l.is_some_and(textcat_type) && stringy(r))
+        || (r.is_some_and(textcat_type) && stringy(l))
+        || (own(l) && typed_string(r))
+        || (own(r) && typed_string(l))
+}
+
+/// Is `n` a bare `NULL` (untyped, so `unknown` like a string literal)?
+fn null_literal(n: Option<&pg_query::protobuf::Node>) -> bool {
+    matches!(n.and_then(|x| x.node.as_ref()), Some(N::AConst(c)) if c.isnull)
+}
+
+/// Is `n` a TYPED string operand (`'x'::text`, a text column), as opposed
+/// to an untyped literal or parameter?
+fn typed_string_operand(n: Option<&pg_query::protobuf::Node>, v: &Bson) -> bool {
+    !unknown_operand(n) && !null_literal(n) && n.is_some_and(|n| is_string_type(&static_type(n, v)))
+}
+
+/// The type an untyped operand of `||` is read as beside `t`, when `t` has a
+/// `||` of its own (`byteacat`, `bitcat`, `tsvector_concat`, `tsquery_or`,
+/// `jsonb_concat`): `'\x01'::bytea || 'x'` is the bytea `\x0178`,
+/// `B'10' || '01'` the varbit `1001`, `'c' || 'a b'::tsvector` a tsvector.
+/// Measured on PostgreSQL 15.19.
+fn own_concat_type(t: &str) -> Option<&'static str> {
+    Some(match t {
+        "bytea" => "bytea",
+        "bit" | "varbit" | "bit varying" => "varbit",
+        "tsvector" => "tsvector",
+        "tsquery" => "tsquery",
+        "jsonb" => "jsonb",
+        _ => return None,
+    })
 }
 
 /// Is `f` one of the functions that print their arguments (`concat`,
@@ -30771,6 +30827,13 @@ fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bs
     if !matches!(op, "@@" | "@@@" | "||" | "&&" | "<->") {
         return None;
     }
+    // `tsvector || text` has no operator of its own: it is `anytextcat`.
+    if op == "||"
+        && (typed_string_operand(e.lexpr.as_deref(), lhs)
+            || typed_string_operand(e.rexpr.as_deref(), rhs))
+    {
+        return None;
+    }
     let lt = e
         .lexpr
         .as_deref()
@@ -30781,6 +30844,16 @@ fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bs
         .map_or_else(String::new, |n| static_type(n, rhs));
     let fts_type = |t: &str| t == "tsvector" || t == "tsquery";
     if op != "@@" && op != "@@@" {
+        // An untyped left side beside a tsvector / tsquery is read as that
+        // type (`'c' || 'a b'::tsvector` is `tsvector_concat`).
+        if !fts_type(&lt) && fts_type(&rt) && unknown_operand(e.lexpr.as_deref()) {
+            if *lhs == Bson::Null || *rhs == Bson::Null {
+                return Some(Ok(Bson::Null));
+            }
+            return Some(
+                cast_value(lhs.clone(), &rt).and_then(|l| fts::operator(op, &rt, &l, rhs)),
+            );
+        }
         if !fts_type(&lt) {
             return None;
         }
@@ -30998,6 +31071,42 @@ fn coerce_unknown_operand(
         } else {
             (coerced, rhs)
         });
+    }
+    // Beside a NULL array an unknown is that array type: `null::int[] ||
+    // '{3}'` is array_cat's `{3}`.
+    if op == "||" && *typed == Bson::Null {
+        if let Some(ty) = typed_node
+            .map(|n| static_type(n, typed))
+            .filter(|t| t.ends_with("[]"))
+        {
+            let coerced = cast_value(Bson::String(text.clone()), &ty)?;
+            return Ok(if r_bare {
+                (lhs, coerced)
+            } else {
+                (coerced, rhs)
+            });
+        }
+    }
+    // Beside a type with a `||` of its own an unknown is that type.
+    if op == "||" {
+        if let Some(ty) = typed_node.and_then(|n| own_concat_type(&static_type(n, typed))) {
+            // A literal its type's input refuses is reported at the literal.
+            let literal = if r_bare {
+                e.rexpr.as_deref()
+            } else {
+                e.lexpr.as_deref()
+            };
+            let coerced = cast_value(Bson::String(text.clone()), ty).inspect_err(|_| {
+                if let Some(N::AConst(c)) = literal.and_then(|n| n.node.as_ref()) {
+                    set_error_location(c.location);
+                }
+            })?;
+            return Ok(if r_bare {
+                (lhs, coerced)
+            } else {
+                (coerced, rhs)
+            });
+        }
     }
     let coerced = match typed {
         // Beside an interval or a timestamp an unknown is that type -- except
@@ -35371,7 +35480,22 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 .as_deref()
                 .is_some_and(|n| bits::is_bit_type(&static_type(n, &rhs)))
         {
-            if let Some(out) = bits::binary(&op, &lhs, &rhs) {
+            // `B'10' || '01'` is `bitcat`: the untyped side is read by the
+            // bit-string input function (`'x1F'` is hex, `'012'` refused).
+            let read = |n: Option<&pg_query::protobuf::Node>, v: Bson| -> Result<Bson> {
+                if op == "||" && unknown_operand(n) && matches!(v, Bson::String(_)) {
+                    cast_value(v, "varbit").inspect_err(|_| {
+                        if let Some(N::AConst(c)) = n.and_then(|n| n.node.as_ref()) {
+                            set_error_location(c.location);
+                        }
+                    })
+                } else {
+                    Ok(v)
+                }
+            };
+            let bl = read(e.lexpr.as_deref(), lhs.clone())?;
+            let br = read(e.rexpr.as_deref(), rhs.clone())?;
+            if let Some(out) = bits::binary(&op, &bl, &br) {
                 return out;
             }
         }
@@ -35494,9 +35618,28 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             let r_json = static_json_type(e.rexpr.as_deref(), &rhs);
             let jsonb = l_json.as_deref() == Some("jsonb")
                 || (op == "||" && r_json.as_deref() == Some("jsonb"));
-            if jsonb {
+            // Beside a TYPED string there is no `jsonb || text`: it is
+            // `anytextcat`, text concatenation (below).
+            let beside_text = op == "||"
+                && (typed_string_operand(e.lexpr.as_deref(), &lhs)
+                    || typed_string_operand(e.rexpr.as_deref(), &rhs));
+            if jsonb && !beside_text {
                 if lhs == Bson::Null || rhs == Bson::Null {
                     return Ok(Bson::Null);
+                }
+                // An untyped side is read by jsonb's input function, so a
+                // text it refuses is reported at the literal.
+                for (n, v) in [(e.lexpr.as_deref(), &lhs), (e.rexpr.as_deref(), &rhs)] {
+                    if let (Some(N::AConst(c)), Bson::String(t)) =
+                        (n.and_then(|n| n.node.as_ref()), v)
+                    {
+                        if op == "||" && unknown_operand(n) && json::parse(t).is_err() {
+                            set_error_location(c.location);
+                            return Err(Error::InvalidText(
+                                "invalid input syntax for type json".to_string(),
+                            ));
+                        }
+                    }
                 }
                 return match op.as_str() {
                     "-" => {
@@ -35586,6 +35729,17 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // `int4range || 'x'` a malformed range literal.
         let lt = e.lexpr.as_deref().map(|n| static_type(n, &lhs));
         let rt = e.rexpr.as_deref().map(|n| static_type(n, &rhs));
+        let spell = |t: &Option<String>, n: Option<&pg_query::protobuf::Node>| {
+            if unknown_operand(n) || null_literal(n) {
+                Some("unknown".to_string())
+            } else {
+                t.clone()
+            }
+        };
+        let (lt, rt) = (
+            spell(&lt, e.lexpr.as_deref()),
+            spell(&rt, e.rexpr.as_deref()),
+        );
         let (lhs, rhs) = if op == "||" && textcat_operands(lt.as_deref(), rt.as_deref()) {
             let side = |t: Option<&str>, v: Bson| match t {
                 Some(t) if textcat_type(t) && v != Bson::Null => {
