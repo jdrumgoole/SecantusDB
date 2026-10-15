@@ -699,7 +699,7 @@ def test_ties_under_an_aggregate_sort_with_a_limit(rust_mongo: Any, mongod: Any)
     _same_order(rust_mongo, mongod, "rm049a", [], command)
 
 
-@pytest.mark.backlog("RM-050")
+@pytest.mark.backlog_fixed("RM-050")
 def test_ties_between_merged_scans(rust_mongo: Any, mongod: Any) -> None:
     """`{a: {$in: [5, 3]}}, sort {b: 1}` over `{a: 1, b: 1}`: mongod merges a
     scan per value through a priority queue."""
@@ -718,7 +718,7 @@ def test_unknown_hint_on_aggregate(rust_mongo: Any, mongod: Any) -> None:
 THREE = [_index({"a": 1}), _index({"b": 1}), _index({"a": 1, "b": 1})]
 
 
-@pytest.mark.backlog("RM-052")
+@pytest.mark.backlog_fixed("RM-052")
 def test_which_predicate_index_is_read(rust_mongo: Any, mongod: Any) -> None:
     """`{a: {$gt: 0}, b: 1}` with `a_1`, `b_1` and `a_1_b_1`: mongod reads
     `b_1`, and returns the documents in its order."""
@@ -726,7 +726,7 @@ def test_which_predicate_index_is_read(rust_mongo: Any, mongod: Any) -> None:
     _same_order(rust_mongo, mongod, "rm052", THREE, command)
 
 
-@pytest.mark.backlog("RM-053")
+@pytest.mark.backlog_fixed("RM-053")
 def test_match_after_add_fields_reads_its_index(rust_mongo: Any, mongod: Any) -> None:
     """mongod moves a `$match` that reads no field `$addFields` writes ahead
     of it, and reads `b_1` for it."""
@@ -745,7 +745,7 @@ WORDS = [
 CI = {"locale": "en", "strength": 2}
 
 
-@pytest.mark.backlog("RM-054")
+@pytest.mark.backlog_fixed("RM-054")
 def test_regex_under_a_collation_with_two_indexes(rust_mongo: Any, mongod: Any) -> None:
     """`{w: {$regex: "^a"}}, sort {w: 1}` under a collation, with a plain and
     a collated index on `w`."""
@@ -754,7 +754,7 @@ def test_regex_under_a_collation_with_two_indexes(rust_mongo: Any, mongod: Any) 
     _same_order(rust_mongo, mongod, "rm054", indexes, command, docs=WORDS)
 
 
-@pytest.mark.backlog("RM-054")
+@pytest.mark.backlog_fixed("RM-054")
 def test_in_sort_after_writes(rust_mongo: Any, mongod: Any) -> None:
     """`{a: {$in: [5, 3]}}, sort {a: -1}` over `a_1` after writes that move
     documents: the same merge as RM-050."""

@@ -211,20 +211,21 @@ Size: two batches.
 
 Size: one or two batches; scan order is the hard part.
 
-## Phase 4 -- the planner and the order (7.080: 97; 7.075: 72)
+## Phase 4 -- the planner and the order (7.080: 97 -> 77; 7.075: 72 -> 35)
 
-- [ ] Ties between the scans a sort merges (about 15): mongod's priority
-      queue.
-- [ ] Which of several predicate indexes is read (1); `$match` moved ahead of
-      `$addFields` (1).
-- [ ] The storage router reads the index for `$ne`, `$nin`, `$exists`,
-      regex and the other 19 filter shapes (7.075); this also removes the
-      3.2x cost recorded under 7.080.
-- [ ] `explain` of `aggregate` (about 24): slot-based plans, `DISTINCT_SCAN`,
-      the added projection, `$match` ahead of `$unwind`, per-stage counts
-      under `$limit`. The largest single job; last, or not at all.
-
-Size: two batches without the aggregate `explain`, three or more with it.
+- [x] Ties between the scans a sort merges: mongod's priority queue.
+- [x] Which of several predicate indexes is read; `$match` moved ahead of
+      `$addFields`. Done by reproducing mongod's plan trial, which also
+      gives `rejectedPlans`.
+- [x] The storage router reads the index for `$ne`, `$nin`, `$exists`,
+      regex and the other filter shapes (RM-069 closed).
+- [x] `explain` of `aggregate`, classic part: `DISTINCT_SCAN`, the added
+      projection, `$match` ahead of `$unwind`, per-stage counts under
+      `$limit`. Not done: the slot-based plans (RM-071 / RM-072), which
+      need the engine's own programs; a stand-in is Joe's call.
+- Split off: exact numeric comparison (RM-152), found during this phase,
+  on its own branch `rust-numeric-exact`; it merges after the Rust PG
+  server's RP-040.
 
 ## Phase 5 -- smaller tails
 

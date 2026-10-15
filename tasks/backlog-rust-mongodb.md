@@ -869,7 +869,7 @@ over a raw connection. A read is compared by the `_id`s it returns, in
 order; a write of one document (`delete` with `limit: 1`, `update` without
 `multi`, `findAndModify`) by its reply and by what the collection holds
 afterwards. mongod answered the same on three runs against itself. The
-Rust server differs on 97 replies. Pinned by
+Rust server differs on 77 replies (97 before Phase 4, 2026-10-15). Pinned by
 `crates/secantus-storage-adapter/tests/find_order_wt.rs`.
 
 The store says only WHICH documents match (`Storage::matching_rows`, in
@@ -885,8 +885,8 @@ What the order follows, each measured:
 - An index scan returns its entries by key and then by insertion; a
   backward scan returns equal keys last first.
 - `$ne`, `$nin`, `$exists`, `$type`, `$not`, `$mod` and a regex read the
-  index in mongod, and come back in its order. The router scans the
-  collection for them.
+  index in mongod, and come back in its order. The router reads the index
+  for them too (`secantus-storage/src/scan_bounds.rs`).
 - A hinted `_id` index reads in `_id` order.
 - `$or` branches that are one predicate on an index's leading field share
   one scan of it; the scans come index by index, not in the order written.
@@ -897,12 +897,20 @@ What the order follows, each measured:
   counted here, in mongod's own steps, for a collection of up to 2,000
   documents (`plan::walk_finishes_first`). Past that the predicate's index
   is kept.
+- Where several plans could serve a query, mongod's trial is reproduced
+  (`explain/trial.rs`): works counted round-robin, its plan ranker's
+  scores, AND_SORTED intersections, and one plan per predicate on an
+  index's array field. That trial also picks the read order.
+- Scans a sort merges (an `$in` under a sort) come out through libc++'s
+  priority queue (`secantus_core::heap`), as in mongod.
+- A `$match` after `$addFields` or `$unwind` that reads no field the stage
+  writes moves ahead of it (`explain/hoist.rs`).
 - An index of another collation does not return a sort, and a regex is
   still bounded by an index of plain strings under a query collation.
 - An empty array is indexed as `undefined`, between MinKey and null, and an
   array element without the rest of the path as null.
 
-Still different, all 97:
+Still different, all 77:
 
 - [ ] **Ties under a sort with a limit** (62). mongod keeps the first
       `limit` documents of a blocking sort in a heap, and the order the heap
@@ -913,29 +921,50 @@ Still different, all 97:
       and was not measured.
       Backlog-ID: RM-049
       Verify: tests/backlog/test_rm_029_056.py::test_ties_under_a_sort_with_a_limit,tests/backlog/test_rm_029_056.py::test_ties_under_an_aggregate_sort_with_a_limit
-- [ ] **Ties between the scans a sort merges** (about 15): `{a: {$in: [5,
-      3]}}, sort {b: 1}` over `{a: 1, b: 1}`. mongod merges one scan per
-      value through a priority queue; equal documents come out in the
-      queue's order. Here they come out scan by scan.
-      Backlog-ID: RM-050
-      Verify: tests/backlog/test_rm_029_056.py::test_ties_between_merged_scans
 - [ ] **An unknown hint's wording** on `aggregate` (15), as under 7.075.
   Backlog-ID: RM-051
   Verify: tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate
-- [ ] **Which of several predicate indexes is read** (1): `{a: {$gt: 0},
-      b: 1}` with `a_1`, `b_1` and `a_1_b_1`. mongod reads `b_1`; the fixed
-      preference here takes `a_1_b_1`.
-      Backlog-ID: RM-052
-      Verify: tests/backlog/test_rm_029_056.py::test_which_predicate_index_is_read
-- [ ] **A `$match` after `$addFields`** (1): mongod moves it ahead of the
-      stage when it reads no field the stage writes, and then reads its
-      index.
-      Backlog-ID: RM-053
-      Verify: tests/backlog/test_rm_029_056.py::test_match_after_add_fields_reads_its_index
-- [ ] One regex under a collation with two indexes on the field, and two
-      `$in` sorts after writes that turn on the same merge.
-      Backlog-ID: RM-054
-      Verify: tests/backlog/test_rm_029_056.py::test_regex_under_a_collation_with_two_indexes,tests/backlog/test_rm_029_056.py::test_in_sort_after_writes
+- [ ] **The order of an unsorted `find` for six predicate shapes the
+      plan derives differently from mongod.** Found by p4-router's
+      824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
+      matched set right in every one, only the order different.
+      - `$ne: null` / `$nin: [null]` over an index holding arrays (8):
+        mongod runs a COLLSCAN; this server scans the index over
+        `[MinKey, null), (null, MaxKey]`.
+      - `$type: "object"` (5): mongod scans the object bracket `[{}, [])`
+        and returns the documents by value; this server scans the
+        collection.
+      - `$elemMatch: {$ne: 5}` (4): mongod scans `[MinKey, 5), (5,
+        MaxKey]`; this server scans the collection.
+      - `$type: "date"` over a descending index (2): mongod reads the date
+        bracket, latest first; this server scans the collection.
+      - A regex with an alternation, `^s|t`, over a descending index (2):
+        mongod bounds it by every string; the plan here takes the prefix
+        `s` (`regex_prefix` ignores `|`), so its bounds are wrong, and the
+        result is right only because the router decides membership.
+      - `$exists: true` with `c: {$gte: 1}` over a partial index on `c >=
+        1` (1): mongod sees the query implies the filter and reads the
+        partial index in key order; this server scans the collection.
+      Backlog-ID: RM-155
+      Verify: tests/backlog/test_rm_order_shapes.py::test_ne_null_over_a_multikey_index_scans_the_collection,tests/backlog/test_rm_order_shapes.py::test_type_object_reads_the_object_bracket,tests/backlog/test_rm_order_shapes.py::test_elem_match_ne_reads_the_index,tests/backlog/test_rm_order_shapes.py::test_type_date_reads_a_descending_index_latest_first,tests/backlog/test_rm_order_shapes.py::test_regex_with_an_alternation_reads_every_string,tests/backlog/test_rm_order_shapes.py::test_exists_over_a_partial_index_the_query_implies
+- [ ] **A double is compared with a Decimal128 or an Int64 by its
+      shortest decimal form, not its exact value.** Silent wrong answers,
+      with or without an index. mongod 8.2.11 (2026-10-15): `find({a:
+      0.1})` matches the double and not `Decimal128("0.1")` (this server:
+      both); `{a: {$lt: 0.1}}` matches `Decimal128("0.1")` (here:
+      nothing); `{a: 2.0**62}` matches `Int64(2**62)` (here: not);
+      `{a: {$gt: 2.0**62}}` matches `Int64(4611686018427387950)` (here:
+      not). `_id` uniqueness follows the same rule: mongod refuses `_id:
+      2.0**62` beside `_id: Int64(2**62)` and accepts `_id: 0.1` beside
+      `_id: Decimal128("0.1")`; this server does the opposite. The matcher
+      and the sort key (`sortkey::encode_number`, `format!("{d}")`, the
+      Python server's `Decimal(repr(value))`) share the error, so an index
+      agrees with a collection scan. The sort key is on disk in both
+      servers: a fix changes the index entries of every non-integral
+      double, so stored indexes must be rebuilt or refused.
+      Found by the p4-router agent during the Phase 4 router work.
+      Backlog-ID: RM-152
+      Verify: tests/backlog/test_rm_numeric_compare.py::test_double_compared_with_decimal_and_int64_exactly,tests/backlog/test_rm_numeric_compare.py::test_id_uniqueness_compares_numbers_exactly
 - [ ] **The multikey paths are not stored.** They are read from the
       collection the first time a query needs them after the server starts
       or an index is dropped, and kept current by writes after that
@@ -943,19 +972,26 @@ Still different, all 97:
       never shrink; after a restart these are what the documents hold.
       Backlog-ID: RM-055
       Verify: tests/backlog/test_rm_029_056.py::test_multikey_paths_survive_a_restart
-- [ ] **The cost.** Timed against the build before on 20,000 documents
-      (`find` by `_id`, by an indexed value, an indexed range, a multikey
-      value, a full scan, sorts, `update_one`): within 8% where the router
-      read the index the plan names, since its rows are already in order
-      (`already_in_order`), and for a scan. `{a: {$ne: 5}}` over `a_1`
-      costs 3.2 times as much (19,980 rows to put in index order where the
-      router scans), a sort with ties over a 500-document collection with
-      an index on each field 1.6 times (the trial reads the collection),
-      and `update_one` by an indexed value 1.2 times (the rows are read to
-      be ordered, then again to be written). An index scan in the store
-      that reads bounds in order would remove the first.
+- [ ] **The cost of the plan trial.** Release builds against 43463aa6
+      (2026-10-15): a query two indexes could serve costs about 5 times as
+      much on 2,000 documents (`{a: 5, b: 3}` over `a_1` and `b_1`), 2
+      times for a range; the trial reads and decodes the collection and
+      encodes its keys. `update_one` by an indexed value is 0.9 times the
+      build before and 1.2 times an update by `_id`
+      (`order::store_order_is_the_plans`); `{a: {$ne: 5}}` over `a_1` 0.7
+      times, a regex prefix 0.01 times, now that the router reads the index.
+      The lever is mongod's plan cache (RM-154).
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
+- [ ] **mongod's plan cache is not reproduced.** mongod runs the trial once
+      per query shape, caches the winner and reuses it, replanning when it
+      does badly, until the entry is evicted. Here every query runs its
+      trial. That decides which plan, and so which order, a repeated query
+      shape gets: mongod's second `{a: 1, b: 9}` uses the plan cached for
+      the shape, which this server picks afresh. It is also the cost lever
+      for RM-056.
+      Backlog-ID: RM-154
+      Verify: none -- needs a scenario measured on mongod first; file a gap test with it
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
@@ -1100,53 +1136,46 @@ paging, projection, `$or`, hints, collation, views, execution counts, what
 the command refuses). Nearly every scenario offers the planner ONE usable
 index or none, so the plan is a rule and not the outcome of mongod's trial
 runs; the scenarios named `choice:` offer two. The Rust server differs on
-72 of 791. `explain` (`crates/secantus-commands/src/explain/`) derives the
+35 of 791 (72 before Phase 4, 2026-10-15). `explain` (`crates/secantus-commands/src/explain/`) derives the
 plan from mongod's planning rules, and `executionStats` from walking that
 plan over the collection's documents. Pinned by
 `crates/secantus-storage-adapter/tests/explain_commands_wt.rs`.
 
 What is left, all on the RUST MongoDB server:
 
-- [ ] **`explain` describes the plan mongod runs, which is not always how
-      this server reads the documents.** Results are the same; the access
-      path is not. Measured over 57 filter shapes, `explain` reports an
-      index scan and the storage router scans the collection for 19: `$ne`,
-      `$nin`, `$not`, `$exists`, `$type`, `$mod`, `$all` of one, both forms
-      of `$elemMatch`, an equality to a sub-document, a `$regex` (prefix or
-      not), a range on `_id`, and a filter written as an explicit `$and`.
-      Each is a place the router could use the index it has. Whether
-      `explain` should say what mongod does or what this server does is
-      Joe's call; it says what mongod does.
-      Backlog-ID: RM-069
-      Verify: none -- the router's internal access path is not observable on the wire (results and explain both match mongod); whether explain should describe it is Joe's call
-- [ ] **No rejected plans.** `rejectedPlans` is always empty. Where two
-      indexes could serve a query, the winner agreed with mongod on all 20
-      `choice:` replies, by a fixed order of preference (`plan.rs`) and not
-      by trial. 19 replies differ only in the count of rejected plans.
-      Backlog-ID: RM-070
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_reports_rejected_plans
-- [ ] **`aggregate` beyond the stages the planner absorbs** (about 24
-      replies). Not reproduced: `$group`, `$count`, `$sortByCount`,
-      `$bucket` and `$lookup` pushed into the query (mongod reports a
-      slot-based plan, `explainVersion: "2"`); `$group` served by a
-      `DISTINCT_SCAN`; the projection mongod adds for the fields later
-      stages need; a `$match` moved ahead of an `$unwind`; `$facet`,
-      `$documents`, `$project` and `$group` as mongod re-prints them; and
-      per-stage `nReturned` under a `$limit`, which here is the count of a
-      full run.
+- [ ] **`aggregate` stages mongod runs in its slot-based engine** (14
+      replies). mongod 8.2.11 pushes a `$group` not served by a
+      DISTINCT_SCAN, and `$count`, `$sortByCount`, `$bucket` and `$lookup`,
+      into SBE and explains them with `explainVersion: "2"`, a
+      `winningPlan` of `{queryPlan, slotBasedPlan}` and executionStats made
+      of SBE stages with slot expressions. This server reports the classic
+      `$cursor` / `stages` shape. The `queryPlan` tree could be derived
+      from the rules this server follows; `slotBasedPlan` and the SBE
+      statistics are the engine's own programs and are not reproduced.
+      Sending `queryPlan` alone is Joe's call. `explain_commands.py`
+      replies: `aggregate: stages after the cursor` 6, 7, 8, 11;
+      `aggregate: $group and $lookup` 1, 2, 3, 5, 6, 7; `executionStats:
+      aggregate` 5, 6; `a collection that does not exist` 9. The rest of
+      the aggregate explain is reproduced (the cursor's dependency
+      projection, `$groupByDistinctScan`, `$match` and `$sort` moved ahead
+      of `$unwind`, stages as mongod parses them, per-stage counts under
+      `$limit`). Also open in listings: mongod constant-folds (`{$abs: -1}`
+      is `{$const: 1}`) and orders the fields of object-form operators its
+      own way (`$dateToString`).
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query
-- [ ] **`count` and `distinct` on a view** report the cursor and the
-      desugared stages, not mongod's slot-based `GROUP`.
+- [ ] **`count` on a view** is explained by mongod 8.2.11 as an SBE plan
+      (`explainVersion: "2"`, a `queryPlan` of `GROUP` over the view's
+      scan); this server reports the classic cursor and the `$count`
+      stage. The same decision as RM-071. `distinct` and `aggregate` on a
+      view match mongod. `explain_commands.py`: `a view` 4 and 5.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
 - [ ] **Smaller:** `$expr` is not rewritten (`{$expr: false}` is not an
       `EOF`, an equality inside `$expr` adds no `$_internalExprEq`); a
       comparison to an ARRAY bounds nothing; `$where` is refused by `find`
       itself; `explain` of `mapReduce` and `bulkWrite` is refused;
-      `local.oplog.rs` and `system.views` report `EOF`; several intervals
-      on one multikey field take the first predicate's bounds, where mongod
-      races the alternatives.
+      `local.oplog.rs` and `system.views` report `EOF`.
       Backlog-ID: RM-074
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_expr_false_is_eof
 
@@ -1218,7 +1247,9 @@ differs on 5 scenarios. What is left:
 - [ ] **RUST MongoDB server: `listIndexes` answers in name order.** mongod
       answers in the order the indexes were built (`_id_` first on both).
       The catalog keeps no build order, so this needs a field on disk, which
-      the Python server would then have to carry too. One scenario.
+      the Python server would then have to carry too. One scenario. The
+      same order is the order `explain` lists rejected plans in, which here
+      follows the catalog's name order.
       Backlog-ID: RM-081
       Verify: tests/backlog/test_rm_057_084.py::test_list_indexes_in_build_order
 - [ ] **RUST MongoDB server: an `aggregate` cursor outlives the index it
