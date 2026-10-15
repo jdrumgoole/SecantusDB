@@ -55,6 +55,13 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - An identity column's options (`GENERATED ... AS IDENTITY (START 5
   INCREMENT 2)`) are its sequence's; they were ignored, so the column
   numbered from 1.
+- `CREATE SEQUENCE ... AS smallint | integer` and `CACHE n` are obeyed: the
+  type bounds the sequence (it had run past 32767) with PostgreSQL's
+  out-of-range errors, `ALTER SEQUENCE ... AS` moves a bound left at the
+  old type's limit, and a descending sequence's default minimum is the
+  type's minimum. `ALTER SEQUENCE` refuses bounds that leave the start or
+  the current value outside them, as PostgreSQL does. A serial's and an
+  identity's sequence take their column's type.
 - `format_type` prints every modifier as PostgreSQL does (`time(1) without
   time zone`, `interval day to minute`, `bit(3)`, `numeric(5,-2)`, an
   array's element modifier) and takes a `regtype`; `'_int4'::regtype`
@@ -94,6 +101,7 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `regconfig` and a new `regdictionary` resolve by name or oid
   (`3748::regconfig` is `simple`); and `ts_lexize`. Part of RP-015
   (tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed).
+- `pg_sequences`.
 - The length-coercion functions by name, `pg_catalog."numeric"(x,
   typmod)` and the `varchar` / `bpchar` / `bit` / `varbit` / `time` /
   `timetz` / `timestamp` / `timestamptz` / `interval` forms, with
@@ -103,4 +111,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
-  `to_reg_functions`, `typed_value_residue`, `ts_catalogs` and `typmods`.
+  `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods` and `sequence_types`.

@@ -146,6 +146,26 @@ pub(crate) fn pg_collation_def() -> TableDef {
     )
 }
 
+/// `pg_sequences`: the readable view over `pg_sequence`.
+pub(crate) fn pg_sequences_def() -> TableDef {
+    TableDef::new(
+        "pg_sequences",
+        vec![
+            Column::new("schemaname", "name", false),
+            Column::new("sequencename", "name", false),
+            Column::new("sequenceowner", "name", false),
+            Column::new("data_type", "regtype", false),
+            Column::new("start_value", "int8", false),
+            Column::new("min_value", "int8", false),
+            Column::new("max_value", "int8", false),
+            Column::new("increment_by", "int8", false),
+            Column::new("cycle", "bool", false),
+            Column::new("cache_size", "int8", false),
+            Column::new("last_value", "int8", false),
+        ],
+    )
+}
+
 /// `pg_am`: the access methods.
 pub(crate) fn pg_am_def() -> TableDef {
     TableDef::new(
@@ -430,13 +450,21 @@ impl PgHandler {
                 };
                 let name = s.get_str("_id").unwrap_or_default();
                 let max = int("max_value", i64::MAX);
-                // A serial's sequence is typed by its column's width.
-                let typ = if max == i64::from(i32::MAX) {
-                    23
-                } else if max == i64::from(i16::MAX) {
-                    21
-                } else {
-                    20
+                // The sequence's `AS` type; one stored before it was
+                // recorded is typed by its bound, as a serial's was.
+                let typ = match s.get_str("data_type") {
+                    Ok("int2") => 21,
+                    Ok("int4") => 23,
+                    Ok(_) => 20,
+                    Err(_) => {
+                        if max == i64::from(i32::MAX) {
+                            23
+                        } else if max == i64::from(i16::MAX) {
+                            21
+                        } else {
+                            20
+                        }
+                    }
                 };
                 let mut d = Document::new();
                 d.insert(f("seqrelid"), Bson::Int64(Self::sequence_oid(name)));
@@ -447,6 +475,50 @@ impl PgHandler {
                 d.insert(f("seqmin"), Bson::Int64(int("min_value", 1)));
                 d.insert(f("seqcache"), Bson::Int64(int("cache", 1)));
                 d.insert(f("seqcycle"), s.get_bool("cycle").unwrap_or(false));
+                d
+            })
+            .collect()
+    }
+
+    /// `pg_sequences`' rows: each sequence's options, and its `last_value`
+    /// only once `nextval` has handed one out (NULL before, as on 15.19).
+    pub(crate) fn pg_sequences_rows(&self, def: &TableDef) -> Vec<Document> {
+        let f = |name: &str| def.field_of(name).expect("column");
+        self.all_sequence_docs()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| {
+                let int = |k: &str, dflt: i64| {
+                    s.get_i64(k)
+                        .or_else(|_| s.get_i32(k).map(i64::from))
+                        .unwrap_or(dflt)
+                };
+                let name = s.get_str("_id").unwrap_or_default();
+                let (schema, bare) = secantus_pgplan::schemas::split_key(name);
+                let typ = match s.get_str("data_type") {
+                    Ok("int2") => 21,
+                    Ok("int4") => 23,
+                    _ => 20,
+                };
+                let mut d = Document::new();
+                d.insert(f("schemaname"), schema.as_str());
+                d.insert(f("sequencename"), bare.as_str());
+                d.insert(f("sequenceowner"), secantus_pgplan::regobj::role_name(10));
+                d.insert(f("data_type"), secantus_pgplan::regtype_value(typ));
+                d.insert(f("start_value"), Bson::Int64(int("start", 1)));
+                d.insert(f("min_value"), Bson::Int64(int("min_value", 1)));
+                d.insert(f("max_value"), Bson::Int64(int("max_value", i64::MAX)));
+                d.insert(f("increment_by"), Bson::Int64(int("increment", 1)));
+                d.insert(f("cycle"), s.get_bool("cycle").unwrap_or(false));
+                d.insert(f("cache_size"), Bson::Int64(int("cache", 1)));
+                d.insert(
+                    f("last_value"),
+                    if s.get_bool("is_called").unwrap_or(false) {
+                        Bson::Int64(int("last_value", 1))
+                    } else {
+                        Bson::Null
+                    },
+                );
                 d
             })
             .collect()

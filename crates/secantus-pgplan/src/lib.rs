@@ -6697,6 +6697,10 @@ pub struct SequenceOptions {
     pub restart: Option<Option<i64>>,
     /// `OWNED BY t.c`, or `OWNED BY NONE` as an empty string.
     pub owned_by: Option<String>,
+    /// `AS smallint | integer | bigint`, as `int2` / `int4` / `int8`.
+    pub data_type: Option<String>,
+    /// `CACHE n`.
+    pub cache: Option<i64>,
 }
 
 /// The `column.extra` key an identity column's sequence options ride in
@@ -6774,10 +6778,31 @@ fn plan_sequence_options(options: &[pg_query::protobuf::Node]) -> Result<Sequenc
                     },
                 );
             }
-            // `AS bigint` fixes the bounds, and the sequence's own MIN/MAX
-            // options override it; `CACHE` is a performance hint with no
-            // effect on the values this server hands out.
-            "as" | "cache" => {}
+            // `AS smallint` sets the type, whose range bounds the sequence
+            // (its MIN/MAX default to it and may not leave it).
+            "as" => {
+                let ty = match d.arg.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::TypeName(tn)) => {
+                        let written = type_name_of(tn);
+                        let bare = written.strip_prefix("pg_catalog.").unwrap_or(&written);
+                        pgtypes::oid_of_name(bare)
+                            .and_then(pgtypes::name_of_oid)
+                            .unwrap_or_default()
+                            .to_string()
+                    }
+                    _ => String::new(),
+                };
+                if !matches!(ty.as_str(), "int2" | "int4" | "int8") {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        "sequence type must be smallint, integer, or bigint".into(),
+                    ));
+                }
+                out.data_type = Some(ty);
+            }
+            // `CACHE` is recorded (`pg_sequence.seqcache`); every value is
+            // handed out one at a time here, which is what `CACHE 1` does.
+            "cache" => out.cache = value()?,
             other => return Err(Error::Unsupported(format!("the sequence option {other}"))),
         }
     }
@@ -24772,7 +24797,7 @@ pub fn is_companion_field(name: &str) -> bool {
 /// keeps the oid; the render helpers below produce the name.
 pub const REGTYPE_KEY: &str = "__regtype_oid";
 
-pub(crate) fn regtype_value(oid: i64) -> Bson {
+pub fn regtype_value(oid: i64) -> Bson {
     let mut d = Document::new();
     d.insert(REGTYPE_KEY, Bson::Int64(oid));
     Bson::Document(d)
@@ -25422,6 +25447,7 @@ const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_language", 2612),
     ("pg_tablespace", 1213),
     ("pg_sequence", 2224),
+    ("pg_sequences", 12048),
     ("pg_statistic_ext", 3381),
     ("pg_publication", 6104),
     ("pg_publication_rel", 6106),

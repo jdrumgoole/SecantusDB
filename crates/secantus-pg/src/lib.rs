@@ -13276,6 +13276,7 @@ impl PgHandler {
             "pg_am" => Some(catalog_fill::pg_am_def()),
             "pg_policy" => Some(catalog_fill::pg_policy_def()),
             "pg_sequence" => Some(catalog_fill::pg_sequence_def()),
+            "pg_sequences" => Some(catalog_fill::pg_sequences_def()),
             "pg_description" => Some(catalog_fill::pg_description_def()),
             "pg_opclass" => Some(catalog_fill::pg_opclass_def()),
             "pg_cast" => Some(casts::pg_cast_def()),
@@ -13307,6 +13308,7 @@ impl PgHandler {
             "pg_am" => self.pg_am_rows(&def),
             "pg_policy" => self.pg_policy_rows(&def),
             "pg_sequence" => self.pg_sequence_rows(&def),
+            "pg_sequences" => self.pg_sequences_rows(&def),
             "pg_description" => self.pg_description_rows(&def),
             "pg_opclass" => self.pg_opclass_rows(&def),
             "pg_cast" => self.pg_cast_rows(&def),
@@ -13739,7 +13741,14 @@ impl PgHandler {
                         d.insert(f("sequence_catalog"), db.as_str());
                         d.insert(f("sequence_schema"), "public");
                         d.insert(f("sequence_name"), s.get_str("_id").unwrap_or_default());
-                        d.insert(f("data_type"), "bigint");
+                        d.insert(
+                            f("data_type"),
+                            match s.get_str("data_type") {
+                                Ok("int2") => "smallint",
+                                Ok("int4") => "integer",
+                                _ => "bigint",
+                            },
+                        );
                         // The bounds are TEXT in this view, which is the SQL
                         // standard's shape for a value that may not fit the
                         // view's own numeric type.
@@ -20844,12 +20853,43 @@ impl PgHandler {
             ))));
         }
         let ascending = increment > 0;
-        let min_value = options
-            .min_value
-            .unwrap_or(if ascending { 1 } else { i64::MIN + 1 });
+        // `AS type`: the range MIN / MAX default to and may not leave
+        // (`init_params`, PostgreSQL 15.19; bigint when not named).
+        let data_type = options.data_type.as_deref().unwrap_or("int8");
+        let (type_min, type_max, type_name) = match data_type {
+            "int2" => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
+            "int4" => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
+            _ => (i64::MIN, i64::MAX, "bigint"),
+        };
+        let invalid = |msg: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                msg,
+            )))
+        };
         let max_value = options
             .max_value
-            .unwrap_or(if ascending { i64::MAX } else { -1 });
+            .unwrap_or(if ascending { type_max } else { -1 });
+        if !(type_min..=type_max).contains(&max_value) {
+            return Err(invalid(format!(
+                "MAXVALUE ({max_value}) is out of range for sequence data type {type_name}"
+            )));
+        }
+        let min_value = options
+            .min_value
+            .unwrap_or(if ascending { 1 } else { type_min });
+        if !(type_min..=type_max).contains(&min_value) {
+            return Err(invalid(format!(
+                "MINVALUE ({min_value}) is out of range for sequence data type {type_name}"
+            )));
+        }
+        let cache = options.cache.unwrap_or(1);
+        if cache < 1 {
+            return Err(invalid(format!(
+                "CACHE ({cache}) must be greater than zero"
+            )));
+        }
         if min_value > max_value {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -20891,6 +20931,8 @@ impl PgHandler {
             "cycle": options.cycle.unwrap_or(false),
             "is_called": false,
             "owned_by": options.owned_by.clone().unwrap_or_default(),
+            "data_type": data_type,
+            "cache": cache,
         })
     }
 
@@ -20925,6 +20967,48 @@ impl PgHandler {
         if let Some(v) = options.owned_by.clone() {
             doc.insert("owned_by", v);
         }
+        if let Some(cache) = options.cache {
+            if cache < 1 {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "22023".into(),
+                    format!("CACHE ({cache}) must be greater than zero"),
+                ))));
+            }
+            doc.insert("cache", cache);
+        }
+        // `AS type`: a bound left at the OLD type's limit moves to the new
+        // type's (`init_params`), and both must fit the new type.
+        if let Some(ty) = options.data_type.as_deref() {
+            let range = |t: &str| match t {
+                "int2" => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
+                "int4" => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
+                _ => (i64::MIN, i64::MAX, "bigint"),
+            };
+            let (old_min, old_max, _) = range(doc.get_str("data_type").unwrap_or("int8"));
+            let (new_min, new_max, name) = range(ty);
+            if options.max_value.is_none()
+                && doc.get("max_value").and_then(bson_i64) == Some(old_max)
+            {
+                doc.insert("max_value", new_max);
+            }
+            if options.min_value.is_none()
+                && doc.get("min_value").and_then(bson_i64) == Some(old_min)
+            {
+                doc.insert("min_value", new_min);
+            }
+            for (key, label) in [("max_value", "MAXVALUE"), ("min_value", "MINVALUE")] {
+                let v = doc.get(key).and_then(bson_i64).unwrap_or(0);
+                if !(new_min..=new_max).contains(&v) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "22023".into(),
+                        format!("{label} ({v}) is out of range for sequence data type {name}"),
+                    ))));
+                }
+            }
+            doc.insert("data_type", ty);
+        }
         // RESTART last, and it un-calls the sequence: the next `nextval`
         // returns the restart value itself rather than one past it. Bare
         // `RESTART` goes back to the sequence's START.
@@ -20934,6 +21018,38 @@ impl PgHandler {
                 .unwrap_or(1);
             doc.insert("last_value", to);
             doc.insert("is_called", false);
+        }
+        // The bounds as they now stand must hold the start and the current
+        // value (`init_params`, in PostgreSQL's order).
+        let get = |k: &str| doc.get(k).and_then(bson_i64);
+        let (min, max) = (
+            get("min_value").unwrap_or(1),
+            get("max_value").unwrap_or(i64::MAX),
+        );
+        let refuse = |msg: String| {
+            Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                msg,
+            ))))
+        };
+        if min > max {
+            return refuse(format!(
+                "MINVALUE ({min}) must be less than MAXVALUE ({max})"
+            ));
+        }
+        for (key, label) in [("start", "START"), ("last_value", "RESTART")] {
+            let Some(v) = get(key) else { continue };
+            if v < min {
+                return refuse(format!(
+                    "{label} value ({v}) cannot be less than MINVALUE ({min})"
+                ));
+            }
+            if v > max {
+                return refuse(format!(
+                    "{label} value ({v}) cannot be greater than MAXVALUE ({max})"
+                ));
+            }
         }
         Ok(())
     }
@@ -27210,10 +27326,18 @@ impl PgHandler {
                         };
                         let owned_by = format!("{}.{}", def.name, c.name);
                         let Some(o) = identity_options.get(&c.name) else {
-                            return encode_doc(&secantus_pgcatalog::sequence_document(
-                                seq, &owned_by, max_value,
-                            ))
-                            .map_err(|e| Self::storage_err("could not encode a sequence", e));
+                            let mut doc =
+                                secantus_pgcatalog::sequence_document(seq, &owned_by, max_value);
+                            // A serial's sequence is typed by its column.
+                            doc.insert(
+                                "data_type",
+                                match c.pg_type.as_str() {
+                                    "int2" | "int8" => c.pg_type.as_str(),
+                                    _ => "int4",
+                                },
+                            );
+                            return encode_doc(&doc)
+                                .map_err(|e| Self::storage_err("could not encode a sequence", e));
                         };
                         // The bounds a sequence of the column's type takes by
                         // default, for the direction its increment runs.
@@ -27236,6 +27360,14 @@ impl PgHandler {
                             cycle: o.get_bool("cycle").ok(),
                             restart: None,
                             owned_by: Some(owned_by.clone()),
+                            data_type: Some(
+                                match c.pg_type.as_str() {
+                                    "int2" | "int8" => c.pg_type.as_str(),
+                                    _ => "int4",
+                                }
+                                .to_string(),
+                            ),
+                            cache: None,
                         };
                         let doc = Self::new_sequence_doc(seq, &options)?;
                         encode_doc(&doc)
