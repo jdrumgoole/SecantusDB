@@ -22039,6 +22039,10 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regclass") => {
             "regclass".to_string()
         }
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some(builtin_alias::ALIAS_CHECK) => f
+            .args
+            .get(1)
+            .map_or_else(|| "text".to_string(), |e| static_type(e, value)),
         // `__typmod_coerce(value, 'type', typmod)` (`typmod_cast`): the type
         // its second argument names.
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("__typmod_coerce") => {
@@ -35451,6 +35455,36 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             } else {
                 def
             }));
+        }
+        // `__alias_check(name, expr, args...)` (`builtin_alias`): the call's
+        // argument types, now known, must be ones a `name` overload takes.
+        if func_name(f).as_deref() == Some(builtin_alias::ALIAS_CHECK) {
+            let (Some(N::AConst(c)), Some(expr)) =
+                (f.args.first().and_then(|a| a.node.as_ref()), f.args.get(1))
+            else {
+                return Err(Error::Internal("a malformed alias check".into()));
+            };
+            let Some(a_const::Val::Sval(name)) = c.val.as_ref() else {
+                return Err(Error::Internal("a malformed alias check".into()));
+            };
+            let types: Vec<String> = f.args[2..]
+                .iter()
+                .map(|a| static_type(a, &Bson::Null))
+                .collect();
+            let known = types.iter().all(|t| !t.is_empty() && t != "unknown");
+            if known && funcsig::resolves(&name.sval, &types) == Some(false) {
+                set_error_location(c.location);
+                return Err(Error::UndefinedFunction(format!(
+                    "function {}({}) does not exist",
+                    name.sval,
+                    types
+                        .iter()
+                        .map(|t| display_type(t))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            return const_value(expr, params);
         }
         // `to_regclass(text)`: the relation's regclass, or NULL when there is
         // none -- the `::regclass` cast without its 42P01.

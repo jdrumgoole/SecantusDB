@@ -7,3 +7,8 @@ SELECT c from (values ('a'::"char"), (E'\\351'::"char"), ('z'::"char"), (E'\\201
 SELECT c from sm2 order by c desc
 SELECT c from (values ('b'::"char"), (''::"char"), ('A'::"char")) v(c) order by c
 SELECT relname, relpersistence from pg_class where relname in ('smu', 'sm2') order by 1
+SELECT int4pl(n, 2) from sm2
+SELECT int4pl(k, 2), int4mi(k, 1), textcat(c::text, 'x') from (values (1, 'a'::"char")) v(k, c)
+SELECT int4pl(k, 2) from (values (1::int8)) v(k)
+SELECT int8pl(k, 2) from (values (1)) v(k)
+SELECT int4pl(1, 2), int4pl(1, 2::int2)

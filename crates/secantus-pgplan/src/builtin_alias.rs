@@ -538,7 +538,7 @@ pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::prot
         let args = [typed(&args[0], left), typed(&args[1], right)];
         return Some(substitute(template, &args));
     }
-    let op = operators().get(&(name, args.len()))?;
+    let op = operators().get(&(name.clone(), args.len()))?;
     let refused = match args {
         [l, r] => literal_refused(l, &op.left) || literal_refused(r, &op.right),
         [r] => literal_refused(r, &op.right),
@@ -561,7 +561,7 @@ pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::prot
         "~~*" | "!~~*" => pg_query::protobuf::AExprKind::AexprIlike,
         _ => pg_query::protobuf::AExprKind::AexprOp,
     };
-    Some(pg_query::protobuf::Node {
+    let expr = pg_query::protobuf::Node {
         node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
             kind: kind as i32,
             name: vec![string(&op.symbol)],
@@ -569,8 +569,45 @@ pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::prot
             rexpr,
             location: f.location,
         }))),
+    };
+    // A column (or any other argument whose type only planning knows) may
+    // not be one the function takes (`int4pl(numeric_col, 2)` is 42883 on
+    // PostgreSQL): `__alias_check` types the call's own arguments once they
+    // are typed, and refuses it as PostgreSQL does.
+    if args
+        .iter()
+        .all(|a| matches!(a.node, Some(N::AConst(_) | N::TypeCast(_))))
+    {
+        return Some(expr);
+    }
+    let mut check_args = vec![
+        pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: false,
+                location: f.location,
+                val: Some(pg_query::protobuf::a_const::Val::Sval(
+                    pg_query::protobuf::String { sval: name.clone() },
+                )),
+            })),
+        },
+        expr,
+    ];
+    check_args.extend(args.iter().cloned());
+    Some(pg_query::protobuf::Node {
+        node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+            funcname: vec![string(ALIAS_CHECK)],
+            args: check_args,
+            funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+            location: f.location,
+            ..Default::default()
+        }))),
     })
 }
+
+/// The internal call that checks an operator-function call's argument
+/// types once they are known: `(name, the operator expression, the call's
+/// arguments...)`.
+pub(crate) const ALIAS_CHECK: &str = "__alias_check";
 
 #[cfg(test)]
 #[path = "builtin_alias_tests.rs"]

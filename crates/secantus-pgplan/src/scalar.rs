@@ -229,6 +229,7 @@ const SCALAR_NAMES: &[&str] = &[
     "__net_sortkey",
     "__range_sortkey",
     "__typmod_coerce",
+    "__alias_check",
     "__net_op",
     "__net_arith",
     "__net_diff",
@@ -789,6 +790,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "__net_diff" => {
             need(2)?;
             crate::net::diff(&arg(0), &arg(1))
+        }
+        // `__alias_check` is evaluated by `const_value`, which can type its
+        // arguments; here (no types) it is the expression it wraps.
+        "__alias_check" => {
+            need(2)?;
+            Ok(arg(1))
         }
         // `__typmod_coerce(value, type, typmod)`: a modifier applied as a
         // column assignment applies it (`typmod_cast`).

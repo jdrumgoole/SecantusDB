@@ -176,8 +176,9 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - Distances to a segment or a box use geo_ops.c's own routines, so they
   hold at the float range (`lseg <-> point` had been NaN there); a
   `"char"` sorts by its byte (a high byte had sorted by its `\ooo` text);
-  an UNLOGGED table is `relpersistence` `u` and not publishable. Part of
-  RP-015.
+  an UNLOGGED table is `relpersistence` `u` and not publishable; and an
+  operator's function called over a column of a type it does not take
+  (`int4pl(numeric_col, 2)`) is 42883 instead of running. Part of RP-015.
 - `pg_sequences`.
 - `pg_relation_is_updatable`, `pg_column_is_updatable`,
   `pg_is_other_temp_schema` and `pg_settings_get_flags` (PostgreSQL

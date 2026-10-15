@@ -489,8 +489,6 @@ one beside it.
         through `array_append('{1.5}', 2)` has no position. `abs(NULL)`'s
         column is described as `numeric` (oid 1700); PostgreSQL says
         `float8` (701), and its `pg_typeof` is right here.
-      - **Smaller**: an alias call with a COLUMN of the wrong type still
-        runs (`int4pl(numeric_col, 2)` answers; PostgreSQL 15.19 is 42883).
       - **A VARIADIC argument** that is neither an `ARRAY[...]` constructor
         nor a json path / `jsonb_delete` call (`concat(VARIADIC arr_col)`).
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and

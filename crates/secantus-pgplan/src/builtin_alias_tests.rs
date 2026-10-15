@@ -23,14 +23,23 @@ fn rewritten(sql: &str) -> Option<String> {
 
 #[test]
 fn an_operator_function_is_its_operator() {
-    assert_eq!(rewritten("int4pl(a, b)").as_deref(), Some("SELECT a + b"));
+    assert_eq!(
+        rewritten("int4pl(1, 2)").as_deref(),
+        Some("SELECT 1::int + 2::int")
+    );
+    // A column argument's type is known only when the call is planned, so
+    // the operator is wrapped in the check that refuses a wrong one (42883).
+    assert_eq!(
+        rewritten("int4pl(a, b)").as_deref(),
+        Some("SELECT __alias_check('int4pl', a + b, a, b)")
+    );
     assert_eq!(
         rewritten("pg_catalog.int4eq(a, 2)").as_deref(),
-        Some("SELECT a = 2::int")
+        Some("SELECT __alias_check('int4eq', a = 2::int, a, 2)")
     );
     assert_eq!(
         rewritten("textlike(a, 'x%')").as_deref(),
-        Some("SELECT a LIKE 'x%'::pg_catalog.text")
+        Some("SELECT __alias_check('textlike', a LIKE 'x%'::pg_catalog.text, a, 'x%')")
     );
 }
 
@@ -50,10 +59,11 @@ fn a_literal_takes_the_declared_type_where_postgresql_would_coerce_it() {
     // A whole number past int4 is a bigint: int8pl takes it, int4pl not.
     assert!(rewritten("int8pl(5000000000, 1)").is_some());
     assert_eq!(rewritten("int4pl(5000000000, 1)"), None);
-    // A column's type is not known here, so a column argument is rewritten.
+    // A column's type is not known here, so a column argument is rewritten
+    // under the check that types it when the call is planned.
     assert_eq!(
         rewritten("int4pl(a, 2)").as_deref(),
-        Some("SELECT a + 2::int")
+        Some("SELECT __alias_check('int4pl', a + 2::int, a, 2)")
     );
 }
 
