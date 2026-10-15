@@ -85,6 +85,7 @@ pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod funcsig;
+pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
 pub mod wparser;
@@ -740,6 +741,8 @@ pub enum Statement {
         schema: Option<String>,
         /// (field name, field type name), in declared order.
         fields: Vec<(String, String)>,
+        /// Each field's declared modifier (`atttypmod`, -1 for none).
+        typmods: Vec<i32>,
     },
     /// `CREATE TYPE <name> AS RANGE (subtype = <type>)` -- a custom range type.
     CreateRange {
@@ -4237,21 +4240,23 @@ fn plan_node(
                 Some(typevar.schemaname.clone())
             };
             let mut fields = Vec::new();
+            let mut typmods = Vec::new();
             for col in &ct.coldeflist {
                 let Some(N::ColumnDef(cd)) = col.node.as_ref() else {
                     return Err(Error::Unsupported("this composite field".into()));
                 };
-                let ty = cd
+                let tn = cd
                     .type_name
                     .as_ref()
-                    .map(type_name_of)
                     .ok_or_else(|| Error::Parse("composite field without a type".into()))?;
-                fields.push((cd.colname.clone(), ty));
+                fields.push((cd.colname.clone(), type_name_of(tn)));
+                typmods.push(declared_typmod(tn));
             }
             Ok(Statement::CreateComposite {
                 name,
                 schema,
                 fields,
+                typmods,
             })
         }
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
@@ -18295,6 +18300,57 @@ fn rewrite_xmlagg(
     Ok(changed.then_some(out))
 }
 
+/// `FROM pg_timezone_names()` / `pg_timezone_abbrevs()`: the functions the
+/// views of those names select from, read as the views (an alias kept; with
+/// none, PostgreSQL names the relation after the function, which is the
+/// view's name too). `None` when the FROM list holds neither.
+fn timezone_functions_as_views(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let view = |n: &pg_query::protobuf::Node| -> Option<pg_query::protobuf::Node> {
+        let Some(N::RangeFunction(rf)) = n.node.as_ref() else {
+            return None;
+        };
+        if rf.ordinality || rf.is_rowsfrom || !rf.coldeflist.is_empty() || rf.functions.len() != 1 {
+            return None;
+        }
+        let Some(N::List(l)) = rf.functions[0].node.as_ref() else {
+            return None;
+        };
+        let Some(N::FuncCall(f)) = l.items.first().and_then(|i| i.node.as_ref()) else {
+            return None;
+        };
+        let name = func_name(f)?;
+        if !f.args.is_empty()
+            || !matches!(name.as_str(), "pg_timezone_names" | "pg_timezone_abbrevs")
+            || correlated::user_function_named(&name)
+        {
+            return None;
+        }
+        Some(pg_query::protobuf::Node {
+            node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
+                schemaname: "pg_catalog".into(),
+                relname: name,
+                inh: true,
+                relpersistence: "p".into(),
+                alias: rf.alias.clone(),
+                location: f.location,
+                ..Default::default()
+            })),
+        })
+    };
+    if !s.from_clause.iter().any(|n| view(n).is_some()) {
+        return None;
+    }
+    let mut out = s.clone();
+    for n in &mut out.from_clause {
+        if let Some(v) = view(n) {
+            *n = v;
+        }
+    }
+    Some(out)
+}
+
 /// `pg_typeof(c)` over a column of a domain type names the DOMAIN, though
 /// the column is stored (and sent) as its base type: the argument is cast
 /// to the domain, which its value already satisfies. Over the one table of
@@ -19212,6 +19268,9 @@ fn plan_select(
         return plan_select(&values_as_subquery(s), lookup, params);
     }
     if let Some(rewritten) = ungrouped_having(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = timezone_functions_as_views(s) {
         return plan_select(&rewritten, lookup, params);
     }
     if let Some(rewritten) = rewrite_domain_typeof(s, lookup)? {
@@ -25760,7 +25819,19 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
         });
     }
     let mut out = Vec::with_capacity(raw.len());
-    for (v, (_, ty)) in raw.into_iter().zip(fields.iter()) {
+    // A table's row type pads a `char(n)` field to the column's width, as
+    // the column itself does (`'(ab,x)'::t` is `("ab ",x)` on 15.19).
+    let widths = user_composite_widths(target).unwrap_or_default();
+    for (i, (v, (_, ty))) in raw.into_iter().zip(fields.iter()).enumerate() {
+        let width = widths.get(i).copied().flatten();
+        let v = if let (true, Some(n)) = (ty == "bpchar", width) {
+            // The column's typmod applies as on input: excess blanks are cut,
+            // anything else is 22001.
+            let n32 = i32::try_from(n).unwrap_or(i32::MAX - 4);
+            pad_bpchar(fit_length(cast_value_inner(v, ty)?, ty, n32 + 4)?, width)
+        } else {
+            v
+        };
         // A `char(n)` field keeps the blanks it arrived with: a whole-row
         // value is padded to the column's width before it gets here, and a
         // record prints its fields padded (`("ab ",1)` on 15.19), where
@@ -27303,6 +27374,30 @@ pub type CompositeType = (String, i64, CompositeFields);
 /// Composite types: `(resolution name, oid, [(field name, field type)])`.
 pub fn set_user_composites(composites: Vec<CompositeType>) {
     PLAN_USER_COMPOSITES.with(|t| *t.borrow_mut() = composites);
+}
+
+thread_local! {
+    /// The `char(n)` width of each field of a table's row type, by
+    /// resolution name (`None` for a field that is not `char(n)`).
+    static PLAN_COMPOSITE_WIDTHS: std::cell::RefCell<std::collections::HashMap<String, Vec<Option<usize>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The `char(n)` widths of the row types' fields, installed with them.
+pub fn set_user_composite_widths(widths: std::collections::HashMap<String, Vec<Option<usize>>>) {
+    PLAN_COMPOSITE_WIDTHS.with(|t| *t.borrow_mut() = widths);
+}
+
+/// A composite's field widths, found as `user_composite` finds the type.
+fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
+    let target = canonical_type_ref(name);
+    let fold = !name.trim().contains('"');
+    PLAN_COMPOSITE_WIDTHS.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _)| **n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .map(|(_, w)| w.clone())
+    })
 }
 
 /// A composite type's `(oid, fields)` by name, folded exactly as `user_enum`:
@@ -29172,6 +29267,16 @@ fn array_rectangular(items: &[Bson]) -> bool {
 const STRUCTURAL: &str = "unexpected";
 
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
+    // `array_in` checks the literal's structure before it reads an element
+    // (`'{1,{2,x}}'::int[]` is `malformed array literal`, not `"x"`): the
+    // same parse with text elements, which only the structure can fail.
+    if !matches!(element_type, "text" | "varchar" | "bpchar" | "name") {
+        if let Err(e @ Error::InvalidText(_)) = parse_array(text, "text") {
+            if e.to_string().starts_with("malformed array literal") {
+                return Err(e);
+            }
+        }
+    }
     let malformed = || Error::InvalidText(format!("malformed array literal: \"{text}\""));
     let mut p = ArrayParser {
         chars: text.chars().collect(),
@@ -30353,6 +30458,12 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "tsquery" => Ok(Bson::String(fts::render_query(&fts::parse_query(
             &as_text(&value),
         )?))),
+        // `record_in`: text cannot be read as an anonymous record, which
+        // has no field types to read it by (15.19, at the literal).
+        "record" if matches!(value, Bson::String(_)) => Err(Error::Sqlstate(
+            "0A000",
+            "input of anonymous composite types is not implemented".into(),
+        )),
         // A name no catalog knows is PostgreSQL's 42704; only a REAL type
         // this server has no cast arm for is the honest 0A000.
         other => {
@@ -37385,6 +37496,24 @@ fn is_timestamp_field(def: &TableDef, field: &str) -> bool {
 /// than their text; a text-stored type (date, time, uuid) compares correctly
 /// as a string already and is left alone.
 fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
+    // PostgreSQL resolves `float8 = numeric` (either way round) as `float8 =
+    // float8`, casting the numeric side. A numeric constant against a
+    // floating column is cast here, so the filter compares a double with a
+    // double; a floating constant against a numeric column would need the
+    // COLUMN cast, which a filter cannot do, so it is evaluated per row.
+    // (Compared as BSON, a double and a Decimal128 meet exactly: `0.1` is
+    // not `Decimal128("0.1")`.)
+    match (&value, field_type(def, field)) {
+        // To float8 against a float4 column too: PostgreSQL has no `float4 =
+        // numeric`, and resolves `r = 0.1` as `float4 = float8`.
+        (Bson::Decimal128(_), Some("float4" | "float8")) => return cast_value(value, "float8"),
+        (Bson::Double(_), Some("numeric")) => {
+            return Err(Error::Unsupported(
+                "a numeric column against a float".into(),
+            ))
+        }
+        _ => {}
+    }
     let Bson::String(_) = &value else {
         return Ok(value);
     };
@@ -38081,15 +38210,16 @@ fn lower_distinct(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document
 /// without a type, so it arrives as the array literal TEXT `{a,b}`; parse it
 /// into a real array using the scalar side's element type. A non-`{...}` value
 /// (a properly typed array, or a genuine scalar) is returned unchanged.
-fn coerce_any_array(rhs: Bson, element_type: &str) -> Bson {
+/// An untyped array literal on the right of `x op ANY / ALL`, read as an
+/// array of `x`'s type -- PostgreSQL resolves it so, and reports an element
+/// that does not read (`2 = any('{1,x}')` is 22P02 for `"x"`, 15.19).
+fn coerce_any_array(rhs: Bson, element_type: &str) -> Result<Bson> {
     if let Bson::String(s) = &rhs {
         if s.starts_with('{') {
-            if let Ok(arr) = parse_array(s, element_type) {
-                return arrays::strip(&arr);
-            }
+            return parse_array(s, element_type).map(|arr| arrays::strip(&arr));
         }
     }
-    rhs
+    Ok(rhs)
 }
 
 /// The MQL comparison operator for a SQL scalar comparison operator.
@@ -38122,7 +38252,7 @@ fn eval_scalar_array_const(op: &str, lhs: Bson, rhs: Bson, is_any: bool) -> Resu
         }
         return Ok(Bson::Null);
     }
-    let rhs = coerce_any_array(rhs, inferred_type(&lhs));
+    let rhs = coerce_any_array(rhs, inferred_type(&lhs))?;
     let elems = match rhs {
         Bson::Array(v) => v,
         Bson::Null => return Ok(Bson::Null),
@@ -38184,7 +38314,7 @@ fn lower_scalar_array(
     if elem_type == "jsonb" || field_type(def, &field) == Some("jsonb") {
         return Err(Error::Unsupported("a jsonb comparison".into()));
     }
-    let rhs = coerce_any_array(rhs, elem_type);
+    let rhs = coerce_any_array(rhs, elem_type)?;
     let elems = match rhs {
         Bson::Array(v) => v,
         // A NULL array (a genuine NULL operand, or an unbound parameter at
@@ -38192,6 +38322,17 @@ fn lower_scalar_array(
         Bson::Null => return Ok(match_nothing()),
         _ => return Err(Error::Unsupported("this ANY/ALL operand".into())),
     };
+    // Each element meets the column as a single comparison does
+    // (`coerce_to_column`): a numeric element against a float column as a
+    // float8, a float element against a numeric column per row.
+    let elems = elems
+        .into_iter()
+        .map(|el| match el {
+            Bson::Null => Ok(el),
+            el @ (Bson::Decimal128(_) | Bson::Double(_)) => coerce_to_column(def, &field, el),
+            el => Ok(el),
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut nonnull = Vec::new();
     let mut saw_null = false;
     for el in elems {

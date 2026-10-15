@@ -141,7 +141,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 _RP015 = {
     "query-to-xmlschema": "select query_to_xmlschema('select 1 as a', true, false, '')",
     "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
-    "timezone-names": "select count(*) > 100 from pg_timezone_names",
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
@@ -152,7 +151,13 @@ _RP015_FIXED = {
     ),
     "variadic-nested-array": "select concat(variadic array[[1, 2], [3, 4]])",
     "variadic-arity": "select concat('a', variadic array['b', 'c'])",
+    "timezone-names": "select count(*) > 100 from pg_timezone_names",
+    "timezone-abbrevs": (
+        "select * from pg_timezone_abbrevs() where abbrev in ('EST', 'IST') order by 1"
+    ),
     "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
+    "array-element-position": "select array_append('{1.5}', 2)",
+    "record-input": "select '(1,x)'::record",
     "record-srf-field": (
         "select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1"
     ),
@@ -447,7 +452,7 @@ def test_record_text_keeps_char_padding(pg: Any) -> None:
     assert pg_answer(pg, "select (t)::text from rp032_t t") == ("ok", [('("ab ")',)])
 
 
-@pytest.mark.backlog("RP-032")
+@pytest.mark.backlog_fixed("RP-032")
 def test_record_literal_pads_char_field(pg: Any) -> None:
     """PostgreSQL 15.19: a text literal cast to a table's row type pads its
     `char(3)` field to the column's width, `("ab ",x)`; here it is `(ab,x)`,
@@ -455,6 +460,35 @@ def test_record_literal_pads_char_field(pg: Any) -> None:
     pg.execute("drop table if exists rp032_l")
     pg.execute("create table rp032_l (c char(3), v text)")
     assert pg_answer(pg, "select '(ab,x)'::rp032_l::text") == ("ok", [('("ab ",x)',)])
+
+
+@pytest.mark.backlog_fixed("RP-032")
+def test_row_type_follows_alter_table(pg: Any) -> None:
+    """PostgreSQL 15.19: after `alter table add column`, `'(1,x)'::t` reads
+    both columns; here the row type kept the table's first shape and the
+    literal was 22P02 `malformed record literal`."""
+    pg.execute("drop table if exists rp032_a")
+    pg.execute("create table rp032_a (a int)")
+    pg.execute("alter table rp032_a add column b text")
+    try:
+        got = pg_answer(pg, "select '(1,x)'::rp032_a::text")
+    finally:
+        pg.execute("drop table rp032_a")
+    assert got == ("ok", [("(1,x)",)])
+
+
+@pytest.mark.backlog("RP-032")
+def test_row_type_char_overflow_has_a_position(pg: Any) -> None:
+    """PostgreSQL 15.19: `'(abcd,x)'::t` over `t (c char(3), v text)` is
+    22001 `value too long for type character(3)` at the literal (position
+    8); here it has no position."""
+    pg.execute("drop table if exists rp032_p")
+    pg.execute("create table rp032_p (c char(3), v text)")
+    try:
+        got = _error_and_position(pg, [], "select '(abcd,x)'::rp032_p")
+    finally:
+        pg.execute("drop table rp032_p")
+    assert got == ("22001", "8")
 
 
 @pytest.mark.backlog_fixed("RP-033")
@@ -686,3 +720,13 @@ def test_null_tsquery_sends_no_notice(pg: Any) -> None:
     for sql in ("select null::tsquery", "select numnode(null)", "select querytree(null::tsquery)"):
         pg.execute(sql).fetchall()
     assert notices == []
+
+
+@pytest.mark.backlog_fixed("RP-039")
+@pytest.mark.parametrize(
+    "sql",
+    ["select 1 where 2 = any('{1,x}')", "select '{1,{2,x}}'::int[]"],
+    ids=["any-untyped-array", "nested-array-dimensions"],
+)
+def test_untyped_array_literals(pg: Any, pg15: Any, sql: str) -> None:
+    _same_as_reference(pg, pg15, sql)
