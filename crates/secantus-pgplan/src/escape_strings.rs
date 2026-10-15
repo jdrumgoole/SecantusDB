@@ -90,10 +90,64 @@ pub fn rewrite_with(
     sql: &str,
     syntax: Syntax,
 ) -> (Result<String>, Vec<EscapeWarning>, Option<usize>) {
+    let (out, warnings, position, _) = rewrite_mapped(sql, syntax);
+    (out, warnings, position)
+}
+
+/// What the rewrite inserted, so a position the parser or executor reports
+/// in the rewritten text can be put back where the client wrote it: each
+/// `(byte offset in the rewritten text, bytes inserted there)`, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PositionMap {
+    inserts: Vec<(usize, usize)>,
+}
+
+impl PositionMap {
+    /// Whether the rewrite moved anything.
+    pub fn is_identity(&self) -> bool {
+        self.inserts.is_empty()
+    }
+
+    /// The 1-based character position in `original` of the 1-based
+    /// character position `pos` of `rewritten`. A position inside inserted
+    /// text is the original character it was inserted before.
+    pub fn original(&self, rewritten: &str, original: &str, pos: usize) -> usize {
+        let byte = rewritten
+            .char_indices()
+            .nth(pos.saturating_sub(1))
+            .map_or(rewritten.len(), |(b, _)| b);
+        let mut shift = 0usize;
+        for &(at, len) in &self.inserts {
+            if at >= byte {
+                break;
+            }
+            shift += len.min(byte - at);
+        }
+        let orig = (byte - shift).min(original.len());
+        let orig = (0..=orig)
+            .rev()
+            .find(|b| original.is_char_boundary(*b))
+            .unwrap_or(0);
+        original[..orig].chars().count() + 1
+    }
+}
+
+/// `rewrite_with`, plus the map from the rewritten text's positions back to
+/// `sql`'s.
+pub fn rewrite_mapped(
+    sql: &str,
+    syntax: Syntax,
+) -> (
+    Result<String>,
+    Vec<EscapeWarning>,
+    Option<usize>,
+    PositionMap,
+) {
     let mut warnings = Vec::new();
     let mut position = None;
-    let out = rewrite_into(sql, syntax, &mut warnings, &mut position);
-    (out, warnings, position)
+    let mut map = PositionMap::default();
+    let out = rewrite_into(sql, syntax, &mut warnings, &mut position, &mut map.inserts);
+    (out, warnings, position, map)
 }
 
 fn rewrite_into(
@@ -101,6 +155,7 @@ fn rewrite_into(
     syntax: Syntax,
     warnings: &mut Vec<EscapeWarning>,
     error_position: &mut Option<usize>,
+    inserts: &mut Vec<(usize, usize)>,
 ) -> Result<String> {
     let warn_escapes = syntax.warn_escapes && !syntax.conforming;
     let b = sql.as_bytes();
@@ -156,18 +211,23 @@ fn rewrite_into(
             let position = sql[..start].chars().count() + 1;
             let mut warned = false;
             if national {
-                // `N` + `'...'` is the NCHAR keyword then a plain literal.
+                // `N` + `'...'` is the NCHAR keyword then a plain literal;
+                // the `n` stands where the `N` was.
                 out.pop();
-                out.push_str("nchar ");
+                out.push('n');
+                inserts.push((out.len(), 5));
+                out.push_str("char ");
             }
             if !keep {
                 // A plain literal: the parser must read it as `E'...'`. After
                 // a word (`int4'1'`, a typed literal) the `E` is a token of
                 // its own, or it would join the type name (`int4E`).
+                let at = out.len();
                 if !national && prev_is_ident(b, i) {
                     out.push(' ');
                 }
                 out.push('E');
+                inserts.push((at, out.len() - at));
             }
             let mut segment = Segment {
                 warn: !keep && warn_escapes,
@@ -619,5 +679,32 @@ mod tests {
                 vec![]
             )
         );
+    }
+
+    #[test]
+    fn positions_map_back_to_the_text_as_written() {
+        let sql = r"select N'q', int4'x', 1/0, 'a\b'::int";
+        let (out, _, _, map) = rewrite_mapped(
+            sql,
+            Syntax {
+                conforming: false,
+                warn_escapes: false,
+                refuse_backslash_quote: false,
+            },
+        );
+        let out = out.unwrap();
+        assert_eq!(out, r"select nchar E'q', int4 E'x', 1/0, E'a\b'::int");
+        let at = |needle: &str| out.find(needle).unwrap() + 1;
+        let orig = |needle: &str| sql.find(needle).unwrap() + 1;
+        // A token's start in the rewritten text is the same token's start in
+        // the original: the `n` of `nchar` is the `N`, an `E` the quote.
+        assert_eq!(map.original(&out, sql, at("nchar")), orig("N'q'"));
+        assert_eq!(map.original(&out, sql, at("E'q'")), orig("'q'"));
+        assert_eq!(map.original(&out, sql, at("int4 E")), orig("int4'"));
+        assert_eq!(map.original(&out, sql, at("E'x'")), orig("'x'"));
+        assert_eq!(map.original(&out, sql, at("1/0")), orig("1/0"));
+        assert_eq!(map.original(&out, sql, at("E'a")), orig("'a"));
+        assert_eq!(map.original(&out, sql, at("::int")), orig("::int"));
+        assert!(!map.is_identity());
     }
 }

@@ -23641,6 +23641,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         None => true,
         Some(w) => constant_where(w, params)?,
     };
+    // LIMIT and OFFSET over the one row: read (and refused) as anywhere
+    // else -- 42P02 at a missing `$1`, 2201W for a negative count -- and a
+    // LIMIT 0 or an OFFSET past the row leaves none (15.19: `select 1 limit
+    // 0` and `select 1 offset 1` answer no row). The row is then not
+    // evaluated at all, which is right for LIMIT 0 (the Limit node never
+    // reads it) and skips an error an OFFSET would raise.
+    let (limit, offset) = limit_offset(s, params)?;
+    let where_true = where_true && limit != Some(0) && offset < 1;
     let mut columns: Vec<(String, ConstCol, String, i32)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
