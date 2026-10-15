@@ -209,6 +209,7 @@ fn fix(slot: &mut pg_query::protobuf::Node) -> bool {
     match user_ops::replacement(slot)
         .or_else(|| as_cast(slot))
         .or_else(|| builtin_alias::replacement(slot))
+        .or_else(|| typmod_cast::replacement(slot))
     {
         Some(cast) => {
             *slot = cast;
@@ -234,7 +235,9 @@ fn fix_all(slots: &mut [pg_query::protobuf::Node]) -> bool {
 pub(crate) fn rewrite(node: &mut N) {
     let wanted = user_ops::wanted(node)
         || node.nodes().iter().any(|(n, _, _, _)| match n {
-            pg_query::NodeRef::FuncCall(f) => cast_target(f).is_some() || builtin_alias::wanted(f),
+            pg_query::NodeRef::FuncCall(f) => {
+                cast_target(f).is_some() || builtin_alias::wanted(f) || typmod_cast::wanted(f)
+            }
             pg_query::NodeRef::JsonParseExpr(_) => true,
             _ => false,
         });
@@ -260,7 +263,10 @@ pub(crate) fn rewrite(node: &mut N) {
                             if let Some(N::FuncCall(f)) =
                                 rt.val.as_deref().and_then(|v| v.node.as_ref())
                             {
-                                if cast_target(f).is_some() || builtin_alias::wanted(f) {
+                                if cast_target(f).is_some()
+                                    || builtin_alias::wanted(f)
+                                    || typmod_cast::wanted(f)
+                                {
                                     if let Some(name) = func_name(f) {
                                         rt.name = name;
                                     }

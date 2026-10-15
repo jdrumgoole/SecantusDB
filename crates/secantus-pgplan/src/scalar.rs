@@ -1819,12 +1819,13 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
     let Some(oid) = args.first().and_then(|v| match v {
         Bson::Int32(x) => Some(i64::from(*x)),
         Bson::Int64(x) => Some(*x),
-        _ => None,
+        // `format_type('timestamp'::regtype, 3)`: a regtype is its oid.
+        other => crate::regtype_oid(other),
     }) else {
         // A NULL OID is the one argument that DOES make it NULL.
         return Ok(Bson::Null);
     };
-    let Some(name) = crate::pgtypes::name_of_oid(oid) else {
+    let Some(name) = crate::pgtypes::type_name_of_oid(oid) else {
         // A user type (enum, composite, range, domain, ...) prints as its
         // regtype name; only an oid nothing knows is `???`.
         let text = crate::regtype_text(oid);
@@ -1839,27 +1840,64 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
         Bson::Int64(x) => i32::try_from(*x).ok(),
         _ => None,
     });
-    Ok(Bson::String(format_type_text(name, typmod)))
+    Ok(Bson::String(format_type_text(&name, typmod)))
 }
 
 /// `format_type`'s rendering: the display name, with the declared width or
 /// precision put back on when the modifier carries one.
-pub(crate) fn format_type_text_public(name: &str, typmod: Option<i32>) -> String {
+pub fn format_type_text_public(name: &str, typmod: Option<i32>) -> String {
     format_type_text(name, typmod)
 }
 
 pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
+    // An array prints its element with the modifier, then `[]`
+    // (`timestamp(2) without time zone[]`).
+    if let Some(element) = name.strip_suffix("[]") {
+        return format!("{}[]", format_type_text(element, typmod));
+    }
     let display = crate::display_type(name);
-    let Some(typmod) = typmod.filter(|m| *m >= 4) else {
+    let Some(typmod) = typmod.filter(|m| *m >= 0) else {
         return display;
     };
+    // Each type's own `typmodout`, measured on PostgreSQL 15.19.
     match name {
-        // A `numeric`'s two numbers are packed into one modifier.
-        "numeric" | "decimal" => {
+        // A `numeric`'s two numbers are packed into one modifier; the scale
+        // is an 11-bit signed field.
+        "numeric" | "decimal" if typmod >= 4 => {
             let packed = typmod - 4;
-            format!("{display}({},{})", packed >> 16, packed & 0xffff)
+            let scale = ((packed & 0x7ff) ^ 1024) - 1024;
+            format!("{display}({},{scale})", (packed >> 16) & 0xffff)
         }
-        "varchar" | "bpchar" => format!("{display}({})", typmod - 4),
+        "varchar" | "bpchar" if typmod >= 4 => format!("{display}({})", typmod - 4),
+        "bit" | "varbit" => format!("{display}({typmod})"),
+        "timestamp" | "timestamptz" | "time" | "timetz" => {
+            let (base, rest) = display.split_once(' ').unwrap_or((display.as_str(), ""));
+            format!("{base}({typmod}) {rest}").trim_end().to_string()
+        }
+        "interval" => {
+            let (range, precision) = (typmod >> 16, typmod & 0xffff);
+            let fields = match range {
+                4 => " year",
+                2 => " month",
+                8 => " day",
+                1024 => " hour",
+                2048 => " minute",
+                4096 => " second",
+                6 => " year to month",
+                1032 => " day to hour",
+                3080 => " day to minute",
+                7176 => " day to second",
+                3072 => " hour to minute",
+                7168 => " hour to second",
+                6144 => " minute to second",
+                _ => "",
+            };
+            if precision == 0xffff {
+                format!("interval{fields}")
+            } else {
+                format!("interval{fields}({precision})")
+            }
+        }
         _ => display,
     }
 }

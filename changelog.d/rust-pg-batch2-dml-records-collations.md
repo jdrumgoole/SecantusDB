@@ -46,6 +46,24 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `path` compares by point count; `time` compared with `timetz` or
   `interval` is widened first; `macaddr = macaddr8` is 42725; and input-cast
   error positions follow PostgreSQL.
+- `time(n)` / `timetz(n)` precision and `interval` field and precision
+  modifiers are applied, in casts and to stored columns: a `time(1)`
+  column kept `04:05:06.789`, an `interval day to minute` column kept its
+  seconds, and `interval(1)` kept every digit. Rounding follows
+  `AdjustTimeForTypmod` / `AdjustIntervalForTypmod` (`23:59:59.99::time(1)`
+  is `24:00:00`).
+- An identity column's options (`GENERATED ... AS IDENTITY (START 5
+  INCREMENT 2)`) are its sequence's; they were ignored, so the column
+  numbered from 1.
+- `format_type` prints every modifier as PostgreSQL does (`time(1) without
+  time zone`, `interval day to minute`, `bit(3)`, `numeric(5,-2)`, an
+  array's element modifier) and takes a `regtype`; `'_int4'::regtype`
+  names the array type.
+- `information_schema.columns` has PostgreSQL's 44 columns in its order
+  (it had 23, in another), with `character_octet_length`,
+  `numeric_precision_radix`, `datetime_precision`, `interval_type`,
+  `udt_schema`, `dtd_identifier`, the `identity_*` options and
+  `is_updatable` filled as `information_schema.sql` derives them.
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.
@@ -76,8 +94,13 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
   `regconfig` and a new `regdictionary` resolve by name or oid
   (`3748::regconfig` is `simple`); and `ts_lexize`. Part of RP-015
   (tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed).
+- The length-coercion functions by name, `pg_catalog."numeric"(x,
+  typmod)` and the `varchar` / `bpchar` / `bit` / `varbit` / `time` /
+  `timetz` / `timestamp` / `timestamptz` / `interval` forms, with
+  constant modifiers (the non-explicit string form stays refused). Part
+  of RP-015.
 - `to_regnamespace`, `to_regrole`, `to_regcollation`, `to_regproc` and
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
-  `to_reg_functions`, `typed_value_residue` and `ts_catalogs`.
+  `to_reg_functions`, `typed_value_residue`, `ts_catalogs` and `typmods`.

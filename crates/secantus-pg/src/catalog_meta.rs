@@ -100,6 +100,22 @@ pub(crate) fn column_rows(def: &TableDef, db: &str) -> Vec<Document> {
             put("domain_name", text(domain));
             put("is_generated", text(generated));
             put("generation_expression", Bson::Null);
+            // The columns the dump does not carry, derived as for a table's.
+            let mut derived = Document::new();
+            crate::info_columns::fill(
+                &mut derived,
+                def,
+                udt,
+                -1,
+                ordinal.parse().unwrap_or(0),
+                udt_schema,
+                db,
+            );
+            for (k, v) in derived {
+                if !d.contains_key(&k) {
+                    d.insert(k, v);
+                }
+            }
             Some(d)
         })
         .collect()

@@ -25,6 +25,7 @@ mod srf_tlist;
 pub mod systypes;
 pub mod tid;
 pub mod typeout;
+mod typmod_cast;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -5556,11 +5557,12 @@ fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
             _ => -1,
         },
         // interval carries its typmod as [range-field mask, precision]:
-        // `interval(6)` is [32767, 6] packed as (range << 16) | precision. A
-        // lone precision (no field list) takes the full-range mask.
+        // `interval(6)` is [32767, 6] packed as (range << 16) | precision.
+        // A lone modifier is the grammar's field mask (`interval day to
+        // minute`), with no precision (0xFFFF), as `intervaltypmodin` reads it.
         "interval" => match mods.as_slice() {
             [range, prec] => (range << 16) | prec,
-            [prec] => (0x7FFF << 16) | prec,
+            [range] => (range << 16) | 0xFFFF,
             _ => -1,
         },
         _ => -1,
@@ -6696,6 +6698,10 @@ pub struct SequenceOptions {
     /// `OWNED BY t.c`, or `OWNED BY NONE` as an empty string.
     pub owned_by: Option<String>,
 }
+
+/// The `column.extra` key an identity column's sequence options ride in
+/// from the planner to CREATE TABLE, which removes it before storing.
+pub const IDENTITY_OPTIONS: &str = "__identity_options";
 
 /// `CREATE SEQUENCE` / `ALTER SEQUENCE` options, read off the parser's
 /// `DefElem` list.
@@ -8194,6 +8200,28 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             column.sequence = Some(format!("{table}_{}_seq", cd.colname));
                             // An identity column is NOT NULL by definition.
                             column.nullable = false;
+                            // `AS IDENTITY (START 5 INCREMENT 2)`: the
+                            // sequence's options, carried to where CREATE
+                            // TABLE makes it (`IDENTITY_OPTIONS`, removed
+                            // there before the table is stored).
+                            let o = plan_sequence_options(&k.options)?;
+                            if o != SequenceOptions::default() {
+                                let mut d = Document::new();
+                                for (key, v) in [
+                                    ("start", o.start),
+                                    ("increment", o.increment),
+                                    ("min_value", o.min_value),
+                                    ("max_value", o.max_value),
+                                ] {
+                                    if let Some(v) = v {
+                                        d.insert(key, v);
+                                    }
+                                }
+                                if let Some(c) = o.cycle {
+                                    d.insert("cycle", c);
+                                }
+                                column.extra.insert(IDENTITY_OPTIONS, d);
+                            }
                         }
                         _ => {
                             return Err(Error::Unsupported(format!(
@@ -12639,6 +12667,12 @@ pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
         return Ok(numeric::numeric_bson(&numeric::apply_numeric_typmod(
             &text, typmod,
         )?));
+    }
+    if matches!(pg_type, "time" | "timetz") && (0..6).contains(&typmod) {
+        return Ok(round_time_value(v, typmod));
+    }
+    if pg_type == "interval" && typmod >= 0 {
+        return Ok(adjust_interval(v, typmod));
     }
     if matches!(pg_type, "timestamp" | "timestamptz") && (0..6).contains(&typmod) {
         return Ok(match instant_micros(&v) {
@@ -25647,6 +25681,12 @@ fn timestamp_precision(tc: &pg_query::protobuf::TypeCast, target: &str, v: Bson)
         return v;
     };
     let p = declared_typmod(tn);
+    if (0..6).contains(&p) && matches!(target, "time" | "timetz") {
+        return round_time_value(v, p);
+    }
+    if p >= 0 && target == "interval" {
+        return adjust_interval(v, p);
+    }
     if !(0..6).contains(&p) || !matches!(target, "timestamp" | "timestamptz") {
         return v;
     }
@@ -25654,6 +25694,92 @@ fn timestamp_precision(tc: &pg_query::protobuf::TypeCast, target: &str, v: Bson)
         Some(micros) => instant_value(round_timestamp_micros(micros, p)),
         None => v,
     }
+}
+
+/// `AdjustIntervalForTypmod`: an interval cut to its declared fields and
+/// rounded to its declared fractional-second precision. `interval day to
+/// minute` drops the seconds, `interval year` the months below a year, and
+/// `interval(1)` rounds half away from zero (PostgreSQL 15.19). C's integer
+/// division truncates toward zero, as Rust's does.
+fn adjust_interval(v: Bson, typmod: i32) -> Bson {
+    const HOUR: i64 = 3_600_000_000;
+    const MINUTE: i64 = 60_000_000;
+    let Some(mut iv) = Interval::from_bson(&v) else {
+        return v;
+    };
+    let (range, precision) = (typmod >> 16, typmod & 0xFFFF);
+    const YEAR: i32 = 1 << 2;
+    const MONTH: i32 = 1 << 1;
+    const DAY: i32 = 1 << 3;
+    const H: i32 = 1 << 10;
+    const M: i32 = 1 << 11;
+    match range {
+        0x7FFF => {}
+        YEAR => {
+            iv.months = iv.months / 12 * 12;
+            iv.days = 0;
+            iv.micros = 0;
+        }
+        MONTH => {
+            iv.days = 0;
+            iv.micros = 0;
+        }
+        r if r == YEAR | MONTH => {
+            iv.days = 0;
+            iv.micros = 0;
+        }
+        DAY => iv.micros = 0,
+        H => iv.micros = iv.micros / HOUR * HOUR,
+        M => iv.micros = iv.micros / MINUTE * MINUTE,
+        r if r == DAY | H => iv.micros = iv.micros / HOUR * HOUR,
+        r if r == DAY | H | M || r == H | M => iv.micros = iv.micros / MINUTE * MINUTE,
+        _ => {}
+    }
+    if (0..=6).contains(&precision) {
+        let scale = 10i64.pow(6 - precision as u32);
+        let offset = scale / 2;
+        iv.micros = if iv.micros >= 0 {
+            (iv.micros + offset) / scale * scale
+        } else {
+            -((-iv.micros + offset) / scale * scale)
+        };
+    }
+    iv.to_bson()
+}
+
+/// `AdjustTimeForTypmod`: a `time` / `timetz` value (carried as its text,
+/// `HH:MM:SS[.ffffff]` and, for timetz, the zone after it) rounded half up
+/// to `precision` fractional digits. `23:59:59.99` to one digit is
+/// `24:00:00`, as on PostgreSQL 15.19.
+fn round_time_value(v: Bson, precision: i32) -> Bson {
+    let Bson::String(text) = &v else { return v };
+    let end = text
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || *c == ':' || *c == '.'))
+        .map_or(text.len(), |(i, _)| i);
+    let (clock, zone) = text.split_at(end);
+    let mut parts = clock.splitn(3, ':');
+    let (Some(h), Some(m), Some(sec)) = (parts.next(), parts.next(), parts.next()) else {
+        return v;
+    };
+    let (whole, frac) = sec.split_once('.').unwrap_or((sec, ""));
+    let (Ok(h), Ok(m), Ok(whole)) = (h.parse::<i64>(), m.parse::<i64>(), whole.parse::<i64>())
+    else {
+        return v;
+    };
+    let frac: String = frac.chars().chain(std::iter::repeat('0')).take(6).collect();
+    let Ok(us) = frac.parse::<i64>() else {
+        return v;
+    };
+    let micros = ((h * 60 + m) * 60 + whole) * 1_000_000 + us;
+    let scale = 10i64.pow(6 - precision as u32);
+    let rounded = (micros + scale / 2) / scale * scale;
+    let clock = if rounded >= 86_400_000_000 {
+        "24:00:00".to_string()
+    } else {
+        render_time_from_micros(rounded)
+    };
+    Bson::String(format!("{clock}{zone}"))
 }
 
 /// `AdjustTimestampForTypmod`: round to `precision` fractional digits, half

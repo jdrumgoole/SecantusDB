@@ -141,6 +141,16 @@ pub fn oid_of_name(name: &str) -> Option<i64> {
         .iter()
         .find(|(t, _, _)| *t == internal)
         .map(|(_, oid, _)| *oid)
+        // An array type's own name is its element's with a leading `_`
+        // (`'_timestamp'::regtype` is `timestamp without time zone[]`).
+        .or_else(|| {
+            let element = internal.strip_prefix('_')?;
+            BUILTIN_TYPES
+                .iter()
+                .find(|(t, _, _)| *t == element)
+                .map(|(_, _, arr)| *arr)
+                .filter(|a| *a != 0)
+        })
 }
 
 /// The internal name for a scalar OR ARRAY type oid (`int4`, `int4[]`).

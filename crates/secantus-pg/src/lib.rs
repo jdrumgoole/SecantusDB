@@ -52,6 +52,7 @@ mod fdw;
 mod grace_join;
 mod hba;
 mod ident;
+mod info_columns;
 mod largeobjects;
 mod live;
 mod live_notices;
@@ -12666,34 +12667,7 @@ impl PgHandler {
             // views are called `tables` / `columns` / `sequences` -- names a
             // user table may have, and a virtual relation wins over the
             // catalog. See `secantus_pgplan::relation_name`.
-            "information_schema.columns" => Some(TableDef::new(
-                "columns",
-                vec![
-                    Column::new("table_catalog", "name", false),
-                    Column::new("table_schema", "name", false),
-                    Column::new("table_name", "name", false),
-                    Column::new("column_name", "name", false),
-                    Column::new("ordinal_position", "int4", false),
-                    Column::new("column_default", "varchar", false),
-                    Column::new("is_nullable", "varchar", false),
-                    Column::new("data_type", "varchar", false),
-                    Column::new("character_maximum_length", "int4", false),
-                    Column::new("numeric_precision", "int4", false),
-                    Column::new("numeric_scale", "int4", false),
-                    Column::new("datetime_precision", "int4", false),
-                    Column::new("udt_name", "name", false),
-                    Column::new("is_identity", "varchar", false),
-                    Column::new("identity_generation", "varchar", false),
-                    Column::new("collation_catalog", "name", false),
-                    Column::new("collation_schema", "name", false),
-                    Column::new("collation_name", "name", false),
-                    Column::new("domain_catalog", "name", false),
-                    Column::new("domain_schema", "name", false),
-                    Column::new("domain_name", "name", false),
-                    Column::new("is_generated", "varchar", false),
-                    Column::new("generation_expression", "varchar", false),
-                ],
-            )),
+            "information_schema.columns" => Some(info_columns::def()),
             "information_schema.views" => Some(TableDef::new(
                 "views",
                 vec![
@@ -13362,7 +13336,7 @@ impl PgHandler {
                         // standard's view and PostgreSQL follows it.
                         d.insert(f("is_nullable"), if c.nullable { "YES" } else { "NO" });
                         let (data_type, udt_name) = Self::information_schema_type(&c.pg_type);
-                        d.insert(f("data_type"), data_type);
+                        d.insert(f("data_type"), data_type.clone());
                         let (precision, scale, length) = Self::typmod_parts(c);
                         d.insert(f("character_maximum_length"), length);
                         d.insert(f("numeric_precision"), precision);
@@ -13430,6 +13404,29 @@ impl PgHandler {
                                 })
                                 .map_or(Bson::Null, Bson::String),
                         );
+                        let udt_schema = if data_type == "USER-DEFINED" {
+                            "public"
+                        } else {
+                            "pg_catalog"
+                        };
+                        info_columns::fill(
+                            &mut d,
+                            &def,
+                            &c.pg_type,
+                            c.typmod,
+                            i + 1,
+                            udt_schema,
+                            &db,
+                        );
+                        if c.identity.is_some() {
+                            if let Some(seq) = c
+                                .sequence
+                                .as_deref()
+                                .and_then(|n| self.sequence_doc(n).ok().flatten())
+                            {
+                                info_columns::fill_identity(&mut d, &def, &seq);
+                            }
+                        }
                         rows.push(d);
                     }
                 }
@@ -13466,7 +13463,7 @@ impl PgHandler {
                                 .map_or(Bson::Null, |s| Bson::String(s.to_string())),
                         );
                         d.insert(f("is_nullable"), "YES");
-                        d.insert(f("data_type"), data_type);
+                        d.insert(f("data_type"), data_type.clone());
                         for k in [
                             "character_maximum_length",
                             "numeric_precision",
@@ -13480,9 +13477,20 @@ impl PgHandler {
                         ] {
                             d.insert(f(k), Bson::Null);
                         }
+                        let udt_schema = if data_type == "USER-DEFINED" {
+                            "public"
+                        } else {
+                            "pg_catalog"
+                        };
                         d.insert(f("udt_name"), udt_name);
                         d.insert(f("is_identity"), "NO");
                         d.insert(f("is_generated"), "NEVER");
+                        info_columns::fill(&mut d, &def, &ty, -1, i + 1, udt_schema, &db);
+                        if !secantus_pgplan::view_dml::is_updatable(
+                            v.get_str("definition").unwrap_or_default(),
+                        ) {
+                            d.insert(f("is_updatable"), "NO");
+                        }
                         rows.push(d);
                     }
                 }
@@ -27071,6 +27079,16 @@ impl PgHandler {
             }
             Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
+                // An identity column's sequence options: taken out of the
+                // column so they are not stored with the table.
+                let identity_options: HashMap<String, Document> = def
+                    .columns
+                    .iter_mut()
+                    .filter_map(|c| {
+                        let o = c.extra.remove(secantus_pgplan::IDENTITY_OPTIONS)?;
+                        Some((c.name.clone(), o.as_document()?.clone()))
+                    })
+                    .collect();
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
                     || self
@@ -27185,18 +27203,45 @@ impl PgHandler {
                     .iter()
                     .filter_map(|c| c.sequence.as_deref().map(|seq| (c, seq)))
                     .map(|(c, seq)| {
-                        let max_value = match c.pg_type.as_str() {
-                            "int2" => i64::from(i16::MAX),
-                            "int8" => i64::MAX,
-                            _ => i64::from(i32::MAX),
+                        let (type_min, max_value) = match c.pg_type.as_str() {
+                            "int2" => (i64::from(i16::MIN), i64::from(i16::MAX)),
+                            "int8" => (i64::MIN, i64::MAX),
+                            _ => (i64::from(i32::MIN), i64::from(i32::MAX)),
                         };
                         let owned_by = format!("{}.{}", def.name, c.name);
-                        encode_doc(&secantus_pgcatalog::sequence_document(
-                            seq, &owned_by, max_value,
-                        ))
+                        let Some(o) = identity_options.get(&c.name) else {
+                            return encode_doc(&secantus_pgcatalog::sequence_document(
+                                seq, &owned_by, max_value,
+                            ))
+                            .map_err(|e| Self::storage_err("could not encode a sequence", e));
+                        };
+                        // The bounds a sequence of the column's type takes by
+                        // default, for the direction its increment runs.
+                        let int = |k: &str| o.get(k).and_then(bson_i64);
+                        let increment = int("increment");
+                        let ascending = increment.unwrap_or(1) > 0;
+                        let options = secantus_pgplan::SequenceOptions {
+                            start: int("start"),
+                            increment,
+                            min_value: int("min_value").or(Some(if ascending {
+                                1
+                            } else {
+                                type_min
+                            })),
+                            max_value: int("max_value").or(Some(if ascending {
+                                max_value
+                            } else {
+                                -1
+                            })),
+                            cycle: o.get_bool("cycle").ok(),
+                            restart: None,
+                            owned_by: Some(owned_by.clone()),
+                        };
+                        let doc = Self::new_sequence_doc(seq, &options)?;
+                        encode_doc(&doc)
+                            .map_err(|e| Self::storage_err("could not encode a sequence", e))
                     })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Self::storage_err("could not encode a sequence", e))?;
+                    .collect::<PgWireResult<Vec<_>>>()?;
                 if !sequences.is_empty() {
                     self.ensure_collection(SEQUENCE_COLLECTION)?;
                     // A sequence left behind by a dropped table of the same
