@@ -308,18 +308,6 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-009
       Verify: tests/backlog/test_rm_001_028.py::test_where_runs_javascript
 
-- [ ] **OPEN — `$geoIntersects` with no sort may return a different order
-      from mongod over a 2dsphere index (measured 2026-09-28).** Probing the
-      Java `GeoJsonFilters` fixture, mongod returned `[1, 2, 4, 3]` and the Rust
-      server `[1, 2, 3, 4]`. Unsorted order carries no guarantee, so this may
-      be nothing; but since 2026-10-13 the Rust server orders documents by the
-      plan mongod would run (`explain/order.rs`), so re-run the fixture
-      against mongod 8.2.11 and either close this or file it under
-      `tools/probes/find_order.py`. (The sort-BY-the-2dsphere-field divergence
-      found alongside it was a document-comparator bug, fixed 2026-10-06.)
-      Backlog-ID: RM-010
-      Verify: tests/backlog/test_rm_001_028.py::test_geo_intersects_unsorted_order
-
 - **Not a defect: the C gauge's two `/Client/ipv6/single` failures.** The
       test hard-codes `[::1]:27017` (documented as inherent); they are the gauge's only failures (790 / 2 / 46 of 838 with both
       topologies merged, `tests/test_c_gauge_topologies.py`).
@@ -822,30 +810,36 @@ over a raw connection (`$geoWithin`, `$geoIntersects`, `$near`,
 holds and refuses). A read is compared by its whole reply, a double to nine
 digits; an index build or a write by its reply and by what the collection
 and its indexes hold afterwards. mongod answered the same on three runs
-against itself. The Rust server differs on 113 replies (137 before 2026-10-15). Pinned by
-`crates/secantus-storage-adapter/tests/geo_queries_wt.rs`.
+against itself. The Rust server differed on 137 replies; since 2026-10-15
+it differs on none. Pinned by
+`crates/secantus-storage-adapter/tests/geo_queries_wt.rs`, `geo_edges_wt.rs`
+and `geo_order_wt.rs`.
 
 mongod tests `$geometry` on the sphere (an edge is the great-circle arc
 between its ends), and a flat shape (`$box`, `$polygon`, `$center`) holds
 points only. Where the code is now: `secantus_core::geoshape` (shapes, the
 sphere, `$near`, what an index holds), `secantus-commands/src/near.rs`
 (where `$near` may stand, its index, nearest first),
-`aggregate::apply_geo_near`.
+`aggregate::apply_geo_near`. The ORDER is mongod's own index scan, replayed:
+`secantus_core::s2legacy` (mongod's S2 library, transcribed),
+`secantus_core::geohash2d` (the `2d` hash and its coverer),
+`secantus_core::geoorder` (what an index keys a document by, a query's
+intervals, the `$near` stage's rings), `secantus_core::heap` (libc++'s
+priority queue) and `secantus-commands/src/explain/geo.rs`.
 
-Still different, all 113:
+What the probe does not reach, each found beside it:
 
-- [ ] **The order under a geo index** (about 100). mongod returns a
-      `$geoWithin` or `$geoIntersects` in the order of its index scan: S2
-      cell order for `2dsphere`, geohash order for `2d`. Here it is storage
-      order. Documents at one distance from a `$near` come in that scan's
-      order too; here points first, then insertion order.
-      Backlog-ID: RM-041
-      Verify: tests/backlog/test_rm_029_056.py::test_geo_within_in_2dsphere_scan_order,tests/backlog/test_rm_029_056.py::test_geo_within_in_2d_scan_order,tests/backlog/test_rm_029_056.py::test_near_ties_in_scan_order
-- [ ] **A hinted geo index** (10): `find({}, hint: <2dsphere index>)`
-      returns what the index holds in its order; a `$near` with a hint to
-      another index is refused.
-      Backlog-ID: RM-044
-      Verify: tests/backlog/test_rm_029_056.py::test_hinted_2dsphere_index_order,tests/backlog/test_rm_029_056.py::test_near_hinted_to_another_index
+- [ ] **Geo order outside the replayed shapes.** The order of a geo read
+      is mongod's index scan only where one geo index serves the query
+      alone. A geo predicate in an `$or` branch (mongod scans the branches
+      and merges), and a compound `2dsphere` index with a non-equality
+      predicate on its trailing field, still come back in storage order.
+      Also left as before, not measured as different: a `$near` replay past
+      2,000 documents (nearest first), and `2dsphere` index versions 1 and 2.
+      The geo order is the macOS arm64 reference's (libc++ heap, FMA); a
+      Linux x86-64 mongod was not measured.
+      Backlog-ID: RM-151
+      Verify: tests/backlog/test_rm_geo_order_residuals.py::test_geo_predicates_in_or_branches,tests/backlog/test_rm_geo_order_residuals.py::test_geo_predicate_or_id,tests/backlog/test_rm_geo_order_residuals.py::test_compound_geo_index_with_a_range_on_its_trailing_field
 - [ ] **A point exactly on an edge's great circle.** S2 settles a point
       or vertex exactly on another edge's great circle with exact
       predicates and symbolic perturbation; here it is floats. A line
@@ -867,12 +861,6 @@ Still different, all 113:
       mongod's 9, but the collection stays; mongod leaves none.
       Backlog-ID: RM-150
       Verify: tests/backlog/test_rm_geo_residuals.py::test_refused_spec_leaves_no_created_collection
-- [ ] **A bounded `$geoNear` reads every document.** Its `$centerSphere`
-      candidate fetch left out a line or polygon whose nearest point is
-      inside the distance and a vertex outside (`geo_near_index_filter`,
-      switched off).
-      Backlog-ID: RM-048
-      Verify: none -- performance: the bounded $geoNear answer is right, it reads every document
 
 ### 7.080 The order `find` returns documents in -- 2026-10-13
 
@@ -1098,11 +1086,6 @@ What is left, on the RUST MongoDB server:
       empty; mongod's holds the oplog.)
       Backlog-ID: RM-066
       Verify: tests/backlog/test_rm_057_084.py::test_list_databases_always_has_admin_and_config
-- [ ] **`listIndexes` after a conversion to unique** lists `unique` after
-      `expireAfterSeconds`; mongod lists it before. The same family as the
-      index build order under 7.071.
-      Backlog-ID: RM-067
-      Verify: tests/backlog/test_rm_057_084.py::test_list_indexes_key_order_after_conversion_to_unique
 - [ ] **`dbStats` reports `fsUsedSize` and `fsTotalSize` as 0.** The
       filesystem's numbers are not read.
       Backlog-ID: RM-068

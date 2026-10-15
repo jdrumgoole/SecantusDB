@@ -745,3 +745,36 @@ fn a_boundary_shared_is_not_an_intersection() {
         assert_eq!(ids(c, "c", query), [1, 9, 11, 15]);
     });
 }
+
+/// mongod parses a `$geoNear` query before it looks for an index: with no
+/// index the point can use, an unknown top-level operator is 2, and only a
+/// query that parses is refused 291 (measured 8.2.11, 2026-10-15).
+#[test]
+fn geo_near_parses_its_query_before_it_plans() {
+    with_wt(|c| {
+        insert(c, "c", vec![doc! { "_id": 0, "loc": [1, 1] }]);
+        ok(&create(
+            c,
+            "c",
+            vec![doc! { "key": { "loc": "2d" }, "name": "l" }],
+        ));
+        let run = |c: &mut CommandContext, query: Document| {
+            let stage = doc! { "near": point(0.0, 0.0), "distanceField": "d", "query": query };
+            dispatch_full(
+                &doc! { "aggregate": "c", "pipeline": [{ "$geoNear": stage }], "cursor": {} },
+                c,
+            )
+        };
+        let (code, errmsg) = refusal(&run(c, doc! { "$nope": 1 }));
+        assert_eq!(code, 2);
+        assert_eq!(
+            errmsg,
+            "unknown top level operator: $nope. If you have a field name that starts with a \
+             '$' symbol, consider using $getField or $setField."
+        );
+        let (code, _) = refusal(&run(c, doc! { "$or": [{ "$nope": 1 }] }));
+        assert_eq!(code, 2);
+        let (code, _) = refusal(&run(c, doc! { "k": 1 }));
+        assert_eq!(code, 291);
+    });
+}

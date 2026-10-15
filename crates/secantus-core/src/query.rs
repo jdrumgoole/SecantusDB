@@ -429,6 +429,28 @@ const KNOWN_TOP_LEVEL_OPERATORS: &[&str] = &[
     "$sampleRate",
 ];
 
+/// mongod's refusal of the first top-level name it does not know in
+/// `filter`, looking through `$and` / `$or` / `$nor`. mongod parses a query
+/// before it plans one, so a caller that refuses for want of a plan asks
+/// this first.
+pub fn unknown_top_level_refusal(filter: &Document) -> Option<Fallback> {
+    for (key, value) in filter {
+        if matches!(key.as_str(), "$and" | "$or" | "$nor") {
+            if let Bson::Array(branches) = value {
+                for branch in branches {
+                    if let Some(refusal) = branch.as_document().and_then(unknown_top_level_refusal)
+                    {
+                        return Some(refusal);
+                    }
+                }
+            }
+        } else if key.starts_with('$') && !KNOWN_TOP_LEVEL_OPERATORS.contains(&key.as_str()) {
+            return Some(unknown_top_level_operator(key));
+        }
+    }
+    None
+}
+
 fn unknown_top_level_operator(key: &str) -> Fallback {
     Fallback::mongo(
         2,

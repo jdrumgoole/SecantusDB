@@ -2913,6 +2913,18 @@ fn near_stage(
         })?;
     }
     if usable.is_empty() {
+        // mongod parses the query before it plans, so an unknown top-level
+        // operator is its 2, not the 291 (measured 8.2.11, 2026-10-15).
+        if let Some(secantus_core::fallback::Fallback::Mongo { code, message, .. }) = stage
+            .query
+            .and_then(secantus_core::query::unknown_top_level_refusal)
+        {
+            return Err(CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                message,
+            ));
+        }
         return Err(CommandError::new(
             291,
             "NoQueryExecutionPlans",

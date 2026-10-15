@@ -16,6 +16,11 @@ complement.
   larger than a hemisphere.
 - `delete` and `update` with a `$near` that had no usable index, or a centre
   outside the `2d` range, changed documents; mongod refuses them.
+- `listIndexes` after a conversion to unique lists `unique` where mongod
+  does. Fixes RM-067
+  (tests/backlog/test_rm_057_084.py::test_list_indexes_key_order_after_conversion_to_unique).
+- A `$geoNear` whose `query` has an unknown top-level operator is mongod's
+  2, not the 291 for want of an index: mongod parses the query first.
 - `bits: 20.0` on a `2d` index was read as the default 26. Existing `2d`
   indexes are rebuilt when the store opens.
 
