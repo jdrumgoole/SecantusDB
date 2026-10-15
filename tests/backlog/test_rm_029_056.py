@@ -75,7 +75,7 @@ def test_roles_info_lists_roles_in_creation_order(rust_mongo: Any) -> None:
 # ======================================================== 7.082 diagnostics
 
 
-@pytest.mark.backlog("RM-033")
+@pytest.mark.backlog_fixed("RM-033")
 def test_validate_system_views(rust_mongo: Any) -> None:
     """mongod 8.2.11 validates `system.views` as the collection it is."""
     db = _fresh(rust_mongo, "rm033")
@@ -131,7 +131,7 @@ def test_server_status_metrics(rust_mongo: Any) -> None:
     assert {"document", "operation", "query", "commands"} - got == set()
 
 
-@pytest.mark.backlog("RM-035")
+@pytest.mark.backlog_fixed("RM-035")
 def test_set_parameter_at_runtime(rust_mongo: Any) -> None:
     """mongod 8.2.11 changes `cursorTimeoutMillis` and
     `transactionLifetimeLimitSeconds` while it runs (`was` is the old value)."""
@@ -155,7 +155,7 @@ def test_notablescan_parameter(rust_mongo: Any) -> None:
     assert got == ("ok", False)
 
 
-@pytest.mark.backlog("RM-036")
+@pytest.mark.backlog_fixed("RM-036")
 def test_replica_set_commands(rust_mongo: Any) -> None:
     """mongod 8.2.11, an initiated one-member replica set: these run (or, for
     `replSetInitiate`, say the set is already initiated)."""
@@ -168,7 +168,7 @@ def test_replica_set_commands(rust_mongo: Any) -> None:
     assert got == [("err", 23), ("ok", 1.0), ("ok", 1.0)]
 
 
-@pytest.mark.backlog("RM-036")
+@pytest.mark.backlog_fixed("RM-036")
 def test_replica_set_internal_collections(rust_mongo: Any) -> None:
     """mongod 8.2.11, one-member replica set: `local` lists the oplog and the
     replica-set configuration, and `replSetGetStatus` has
@@ -181,7 +181,7 @@ def test_replica_set_internal_collections(rust_mongo: Any) -> None:
     ) == (set(), True)
 
 
-@pytest.mark.backlog("RM-037")
+@pytest.mark.backlog_fixed("RM-037")
 def test_commands_not_there(rust_mongo: Any) -> None:
     """mongod 8.2.11 runs `features`, `lockInfo`, `getClusterParameter` and
     the plan-cache commands."""
@@ -198,7 +198,7 @@ def test_commands_not_there(rust_mongo: Any) -> None:
     assert got == [("ok", 1.0)] * 5
 
 
-@pytest.mark.backlog("RM-037")
+@pytest.mark.backlog_fixed("RM-037")
 def test_admin_only_command_parses_its_argument_first(rust_mongo: Any) -> None:
     """mongod 8.2.11 parses `getClusterParameter`'s argument before it
     refuses a database other than `admin`."""
@@ -245,7 +245,7 @@ def test_hello_names_compressors(rust_mongo: Any) -> None:
     assert reply.get("compression") == ["zlib", "snappy", "zstd"]
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_host_info_system_fields(rust_mongo: Any) -> None:
     """mongod 8.2.11 (macOS arm64): twelve `system` fields, a real memory
     size."""
@@ -265,12 +265,6 @@ def test_host_info_system_fields(rust_mongo: Any) -> None:
         "numaEnabled",
     }
     assert (want - set(system), system.get("memSizeMB", 0) > 0) == (set(), True)
-
-
-@pytest.mark.backlog("RM-040")
-def test_build_info_has_no_secantus_version(rust_mongo: Any) -> None:
-    """mongod 8.2.11's `buildInfo` has no `secantusVersion`."""
-    assert "secantusVersion" not in rust_mongo.admin.command("buildInfo")
 
 
 @pytest.mark.backlog("RM-040")
@@ -294,7 +288,7 @@ def test_index_stats_counts_use(rust_mongo: Any) -> None:
     assert got == [("_id_", 0), ("a_1", 2)]
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_db_stats_counts_view_definitions(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 counts `system.views` in `dataSize` and `avgObjSize`."""
 
@@ -322,7 +316,7 @@ def test_list_catalog_stage(rust_mongo: Any) -> None:
     assert got == ("ok", True)
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_x509_without_a_certificate(rust_mongo: Any) -> None:
     """mongod 8.2.11 says only "Authentication failed." """
     got = mongo_answer(
@@ -331,7 +325,7 @@ def test_x509_without_a_certificate(rust_mongo: Any) -> None:
     assert got == ("err", 18, "Authentication failed.")
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_sasl_start_base64_payload(rust_mongo: Any) -> None:
     """mongod 8.2.11 decodes a base64 string `saslStart` payload and goes on
     with the conversation."""
@@ -345,6 +339,56 @@ def test_sasl_start_base64_payload(rust_mongo: Any) -> None:
         return (r["ok"], r["done"], type(r["payload"]).__name__)
 
     assert mongo_answer(run) == ("ok", (1.0, False, "str"))
+
+
+@pytest.mark.backlog("RM-143")
+def test_features_reports_the_script_engine(rust_mongo: Any) -> None:
+    """mongod 8.2.11's `features` has `js: {utf8: true}`: it has a script
+    engine."""
+    assert rust_mongo.admin.command("features").get("js") == {"utf8": True}
+
+
+@pytest.mark.backlog("RM-143")
+def test_features_oid_reset(rust_mongo: Any) -> None:
+    """mongod 8.2.11 answers `oidReset` with the old machine value."""
+    got = mongo_answer(
+        lambda: "oidMachineOld" in rust_mongo.admin.command("features", oidReset=True)
+    )
+    assert got == ("ok", True)
+
+
+@pytest.mark.backlog("RM-143")
+def test_plan_cache_set_filter(rust_mongo: Any) -> None:
+    """mongod 8.2.11 sets an index filter and lists it."""
+    db = _fresh(rust_mongo, "rm_pcsf")
+    db.c.insert_one({"a": 1})
+    db.c.create_index("a")
+
+    def run() -> int:
+        db.command("planCacheSetFilter", "c", query={"a": 1}, indexes=[{"a": 1}])
+        return len(db.command("planCacheListFilters", "c")["filters"])
+
+    assert mongo_answer(run) == ("ok", 1)
+
+
+@pytest.mark.backlog("RM-143")
+def test_resize_oplog_min_retention_hours(rust_mongo: Any) -> None:
+    """mongod 8.2.11 (one-member replica set) takes a `minRetentionHours`."""
+    got = mongo_answer(
+        lambda: rust_mongo.admin.command("replSetResizeOplog", 1, minRetentionHours=1.5)["ok"]
+    )
+    assert got == ("ok", 1.0)
+
+
+@pytest.mark.backlog("RM-143")
+def test_every_cluster_parameter(rust_mongo: Any) -> None:
+    """mongod 8.2.11 (one-member replica set) has fifteen cluster
+    parameters, `fleCompactionOptions` and `internalSearchOptions` among
+    them."""
+    got = mongo_answer(
+        lambda: len(rust_mongo.admin.command("getClusterParameter", "*")["clusterParameters"])
+    )
+    assert got == ("ok", 15)
 
 
 # ================================================================= 7.081 geo

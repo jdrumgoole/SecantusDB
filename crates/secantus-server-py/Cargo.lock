@@ -2189,6 +2189,7 @@ dependencies = [
 name = "secantus-commands"
 version = "0.5.3-beta.195"
 dependencies = [
+ "base64 0.22.1",
  "bson",
  "libc",
  "md-5 0.10.6",

@@ -68,21 +68,40 @@ pub fn get_cmd_line_opts(_doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     Ok(doc! { "argv": argv, "parsed": parsed, "ok": 1.0 })
 }
 
-/// `hostInfo` — host / OS / CPU info (minimal).
-pub fn host_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(1);
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "secantus".to_string());
+/// `hostInfo`: the machine's own figures, in mongod's keys, types and order
+/// (measured 8.2.11 on macOS arm64, 2026-10-15). `hostname` is the host's
+/// name and the server's port, as mongod gives it. A figure this platform
+/// cannot read is left out rather than reported as zero.
+pub fn host_info(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let host = crate::hostinfo::Host::read();
+    let hostname = match &ctx.server_address {
+        Some((_, port)) => format!("{}:{port}", host.hostname),
+        None => host.hostname.clone(),
+    };
+    let mut system = doc! {
+        "currentTime": bson::DateTime::now(),
+        "hostname": hostname,
+        "cpuAddrSize": (usize::BITS) as i32,
+    };
+    if let Some(mb) = host.mem_size_mb {
+        system.insert("memSizeMB", mb);
+        system.insert("memLimitMB", host.mem_limit_mb.unwrap_or(mb));
+    }
+    system.insert("numCores", host.logical_cores);
+    system.insert("numCoresAvailableToProcess", host.available_cores);
+    if let Some(n) = host.physical_cores {
+        system.insert("numPhysicalCores", n);
+    }
+    if let Some(n) = host.sockets {
+        system.insert("numCpuSockets", n);
+    }
+    system.insert("cpuArch", host.machine.clone());
+    system.insert("numaEnabled", false);
+    system.insert("numNumaNodes", 1_i32);
     Ok(doc! {
-        "system": {
-            "hostname": hostname,
-            "cpuArch": std::env::consts::ARCH,
-            "numCores": cores,
-            "memSizeMB": 0_i64,
-        },
-        "os": { "type": std::env::consts::OS, "name": std::env::consts::OS, "version": "" },
-        "extra": {},
+        "system": system,
+        "os": {"type": host.os_type, "name": host.os_name, "version": host.os_version},
+        "extra": host.extra,
         "ok": 1.0,
     })
 }

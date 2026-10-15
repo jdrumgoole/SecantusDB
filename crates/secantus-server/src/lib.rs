@@ -344,6 +344,22 @@ pub fn bind(
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
 
+    // mongod writes the feature compatibility version when it starts on a
+    // new store, so `admin` is always there.
+    secantus_commands::cluster_admin::record_initial_fcv(storage.as_ref())
+        .map_err(|e| io::Error::other(format!("recording the FCV: {e:?}")))?;
+    // A set member keeps its configuration in `local.system.replset`, as
+    // mongod does, so its `replicaSetId` outlives the process.
+    if let Some(set_name) = &config.replica_set_name {
+        secantus_commands::serverinfo::record_replset_config(
+            storage.as_ref(),
+            set_name,
+            &address.ip().to_string(),
+            address.port(),
+        )
+        .map_err(|e| io::Error::other(format!("recording the replica-set configuration: {e:?}")))?;
+    }
+
     // Build the rustls config up front so a bad cert / key fails `bind`, not the
     // first connection.
     let tls = match &config.tls {

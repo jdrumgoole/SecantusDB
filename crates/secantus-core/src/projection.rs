@@ -20,9 +20,8 @@ type R<T> = Result<T, Fallback>;
 /// included fields, so we decode ONLY those from `raw` instead of materialising
 /// the whole document (the return-path materialization,
 /// `tasks/rust-perf-findings.md`). The result is byte-identical to
-/// `apply_projection(&raw.to_document(), spec, None)` — including field order:
-/// `_id` first, then the included fields in sorted order (`apply_projection`'s
-/// inclusion path emits them through a `BTreeMap`). Returns `None` for any spec
+/// `apply_projection(&raw.to_document(), spec, None)` — including field order,
+/// which is the stored document's, as mongod's is. Returns `None` for any spec
 /// this fast path doesn't cover, so the caller falls back to the full
 /// `apply_projection` on a decoded document.
 pub fn apply_projection_raw(raw: &RawDocument, spec: &Document) -> Option<Document> {
@@ -56,22 +55,20 @@ pub fn apply_projection_raw(raw: &RawDocument, spec: &Document) -> Option<Docume
     if include_fields.is_empty() {
         return None; // `_id`-only / degenerate specs -> let the full path handle
     }
-    // Match `apply_projection`'s inclusion order: `_id` first (when kept and
-    // present), then the included fields sorted (its SpecTree is a BTreeMap).
-    include_fields.sort_unstable();
-    include_fields.dedup();
-
+    // The stored document's order, as `include_doc` and mongod both emit it
+    // (probed 8.2.11, 2026-10-15: `{op, ns, o}` projected on `op, ns, o`
+    // stays `op, ns, o`). This path sorted the names, which matched the full
+    // path only before that path was fixed to walk the document.
     let mut out = Document::new();
-    if include_id {
-        if let Ok(Some(v)) = raw.get("_id") {
-            out.insert("_id".to_string(), Bson::try_from(v).ok()?);
-        }
-    }
-    for f in include_fields {
-        // A field absent from the document is simply omitted (matching
-        // `include_doc`'s `doc.get(key)` guard).
-        if let Ok(Some(v)) = raw.get(f) {
-            out.insert(f.to_string(), Bson::try_from(v).ok()?);
+    for element in raw {
+        let (key, value) = element.ok()?;
+        let kept = if key == "_id" {
+            include_id
+        } else {
+            include_fields.contains(&key)
+        };
+        if kept && !out.contains_key(key) {
+            out.insert(key.to_string(), Bson::try_from(value).ok()?);
         }
     }
     Some(out)
@@ -1040,7 +1037,10 @@ mod tests {
             doc! {"a": 1, "_id": 0},
         ] {
             let fast = apply_projection_raw(raw, &spec).expect("inclusion should fast-path");
-            assert_eq!(fast, apply_projection(&d, &spec, None).unwrap());
+            let full = apply_projection(&d, &spec, None).unwrap();
+            // `Document`'s `==` ignores key order, so compare the keys too.
+            assert_eq!(fast, full);
+            assert!(fast.keys().eq(full.keys()), "{fast:?} vs {full:?}");
         }
         // Everything else must defer (None) so the owned path runs.
         for spec in [
@@ -1055,6 +1055,29 @@ mod tests {
                 apply_projection_raw(raw, &spec).is_none(),
                 "spec should defer: {spec:?}"
             );
+        }
+    }
+
+    /// mongod emits an inclusion projection's fields in the stored
+    /// document's order, whatever the spec's (probed 8.2.11, 2026-10-15).
+    /// The raw fast path sorted them by name.
+    #[test]
+    fn raw_fast_path_keeps_the_documents_order() {
+        let d = doc! {"_id": 1, "op": "n", "ns": "", "o": {"x": 1}, "b": 2, "a": 1};
+        let b = raw_of(&d);
+        let raw = RawDocument::from_bytes(&b).unwrap();
+        for (spec, want) in [
+            (
+                doc! {"_id": 0, "op": 1, "ns": 1, "o": 1},
+                vec!["op", "ns", "o"],
+            ),
+            (doc! {"_id": 0, "a": 1, "b": 1}, vec!["b", "a"]),
+            (doc! {"a": 1, "op": 1}, vec!["_id", "op", "a"]),
+        ] {
+            let fast = apply_projection_raw(raw, &spec).expect("fast path");
+            assert_eq!(fast.keys().collect::<Vec<_>>(), want);
+            let full = apply_projection(&d, &spec, None).unwrap();
+            assert_eq!(full.keys().collect::<Vec<_>>(), want);
         }
     }
 

@@ -764,6 +764,22 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Append `appendOplogNote`'s no-op oplog entry carrying `data`.
+    /// Default: unsupported, a backend with no oplog.
+    fn append_oplog_note(&self, _data: Document) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "appendOplogNote: this storage backend has no oplog".into(),
+        ))
+    }
+
+    /// Cap the oplog at `n` entries (`replSetResizeOplog`). Default:
+    /// unsupported, a backend with no oplog.
+    fn set_oplog_max_entries(&self, _n: usize) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "replSetResizeOplog: this storage backend has no oplog".into(),
+        ))
+    }
+
     /// The TTL monitor as `(ttlMonitorSleepSecs, enabled, passes, deleted)`;
     /// the sleep is 0 until a client sets it. Default: `None`, a backend with
     /// no monitor.

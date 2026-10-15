@@ -44,7 +44,7 @@ mod builtin_roles;
 mod bulkwrite;
 mod capped_admin;
 pub mod changestream;
-mod cluster_admin;
+pub mod cluster_admin;
 pub mod crud;
 pub mod cursors;
 mod dbhash;
@@ -58,6 +58,7 @@ pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
 pub mod handshake;
+mod hostinfo;
 pub mod logbuf;
 pub mod mapreduce;
 pub mod mongod_codes;
@@ -66,6 +67,7 @@ mod near;
 pub mod params;
 mod privileges;
 pub mod rbac;
+mod replset_admin;
 pub mod roles;
 mod rwconcern;
 pub mod serverinfo;
@@ -612,6 +614,14 @@ fn lookup(name: &str) -> Option<Handler> {
         "hostInfo" => diagnostics::host_info,
         "top" => diagnostics::top,
         "getLog" => serverinfo::get_log,
+        "replSetInitiate" => replset_admin::repl_set_initiate,
+        "appendOplogNote" => replset_admin::append_oplog_note,
+        "replSetResizeOplog" => replset_admin::repl_set_resize_oplog,
+        "lockInfo" => replset_admin::lock_info,
+        "features" => replset_admin::features,
+        "getClusterParameter" => replset_admin::get_cluster_parameter,
+        "planCacheClear" | "planCacheClearFilters" => replset_admin::plan_cache_clear,
+        "planCacheListFilters" => replset_admin::plan_cache_list_filters,
         "configureFailPoint" => configure_fail_point,
         _ => return None,
     })
@@ -1304,6 +1314,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                 | "listDatabases"
                 | "abortTransaction"
                 | "commitTransaction"
+                | "getClusterParameter"
         )
     {
         return CommandError::new(
