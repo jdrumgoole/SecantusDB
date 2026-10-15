@@ -4289,6 +4289,23 @@ impl PgHandler {
         secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
         catalog_meta::install_system_relations();
         let routines = self.user_function_docs().unwrap_or_default();
+        // Each routine's `pg_proc` oid and language, for the validators.
+        secantus_pgplan::validators::set_user_function_languages(
+            routines
+                .iter()
+                .map(|d| {
+                    let oid =
+                        Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()));
+                    let lang = match d.get_str("language").unwrap_or_default() {
+                        "sql" => 14i64,
+                        "plpgsql" => 14078,
+                        "c" => 13,
+                        _ => 12,
+                    };
+                    (oid, lang)
+                })
+                .collect(),
+        );
         let is_procedure = |d: &&Document| d.get_bool("is_procedure").unwrap_or(false);
         secantus_pgplan::set_user_functions(
             routines

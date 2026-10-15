@@ -20,6 +20,7 @@ pub fn is_scalar(name: &str) -> bool {
         || extension_scalar(name).is_some()
         || crate::fts::is_function(name)
         || crate::xml::is_function(name)
+        || crate::validators::is_function(name)
         || crate::jsonops::FUNCTIONS.contains(&name)
         || crate::mathfn::FUNCTIONS.contains(&name)
         || crate::snapshots::FUNCTIONS.contains(&name)
@@ -717,6 +718,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         return eval(name, &plain);
     }
     if let Some(out) = crate::fts::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::validators::call(name, args) {
         return out;
     }
     if let Some(out) = crate::xml::call(name, args) {
@@ -2674,6 +2678,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         return t;
     }
     if let Some(t) = crate::fts::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::validators::result_type(name) {
         return t;
     }
     if let Some(t) = crate::xml::result_type(name) {

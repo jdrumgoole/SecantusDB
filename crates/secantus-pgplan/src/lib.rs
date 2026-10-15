@@ -88,6 +88,7 @@ mod funcsig;
 pub mod timezones;
 mod ts_debug;
 mod ts_rewrite;
+pub mod validators;
 pub mod wparser;
 mod xml_export;
 pub use funcsig::is_builtin_function_name as is_known_function;
@@ -22306,6 +22307,16 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
             "regtype".to_string()
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
+                .and_then(validators::result_type)
+                .is_some() =>
+        {
+            validators::result_type(&func_name(f).unwrap_or_default())
+                .unwrap_or("void")
+                .to_string()
+        }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("current_schemas") => {
             "name[]".to_string()
         }
@@ -24261,6 +24272,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || declared.starts_with("aclitem")
                             || fts::result_type(&name).is_some()
                             || xml::result_type(&name).is_some()
+                            || validators::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
                             || mathfn::result_type(&name).is_some()
                             || snapshots::result_type(&name).is_some()

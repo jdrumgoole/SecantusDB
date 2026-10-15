@@ -13,4 +13,13 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
 
 #### Added
 
-- Corpus `row_type_char_overflow`.
+- The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
+  `fmgr_sql_validator` and `plpgsql_validator`, and
+  `postgresql_fdw_validator`, transcribed from PostgreSQL 15
+  (`CheckFunctionValidatorAccess`, foreign.c): `void` for a function of the
+  validator's language, 42501 naming the language's own validator
+  otherwise, 42883 for an oid naming no function, and the libpq options a
+  foreign server or user mapping may set. Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
+  `[fdw-validator]`).
+- Corpora `row_type_char_overflow` and `fmgr_validators`.

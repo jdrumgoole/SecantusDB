@@ -124,6 +124,11 @@ fn builtin_procs() -> &'static BuiltinProcs {
     })
 }
 
+/// Is `oid` one of PostgreSQL 15's own functions?
+pub(crate) fn is_builtin_proc(oid: i64) -> bool {
+    builtin_procs().0.contains_key(&oid)
+}
+
 /// Each built-in function as `regprocedure` prints it, by oid, read from
 /// PostgreSQL 15.19 (`oid::regprocedure::text`): the name quoted where it
 /// is a keyword there (`"char"(integer)`) and qualified outside

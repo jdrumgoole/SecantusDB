@@ -158,6 +158,8 @@ _RP015_FIXED = {
     "ts-stat": "select * from ts_stat('select to_tsvector(''a b a'')') order by 1",
     "array-element-position": "select array_append('{1.5}', 2)",
     "record-input": "select '(1,x)'::record",
+    "fmgr-validator": "select pg_typeof(fmgr_internal_validator('abs(int4)'::regprocedure))::text",
+    "fdw-validator": "select postgresql_fdw_validator(array['nosuch=x'], 1418)",
     "record-srf-field": (
         "select (aclexplode('{postgres=ar/postgres}'::aclitem[])).privilege_type order by 1"
     ),

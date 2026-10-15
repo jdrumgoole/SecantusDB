@@ -460,8 +460,7 @@ one beside it.
         (items are carried as text, PostgreSQL's as oids).
       - **Not written**: the XML schema exports (`query_to_xmlschema`,
         `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`
-        and the schema / database forms, and the `fmgr_*` /
-        `postgresql_fdw_validator` validators (`query_to_xml` /
+        and the schema / database forms (`query_to_xml` /
         `table_to_xml` are).
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
