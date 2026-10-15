@@ -86,7 +86,10 @@ pub(crate) fn check_ambiguous(node: &N) -> Result<()> {
         let Some((name, types)) = unknown_call(f) else {
             continue;
         };
-        if funcsig::unknown_ambiguous(&name, &types) {
+        // Only a call of untyped arguments alone: beside a typed one the
+        // rules here do not yet follow every step of PostgreSQL's (a `date`
+        // reaching `overlaps(timestamptz, ...)` through its implicit cast).
+        if types.iter().all(|t| t == "unknown") && funcsig::unknown_ambiguous(&name, &types) {
             set_error_location(f.location);
             return Err(Error::Sqlstate(
                 "42725",
@@ -103,6 +106,18 @@ pub(crate) fn check_ambiguous(node: &N) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parameter types whose functions read an untyped literal themselves, in the
+/// session's context, which a cast made while parsing would get wrong: a
+/// date or time (read in the session zone when the call runs -- a range
+/// constructor given `'2020-01-01 00:00+00'` shifted by the offset), and an
+/// object name (`nextval('public.s')` resolves it at the call).
+fn own_reading(ty: &str) -> bool {
+    let base = ty.trim_end_matches("[]");
+    crate::datetime::is_datetime(base)
+        || matches!(base, "interval" | "timetz" | "time" | "date")
+        || base.starts_with("reg")
 }
 
 /// Cast each untyped string argument of a constant built-in call to the
@@ -132,7 +147,7 @@ pub(crate) fn rewrite(node: &mut N) {
                 };
                 // A text parameter takes the literal as it is; a name the
                 // catalog quotes (`"char"`) is not one to spell back.
-                if ty == "text" || ty.contains('"') || ty.starts_with("any") {
+                if ty == "text" || ty.contains('"') || ty.starts_with("any") || own_reading(&ty) {
                     continue;
                 }
                 let literal = std::mem::take(arg);
