@@ -690,3 +690,127 @@ fn a_lookup_by_id_in_a_missing_collection_finds_nothing() {
         }
     });
 }
+
+/// Several indexes a predicate bounds: the plan is the one that wins
+/// mongod's trial, and a merge of scans runs them in the order the scan
+/// meets their values.
+#[test]
+fn the_trial_picks_the_plan_and_a_merge_reads_its_scans_in_scan_order() {
+    with_wt(|c| {
+        let docs: Vec<Document> = (0..40)
+            .map(|i| doc! { "_id": i, "a": i % 5, "b": i % 3, "z": i })
+            .collect();
+        let inserted = dispatch_full(&doc! { "insert": "m", "documents": docs }, c);
+        assert_eq!(inserted.get_i32("n"), Ok(40), "{inserted}");
+        let built = dispatch_full(
+            &doc! { "createIndexes": "m", "indexes": [
+                { "key": { "a": 1 }, "name": "a_1" },
+                { "key": { "a": 1, "b": 1 }, "name": "a_1_b_1" },
+                { "key": { "b": 1 }, "name": "b_1" },
+            ] },
+            c,
+        );
+        assert_eq!(built.get_f64("ok"), Ok(1.0), "{built}");
+        let run = |c: &mut CommandContext, command: Document| {
+            let reply = explain(c, command, "executionStats");
+            let stats = reply.get_document("executionStats").unwrap().clone();
+            (
+                winning(&reply),
+                stats.get_i32("nReturned").unwrap(),
+                stats.get_i32("totalKeysExamined").unwrap(),
+                stats.get_i32("totalDocsExamined").unwrap(),
+            )
+        };
+        // `b_1` runs out after 14 works; `a_1_b_1` and `a_1` have not.
+        let (plan, n, keys, docs) = run(
+            c,
+            doc! { "find": "m", "filter": { "a": { "$gt": 0 }, "b": 1 } },
+        );
+        assert!(
+            plan.starts_with("FETCH filtered <- IXSCAN b_1 forward"),
+            "{plan}"
+        );
+        assert_eq!((n, keys, docs), (11, 13, 13));
+        // Read backward, the scan of `[3, 3]` comes first; under a limit the
+        // merge has read one key past the documents it handed over.
+        let (plan, n, keys, docs) = run(
+            c,
+            doc! { "find": "m", "filter": { "a": { "$in": [1, 3] } },
+            "sort": { "b": -1 }, "limit": 3 },
+        );
+        let three = plan.find("[3, 3]").expect("a scan of 3");
+        let one = plan.find("[1, 1]").expect("a scan of 1");
+        assert!(plan.starts_with("LIMIT 3 <- FETCH <- SORT_MERGE"), "{plan}");
+        assert!(three < one, "{plan}");
+        assert_eq!((n, keys, docs), (3, 4, 3));
+    });
+}
+
+/// The plans mongod tried and did not keep: listed as tried, the winner
+/// swapped with the first, each with its score and what it counted during
+/// the trial. Two point scans are also tried as an intersection.
+#[test]
+fn explain_lists_the_plans_it_rejected() {
+    with_wt(|c| {
+        let docs: Vec<Document> = (0..50)
+            .map(|i| doc! { "_id": i, "a": i % 7, "b": i % 5 })
+            .collect();
+        dispatch_full(&doc! { "insert": "r", "documents": docs }, c);
+        let built = dispatch_full(
+            &doc! { "createIndexes": "r", "indexes": [
+                { "key": { "a": 1 }, "name": "a_1" },
+                { "key": { "b": 1 }, "name": "b_1" },
+            ] },
+            c,
+        );
+        assert_eq!(built.get_f64("ok"), Ok(1.0), "{built}");
+        let reply = explain(
+            c,
+            doc! { "find": "r", "filter": { "a": 1, "b": 1 } },
+            "allPlansExecution",
+        );
+        assert!(
+            winning(&reply).starts_with("FETCH filtered <- IXSCAN a_1"),
+            "{reply}"
+        );
+        let rejected: Vec<String> = reply
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_array("rejectedPlans")
+            .unwrap()
+            .iter()
+            .map(|p| text(p.as_document().unwrap()))
+            .collect();
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        assert!(rejected[0].starts_with("FETCH filtered <- IXSCAN b_1"));
+        assert!(rejected[1].starts_with("FETCH filtered <- AND_SORTED <- [IXSCAN a_1"));
+        let all: Vec<(i32, i32, i32, f64)> = reply
+            .get_document("executionStats")
+            .unwrap()
+            .get_array("allPlansExecution")
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let p = p.as_document().unwrap();
+                (
+                    p.get_i32("nReturned").unwrap(),
+                    p.get_i32("totalKeysExamined").unwrap(),
+                    p.get_i32("totalDocsExamined").unwrap(),
+                    (p.get_f64("score").unwrap() * 10_000.0).round() / 10_000.0,
+                )
+            })
+            .collect();
+        assert_eq!(
+            all,
+            [(2, 7, 7, 2.2502), (2, 8, 8, 1.2502), (1, 8, 1, 1.1251)]
+        );
+        // A unique index pinned to one key leaves nothing to try.
+        let reply = explain(
+            c,
+            doc! { "find": "r", "filter": { "_id": 3, "a": 3 } },
+            "queryPlanner",
+        );
+        let planner = reply.get_document("queryPlanner").unwrap();
+        assert_eq!(planner.get_array("rejectedPlans").unwrap().len(), 0);
+    });
+}

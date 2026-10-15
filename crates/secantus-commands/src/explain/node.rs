@@ -154,6 +154,9 @@ pub(crate) enum Node {
         input: Box<Node>,
     },
     Or(Vec<Node>),
+    /// An intersection of scans that each return their documents in
+    /// RecordId order.
+    AndSorted(Vec<Node>),
     SortMerge {
         pattern: Document,
         inputs: Vec<Node>,
@@ -299,6 +302,12 @@ impl Node {
             }
             Node::Or(inputs) => {
                 out.insert("stage", "OR");
+                counted(&mut out);
+                extra(&mut out);
+                inputs_of(&mut out, inputs);
+            }
+            Node::AndSorted(inputs) => {
+                out.insert("stage", "AND_SORTED");
                 counted(&mut out);
                 extra(&mut out);
                 inputs_of(&mut out, inputs);

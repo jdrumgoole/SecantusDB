@@ -325,8 +325,12 @@ fn regex_prefix(pattern: &str, options: &str) -> (String, bool) {
 
 fn regex_bounds(pattern: &str, options: &str, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
     // A regex matches the string as it is stored, whatever the query's
-    // collation, so an index of plain strings still bounds it.
-    if ctx.collated && !ctx.plain_strings {
+    // collation, so an index of plain strings still bounds it. An index of
+    // collation keys holds no string as stored: mongod does not read it for
+    // a regex at all, even under its own collation (measured 8.2.11: with
+    // `w_1` and a `w_ci` of the query's collation, `w_ci` is not a
+    // candidate for `{w: /^a/}`).
+    if !ctx.plain_strings {
         return None;
     }
     let (prefix, exact) = regex_prefix(pattern, options);
@@ -683,7 +687,10 @@ mod tests {
 
     #[test]
     fn a_prefix_regex_bounds_the_strings() {
-        let c = Ctx::default();
+        let c = Ctx {
+            plain_strings: true,
+            ..Ctx::default()
+        };
         let exact = shown(doc! {"$regex": "^s0"}, c).unwrap();
         assert_eq!(exact.0, ["[\"s0\", \"s1\")", "[/^s0/, /^s0/]"]);
         assert_eq!(exact.1, Tight::Exact);
@@ -692,6 +699,8 @@ mod tests {
         assert_eq!(loose.1, Tight::IndexFilter);
         let escaped = shown(doc! {"$regex": "^s\\.0"}, c).unwrap();
         assert_eq!(escaped.0[0], "[\"s.0\", \"s.1\")");
+        // An index of collation keys is not read for a regex at all.
+        assert!(shown(doc! {"$regex": "^s0"}, Ctx::default()).is_none());
     }
 
     #[test]

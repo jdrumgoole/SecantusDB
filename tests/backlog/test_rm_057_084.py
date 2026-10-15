@@ -297,7 +297,7 @@ def _rejected_plans(client: Any) -> int:
     return len(ex["queryPlanner"]["rejectedPlans"])
 
 
-@pytest.mark.backlog("RM-070")
+@pytest.mark.backlog_fixed("RM-070")
 def test_explain_reports_rejected_plans(rust_mongo: Any, mongod: Any) -> None:
     """With an index on each of two equalities, mongod 8.2.11 reports the
     plans it rejected (2: the other index, and their intersection)."""
