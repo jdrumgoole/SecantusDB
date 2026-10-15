@@ -160,6 +160,127 @@ pub fn logout(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
 
+/// The one-member set's configuration, in mongod's shape for a
+/// configuration nobody has changed.
+fn replset_config(
+    set_name: &str,
+    host_port: &str,
+    replica_set_id: bson::oid::ObjectId,
+) -> Document {
+    doc! {
+        "_id": set_name,
+        "version": 1_i32,
+        "term": 1_i32,
+        "members": [{
+            "_id": 0_i32,
+            "host": host_port,
+            "arbiterOnly": false,
+            "buildIndexes": true,
+            "hidden": false,
+            "priority": 1.0,
+            "tags": {},
+            "secondaryDelaySecs": 0_i64,
+            "votes": 1_i32,
+        }],
+        "protocolVersion": 1_i64,
+        "writeConcernMajorityJournalDefault": true,
+        "settings": {
+            "chainingAllowed": true,
+            "heartbeatIntervalMillis": 2000_i32,
+            "heartbeatTimeoutSecs": 10_i32,
+            "electionTimeoutMillis": 10000_i32,
+            "catchUpTimeoutMillis": -1_i32,
+            "catchUpTakeoverDelayMillis": 30000_i32,
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {"w": 1_i32, "wtimeout": 0_i32},
+            "replicaSetId": replica_set_id,
+        },
+    }
+}
+
+/// The configuration stored in `local.system.replset` for `set_name`.
+fn stored_replset_config(
+    storage: &dyn crate::storage::Storage,
+    set_name: &str,
+) -> Option<Document> {
+    let rows = storage
+        .find(
+            "local",
+            "system.replset",
+            &doc! {"_id": set_name},
+            None,
+            None,
+        )
+        .ok()?;
+    let bytes = rows.first()?;
+    secantus_core::bsondoc::from_bytes(bytes).ok()
+}
+
+/// The oplog's collection UUID. mongod mints one when the set is initiated
+/// and keeps it; here it is derived from the stored `replicaSetId`, so it
+/// too is the same after a restart.
+pub(crate) fn oplog_uuid(storage: &dyn crate::storage::Storage) -> Vec<u8> {
+    use sha2::Digest;
+    let id = storage
+        .find("local", "system.replset", &doc! {}, None, None)
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|bytes| secantus_core::bsondoc::from_bytes(&bytes).ok())
+        .and_then(|d| {
+            d.get_document("settings")
+                .ok()
+                .and_then(|s| s.get_object_id("replicaSetId").ok())
+        })
+        .unwrap_or_else(crate::handshake::hello_process_id);
+    let mut bytes =
+        sha2::Sha256::digest([b"local.oplog.rs".as_slice(), &id.bytes()].concat())[..16].to_vec();
+    // A version-4 (random) UUID's version and variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes
+}
+
+/// Keep the set's configuration where mongod keeps it, the one document in
+/// `local.system.replset`, so its `replicaSetId` is the same after a
+/// restart. Called as the server binds: a store that has none gets one, and
+/// one whose member is at another address (a server bound to port 0 moves
+/// each run) has the address brought up to date, keeping its id.
+pub fn record_replset_config(
+    storage: &dyn crate::storage::Storage,
+    set_name: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), crate::storage::StorageError> {
+    let host_port = format!("{host}:{port}");
+    match stored_replset_config(storage, set_name) {
+        Some(stored) => {
+            let id = stored
+                .get_document("settings")
+                .ok()
+                .and_then(|s| s.get_object_id("replicaSetId").ok())
+                .unwrap_or_else(bson::oid::ObjectId::new);
+            let config = replset_config(set_name, &host_port, id);
+            if stored != config {
+                storage.update_matching(
+                    "local",
+                    "system.replset",
+                    &doc! {"_id": set_name},
+                    &config,
+                    false,
+                    false,
+                )?;
+            }
+        }
+        None => {
+            let config = replset_config(set_name, &host_port, bson::oid::ObjectId::new());
+            let bytes = bson::to_vec(&config)
+                .map_err(|e| crate::storage::StorageError::Internal(e.to_string()))?;
+            storage.insert("local", "system.replset", vec![bytes], true)?;
+        }
+    }
+    Ok(())
+}
+
 /// `replSetGetConfig`: the one-member set `hello` describes, in the shape
 /// of a configuration nobody has changed. A server run without a set name
 /// answers as a standalone does.
@@ -186,39 +307,18 @@ pub fn repl_set_get_config(doc: &Document, ctx: &mut CommandContext) -> HandlerR
             "not running with --replSet",
         ));
     };
-    let mut reply = doc! {
-        "config": {
-            "_id": set_name.clone(),
-            "version": 1_i32,
-            "term": 1_i32,
-            "members": [{
-                "_id": 0_i32,
-                "host": format!("{host}:{port}"),
-                "arbiterOnly": false,
-                "buildIndexes": true,
-                "hidden": false,
-                "priority": 1.0,
-                "tags": {},
-                "secondaryDelaySecs": 0_i64,
-                "votes": 1_i32,
-            }],
-            "protocolVersion": 1_i64,
-            "writeConcernMajorityJournalDefault": true,
-            "settings": {
-                "chainingAllowed": true,
-                "heartbeatIntervalMillis": 2000_i32,
-                "heartbeatTimeoutSecs": 10_i32,
-                "electionTimeoutMillis": 10000_i32,
-                "catchUpTimeoutMillis": -1_i32,
-                "catchUpTakeoverDelayMillis": 30000_i32,
-                "getLastErrorModes": {},
-                "getLastErrorDefaults": {"w": 1_i32, "wtimeout": 0_i32},
-                // The set has no stored configuration to take an id from;
-                // the process's own id is fixed for as long as it runs.
-                "replicaSetId": crate::handshake::hello_process_id(),
-            },
-        },
+    let host_port = format!("{host}:{port}");
+    let stored = ctx
+        .storage
+        .as_ref()
+        .and_then(|s| stored_replset_config(s.as_ref(), set_name));
+    let config = match stored {
+        Some(config) => config,
+        // No store to keep it in (a test context): the process's own id
+        // stands for the stored one.
+        None => replset_config(set_name, &host_port, crate::handshake::hello_process_id()),
     };
+    let mut reply = doc! {"config": config};
     if commitment == Some(true) {
         reply.insert("commitmentStatus", true);
     }

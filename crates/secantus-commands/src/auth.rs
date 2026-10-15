@@ -168,6 +168,36 @@ fn payload_bytes(value: Option<&Bson>) -> Vec<u8> {
     }
 }
 
+/// A SASL payload as mongod reads it: binary, or a base64 string, which it
+/// decodes and answers in kind (measured 8.2.11, 2026-10-15). The flag says
+/// whether the reply's payload goes back as base64.
+fn sasl_payload(value: Option<&Bson>) -> Result<(Vec<u8>, bool), CommandError> {
+    use base64::Engine as _;
+    match value {
+        Some(Bson::String(s)) => base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map(|bytes| (bytes, true))
+            .map_err(|_| {
+                CommandError::new(
+                    40537,
+                    "Location40537",
+                    "Failed decoding SASL payload: Invalid base64 character",
+                )
+            }),
+        other => Ok((payload_bytes(other), false)),
+    }
+}
+
+/// The reply's payload, in the form the request's came in.
+fn sasl_reply_payload(bytes: Vec<u8>, as_base64: bool) -> Bson {
+    use base64::Engine as _;
+    if as_base64 {
+        Bson::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        payload_binary(bytes)
+    }
+}
+
 /// Wrap a server SCRAM payload back into a generic BSON Binary (subtype 0).
 fn payload_binary(bytes: Vec<u8>) -> Bson {
     Bson::Binary(Binary {
@@ -289,7 +319,7 @@ pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Received authentication for mechanism {mechanism} which is not enabled"),
         ));
     };
-    let payload = payload_bytes(doc.get("payload"));
+    let (payload, as_base64) = sasl_payload(doc.get("payload"))?;
     let db_name = if ctx.db_name.is_empty() {
         "admin".to_string()
     } else {
@@ -310,7 +340,7 @@ pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! {
         "conversationId": conversation_id,
         "done": false,
-        "payload": payload_binary(server_first),
+        "payload": sasl_reply_payload(server_first, as_base64),
         "ok": 1.0,
     })
 }
@@ -320,7 +350,7 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     required_field(doc, "saslContinue", "conversationId", "int", |v| {
         matches!(v, Bson::Int32(_))
     })?;
-    let payload = payload_bytes(doc.get("payload"));
+    let (payload, as_base64) = sasl_payload(doc.get("payload"))?;
     let incoming_id = doc.get_i32("conversationId").ok();
 
     let auth = conn_auth(ctx)?;
@@ -358,7 +388,7 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     Ok(doc! {
         "conversationId": conversation_id,
         "done": true,
-        "payload": payload_binary(server_final),
+        "payload": sasl_reply_payload(server_final, as_base64),
         "ok": 1.0,
     })
 }
@@ -383,17 +413,15 @@ fn verify_x509(
     ctx: &CommandContext,
     claimed: Option<String>,
 ) -> Result<(String, String), CommandError> {
+    // No verified certificate, or one naming another user: mongod gives no
+    // reason, as for every failed authentication (measured 8.2.11,
+    // 2026-10-15).
     let Some(dn) = ctx.peer_cert_dn.clone() else {
-        return Err(auth_failure(
-            "MONGODB-X509 requires the client to present a verified TLS cert \
-             (connection is plaintext or no client cert was offered)",
-        ));
+        return Err(auth_failure(AUTHENTICATION_FAILED_MSG));
     };
     if let Some(claimed) = claimed {
         if !claimed.is_empty() && claimed != dn {
-            return Err(auth_failure(format!(
-                "MONGODB-X509: claimed user '{claimed}' doesn't match cert DN '{dn}'"
-            )));
+            return Err(auth_failure(AUTHENTICATION_FAILED_MSG));
         }
     }
     let mut db_name = if ctx.db_name.is_empty() {

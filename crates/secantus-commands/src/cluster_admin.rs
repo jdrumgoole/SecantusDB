@@ -126,6 +126,22 @@ const FCV_DB: &str = "admin";
 const FCV_COLL: &str = "system.version";
 const FCV_ID: &str = "featureCompatibilityVersion";
 
+/// Record the FCV as mongod does when it starts on a store with none:
+/// `{_id: "featureCompatibilityVersion", version: "8.2"}` in
+/// `admin.system.version`. That document is why mongod always lists the
+/// `admin` database. A stored FCV is left as it is.
+pub fn record_initial_fcv(
+    storage: &dyn crate::storage::Storage,
+) -> Result<(), crate::storage::StorageError> {
+    let stored = storage.find(FCV_DB, FCV_COLL, &doc! {"_id": FCV_ID}, None, None)?;
+    if stored.is_empty() {
+        let bytes = bson::to_vec(&doc! {"_id": FCV_ID, "version": FCV_LATEST})
+            .map_err(|e| crate::storage::StorageError::Internal(e.to_string()))?;
+        storage.insert(FCV_DB, FCV_COLL, vec![bytes], true)?;
+    }
+    Ok(())
+}
+
 /// The FCV in force: the stored one, else this server's own version. What
 /// `getParameter` reports as `featureCompatibilityVersion.version`.
 pub(crate) fn current_fcv(ctx: &CommandContext) -> String {

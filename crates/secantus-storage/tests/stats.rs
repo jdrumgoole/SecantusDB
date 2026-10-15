@@ -59,11 +59,13 @@ fn get_collection_options_round_trips() {
 #[test]
 fn synthetic_oplog_rs_options() {
     with_db(|st| {
-        // local.oplog.rs reports the synthetic capped shape when oplog is on.
+        // local.oplog.rs reports mongod's options for its oplog when the
+        // oplog is on: capped to a size in bytes, no `_id` index, no `max`.
         let opts = st.get_collection_options("local", "oplog.rs").unwrap();
         assert!(opts.get_bool("capped").unwrap());
-        assert!(opts.get_i64("max").unwrap() > 0);
         assert!(opts.get_i64("size").unwrap() > 0);
+        assert_eq!(opts.get_bool("autoIndexId"), Ok(false));
+        assert!(opts.get("max").is_none());
     });
 }
 

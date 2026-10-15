@@ -251,6 +251,20 @@ pub struct UserTransactionHandle {
     /// or rollback changes what other sessions see there, so it moves
     /// [`COLL_TABLE_GEN`] on again when it ends.
     wrote_registry: bool,
+    /// Collections created inside the transaction are held here, not
+    /// written to the registry, until it commits (`set_defer_collection_creates`):
+    /// `(db, collection) -> options blob`. Only the transaction itself reads
+    /// them (`deferred_row`), and the commit writes them, so two transactions
+    /// creating one collection conflict at the SECOND COMMIT, as on mongod,
+    /// and not at the second one's first write.
+    defer_creates: bool,
+    deferred_creates: BTreeMap<(String, String), Vec<u8>>,
+    /// For each of `deferred_creates`, the name its `_id` index rows and
+    /// unique claims are kept under until the commit moves them (`key_coll`):
+    /// keyed by the plain name, two transactions that each created the
+    /// collection and stored one `_id` would conflict at the second insert,
+    /// where mongod fails the second COMMIT.
+    deferred_keys: BTreeMap<(String, String), String>,
     /// The `(db, collection)`s its oplog entries name, and whether it wrote
     /// anything an entry does not attribute to one collection (a command
     /// entry): what its commit is recorded as touching ([`NS_COMMITS`]).
@@ -263,6 +277,14 @@ pub struct UserTransactionHandle {
 }
 
 impl UserTransactionHandle {
+    /// Hold the collections this transaction creates until it commits, as
+    /// mongod does (see `deferred_creates`). The MongoDB server turns this
+    /// on; the PostgreSQL server, whose `CREATE TABLE` follows PostgreSQL's
+    /// rules, leaves it off.
+    pub fn set_defer_collection_creates(&mut self, on: bool) {
+        self.defer_creates = on;
+    }
+
     /// Has the transaction written anything? Until it has, abandoning it and
     /// starting afresh is invisible at READ COMMITTED -- which is how a
     /// server retries a statement whose first write lost a conflict.
@@ -520,6 +542,16 @@ const WRITE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// dirties few leaf pages; 4000 keeps each transaction far under the cache
 /// dirty trigger while bounding the number of commits for a large drop.
 const PURGE_CHUNK_MAX_ROWS: usize = 4000;
+
+/// Whether an oplog entry is for the `local` database, which mongod does not
+/// replicate and so does not log.
+fn oplog_entry_is_local(e: &OplogEntry) -> bool {
+    let ns = match e {
+        OplogEntry::Doc(d) => d.get_str("ns").ok(),
+        OplogEntry::Raw(buf) => buf.get_str("ns").ok(),
+    };
+    ns.is_some_and(|ns| ns == "local" || ns.starts_with("local."))
+}
 
 /// Approximate encoded size of an oplog entry, for the user-transaction
 /// dirty budget. `Raw` is exact; `Doc` (the rare DDL / noop shapes) pays one
@@ -5650,9 +5682,15 @@ impl Storage {
     }
 
     /// Set the oplog hard entry cap (default 100_000). Mirrors
-    /// `oplog_max_entries`.
-    pub fn set_oplog_max_entries(&mut self, n: usize) {
+    /// `oplog_max_entries`. Takes `&self` because `replSetResizeOplog`
+    /// changes it while the server runs; the next sweep applies it.
+    pub fn set_oplog_max_entries(&self, n: usize) {
         self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
+    }
+
+    /// Whether this store keeps an oplog at all.
+    pub fn oplog_enabled(&self) -> bool {
+        self.enable_oplog
     }
 
     // --- locking (per-collection write locks + write-conflict retry) ---
@@ -6085,6 +6123,21 @@ impl Storage {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
+        // The `local` database is not replicated: mongod writes no oplog entry
+        // for a write to it, so a change stream never sees one.
+        let (entries, pre_images) = if entries.iter().any(oplog_entry_is_local) {
+            let (entries, pre_images): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .zip(pre_images)
+                .filter(|(e, _)| !oplog_entry_is_local(e))
+                .unzip();
+            if entries.is_empty() {
+                return Ok(0);
+            }
+            (entries, pre_images)
+        } else {
+            (entries, pre_images)
+        };
         // A transaction statement's writes name the transaction, as mongod's
         // do. Stamped here, on the statement's thread, whichever thread later
         // writes the entries.
@@ -7504,6 +7557,18 @@ impl Storage {
         self.emit_oplog(&session, vec![entry], vec![None])
     }
 
+    /// Append `appendOplogNote`'s no-op entry, `{op: "n", ns: "", o: data}`,
+    /// as mongod writes it, and return its seq.
+    pub fn append_oplog_note(&self, data: Document) -> Result<i64> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        let mut entry = Document::new();
+        entry.insert("op", "n");
+        entry.insert("ns", "");
+        entry.insert("o", Bson::Document(data));
+        self.emit_oplog(&session, vec![entry], vec![None])
+    }
+
     /// The smallest seq whose entry `ts >= target` (tail + 1 if none qualify) —
     /// used to resolve `startAtOperationTime`. Mirrors `storage.find_seq_for_ts`.
     pub fn find_seq_for_ts(&self, ts: bson::Timestamp) -> Result<i64> {
@@ -7648,6 +7713,9 @@ impl Storage {
             locked: Vec::new(),
             doomed: false,
             wrote_registry: false,
+            defer_creates: false,
+            deferred_creates: BTreeMap::new(),
+            deferred_keys: BTreeMap::new(),
             written_ns: Vec::new(),
             unattributed: false,
             registry_gen: 0,
@@ -7952,6 +8020,20 @@ impl Storage {
                     written,
                 )
             };
+            // The collections it created go into the registry now, in the
+            // transaction: one somebody else created meanwhile fails the
+            // commit, as on mongod (see `deferred_creates`).
+            if !handle.deferred_creates.is_empty() {
+                let creates = std::mem::take(&mut handle.deferred_creates);
+                let keys = std::mem::take(&mut handle.deferred_keys);
+                if let Err(e) = flush_deferred_creates(&session, creates, keys) {
+                    // Nothing of it is committed: `session` drops below and
+                    // rolls it back.
+                    handle.deregister_minted();
+                    handle.pending_async.clear();
+                    return Err(e);
+                }
+            }
             let began = handle.began;
             handle.began = false;
             if began {
@@ -8045,6 +8127,8 @@ impl Storage {
         release_shared: bool,
     ) -> Result<()> {
         let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
+        handle.deferred_creates.clear();
+        handle.deferred_keys.clear();
         if let Some(session) = handle.session.take() {
             {
                 let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
@@ -8223,6 +8307,11 @@ impl Storage {
                 return Ok(false);
             }
         }
+        // The collections it holds until commit move with it: the replay
+        // finds them there rather than creating them again.
+        fresh.defer_creates = handle.defer_creates;
+        fresh.deferred_creates = handle.deferred_creates.clone();
+        fresh.deferred_keys = handle.deferred_keys.clone();
         let _moving = MoveGuard::new(&handle.held);
         self.rollback_user_transaction_inner(handle, false)?;
         // The locks taken by rewriting a row unchanged have no oplog entry:
@@ -8438,6 +8527,17 @@ impl Storage {
             // The preparing transaction dies with the error, as it does in
             // PostgreSQL: dropping the handle rolls it back.
             return Err(StorageError::PreparedTransactionExists(gid.to_string()));
+        }
+        // A prepared transaction's registry rows are part of what it
+        // prepares: the collections it holds until commit go in now.
+        if !handle.deferred_creates.is_empty() {
+            let creates = std::mem::take(&mut handle.deferred_creates);
+            let keys = std::mem::take(&mut handle.deferred_keys);
+            let session = handle
+                .session
+                .as_ref()
+                .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
+            flush_deferred_creates(session, creates, keys)?;
         }
         let ops = self.transaction_write_set(&mut handle)?;
         // A transaction id for `pg_prepared_xacts.transaction`: one oplog seq,
@@ -8915,11 +9015,8 @@ impl Storage {
     fn read_is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
         // On every `_id` point lookup: look the key up in the raw options
         // rather than decoding the whole document.
-        let cur = session.open_cursor(COLL_TABLE, None)?;
-        cur.set_key_ss(db, coll);
-        match cur.search() {
-            Ok(()) => {
-                let blob = cur.get_value_u()?;
+        match coll_options_raw(session, db, coll)? {
+            Some(blob) => {
                 if blob.is_empty() {
                     return Ok(false);
                 }
@@ -8930,8 +9027,7 @@ impl Storage {
                     .map_err(|e| StorageError::Internal(format!("collection options: {e}")))?
                     .is_some())
             }
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e.into()),
+            None => Ok(false),
         }
     }
 
@@ -9701,13 +9797,7 @@ impl Storage {
         // savepoint restore relied on this answer to decide whether a
         // `ROLLBACK TO` had a collection to drop.
         let session = self.op_session()?;
-        let cur = session.open_cursor(COLL_TABLE, None)?;
-        cur.set_key_ss(db, coll);
-        match cur.search() {
-            Ok(()) => Ok(true),
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        collection_registered(&session, db, coll)
     }
 
     /// Collection names registered under `db`, in registry order.
@@ -10575,9 +10665,12 @@ impl Storage {
         if self.enable_oplog && db == "local" && coll == "oplog.rs" {
             let mut o = Document::new();
             o.insert("capped", true);
+            // mongod's options for its oplog: capped to a size in bytes, and
+            // no `_id` index. The cap here is counted in entries, at 16 KiB
+            // an entry.
             let max_entries = self.prune_ctx.max_entries.load(Ordering::Relaxed) as i64;
             o.insert("size", max_entries * 16 * 1024);
-            o.insert("max", max_entries);
+            o.insert("autoIndexId", false);
             return Ok(o);
         }
         // Lock-free read (see the `lock` field's invariants), on the
@@ -11801,7 +11894,7 @@ impl Storage {
         // unique + monotonic; gaps are fine.
         rev.reset()?;
         note_id_key(db, coll, id_key)?;
-        rev.set_key_ssu(db, coll, id_key);
+        rev.set_key_ssu(db, &key_coll(db, coll), id_key);
         rev.set_value_q(recordid);
         match rev.insert() {
             Ok(()) => Ok(recordid),
@@ -11820,7 +11913,7 @@ impl Storage {
         id_key: &[u8],
     ) -> Result<Option<i64>> {
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        rev.set_key_ssu(db, coll, id_key);
+        rev.set_key_ssu(db, &key_coll(db, coll), id_key);
         match rev.search() {
             Ok(()) => Ok(Some(rev.get_value_q()?)),
             Err(e) if e.is_not_found() => Ok(None),
@@ -11841,7 +11934,7 @@ impl Storage {
         // caller can delete the doc-table row keyed by it. (No forward NAT_TABLE
         // row to remove — the doc table itself is in RecordId order.)
         let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        rev.set_key_ssu(db, coll, id_key);
+        rev.set_key_ssu(db, &key_coll(db, coll), id_key);
         let recordid = match rev.search() {
             Ok(()) => rev.get_value_q()?,
             Err(e) if e.is_not_found() => return Ok(None),
@@ -12237,14 +12330,14 @@ impl Storage {
             {
                 let esc = escape_kb(&kb);
                 claims.reset()?;
-                claims.set_key_sssu(db, coll, &desc.name, &esc);
+                claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
                 claims.set_value_q(recordid);
                 match claims.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
                         if desc.id_claim {
                             let owner = session.open_cursor(UNIQ_TABLE, None)?;
-                            owner.set_key_sssu(db, coll, &desc.name, &esc);
+                            owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
                             let held = match owner.search() {
                                 Ok(()) => Some(owner.get_value_q()?),
                                 Err(e) if e.is_not_found() => None,
@@ -12257,7 +12350,7 @@ impl Storage {
                             };
                             if stale {
                                 owner.reset()?;
-                                owner.set_key_sssu(db, coll, &desc.name, &esc);
+                                owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
                                 owner.set_value_q(recordid);
                                 owner.insert()?;
                                 continue;
@@ -12327,7 +12420,7 @@ impl Storage {
                     index_key_variants_c(doc, &desc.key_spec, desc.sparse, desc.collation.as_ref())?
                 {
                     claims.reset()?;
-                    claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                    claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &escape_kb(&kb));
                     match claims.search() {
                         Ok(()) => {
                             if claims.get_value_q().ok() == Some(recordid) {
@@ -13047,7 +13140,7 @@ impl Storage {
                     index_key_variants_c(candidate, &desc.key_spec, false, desc.collation.as_ref())?
                 {
                     claims.reset()?;
-                    claims.set_key_sssu(db, coll, &desc.name, &escape_kb(&kb));
+                    claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &escape_kb(&kb));
                     let owner = match claims.search() {
                         Ok(()) => claims.get_value_q()?,
                         Err(e) if e.is_not_found() => continue,
@@ -18040,7 +18133,7 @@ fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool
     cur.set_key_ss(db, coll);
     match cur.search() {
         Ok(()) => Ok(true),
-        Err(e) if e.is_not_found() => Ok(false),
+        Err(e) if e.is_not_found() => Ok(deferred_row(session, db, coll).is_some()),
         Err(e) => Err(e.into()),
     }
 }
@@ -18088,6 +18181,34 @@ fn ensure_collection(
     probe.set_key_ss(db, coll);
     match probe.search() {
         Ok(()) => Ok(false),
+        Err(e) if e.is_not_found() && deferred_row(session, db, coll).is_some() => Ok(false),
+        Err(e) if e.is_not_found() && deferring_handle(session).is_some() => {
+            // Held by the transaction until it commits (see
+            // `UserTransactionHandle::deferred_creates`). The documents'
+            // shard is made now: a table is not part of any transaction, and
+            // an empty one reads as no documents.
+            let hp = deferring_handle(session).expect("just checked");
+            // SAFETY: as `deferring_handle`; the only writer on this thread.
+            let handle = unsafe { &mut *hp };
+            handle
+                .deferred_creates
+                .insert((db.to_string(), coll.to_string()), empty_options());
+            let incarnation: String = new_uuid_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            handle.deferred_keys.insert(
+                (db.to_string(), coll.to_string()),
+                format!("{coll}{DEFERRED_KEY_SEP}{incarnation}"),
+            );
+            // Its commit changes what other sessions see in the registry.
+            handle.wrote_registry = true;
+            session.create(
+                &doc_table_for(db, coll),
+                &data_table_cfg(DOC_TABLE_CFG, data_nonlogged),
+            )?;
+            Ok(true)
+        }
         Err(e) if e.is_not_found() => {
             let cur: Cursor = session.open_cursor(COLL_TABLE, None)?;
             // `opts` must outlive `insert()`: set_value_u stores a pointer to the
@@ -18149,19 +18270,10 @@ fn is_clustered(session: &Session, db: &str, coll: &str) -> Result<bool> {
 /// The collection's options document (`{}` when registered with none), or
 /// `None` when the collection isn't registered.
 fn coll_options(session: &Session, db: &str, coll: &str) -> Result<Option<Document>> {
-    let cur = session.open_cursor(COLL_TABLE, None)?;
-    cur.set_key_ss(db, coll);
-    match cur.search() {
-        Ok(()) => {
-            let blob = cur.get_value_u()?;
-            if blob.is_empty() {
-                Ok(Some(Document::new()))
-            } else {
-                Ok(Some(decode_doc(&blob)?))
-            }
-        }
-        Err(e) if e.is_not_found() => Ok(None),
-        Err(e) => Err(e.into()),
+    match coll_options_raw(session, db, coll)? {
+        None => Ok(None),
+        Some(blob) if blob.is_empty() => Ok(Some(Document::new())),
+        Some(blob) => Ok(Some(decode_doc(&blob)?)),
     }
 }
 
@@ -18278,6 +18390,16 @@ fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) 
         TIMESERIES_SEEN.store(true, Ordering::SeqCst);
     }
     let blob = encode_doc(opts)?;
+    // A collection the transaction created and holds until commit keeps its
+    // options there too.
+    if let Some(hp) = deferring_handle(session) {
+        // SAFETY: as `deferring_handle`; the only writer on this thread.
+        let held = &mut unsafe { &mut *hp }.deferred_creates;
+        if let Some(row) = held.get_mut(&(db.to_string(), coll.to_string())) {
+            *row = blob;
+            return Ok(());
+        }
+    }
     let cur = session.open_cursor(COLL_TABLE, None)?;
     cur.set_key_ss(db, coll);
     cur.set_value_u(&blob);
@@ -18379,8 +18501,194 @@ fn coll_options_raw(session: &Session, db: &str, coll: &str) -> Result<Option<Ve
     cur.set_key_ss(db, coll);
     match cur.search() {
         Ok(()) => Ok(Some(cur.get_value_u()?)),
-        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) if e.is_not_found() => Ok(deferred_row(session, db, coll)),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// The transaction whose statement runs on this thread, when `session` is
+/// its session and it holds its creates until commit.
+fn deferring_handle(session: &Session) -> Option<*mut UserTransactionHandle> {
+    if !std::ptr::eq(session, ACTIVE_TXN_SESSION.with(|c| c.get())) {
+        return None;
+    }
+    let hp = Storage::active_handle()?;
+    // SAFETY: see `Storage::active_handle`; a shared read.
+    unsafe { &*hp }.defer_creates.then_some(hp)
+}
+
+/// The registry row a transaction holds for a collection it created and has
+/// not committed (`UserTransactionHandle::deferred_creates`). Only that
+/// transaction's own session sees it.
+fn deferred_row(session: &Session, db: &str, coll: &str) -> Option<Vec<u8>> {
+    let hp = deferring_handle(session)?;
+    // SAFETY: as `deferring_handle`.
+    unsafe { &*hp }
+        .deferred_creates
+        .get(&(db.to_string(), coll.to_string()))
+        .cloned()
+}
+
+/// Write the registry rows a transaction held for the collections it created,
+/// in that transaction. One somebody else committed meanwhile, or holds
+/// uncommitted, is mongod's 112 `Collection namespace ... is already in use`.
+fn flush_deferred_creates(
+    session: &Session,
+    creates: BTreeMap<(String, String), Vec<u8>>,
+    keys: BTreeMap<(String, String), String>,
+) -> Result<()> {
+    // The `_id` index rows and unique claims, from the name they were kept
+    // under to the collection's own. One somebody else holds is the same
+    // conflict as the registry row.
+    for ((db, coll), held) in &keys {
+        move_keyed_rows(session, NAT_SEQ_TABLE, db, held, coll, |c| {
+            let (_, _, k) = c.get_key_ssu()?;
+            Ok((None, k))
+        })?;
+        move_keyed_rows(session, UNIQ_TABLE, db, held, coll, |c| {
+            let (_, _, n, k) = c.get_key_sssu()?;
+            Ok((Some(n), k))
+        })?;
+    }
+    let cur = session.open_cursor(COLL_TABLE, Some("overwrite=false"))?;
+    for ((db, coll), blob) in &creates {
+        cur.reset()?;
+        cur.set_key_ss(db, coll);
+        cur.set_value_u(blob);
+        match cur.insert() {
+            Ok(()) => {}
+            Err(e) if e.is_duplicate_key() || e.is_rollback() => {
+                return Err(namespace_in_use(db, coll));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if blob_names_timeseries(blob) {
+            TIMESERIES_SEEN.store(true, Ordering::SeqCst);
+        }
+    }
+    COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Move every row of `table` under `(db, from, ...)` to `(db, to, ...)`, in
+/// the transaction. `split` reads a row's key past the collection: the index
+/// name (for `UNIQ_TABLE`) and the trailing bytes. A row `to` already holds
+/// is mongod's 112 for `to`.
+fn move_keyed_rows(
+    session: &Session,
+    table: &str,
+    db: &str,
+    from: &str,
+    to: &str,
+    split: impl Fn(&Cursor) -> Result<(Option<String>, Vec<u8>)>,
+) -> Result<()> {
+    let scan = session.open_cursor(table, None)?;
+    let mut rows: Vec<(Option<String>, Vec<u8>, i64)> = Vec::new();
+    let with_name = table == UNIQ_TABLE;
+    if with_name {
+        scan.set_key_sssu(db, from, "", b"");
+    } else {
+        scan.set_key_ssu(db, from, b"");
+    }
+    let mut more = match scan.search_near() {
+        Ok(cmp) => {
+            if cmp < 0 {
+                scan.next()?
+            } else {
+                true
+            }
+        }
+        Err(e) if e.is_not_found() => false,
+        Err(e) => return Err(e.into()),
+    };
+    while more {
+        let (d, c) = if with_name {
+            let (d, c, _, _) = scan.get_key_sssu()?;
+            (d, c)
+        } else {
+            let (d, c, _) = scan.get_key_ssu()?;
+            (d, c)
+        };
+        if d != db || c != from {
+            break;
+        }
+        let (name, key) = split(&scan)?;
+        rows.push((name, key, scan.get_value_q()?));
+        more = scan.next()?;
+    }
+    let put = session.open_cursor(table, Some("overwrite=false"))?;
+    let del = session.open_cursor(table, None)?;
+    for (name, key, value) in rows {
+        put.reset()?;
+        del.reset()?;
+        match &name {
+            Some(n) => {
+                put.set_key_sssu(db, to, n, &key);
+                del.set_key_sssu(db, from, n, &key);
+            }
+            None => {
+                put.set_key_ssu(db, to, &key);
+                del.set_key_ssu(db, from, &key);
+            }
+        }
+        put.set_value_q(value);
+        match put.insert() {
+            Ok(()) => {}
+            Err(e) if e.is_duplicate_key() || e.is_rollback() => {
+                return Err(namespace_in_use(db, to));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        del.remove()?;
+    }
+    Ok(())
+}
+
+/// Between a collection's name and the incarnation a transaction keeps its
+/// `_id` index rows and claims under (`key_coll`). Not a character a
+/// collection name holds.
+const DEFERRED_KEY_SEP: &str = "\u{1}txn\u{1}";
+
+/// The name the `_id` index rows and unique claims of `(db, coll)` are keyed
+/// under: the collection's own, or, for one the running transaction created
+/// and has not committed, the name it keeps them under until its commit
+/// moves them (`UserTransactionHandle::deferred_keys`).
+fn key_coll<'a>(db: &str, coll: &'a str) -> std::borrow::Cow<'a, str> {
+    if let Some(hp) = Storage::active_handle() {
+        // SAFETY: see `Storage::active_handle`; a shared read.
+        let handle = unsafe { &*hp };
+        if !handle.deferred_keys.is_empty() {
+            if let Some(held) = handle
+                .deferred_keys
+                .get(&(db.to_string(), coll.to_string()))
+            {
+                return std::borrow::Cow::Owned(held.clone());
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(coll)
+}
+
+/// Whether an options blob names a time-series collection.
+fn blob_names_timeseries(blob: &[u8]) -> bool {
+    !blob.is_empty()
+        && bson::RawDocument::from_bytes(blob)
+            .ok()
+            .and_then(|raw| raw.get("timeseries").ok().flatten())
+            .is_some()
+}
+
+/// mongod's answer to a transaction whose commit finds that a collection it
+/// created was created by somebody else meanwhile (measured 8.2.11,
+/// 2026-10-14). Code 112, so the client is told to retry the transaction.
+fn namespace_in_use(db: &str, coll: &str) -> StorageError {
+    StorageError::QueryError {
+        code: 112,
+        errmsg: format!(
+            "Caused by :: Collection namespace '{db}.{coll}' is already in use. :: Please \
+             retry your operation or multi-document transaction."
+        ),
+        exec: false,
     }
 }
 
@@ -20505,7 +20813,7 @@ mod tests {
         // long-running server bounds its oplog from writes alone — with NO
         // explicit prune_oplog call and NO noop-heartbeat sweeper (the default).
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
         s.set_oplog_max_entries(10);
         let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
         let total = OPLOG_PRUNE_INTERVAL as i32 + 1; // cross the threshold once
