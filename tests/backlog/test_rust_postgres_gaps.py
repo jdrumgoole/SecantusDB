@@ -141,7 +141,6 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 _RP015 = {
     "sjis-non-ascii": "select convert_to('é', 'SJIS')",
     "euc-jp-from-bytes": "select convert_from('\\xa4a2'::bytea, 'EUC_JP')",
-    "regconfig-by-oid": "select 3748::regconfig::text",
     "ts-headline-untyped": "select ts_headline('english', 'a b c', 'b')",
 }
 
@@ -160,6 +159,11 @@ _RP015_FIXED = {
     "srf-in-coalesce": "select coalesce(unnest(array[1, null]), 0)",
     "timetz-date-part": "select date_part('timezone_h', '01:00-03:30'::timetz)",
     "int2-to-char-cast": 'select 65::int2::"char"',
+    "regconfig-by-oid": "select 3748::regconfig::text",
+    "pg-ts-config": "select count(*) from pg_ts_config",
+    "regdictionary": "select 'simple'::regdictionary::oid",
+    "ts-lexize": "select ts_lexize('english_stem', 'cats')",
+    "ts-config-position": "select to_tsvector('nope', 'a b')",
 }
 
 

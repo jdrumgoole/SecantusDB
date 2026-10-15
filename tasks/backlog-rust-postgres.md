@@ -503,17 +503,15 @@ one beside it.
         a `client_encoding` (passed through as UTF-8). The single-byte ones
         are done from tables measured on PostgreSQL (`sbcs.rs`); these need
         PostgreSQL's mapping tables, which are large.
-      - **Text search**: a `regconfig` / `regdictionary` by oid
-        (`3748::regconfig`) and `pg_ts_config` do not exist; `null::tsquery`
-        sends a spurious "doesn't contain lexemes" NOTICE; a bad
-        configuration name carries no position; `ts_headline` refuses its
-        `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments` options,
-        chooses its words by a rule of its own, and answers an all-untyped
-        call PostgreSQL refuses as not unique (42725); `ts_rewrite`'s
-        substitute loses its AND/OR nesting (a tsquery is carried as its
-        canonical text), its SELECT form checks the column count only on
-        rows it gets back, and a syntax error in that SQL has a position
-        PostgreSQL does not give.
+      - **Text search**: `null::tsquery` sends a spurious "doesn't
+        contain lexemes" NOTICE from a FROM-less select; `ts_headline`
+        refuses its `MaxWords` / `MinWords` / `ShortWord` / `MaxFragments`
+        options, chooses its words by a rule of its own, and answers an
+        all-untyped call PostgreSQL refuses as not unique (42725);
+        `ts_rewrite`'s substitute loses its AND/OR nesting (a tsquery is
+        carried as its canonical text), its SELECT form checks the column
+        count only on rows it gets back, and a syntax error in that SQL has
+        a position PostgreSQL does not give.
       - **`aclexplode`, `acldefault`, `makeaclitem`** need role oids;
         **`pg_relation_is_updatable`**, **`pg_is_other_temp_schema`**,
         **`pg_settings_get_flags`** need catalog or GUC state the planner

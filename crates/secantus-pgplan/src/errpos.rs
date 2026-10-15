@@ -249,6 +249,24 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 }
             }
         }
+        // An object a `reg*` type's input reads from a string
+        // (`'nope'::regconfig`, `to_tsvector('nope', ...)`, `'x'::regrole`,
+        // `'s'::regnamespace`): at the literal, as on PostgreSQL 15.19.
+        "42704" | "3F000"
+            if [
+                "text search configuration ",
+                "text search dictionary ",
+                "role ",
+                "schema ",
+                "collation ",
+            ]
+            .iter()
+            .any(|p| m.starts_with(p)) =>
+        {
+            let name = m.split_once('"')?.1.split_once('"')?.0;
+            let lit = format!("'{}'", name.replace('\'', "''"));
+            pos(toks.iter().find(|t| t.text == lit)?.start)
+        }
         "42704" => {
             let name = quoted_between(m, "type ")?;
             let name = name.rsplit('.').next()?;

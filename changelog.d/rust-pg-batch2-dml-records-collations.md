@@ -60,11 +60,24 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - `ROW(t.*)` is a row of t's columns, not a row holding t's row.
 - An aggregate's `ORDER BY ... COLLATE "x"` naming no collation is 42704
   at the clause; it had sorted nothing.
+- `default_text_search_config` is obeyed: `to_tsvector(text)`,
+  `plainto_tsquery(text)` and the other one-argument forms, and
+  `get_current_ts_config()`, use the session's configuration (they always
+  used `english`). `SET` validates the name (22023) and keeps it as
+  `pg_catalog.<name>`, as PostgreSQL shows it.
+- An unknown text-search configuration, dictionary, role, schema or
+  collation named in a string is reported at the literal. Part of RP-015
+  (tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed).
 
 #### Added
 
+- The text-search catalogs `pg_ts_config`, `pg_ts_dict`, `pg_ts_parser`,
+  `pg_ts_template` and `pg_ts_config_map`, with PostgreSQL 15.19's rows;
+  `regconfig` and a new `regdictionary` resolve by name or oid
+  (`3748::regconfig` is `simple`); and `ts_lexize`. Part of RP-015
+  (tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed).
 - `to_regnamespace`, `to_regrole`, `to_regcollation`, `to_regproc` and
   `to_regprocedure`; a dotted schema or role name is 42602 `invalid name
   syntax`. `regcollation` columns are described with their own type oid.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
-  `to_reg_functions` and `typed_value_residue`.
+  `to_reg_functions`, `typed_value_residue` and `ts_catalogs`.

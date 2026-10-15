@@ -143,7 +143,7 @@ pub(crate) fn debug(args: &[Bson]) -> Result<Rows> {
     let cfg = match cfg {
         Some(Bson::Null) => return Ok((names, types, Vec::new())),
         Some(c) => fts::config(&value_text(c))?,
-        None => fts::DEFAULT_CONFIG,
+        None => fts::default_config(),
     };
     if *doc == Bson::Null {
         return Ok((names, types, Vec::new()));

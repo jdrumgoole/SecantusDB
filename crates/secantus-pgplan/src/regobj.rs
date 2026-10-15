@@ -17,6 +17,8 @@ pub const KINDS: &[(&str, &str)] = &[
     ("regproc", "__regproc_oid"),
     ("regprocedure", "__regprocedure_oid"),
     ("regcollation", "__regcollation_oid"),
+    ("regconfig", "__regconfig_oid"),
+    ("regdictionary", "__regdictionary_oid"),
     ("regoper", "__regoper_oid"),
     ("regoperator", "__regoperator_oid"),
 ];
@@ -247,6 +249,10 @@ pub fn text(kind: &str, oid: i64) -> String {
             .into_iter()
             .find(|(_, o)| *o == oid)
             .map(|(n, _)| crate::scalar::quote_identifier(&n)),
+        "regconfig" => crate::ts_catalog::name_of(oid, false).map(crate::scalar::quote_identifier),
+        "regdictionary" => {
+            crate::ts_catalog::name_of(oid, true).map(crate::scalar::quote_identifier)
+        }
         "regproc" => PROCS
             .with(|t| {
                 t.borrow()
@@ -326,6 +332,19 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
                 .ok_or_else(|| {
                     Error::Sqlstate("3F000", format!("schema \"{name}\" does not exist"))
                 })
+        }
+        "regconfig" | "regdictionary" => {
+            let dict = kind == "regdictionary";
+            crate::ts_catalog::oid_of(input, dict).ok_or_else(|| {
+                Error::Sqlstate(
+                    "42704",
+                    format!(
+                        "text search {} \"{}\" does not exist",
+                        if dict { "dictionary" } else { "configuration" },
+                        input.trim()
+                    ),
+                )
+            })
         }
         "regcollation" => {
             let name = unquote(input);

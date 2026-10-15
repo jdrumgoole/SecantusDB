@@ -69,6 +69,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("tsvector", 3614, 3643),
     ("tsquery", 3615, 3645),
     ("regconfig", 3734, 3735),
+    ("regdictionary", 3769, 3770),
     ("jsonpath", 4072, 4073),
     ("jsonb", 3802, 3807),
     ("int4range", 3904, 3905),

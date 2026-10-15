@@ -262,8 +262,13 @@ pub fn config(name: &str) -> Result<Config> {
     }
 }
 
-/// The session default, `default_text_search_config`.
-pub const DEFAULT_CONFIG: Config = Config::English;
+/// The configuration a call without one uses: the session's
+/// `default_text_search_config` (validated by `SET`), else `english`.
+pub fn default_config() -> Config {
+    crate::session_setting("default_text_search_config")
+        .and_then(|n| config(&n).ok())
+        .unwrap_or(Config::English)
+}
 
 thread_local! {
     static NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -1873,7 +1878,7 @@ pub(crate) fn json_headline(args: &[Bson], doc_at: usize, jsonb: bool) -> Result
     let cfg = if doc_at == 1 {
         config(&text_of(&args[0]))?
     } else {
-        DEFAULT_CONFIG
+        default_config()
     };
     let (Some(doc), Some(q)) = (args.get(doc_at), args.get(doc_at + 1)) else {
         return Err(wrong("ts_headline"));
@@ -2278,6 +2283,7 @@ const FUNCTIONS: &[&str] = &[
     "ts_rank",
     "ts_rank_cd",
     "ts_rewrite",
+    "ts_lexize",
 ];
 
 /// Is `name` one of the full-text functions?
@@ -2299,7 +2305,7 @@ pub fn result_type(name: &str) -> Option<&'static str> {
         | "tsquery_not"
         | "tsquery_phrase"
         | "ts_rewrite" => "tsquery",
-        "tsvector_to_array" => "text[]",
+        "tsvector_to_array" | "ts_lexize" => "text[]",
         "numnode" | "tsvector_length" => "int4",
         "querytree" | "ts_headline" => "text",
         "get_current_ts_config" => "regconfig",
@@ -2423,7 +2429,7 @@ fn split_config(args: &[Bson], plain: usize) -> Result<(Config, &[Bson])> {
     if args.len() > plain {
         Ok((config(&text_of(&args[0]))?, &args[1..]))
     } else {
-        Ok((DEFAULT_CONFIG, args))
+        Ok((default_config(), args))
     }
 }
 
@@ -2603,6 +2609,43 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
             });
             Ok(vector_out(&v))
         }
+        // `ts_lexize(dict, token)`: what one built-in dictionary makes of a
+        // token -- `simple` lower-cases it, a `_stem` dictionary drops a
+        // stop-word (`{}`) and stems the rest.
+        "ts_lexize" => {
+            let [dict, token] = args else {
+                return Err(wrong(name));
+            };
+            let name = text_of(dict);
+            let name = crate::ts_catalog::oid_of(&name, true)
+                .and_then(|o| crate::ts_catalog::name_of(o, true))
+                .ok_or_else(|| {
+                    Error::Sqlstate(
+                        "42704",
+                        format!("text search dictionary \"{}\" does not exist", name.trim()),
+                    )
+                })?;
+            let lower: String = text_of(token)
+                .chars()
+                .map(crate::scalar::simple_lower)
+                .collect();
+            let lexemes = match name.strip_suffix("_stem") {
+                Some("english") => {
+                    if ENGLISH_STOP.contains(&lower.as_str()) {
+                        Vec::new()
+                    } else {
+                        vec![stem(&lower)]
+                    }
+                }
+                Some(lang) => match LANGS.iter().find(|l| l.name() == lang) {
+                    Some(l) if l.is_stop(&lower) => Vec::new(),
+                    Some(l) => vec![l.stem(&lower)],
+                    None => vec![lower],
+                },
+                None => vec![lower],
+            };
+            Ok(Bson::Array(lexemes.into_iter().map(Bson::String).collect()))
+        }
         "ts_rewrite" => match args {
             [q, ex, subs] => Ok(query_out(&crate::ts_rewrite::rewrite(
                 &query_arg(q)?,
@@ -2642,8 +2685,8 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
                 {
                     (config(&text_of(&args[0]))?, &args[1..3], None)
                 }
-                3 => (DEFAULT_CONFIG, &args[..2], args.get(2)),
-                _ => (DEFAULT_CONFIG, &args[..2], None),
+                3 => (default_config(), &args[..2], args.get(2)),
+                _ => (default_config(), &args[..2], None),
             };
             let [doc, q] = rest else {
                 return Err(wrong(name));
@@ -2659,7 +2702,11 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
                 &opts,
             )))
         }
-        "get_current_ts_config" => Ok(Bson::String("english".into())),
+        "get_current_ts_config" => Ok(crate::ts_catalog::oid_of(default_config().name(), false)
+            .map_or_else(
+                || Bson::String(default_config().name().into()),
+                |oid| crate::regobj::value("regconfig", oid),
+            )),
         "ts_rank" => rank_call(args, false),
         "ts_rank_cd" => rank_call(args, true),
         _ => Err(wrong(name)),

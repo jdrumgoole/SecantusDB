@@ -94,6 +94,7 @@ mod rowsfrom;
 pub mod rule_rewrite;
 pub mod ruleutils;
 pub mod trgm;
+pub mod ts_catalog;
 pub mod user_casts;
 pub use correlated::{is_user_procedure, set_user_functions, set_user_procedures};
 pub use correlated::{
@@ -25372,6 +25373,11 @@ const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_inherits", 2611),
     ("pg_am", 2601),
     ("pg_collation", 3456),
+    ("pg_ts_dict", 3600),
+    ("pg_ts_parser", 3601),
+    ("pg_ts_config", 3602),
+    ("pg_ts_config_map", 3603),
+    ("pg_ts_template", 3764),
     ("pg_policy", 3256),
     ("pg_rewrite", 2618),
     ("pg_attrdef", 2604),
@@ -29664,15 +29670,6 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "tsquery" => Ok(Bson::String(fts::render_query(&fts::parse_query(
             &as_text(&value),
         )?))),
-        "regconfig" => {
-            let text = as_text(&value);
-            fts::config(&text)?;
-            Ok(Bson::String(
-                text.trim()
-                    .trim_start_matches("pg_catalog.")
-                    .to_ascii_lowercase(),
-            ))
-        }
         // A name no catalog knows is PostgreSQL's 42704; only a REAL type
         // this server has no cast arm for is the honest 0A000.
         other => {
@@ -31016,12 +31013,12 @@ fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bs
         let vector = if dt == "tsvector" {
             fts::parse_vector(&fts::text_of(doc))?
         } else {
-            fts::to_tsvector(fts::DEFAULT_CONFIG, &fts::text_of(doc))
+            fts::to_tsvector(fts::default_config(), &fts::text_of(doc))
         };
         let q = if qt == "tsquery" {
             fts::parse_query(&fts::text_of(query))?
         } else {
-            fts::plainto_tsquery(fts::DEFAULT_CONFIG, &fts::text_of(query))
+            fts::plainto_tsquery(fts::default_config(), &fts::text_of(query))
         };
         Ok(Bson::Boolean(fts::matches(&vector, &q)))
     })())

@@ -77,6 +77,7 @@ mod stream_join;
 mod table_locks;
 mod tls;
 mod triggers;
+mod ts_catalogs;
 mod txn_gucs;
 mod window_order;
 mod wire_portals;
@@ -13297,6 +13298,7 @@ impl PgHandler {
                 ],
             )),
             "pg_collation" => Some(catalog_fill::pg_collation_def()),
+            other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => ts_catalogs::def(other),
             "pg_am" => Some(catalog_fill::pg_am_def()),
             "pg_policy" => Some(catalog_fill::pg_policy_def()),
             "pg_sequence" => Some(catalog_fill::pg_sequence_def()),
@@ -13324,6 +13326,9 @@ impl PgHandler {
                 let mut rows = self.pg_collation_rows(&def);
                 rows.extend(self.user_collation_rows(&def));
                 rows
+            }
+            other if secantus_pgplan::ts_catalog::NAMES.contains(&other) => {
+                ts_catalogs::rows(other, &def)
             }
             "pg_am" => self.pg_am_rows(&def),
             "pg_policy" => self.pg_policy_rows(&def),
@@ -17340,6 +17345,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             4089 => "regnamespace",
             4096 => "regrole",
             4191 => "regcollation",
+            3734 => "regconfig",
+            3769 => "regdictionary",
             600 => "point",
             601 => "lseg",
             602 => "path",
@@ -17502,6 +17509,7 @@ fn wire_type(pg_type: &str) -> Type {
         "tsvector" => Type::TS_VECTOR,
         "tsquery" => Type::TSQUERY,
         "regconfig" => Type::REGCONFIG,
+        "regdictionary" => Type::REGDICTIONARY,
         // `ts_debug`'s `dictionary` / `dictionaries` columns.
         "regdictionary" => Type::REGDICTIONARY,
         "regdictionary[]" => Type::REGDICTIONARY_ARRAY,
@@ -30798,6 +30806,21 @@ impl PgHandler {
                         canonical_ms_guc(&key, &value)?
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &value)?
+                    } else if key == "default_text_search_config" {
+                        // A configuration by name, kept qualified as
+                        // PostgreSQL shows it (`German` -> `pg_catalog.german`).
+                        match secantus_pgplan::ts_catalog::oid_of(&value, false)
+                            .and_then(|o| secantus_pgplan::ts_catalog::name_of(o, false))
+                        {
+                            Some(name) => format!("pg_catalog.{name}"),
+                            None => {
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".into(),
+                                    "22023".into(),
+                                    format!("invalid value for parameter \"{key}\": \"{value}\""),
+                                ))))
+                            }
+                        }
                     } else if key == "TimeZone" {
                         // A bare number of hours is recorded as its POSIX
                         // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
