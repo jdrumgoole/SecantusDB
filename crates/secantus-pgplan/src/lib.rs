@@ -17102,7 +17102,7 @@ fn resolve_one_sublink(
                     // subquery's column wherever it lands: a bare parameter
                     // has no declared type, which made `pg_typeof((select
                     // 1))` 42P18 and a CASE over it text (RP-023).
-                    let typed = |t: &str| {
+                    let cast = |t: &str| {
                         matches!(
                             t,
                             "int2vector"
@@ -17123,13 +17123,30 @@ fn resolve_one_sublink(
                                 | "timetz"
                                 | "interval"
                                 | "uuid"
-                        ) || (!matches!(t, "" | "unknown" | "record" | "text")
+                        )
+                    };
+                    // Any other built-in type is DECLARED for the parameter
+                    // rather than cast to: a value carried in another form
+                    // (a `pg_lsn` as its position) would not survive a cast
+                    // of itself.
+                    if let Some(t) = ty.as_deref().filter(|t| {
+                        !cast(t)
+                            && !matches!(*t, "" | "unknown" | "record" | "text")
                             && !t.contains('"')
                             && pgtypes::oid_of_name(t).is_some()
-                            && user_composite(t).is_none())
-                    };
+                            && user_composite(t).is_none()
+                    }) {
+                        let at = params.len() - 1;
+                        PLAN_PARAM_TYPES.with(|p| {
+                            let mut p = p.borrow_mut();
+                            if p.len() <= at {
+                                p.resize(at + 1, None);
+                            }
+                            p[at] = Some(t.to_string());
+                        });
+                    }
                     Ok(match ty.as_deref() {
-                        Some(ty) if typed(ty) => pg_query::protobuf::Node {
+                        Some(ty) if cast(ty) => pg_query::protobuf::Node {
                             node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                                 arg: Some(Box::new(node)),
                                 type_name: Some(type_name_node(ty)),
