@@ -434,18 +434,14 @@ one beside it.
       before working an item.
 
       What is left (re-measured 2026-10-15 against 15.19):
-      - **`ts_rewrite(query, select)`** checks that its SELECT returns two
-        tsquery columns only on the rows it gets back: over none
-        (`... where false`) it answers the query unchanged, where
-        PostgreSQL is 22023 `ts_rewrite query must return two tsquery
-        columns`. The checker would need the SELECT's described column
-        types, which `correlated::run_sql` does not return.
-      - **An aclitem naming a role oid no role has** cannot be read back
-        (items are carried as text, PostgreSQL's as oids).
-      - **Not written**: the XML schema exports (`query_to_xmlschema`,
-        `table_to_xmlschema`, the `*_and_xmlschema` forms), `cursor_to_xml`
-        and the schema / database forms (`query_to_xml` /
-        `table_to_xml` are).
+      - **An aclitem naming a role oid no role has** (`makeaclitem(12345,
+        ...)`) cannot be read back once it is in an array: items are
+        carried as their TEXT (`12345=r/postgres`), and building
+        `ARRAY[...]` of them re-reads each through the aclitem input,
+        which (as PostgreSQL's) refuses an unknown role name, so
+        `aclexplode` over one is 42704 where PostgreSQL answers the oid.
+        PostgreSQL carries the item as oids; `acl::explode` already reads
+        such a text back as its oid.
       - **Not to be closed by an alias**: `bttextcmp`, `bpcharcmp` and
         `byteacmp` answer what the C library's `memcmp` returns (14 for
         `bttextcmp('b', 'a')` on macOS, 1 elsewhere); the type input/output,

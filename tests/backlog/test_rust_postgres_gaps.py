@@ -139,11 +139,14 @@ def test_wrong_password_checked_before_the_database(pg: Any, rust_pg: Any) -> No
 # RP-015: what `pg_builtin_coverage.py` still reports. Each is compared with
 # the live PostgreSQL 15 reference, under the same session time zone.
 _RP015 = {
-    "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
+    "aclitem-unknown-role": (
+        "select a.grantee from aclexplode(array[makeaclitem(12345, 10, 'SELECT', false)]) a"
+    ),
 }
 
 # What the 2026-10-15 batch fixed, kept as regression tests.
 _RP015_FIXED = {
+    "ts-rewrite-no-rows": "select ts_rewrite('a'::tsquery, 'select 1, 2 where false')",
     "variadic-column": (
         "select concat(variadic a), format('%s-%s', variadic a)"
         " from (values (array['x', 'y'])) v(a)"

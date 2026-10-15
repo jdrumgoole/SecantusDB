@@ -2294,28 +2294,26 @@ fn rewrite_by_query(q: &Option<Query>, sql: &str) -> Result<Option<Query>> {
     if q.is_none() {
         return Ok(None);
     }
-    let rows = crate::correlated::run_sql(sql)?;
     let bad = || {
         Error::Sqlstate(
             "22023",
             "ts_rewrite query must return two tsquery columns".into(),
         )
     };
-    if let Some(first) = rows.first() {
-        if first.len() != 2 {
-            return Err(bad());
-        }
-        let types = crate::correlated::run_sql(&format!(
-            "select pg_typeof(s.a)::text, pg_typeof(s.b)::text from ({sql}) s(a, b) limit 1"
-        ))?;
-        let tsquery = |v: Option<&Bson>| v.is_some_and(|v| text_of(v) == "tsquery");
-        if !types
-            .first()
-            .is_some_and(|t| tsquery(t.first()) && tsquery(t.get(1)))
-        {
-            return Err(bad());
-        }
+    // The query's described columns, as SPI's tuple descriptor has them: two
+    // tsquery columns, whether or not it returns a row (`... where false`
+    // is 22023 too on 15.19).
+    let columns = crate::correlated::describe_sql(sql)?;
+    const TSQUERY: i64 = 3615;
+    let is_tsquery = |c: &Vec<Bson>| match c.get(1) {
+        Some(Bson::Int64(oid)) => *oid == TSQUERY,
+        Some(Bson::Int32(oid)) => i64::from(*oid) == TSQUERY,
+        _ => false,
+    };
+    if columns.len() != 2 || !columns.iter().all(is_tsquery) {
+        return Err(bad());
     }
+    let rows = crate::correlated::run_sql(sql)?;
     // The rows are tsquery VALUES, not input: an empty one raises no
     // "doesn't contain lexemes" notice.
     let stored = |v: &Bson| {

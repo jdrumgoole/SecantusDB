@@ -88,6 +88,22 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   rest printed `UNDEF`. Part of RP-013 (the `short_names_are_openssls`
   unit test in `crates/secantus-pg/src/x509.rs`).
 
+- `ts_rewrite(query, select)` checks that its SELECT describes two tsquery
+  columns before it runs it, as PostgreSQL's SPI does: over no rows (`...
+  where false`) a wrong shape is 22023, where it had answered the query
+  unchanged. It asks the server for the SELECT's described columns
+  (`correlated::describe_sql`). Part of RP-015
+  (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[ts-rewrite-no-rows]`).
+- The XML schema exports -- `query_to_xmlschema`, `table_to_xmlschema`,
+  the `*_and_xmlschema` forms, `cursor_to_xml` / `cursor_to_xmlschema` and
+  the schema and database forms -- transcribed from PostgreSQL 15's
+  xml.c (`map_sql_table_to_xmlschema`, `map_sql_type_to_xmlschema_type`),
+  over the query's described column types. `query_to_xml` also puts an
+  `xml` column's value in raw, where it had escaped it, and `xmlbinary =
+  hex` is honoured. Part of RP-015
+  (`::test_builtin_coverage_fixed[query-to-xmlschema]` and the cases
+  beside it; corpus `xml_schema_export`).
+
 #### Added
 
 - The language validators `fmgr_internal_validator`, `fmgr_c_validator`,
@@ -99,4 +115,4 @@ PostgreSQL 15.19 and pinned by the backlog test that found it.
   foreign server or user mapping may set. Part of RP-015
   (`tests/backlog/test_rust_postgres_gaps.py::test_builtin_coverage_fixed[fmgr-validator]`,
   `[fdw-validator]`).
-- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents`, `enum_literal_analysis` and `restricted_builtins`.
+- Corpora `row_type_char_overflow`, `fmgr_validators`, `type_named_like_grammar`, `drop_type_dependents`, `enum_literal_analysis`, `restricted_builtins` and `xml_schema_export`.
