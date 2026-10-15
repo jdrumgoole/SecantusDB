@@ -78,6 +78,7 @@ mod table_locks;
 mod tls;
 mod triggers;
 mod txn_gucs;
+mod window_order;
 mod wire_portals;
 mod x509;
 mod xids;
@@ -25520,7 +25521,7 @@ impl PgHandler {
             docs = kept;
         }
         if !sel.windows.is_empty() {
-            materialise_windows(&mut docs, &sel.windows).map_err(|e| Self::err(&e))?;
+            materialise_windows(&mut docs, &sel.windows, &sel.order).map_err(|e| Self::err(&e))?;
             // The synthetic `__winN` columns go into the def HERE rather than
             // only in `select_def`, because every reader of a select's schema
             // -- the row encoder, `rows_with_schema`, `COPY (query)` -- takes
@@ -34887,17 +34888,23 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
 /// Compute every window function into its synthetic field.
 ///
 /// Runs after the WHERE and before `DISTINCT` / `ORDER BY` / `LIMIT`, which is
-/// PostgreSQL's evaluation order. The rows are NOT reordered: a window's own
-/// ordering is internal to it, so the work is done over an index permutation
-/// and the values are written back in place.
+/// PostgreSQL's evaluation order. The windows are evaluated in the order
+/// PostgreSQL's planner stacks them, each over the rows sorted for it unless
+/// they already arrive in that order (`window_order.rs`), and the rows are
+/// left in the last sort's order: a query with no ORDER BY of its own returns
+/// them that way on PostgreSQL 15. `query_order` is that ORDER BY, which
+/// numbers its keys before any window's and so decides which window runs
+/// last.
 fn materialise_windows(
     docs: &mut [Document],
     windows: &[secantus_pgplan::WindowItem],
+    query_order: &[OrderKey],
 ) -> Result<(), PlanError> {
+    // A computed PARTITION BY / ORDER BY key has no stored field, so it is
+    // evaluated per row into its own `__wkeyN` first and then read back
+    // like any column -- one comparator rather than two. All of them before
+    // any window runs: a window's sort may be another's.
     for w in windows {
-        // A computed PARTITION BY / ORDER BY key has no stored field, so it is
-        // evaluated per row into its own `__wkeyN` first and then read back
-        // like any column -- one comparator rather than two.
         for key in w.partition_by.iter().chain(w.order_by.iter()) {
             if let Some(expr) = key.expr.as_ref() {
                 for d in docs.iter_mut() {
@@ -34906,31 +34913,57 @@ fn materialise_windows(
                 }
             }
         }
-        let values: Vec<Bson> = match w.arg.as_ref() {
-            Some(expr) => docs
-                .iter()
-                .map(|d| secantus_pgplan::apply_row_expr(expr, d))
-                .collect::<Result<_, _>>()?,
-            None => vec![Bson::Null; docs.len()],
-        };
-        // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
-        // the output: the row still gets a value, computed over the rows that
-        // did pass.
-        let included: Vec<bool> = match w.filter.as_ref() {
-            Some(expr) => docs
-                .iter()
-                .map(|d| {
-                    Ok::<bool, PlanError>(
-                        secantus_pgplan::apply_row_expr(expr, d)? == Bson::Boolean(true),
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            None => vec![true; docs.len()],
-        };
-
-        for partition in window_partitions(docs, &w.partition_by, &w.partition_jsonb) {
-            window_partition_values(docs, &partition, w, &values, &included)?;
+    }
+    let mut order: Vec<usize> = (0..docs.len()).collect();
+    let mut sorted_by: Vec<OrderKey> = Vec::new();
+    for clause in window_order::window_clauses(windows, query_order) {
+        if !window_order::presorted(&clause.sort, &sorted_by) {
+            window_order::pg_qsort(&mut order, &mut |a, b| {
+                compare_rows(&docs[*a], &docs[*b], &clause.sort)
+            });
+            sorted_by = clause.sort.clone();
         }
+        let mut rank = vec![0usize; docs.len()];
+        for (pos, row) in order.iter().enumerate() {
+            rank[*row] = pos;
+        }
+        for &wi in &clause.windows {
+            let w = &windows[wi];
+            let values: Vec<Bson> = match w.arg.as_ref() {
+                Some(expr) => docs
+                    .iter()
+                    .map(|d| secantus_pgplan::apply_row_expr(expr, d))
+                    .collect::<Result<_, _>>()?,
+                None => vec![Bson::Null; docs.len()],
+            };
+            // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
+            // the output: the row still gets a value, computed over the rows that
+            // did pass.
+            let included: Vec<bool> = match w.filter.as_ref() {
+                Some(expr) => docs
+                    .iter()
+                    .map(|d| {
+                        Ok::<bool, PlanError>(
+                            secantus_pgplan::apply_row_expr(expr, d)? == Bson::Boolean(true),
+                        )
+                    })
+                    .collect::<Result<_, _>>()?,
+                None => vec![true; docs.len()],
+            };
+            for mut partition in window_partitions(docs, &w.partition_by, &w.partition_jsonb) {
+                // In the sorted order, so rows that tie on the window's ORDER
+                // BY are taken in the order PostgreSQL's sort left them.
+                partition.sort_by_key(|r| rank[*r]);
+                window_partition_values(docs, &partition, w, &values, &included)?;
+            }
+        }
+    }
+    let mut taken: Vec<Document> = order
+        .iter()
+        .map(|i| std::mem::take(&mut docs[*i]))
+        .collect();
+    for (slot, d) in docs.iter_mut().zip(taken.drain(..)) {
+        *slot = d;
     }
     Ok(())
 }

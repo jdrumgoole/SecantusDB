@@ -295,7 +295,7 @@ def test_case_over_a_scalar_subquery_keeps_its_type(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-024")
+@pytest.mark.backlog_fixed("RP-024")
 def test_window_rows_come_out_in_window_sort_order(pg: Any) -> None:
     """PostgreSQL 15.19: with no ORDER BY of its own, a query with a window
     returns its rows in the window's sort order (the WindowAgg's input is

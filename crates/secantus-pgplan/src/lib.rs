@@ -2068,6 +2068,12 @@ pub struct WindowItem {
     pub filter: Option<ColumnExpr>,
     /// `WindowFunc::User`'s aggregate.
     pub user: Option<user_agg::UserAggregate>,
+    /// Where PostgreSQL's parser lists this window's definition: the named
+    /// windows of the WINDOW clause first, in that clause's order (a bare
+    /// `OVER w` IS that definition), then each inline one as it appears. The
+    /// order the definitions' keys are given sortgroup refs in, which
+    /// decides the order the windows are evaluated in.
+    pub def_order: usize,
 }
 
 /// The window functions this server computes.
@@ -10099,7 +10105,23 @@ fn plan_window_call(
         .iter()
         .map(|k| k.expr.is_none() && field_type(def, &k.field) == Some("jsonb"))
         .collect();
+    // `OVER (w)` with nothing added is `OVER w` (`transformWindowFuncCall`).
+    let reference = if !over.name.is_empty() {
+        Some(over.name.as_str())
+    } else if !over.refname.is_empty()
+        && over.partition_clause.is_empty()
+        && over.order_clause.is_empty()
+        && over.frame_options & frameopt::NONDEFAULT == 0
+    {
+        Some(over.refname.as_str())
+    } else {
+        None
+    };
+    let def_order = reference
+        .and_then(|r| named.iter().position(|w| w.name == r))
+        .unwrap_or(named.len() + windows.len());
     windows.push(WindowItem {
+        def_order,
         field: field.clone(),
         func,
         arg,
