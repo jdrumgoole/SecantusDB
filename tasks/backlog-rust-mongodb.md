@@ -924,6 +924,29 @@ Still different, all 77:
 - [ ] **An unknown hint's wording** on `aggregate` (15), as under 7.075.
   Backlog-ID: RM-051
   Verify: tests/backlog/test_rm_029_056.py::test_unknown_hint_on_aggregate
+- [ ] **The order of an unsorted `find` for six predicate shapes the
+      plan derives differently from mongod.** Found by p4-router's
+      824-case shapes harness (2026-10-15), mongod 8.2.11: 22 replies, the
+      matched set right in every one, only the order different.
+      - `$ne: null` / `$nin: [null]` over an index holding arrays (8):
+        mongod runs a COLLSCAN; this server scans the index over
+        `[MinKey, null), (null, MaxKey]`.
+      - `$type: "object"` (5): mongod scans the object bracket `[{}, [])`
+        and returns the documents by value; this server scans the
+        collection.
+      - `$elemMatch: {$ne: 5}` (4): mongod scans `[MinKey, 5), (5,
+        MaxKey]`; this server scans the collection.
+      - `$type: "date"` over a descending index (2): mongod reads the date
+        bracket, latest first; this server scans the collection.
+      - A regex with an alternation, `^s|t`, over a descending index (2):
+        mongod bounds it by every string; the plan here takes the prefix
+        `s` (`regex_prefix` ignores `|`), so its bounds are wrong, and the
+        result is right only because the router decides membership.
+      - `$exists: true` with `c: {$gte: 1}` over a partial index on `c >=
+        1` (1): mongod sees the query implies the filter and reads the
+        partial index in key order; this server scans the collection.
+      Backlog-ID: RM-155
+      Verify: tests/backlog/test_rm_order_shapes.py::test_ne_null_over_a_multikey_index_scans_the_collection,tests/backlog/test_rm_order_shapes.py::test_type_object_reads_the_object_bracket,tests/backlog/test_rm_order_shapes.py::test_elem_match_ne_reads_the_index,tests/backlog/test_rm_order_shapes.py::test_type_date_reads_a_descending_index_latest_first,tests/backlog/test_rm_order_shapes.py::test_regex_with_an_alternation_reads_every_string,tests/backlog/test_rm_order_shapes.py::test_exists_over_a_partial_index_the_query_implies
 - [ ] **A double is compared with a Decimal128 or an Int64 by its
       shortest decimal form, not its exact value.** Silent wrong answers,
       with or without an index. mongod 8.2.11 (2026-10-15): `find({a:
