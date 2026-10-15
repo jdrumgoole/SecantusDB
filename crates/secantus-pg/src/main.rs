@@ -130,6 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tls_client_cert: Option<ClientCert> = None;
     let mut tls_require = false;
     let mut tls_crl_file: Option<String> = None;
+    let mut tls_key_passphrase_command: Option<String> = None;
     let mut tls_ident_file: Option<String> = None;
     let mut tls_user_map: Option<String> = None;
     let mut tls_client_name: Option<ClientName> = None;
@@ -160,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  USAGE:\n    \
                  secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n                \
                  [--tls-cert-file PATH --tls-key-file PATH [--tls-require]\n                 \
+                 [--tls-key-passphrase-command CMD]\n                 \
                  [--tls-ca-file PATH [--tls-client-cert MODE] [--tls-crl-file PATH]\n                  \
                  [--tls-client-name CN|DN]\n                  \
                  [--tls-ident-file PATH --tls-user-map NAME]]]\n                \
@@ -179,8 +181,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  client that asks for TLS gets it; one that does not is\n                     \
                  still served in the clear. Without the pair the server\n                     \
                  answers a TLS request with \"not supported\".\n    \
-                 --tls-key-file PATH   PEM private key for that certificate, with no\n                     \
-                 passphrase.\n    \
+                 --tls-key-file PATH   PEM private key for that certificate.\n    \
+                 --tls-key-passphrase-command CMD  A shell command printing the\n                     \
+                 passphrase of an encrypted PKCS#8 key\n                     \
+                 (ssl_passphrase_command; %p is the prompt).\n    \
                  --tls-require    Refuse a connection that is not TLS (a pg_hba.conf\n                     \
                  with only `hostssl` lines).\n    \
                  --tls-ca-file PATH    PEM certificate authorities. A TLS client is\n                     \
@@ -244,6 +248,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode.parse()
                     .map_err(|e| format!("--tls-client-cert: {e}"))?,
             );
+        } else if arg == "--tls-key-passphrase-command" {
+            tls_key_passphrase_command = Some(
+                args.next()
+                    .ok_or("--tls-key-passphrase-command needs a command")?,
+            );
+        } else if let Some(command) = arg.strip_prefix("--tls-key-passphrase-command=") {
+            tls_key_passphrase_command = Some(command.to_string());
         } else if arg == "--tls-crl-file" {
             tls_crl_file = Some(args.next().ok_or("--tls-crl-file needs a path")?);
         } else if let Some(path) = arg.strip_prefix("--tls-crl-file=") {
@@ -302,6 +313,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (tls_client_cert.is_some(), "--tls-client-cert"),
             (tls_require, "--tls-require"),
             (tls_crl_file.is_some(), "--tls-crl-file"),
+            (
+                tls_key_passphrase_command.is_some(),
+                "--tls-key-passphrase-command",
+            ),
             (tls_ident_file.is_some(), "--tls-ident-file"),
             (tls_user_map.is_some(), "--tls-user-map"),
             (tls_client_name.is_some(), "--tls-client-name"),
@@ -322,6 +337,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(crl) = tls_crl_file {
                 tls = tls.crl_file(crl);
+            }
+            if let Some(command) = tls_key_passphrase_command {
+                tls = tls.key_passphrase_command(command);
             }
             if let Some(name) = tls_client_name {
                 tls = tls.client_name(name);

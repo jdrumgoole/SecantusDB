@@ -69,6 +69,9 @@ pgwire = { package = "secantus-pgwire", version = "=0.1.0-beta.16", path = "../s
 # `rustls-pki-types`' own, so the unmaintained `rustls-pemfile` stays out.
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1.10", features = ["std"] }
+# An encrypted PKCS#8 key, decrypted with what `--tls-key-passphrase-command`
+# prints (PostgreSQL's `ssl_passphrase_command`).
+pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }
 # The hash of the server certificate a SCRAM channel binding carries
 # (src/x509.rs), and the base64 it travels in (src/scram_binding.rs). Both
 # are the versions `secantus-auth` already builds.

@@ -118,7 +118,8 @@ impl std::str::FromStr for ClientName {
 ///
 /// The certificate file holds the server's certificate first and any
 /// intermediates after it, as PostgreSQL's `ssl_cert_file` does. The key is
-/// PKCS#8, PKCS#1 (RSA) or SEC1 (EC), and not passphrase-protected.
+/// PKCS#8, PKCS#1 (RSA) or SEC1 (EC); an encrypted PKCS#8 key needs
+/// [`TlsConfig::key_passphrase_command`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TlsConfig {
@@ -134,6 +135,9 @@ pub struct TlsConfig {
     pub client_name: ClientName,
     /// A `pg_ident.conf` and the name of the map in it to use.
     pub user_map: Option<(PathBuf, String)>,
+    /// The shell command whose output is an encrypted key's passphrase:
+    /// PostgreSQL's `ssl_passphrase_command`, `%p` its prompt.
+    pub key_passphrase_command: Option<String>,
 }
 
 impl TlsConfig {
@@ -147,7 +151,17 @@ impl TlsConfig {
             crl_file: None,
             client_name: ClientName::CommonName,
             user_map: None,
+            key_passphrase_command: None,
         }
+    }
+
+    /// Decrypt an encrypted PKCS#8 key with the first line this shell
+    /// command prints, as PostgreSQL's `ssl_passphrase_command` does: `%p`
+    /// is replaced by the prompt and `%%` by a `%`. Run each time the key
+    /// is read, a reload included.
+    pub fn key_passphrase_command(mut self, command: impl Into<String>) -> Self {
+        self.key_passphrase_command = Some(command.into());
+        self
     }
 
     /// Refuse a client certificate that a revocation list in this PEM file
@@ -233,7 +247,7 @@ impl TlsConfig {
             None => None,
         };
         let certs = read_certs(&self.cert_file)?;
-        let key = read_key(&self.key_file)?;
+        let key = read_key(&self.key_file, self.key_passphrase_command.as_deref())?;
         let end_point = crate::x509::end_point(&certs[0]);
         let provider = Arc::new(default_provider());
         let builder = ServerConfig::builder_with_provider(provider.clone())
@@ -453,8 +467,84 @@ fn read_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn read_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(path).map_err(|e| invalid(path, &e))
+fn read_key(path: &Path, passphrase_command: Option<&str>) -> io::Result<PrivateKeyDer<'static>> {
+    let text = std::fs::read_to_string(path).map_err(|e| invalid(path, &e))?;
+    if !text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+        if text.contains("Proc-Type: 4,ENCRYPTED") {
+            return Err(invalid_data(format!(
+                "TLS key file {} is encrypted in the legacy PEM form; \
+                 convert it to PKCS#8 (`openssl pkcs8 -topk8`)",
+                path.display()
+            )));
+        }
+        return PrivateKeyDer::from_pem_file(path).map_err(|e| invalid(path, &e));
+    }
+    let Some(command) = passphrase_command else {
+        return Err(invalid_data(format!(
+            "TLS key file {} is encrypted and no --tls-key-passphrase-command was given",
+            path.display()
+        )));
+    };
+    let passphrase = run_passphrase_command(command)?;
+    let (_, document) = pkcs8::SecretDocument::from_pem(&text).map_err(|e| invalid(path, &e))?;
+    let encrypted = pkcs8::EncryptedPrivateKeyInfo::try_from(document.as_bytes())
+        .map_err(|e| invalid(path, &e))?;
+    let decrypted = encrypted.decrypt(passphrase.as_bytes()).map_err(|_| {
+        invalid_data(format!(
+            "TLS key file {}: could not decrypt it with the passphrase given",
+            path.display()
+        ))
+    })?;
+    Ok(PrivateKeyDer::Pkcs8(decrypted.as_bytes().to_vec().into()))
+}
+
+/// The first line `ssl_passphrase_command` prints: `%p` is the prompt,
+/// `%%` a `%` (`run_ssl_passphrase_command`).
+fn run_passphrase_command(command: &str) -> io::Result<String> {
+    let expanded = expand_passphrase_command(command);
+    #[cfg(unix)]
+    let mut shell = {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(&expanded);
+        c
+    };
+    #[cfg(not(unix))]
+    let mut shell = {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(&expanded);
+        c
+    };
+    let output = shell
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| invalid_data(format!("could not run --tls-key-passphrase-command: {e}")))?;
+    if !output.status.success() {
+        return Err(invalid_data(format!(
+            "--tls-key-passphrase-command failed: {}",
+            output.status
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.lines().next().unwrap_or("").to_string())
+}
+
+fn expand_passphrase_command(command: &str) -> String {
+    let mut expanded = String::new();
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('%', Some('p')) => {
+                chars.next();
+                expanded.push_str("Enter PEM pass phrase:");
+            }
+            ('%', Some('%')) => {
+                chars.next();
+                expanded.push('%');
+            }
+            _ => expanded.push(c),
+        }
+    }
+    expanded
 }
 
 fn invalid(path: &Path, e: &dyn std::fmt::Display) -> io::Error {
@@ -467,7 +557,27 @@ fn invalid_data(message: String) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientCert, ClientName, TlsConfig};
+    use super::{
+        expand_passphrase_command, run_passphrase_command, ClientCert, ClientName, TlsConfig,
+    };
+
+    #[test]
+    fn a_passphrase_command_takes_the_prompt_and_a_percent() {
+        assert_eq!(
+            expand_passphrase_command("echo %p >&2; printf 100%%"),
+            "echo Enter PEM pass phrase: >&2; printf 100%"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_passphrase_is_the_first_line_printed() {
+        assert_eq!(
+            run_passphrase_command("printf 'pw\\nmore\\n'").unwrap(),
+            "pw"
+        );
+        assert!(run_passphrase_command("exit 3").is_err());
+    }
 
     #[test]
     fn a_missing_certificate_file_is_named_in_the_error() {

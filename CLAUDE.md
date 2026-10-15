@@ -753,7 +753,7 @@ one request path:
     options that stood in for such lines are refused beside it.
     The login rules have a standing comparison with PostgreSQL 15:
     `tests/test_rust_pg_login_differential.py` runs three probes
-    (`tools/probes/pg_login_*.py`, 909 scenarios) and needs
+    (`tools/probes/pg_login_*.py`, 912 scenarios) and needs
     `SECANTUS_PG15_BIN` set to a PostgreSQL 15 `bin` directory, which CI's
     `pg-oracle` lane installs. **Without that variable it SKIPS**, so a
     green local suite says nothing about a login change: run it by name.

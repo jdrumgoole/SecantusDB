@@ -309,7 +309,9 @@ one beside it.
       them** (the `regex` crate, through `pg_regex_source`'s POSIX-class
       translation, 2026-10-15), so they share that engine's distance from
       PostgreSQL's advanced regular expressions.
-  - The key must have no passphrase.
+  - A key encrypted in the legacy OpenSSL PEM form (`Proc-Type: 4,ENCRYPTED`)
+    is refused; PostgreSQL reads it. An encrypted PKCS#8 key works with
+    `--tls-key-passphrase-command`.
   - **The libpq scenarios (`attempt`) in the login probes do not retry**
     when the answer is the close; `raw_first` does (up to four times), after
     `pg_login_tls_files.py` once failed 479 of 480 in CI when the client

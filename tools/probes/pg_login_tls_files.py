@@ -5,7 +5,7 @@ Revocation lists (current, empty, expired, dated in the future, from another
 CA, forged, with and without extensions, through an intermediate CA), user
 name maps by exact name and by pattern, ``clientname=DN``, server
 certificates whose signature is RSA-PSS or Ed25519, and what a reload picks
-up. 541 scenarios. Arguments after the binary name the groups to run; with
+up. 544 scenarios. Arguments after the binary name the groups to run; with
 none, all of them.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -197,6 +197,16 @@ other_ca = Authority("another CA")
 capem = ca.pem(f"{d}/ca.pem")
 SERVER = ca.issue("s", cn("localhost"), san=True)
 SERVER2 = ca.issue("s2", cn("localhost"), san=True)
+# The server's key again, as an encrypted PKCS#8 file (passphrase `pw`).
+shutil.copy(f"{d}/s.crt", f"{d}/senc.crt")
+open(f"{d}/senc.key", "wb").write(
+    serialization.load_pem_private_key(open(f"{d}/s.key", "rb").read(), None).private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.BestAvailableEncryption(b"pw"),
+    )
+)
+os.chmod(f"{d}/senc.key", 0o600)
 PGCERT = ca.issue("pguser", cn("postgres"))
 ALICE = ca.issue("alice", cn("alice"))
 REVOKED = ca.issue("revoked", cn("postgres"))
@@ -505,6 +515,15 @@ def scope_scenarios(port):
     }
 
 
+def passphrase_scenarios(port):
+    """An encrypted key, its passphrase from `ssl_passphrase_command`."""
+    return {
+        "good cert": attempt(port, **PGCERT),
+        "no cert": attempt(port),
+        "verify-full": attempt(port, sslmode="verify-full"),
+    }
+
+
 def direct_scenarios(port):
     """`sslnegotiation=direct` is PostgreSQL 17's; 15 has no direct TLS and
     closes the connection. The usual negotiation still works beside it."""
@@ -675,6 +694,13 @@ GROUPS = {
         )
     },
     "direct tls": ("", OPEN, [], direct_scenarios, "s"),
+    "passphrase": (
+        "ssl_passphrase_command = 'echo pw'",
+        OPEN,
+        ["--tls-key-passphrase-command", "echo pw"],
+        passphrase_scenarios,
+        "senc",
+    ),
     "no crl, chain": ("", OPEN, [], chain_scenarios, "s"),
     "crl-cert": (
         "ssl_crl_file = '{d}/crl.pem'",

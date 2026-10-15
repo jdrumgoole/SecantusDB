@@ -70,3 +70,7 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   reverse-resolved, compared without case, and confirmed by a forward
   lookup. It was refused at startup. Part of RP-013, pinned by
   `tools/probes/pg_login_hba.py` (134 of 134).
+- `--tls-key-passphrase-command CMD`, PostgreSQL's `ssl_passphrase_command`:
+  an encrypted PKCS#8 key is decrypted with the first line the command
+  prints. The key had to have no passphrase. Part of RP-013, pinned by the
+  `passphrase` group in `tools/probes/pg_login_tls_files.py` (544 of 544).
