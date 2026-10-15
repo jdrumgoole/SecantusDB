@@ -30517,6 +30517,8 @@ fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
         Some(N::ParamRef(p)) => {
             declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
         }
+        // `'a  ' COLLATE "C"` is still an untyped literal (RP-022).
+        Some(N::CollateClause(cc)) => unknown_operand(cc.arg.as_deref()),
         _ => false,
     }
 }

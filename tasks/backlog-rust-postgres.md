@@ -367,16 +367,6 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: an untyped literal under `COLLATE` does not take a
-  `char(n)` column's type in the select list.** Over a `char(3)` column
-  holding `a`, `select c = 'a  ' collate "C"` is false here and true on
-  PostgreSQL 15.19 (the literal is `bpchar`, so its trailing blanks do not
-  count); the same comparison in WHERE is right, and so is a literal cast
-  first (`'a  '::bpchar collate "C"`). The text pattern operators avoid it
-  by collating the non-literal side. Found 2026-10-15 while adding them.
-  Backlog-ID: RP-022
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_collated_literal_against_a_char_column
-
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
       psycopg's suite against the Rust PostgreSQL server until

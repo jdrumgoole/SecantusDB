@@ -250,7 +250,7 @@ def test_insert_arity_error_carries_position(pg: Any, sql: str, position: str) -
     assert info.value.diag.statement_position == position
 
 
-@pytest.mark.backlog("RP-022")
+@pytest.mark.backlog_fixed("RP-022")
 def test_collated_literal_against_a_char_column(pg: Any) -> None:
     """PostgreSQL 15.19: an untyped literal under COLLATE takes the
     `char(n)` column's type, trailing blanks and all, so `'a  '` equals the
