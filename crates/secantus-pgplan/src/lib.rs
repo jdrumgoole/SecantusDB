@@ -9263,7 +9263,15 @@ fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Re
 /// Where an expression starts, as PostgreSQL's `exprLocation` reports it.
 fn expr_location(node: &pg_query::protobuf::Node) -> Option<i32> {
     let loc = match node.node.as_ref()? {
-        N::TypeCast(t) => t.location,
+        // `leftmostLoc` of the cast and its operand: `65::int2` is reported
+        // at the `65`.
+        N::TypeCast(t) => {
+            let inner = t.arg.as_deref().and_then(expr_location);
+            return match inner {
+                Some(i) if t.location < 0 || i < t.location => Some(i),
+                _ => (t.location >= 0).then_some(t.location),
+            };
+        }
         N::FuncCall(f) => f.location,
         N::AExpr(e) => e.location,
         N::AConst(c) => c.location,
@@ -9335,6 +9343,10 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
             "bool" | "boolean" => 7,
             "uuid" => 8,
             "bytea" => 9,
+            // `"char"` has only EXPLICIT casts to and from int4 (and none to
+            // any other number or boolean): `insert ... values (65)` into a
+            // `"char"` column is 42804 (measured).
+            QUOTED_CHAR => 10,
             _ => return None,
         })
     };
@@ -9360,6 +9372,9 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
         && (from_s == to_s
             || from == "unknown"
             || is_string_type(to)
+            // `text_char` is an ASSIGNMENT cast: a string stores into a
+            // `"char"` column (measured, text and varchar).
+            || (to == QUOTED_CHAR && is_string_type(&from))
             || !(is_string_type(&from)
                 || cross_family
                 || (is_boolean_type(&from) && is_integer_type(to))
@@ -23504,6 +23519,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || declared == "timestamptz"
                             || declared == "name"
                             || declared == "name[]"
+                            // A `"char"` is carried as its text.
+                            || declared == QUOTED_CHAR
                             || fts::result_type(&name).is_some()
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
@@ -28579,8 +28596,43 @@ pub(crate) fn char_out(b: u8) -> String {
     }
 }
 
+/// A cast to or from `"char"` that PostgreSQL 15 has no path for (42846):
+/// `pg_cast` holds `int4` <-> `"char"` (`i4tochar` / `chartoi4`) and the
+/// string types' I/O casts, and nothing for the other numbers or boolean --
+/// `65::int2::"char"` and `'A'::"char"::int8` are both refused, NULL or not
+/// (measured). The call `"char"(x)` is a function, not this cast.
+pub(crate) fn char_cast_refused(source: &str, target: &str) -> Option<Error> {
+    let other = match (source, target) {
+        (s, QUOTED_CHAR) if s != QUOTED_CHAR => s,
+        (QUOTED_CHAR, t) if t != QUOTED_CHAR => t,
+        _ => return None,
+    };
+    matches!(
+        other,
+        "int2"
+            | "smallint"
+            | "int8"
+            | "bigint"
+            | "numeric"
+            | "decimal"
+            | "float4"
+            | "real"
+            | "float8"
+            | "double precision"
+            | "bool"
+            | "boolean"
+    )
+    .then(|| {
+        Error::CannotCoerce(format!(
+            "cannot cast type {} to {}",
+            display_type(source),
+            display_type(target)
+        ))
+    })
+}
+
 /// `i4tochar`.
-fn char_from_int(i: i64) -> Result<Bson> {
+pub(crate) fn char_from_int(i: i64) -> Result<Bson> {
     i8::try_from(i)
         .map(|v| Bson::String(char_out(v as u8)))
         .map_err(|_| Error::NumericOutOfRange("\"char\" out of range".into()))
@@ -33390,6 +33442,10 @@ fn jsonb_scalar_target(t: &str) -> Option<bool> {
 /// `pg_lsn_out`; a `macaddr8` to `macaddr` drops the `ff:fe` middle (and
 /// refuses an address without it). `None` for every other cast.
 fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<Bson>> {
+    // Checked by TYPE, so a NULL is refused too.
+    if let Some(e) = source.and_then(|s| char_cast_refused(s, target)) {
+        return Some(Err(e));
+    }
     if *v == Bson::Null {
         return None;
     }
@@ -33438,17 +33494,6 @@ fn systypes_cast(source: Option<&str>, target: &str, v: &Bson) -> Option<Result<
         (s, "tid") if !is_string_type(s) && s != "unknown" => Some(Err(Error::CannotCoerce(
             format!("cannot cast type {} to tid", display_type(s)),
         ))),
-        // Only int4 has a cast to and from "char" (`i4tochar` / `chartoi4`).
-        // An int2 source is let through: `"char"(x)` reaches here as a cast,
-        // and as a FUNCTION call PostgreSQL promotes an int2 to int4, so
-        // refusing it broke `"char"(65::int2)` to fix `65::int2::"char"`.
-        ("int8", QUOTED_CHAR) | (QUOTED_CHAR, "int2" | "int8") => {
-            Some(Err(Error::CannotCoerce(format!(
-                "cannot cast type {} to {}",
-                display_type(source?),
-                display_type(target)
-            ))))
-        }
         // `chartoi4`: the byte, signed.
         (QUOTED_CHAR, "int4" | "integer") => {
             Some(Ok(Bson::Int32(i32::from(char_in(&value_text(v)) as i8))))
@@ -33620,6 +33665,10 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     display_type(&source),
                     display_type(&target)
                 )));
+            }
+            if let Some(e) = char_cast_refused(&source, &target) {
+                set_error_location(tc.location);
+                return Err(e);
             }
             // A tid is cast to and from the string types only (`pg_cast`
             // has nothing for it but the I/O casts), NULL or not.

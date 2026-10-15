@@ -285,10 +285,16 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 }) {
                     return None;
                 }
-                let name = call.split('(').next()?.rsplit('.').next()?;
+                let full = call.split('(').next()?;
+                let name = full.rsplit('.').next()?;
                 let i = toks.iter().enumerate().position(|(i, t)| {
                     unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
                 })?;
+                // A call named with its schema (`pg_catalog.lower(1)`) is
+                // reported at the schema, where the name starts (measured).
+                if full.contains('.') && i >= 2 && toks[i - 1].text == "." {
+                    return pos(toks[i - 2].start);
+                }
                 return pos(toks[i].start);
             }
             let rest = m.strip_prefix("operator does not exist: ")?;

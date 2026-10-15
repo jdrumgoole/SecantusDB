@@ -1004,6 +1004,44 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 walk(a, scope, cx)?;
             }
         }
+        // A cast to or from `"char"` with no path is refused when the
+        // statement is analysed, whatever the rows (`i2::"char"` over an
+        // empty table too). The call form `int2(x)` is a function call on
+        // PostgreSQL when no cast applies, so it is a missing function
+        // instead (`func_cast` marks the casts it builds with location -1).
+        N::TypeCast(tc) => {
+            if let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) {
+                let target = type_name_of(tn);
+                if let Some(e) = operand_type(arg, scope).and_then(|source| {
+                    crate::char_cast_refused(&source, &target).map(|e| (source, e))
+                }) {
+                    let (source, e) = e;
+                    if tc.location == -1 {
+                        let name: Vec<String> = tn
+                            .names
+                            .iter()
+                            .filter_map(|n| match n.node.as_ref() {
+                                Some(N::String(s)) => Some(s.sval.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        set_error_location(tn.location);
+                        return Err(Error::UndefinedFunction(format!(
+                            "function {}({}) does not exist",
+                            name.join("."),
+                            crate::display_type(&source)
+                        )));
+                    }
+                    set_error_location(tc.location);
+                    return Err(e);
+                }
+                // Only the cast an operand is cast from: the rest of a cast's
+                // operand was never checked here, and is not now.
+                if matches!(arg.node, Some(N::TypeCast(_))) {
+                    walk(arg, scope, cx)?;
+                }
+            }
+        }
         N::ResTarget(r) => {
             if let Some(v) = r.val.as_deref() {
                 walk(v, scope, cx)?;
