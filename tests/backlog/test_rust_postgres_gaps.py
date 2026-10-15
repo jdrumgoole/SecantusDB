@@ -229,7 +229,7 @@ def test_grant_and_revoke_take_effect_inside_a_transaction_block(pg: Any) -> Non
     assert _privilege_in_a_block(pg, "rp020") == [("ok", [(1,)]), ("err", "42501")]
 
 
-@pytest.mark.backlog("RP-021")
+@pytest.mark.backlog_fixed("RP-021")
 @pytest.mark.parametrize(
     ("sql", "position"),
     [
@@ -248,3 +248,26 @@ def test_insert_arity_error_carries_position(pg: Any, sql: str, position: str) -
     with pytest.raises(psycopg.errors.SyntaxError) as info:
         pg.execute(sql)
     assert info.value.diag.statement_position == position
+
+
+@pytest.mark.backlog("RP-022")
+def test_collated_literal_against_a_char_column(pg: Any) -> None:
+    """PostgreSQL 15.19: an untyped literal under COLLATE takes the
+    `char(n)` column's type, trailing blanks and all, so `'a  '` equals the
+    stored `a` in the select list as it does in WHERE."""
+    pg.execute("drop table if exists rp022_t")
+    pg.execute("create table rp022_t (c char(3))")
+    pg.execute("insert into rp022_t values ('a'), ('b')")
+    sql = "select c = 'a  ' collate \"C\", c >= ('a  ' collate \"C\") from rp022_t order by c"
+    assert pg_answer(pg, sql) == ("ok", [(True, True), (False, True)])
+
+
+@pytest.mark.backlog_fixed("RP-023")
+def test_case_over_a_scalar_subquery_keeps_its_type(pg: Any) -> None:
+    """PostgreSQL 15.19: `case when true then (select 1) end` is an integer:
+    an uncorrelated subquery's value keeps its column's type."""
+    assert pg_answer(pg, "select case when true then (select 1) end") == ("ok", [(1,)])
+    assert pg_answer(pg, "select pg_typeof(case when true then (select 1) end)::text") == (
+        "ok",
+        [("integer",)],
+    )

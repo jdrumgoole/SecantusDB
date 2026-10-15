@@ -9027,6 +9027,69 @@ fn plan_insert(
     // `INSERT ... SELECT`: the query is planned whole and evaluated by the
     // executor, which has the storage. Before this it was silently treated
     // as an empty VALUES list -- `INSERT 0 0`, nothing written, no error.
+    // The number of expressions against the target list, as
+    // `transformInsertStmt` checks it, pointing at the first expression past
+    // the list or the first target column left with none (RP-021).
+    let arity = |exprs: &[&pg_query::protobuf::Node]| -> Result<()> {
+        if exprs.len() > targets.len() {
+            if let Some(loc) = exprs.get(targets.len()).and_then(|e| expr_location(e)) {
+                set_error_location(loc);
+            }
+            return Err(Error::Parse(
+                "INSERT has more expressions than target columns".into(),
+            ));
+        }
+        if exprs.len() < targets.len() && !i.cols.is_empty() {
+            if let Some(Some(N::ResTarget(rt))) = i.cols.get(exprs.len()).map(|c| c.node.as_ref()) {
+                set_error_location(rt.location);
+            }
+            return Err(Error::Parse(
+                "INSERT has more target columns than expressions".into(),
+            ));
+        }
+        Ok(())
+    };
+    if sel.values_lists.is_empty() && sel.op == pg_query::protobuf::SetOperation::SetopNone as i32 {
+        let exprs: Vec<&pg_query::protobuf::Node> = sel
+            .target_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            })
+            .collect();
+        // A `*` stands for columns not counted here.
+        let star = exprs.iter().any(|e| {
+            matches!(e.node.as_ref(), Some(N::ColumnRef(c))
+                if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))))
+        });
+        if !star {
+            arity(&exprs)?;
+        }
+    }
+    // Every VALUES list as long as the first, before the target list is
+    // counted against any of them.
+    let lists: Vec<&Vec<pg_query::protobuf::Node>> = sel
+        .values_lists
+        .iter()
+        .filter_map(|vl| match vl.node.as_ref() {
+            Some(N::List(l)) => Some(&l.items),
+            _ => None,
+        })
+        .collect();
+    if let Some(first) = lists.first() {
+        // `transformInsertStmt` counts the first row against the targets,
+        // then each later one against the first.
+        arity(&first.iter().collect::<Vec<_>>())?;
+        if let Some(odd) = lists.iter().find(|l| l.len() != first.len()) {
+            if let Some(loc) = odd.first().and_then(expr_location) {
+                set_error_location(loc);
+            }
+            return Err(Error::Parse(
+                "VALUES lists must all be the same length".into(),
+            ));
+        }
+    }
     let source = if sel.values_lists.is_empty() {
         // Every target of an INSERT ... SELECT receives a value.
         if let Some(t) = targets.iter().find(|t| {
@@ -17029,14 +17092,39 @@ fn resolve_one_sublink(
                         .ok()
                         .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
                     // So must a type the value reads back as another (an
-                    // `oid` is carried as a bigint, a `name` as text).
+                    // `oid` is carried as a bigint, a `name` as text) -- and
+                    // every other built-in type, so the value is typed as the
+                    // subquery's column wherever it lands: a bare parameter
+                    // has no declared type, which made `pg_typeof((select
+                    // 1))` 42P18 and a CASE over it text (RP-023).
+                    let typed = |t: &str| {
+                        matches!(
+                            t,
+                            "int2vector"
+                                | "oidvector"
+                                | "oid"
+                                | "int2"
+                                | "float4"
+                                | "name"
+                                | "varchar"
+                                | "bpchar"
+                                | "\"char\""
+                                | "xid"
+                                | "cid"
+                                | "timestamp"
+                                | "timestamptz"
+                                | "date"
+                                | "time"
+                                | "timetz"
+                                | "interval"
+                                | "uuid"
+                        ) || (!matches!(t, "" | "unknown" | "record" | "text")
+                            && !t.contains('"')
+                            && pgtypes::oid_of_name(t).is_some()
+                            && user_composite(t).is_none())
+                    };
                     Ok(match ty.as_deref() {
-                        Some(
-                            ty @ ("int2vector" | "oidvector" | "oid" | "int2" | "float4" | "name"
-                            | "varchar" | "bpchar" | "\"char\"" | "xid" | "cid" | "timestamp"
-                            | "timestamptz" | "date" | "time" | "timetz" | "interval"
-                            | "uuid"),
-                        ) => pg_query::protobuf::Node {
+                        Some(ty) if typed(ty) => pg_query::protobuf::Node {
                             node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                                 arg: Some(Box::new(node)),
                                 type_name: Some(type_name_node(ty)),
@@ -23002,7 +23090,13 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             width = items.len();
             types = vec![String::new(); width];
         } else if items.len() != width {
-            return Err(Error::Unsupported("VALUES rows of differing widths".into()));
+            // PostgreSQL's `transformValuesClause`, at the odd row's first item.
+            if let Some(loc) = items.first().and_then(expr_location) {
+                set_error_location(loc);
+            }
+            return Err(Error::Parse(
+                "VALUES lists must all be the same length".into(),
+            ));
         }
         let mut row = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {

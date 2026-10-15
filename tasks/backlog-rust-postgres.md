@@ -367,18 +367,15 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **RUST pgserver: an INSERT whose expressions and target columns do
-  not match in number carries no error position.** `insert into t values
-  (1, 'a', 3)` over a two-column table is 42601 `INSERT has more
-  expressions than target columns` on both servers, but PostgreSQL 15.19
-  points at the first expression past the target list (`3`), and at the
-  first unfilled target column for "more target columns than
-  expressions"; here `P` is unset, through a simple query and Parse alike.
-  The check (`insert_row_typed`) runs on values, with no statement
-  locations; the position needs the target list's width, which only the
-  table has. Found 2026-10-15 while fixing RP-012.
-  Backlog-ID: RP-021
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_insert_arity_error_carries_position
+- [ ] **RUST pgserver: an untyped literal under `COLLATE` does not take a
+  `char(n)` column's type in the select list.** Over a `char(3)` column
+  holding `a`, `select c = 'a  ' collate "C"` is false here and true on
+  PostgreSQL 15.19 (the literal is `bpchar`, so its trailing blanks do not
+  count); the same comparison in WHERE is right, and so is a literal cast
+  first (`'a  '::bpchar collate "C"`). The text pattern operators avoid it
+  by collating the non-literal side. Found 2026-10-15 while adding them.
+  Backlog-ID: RP-022
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_collated_literal_against_a_char_column
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
