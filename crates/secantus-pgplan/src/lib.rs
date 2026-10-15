@@ -836,6 +836,13 @@ pub enum Statement {
         name: String,
         value: String,
     },
+    /// `SET [LOCAL] name TO DEFAULT` / `= DEFAULT`: the setting takes the
+    /// value RESET would give it, as `SET` (or `SET LOCAL`) does -- inside a
+    /// transaction it is undone with it.
+    SetDefault {
+        name: String,
+        local: bool,
+    },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
     /// `ALTER DATABASE d SET name = value` (`value` None for `RESET name` /
@@ -1241,6 +1248,8 @@ pub struct SetOpSelect {
     pub order: Vec<SetOpOrder>,
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `FETCH FIRST n ROWS WITH TIES` (see `Select`).
+    pub with_ties: bool,
 }
 
 impl SetOpSelect {
@@ -1307,6 +1316,10 @@ pub struct Select {
     /// `None` = no LIMIT. `LIMIT 0` is a real limit, not an absent one.
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `FETCH FIRST n ROWS WITH TIES`: the LIMIT also takes every row after
+    /// the last that ties with it under the ORDER BY (nodeLimit.c's
+    /// `LIMIT_WINDOWEND_TIES`).
+    pub with_ties: bool,
     /// `SELECT DISTINCT` / `DISTINCT ON (...)`. Dropped on the floor before
     /// 2026-09-20: the clause was read in one place (the aggregate planner,
     /// which refuses it) and nowhere else, so a plain `SELECT DISTINCT`
@@ -2503,6 +2516,8 @@ pub struct Aggregate {
     pub order: Vec<AggOrderKey>,
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `FETCH FIRST n ROWS WITH TIES` over the groups (see `Select`).
+    pub with_ties: bool,
     /// `HAVING ...`, applied to the grouped rows before ORDER BY and LIMIT.
     pub having: Option<Having>,
     /// Expressions over the grouped values, referenced by `OutputCol::Expr`.
@@ -12383,6 +12398,7 @@ fn plan_series_select(
         order,
         limit,
         offset,
+        with_ties: with_ties(s),
         distinct,
         lock: None,
         lock_clauses: Vec::new(),
@@ -13587,6 +13603,7 @@ fn plan_set_operation(
         order,
         limit,
         offset,
+        with_ties: with_ties(s),
     }))
 }
 
@@ -19756,6 +19773,7 @@ fn plan_select_rest(
         order,
         limit,
         offset,
+        with_ties: with_ties(s),
         distinct,
         lock,
         lock_clauses,
@@ -20211,6 +20229,7 @@ fn plan_aggregate_direct(
             order: Vec::new(),
             limit: None,
             offset: 0,
+            with_ties: false,
             having: None,
             exprs: Vec::new(),
             distinct: aggregate_distinct(s)?,
@@ -20278,6 +20297,7 @@ fn plan_join_plain_select(
         order: Vec::new(),
         limit,
         offset,
+        with_ties: with_ties(s),
         distinct,
         lock: None,
         lock_clauses: Vec::new(),
@@ -21433,6 +21453,7 @@ fn finish_aggregate(
         order,
         limit,
         offset,
+        with_ties: with_ties(s),
         having,
         exprs,
         distinct: aggregate_distinct(s)?,
@@ -22624,6 +22645,12 @@ fn boolean_test_equivalent(
 /// means none, a fraction rounds (`LIMIT 2.5` is 3, as the int8 cast
 /// rounds), and a negative one is refused -- `2201W` / `2201X`, which an
 /// empty result used to stand in for.
+/// `FETCH FIRST ... WITH TIES` (the grammar has already refused it without
+/// an ORDER BY, and with SKIP LOCKED).
+fn with_ties(s: &pg_query::protobuf::SelectStmt) -> bool {
+    s.limit_option == pg_query::protobuf::LimitOption::WithTies as i32
+}
+
 fn limit_offset(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<(Option<i64>, i64)> {
     let value = |n: &pg_query::protobuf::Node, what: &str| -> Result<Option<i64>> {
         Ok(match const_value(n, params)? {
@@ -22644,6 +22671,13 @@ fn limit_offset(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<(
         Some(n) => value(n, "LIMIT")?,
         None => None,
     };
+    // `transformLimitClause`: a NULL count has no tie to end at.
+    if with_ties(s) && limit.is_none() && s.limit_count.is_some() {
+        return Err(Error::Sqlstate(
+            "2201W",
+            "row count cannot be null in FETCH FIRST ... WITH TIES clause".into(),
+        ));
+    }
     if limit.is_some_and(|l| l < 0) {
         return Err(Error::Sqlstate(
             "2201W",
@@ -23301,6 +23335,7 @@ fn plan_select_srf(
         order,
         limit,
         offset,
+        with_ties: with_ties(s),
         distinct: plan_distinct(s, &|_| None)?,
         lock: None,
         lock_clauses: Vec::new(),
@@ -32508,7 +32543,13 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
     match VariableSetKind::try_from(v.kind) {
         Ok(VariableSetKind::VarReset) => return Ok(Statement::Reset(v.name.clone())),
         Ok(VariableSetKind::VarResetAll) => return Ok(Statement::Reset(String::new())),
-        Ok(VariableSetKind::VarSetValue | VariableSetKind::VarSetDefault) => {}
+        Ok(VariableSetKind::VarSetDefault) => {
+            return Ok(Statement::SetDefault {
+                name: v.name.clone(),
+                local: v.is_local,
+            })
+        }
+        Ok(VariableSetKind::VarSetValue) => {}
         // `SET TRANSACTION ...` and `SET SESSION CHARACTERISTICS AS TRANSACTION
         // ...` are both VAR_SET_MULTI: the name distinguishes them and the args
         // are DefElem characteristics rather than plain values.

@@ -161,7 +161,12 @@ fn rewrite_into(
                 out.push_str("nchar ");
             }
             if !keep {
-                // A plain literal: the parser must read it as `E'...'`.
+                // A plain literal: the parser must read it as `E'...'`. After
+                // a word (`int4'1'`, a typed literal) the `E` is a token of
+                // its own, or it would join the type name (`int4E`).
+                if !national && prev_is_ident(b, i) {
+                    out.push(' ');
+                }
                 out.push('E');
             }
             let mut segment = Segment {
@@ -602,6 +607,17 @@ mod tests {
         assert_eq!(
             rewrite_with(r"select 'a\'b'", syntax(false, false)).0,
             Ok(r"select E'a\'b'".into())
+        );
+    }
+
+    #[test]
+    fn a_typed_literal_keeps_its_type_name() {
+        assert_eq!(
+            rw(r"select int4'1', date'2020-01-02', x'1f', n'a', (1)||'b'"),
+            (
+                r"select int4 E'1', date E'2020-01-02', x'1f', nchar E'a', (1)||E'b'".into(),
+                vec![]
+            )
         );
     }
 }

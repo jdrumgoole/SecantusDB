@@ -5387,35 +5387,37 @@ impl PgHandler {
         // and the groups do not arrive in PostgreSQL's (HashAggregate /
         // GroupAggregate) order. Over them a stable sort matched more
         // (b67_grouping_sets' ROLLUP rows, RP-028).
-        if !agg.order.is_empty() {
-            groups.sort_by(|a, b| {
-                for key in &agg.order {
-                    let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
-                    let ord = match (l, r) {
-                        (None, None) => Ordering::Equal,
-                        (None, Some(_)) => match key.nulls {
-                            Nulls::First => Ordering::Less,
-                            Nulls::Last => Ordering::Greater,
-                        },
-                        (Some(_), None) => match key.nulls {
-                            Nulls::First => Ordering::Greater,
-                            Nulls::Last => Ordering::Less,
-                        },
-                        (Some(x), Some(y)) => {
-                            let c = compare_values(x, y);
-                            if key.ascending {
-                                c
-                            } else {
-                                c.reverse()
-                            }
+        #[allow(clippy::type_complexity)]
+        let order_cmp = |a: &(Vec<Option<Bson>>, Vec<Bson>), b: &(Vec<Option<Bson>>, Vec<Bson>)| {
+            for key in &agg.order {
+                let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
+                let ord = match (l, r) {
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => match key.nulls {
+                        Nulls::First => Ordering::Less,
+                        Nulls::Last => Ordering::Greater,
+                    },
+                    (Some(_), None) => match key.nulls {
+                        Nulls::First => Ordering::Greater,
+                        Nulls::Last => Ordering::Less,
+                    },
+                    (Some(x), Some(y)) => {
+                        let c = compare_values(x, y);
+                        if key.ascending {
+                            c
+                        } else {
+                            c.reverse()
                         }
-                    };
-                    if ord != Ordering::Equal {
-                        return ord;
                     }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
                 }
-                Ordering::Equal
-            });
+            }
+            Ordering::Equal
+        };
+        if !agg.order.is_empty() {
+            groups.sort_by(order_cmp);
         }
         // HAVING filters the GROUPS, before DISTINCT, ORDER BY and LIMIT see
         // them -- and after the aggregates are computed, which is the whole
@@ -5466,7 +5468,13 @@ impl PgHandler {
             groups = groups.into_iter().skip(skip).collect();
         }
         if let Some(limit) = agg.limit {
-            groups.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+            let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            let take = if agg.with_ties {
+                with_ties_end(&groups, take, order_cmp)
+            } else {
+                take
+            };
+            groups.truncate(take);
         }
         if max_rows > 0 {
             groups.truncate(max_rows);
@@ -6174,7 +6182,7 @@ impl PgHandler {
     }
 
     fn join_docs(&self, join: &secantus_pgplan::JoinSelect) -> PgWireResult<Vec<Document>> {
-        self.join_docs_with(join, None, None, None)
+        self.join_docs_with(join, None, None, None, false)
     }
 
     /// `join_docs` with optional pre-materialised rows for a side that is a
@@ -6421,6 +6429,7 @@ impl PgHandler {
         left_rows: Option<Vec<Document>>,
         right_rows: Option<Vec<Document>>,
         bound: Option<usize>,
+        keep_order_key: bool,
     ) -> PgWireResult<Vec<Document>> {
         let mut left_rows = Some(match left_rows {
             Some(r) => r,
@@ -6465,8 +6474,10 @@ impl PgHandler {
                     ord.reverse()
                 }
             });
-            for d in &mut out {
-                d.remove("__join_order");
+            if !keep_order_key {
+                for d in &mut out {
+                    d.remove("__join_order");
+                }
             }
         }
         Ok(out)
@@ -25721,7 +25732,9 @@ impl PgHandler {
                 } else {
                     None
                 };
-                let docs = self.join_docs_with(join, left_rows, right_rows, bound)?;
+                // WITH TIES finds its ties by the join's sort key.
+                let keep_key = sel.with_ties && sel.order.is_empty();
+                let docs = self.join_docs_with(join, left_rows, right_rows, bound, keep_key)?;
                 let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
                     .map_err(|e| Self::err(&e))?;
                 (docs, def)
@@ -25971,6 +25984,34 @@ impl PgHandler {
             // A negative LIMIT is a PostgreSQL error, but the parser
             // hands it through; clamp rather than panic on the cast.
             let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            // The ORDER BY of a two-table join is the join's own sort, by
+            // the key it kept under `__join_order` for this (nulls last
+            // ascending, first descending).
+            let join_key: Vec<OrderKey> = match sel.join.as_ref().and_then(|j| j.order.as_ref()) {
+                Some((_, _, ascending)) if sel.with_ties && sel.order.is_empty() => {
+                    vec![OrderKey {
+                        field: "__join_order".into(),
+                        ascending: *ascending,
+                        nulls: if *ascending {
+                            Nulls::Last
+                        } else {
+                            Nulls::First
+                        },
+                        expr: None,
+                    }]
+                }
+                _ => Vec::new(),
+            };
+            let tie_order = if join_key.is_empty() {
+                &sel.order
+            } else {
+                &join_key
+            };
+            let take = if sel.with_ties {
+                with_ties_end(&docs, take, |a, b| compare_rows(a, b, tie_order))
+            } else {
+                take
+            };
             docs.truncate(take);
         }
         // `Execute` may cap rows independently of any SQL LIMIT; 0 means
@@ -26582,45 +26623,52 @@ impl PgHandler {
             }
             out = kept;
         }
-        if !set.order.is_empty() {
-            out.sort_by(|a, b| {
-                for key in &set.order {
-                    let l = a.get(key.index).and_then(|v| v.as_ref());
-                    let r = b.get(key.index).and_then(|v| v.as_ref());
-                    let l_null = matches!(l, None | Some(Bson::Null));
-                    let r_null = matches!(r, None | Some(Bson::Null));
-                    let ord = match (l_null, r_null) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => match key.nulls {
-                            Nulls::First => Ordering::Less,
-                            Nulls::Last => Ordering::Greater,
-                        },
-                        (false, true) => match key.nulls {
-                            Nulls::First => Ordering::Greater,
-                            Nulls::Last => Ordering::Less,
-                        },
-                        (false, false) => {
-                            let cmp = compare_values(l.expect("not null"), r.expect("not null"));
-                            if key.ascending {
-                                cmp
-                            } else {
-                                cmp.reverse()
-                            }
+        let order_cmp = |a: &Vec<Option<Bson>>, b: &Vec<Option<Bson>>| {
+            for key in &set.order {
+                let l = a.get(key.index).and_then(|v| v.as_ref());
+                let r = b.get(key.index).and_then(|v| v.as_ref());
+                let l_null = matches!(l, None | Some(Bson::Null));
+                let r_null = matches!(r, None | Some(Bson::Null));
+                let ord = match (l_null, r_null) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => match key.nulls {
+                        Nulls::First => Ordering::Less,
+                        Nulls::Last => Ordering::Greater,
+                    },
+                    (false, true) => match key.nulls {
+                        Nulls::First => Ordering::Greater,
+                        Nulls::Last => Ordering::Less,
+                    },
+                    (false, false) => {
+                        let cmp = compare_values(l.expect("not null"), r.expect("not null"));
+                        if key.ascending {
+                            cmp
+                        } else {
+                            cmp.reverse()
                         }
-                    };
-                    if ord != Ordering::Equal {
-                        return ord;
                     }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
                 }
-                Ordering::Equal
-            });
+            }
+            Ordering::Equal
+        };
+        if !set.order.is_empty() {
+            out.sort_by(order_cmp);
         }
         if set.offset > 0 {
             let skip = usize::try_from(set.offset).unwrap_or(usize::MAX);
             out = out.into_iter().skip(skip).collect();
         }
         if let Some(limit) = set.limit {
-            out.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+            let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            let take = if set.with_ties {
+                with_ties_end(&out, take, order_cmp)
+            } else {
+                take
+            };
+            out.truncate(take);
         }
         Ok((schema, out))
     }
@@ -26993,6 +27041,7 @@ impl PgHandler {
                 | Statement::Show(_)
                 | Statement::Set { .. }
                 | Statement::SetLocal { .. }
+                | Statement::SetDefault { .. }
                 | Statement::Reset(_)
                 | Statement::SetTransaction(_)
                 | Statement::SetSessionCharacteristics(_)
@@ -30984,6 +31033,36 @@ impl PgHandler {
             }
 
             // `SET LOCAL`: a SET the end of the block takes back.
+            Statement::SetDefault { name, local } => {
+                // PostgreSQL's `set_config_option` with no value: the
+                // setting's reset value -- what RESET restores (a database's
+                // own default first) -- set the way `SET` / `SET LOCAL` set
+                // it, so a transaction undoes it and it is reported
+                // (measured on 15.19: `SET LOCAL datestyle TO DEFAULT` in a
+                // block reads `ISO, MDY`, and the session's `German, DMY`
+                // is back after COMMIT).
+                let key = canonical_setting(&name);
+                let value = self
+                    .db_setting_defaults()
+                    .into_iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v)
+                    .or_else(|| self.server_defaults().get(&key).cloned())
+                    // `SET ROLE` has no stored default: it is NONE.
+                    .unwrap_or_else(|| {
+                        if key == "role" {
+                            "none".into()
+                        } else {
+                            String::new()
+                        }
+                    });
+                let stmt = if local {
+                    Statement::SetLocal { name, value }
+                } else {
+                    Statement::Set { name, value }
+                };
+                self.execute_statement(stmt, max_rows)
+            }
             Statement::SetLocal { name, value } => {
                 if !self.set_local_allowed() {
                     return Ok(vec![Response::Execution(Tag::new("SET"))]);
@@ -36177,12 +36256,32 @@ fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<
 /// (`ExecSetTupleBound`: OFFSET + LIMIT), when it reaches one: a Unique (any
 /// DISTINCT) or a LockRows in between passes none.
 fn sort_bound(sel: &secantus_pgplan::Select) -> Option<usize> {
-    if sel.distinct != secantus_pgplan::Distinct::None || !sel.lock_clauses.is_empty() {
+    // `compute_tuples_needed`: none under WITH TIES, whose last rows are
+    // not known until the ties end.
+    if sel.distinct != secantus_pgplan::Distinct::None
+        || !sel.lock_clauses.is_empty()
+        || sel.with_ties
+    {
         return None;
     }
     let count = |n: i64| usize::try_from(n.max(0)).unwrap_or(usize::MAX);
     sel.limit
         .map(|l| count(l).saturating_add(count(sel.offset)))
+}
+
+/// How many of `rows` (sorted, OFFSET already taken) a `FETCH FIRST n ROWS
+/// WITH TIES` returns: the first `n`, then every row equal under the ORDER BY
+/// to the last of them (nodeLimit.c's `LIMIT_WINDOWEND_TIES`). `n = 0` is no
+/// rows: the Limit node never reads one.
+fn with_ties_end<T>(rows: &[T], n: usize, mut cmp: impl FnMut(&T, &T) -> Ordering) -> usize {
+    if n == 0 || n >= rows.len() {
+        return n.min(rows.len());
+    }
+    let mut end = n;
+    while end < rows.len() && cmp(&rows[n - 1], &rows[end]) == Ordering::Equal {
+        end += 1;
+    }
+    end
 }
 
 /// PostgreSQL's in-memory sort (`tuplesort.c`'s quicksort), so rows that

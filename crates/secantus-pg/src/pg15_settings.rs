@@ -3,7 +3,9 @@
 //! `pg15_settings.tsv` is a dump of a stock PostgreSQL 15 cluster's
 //! `pg_settings` (machine-specific paths, the port and the zones left out):
 //! `name, SHOW value, setting, unit, category, short_desc, context, vartype,
-//! min_val, max_val, boot_val`. Every parameter there is SHOW-able and
+//! min_val, max_val, boot_val`, and for an enum its `enumvals` joined by
+//! commas (dumped from PostgreSQL 15.19; `ssl_max_protocol_version`'s first
+//! value is the empty string). Every parameter there is SHOW-able and
 //! RESET-able here with PostgreSQL's default, so a client that reads one this
 //! server does not obey (`work_mem`, `maintenance_work_mem`, ...) gets
 //! PostgreSQL's answer rather than 42704.
@@ -23,6 +25,8 @@ pub(crate) struct Pg15Setting {
     pub min_val: &'static str,
     pub max_val: &'static str,
     pub boot_val: &'static str,
+    /// `enumvals` joined by commas; empty for a type that is not an enum.
+    pub enumvals: &'static str,
 }
 
 const TSV: &str = include_str!("pg15_settings.tsv");
@@ -48,6 +52,7 @@ pub(crate) fn pg15_settings() -> &'static [Pg15Setting] {
                     min_val: g(8),
                     max_val: g(9),
                     boot_val: g(10),
+                    enumvals: g(11),
                 }
             })
             .collect()
@@ -72,5 +77,15 @@ mod tests {
         assert!(pg15_settings().iter().all(|s| !s.name.is_empty()));
         let w = pg15_setting("work_mem").expect("work_mem");
         assert_eq!((w.show, w.setting, w.unit), ("4MB", "4096", "kB"));
+        let enums: Vec<_> = pg15_settings()
+            .iter()
+            .filter(|s| s.vartype == "enum")
+            .collect();
+        assert_eq!(enums.len(), 36);
+        assert!(enums.iter().all(|s| !s.enumvals.is_empty()));
+        assert_eq!(
+            pg15_setting("backslash_quote").unwrap().enumvals,
+            "safe_encoding,on,off"
+        );
     }
 }
