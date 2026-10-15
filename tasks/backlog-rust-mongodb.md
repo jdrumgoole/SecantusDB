@@ -249,9 +249,11 @@ These are explicit non-goals. Don't add them without a reason.
   Verify: tests/backlog/test_rm_found_2026_10_14.py::test_sasl_start_for_an_unknown_user_fails
 
 - [ ] **OPEN — the Go gauge's remaining failures, triaged (2026-09-29; 6
-      leaves as of the 2026-10-09 run).** The gauge completes 659 of 659 and
+      leaves as of the 2026-10-15 run).** The gauge completes 659 of 659 and
       reads 598 / 12 / 49 = 98.0% (`docs/validation-report-go-rust-server.md`,
-      measured 2026-10-09). The 12 fail events are 6 distinct leaves:
+      measured 2026-10-15, the same six leaves as 2026-10-09;
+      `TestSDAMProse/heartbeats_processed_more_frequently` passes). The 12
+      fail events are 6 distinct leaves:
 
       | leaf | needs |
       | --- | --- |
@@ -624,11 +626,13 @@ may run a command.
       its buckets; mongod hashes `system.buckets.<name>`. Not measured.
       Backlog-ID: RM-026
       Verify: tests/backlog/test_rm_001_028.py::test_dbhash_includes_timeseries_buckets
-- [ ] **`mapReduce` with `out`** (18) and **`setParameter notablescan`**
-      (3) answer an error here where mongod runs them; the users allowed are
-      the same. (`compact` and `reIndex` refuse as mongod does on a
-      replica-set primary, which this server reports itself as; compared
-      against a standalone mongod they look like a difference and are not.)
+- [ ] **`mapReduce` with `out`** (18) answers an error here (9, "only
+      supports {out: {inline: 1}}") where mongod runs it; the users allowed
+      are the same. `compact` and `setParameter notablescan` match mongod
+      8.2.11 (re-measured 2026-10-15; the test still asserts all three).
+      `reIndex` refuses as mongod does on a replica-set primary, which this
+      server reports itself as; compared against a standalone mongod it looks
+      like a difference and is not.
       Backlog-ID: RM-027
       Verify: tests/backlog/test_rm_001_028.py::test_commands_mongod_runs
 - [ ] **The server's own commands have no mongod rule.**
@@ -1573,27 +1577,6 @@ dropped (four), and `listIndexes` lists by name.
       Backlog-ID: RM-111
       Verify: none -- performance (rescan per insert), no answer differs
 
-### 7.06 Release tooling gaps found cutting 0.6.0b18 -- 2026-10-07
-
-- [ ] **The binary smoke test and the stale-artifact check look at DIFFERENT
-  binaries.** `tests/test_rust_binary_smoke.py` prefers
-  `crates/secantusdb/target/release/secantusd-rs` and falls back to debug,
-  while `./inv rust-binary-build` builds debug and the provenance check passed
-  on it. A `beta.165` release binary from 29 September, older than the SIGTERM
-  fix (#1738), was smoked instead and failed
-  `test_stops_on_sigterm_sent_at_the_banner...[_block_stop_signals]`
-  deterministically. That looked like a regression in the release suite.
-  Fix: make the provenance check cover every binary the smoke test can pick,
-  or make the smoke test use exactly the one the check verified.
-  Backlog-ID: RM-112
-  Verify: none -- release tooling (which binary the smoke test picks)
-- [ ] **The `secantusdb-release` skill's finalize loop uses `timeout`, which
-  macOS does not have** (`command not found`, exit 127 on all four attempts,
-  which reads as four finalize failures). Use a background run, or `gtimeout`
-  from coreutils.
-  Backlog-ID: RM-113
-  Verify: none -- release-skill tooling (macOS lacks timeout)
-
 ### 7.05 MongoDB-server backlog close-out -- 2026-10-07
 
 **Left open on purpose, each with its reason** (the entry itself has the detail):
@@ -1602,9 +1585,6 @@ dropped (four), and `listIndexes` lists by name.
   mongod's planner `debugString` renderer for text on an already-correct code.
 - **`$where` / server-side JavaScript**: a scope decision; it also accounts for
   three of the Go gauge's remaining failures.
-- **Go gauge `TestSDAMProse/heartbeats_processed_more_frequently`**: the Python
-  cause was the awaitable `hello` (fixed); not re-run on the Rust server this
-  batch, so the Go-gauge triage entry stays open until the next Go run.
 - **A `w` tag set with more than one key**: accepted divergence (mongod's
   hash-map order).
 - **The multikey `$sort` plan artifact**: accepted -- mongod contradicting its
@@ -1622,8 +1602,6 @@ dropped (four), and `listIndexes` lists by name.
   durability decisions, not code.
 - **`test_tmp_retention_guard` timeout**: not reproduced; a watch item.
 - **Go smoke tests fetch modules at test time**: needs a vendoring decision.
-- **Stale `-rust-server` validation reports**: the stamping is fixed; the
-  numbers wait on re-running those gauges.
 - **Out of scope**: macOS x86_64 wheels, and the in-process engine-selection
   notes in the porting history.
 
