@@ -17557,7 +17557,6 @@ fn wire_type(pg_type: &str) -> Type {
         "tsvector" => Type::TS_VECTOR,
         "tsquery" => Type::TSQUERY,
         "regconfig" => Type::REGCONFIG,
-        "regdictionary" => Type::REGDICTIONARY,
         // `ts_debug`'s `dictionary` / `dictionaries` columns.
         "regdictionary" => Type::REGDICTIONARY,
         "regdictionary[]" => Type::REGDICTIONARY_ARRAY,
