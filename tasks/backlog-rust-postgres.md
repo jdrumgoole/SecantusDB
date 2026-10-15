@@ -368,16 +368,18 @@ one beside it.
 
 - [ ] **RUST pgserver: what the 2026-10-15 batch saw beside its items.**
   Each measured on PostgreSQL 15.19:
-  - An operator's function called over typed columns it does not take
-    (`int4pl(text_col, int_col)`) is 42883 at the right place, worded
-    `operator does not exist: text + integer`; PostgreSQL names the
-    function, `function int4pl(text, integer) does not exist`. (Over
-    constants it is worded as PostgreSQL has it.)
-  - `create type int` / `create type integer` are 42710; PostgreSQL makes
-    `public."int"`. They are grammar spellings with no pg_type row, and the
-    planner folds `int` to `int4`, so the fix has to keep the two apart.
+  - `create type int` / `create type integer` (and their quoted forms) are
+    42710; PostgreSQL makes `public."int"`, printed `"int"` (a keyword, not
+    hidden by `pg_catalog`, so unlike `public.uuid` it is not qualified).
+    Letting the CREATE through is a one-line gate change, measured: a
+    column or cast of `"int"` then comes back described as `int4`,
+    because the planner carries a type as a string and `int` already
+    means `int4` there at dozens of sites. A bare `int` reaches the planner
+    as `pg_catalog.int4`, so a single-part `"int"` can only have been
+    quoted; the fix is a distinct internal name for it, as `"char"` has
+    (`QUOTED_CHAR`).
   Backlog-ID: RP-038
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_batch_residue,tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_create_type_named_int
 
 - [ ] **RUST pgserver: grouped and DISTINCT ON rows that tie under ORDER BY
   come out in another order from PostgreSQL's.** A plain ORDER BY (and an

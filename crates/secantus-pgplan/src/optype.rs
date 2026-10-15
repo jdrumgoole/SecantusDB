@@ -1229,6 +1229,37 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 check_select(sel, &cx.ctes, cx.lookup, Some(scope))?;
             }
         }
+        // `__alias_check(name, expr, args...)` (`builtin_alias`): an
+        // operator's function called by name over arguments none of its
+        // overloads takes is a missing FUNCTION on PostgreSQL, named as
+        // called -- not the operator the call was rewritten into.
+        N::FuncCall(f) if func_name(f).as_deref() == Some(crate::builtin_alias::ALIAS_CHECK) => {
+            if let (Some(N::AConst(c)), Some(expr)) =
+                (f.args.first().and_then(|a| a.node.as_ref()), f.args.get(1))
+            {
+                if let Some(pg_query::protobuf::a_const::Val::Sval(name)) = c.val.as_ref() {
+                    let mut call = (**f).clone();
+                    call.args = f.args[2..].to_vec();
+                    if let Some(types) = call_arg_types(&call, scope) {
+                        if types.iter().all(|t| !t.is_empty() && t != "unknown")
+                            && crate::funcsig::resolves(&name.sval, &types) == Some(false)
+                        {
+                            crate::set_error_location(c.location);
+                            return Err(Error::UndefinedFunction(format!(
+                                "function {}({}) does not exist",
+                                name.sval,
+                                types
+                                    .iter()
+                                    .map(|t| crate::display_type(t))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )));
+                        }
+                    }
+                }
+                walk(expr, scope, cx)?;
+            }
+        }
         N::FuncCall(f) => {
             record_builtin_call(f, scope);
             if let Some(w) = f.over.as_deref() {
