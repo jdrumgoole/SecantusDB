@@ -304,6 +304,9 @@ impl PgHandler {
             && sel.residual.is_none()
             && sel.casts.iter().all(Option::is_none)
             && sel.offset >= 0
+            // WITH TIES reads past the LIMIT, which the streamed sort's
+            // top-k has already dropped.
+            && !sel.with_ties
             && !sel.table.is_empty()
             && Self::virtual_table(&sel.table).is_none();
         if !plain {
