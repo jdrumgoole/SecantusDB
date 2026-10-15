@@ -268,6 +268,13 @@ impl PgServer {
     ///   `"verify-full"` or `"cert"`.
     /// * `tls_require` -- refuse a connection that is not TLS.
     /// * `refuse_unknown_users` -- refuse a user there is no role for.
+    /// * `tls_crl_file` -- PEM revocation lists a client certificate is
+    ///   checked against (`ssl_crl_file`).
+    /// * `tls_client_name` -- `"CN"` (default) or `"DN"`: what of a client
+    ///   certificate names the user (`clientname=`).
+    /// * `tls_ident_file` / `tls_user_map` -- a `pg_ident.conf` and the map
+    ///   in it that turns the certificate's name into a user (both or
+    ///   neither), as `secantusd-pg --tls-ident-file --tls-user-map`.
     /// * `hba_file` / `ident_file` -- a `pg_hba.conf`, whose lines then decide
     ///   every login, and the `pg_ident.conf` its `map=` options name. The
     ///   file takes the place of `tls_require`, `tls_client_cert` and
@@ -286,6 +293,10 @@ impl PgServer {
         refuse_unknown_users = false,
         hba_file = None,
         ident_file = None,
+        tls_crl_file = None,
+        tls_client_name = None,
+        tls_ident_file = None,
+        tls_user_map = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -301,6 +312,10 @@ impl PgServer {
         refuse_unknown_users: bool,
         hba_file: Option<String>,
         ident_file: Option<String>,
+        tls_crl_file: Option<String>,
+        tls_client_name: Option<String>,
+        tls_ident_file: Option<String>,
+        tls_user_map: Option<String>,
     ) -> PyResult<Self> {
         // The options are checked before the store is opened, so a mistake in
         // them costs no WiredTiger open and leaves no directory behind.
@@ -316,12 +331,39 @@ impl PgServer {
                         .map_err(|e| PyValueError::new_err(format!("tls_client_cert: {e}")))?;
                     tls = tls.client_cert(mode);
                 }
+                if let Some(crl) = tls_crl_file {
+                    tls = tls.crl_file(crl);
+                }
+                if let Some(name) = tls_client_name {
+                    let name = name
+                        .parse()
+                        .map_err(|e| PyValueError::new_err(format!("tls_client_name: {e}")))?;
+                    tls = tls.client_name(name);
+                }
+                match (tls_ident_file, tls_user_map) {
+                    (Some(file), Some(map)) => tls = tls.user_map(file, map),
+                    (Some(_), None) => {
+                        return Err(PyValueError::new_err("tls_ident_file needs tls_user_map"))
+                    }
+                    (None, Some(_)) => {
+                        return Err(PyValueError::new_err("tls_user_map needs tls_ident_file"))
+                    }
+                    (None, None) => {}
+                }
                 Some(tls)
             }
             (None, None) => {
-                if tls_ca_file.is_some() || tls_client_cert.is_some() || tls_require {
+                if tls_ca_file.is_some()
+                    || tls_client_cert.is_some()
+                    || tls_require
+                    || tls_crl_file.is_some()
+                    || tls_client_name.is_some()
+                    || tls_ident_file.is_some()
+                    || tls_user_map.is_some()
+                {
                     return Err(PyValueError::new_err(
-                        "tls_ca_file, tls_client_cert and tls_require need \
+                        "tls_ca_file, tls_client_cert, tls_require, tls_crl_file, \
+                         tls_client_name, tls_ident_file and tls_user_map need \
                          tls_cert_file and tls_key_file",
                     ));
                 }

@@ -331,9 +331,6 @@ one beside it.
     in BOTH the plain and TLS runs is printed and does not fail the
     `psycopg-tls.yml` lane, which is the plain gauge's number and has no
     Linux lane that gates it.
-  - The embedded Python handle (`_secantus_server.PgServer`) **does not
-    take a revocation list, a user name map or `clientname=DN` as
-    options**; a `pg_hba.conf` passed as `hba_file` can say the last two.
   Backlog-ID: RP-013
   Verify: tests/backlog/test_rust_postgres_gaps.py::test_unknown_user_is_asked_for_a_password
 

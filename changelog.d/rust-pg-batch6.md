@@ -31,6 +31,14 @@ does.
   `pg_lsn_pli`, `ts_match_vq`, ...), and the operators `line ?# box`,
   `lseg ?# line` and `line <-> line`.
 
+- The embedded Python handle (`_secantus_server.PgServer`) takes
+  `tls_crl_file`, `tls_client_name` and `tls_ident_file` / `tls_user_map`,
+  checked as `secantusd-pg` checks `--tls-crl-file`, `--tls-client-name`
+  and `--tls-ident-file` / `--tls-user-map` (part of RP-013,
+  `tests/test_pgserver_embedded.py::test_a_user_name_map_names_the_role_a_certificate_logs_in_as`).
+  The handle lives in `secantus-server-py`, which the Rust MongoDB server's
+  extension builds too; nothing on its MongoDB side changed.
+
 #### Fixed
 
 - `jsonb - text` with a typed text key was 42883.
