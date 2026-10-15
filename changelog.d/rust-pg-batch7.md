@@ -43,3 +43,7 @@ More of the Rust PostgreSQL server's backlog, measured against PostgreSQL
   to re-read takes the signal and carries on, as a postmaster does. It
   stopped. Part of RP-013
   (`crates/secantus-pg/tests/signals.rs::sighup_does_not_stop_a_server_with_nothing_to_reload`).
+- A direct-TLS connection (`sslnegotiation=direct`, PostgreSQL 17's) is
+  closed as PostgreSQL 15.19 closes it, the client seeing "unexpected eof";
+  it was accepted. Part of RP-013, pinned by the `direct tls` group in
+  `tools/probes/pg_login_tls_files.py`.

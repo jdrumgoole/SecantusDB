@@ -5,7 +5,7 @@ Revocation lists (current, empty, expired, dated in the future, from another
 CA, forged, with and without extensions, through an intermediate CA), user
 name maps by exact name and by pattern, ``clientname=DN``, server
 certificates whose signature is RSA-PSS or Ed25519, and what a reload picks
-up. 510 scenarios. Arguments after the binary name the groups to run; with
+up. 513 scenarios. Arguments after the binary name the groups to run; with
 none, all of them.
 
 Every scenario is one login, made against a throwaway PostgreSQL cluster this
@@ -505,6 +505,16 @@ def scope_scenarios(port):
     }
 
 
+def direct_scenarios(port):
+    """`sslnegotiation=direct` is PostgreSQL 17's; 15 has no direct TLS and
+    closes the connection. The usual negotiation still works beside it."""
+    return {
+        "direct, require": attempt(port, sslnegotiation="direct"),
+        "direct, verify-full": attempt(port, sslnegotiation="direct", sslmode="verify-full"),
+        "postgres negotiation": attempt(port, sslnegotiation="postgres"),
+    }
+
+
 def chain_scenarios(port):
     out = crl_scenarios(port)
     out["intermediate's good cert"] = attempt(port, **INTER_GOOD)
@@ -659,6 +669,7 @@ GROUPS = {
             ("delta", CRL_DELTA),
         )
     },
+    "direct tls": ("", OPEN, [], direct_scenarios, "s"),
     "no crl, chain": ("", OPEN, [], chain_scenarios, "s"),
     "crl-cert": (
         "ssl_crl_file = '{d}/crl.pem'",

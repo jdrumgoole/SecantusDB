@@ -49,8 +49,9 @@ use tokio_rustls::rustls::{
 };
 use tokio_rustls::TlsAcceptor;
 
-/// The ALPN protocol a PostgreSQL 17 client offers, and the only one a
-/// direct-TLS connection (`sslnegotiation=direct`) may select.
+/// The ALPN protocol a PostgreSQL 17 client offers. A direct-TLS connection
+/// (`sslnegotiation=direct`) is closed before TLS starts, as PostgreSQL 15
+/// closes one (pgwire's `negotiate_tls`).
 const ALPN_POSTGRESQL: &[u8] = b"postgresql";
 
 /// What a connection must show by way of a client certificate. Every choice

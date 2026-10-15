@@ -317,8 +317,6 @@ one beside it.
       translation, 2026-10-15), so they share that engine's distance from
       PostgreSQL's advanced regular expressions; `@file` inclusion in
       `pg_ident.conf` is refused.
-  - **Direct TLS (`sslnegotiation=direct`) is accepted**, which is
-    PostgreSQL 17's behaviour; 15.19 answers "SSL error: unexpected eof".
   - The key must have no passphrase.
   - **The libpq scenarios (`attempt`) in the login probes do not retry**
     when the answer is the close; `raw_first` does (up to four times), after

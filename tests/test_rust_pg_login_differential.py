@@ -45,7 +45,7 @@ REFERENCE_MAJOR = 15
 #: probe -> (arguments after the binary, scenarios it holds)
 CASES: dict[str, tuple[tuple[str, ...], int]] = {
     "pg_login_options.py": (("--refuse-unknown-users",), 219),
-    "pg_login_tls_files.py": ((), 510),
+    "pg_login_tls_files.py": ((), 513),
     "pg_login_hba.py": ((), 118),
 }
 
