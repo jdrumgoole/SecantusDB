@@ -114,6 +114,11 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - `pg_settings.enumvals` lists each enum setting's values (it was NULL).
 - With `standard_conforming_strings = off`, a typed literal (`int4'1'`,
   `date'2020-01-02'`) reads as one; it had failed with 42704.
+- ORDER BY a range or multirange sorts as PostgreSQL's `range_cmp` /
+  `multirange_cmp` do (empty first, then by bound), in a query, a window
+  and over a VALUES column; it had sorted by the text, so `empty` came last
+  and `[10,11)` before `[5,7)`. Fixes RP-037
+  (tests/backlog/test_rust_postgres_gaps.py::test_order_by_a_range).
 - Inside a correlated subquery, an outer column has its own type:
   `(select t.c = 'x' from s limit 1)` over a `char(3)` had compared an
   integer and answered false, and `pg_typeof` said `integer`.
@@ -182,4 +187,4 @@ and `UPDATE ... FROM ... RETURNING *` left out the FROM table's columns.
 - Corpora `multi_assign_update`, `returning_star`, `icu_collations`,
   `to_reg_functions`, `typed_value_residue`, `ts_catalogs`, `typmods`, `sequence_types`, `polymorphic_literals`, `acl_functions`, `relation_updatable`, `order_ties`,
   `string_syntax_settings`, `record_fields_using`, `fetch_ties_settings`
-  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops` and `multirange_ops`.
+  `series_order_exprs`, `multibyte_encodings`, `geometric_ops_2`, `tsquery_containment`, `variadic_calls`, `macaddr_bitops`, `multirange_ops` and `range_order`.

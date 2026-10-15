@@ -227,6 +227,7 @@ const SCALAR_NAMES: &[&str] = &[
     "now",
     // The planner's own: an inet / cidr value's order key (`enum_order`).
     "__net_sortkey",
+    "__range_sortkey",
     "__net_op",
     "__net_arith",
     "__net_diff",
@@ -787,6 +788,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "__net_diff" => {
             need(2)?;
             crate::net::diff(&arg(0), &arg(1))
+        }
+        "__range_sortkey" => {
+            need(2)?;
+            crate::range_ops::sort_key(&arg(0), &s(1))
         }
         "__net_sortkey" => {
             need(1)?;

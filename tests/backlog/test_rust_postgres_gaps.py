@@ -561,7 +561,7 @@ def test_error_positions(pg: Any, pg15: Any, setup: list[str], sql: str) -> None
     assert _error_and_position(pg, setup, sql) == _error_and_position(pg15, setup, sql)
 
 
-@pytest.mark.backlog("RP-037")
+@pytest.mark.backlog_fixed("RP-037")
 @pytest.mark.parametrize(
     "sql",
     [

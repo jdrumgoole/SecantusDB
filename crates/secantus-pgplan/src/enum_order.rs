@@ -156,6 +156,19 @@ fn derived_def(
             if let Some(coll) = collation {
                 c.extra.insert("collation", coll);
             }
+            // A range or multirange column: a row casting to one types it,
+            // so ORDER BY sorts it by `__range_sortkey`.
+            let ranged = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
+                Some(N::TypeCast(tc)) => {
+                    let t = type_name_of(tc.type_name.as_ref()?);
+                    (crate::range::is_range_type(&t) || crate::range::is_multirange_type(&t))
+                        .then_some(t)
+                }
+                _ => None,
+            });
+            if let Some(t) = ranged {
+                c.pg_type = t;
+            }
             c
         })
         .collect();
@@ -270,6 +283,46 @@ impl Rewriter<'_> {
             }
             Some(N::TypeCast(tc)) => net(&tc.type_name.as_ref().map(type_name_of)?),
             _ => None,
+        }
+    }
+
+    /// The range or multirange type `node` statically has: a column of one
+    /// in scope, or a cast to one.
+    fn range_of(&self, node: &pg_query::protobuf::Node) -> Option<String> {
+        let ranged = |t: &str| {
+            (crate::range::is_range_type(t) || crate::range::is_multirange_type(t))
+                .then(|| t.to_string())
+        };
+        match node.node.as_ref() {
+            Some(N::ColumnRef(c)) => self.column_of(c).and_then(|c| ranged(&c.pg_type)),
+            Some(N::TypeCast(tc)) => ranged(&tc.type_name.as_ref().map(type_name_of)?),
+            _ => None,
+        }
+    }
+
+    /// `__range_sortkey(node, 'type')`.
+    fn range_key(node: pg_query::protobuf::Node, ty: &str) -> pg_query::protobuf::Node {
+        let ty = pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: false,
+                location: -1,
+                val: Some(a_const::Val::Sval(pg_query::protobuf::String {
+                    sval: ty.into(),
+                })),
+            })),
+        };
+        pg_query::protobuf::Node {
+            node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                funcname: vec![pg_query::protobuf::Node {
+                    node: Some(N::String(pg_query::protobuf::String {
+                        sval: "__range_sortkey".into(),
+                    })),
+                }],
+                args: vec![node, ty],
+                funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+                location: -1,
+                ..Default::default()
+            }))),
         }
     }
 
@@ -753,6 +806,9 @@ impl Rewriter<'_> {
                     self.changed = true;
                 } else if self.net_of(key).is_some() {
                     sb.node = Some(Box::new(Self::net_key(key.clone())));
+                    self.changed = true;
+                } else if let Some(ty) = self.range_of(key) {
+                    sb.node = Some(Box::new(Self::range_key(key.clone(), &ty)));
                     self.changed = true;
                 } else if let Some((collation, _)) = self.coll_of(key) {
                     sb.node = Some(Box::new(Self::coll_key(key, &collation)));

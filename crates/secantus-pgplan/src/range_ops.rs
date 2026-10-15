@@ -572,3 +572,101 @@ pub fn result_type(op: &str, lt: &str, rt: &str) -> Option<String> {
         _ => "bool".to_string(),
     })
 }
+
+/// An element as a string whose byte order is its type's order, ending in a
+/// byte below every byte it can contain so a longer value sorts after its
+/// prefix. Integers are offset into unsigned hex; a numeric is its sign,
+/// exponent and digits (inverted when negative); the date / time types
+/// are their canonical text, which already sorts.
+fn element_key(v: &str, element: &str) -> String {
+    match element {
+        "int4" | "int8" => match v.trim().parse::<i64>() {
+            Ok(i) => format!("{:016x} ", (i as u64) ^ (1 << 63)),
+            Err(_) => format!("{v} "),
+        },
+        "numeric" => numeric_key(v.trim()),
+        _ => format!("{v} "),
+    }
+}
+
+/// `numeric` order as text: `0` below `1` (zero) below `2`, then a biased
+/// decimal exponent and the significant digits; a negative value inverts
+/// both so a larger magnitude sorts first.
+fn numeric_key(v: &str) -> String {
+    let (neg, body) = match v.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    if body.eq_ignore_ascii_case("nan") {
+        return "3 ".into();
+    }
+    if body.eq_ignore_ascii_case("infinity") {
+        return if neg { "/ ".into() } else { "2~ ".into() };
+    }
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let digits: String = format!("{int}{frac}");
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    let sig = digits.trim_start_matches('0').trim_end_matches('0');
+    if sig.is_empty() {
+        return "1 ".into();
+    }
+    // The exponent of the first significant digit, biased positive.
+    let exp = int.len() as i64 - lead as i64 + 50_000;
+    if neg {
+        let inv: String = sig
+            .chars()
+            .map(|c| char::from(b'9' - (c as u8 - b'0')))
+            .collect();
+        format!("0{:05}{inv}~", 99_999 - exp)
+    } else {
+        format!("2{exp:05}{sig} ")
+    }
+}
+
+/// One bound's key: an infinite lower bound first and an infinite upper
+/// bound last; at one value an inclusive lower bound sorts before an
+/// exclusive one and an exclusive upper bound before an inclusive one
+/// (`range_cmp_bounds`).
+fn bound_key(b: &Bound, element: &str) -> String {
+    match (&b.val, b.lower) {
+        (None, true) => "0".into(),
+        (None, false) => "2".into(),
+        (Some(v), lower) => {
+            let flag = if lower == b.inclusive { '0' } else { '1' };
+            format!("1{}{flag}", element_key(v, element))
+        }
+    }
+}
+
+fn one_range_key(r: &Range, element: &str) -> String {
+    if r.empty {
+        return "0".into();
+    }
+    format!(
+        "1{}{}",
+        bound_key(&lower(r), element),
+        bound_key(&upper(r), element)
+    )
+}
+
+/// `__range_sortkey(value, type)`: a string whose order is `range_cmp` for a
+/// range and `multirange_cmp` for a multirange (range by range, a shorter
+/// one first), so ORDER BY can sort a range value by it.
+pub fn sort_key(v: &Bson, ty: &str) -> Result<Bson> {
+    if *v == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    Ok(Bson::String(match side(v, ty)? {
+        Side::Range(r, t) => one_range_key(&r, &element(&t)?),
+        Side::Multi(m, t) => {
+            let e = element(&t)?;
+            let mut key: String = range::normalise_multirange(m, &t)?
+                .iter()
+                .map(|r| format!("1{}", one_range_key(r, &e)))
+                .collect();
+            key.push('0');
+            key
+        }
+        Side::Elem(e) => crate::render_value_text(&e),
+    }))
+}
